@@ -1,0 +1,32 @@
+# Claude workspace (per user prefs: never check in)
+.claude/
+CLAUDE.md
+
+# Original game binaries and archives — never commit
+*.rar
+*.DLL
+*.dll
+mudbins/
+tmp/
+
+# Reverse-engineering derived artifacts (regenerable / derivative of the binary)
+re/ghidra_proj/
+re/wg_nt_ghidra/
+re/wccmmpls_ghidra/
+re/wg_nt_ref/
+re/exports/*
+!re/exports/gang_house_description_files.txt
+re/__pycache__/
+re/mmud_wgnt.sqlite
+
+# Third-party reference repositories (vendored, not ours)
+re/Nightmare-Redux/
+re/MMUD-Explorer/
+
+# Rust
+target/
+
+# Runtime state
+state.sqlite
+state.sqlite-journal
+state.sqlite-wal
