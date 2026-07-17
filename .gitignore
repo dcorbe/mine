@@ -30,3 +30,4 @@ target/
 state.sqlite
 state.sqlite-journal
 state.sqlite-wal
+__pycache__/
