@@ -34,3 +34,4 @@ state.sqlite
 state.sqlite-journal
 state.sqlite-wal
 __pycache__/
+wccmdact.ini
