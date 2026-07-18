@@ -2,6 +2,9 @@
 .claude/
 CLAUDE.md
 
+# Mirrored third-party documentation sites (large raw HTML dumps)
+docs/mirrors/
+
 # Original game binaries and archives — never commit
 *.rar
 *.DLL
@@ -31,3 +34,4 @@ state.sqlite
 state.sqlite-journal
 state.sqlite-wal
 __pycache__/
+wccmdact.ini
