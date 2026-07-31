@@ -26,6 +26,13 @@ re/mmud_wgnt.sqlite
 re/Nightmare-Redux/
 re/MMUD-Explorer/
 
+# Stray live-board captures dropped in the working directory: their TX
+# stream carries the account password, so they must never be committed.
+# Root-scoped on purpose — the curated RX-only corpus in re/oracle/ is
+# added by hand and stays tracked.
+/*.raw
+/*_timing.log
+
 # Rust
 target/
 
