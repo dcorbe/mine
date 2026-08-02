@@ -26,6 +26,13 @@ re/mmud_wgnt.sqlite
 re/Nightmare-Redux/
 re/MMUD-Explorer/
 
+# Recovered Galacticomm archive: vendor SDKs, host binaries, scanned manuals,
+# and cloned third-party module/tooling repos. Hundreds of MB, all of it
+# re-downloadable from software.bbsdocumentary.com and GitHub, and none of it
+# ours to redistribute. Derived tables extracted from it (ordinal maps) are
+# committed separately under re/.
+archive/
+
 # Stray live-board captures dropped in the working directory: their TX
 # stream carries the account password, so they must never be committed.
 # Root-scoped on purpose — the curated RX-only corpus in re/oracle/ is
