@@ -63,6 +63,10 @@ pub(crate) struct Ctx {
     pub out_si: u64,
     pub out_di: u64,
     pub out_bp: u64,
+
+    /// Set by the fault handler when a module dies, and by nothing else. Zero
+    /// means the excursion ended by reaching the trampoline.
+    pub out_signo: u64,
 }
 
 impl Ctx {

@@ -51,20 +51,11 @@
 //! no return frame for module code to `RETF` through, and a module signals
 //! completion by calling [`EXIT_THUNK`] instead.
 //!
-//! **Faults are fatal, not reported.** [`Exit::Fault`] is part of the shape this
-//! wants to have and is currently unreachable: a module that faults takes the
-//! process with it. Recovering needs a `SIGSEGV`/`SIGILL` handler that rewrites
-//! the interrupted context -- setting `RIP` from `R11`, `RSP` from `R15` and the
-//! saved `CS`/`SS` back to the host's, which is precisely the restore the
-//! trampoline performs, and precisely what `<asm/ucontext.h>` describes DOSEMU
-//! doing. That handler must carry `SA_ONSTACK` over an alternate signal stack
-//! mapped below 4 GiB, because a signal taken in compatibility mode cannot have
-//! its frame built on a stack above that line: the kernel fails, calls
-//! `force_sigsegv()`, fails again, and the process dies. None of that is built
-//! yet, so **any signal delivered during an excursion is fatal**, not only a
-//! fault.
+//! That gap is not a limit of the mechanism; it is simply not built.
 //!
-//! Neither gap is a limit of the mechanism; both are simply not built.
+//! A module that faults is survivable: see [`Exit::Fault`] and the `fault`
+//! module. A module that loops forever is not -- there is no way to interrupt
+//! one yet.
 //!
 //! # Testing
 //!
@@ -81,6 +72,7 @@
 
 mod asm;
 mod farptr;
+mod fault;
 mod seg;
 
 use std::io;
@@ -189,6 +181,9 @@ impl Machine {
         let mut code = Segment::new(SEGMENT_BYTES, true)?;
         let stack = Segment::new(SEGMENT_BYTES, false)?;
 
+        let cs64 = current_cs();
+        fault::arm(cs64)?;
+
         let tramp_linear = code.linear(TRAMPOLINE_OFFSET);
         code.write(TRAMPOLINE_OFFSET, trampoline())?;
 
@@ -202,7 +197,6 @@ impl Machine {
         // 16-bit segment takes a 16-bit offset and could not name the
         // trampoline. With it the offset is 32 bits, which reaches anywhere
         // below 4 GiB.
-        let cs64 = current_cs();
         for index in 0..=MAX_THUNKS {
             let logical = if index == MAX_THUNKS {
                 EXIT_THUNK
@@ -493,12 +487,23 @@ impl Machine {
         self.ctx.out_ax = 0;
         self.ctx.out_sp = 0;
         self.ctx.out_ss = 0;
+        self.ctx.out_signo = 0;
 
         // SAFETY: every field the assembly reads is set immediately above; the
         // code and stack segments are mapped, described and live for as long as
         // `self`; and the trampoline the module will far-jump to was written
         // into the code segment by `new`.
         unsafe { mbbs16_enter(&raw mut self.ctx) };
+
+        if self.ctx.out_signo != 0 {
+            // The module died and the handler carried us out. Nothing about its
+            // state is meaningful now, so forget the call frame rather than let
+            // `arg_u16` and friends report stale nonsense.
+            self.frame_sp = None;
+            return Ok(Exit::Fault {
+                signo: self.ctx.out_signo as i32,
+            });
+        }
 
         debug_assert_eq!(
             self.ctx.out_ss as u16,

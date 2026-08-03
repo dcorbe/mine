@@ -8,5 +8,8 @@ publish.workspace = true
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
