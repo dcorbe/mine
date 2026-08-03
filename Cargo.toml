@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mud-core", "crates/mud-server", "crates/mud-oracle", "crates/mud-client"]
+members = ["crates/mbbs16", "crates/mud-core", "crates/mud-server", "crates/mud-oracle", "crates/mud-client"]
 
 [workspace.package]
 edition = "2024"
