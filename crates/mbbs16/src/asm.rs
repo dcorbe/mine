@@ -51,6 +51,10 @@ pub(crate) struct Ctx {
     pub di: u64,
     pub bp: u64,
 
+    /// The module's data segment -- Borland's `DGROUP`, where its globals live.
+    /// Also callee-saved: a shim must hand back the `DS` the module had.
+    pub ds: u64,
+
     /// `AX` when the trampoline was reached: the thunk index.
     pub out_ax: u64,
     /// `SP` at the same instant, still a segment offset.
@@ -63,6 +67,7 @@ pub(crate) struct Ctx {
     pub out_si: u64,
     pub out_di: u64,
     pub out_bp: u64,
+    pub out_ds: u64,
 
     /// Set by the fault handler when a module dies, and by nothing else. Zero
     /// means the excursion ended by reaching the trampoline.
@@ -106,6 +111,10 @@ mbbs16_enter:
     movw    %ss, %r13w                  /* the host's SS, for the trampoline */
     movq    %rsp, %r15                  /* and the host's RSP */
 
+    movw    %ds, %r12w                  /* the host's DS, for the way back */
+    movzwl  {ds}(%r14), %ecx            /* and the module's, which its globals */
+    movw    %cx, %ds                    /* are addressed through */
+
     movq    {ax}(%r14), %rax            /* the call's return value, AX or DX:AX */
     movq    {dx}(%r14), %rdx
     movq    {si}(%r14), %rsi            /* and the callee-saved trio, which a */
@@ -128,6 +137,7 @@ mbbs16_enter:
     retq
 "#,
     ax = const offset_of!(Ctx, ax),
+    ds = const offset_of!(Ctx, ds),
     dx = const offset_of!(Ctx, dx),
     si = const offset_of!(Ctx, si),
     di = const offset_of!(Ctx, di),
@@ -158,6 +168,8 @@ mbbs16_tramp_start:
     movq    %rsi, {out_si}(%r14)        /* the callee-saved trio, to be handed */
     movq    %rdi, {out_di}(%r14)        /* back unchanged when the module is   */
     movq    %rbp, {out_bp}(%r14)        /* resumed                             */
+    movw    %ds,  {out_ds}(%r14)        /* including DS, which the module may  */
+    movw    %r12w, %ds                  /* have moved; then the host's back    */
 
     movw    %r13w, %ss
     movq    %r15, %rsp
@@ -170,6 +182,7 @@ mbbs16_tramp_end:
     out_si = const offset_of!(Ctx, out_si),
     out_di = const offset_of!(Ctx, out_di),
     out_bp = const offset_of!(Ctx, out_bp),
+    out_ds = const offset_of!(Ctx, out_ds),
     options(att_syntax)
 );
 

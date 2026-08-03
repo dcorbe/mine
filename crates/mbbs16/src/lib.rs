@@ -45,6 +45,11 @@
 //! by the caller, results come back in `AX` (or `DX:AX`), `char` is unsigned,
 //! and no instruction newer than the 286 will ever appear.
 //!
+//! A module therefore gets three segments: code, a stack, and a data segment of
+//! its own for globals -- Borland's `DGROUP`, which `MAJORBBS` exports as
+//! `DGROUP@`. `DS` is loaded before entry and, like `SI`, `DI` and `BP`, is
+//! **callee-saved**: whatever the module had is handed back on every resume.
+//!
 //! # What this is not, yet
 //!
 //! The host cannot yet *call into* a module -- entry is by far jump, so there is
@@ -168,6 +173,7 @@ pub struct Machine {
     segments: Vec<Segment>,
     code: usize,
     stack: usize,
+    data: usize,
     ctx: Ctx,
 
     /// `SP` when the module last called out, or `None` before its first call.
@@ -180,6 +186,11 @@ impl Machine {
     pub fn new() -> io::Result<Self> {
         let mut code = Segment::new(SEGMENT_BYTES, true)?;
         let stack = Segment::new(SEGMENT_BYTES, false)?;
+
+        // The module's globals. Borland calls this DGROUP, and MAJORBBS exports
+        // `DGROUP@` so a module can find its own -- which is what the NE loader
+        // will resolve against this segment.
+        let data = Segment::new(SEGMENT_BYTES, false)?;
 
         let cs64 = current_cs();
         fault::arm(cs64)?;
@@ -219,9 +230,10 @@ impl Machine {
         }
 
         Ok(Self {
-            segments: vec![code, stack],
+            segments: vec![code, stack, data],
             code: 0,
             stack: 1,
+            data: 2,
             ctx: Ctx::default(),
             frame_sp: None,
         })
@@ -266,6 +278,11 @@ impl Machine {
         self.ctx.out_si = 0;
         self.ctx.out_di = 0;
         self.ctx.out_bp = 0;
+
+        // A module starts with DS naming its own data segment. Everything after
+        // this is whatever the module last had, since DS is callee-saved.
+        self.ctx.out_ds = u64::from(self.data_selector());
+
         self.run(ip, INITIAL_SP, Ret::Void)
     }
 
@@ -317,6 +334,11 @@ impl Machine {
     /// hands out pointers to its own locals, and this is the segment they name.
     pub fn stack_selector(&self) -> u16 {
         self.segments[self.stack].selector()
+    }
+
+    /// Selector of the module's data segment: its `DGROUP`.
+    pub fn data_selector(&self) -> u16 {
+        self.segments[self.data].selector()
     }
 
     fn stack(&self) -> &Segment {
@@ -481,6 +503,7 @@ impl Machine {
         self.ctx.si = self.ctx.out_si;
         self.ctx.di = self.ctx.out_di;
         self.ctx.bp = self.ctx.out_bp;
+        self.ctx.ds = self.ctx.out_ds;
 
         // The trampoline writes SS as a bare 16-bit store, so the rest of the
         // slot has to start clean.

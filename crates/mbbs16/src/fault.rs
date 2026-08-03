@@ -184,6 +184,14 @@ extern "C" fn handler(signo: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut
     // keeps alive across the excursion, and 16-bit code cannot have altered it.
     unsafe { (*ctx16).out_signo = signo as u64 };
 
+    // DS is not part of the x86-64 signal frame, so `sigreturn` will not put it
+    // back. Set it here instead -- the change outlives the handler precisely
+    // because nothing will overwrite it. R12 holds the host's, put there by
+    // `mbbs16_enter` for the trampoline that this is standing in for.
+    let host_ds = gregs[libc::REG_R12 as usize] as u16;
+    // SAFETY: loading a selector the host was already running under.
+    unsafe { std::arch::asm!("mov ds, {0:x}", in(reg) host_ds, options(nostack, preserves_flags)) };
+
     gregs[libc::REG_RIP as usize] = gregs[libc::REG_R11 as usize];
     gregs[libc::REG_RSP as usize] = gregs[libc::REG_R15 as usize];
     gregs[libc::REG_CSGSFS as usize] = ((packed & KEEP_GS_FS)
