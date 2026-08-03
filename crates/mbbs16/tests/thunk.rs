@@ -8,7 +8,7 @@
 //! and read back out of `objdump` rather than worked out by hand -- the
 //! listing in [`test_module`] is what was assembled.
 
-use mbbs16::{EXIT_THUNK, Exit, INITIAL_SP, Machine};
+use mbbs16::{EXIT_THUNK, Exit, INITIAL_SP, Machine, Ret};
 
 /// Thunk index the test module calls. Arbitrary; a real module would use the
 /// import's ordinal.
@@ -87,7 +87,7 @@ fn sixteen_bit_code_calls_a_host_function_and_uses_the_result() {
 
                 serviced += 1;
                 let sum = machine.arg_u16(0).wrapping_add(machine.arg_u16(1));
-                exit_reason = machine.resume(sum).expect("resumed");
+                exit_reason = machine.resume(Ret::U16(sum)).expect("resumed");
             }
             Exit::Call { index: EXIT_THUNK } => {
                 // The module cleaned its own arguments, so all that is below

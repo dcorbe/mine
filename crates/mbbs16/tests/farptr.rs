@@ -9,7 +9,7 @@
 //! The module here passes two pointers into two different segments to the same
 //! import. Resolving both correctly is only possible by selector.
 
-use mbbs16::{EXIT_THUNK, Exit, FarPtr, INITIAL_SP, Machine};
+use mbbs16::{EXIT_THUNK, Exit, FarPtr, INITIAL_SP, Machine, Ret};
 
 /// The import the module calls: something `strlen`-shaped, which is the shape
 /// most of the real API has.
@@ -116,7 +116,7 @@ fn a_far_pointer_argument_resolves_through_the_segment_it_names() {
 
                 let len = s.len() as u16;
                 seen.push(s);
-                exit = machine.resume(len).expect("resumed");
+                exit = machine.resume(Ret::U16(len)).expect("resumed");
             }
             Exit::Call { index: EXIT_THUNK } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),

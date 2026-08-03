@@ -14,7 +14,7 @@
 //! services the call and resumes it with an answer:
 //!
 //! ```no_run
-//! # use mbbs16::{Exit, Machine};
+//! # use mbbs16::{Exit, Machine, Ret};
 //! # fn demo() -> std::io::Result<()> {
 //! let mut machine = Machine::new()?;
 //! machine.load_code(&[0xcb])?;
@@ -24,7 +24,7 @@
 //!         Exit::Call { index } => {
 //!             let sum = machine.arg_u16(0).wrapping_add(machine.arg_u16(1));
 //!             let _ = index;
-//!             exit = machine.resume(sum)?;
+//!             exit = machine.resume(Ret::U16(sum))?;
 //!         }
 //!         Exit::Fault { .. } => break,
 //!     }
@@ -65,6 +65,19 @@
 //! fault.
 //!
 //! Neither gap is a limit of the mechanism; both are simply not built.
+//!
+//! # Testing
+//!
+//! **Run the tests in both profiles.** `cargo test -p mbbs16` and
+//! `cargo test -p mbbs16 --release` are not the same check here.
+//!
+//! This is not a general principle, it is a measured property of this crate.
+//! Deleting the instruction that loads `DX` before entering 16-bit code leaves
+//! every test passing in debug and fails four of them in release: at `-O0` the
+//! host's own code generation happens to leave the right value in `%rdx`
+//! anyway, so the module gets it by accident. Anything whose correctness rests
+//! on the contents of a register at a mode transition can be masked this way,
+//! and only the other profile shows it.
 
 mod asm;
 mod farptr;
@@ -116,6 +129,42 @@ pub enum Exit {
 
     /// The module took a signal. Nothing is resumable.
     Fault { signo: i32 },
+}
+
+/// What a host call hands back to the module.
+///
+/// Borland's 16-bit C returns an `int` in `AX`, and anything 32 bits wide --
+/// a `long`, or a far pointer -- in `DX:AX`, high half in `DX`. Naming the
+/// width here rather than offering a resume method per shape keeps the choice
+/// explicit at the one place it is made, which is what a table of several
+/// hundred shims wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ret {
+    /// Nothing to return. Both halves are cleared, so a module that reads them
+    /// anyway sees something deterministic.
+    Void,
+
+    /// An `int`, in `AX`.
+    U16(u16),
+
+    /// A `long`, split `DX:AX` with the high half in `DX`.
+    U32(u32),
+
+    /// A far pointer: **segment in `DX`, offset in `AX`**. Same order as a
+    /// `long`, since that is what it is -- and the pair most easily swapped.
+    Far(FarPtr),
+}
+
+impl Ret {
+    /// The `(AX, DX)` the module should resume with.
+    fn registers(self) -> (u16, u16) {
+        match self {
+            Self::Void => (0, 0),
+            Self::U16(v) => (v, 0),
+            Self::U32(v) => (v as u16, (v >> 16) as u16),
+            Self::Far(p) => (p.offset, p.selector),
+        }
+    }
 }
 
 /// One module's 16-bit world: its code, its stack, and the state needed to
@@ -217,13 +266,13 @@ impl Machine {
 
     /// Begin executing at `ip` in the code segment, on a fresh stack.
     pub fn enter(&mut self, ip: u16) -> io::Result<Exit> {
-        let () = Ctx::ASSERT_LAYOUT;
+        let () = Ctx::ASSERT_FAR_POINTER_FIRST;
 
         self.frame_sp = None;
         self.ctx.out_si = 0;
         self.ctx.out_di = 0;
         self.ctx.out_bp = 0;
-        self.run(ip, INITIAL_SP, 0)
+        self.run(ip, INITIAL_SP, Ret::Void)
     }
 
     /// Resume the module from its outstanding call, handing back `value` in
@@ -236,7 +285,7 @@ impl Machine {
     /// # Panics
     ///
     /// If the module is not stopped at a call.
-    pub fn resume(&mut self, value: u16) -> io::Result<Exit> {
+    pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
         let sp = self
             .frame_sp
             .expect("resume() with no outstanding call to resume from");
@@ -245,7 +294,7 @@ impl Machine {
         let cs = self.stack().read_u16(usize::from(sp) + 2);
         debug_assert_eq!(cs, self.code_selector(), "call frame names another segment");
 
-        self.run(ip, sp + 4, value)
+        self.run(ip, sp + 4, ret)
     }
 
     /// Read the `n`th 16-bit argument of the outstanding call.
@@ -420,12 +469,15 @@ impl Machine {
     }
 
     /// Cross into 16-bit mode and come back.
-    fn run(&mut self, ip: u16, sp: u16, ax: u16) -> io::Result<Exit> {
+    fn run(&mut self, ip: u16, sp: u16, ret: Ret) -> io::Result<Exit> {
+        let (ax, dx) = ret.registers();
+
         self.ctx.target_offset = u32::from(ip);
         self.ctx.target_selector = self.code_selector();
         self.ctx.ss16 = self.stack_selector();
         self.ctx.sp = u64::from(sp);
         self.ctx.ax = u64::from(ax);
+        self.ctx.dx = u64::from(dx);
 
         // Hand the callee-saved registers back exactly as the module left them.
         // Borland's cdecl makes SI, DI and BP the callee's to preserve, and a

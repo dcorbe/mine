@@ -1,27 +1,28 @@
 //! The two pieces of assembly that cross between 64-bit and 16-bit code.
 //!
-//! Both are written as real assembly rather than hand-assembled byte arrays.
-//! The encodings involved are easy to get subtly wrong -- an off-by-one in a
-//! patch offset silently overwrites the following instruction -- and the
-//! assembler does not make that mistake.
+//! Both are written as real assembly rather than hand-assembled byte arrays,
+//! and both address [`Ctx`] through `const` operands rather than literal
+//! displacements. That is deliberate: an encoding or an offset worked out by
+//! hand is the mistake this project keeps making, and it is always silent --
+//! a field written one byte late lands on its neighbour and nothing complains.
+//! Deriving the numbers from the struct removes the possibility.
 //!
 //! Everything here follows the findings recorded in
 //! `docs/plans/2026-08-03-16bit-module-execution.md`, measured in
 //! <https://github.com/dcorbe/x86-compat16>.
 
 use core::arch::global_asm;
+use core::mem::offset_of;
 
 /// State handed to [`mbbs16_enter`], and filled in by the trampoline on the way
 /// back out.
-///
-/// The offsets are load-bearing: both assembly stubs address these fields by
-/// displacement off `%r14`. [`Ctx::ASSERT_LAYOUT`] fails the build if they
-/// drift.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct Ctx {
     /// Far pointer to enter through, in the `m16:32` form `ljmp` expects: a
-    /// 32-bit offset immediately followed by a 16-bit selector.
+    /// 32-bit offset immediately followed by a 16-bit selector. These two must
+    /// stay adjacent and at the very front -- the jump reads them as one
+    /// operand, straight off `%r14`.
     pub target_offset: u32,
     pub target_selector: u16,
 
@@ -34,8 +35,11 @@ pub(crate) struct Ctx {
     /// segment happened to start on a 64 KiB boundary.
     pub sp: u64,
 
-    /// Value to present in `AX` on entry -- a host call's return value.
+    /// Registers carrying a host call's return value back to the module. `AX`
+    /// alone for an `int`; `DX:AX` for a `long` or a far pointer, high half in
+    /// `DX`.
     pub ax: u64,
+    pub dx: u64,
 
     /// Registers Borland's cdecl treats as **callee-saved**, restored on entry
     /// so that a host call is transparent to the module.
@@ -62,24 +66,12 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    /// Compile-time check that the field offsets the assembly hardcodes still
-    /// match the struct. Referenced from [`super::Machine::enter`] so it is
-    /// actually evaluated.
-    pub const ASSERT_LAYOUT: () = {
-        assert!(core::mem::offset_of!(Ctx, target_offset) == 0x00);
-        assert!(core::mem::offset_of!(Ctx, target_selector) == 0x04);
-        assert!(core::mem::offset_of!(Ctx, ss16) == 0x06);
-        assert!(core::mem::offset_of!(Ctx, sp) == 0x08);
-        assert!(core::mem::offset_of!(Ctx, ax) == 0x10);
-        assert!(core::mem::offset_of!(Ctx, si) == 0x18);
-        assert!(core::mem::offset_of!(Ctx, di) == 0x20);
-        assert!(core::mem::offset_of!(Ctx, bp) == 0x28);
-        assert!(core::mem::offset_of!(Ctx, out_ax) == 0x30);
-        assert!(core::mem::offset_of!(Ctx, out_sp) == 0x38);
-        assert!(core::mem::offset_of!(Ctx, out_ss) == 0x40);
-        assert!(core::mem::offset_of!(Ctx, out_si) == 0x48);
-        assert!(core::mem::offset_of!(Ctx, out_di) == 0x50);
-        assert!(core::mem::offset_of!(Ctx, out_bp) == 0x58);
+    /// The one part of the layout `const` operands cannot express: `ljmpl
+    /// *(%r14)` reads a packed `m16:32` from the start of the struct, so the
+    /// far pointer's two halves must be adjacent and first.
+    pub const ASSERT_FAR_POINTER_FIRST: () = {
+        assert!(offset_of!(Ctx, target_offset) == 0);
+        assert!(offset_of!(Ctx, target_selector) == 4);
     };
 }
 
@@ -110,12 +102,13 @@ mbbs16_enter:
     movw    %ss, %r13w                  /* the host's SS, for the trampoline */
     movq    %rsp, %r15                  /* and the host's RSP */
 
-    movq    0x10(%r14), %rax            /* AX to present to 16-bit code */
-    movq    0x18(%r14), %rsi            /* and the callee-saved trio, which a */
-    movq    0x20(%r14), %rdi            /* host call must leave untouched --  */
-    movq    0x28(%r14), %rbp            /* note %rdi arrived holding the Ctx  */
-    movzwl  0x06(%r14), %ecx            /* the 16-bit stack selector */
-    movq    0x08(%r14), %rbx            /* SP, as a segment offset */
+    movq    {ax}(%r14), %rax            /* the call's return value, AX or DX:AX */
+    movq    {dx}(%r14), %rdx
+    movq    {si}(%r14), %rsi            /* and the callee-saved trio, which a */
+    movq    {di}(%r14), %rdi            /* host call must leave untouched --  */
+    movq    {bp}(%r14), %rbp            /* note %rdi arrived holding the Ctx  */
+    movzwl  {ss16}(%r14), %ecx          /* the 16-bit stack selector */
+    movq    {sp}(%r14), %rbx            /* SP, as a segment offset */
 
     movw    %cx, %ss                    /* paired with the next instruction: */
     movq    %rbx, %rsp                  /* MOV SS's shadow covers the gap */
@@ -130,6 +123,13 @@ mbbs16_enter:
     popq    %rbp
     retq
 "#,
+    ax = const offset_of!(Ctx, ax),
+    dx = const offset_of!(Ctx, dx),
+    si = const offset_of!(Ctx, si),
+    di = const offset_of!(Ctx, di),
+    bp = const offset_of!(Ctx, bp),
+    ss16 = const offset_of!(Ctx, ss16),
+    sp = const offset_of!(Ctx, sp),
     options(att_syntax)
 );
 
@@ -148,18 +148,24 @@ global_asm!(
 .hidden mbbs16_tramp_start, mbbs16_tramp_end
 .p2align 4
 mbbs16_tramp_start:
-    movq    %rax, 0x30(%r14)            /* the thunk index */
-    movq    %rsp, 0x38(%r14)            /* SP: the call frame is just above */
-    movw    %ss,  0x40(%r14)
-    movq    %rsi, 0x48(%r14)            /* the callee-saved trio, to be handed */
-    movq    %rdi, 0x50(%r14)            /* back unchanged when the module is   */
-    movq    %rbp, 0x58(%r14)            /* resumed                             */
+    movq    %rax, {out_ax}(%r14)        /* the thunk index */
+    movq    %rsp, {out_sp}(%r14)        /* SP: the call frame is just above */
+    movw    %ss,  {out_ss}(%r14)
+    movq    %rsi, {out_si}(%r14)        /* the callee-saved trio, to be handed */
+    movq    %rdi, {out_di}(%r14)        /* back unchanged when the module is   */
+    movq    %rbp, {out_bp}(%r14)        /* resumed                             */
 
     movw    %r13w, %ss
     movq    %r15, %rsp
     jmp     *%r11
 mbbs16_tramp_end:
 "#,
+    out_ax = const offset_of!(Ctx, out_ax),
+    out_sp = const offset_of!(Ctx, out_sp),
+    out_ss = const offset_of!(Ctx, out_ss),
+    out_si = const offset_of!(Ctx, out_si),
+    out_di = const offset_of!(Ctx, out_di),
+    out_bp = const offset_of!(Ctx, out_bp),
     options(att_syntax)
 );
 

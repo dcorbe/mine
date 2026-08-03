@@ -9,7 +9,7 @@
 //! The module carries on with a value it stored before the call quietly
 //! replaced, and says nothing about it.
 
-use mbbs16::{EXIT_THUNK, Exit, Machine};
+use mbbs16::{EXIT_THUNK, Exit, Machine, Ret};
 
 const NOOP_THUNK: u16 = 1;
 
@@ -59,7 +59,7 @@ fn a_host_call_preserves_si_di_and_bp() {
                 assert_eq!(machine.si(), SI_MARK, "SI at the call");
                 assert_eq!(machine.di(), DI_MARK, "DI at the call");
                 assert_eq!(machine.bp(), BP_MARK, "BP at the call");
-                exit_reason = machine.resume(0).expect("resumed");
+                exit_reason = machine.resume(Ret::Void).expect("resumed");
             }
             Exit::Call { index: EXIT_THUNK } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),
