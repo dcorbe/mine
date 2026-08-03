@@ -72,7 +72,11 @@ impl Segment {
         let base = base.cast::<u8>();
 
         let entry = take_ldt_entry();
-        let contents = if executable { CONTENTS_CODE } else { CONTENTS_DATA };
+        let contents = if executable {
+            CONTENTS_CODE
+        } else {
+            CONTENTS_DATA
+        };
 
         let desc = UserDesc {
             entry_number: entry,
@@ -112,6 +116,32 @@ impl Segment {
     /// the LDT rather than the GDT, RPL 3.
     pub(crate) fn selector(&self) -> u16 {
         ((self.entry as u16) << 3) | 0x7
+    }
+
+    /// The LDT slot describing this segment.
+    pub(crate) fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    /// The segment's length, which is also its bound.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Borrow `len` bytes at `offset`.
+    ///
+    /// # Panics
+    ///
+    /// If the range leaves the segment. Callers bounds-check first and report
+    /// that as an error; reaching the panic is a host bug, not a module one.
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(
+            offset + len <= self.len,
+            "slice past the end of the segment"
+        );
+        // SAFETY: bounds checked, and the mapping is readable for its whole
+        // length and outlives the borrow.
+        unsafe { std::slice::from_raw_parts(self.base.add(offset), len) }
     }
 
     /// The mapping's linear address, for the far-jump targets that need one.

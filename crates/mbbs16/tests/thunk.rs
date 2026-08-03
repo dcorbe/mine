@@ -31,13 +31,28 @@ const ARG_B: u16 = 7;
 /// ```
 fn test_module() -> Vec<u8> {
     vec![
-        0xb8, 0x34, 0x12, // mov   $0x1234, %ax
-        0x6a, ARG_B as u8, // push  $7
-        0x6a, ARG_A as u8, // push  $35
-        0x9a, 0, 0, 0, 0, // lcall $CS, $add_thunk
-        0x83, 0xc4, 0x04, // add   $4, %sp
-        0x89, 0xc6, // mov   %ax, %si
-        0x9a, 0, 0, 0, 0, // lcall $CS, $exit_thunk
+        0xb8,
+        0x34,
+        0x12, // mov   $0x1234, %ax
+        0x6a,
+        ARG_B as u8, // push  $7
+        0x6a,
+        ARG_A as u8, // push  $35
+        0x9a,
+        0,
+        0,
+        0,
+        0, // lcall $CS, $add_thunk
+        0x83,
+        0xc4,
+        0x04, // add   $4, %sp
+        0x89,
+        0xc6, // mov   %ax, %si
+        0x9a,
+        0,
+        0,
+        0,
+        0, // lcall $CS, $exit_thunk
     ]
 }
 

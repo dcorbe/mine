@@ -67,11 +67,14 @@
 //! Neither gap is a limit of the mechanism; both are simply not built.
 
 mod asm;
+mod farptr;
 mod seg;
 
 use std::io;
 
 use asm::{Ctx, mbbs16_enter, trampoline};
+use farptr::ldt_index;
+pub use farptr::{FarPtr, FarPtrError};
 use seg::Segment;
 
 /// Size of a module's code and stack segments. 64 KiB is the most a 16-bit
@@ -115,29 +118,15 @@ pub enum Exit {
     Fault { signo: i32 },
 }
 
-/// A far pointer as 16-bit code understands it: a 16-bit offset and a 16-bit
-/// selector, offset first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FarPtr {
-    pub offset: u16,
-    pub selector: u16,
-}
-
-impl FarPtr {
-    /// The four bytes an `lcall`'s operand expects.
-    pub fn to_bytes(self) -> [u8; 4] {
-        let mut out = [0u8; 4];
-        out[0..2].copy_from_slice(&self.offset.to_le_bytes());
-        out[2..4].copy_from_slice(&self.selector.to_le_bytes());
-        out
-    }
-}
-
 /// One module's 16-bit world: its code, its stack, and the state needed to
 /// re-enter it where it left off.
 pub struct Machine {
-    code: Segment,
-    stack: Segment,
+    /// Every segment this module owns, in no particular order. Lookup is by
+    /// selector, because that is the only thing a far pointer carries; a real
+    /// NE image will add its own code and data segments here.
+    segments: Vec<Segment>,
+    code: usize,
+    stack: usize,
     ctx: Ctx,
 
     /// `SP` when the module last called out, or `None` before its first call.
@@ -166,7 +155,11 @@ impl Machine {
         // below 4 GiB.
         let cs64 = current_cs();
         for index in 0..=MAX_THUNKS {
-            let logical = if index == MAX_THUNKS { EXIT_THUNK } else { index };
+            let logical = if index == MAX_THUNKS {
+                EXIT_THUNK
+            } else {
+                index
+            };
 
             let mut thunk = [0u8; 11];
             thunk[0] = 0xb8;
@@ -183,8 +176,9 @@ impl Machine {
         }
 
         Ok(Self {
-            code,
-            stack,
+            segments: vec![code, stack],
+            code: 0,
+            stack: 1,
             ctx: Ctx::default(),
             frame_sp: None,
         })
@@ -206,7 +200,7 @@ impl Machine {
 
         FarPtr {
             offset: (THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE) as u16,
-            selector: self.code.selector(),
+            selector: self.code_selector(),
         }
     }
 
@@ -218,7 +212,7 @@ impl Machine {
                 "module image would overlap the thunk table",
             ));
         }
-        self.code.write(0, image)
+        self.segments[self.code].write(0, image)
     }
 
     /// Begin executing at `ip` in the code segment, on a fresh stack.
@@ -226,6 +220,9 @@ impl Machine {
         let () = Ctx::ASSERT_LAYOUT;
 
         self.frame_sp = None;
+        self.ctx.out_si = 0;
+        self.ctx.out_di = 0;
+        self.ctx.out_bp = 0;
         self.run(ip, INITIAL_SP, 0)
     }
 
@@ -244,9 +241,9 @@ impl Machine {
             .frame_sp
             .expect("resume() with no outstanding call to resume from");
 
-        let ip = self.stack.read_u16(usize::from(sp));
-        let cs = self.stack.read_u16(usize::from(sp) + 2);
-        debug_assert_eq!(cs, self.code.selector(), "call frame names another segment");
+        let ip = self.stack().read_u16(usize::from(sp));
+        let cs = self.stack().read_u16(usize::from(sp) + 2);
+        debug_assert_eq!(cs, self.code_selector(), "call frame names another segment");
 
         self.run(ip, sp + 4, value)
     }
@@ -263,7 +260,136 @@ impl Machine {
         let sp = self
             .frame_sp
             .expect("arg_u16() with no outstanding call to read from");
-        self.stack.read_u16(usize::from(sp) + 4 + n * 2)
+        self.stack().read_u16(usize::from(sp) + 4 + n * 2)
+    }
+
+    /// Selector of the module's code segment.
+    pub fn code_selector(&self) -> u16 {
+        self.segments[self.code].selector()
+    }
+
+    /// Selector of the module's stack segment.
+    ///
+    /// Worth having separately from the code one: under `DS != SS` a module
+    /// hands out pointers to its own locals, and this is the segment they name.
+    pub fn stack_selector(&self) -> u16 {
+        self.segments[self.stack].selector()
+    }
+
+    fn stack(&self) -> &Segment {
+        &self.segments[self.stack]
+    }
+
+    /// Find the segment a selector names.
+    fn segment(&self, selector: u16) -> Result<&Segment, FarPtrError> {
+        let index = ldt_index(selector)?;
+        self.segments
+            .iter()
+            .find(|s| s.entry() == u32::from(index))
+            .ok_or(FarPtrError::NoSuchSegment { selector })
+    }
+
+    /// Borrow `len` bytes of module memory through a far pointer.
+    ///
+    /// This is the only correct way to follow a pointer a module gave you. The
+    /// segment is found by selector -- never by adding a base -- and the access
+    /// is bounds-checked against that segment's own length, which is the only
+    /// place the limit is known.
+    ///
+    /// # Errors
+    ///
+    /// If the selector names nothing of this module's, or the access would run
+    /// past the end of what it names. Both are things a module can do, so
+    /// neither is a panic.
+    pub fn resolve(&self, ptr: FarPtr, len: usize) -> Result<&[u8], FarPtrError> {
+        let segment = self.segment(ptr.selector)?;
+        let start = usize::from(ptr.offset);
+        let end = start.checked_add(len).ok_or(FarPtrError::OutOfBounds {
+            ptr,
+            len,
+            limit: segment.len(),
+        })?;
+        if end > segment.len() {
+            return Err(FarPtrError::OutOfBounds {
+                ptr,
+                len,
+                limit: segment.len(),
+            });
+        }
+        Ok(segment.slice(start, len))
+    }
+
+    /// Read a NUL-terminated string through a far pointer, without the NUL.
+    ///
+    /// Most of the MajorBBS API is shaped this way. The scan stops at the end
+    /// of the segment rather than running on, so a module that forgets its
+    /// terminator gets an error instead of handing the host whatever follows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Machine::resolve`], plus [`FarPtrError::Unterminated`].
+    pub fn read_cstr(&self, ptr: FarPtr) -> Result<&[u8], FarPtrError> {
+        let limit = self.segment(ptr.selector)?.len();
+        let start = usize::from(ptr.offset);
+
+        // Everything from the pointer to the end of its segment is the most a
+        // string could possibly be. Going through `resolve` rather than
+        // reaching for the segment directly keeps one bounds check and one
+        // lookup in the crate, instead of two that can drift apart.
+        let avail = limit
+            .checked_sub(start)
+            .filter(|n| *n > 0)
+            .ok_or(FarPtrError::OutOfBounds { ptr, len: 1, limit })?;
+        let tail = self.resolve(ptr, avail)?;
+
+        let n = tail
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(FarPtrError::Unterminated { ptr })?;
+        Ok(&tail[..n])
+    }
+
+    /// Write into module memory through a far pointer.
+    ///
+    /// The same rules as [`Machine::resolve`]: found by selector, bounds
+    /// checked. Real shims need this for the API calls that fill a caller's
+    /// buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Machine::resolve`].
+    pub fn write(&mut self, ptr: FarPtr, bytes: &[u8]) -> Result<(), FarPtrError> {
+        // Resolve first so the bounds check and the error are shared.
+        self.resolve(ptr, bytes.len())?;
+        let index = ldt_index(ptr.selector)?;
+        let segment = self
+            .segments
+            .iter_mut()
+            .find(|s| s.entry() == u32::from(index))
+            .ok_or(FarPtrError::NoSuchSegment {
+                selector: ptr.selector,
+            })?;
+        segment
+            .write(usize::from(ptr.offset), bytes)
+            .expect("bounds already checked by resolve");
+        Ok(())
+    }
+
+    /// Read the `n`th argument of the outstanding call as a far pointer.
+    ///
+    /// A far pointer occupies two argument words: offset first, then segment,
+    /// which is how a right-to-left push of `seg` then `off` leaves them. `n`
+    /// counts words, so a far pointer at `n` is followed by the next argument
+    /// at `n + 2`.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn arg_far(&self, n: usize) -> FarPtr {
+        FarPtr {
+            offset: self.arg_u16(n),
+            selector: self.arg_u16(n + 1),
+        }
     }
 
     /// The module's `SP` at the outstanding call, before the call frame.
@@ -275,30 +401,46 @@ impl Machine {
     ///
     /// If the module is not stopped at a call.
     pub fn sp(&self) -> u16 {
-        self.frame_sp
-            .expect("sp() with no outstanding call")
+        self.frame_sp.expect("sp() with no outstanding call")
     }
 
-    /// `SI` as the module last left it. Borland's cdecl treats it as
-    /// callee-saved, so modules keep values there across calls.
+    /// `SI` as the module last left it.
     pub fn si(&self) -> u16 {
         self.ctx.out_si as u16
+    }
+
+    /// `DI` as the module last left it.
+    pub fn di(&self) -> u16 {
+        self.ctx.out_di as u16
+    }
+
+    /// `BP` as the module last left it -- its frame pointer.
+    pub fn bp(&self) -> u16 {
+        self.ctx.out_bp as u16
     }
 
     /// Cross into 16-bit mode and come back.
     fn run(&mut self, ip: u16, sp: u16, ax: u16) -> io::Result<Exit> {
         self.ctx.target_offset = u32::from(ip);
-        self.ctx.target_selector = self.code.selector();
-        self.ctx.ss16 = self.stack.selector();
+        self.ctx.target_selector = self.code_selector();
+        self.ctx.ss16 = self.stack_selector();
         self.ctx.sp = u64::from(sp);
         self.ctx.ax = u64::from(ax);
+
+        // Hand the callee-saved registers back exactly as the module left them.
+        // Borland's cdecl makes SI, DI and BP the callee's to preserve, and a
+        // host call is a callee like any other. Losing them does not crash
+        // anything -- the module simply carries on with a value it stored
+        // before the call quietly replaced, which is far worse.
+        self.ctx.si = self.ctx.out_si;
+        self.ctx.di = self.ctx.out_di;
+        self.ctx.bp = self.ctx.out_bp;
 
         // The trampoline writes SS as a bare 16-bit store, so the rest of the
         // slot has to start clean.
         self.ctx.out_ax = 0;
         self.ctx.out_sp = 0;
         self.ctx.out_ss = 0;
-        self.ctx.out_si = 0;
 
         // SAFETY: every field the assembly reads is set immediately above; the
         // code and stack segments are mapped, described and live for as long as
@@ -308,7 +450,7 @@ impl Machine {
 
         debug_assert_eq!(
             self.ctx.out_ss as u16,
-            self.stack.selector(),
+            self.stack_selector(),
             "came back on a stack that is not the module's"
         );
 
@@ -328,6 +470,8 @@ impl Machine {
 fn current_cs() -> u16 {
     let cs: u16;
     // SAFETY: reading a segment register has no side effects.
-    unsafe { std::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags)) };
+    unsafe {
+        std::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
+    };
     cs
 }

@@ -37,6 +37,16 @@ pub(crate) struct Ctx {
     /// Value to present in `AX` on entry -- a host call's return value.
     pub ax: u64,
 
+    /// Registers Borland's cdecl treats as **callee-saved**, restored on entry
+    /// so that a host call is transparent to the module.
+    ///
+    /// Getting this wrong is quiet and awful: the module keeps running, with a
+    /// value it stored before the call silently replaced. `DI` is the easiest
+    /// to lose, because `mbbs16_enter` is handed its `Ctx` in `%rdi`.
+    pub si: u64,
+    pub di: u64,
+    pub bp: u64,
+
     /// `AX` when the trampoline was reached: the thunk index.
     pub out_ax: u64,
     /// `SP` at the same instant, still a segment offset.
@@ -44,9 +54,11 @@ pub(crate) struct Ctx {
     /// `SS` at the same instant. Only 16 bits are written, so the field is
     /// zeroed before every entry.
     pub out_ss: u64,
-    /// `SI`, which Borland's cdecl treats as callee-saved and modules use for
-    /// values that outlive a call.
+    /// The callee-saved trio as the module left them, to be fed back in on the
+    /// next entry.
     pub out_si: u64,
+    pub out_di: u64,
+    pub out_bp: u64,
 }
 
 impl Ctx {
@@ -59,10 +71,15 @@ impl Ctx {
         assert!(core::mem::offset_of!(Ctx, ss16) == 0x06);
         assert!(core::mem::offset_of!(Ctx, sp) == 0x08);
         assert!(core::mem::offset_of!(Ctx, ax) == 0x10);
-        assert!(core::mem::offset_of!(Ctx, out_ax) == 0x18);
-        assert!(core::mem::offset_of!(Ctx, out_sp) == 0x20);
-        assert!(core::mem::offset_of!(Ctx, out_ss) == 0x28);
-        assert!(core::mem::offset_of!(Ctx, out_si) == 0x30);
+        assert!(core::mem::offset_of!(Ctx, si) == 0x18);
+        assert!(core::mem::offset_of!(Ctx, di) == 0x20);
+        assert!(core::mem::offset_of!(Ctx, bp) == 0x28);
+        assert!(core::mem::offset_of!(Ctx, out_ax) == 0x30);
+        assert!(core::mem::offset_of!(Ctx, out_sp) == 0x38);
+        assert!(core::mem::offset_of!(Ctx, out_ss) == 0x40);
+        assert!(core::mem::offset_of!(Ctx, out_si) == 0x48);
+        assert!(core::mem::offset_of!(Ctx, out_di) == 0x50);
+        assert!(core::mem::offset_of!(Ctx, out_bp) == 0x58);
     };
 }
 
@@ -94,6 +111,9 @@ mbbs16_enter:
     movq    %rsp, %r15                  /* and the host's RSP */
 
     movq    0x10(%r14), %rax            /* AX to present to 16-bit code */
+    movq    0x18(%r14), %rsi            /* and the callee-saved trio, which a */
+    movq    0x20(%r14), %rdi            /* host call must leave untouched --  */
+    movq    0x28(%r14), %rbp            /* note %rdi arrived holding the Ctx  */
     movzwl  0x06(%r14), %ecx            /* the 16-bit stack selector */
     movq    0x08(%r14), %rbx            /* SP, as a segment offset */
 
@@ -128,10 +148,12 @@ global_asm!(
 .hidden mbbs16_tramp_start, mbbs16_tramp_end
 .p2align 4
 mbbs16_tramp_start:
-    movq    %rax, 0x18(%r14)            /* the thunk index */
-    movq    %rsp, 0x20(%r14)            /* SP: the call frame is just above */
-    movw    %ss,  0x28(%r14)
-    movq    %rsi, 0x30(%r14)
+    movq    %rax, 0x30(%r14)            /* the thunk index */
+    movq    %rsp, 0x38(%r14)            /* SP: the call frame is just above */
+    movw    %ss,  0x40(%r14)
+    movq    %rsi, 0x48(%r14)            /* the callee-saved trio, to be handed */
+    movq    %rdi, 0x50(%r14)            /* back unchanged when the module is   */
+    movq    %rbp, 0x58(%r14)            /* resumed                             */
 
     movw    %r13w, %ss
     movq    %r15, %rsp
