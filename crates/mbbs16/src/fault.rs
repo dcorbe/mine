@@ -24,20 +24,18 @@
 //! <https://github.com/dcorbe/x86-compat16>.
 //!
 //! That project also concluded the alternate stack had to be **below 4 GiB**,
-//! and that part is wrong -- or rather, it changed two things at once. Its
-//! failing case had no alternate stack at all; the fix added one *and* mapped
-//! it low, and the low mapping got the credit. Isolating the two here, by
-//! dropping `MAP_32BIT` and faulting a module with the alternate stack at
-//! `0x7fe1cd8f2000`, recovery still works.
+//! which was wrong: its fix added an alternate stack *and* mapped it low, and
+//! the low mapping was credited with both. Dropping `MAP_32BIT` here changed
+//! nothing, and compat16 now carries a three-arm test that settles it --
+//! killed with no alternate stack, fine with one at any address.
 //!
 //! So the rule is `SA_ONSTACK`, not the address. That makes sense: with an
 //! alternate stack the frame goes at a location the kernel already knows,
 //! instead of one derived from an `RSP` that compatibility mode has truncated
 //! and a 16-bit `SS` has re-based.
 //!
-//! `MAP_32BIT` is kept below regardless. It costs nothing, and it keeps this
-//! crate inside the configuration that has been measured end to end rather than
-//! the one merely argued for.
+//! `MAP_32BIT` is kept below anyway. It costs nothing and rules out a whole
+//! class of surprise for free.
 
 use std::cell::Cell;
 use std::io;
