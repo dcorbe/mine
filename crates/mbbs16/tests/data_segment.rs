@@ -6,7 +6,7 @@
 //! to load `DS` before entering and hand back whatever the module had on every
 //! resume. `DS` is callee-saved exactly like `SI`, `DI` and `BP`.
 
-use mbbs16::{EXIT_THUNK, Exit, FarPtr, Machine, Ret};
+use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 const THUNK: u16 = 5;
 
@@ -20,7 +20,7 @@ const SECOND: u16 = 0xf00d;
 ///  0: 8b 36 00 02     mov   0x200, %si   read a global -- DS-relative
 ///  4: 9a <far ptr>    lcall $CS, $thunk  the host gets a turn
 ///  9: 8b 3e 02 02     mov   0x202, %di   read another, AFTER the call
-///  d: 9a <far ptr>    lcall $CS, $exit
+///  d: cb              lret
 /// ```
 ///
 /// The second read is the point. It only lands on the right bytes if `DS` came
@@ -31,21 +31,18 @@ fn test_module() -> Vec<u8> {
     code.extend_from_slice(&[0x9a, 0, 0, 0, 0]);
     code.extend_from_slice(&[0x8b, 0x3e]);
     code.extend_from_slice(&SECOND_AT.to_le_bytes());
-    code.extend_from_slice(&[0x9a, 0, 0, 0, 0]);
+    code.push(0xcb); // lret
     code
 }
 
 const CALL_SITE: usize = 5;
-const EXIT_SITE: usize = 14;
 
 fn run() -> (u16, u16) {
     let mut machine = Machine::new().expect("16-bit machine");
 
     let mut code = test_module();
     let thunk = machine.thunk_address(THUNK).to_bytes();
-    let exit = machine.thunk_address(EXIT_THUNK).to_bytes();
     code[CALL_SITE..CALL_SITE + 4].copy_from_slice(&thunk);
-    code[EXIT_SITE..EXIT_SITE + 4].copy_from_slice(&exit);
     machine.load_code(&code).expect("module fits");
 
     // Plant the globals in the data segment, which is neither the code segment
@@ -70,13 +67,13 @@ fn run() -> (u16, u16) {
         )
         .expect("second global");
 
-    let mut exit_reason = machine.enter(0).expect("entered 16-bit mode");
+    let mut exit_reason = machine.call(0, &[]).expect("called the module");
     loop {
         match exit_reason {
             Exit::Call { index: THUNK } => {
                 exit_reason = machine.resume(Ret::Void).expect("resumed");
             }
-            Exit::Call { index: EXIT_THUNK } => break,
+            Exit::Returned { .. } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),
             Exit::Fault { signo } => panic!("module faulted with signal {signo}"),
         }

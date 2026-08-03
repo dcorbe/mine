@@ -4,7 +4,7 @@
 //! in host code -- the same edit the trampoline would have made had the module
 //! reached it. See `src/fault.rs`.
 
-use mbbs16::{EXIT_THUNK, Exit, Machine, Ret};
+use mbbs16::{Exit, Machine, Ret};
 
 /// A module that executes `HLT`.
 ///
@@ -18,11 +18,9 @@ fn suicidal_module() -> Vec<u8> {
     ]
 }
 
-/// A module that behaves, for checking the host is still healthy afterwards.
-fn polite_module(machine: &Machine) -> Vec<u8> {
-    let mut code = vec![0x9a, 0, 0, 0, 0];
-    code[1..5].copy_from_slice(&machine.thunk_address(EXIT_THUNK).to_bytes());
-    code
+/// A module that behaves: it returns immediately.
+fn polite_module() -> Vec<u8> {
+    vec![0xcb] // lret
 }
 
 #[test]
@@ -30,7 +28,7 @@ fn a_module_that_faults_is_reported_not_fatal() {
     let mut machine = Machine::new().expect("16-bit machine");
     machine.load_code(&suicidal_module()).expect("module fits");
 
-    let exit = machine.enter(0).expect("entered 16-bit mode");
+    let exit = machine.call(0, &[]).expect("called the module");
 
     match exit {
         Exit::Fault { signo } => assert_eq!(signo, libc::SIGSEGV, "HLT raises #GP"),
@@ -44,18 +42,17 @@ fn the_host_still_works_after_a_module_faults() {
     let mut doomed = Machine::new().expect("16-bit machine");
     doomed.load_code(&suicidal_module()).expect("module fits");
     assert!(matches!(
-        doomed.enter(0).expect("entered"),
+        doomed.call(0, &[]).expect("called"),
         Exit::Fault { .. }
     ));
 
     // ...and the next one runs as if nothing happened. This is the whole point:
     // one bad module must not be able to end the process serving everyone else.
     let mut fresh = Machine::new().expect("second 16-bit machine");
-    let code = polite_module(&fresh);
-    fresh.load_code(&code).expect("module fits");
+    fresh.load_code(&polite_module()).expect("module fits");
     assert!(matches!(
-        fresh.enter(0).expect("entered"),
-        Exit::Call { index: EXIT_THUNK }
+        fresh.call(0, &[]).expect("called"),
+        Exit::Returned { .. }
     ));
 }
 
@@ -72,7 +69,7 @@ fn a_faulted_module_reports_the_fault_rather_than_a_stale_call() {
     code.push(0xf4); // hlt, on return
     machine.load_code(&code).expect("module fits");
 
-    let first = machine.enter(0).expect("entered");
+    let first = machine.call(0, &[]).expect("called");
     assert!(matches!(first, Exit::Call { index: THUNK }), "{first:?}");
 
     let second = machine.resume(Ret::U16(0)).expect("resumed");

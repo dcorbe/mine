@@ -9,7 +9,7 @@
 //! The module here passes two pointers into two different segments to the same
 //! import. Resolving both correctly is only possible by selector.
 
-use mbbs16::{EXIT_THUNK, Exit, FarPtr, INITIAL_SP, Machine, Ret};
+use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 /// The import the module calls: something `strlen`-shaped, which is the shape
 /// most of the real API has.
@@ -36,39 +36,36 @@ const CODE_STRING: &[u8] = b"worldly\0";
 /// 17: 83 c4 04        add   $4, %sp
 /// 1a: 01 f8           add   %di, %ax
 /// 1c: 89 c6           mov   %ax, %si       total, somewhere callee-saved
-/// 1e: 9a <far ptr>    lcall $CS, $exit
+/// 1e: cb              lret
 /// ```
 fn test_module() -> Vec<u8> {
-    let mut code = vec![0x16];
-    code.extend_from_slice(&[0x68]);
+    let mut code = vec![0x16]; // push %ss
+    code.push(0x68);
     code.extend_from_slice(&STACK_STRING_AT.to_le_bytes());
     code.extend_from_slice(&[0x9a, 0, 0, 0, 0]);
     code.extend_from_slice(&[0x83, 0xc4, 0x04]);
     code.extend_from_slice(&[0x89, 0xc7]);
-    code.extend_from_slice(&[0x0e]);
-    code.extend_from_slice(&[0x68]);
+    code.push(0x0e); // push %cs
+    code.push(0x68);
     code.extend_from_slice(&CODE_STRING_AT.to_le_bytes());
     code.extend_from_slice(&[0x9a, 0, 0, 0, 0]);
     code.extend_from_slice(&[0x83, 0xc4, 0x04]);
     code.extend_from_slice(&[0x01, 0xf8]);
     code.extend_from_slice(&[0x89, 0xc6]);
-    code.extend_from_slice(&[0x9a, 0, 0, 0, 0]);
+    code.push(0xcb); // lret
     code
 }
 
 const CALL1_SITE: usize = 5;
 const CALL2_SITE: usize = 19;
-const EXIT_SITE: usize = 31;
 
 fn loaded_machine() -> Machine {
     let mut machine = Machine::new().expect("16-bit machine");
 
     let mut code = test_module();
     let strlen = machine.thunk_address(STRLEN_THUNK).to_bytes();
-    let exit = machine.thunk_address(EXIT_THUNK).to_bytes();
     code[CALL1_SITE..CALL1_SITE + 4].copy_from_slice(&strlen);
     code[CALL2_SITE..CALL2_SITE + 4].copy_from_slice(&strlen);
-    code[EXIT_SITE..EXIT_SITE + 4].copy_from_slice(&exit);
     machine.load_code(&code).expect("module fits");
 
     // Plant one string in the stack segment and one in the code segment. The
@@ -95,7 +92,7 @@ fn a_far_pointer_argument_resolves_through_the_segment_it_names() {
     let stack_sel = machine.stack_selector();
     let code_sel = machine.code_selector();
 
-    let mut exit = machine.enter(0).expect("entered 16-bit mode");
+    let mut exit = machine.call(0, &[]).expect("called the module");
     let mut seen: Vec<Vec<u8>> = Vec::new();
 
     loop {
@@ -118,14 +115,13 @@ fn a_far_pointer_argument_resolves_through_the_segment_it_names() {
                 seen.push(s);
                 exit = machine.resume(Ret::U16(len)).expect("resumed");
             }
-            Exit::Call { index: EXIT_THUNK } => break,
+            Exit::Returned { .. } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),
             Exit::Fault { signo } => panic!("module faulted with signal {signo}"),
         }
     }
 
     assert_eq!(seen, vec![b"hello".to_vec(), b"worldly".to_vec()]);
-    assert_eq!(machine.sp(), INITIAL_SP - 4, "stack unwound cleanly");
     assert_eq!(machine.si(), 5 + 7, "module summed both lengths");
 }
 

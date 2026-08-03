@@ -55,8 +55,14 @@ pub(crate) struct Ctx {
     /// Also callee-saved: a shim must hand back the `DS` the module had.
     pub ds: u64,
 
-    /// `AX` when the trampoline was reached: the thunk index.
+    /// `AX` when the trampoline was reached: a thunk index on the way in, or a
+    /// module's return value on the way out.
     pub out_ax: u64,
+    /// `DX` alongside it, for a `long` or far pointer returned by the module.
+    pub out_dx: u64,
+    /// `CX`, which every thunk sets to say which kind it is. Distinguishing the
+    /// two this way keeps `AX` free to carry a return value.
+    pub out_cx: u64,
     /// `SP` at the same instant, still a segment offset.
     pub out_sp: u64,
     /// `SS` at the same instant. Only 16 bits are written, so the field is
@@ -162,7 +168,9 @@ global_asm!(
 .hidden mbbs16_tramp_start, mbbs16_tramp_end
 .p2align 4
 mbbs16_tramp_start:
-    movq    %rax, {out_ax}(%r14)        /* the thunk index */
+    movq    %rax, {out_ax}(%r14)        /* a thunk index, or a return value */
+    movq    %rdx, {out_dx}(%r14)
+    movq    %rcx, {out_cx}(%r14)        /* which kind of thunk we came through */
     movq    %rsp, {out_sp}(%r14)        /* SP: the call frame is just above */
     movw    %ss,  {out_ss}(%r14)
     movq    %rsi, {out_si}(%r14)        /* the callee-saved trio, to be handed */
@@ -177,6 +185,8 @@ mbbs16_tramp_start:
 mbbs16_tramp_end:
 "#,
     out_ax = const offset_of!(Ctx, out_ax),
+    out_dx = const offset_of!(Ctx, out_dx),
+    out_cx = const offset_of!(Ctx, out_cx),
     out_sp = const offset_of!(Ctx, out_sp),
     out_ss = const offset_of!(Ctx, out_ss),
     out_si = const offset_of!(Ctx, out_si),

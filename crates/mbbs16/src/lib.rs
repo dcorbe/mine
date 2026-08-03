@@ -17,8 +17,8 @@
 //! # use mbbs16::{Exit, Machine, Ret};
 //! # fn demo() -> std::io::Result<()> {
 //! let mut machine = Machine::new()?;
-//! machine.load_code(&[0xcb])?;
-//! let mut exit = machine.enter(0)?;
+//! machine.load_code(&[0xcb])?;              // a module that returns at once
+//! let mut exit = machine.call(0, &[])?;
 //! loop {
 //!     match exit {
 //!         Exit::Call { index } => {
@@ -26,7 +26,7 @@
 //!             let _ = index;
 //!             exit = machine.resume(Ret::U16(sum))?;
 //!         }
-//!         Exit::Fault { .. } => break,
+//!         Exit::Returned { .. } | Exit::Fault { .. } => break,
 //!     }
 //! }
 //! # Ok(())
@@ -52,15 +52,10 @@
 //!
 //! # What this is not, yet
 //!
-//! The host cannot yet *call into* a module -- entry is by far jump, so there is
-//! no return frame for module code to `RETF` through, and a module signals
-//! completion by calling [`EXIT_THUNK`] instead.
-//!
-//! That gap is not a limit of the mechanism; it is simply not built.
-//!
 //! A module that faults is survivable: see [`Exit::Fault`] and the `fault`
-//! module. A module that loops forever is not -- there is no way to interrupt
-//! one yet.
+//! module. A module that **loops forever is not** -- there is no way to
+//! interrupt one yet, and for a host serving many users a wedged module is as
+//! bad as a crashing one.
 //!
 //! # Testing
 //!
@@ -111,11 +106,17 @@ const TRAMPOLINE_OFFSET: usize = 0xc000;
 /// word so that the first push has somewhere to go.
 pub const INITIAL_SP: u16 = 0xfff0;
 
-/// Thunk index reserved to mean "this module is finished".
+/// What kind of thunk reached the trampoline, carried in `CX`.
 ///
-/// A stand-in. Real modules return to whoever called them; until this crate can
-/// enter a module by far call, they say so by calling this instead.
-pub const EXIT_THUNK: u16 = 0xffff;
+/// `CX` rather than `AX` because a returning module has its result in `AX`, and
+/// a thunk announcing itself there would destroy it. `CX` is scratch under
+/// cdecl, so nothing can be relying on it across a call.
+const KIND_CALL: u16 = 0;
+const KIND_RETURN: u16 = 1;
+
+/// The thunk a module returns *through*. Its address is what the host pushes as
+/// the return half of the far-call frame, so `RETF` lands here.
+const RETURN_THUNK_SLOT: u16 = MAX_THUNKS;
 
 /// Why 16-bit execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +124,10 @@ pub enum Exit {
     /// The module far-called an import thunk. Arguments are readable with
     /// [`Machine::arg_u16`]; [`Machine::resume`] continues it.
     Call { index: u16 },
+
+    /// The module returned from the entry point it was called at, by `RETF`.
+    /// `ax` alone for an `int`, `dx:ax` for anything 32 bits wide.
+    Returned { ax: u16, dx: u16 },
 
     /// The module took a signal. Nothing is resumable.
     Fault { signo: i32 },
@@ -198,33 +203,41 @@ impl Machine {
         let tramp_linear = code.linear(TRAMPOLINE_OFFSET);
         code.write(TRAMPOLINE_OFFSET, trampoline())?;
 
-        // A thunk announces which import it is and leaves. That is all a real
-        // import thunk does either; the work happens on this side.
+        // An import thunk names itself and leaves. That is all a real one does
+        // either; the work happens on this side.
         //
+        //   b9 00 00              mov   $KIND_CALL, %cx
         //   b8 ii ii              mov   $index, %ax
         //   66 ea <off32> <sel>   ljmpl $CS64, $trampoline
         //
-        // The 0x66 is what makes this possible at all: without it `EA` in a
+        // The return thunk omits the second instruction, because AX is carrying
+        // the module's result and has to survive.
+        //
+        // The 0x66 is what makes any of this possible: without it `EA` in a
         // 16-bit segment takes a 16-bit offset and could not name the
         // trampoline. With it the offset is 32 bits, which reaches anywhere
         // below 4 GiB.
-        for index in 0..=MAX_THUNKS {
-            let logical = if index == MAX_THUNKS {
-                EXIT_THUNK
+        for slot in 0..=RETURN_THUNK_SLOT {
+            let kind = if slot == RETURN_THUNK_SLOT {
+                KIND_RETURN
             } else {
-                index
+                KIND_CALL
             };
 
-            let mut thunk = [0u8; 11];
-            thunk[0] = 0xb8;
-            thunk[1..3].copy_from_slice(&logical.to_le_bytes());
-            thunk[3] = 0x66;
-            thunk[4] = 0xea;
-            thunk[5..9].copy_from_slice(&tramp_linear.to_le_bytes());
-            thunk[9..11].copy_from_slice(&cs64.to_le_bytes());
+            let mut thunk = Vec::with_capacity(THUNK_STRIDE);
+            thunk.push(0xb9);
+            thunk.extend_from_slice(&kind.to_le_bytes());
+            if kind == KIND_CALL {
+                thunk.push(0xb8);
+                thunk.extend_from_slice(&slot.to_le_bytes());
+            }
+            thunk.extend_from_slice(&[0x66, 0xea]);
+            thunk.extend_from_slice(&tramp_linear.to_le_bytes());
+            thunk.extend_from_slice(&cs64.to_le_bytes());
 
+            debug_assert!(thunk.len() <= THUNK_STRIDE, "thunk outgrew its slot");
             code.write(
-                THUNK_TABLE_OFFSET + usize::from(index) * THUNK_STRIDE,
+                THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE,
                 &thunk,
             )?;
         }
@@ -241,18 +254,18 @@ impl Machine {
 
     /// The far pointer a module should `lcall` to reach import `index`.
     ///
-    /// [`EXIT_THUNK`] is accepted and maps to the reserved final slot.
-    ///
     /// # Panics
     ///
-    /// If `index` is neither below [`MAX_THUNKS`] nor [`EXIT_THUNK`].
+    /// If `index` is not below [`MAX_THUNKS`].
     pub fn thunk_address(&self, index: u16) -> FarPtr {
-        let slot = match index {
-            EXIT_THUNK => MAX_THUNKS,
-            i if i < MAX_THUNKS => i,
-            other => panic!("thunk index {other} is beyond MAX_THUNKS ({MAX_THUNKS})"),
-        };
+        assert!(
+            index < MAX_THUNKS,
+            "thunk index {index} is beyond MAX_THUNKS ({MAX_THUNKS})"
+        );
+        self.thunk_slot(index)
+    }
 
+    fn thunk_slot(&self, slot: u16) -> FarPtr {
         FarPtr {
             offset: (THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE) as u16,
             selector: self.code_selector(),
@@ -270,20 +283,65 @@ impl Machine {
         self.segments[self.code].write(0, image)
     }
 
-    /// Begin executing at `ip` in the code segment, on a fresh stack.
-    pub fn enter(&mut self, ip: u16) -> io::Result<Exit> {
+    /// Call a module entry point, the way the real host does.
+    ///
+    /// `args` are 16-bit words in declaration order; they are pushed right to
+    /// left, as cdecl requires. A far pointer argument is two words, offset
+    /// first.
+    ///
+    /// 64-bit mode has no far call that could reach 16-bit code, so the frame a
+    /// far call would have left is built by hand -- the arguments, then the
+    /// return `CS:IP` -- and the entry point is reached by far jump. From
+    /// inside, the module cannot tell the difference: its `RETF` pops that
+    /// frame and lands on the return thunk, which brings control back here as
+    /// [`Exit::Returned`].
+    ///
+    /// The stack starts fresh at [`INITIAL_SP`] on every call, so the arguments
+    /// need no cleaning afterwards even though cdecl makes that the caller's
+    /// job.
+    ///
+    /// # Errors
+    ///
+    /// If the arguments and frame will not fit on the module's stack.
+    pub fn call(&mut self, entry: u16, args: &[u16]) -> io::Result<Exit> {
         let () = Ctx::ASSERT_FAR_POINTER_FIRST;
 
+        let frame_words = args.len() + 2;
+        let bytes = frame_words
+            .checked_mul(2)
+            .filter(|n| *n <= usize::from(INITIAL_SP))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "call frame will not fit")
+            })?;
+
+        let sp = INITIAL_SP - bytes as u16;
+        let ret = self.thunk_slot(RETURN_THUNK_SLOT);
+
+        // Laid out low to high, which is the order the module reads them:
+        // return offset, return selector, then argument zero upwards. Pushing
+        // right to left produces exactly this arrangement.
+        let frame: Vec<u16> = std::iter::once(ret.offset)
+            .chain(std::iter::once(ret.selector))
+            .chain(args.iter().copied())
+            .collect();
+
+        let stack = &mut self.segments[self.stack];
+        for (i, word) in frame.iter().enumerate() {
+            stack.write(usize::from(sp) + i * 2, &word.to_le_bytes())?;
+        }
+
         self.frame_sp = None;
+        self.ctx.out_ax = 0;
+        self.ctx.out_dx = 0;
         self.ctx.out_si = 0;
         self.ctx.out_di = 0;
         self.ctx.out_bp = 0;
 
-        // A module starts with DS naming its own data segment. Everything after
-        // this is whatever the module last had, since DS is callee-saved.
+        // A module starts with DS naming its own data segment. After that it is
+        // whatever the module last had, since DS is callee-saved.
         self.ctx.out_ds = u64::from(self.data_selector());
 
-        self.run(ip, INITIAL_SP, Ret::Void)
+        self.run(entry, sp, Ret::Void)
     }
 
     /// Resume the module from its outstanding call, handing back `value` in
@@ -507,10 +565,10 @@ impl Machine {
 
         // The trampoline writes SS as a bare 16-bit store, so the rest of the
         // slot has to start clean.
-        self.ctx.out_ax = 0;
         self.ctx.out_sp = 0;
         self.ctx.out_ss = 0;
         self.ctx.out_signo = 0;
+        self.ctx.out_cx = 0;
 
         // SAFETY: every field the assembly reads is set immediately above; the
         // code and stack segments are mapped, described and live for as long as
@@ -536,6 +594,16 @@ impl Machine {
 
         let out_sp = self.ctx.out_sp as u16;
         self.frame_sp = Some(out_sp);
+
+        // Which thunk brought us here. The module's return value would have
+        // been destroyed if the answer lived in AX, so it lives in CX.
+        if self.ctx.out_cx as u16 == KIND_RETURN {
+            self.frame_sp = None;
+            return Ok(Exit::Returned {
+                ax: self.ctx.out_ax as u16,
+                dx: self.ctx.out_dx as u16,
+            });
+        }
 
         Ok(Exit::Call {
             index: self.ctx.out_ax as u16,

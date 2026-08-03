@@ -5,7 +5,7 @@
 //! **segment** is in `DX` and the **offset** in `AX`, which is the same order a
 //! 32-bit value has -- and exactly the pair a host is most likely to swap.
 
-use mbbs16::{EXIT_THUNK, Exit, FarPtr, Machine, Ret};
+use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 const THUNK: u16 = 2;
 
@@ -13,19 +13,18 @@ const THUNK: u16 = 2;
 ///  0: 9a <far ptr>    lcall $CS, $thunk
 ///  5: 89 c6           mov   %ax, %si     the low half, somewhere callee-saved
 ///  7: 89 d7           mov   %dx, %di     and the high half
-///  9: 9a <far ptr>    lcall $CS, $exit
+///  9: cb              lret
 /// ```
 fn test_module() -> Vec<u8> {
     vec![
         0x9a, 0, 0, 0, 0, // lcall $CS, $thunk
         0x89, 0xc6, // mov %ax, %si
         0x89, 0xd7, // mov %dx, %di
-        0x9a, 0, 0, 0, 0, // lcall $CS, $exit
+        0xcb, // lret
     ]
 }
 
 const CALL_SITE: usize = 1;
-const EXIT_SITE: usize = 10;
 
 /// Run the module, servicing its one call with `ret`, and give back what it
 /// kept in `(SI, DI)` -- which is `(AX, DX)`.
@@ -34,18 +33,16 @@ fn returned(ret: Ret) -> (u16, u16) {
 
     let mut code = test_module();
     let thunk = machine.thunk_address(THUNK).to_bytes();
-    let exit = machine.thunk_address(EXIT_THUNK).to_bytes();
     code[CALL_SITE..CALL_SITE + 4].copy_from_slice(&thunk);
-    code[EXIT_SITE..EXIT_SITE + 4].copy_from_slice(&exit);
     machine.load_code(&code).expect("module fits");
 
-    let mut exit_reason = machine.enter(0).expect("entered 16-bit mode");
+    let mut exit_reason = machine.call(0, &[]).expect("called the module");
     loop {
         match exit_reason {
             Exit::Call { index: THUNK } => {
                 exit_reason = machine.resume(ret).expect("resumed");
             }
-            Exit::Call { index: EXIT_THUNK } => break,
+            Exit::Returned { .. } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),
             Exit::Fault { signo } => panic!("module faulted with signal {signo}"),
         }
