@@ -64,6 +64,10 @@ pub struct Records {
     /// offset and the next `qnxbtv` after it has to carry on in key order from
     /// there.
     rank: Vec<Vec<usize>>,
+
+    /// For each key, how many adjacent pairs in its order carry the same key
+    /// value. See [`Self::ties`].
+    ties: Vec<usize>,
 }
 
 impl Records {
@@ -95,12 +99,14 @@ impl Records {
 
         let mut order = Vec::with_capacity(keys.len());
         let mut rank = Vec::with_capacity(keys.len());
+        let mut ties = Vec::with_capacity(keys.len());
         for key in keys {
             let mut sorted: Vec<usize> = (0..records.len()).collect();
             // Ties broken by physical position, so the order is total: two
             // records with the same duplicate key must still come out in the
             // same sequence every run, or `qnxbtv` would step somewhere else on
-            // a second pass over the same file.
+            // a second pass over the same file. See [`Self::ties`] for what
+            // that tie-break is and is not.
             sorted.sort_by(|a, b| {
                 match key.compare(&records[*a].bytes, &records[*b].bytes) {
                     Ordering::Equal => records[*a].position.cmp(&records[*b].position),
@@ -111,15 +117,46 @@ impl Records {
             for (place, record) in sorted.iter().enumerate() {
                 places[*record] = place;
             }
+            let tied = sorted
+                .windows(2)
+                .filter(|pair| {
+                    key.compare(&records[pair[0]].bytes, &records[pair[1]].bytes) == Ordering::Equal
+                })
+                .count();
             order.push(sorted);
             rank.push(places);
+            ties.push(tied);
         }
 
         Ok(Self {
             records,
             order,
             rank,
+            ties,
         })
+    }
+
+    /// How many records share a key value with the record before them, per key.
+    ///
+    /// **This is the one place the derived order can differ from the file's own
+    /// index, and it is not checkable against these files.**
+    ///
+    /// Every other part of the ordering is verified against the B-tree pages
+    /// themselves -- 1,219 index pages and 77,505 entries agree with the
+    /// comparator exactly. But two records with the *same* key value are in
+    /// whatever order Btrieve's duplicate chain put them, which is the order
+    /// they were inserted; here they come out in file-position order, and a
+    /// record inserted into a slot freed by a deletion has a low position and a
+    /// late insertion.
+    ///
+    /// It cannot be measured because all four keys in MajorMUD's files that
+    /// permit duplicates -- `WCCUSERS` key 2, `WCCGANGS` key 1, `WCCBANKS`
+    /// key 0, `WCCITOWN` key 1 -- are in files that hold no records at all.
+    /// So this counts the pairs where it *could* matter, and the host reports
+    /// the number rather than letting the difference be silent. On a board
+    /// nobody has played on, every one of them is zero.
+    pub fn ties(&self) -> &[usize] {
+        &self.ties
     }
 
     /// How many records there are.

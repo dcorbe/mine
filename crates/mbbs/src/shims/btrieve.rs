@@ -380,6 +380,7 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         false => into,
     };
     let block = positioned(machine, host, "stpbtvl")?;
+    load(host, block)?;
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
 
@@ -478,6 +479,7 @@ fn absolute(
         false => into,
     };
     let block = positioned(machine, host, who)?;
+    load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -518,6 +520,7 @@ fn locate(
     into: Option<FarPtr>,
 ) -> Result<bool, ShimError> {
     let block = positioned(machine, host, who)?;
+    load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
 
     // `PLBTVSTF.C:266` -- the module's key value is copied into `bb->key`
@@ -707,6 +710,39 @@ fn key_length(host: &Host, block: FarPtr, key: u16) -> Result<u16, ShimError> {
         .ok_or_else(|| {
             ShimError::Failed(format!("{} has no key {key}", file.name()))
         })
+}
+
+/// Read a file's records, if this is the first time anything has asked.
+///
+/// The one place a load happens, so that the one thing worth saying about a
+/// freshly loaded file gets said once: how many of its records share a key with
+/// their neighbour. That is the only part of the order this host cannot check
+/// against the file's own index pages -- see
+/// [`Records::ties`](crate::btrieve::Records::ties) -- so it is counted and
+/// reported rather than left silent.
+fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    if file.loaded().is_some() {
+        return Ok(());
+    }
+    let name = file.name().to_owned();
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let ties: Vec<(u16, usize)> = records
+        .ties()
+        .iter()
+        .enumerate()
+        .filter(|(_, tied)| **tied > 0)
+        .map(|(key, tied)| (key as u16, *tied))
+        .collect();
+    for (key, tied) in ties {
+        host.note(format!(
+            "{name} has {tied} records sharing key {key} with their neighbour, \
+             and this host orders those by file position where Btrieve orders \
+             them by insertion -- the one part of the order its index pages \
+             cannot be checked against"
+        ));
+    }
+    Ok(())
 }
 
 /// The current file, refusing if there is none.

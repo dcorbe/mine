@@ -60,6 +60,29 @@ mod flag {
     pub const EXTENDED: u16 = 1 << 8;
 }
 
+/// Attribute bits that change what an index *contains* or how it collates, and
+/// which this host does not reproduce.
+///
+/// Each of them would make the order derived from the records differ from the
+/// order the file's own index pages hold, silently:
+///
+/// - `NULL_ALL_SEGMENTS` and `NULL_ANY_SEGMENT` **leave records out of the
+///   index** when the key field is entirely the null value. Sorting every
+///   record would then offer the module a record Btrieve would have skipped.
+/// - `NUMBERED_ACS` collates through an alternate character sequence, so `a`
+///   and `A` may be one letter, or the alphabet may not be the alphabet.
+/// - `REPEATING_DUPLICATES` stores duplicate keys differently again.
+///
+/// **None of them is set on any key of any file MajorMUD ships**, which is
+/// checked by `crates/mbbs/tests/btrieve.rs` -- so this refuses on nothing that
+/// exists here, and refuses rather than guesses on a file that used one.
+const UNSUPPORTED: [(u16, &str); 4] = [
+    (1 << 3, "null-all-segments"),
+    (1 << 9, "null-any-segment"),
+    (1 << 5, "a numbered alternate collating sequence"),
+    (1 << 7, "repeating duplicates"),
+];
+
 /// How a key segment's bytes are to be compared.
 ///
 /// Btrieve defines twenty-odd data types and MajorMUD's eighteen files use
@@ -303,6 +326,16 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
             u16::from_le_bytes([definition[offset], definition[offset + 1]])
         };
         let attributes = word(at::ATTRIBUTES);
+        for (bit, what) in UNSUPPORTED {
+            if attributes & bit != 0 {
+                return Err(fail(format!(
+                    "key {} is declared with {what}, which changes what its index \
+                     holds and is not reproduced by sorting the records",
+                    keys.len()
+                )));
+            }
+        }
+
         let length = word(at::LENGTH);
         if length == 0 {
             return Err(fail(format!(
