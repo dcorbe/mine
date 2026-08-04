@@ -1,0 +1,12 @@
+; SAMPLE.MDF -- a module definition file, in the shape gmdnam expects.
+;
+; The real thing is tmp/WCCMMUD.MDF, which is not in the repository. This is
+; the same format with nothing in it that matters, so that a shim reading an
+; .MDF is testable without the module.
+
+Module Name: Sample Module
+
+Developer: nobody
+
+DLLs: SAMPLE
+MSGs: SAMPLE

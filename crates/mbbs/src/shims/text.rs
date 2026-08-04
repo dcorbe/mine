@@ -1,0 +1,415 @@
+//! Strings, numbers and the print buffer.
+//!
+//! Everything here is a leaf: it computes, and it touches no host state a
+//! module can observe later except the memory it was pointed at. `prf` and
+//! `clrprf` are the exception that proves it -- they move `prfptr`, which is a
+//! host global the module reads back.
+//!
+//! Signatures from `GCOMM.H`. Semantics from Galacticomm's own use of them
+//! where the header does not say: `GALFILUT.C:73` passes `stzcpy`'s result
+//! straight to `checkdir`, which is how we know it returns the destination and
+//! not the terminator.
+
+use mbbs16::{FarPtr, Machine, Ret};
+
+use crate::Host;
+use crate::fmt::format;
+use crate::shims::ShimError;
+
+/// Bytes in one of `spr`'s rotating buffers.
+pub const SPR_BYTES: u16 = 1024;
+
+/// How many buffers `spr` rotates through.
+///
+/// Four, and it is observable: `prf("%s and %s", spr(...), spr(...))` needs
+/// both results alive at once, and a module that nests more than four deep
+/// gets the oldest one back. Galacticomm's own rotating-buffer idiom is
+/// `cycle=((cycle+1)&3)` (`GALFILUT.C:73`), and MBBSEmu independently reads the
+/// same count out of the binary.
+pub const SPR_BUFFERS: usize = 4;
+
+/// `char *spr(char *fmat, ...)` -- format into a buffer the host owns.
+///
+/// The module keeps the pointer, so the buffer has to outlive the call and the
+/// rotation has to be wide enough that the next few calls do not tread on it.
+pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (text, _) = format(machine, machine.arg_far(0), 2)?;
+    let at = host.next_spr_buffer();
+    write_cstr(machine, at, &text, SPR_BYTES)?;
+    Ok(Ret::Far(at))
+}
+
+/// `int sprintf(char *buf, char *fmat, ...)` -- format into the caller's
+/// buffer, and return how many bytes that took.
+///
+/// How big the buffer is, only the caller knows. The bounds check is the
+/// segment's, which is the only limit the host can see.
+pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let buffer = machine.arg_far(0);
+    let (text, _) = format(machine, machine.arg_far(2), 4)?;
+    let len = text.len();
+    machine.write(buffer, &text)?;
+    machine.write(
+        FarPtr {
+            offset: buffer.offset.wrapping_add(len as u16),
+            selector: buffer.selector,
+        },
+        &[0],
+    )?;
+    Ok(Ret::U16(len as u16))
+}
+
+/// `void prf(char *fmat, ...)` -- append to the channel's output.
+///
+/// `prfbuf` and `prfptr` are `char *` globals, not the buffer (`GCOMM.H:449`).
+/// **`prfptr` is read back out of module memory every time**, never remembered:
+/// the module moves it itself, and a host that cached it would append over
+/// whatever the module had written.
+pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (text, _) = format(machine, machine.arg_far(0), 2)?;
+
+    let at = host
+        .globals()
+        .pointer(machine, "prfptr")
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    let end = host.prf_end();
+    if usize::from(at.offset) + text.len() + 1 > usize::from(end) {
+        return Err(ShimError::Failed(format!(
+            "prf would put {} bytes past the end of a {end}-byte buffer",
+            text.len()
+        )));
+    }
+
+    write_cstr(machine, at, &text, end - at.offset)?;
+    let moved = FarPtr {
+        offset: at.offset + text.len() as u16,
+        selector: at.selector,
+    };
+    host.globals()
+        .write(machine, "prfptr", &moved.to_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(Ret::Void)
+}
+
+/// `void clrprf(void)` -- throw away whatever `prf` has queued.
+pub fn clrprf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let start = host
+        .globals()
+        .pointer(machine, "prfbuf")
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    machine.write(start, &[0])?;
+    host.globals()
+        .write(machine, "prfptr", &start.to_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(Ret::Void)
+}
+
+/// `char *stzcpy(char *dst, char *src, unsigned num)` -- copy, bounded,
+/// always terminated.
+///
+/// Not `strncpy`. `num` is the size of the destination, so at most `num - 1`
+/// characters are copied and the NUL always fits; `strncpy` would copy `num`
+/// and leave an unterminated buffer, which is the bug this routine exists to
+/// avoid.
+pub fn stzcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let src = machine.arg_far(2);
+    let num = machine.arg_u16(4);
+
+    if num == 0 {
+        // Nowhere to put even the terminator. Copying nothing is the only
+        // thing that cannot overrun.
+        return Ok(Ret::Far(dst));
+    }
+    let text = machine.read_cstr(src)?;
+    let take = text.len().min(usize::from(num) - 1);
+    let text = text[..take].to_vec();
+
+    write_cstr(machine, dst, &text, num)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `char *strcpy(char *dst, char *src)`.
+pub fn strcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let text = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let len = text.len() as u16 + 1;
+    write_cstr(machine, dst, &text, len)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `unsigned strlen(char *s)`.
+pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let text = machine.read_cstr(machine.arg_far(0))?;
+    Ok(Ret::U16(text.len() as u16))
+}
+
+/// `long atol(char *s)`.
+///
+/// Leading whitespace, an optional sign, then digits until something that is
+/// not one. No error: C says the value is undefined on overflow and Borland
+/// wraps, so this wraps.
+pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let text = machine.read_cstr(machine.arg_far(0))?;
+    let mut rest = text;
+
+    while rest.first().is_some_and(u8::is_ascii_whitespace) {
+        rest = &rest[1..];
+    }
+    let negative = match rest.first() {
+        Some(b'-') => {
+            rest = &rest[1..];
+            true
+        }
+        Some(b'+') => {
+            rest = &rest[1..];
+            false
+        }
+        _ => false,
+    };
+
+    let mut value = 0i32;
+    while let Some(&byte) = rest.first().filter(|b| b.is_ascii_digit()) {
+        value = value.wrapping_mul(10).wrapping_add(i32::from(byte - b'0'));
+        rest = &rest[1..];
+    }
+    if negative {
+        value = value.wrapping_neg();
+    }
+    Ok(Ret::U32(value as u32))
+}
+
+/// Write `text` and its terminator at `at`, refusing to exceed `capacity`.
+pub fn write_cstr(
+    machine: &mut Machine,
+    at: FarPtr,
+    text: &[u8],
+    capacity: u16,
+) -> Result<(), ShimError> {
+    if text.len() + 1 > usize::from(capacity) {
+        return Err(ShimError::Failed(format!(
+            "{} bytes and a terminator will not fit in {capacity}",
+            text.len()
+        )));
+    }
+    let mut bytes = text.to_vec();
+    bytes.push(0);
+    machine.write(at, &bytes)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Fixture;
+
+    #[test]
+    fn stzcpy_truncates_and_always_terminates() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(16);
+        let src = f.text("Newhaven");
+
+        // Five bytes of room means four characters and the NUL. `strncpy`
+        // would put five characters and no NUL, which is the difference.
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
+        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "Newh");
+    }
+
+    #[test]
+    fn stzcpy_returns_the_destination() {
+        // `GALFILUT.C:73` passes the result straight to `checkdir`, so it is
+        // the string that was written and not its terminator.
+        let mut f = Fixture::new();
+        let dst = f.buffer(16);
+        let src = f.text("hi");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
+        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "hi");
+    }
+
+    #[test]
+    fn stzcpy_with_no_room_writes_nothing() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"keep", true);
+        let src = f.text("overwrite me");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
+        f.invoke(stzcpy, &args).expect("copied nothing");
+        assert_eq!(f.read(dst), "keep", "not even a terminator fits in zero");
+    }
+
+    #[test]
+    fn strcpy_and_strlen() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(16);
+        let src = f.text("kobold");
+        let args = [dst.offset, dst.selector, src.offset, src.selector];
+        assert_eq!(f.invoke(strcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "kobold");
+
+        let mut f = Fixture::new();
+        let at = f.text("kobold");
+        assert_eq!(
+            f.invoke(strlen, &Fixture::far(at)).expect("ok"),
+            Ret::U16(6)
+        );
+    }
+
+    #[test]
+    fn atol_reads_a_long_out_of_a_string() {
+        let cases = [
+            ("100000", 100_000i32),
+            ("  -42abc", -42),
+            ("+7", 7),
+            ("", 0),
+            ("not a number", 0),
+        ];
+        for (text, expect) in cases {
+            let mut f = Fixture::new();
+            let at = f.text(text);
+            assert_eq!(
+                f.invoke(atol, &Fixture::far(at)).expect("parsed"),
+                Ret::U32(expect as u32),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spr_rotates_far_enough_to_keep_four_results_alive() {
+        // `prf("%s and %s", spr(...), spr(...))` needs both, so the rotation
+        // is observable. Four calls must land in four different places, and
+        // the fifth must come back to the first.
+        let mut f = Fixture::new();
+        let template = f.text("%d");
+        let mut seen = Vec::new();
+        for n in 0..=SPR_BUFFERS {
+            let args = [template.offset, template.selector, n as u16];
+            let Ret::Far(at) = f.invoke(spr, &args).expect("formatted") else {
+                panic!("spr returns a pointer");
+            };
+            seen.push(at);
+        }
+
+        let mut offsets: Vec<u16> = seen[..SPR_BUFFERS].iter().map(|p| p.offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), SPR_BUFFERS, "{seen:?}");
+        assert_eq!(seen[SPR_BUFFERS], seen[0], "the fifth reuses the first");
+
+        // And the fourth is still readable after the fifth overwrote the first.
+        assert_eq!(f.read(seen[3]), "3");
+    }
+
+    #[test]
+    fn sprintf_writes_into_the_callers_buffer_and_returns_the_length() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        let template = f.text("%s/%d");
+        let text = f.text("gold");
+        let args = [
+            dst.offset,
+            dst.selector,
+            template.offset,
+            template.selector,
+            text.offset,
+            text.selector,
+            9,
+        ];
+        assert_eq!(f.invoke(sprintf, &args).expect("ok"), Ret::U16(6));
+        assert_eq!(f.read(dst), "gold/9");
+    }
+
+    #[test]
+    fn prf_appends_and_clrprf_starts_over() {
+        let mut f = Fixture::new();
+        let template = f.text("<%d>");
+
+        f.invoke(prf, &[template.offset, template.selector, 1])
+            .expect("first");
+        f.invoke(prf, &[template.offset, template.selector, 2])
+            .expect("second");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "<1><2>", "the second call appends");
+
+        f.invoke(clrprf, &[]).expect("cleared");
+        assert_eq!(f.read(buffer), "");
+        assert_eq!(
+            f.host
+                .globals()
+                .pointer(&f.machine, "prfptr")
+                .expect("prfptr"),
+            buffer,
+            "clrprf puts prfptr back at the start"
+        );
+    }
+
+    #[test]
+    fn prf_reads_prfptr_back_rather_than_remembering_it() {
+        // The module moves `prfptr` itself -- it writes into the buffer and
+        // advances the pointer without telling anyone. A host that remembered
+        // where it last wrote would append over that, and the damage would
+        // show up as scrambled output much later.
+        let mut f = Fixture::new();
+        let template = f.text("%d");
+        f.invoke(prf, &[template.offset, template.selector, 1])
+            .expect("first");
+
+        let buffer = f.host.globals().prf_buffer();
+        let moved = FarPtr {
+            offset: buffer.offset + 8,
+            selector: buffer.selector,
+        };
+        f.host
+            .globals()
+            .write(&mut f.machine, "prfptr", &moved.to_bytes())
+            .expect("moved");
+
+        f.invoke(prf, &[template.offset, template.selector, 2])
+            .expect("second");
+        assert_eq!(f.read(moved), "2", "prf wrote where prfptr now points");
+        assert_eq!(f.read(buffer), "1", "and left the earlier text alone");
+    }
+
+    #[test]
+    fn prf_refuses_to_run_past_the_end_of_the_buffer() {
+        let mut f = Fixture::new();
+        let template = f.text("%s");
+        let long = f.bytes(&vec![b'x'; 2000], true);
+
+        // Twice over is more than the 4 KiB buffer holds. The real one would
+        // simply write past it.
+        f.invoke(
+            prf,
+            &[
+                template.offset,
+                template.selector,
+                long.offset,
+                long.selector,
+            ],
+        )
+        .expect("the first fits");
+        let second = f.invoke(
+            prf,
+            &[
+                template.offset,
+                template.selector,
+                long.offset,
+                long.selector,
+            ],
+        );
+        assert!(second.is_ok(), "two of these still fit");
+
+        let third = f.invoke(
+            prf,
+            &[
+                template.offset,
+                template.selector,
+                long.offset,
+                long.selector,
+            ],
+        );
+        assert!(third.is_err(), "the third would overrun");
+    }
+}

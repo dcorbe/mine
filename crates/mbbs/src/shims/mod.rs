@@ -1,8 +1,12 @@
 //! What sits behind each import, and what to do when nothing does.
 
+pub mod system;
+pub mod text;
+
 use mbbs16::{Machine, Ret};
 
 use crate::Host;
+use crate::exports::MAJORBBS;
 use crate::globals::GLOBALS;
 
 /// One host routine.
@@ -65,7 +69,27 @@ pub enum Entry {
 /// place ordinals are written down. A different host version re-keys the whole
 /// table by itself; a table of ordinals would have to be rewritten and would
 /// look right while being wrong.
-const ROUTINES: &[(&str, &str, Shim)] = &[];
+const ROUTINES: &[(&str, &str, Shim)] = &[
+    // Strings, numbers and the print buffer.
+    (MAJORBBS, "spr", text::spr),
+    (MAJORBBS, "sprintf", text::sprintf),
+    (MAJORBBS, "prf", text::prf),
+    (MAJORBBS, "clrprf", text::clrprf),
+    (MAJORBBS, "stzcpy", text::stzcpy),
+    (MAJORBBS, "strcpy", text::strcpy),
+    (MAJORBBS, "strlen", text::strlen),
+    (MAJORBBS, "atol", text::atol),
+    // The clock, the audit trail, and coming online.
+    (MAJORBBS, "now", system::now),
+    (MAJORBBS, "today", system::today),
+    (MAJORBBS, "time", system::time),
+    (MAJORBBS, "srand", system::srand),
+    (MAJORBBS, "gmdnam", system::gmdnam),
+    (MAJORBBS, "shocst", system::shocst),
+    (MAJORBBS, "dclvda", system::dclvda),
+    (MAJORBBS, "register_module", system::register_module),
+    (MAJORBBS, "catastro", system::catastro),
+];
 
 /// Every constant the host exports.
 ///
@@ -108,7 +132,7 @@ pub fn entry(dll: &str, symbol: &str) -> Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exports::{GALGSBL, MAJORBBS};
+    use crate::exports::GALGSBL;
 
     #[test]
     fn a_global_is_a_datum() {

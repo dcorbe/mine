@@ -21,14 +21,19 @@
 //! symbol -- see [`Poison::Unimplemented`](mbbs16::Poison::Unimplemented).
 
 mod exports;
+mod fmt;
 mod globals;
 mod shims;
+#[cfg(test)]
+mod testing;
 
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 
 pub use exports::Exports;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
+pub use shims::system::Registration;
 pub use shims::{Entry, Shim, ShimError};
 
 use mbbs16::{
@@ -123,25 +128,132 @@ impl From<io::Error> for LoadError {
 pub struct Host {
     exports: &'static Exports,
     globals: Globals,
+
+    /// Where the module's own files are: its `.MDF`, its `.MSG` files, and
+    /// eventually its Btrieve tables. A DOS module names them without a path
+    /// and in whatever case it likes.
+    pub root: PathBuf,
+
+    /// `spr`'s rotating buffers, and which one is next.
+    spr: FarPtr,
+    spr_next: usize,
+
+    /// The line buffer `gmdnam` returns a pointer into.
+    mdf: FarPtr,
+
+    /// Where the print buffer ends, so `prf` can refuse to run past it.
+    prf_end: u16,
+
+    /// What `srand` was last given. `rand` is not implemented, so nothing
+    /// consumes it yet -- but discarding it would make `srand` a lie.
+    seed: u16,
+
+    /// Every line `shocst` has been given.
+    audit: Vec<String>,
+
+    /// Every module that has come online, in registration order. A module's
+    /// number is its index here, which is what `register_module` returns and
+    /// what the module passes back.
+    modules: Vec<Registration>,
 }
 
 impl Host {
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
     ///
+    /// `root` is the directory the module's own files live in.
+    ///
     /// # Errors
     ///
-    /// If the globals cannot be mapped.
-    pub fn new(machine: &mut Machine) -> io::Result<Self> {
+    /// If the globals or the host's buffers cannot be mapped.
+    pub fn new(machine: &mut Machine, root: impl Into<PathBuf>) -> io::Result<Self> {
+        let globals = Globals::new(machine)?;
+        let prf_end = OUTBSZ;
+
+        // One segment for everything the host hands a module a pointer into and
+        // then keeps: `spr`'s four buffers and `gmdnam`'s line. Separate from
+        // the globals so that a module overrunning one of these cannot reach
+        // `usrnum`.
+        let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
+        let selector = machine.alloc_segment(spr_bytes + 64)?;
+
         Ok(Self {
             exports: Exports::wg101(),
-            globals: Globals::new(machine)?,
+            globals,
+            root: root.into(),
+            spr: FarPtr {
+                offset: 0,
+                selector,
+            },
+            spr_next: 0,
+            mdf: FarPtr {
+                offset: spr_bytes as u16,
+                selector,
+            },
+            prf_end,
+            seed: 0,
+            audit: Vec::new(),
+            modules: Vec::new(),
         })
     }
 
     /// The host's globals.
     pub fn globals(&self) -> &Globals {
         &self.globals
+    }
+
+    /// Every line `shocst` has produced, oldest first.
+    pub fn audit(&self) -> &[String] {
+        &self.audit
+    }
+
+    /// Every module that has registered, in the order they did.
+    pub fn modules(&self) -> &[Registration] {
+        &self.modules
+    }
+
+    /// Find one of the module's files, whatever case it named it in.
+    ///
+    /// DOS filenames are case-insensitive and a module's are all upper case in
+    /// some places and not in others; the filesystem underneath is not. An
+    /// exact match first, then one scan of the directory -- so the ordinary
+    /// case costs nothing and the awkward one still works.
+    pub fn find(&self, name: &str) -> Option<PathBuf> {
+        let exact = self.root.join(name);
+        if exact.is_file() {
+            return Some(exact);
+        }
+        std::fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+            .map(|e| e.path())
+    }
+
+    /// The next of `spr`'s rotating buffers.
+    fn next_spr_buffer(&mut self) -> FarPtr {
+        let at = FarPtr {
+            offset: self.spr.offset + (self.spr_next as u16) * shims::text::SPR_BYTES,
+            selector: self.spr.selector,
+        };
+        self.spr_next = (self.spr_next + 1) % shims::text::SPR_BUFFERS;
+        at
+    }
+
+    /// The line buffer `gmdnam` writes into.
+    fn mdf_buffer(&self) -> FarPtr {
+        self.mdf
+    }
+
+    /// One past the last byte `prf` may write.
+    fn prf_end(&self) -> u16 {
+        self.prf_end
+    }
+
+    /// Take a module online, and give it its number.
+    fn register(&mut self, description: String, block: FarPtr) -> u16 {
+        self.modules.push(Registration { description, block });
+        (self.modules.len() - 1) as u16
     }
 
     /// Load a module, binding its imports to this host.
