@@ -139,6 +139,12 @@ pub const GLOBALS: &[Global] = &[
     // MAJORBBS.H:156, :489 -- BTVFILE *accbb, *genbb;
     g("accbb", PTR),
     g("genbb", PTR),
+    // BTVSTF.H:36 -- struct btvblk *bb; the Btrieve file every one of `opnbtv`,
+    // `setbtv`, `cntrbtv` and the rest works on. `WCCMMUD.DLL` does not address
+    // it, the same as `curmbk`, and it is placed here for the same reason: a
+    // host global belongs in module memory whether or not this module reads it,
+    // and the stack behind it in `PLBTVSTF.C` is a `static` that does not.
+    g("bb", PTR),
     // MAJORBBS.H:286 -- struct sysvbl sv; addressed with addends up to 452, so
     // this one has to be the field-accurate 1,300 and not merely large enough.
     g("sv", SYSVBL),

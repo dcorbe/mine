@@ -68,6 +68,55 @@ pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::Void)
 }
 
+/// `int access(char *path, int amode)` -- is this file there, and may I use it?
+///
+/// Borland's, re-exported by `MAJORBBS.DLL` as ordinal 850. `amode` is a mask:
+/// 0 asks only whether the file exists, 2 whether it can be written, 4 whether
+/// it can be read, 6 both. Zero means yes and -1 means no.
+///
+/// **-1 is an answer, not a refusal.** This is the one routine in the host so
+/// far whose whole purpose is to report an absence, so returning "no" for a
+/// file that is not there is exactly right where everywhere else it would be
+/// the lie this crate is built to avoid.
+///
+/// It is here rather than with the Btrieve routines it arrived among because it
+/// is not one -- but answering it is what lets initialisation finish opening its
+/// data files. MajorMUD builds a sixteenth filename, asks
+/// `access(".\WCCVACN.DAT", 0)`, is told -1, and **does not open it**. There is
+/// no `WCCVACN.VIR` to install one from and no working board has the file, so
+/// -1 is both the true answer and the one that lets the module continue.
+pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    let mode = machine.arg_u16(2);
+
+    // A path this host will not look in is not a file that is missing -- it is
+    // a question it cannot answer, and answering "no" would tell the module the
+    // file is absent when nobody looked.
+    let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
+    let Some(path) = host.find(name) else {
+        return Ok(Ret::U16(NO));
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return Ok(Ret::U16(NO));
+    };
+
+    // Bit 1 is write and bit 2 is read. Nothing else is defined, and a mode
+    // with anything else in it is a call this host has misread rather than a
+    // question about a file.
+    if mode & !0b110 != 0 {
+        return Err(ShimError::Failed(format!(
+            "access({named}, {mode}), and only 0, 2, 4 and 6 are modes"
+        )));
+    }
+    if mode & 2 != 0 && metadata.permissions().readonly() {
+        return Ok(Ret::U16(NO));
+    }
+    Ok(Ret::U16(0))
+}
+
+/// What `access` returns for a file that is not there or not usable.
+const NO: u16 = -1i16 as u16;
+
 /// `char *gmdnam(char *mdfnam)` -- a module's name, out of its `.MDF`.
 ///
 /// The real one (`MAJORBBS.C:1137`) opens the file, finds the line beginning

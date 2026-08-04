@@ -20,6 +20,7 @@
 //! return an error the module can interpret. It stops the module, naming the
 //! symbol -- see [`Poison::Unimplemented`](mbbs16::Poison::Unimplemented).
 
+pub mod btrieve;
 mod exports;
 mod fmt;
 mod globals;
@@ -164,6 +165,23 @@ pub struct Host {
     /// can see.
     pub(crate) messages: msg::Messages,
 
+    /// The Btrieve files that are open, and the stack of which is current.
+    /// Which one *is* current is `bb`, for the same reason.
+    pub(crate) btrieve: btrieve::Btrieve,
+
+    /// Every data file the host created from its virgin copy, in the order it
+    /// did. See [`Host::btrieve_file`].
+    installed: Vec<String>,
+
+    /// Everything the host did that a module cannot be told about.
+    ///
+    /// The rule everywhere else is that a host which cannot answer honestly
+    /// stops the module. A few things are neither an answer nor a refusal --
+    /// a `setbtv` stack that overflowed exactly as the real host's would, a
+    /// file installed from its virgin copy -- and they would otherwise happen
+    /// in silence. Kept rather than printed, so a test can assert on them.
+    notes: Vec<String>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -171,6 +189,9 @@ pub struct Host {
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
     calls: u64,
+
+    /// Whether to print each call as it is serviced. See [`Host::set_trace`].
+    trace: bool,
 }
 
 impl Host {
@@ -211,8 +232,12 @@ impl Host {
             audit: Vec::new(),
             modules: Vec::new(),
             messages: msg::Messages::default(),
+            btrieve: btrieve::Btrieve::default(),
+            installed: Vec::new(),
+            notes: Vec::new(),
             heap: Heap::new(Config::default()),
             calls: 0,
+            trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
     }
 
@@ -236,6 +261,26 @@ impl Host {
         &self.messages
     }
 
+    /// The Btrieve files that are open.
+    pub fn btrieve(&self) -> &btrieve::Btrieve {
+        &self.btrieve
+    }
+
+    /// Every data file the host created from its virgin copy.
+    pub fn installed(&self) -> &[String] {
+        &self.installed
+    }
+
+    /// Everything the host did that the module could not be told about.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Record something the module cannot be told. See [`Host::notes`].
+    pub(crate) fn note(&mut self, what: String) {
+        self.notes.push(what);
+    }
+
     /// The module's heap.
     pub fn heap(&self) -> &Heap {
         &self.heap
@@ -244,6 +289,17 @@ impl Host {
     /// How many host calls this host has serviced.
     pub fn calls(&self) -> u64 {
         self.calls
+    }
+
+    /// Print every host call as it is serviced, numbered.
+    ///
+    /// Where a module *stopped* is in the outcome, but how it got there is only
+    /// visible as a sequence -- and every step of this host so far has found the
+    /// order the module actually asks in differing from what was predicted for
+    /// it. On by default when `MBBS_TRACE` is set in the environment, so that
+    /// producing the sequence never means editing code to get it.
+    pub fn set_trace(&mut self, trace: bool) {
+        self.trace = trace;
     }
 
     /// Find one of the module's files, whatever case it named it in.
@@ -262,6 +318,91 @@ impl Host {
             .filter_map(Result::ok)
             .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
             .map(|e| e.path())
+    }
+
+    /// The file a module named, with the directory it is allowed to name
+    /// stripped off.
+    ///
+    /// A module builds its filenames from `DATADIR`, an option in its `.MSG`.
+    /// MajorMUD's is empty, so what `spr` produces is `.\WCCITEMS.DAT` -- the
+    /// module's own directory, which is [`Host::root`] and is where this host
+    /// looks anyway. That prefix is accepted and removed.
+    ///
+    /// **Any other directory is refused rather than stripped.** A module
+    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
+    /// the file of the same name from somewhere else would be the exact failure
+    /// this crate exists to avoid -- with the added charm that a board with two
+    /// installs would silently play the wrong one.
+    ///
+    /// # Errors
+    ///
+    /// If the name has a directory component other than `.\`.
+    pub fn dos_name(named: &str) -> Result<&str, String> {
+        let bare = named
+            .strip_prefix(".\\")
+            .or_else(|| named.strip_prefix("./"))
+            .unwrap_or(named);
+        if bare.contains(['\\', '/', ':']) {
+            return Err(format!(
+                "{named} names a directory; this host only opens a module's own"
+            ));
+        }
+        Ok(bare)
+    }
+
+    /// Find one of the module's Btrieve files, installing it if this is a fresh
+    /// board.
+    ///
+    /// A MajorMUD distribution ships fifteen `.VIR` files and no `.DAT`, and the
+    /// module opens `.DAT`. The `.VIR` is the *virgin* copy -- the pristine
+    /// content, ready to be played on -- and turning one into the other is an
+    /// install step that the sysop's `WCCMISC.BAT` and the setup program did
+    /// between them. It is done here, once per file, and said out loud.
+    ///
+    /// This is the one place the host creates something rather than reading it,
+    /// so it is worth being exact about what it is not: it never invents a file
+    /// that has no virgin copy, and it never writes to the `.VIR` itself. A
+    /// `.DAT` this host cannot account for is a refusal, because the failure it
+    /// replaces -- handing the module an empty file where the game's content
+    /// should be -- looks exactly like a working board with no items in it.
+    ///
+    /// # Errors
+    ///
+    /// If neither the file nor a virgin copy of it is there, or the copy fails.
+    pub fn btrieve_file(&mut self, name: &str) -> Result<PathBuf, String> {
+        if let Some(path) = self.find(name) {
+            return Ok(path);
+        }
+
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        let virgin = format!("{stem}.VIR");
+        let from = self.find(&virgin).ok_or_else(|| {
+            format!(
+                "no {name} in {}, and no {virgin} to install it from",
+                self.root.display()
+            )
+        })?;
+
+        // Copied beside the destination and then renamed onto it, because a
+        // rename within a directory is the one filesystem operation that
+        // cannot be seen half-done. `WCCMP001.DAT` is 43 MB, and a plain copy
+        // interrupted -- or merely *read* while it is still going -- is a file
+        // whose header says it has 29,232 pages and whose body does not. That
+        // file would then look installed forever after.
+        let to = self.root.join(name);
+        let part = self.root.join(format!("{name}.{}.part", std::process::id()));
+        std::fs::copy(&from, &part)
+            .and_then(|_| std::fs::rename(&part, &to))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                format!("installing {name} from {}: {e}", from.display())
+            })?;
+        self.installed.push(name.to_owned());
+        self.note(format!(
+            "installed {name} from {} -- this board had never been played on",
+            from.display()
+        ));
+        Ok(to)
     }
 
     /// The next of `spr`'s rotating buffers.
@@ -370,6 +511,9 @@ impl Host {
             };
 
             self.calls += 1;
+            if self.trace {
+                eprintln!("{:4} {symbol}", self.calls);
+            }
             match shim(machine, self) {
                 Ok(ret) => exit = machine.resume(ret)?,
                 Err(e) => {

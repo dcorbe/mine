@@ -1,5 +1,6 @@
 //! What sits behind each import, and what to do when nothing does.
 
+pub mod btrieve;
 pub mod memory;
 pub mod msg;
 pub mod system;
@@ -103,7 +104,14 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "movmem", memory::movmem),
     (MAJORBBS, "memcpy", memory::memcpy),
     (MAJORBBS, "memcmp", memory::memcmp),
+    // Btrieve: opening a module's data files, and which one is current.
+    (MAJORBBS, "omdbtv", btrieve::omdbtv),
+    (MAJORBBS, "opnbtv", btrieve::opnbtv),
+    (MAJORBBS, "setbtv", btrieve::setbtv),
+    (MAJORBBS, "rstbtv", btrieve::rstbtv),
+    (MAJORBBS, "cntrbtv", btrieve::cntrbtv),
     // The clock, the audit trail, and coming online.
+    (MAJORBBS, "access", system::access),
     (MAJORBBS, "now", system::now),
     (MAJORBBS, "today", system::today),
     (MAJORBBS, "time", system::time),
@@ -177,7 +185,10 @@ mod tests {
 
     #[test]
     fn an_unknown_symbol_is_unimplemented() {
-        assert!(matches!(entry(MAJORBBS, "opnbtv"), Entry::Unimplemented));
+        // `obtbtvl` is the acquire-by-key that reading records needs, and is
+        // deliberately absent: opening files and counting them is the whole of
+        // what initialisation asks Btrieve for.
+        assert!(matches!(entry(MAJORBBS, "obtbtvl"), Entry::Unimplemented));
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
     }
 

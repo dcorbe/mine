@@ -24,10 +24,48 @@ pub fn data() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data")
 }
 
+/// An empty directory a test may write into, under `target/`.
+///
+/// Some of what the host does is *install* a file rather than read one, and a
+/// test of that has to have somewhere to put it that is neither the checked-in
+/// sample directory nor the system temporary one. `target/` is both inside the
+/// repository and already ignored by git.
+///
+/// Cleared on each call, so a test never sees what the last run left.
+pub fn scratch(name: &str) -> PathBuf {
+    let at = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/test-scratch")
+        .join(name);
+    let _ = std::fs::remove_dir_all(&at);
+    std::fs::create_dir_all(&at).expect("a scratch directory");
+    at
+}
+
+/// A scratch directory holding copies of `files` from [`data`].
+///
+/// What an install step needs: the module's own files, somewhere the test may
+/// let the host change them.
+pub fn scratch_with(name: &str, files: &[&str]) -> PathBuf {
+    let at = scratch(name);
+    for file in files {
+        std::fs::copy(data().join(file), at.join(file)).expect("a sample file to copy");
+    }
+    at
+}
+
 impl Fixture {
+    /// A host over the checked-in sample files.
     pub fn new() -> Self {
+        Self::rooted(data())
+    }
+
+    /// A host over a directory of the test's choosing.
+    ///
+    /// For the few shims that *write* into a module's directory -- see
+    /// [`scratch_with`] -- which must not be the checked-in one.
+    pub fn rooted(root: PathBuf) -> Self {
         let mut machine = Machine::new().expect("16-bit machine");
-        let host = Host::new(&mut machine, data()).expect("host");
+        let host = Host::new(&mut machine, root).expect("host");
         let scratch = machine.alloc_segment(4096).expect("scratch");
         Self {
             machine,
