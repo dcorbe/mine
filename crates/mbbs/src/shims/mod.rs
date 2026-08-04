@@ -3,6 +3,7 @@
 pub mod btrieve;
 pub mod memory;
 pub mod msg;
+pub mod stream;
 pub mod system;
 pub mod text;
 
@@ -11,6 +12,15 @@ use mbbs16::{Machine, Ret};
 use crate::Host;
 use crate::exports::MAJORBBS;
 use crate::globals::GLOBALS;
+
+/// -1, as a 16-bit `int`.
+///
+/// What a routine returns when absence or failure is the truth and the module is
+/// entitled to be told: `access` on a file that is not there, `unlink` on one it
+/// cannot remove. Everywhere else in this crate a host that cannot answer stops
+/// the module instead -- these are the routines whose *purpose* includes
+/// reporting that something is not there, and for them -1 is an answer.
+pub(crate) const NO: u16 = -1i16 as u16;
 
 /// One host routine.
 ///
@@ -118,6 +128,14 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "absbtv", btrieve::absbtv),
     (MAJORBBS, "aabbtv", btrieve::aabbtv),
     (MAJORBBS, "gabbtvl", btrieve::gabbtvl),
+    // Streams: the module's own files, read and written.
+    (MAJORBBS, "fopen", stream::fopen),
+    (MAJORBBS, "fclose", stream::fclose),
+    (MAJORBBS, "fgets", stream::fgets),
+    (MAJORBBS, "fread", stream::fread),
+    (MAJORBBS, "fprintf", stream::fprintf),
+    (MAJORBBS, "fflush", stream::fflush),
+    (MAJORBBS, "unlink", stream::unlink),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "access", system::access),
     (MAJORBBS, "now", system::now),

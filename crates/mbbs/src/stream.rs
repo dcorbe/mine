@@ -1,0 +1,568 @@
+//! Streams: the module's own files, opened by name and read or written through.
+//!
+//! Seven routines over a handle -- `fopen`, `fclose`, `fgets`, `fread`,
+//! `fprintf`, `fflush`, `unlink` -- and no `fseek`, `ftell` or `rewind`
+//! anywhere in `WCCMMUD.DLL`. Every stream is read or written straight through,
+//! once. The design is `docs/plans/2026-08-04-streams.md`.
+//!
+//! # The import census does not cover this one
+//!
+//! Everywhere else in this host, what a module can ask for is bounded by what it
+//! imports, and an import the host does not have stops the module by name. Here
+//! that is not true. `feof`, `ferror`, `fileno`, `getc` and `putc` are **macros**
+//! in Borland's `stdio.h`; they compile to direct reads of the `FILE` struct and
+//! emit no import record at all. The host is never called and has nothing to
+//! refuse.
+//!
+//! `WCCMMUD.DLL` does exactly this. `_CHECK_BEGIN_UPDATING`
+//! (`re/exports/WCCMMUD_decompiled.c:57759`) reads `fp->fd` and hands it to
+//! `getdtd`. So the struct this module hands back is **filled in, not zeroed**,
+//! and [`Stream::flags`] has to stay current for the whole life of the stream --
+//! an `_F_EOF` written one call late is a module reading past the end with
+//! nothing to stop it.
+//!
+//! # Everything here is measured against Borland's own runtime
+//!
+//! Not against C's standard, which is looser than the module's behaviour. The
+//! source is in `archive/tooling/compilers/bc452.zip`, and where it and the
+//! standard differ this follows the source, because the module was linked
+//! against the source.
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, Read, Write};
+use std::path::Path;
+
+use mbbs16::{FarPtr, Machine};
+
+use crate::arena::Arena;
+
+/// Bytes of Borland's `FILE`, as `INCLUDE/STDIO.H:104-114` declares it: two
+/// `int`s, two `char`s, an `int`, two far pointers, an `unsigned` and a `short`.
+///
+/// Large model, so the pointers are four bytes each. Twenty in total, and no
+/// padding -- every field lands on its natural boundary already.
+pub const FILE_SIZE: usize = 2 + 2 + 1 + 1 + 2 + 4 + 4 + 2 + 2;
+
+/// Where `flags` is, which `feof(f)` and `ferror(f)` expand to a read of.
+const FLAGS: u16 = 2;
+
+/// Where `fd` is, which `fileno(f)` expands to a read of. **One byte.**
+const FD: u16 = 4;
+
+/// `STDIO.H:59-69` -- the bits of `FILE.flags`.
+///
+/// Only the ones this host can set truthfully are here. `_F_BUF`, `_F_LBUF`,
+/// `_F_IN`, `_F_OUT` and `_F_TERM` describe a buffering arrangement this host
+/// does not have, and a module reading one of them would be told about a
+/// runtime that is not underneath it.
+mod flags {
+    /// `_F_READ` -- open for reading.
+    pub const READ: u16 = 0x0001;
+    /// `_F_WRIT` -- open for writing.
+    pub const WRIT: u16 = 0x0002;
+    /// `_F_EOF` -- a read has hit the end.
+    pub const EOF: u16 = 0x0020;
+    /// `_F_BIN` -- binary, so no `\r` translation in either direction.
+    pub const BIN: u16 = 0x0040;
+}
+
+/// DOS's soft end-of-file. A text-mode read stops here and does not look past
+/// it, which `READ.CAS`'s `cmp al, _ctlZ / je endSeen` is the whole of.
+const CTRL_Z: u8 = 0x1a;
+
+/// The first file descriptor a module's own stream may have.
+///
+/// 0 to 4 are `stdin`, `stdout`, `stderr`, `stdaux` and `stdprn`, which this
+/// host does not implement and a module must not be handed. Starting past them
+/// also means **a zeroed `FILE` cannot be mistaken for one of ours**: `fd` 0 in
+/// an uninitialised struct reads as `stdin` rather than as a live stream.
+const FIRST_FD: u8 = 5;
+
+/// What `fopen`'s mode string asked for.
+///
+/// `r`, `w` or `a`, then at most one `+` and at most one of `t` or `b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mode {
+    pub read: bool,
+    pub write: bool,
+    pub append: bool,
+    pub update: bool,
+    pub binary: bool,
+}
+
+impl Mode {
+    /// Read a mode string, or say why it could not be read.
+    ///
+    /// **Neither `t` nor `b` means text**, because that is `_fmode`'s default and
+    /// the module relies on it: two of its eleven resolved `fopen` sites pass a
+    /// bare `"w"` or `"a"`. A host that defaulted to binary would write
+    /// `WCCRECOV.FLG` and the list dump with Unix line endings, and nothing that
+    /// reads either would complain.
+    ///
+    /// # Errors
+    ///
+    /// If the string is not a mode. Guessing at one would mean a stream opened
+    /// for reading when it meant append -- which loses a log -- or as text when
+    /// it meant binary, which corrupts a record by two bytes a line. Neither
+    /// fails loudly on its own.
+    pub fn parse(mode: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "fopen mode {mode:?}: expected r, w or a, then at most one + \
+                 and at most one of t or b"
+            )
+        };
+
+        let mut rest = mode.chars();
+        let (read, write, append) = match rest.next() {
+            Some('r') => (true, false, false),
+            Some('w') => (false, true, false),
+            Some('a') => (false, true, true),
+            _ => return Err(bad()),
+        };
+
+        let mut update = false;
+        let mut binary = None;
+        for c in rest {
+            match c {
+                '+' if !update => update = true,
+                't' | 'b' if binary.is_none() => binary = Some(c == 'b'),
+                _ => return Err(bad()),
+            }
+        }
+
+        Ok(Self {
+            read,
+            write,
+            append,
+            update,
+            binary: binary.unwrap_or(false),
+        })
+    }
+}
+
+/// An open file, and how the module is reading or writing it.
+///
+/// Reading is buffered because it is done a byte at a time -- see [`Self::getc`]
+/// -- and writing is not, which is what makes `fflush` an honest no-op rather
+/// than a convenient one.
+enum Io {
+    Read(BufReader<File>),
+    Write(File),
+}
+
+/// One open stream.
+struct Stream {
+    /// What the module called it, in the module's own spelling.
+    name: String,
+
+    /// The `FILE *` the module holds. Unique for the life of the host.
+    cookie: FarPtr,
+
+    /// What `fileno(fp)` reads out of the struct. One byte, so it is reused
+    /// after a close -- unlike the cookie. See [`Streams::close`].
+    fd: u8,
+
+    mode: Mode,
+    io: Io,
+
+    /// Whether a read has hit the end. `_F_EOF`, and mirrored into module
+    /// memory rather than only kept here, because `feof` never asks the host.
+    ended: bool,
+}
+
+impl Stream {
+    /// The `flags` word the module should see.
+    fn flags(&self) -> u16 {
+        let mut bits = if self.mode.read {
+            flags::READ
+        } else {
+            flags::WRIT
+        };
+        if self.mode.binary {
+            bits |= flags::BIN;
+        }
+        if self.ended {
+            bits |= flags::EOF;
+        }
+        bits
+    }
+
+    /// The next byte the module should see, or `None` at the end.
+    ///
+    /// The text-mode rule is Borland's, from the assembly in
+    /// `IO/COMMON16/READ.CAS`, and it is **not** the one usually described:
+    ///
+    /// ```text
+    /// squeeze:  lods al
+    ///           cmp  al, _ctlZ ; je endSeen      -- ^Z ends the file
+    ///           cmp  al, 0Dh   ; je elseSqueeze  -- and every \r is dropped
+    ///           stosb
+    /// ```
+    ///
+    /// There is no lookahead. A carriage return is deleted whether or not a
+    /// newline follows it, so `"a\rb"` in text mode reads as `"ab"`. The one
+    /// exception in the RTL fires only when a `\r` is the last byte of an
+    /// internal buffer, which is an artefact of where the buffer happened to
+    /// end rather than a rule about the file, and is not reproduced here.
+    fn getc(&mut self) -> io::Result<Option<u8>> {
+        let Io::Read(reader) = &mut self.io else {
+            return Ok(None);
+        };
+        if self.ended {
+            return Ok(None);
+        }
+
+        loop {
+            let mut one = [0u8; 1];
+            if reader.read(&mut one)? == 0 {
+                self.ended = true;
+                return Ok(None);
+            }
+            if !self.mode.binary {
+                match one[0] {
+                    // `endSeen`: the file stops here, and stays stopped --
+                    // the real runtime seeks back over it and latches `_O_EOF`.
+                    CTRL_Z => {
+                        self.ended = true;
+                        return Ok(None);
+                    }
+                    b'\r' => continue,
+                    _ => {}
+                }
+            }
+            return Ok(Some(one[0]));
+        }
+    }
+
+    /// Up to `max` bytes, stopping after a newline and keeping it.
+    ///
+    /// `FGETS.C` is one line and this is it:
+    ///
+    fn line(&mut self, max: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        while out.len() < max {
+            match self.getc()? {
+                Some(b) => {
+                    out.push(b);
+                    if b == b'\n' {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Up to `want` bytes. A short answer is the end of the file.
+    fn read(&mut self, want: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(want);
+        while out.len() < want {
+            match self.getc()? {
+                Some(b) => out.push(b),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Put `bytes` on the end, translating if this is a text stream.
+    ///
+    /// `WRITE.C:111` -- `if ((c = *sbuf++) == '\n') *tbuf++ = '\r';` -- so a
+    /// `.LOG` a sysop opens in a DOS editor has DOS line endings.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let Io::Write(file) = &mut self.io else {
+            return Ok(());
+        };
+        if self.mode.binary {
+            return file.write_all(bytes);
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            if b == b'\n' {
+                out.push(b'\r');
+            }
+            out.push(b);
+        }
+        file.write_all(&out)
+    }
+}
+
+/// The streams that are open, and every cookie ever issued.
+#[derive(Default)]
+pub struct Streams {
+    /// Where the `FILE` structs live. Deliberately **not** the module heap: a
+    /// Borland `FILE` belongs to the runtime's own static `_streams[]` and the
+    /// module never allocates or frees one, and putting them on the heap would
+    /// make `farcoreleft` depend on how many files had been opened.
+    arena: Arena,
+
+    open: Vec<Stream>,
+
+    /// Every cookie that has been closed, and what it named.
+    ///
+    /// The addresses are never reissued, so a use-after-close is a refusal that
+    /// can say *which file* -- rather than a write into whichever stream had
+    /// since landed on that address.
+    retired: Vec<(FarPtr, String)>,
+}
+
+impl Streams {
+    /// Open `path` and give the module a `FILE *` to name it by.
+    ///
+    /// # Errors
+    ///
+    /// If the mode asks for something this host does not do, if the file will
+    /// not open, or if there is no descriptor left.
+    pub fn open(
+        &mut self,
+        machine: &mut Machine,
+        name: &str,
+        path: &Path,
+        mode: Mode,
+    ) -> Result<FarPtr, String> {
+        // Parseable and refused, which is a different thing from unparseable.
+        // Nothing in the module opens for update -- none of the eleven resolved
+        // call sites has a `+` -- and a stream that read back what it had just
+        // written would need a buffering arrangement this host does not have.
+        if mode.update {
+            return Err(format!(
+                "{name} opened for update; this host reads or writes a stream, not both"
+            ));
+        }
+
+        let fd = self.free_fd().ok_or_else(|| {
+            format!(
+                "{name}: all {} descriptors are in use",
+                u16::from(u8::MAX) + 1 - u16::from(FIRST_FD)
+            )
+        })?;
+
+        let io = if mode.read {
+            Io::Read(BufReader::new(
+                File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            ))
+        } else {
+            Io::Write(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(mode.append)
+                    .truncate(!mode.append)
+                    .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        };
+
+        let cookie = self
+            .arena
+            .reserve(machine, FILE_SIZE)
+            .map_err(|e| format!("{name}: {e}"))?;
+
+        let stream = Stream {
+            name: name.to_owned(),
+            cookie,
+            fd,
+            mode,
+            io,
+            ended: false,
+        };
+
+        // The two fields a module reads without asking the host. Written before
+        // the stream is recorded, so a failure here cannot leave a stream the
+        // host believes in behind a struct that says nothing.
+        let mut image = [0u8; FILE_SIZE];
+        let at = usize::from(FLAGS);
+        image[at..at + 2].copy_from_slice(&stream.flags().to_le_bytes());
+        image[usize::from(FD)] = fd;
+        machine
+            .write(cookie, &image)
+            .map_err(|e| format!("{name}: {e}"))?;
+
+        self.open.push(stream);
+        Ok(cookie)
+    }
+
+    /// Close a stream.
+    ///
+    /// The cookie is retired rather than reused, which is what makes a later use
+    /// of it a refusal. **The descriptor is not**: `fd` is one byte, so never
+    /// reusing it would run out after 251 opens, and the real runtime reuses it
+    /// too. The asymmetry is deliberate -- the cookie is what every host call is
+    /// validated against, and the descriptor is only ever read out of a `FILE`
+    /// the module has open in front of it.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream.
+    pub fn close(&mut self, cookie: FarPtr) -> Result<(), String> {
+        let at = self.find(cookie)?;
+        let stream = self.open.remove(at);
+        self.retired.push((cookie, stream.name));
+        Ok(())
+    }
+
+    /// What a stream was opened as.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream.
+    pub fn name(&self, cookie: FarPtr) -> Result<&str, String> {
+        Ok(&self.open[self.find(cookie)?].name)
+    }
+
+    /// A line, or `None` if the stream ended before one could start.
+    ///
+    /// `None` is `fgets` returning `NULL`, which is an answer.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream, if it is not open for reading, or if
+    /// the read fails.
+    pub fn line(
+        &mut self,
+        machine: &mut Machine,
+        cookie: FarPtr,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let at = self.readable(cookie)?;
+        let line = self.open[at]
+            .line(max)
+            .map_err(|e| format!("{}: {e}", self.open[at].name))?;
+        self.sync(machine, at)?;
+
+        // `FGETS.C`: `if (EOF == c && P == s) return NULL`. Nothing read *and*
+        // the stream is over -- a zero-length answer from a stream that is still
+        // going is a caller who asked for no bytes.
+        Ok((!line.is_empty() || !self.open[at].ended).then_some(line))
+    }
+
+    /// Up to `want` bytes. A short answer means the file ended.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream, if it is not open for reading, or if
+    /// the read fails.
+    pub fn read(
+        &mut self,
+        machine: &mut Machine,
+        cookie: FarPtr,
+        want: usize,
+    ) -> Result<Vec<u8>, String> {
+        let at = self.readable(cookie)?;
+        let bytes = self.open[at]
+            .read(want)
+            .map_err(|e| format!("{}: {e}", self.open[at].name))?;
+        self.sync(machine, at)?;
+        Ok(bytes)
+    }
+
+    /// Put `bytes` on the end of a stream.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream, if it is not open for writing, or if
+    /// the write fails.
+    pub fn write(&mut self, cookie: FarPtr, bytes: &[u8]) -> Result<(), String> {
+        let at = self.find(cookie)?;
+        let stream = &mut self.open[at];
+        if !stream.mode.write {
+            return Err(format!("{} is open for reading", stream.name));
+        }
+        stream
+            .write(bytes)
+            .map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// How many streams are open.
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Whether nothing is open.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    /// Where the stream `cookie` names is, or why it names none.
+    fn find(&self, cookie: FarPtr) -> Result<usize, String> {
+        if let Some(at) = self.open.iter().position(|s| s.cookie == cookie) {
+            return Ok(at);
+        }
+        // Retired addresses are never reissued, so this can name the file --
+        // which is the difference between a refusal somebody can act on and one
+        // that says only that a pointer was wrong.
+        match self.retired.iter().find(|(at, _)| *at == cookie) {
+            Some((_, name)) => Err(format!("{name} was closed")),
+            None => Err(format!("{cookie} is not a stream this host opened")),
+        }
+    }
+
+    /// Where the stream `cookie` names is, given it must be readable.
+    fn readable(&self, cookie: FarPtr) -> Result<usize, String> {
+        let at = self.find(cookie)?;
+        if !self.open[at].mode.read {
+            return Err(format!("{} is open for writing", self.open[at].name));
+        }
+        Ok(at)
+    }
+
+    /// Put the stream's `flags` back where the module reads it.
+    fn sync(&mut self, machine: &mut Machine, at: usize) -> Result<(), String> {
+        let stream = &self.open[at];
+        let field = FarPtr {
+            offset: stream.cookie.offset + FLAGS,
+            selector: stream.cookie.selector,
+        };
+        machine
+            .write(field, &stream.flags().to_le_bytes())
+            .map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// The lowest descriptor no open stream is using.
+    fn free_fd(&self) -> Option<u8> {
+        (FIRST_FD..=u8::MAX).find(|fd| !self.open.iter().any(|s| s.fd == *fd))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_mode_is_text() {
+        // `_fmode`'s default, and the module relies on it: `WCCRECOV.FLG` is
+        // opened `"w"` and the list dump `"a"`.
+        for bare in ["r", "w", "a"] {
+            assert!(!Mode::parse(bare).expect("a mode").binary, "{bare}");
+        }
+    }
+
+    #[test]
+    fn every_mode_the_module_uses_parses() {
+        // The eleven resolved `fopen` call sites, between them.
+        for used in ["w", "a", "rt", "wt", "at", "rb"] {
+            Mode::parse(used).unwrap_or_else(|e| panic!("{used}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_mode_is_read_or_written_but_not_guessed() {
+        let r = Mode::parse("rt").expect("a mode");
+        assert!(r.read && !r.write && !r.append && !r.binary);
+        let a = Mode::parse("ab").expect("a mode");
+        assert!(!a.read && a.write && a.append && a.binary);
+        let w = Mode::parse("wt").expect("a mode");
+        assert!(!w.read && w.write && !w.append && !w.binary);
+    }
+
+    #[test]
+    fn a_mode_this_host_cannot_read_is_refused_naming_it() {
+        // Each of these would otherwise be silently treated as something.
+        for bad in ["", "x", "rw", "rtb", "r++", "rz", " r"] {
+            let e = Mode::parse(bad).expect_err(bad);
+            assert!(e.contains(&format!("{bad:?}")), "{bad}: {e}");
+        }
+    }
+}

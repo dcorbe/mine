@@ -28,6 +28,7 @@ mod globals;
 pub mod heap;
 pub mod msg;
 mod shims;
+pub mod stream;
 #[cfg(test)]
 mod testing;
 
@@ -170,6 +171,11 @@ pub struct Host {
     /// Which one *is* current is `bb`, for the same reason.
     pub(crate) btrieve: btrieve::Btrieve,
 
+    /// The streams that are open. No notion of a current one -- `fopen` hands
+    /// back a `FILE *` and every routine takes it, so there is no `curmbk` or
+    /// `bb` equivalent to keep in module memory.
+    pub(crate) streams: stream::Streams,
+
     /// Every data file the host created from its virgin copy, in the order it
     /// did. See [`Host::btrieve_file`].
     installed: Vec<String>,
@@ -234,6 +240,7 @@ impl Host {
             modules: Vec::new(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
+            streams: stream::Streams::default(),
             installed: Vec::new(),
             notes: Vec::new(),
             heap: Heap::new(Config::default()),
@@ -265,6 +272,11 @@ impl Host {
     /// The Btrieve files that are open.
     pub fn btrieve(&self) -> &btrieve::Btrieve {
         &self.btrieve
+    }
+
+    /// The streams that are open.
+    pub fn streams(&self) -> &stream::Streams {
+        &self.streams
     }
 
     /// Every data file the host created from its virgin copy.

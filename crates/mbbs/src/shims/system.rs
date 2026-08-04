@@ -7,7 +7,7 @@ use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
 use crate::fmt::format;
-use crate::shims::ShimError;
+use crate::shims::{NO, ShimError};
 use crate::shims::text::write_cstr;
 
 /// `MAJORBBS.H:37` -- maximum size for module names, terminator included.
@@ -113,9 +113,6 @@ pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     }
     Ok(Ret::U16(0))
 }
-
-/// What `access` returns for a file that is not there or not usable.
-const NO: u16 = -1i16 as u16;
 
 /// `char *gmdnam(char *mdfnam)` -- a module's name, out of its `.MDF`.
 ///
