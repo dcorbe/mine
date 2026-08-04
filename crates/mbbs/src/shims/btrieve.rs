@@ -10,9 +10,10 @@
 //!                dupdbtv  23    qnpbtv    7
 //! ```
 //!
-//! Seventeen symbols over 716 sites. Twelve are here: opening and choosing a
-//! file, and reading records out of it. The five that are not are the ones that
-//! *write* -- `dinsbtv`, `dupdbtv`, `invbtv`, `delbtv` -- and `clsbtv`.
+//! Seventeen symbols over 716 sites. **Fourteen are here**: opening and
+//! choosing a file, reading records out of it, and the two write routines that
+//! have something to answer when no file is current. The three that are not are
+//! `dinsbtv`, `dupdbtv` and `clsbtv`.
 //!
 //! **Initialisation uses six of the twelve, and reads exactly one record's
 //! worth**, measured by `crates/mbbs/tests/wccmmud.rs` against the module
@@ -27,11 +28,30 @@
 //! with is Galacticomm's own `PLBTVSTF.C`, which is quoted rather than
 //! paraphrased wherever it decided something.
 //!
-//! # Nothing here writes
+//! # Nothing here writes, and two routines say so by name
 //!
-//! A module that saves a character gets a refusal naming `dinsbtv` or
-//! `dupdbtv`, rather than a host that appears to work and loses the data. That
-//! is the whole reason the write family is absent rather than stubbed.
+//! A module that saves a character gets a refusal, rather than a host that
+//! appears to work and loses the data. That is the whole reason the write
+//! family is refused rather than stubbed.
+//!
+//! [`invbtv`] and [`delbtv`] are nonetheless *present*, because refusing is
+//! only half of what the real host did. Both are guarded with
+//! `if (bb == NULL) { return; }` -- `PLBTVSTF.C:584` and `:623` -- so with no
+//! file current they wrote nothing and said nothing, and reproducing that is
+//! not a lie. **Initialisation depends on it**: call 130 is an `invbtv` with a
+//! null `bb`, and the real host discarded it too.
+//!
+//! *Why* `bb` is null there is a separate and still-open question. It is not
+//! the missing `WCCVACN.DAT` -- staging that file in gives a sixteenth
+//! `opnbtv` and the same null two calls later, measured in
+//! `crates/mbbs/tests/wccmmud.rs` -- and it is not the ten-deep `setbtv` stack
+//! overflowing either, because that surfaces in `rstbtv` and this is a
+//! `setbtv` handed a null. Whichever module-side pointer is still zero, the
+//! guard is the same guard and the insert is discarded either way.
+//!
+//! With a file current they refuse and name it. `dinsbtv` and `dupdbtv` have no
+//! guard at all -- `:603` and `:555` read `bb->reclen` first -- so they refuse
+//! either way, which is what leaving them unbound already does.
 //!
 //! # What every routine does when no file is current
 //!
