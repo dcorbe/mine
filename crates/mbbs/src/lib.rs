@@ -155,6 +155,11 @@ pub struct Host {
     /// number is its index here, which is what `register_module` returns and
     /// what the module passes back.
     modules: Vec<Registration>,
+
+    /// How many host calls have been serviced. The progress meter: with an
+    /// unfinished host, how far a module gets before it asks for something
+    /// that is not there is a number rather than an impression.
+    calls: u64,
 }
 
 impl Host {
@@ -194,6 +199,7 @@ impl Host {
             seed: 0,
             audit: Vec::new(),
             modules: Vec::new(),
+            calls: 0,
         })
     }
 
@@ -210,6 +216,11 @@ impl Host {
     /// Every module that has registered, in the order they did.
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// How many host calls this host has serviced.
+    pub fn calls(&self) -> u64 {
+        self.calls
     }
 
     /// Find one of the module's files, whatever case it named it in.
@@ -335,6 +346,7 @@ impl Host {
                 }
             };
 
+            self.calls += 1;
             match shim(machine, self) {
                 Ok(ret) => exit = machine.resume(ret)?,
                 Err(e) => {

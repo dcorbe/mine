@@ -1,9 +1,13 @@
 //! What `_INIT__WCCMMUD` asks the host for, in order.
 //!
-//! Not an assertion about anything -- a measurement, and step 7's progress
-//! meter. It drives the module's initialisation entry point with a host that
-//! answers zero to every call and prints what was asked, so "how far does init
-//! get" is a number anyone can produce rather than a thing to reason about.
+//! Not an assertion about anything -- a measurement, and the road ahead. It
+//! drives the module's initialisation entry point with a host that answers zero
+//! to every call and prints what was asked, so what a *finished* host will have
+//! to answer is a list anyone can produce rather than a thing to reason about.
+//!
+//! It is no longer the progress meter. `crates/mbbs`'s
+//! `init_gets_as_far_as_the_message_files` is, because it runs against a host
+//! that tells the truth.
 //!
 //! ```text
 //! cargo test -p mbbs16 --test trace_init -- --ignored --nocapture
