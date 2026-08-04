@@ -727,6 +727,60 @@ fn an_unresolved_import_still_gets_a_thunk_that_names_it() {
     assert_eq!(word(&machine, code_sel, 0x02), thunk.selector);
 }
 
+/// A resolver is asked about each distinct symbol exactly once.
+///
+/// The natural way to write a host's data resolver is to hand out a slot of
+/// memory per global, allocating on first sight. If the loader asks per fixup
+/// instead of per symbol, that resolver scatters one global across as many
+/// addresses as it has fixups -- 1,285 of them for `usrnum` -- and the module
+/// uses whichever the last one happened to be. Nothing about it looks wrong.
+#[test]
+fn a_symbol_is_resolved_once_however_many_fixups_name_it() {
+    let mut code = vec![0u8; 0x40];
+    for at in [0x00usize, 0x08, 0x10] {
+        code[at..at + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+    }
+
+    let ne = Ne {
+        segments: vec![
+            Seg::code(code).with(&[
+                // Three fixups, one symbol.
+                Reloc::import(FAR_ADDR, 0x00, 1, 55),
+                Reloc::import(FAR_ADDR, 0x08, 1, 55),
+                Reloc::import(FAR_ADDR, 0x10, 1, 55),
+            ]),
+            Seg::data(vec![0; 16]),
+        ],
+        modules: vec!["MAJORBBS".into()],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    // A resolver that hands out a fresh address every time it is asked, which
+    // is what an allocating one does.
+    let asked = std::cell::Cell::new(0u16);
+    let mut machine = Machine::new().expect("16-bit machine");
+    let scratch = machine.data_selector();
+    let module = machine
+        .load_ne(&ne.finish(), &|_: &str, _: &Symbol| {
+            let n = asked.get();
+            asked.set(n + 1);
+            Some(Import::Data(FarPtr {
+                offset: n * 16,
+                selector: scratch,
+            }))
+        })
+        .expect("loaded");
+
+    assert_eq!(asked.get(), 1, "the resolver was asked once");
+
+    let code_sel = module.segment_selector(1).unwrap();
+    for at in [0x00u16, 0x08, 0x10] {
+        assert_eq!(word(&machine, code_sel, at), 0, "every fixup got slot zero");
+        assert_eq!(word(&machine, code_sel, at + 2), scratch);
+    }
+}
+
 #[test]
 fn a_loaded_module_can_be_entered_by_ordinal_and_by_name() {
     // 0: 9a <far ptr>   lcall $CS, $import

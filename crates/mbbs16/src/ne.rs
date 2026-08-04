@@ -850,6 +850,18 @@ impl Machine {
         let mut thunks = Thunks::new();
         let mut applied = 0;
 
+        // Every distinct symbol is resolved exactly once, and every fixup naming
+        // it gets that same answer.
+        //
+        // This is not an optimisation, though it is also that: `usrnum` is
+        // addressed at 1,285 sites, and a resolver asked 1,285 times is a
+        // resolver that can answer differently 1,285 times. The natural way to
+        // write one -- hand out a slot of host memory per global, allocating on
+        // first sight -- would then scatter a single global across 1,285
+        // addresses, of which the module would use whichever the last fixup
+        // happened to name.
+        let mut resolved: HashMap<(&str, &Symbol), FarPtr> = HashMap::new();
+
         for (i, entry) in image.segments.iter().enumerate() {
             for reloc in &entry.relocations {
                 let value = match &reloc.target {
@@ -863,17 +875,24 @@ impl Machine {
                     },
                     Target::Import { module, symbol } => {
                         let name = image.module_name(*module)?;
-                        match imports.resolve(name, symbol) {
-                            // A datum is addressed, never called: the host's
-                            // own memory goes straight into the fixup.
-                            Some(Import::Data(ptr)) => ptr,
-                            resolved => {
-                                let index = thunks.index_of(
-                                    name,
-                                    symbol,
-                                    matches!(resolved, Some(Import::Routine)),
-                                )?;
-                                self.thunk_slot(index)
+                        match resolved.get(&(name, symbol)) {
+                            Some(&ptr) => ptr,
+                            None => {
+                                let ptr = match imports.resolve(name, symbol) {
+                                    // A datum is addressed, never called: the
+                                    // host's own memory goes into the fixup.
+                                    Some(Import::Data(ptr)) => ptr,
+                                    answer => {
+                                        let index = thunks.index_of(
+                                            name,
+                                            symbol,
+                                            matches!(answer, Some(Import::Routine)),
+                                        )?;
+                                        self.thunk_slot(index)
+                                    }
+                                };
+                                resolved.insert((name, symbol), ptr);
+                                ptr
                             }
                         }
                     }
