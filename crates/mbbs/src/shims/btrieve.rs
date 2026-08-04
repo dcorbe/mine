@@ -647,6 +647,29 @@ fn absolute(
         false => into,
     };
     load(host, block)?;
+
+    // **`PLBTVSTF.C:483` is `bb->lastkn=keynum;` and nothing else** -- the only
+    // place in the file that stores a key number without either resolving a
+    // negative one or bounds-checking it. So the real `aabbtv(rec,pos,-1)`
+    // stored -1, and the next `qnxbtv` asked Btrieve for key number -1.
+    //
+    // `key_number` reads `lastkn` when the number is negative and refuses one
+    // past the file's key count, which is what every other routine in
+    // `PLBTVSTF.C` does. Kept deliberately: storing -1 as a key number is a bug
+    // with no defined consequence to reproduce.
+    //
+    // Unreachable for MajorMUD -- neither of `aabbtv`'s eight call sites nor
+    // `gabbtvl`'s thirty-four pushes a negative key number -- and noted rather
+    // than refused for the same reason the `keylns` case is.
+    if keynum < 0 {
+        host.note_once(
+            "lastkn",
+            format!(
+                "{who} was given key number {keynum}, and PLBTVSTF.C:483 would \
+                 have stored it in bb->lastkn unchecked. Read lastkn instead"
+            ),
+        );
+    }
     let key = key_number(machine, host, block, keynum)?;
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -722,6 +745,33 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
     // module may pass the buffer it was given last time and mean "the same key
     // again", which only works if the copy really happens.
     if value != Btrieve::null() {
+        // **The original measured this copy with the key number as passed**,
+        // before `:268` resolved a negative one to `bb->lastkn`:
+        //
+        //
+        // `keylns` is at offset 144 of the block and `lastkn` at 142, so
+        // `keylns[-1]` *is* `lastkn` -- the real host copied a key-number's
+        // worth of bytes. That is an out-of-bounds read with a citation, not a
+        // behaviour to reproduce, so this measures with the resolved key.
+        //
+        // Unreachable for MajorMUD: no `qrybtv` or `obtbtvl` call site in
+        // `WCCMMUD.DLL` pushes a negative key number, and every site that
+        // disassembles pushes a small constant. Noted rather than refused
+        // because the host's answer here is the *better* one -- stopping a
+        // module over a case handled correctly would be the wrong trade -- and
+        // because an unreachable divergence should announce itself if it ever
+        // stops being unreachable.
+        if keynum < 0 {
+            host.note_once(
+                "keylns",
+                format!(
+                    "{who} passed a key value with key number {keynum}, and \
+                     PLBTVSTF.C:266 would have measured the copy with \
+                     bb->keylns[{keynum}] -- which is bb->lastkn. Measured with \
+                     key {key} instead"
+                ),
+            );
+        }
         let length = key_length(host, block, key)?;
         let bytes = machine.resolve(value, usize::from(length))?.to_vec();
         let buffer = host
@@ -1596,6 +1646,65 @@ mod tests {
         assert!(f.invoke(qnpbtv, &[56]).is_err());
         assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
         assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
+    }
+
+    #[test]
+    fn a_negative_key_number_with_a_key_value_measures_by_the_resolved_key() {
+        // `PLBTVSTF.C:266` measures the copy with the key number as passed, so
+        // `keylns[-1]` -- which is `lastkn`, two bytes below `keylns` in the
+        // block. The real host copied a key-number's worth of bytes.
+        //
+        // This host resolves first and copies the key's real length. Not
+        // reproducing an out-of-bounds read, and not refusing over it either:
+        // the answer here is the better one. What it does owe is a note.
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let key = f.host.btrieve().block(block).expect("open").key();
+
+        // Establish key 0 as `lastkn`, then search it again by name.
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5");
+        assert!(acquire(&mut f, Some(3), -1, 5), "equal to 3, by the last key");
+        assert_eq!(got(&f, key), 3, "the whole two-byte key value was copied");
+
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("keylns")),
+            "the divergence is recorded: {:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn a_negative_key_number_reads_lastkn_rather_than_being_stored_as_one() {
+        // `PLBTVSTF.C:483` stores it unchecked -- the only place in the file
+        // that does -- so the real `aabbtv(rec,pos,-1)` left -1 in `lastkn` and
+        // the next keyed read asked Btrieve for key number -1.
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6, so lastkn is 0");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
+
+        let minus_one = -1i16 as u16;
+        f.invoke(
+            aabbtv,
+            &[0, 0, position as u16, (position >> 16) as u16, minus_one],
+        )
+        .expect("a negative key number reads lastkn");
+        assert_eq!(got(&f, into), 6);
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("lastkn")),
+            "and is recorded: {:?}",
+            f.host.notes()
+        );
+
+        // And the key path really is key 0's, not key -1's: the next record in
+        // that order is 7.
+        assert!(acquire(&mut f, None, -1, 6), "next");
+        assert_eq!(got(&f, into), 7);
     }
 
     #[test]
