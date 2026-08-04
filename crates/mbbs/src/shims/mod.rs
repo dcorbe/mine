@@ -110,6 +110,14 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "setbtv", btrieve::setbtv),
     (MAJORBBS, "rstbtv", btrieve::rstbtv),
     (MAJORBBS, "cntrbtv", btrieve::cntrbtv),
+    // Btrieve: reading records.
+    (MAJORBBS, "qrybtv", btrieve::qrybtv),
+    (MAJORBBS, "qnpbtv", btrieve::qnpbtv),
+    (MAJORBBS, "obtbtvl", btrieve::obtbtvl),
+    (MAJORBBS, "stpbtvl", btrieve::stpbtvl),
+    (MAJORBBS, "absbtv", btrieve::absbtv),
+    (MAJORBBS, "aabbtv", btrieve::aabbtv),
+    (MAJORBBS, "gabbtvl", btrieve::gabbtvl),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "access", system::access),
     (MAJORBBS, "now", system::now),
@@ -185,10 +193,11 @@ mod tests {
 
     #[test]
     fn an_unknown_symbol_is_unimplemented() {
-        // `obtbtvl` is the acquire-by-key that reading records needs, and is
-        // deliberately absent: opening files and counting them is the whole of
-        // what initialisation asks Btrieve for.
-        assert!(matches!(entry(MAJORBBS, "obtbtvl"), Entry::Unimplemented));
+        // `dinsbtv` is the insert that writing records needs, and is
+        // deliberately absent: nothing in this host writes to a Btrieve file
+        // yet, so a module that saves a character is stopped rather than
+        // appearing to work.
+        assert!(matches!(entry(MAJORBBS, "dinsbtv"), Entry::Unimplemented));
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
     }
 

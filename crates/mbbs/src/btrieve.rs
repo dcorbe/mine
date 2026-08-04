@@ -28,10 +28,16 @@
 //! FCR, verified against all eighteen files MajorMUD ships by
 //! `crates/mbbs/tests/btrieve.rs`.
 
+pub mod keys;
+pub mod records;
+
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mbbs16::{FarPtr, Machine};
+
+pub use keys::Key;
+pub use records::{Record, Records};
 
 /// How much of the first page this host reads.
 ///
@@ -306,13 +312,38 @@ const NULL: FarPtr = FarPtr {
     selector: 0,
 };
 
+/// Where a file is positioned: the cursor Btrieve keeps in its position block.
+///
+/// Not in the module's memory. Btrieve kept it in `posblk`, which is 128 opaque
+/// bytes the real host only ever handed back to the TSR -- so a module cannot
+/// read it, cannot corrupt it, and has no way to notice that this host keeps it
+/// somewhere else entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cursor {
+    /// Nothing has positioned the file yet, and `absbtv` has nothing to report.
+    Nowhere,
+
+    /// At a place in a key's order: what the query and acquire families leave
+    /// behind, and what `qnxbtv` steps along.
+    Ordered { key: u16, at: usize },
+
+    /// At a place in physical order: what the step family leaves behind.
+    Physical { at: usize },
+}
+
 /// One open Btrieve file.
 pub struct Block {
     /// What the module named it, for error messages.
     name: String,
 
+    /// Where it is on disk, so records can be read without opening it again.
+    path: PathBuf,
+
     /// The file's own shape.
     geometry: Geometry,
+
+    /// What the file is indexed by.
+    keys: Vec<Key>,
 
     /// The `struct btvblk` the module was handed. Also this block's identity:
     /// `setbtv`, `cntrbtv` and `clsbtv` name it and nothing else does.
@@ -326,6 +357,21 @@ pub struct Block {
 
     /// The record buffer, `maxlen` bytes of the module's heap.
     data: FarPtr,
+
+    /// The key buffer, `clckln()` bytes of the module's heap. What a search
+    /// value is copied into, and what a `Get Key` operation leaves the found
+    /// key in.
+    key: FarPtr,
+
+    /// The records, read the first time something asks for one.
+    ///
+    /// **Lazily**, because `opnbtv` is not a read: initialisation opens fifteen
+    /// files totalling 55 MB and then queries one of them. Loading at open time
+    /// would make every module pay for every file it merely holds a handle to.
+    records: Option<Records>,
+
+    /// Where the file is positioned.
+    cursor: Cursor,
 }
 
 impl Block {
@@ -337,6 +383,11 @@ impl Block {
     /// The file's shape.
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// What the file is indexed by.
+    pub fn keys(&self) -> &[Key] {
+        &self.keys
     }
 
     /// The `struct btvblk` the module holds.
@@ -354,15 +405,57 @@ impl Block {
         self.data
     }
 
-    /// Where `bb->key` would point.
+    /// The key buffer a search value is copied into.
     ///
-    /// Nowhere yet. `PLBTVSTF.C:166` sizes the key buffer with `clckln()`,
-    /// which reads the key definitions out of the file -- and no step so far
-    /// reads a record, so no step so far needs a key. A null pointer is what
-    /// "not known" honestly looks like; inventing a buffer of a guessed size
-    /// would be a lie that only failed once something searched by it.
+    /// `PLBTVSTF.C:166` sizes it with `clckln()`, which is the longest key plus
+    /// one. The buffer exists whether or not the module ever searches by key,
+    /// because the real host allocated it in `opnbtv` and a module is entitled
+    /// to find a pointer there.
     pub fn key(&self) -> FarPtr {
-        NULL
+        self.key
+    }
+
+    /// Where the file is positioned.
+    pub fn cursor(&self) -> Cursor {
+        self.cursor
+    }
+
+    /// Move the file to a new position.
+    pub fn seek_to(&mut self, cursor: Cursor) {
+        self.cursor = cursor;
+    }
+
+    /// The file's records, reading them if this is the first time.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read, or holds a different number of records from
+    /// the number its header claims.
+    pub fn records(&mut self) -> Result<&Records, BtvError> {
+        if self.records.is_none() {
+            self.records = Some(Records::read(
+                &self.name,
+                &self.path,
+                &self.geometry,
+                &self.keys,
+            )?);
+        }
+        Ok(self.records.as_ref().expect("just read"))
+    }
+
+    /// The file's records, if they have been read.
+    pub fn loaded(&self) -> Option<&Records> {
+        self.records.as_ref()
+    }
+
+    /// The record the cursor names, if it names one.
+    pub fn current(&self) -> Option<&Record> {
+        let records = self.records.as_ref()?;
+        match self.cursor {
+            Cursor::Nowhere => None,
+            Cursor::Ordered { key, at } => records.ordered(key, at),
+            Cursor::Physical { at } => records.physical(at),
+        }
     }
 }
 
@@ -414,15 +507,25 @@ impl Btrieve {
     ///
     /// # Errors
     ///
-    /// If the heap has no room for the block, its name or its record buffer.
+    /// If the file's key definitions cannot be read, or the heap has no room
+    /// for the block, its name, its record buffer or its key buffer.
     pub fn open(
         &mut self,
         machine: &mut Machine,
         heap: &mut crate::Heap,
         name: &str,
+        path: &Path,
         geometry: Geometry,
         maxlen: u16,
     ) -> Result<FarPtr, String> {
+        // The key definitions come out of the same first page the geometry did,
+        // and they are read at open time rather than with the records because
+        // `clckln()` -- which sizes the key buffer below -- is part of what
+        // `opnbtv` does. A file whose keys cannot be read is refused here, not
+        // at whatever much later moment something first searches by one.
+        let fcr = read_head(path, FCR).map_err(|e| format!("{}: {e}", path.display()))?;
+        let parsed = keys::parse(name, &fcr, geometry.keys).map_err(|e| e.why)?;
+
         // `PLBTVSTF.C:148` -- `bb->filnam=alcmem(strlen(filnam)+1)`. The
         // module's, not the host's: `clsbtv` frees it.
         let bytes = name.as_bytes();
@@ -438,6 +541,15 @@ impl Btrieve {
             .write(data, &vec![0u8; usize::from(maxlen)])
             .map_err(|e| e.to_string())?;
 
+        // `clckln()` returns the longest key plus one, and that is what the
+        // real host allocated. Plus one because a Btrieve key buffer for a
+        // string key holds a terminator the key length does not count.
+        let longest = parsed.iter().map(Key::length).max().unwrap_or(0);
+        let key = heap.alloc(machine, longest + 1)?;
+        machine
+            .write(key, &vec![0u8; usize::from(longest) + 1])
+            .map_err(|e| e.to_string())?;
+
         let block = heap.alloc(machine, field::SIZE)?;
         let mut image = vec![0u8; usize::from(field::SIZE)];
         let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
@@ -447,14 +559,30 @@ impl Btrieve {
         put(&mut image, field::FILNAM, &filnam.to_bytes());
         put(&mut image, field::RECLEN, &maxlen.to_le_bytes());
         put(&mut image, field::DATA, &data.to_bytes());
+        put(&mut image, field::KEY, &key.to_bytes());
+
+        // `bb->keylns[n]`, which `clckln()` fills in and which `qrybtv` and the
+        // acquire family read to know how many bytes of the module's buffer are
+        // the key. Every one this host knows is written; the rest stay zero.
+        for definition in &parsed {
+            let at = field::KEYLNS + definition.number * 2;
+            if at + 2 <= field::REALSEG {
+                put(&mut image, at, &definition.length().to_le_bytes());
+            }
+        }
         machine.write(block, &image).map_err(|e| e.to_string())?;
 
         self.open.push(Block {
             name: name.to_owned(),
+            path: path.to_owned(),
             geometry,
+            keys: parsed,
             block,
             maxlen,
             data,
+            key,
+            records: None,
+            cursor: Cursor::Nowhere,
         });
         Ok(block)
     }
@@ -532,6 +660,16 @@ impl Btrieve {
     /// If it names no open file.
     pub fn block(&self, at: FarPtr) -> Result<&Block, String> {
         Ok(&self.open[self.find(at)?])
+    }
+
+    /// The block a module's pointer names, to be read from or positioned.
+    ///
+    /// # Errors
+    ///
+    /// If it names no open file.
+    pub fn block_mut(&mut self, at: FarPtr) -> Result<&mut Block, String> {
+        let index = self.find(at)?;
+        Ok(&mut self.open[index])
     }
 
     /// How many files are open.
