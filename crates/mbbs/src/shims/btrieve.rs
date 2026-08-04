@@ -33,6 +33,33 @@
 //! `dupdbtv`, rather than a host that appears to work and loses the data. That
 //! is the whole reason the write family is absent rather than stubbed.
 //!
+//! # What every routine does when no file is current
+//!
+//! `PLBTVSTF.C` opens **eleven** of its routines with the same three lines --
+//! `if (bb == NULL) { return 0; }` -- and a module written against that host is
+//! entitled to ask a question with no file current and be told there is no
+//! answer. Six of them are here, and all six answer rather than refuse:
+//!
+//! ```text
+//! qrybtv  :262  0        gabbtvl :452  nothing (it is void)
+//! qnpbtv  :287  0        aabbtvl :476  0
+//! obtbtvl :357  0        absbtv  :426  0L
+//! ```
+//!
+//! **Two do not, and for two different reasons.** `stpbtvl` (`:509`) has no
+//! guard and dereferences `bb` twice before it checks anything, so the real
+//! host faulted and there is nothing to reproduce. `cntrbtv` (`:681`) has no
+//! guard because it never reads `bb` -- it asks the Btrieve TSR about whatever
+//! file *it* is positioned on, and this host has no TSR to ask. Both refuse,
+//! and each says which of the two it is.
+//!
+//! The remaining five guards belong to routines this host does not implement,
+//! recorded here so the step that adds one does not derive them again:
+//! `getbtvl` (`:318`, returns), `anpbtvlk` (`:406`, 0), `upvbtv` (`:536`,
+//! returns), `invbtv` (`:584`, returns), `delbtv` (`:623`, returns). Note that
+//! `dupdbtv` and `dinsbtv` have *no* guard and read `bb->reclen` immediately,
+//! which is the `stpbtvl` shape again.
+//!
 //! # This is where matching the original beats refusing
 //!
 //! Everywhere else in this crate, a host that cannot answer honestly stops the
@@ -186,16 +213,30 @@ pub fn rstbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// carries the same number the file's first page does.
 ///
 /// **A count of zero is an answer**, not a failure: `WCCUSERS.DAT` on a fresh
-/// board genuinely has no records in it. With no file current there is nothing
-/// to count, and that is a refusal -- the real host would have dereferenced a
-/// null `bb` and taken the board down with it.
+/// board genuinely has no records in it.
+///
+/// # With no file current, and why the refusal is not the null-`bb` one
+///
+/// `cntrbtv` is one of two routines in `PLBTVSTF.C` that this host implements
+/// and that has **no** `bb == NULL` guard, and unlike `stpbtvl` it has not got
+/// one because it does not need one: `:681-694` never mentions `bb` at all. It
+/// asks Btrieve for a `STAT` on whatever file the TSR is positioned on and
+/// returns `GIBP->fs.numofr`. On a real board with no `setbtv` in force that
+/// answered about *some* file -- the last one touched -- rather than faulting.
+///
+/// The refusal here survives for a different reason. **This host has no Btrieve
+/// TSR holding a position**; it reads the file itself, so "which file" comes
+/// from `bb` and from nowhere else. With none current the question has no
+/// referent, and 0 would be a count of a file this host cannot name.
 pub fn cntrbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = current(machine, host)?;
-    if block == Btrieve::null() {
-        return Err(ShimError::Failed(
-            "cntrbtv with no Btrieve file current".to_owned(),
-        ));
-    }
+    let block = positioned(machine, host, "cntrbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "cntrbtv with no Btrieve file current -- PLBTVSTF.C:681 would have \
+             counted whatever file Btrieve was last positioned on, and this \
+             host has no such position to fall back on"
+                .to_owned(),
+        )
+    })?;
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     Ok(Ret::U32(file.geometry().records))
 }
@@ -272,7 +313,18 @@ impl Op {
 /// every call site is written for it: initialisation's very first read is
 /// `qlobtv(0)` on `WCCUSERS.DAT`, which holds no records at all, and 0 is what
 /// tells the module the board has no characters yet.
+///
+/// **With no file current it is the same zero**, per the guard at
+/// `PLBTVSTF.C:262`. That indistinguishability is the point: a module could
+/// never tell "no such record" from "no such file" and none was written to.
 pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    // The guard is the first thing `PLBTVSTF.C:262` does -- before the key, the
+    // key number or the option are looked at -- so it is the first thing here.
+    let Some(block) = positioned(machine, host, "qrybtv")? else {
+        note_no_file(host, "qrybtv");
+        return Ok(Ret::U16(0));
+    };
+
     let value = machine.arg_far(0);
     let keynum = machine.arg_u16(2) as i16;
     let opt = machine.arg_u16(3) as i16;
@@ -284,7 +336,16 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         ))
     })?;
     Ok(Ret::U16(u16::from(locate(
-        machine, host, "qrybtv", op, keynum, value, None,
+        machine,
+        host,
+        Request {
+            who: "qrybtv",
+            block,
+            op,
+            keynum,
+            value,
+            into: None,
+        },
     )?)))
 }
 
@@ -298,6 +359,13 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// The pattern the two make together is what MajorMUD uses them for: `qeqbtv`
 /// to find where a group of records starts, then `qnxbtv` along it.
 pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    // `PLBTVSTF.C:287`, and it has to be before `bb->data` is read for the same
+    // reason the C puts it there: there is no `bb->data` to read.
+    let Some(block) = positioned(machine, host, "qnpbtv")? else {
+        note_no_file(host, "qnpbtv");
+        return Ok(Ret::U16(0));
+    };
+
     let opt = machine.arg_u16(0) as i16;
     let op = Op::of(opt - 50).ok_or_else(|| {
         ShimError::Failed(format!("qnpbtv with option {opt}, which is not a get operation"))
@@ -305,15 +373,18 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
     // `bb->lastkn`: which key the last positioning used. Passed as -1 so that
     // `locate` reads it back rather than changing it, exactly as the C does.
-    let into = data_buffer(machine, host)?;
+    let into = data_buffer(host, block)?;
     Ok(Ret::U16(u16::from(locate(
         machine,
         host,
-        "qnpbtv",
-        op,
-        -1,
-        Btrieve::null(),
-        Some(into),
+        Request {
+            who: "qnpbtv",
+            block,
+            op,
+            keynum: -1,
+            value: Btrieve::null(),
+            into: Some(into),
+        },
     )?)))
 }
 
@@ -332,7 +403,20 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// multi-user concern this host has no second user for yet, and a lock silently
 /// not taken is the kind of difference that shows up as two channels writing
 /// over each other much later.
+///
+/// **With no file current it answers 0**, per `PLBTVSTF.C:357` -- and this is
+/// the one initialisation actually reaches. Call 128 of `_INIT__WCCMMUD` is an
+/// `obtbtvl` after a `setbtv(NULL)`, and it is entitled to be told there is no
+/// record rather than stopped.
 pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    // `:357` guards, and only then does `:360` default `recptr` to `bb->data`.
+    // The order is the whole of it: `bb->data` cannot be read from a null `bb`,
+    // so a guard placed after that default never runs.
+    let Some(block) = positioned(machine, host, "obtbtvl")? else {
+        note_no_file(host, "obtbtvl");
+        return Ok(Ret::U16(0));
+    };
+
     let into = machine.arg_far(0);
     let value = machine.arg_far(2);
     let keynum = machine.arg_u16(4) as i16;
@@ -346,17 +430,20 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         ))
     })?;
     let into = match into == Btrieve::null() {
-        true => data_buffer(machine, host)?,
+        true => data_buffer(host, block)?,
         false => into,
     };
     Ok(Ret::U16(u16::from(locate(
         machine,
         host,
-        "obtbtvl",
-        op,
-        keynum,
-        value,
-        Some(into),
+        Request {
+            who: "obtbtvl",
+            block,
+            op,
+            keynum,
+            value,
+            into: Some(into),
+        },
     )?)))
 }
 
@@ -369,17 +456,37 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// This is how a module reads a whole file when the order does not matter --
 /// and it is *not* the same sequence a keyed walk gives. `WCCRACE` holds
 /// thirteen races whose first record is number 10.
+///
+/// # The one step routine that refuses on a null `bb`
+///
+/// Eleven routines in `PLBTVSTF.C` open with `if (bb == NULL) return 0;` and
+/// this is not one of them. `:509` goes straight to work:
+///
+///
+/// Two dereferences before anything is checked. A real board that stepped with
+/// no file current took the fault there, so there is no answer to reproduce and
+/// refusing is the honest translation of what happened.
 pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    // Before `recptr` is defaulted, so that the refusal names `stpbtvl` rather
+    // than coming out of a `bb->data` lookup on a null block.
+    let block = positioned(machine, host, "stpbtvl")?.ok_or_else(|| {
+        ShimError::Failed(
+            "stpbtvl with no Btrieve file current -- PLBTVSTF.C:509 has no \
+             guard for that and dereferences bb twice, so the real host faulted \
+             here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
     let into = machine.arg_far(0);
     let opt = machine.arg_u16(2) as i16;
     let lock = machine.arg_u16(3) as i16;
     unlocked("stpbtvl", lock)?;
 
     let into = match into == Btrieve::null() {
-        true => data_buffer(machine, host)?,
+        true => data_buffer(host, block)?,
         false => into,
     };
-    let block = positioned(machine, host, "stpbtvl")?;
     load(host, block)?;
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
@@ -424,12 +531,21 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// identity: `gabbtvl` and `aabbtv` take it back, and `gcrbtv` is defined as
 /// `gabbtvl(rec,absbtv(),n,0)` -- re-read where you already are.
 ///
-/// `PLBTVSTF.C:424` returns 0 when no file is current. **Here a file that is
-/// current but not positioned is a refusal**, because zero is a real file
-/// offset in the sense that the module will hand it straight back to
-/// `gabbtvl`, and answering it would name the file control record.
+/// `PLBTVSTF.C:426` returns `0L` when no file is current, and that is what this
+/// gives -- a `long` zero, in `DX:AX`, because `absbtv` is declared `long` and
+/// the return type should say so.
+///
+/// **A file that is current but not positioned is still a refusal.** The two
+/// cases are not the same: the real host's Btrieve answered a Get Position on
+/// an unpositioned file with status 8 and `btverr` turned that into a
+/// `catastro`, so there was never a zero to reproduce there. Zero is also a
+/// real file offset in the sense that matters -- the module hands it straight
+/// back to `gabbtvl` -- and answering it would name the file control record.
 pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = positioned(machine, host, "absbtv")?;
+    let Some(block) = positioned(machine, host, "absbtv")? else {
+        note_no_file(host, "absbtv");
+        return Ok(Ret::U32(0));
+    };
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let record = file.current().ok_or_else(|| {
         ShimError::Failed(format!(
@@ -450,24 +566,46 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// It also establishes the key path, so a `qnxbtv` after it continues in
 /// `keynum`'s order from wherever the position landed.
+///
+/// With no file current it answers 0, per the guard at `PLBTVSTF.C:476`.
 pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    absolute(machine, host, "aabbtv", false)
+    Ok(Ret::U16(u16::from(absolute(
+        machine, host, "aabbtv", false,
+    )?)))
 }
 
 /// `void gabbtvl(void *recptr, long abspos, int keynum, int loktyp)` -- get the
 /// record at a file position, or stop.
+///
+/// **The one routine of the six that answers with nothing.** `PLBTVSTF.C:452`
+/// is `if (bb == NULL) { return; }` in a `void` function, so with no file
+/// current it does not fail, does not stop the module, and above all does not
+/// write into the module's record buffer -- which is the whole of what a caller
+/// could observe.
 pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     absolute(machine, host, "gabbtvl", true)?;
     Ok(Ret::Void)
 }
 
-/// The body of `aabbtv` and `gabbtvl`.
+/// The body of `aabbtv` and `gabbtvl`. Returns whether a record was delivered.
+///
+/// `false` covers both of the original's non-answers: no file current
+/// (`PLBTVSTF.C:476`) and no record at that position. They differ for
+/// `gabbtvl`, which `:455` sends to `posbtverr` in the second case only -- so
+/// `fatal` turns the second into a refusal and never the first.
 fn absolute(
     machine: &mut Machine,
     host: &mut Host,
     who: &str,
     fatal: bool,
-) -> Result<Ret, ShimError> {
+) -> Result<bool, ShimError> {
+    // `:452` and `:476` both guard before `:479` defaults `recptr` to
+    // `bb->data`. Same ordering point as `obtbtvl`.
+    let Some(block) = positioned(machine, host, who)? else {
+        note_no_file(host, who);
+        return Ok(false);
+    };
+
     let into = machine.arg_far(0);
     let position = machine.arg_u32(2);
     let keynum = machine.arg_u16(4) as i16;
@@ -475,10 +613,9 @@ fn absolute(
     unlocked(who, lock)?;
 
     let into = match into == Btrieve::null() {
-        true => data_buffer(machine, host)?,
+        true => data_buffer(host, block)?,
         false => into,
     };
-    let block = positioned(machine, host, who)?;
     load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
 
@@ -491,7 +628,7 @@ fn absolute(
                 file.name()
             )));
         }
-        return Ok(Ret::U16(0));
+        return Ok(false);
     };
 
     // The position names a record; the key number says which order a later
@@ -502,24 +639,48 @@ fn absolute(
     };
     file.seek_to(cursor);
     deliver(machine, host, block, into)?;
-    Ok(Ret::U16(1))
+    Ok(true)
 }
 
-/// Position the current file, and hand back the record if asked.
+/// One positioning request: which file, what to find in it, and where the
+/// record goes.
 ///
-/// The one place the query, acquire and key families meet: they differ in
-/// whether the record is delivered and in the numbering of their options, and
-/// in nothing else. Returns whether a record was found.
-fn locate(
-    machine: &mut Machine,
-    host: &mut Host,
-    who: &str,
+/// The query, acquire and key families differ in exactly these fields and in
+/// nothing else, which is what makes [`locate`] one routine.
+struct Request<'a> {
+    /// The routine asking, for anything it has to refuse by name.
+    who: &'a str,
+
+    /// The file. The caller's rather than read from `bb` here, because the
+    /// caller has already had to decide what a null `bb` means to it -- see
+    /// [`positioned`].
+    block: FarPtr,
+
+    /// What to find.
     op: Op,
+
+    /// Which key to find it by, or negative for `bb->lastkn`.
     keynum: i16,
+
+    /// The module's key value, or null for an operation that needs none.
     value: FarPtr,
+
+    /// Where the record goes, or `None` for a query, which reads none.
     into: Option<FarPtr>,
-) -> Result<bool, ShimError> {
-    let block = positioned(machine, host, who)?;
+}
+
+/// Position the file a [`Request`] names, and hand back the record if asked.
+///
+/// Returns whether a record was found.
+fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, ShimError> {
+    let Request {
+        who,
+        block,
+        op,
+        keynum,
+        value,
+        into,
+    } = req;
     load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
 
@@ -646,10 +807,19 @@ fn locate(
 
 /// Copy the record the cursor names into the module's memory.
 ///
-/// `bb->reclen` bytes -- the length the *module* opened the file for, not the
-/// file's. A record longer than that is truncated to what the module asked for
-/// and a record shorter leaves the rest of the buffer alone, which is what
-/// `movmem(gpbptr,recptr,btvdatptr->dbflen)` did.
+/// At most `bb->reclen` bytes -- the length the *module* opened the file for,
+/// not the file's. A record longer than that is truncated to what the module
+/// asked for and a record shorter leaves the rest of the buffer alone.
+///
+/// The C is `movmem(gpbptr,recptr,btvdatptr->dbflen)`, and `dbflen` is **the
+/// length Btrieve returned**, not the one the module asked for: `btvu` sets it
+/// to `rlen` on the way in (`:794`) and reads back whatever the TSR left there
+/// (`:812`). The two agree for a fixed-length file opened at its own record
+/// length, which is every file MajorMUD opens. Where they would not is a module
+/// opening a file for *less* than its record length -- real Btrieve answers
+/// status 22 and `posbtverr` (`:746`) truncates with a NUL at `bb->reclen-1`
+/// before the copy runs, where this truncates silently. `opnbtv` already notes
+/// the mismatch that would make it live.
 fn deliver(
     machine: &mut Machine,
     host: &mut Host,
@@ -745,21 +915,48 @@ fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
     Ok(())
 }
 
-/// The current file, refusing if there is none.
-fn positioned(machine: &Machine, host: &Host, who: &str) -> Result<FarPtr, ShimError> {
+/// The current file, or `None` if there is none.
+///
+/// **Not an error.** `PLBTVSTF.C` opens eleven of its routines with
+/// `if (bb == NULL) { return 0; }` and each caller knows what its own zero is:
+/// an `int` 0, a `long` 0, or nothing at all. So the decision belongs to the
+/// caller and this only reports.
+///
+/// A pointer that is neither null nor a file this host opened *is* a refusal,
+/// which is [`setbtv`]'s contract and unrelated to the null case.
+fn positioned(machine: &Machine, host: &Host, who: &str) -> Result<Option<FarPtr>, ShimError> {
     let block = current(machine, host)?;
     if block == Btrieve::null() {
-        return Err(ShimError::Failed(format!(
-            "{who} with no Btrieve file current"
-        )));
+        return Ok(None);
     }
-    host.btrieve.block(block).map_err(ShimError::Failed)?;
-    Ok(block)
+    host.btrieve
+        .block(block)
+        .map_err(|e| ShimError::Failed(format!("{who}: {e}")))?;
+    Ok(Some(block))
 }
 
-/// Where `bb->data` points.
-fn data_buffer(machine: &Machine, host: &Host) -> Result<FarPtr, ShimError> {
-    let block = current(machine, host)?;
+/// Say once that a routine was asked something with no Btrieve file current.
+///
+/// Answering 0 is what the real host did, and it is also what an upstream
+/// mistake looks like -- a `rstbtv` too many, a `setbtv` of something that was
+/// never opened. This is neither an answer nor a refusal: it does not stop the
+/// module, and a test can assert on it.
+///
+/// Once per routine. `obtbtvl` inside a loop would otherwise fill
+/// [`Host::notes`](crate::Host::notes) with thousands of identical lines.
+fn note_no_file(host: &mut Host, who: &str) {
+    host.note_once(
+        who,
+        format!(
+            "{who} with no Btrieve file current, answered as PLBTVSTF.C does \
+             -- nothing found. A null bb is legitimate, and is also what a \
+             rstbtv too many leaves behind"
+        ),
+    );
+}
+
+/// Where `bb->data` points, for a file the caller has already established.
+fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
     Ok(host
         .btrieve
         .block(block)
@@ -1310,11 +1507,192 @@ mod tests {
         assert!(e.to_string().contains("100"), "{e}");
     }
 
+    // # With no Btrieve file current
+    //
+    // Six routines answer and two refuse, and which is which comes from
+    // `PLBTVSTF.C` rather than from what is convenient. One test per routine
+    // deliberately: a shared one would pass with five of the six still
+    // refusing.
+
+    /// A host on which `bb` is null, which is where a module starts and where a
+    /// `rstbtv` too many puts it back.
+    fn nothing_current() -> Fixture {
+        let f = Fixture::new();
+        assert_eq!(bb(&f), Btrieve::null(), "nothing is current to begin with");
+        f
+    }
+
     #[test]
-    fn reading_with_no_file_current_refuses() {
+    fn qrybtv_with_no_file_current_answers_nothing_found() {
+        let mut f = nothing_current();
+        assert_eq!(
+            f.invoke(qrybtv, &[0, 0, 0, 62]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn qnpbtv_with_no_file_current_answers_nothing_found() {
+        // And in particular does not fail looking for `bb->data` to read into,
+        // which is a null block away.
+        let mut f = nothing_current();
+        assert_eq!(f.invoke(qnpbtv, &[56]).expect("answers"), Ret::U16(0));
+    }
+
+    #[test]
+    fn obtbtvl_with_no_file_current_answers_nothing_found() {
+        // Call 128 of `_INIT__WCCMMUD`, and the reason this step exists. The
+        // null `recptr` is the module's own: `alobtv`/`ahibtv` pass NULL, so
+        // the guard has to come before `recptr` is defaulted to `bb->data`.
+        let mut f = nothing_current();
+        assert_eq!(
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn aabbtv_with_no_file_current_answers_nothing_found() {
+        let mut f = nothing_current();
+        assert_eq!(
+            f.invoke(aabbtv, &[0, 0, 7, 0, 0, 0]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn absbtv_with_no_file_current_answers_a_long_zero() {
+        // `PLBTVSTF.C:427` is `return(0L)`, and `absbtv` is declared `long`, so
+        // the answer occupies `DX:AX` and not just `AX`. A `Ret::U16(0)` here
+        // would pass a test that only compared the low half.
+        let mut f = nothing_current();
+        assert_eq!(f.invoke(absbtv, &[]).expect("answers"), Ret::U32(0));
+    }
+
+    #[test]
+    fn gabbtvl_with_no_file_current_answers_with_nothing_at_all() {
+        // The odd one out in a family that otherwise returns an int: `:452`
+        // returns from a `void`. What a caller can actually observe is the
+        // record buffer, so that is what this checks -- a test on the return
+        // value alone would not notice it scribbling.
+        let mut f = nothing_current();
+        let into = f.bytes(&[0xAA; 8], false);
+        assert_eq!(
+            f.invoke(
+                gabbtvl,
+                &[into.offset, into.selector, 0, 0, 0, 0]
+            )
+            .expect("answers"),
+            Ret::Void
+        );
+        assert_eq!(
+            f.machine.resolve(into, 8).expect("readable"),
+            [0xAA; 8],
+            "and left the module's buffer alone"
+        );
+    }
+
+    #[test]
+    fn the_null_bb_zero_is_the_same_zero_as_not_found() {
+        // This is the argument the whole step rests on, so it is a test rather
+        // than a paragraph. The rule everywhere else in this crate is that a
+        // host which cannot answer stops the module; answering 0 here is not an
+        // exception to it, because the module already gets this exact 0 from a
+        // perfectly good file and every call site tests for it.
         let mut f = Fixture::new();
-        assert!(f.invoke(qrybtv, &[0, 0, 0, 62]).is_err());
-        assert!(f.invoke(stpbtvl, &[0, 0, 33, 0]).is_err());
-        assert!(f.invoke(absbtv, &[]).is_err());
+        open(&mut f, "EMPTY.DAT", 64);
+        let not_found = f.invoke(qrybtv, &[0, 0, 0, 62]).expect("empty file");
+
+        f.invoke(rstbtv, &[]).expect("restores");
+        f.invoke(rstbtv, &[]).expect("and past the bottom");
+        assert_eq!(bb(&f), Btrieve::null(), "nothing current now");
+        let no_file = f.invoke(qrybtv, &[0, 0, 0, 62]).expect("no file");
+
+        assert_eq!(not_found, no_file, "the module cannot tell them apart");
+    }
+
+    #[test]
+    fn stpbtvl_with_no_file_current_refuses_by_name() {
+        // The one step routine with no guard in `PLBTVSTF.C`. It dereferences
+        // `bb` twice before checking anything, so the real host faulted and
+        // there is no answer to reproduce.
+        let mut f = nothing_current();
+        let e = f.invoke(stpbtvl, &[0, 0, 33, 0]).expect_err("no file");
+        assert!(e.to_string().contains("stpbtvl"), "{e}");
+
+        // With a null `recptr` too, which is the path that used to refuse from
+        // inside a `bb->data` lookup and so named the block rather than itself.
+        let e = f.invoke(stpbtvl, &[0, 0, 24, 0]).expect_err("no file");
+        assert!(e.to_string().contains("stpbtvl"), "{e}");
+    }
+
+    #[test]
+    fn cntrbtv_with_no_file_current_refuses_by_name() {
+        // Right refusal, different reason: `:681` never reads `bb` and would
+        // have counted whatever Btrieve was positioned on. This host has no
+        // such position, so there is nothing to count rather than nothing to
+        // dereference.
+        let mut f = nothing_current();
+        let e = f.invoke(cntrbtv, &[]).expect_err("no file");
+        assert!(e.to_string().contains("cntrbtv"), "{e}");
+    }
+
+    #[test]
+    fn the_missing_file_is_noted_once_however_often_it_is_asked() {
+        // A null `bb` is legitimate and is also what an upstream mistake looks
+        // like. The note is the only channel that says so -- and one identical
+        // line per iteration of a module's loop is a channel nobody reads.
+        let mut f = nothing_current();
+        for _ in 0..50 {
+            assert_eq!(
+                f.invoke(qrybtv, &[0, 0, 0, 62]).expect("answers"),
+                Ret::U16(0)
+            );
+        }
+        let noted: Vec<&String> = f
+            .host
+            .notes()
+            .iter()
+            .filter(|n| n.contains("qrybtv"))
+            .collect();
+        assert_eq!(noted.len(), 1, "{:?}", f.host.notes());
+
+        // Per routine, not per host: a second routine has its own to say.
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]).expect("answers");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("obtbtvl")),
+            "{:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn a_block_that_names_no_open_file_is_still_a_refusal() {
+        // Answering 0 is for a *null* `bb` -- the value `rstbtv` produces and
+        // `PLBTVSTF.C` checks for. A non-null pointer to nothing is a different
+        // thing entirely, and `setbtv` already refuses it; this pins that the
+        // routines behind it do too, in case anything ever writes `bb`
+        // directly.
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let nonsense = FarPtr {
+            offset: block.offset,
+            selector: f.host.globals().selector(),
+        };
+        f.host
+            .globals()
+            .write(&mut f.machine, "bb", &nonsense.to_bytes())
+            .expect("bb");
+
+        for who in ["qrybtv", "obtbtvl", "absbtv", "cntrbtv"] {
+            let e = match who {
+                "qrybtv" => f.invoke(qrybtv, &[0, 0, 0, 62]),
+                "obtbtvl" => f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]),
+                "absbtv" => f.invoke(absbtv, &[]),
+                _ => f.invoke(cntrbtv, &[]),
+            }
+            .expect_err("{who} on a block that was never opened");
+            assert!(e.to_string().contains(who), "{who}: {e}");
+        }
     }
 }

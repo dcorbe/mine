@@ -32,7 +32,7 @@ pub mod stream;
 #[cfg(test)]
 mod testing;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -189,6 +189,12 @@ pub struct Host {
     /// in silence. Kept rather than printed, so a test can assert on them.
     notes: Vec<String>,
 
+    /// Which [`Host::note_once`] keys have already been recorded.
+    ///
+    /// Separate from the note text so that a note carrying a file name still
+    /// reports once for the routine that produced it.
+    noted: HashSet<String>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -243,6 +249,7 @@ impl Host {
             streams: stream::Streams::default(),
             installed: Vec::new(),
             notes: Vec::new(),
+            noted: HashSet::new(),
             heap: Heap::new(Config::default()),
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
@@ -292,6 +299,22 @@ impl Host {
     /// Record something the module cannot be told. See [`Host::notes`].
     pub(crate) fn note(&mut self, what: String) {
         self.notes.push(what);
+    }
+
+    /// Record something once, however many times it happens.
+    ///
+    /// For a note whose cause can repeat without changing: a `qrybtv` with no
+    /// Btrieve file current inside a loop would otherwise put thousands of
+    /// identical lines in [`Host::notes`], and a channel that has to be skimmed
+    /// is one nobody reads.
+    ///
+    /// `key` is what "the same thing" means -- usually the routine's name --
+    /// and is kept apart from `what` so a message carrying a file name still
+    /// reports once.
+    pub(crate) fn note_once(&mut self, key: &str, what: String) {
+        if self.noted.insert(key.to_owned()) {
+            self.notes.push(what);
+        }
     }
 
     /// The module's heap.
