@@ -129,9 +129,10 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
 /// of chunks becomes a selector delta by shifting left three.
 ///
 /// **This is only true once a huge object's chunks occupy consecutive LDT
-/// entries.** Nothing allocates that way yet -- that is the question
-/// `alctile`/`ptrtile` forces in the next step -- so this is the right constant
-/// for a layout the host does not yet guarantee.
+/// entries**, which was an open question when the constant went in and is no
+/// longer: [`alloc_tiled`](mbbs16::Machine::alloc_tiled) reserves a region's
+/// descriptors as one run, and `memory::ptrtile` is tested against exactly this
+/// arithmetic. The module computes tile addresses both ways and they agree.
 const ABSOLUTES: &[(&str, &str, u16)] =
     &[("DOSCALLS", "#135", mbbs16::SELECTOR_STEP.ilog2() as u16)];
 
