@@ -295,6 +295,31 @@ pub fn invbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     )))
 }
 
+/// `void delbtv(void)` -- delete the record the file is positioned on.
+///
+/// Fifteen call sites, and initialisation reaches none of them. Here because it
+/// is the same guard as [`invbtv`] -- `PLBTVSTF.C:623` -- and reproducing one
+/// without the other would leave a module that deletes stopped for a reason
+/// that has nothing to do with deleting.
+///
+/// No arguments at all, which is worth stating because the rest of this family
+/// takes a record pointer: the record is whichever one the current file is
+/// positioned on, and `:626` passes `bb->lastkn` to say in which key's order.
+///
+/// Answers nothing with no file current, refuses with one, for exactly the
+/// reasons in [`invbtv`].
+pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let Some(block) = positioned(machine, host, "delbtv")? else {
+        note_no_file(host, "delbtv");
+        return Ok(Ret::Void);
+    };
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Err(ShimError::Failed(format!(
+        "delbtv from {}, and nothing in this host writes to a Btrieve file",
+        file.name()
+    )))
+}
+
 /// What a Btrieve operation code asks for.
 ///
 /// The numbers are Btrieve's own and they arrive from three directions:
@@ -1958,6 +1983,27 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 64);
         let e = f.invoke(invbtv, &[0, 0, 64]).expect_err("nothing here writes");
         assert!(e.to_string().contains("invbtv"), "{e}");
+        assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
+    }
+
+    #[test]
+    fn delbtv_with_no_file_current_deletes_nothing_and_says_so() {
+        // `PLBTVSTF.C:623`, the same guard again.
+        let mut f = nothing_current();
+        assert_eq!(f.invoke(delbtv, &[]).expect("answers"), Ret::Void);
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("delbtv")),
+            "and it is recorded: {:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn delbtv_with_a_file_current_refuses_and_names_the_file() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f.invoke(delbtv, &[]).expect_err("nothing here writes");
+        assert!(e.to_string().contains("delbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }
 

@@ -132,6 +132,7 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     // reproduces what `PLBTVSTF.C` did with no file current, and refuses when
     // there is one.
     (MAJORBBS, "invbtv", btrieve::invbtv),
+    (MAJORBBS, "delbtv", btrieve::delbtv),
     // Streams: the module's own files, read and written.
     (MAJORBBS, "fopen", stream::fopen),
     (MAJORBBS, "fclose", stream::fclose),
