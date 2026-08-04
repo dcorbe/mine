@@ -16,7 +16,12 @@ use std::fmt;
 
 /// A pointer as 16-bit code understands it: a 16-bit offset and a 16-bit
 /// selector, offset first in memory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` because a host that keeps a block's size out of the module's reach
+/// keys it by the pointer it handed out. Equality is the pair of words as the
+/// module holds them, which is the only identity there is -- two different
+/// selectors can window the same memory, and they are not the same pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FarPtr {
     pub offset: u16,
     pub selector: u16,

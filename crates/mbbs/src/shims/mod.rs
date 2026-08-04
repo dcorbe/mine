@@ -1,5 +1,6 @@
 //! What sits behind each import, and what to do when nothing does.
 
+pub mod memory;
 pub mod msg;
 pub mod system;
 pub mod text;
@@ -91,6 +92,17 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "chropt", msg::chropt),
     (MAJORBBS, "tokopt", msg::tokopt),
     (MAJORBBS, "prfmsg", msg::prfmsg),
+    // Memory the module owns, and the leaves that move bytes about.
+    (MAJORBBS, "alcmem", memory::alcmem),
+    (MAJORBBS, "alczer", memory::alczer),
+    (MAJORBBS, "galfree", memory::galfree),
+    (MAJORBBS, "farcoreleft", memory::farcoreleft),
+    (MAJORBBS, "alctile", memory::alctile),
+    (MAJORBBS, "ptrtile", memory::ptrtile),
+    (MAJORBBS, "setmem", memory::setmem),
+    (MAJORBBS, "movmem", memory::movmem),
+    (MAJORBBS, "memcpy", memory::memcpy),
+    (MAJORBBS, "memcmp", memory::memcmp),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "now", system::now),
     (MAJORBBS, "today", system::today),

@@ -23,6 +23,7 @@
 mod exports;
 mod fmt;
 mod globals;
+pub mod heap;
 pub mod msg;
 mod shims;
 #[cfg(test)]
@@ -34,6 +35,7 @@ use std::path::PathBuf;
 
 pub use exports::Exports;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
+pub use heap::{Config, Heap, Region};
 pub use shims::system::Registration;
 pub use shims::{Entry, Shim, ShimError};
 
@@ -162,6 +164,9 @@ pub struct Host {
     /// can see.
     pub(crate) messages: msg::Messages,
 
+    /// The module's heap and its tiled regions.
+    pub(crate) heap: Heap,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
@@ -206,6 +211,7 @@ impl Host {
             audit: Vec::new(),
             modules: Vec::new(),
             messages: msg::Messages::default(),
+            heap: Heap::new(Config::default()),
             calls: 0,
         })
     }
@@ -228,6 +234,11 @@ impl Host {
     /// The message files that are open.
     pub fn messages(&self) -> &msg::Messages {
         &self.messages
+    }
+
+    /// The module's heap.
+    pub fn heap(&self) -> &Heap {
+        &self.heap
     }
 
     /// How many host calls this host has serviced.

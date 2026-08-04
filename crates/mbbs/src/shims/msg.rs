@@ -116,12 +116,34 @@ pub fn rstmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
 /// `char *stgopt(int msgnum)` -- a message's text, whole.
 ///
-/// The pointer is the module's to keep: message text is interned once when the
-/// file is opened and never moves, so this stays readable for as long as the
-/// block is open however many other calls happen first.
+/// **The string is the module's, from the module's heap, and the module may
+/// free it.** That is not what this looked like from the header, and it is not
+/// what this originally did -- it returned a pointer into the host's own
+/// message arena, on the reasoning that a stable address could only be safer
+/// than the real host's shared `msgbuf`.
+///
+/// MajorMUD settled it by calling `galfree` on the result. Its initialisation
+/// reads `DATADIR` -- message 62, and empty in this distribution -- builds the
+/// path template `.\%s` from it, and hands the pointer straight back. A host
+/// that had returned its own memory would have had to either refuse or let the
+/// module free the host's arena. MBBSEmu allocates here too, which is a second
+/// reading of the same binaries arriving at the same place.
+///
+/// Most call sites never free what they get -- `ACCOUNT.C` and `BBSRIP.C` put
+/// these in globals that live for the run -- so this leaks by design, exactly
+/// as the real one did.
 pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let at = message(machine, host, machine.arg_u16(0))?;
-    Ok(Ret::Far(at))
+    let text = machine.read_cstr(at)?.to_vec();
+
+    let size = u16::try_from(text.len() + 1)
+        .map_err(|_| ShimError::Failed(format!("a {}-byte message", text.len())))?;
+    let out = host
+        .heap
+        .alloc(machine, size)
+        .map_err(|e| ShimError::Failed(format!("stgopt: {e}")))?;
+    text::write_cstr(machine, out, &text, size)?;
+    Ok(Ret::Far(out))
 }
 
 /// `int numopt(int msgnum,int floor,int ceiling)`.
@@ -377,10 +399,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stgopt_string_is_the_modules_own_and_it_may_free_it() {
+        // MajorMUD frees what stgopt returns. If this handed back a pointer
+        // into the host's message arena, the module would be freeing the
+        // host's memory -- and the host would have to refuse, five calls into
+        // initialisation.
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
+            panic!("stgopt returns a pointer")
+        };
+        assert_eq!(f.read(at), "DEMO");
+        assert_eq!(
+            f.host.heap().block(at),
+            Some(5),
+            "four characters and a terminator, from the module's heap"
+        );
+        f.invoke(crate::shims::memory::galfree, &Fixture::far(at))
+            .expect("the module owns it");
+    }
+
+    #[test]
     fn a_stgopt_pointer_stays_valid_across_everything_else() {
-        // The interning contract, and the reason for the arena. The real host
-        // reused one buffer and a module that held the pointer got whatever
-        // was read next.
+        // Whatever else happens, the string the module was given is still
+        // there: nothing the host does later writes over a live heap block.
         let mut f = Fixture::new();
         opened(&mut f);
         let Ret::Far(first) = f.invoke(stgopt, &[1]).expect("read") else {
