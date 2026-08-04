@@ -165,6 +165,15 @@ extern "C" fn handler(signo: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut
         // swallowing another subsystem's SIGSEGV would be much worse than
         // dying.
         //
+        // This is correct for every signal in FAULT_SIGNALS and ONLY because
+        // they are synchronous: returning re-executes the faulting instruction.
+        // An asynchronous signal does not re-raise, so this branch would let it
+        // through *and* leave SIG_DFL installed, and the next one would
+        // terminate the process. If a watchdog timer is added here it needs its
+        // own branch that simply ignores a signal arriving in host code -- see
+        // "Revisit early: the watchdog" in
+        // docs/plans/2026-08-03-16bit-module-execution.md.
+        //
         // SAFETY: restoring the default disposition of a signal.
         unsafe {
             let mut dfl: libc::sigaction = std::mem::zeroed();
