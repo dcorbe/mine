@@ -556,26 +556,50 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::U32(record.position))
 }
 
-/// `int aabbtvl(void *recptr, long abspos, int keynum, int loktyp)` -- acquire
-/// the record at a file position.
+/// `int aabbtv(void *recptr, long abspos, int keynum)` -- acquire the record at
+/// a file position.
 ///
-/// And `gabbtvl`, which `PLBTVSTF.C:445` defines as this plus "stop the board
-/// if it was not there". Both are here: `gabbtvl` is the same routine with
-/// `fatal` set, which is the difference between a module that expects a record
-/// to be missing and one that does not.
+/// **Three arguments, not four.** `BTVSTF.H:155` declares this and `aabbtvl`
+/// separately, and they are separate exports -- ordinals 51 and 1100.
+/// `WCCMMUD.DLL` imports 51 at eight sites and 1100 at none, and every one of
+/// the eight cleans `add sp,10`: five words, which is `recptr` and `abspos` and
+/// `keynum` and nothing else.
+///
+/// So there is no `loktyp` word to read, and reading one got the caller's
+/// lowest local instead -- which [`unlocked`] then refused as a lock type the
+/// module never asked for. It shared [`absolute`] with `gabbtvl`, which really
+/// does take four (`add sp,12` at all 34 of its sites), and that is how it
+/// survived: the helper was right for one caller and wrong for the other.
+///
+/// `PLBTVSTF.C:466` is where the zero comes from -- `aabbtv` is a one-line
+/// wrapper that passes `loktyp` as 0.
+///
+/// And `gabbtvl`, which `:445` defines as `aabbtvl` plus "stop the board if it
+/// was not there": the same routine with `fatal` set, which is the difference
+/// between a module that expects a record to be missing and one that does not.
 ///
 /// It also establishes the key path, so a `qnxbtv` after it continues in
 /// `keynum`'s order from wherever the position landed.
 ///
-/// With no file current it answers 0, per the guard at `PLBTVSTF.C:476`.
+/// With no file current it answers 0, per the guard at `:476`.
 pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(u16::from(absolute(
-        machine, host, "aabbtv", false,
+        machine, host, "aabbtv", false, UNLOCKED,
     )?)))
 }
 
+/// The lock type `aabbtv` has instead of an argument.
+///
+/// `PLBTVSTF.C:466` -- `return(aabbtvl(recptr,abspos,keynum,0))`. Named rather
+/// than written as a bare 0 at the call site, because a 0 there reads as "no
+/// lock was asked for" when what it means is "there was never a word to ask in".
+const UNLOCKED: i16 = 0;
+
 /// `void gabbtvl(void *recptr, long abspos, int keynum, int loktyp)` -- get the
 /// record at a file position, or stop.
+///
+/// Four arguments, unlike [`aabbtv`], and confirmed the same way: `add sp,12` at
+/// all 34 call sites.
 ///
 /// **The one routine of the six that answers with nothing.** `PLBTVSTF.C:452`
 /// is `if (bb == NULL) { return; }` in a `void` function, so with no file
@@ -583,7 +607,8 @@ pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// write into the module's record buffer -- which is the whole of what a caller
 /// could observe.
 pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    absolute(machine, host, "gabbtvl", true)?;
+    let lock = machine.arg_u16(5) as i16;
+    absolute(machine, host, "gabbtvl", true, lock)?;
     Ok(Ret::Void)
 }
 
@@ -593,24 +618,29 @@ pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// (`PLBTVSTF.C:476`) and no record at that position. They differ for
 /// `gabbtvl`, which `:455` sends to `posbtverr` in the second case only -- so
 /// `fatal` turns the second into a refusal and never the first.
+///
+/// **`lock` is the caller's** rather than read here, because the two callers do
+/// not have the same arguments. See [`aabbtv`].
 fn absolute(
     machine: &mut Machine,
     host: &mut Host,
     who: &str,
     fatal: bool,
+    lock: i16,
 ) -> Result<bool, ShimError> {
     // `:452` and `:476` both guard before `:479` defaults `recptr` to
-    // `bb->data`. Same ordering point as `obtbtvl`.
+    // `bb->data`. Same ordering point as `obtbtvl`, and the lock is refused
+    // after it for the same reason: with no file current the original returned
+    // before it looked at anything.
     let Some(block) = positioned(machine, host, who)? else {
         note_no_file(host, who);
         return Ok(false);
     };
+    unlocked(who, lock)?;
 
     let into = machine.arg_far(0);
     let position = machine.arg_u32(2);
     let keynum = machine.arg_u16(4) as i16;
-    let lock = machine.arg_u16(5) as i16;
-    unlocked(who, lock)?;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
@@ -1437,13 +1467,47 @@ mod tests {
     fn a_position_no_record_has_is_a_refusal_for_gabbtvl_and_a_no_for_aabbtv() {
         // The two differ in exactly this, which is why the module has both:
         // `PLBTVSTF.C:455` sends `gabbtvl`'s failure to `catastro`.
+        //
+        // Note the argument counts, which differ too: five words and six.
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
         assert_eq!(
-            f.invoke(aabbtv, &[0, 0, 7, 0, 0, 0]).expect("answers"),
+            f.invoke(aabbtv, &[0, 0, 7, 0, 0]).expect("answers"),
             Ret::U16(0)
         );
         assert!(f.invoke(gabbtvl, &[0, 0, 7, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn aabbtv_takes_three_arguments_and_never_reads_a_fourth() {
+        // `BTVSTF.H:155` declares `int aabbtv(void*, long, int)` -- five
+        // argument words -- and all eight of `WCCMMUD.DLL`'s call sites clean
+        // `add sp,10`, which is those five and no more. `aabbtvl`, the
+        // four-argument form, is a separate export the module never imports.
+        //
+        // This host read a sixth word as `loktyp` because it shared a helper
+        // with `gabbtvl`, which really does take four. The sixth word is the
+        // caller's, and `unlocked` refused anything nonzero in it -- so the
+        // failure was a lock the module never asked for.
+        //
+        // Invoked with exactly five words, which is what gives this teeth: the
+        // word above them is the outer frame's return offset and is not zero.
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
+
+        assert_eq!(
+            f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
+                .expect("five argument words are all there are"),
+            Ret::U16(1)
+        );
+        assert_eq!(got(&f, into), 6, "and it read the record it was sent to");
     }
 
     #[test]
@@ -1553,9 +1617,10 @@ mod tests {
 
     #[test]
     fn aabbtv_with_no_file_current_answers_nothing_found() {
+        // Five argument words, per `BTVSTF.H:155`.
         let mut f = nothing_current();
         assert_eq!(
-            f.invoke(aabbtv, &[0, 0, 7, 0, 0, 0]).expect("answers"),
+            f.invoke(aabbtv, &[0, 0, 7, 0, 0]).expect("answers"),
             Ret::U16(0)
         );
     }
