@@ -101,9 +101,16 @@ use watchdog::Watched;
 /// segment can address, so there is nothing to gain by asking for less.
 const SEGMENT_BYTES: usize = 64 * 1024;
 
-/// Where the thunk table sits within the code segment, past any plausible
-/// module image.
-const THUNK_TABLE_OFFSET: usize = 0x8000;
+/// Where the thunk table sits within the **bridge** segment, which holds
+/// nothing else before it.
+///
+/// The bridge has a segment of its own rather than a corner of the module's
+/// code segment. A real module image is up to 64 KiB per segment -- six of
+/// `WCCMMUD.DLL`'s are larger than the 0x8000 this used to be -- so any fixed
+/// offset inside the module's own code is an offset some module collides with.
+/// Nothing about the crossings changes: a thunk is reached by far call and names
+/// its selector explicitly.
+const THUNK_TABLE_OFFSET: usize = 0;
 
 /// Bytes per thunk. The entry needs eleven; sixteen keeps `index * STRIDE`
 /// legible against a hex dump.
@@ -113,9 +120,11 @@ const THUNK_STRIDE: usize = 16;
 /// 408 symbols, so this is room to spare.
 pub const MAX_THUNKS: u16 = 512;
 
-/// Where the 64-bit trampoline is copied to. It must live below 4 GiB, because
-/// the 16-bit far jump that reaches it can name a 32-bit offset and no more.
-const TRAMPOLINE_OFFSET: usize = 0xc000;
+/// Where the 64-bit trampoline is copied to: immediately past the thunk table,
+/// in the same segment. It must live below 4 GiB, because the 16-bit far jump
+/// that reaches it can name a 32-bit offset and no more.
+const TRAMPOLINE_OFFSET: usize =
+    THUNK_TABLE_OFFSET + (MAX_THUNKS as usize + 1) * THUNK_STRIDE;
 
 /// Stack pointer a module starts with: the top of its stack segment, less a
 /// word so that the first push has somewhere to go.
@@ -241,6 +250,7 @@ pub struct Machine {
     code: usize,
     stack: usize,
     data: usize,
+    bridge: usize,
 
     /// The state the assembly is entered through, together with the CPU-time
     /// timer that stops a module which will not stop itself. One object because
@@ -263,7 +273,7 @@ pub struct Machine {
 impl Machine {
     /// Build a module's segments and lay out its thunk table.
     pub fn new() -> io::Result<Self> {
-        let mut code = Segment::new(SEGMENT_BYTES, true)?;
+        let code = Segment::new(SEGMENT_BYTES, true)?;
         let stack = Segment::new(SEGMENT_BYTES, false)?;
 
         // The module's globals. Borland calls this DGROUP, and MAJORBBS exports
@@ -271,11 +281,17 @@ impl Machine {
         // will resolve against this segment.
         let data = Segment::new(SEGMENT_BYTES, false)?;
 
+        // The bridge: thunk table then trampoline, and nothing a module wrote.
+        // Sized to exactly what it holds, so the segment limit is itself a
+        // bound on where a stray far call can land.
+        let tramp = trampoline();
+        let mut bridge = Segment::new(TRAMPOLINE_OFFSET + tramp.len(), true)?;
+
         let cs64 = current_cs();
         fault::arm(cs64)?;
 
-        let tramp_linear = code.linear(TRAMPOLINE_OFFSET);
-        code.write(TRAMPOLINE_OFFSET, trampoline())?;
+        let tramp_linear = bridge.linear(TRAMPOLINE_OFFSET);
+        bridge.write(TRAMPOLINE_OFFSET, tramp)?;
 
         // An import thunk names itself and leaves. That is all a real one does
         // either; the work happens on this side.
@@ -310,17 +326,18 @@ impl Machine {
             thunk.extend_from_slice(&cs64.to_le_bytes());
 
             debug_assert!(thunk.len() <= THUNK_STRIDE, "thunk outgrew its slot");
-            code.write(
+            bridge.write(
                 THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE,
                 &thunk,
             )?;
         }
 
         Ok(Self {
-            segments: vec![code, stack, data],
+            segments: vec![code, stack, data, bridge],
             code: 0,
             stack: 1,
             data: 2,
+            bridge: 3,
             ctx: Watched::new()?,
             frame_sp: None,
             budget: DEFAULT_BUDGET,
@@ -370,18 +387,15 @@ impl Machine {
     fn thunk_slot(&self, slot: u16) -> FarPtr {
         FarPtr {
             offset: (THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE) as u16,
-            selector: self.code_selector(),
+            selector: self.bridge_selector(),
         }
     }
 
     /// Place a module image at offset 0 of the code segment.
+    ///
+    /// The image may be as large as a 16-bit segment: nothing of the host's
+    /// shares that segment with it.
     pub fn load_code(&mut self, image: &[u8]) -> io::Result<()> {
-        if image.len() > THUNK_TABLE_OFFSET {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "module image would overlap the thunk table",
-            ));
-        }
         self.segments[self.code].write(0, image)
     }
 
@@ -526,6 +540,12 @@ impl Machine {
     /// Selector of the module's data segment: its `DGROUP`.
     pub fn data_selector(&self) -> u16 {
         self.segments[self.data].selector()
+    }
+
+    /// Selector of the bridge: the thunk table and the trampoline, which are
+    /// the host's and no module's.
+    fn bridge_selector(&self) -> u16 {
+        self.segments[self.bridge].selector()
     }
 
     fn stack(&self) -> &Segment {
