@@ -106,6 +106,19 @@ use watchdog::Watched;
 /// segment can address, so there is nothing to gain by asking for less.
 const SEGMENT_BYTES: usize = 64 * 1024;
 
+/// How much a selector value increases from one LDT entry to the next.
+///
+/// A selector is its descriptor's index shifted left by three, because the low
+/// three bits carry the table-indicator and the privilege level. So consecutive
+/// entries are eight apart, always.
+///
+/// Exported because a host has to know it. 16-bit code that walks an object
+/// larger than a segment steps the *selector* to reach the next 64 KiB, and
+/// the amount to step by is the one number that makes those pointers land --
+/// `DOSCALLS.135` is how a Phar Lap module asks for it. Deriving it here rather
+/// than writing 3 or 8 into the host keeps the two from drifting apart.
+pub const SELECTOR_STEP: u16 = 1 << 3;
+
 /// Where the thunk table sits within the **bridge** segment, which holds
 /// nothing else before it.
 ///

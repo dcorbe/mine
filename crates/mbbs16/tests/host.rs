@@ -70,13 +70,7 @@ fn a_module_reads_what_the_host_wrote_into_a_host_segment() {
 
     // A host global is not a Rust value with a mirror in module memory. It is
     // *in* module memory, and this is the read that proves it.
-    assert_eq!(
-        run(&mut machine),
-        Exit::Returned {
-            ax: CANARY,
-            dx: 0
-        }
-    );
+    assert_eq!(run(&mut machine), Exit::Returned { ax: CANARY, dx: 0 });
 }
 
 #[test]

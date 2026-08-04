@@ -591,6 +591,73 @@ fn an_additive_offset_adds_to_what_is_already_there() {
     );
 }
 
+/// An export can be a constant rather than an address, and `WCCMMUD.DLL` needs
+/// one: `DOSCALLS.135` is the huge shift, resolved into the immediate of a
+/// `mov $x, %cx` that precedes a `shl`. Given a thunk's address instead, the
+/// module shifts by whatever slot that thunk landed in -- which is a wrong
+/// number, not a crash.
+#[test]
+fn an_absolute_import_writes_its_value_into_the_instruction() {
+    let ne = Ne {
+        segments: vec![
+            Seg::code(vec![0u8; 0x10]).with(&[Reloc::import(OFFSET, 0x02, 1, 135).additive()]),
+            Seg::data(vec![0; 16]),
+        ],
+        modules: vec!["DOSCALLS".into()],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine
+        .load_ne(&ne.finish(), &|_: &str, _: &Symbol| {
+            Some(Import::Absolute(3))
+        })
+        .expect("loaded");
+
+    assert_eq!(
+        word(&machine, module.segment_selector(1).unwrap(), 0x02),
+        3,
+        "the constant itself, and no address anywhere"
+    );
+    assert!(
+        module.imports().is_empty(),
+        "a constant is not called, so it gets no thunk"
+    );
+}
+
+#[test]
+fn an_absolute_import_refuses_a_fixup_that_wants_a_selector() {
+    // A constant has no selector. Writing half of it as one would produce a
+    // wrong address and no complaint, which is exactly what this loader is for.
+    for source in [SEGMENT, FAR_ADDR] {
+        let ne = Ne {
+            segments: vec![
+                Seg::code(vec![0u8; 0x10]).with(&[Reloc::import(source, 0x02, 1, 135)]),
+                Seg::data(vec![0; 16]),
+            ],
+            modules: vec!["DOSCALLS".into()],
+            autodata: 2,
+            ..Ne::default()
+        };
+
+        let mut machine = Machine::new().expect("16-bit machine");
+        let failed = machine
+            .load_ne(&ne.finish(), &|_: &str, _: &Symbol| {
+                Some(Import::Absolute(3))
+            })
+            .expect_err("a constant cannot fill an address fixup");
+        assert_eq!(
+            failed.to_string(),
+            NeError::AbsoluteNeedsAnAddress {
+                segment: 1,
+                offset: 0x02
+            }
+            .to_string()
+        );
+    }
+}
+
 #[test]
 fn an_addend_may_wrap_past_the_end_of_the_segment() {
     // The real shape of this: `margv` is reached with an addend of 0xfffe,

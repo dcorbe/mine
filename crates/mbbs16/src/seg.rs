@@ -180,8 +180,12 @@ impl Segment {
 
     /// The selector naming this segment: index in bits 3..15, TI set to select
     /// the LDT rather than the GDT, RPL 3.
+    ///
+    /// The shift is [`crate::SELECTOR_STEP`]'s reason for existing, and the two
+    /// have to agree: a host that steps selectors by a different amount walks
+    /// off the end of the LDT rather than onto the next entry.
     pub(crate) fn selector(&self) -> u16 {
-        ((self.entry as u16) << 3) | 0x7
+        ((self.entry as u16) * crate::SELECTOR_STEP) | 0x7
     }
 
     /// The LDT slot describing this segment.

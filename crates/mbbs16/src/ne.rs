@@ -13,7 +13,7 @@
 //! `re/nefmt.py` reads the same structures out of the same file and is the
 //! cross-check.
 //!
-//! # Two kinds of import
+//! # Three kinds of import
 //!
 //! The obvious model -- every import is a routine, so every import gets a thunk
 //! -- is wrong, and wrong for a fifth of them. Of MajorMUD's 188 distinct
@@ -22,9 +22,12 @@
 //! `selector:offset` and reading or writing it directly. `usrnum` alone is
 //! addressed at 1,285 sites and there is no call anywhere to intercept.
 //!
-//! So [`Import`] has two arms. A routine gets a thunk and comes back as
+//! So [`Import`] has three arms. A routine gets a thunk and comes back as
 //! [`Exit::Call`](crate::Exit::Call); a datum gets a far pointer into memory the
-//! host owns, and the module reads and writes it with the host none the wiser.
+//! host owns, and the module reads and writes it with the host none the wiser;
+//! and an absolute is not an address at all -- its value goes straight into an
+//! instruction's immediate field, which is how `DOSCALLS.135` tells a module how
+//! far to shift a 64 KiB count to reach the next selector.
 //!
 //! # Parse, then map
 //!
@@ -138,6 +141,11 @@ pub enum NeError {
     /// The header names an automatic data segment that does not exist.
     NoAutoData { segment: u16 },
 
+    /// The host resolved a symbol to an [`Import::Absolute`], and a fixup for
+    /// it wants a selector. A constant has no selector, and writing one of its
+    /// halves as an address would be a wrong address rather than an error.
+    AbsoluteNeedsAnAddress { segment: u16, offset: u16 },
+
     /// A segment could not be mapped. The errno rather than the `io::Error`,
     /// because a parse result is worth comparing and an `io::Error` is not.
     Mapping { segment: u16, errno: i32 },
@@ -196,6 +204,11 @@ impl fmt::Display for NeError {
                     "the automatic data segment is {segment}, which does not exist"
                 )
             }
+            Self::AbsoluteNeedsAnAddress { segment, offset } => write!(
+                f,
+                "segment {segment}:{offset:#06x} wants an address, and the host \
+                 resolved that symbol to a constant"
+            ),
             Self::Mapping { segment, errno } => write!(
                 f,
                 "could not map segment {segment}: {}",
@@ -457,7 +470,11 @@ impl NeImage {
     }
 
     /// The module reference index `n` names, 1-based as relocations give it.
-    fn module_name(&self, n: u16) -> Result<&str, NeError> {
+    ///
+    /// Public because a host reads the relocations too -- to work out which
+    /// imports are data rather than routines -- and the 1-based indexing is not
+    /// a thing to re-implement in two places.
+    pub fn module_name(&self, n: u16) -> Result<&str, NeError> {
         self.modules
             .get(usize::from(n).wrapping_sub(1))
             .map(String::as_str)
@@ -651,6 +668,20 @@ pub enum Import {
 
     /// A host global the module addresses directly.
     Data(FarPtr),
+
+    /// A constant. The export has no address at all: its "offset" *is* the
+    /// value, and the fixup writes it into an instruction's immediate field.
+    ///
+    /// `WCCMMUD.DLL` needs exactly one of these. `DOSCALLS.135` is the huge
+    /// shift -- how far to shift a 64 KiB count to get a selector increment --
+    /// and thirteen sites resolve it into `mov $x, %cx` immediately before a
+    /// `shl`. Given a thunk's offset instead, the module shifts by whatever
+    /// slot the thunk happened to land in.
+    ///
+    /// Only an OFFSET or LOBYTE fixup can carry one, because a SEGMENT or
+    /// FAR_ADDR site wants a selector and a constant has none. Anything else is
+    /// [`NeError::AbsoluteNeedsAnAddress`].
+    Absolute(u16),
 }
 
 /// How a host answers "what is `MAJORBBS.474`?".
@@ -860,39 +891,40 @@ impl Machine {
         // first sight -- would then scatter a single global across 1,285
         // addresses, of which the module would use whichever the last fixup
         // happened to name.
-        let mut resolved: HashMap<(&str, &Symbol), FarPtr> = HashMap::new();
+        let mut resolved: HashMap<(&str, &Symbol), Value> = HashMap::new();
 
         for (i, entry) in image.segments.iter().enumerate() {
             for reloc in &entry.relocations {
                 let value = match &reloc.target {
-                    Target::Internal { segment, offset } => FarPtr {
+                    Target::Internal { segment, offset } => Value::Address(FarPtr {
                         offset: *offset,
                         selector: *selectors.get(usize::from(*segment).wrapping_sub(1)).ok_or(
                             NeError::NoSuchSegment {
                                 segment: u16::from(*segment),
                             },
                         )?,
-                    },
+                    }),
                     Target::Import { module, symbol } => {
                         let name = image.module_name(*module)?;
                         match resolved.get(&(name, symbol)) {
-                            Some(&ptr) => ptr,
+                            Some(&value) => value,
                             None => {
-                                let ptr = match imports.resolve(name, symbol) {
+                                let value = match imports.resolve(name, symbol) {
                                     // A datum is addressed, never called: the
                                     // host's own memory goes into the fixup.
-                                    Some(Import::Data(ptr)) => ptr,
+                                    Some(Import::Data(ptr)) => Value::Address(ptr),
+                                    Some(Import::Absolute(n)) => Value::Absolute(n),
                                     answer => {
                                         let index = thunks.index_of(
                                             name,
                                             symbol,
                                             matches!(answer, Some(Import::Routine)),
                                         )?;
-                                        self.thunk_slot(index)
+                                        Value::Address(self.thunk_slot(index))
                                     }
                                 };
-                                resolved.insert((name, symbol), ptr);
-                                ptr
+                                resolved.insert((name, symbol), value);
+                                value
                             }
                         }
                     }
@@ -921,6 +953,13 @@ impl Machine {
     }
 }
 
+/// What a fixup writes: an address, or a constant that has none.
+#[derive(Debug, Clone, Copy)]
+enum Value {
+    Address(FarPtr),
+    Absolute(u16),
+}
+
 /// Write one relocation's value into its segment.
 ///
 /// The ADDITIVE flag's real meaning is "this record names exactly one site, do
@@ -941,8 +980,23 @@ fn apply(
     segment: &mut Segment,
     number: u16,
     reloc: &Relocation,
-    value: FarPtr,
+    value: Value,
 ) -> Result<(), NeError> {
+    // A constant has no selector, so a fixup that wants one has nothing to be
+    // given. Refused here rather than fudged: writing half a constant as an
+    // address produces a wrong address and no complaint.
+    let (offset, selector) = match value {
+        Value::Address(ptr) => (ptr.offset, Some(ptr.selector)),
+        Value::Absolute(n) => (n, None),
+    };
+    if selector.is_none() && matches!(reloc.source, Source::Segment | Source::FarAddr) {
+        return Err(NeError::AbsoluteNeedsAnAddress {
+            segment: number,
+            offset: reloc.offset,
+        });
+    }
+    let selector = selector.unwrap_or_default();
+
     // A site needs room for what is written into it, and -- when it is a link
     // in a chain -- room for the word holding the next offset. The two are the
     // same for every source but LOBYTE, which writes one byte and still carries
@@ -983,31 +1037,31 @@ fn apply(
         match reloc.source {
             Source::LoByte => {
                 let byte = if reloc.additive {
-                    (addend as u8).wrapping_add(value.offset as u8)
+                    (addend as u8).wrapping_add(offset as u8)
                 } else {
-                    value.offset as u8
+                    offset as u8
                 };
                 segment.write(site, &[byte]).expect("bounds checked above");
             }
             Source::Segment => {
                 segment
-                    .write(site, &value.selector.to_le_bytes())
+                    .write(site, &selector.to_le_bytes())
                     .expect("bounds checked above");
             }
             Source::Offset | Source::FarAddr => {
                 let word = if reloc.additive {
                     // Wrapping, not saturating and not checked: `margv` is
                     // reached with an addend of 0xfffe, which is -2.
-                    addend.wrapping_add(value.offset)
+                    addend.wrapping_add(offset)
                 } else {
-                    value.offset
+                    offset
                 };
                 segment
                     .write(site, &word.to_le_bytes())
                     .expect("bounds checked above");
                 if reloc.source == Source::FarAddr {
                     segment
-                        .write(site + 2, &value.selector.to_le_bytes())
+                        .write(site + 2, &selector.to_le_bytes())
                         .expect("bounds checked above");
                 }
             }
