@@ -26,7 +26,7 @@
 //!             let _ = index;
 //!             exit = machine.resume(Ret::U16(sum))?;
 //!         }
-//!         Exit::Returned { .. } | Exit::Fault { .. } => break,
+//!         Exit::Returned { .. } | Exit::Fault { .. } | Exit::Timeout { .. } => break,
 //!     }
 //! }
 //! # Ok(())
@@ -50,12 +50,24 @@
 //! `DGROUP@`. `DS` is loaded before entry and, like `SI`, `DI` and `BP`, is
 //! **callee-saved**: whatever the module had is handed back on every resume.
 //!
-//! # What this is not, yet
+//! # A module cannot take the host with it
 //!
-//! A module that faults is survivable: see [`Exit::Fault`] and the `fault`
-//! module. A module that **loops forever is not** -- there is no way to
-//! interrupt one yet, and for a host serving many users a wedged module is as
-//! bad as a crashing one.
+//! Neither by dying nor by refusing to stop. A module that faults comes back as
+//! [`Exit::Fault`]; one that overruns its CPU budget comes back as
+//! [`Exit::Timeout`]. Both are terminal: the machine is [`Machine::poisoned`]
+//! afterwards and refuses to be entered again.
+//!
+//! That is as far as this crate goes, and the limit is worth stating. A
+//! module's globals are shared by every user of it, so killing a wedged call
+//! leaves `DGROUP` in whatever state it was mid-update. Poisoning contains the
+//! damage to "this module is now untrustworthy"; it does not repair a list
+//! someone was halfway through relinking. What the host does about a poisoned
+//! module -- drop its sessions, reload it, refuse it -- is the host's decision,
+//! not this crate's.
+//!
+//! The watchdog measures **CPU time**, so a call blocked in a syscall is
+//! invisible to it. See the `watchdog` module for why, and for what a host has
+//! to do instead.
 //!
 //! # Testing
 //!
@@ -74,13 +86,16 @@ mod asm;
 mod farptr;
 mod fault;
 mod seg;
+mod watchdog;
 
 use std::io;
+use std::time::Duration;
 
 use asm::{Ctx, mbbs16_enter, trampoline};
 use farptr::ldt_index;
 pub use farptr::{FarPtr, FarPtrError};
 use seg::Segment;
+use watchdog::Watched;
 
 /// Size of a module's code and stack segments. 64 KiB is the most a 16-bit
 /// segment can address, so there is nothing to gain by asking for less.
@@ -118,6 +133,15 @@ const KIND_RETURN: u16 = 1;
 /// the return half of the far-call frame, so `RETF` lands here.
 const RETURN_THUNK_SLOT: u16 = MAX_THUNKS;
 
+/// CPU time one entry point gets before the watchdog stops it.
+///
+/// Generous on purpose. A `sttrou` handling a line of input should return in
+/// microseconds, but an `inirou` reading message files and opening Btrieve
+/// tables at startup can legitimately burn real CPU, and a watchdog that fires
+/// on correct behaviour is worse than none. Adjust per module with
+/// [`Machine::set_budget`].
+const DEFAULT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Why 16-bit execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -129,8 +153,46 @@ pub enum Exit {
     /// `ax` alone for an `int`, `dx:ax` for anything 32 bits wide.
     Returned { ax: u16, dx: u16 },
 
-    /// The module took a signal. Nothing is resumable.
-    Fault { signo: i32 },
+    /// The module took a signal. Nothing is resumable, and the machine is
+    /// [`Machine::poisoned`].
+    ///
+    /// `cs:ip` is where it stopped, as an offset within the module's own code
+    /// segment -- the address a disassembly of the image is labelled with.
+    Fault { signo: i32, cs: u16, ip: u16 },
+
+    /// The module used its whole CPU budget without returning. Nothing is
+    /// resumable, and the machine is [`Machine::poisoned`].
+    ///
+    /// `cs:ip` is wherever the tick happened to land, which for a wedged module
+    /// is somewhere inside the loop it will not leave.
+    Timeout { cs: u16, ip: u16 },
+}
+
+/// Why a machine will not be entered again.
+///
+/// Both cases are the same shape as the [`Exit`] that produced them, kept so a
+/// host that discarded the exit can still say what happened -- and so that
+/// refusing a call can explain itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Poison {
+    /// It faulted. See [`Exit::Fault`].
+    Fault { signo: i32, cs: u16, ip: u16 },
+
+    /// It overran its budget. See [`Exit::Timeout`].
+    Timeout { cs: u16, ip: u16 },
+}
+
+impl std::fmt::Display for Poison {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fault { signo, cs, ip } => {
+                write!(f, "module faulted with signal {signo} at {cs:#06x}:{ip:#06x}")
+            }
+            Self::Timeout { cs, ip } => {
+                write!(f, "module timed out at {cs:#06x}:{ip:#06x}")
+            }
+        }
+    }
 }
 
 /// What a host call hands back to the module.
@@ -179,11 +241,23 @@ pub struct Machine {
     code: usize,
     stack: usize,
     data: usize,
-    ctx: Ctx,
+
+    /// The state the assembly is entered through, together with the CPU-time
+    /// timer that stops a module which will not stop itself. One object because
+    /// the timer holds the context's address; see [`watchdog::Watched`]. Armed
+    /// for the whole of a [`Machine::call`], shim servicing included.
+    ctx: Watched,
 
     /// `SP` when the module last called out, or `None` before its first call.
     /// The call frame -- `CS:IP`, two words -- sits at exactly this offset.
     frame_sp: Option<u16>,
+
+    /// How much CPU time one entry point may have.
+    budget: Duration,
+
+    /// Set once the module has faulted or overrun, and never cleared. A
+    /// poisoned machine refuses to be entered.
+    poisoned: Option<Poison>,
 }
 
 impl Machine {
@@ -247,9 +321,37 @@ impl Machine {
             code: 0,
             stack: 1,
             data: 2,
-            ctx: Ctx::default(),
+            ctx: Watched::new()?,
             frame_sp: None,
+            budget: DEFAULT_BUDGET,
+            poisoned: None,
         })
+    }
+
+    /// How much CPU time one entry point may have. See [`Machine::set_budget`].
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// Change the CPU budget an entry point gets, for calls made from now on.
+    ///
+    /// # Panics
+    ///
+    /// If `budget` is zero, which would mean "no time at all" but is how
+    /// `timer_settime` spells "no limit". Nothing good comes of guessing which
+    /// was meant.
+    pub fn set_budget(&mut self, budget: Duration) {
+        assert!(!budget.is_zero(), "a zero watchdog budget is not a budget");
+        self.budget = budget;
+    }
+
+    /// Why this machine will not run again, if it will not.
+    ///
+    /// A module that faulted or overran left its globals mid-update, so it is
+    /// not merely stopped -- it is untrustworthy. The host decides what follows
+    /// from that; this crate only refuses to make it worse.
+    pub fn poisoned(&self) -> Option<Poison> {
+        self.poisoned
     }
 
     /// The far pointer a module should `lcall` to reach import `index`.
@@ -300,11 +402,24 @@ impl Machine {
     /// need no cleaning afterwards even though cdecl makes that the caller's
     /// job.
     ///
+    /// The watchdog is armed here and stays armed until the module reaches a
+    /// terminal exit, so the budget covers the whole entry point -- every
+    /// crossing, and all the time the host spends servicing imports in between.
+    /// Re-arming per crossing instead would reset the budget on every host
+    /// call, and a module looping on one would never expire.
+    ///
     /// # Errors
     ///
-    /// If the arguments and frame will not fit on the module's stack.
+    /// If the machine is [`Machine::poisoned`], or the arguments and frame will
+    /// not fit on the module's stack.
     pub fn call(&mut self, entry: u16, args: &[u16]) -> io::Result<Exit> {
         let () = Ctx::ASSERT_FAR_POINTER_FIRST;
+
+        if let Some(poison) = self.poisoned {
+            return Err(io::Error::other(format!(
+                "refusing to enter a poisoned module: {poison}"
+            )));
+        }
 
         let frame_words = args.len() + 2;
         let bytes = frame_words
@@ -341,6 +456,7 @@ impl Machine {
         // whatever the module last had, since DS is callee-saved.
         self.ctx.out_ds = u64::from(self.data_selector());
 
+        self.ctx.arm(self.budget)?;
         self.run(entry, sp, Ret::Void)
     }
 
@@ -350,6 +466,12 @@ impl Machine {
     /// The call frame is dropped -- `SP` moves up over the `CS:IP` the far call
     /// pushed -- but the arguments are left alone, because cdecl makes cleaning
     /// them the module's job.
+    ///
+    /// This is where an overrun spent on host code is caught. A watchdog tick
+    /// that arrives while the host is servicing an import proves the budget is
+    /// gone just as surely as one that interrupts 16-bit code, and there is no
+    /// sense re-entering a module whose time is up in order to stop it a moment
+    /// later.
     ///
     /// # Panics
     ///
@@ -362,6 +484,13 @@ impl Machine {
         let ip = self.stack().read_u16(usize::from(sp));
         let cs = self.stack().read_u16(usize::from(sp) + 2);
         debug_assert_eq!(cs, self.code_selector(), "call frame names another segment");
+
+        if self.ctx.expired() {
+            // Report where it would have resumed. That is the honest answer to
+            // "where did it stop": the module is parked at an import call, and
+            // this is the instruction after it.
+            return self.terminate(Exit::Timeout { cs, ip });
+        }
 
         self.run(ip, sp + 4, ret)
     }
@@ -574,16 +703,22 @@ impl Machine {
         // code and stack segments are mapped, described and live for as long as
         // `self`; and the trampoline the module will far-jump to was written
         // into the code segment by `new`.
-        unsafe { mbbs16_enter(&raw mut self.ctx) };
+        unsafe { mbbs16_enter(self.ctx.as_ptr()) };
 
         if self.ctx.out_signo != 0 {
-            // The module died and the handler carried us out. Nothing about its
-            // state is meaningful now, so forget the call frame rather than let
-            // `arg_u16` and friends report stale nonsense.
-            self.frame_sp = None;
-            return Ok(Exit::Fault {
-                signo: self.ctx.out_signo as i32,
-            });
+            let signo = self.ctx.out_signo as i32;
+            let cs = self.ctx.out_cs as u16;
+            // The CPU pushed a 16-bit IP; the wider field is only how the
+            // handler could store it.
+            let ip = self.ctx.out_ip as u16;
+
+            // Which signal it was is the whole distinction. Everything else --
+            // the recovery, the poisoning, the lost state -- is identical.
+            return if signo == watchdog::signo() {
+                self.terminate(Exit::Timeout { cs, ip })
+            } else {
+                self.terminate(Exit::Fault { signo, cs, ip })
+            };
         }
 
         debug_assert_eq!(
@@ -599,6 +734,9 @@ impl Machine {
         // been destroyed if the answer lived in AX, so it lives in CX.
         if self.ctx.out_cx as u16 == KIND_RETURN {
             self.frame_sp = None;
+            // The entry point is over, so its budget is too. Leaving the timer
+            // armed would charge the next call for this one's leftovers.
+            self.ctx.disarm()?;
             return Ok(Exit::Returned {
                 ax: self.ctx.out_ax as u16,
                 dx: self.ctx.out_dx as u16,
@@ -608,6 +746,23 @@ impl Machine {
         Ok(Exit::Call {
             index: self.ctx.out_ax as u16,
         })
+    }
+
+    /// Stop for good: disarm the watchdog, poison the machine and forget the
+    /// call frame.
+    ///
+    /// Forgetting the frame matters as much as the rest. A module that died or
+    /// was stopped mid-call has nothing meaningful left on its stack, and
+    /// `arg_u16` and friends would otherwise happily report the leftovers.
+    fn terminate(&mut self, exit: Exit) -> io::Result<Exit> {
+        self.poisoned = Some(match exit {
+            Exit::Fault { signo, cs, ip } => Poison::Fault { signo, cs, ip },
+            Exit::Timeout { cs, ip } => Poison::Timeout { cs, ip },
+            other => unreachable!("{other:?} is not a terminal exit"),
+        });
+        self.frame_sp = None;
+        self.ctx.disarm()?;
+        Ok(exit)
     }
 }
 

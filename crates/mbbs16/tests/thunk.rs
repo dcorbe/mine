@@ -81,7 +81,10 @@ fn sixteen_bit_code_calls_a_host_function_and_uses_the_result() {
                 break;
             }
             Exit::Call { index } => panic!("module called an unexpected thunk {index}"),
-            Exit::Fault { signo } => panic!("module faulted with signal {signo}"),
+            Exit::Fault { signo, cs, ip } => {
+                panic!("module faulted with signal {signo} at {cs:#06x}:{ip:#06x}")
+            }
+            Exit::Timeout { cs, ip } => panic!("module timed out at {cs:#06x}:{ip:#06x}"),
         }
     }
 

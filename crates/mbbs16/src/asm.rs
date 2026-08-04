@@ -75,9 +75,26 @@ pub(crate) struct Ctx {
     pub out_bp: u64,
     pub out_ds: u64,
 
-    /// Set by the fault handler when a module dies, and by nothing else. Zero
-    /// means the excursion ended by reaching the trampoline.
+    /// Nonzero once a watchdog tick has been recorded against this module,
+    /// whether or not it was in 16-bit mode at the time. The assembly never
+    /// touches it: the signal handler sets it and
+    /// [`crate::watchdog::Watched::arm`] clears it, so it survives the crossings
+    /// in between and outlives the excursion a tick may have interrupted.
+    ///
+    /// Separate from `out_signo` because that one is cleared before every entry,
+    /// and a tick that arrives while the host is servicing an import must not be
+    /// wiped out by the next crossing it triggers.
+    pub expired: u64,
+    /// Set by the signal handler when a module dies or is stopped in 16-bit
+    /// mode, and by nothing else. Zero means the excursion ended by reaching the
+    /// trampoline.
     pub out_signo: u64,
+    /// Where 16-bit execution stopped, recorded before the handler overwrites
+    /// the interrupted context. `CS` is the module's code selector and `IP` is
+    /// an offset within it, because that is what the CPU pushed. Meaningless
+    /// unless `out_signo` is nonzero.
+    pub out_cs: u64,
+    pub out_ip: u64,
 }
 
 impl Ctx {

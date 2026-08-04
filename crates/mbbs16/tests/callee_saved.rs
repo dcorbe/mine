@@ -60,7 +60,10 @@ fn a_host_call_preserves_si_di_and_bp() {
             }
             Exit::Returned { .. } => break,
             Exit::Call { index } => panic!("unexpected thunk {index}"),
-            Exit::Fault { signo } => panic!("module faulted with signal {signo}"),
+            Exit::Fault { signo, cs, ip } => {
+                panic!("module faulted with signal {signo} at {cs:#06x}:{ip:#06x}")
+            }
+            Exit::Timeout { cs, ip } => panic!("module timed out at {cs:#06x}:{ip:#06x}"),
         }
     }
 
