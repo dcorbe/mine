@@ -492,6 +492,36 @@ impl Machine {
         Ok(selector)
     }
 
+    /// One region of `qty * size` bytes, described by `qty` consecutive LDT
+    /// entries of `size` bytes each.
+    ///
+    /// The far pointer names the first tile; **tile `n` is at
+    /// `selector + n * `[`SELECTOR_STEP`]**. That is what makes this different
+    /// from `qty` separate segments, and it is not a convenience: `ptrtile` in
+    /// Galacticomm's `PLSTUFF.C` is `(long)bigptr + (index << 19)`, which is
+    /// the module computing a tile's address *itself*, on the selector, without
+    /// telling the host. Every descriptor has to exist and be adjacent before
+    /// it does.
+    ///
+    /// Each tile's descriptor windows only its own tile, so 16-bit code that
+    /// runs off the end of one is stopped rather than sliding into the next --
+    /// which is also what the real hardware did, `pltile` having passed the
+    /// tile size as both the stride and the limit.
+    ///
+    /// # Errors
+    ///
+    /// If `qty` or `size` is zero, if the region cannot be mapped, or if the
+    /// LDT has no run of `qty` free entries.
+    pub fn alloc_tiled(&mut self, qty: u16, size: u16) -> io::Result<FarPtr> {
+        let tiles = Segment::tiled(qty, size)?;
+        let selector = tiles[0].selector();
+        self.segments.extend(tiles);
+        Ok(FarPtr {
+            offset: 0,
+            selector,
+        })
+    }
+
     /// Place a raw image at offset 0 of the scratch code segment.
     ///
     /// The image may be as large as a 16-bit segment: nothing of the host's

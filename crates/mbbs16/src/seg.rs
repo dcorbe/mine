@@ -1,7 +1,7 @@
 //! Segments: memory below 4 GiB, and the LDT descriptors that name it.
 
 use std::io;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::rc::Rc;
 use std::sync::{Mutex, PoisonError};
 
 /// `modify_ldt(2)` function code for writing an entry.
@@ -32,39 +32,70 @@ const F_READ_EXEC_ONLY: u32 = 1 << 3;
 const F_SEG_NOT_PRESENT: u32 = 1 << 5;
 const F_USEABLE: u32 = 1 << 6;
 
-/// Slots never yet handed out. A process has exactly one LDT, so allocation has
-/// to be process-wide even though a `Machine` feels local.
-static NEXT_ENTRY: AtomicU32 = AtomicU32::new(0);
+/// `u64`s needed to give every LDT entry a bit.
+const WORDS: usize = LDT_ENTRIES as usize / 64;
 
-/// Slots handed back by a dropped segment. Reuse before the bump allocator,
-/// because the LDT is a fixed 8192 entries and a module load takes 82 of them:
-/// without this, loading and unloading the same module a hundred times runs the
-/// table out.
-static FREE_ENTRIES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Which LDT entries are spoken for.
+///
+/// A bitmap rather than a counter and a free list, because **a tiled region
+/// needs its descriptors to be adjacent** and neither of those can promise it.
+/// `alctile` hands the module one far pointer and the module computes the rest
+/// itself by stepping the selector, so if entry `n + 1` belongs to something
+/// else the module writes through it and nothing reports anything.
+///
+/// A bump allocator *happens* to hand out consecutive entries, which is worse
+/// than not doing so: it holds until the first free and then quietly stops.
+///
+/// One kilobyte, and a process has exactly one LDT -- so this is process-wide
+/// even though a `Machine` feels local.
+static IN_USE: Mutex<[u64; WORDS]> = Mutex::new([0; WORDS]);
 
-fn free_entries() -> std::sync::MutexGuard<'static, Vec<u32>> {
+fn in_use() -> std::sync::MutexGuard<'static, [u64; WORDS]> {
     // Nothing inside the critical section can panic in a way that matters, and
     // failing an allocation because an unrelated thread died is worse than
-    // carrying on with a list that is merely correct.
-    FREE_ENTRIES.lock().unwrap_or_else(PoisonError::into_inner)
+    // carrying on with a table that is merely correct.
+    IN_USE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn take_ldt_entry() -> io::Result<u32> {
-    if let Some(entry) = free_entries().pop() {
-        return Ok(entry);
-    }
+fn taken(bits: &[u64; WORDS], entry: u32) -> bool {
+    bits[entry as usize / 64] & (1 << (entry % 64)) != 0
+}
 
-    let entry = NEXT_ENTRY.fetch_add(1, Ordering::Relaxed);
-    if entry >= LDT_ENTRIES {
-        // Recoverable, and deliberately not recovered here: dropping segments
-        // refills the free list, so the counter running past the end is not
-        // itself the end of anything.
-        return Err(io::Error::new(
-            io::ErrorKind::OutOfMemory,
-            format!("the LDT's {LDT_ENTRIES} entries are all in use"),
-        ));
+/// Reserve `count` adjacent entries and return the first.
+///
+/// First fit, lowest first, so a freed slot is handed out again before a fresh
+/// one -- the LDT is a fixed 8,192 entries and a module load takes 82, so
+/// loading and unloading the same module a hundred times would otherwise run
+/// the table out.
+fn take_ldt_run(count: u32) -> io::Result<u32> {
+    let mut bits = in_use();
+    let mut run = 0;
+    for entry in 0..LDT_ENTRIES {
+        if taken(&bits, entry) {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        if run == count {
+            let start = entry + 1 - count;
+            for e in start..start + count {
+                bits[e as usize / 64] |= 1 << (e % 64);
+            }
+            return Ok(start);
+        }
     }
-    Ok(entry)
+    Err(io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!("no run of {count} free entries in the LDT's {LDT_ENTRIES}"),
+    ))
+}
+
+/// Hand `count` entries starting at `start` back.
+fn give_ldt_run(start: u32, count: u32) {
+    let mut bits = in_use();
+    for e in start..start + count {
+        bits[e as usize / 64] &= !(1 << (e % 64));
+    }
 }
 
 /// Write `desc` into the LDT.
@@ -101,22 +132,23 @@ fn clear_ldt_entry(entry: u32) -> io::Result<()> {
     })
 }
 
-/// A mapping below 4 GiB with an LDT descriptor over it.
+/// One anonymous mapping below 4 GiB.
 ///
 /// The 4 GiB limit is not a preference. A descriptor's base is a 32-bit field,
 /// so anything higher cannot be named at all.
-pub(crate) struct Segment {
+///
+/// Separate from the descriptors over it because a **tiled** region is one
+/// mapping described by several: `PLSTUFF.C`'s `pltile` allocates one linear
+/// region and lays consecutive DPMI descriptors across it, and `alctile` is
+/// built on that. Shared, so the mapping outlives whichever descriptor is
+/// dropped last.
+struct Mapping {
     base: *mut u8,
     len: usize,
-    entry: u32,
 }
 
-impl Segment {
-    /// Map `len` bytes below 4 GiB and describe them as a 16-bit segment.
-    ///
-    /// `executable` picks between a readable code segment and a writable data
-    /// segment; the latter is what `SS` requires.
-    pub(crate) fn new(len: usize, executable: bool) -> io::Result<Self> {
+impl Mapping {
+    fn new(len: usize, executable: bool) -> io::Result<Rc<Self>> {
         let mut prot = libc::PROT_READ | libc::PROT_WRITE;
         if executable {
             prot |= libc::PROT_EXEC;
@@ -137,45 +169,125 @@ impl Segment {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let base = base.cast::<u8>();
+        Ok(Rc::new(Self {
+            base: base.cast::<u8>(),
+            len,
+        }))
+    }
+}
 
-        let entry = match take_ldt_entry() {
-            Ok(entry) => entry,
-            Err(e) => {
-                // SAFETY: unmapping a mapping we just made and are abandoning.
-                unsafe { libc::munmap(base.cast(), len) };
-                return Err(e);
-            }
-        };
-        let contents = if executable {
-            CONTENTS_CODE
-        } else {
-            CONTENTS_DATA
-        };
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: our own mapping, dropped exactly once -- the `Rc` is what
+        // guarantees the "once", and every descriptor over it is already gone
+        // because each holds one of the references being counted.
+        unsafe { libc::munmap(self.base.cast(), self.len) };
+    }
+}
 
-        let desc = UserDesc {
-            entry_number: entry,
-            base_addr: base as usize as u32,
-            limit: (len - 1) as u32,
+/// A window onto a mapping, with an LDT descriptor naming it.
+///
+/// Usually the whole of a mapping of its own. For a tile it is one `size`-byte
+/// slice of a larger region, and the descriptor's limit is the tile's -- so 16-bit
+/// code that runs off the end of tile `n` is stopped by the same bound as any
+/// other segment, rather than sliding into tile `n + 1`.
+pub(crate) struct Segment {
+    mapping: Rc<Mapping>,
+    /// Where this window starts within the mapping.
+    at: usize,
+    len: usize,
+    entry: u32,
+}
 
-            // Every other bit is deliberately zero. seg_32bit clear is the
-            // whole point: for code it clears D, making the default operand and
-            // address size 16-bit; for a stack segment the same field is B,
-            // declaring the stack pointer to be SP rather than ESP.
-            // read_exec_only clear leaves code readable and data writable,
-            // limit_in_pages clear keeps the limit in bytes, and
-            // seg_not_present clear makes the descriptor live.
-            flags: (contents << CONTENTS_SHIFT) | F_USEABLE,
-        };
+/// Point LDT `entry` at `len` bytes of memory starting at `base`.
+fn describe(entry: u32, base: *const u8, len: usize, executable: bool) -> io::Result<()> {
+    let contents = if executable {
+        CONTENTS_CODE
+    } else {
+        CONTENTS_DATA
+    };
+    write_ldt(&UserDesc {
+        entry_number: entry,
+        base_addr: base as usize as u32,
+        limit: (len - 1) as u32,
 
-        if let Err(e) = write_ldt(&desc) {
-            // SAFETY: unmapping a mapping we just made and are abandoning.
-            unsafe { libc::munmap(base.cast(), len) };
-            free_entries().push(entry);
+        // Every other bit is deliberately zero. seg_32bit clear is the
+        // whole point: for code it clears D, making the default operand and
+        // address size 16-bit; for a stack segment the same field is B,
+        // declaring the stack pointer to be SP rather than ESP.
+        // read_exec_only clear leaves code readable and data writable,
+        // limit_in_pages clear keeps the limit in bytes, and
+        // seg_not_present clear makes the descriptor live.
+        flags: (contents << CONTENTS_SHIFT) | F_USEABLE,
+    })
+}
+
+impl Segment {
+    /// Map `len` bytes below 4 GiB and describe them as a 16-bit segment.
+    ///
+    /// `executable` picks between a readable code segment and a writable data
+    /// segment; the latter is what `SS` requires.
+    pub(crate) fn new(len: usize, executable: bool) -> io::Result<Self> {
+        let mapping = Mapping::new(len, executable)?;
+        let entry = take_ldt_run(1)?;
+
+        if let Err(e) = describe(entry, mapping.base, len, executable) {
+            give_ldt_run(entry, 1);
             return Err(e);
         }
+        Ok(Self {
+            mapping,
+            at: 0,
+            len,
+            entry,
+        })
+    }
 
-        Ok(Self { base, len, entry })
+    /// One region of `qty * size` bytes, described by `qty` **consecutive**
+    /// descriptors of `size` bytes each.
+    ///
+    /// This is `PLSTUFF.C`'s `pltile`, which is what `alctile` is: one
+    /// `DosAllocLinMem`, then DPMI *Allocate LDT Descriptors* for `qty + 1`
+    /// consecutive slots, then one `DosMapLinMemToSelector` per tile stepping
+    /// the address by the tile size.
+    ///
+    /// Adjacency is the whole contract. The module reaches tile `n` by adding
+    /// `n * `[`SELECTOR_STEP`](crate::SELECTOR_STEP) to the selector itself --
+    /// `ptrtile` is `(long)bigptr + (index << 19)`, which is exactly that -- so
+    /// the host is never told when a tile is used and cannot check it after
+    /// the fact.
+    pub(crate) fn tiled(qty: u16, size: u16) -> io::Result<Vec<Self>> {
+        let qty = usize::from(qty);
+        let size = usize::from(size);
+        if qty == 0 || size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a tiled region of {qty} tiles of {size} bytes is nothing"),
+            ));
+        }
+
+        let mapping = Mapping::new(qty * size, false)?;
+        let start = take_ldt_run(qty as u32)?;
+
+        let mut tiles = Vec::with_capacity(qty);
+        for n in 0..qty {
+            // SAFETY: `n * size` is within the mapping, which is `qty * size`.
+            let base = unsafe { mapping.base.add(n * size) };
+            if let Err(e) = describe(start + n as u32, base, size, false) {
+                // Whatever was described already is in `tiles` and clears
+                // itself; the rest of the run was never used, so it goes back
+                // here.
+                give_ldt_run(start + n as u32, (qty - n) as u32);
+                return Err(e);
+            }
+            tiles.push(Self {
+                mapping: Rc::clone(&mapping),
+                at: n * size,
+                len: size,
+                entry: start + n as u32,
+            });
+        }
+        Ok(tiles)
     }
 
     /// The selector naming this segment: index in bits 3..15, TI set to select
@@ -211,13 +323,20 @@ impl Segment {
         );
         // SAFETY: bounds checked, and the mapping is readable for its whole
         // length and outlives the borrow.
-        unsafe { std::slice::from_raw_parts(self.base.add(offset), len) }
+        unsafe { std::slice::from_raw_parts(self.at(offset), len) }
     }
 
     /// The mapping's linear address, for the far-jump targets that need one.
     pub(crate) fn linear(&self, offset: usize) -> u32 {
         debug_assert!(offset < self.len);
-        (self.base as usize + offset) as u32
+        self.at(offset) as usize as u32
+    }
+
+    /// Where `offset` within this segment is in the mapping underneath.
+    fn at(&self, offset: usize) -> *mut u8 {
+        // SAFETY: `self.at + self.len` is within the mapping by construction,
+        // and every caller has bounds-checked `offset` against `self.len`.
+        unsafe { self.mapping.base.add(self.at + offset) }
     }
 
     /// Write `bytes` at `offset` within the segment.
@@ -230,7 +349,7 @@ impl Segment {
         }
         // SAFETY: bounds checked immediately above, and the mapping is writable.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(offset), bytes.len());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at(offset), bytes.len());
         }
         Ok(())
     }
@@ -240,7 +359,7 @@ impl Segment {
         assert!(offset + 2 <= self.len, "read past the end of the segment");
         // SAFETY: bounds checked, and the mapping is readable. `read_unaligned`
         // because 16-bit code has no alignment obligations whatsoever.
-        unsafe { self.base.add(offset).cast::<u16>().read_unaligned() }
+        unsafe { self.at(offset).cast::<u16>().read_unaligned() }
     }
 }
 
@@ -256,15 +375,15 @@ impl Drop for Segment {
         // A failed clear therefore leaks both, on purpose: the mapping stays
         // ours, so the stale descriptor names memory we still hold rather than
         // whatever the allocator hands out next. There is no entry number this
-        // can fail for that `take_ldt_entry` could have produced, so reaching
+        // can fail for that `take_ldt_run` could have produced, so reaching
         // here is a host bug and worth the abort.
         clear_ldt_entry(self.entry)
             .expect("could not clear an LDT entry; leaking its mapping rather than dangling it");
 
-        // SAFETY: our own mapping, dropped exactly once.
-        unsafe { libc::munmap(self.base.cast(), self.len) };
-
-        free_entries().push(self.entry);
+        // The mapping goes when the last descriptor over it does, which for a
+        // tiled region is the last tile rather than this one -- so it is the
+        // `Rc` that unmaps, after this.
+        give_ldt_run(self.entry, 1);
     }
 }
 
@@ -336,6 +455,115 @@ mod tests {
             entry,
             "a freed slot should be handed out again before a fresh one"
         );
+    }
+
+    #[test]
+    fn a_tiled_region_gets_consecutive_descriptors() {
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let tiles = Segment::tiled(6, 4096).expect("a tiled region");
+        assert_eq!(tiles.len(), 6);
+        for (n, tile) in tiles.iter().enumerate() {
+            assert_eq!(
+                tile.entry(),
+                tiles[0].entry() + n as u32,
+                "tile {n} is not adjacent to its neighbour"
+            );
+            // Which is the same thing said the way the module says it: step the
+            // selector, because that is all `ptrtile` does.
+            assert_eq!(
+                tile.selector(),
+                tiles[0].selector() + n as u16 * crate::SELECTOR_STEP
+            );
+        }
+    }
+
+    #[test]
+    fn a_tile_windows_only_its_own_slice_of_the_region() {
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let mut tiles = Segment::tiled(3, 4096).expect("a tiled region");
+        for (n, tile) in tiles.iter_mut().enumerate() {
+            tile.write(0, &[n as u8; 16]).expect("in bounds");
+        }
+
+        // One region underneath: tile n's bytes are at n * size from the start.
+        let start = tiles[0].linear(0) as usize;
+        for (n, tile) in tiles.iter().enumerate() {
+            assert_eq!(
+                tile.slice(0, 1)[0],
+                n as u8,
+                "tile {n} reads back what was written through it"
+            );
+            assert_eq!(
+                tile.linear(0) as usize,
+                start + n * 4096,
+                "tile {n} is not where the mapping says it is"
+            );
+        }
+
+        // And the descriptor's limit is the tile's, not the region's, so
+        // running off the end of one does not reach the next.
+        assert_eq!(tiles[0].len(), 4096);
+        assert!(tiles[0].write(4090, &[0; 16]).is_err());
+    }
+
+    #[test]
+    fn a_run_stays_contiguous_after_the_table_is_fragmented() {
+        // The reason the bump allocator had to go. It hands out consecutive
+        // entries too -- right up until the first free, after which nothing
+        // would have reported that it had stopped.
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let mut held: Vec<Option<Segment>> = (0..8)
+            .map(|_| Some(Segment::new(4096, false).expect("a segment")))
+            .collect();
+
+        // Punch a two-entry hole, then ask for four.
+        let hole = [
+            held[2].as_ref().expect("held").entry(),
+            held[3].as_ref().expect("held").entry(),
+        ];
+        held[2] = None;
+        held[3] = None;
+
+        let tiles = Segment::tiled(4, 4096).expect("a run of four");
+        for (n, tile) in tiles.iter().enumerate() {
+            assert_eq!(
+                tile.entry(),
+                tiles[0].entry() + n as u32,
+                "tile {n} landed away from the run"
+            );
+            assert!(
+                !hole.contains(&tile.entry()),
+                "tile {n} took an entry from a hole too small for the run"
+            );
+        }
+        drop(held);
+    }
+
+    #[test]
+    fn a_tiled_region_of_nothing_is_refused() {
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(Segment::tiled(0, 4096).is_err());
+        assert!(Segment::tiled(4, 0).is_err());
+    }
+
+    #[test]
+    fn dropping_a_tiled_region_leaves_no_live_descriptor() {
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let tiles = Segment::tiled(4, 4096).expect("a tiled region");
+        let entries: Vec<u32> = tiles.iter().map(Segment::entry).collect();
+        drop(tiles);
+
+        for entry in entries {
+            assert_eq!(
+                descriptor(entry),
+                [0u8; LDT_ENTRY_SIZE],
+                "entry {entry} still names the region that was just unmapped"
+            );
+        }
     }
 
     #[test]
