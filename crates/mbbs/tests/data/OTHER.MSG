@@ -1,0 +1,3 @@
+LEVEL0 {OTHER}
+
+GREET {hello} S 8 A greeting

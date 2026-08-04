@@ -1,5 +1,6 @@
 //! What sits behind each import, and what to do when nothing does.
 
+pub mod msg;
 pub mod system;
 pub mod text;
 
@@ -79,6 +80,17 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "strcpy", text::strcpy),
     (MAJORBBS, "strlen", text::strlen),
     (MAJORBBS, "atol", text::atol),
+    // Message files, and the options in them.
+    (MAJORBBS, "opnmsg", msg::opnmsg),
+    (MAJORBBS, "clsmsg", msg::clsmsg),
+    (MAJORBBS, "setmbk", msg::setmbk),
+    (MAJORBBS, "rstmbk", msg::rstmbk),
+    (MAJORBBS, "stgopt", msg::stgopt),
+    (MAJORBBS, "numopt", msg::numopt),
+    (MAJORBBS, "ynopt", msg::ynopt),
+    (MAJORBBS, "chropt", msg::chropt),
+    (MAJORBBS, "tokopt", msg::tokopt),
+    (MAJORBBS, "prfmsg", msg::prfmsg),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "now", system::now),
     (MAJORBBS, "today", system::today),

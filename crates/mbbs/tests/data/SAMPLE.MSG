@@ -1,0 +1,19 @@
+LEVEL0 {SAMPLE}
+
+ This comment is prose, and ACTIVATE here is not an option.
+
+ACTIVATE {DEMO} S 30 Enter your activation code
+
+GAMCRD {Credits per minute consumed while in the game 60} N 0 32767
+
+YESOPT {Something enabled? YES} B
+
+NOOPT {Something else? NO} B
+
+NEGOPT {Watch level -5} N -32767 32767
+
+TLCCHR { =} C
+
+PUNHUP {Level of punishment? NONE} E HIGH MEDIUM LOW NONE
+
+FMT {<%d>} T A template prfmsg can use

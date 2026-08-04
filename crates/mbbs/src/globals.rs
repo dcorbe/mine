@@ -123,6 +123,12 @@ pub const GLOBALS: &[Global] = &[
     // GCOMM.H:449 -- char *prfbuf, *prfptr;
     g("prfbuf", PTR),
     g("prfptr", PTR),
+    // GCOMM.H:282 -- FILE *curmbk; the message block `stgopt` and the rest
+    // read from. `WCCMMUD.DLL` does not address it -- the load check would say
+    // so -- but it is placed here anyway, because a host global belongs in
+    // module memory whether or not this particular module looks at it. Keeping
+    // it Rust-side instead is the exact shape of the bug that rule prevents.
+    g("curmbk", PTR),
     // MAJORBBS.H:443 -- char *vdaptr, *vdatmp;
     g("vdaptr", PTR),
     g("vdatmp", PTR),

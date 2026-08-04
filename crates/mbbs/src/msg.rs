@@ -36,6 +36,9 @@
 //! every other module.
 
 use std::fmt;
+use std::io;
+
+use mbbs16::{FarPtr, Machine};
 
 /// One `.MSG` file, as a numbered list of messages.
 ///
@@ -258,6 +261,257 @@ fn line_endings(value: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The value an option carries, out of the message text.
+///
+/// Two shapes are in the files, and one rule reads both. An `S` option is the
+/// bare value -- `ACTIVATE {DEMO}` -- while `N`, `B`, `E` and some `C` options
+/// put the sysop's prompt in front of it: `GAMCRD {Credits per minute consumed
+/// while in the game 60}`, `PROFCHEK {Profanity checking? NO}`. **The value is
+/// the last whitespace-delimited token**, which is the bare value when there is
+/// no prompt and the value when there is.
+///
+/// Measured across the 91 recovered `.MSG` files: all 1,408 `N` options have a
+/// numeric last token, all 267 `B` options end in `YES` or `NO`, and the `C`
+/// options this has to survive include `TLCCHR { =}` and `ANSCHR { \}`, whose
+/// values are a leading space and one character.
+///
+/// [`MsgFile::get`] is what `stgopt` returns, and it is deliberately *not* this:
+/// a string option is its whole text.
+pub fn value(message: &[u8]) -> &[u8] {
+    match message.iter().rposition(|b| b.is_ascii_whitespace()) {
+        Some(at) => &message[at + 1..],
+        None => message,
+    }
+}
+
+/// Bytes of `struct msgblk`, as `MSGUTL.H` declares it: five far pointers, an
+/// `int`, three `long`s and two more `int`s.
+const MSGBLK: usize = 5 * 4 + 2 + 3 * 4 + 2 + 2;
+
+/// Bytes in one of the arena's segments.
+const ARENA_SEGMENT: usize = 64 * 1024;
+
+/// Message text, in memory the module can address and the host never moves.
+///
+/// `stgopt` returns a `char *` the module may hold across other calls. The real
+/// host reused one `msgbuf` for this, and a module that held a pointer too long
+/// got whatever was read next; we can be strictly safer for nothing, by giving
+/// every message an address of its own that lives as long as the block does.
+///
+/// Append-only across a list of segments, because `WCCMMHLP.MSG` is 124 KB and
+/// one 16-bit segment is 64. No allocator and **no dependency on the module
+/// heap**, which is what lets message files come first.
+///
+/// Nothing here is ever reclaimed -- `clsmsg` does not shrink it. Three files
+/// is nothing; a host that opened and closed message files in a loop would grow
+/// without bound, and that is worth knowing rather than mechanising.
+#[derive(Default)]
+struct Arena {
+    /// Each segment and how much of it is spoken for.
+    segments: Vec<(u16, usize)>,
+}
+
+impl Arena {
+    /// Copy `bytes` and a terminator somewhere stable, and say where.
+    ///
+    /// # Errors
+    ///
+    /// If a segment cannot be mapped, or `bytes` is too long for one.
+    fn intern(&mut self, machine: &mut Machine, bytes: &[u8]) -> io::Result<FarPtr> {
+        let need = bytes.len() + 1;
+        if need > ARENA_SEGMENT {
+            // `OPTSIZE` is 16,384, so this is a corrupt file rather than a
+            // limit anything legitimate reaches.
+            return Err(io::Error::other(format!(
+                "a {need}-byte message will not fit in a {ARENA_SEGMENT}-byte segment"
+            )));
+        }
+
+        // A C string cannot cross a selector boundary, so a message that does
+        // not fit in what is left starts a new segment rather than being split.
+        let room = self
+            .segments
+            .last()
+            .is_some_and(|(_, used)| ARENA_SEGMENT - used >= need);
+        if !room {
+            self.segments.push((machine.alloc_segment(ARENA_SEGMENT)?, 0));
+        }
+
+        let (selector, used) = self.segments.last_mut().expect("just ensured");
+        let at = FarPtr {
+            offset: *used as u16,
+            selector: *selector,
+        };
+        let mut out = bytes.to_vec();
+        out.push(0);
+        machine.write(at, &out).map_err(io::Error::other)?;
+        *used += need;
+        Ok(at)
+    }
+}
+
+/// One open message file.
+struct Block {
+    /// What it was opened as, for error messages.
+    name: String,
+
+    /// The `msgblk`-shaped region the module was handed, which is also this
+    /// block's identity: `setmbk` and `clsmsg` name it and nothing else does.
+    cookie: FarPtr,
+
+    /// Where each message's text was interned, by message number.
+    text: Vec<FarPtr>,
+}
+
+/// Every message file the host has open, and which one is current.
+///
+/// The current block is **not** here. It is `curmbk`, a host global living in
+/// module memory (`GCOMM.H:282`), and it is read back from there every time --
+/// the same rule `prfptr` is under, and for the same reason. What is here is
+/// the stack of blocks to restore, which the module cannot see and has no way
+/// to change.
+#[derive(Default)]
+pub struct Messages {
+    arena: Arena,
+    open: Vec<Block>,
+
+    /// What `curmbk` held before each unmatched `setmbk`, oldest first.
+    saved: Vec<FarPtr>,
+}
+
+impl Messages {
+    /// Open a message file, and give the module something to name it by.
+    ///
+    /// The cookie is backed by a real, zeroed, `msgblk`-shaped region rather
+    /// than an invented number. `MSGUTL.H` says the struct is used "for some
+    /// special purposes by the application program", so a module that reads a
+    /// field gets zeros instead of a fault. The two fields the host actually
+    /// knows -- how many languages and how many messages -- are filled in,
+    /// because writing zero where the truth is free is the habit this crate
+    /// exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// If the arena cannot be extended.
+    pub fn open(
+        &mut self,
+        machine: &mut Machine,
+        name: &str,
+        file: &MsgFile,
+    ) -> io::Result<FarPtr> {
+        let mut text = Vec::with_capacity(file.len());
+        for message in file.messages() {
+            text.push(self.arena.intern(machine, message)?);
+        }
+
+        // `intern` adds the terminator, which is the struct's last byte.
+        let cookie = self.arena.intern(machine, &[0u8; MSGBLK - 1])?;
+        let count = u16::try_from(file.len()).map_err(|_| {
+            io::Error::other(format!("{name} has {} messages, which is more \
+                than a 16-bit msgcnt holds", file.len()))
+        })?;
+
+        // `lngcnt` and `msgcnt` are the last two `int`s of the struct.
+        let tail = FarPtr {
+            offset: cookie.offset + (MSGBLK - 4) as u16,
+            selector: cookie.selector,
+        };
+        let mut fields = 1u16.to_le_bytes().to_vec();
+        fields.extend_from_slice(&count.to_le_bytes());
+        machine.write(tail, &fields).map_err(io::Error::other)?;
+
+        self.open.push(Block {
+            name: name.to_owned(),
+            cookie,
+            text,
+        });
+        Ok(cookie)
+    }
+
+    /// Close a block.
+    ///
+    /// The text stays interned -- see [`Arena`] -- so this only forgets the
+    /// block, which is what makes a later use of the cookie a refusal.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open block, or names one that is still set: closing
+    /// the current block would leave `curmbk` pointing at something the host
+    /// has forgotten, and every option read after it would be a refusal naming
+    /// the wrong thing.
+    pub fn close(&mut self, current: FarPtr, cookie: FarPtr) -> Result<(), String> {
+        let at = self.find(cookie)?;
+        if cookie == current || self.saved.contains(&cookie) {
+            return Err(format!(
+                "{} is the current message block, or is waiting under one",
+                self.open[at].name
+            ));
+        }
+        self.open.remove(at);
+        Ok(())
+    }
+
+    /// Remember what was current, so `rstmbk` can put it back.
+    pub fn push(&mut self, previous: FarPtr) {
+        self.saved.push(previous);
+    }
+
+    /// What was current before the last unmatched `setmbk`.
+    ///
+    /// # Errors
+    ///
+    /// If nothing was saved. The alternative is guessing at a value for
+    /// `curmbk`, and every option read afterwards would come from whichever
+    /// block that guess named.
+    pub fn pop(&mut self) -> Result<FarPtr, String> {
+        self.saved
+            .pop()
+            .ok_or_else(|| "rstmbk with no setmbk to undo".to_owned())
+    }
+
+    /// Where message `n` of the block named by `cookie` was interned.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open block, or the block has no message `n`.
+    pub fn text(&self, cookie: FarPtr, n: u16) -> Result<FarPtr, String> {
+        let block = &self.open[self.find(cookie)?];
+        block.text.get(usize::from(n)).copied().ok_or_else(|| {
+            format!(
+                "message {n} of {}, which has {}",
+                block.name,
+                block.text.len()
+            )
+        })
+    }
+
+    /// What a block was opened as.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open block.
+    pub fn name(&self, cookie: FarPtr) -> Result<&str, String> {
+        Ok(&self.open[self.find(cookie)?].name)
+    }
+
+    /// How many message files are open.
+    pub fn len(&self) -> usize {
+        self.open.len()
+    }
+
+    /// Whether no message file is open.
+    pub fn is_empty(&self) -> bool {
+        self.open.is_empty()
+    }
+
+    fn find(&self, cookie: FarPtr) -> Result<usize, String> {
+        self.open
+            .iter()
+            .position(|b| b.cookie == cookie)
+            .ok_or_else(|| format!("{cookie:?} is not an open message block"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +626,35 @@ mod tests {
         let file = parse("");
         assert!(file.is_empty());
         assert_eq!(file.get(0), None);
+    }
+
+    #[test]
+    fn a_value_is_the_last_token_whether_or_not_a_prompt_precedes_it() {
+        // Both shapes are in MajorMUD's own file, and both of these are real
+        // lines from it.
+        assert_eq!(value(b"DEMO"), b"DEMO");
+        assert_eq!(
+            value(b"Credits per minute consumed while in the game 60"),
+            b"60"
+        );
+        assert_eq!(value(b"Profanity checking? NO"), b"NO");
+        assert_eq!(value(b"Level of punishment for hanging up? NONE"), b"NONE");
+    }
+
+    #[test]
+    fn a_character_option_survives_the_space_in_front_of_it() {
+        // `TLCCHR { =}` and `ANSCHR { \}` are real options from the archive:
+        // the value is one character with a space before it, and a reader that
+        // took the whole text would hand the module a space.
+        assert_eq!(value(b" ="), b"=");
+        assert_eq!(value(b" \\"), b"\\");
+        assert_eq!(value(b"Optional menu character: N"), b"N");
+        assert_eq!(value(b"."), b".");
+    }
+
+    #[test]
+    fn a_value_that_is_only_whitespace_is_empty_rather_than_whitespace() {
+        assert_eq!(value(b"   "), b"");
+        assert_eq!(value(b""), b"");
     }
 }

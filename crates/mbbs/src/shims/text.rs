@@ -67,7 +67,15 @@ pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// whatever the module had written.
 pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (text, _) = format(machine, machine.arg_far(0), 2)?;
+    append(machine, host, &text)?;
+    Ok(Ret::Void)
+}
 
+/// Put `text` where `prfptr` points, and move `prfptr` past it.
+///
+/// Shared with `prfmsg`, which is this and a template that came out of a
+/// message file rather than out of the module.
+pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
     let at = host
         .globals()
         .pointer(machine, "prfptr")
@@ -80,7 +88,7 @@ pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
         )));
     }
 
-    write_cstr(machine, at, &text, end - at.offset)?;
+    write_cstr(machine, at, text, end - at.offset)?;
     let moved = FarPtr {
         offset: at.offset + text.len() as u16,
         selector: at.selector,
@@ -88,7 +96,7 @@ pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     host.globals()
         .write(machine, "prfptr", &moved.to_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(Ret::Void)
+    Ok(())
 }
 
 /// `void clrprf(void)` -- throw away whatever `prf` has queued.

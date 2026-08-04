@@ -157,6 +157,11 @@ pub struct Host {
     /// what the module passes back.
     modules: Vec<Registration>,
 
+    /// The message files that are open, and their text in module memory. Which
+    /// one is *current* is not here -- that is `curmbk`, a global the module
+    /// can see.
+    pub(crate) messages: msg::Messages,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
@@ -200,6 +205,7 @@ impl Host {
             seed: 0,
             audit: Vec::new(),
             modules: Vec::new(),
+            messages: msg::Messages::default(),
             calls: 0,
         })
     }
@@ -217,6 +223,11 @@ impl Host {
     /// Every module that has registered, in the order they did.
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// The message files that are open.
+    pub fn messages(&self) -> &msg::Messages {
+        &self.messages
     }
 
     /// How many host calls this host has serviced.
