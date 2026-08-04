@@ -10,7 +10,7 @@
 //! nothing left to notice. That is unavoidable and is why the loops that *can*
 //! be bounded are bounded.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mbbs16::{Exit, Machine, Poison, Ret};
 
@@ -33,12 +33,32 @@ fn polite_module() -> Vec<u8> {
     vec![0xcb] // lret
 }
 
-/// Burn `d` of CPU without sleeping, so a CPU-time timer actually advances.
+/// Burn `d` of **this thread's CPU time**, which is the clock the watchdog
+/// measures.
+///
+/// Not wall clock, and the difference is the whole point. A spin loop that runs
+/// for 100 ms of wall time on a box that is also compiling something may have
+/// had 40 ms of CPU, and the timer these tests are waiting on would not have
+/// fired -- so the test fails, on a busy machine, for a reason that has nothing
+/// to do with what it is testing. Waiting on the quantity the timer counts
+/// makes the wait exact rather than hopeful.
 fn burn(d: Duration) {
-    let start = Instant::now();
-    while start.elapsed() < d {
+    let start = cpu_time();
+    while cpu_time() - start < d {
         std::hint::black_box(0u64);
     }
+}
+
+/// This thread's CPU time so far, from the same clock the watchdog arms.
+fn cpu_time() -> Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes the `timespec` and nothing else.
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut ts) };
+    assert_eq!(ok, 0, "the thread CPU clock is not readable");
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
 fn wedged_machine() -> Machine {
