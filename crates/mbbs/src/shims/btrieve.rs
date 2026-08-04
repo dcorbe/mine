@@ -668,6 +668,9 @@ fn absolute(
         None => Cursor::Physical { at: physical },
     };
     file.seek_to(cursor);
+
+    // `:484` passes `bb->keyseg`, so Btrieve left the found record's key there.
+    answer_with_key(machine, host, block, key)?;
     deliver(machine, host, block, into)?;
     Ok(true)
 }
@@ -816,23 +819,45 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         return Ok(false);
     };
     file.seek_to(Cursor::Ordered { key, at });
-
-    // A *get key* operation answers with the key it found, in the same buffer
-    // the search value went into.
-    let key_bytes = definitions[usize::from(key)].extract(
-        &file
-            .current()
-            .expect("just positioned on a record")
-            .bytes
-            .clone(),
-    );
-    let buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
-    machine.write(buffer, &key_bytes)?;
+    answer_with_key(machine, host, block, key)?;
 
     if let Some(into) = into {
         deliver(machine, host, block, into)?;
     }
     Ok(true)
+}
+
+/// Leave the key of the record the file is now positioned on in `bb->key`.
+///
+/// Btrieve wrote the found key back into whatever buffer an operation named,
+/// and **every read operation names `bb->keyseg`** -- `qrybtv` at
+/// `PLBTVSTF.C:274`, `qnpbtv` at `:290`, `obtbtvl` at `:372`, `aabbtvl` at
+/// `:484`. So after any of them a module reading `bb->key` sees the key it
+/// landed on rather than the value it searched for.
+///
+/// The one that does not is `stpbtvl` (`:512`), which passes `NULL` for the key
+/// buffer -- a step has no key -- and so leaves whatever was there.
+///
+/// Shared rather than written twice: the absolute-position family had it
+/// missing for exactly as long as this was inline in [`locate`].
+fn answer_with_key(
+    machine: &mut Machine,
+    host: &mut Host,
+    block: FarPtr,
+    key: u16,
+) -> Result<(), ShimError> {
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let record = file
+        .current()
+        .ok_or_else(|| ShimError::Failed(format!("{} is not positioned", file.name())))?;
+    let bytes = file
+        .keys()
+        .get(usize::from(key))
+        .ok_or_else(|| ShimError::Failed(format!("{} has no key {key}", file.name())))?
+        .extract(&record.bytes);
+    let buffer = file.key();
+    machine.write(buffer, &bytes)?;
+    Ok(())
 }
 
 /// Copy the record the cursor names into the module's memory.
@@ -1508,6 +1533,39 @@ mod tests {
             Ret::U16(1)
         );
         assert_eq!(got(&f, into), 6, "and it read the record it was sent to");
+    }
+
+    #[test]
+    fn the_absolute_family_leaves_the_found_key_in_the_key_buffer() {
+        // `PLBTVSTF.C:484` passes `bb->keyseg` to Btrieve, which writes the
+        // found record's key back into it -- exactly as the query and acquire
+        // families do at `:274` and `:372`. This host did it for those two and
+        // not for this one, so a module reading `bb->key` after a `gcrbtv` saw
+        // whatever the last search had put there.
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let key = f.host.btrieve().block(block).expect("open").key();
+
+        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        // Somewhere else, so the key buffer holds something wrong to begin with.
+        assert!(acquire(&mut f, None, 0, 12), "lowest");
+        assert_eq!(got(&f, key), 1);
+
+        f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
+            .expect("back to where it was");
+        assert_eq!(got(&f, key), 6, "aabbtv answers with the key it landed on");
+
+        assert!(acquire(&mut f, None, 0, 12), "lowest again");
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 0, 0],
+        )
+        .expect("and gabbtvl too");
+        assert_eq!(got(&f, key), 6);
     }
 
     #[test]
