@@ -183,16 +183,23 @@ pub enum Exit {
 
 /// Why a machine will not be entered again.
 ///
-/// Both cases are the same shape as the [`Exit`] that produced them, kept so a
-/// host that discarded the exit can still say what happened -- and so that
+/// The first two are the same shape as the [`Exit`] that produced them, kept so
+/// a host that discarded the exit can still say what happened -- and so that
 /// refusing a call can explain itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The third has no [`Exit`] behind it. It is the host's own judgement, reached
+/// while servicing a call: this module asked for something the host does not
+/// implement, and there is no honest answer to give it. See [`Machine::poison`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Poison {
     /// It faulted. See [`Exit::Fault`].
     Fault { signo: i32, cs: u16, ip: u16 },
 
     /// It overran its budget. See [`Exit::Timeout`].
     Timeout { cs: u16, ip: u16 },
+
+    /// It called an import the host has no implementation for.
+    Unimplemented { module: String, symbol: String },
 }
 
 impl std::fmt::Display for Poison {
@@ -206,6 +213,9 @@ impl std::fmt::Display for Poison {
             }
             Self::Timeout { cs, ip } => {
                 write!(f, "module timed out at {cs:#06x}:{ip:#06x}")
+            }
+            Self::Unimplemented { module, symbol } => {
+                write!(f, "{module}.{symbol} is not implemented")
             }
         }
     }
@@ -386,8 +396,35 @@ impl Machine {
     /// A module that faulted or overran left its globals mid-update, so it is
     /// not merely stopped -- it is untrustworthy. The host decides what follows
     /// from that; this crate only refuses to make it worse.
-    pub fn poisoned(&self) -> Option<Poison> {
-        self.poisoned
+    pub fn poisoned(&self) -> Option<&Poison> {
+        self.poisoned.as_ref()
+    }
+
+    /// Refuse this module from now on, for a reason the host reached itself.
+    ///
+    /// The machinery is the same one a fault or an overrun uses: the watchdog
+    /// stops, the call frame is forgotten, and every later
+    /// [`call`](Machine::call) fails naming the reason. Only the reason is new.
+    ///
+    /// It exists for the case where a module asks for something the host cannot
+    /// answer. **Returning zero instead is the bug this method is here to
+    /// prevent.** A host that invents a null pointer for an allocator gets a
+    /// SIGSEGV somewhere in module code many calls later, naming nothing about
+    /// where the lie was told; a host that poisons gets the symbol's name.
+    ///
+    /// The first reason wins. A module poisoned for one thing that then trips
+    /// over another is still poisoned for the first, which is the one that is
+    /// true.
+    ///
+    /// # Errors
+    ///
+    /// If the watchdog timer cannot be disarmed.
+    pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(reason);
+        }
+        self.frame_sp = None;
+        self.ctx.disarm()
     }
 
     /// The far pointer a module should `lcall` to reach import `index`.
@@ -408,6 +445,38 @@ impl Machine {
             offset: (THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE) as u16,
             selector: self.bridge,
         }
+    }
+
+    /// Map `len` bytes of writable memory the module can address, and return
+    /// the selector naming it.
+    ///
+    /// This is how the host owns memory a module can reach. It needs it twice
+    /// over: for the globals a module addresses directly -- `usrnum`, `margv`,
+    /// `prfbuf` and their like are imports the module never *calls*, so their
+    /// fixups have to name real memory -- and later for whatever the host's
+    /// allocator hands out.
+    ///
+    /// The segment lives as long as this machine and is not otherwise
+    /// distinguished: a far pointer into it resolves through
+    /// [`resolve`](Machine::resolve) and [`write`](Machine::write) like any
+    /// other, and a stray far pointer that lands outside it is bounded by the
+    /// same descriptor limit.
+    ///
+    /// # Errors
+    ///
+    /// If `len` is zero or larger than a 16-bit segment can address, or if the
+    /// mapping or its descriptor cannot be made.
+    pub fn alloc_segment(&mut self, len: usize) -> io::Result<u16> {
+        if len == 0 || len > SEGMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a 16-bit segment is 1..={SEGMENT_BYTES} bytes, not {len}"),
+            ));
+        }
+        let segment = Segment::new(len, false)?;
+        let selector = segment.selector();
+        self.segments.push(segment);
+        Ok(selector)
     }
 
     /// Place a raw image at offset 0 of the scratch code segment.
@@ -465,7 +534,7 @@ impl Machine {
         // no way back. Better an error here than a fault there.
         self.segment(entry.selector)?;
 
-        if let Some(poison) = self.poisoned {
+        if let Some(poison) = &self.poisoned {
             return Err(io::Error::other(format!(
                 "refusing to enter a poisoned module: {poison}"
             )));
@@ -572,6 +641,22 @@ impl Machine {
             .frame_sp
             .expect("arg_u16() with no outstanding call to read from");
         self.stack().read_u16(usize::from(sp) + 4 + n * 2)
+    }
+
+    /// Read the `n`th and `n + 1`th argument words as one 32-bit value, low
+    /// half first.
+    ///
+    /// That is a `long`, and it is also the shape a far pointer arrives in --
+    /// [`arg_far`](Machine::arg_far) is the same two words read as an address
+    /// rather than a number. Which of the two a given argument is depends on
+    /// the routine, and for a varargs routine on the format string, so the
+    /// choice belongs to the caller.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn arg_u32(&self, n: usize) -> u32 {
+        u32::from(self.arg_u16(n)) | (u32::from(self.arg_u16(n + 1)) << 16)
     }
 
     /// Selector of the scratch code segment [`Machine::load_code`] fills.
