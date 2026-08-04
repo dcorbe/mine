@@ -23,6 +23,7 @@
 mod exports;
 mod fmt;
 mod globals;
+pub mod msg;
 mod shims;
 #[cfg(test)]
 mod testing;
