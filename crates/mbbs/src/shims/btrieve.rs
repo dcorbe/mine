@@ -141,10 +141,31 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let geometry = Geometry::read(&name, &path).map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // `PLBTVSTF.C:150` -- `bb->reclen=maxlen`, the module's number and not the
-    // file's. They are allowed to differ: a module whose struct is a prefix of
-    // the record reads the prefix. What is not allowed is a `data` buffer this
-    // host would later overrun, which is the step that reads records.
-    if maxlen != geometry.reclen {
+    // file's. They are allowed to differ, and **the two directions are not the
+    // same thing**, which is why they are reported differently.
+    //
+    // Opening for *more* is ordinary: `WCCTEXT.DAT` holds variable-length
+    // records up to 22 bytes and MajorMUD opens it for 2022, which is the
+    // buffer a variable-length read needs. `movmem(gpbptr,recptr,dbflen)`
+    // copies what Btrieve returned, and so does [`deliver`]. They agree.
+    //
+    // Opening for *less* is where this host and the original part company.
+    // Btrieve answered a read on a too-short buffer with status 22;
+    // `posbtverr` (`:746`) declined to `catastro` because the status was 22,
+    // wrote `gpbptr[bb->reclen-1]='\0'`, and only then let the copy run. This
+    // host truncates and writes no terminator. No module has done it yet --
+    // fifteen of MajorMUD's opens match exactly and the sixteenth is `WCCTEXT`
+    // -- so the divergence is recorded rather than implemented, and this note
+    // is what would say it had become live.
+    if maxlen < geometry.reclen {
+        host.note(format!(
+            "{name} holds {}-byte records and the module opened it for only \
+             {maxlen}, so a read is truncated -- where the real host would also \
+             have terminated it at byte {}, per PLBTVSTF.C:750",
+            geometry.reclen,
+            maxlen.saturating_sub(1)
+        ));
+    } else if maxlen > geometry.reclen {
         host.note(format!(
             "{name} holds {}-byte records and the module opened it for {maxlen}",
             geometry.reclen
@@ -1350,13 +1371,23 @@ mod tests {
         // disagreeing is legitimate -- a module may read a prefix of a record --
         // but it is also what a mismatched data file looks like, so it is
         // visible rather than silent.
+        //
+        // **The two directions are reported differently**, because only one of
+        // them diverges from the original: opening short is where Btrieve
+        // answered status 22 and `posbtverr` wrote a terminator this host does
+        // not. Opening long is what `WCCTEXT.DAT` does and agrees exactly.
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 32);
-        assert!(
-            f.host.notes().iter().any(|n| n.contains("SAMPLE.DAT")),
-            "{:?}",
-            f.host.notes()
-        );
+        let short = f.host.notes().last().expect("noted").clone();
+        assert!(short.contains("SAMPLE.DAT"), "{short}");
+        assert!(short.contains("only 32"), "the short direction: {short}");
+        assert!(short.contains("truncated"), "and what it costs: {short}");
+
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 128);
+        let long = f.host.notes().last().expect("noted").clone();
+        assert!(long.contains("SAMPLE.DAT"), "{long}");
+        assert!(!long.contains("truncated"), "nothing is lost either way: {long}");
     }
 
     #[test]
