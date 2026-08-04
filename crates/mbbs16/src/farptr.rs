@@ -28,6 +28,18 @@ pub struct FarPtr {
 }
 
 impl FarPtr {
+    /// The null pointer, as 16-bit code writes it.
+    ///
+    /// Selector 0 names nothing -- [`ldt_index`] rejects it before any access --
+    /// so this is a value the host can hand back and a module can test, and
+    /// never one that resolves. It is what a routine returns when absence is the
+    /// answer: `fopen` of a file that is not there, `rstbtv` past the bottom of
+    /// the stack.
+    pub const NULL: Self = Self {
+        offset: 0,
+        selector: 0,
+    };
+
     /// The four bytes an `lcall` operand -- or a pushed far pointer argument --
     /// consists of.
     pub fn to_bytes(self) -> [u8; 4] {

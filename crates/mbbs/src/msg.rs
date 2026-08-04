@@ -40,6 +40,8 @@ use std::io;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::arena::Arena;
+
 /// One `.MSG` file, as a numbered list of messages.
 ///
 /// Message *text* only. The type letter and its arguments -- `S 30 <prompt>`,
@@ -288,68 +290,6 @@ pub fn value(message: &[u8]) -> &[u8] {
 /// `int`, three `long`s and two more `int`s.
 const MSGBLK: usize = 5 * 4 + 2 + 3 * 4 + 2 + 2;
 
-/// Bytes in one of the arena's segments.
-const ARENA_SEGMENT: usize = 64 * 1024;
-
-/// Message text, in memory the module can address and the host never moves.
-///
-/// `stgopt` returns a `char *` the module may hold across other calls. The real
-/// host reused one `msgbuf` for this, and a module that held a pointer too long
-/// got whatever was read next; we can be strictly safer for nothing, by giving
-/// every message an address of its own that lives as long as the block does.
-///
-/// Append-only across a list of segments, because `WCCMMHLP.MSG` is 124 KB and
-/// one 16-bit segment is 64. No allocator and **no dependency on the module
-/// heap**, which is what lets message files come first.
-///
-/// Nothing here is ever reclaimed -- `clsmsg` does not shrink it. Three files
-/// is nothing; a host that opened and closed message files in a loop would grow
-/// without bound, and that is worth knowing rather than mechanising.
-#[derive(Default)]
-struct Arena {
-    /// Each segment and how much of it is spoken for.
-    segments: Vec<(u16, usize)>,
-}
-
-impl Arena {
-    /// Copy `bytes` and a terminator somewhere stable, and say where.
-    ///
-    /// # Errors
-    ///
-    /// If a segment cannot be mapped, or `bytes` is too long for one.
-    fn intern(&mut self, machine: &mut Machine, bytes: &[u8]) -> io::Result<FarPtr> {
-        let need = bytes.len() + 1;
-        if need > ARENA_SEGMENT {
-            // `OPTSIZE` is 16,384, so this is a corrupt file rather than a
-            // limit anything legitimate reaches.
-            return Err(io::Error::other(format!(
-                "a {need}-byte message will not fit in a {ARENA_SEGMENT}-byte segment"
-            )));
-        }
-
-        // A C string cannot cross a selector boundary, so a message that does
-        // not fit in what is left starts a new segment rather than being split.
-        let room = self
-            .segments
-            .last()
-            .is_some_and(|(_, used)| ARENA_SEGMENT - used >= need);
-        if !room {
-            self.segments.push((machine.alloc_segment(ARENA_SEGMENT)?, 0));
-        }
-
-        let (selector, used) = self.segments.last_mut().expect("just ensured");
-        let at = FarPtr {
-            offset: *used as u16,
-            selector: *selector,
-        };
-        let mut out = bytes.to_vec();
-        out.push(0);
-        machine.write(at, &out).map_err(io::Error::other)?;
-        *used += need;
-        Ok(at)
-    }
-}
-
 /// One open message file.
 struct Block {
     /// What it was opened as, for error messages.
@@ -404,8 +344,7 @@ impl Messages {
             text.push(self.arena.intern(machine, message)?);
         }
 
-        // `intern` adds the terminator, which is the struct's last byte.
-        let cookie = self.arena.intern(machine, &[0u8; MSGBLK - 1])?;
+        let cookie = self.arena.reserve(machine, MSGBLK)?;
         let count = u16::try_from(file.len()).map_err(|_| {
             io::Error::other(format!("{name} has {} messages, which is more \
                 than a 16-bit msgcnt holds", file.len()))

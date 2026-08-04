@@ -305,13 +305,6 @@ const SEGMAX: u16 = 24;
 /// `BTVSTF.H:14` -- how deep `setbtv`'s stack is.
 const BBSTSZ: usize = 10;
 
-/// The null `struct btvblk *`, which is what the bottom of the stack holds and
-/// what every routine in `PLBTVSTF.C` checks for before doing anything.
-const NULL: FarPtr = FarPtr {
-    offset: 0,
-    selector: 0,
-};
-
 /// Where a file is positioned: the cursor Btrieve keeps in its position block.
 ///
 /// Not in the module's memory. Btrieve kept it in `posblk`, which is 128 opaque
@@ -486,7 +479,7 @@ impl Default for Btrieve {
     fn default() -> Self {
         Self {
             open: Vec::new(),
-            stack: [NULL; BBSTSZ],
+            stack: [FarPtr::NULL; BBSTSZ],
             mode: 0,
         }
     }
@@ -609,7 +602,7 @@ impl Btrieve {
         let dropped = self.stack[BBSTSZ - 1];
         self.stack.copy_within(0..BBSTSZ - 1, 1);
         self.stack[0] = current;
-        if dropped == NULL {
+        if dropped == FarPtr::NULL {
             return None;
         }
         Some(match self.find(dropped) {
@@ -635,12 +628,12 @@ impl Btrieve {
     pub fn restore(&mut self) -> (FarPtr, bool) {
         let restored = self.stack[0];
         self.stack.copy_within(1..BBSTSZ, 0);
-        (restored, restored == NULL)
+        (restored, restored == FarPtr::NULL)
     }
 
     /// The null `struct btvblk *`.
     pub fn null() -> FarPtr {
-        NULL
+        FarPtr::NULL
     }
 
     /// The mode the next `opnbtv` will use.
