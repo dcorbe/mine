@@ -262,6 +262,39 @@ pub fn cntrbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     Ok(Ret::U32(file.geometry().records))
 }
 
+/// `void invbtv(void *recptr, int length)` -- insert a new record.
+///
+/// Four call sites, and **initialisation reaches one of them**: call 130,
+/// straight after the `obtbtvl` that answered "there is no such record".
+///
+/// # It answers when there is no file, and refuses when there is
+///
+/// The two are not the same thing and this is the one routine so far where the
+/// difference is load-bearing. `PLBTVSTF.C:584` opens with the same guard the
+/// six reads have:
+///
+///
+/// With no file current the real host inserted nothing and returned, so
+/// answering nothing is reproducing it rather than pretending. **That is all
+/// initialisation needs**, and it needs it without this host having written a
+/// byte.
+///
+/// With a file current it is a real insert, and nothing in this crate writes to
+/// a Btrieve file. That is a refusal, and it is the refusal the whole design
+/// exists for: a module told its insert worked and then finding the character
+/// gone is the failure nothing else catches.
+pub fn invbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let Some(block) = positioned(machine, host, "invbtv")? else {
+        note_no_file(host, "invbtv");
+        return Ok(Ret::Void);
+    };
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Err(ShimError::Failed(format!(
+        "invbtv into {}, and nothing in this host writes to a Btrieve file",
+        file.name()
+    )))
+}
+
 /// What a Btrieve operation code asks for.
 ///
 /// The numbers are Btrieve's own and they arrive from three directions:
@@ -1898,6 +1931,34 @@ mod tests {
         let mut f = nothing_current();
         let e = f.invoke(cntrbtv, &[]).expect_err("no file");
         assert!(e.to_string().contains("cntrbtv"), "{e}");
+    }
+
+    #[test]
+    fn invbtv_with_no_file_current_inserts_nothing_and_says_so() {
+        // `PLBTVSTF.C:584` is the same guard the six reads have, in a `void`
+        // function: with no file current the real host inserted nothing and
+        // returned. Call 130 of `_INIT__WCCMMUD` is exactly this.
+        let mut f = nothing_current();
+        assert_eq!(f.invoke(invbtv, &[0, 0, 64]).expect("answers"), Ret::Void);
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("invbtv")),
+            "and it is recorded: {:?}",
+            f.host.notes()
+        );
+    }
+
+    #[test]
+    fn invbtv_with_a_file_current_refuses_and_names_the_file() {
+        // The other half, and the more important one. Nothing in this host
+        // writes to a Btrieve file, so an insert into a real file must stop the
+        // module rather than appear to work -- a module told its insert
+        // succeeded and then finding the record gone is the failure mode this
+        // whole crate is shaped around.
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f.invoke(invbtv, &[0, 0, 64]).expect_err("nothing here writes");
+        assert!(e.to_string().contains("invbtv"), "{e}");
+        assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }
 
     #[test]

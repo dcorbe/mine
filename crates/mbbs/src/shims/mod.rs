@@ -128,6 +128,10 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "absbtv", btrieve::absbtv),
     (MAJORBBS, "aabbtv", btrieve::aabbtv),
     (MAJORBBS, "gabbtvl", btrieve::gabbtvl),
+    // Btrieve: the write family's guards. Neither of these writes -- each
+    // reproduces what `PLBTVSTF.C` did with no file current, and refuses when
+    // there is one.
+    (MAJORBBS, "invbtv", btrieve::invbtv),
     // Streams: the module's own files, read and written.
     (MAJORBBS, "fopen", stream::fopen),
     (MAJORBBS, "fclose", stream::fclose),
