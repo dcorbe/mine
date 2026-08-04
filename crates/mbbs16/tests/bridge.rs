@@ -45,7 +45,9 @@ fn a_module_image_may_fill_its_whole_code_segment() {
 
     machine.load_code(&image).expect("a full segment of module");
 
-    let mut exit = machine.call(HIGH_ENTRY as u16, &[]).expect("called it");
+    let mut exit = machine
+        .call(machine.code_ptr(HIGH_ENTRY as u16), &[])
+        .expect("called it");
     let mut serviced = 0;
 
     loop {

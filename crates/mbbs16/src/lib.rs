@@ -18,7 +18,7 @@
 //! # fn demo() -> std::io::Result<()> {
 //! let mut machine = Machine::new()?;
 //! machine.load_code(&[0xcb])?;              // a module that returns at once
-//! let mut exit = machine.call(0, &[])?;
+//! let mut exit = machine.call(machine.code_ptr(0), &[])?;
 //! loop {
 //!     match exit {
 //!         Exit::Call { index } => {
@@ -85,6 +85,7 @@
 mod asm;
 mod farptr;
 mod fault;
+mod ne;
 mod seg;
 mod watchdog;
 
@@ -94,6 +95,10 @@ use std::time::Duration;
 use asm::{Ctx, mbbs16_enter, trampoline};
 use farptr::ldt_index;
 pub use farptr::{FarPtr, FarPtrError};
+pub use ne::{
+    EntryPoint, Import, ImportResolver, ImportSite, Module, NeError, NeImage, Relocation,
+    SegmentEntry, Source, Symbol, Target,
+};
 use seg::Segment;
 use watchdog::Watched;
 
@@ -123,8 +128,7 @@ pub const MAX_THUNKS: u16 = 512;
 /// Where the 64-bit trampoline is copied to: immediately past the thunk table,
 /// in the same segment. It must live below 4 GiB, because the 16-bit far jump
 /// that reaches it can name a 32-bit offset and no more.
-const TRAMPOLINE_OFFSET: usize =
-    THUNK_TABLE_OFFSET + (MAX_THUNKS as usize + 1) * THUNK_STRIDE;
+const TRAMPOLINE_OFFSET: usize = THUNK_TABLE_OFFSET + (MAX_THUNKS as usize + 1) * THUNK_STRIDE;
 
 /// Stack pointer a module starts with: the top of its stack segment, less a
 /// word so that the first push has somewhere to go.
@@ -195,7 +199,10 @@ impl std::fmt::Display for Poison {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fault { signo, cs, ip } => {
-                write!(f, "module faulted with signal {signo} at {cs:#06x}:{ip:#06x}")
+                write!(
+                    f,
+                    "module faulted with signal {signo} at {cs:#06x}:{ip:#06x}"
+                )
             }
             Self::Timeout { cs, ip } => {
                 write!(f, "module timed out at {cs:#06x}:{ip:#06x}")
@@ -244,13 +251,22 @@ impl Ret {
 /// re-enter it where it left off.
 pub struct Machine {
     /// Every segment this module owns, in no particular order. Lookup is by
-    /// selector, because that is the only thing a far pointer carries; a real
-    /// NE image will add its own code and data segments here.
-    segments: Vec<Segment>,
-    code: usize,
-    stack: usize,
-    data: usize,
-    bridge: usize,
+    /// selector, because that is the only thing a far pointer carries -- and a
+    /// loaded NE image appends 82 more of them here, so an index would be a
+    /// second way of naming a segment that the module itself cannot use.
+    pub(crate) segments: Vec<Segment>,
+
+    /// The scratch code segment [`Machine::load_code`] fills. Unused once an NE
+    /// image is loaded, which brings 34 code segments of its own.
+    code: u16,
+    stack: u16,
+
+    /// The segment `DS` is loaded from: the scratch one until an NE image is
+    /// loaded, and that image's `DGROUP` afterwards.
+    pub(crate) data: u16,
+
+    /// The thunk table and the trampoline. The host's, and no module's.
+    bridge: u16,
 
     /// The state the assembly is entered through, together with the CPU-time
     /// timer that stops a module which will not stop itself. One object because
@@ -332,12 +348,15 @@ impl Machine {
             )?;
         }
 
+        let (code_sel, stack_sel) = (code.selector(), stack.selector());
+        let (data_sel, bridge_sel) = (data.selector(), bridge.selector());
+
         Ok(Self {
             segments: vec![code, stack, data, bridge],
-            code: 0,
-            stack: 1,
-            data: 2,
-            bridge: 3,
+            code: code_sel,
+            stack: stack_sel,
+            data: data_sel,
+            bridge: bridge_sel,
             ctx: Watched::new()?,
             frame_sp: None,
             budget: DEFAULT_BUDGET,
@@ -384,19 +403,32 @@ impl Machine {
         self.thunk_slot(index)
     }
 
-    fn thunk_slot(&self, slot: u16) -> FarPtr {
+    pub(crate) fn thunk_slot(&self, slot: u16) -> FarPtr {
         FarPtr {
             offset: (THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE) as u16,
-            selector: self.bridge_selector(),
+            selector: self.bridge,
         }
     }
 
-    /// Place a module image at offset 0 of the code segment.
+    /// Place a raw image at offset 0 of the scratch code segment.
     ///
     /// The image may be as large as a 16-bit segment: nothing of the host's
-    /// shares that segment with it.
+    /// shares that segment with it. For a real module, see
+    /// [`Machine::load_ne`].
     pub fn load_code(&mut self, image: &[u8]) -> io::Result<()> {
-        self.segments[self.code].write(0, image)
+        let code = self.code;
+        self.segment_mut(code)
+            .expect("the scratch code segment is this machine's own")
+            .write(0, image)
+    }
+
+    /// A far pointer to `offset` within the scratch code segment. The entry
+    /// point of anything [`Machine::load_code`] placed there.
+    pub fn code_ptr(&self, offset: u16) -> FarPtr {
+        FarPtr {
+            offset,
+            selector: self.code,
+        }
     }
 
     /// Call a module entry point, the way the real host does.
@@ -426,8 +458,12 @@ impl Machine {
     ///
     /// If the machine is [`Machine::poisoned`], or the arguments and frame will
     /// not fit on the module's stack.
-    pub fn call(&mut self, entry: u16, args: &[u16]) -> io::Result<Exit> {
+    pub fn call(&mut self, entry: FarPtr, args: &[u16]) -> io::Result<Exit> {
         let () = Ctx::ASSERT_FAR_POINTER_FIRST;
+
+        // A far jump into a segment we do not own would leave 16-bit mode with
+        // no way back. Better an error here than a fault there.
+        self.segment(entry.selector)?;
 
         if let Some(poison) = self.poisoned {
             return Err(io::Error::other(format!(
@@ -454,7 +490,10 @@ impl Machine {
             .chain(args.iter().copied())
             .collect();
 
-        let stack = &mut self.segments[self.stack];
+        let stack_sel = self.stack;
+        let stack = self
+            .segment_mut(stack_sel)
+            .expect("the stack segment is this machine's own");
         for (i, word) in frame.iter().enumerate() {
             stack.write(usize::from(sp) + i * 2, &word.to_le_bytes())?;
         }
@@ -468,7 +507,7 @@ impl Machine {
 
         // A module starts with DS naming its own data segment. After that it is
         // whatever the module last had, since DS is callee-saved.
-        self.ctx.out_ds = u64::from(self.data_selector());
+        self.ctx.out_ds = u64::from(self.data);
 
         self.ctx.arm(self.budget)?;
         self.run(entry, sp, Ret::Void)
@@ -495,18 +534,29 @@ impl Machine {
             .frame_sp
             .expect("resume() with no outstanding call to resume from");
 
-        let ip = self.stack().read_u16(usize::from(sp));
-        let cs = self.stack().read_u16(usize::from(sp) + 2);
-        debug_assert_eq!(cs, self.code_selector(), "call frame names another segment");
+        // Where the module's own far call will return to. A module with 34 code
+        // segments calls out from any of them, so this is read back rather than
+        // assumed -- but it must still be a segment we own.
+        let at = FarPtr {
+            offset: self.stack().read_u16(usize::from(sp)),
+            selector: self.stack().read_u16(usize::from(sp) + 2),
+        };
+        debug_assert!(
+            self.segment(at.selector).is_ok(),
+            "call frame names a segment that is not this machine's"
+        );
 
         if self.ctx.expired() {
             // Report where it would have resumed. That is the honest answer to
             // "where did it stop": the module is parked at an import call, and
             // this is the instruction after it.
-            return self.terminate(Exit::Timeout { cs, ip });
+            return self.terminate(Exit::Timeout {
+                cs: at.selector,
+                ip: at.offset,
+            });
         }
 
-        self.run(ip, sp + 4, ret)
+        self.run(at, sp + 4, ret)
     }
 
     /// Read the `n`th 16-bit argument of the outstanding call.
@@ -524,9 +574,9 @@ impl Machine {
         self.stack().read_u16(usize::from(sp) + 4 + n * 2)
     }
 
-    /// Selector of the module's code segment.
+    /// Selector of the scratch code segment [`Machine::load_code`] fills.
     pub fn code_selector(&self) -> u16 {
-        self.segments[self.code].selector()
+        self.code
     }
 
     /// Selector of the module's stack segment.
@@ -534,22 +584,20 @@ impl Machine {
     /// Worth having separately from the code one: under `DS != SS` a module
     /// hands out pointers to its own locals, and this is the segment they name.
     pub fn stack_selector(&self) -> u16 {
-        self.segments[self.stack].selector()
+        self.stack
     }
 
     /// Selector of the module's data segment: its `DGROUP`.
+    ///
+    /// The scratch one until [`Machine::load_ne`] replaces it with the loaded
+    /// module's own.
     pub fn data_selector(&self) -> u16 {
-        self.segments[self.data].selector()
-    }
-
-    /// Selector of the bridge: the thunk table and the trampoline, which are
-    /// the host's and no module's.
-    fn bridge_selector(&self) -> u16 {
-        self.segments[self.bridge].selector()
+        self.data
     }
 
     fn stack(&self) -> &Segment {
-        &self.segments[self.stack]
+        self.segment(self.stack)
+            .expect("the stack segment is this machine's own")
     }
 
     /// Find the segment a selector names.
@@ -557,6 +605,15 @@ impl Machine {
         let index = ldt_index(selector)?;
         self.segments
             .iter()
+            .find(|s| s.entry() == u32::from(index))
+            .ok_or(FarPtrError::NoSuchSegment { selector })
+    }
+
+    /// Find the segment a selector names, to write to.
+    fn segment_mut(&mut self, selector: u16) -> Result<&mut Segment, FarPtrError> {
+        let index = ldt_index(selector)?;
+        self.segments
+            .iter_mut()
             .find(|s| s.entry() == u32::from(index))
             .ok_or(FarPtrError::NoSuchSegment { selector })
     }
@@ -633,15 +690,7 @@ impl Machine {
     pub fn write(&mut self, ptr: FarPtr, bytes: &[u8]) -> Result<(), FarPtrError> {
         // Resolve first so the bounds check and the error are shared.
         self.resolve(ptr, bytes.len())?;
-        let index = ldt_index(ptr.selector)?;
-        let segment = self
-            .segments
-            .iter_mut()
-            .find(|s| s.entry() == u32::from(index))
-            .ok_or(FarPtrError::NoSuchSegment {
-                selector: ptr.selector,
-            })?;
-        segment
+        self.segment_mut(ptr.selector)?
             .write(usize::from(ptr.offset), bytes)
             .expect("bounds already checked by resolve");
         Ok(())
@@ -692,12 +741,12 @@ impl Machine {
     }
 
     /// Cross into 16-bit mode and come back.
-    fn run(&mut self, ip: u16, sp: u16, ret: Ret) -> io::Result<Exit> {
+    fn run(&mut self, at: FarPtr, sp: u16, ret: Ret) -> io::Result<Exit> {
         let (ax, dx) = ret.registers();
 
-        self.ctx.target_offset = u32::from(ip);
-        self.ctx.target_selector = self.code_selector();
-        self.ctx.ss16 = self.stack_selector();
+        self.ctx.target_offset = u32::from(at.offset);
+        self.ctx.target_selector = at.selector;
+        self.ctx.ss16 = self.stack;
         self.ctx.sp = u64::from(sp);
         self.ctx.ax = u64::from(ax);
         self.ctx.dx = u64::from(dx);
@@ -742,8 +791,7 @@ impl Machine {
         }
 
         debug_assert_eq!(
-            self.ctx.out_ss as u16,
-            self.stack_selector(),
+            self.ctx.out_ss as u16, self.stack,
             "came back on a stack that is not the module's"
         );
 

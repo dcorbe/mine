@@ -47,7 +47,9 @@ fn a_host_call_preserves_si_di_and_bp() {
     code[NOOP_SITE..NOOP_SITE + 4].copy_from_slice(&noop);
     machine.load_code(&code).expect("module fits");
 
-    let mut exit_reason = machine.call(0, &[]).expect("called the module");
+    let mut exit_reason = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
 
     loop {
         match exit_reason {

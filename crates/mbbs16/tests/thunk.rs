@@ -52,7 +52,9 @@ fn sixteen_bit_code_calls_a_host_function_and_uses_the_result() {
     code[ADD_CALL_SITE..ADD_CALL_SITE + 4].copy_from_slice(&add);
     machine.load_code(&code).expect("module fits");
 
-    let mut exit_reason = machine.call(0, &[]).expect("called the module");
+    let mut exit_reason = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     let mut serviced = 0;
     let returned;
 

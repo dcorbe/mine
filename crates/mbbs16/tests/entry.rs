@@ -47,7 +47,9 @@ fn machine_with(code: &[u8]) -> Machine {
 fn a_module_entry_point_receives_its_arguments_in_cdecl_order() {
     let mut machine = machine_with(SUBTRACT_ENTRY);
 
-    let exit = machine.call(0, &[70, 28]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[70, 28])
+        .expect("called the module");
 
     match exit {
         Exit::Returned { ax, dx } => {
@@ -64,7 +66,9 @@ fn arguments_are_not_silently_reversed() {
     // module would compute 28 - 70 and this would be the passing case.
     let mut machine = machine_with(SUBTRACT_ENTRY);
 
-    let exit = machine.call(0, &[28, 70]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[28, 70])
+        .expect("called the module");
 
     match exit {
         Exit::Returned { ax, .. } => assert_eq!(ax, 28u16.wrapping_sub(70)),
@@ -76,7 +80,10 @@ fn arguments_are_not_silently_reversed() {
 fn a_module_can_return_a_long() {
     let mut machine = machine_with(LONG_ENTRY);
 
-    match machine.call(0, &[]).expect("called the module") {
+    match machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module")
+    {
         Exit::Returned { ax, dx } => {
             assert_eq!(ax, 0x1234, "low half");
             assert_eq!(dx, 0x5678, "high half");
@@ -93,7 +100,10 @@ fn each_call_starts_from_a_clean_stack() {
     let mut machine = machine_with(SUBTRACT_ENTRY);
 
     for _ in 0..64 {
-        match machine.call(0, &[100, 1]).expect("called the module") {
+        match machine
+            .call(machine.code_ptr(0), &[100, 1])
+            .expect("called the module")
+        {
             Exit::Returned { ax, .. } => assert_eq!(ax, 99),
             other => panic!("expected a return, got {other:?}"),
         }
@@ -114,7 +124,9 @@ fn an_entry_point_can_call_the_host_and_still_return() {
     code[1..5].copy_from_slice(&machine.thunk_address(THUNK).to_bytes());
     machine.load_code(&code).expect("module fits");
 
-    let mut exit = machine.call(0, &[]).expect("called the module");
+    let mut exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     let mut serviced = 0;
 
     loop {

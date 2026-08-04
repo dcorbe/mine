@@ -92,7 +92,9 @@ fn a_far_pointer_argument_resolves_through_the_segment_it_names() {
     let stack_sel = machine.stack_selector();
     let code_sel = machine.code_selector();
 
-    let mut exit = machine.call(0, &[]).expect("called the module");
+    let mut exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     let mut seen: Vec<Vec<u8>> = Vec::new();
 
     loop {

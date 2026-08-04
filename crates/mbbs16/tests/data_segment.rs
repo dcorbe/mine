@@ -67,7 +67,9 @@ fn run() -> (u16, u16) {
         )
         .expect("second global");
 
-    let mut exit_reason = machine.call(0, &[]).expect("called the module");
+    let mut exit_reason = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     loop {
         match exit_reason {
             Exit::Call { index: THUNK } => {

@@ -52,7 +52,9 @@ fn wedged_machine() -> Machine {
 fn a_module_that_never_returns_is_interrupted() {
     let mut machine = wedged_machine();
 
-    let exit = machine.call(0, &[]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
 
     match exit {
         Exit::Timeout { cs, ip } => {
@@ -88,7 +90,9 @@ fn a_module_looping_on_a_host_call_is_interrupted() {
     // Bounded so that a broken watchdog fails the test instead of running until
     // someone notices. An iteration costs a few hundred nanoseconds even at
     // -O0, so this is orders of magnitude more than the budget can cover.
-    let mut exit = machine.call(0, &[]).expect("called the module");
+    let mut exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     for _ in 0..10_000_000 {
         match exit {
             Exit::Call { index } => {
@@ -124,7 +128,9 @@ fn an_overrun_spent_in_host_code_still_counts() {
     code.push(0xcb); // lret, once the host is done
     machine.load_code(&code).expect("module fits");
 
-    let exit = machine.call(0, &[]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     assert!(matches!(exit, Exit::Call { index: THUNK }), "{exit:?}");
 
     burn(BUDGET * 3);
@@ -144,7 +150,7 @@ fn an_overrun_spent_in_host_code_still_counts() {
 fn the_host_still_works_after_a_timeout() {
     let mut wedged = wedged_machine();
     assert!(matches!(
-        wedged.call(0, &[]).expect("called"),
+        wedged.call(wedged.code_ptr(0), &[]).expect("called"),
         Exit::Timeout { .. }
     ));
 
@@ -153,7 +159,7 @@ fn the_host_still_works_after_a_timeout() {
     let mut fresh = Machine::new().expect("second 16-bit machine");
     fresh.load_code(&polite_module()).expect("module fits");
     assert!(matches!(
-        fresh.call(0, &[]).expect("called"),
+        fresh.call(fresh.code_ptr(0), &[]).expect("called"),
         Exit::Returned { .. }
     ));
 }
@@ -164,7 +170,7 @@ fn a_timed_out_machine_refuses_to_be_entered_again() {
     // updating. The module is untrustworthy, not merely stopped.
     let mut machine = wedged_machine();
     assert!(matches!(
-        machine.call(0, &[]).expect("called"),
+        machine.call(machine.code_ptr(0), &[]).expect("called"),
         Exit::Timeout { .. }
     ));
 
@@ -173,7 +179,7 @@ fn a_timed_out_machine_refuses_to_be_entered_again() {
         "a timed-out machine is poisoned"
     );
     assert!(
-        machine.call(0, &[]).is_err(),
+        machine.call(machine.code_ptr(0), &[]).is_err(),
         "a poisoned machine must refuse a second call"
     );
 }
@@ -190,7 +196,7 @@ fn a_well_behaved_module_is_never_interrupted() {
 
     for _ in 0..10_000 {
         assert!(matches!(
-            machine.call(0, &[]).expect("called"),
+            machine.call(machine.code_ptr(0), &[]).expect("called"),
             Exit::Returned { .. }
         ));
     }
@@ -213,7 +219,7 @@ fn a_ticking_machine_does_not_kill_a_different_one() {
     code.push(0xcb); // lret
     parked.load_code(&code).expect("module fits");
     assert!(matches!(
-        parked.call(0, &[]).expect("called"),
+        parked.call(parked.code_ptr(0), &[]).expect("called"),
         Exit::Call { index: THUNK }
     ));
 
@@ -232,7 +238,7 @@ fn a_ticking_machine_does_not_kill_a_different_one() {
     spin.push(0xcb); // lret
     busy.load_code(&spin).expect("module fits");
 
-    let exit = busy.call(0, &[]).expect("called");
+    let exit = busy.call(busy.code_ptr(0), &[]).expect("called");
     assert!(
         matches!(exit, Exit::Returned { .. }),
         "a tick meant for another machine stopped this one: {exit:?}"

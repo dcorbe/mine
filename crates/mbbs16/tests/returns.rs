@@ -36,7 +36,9 @@ fn returned(ret: Ret) -> (u16, u16) {
     code[CALL_SITE..CALL_SITE + 4].copy_from_slice(&thunk);
     machine.load_code(&code).expect("module fits");
 
-    let mut exit_reason = machine.call(0, &[]).expect("called the module");
+    let mut exit_reason = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
     loop {
         match exit_reason {
             Exit::Call { index: THUNK } => {

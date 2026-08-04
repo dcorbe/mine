@@ -28,7 +28,9 @@ fn a_module_that_faults_is_reported_not_fatal() {
     let mut machine = Machine::new().expect("16-bit machine");
     machine.load_code(&suicidal_module()).expect("module fits");
 
-    let exit = machine.call(0, &[]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
 
     match exit {
         Exit::Fault { signo, .. } => assert_eq!(signo, libc::SIGSEGV, "HLT raises #GP"),
@@ -45,7 +47,9 @@ fn a_fault_says_where_the_module_stopped() {
     let mut machine = Machine::new().expect("16-bit machine");
     machine.load_code(&suicidal_module()).expect("module fits");
 
-    let exit = machine.call(0, &[]).expect("called the module");
+    let exit = machine
+        .call(machine.code_ptr(0), &[])
+        .expect("called the module");
 
     match exit {
         Exit::Fault { cs, ip, .. } => {
@@ -63,7 +67,7 @@ fn a_faulted_machine_refuses_to_be_entered_again() {
     let mut machine = Machine::new().expect("16-bit machine");
     machine.load_code(&suicidal_module()).expect("module fits");
     assert!(matches!(
-        machine.call(0, &[]).expect("called"),
+        machine.call(machine.code_ptr(0), &[]).expect("called"),
         Exit::Fault { .. }
     ));
 
@@ -72,7 +76,7 @@ fn a_faulted_machine_refuses_to_be_entered_again() {
         "a faulted machine is poisoned, not merely stopped"
     );
     assert!(
-        machine.call(0, &[]).is_err(),
+        machine.call(machine.code_ptr(0), &[]).is_err(),
         "a poisoned machine must refuse a second call"
     );
 }
@@ -83,7 +87,7 @@ fn the_host_still_works_after_a_module_faults() {
     let mut doomed = Machine::new().expect("16-bit machine");
     doomed.load_code(&suicidal_module()).expect("module fits");
     assert!(matches!(
-        doomed.call(0, &[]).expect("called"),
+        doomed.call(doomed.code_ptr(0), &[]).expect("called"),
         Exit::Fault { .. }
     ));
 
@@ -92,7 +96,7 @@ fn the_host_still_works_after_a_module_faults() {
     let mut fresh = Machine::new().expect("second 16-bit machine");
     fresh.load_code(&polite_module()).expect("module fits");
     assert!(matches!(
-        fresh.call(0, &[]).expect("called"),
+        fresh.call(fresh.code_ptr(0), &[]).expect("called"),
         Exit::Returned { .. }
     ));
 }
@@ -110,7 +114,7 @@ fn a_faulted_module_reports_the_fault_rather_than_a_stale_call() {
     code.push(0xf4); // hlt, on return
     machine.load_code(&code).expect("module fits");
 
-    let first = machine.call(0, &[]).expect("called");
+    let first = machine.call(machine.code_ptr(0), &[]).expect("called");
     assert!(matches!(first, Exit::Call { index: THUNK }), "{first:?}");
 
     let second = machine.resume(Ret::U16(0)).expect("resumed");
