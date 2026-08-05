@@ -13,55 +13,66 @@
 //! empty range answers its own lower bound, which is outside the range the name
 //! promises.
 //!
-//! # `rand` is disassembled out of period binaries
+//! # `rand` is disassembled out of the host binary itself
 //!
-//! No `MAJORBBS.DLL` survives in `archive/`, so the host's own copy of `rand`
-//! cannot be read directly. It did not have to be. `rand` was *statically
-//! linked* from the Borland C runtime, which means every program built with
-//! that runtime carries a copy -- and three in `archive/` do, byte for byte
-//! identical, differing only in where each one's `RANDSEED` static landed and
-//! in the relative offset of the long-multiply helper:
+//! **There is no `MAJORBBS.DLL`, and looking for one is the mistake.** The
+//! 16-bit host is `MAJORBBS.EXE`: an NE *executable* whose module name is
+//! `MAJORBBS` and which exports ~1,230 ordinals, which is what a module's
+//! imports resolve against. Search `archive/` for a `.dll` and you conclude the
+//! host binary was lost; it was not.
 //!
-//!
-//! The first of those is **Galacticomm's own binary**, off the Worldgroup 3.00
-//! DOS CD-ROM. It is not `MAJORBBS.DLL`, but it is Galacticomm's own build of
-//! the runtime `MAJORBBS.DLL` was built against, and TTI and Infinetwork agree
-//! with it independently. Disassembled (`TTICWD.DLL`, offset `0x73f`):
+//! Four versions are extracted to `re/hosts/` (gitignored, re-extractable), and
+//! `rand` is intact in all four -- byte-identical but for where each build's
+//! `RANDSEED` landed. **`wg200` and `wg101` are the version-matched ones**,
+//! MajorMUD 1.11p being a Worldgroup module:
 //!
 //! ```text
-//! 8b 0e 40 04   mov cx,[0x0440]    ; RANDSEED, high half
-//! 8b 1e 3e 04   mov bx,[0x043e]    ; RANDSEED, low half
-//! ba 5a 01      mov dx,0x015a      ; \  0x015A4E35
-//! b8 35 4e      mov ax,0x4e35      ; /  = 22695477
-//! e8 ba ff      call <long multiply>
-//! 05 01 00      add ax,1           ; \  + 1
-//! 83 d2 00      adc dx,0           ; /
-//! 89 16 40 04   mov [0x0440],dx    ; \  store the new state
-//! a3 3e 04      mov [0x043e],ax    ; /
-//! a1 40 04      mov ax,[0x0440]    ; return the HIGH word -- i.e. state >> 16
-//! 99            cwd
-//! 25 ff 7f      and ax,0x7fff      ; masked to RAND_MAX
-//! cb            retf
+//! MAJORBBS-wg200.EXE   @0x422a2   1996-03   <- matches MajorMUD
+//! MAJORBBS-wg101.EXE   @0x420a2   1995-07   <- matches MajorMUD
+//! MAJORBBS-eng201.EXE  @0x422c8   1996-06
+//! MAJORBBS-mbbstd.EXE  @0x3c028   1993-08
 //! ```
 //!
-//! which is `state = state * 22695477 + 1` and `(state >> 16) & 0x7fff`, and is
-//! line for line what [`Random::rand`] does below. The `+ 1` increment, the
-//! *high* half being the half that is returned, and the mask are all read off
-//! the instructions rather than assumed -- which matters, because those are the
-//! three details a from-memory reconstruction of "the Borland LCG" gets wrong.
+//! Disassembled from `wg200`, which is the copy MajorMUD would have called:
+//!
+//! ```text
+//! srand:
+//!   8b 46 06            mov ax,[bp+6]          ; the 16-bit argument
+//!   c7 06 0c 1b 00 00   mov word [0x1b0c],0    ; RANDSEED high := 0  -- zero-extended
+//!   a3 0a 1b            mov [0x1b0a],ax        ; RANDSEED low  := it
+//!
+//! rand:
+//!   8b 0e 0c 1b   mov cx,[0x1b0c]    ; RANDSEED, high half
+//!   8b 1e 0a 1b   mov bx,[0x1b0a]    ; RANDSEED, low half
+//!   ba 5a 01      mov dx,0x015a      ; \  0x015A4E35
+//!   b8 35 4e      mov ax,0x4e35      ; /  = 22695477
+//!   e8 b4 ff      call <long multiply>
+//!   05 01 00      add ax,1           ; \  + 1
+//!   83 d2 00      adc dx,0           ; /
+//!   89 16 0c 1b   mov [0x1b0c],dx    ; \  store the new state
+//!   a3 0a 1b      mov [0x1b0a],ax    ; /
+//!   a1 0c 1b      mov ax,[0x1b0c]    ; return the HIGH word -- i.e. state >> 16
+//!   25 ff 7f      and ax,0x7fff      ; masked to RAND_MAX
+//! ```
+//!
+//! So `state = state * 22695477 + 1` returning `(state >> 16) & 0x7fff`, from a
+//! seed zero-extended into the low half -- which is line for line
+//! [`Random::new`] and [`Random::rand`] below. The `+ 1` increment, the *high*
+//! half being the half handed back, the mask, and the zero-extension are each
+//! read off an instruction rather than assumed. Those are exactly the details a
+//! from-memory reconstruction of "the Borland LCG" gets wrong.
+//!
+//! Three unrelated period binaries carry the identical function, which is what
+//! first established it before the host was located and is worth keeping as
+//! corroboration: Galacticomm's own `wg300/WGDOS/REGDISK/INSTALL.EXE`, TTI's
+//! `TTICWD.DLL`, and an Infinetwork addon.
 //!
 //! # What is still not pinned, and it is not the generator
 //!
-//! Two honest gaps remain, and neither is large:
-//!
-//! - `MAJORBBS.DLL`'s *own* copy is still unread. Three period parties linking
-//!   the identical function is strong evidence about the runtime, not a
-//!   sighting of the host. If a `MAJORBBS.DLL` ever turns up, the same grep
-//!   settles it outright.
-//! - **The seed is the wall clock.** MajorMUD calls `srand(time(NULL))` six
-//!   calls into initialisation, so no two boots of the *real* host produced the
-//!   same numbers either. Nothing here makes a world reproducible; that is a
-//!   question about the clock, not about this file.
+//! One thing, and it is not about this file: **the seed is the wall clock.**
+//! MajorMUD calls `srand(time(NULL))` six calls into initialisation, so no two
+//! boots of the *real* host produced the same numbers either. Nothing here
+//! makes a world reproducible; that is a question about the clock.
 //!
 //! Note also that the meter cannot see any of this. Initialisation reaches the
 //! same 8,546 calls and the same next stop under this generator, under the ANSI
@@ -133,8 +144,11 @@ pub struct Random {
 impl Random {
     /// Start from `seed`, as `srand` does.
     ///
-    /// Borland's `RANDSEED` is a `long` and `srand` takes an `unsigned`, so the
-    /// 16 bits the module supplies are the low half and the rest is zero.
+    /// `RANDSEED` is a `long` and `srand` takes an `unsigned`, so the 16 bits
+    /// the module supplies are the low half and the rest is zero. That is read
+    /// off the host rather than inferred: `MAJORBBS.EXE` wg200 does
+    /// `mov word [RANDSEED+2],0` before storing the argument into
+    /// `[RANDSEED]`. Zeroed, not sign-extended.
     pub fn new(seed: u16) -> Self {
         Self {
             state: u32::from(seed),
