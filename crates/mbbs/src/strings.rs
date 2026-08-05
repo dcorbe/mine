@@ -46,6 +46,30 @@ pub fn is_white(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
+/// `int toupper(int c)`, for the byte the host actually indexes with.
+///
+/// Ordinal 604, `seg 1:0x54a9`. The original tests **bit 3 of the ctype table**
+/// -- `test byte [es:bx+0x1a09],0x8`, Borland's `_IS_LOW` -- and subtracts 32
+/// when it is set. Nothing above 127 carries a flag in that table, so **only
+/// the 26 ASCII lowercase letters fold** and MajorMUD's high-bit text passes
+/// through untouched.
+///
+/// The `int`-level behaviour -- EOF, and the truncation of everything else to
+/// a byte -- is [`crate::shims::text::toupper`]'s, because it is the `int` that
+/// the argument arrives as and this is the byte the table is indexed with.
+pub fn toupper(c: u8) -> u8 {
+    if c.is_ascii_lowercase() { c - 32 } else { c }
+}
+
+/// `int tolower(int c)` -- ordinal 603, `seg 1:0x5473`, and [`toupper`]'s
+/// mirror instruction for instruction: bit 2 (`_IS_UPP`), plus 32.
+///
+/// This is the routine `sameas`, `sameto` and `samein` fold with -- their
+/// relocation records resolve to ordinal 603, not 604.
+pub fn tolower(c: u8) -> u8 {
+    if c.is_ascii_uppercase() { c + 32 } else { c }
+}
+
 /// `void rmvwht(char *string)` -- remove **every** whitespace character.
 ///
 /// Not a trim. The original keeps two cursors over the one buffer and compacts
@@ -91,6 +115,22 @@ pub fn depad(s: &[u8]) -> (usize, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_folding_covers_the_ascii_letters_and_nothing_else() {
+        // `_ctype` carries `_IS_LOW` and `_IS_UPP` on the 26 ASCII letters and
+        // on nothing at all above 127. MajorMUD's text is full of high-bit
+        // bytes and not one of them folds.
+        let folded: Vec<u8> = (0..=255u8).filter(|&c| toupper(c) != c).collect();
+        assert_eq!(folded, (b'a'..=b'z').collect::<Vec<u8>>());
+
+        let folded: Vec<u8> = (0..=255u8).filter(|&c| tolower(c) != c).collect();
+        assert_eq!(folded, (b'A'..=b'Z').collect::<Vec<u8>>());
+
+        assert_eq!(toupper(b'a'), b'A');
+        assert_eq!(tolower(b'A'), b'a');
+        assert_eq!(toupper(0xe9), 0xe9, "an accented byte is not a letter here");
+    }
 
     #[test]
     fn whitespace_is_the_c_isspace_set_and_nothing_else() {

@@ -291,6 +291,41 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U32(value as u32))
 }
 
+/// `int toupper(int c)`.
+///
+/// **Not a macro here.** Borland's macro is `_toupper`; `toupper` is a real
+/// routine in the runtime, which is why `WCCMMUD.DLL` has 530 *call sites* for
+/// ordinal 604 rather than 530 inlined subtractions.
+///
+/// Two things the prototype does not say, both read off `seg 1:0x54a9`. `-1` is
+/// compared *before* the ctype table is indexed and returned unchanged, so EOF
+/// survives as a full word. Everything else is `mov al,cl; mov ah,0` -- cut to
+/// its low byte and zero-extended back -- so `toupper(0x161)` is `toupper('a')`
+/// and answers `0x41`, not `0x141`.
+pub fn toupper(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::toupper)))
+}
+
+/// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
+/// `sameto` and `samein` fold with.
+pub fn tolower(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::tolower)))
+}
+
+/// The `int` wrapper both case-folding routines share: EOF through untouched,
+/// everything else truncated to a byte and zero-extended back.
+fn fold(c: u16, by: fn(u8) -> u8) -> u16 {
+    /// What `cmp cx,0xffff` compares against, and the one argument that is not
+    /// truncated.
+    const EOF: u16 = -1i16 as u16;
+
+    if c == EOF {
+        EOF
+    } else {
+        u16::from(by(c as u8))
+    }
+}
+
 /// Put `text` and its terminator where a caller's `char *` points.
 ///
 /// How big the buffer is, only the caller knows -- `sprintf` and `vsprintf` are
@@ -337,6 +372,64 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn toupper_folds_a_letter_and_leaves_everything_else() {
+        let mut f = Fixture::new();
+        for (input, want) in [
+            (u16::from(b'a'), u16::from(b'A')),
+            (u16::from(b'A'), u16::from(b'A')),
+            (u16::from(b'7'), u16::from(b'7')),
+            (0, 0),
+        ] {
+            assert_eq!(f.invoke(toupper, &[input]).expect("folded"), Ret::U16(want));
+        }
+        assert_eq!(
+            f.invoke(tolower, &[u16::from(b'Z')]).expect("folded"),
+            Ret::U16(u16::from(b'z'))
+        );
+    }
+
+    #[test]
+    fn toupper_passes_eof_through_and_truncates_everything_else() {
+        // `cmp cx,0xffff` happens before the table is indexed, so EOF is the
+        // one argument that survives as a full word. Every other `int` is cut
+        // to its low byte: `toupper(0x161)` is `toupper('a')`.
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(toupper, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(tolower, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(toupper, &[0x161]).expect("cut"), Ret::U16(0x41));
+        assert_eq!(f.invoke(tolower, &[0xff41]).expect("cut"), Ret::U16(0x61));
+    }
+
+    #[test]
+    fn case_folding_agrees_with_the_ctype_table_the_host_placed() {
+        // Two sources of case-folding is a bug waiting to happen. The module
+        // indexes `_ctype` itself -- it imports it as the `__CTYPE` datum --
+        // and the real `toupper` reads that same table. This sweeps all 256
+        // bytes and asserts the transcription and the placed bytes agree, so
+        // that a change to either is caught here rather than 500 sites later.
+        let f = Fixture::new();
+        let at = f
+            .host
+            .globals()
+            .address("_ctype")
+            .expect("_ctype is placed");
+        let table = f.machine.resolve(at, 257).expect("257 bytes").to_vec();
+        for c in 0..=255u8 {
+            let bits = table[usize::from(c) + 1];
+            assert_eq!(
+                bits & 0x08 != 0,
+                crate::strings::toupper(c) != c,
+                "_IS_LOW disagrees about {c:#04x}"
+            );
+            assert_eq!(
+                bits & 0x04 != 0,
+                crate::strings::tolower(c) != c,
+                "_IS_UPP disagrees about {c:#04x}"
+            );
+        }
+    }
 
     #[test]
     fn stzcpy_truncates_and_always_terminates() {
