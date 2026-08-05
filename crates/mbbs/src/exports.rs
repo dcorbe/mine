@@ -39,6 +39,7 @@ use std::sync::OnceLock;
 /// The host DLLs whose ordinals are known.
 pub const MAJORBBS: &str = "MAJORBBS";
 pub const GALGSBL: &str = "GALGSBL";
+pub const GALME: &str = "GALME";
 
 /// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
 ///
@@ -47,6 +48,14 @@ pub const GALGSBL: &str = "GALGSBL";
 /// whose refusals report bare ordinals.
 const MAJORBBS_WG101: &str = include_str!("../data/majorbbs_wg101.tsv");
 const GALGSBL_WG101: &str = include_str!("../data/galgsbl_wg101.tsv");
+
+/// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
+///
+/// The one place a DEF and a binary disagree in this crate: `GMEDEF.DEF` in the
+/// Worldgroup 1.01 source kit names 207 ordinals and the shipped DLL exports
+/// 208, the extra being `_INIT__GME` at ordinal 1. They agree on the other 207,
+/// and the binary is the thing the module is actually linked against.
+const GALME_WG101: &str = include_str!("../data/galme_wg101.tsv");
 
 /// One host version's exports, across every DLL it ships.
 pub struct Exports {
@@ -61,6 +70,7 @@ impl Exports {
             by_dll: [
                 (MAJORBBS, parse(MAJORBBS_WG101)),
                 (GALGSBL, parse(GALGSBL_WG101)),
+                (GALME, parse(GALME_WG101)),
             ]
             .into_iter()
             .collect(),
@@ -118,6 +128,7 @@ mod tests {
     fn the_tables_are_the_size_the_host_exports() {
         assert_eq!(Exports::wg101().len(MAJORBBS), 1210);
         assert_eq!(Exports::wg101().len(GALGSBL), 101);
+        assert_eq!(Exports::wg101().len(GALME), 208);
     }
 
     #[test]
@@ -138,6 +149,15 @@ mod tests {
         assert_eq!(wg101.name(GALGSBL, 72), Some("bturno"));
         assert_ne!(wg101.name(MAJORBBS, 72), Some("bturno"));
         assert_eq!(wg101.name("DOSCALLS", 135), None, "no table for DOSCALLS");
+    }
+
+    #[test]
+    fn galme_ordinal_30_is_the_messaging_engines_6x_compatibility_entry() {
+        // `GME.H` declares `BOOL _oldsend(struct oldmsg *, char *)`, and both
+        // of the module's sites clean 8 bytes -- cdecl with those two
+        // arguments. Borland's underscore makes the export `__OLDSEND`, so
+        // exactly one comes off.
+        assert_eq!(Exports::wg101().name(GALME, 30), Some("_oldsend"));
     }
 
     #[test]
@@ -168,7 +188,7 @@ mod tests {
     fn no_two_ordinals_share_a_c_name() {
         // Stripping and lowercasing could in principle merge two exports into
         // one, which would make a lookup by name ambiguous. It does not.
-        for dll in [MAJORBBS, GALGSBL] {
+        for dll in [MAJORBBS, GALGSBL, GALME] {
             let mut names: Vec<&str> = Exports::wg101().by_dll[dll]
                 .values()
                 .map(AsRef::as_ref)
