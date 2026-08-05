@@ -23,6 +23,7 @@
 mod arena;
 pub mod btrieve;
 pub mod clock;
+pub mod dos;
 mod exports;
 mod fmt;
 pub mod fsd;
