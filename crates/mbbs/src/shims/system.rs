@@ -847,4 +847,74 @@ mod tests {
         );
         assert_eq!(f.host.agents()[0].read, Some(read));
     }
+
+    #[test]
+    fn a_null_vector_is_no_vector() {
+        // What the real host does here is substitute its own default --
+        // `rejectreq` for read and write, nothing for the other two. This host
+        // has nothing to dispatch, so it records the absence instead. See
+        // `Agent`.
+        let mut f = Fixture::new();
+        let block = agent_block(&mut f, "SILENT", &[]);
+        f.invoke(register_agent, &Fixture::far(block))
+            .expect("registered");
+
+        let agent = &f.host.agents()[0];
+        assert_eq!(agent.read, None);
+        assert_eq!(agent.write, None);
+        assert_eq!(agent.xferdone, None);
+        assert_eq!(agent.abort, None);
+    }
+
+    #[test]
+    fn a_vector_at_offset_zero_is_still_a_vector() {
+        // The real routine tests both words -- `mov ax,[es:bx+9]` then
+        // `or ax,[es:bx+0xb]` -- and this is why that is not pedantry. Offset
+        // zero is a real address: `seg 26:0x0000` of `WCCMMUD.DLL` is the
+        // routine that calls `register_agent` in the first place.
+        let mut f = Fixture::new();
+        let start = FarPtr {
+            offset: 0,
+            selector: f.machine.code_selector(),
+        };
+        let block = agent_block(&mut f, "WCCMMUD", &[start]);
+        f.invoke(register_agent, &Fixture::far(block))
+            .expect("registered");
+
+        assert_eq!(f.host.agents()[0].read, Some(start));
+    }
+
+    #[test]
+    fn an_appid_filling_its_field_is_read_bounded() {
+        // `char appid[AIDSIZ]` is nine bytes and a name that uses all nine has
+        // no terminator. Scanning for one would run into the `read` vector and
+        // return a name with a pointer stuck to the end of it.
+        let mut f = Fixture::new();
+        let read = FarPtr {
+            offset: 0x0069,
+            selector: f.machine.code_selector(),
+        };
+        let block = agent_block(&mut f, "ABCDEFGHI", &[read]);
+        f.invoke(register_agent, &Fixture::far(block))
+            .expect("registered");
+
+        assert_eq!(f.host.agents()[0].appid, "ABCDEFGHI");
+        assert_eq!(f.host.agents()[0].read, Some(read));
+    }
+
+    #[test]
+    fn an_agent_with_no_appid_is_refused() {
+        // This host's own refusal and not the original's. A client addresses an
+        // agent by its appid, so an empty one is an agent nobody can reach --
+        // no caller can mean it, and a misread argument list is what produces
+        // one. Same grounds as `rtkick`'s negative delay.
+        let mut f = Fixture::new();
+        let block = agent_block(&mut f, "", &[]);
+
+        let e = f
+            .invoke(register_agent, &Fixture::far(block))
+            .expect_err("refused");
+        assert!(format!("{e}").contains("no appid"), "{e}");
+        assert!(f.host.agents().is_empty());
+    }
 }
