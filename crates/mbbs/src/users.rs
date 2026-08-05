@@ -41,6 +41,10 @@
 //! it can grow without moving. That makes 338 the size on disk as well as in
 //! memory, and it is what `ACCOUNT.C:108` opens `bbsusr.dat` with.
 
+use std::io;
+
+use mbbs16::{FarPtr, Machine};
+
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
 /// `0x29` the module strides by, not arithmetic from the declaration.
 pub const USER: u16 = 41;
@@ -71,6 +75,100 @@ pub mod user {
     /// `char lcstat` -- LAN channel state, and the odd byte that makes the
     /// stride 41 and not 42.
     pub const LCSTAT: u16 = 40;
+}
+
+/// The per-channel tables, and where each one starts.
+///
+/// One allocation each, `nterms` slots long, exactly as `MAJORBBS.C:735-736`
+/// and `ACCOUNT.C:109` made them. Held here rather than as three globals
+/// because two of the three heads -- `extusr` and `uablok` -- are not globals
+/// the module can address: `WCCMMUD.DLL` imports neither, and reaches the
+/// account block only through `uacoff`.
+pub struct Users {
+    /// How many channels there are: `nterms`.
+    terms: u16,
+    /// `struct user *user` -- the head of the array the module indexes itself.
+    users: FarPtr,
+    /// `struct extusr *extusr`.
+    extra: FarPtr,
+    /// `uablok`, `ACCOUNT.C:30` -- the account records, one per channel.
+    accounts: FarPtr,
+}
+
+impl Users {
+    /// Allocate `terms` channels' worth of everything, zeroed.
+    ///
+    /// `alczer` and not `alcmem`, at `MAJORBBS.C:735-736`, and `ACCOUNT.C:112`
+    /// follows its `alcblok` with a `setmem(...,0)` over every slot. A channel
+    /// whose `state` came up as whatever the heap last held would be in some
+    /// module the module never entered.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room.
+    pub fn new(machine: &mut Machine, heap: &mut crate::Heap, terms: u16) -> io::Result<Self> {
+        let mut block = |each: u16| -> io::Result<FarPtr> {
+            let bytes = each
+                .checked_mul(terms)
+                .ok_or_else(|| io::Error::other(format!("{terms} channels of {each} bytes")))?;
+            let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
+            machine
+                .write(at, &vec![0u8; usize::from(bytes)])
+                .map_err(io::Error::other)?;
+            Ok(at)
+        };
+        let users = block(USER)?;
+        let extra = block(EXTUSR)?;
+        let accounts = block(USRACC)?;
+        Ok(Self {
+            terms,
+            users,
+            extra,
+            accounts,
+        })
+    }
+
+    /// How many channels there are.
+    pub fn terms(&self) -> u16 {
+        self.terms
+    }
+
+    /// The head of `user[]`, which is what the `user` global holds.
+    pub fn head(&self) -> FarPtr {
+        self.users
+    }
+
+    /// `&user[unum]`, or `None` for a channel that does not exist.
+    pub fn slot(&self, unum: i16) -> Option<FarPtr> {
+        self.nth(self.users, USER, unum)
+    }
+
+    /// `&extusr[unum]`, or `None` for a channel that does not exist.
+    pub fn extra(&self, unum: i16) -> Option<FarPtr> {
+        self.nth(self.extra, EXTUSR, unum)
+    }
+
+    /// `uacoff(unum)` -- the channel's account record, or `None` for a channel
+    /// that does not exist.
+    pub fn account(&self, unum: i16) -> Option<FarPtr> {
+        self.nth(self.accounts, USRACC, unum)
+    }
+
+    /// The `unum`th slot of a table of `each`-byte entries, or `None` if there
+    /// is no such channel.
+    ///
+    /// The bound is `curusr`'s own -- `MAJORBBS.C:4293`'s
+    /// `if (0 <= uno && uno < nterms)` -- and it is stated here once so that
+    /// the three tables cannot come to disagree about which channels exist.
+    fn nth(&self, base: FarPtr, each: u16, unum: i16) -> Option<FarPtr> {
+        if unum < 0 || unum >= i16::try_from(self.terms).ok()? {
+            return None;
+        }
+        Some(FarPtr {
+            offset: base.offset.checked_add(each.checked_mul(unum as u16)?)?,
+            selector: base.selector,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +228,61 @@ mod tests {
         // header. It is here because `curusr`'s array is real whether or not
         // this module looks at it.
         assert_eq!(EXTUSR, 22);
+    }
+
+    #[test]
+    fn every_channel_gets_a_slot_in_all_three_tables() {
+        let f = crate::testing::Fixture::new();
+        let users = f.host.users();
+        assert_eq!(users.terms(), 1, "one channel, as `nterms` says");
+        for unum in 0..users.terms() as i16 {
+            assert!(users.slot(unum).is_some(), "user[{unum}]");
+            assert!(users.extra(unum).is_some(), "extusr[{unum}]");
+            assert!(users.account(unum).is_some(), "uacoff({unum})");
+        }
+    }
+
+    #[test]
+    fn the_slots_are_a_stride_apart() {
+        // The only way a second channel is reachable at all. Checked over a
+        // table sized past `nterms` so that the arithmetic is tested even
+        // though this host has one channel -- a stride bug would otherwise be
+        // invisible until the day `nterms` moved.
+        let mut machine = mbbs16::Machine::new().expect("machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let users = Users::new(&mut machine, &mut heap, 4).expect("four channels");
+        let at = |n| users.slot(n).expect("placed").offset;
+        assert_eq!(at(1) - at(0), USER);
+        assert_eq!(at(3) - at(2), USER);
+        assert_eq!(
+            users.account(1).expect("placed").offset - users.account(0).expect("placed").offset,
+            USRACC
+        );
+    }
+
+    #[test]
+    fn a_channel_that_does_not_exist_has_no_slot() {
+        // `curusr`'s guard is `0 <= uno && uno < nterms`, so out of range has
+        // to be answerable as *absent* rather than as some address. A table
+        // that returned a pointer here would hand the module the bytes after
+        // the last channel and call them channel 1.
+        let f = crate::testing::Fixture::new();
+        let users = f.host.users();
+        assert!(users.slot(-1).is_none(), "there is no channel -1");
+        assert!(users.slot(users.terms() as i16).is_none(), "one past the end");
+        assert!(users.account(-1).is_none());
+        assert!(users.extra(-1).is_none());
+    }
+
+    #[test]
+    fn the_tables_start_zeroed() {
+        // `alczer`, not `alcmem`, at MAJORBBS.C:735 -- and `ACCOUNT.C:112`
+        // follows `alcblok` with a `setmem(...,0)` over every slot. A channel
+        // whose `state` came up as whatever the heap last held would be in some
+        // module the module never entered.
+        let f = crate::testing::Fixture::new();
+        let at = f.host.users().slot(0).expect("channel 0");
+        let bytes = f.machine.resolve(at, usize::from(USER)).expect("readable");
+        assert!(bytes.iter().all(|b| *b == 0), "a fresh channel is all zero");
     }
 }

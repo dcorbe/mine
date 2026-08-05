@@ -53,6 +53,7 @@ pub use shims::system::{Agent, Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
+pub use users::Users;
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
@@ -294,6 +295,13 @@ pub struct Host {
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
+    /// The per-channel tables: `user[]`, `extusr[]` and the account block.
+    ///
+    /// One slot each per channel, allocated at construction because the real
+    /// host allocated them before any module's init ran -- `MAJORBBS.C:735-736`
+    /// and `ACCOUNT.C:109`. See [`Users`].
+    pub(crate) users: Users,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
@@ -351,6 +359,13 @@ impl Host {
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
         let selector = machine.alloc_segment(spr_bytes + 64)?;
 
+        // The per-channel tables come off the module heap, because the real
+        // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
+        // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
+        // module allocates from. So the heap has to exist before they do.
+        let mut heap = Heap::new(Config::default());
+        let users = users::Users::new(machine, &mut heap, globals::NTERMS)?;
+
         Ok(Self {
             exports: Exports::wg101(),
             globals,
@@ -383,7 +398,8 @@ impl Host {
             forms: Vec::new(),
             fsdscb: None,
             fsdtmp: None,
-            heap: Heap::new(Config::default()),
+            heap,
+            users,
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
@@ -522,6 +538,11 @@ impl Host {
     /// The module's heap.
     pub fn heap(&self) -> &Heap {
         &self.heap
+    }
+
+    /// The per-channel tables. See [`Users`].
+    pub fn users(&self) -> &Users {
+        &self.users
     }
 
     /// How many host calls this host has serviced.

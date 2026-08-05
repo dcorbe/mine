@@ -286,6 +286,19 @@ fn ctype_table() -> [u8; CTYPE_LEN as usize] {
 /// notice, which is the one way this guess is observable.
 pub const OUTBSZ: u16 = 4096;
 
+/// How many channels this host has: `nterms`.
+///
+/// Written into the `nterms` global below, and used again by
+/// [`Users::new`](crate::Users::new) to size the per-channel tables. **The two
+/// must agree.** `nterms` is what the module bounds its own loops by -- and
+/// what `curusr`'s `uno < nterms` guard admits -- so a table shorter than
+/// `nterms` is a table the module indexes past the end of, with no error
+/// anywhere.
+///
+/// One is not a placeholder; see the `nterms` write in [`Globals::new`] for
+/// where that comes from.
+pub const NTERMS: u16 = 1;
+
 /// The host's globals, placed in a segment the module can address.
 pub struct Globals {
     selector: u16,
@@ -348,8 +361,8 @@ impl Globals {
         // `int nterms;  /* number of channels (always 1) */`, set by
         // `iniogme()`. When this host learns what a channel is, that is what
         // changes this.
-        globals.write(machine, "nterms", &1u16.to_le_bytes())?;
-        globals.write(machine, "hichp1", &1u16.to_le_bytes())?;
+        globals.write(machine, "nterms", &NTERMS.to_le_bytes())?;
+        globals.write(machine, "hichp1", &NTERMS.to_le_bytes())?;
 
         Ok(globals)
     }
