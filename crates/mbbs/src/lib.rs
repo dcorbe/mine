@@ -377,6 +377,7 @@ impl Host {
         // this host places: `WCCMMUD.DLL` imports neither, and reaches an
         // account record only by calling `uacoff`.
         globals.write(machine, "user", &users.head().to_bytes())?;
+        globals.write(machine, "channel", &users.channels().to_bytes())?;
 
         Ok(Self {
             exports: Exports::wg101(),

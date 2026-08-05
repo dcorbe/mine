@@ -93,7 +93,14 @@ pub struct Users {
     extra: FarPtr,
     /// `uablok`, `ACCOUNT.C:30` -- the account records, one per channel.
     accounts: FarPtr,
+    /// `int *channel` -- and this one points [`SENTINELS`] words *into* its own
+    /// allocation, exactly as `MAJORBBS.C:741-743` left it.
+    channels: FarPtr,
 }
+
+/// Words `MAJORBBS.C:740` puts *before* `channel[0]`, so that `channel[-1]`,
+/// `[-2]` and `[-3]` are reads rather than accidents.
+const SENTINELS: u16 = 3;
 
 impl Users {
     /// Allocate `terms` channels' worth of everything, zeroed.
@@ -120,11 +127,54 @@ impl Users {
         let users = block(USER)?;
         let extra = block(EXTUSR)?;
         let accounts = block(USRACC)?;
+
+        // `MAJORBBS.C:740-743`, which is three statements doing one thing:
+        //
+        //     setmem(channel=(int *)alcmem((nterms+3)*2),(nterms+3)*2,-1);
+        //     *channel++=-3;     /* note: channel[-3] == -3 */
+        //     *channel++=-2;     /*       channel[-2] == -2 */
+        //     *channel++=-1;     /*       channel[-1] == -1 */
+        //
+        // Three words of slack in front, filled with their own negative index,
+        // and then the pointer walks past them -- so `channel[-1]` is a read
+        // that yields -1 rather than whatever precedes the block. That matters
+        // because `usrnum` is -1 whenever nobody is on a channel, and
+        // `channel[usrnum]` is what a module puts in a log line.
+        let words = terms
+            .checked_add(SENTINELS)
+            .and_then(|words| words.checked_mul(2))
+            .ok_or_else(|| io::Error::other(format!("{terms} channels of channel[]")))?;
+        let base = heap.alloc(machine, words).map_err(io::Error::other)?;
+        machine
+            .write(base, &vec![0xffu8; usize::from(words)])
+            .map_err(io::Error::other)?;
+        for (index, value) in [-3i16, -2, -1].into_iter().enumerate() {
+            let at = FarPtr {
+                offset: base.offset + index as u16 * 2,
+                selector: base.selector,
+            };
+            machine
+                .write(at, &value.to_le_bytes())
+                .map_err(io::Error::other)?;
+        }
+        let channels = FarPtr {
+            offset: base.offset + SENTINELS * 2,
+            selector: base.selector,
+        };
+
+        // `MAJORBBS.C:878` -- `channel[usrnum]=0` with `usrnum` still zero,
+        // the local console. Reached only when no hardware channel groups are
+        // configured, which is this host: one channel, no serial board.
+        machine
+            .write(channels, &0i16.to_le_bytes())
+            .map_err(io::Error::other)?;
+
         Ok(Self {
             terms,
             users,
             extra,
             accounts,
+            channels,
         })
     }
 
@@ -136,6 +186,11 @@ impl Users {
     /// The head of `user[]`, which is what the `user` global holds.
     pub fn head(&self) -> FarPtr {
         self.users
+    }
+
+    /// The head of `channel[]`, which is three words *into* its allocation.
+    pub fn channels(&self) -> FarPtr {
+        self.channels
     }
 
     /// `&user[unum]`, or `None` for a channel that does not exist.
@@ -297,5 +352,41 @@ mod tests {
         assert_ne!(head, mbbs16::FarPtr::NULL, "the module dereferences this");
         assert_eq!(head, f.host.users().slot(0).expect("channel 0"));
         assert_eq!(head, f.host.users().head());
+    }
+
+    #[test]
+    fn the_channel_table_has_three_sentinels_before_it() {
+        // `MAJORBBS.C:740-743` allocates `nterms+3` words, fills them with -1,
+        // writes -3, -2, -1 into the first three and advances the pointer past
+        // them. The comments in that source say what for: `channel[-1] == -1`
+        // is a legal read. It has to be, because `usrnum` is -1 for as long as
+        // no user is on a channel, and `channel[usrnum]` is what a module puts
+        // in a log line. Without these three words that read is off the front
+        // of the block and returns whatever the heap holds.
+        let f = crate::testing::Fixture::new();
+        let at = f.host.globals().pointer(&f.machine, "channel").expect("channel");
+        assert_ne!(at, mbbs16::FarPtr::NULL);
+        let word = |delta: i16| -> i16 {
+            let from = mbbs16::FarPtr {
+                offset: at.offset.wrapping_add((delta * 2) as u16),
+                selector: at.selector,
+            };
+            let bytes = f.machine.resolve(from, 2).expect("readable");
+            i16::from_le_bytes([bytes[0], bytes[1]])
+        };
+        assert_eq!(word(-3), -3);
+        assert_eq!(word(-2), -2);
+        assert_eq!(word(-1), -1);
+    }
+
+    #[test]
+    fn the_local_console_is_channel_zero() {
+        // `MAJORBBS.C:878` -- `channel[usrnum]=0`, reached with `usrnum` still
+        // zero because no hardware channel groups are configured. This host has
+        // exactly that shape: one channel, no serial hardware.
+        let f = crate::testing::Fixture::new();
+        let at = f.host.globals().pointer(&f.machine, "channel").expect("channel");
+        let bytes = f.machine.resolve(at, 2).expect("readable");
+        assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 0);
     }
 }
