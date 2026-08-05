@@ -207,6 +207,34 @@ pub struct Host {
     trace: bool,
 }
 
+/// Where in the module the call being refused came from, as a place you can
+/// look up in a disassembly.
+///
+/// When a shim runs, the top of the module's stack is the far return address of
+/// the `9A` far call that got there: `frame_sp+0` is the offset, `+2` the
+/// selector. A `9A` call is five bytes, so the instruction itself begins five
+/// before the address it would have returned to.
+///
+/// Reported as an **NE segment**, not a selector. The selector is whatever the
+/// loader happened to hand out this run; the segment is a fact about the file,
+/// and it is what `re/ne_arity.py` and every disassembler speak.
+///
+/// `None` rather than a guess whenever the answer would be misleading: no
+/// outstanding call, a stack that will not resolve, or a selector this module
+/// does not own. A wrong address costs more than no address -- it sends someone
+/// to a real instruction that had nothing to do with it.
+fn caller(machine: &Machine, module: &Module) -> Option<String> {
+    let frame = FarPtr {
+        offset: machine.frame_sp()?,
+        selector: machine.stack_selector(),
+    };
+    let bytes = machine.resolve(frame, 4).ok()?;
+    let offset = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let selector = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let segment = module.segment_at(selector)?;
+    Some(format!("seg {segment}:{:#06x}", offset.wrapping_sub(5)))
+}
+
 impl Host {
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
@@ -536,6 +564,10 @@ impl Host {
             let shim = match shims::entry(&from, &symbol) {
                 Entry::Routine(shim) => shim,
                 Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented => {
+                    let symbol = match caller(machine, module) {
+                        Some(at) => format!("{symbol}, called from {at}"),
+                        None => symbol,
+                    };
                     return self.stop(
                         machine,
                         Poison::Unimplemented {
@@ -553,11 +585,15 @@ impl Host {
             match shim(machine, self) {
                 Ok(ret) => exit = machine.resume(ret)?,
                 Err(e) => {
+                    let symbol = match caller(machine, module) {
+                        Some(at) => format!("{symbol} ({e}), called from {at}"),
+                        None => format!("{symbol} ({e})"),
+                    };
                     return self.stop(
                         machine,
                         Poison::Unimplemented {
                             module: from,
-                            symbol: format!("{symbol} ({e})"),
+                            symbol,
                         },
                     );
                 }
