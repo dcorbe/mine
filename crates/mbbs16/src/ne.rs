@@ -741,6 +741,22 @@ impl Module {
             .copied()
     }
 
+    /// The 1-based NE segment a selector belongs to, if it is one of this
+    /// module's.
+    ///
+    /// The reverse of [`Module::segment_selector`], and the piece that turns a
+    /// runtime address back into a place in the file: a disassembler and
+    /// `re/ne_arity.py` both speak segment-and-offset, and neither has ever
+    /// heard of a selector.
+    ///
+    /// A linear scan. Modules have tens of segments, this runs once per
+    /// refusal, and a reverse index would be a second thing to keep in step
+    /// with the first.
+    pub fn segment_at(&self, selector: u16) -> Option<u16> {
+        let index = self.selectors.iter().position(|&s| s == selector)?;
+        u16::try_from(index + 1).ok()
+    }
+
     /// How many segments the module has.
     pub fn segment_count(&self) -> usize {
         self.selectors.len()

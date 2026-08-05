@@ -390,6 +390,17 @@ fn every_relocation_combination_the_real_module_uses_applies() {
 
     let code = module.segment_selector(1).expect("segment 1");
     let data = module.segment_selector(2).expect("segment 2");
+
+    // And back again, which is what turns a refusal's return address into
+    // something you can find in a disassembly.
+    assert_eq!(module.segment_at(code), Some(1));
+    assert_eq!(module.segment_at(data), Some(2));
+    assert_eq!(
+        module.segment_at(0xFFFF),
+        None,
+        "a selector this module does not own is not one of its segments"
+    );
+
     assert_eq!(module.relocations_applied(), 7);
 
     // FAR_ADDR IMPORTORDINAL: offset then selector, both from the thunk.
