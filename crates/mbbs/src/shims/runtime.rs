@@ -200,6 +200,74 @@ pub fn f_lxursh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimErro
     Ok(Ret::U32(dxax(machine) >> by))
 }
 
+/// How many bytes of argument `f_scopy@` pops. Two far pointers.
+///
+/// The same number as [`OPERANDS`] and deliberately not the same constant: one
+/// is two `long`s and the other is two addresses, and a single name would
+/// describe one of them wrongly.
+pub const POINTERS: u16 = 8;
+
+/// `void F_SCOPY@(void *source, void *dest)` -- Borland's structure copy, with
+/// the length in `CX`.
+///
+/// What `struct x = {...}` inside a function and `a = b` on a struct compile to,
+/// and the only one of these helpers that is not arithmetic. It pops its own
+/// eight bytes, like the division family and unlike the register-only ones.
+///
+/// **The first-pushed pointer is the destination**, so it is the argument
+/// *farther* from the frame. Measured three ways rather than assumed, because
+/// reading it backwards overwrites the source with uninitialised stack and
+/// reports success: the initialiser pattern at `seg 2:0x0e4c1` copies a static
+/// into a local that `enter` made an instant earlier; the loop at
+/// `seg 34:0x001f0` fills 100 elements of a far array from one local, and 100
+/// copies *into* one place would be dead code; and `seg 34:0x0f20` deletes an
+/// array element by shifting the tail down, always writing the lower address.
+///
+/// `CX` is a count of **bytes**: the same site steps its array with
+/// `imul ax,ax,0x63` and passes `CX = 0x63`, and 99 is not an even number of
+/// words.
+///
+/// # It returns the registers it was given
+///
+/// Not [`Ret::Void`], which zeroes `AX` and `DX`. `seg 34:0x0f20` keeps its loop
+/// counter in `DX` across the call -- the instruction after it is `inc dx` -- so
+/// the real helper preserved `DX`, and a host that zeroed it would restart that
+/// loop forever without faulting. `AX` is preserved on the same principle; no
+/// site proves it either way, and a caller cannot depend on a register being
+/// *destroyed*.
+///
+/// The real routine was `rep movsb`, so it also advanced `SI` and `DI` and left
+/// `CX` at zero. This one leaves all three alone, which is the safe direction of
+/// the same argument.
+///
+/// # Errors
+///
+/// If either pointer names nothing of the module's or the copy would leave a
+/// segment, and if the two ranges overlap -- `rep movsb` smears a forward
+/// overlap where a buffered copy would not, and no struct assignment produces
+/// one.
+pub fn f_scopy(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+    let source = machine.arg_far(0);
+    let dest = machine.arg_far(2);
+    let len = usize::from(machine.cx());
+
+    if source.selector == dest.selector {
+        let (from, to) = (usize::from(source.offset), usize::from(dest.offset));
+        if from < to + len && to < from + len {
+            return Err(ShimError::Failed(format!(
+                "f_scopy@({source}, {dest}, {len}): the two ranges overlap"
+            )));
+        }
+    }
+
+    let bytes = machine.resolve(source, len)?.to_vec();
+    machine.write(dest, &bytes)?;
+
+    Ok(Ret::U32(
+        u32::from(machine.ax()) | (u32::from(machine.dx()) << 16),
+    ))
+}
+
 /// The single signed pair that has no answer: `i32::MIN / -1`.
 fn overflow(name: &str, a: i32, b: i32) -> ShimError {
     ShimError::Failed(format!(
@@ -209,6 +277,8 @@ fn overflow(name: &str, a: i32, b: i32) -> ShimError {
 
 #[cfg(test)]
 mod tests {
+    use mbbs16::FarPtr;
+
     use super::*;
     use crate::testing::Fixture;
 
@@ -383,6 +453,110 @@ mod tests {
             let e = shift(shim, 1, 255).expect_err("refused");
             assert!(format!("{e}").contains("255"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_struct_copy_writes_the_pointer_that_was_pushed_first() {
+        // Measured three ways, because getting it backwards overwrites the
+        // source with uninitialised memory and reports nothing: the initialiser
+        // pattern at `seg 2:0x0e4c1` copies a static into a fresh local; the
+        // loop at `seg 34:0x001f0` fills 100 array elements from one local; and
+        // `seg 34:0x0f20` shifts an array down, always writing the lower
+        // address. The first-pushed pointer is the destination.
+        let mut f = Fixture::new();
+        let source = f.text("Galacticomm");
+        let dest = f.buffer(16);
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        f.invoke_with(f_scopy, &args, [0, 0, 11, 0]).unwrap();
+        assert_eq!(f.read(dest), "Galacticomm");
+    }
+
+    #[test]
+    fn the_length_is_a_count_of_bytes() {
+        // `seg 34:0x001f0` steps an array with `imul ax,ax,0x63` and passes
+        // `CX = 0x63`. 99 is odd, so it cannot be a count of words.
+        let mut f = Fixture::new();
+        let source = f.bytes(b"abcdefghij", false);
+        let dest = f.buffer(10);
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        f.invoke_with(f_scopy, &args, [0, 0, 3, 0]).unwrap();
+        assert_eq!(f.read(dest), "abc", "three bytes, not three words");
+    }
+
+    #[test]
+    fn the_struct_copy_hands_back_the_registers_it_was_given() {
+        // The one that would have been silently wrong. `seg 34:0x0f20` keeps its
+        // loop counter in DX across the call and does `inc dx` on the very next
+        // instruction, so `F_SCOPY@` preserves DX. `Ret::Void` zeroes both
+        // halves -- that loop would restart forever, with no fault and no error
+        // to say why.
+        let mut f = Fixture::new();
+        let source = f.text("x");
+        let dest = f.buffer(4);
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        let ret = f
+            .invoke_with(f_scopy, &args, [0xbeef, 0, 1, 0x0007])
+            .unwrap();
+        assert_eq!(ret, Ret::U32(0x0007_beef), "DX:AX, exactly as they arrived");
+    }
+
+    #[test]
+    fn copying_nothing_copies_nothing() {
+        // `CX` of zero is a struct of no bytes. `rep movsb` does nothing and
+        // neither does this; refusing would be inventing a rule.
+        let mut f = Fixture::new();
+        let source = f.text("ignored");
+        let dest = f.buffer(4);
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        f.invoke_with(f_scopy, &args, [0, 0, 0, 0]).unwrap();
+        assert_eq!(f.read(dest), "");
+    }
+
+    #[test]
+    fn a_copy_that_runs_off_a_segment_is_refused() {
+        // The bound is the destination segment's own limit, which is the only
+        // place it is known. A host that copied anyway would be writing into
+        // whatever the loader put next.
+        let mut f = Fixture::new();
+        let source = f.bytes(&[b'z'; 8], false);
+
+        // A segment of its own, so what is refused is its length and not the
+        // two ranges meeting -- the fixture's scratch holds both otherwise.
+        let selector = f.machine.alloc_segment(4).expect("a four-byte segment");
+        let dest = FarPtr {
+            offset: 0,
+            selector,
+        };
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        let e = f
+            .invoke_with(f_scopy, &args, [0, 0, 8, 0])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("runs past the end"), "{e}");
+    }
+
+    #[test]
+    fn a_copy_onto_itself_is_refused_rather_than_smeared() {
+        // `rep movsb` copies forward a byte at a time, so an overlapping copy
+        // with the destination above the source repeats bytes rather than moving
+        // them; buffering the source first would quietly do the other thing. No
+        // struct assignment can overlap, so this is a guard.
+        let mut f = Fixture::new();
+        let source = f.bytes(b"overlapping", false);
+        let dest = FarPtr {
+            offset: source.offset + 2,
+            selector: source.selector,
+        };
+        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+
+        let e = f
+            .invoke_with(f_scopy, &args, [0, 0, 8, 0])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("overlap"), "{e}");
     }
 
     #[test]
