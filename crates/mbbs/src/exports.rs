@@ -1,10 +1,11 @@
 //! The host's export tables: which ordinal of which DLL names which symbol.
 //!
-//! A module imports almost everything by ordinal -- `WCCMMUD.DLL` has 22,370
-//! fixups naming an ordinal and exactly one naming a symbol. An ordinal on its
-//! own says nothing, so without these tables a host that cannot service an
-//! import can only report a number, and a number is not something anyone can
-//! look up in `MAJORBBS.H`.
+//! A module imports almost everything by ordinal. Of `WCCMMUD.DLL`'s 22,371
+//! relocation records, 7,849 are internal references and 14,522 name a DLL --
+//! and of those, 14,521 name an ordinal and exactly one names a symbol. An
+//! ordinal on its own says nothing, so without these tables a host that cannot
+//! service an import can only report a number, and a number is not something
+//! anyone can look up in `MAJORBBS.H`.
 //!
 //! # More than one DLL
 //!
@@ -217,6 +218,24 @@ mod tests {
         // huge-pointer arithmetic, which is why all 13 of the module's sites
         // are `mov cx,<it>` followed by `shl dx,cl` rather than a call.
         assert_eq!(wg101.name(DOSCALLS, 135), Some("doshugeshift"));
+    }
+
+    #[test]
+    fn the_huge_shift_is_reachable_by_the_name_its_ordinal_resolves_to() {
+        // The loader turns an ordinal into a name and *then* asks `shims` about
+        // the name, so the two have to agree or a constant silently becomes a
+        // thunk address in an instruction's immediate.
+        //
+        // They did not agree before `DOSCALLS` had a table. `shims` held the
+        // huge shift under `#135`; `Resolver::resolve` had no name to look up,
+        // returned `None`, and all 13 sites took a thunk offset where the shift
+        // count belongs. This is the join, and it is the assertion that would
+        // have failed.
+        let name = Exports::wg101().name(DOSCALLS, 135).expect("135 is named");
+        let crate::shims::Entry::Absolute(shift) = crate::shims::entry(DOSCALLS, name) else {
+            panic!("{DOSCALLS}.{name} must reach the loader as a constant");
+        };
+        assert_eq!(1u16 << shift, mbbs16::SELECTOR_STEP);
     }
 
     #[test]
