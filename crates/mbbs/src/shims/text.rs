@@ -152,6 +152,56 @@ pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(text.len() as u16))
 }
 
+/// `void rmvwht(char *string)` -- remove every whitespace character, in place.
+///
+/// See [`strings::rmvwht`](crate::strings::rmvwht), which is the transcription;
+/// this is only the read and the write-back. The result is never longer than
+/// what was read, so the original's capacity always holds it.
+pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let at = machine.arg_far(0);
+    let text = machine.read_cstr(at)?.to_vec();
+    let tight = crate::strings::rmvwht(&text);
+    let capacity = text.len() as u16 + 1;
+    write_cstr(machine, at, &tight, capacity)?;
+    Ok(Ret::Void)
+}
+
+/// `char *skpwht(char *cp)` -- past the leading spaces.
+///
+/// The answer is a pointer *into* the caller's own buffer, so the selector is
+/// the one that arrived. See [`strings::skpwht`](crate::strings::skpwht) for
+/// why a tab does not count.
+pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let at = machine.arg_far(0);
+    let text = machine.read_cstr(at)?;
+    let n = crate::strings::skpwht(text) as u16;
+    Ok(Ret::Far(FarPtr {
+        offset: at.offset + n,
+        selector: at.selector,
+    }))
+}
+
+/// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
+pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let at = machine.arg_far(0);
+    let text = machine.read_cstr(at)?;
+    let n = crate::strings::skpwrd(text) as u16;
+    Ok(Ret::Far(FarPtr {
+        offset: at.offset + n,
+        selector: at.selector,
+    }))
+}
+
+/// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
+pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let at = machine.arg_far(0);
+    let text = machine.read_cstr(at)?.to_vec();
+    let (kept, removed) = crate::strings::depad(&text);
+    let capacity = text.len() as u16 + 1;
+    write_cstr(machine, at, &text[..kept], capacity)?;
+    Ok(Ret::U16(removed))
+}
+
 /// `long atol(char *s)`.
 ///
 /// Leading whitespace, an optional sign, then digits until something that is
@@ -419,5 +469,80 @@ mod tests {
             ],
         );
         assert!(third.is_err(), "the third would overrun");
+    }
+
+    #[test]
+    fn rmvwht_rewrites_the_callers_buffer_in_place() {
+        // It returns void, so the only observable effect is the buffer.
+        let mut f = Fixture::new();
+        let at = f.text("  the quick brown fox  ");
+        assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
+    }
+
+    #[test]
+    fn rmvwht_handles_a_string_that_is_entirely_whitespace() {
+        let mut f = Fixture::new();
+        let at = f.text(" \t\r\n ");
+        f.invoke(rmvwht, &Fixture::far(at)).expect("void");
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"");
+    }
+
+    #[test]
+    fn skpwht_answers_a_pointer_into_the_string_it_was_given() {
+        // The return is a far pointer, and its selector must be the caller's --
+        // a shim that rebuilt it from somewhere else would hand back an address
+        // into the wrong segment and the module would read rubbish.
+        let mut f = Fixture::new();
+        let at = f.text("   abc");
+        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
+            panic!("skpwht returns char *");
+        };
+        assert_eq!(p.selector, at.selector);
+        assert_eq!(p.offset, at.offset + 3);
+        assert_eq!(f.machine.read_cstr(p).expect("a string"), b"abc");
+    }
+
+    #[test]
+    fn skpwht_stops_at_a_tab_because_the_original_tests_one_byte() {
+        let mut f = Fixture::new();
+        let at = f.text("\tabc");
+        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
+            panic!("skpwht returns char *");
+        };
+        assert_eq!(p.offset, at.offset, "a tab is not 0x20");
+    }
+
+    #[test]
+    fn skpwrd_answers_the_space_that_ended_the_word() {
+        let mut f = Fixture::new();
+        let at = f.text("word rest");
+        let Ret::Far(p) = f.invoke(skpwrd, &Fixture::far(at)).expect("a pointer") else {
+            panic!("skpwrd returns char *");
+        };
+        assert_eq!(p.offset, at.offset + 4);
+        assert_eq!(f.machine.read_cstr(p).expect("a string"), b" rest");
+    }
+
+    #[test]
+    fn depad_truncates_the_buffer_and_returns_the_count() {
+        let mut f = Fixture::new();
+        let at = f.text("text   ");
+        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
+            panic!("depad returns an int");
+        };
+        assert_eq!(n, 3, "three characters went");
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"text");
+    }
+
+    #[test]
+    fn depad_leaves_a_string_that_needs_nothing_alone() {
+        let mut f = Fixture::new();
+        let at = f.text("  text");
+        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
+            panic!("depad returns an int");
+        };
+        assert_eq!(n, 0, "leading padding is not padding");
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  text");
     }
 }
