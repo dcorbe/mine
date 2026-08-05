@@ -272,6 +272,81 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
+/// The session control block, once `fsdapr` has filled one in.
+///
+/// # Errors
+///
+/// If `fsdroom` never ran, or `fsdapr` never did. The second shows as a null
+/// `newans`, which is the same test the real host's own `fsdchi` makes at
+/// `FSDBBS.C:340` before touching anything.
+fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarPtr), ShimError> {
+    let at = host.fsdscb.ok_or_else(|| {
+        ShimError::Failed(format!(
+            "{who}: no form has been sized, so there is no session; FSDBBS.H:245 has \
+             fsdroom() first"
+        ))
+    })?;
+    let block = read_block(machine, at)?;
+    if block.newans() == FarPtr::NULL {
+        return Err(ShimError::Failed(format!(
+            "{who}: no answers have been prepared; FSD.H has this called after fsdapr()"
+        )));
+    }
+    Ok((block, at))
+}
+
+/// One `struct fsdfld` out of the field array, bounds-checked.
+///
+/// The original indexes with no check at all. `FSD.H:635` states the range, and
+/// a field number outside it reads whatever follows the array and calls it an
+/// answer.
+fn field_record(
+    machine: &Machine,
+    block: &fsd::Scb,
+    field: u16,
+    who: &str,
+) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
+    if field >= block.numfld() {
+        return Err(ShimError::Failed(format!(
+            "{who}({field}): the form has {} fields",
+            block.numfld()
+        )));
+    }
+    let at = offset(block.flddat(), field * fsd::FSDFLD)?;
+    let bytes = machine.resolve(at, usize::from(fsd::FSDFLD))?;
+    let mut out = [0u8; fsd::FSDFLD as usize];
+    out.copy_from_slice(bytes);
+    Ok(out)
+}
+
+/// Where a field's answer starts, out of its record.
+fn answer_offset(record: &[u8; fsd::FSDFLD as usize]) -> u16 {
+    u16::from_le_bytes([record[fsd::fld::ANSOFF], record[fsd::fld::ANSOFF + 1]])
+}
+
+/// `char *fsdnan(int fldi)` -- where field `fldi`'s answer is. `FSD.C:2190`.
+///
+/// `fsdscb->newans + fsdscb->flddat[fldi].ansoff`, and both halves are read out
+/// of module memory rather than remembered, because both are the module's to
+/// change: `fsdord` rewrites `ansoff` for every field after the one it touched,
+/// and the module writes into `flddat` itself at fourteen sites.
+///
+/// MajorMUD calls this eight times and hands seven of the results to `atol` --
+/// the six `TOT_` statistics and one more -- and the eighth to `skpwht` for the
+/// character's name. Those are the values a new character is made of, so an
+/// answer that was merely plausible would be a character with the wrong
+/// statistics and nothing anywhere to say so.
+///
+/// # Errors
+///
+/// If no session has been prepared, or `fldi` is not a field of it.
+pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let field = machine.arg_u16(0);
+    let (block, _) = prepared(machine, host, "fsdnan")?;
+    let record = field_record(machine, &block, field, "fsdnan")?;
+    Ok(Ret::Far(offset(block.newans(), answer_offset(&record))?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +646,74 @@ mod tests {
             .expect("in range");
         assert_eq!(text, b"NAME=\0RANK=MAJOR\0\0");
         assert!(scb.newans().offset > buffer.offset);
+    }
+
+    #[test]
+    fn fsdnan_points_at_the_answer_the_defaults_carried() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "MAJOR");
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "", "no default, so blank");
+    }
+
+    #[test]
+    fn fsdnan_reads_the_field_array_the_module_could_have_changed() {
+        // Not a host-side shadow: the pointer is computed from `fsdscb` and
+        // `flddat[i].ansoff` as they stand in module memory *now*. Move the
+        // answer string and `fsdnan` must follow it there.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        let mut scb = block(&f);
+
+        let moved = f.bytes(b"NAME=\0RANK=COLONEL\0\0", false);
+        scb.set_newans(moved);
+        f.machine.write(at, scb.as_bytes()).expect("written");
+
+        let Ok(Ret::Far(got)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(got), "COLONEL");
+    }
+
+    #[test]
+    fn a_field_number_outside_the_form_stops_the_module() {
+        // FSD.H:635 bounds it at `0 to fsdscb->numfld-1`, and the original
+        // indexes without checking -- so field 99 would be a read of whatever
+        // follows the array, returned as an answer.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"\0");
+        let e = f.invoke(fsdnan, &[2]).expect_err("refused");
+        assert!(format!("{e}").contains("2 fields"), "{e}");
+        let e = f.invoke(fsdnan, &[0xffff]).expect_err("refused");
+        assert!(format!("{e}").contains("2 fields"), "{e}");
+    }
+
+    #[test]
+    fn fsdnan_before_a_session_stops_the_module() {
+        let mut f = Fixture::new();
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
+
+        // And after `fsdroom` but before `fsdapr`, when `newans` is still null.
+        let _ = open_form(&mut f);
+        let spec = f.text("NAME");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdapr"), "{e}");
     }
 
     #[test]
