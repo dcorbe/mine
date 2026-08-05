@@ -8,6 +8,7 @@ pub mod runtime;
 pub mod stream;
 pub mod system;
 pub mod text;
+pub mod user;
 
 use mbbs16::{Machine, Ret};
 
@@ -226,6 +227,9 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         Cleans::Caller,
     ),
     (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
+    // The current user: the two routines that turn a channel number into the
+    // slot it names.
+    (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
     (
