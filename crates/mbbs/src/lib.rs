@@ -28,6 +28,7 @@ pub mod fsd;
 mod globals;
 pub mod heap;
 pub mod msg;
+pub mod random;
 mod shims;
 pub mod stream;
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub use exports::Exports;
 pub use fsd::Form;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
 pub use heap::{Config, Heap, Region};
+pub use random::{RAND_MAX, Random, Runaway};
 pub use shims::system::{Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 
