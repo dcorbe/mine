@@ -35,6 +35,7 @@ pub mod strings;
 pub mod stream;
 #[cfg(test)]
 mod testing;
+pub mod textvar;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -49,6 +50,7 @@ pub use random::{RAND_MAX, Random, Runaway};
 pub use shims::system::{Agent, Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
+pub use textvar::{TextVar, TextVars};
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
