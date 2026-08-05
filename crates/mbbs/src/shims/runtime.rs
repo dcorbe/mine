@@ -8,15 +8,38 @@
 //! provide it.
 //!
 //! The `@` is Borland's marker for a runtime helper and the `f_` prefix is its
-//! far-call form. `WCCMMUD.DLL` imports eight of them across 290 call sites.
+//! far-call form. `WCCMMUD.DLL` imports eight of them across 290 call sites, and
+//! all eight are implemented here.
 //!
-//! # These four pop their own arguments
+//! # Three conventions, in one family of eight
 //!
-//! Four words go on the stack, and there is no `add sp` after the call -- the
-//! helper takes them with it. That is why the shim table has a
-//! [`Cleans`](crate::shims::Cleans) column, and these are the entries that need
-//! it. The others in the family do not share this shape: `F_LXMUL@`, `F_LXLSH@`
-//! and `F_LXURSH@` pass everything in registers and touch the stack not at all.
+//! Nothing about the names says which, so each was read off the call sites:
+//!
+//! ```text
+//! ordinal  name        sites  convention
+//!    654   F_LDIV@        48  \
+//!    655   F_LMOD@         9   |  four words on the stack, callee pops 8,
+//!    656   F_LUDIV@       54   |  answer in DX:AX
+//!    657   F_LUMOD@       22  /
+//!    658   F_LXLSH@        3  \
+//!    659   F_LXMUL@      124   |  registers only: DX:AX against CX:BX or CL,
+//!    661   F_LXURSH@       4  /   answer in DX:AX, stack untouched
+//!    665   F_SCOPY@       26     two far pointers on the stack and a length in
+//!                                CX; callee pops 8; answers nothing, and means
+//!                                it -- see [`f_scopy`]
+//! ```
+//!
+//! The five that take arguments on the stack pop them themselves: the words go
+//! down and there is no `add sp` after the call. That is why the shim table has
+//! a [`Cleans`](crate::shims::Cleans) column, and those are the entries that
+//! need it. `re/ne_arity.py` reports "cleans void" for every site of all eight,
+//! which is the tool being unable to see a callee-cleaned convention rather than
+//! eight nullary routines -- it looks for the caller's stack adjustment and
+//! there is not one to find.
+//!
+//! The three register-only ones are why [`Machine::ax`](mbbs16::Machine::ax) and
+//! its siblings exist. An import thunk overwrites `AX` and `CX` to name itself,
+//! so it now saves them first.
 //!
 //! # The dividend is the argument nearest the frame
 //!

@@ -229,6 +229,20 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         runtime::f_lumod,
         Cleans::Callee(runtime::OPERANDS),
     ),
+    // The rest of that runtime, and it does not share one convention. These
+    // three take their operands in registers and put nothing on the stack, so
+    // there is nothing for either side to clean.
+    (MAJORBBS, "f_lxmul@", runtime::f_lxmul, Cleans::Caller),
+    (MAJORBBS, "f_lxlsh@", runtime::f_lxlsh, Cleans::Caller),
+    (MAJORBBS, "f_lxursh@", runtime::f_lxursh, Cleans::Caller),
+    // And this one is a struct copy: two far pointers on the stack, which it
+    // pops, and the length in `CX`.
+    (
+        MAJORBBS,
+        "f_scopy@",
+        runtime::f_scopy,
+        Cleans::Callee(runtime::POINTERS),
+    ),
 ];
 
 /// Every constant the host exports.
@@ -345,27 +359,30 @@ mod convention {
     use super::*;
 
     #[test]
-    fn every_routine_but_the_borland_helpers_is_caller_cleaned() {
+    fn only_the_stack_helpers_pop_their_own_arguments() {
         // The MajorBBS API is cdecl throughout: the module pushes, the module
-        // pops. Only the compiler's own runtime helpers differ, and there are
-        // four of them.
-        let callee: Vec<&str> = ROUTINES
+        // pops. Only the compiler's own runtime helpers differ, and only the
+        // ones that take arguments on the stack at all -- `f_lxmul@` and the two
+        // shifts pass everything in registers, so there is nothing to clean and
+        // `Cleans::Caller` is the honest answer for them.
+        //
+        // How much each pops is asserted here too, because the two amounts are
+        // the same number for different reasons: two `long`s for the division
+        // family, two far pointers for the struct copy.
+        let callee: Vec<(&str, Cleans)> = ROUTINES
             .iter()
             .filter(|(_, _, _, cleans)| !matches!(cleans, Cleans::Caller))
-            .map(|(_, name, _, _)| *name)
+            .map(|(_, name, _, cleans)| (*name, *cleans))
             .collect();
-        assert_eq!(callee, ["f_ldiv@", "f_lmod@", "f_ludiv@", "f_lumod@"]);
-    }
-
-    #[test]
-    fn the_helpers_pop_two_longs() {
-        for (_, name, _, cleans) in ROUTINES {
-            if name.starts_with("f_l") {
-                assert!(
-                    matches!(cleans, Cleans::Callee(runtime::OPERANDS)),
-                    "{name} pops {cleans:?}"
-                );
-            }
-        }
+        assert_eq!(
+            callee,
+            [
+                ("f_ldiv@", Cleans::Callee(runtime::OPERANDS)),
+                ("f_lmod@", Cleans::Callee(runtime::OPERANDS)),
+                ("f_ludiv@", Cleans::Callee(runtime::OPERANDS)),
+                ("f_lumod@", Cleans::Callee(runtime::OPERANDS)),
+                ("f_scopy@", Cleans::Callee(runtime::POINTERS)),
+            ]
+        );
     }
 }
