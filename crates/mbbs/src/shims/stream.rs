@@ -47,7 +47,9 @@ pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let spelt = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(2))?).into_owned();
 
     let mode = Mode::parse(&spelt).map_err(ShimError::Failed)?;
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
+    let name = Host::dos_name(&named)
+        .map_err(ShimError::Failed)?
+        .to_owned();
 
     let path = match host.find(&name) {
         Some(path) => path,
@@ -214,8 +216,7 @@ pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let Some(path) = host.find(name) else {
         return Ok(Ret::U16(NO));
     };
-    std::fs::remove_file(&path)
-        .map_err(|e| ShimError::Failed(format!("unlink({named}): {e}")))?;
+    std::fs::remove_file(&path).map_err(|e| ShimError::Failed(format!("unlink({named}): {e}")))?;
     Ok(Ret::U16(0))
 }
 
@@ -266,7 +267,10 @@ mod tests {
     fn gets(f: &mut Fixture, fp: FarPtr, n: u16) -> Option<String> {
         let buffer = f.bytes(&vec![0xff; usize::from(n) + 8], false);
         let ret = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
+            .invoke(
+                fgets,
+                &[buffer.offset, buffer.selector, n, fp.offset, fp.selector],
+            )
             .expect("fgets");
         match ret {
             Ret::Far(FarPtr {
@@ -330,7 +334,11 @@ mod tests {
             gets(&mut f, fp, 64).as_deref(),
             Some("the third line is longer than sixteen bytes\n")
         );
-        assert_eq!(gets(&mut f, fp, 64), None, "NULL is how the module finds the end");
+        assert_eq!(
+            gets(&mut f, fp, 64),
+            None,
+            "NULL is how the module finds the end"
+        );
 
         f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
     }
@@ -400,7 +408,10 @@ mod tests {
         let fp = opened(&mut f, "LINES.TXT", "rt");
         let buffer = f.buffer(8);
         let e = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
+            .invoke(
+                fgets,
+                &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector],
+            )
             .expect_err("a refusal");
         assert!(e.to_string().contains("n of 0"), "{e}");
     }
@@ -434,7 +445,10 @@ mod tests {
             .len() as u16;
         assert_eq!(got, on_disk, "binary delivers what is there");
 
-        let seen = f.machine.resolve(buffer, usize::from(want)).expect("buffer");
+        let seen = f
+            .machine
+            .resolve(buffer, usize::from(want))
+            .expect("buffer");
         assert!(
             seen[usize::from(got)..].iter().all(|b| *b == 0xff),
             "the tail of the module's buffer is left alone"
@@ -458,14 +472,25 @@ mod tests {
             word(
                 f.invoke(
                     fread,
-                    &[buffer.offset, buffer.selector, 1, 200, fp.offset, fp.selector],
+                    &[
+                        buffer.offset,
+                        buffer.selector,
+                        1,
+                        200,
+                        fp.offset,
+                        fp.selector,
+                    ],
                 )
                 .expect("fread"),
             )
         };
 
         assert_eq!(count("rb"), on_disk);
-        assert_eq!(count("rt"), on_disk - 4, "the four carriage returns are gone");
+        assert_eq!(
+            count("rt"),
+            on_disk - 4,
+            "the four carriage returns are gone"
+        );
     }
 
     #[test]
@@ -478,7 +503,14 @@ mod tests {
         let e = f
             .invoke(
                 fread,
-                &[buffer.offset, buffer.selector, 256, 256, fp.offset, fp.selector],
+                &[
+                    buffer.offset,
+                    buffer.selector,
+                    256,
+                    256,
+                    fp.offset,
+                    fp.selector,
+                ],
             )
             .expect_err("a refusal");
         assert!(e.to_string().contains("16-bit size_t"), "{e}");
@@ -496,7 +528,10 @@ mod tests {
         let bytes = image(&f, text);
         assert_eq!(bytes.len(), 20, "Borland's FILE is twenty bytes");
         assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), F_READ);
-        assert!(bytes[4] >= 5, "fd 0-4 are stdin, stdout, stderr, stdaux, stdprn");
+        assert!(
+            bytes[4] >= 5,
+            "fd 0-4 are stdin, stdout, stderr, stdaux, stdprn"
+        );
 
         let binary = opened(&mut f, "LINES.TXT", "rb");
         assert_eq!(flags_of(&f, binary), F_READ | F_BIN);
@@ -539,7 +574,10 @@ mod tests {
 
         let buffer = f.buffer(64);
         let e = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector])
+            .invoke(
+                fgets,
+                &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector],
+            )
             .expect_err("a refusal");
         assert!(
             e.to_string().contains("LINES.TXT was closed"),
@@ -554,8 +592,13 @@ mod tests {
     fn a_handle_this_host_never_issued_is_refused() {
         let mut f = Fixture::new();
         let invented = f.buffer(FILE_SIZE as u16);
-        let e = f.invoke(fclose, &Fixture::far(invented)).expect_err("a refusal");
-        assert!(e.to_string().contains("not a stream this host opened"), "{e}");
+        let e = f
+            .invoke(fclose, &Fixture::far(invented))
+            .expect_err("a refusal");
+        assert!(
+            e.to_string().contains("not a stream this host opened"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -641,7 +684,11 @@ mod tests {
             );
             f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
-            assert_eq!(std::fs::read(root.join(name)).expect(name), expected, "{name}");
+            assert_eq!(
+                std::fs::read(root.join(name)).expect(name),
+                expected,
+                "{name}"
+            );
             // "A write to a text file does not count generated carriage
             // returns" -- WRITE.C. So both modes answer 4.
             assert_eq!(wrote, 4, "{name}");
@@ -694,7 +741,10 @@ mod tests {
         let root = scratch("stream-flush");
         let mut f = Fixture::rooted(root);
         let fp = opened(&mut f, "OUT.LOG", "wt");
-        assert_eq!(word(f.invoke(fflush, &Fixture::far(fp)).expect("fflush")), 0);
+        assert_eq!(
+            word(f.invoke(fflush, &Fixture::far(fp)).expect("fflush")),
+            0
+        );
 
         f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
         let e = f.invoke(fflush, &Fixture::far(fp)).expect_err("a refusal");
@@ -709,21 +759,29 @@ mod tests {
         let mut f = Fixture::rooted(root.clone());
 
         let named = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(
+            word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")),
+            0
+        );
         assert!(!root.join("LINES.TXT").exists());
 
         // -1 for a file that is not there is the truth, and `_INIT__WCCMMUD`
         // reads it as one -- its single `unlink` is guarded by an `access` that
         // has already said the same thing.
         let again = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(again)).expect("unlink")), NO);
+        assert_eq!(
+            word(f.invoke(unlink, &Fixture::far(again)).expect("unlink")),
+            NO
+        );
     }
 
     #[test]
     fn unlink_outside_the_modules_own_directory_is_refused() {
         let mut f = Fixture::rooted(scratch("stream-unlink-path"));
         let named = f.text("D:\\LOGS\\MUD.LOG");
-        let e = f.invoke(unlink, &Fixture::far(named)).expect_err("a refusal");
+        let e = f
+            .invoke(unlink, &Fixture::far(named))
+            .expect_err("a refusal");
         assert!(e.to_string().contains("names a directory"), "{e}");
     }
 
@@ -753,7 +811,10 @@ mod tests {
         );
 
         let named = f.text("WCCRECOV.FLG");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(
+            word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")),
+            0
+        );
         assert!(!root.join("WCCRECOV.FLG").exists());
     }
 }

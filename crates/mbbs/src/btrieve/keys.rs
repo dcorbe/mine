@@ -162,7 +162,11 @@ impl Segment {
             Kind::Signed => signed(a, b),
             Kind::Unsigned => unsigned(a, b),
         };
-        if self.descending { order.reverse() } else { order }
+        if self.descending {
+            order.reverse()
+        } else {
+            order
+        }
     }
 }
 
@@ -322,9 +326,7 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
         })?;
         definitions += 1;
 
-        let word = |offset: usize| {
-            u16::from_le_bytes([definition[offset], definition[offset + 1]])
-        };
+        let word = |offset: usize| u16::from_le_bytes([definition[offset], definition[offset + 1]]);
         let attributes = word(at::ATTRIBUTES);
         for (bit, what) in UNSUPPORTED {
             if attributes & bit != 0 {
@@ -446,7 +448,12 @@ mod tests {
         let keys = parse(
             "WCCBANKS.DAT",
             &fcr(&[
-                definition(flag::EXTENDED | flag::ANOSEG | flag::DUPLICATES, 0, 30, 0x0b),
+                definition(
+                    flag::EXTENDED | flag::ANOSEG | flag::DUPLICATES,
+                    0,
+                    30,
+                    0x0b,
+                ),
                 definition(flag::EXTENDED | flag::DUPLICATES, 30, 4, 0x01),
             ]),
             1,
@@ -463,8 +470,12 @@ mod tests {
     fn a_type_this_host_cannot_order_is_refused_by_name() {
         // A `date` key sorted as though it were text would be in the right
         // order for some pairs of records and not others.
-        let e = parse("SOMETHING.DAT", &fcr(&[definition(flag::EXTENDED, 0, 4, 0x03)]), 1)
-            .expect_err("no ordering for a date");
+        let e = parse(
+            "SOMETHING.DAT",
+            &fcr(&[definition(flag::EXTENDED, 0, 4, 0x03)]),
+            1,
+        )
+        .expect_err("no ordering for a date");
         assert!(e.why.contains("date"), "{e}");
     }
 
@@ -473,15 +484,19 @@ mod tests {
         let keys = parse("OLD.DAT", &fcr(&[definition(0, 0, 8, 0)]), 1).expect("parses");
         assert_eq!(keys[0].segments[0].kind, Kind::Text, "old-style ascii");
 
-        let keys = parse("OLD.DAT", &fcr(&[definition(flag::OLD_BINARY, 0, 8, 0)]), 1)
-            .expect("parses");
+        let keys =
+            parse("OLD.DAT", &fcr(&[definition(flag::OLD_BINARY, 0, 8, 0)]), 1).expect("parses");
         assert_eq!(keys[0].segments[0].kind, Kind::Unsigned, "old-style binary");
     }
 
     #[test]
     fn a_file_claiming_more_keys_than_it_describes_is_refused() {
-        let e = parse("SHORT.DAT", &fcr(&[definition(flag::EXTENDED, 0, 30, 0x0b)]), 2)
-            .expect_err("the second definition is all zeros");
+        let e = parse(
+            "SHORT.DAT",
+            &fcr(&[definition(flag::EXTENDED, 0, 30, 0x0b)]),
+            2,
+        )
+        .expect_err("the second definition is all zeros");
         assert!(e.why.contains("zero-length"), "{e}");
     }
 
@@ -524,7 +539,11 @@ mod tests {
     #[test]
     fn a_signed_key_reads_its_sign_from_its_own_width() {
         let key = named(Kind::Signed, 2);
-        assert_eq!(key.compare(&[0xff, 0xff], &[1, 0]), Ordering::Less, "-1 < 1");
+        assert_eq!(
+            key.compare(&[0xff, 0xff], &[1, 0]),
+            Ordering::Less,
+            "-1 < 1"
+        );
 
         // The same bytes as an unsigned key are 65,535 and sort the other way.
         let key = named(Kind::Unsigned, 2);
@@ -576,9 +595,15 @@ mod tests {
 
         // Same name, different number: the second segment decides, and decides
         // numerically.
-        assert_eq!(key.compare(b"abc\0\x02\x00", b"abc\0\x0a\x00"), Ordering::Less);
+        assert_eq!(
+            key.compare(b"abc\0\x02\x00", b"abc\0\x0a\x00"),
+            Ordering::Less
+        );
         // Different name: the first segment decides and the second is not read.
-        assert_eq!(key.compare(b"abc\0\x0a\x00", b"abd\0\x02\x00"), Ordering::Less);
+        assert_eq!(
+            key.compare(b"abc\0\x0a\x00", b"abd\0\x02\x00"),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -609,8 +634,14 @@ mod tests {
         record[10..14].copy_from_slice(b"abc\0");
         record[20..22].copy_from_slice(&7u16.to_le_bytes());
 
-        assert_eq!(key.compare_value(&record, b"abc\0\x07\x00"), Ordering::Equal);
+        assert_eq!(
+            key.compare_value(&record, b"abc\0\x07\x00"),
+            Ordering::Equal
+        );
         assert_eq!(key.compare_value(&record, b"abc\0\x08\x00"), Ordering::Less);
-        assert_eq!(key.compare_value(&record, b"abb\0\x07\x00"), Ordering::Greater);
+        assert_eq!(
+            key.compare_value(&record, b"abb\0\x07\x00"),
+            Ordering::Greater
+        );
     }
 }

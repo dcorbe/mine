@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use mbbs::msg::MsgFile;
 
 fn repo(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
 }
 
 /// A compiled `.MCV`, decoded far enough to read its messages back.
@@ -54,8 +56,7 @@ impl McvFile {
         let messages = (0..msgcnt)
             .map(|n| {
                 let at = loclist + n * 4;
-                let offset =
-                    i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                let offset = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
                 let end = bytes[offset..]
                     .iter()
                     .position(|b| *b == 0)
@@ -144,7 +145,11 @@ fn the_reader_agrees_with_the_host_that_compiled_these() {
         return;
     }
     eprintln!("{checked} modules, {messages} messages, byte for byte");
-    assert!(checked >= 9, "only {checked} of {} pairs found", PAIRS.len());
+    assert!(
+        checked >= 9,
+        "only {checked} of {} pairs found",
+        PAIRS.len()
+    );
 }
 
 /// MajorMUD's own three files, which have no `.MCV` to check against.

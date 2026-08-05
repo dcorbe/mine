@@ -42,6 +42,8 @@
 
 use std::fmt;
 
+use mbbs16::FarPtr;
+
 /// Maximum length of any one answer. `FSD.H:238`.
 const ANSLEN: u16 = 80;
 
@@ -62,6 +64,82 @@ pub const MBPMAX: u16 = 200;
 /// two members `fsdans()` fills in and would be a different size. `FSD.H:262`
 /// states it outright: `/* (23 bytes long) */`.
 pub const FSDFLD: u16 = 23;
+
+/// `sizeof(struct fsdscb)`, `FSD.H:275`.
+///
+/// The host allocates this many bytes, and the `fsdscb` global points at them,
+/// so the number is load-bearing the same way [`FSDFLD`] is: the module reaches
+/// into the structure with offsets its compiler baked in.
+pub const FSDSCB: u16 = 166;
+
+/// Where each member of `struct fsdscb` sits. `FSD.H:275`.
+///
+/// **Byte alignment, not word.** Borland's default (`-a-`), and not an
+/// assumption: `FSD.H:262` documents `struct fsdfld` as 23 bytes, and word
+/// alignment would pad it to 24. Two of the offsets below are settled a second
+/// time by `WCCMMUD.DLL` itself, which reaches `flddat` as `[fsdscb+4]` at
+/// `seg 3:0x4340` and pushes `newans` from `[fsdscb+12]` at `seg 3:0x2d46`.
+///
+/// Only the members this host sets or reads are named. The rest -- `ansbuf`,
+/// `typahd`, `state` and the other entry-session working storage -- are
+/// deliberately absent and deliberately preserved: [`Scb`] keeps the bytes it
+/// does not model rather than zeroing them.
+pub mod scb {
+    /// `char *fldspc` -- the field specification, in the module's memory.
+    pub const FLDSPC: u16 = 0;
+    /// `struct fsdfld *flddat` -- the field array, in the session buffer.
+    pub const FLDDAT: u16 = 4;
+    /// `char *mbpunc` -- the embedded-punctuation templates.
+    pub const MBPUNC: u16 = 8;
+    /// `char *newans` -- the answer string this session is building.
+    pub const NEWANS: u16 = 12;
+    /// `char crsatr` -- the attribute of the field the cursor is on.
+    pub const CRSATR: u16 = 20;
+    /// `int numfld` -- how many fields the specification names.
+    pub const NUMFLD: u16 = 21;
+    /// `int numtpl` -- how many of them the template has room for.
+    pub const NUMTPL: u16 = 23;
+    /// `int mbleng` -- bytes of punctuation template.
+    pub const MBLENG: u16 = 25;
+    /// `int maxans` -- the longest answer string this form can produce.
+    pub const MAXANS: u16 = 27;
+    /// `char hlplen` -- the help field's width, or 0.
+    pub const HLPLEN: u16 = 29;
+    /// `int hlpoff` -- where the help field starts in the template.
+    pub const HLPOFF: u16 = 40;
+    /// `int allans` -- the answer string's current length.
+    pub const ALLANS: u16 = 42;
+}
+
+/// Where each member of `struct fsdfld` sits. `FSD.H:247`.
+///
+/// `FLAGS` at 12 is not read off the header alone: fourteen sites in
+/// `WCCMMUD.DLL` do `or byte [flddat + 23*i + 12], 0x80`, marking the fields a
+/// player may see but not type into.
+pub mod fld {
+    /// `char ansgto[GTOLEN+1]` -- the ANSI cursor-goto command.
+    pub const ANSGTO: usize = 0;
+    /// `char width`.
+    pub const WIDTH: usize = 9;
+    /// `char xwidth`.
+    pub const XWIDTH: usize = 10;
+    /// `char attr`.
+    pub const ATTR: usize = 11;
+    /// `char flags`.
+    pub const FLAGS: usize = 12;
+    /// `char fldtyp`.
+    pub const FLDTYP: usize = 13;
+    /// `int fspoff`.
+    pub const FSPOFF: usize = 14;
+    /// `int tmpoff`.
+    pub const TMPOFF: usize = 16;
+    /// `int mbpoff`.
+    pub const MBPOFF: usize = 18;
+    /// `int ansoff`.
+    pub const ANSOFF: usize = 20;
+    /// `char anslen`.
+    pub const ANSLEN: usize = 22;
+}
 
 /// What a template character means. `FSD.C:44`'s `tmpspc[]` table.
 ///
@@ -163,6 +241,218 @@ pub struct Field {
     pub punctuation_at: Option<u16>,
 }
 
+impl Field {
+    /// This field as the 23 bytes `struct fsdfld` occupies in module memory.
+    ///
+    /// `ansoff` and `anslen` are arguments rather than members for the reason
+    /// [`FSDFLD`] gives: they are not this field's to know. `fsdans()` computes
+    /// them when an answer string is installed, and a [`Form`] describes a form
+    /// nobody has answered.
+    ///
+    /// `ansgto` is left zero. The original never writes it off the ANSI path --
+    /// `fsdppc(templt, 0)` skips every branch that would -- so the real host
+    /// left whatever `alczer` or the stack had put there. Zero is that, and it
+    /// is the same zero every run.
+    pub fn record(&self, ansoff: u16, anslen: u8) -> [u8; FSDFLD as usize] {
+        let mut out = [0u8; FSDFLD as usize];
+        out[fld::ANSGTO] = 0;
+        out[fld::WIDTH] = self.width;
+        out[fld::XWIDTH] = self.xwidth;
+        out[fld::ATTR] = self.attr;
+        out[fld::FLAGS] = self.flags;
+        out[fld::FLDTYP] = self.kind;
+        out[fld::FSPOFF..fld::FSPOFF + 2].copy_from_slice(&self.spec_at.to_le_bytes());
+        out[fld::TMPOFF..fld::TMPOFF + 2].copy_from_slice(&self.template_at.to_le_bytes());
+        // `-1`, not `0`: `tmpfld()` writes -1 for a field with no embedded
+        // punctuation and `embscn()` overwrites only the ones that joined, so a
+        // zero here would name the first punctuation template rather than none.
+        let mbpoff = self.punctuation_at.map_or(-1i16, |at| at as i16);
+        out[fld::MBPOFF..fld::MBPOFF + 2].copy_from_slice(&mbpoff.to_le_bytes());
+        out[fld::ANSOFF..fld::ANSOFF + 2].copy_from_slice(&ansoff.to_le_bytes());
+        out[fld::ANSLEN] = anslen;
+        out
+    }
+}
+
+/// `struct fsdscb`, as a block of bytes with named members.
+///
+/// The bytes are kept whole rather than parsed into a Rust struct, for the
+/// reason `globals.rs` opens with: this is the *module's* view of the session,
+/// and the module writes through it. Round-tripping every byte -- including the
+/// entry session's `ansbuf`, `typahd` and `state`, which this host never sets
+/// -- means a member nobody modelled cannot be quietly zeroed by a member
+/// somebody did.
+///
+/// No `Machine` here on purpose. Reading and writing module memory belongs to
+/// the shims; this is the layout and nothing else, which is what keeps this
+/// module testable with no machine present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scb {
+    bytes: [u8; FSDSCB as usize],
+}
+
+impl Scb {
+    /// Read a control block out of exactly [`FSDSCB`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// If `bytes` is not that long. A caller resolving a far pointer has asked
+    /// for the length already, so this is the second half of one check rather
+    /// than a new one.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FormError> {
+        let bytes: [u8; FSDSCB as usize] = bytes
+            .try_into()
+            .map_err(|_| FormError::ShortBlock(bytes.len()))?;
+        Ok(Self { bytes })
+    }
+
+    /// The block, for writing back where it came from.
+    pub fn as_bytes(&self) -> &[u8; FSDSCB as usize] {
+        &self.bytes
+    }
+
+    fn ptr(&self, at: u16) -> FarPtr {
+        let at = usize::from(at);
+        FarPtr::from_bytes([
+            self.bytes[at],
+            self.bytes[at + 1],
+            self.bytes[at + 2],
+            self.bytes[at + 3],
+        ])
+    }
+
+    fn set_ptr(&mut self, at: u16, value: FarPtr) {
+        let at = usize::from(at);
+        self.bytes[at..at + 4].copy_from_slice(&value.to_bytes());
+    }
+
+    fn word(&self, at: u16) -> u16 {
+        let at = usize::from(at);
+        u16::from_le_bytes([self.bytes[at], self.bytes[at + 1]])
+    }
+
+    fn set_word(&mut self, at: u16, value: u16) {
+        let at = usize::from(at);
+        self.bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn byte(&self, at: u16) -> u8 {
+        self.bytes[usize::from(at)]
+    }
+
+    fn set_byte(&mut self, at: u16, value: u8) {
+        self.bytes[usize::from(at)] = value;
+    }
+
+    /// `fldspc`: the field specification, in the module's memory.
+    pub fn fldspc(&self) -> FarPtr {
+        self.ptr(scb::FLDSPC)
+    }
+    /// Set [`Scb::fldspc`].
+    pub fn set_fldspc(&mut self, value: FarPtr) {
+        self.set_ptr(scb::FLDSPC, value);
+    }
+
+    /// `flddat`: the array of [`Field::record`]s, in the session buffer.
+    pub fn flddat(&self) -> FarPtr {
+        self.ptr(scb::FLDDAT)
+    }
+    /// Set [`Scb::flddat`].
+    pub fn set_flddat(&mut self, value: FarPtr) {
+        self.set_ptr(scb::FLDDAT, value);
+    }
+
+    /// `mbpunc`: the embedded-punctuation templates.
+    pub fn mbpunc(&self) -> FarPtr {
+        self.ptr(scb::MBPUNC)
+    }
+    /// Set [`Scb::mbpunc`].
+    pub fn set_mbpunc(&mut self, value: FarPtr) {
+        self.set_ptr(scb::MBPUNC, value);
+    }
+
+    /// `newans`: the answer string this session is building.
+    pub fn newans(&self) -> FarPtr {
+        self.ptr(scb::NEWANS)
+    }
+    /// Set [`Scb::newans`].
+    pub fn set_newans(&mut self, value: FarPtr) {
+        self.set_ptr(scb::NEWANS, value);
+    }
+
+    /// `crsatr`: the attribute of the field the cursor is on.
+    pub fn crsatr(&self) -> u8 {
+        self.byte(scb::CRSATR)
+    }
+    /// Set [`Scb::crsatr`].
+    pub fn set_crsatr(&mut self, value: u8) {
+        self.set_byte(scb::CRSATR, value);
+    }
+
+    /// `numfld`: how many fields the specification names.
+    pub fn numfld(&self) -> u16 {
+        self.word(scb::NUMFLD)
+    }
+    /// Set [`Scb::numfld`].
+    pub fn set_numfld(&mut self, value: u16) {
+        self.set_word(scb::NUMFLD, value);
+    }
+
+    /// `numtpl`: how many of them the template has room for.
+    pub fn numtpl(&self) -> u16 {
+        self.word(scb::NUMTPL)
+    }
+    /// Set [`Scb::numtpl`].
+    pub fn set_numtpl(&mut self, value: u16) {
+        self.set_word(scb::NUMTPL, value);
+    }
+
+    /// `mbleng`: bytes of punctuation template.
+    pub fn mbleng(&self) -> u16 {
+        self.word(scb::MBLENG)
+    }
+    /// Set [`Scb::mbleng`].
+    pub fn set_mbleng(&mut self, value: u16) {
+        self.set_word(scb::MBLENG, value);
+    }
+
+    /// `maxans`: the longest answer string this form can produce.
+    pub fn maxans(&self) -> u16 {
+        self.word(scb::MAXANS)
+    }
+    /// Set [`Scb::maxans`].
+    pub fn set_maxans(&mut self, value: u16) {
+        self.set_word(scb::MAXANS, value);
+    }
+
+    /// `hlplen`: the help field's width, or 0.
+    pub fn hlplen(&self) -> u8 {
+        self.byte(scb::HLPLEN)
+    }
+    /// Set [`Scb::hlplen`].
+    pub fn set_hlplen(&mut self, value: u8) {
+        self.set_byte(scb::HLPLEN, value);
+    }
+
+    /// `hlpoff`: where the help field starts in the template.
+    pub fn hlpoff(&self) -> u16 {
+        self.word(scb::HLPOFF)
+    }
+    /// Set [`Scb::hlpoff`].
+    pub fn set_hlpoff(&mut self, value: u16) {
+        self.set_word(scb::HLPOFF, value);
+    }
+
+    /// `allans`: the answer string's current length, final NUL included.
+    pub fn allans(&self) -> u16 {
+        self.word(scb::ALLANS)
+    }
+    /// Set [`Scb::allans`].
+    pub fn set_allans(&mut self, value: u16) {
+        self.set_word(scb::ALLANS, value);
+    }
+}
+
 /// The `FFF*` field flags. `FSD.H:265-273`.
 pub mod flags {
     /// Multiple choice field.
@@ -235,12 +525,18 @@ impl Form {
 pub enum FormError {
     /// The session would need more bytes than an `int` can report.
     TooBig(u32),
+
+    /// A session control block was read from fewer bytes than one is.
+    ShortBlock(usize),
 }
 
 impl fmt::Display for FormError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooBig(n) => write!(f, "a session needing {n} bytes does not fit in an int"),
+            Self::ShortBlock(n) => {
+                write!(f, "a session control block is {FSDSCB} bytes, not {n}")
+            }
         }
     }
 }
@@ -673,6 +969,128 @@ mod tests {
         // field characters and invent fields out of the borders.
         let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY);
         assert_eq!(form.in_template, 1);
+    }
+
+    #[test]
+    fn the_session_control_block_is_the_size_the_header_declares() {
+        // Byte-packed, every member of `FSD.H:275` in declaration order. Laid
+        // out as a running total rather than one sum, because the first
+        // spelling of this test said 167 and the mistake -- five trailing
+        // `char`s counted as six -- was invisible in an expression.
+        let members: u16 = [
+            4,  // char *fldspc
+            4,  // struct fsdfld *flddat
+            4,  // char *mbpunc
+            4,  // char *newans
+            4,  // int (*fldvfy)()
+            1,  // char crsatr
+            2,  // int numfld
+            2,  // int numtpl
+            2,  // int mbleng
+            2,  // int maxans
+            1,  // char hlplen
+            9,  // char hlpgto[GTOLEN+1]
+            1,  // char hlpatr
+            2,  // int hlpoff
+            2,  // int allans
+            1,  // char state
+            81, /* char ansbuf[ANSLEN+1] */
+            1,  // char anslen
+            1,  // char ansptr
+            20, /* char typahd[EXTHED] */
+            1,  // char ahdptr
+            1,  // char hdlahd
+            1,  // char entfld
+            1,  // char crsfld
+            1,  // char shffld
+            4,  // char *ftmptr
+            1,  // char flags
+            4,  // char *altptr
+            2,  // int xitkey
+            1,  // char chgcnt
+            1,  // char maxy
+        ]
+        .iter()
+        .sum();
+        assert_eq!(FSDSCB, members);
+        assert_eq!(FSDSCB, 166);
+
+        // And the offsets are that same running total, so a member inserted
+        // above one of them without moving it would show here.
+        assert_eq!(scb::CRSATR, 20);
+        assert_eq!(scb::NUMFLD, 21);
+        assert_eq!(scb::HLPOFF, 40);
+        assert_eq!(scb::ALLANS, 42);
+    }
+
+    #[test]
+    fn the_module_finds_flddat_and_newans_where_this_puts_them() {
+        // Not from the header -- from `WCCMMUD.DLL`. `seg 3:0x4340` is
+        // `les bx,[es:bx+0x4]` on `fsdscb` to reach `flddat`, and
+        // `seg 3:0x2d46` pushes `[es:bx+0xe]:[es:bx+0xc]` as `newans`. If these
+        // two numbers were wrong the module would read two other pointers and
+        // nothing would say so.
+        assert_eq!(scb::FLDDAT, 4);
+        assert_eq!(scb::NEWANS, 12);
+    }
+
+    #[test]
+    fn a_field_record_is_twenty_three_bytes_with_the_flags_at_twelve() {
+        // The module's fourteen `or byte [es:bx+n],0x80` sites are every one
+        // `23*i+12` -- `seg 3:0x4344` is field 2 at 58 and `seg 3:0x4444` is
+        // field 20 at 472.
+        let form = compile(b"Ok Y/N", b"OK", MANY);
+        let record = form.fields[0].record(7, 3);
+        assert_eq!(record.len(), usize::from(FSDFLD));
+        assert_eq!(record[fld::FLAGS], flags::MULTICHOICE | flags::ALTERNATES);
+        assert_eq!(record[fld::WIDTH], 3);
+        assert_eq!(record[fld::FLDTYP], b'Y');
+        assert_eq!(
+            i16::from_le_bytes([record[fld::ANSOFF], record[fld::ANSOFF + 1]]),
+            7
+        );
+        assert_eq!(record[fld::ANSLEN], 3);
+    }
+
+    #[test]
+    fn a_field_with_no_punctuation_records_mbpoff_as_minus_one() {
+        // `tmpfld()` sets `mbpoff = -1` and `embscn()` overwrites it only for
+        // the fields that joined. Zero would name the first punctuation
+        // template rather than none.
+        let plain = compile(b"?? ??", b"A B", MANY);
+        let record = plain.fields[0].record(0, 0);
+        assert_eq!(
+            i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
+            -1
+        );
+
+        let joined = compile(b"###-####", b"P", MANY);
+        let record = joined.fields[0].record(0, 0);
+        assert_eq!(
+            i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
+            0
+        );
+    }
+
+    #[test]
+    fn a_control_block_keeps_the_members_nobody_modelled() {
+        // The entry session's `ansbuf`, `typahd` and `state` are FSD's working
+        // storage and this host sets none of them. A round trip that zeroed
+        // them would be a reset dressed as a write.
+        let mut bytes = [0u8; FSDSCB as usize];
+        bytes[45] = b'x'; // ansbuf[0]
+        bytes[128] = b'y'; // typahd[0]
+        let mut block = Scb::from_bytes(&bytes).expect("the right length");
+        block.set_numfld(9);
+        assert_eq!(block.numfld(), 9);
+        assert_eq!(block.as_bytes()[45], b'x');
+        assert_eq!(block.as_bytes()[128], b'y');
+    }
+
+    #[test]
+    fn a_control_block_read_from_the_wrong_number_of_bytes_is_refused() {
+        assert!(Scb::from_bytes(&[0u8; 165]).is_err());
+        assert!(Scb::from_bytes(&[0u8; 167]).is_err());
     }
 
     #[test]

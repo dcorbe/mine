@@ -49,7 +49,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { heap: 8 * 1024 * 1024 }
+        Self {
+            heap: 8 * 1024 * 1024,
+        }
     }
 }
 
@@ -163,7 +165,10 @@ impl Heap {
             .map_err(|e| e.to_string())?;
         self.arenas.push(Arena {
             selector,
-            free: vec![Span { at: 0, len: SEGMENT }],
+            free: vec![Span {
+                at: 0,
+                len: SEGMENT,
+            }],
         });
 
         let at = self.take(size).expect("a fresh segment has room");

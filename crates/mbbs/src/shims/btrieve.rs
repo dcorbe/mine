@@ -155,7 +155,9 @@ pub fn omdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
     let maxlen = machine.arg_u16(2);
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
+    let name = Host::dos_name(&named)
+        .map_err(ShimError::Failed)?
+        .to_owned();
 
     let path = host.btrieve_file(&name).map_err(ShimError::Failed)?;
     let geometry = Geometry::read(&name, &path).map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -467,7 +469,9 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
     let opt = machine.arg_u16(0) as i16;
     let op = Op::of(opt - 50).ok_or_else(|| {
-        ShimError::Failed(format!("qnpbtv with option {opt}, which is not a get operation"))
+        ShimError::Failed(format!(
+            "qnpbtv with option {opt}, which is not a get operation"
+        ))
     })?;
 
     // `bb->lastkn`: which key the last positioning used. Passed as -1 so that
@@ -588,7 +592,10 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     };
     load(host, block)?;
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
+    let count = file
+        .records()
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .len();
 
     // Where the walk goes next, from where it is now.
     let at = match (opt, file.cursor()) {
@@ -772,7 +779,9 @@ fn absolute(
     let key = key_number(machine, host, block, keynum)?;
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let records = file
+        .records()
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let Some(physical) = records.find_physical(position) else {
         if fatal {
             return Err(ShimError::Failed(format!(
@@ -873,11 +882,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         }
         let length = key_length(host, block, key)?;
         let bytes = machine.resolve(value, usize::from(length))?.to_vec();
-        let buffer = host
-            .btrieve
-            .block(block)
-            .map_err(ShimError::Failed)?
-            .key();
+        let buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
         machine.write(buffer, &bytes)?;
     }
 
@@ -885,11 +890,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         false => Vec::new(),
         true => {
             let length = key_length(host, block, key)?;
-            let buffer = host
-                .btrieve
-                .block(block)
-                .map_err(ShimError::Failed)?
-                .key();
+            let buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
             machine.resolve(buffer, usize::from(length))?.to_vec()
         }
     };
@@ -898,10 +899,12 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
     let name = file.name().to_owned();
     let definitions = file.keys().to_vec();
     let cursor = file.cursor();
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-    let count = records
-        .ordered_len(key)
-        .ok_or_else(|| ShimError::Failed(format!("{who} on {name} by key {key}, which it has not")))?;
+    let records = file
+        .records()
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    let count = records.ordered_len(key).ok_or_else(|| {
+        ShimError::Failed(format!("{who} on {name} by key {key}, which it has not"))
+    })?;
 
     // Where the file is now, in this key's order. A cursor left by a step, or
     // by a query on a different key, is translated through the record's place
@@ -922,7 +925,9 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         Op::Highest => count.checked_sub(1),
         Op::Equal => {
             let at = records.seek(&definitions, key, &wanted);
-            records.matches(&definitions, key, at, &wanted).then_some(at)
+            records
+                .matches(&definitions, key, at, &wanted)
+                .then_some(at)
         }
         Op::AtLeast => Some(records.seek(&definitions, key, &wanted)).filter(|at| *at < count),
         Op::Greater => {
@@ -1081,9 +1086,7 @@ fn key_length(host: &Host, block: FarPtr, key: u16) -> Result<u16, ShimError> {
     file.keys()
         .get(usize::from(key))
         .map(|k| k.length())
-        .ok_or_else(|| {
-            ShimError::Failed(format!("{} has no key {key}", file.name()))
-        })
+        .ok_or_else(|| ShimError::Failed(format!("{} has no key {key}", file.name())))
 }
 
 /// Read a file's records, if this is the first time anything has asked.
@@ -1100,7 +1103,9 @@ fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
         return Ok(());
     }
     let name = file.name().to_owned();
-    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let records = file
+        .records()
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let ties: Vec<(u16, usize)> = records
         .ties()
         .iter()
@@ -1161,11 +1166,7 @@ fn note_no_file(host: &mut Host, who: &str) {
 
 /// Where `bb->data` points, for a file the caller has already established.
 fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
-    Ok(host
-        .btrieve
-        .block(block)
-        .map_err(ShimError::Failed)?
-        .data())
+    Ok(host.btrieve.block(block).map_err(ShimError::Failed)?.data())
 }
 
 /// Refuse a lock type this host cannot honour.
@@ -1465,7 +1466,10 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 128);
         let long = f.host.notes().last().expect("noted").clone();
         assert!(long.contains("SAMPLE.DAT"), "{long}");
-        assert!(!long.contains("truncated"), "nothing is lost either way: {long}");
+        assert!(
+            !long.contains("truncated"),
+            "nothing is lost either way: {long}"
+        );
     }
 
     #[test]
@@ -1500,7 +1504,15 @@ mod tests {
         };
         f.invoke(
             obtbtvl,
-            &[0, 0, value.offset, value.selector, keynum as u16, opt as u16, 0],
+            &[
+                0,
+                0,
+                value.offset,
+                value.selector,
+                keynum as u16,
+                opt as u16,
+                0,
+            ],
         )
         .expect("acquires")
             == Ret::U16(1)
@@ -1544,7 +1556,10 @@ mod tests {
         assert!(!acquire(&mut f, None, -1, 6), "and then the end");
 
         let mut stepped = vec![];
-        assert_eq!(f.invoke(stpbtvl, &[0, 0, 33, 0]).expect("step first"), Ret::U16(1));
+        assert_eq!(
+            f.invoke(stpbtvl, &[0, 0, 33, 0]).expect("step first"),
+            Ret::U16(1)
+        );
         stepped.push(got(&f, into));
         while f.invoke(stpbtvl, &[0, 0, 24, 0]).expect("step next") == Ret::U16(1) {
             stepped.push(got(&f, into));
@@ -1581,8 +1596,12 @@ mod tests {
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let into = buffer(&f, block);
 
-        for (opt, want, what) in [(8, 5, "greater than 4"), (9, 4, "at least 4"),
-                                  (10, 3, "less than 4"), (11, 4, "at most 4")] {
+        for (opt, want, what) in [
+            (8, 5, "greater than 4"),
+            (9, 4, "at least 4"),
+            (10, 3, "less than 4"),
+            (11, 4, "at most 4"),
+        ] {
             assert!(acquire(&mut f, Some(4), 0, opt), "{what}");
             assert_eq!(got(&f, into), want, "{what}");
         }
@@ -1638,8 +1657,11 @@ mod tests {
         assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
         assert_eq!(got(&f, into), 1);
 
-        f.invoke(gabbtvl, &[0, 0, position as u16, (position >> 16) as u16, 0, 0])
-            .expect("back to where it was");
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 0, 0],
+        )
+        .expect("back to where it was");
         assert_eq!(got(&f, into), 6);
 
         // And the key path came with it: the next record in key order is 7.
@@ -1737,9 +1759,15 @@ mod tests {
 
         let mut names = vec![];
         assert!(acquire(&mut f, None, 0, 12), "lowest");
-        names.push(f.read(FarPtr { offset: into.offset + 2, selector: into.selector }));
+        names.push(f.read(FarPtr {
+            offset: into.offset + 2,
+            selector: into.selector,
+        }));
         while acquire(&mut f, None, -1, 6) {
-            names.push(f.read(FarPtr { offset: into.offset + 2, selector: into.selector }));
+            names.push(f.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector,
+            }));
         }
         assert_eq!(names, ["alpha", "beta", "gamma"]);
     }
@@ -1754,7 +1782,10 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 64);
         assert!(f.invoke(qnpbtv, &[56]).is_err());
         assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
-        assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
+        assert!(
+            f.invoke(absbtv, &[]).is_err(),
+            "and nowhere has no position"
+        );
     }
 
     #[test]
@@ -1772,7 +1803,10 @@ mod tests {
 
         // Establish key 0 as `lastkn`, then search it again by name.
         assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5");
-        assert!(acquire(&mut f, Some(3), -1, 5), "equal to 3, by the last key");
+        assert!(
+            acquire(&mut f, Some(3), -1, 5),
+            "equal to 3, by the last key"
+        );
         assert_eq!(got(&f, key), 3, "the whole two-byte key value was copied");
 
         assert!(
@@ -1830,8 +1864,14 @@ mod tests {
     fn an_option_no_macro_produces_is_refused() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(qrybtv, &[0, 0, 0, 5]).is_err(), "5 is an acquire code");
-        assert!(f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 62, 0]).is_err(), "62 is a query code");
+        assert!(
+            f.invoke(qrybtv, &[0, 0, 0, 5]).is_err(),
+            "5 is an acquire code"
+        );
+        assert!(
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 62, 0]).is_err(),
+            "62 is a query code"
+        );
         assert!(f.invoke(stpbtvl, &[0, 0, 99, 0]).is_err());
     }
 
@@ -1919,11 +1959,8 @@ mod tests {
         let mut f = nothing_current();
         let into = f.bytes(&[0xAA; 8], false);
         assert_eq!(
-            f.invoke(
-                gabbtvl,
-                &[into.offset, into.selector, 0, 0, 0, 0]
-            )
-            .expect("answers"),
+            f.invoke(gabbtvl, &[into.offset, into.selector, 0, 0, 0, 0])
+                .expect("answers"),
             Ret::Void
         );
         assert_eq!(
@@ -2001,7 +2038,9 @@ mod tests {
         // whole crate is shaped around.
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        let e = f.invoke(invbtv, &[0, 0, 64]).expect_err("nothing here writes");
+        let e = f
+            .invoke(invbtv, &[0, 0, 64])
+            .expect_err("nothing here writes");
         assert!(e.to_string().contains("invbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }

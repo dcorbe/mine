@@ -107,12 +107,12 @@ impl Records {
             // same sequence every run, or `qnxbtv` would step somewhere else on
             // a second pass over the same file. See [`Self::ties`] for what
             // that tie-break is and is not.
-            sorted.sort_by(|a, b| {
-                match key.compare(&records[*a].bytes, &records[*b].bytes) {
+            sorted.sort_by(
+                |a, b| match key.compare(&records[*a].bytes, &records[*b].bytes) {
                     Ordering::Equal => records[*a].position.cmp(&records[*b].position),
                     other => other,
-                }
-            });
+                },
+            );
             let mut places = vec![0usize; records.len()];
             for (place, record) in sorted.iter().enumerate() {
                 places[*record] = place;
@@ -221,12 +221,8 @@ impl Records {
 /// Walk the data pages and collect every live record.
 fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let size = u32::try_from(
-        file.metadata()
-            .map_err(|e| e.to_string())?
-            .len(),
-    )
-    .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
+    let size = u32::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
     let dead = free_list(&mut file, size)?;
     let page = u32::from(geometry.page);
@@ -511,7 +507,12 @@ mod tests {
         let records = read("INDEX.DAT", &with_index_page(of(&[1, 2]))).expect("reads");
         assert_eq!(records.len(), 2);
         assert!(
-            records.physical(0).expect("first").bytes.iter().all(|b| *b != 0x5a),
+            records
+                .physical(0)
+                .expect("first")
+                .bytes
+                .iter()
+                .all(|b| *b != 0x5a),
             "no byte of an index page reached a record"
         );
     }
@@ -533,7 +534,11 @@ mod tests {
 
         assert_eq!(records.seek(&parsed, 0, &[1, 0]), 0);
         assert_eq!(records.seek(&parsed, 0, &[3, 0]), 1);
-        assert_eq!(records.seek(&parsed, 0, &[4, 0]), 2, "the first one above 4");
+        assert_eq!(
+            records.seek(&parsed, 0, &[4, 0]),
+            2,
+            "the first one above 4"
+        );
         assert_eq!(records.seek(&parsed, 0, &[9, 0]), 3, "past the end");
 
         assert!(records.matches(&parsed, 0, 1, &[3, 0]));

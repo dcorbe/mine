@@ -31,8 +31,8 @@ pub mod heap;
 pub mod msg;
 pub mod random;
 mod shims;
-pub mod strings;
 pub mod stream;
+pub mod strings;
 #[cfg(test)]
 mod testing;
 pub mod textvar;
