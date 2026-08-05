@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 pub const MAJORBBS: &str = "MAJORBBS";
 pub const GALGSBL: &str = "GALGSBL";
 pub const GALME: &str = "GALME";
+pub const DOSCALLS: &str = "DOSCALLS";
 
 /// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
 ///
@@ -57,6 +58,26 @@ const GALGSBL_WG101: &str = include_str!("../data/galgsbl_wg101.tsv");
 /// and the binary is the thing the module is actually linked against.
 const GALME_WG101: &str = include_str!("../data/galme_wg101.tsv");
 
+/// `DOSCALLS`, keyed to the extender release rather than the host release.
+///
+/// No Worldgroup disk ships a `DOSCALLS.DLL`. The 286|DOS-Extender bound into
+/// `MAJORBBS.EXE` provides it, so the table comes from Phar Lap's own copy --
+/// 206 ordinals out of the NE name table of `BIN/DOSCALLS.DLL`, a binary that
+/// describes itself as "EFI FUNCTIONS - DOSCALLS EMULATION" -- plus the three
+/// its entry table skips (`DosExit`, `DosChgFilePtr`, `DosWrite`) taken from
+/// the IMPDEF records of `BC4/LIB/PHAPI.LIB`.
+///
+/// The two sources are independent and agree on all 79 ordinals they share.
+/// They differ in wording on exactly two, and those are aliases rather than
+/// conflicts: Borland's import library calls 135 and 136 `__AHSHIFT` and
+/// `__AHINCR`, which is what its runtime wants huge-pointer arithmetic to link
+/// against. What a DLL calls its own ordinal is what this records.
+///
+/// `pharlap31` is measured, not assumed. WG 1.01's `MAJORBBS.EXE` carries the
+/// 286|DOS-Extender banner and the version literal `3.1`, and the 3.04 and 3.12
+/// `DOSCALLS.DLL` files -- different binaries -- name every ordinal the same.
+const DOSCALLS_PHARLAP31: &str = include_str!("../data/doscalls_pharlap31.tsv");
+
 /// One host version's exports, across every DLL it ships.
 pub struct Exports {
     by_dll: HashMap<&'static str, HashMap<u16, Box<str>>>,
@@ -71,6 +92,7 @@ impl Exports {
                 (MAJORBBS, parse(MAJORBBS_WG101)),
                 (GALGSBL, parse(GALGSBL_WG101)),
                 (GALME, parse(GALME_WG101)),
+                (DOSCALLS, parse(DOSCALLS_PHARLAP31)),
             ]
             .into_iter()
             .collect(),
@@ -129,6 +151,7 @@ mod tests {
         assert_eq!(Exports::wg101().len(MAJORBBS), 1210);
         assert_eq!(Exports::wg101().len(GALGSBL), 101);
         assert_eq!(Exports::wg101().len(GALME), 208);
+        assert_eq!(Exports::wg101().len(DOSCALLS), 209);
     }
 
     #[test]
@@ -148,7 +171,41 @@ mod tests {
         let wg101 = Exports::wg101();
         assert_eq!(wg101.name(GALGSBL, 72), Some("bturno"));
         assert_ne!(wg101.name(MAJORBBS, 72), Some("bturno"));
-        assert_eq!(wg101.name("DOSCALLS", 135), None, "no table for DOSCALLS");
+
+        // And ordinal 135 is `doshugeshift` in DOSCALLS and something else
+        // again in MAJORBBS.
+        assert_eq!(wg101.name(DOSCALLS, 135), Some("doshugeshift"));
+        assert_ne!(wg101.name(MAJORBBS, 135), Some("doshugeshift"));
+
+        // PHAPI is the fifth DLL and has no table because it has no ordinals:
+        // all 70 of its entries in `PHAPI.LIB` are by-name IMPDEF records, and
+        // the shipped `PHAPI.DLL` -- "Empty DLL for various Debuggers" --
+        // exports nothing at all. That is why the module's single by-name fixup
+        // out of 22,371 is the one that names `DOSCREATEDSALIAS`.
+        assert_eq!(wg101.name("PHAPI", 1), None, "PHAPI has no ordinal space");
+    }
+
+    #[test]
+    fn doscalls_names_the_two_ordinals_the_module_imports() {
+        let wg101 = Exports::wg101();
+        // `DosSetVec(0, handler, &prev)`, far pascal, twice in segment 1 --
+        // install a divide-by-zero handler and put the old one back.
+        assert_eq!(wg101.name(DOSCALLS, 89), Some("dossetvec"));
+        // Not a routine. An absolute-valued export, the selector shift for
+        // huge-pointer arithmetic, which is why all 13 of the module's sites
+        // are `mov cx,<it>` followed by `shl dx,cl` rather than a call.
+        assert_eq!(wg101.name(DOSCALLS, 135), Some("doshugeshift"));
+    }
+
+    #[test]
+    fn doscalls_ordinals_the_exporting_dll_skips_come_from_the_import_library() {
+        // Phar Lap's `DOSCALLS.DLL` entry table has no entry for these three;
+        // `PHAPI.LIB`'s IMPDEF records name them, and the two sources agree on
+        // every one of the 79 ordinals they both cover.
+        let wg101 = Exports::wg101();
+        assert_eq!(wg101.name(DOSCALLS, 5), Some("dosexit"));
+        assert_eq!(wg101.name(DOSCALLS, 58), Some("doschgfileptr"));
+        assert_eq!(wg101.name(DOSCALLS, 138), Some("doswrite"));
     }
 
     #[test]
@@ -188,7 +245,7 @@ mod tests {
     fn no_two_ordinals_share_a_c_name() {
         // Stripping and lowercasing could in principle merge two exports into
         // one, which would make a lookup by name ambiguous. It does not.
-        for dll in [MAJORBBS, GALGSBL, GALME] {
+        for dll in [MAJORBBS, GALGSBL, GALME, DOSCALLS] {
             let mut names: Vec<&str> = Exports::wg101().by_dll[dll]
                 .values()
                 .map(AsRef::as_ref)
