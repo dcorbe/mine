@@ -1,4 +1,4 @@
-//! Borland's `printf`, over a 16-bit module's stack.
+//! Borland's `printf`, over a 16-bit module's arguments.
 //!
 //! `spr`, `sprintf`, `prf` and `shocst` are all one engine and a different
 //! destination, so this is written once and a bug here is a bug in all of them.
@@ -11,6 +11,10 @@
 //! string* -- there is no other record of how many there are or how wide each
 //! is. A conversion that consumes the wrong number of words does not fail; it
 //! shifts every argument after it, and the output looks like data.
+//!
+//! A `v`-spelled routine is handed an [`Args::List`] instead: a `va_list`
+//! pointing at the *caller's* frame, whose words are laid out identically. The
+//! walk below cannot tell the difference and must not have to.
 //!
 //! Widths follow from the model Galacticomm built with, which is Borland's
 //! **huge**: an `int` is one word, a `long` two, and `char *` is *far* and
@@ -43,6 +47,14 @@ pub enum Args {
     /// counts argument *words* and not arguments, because a far `char *` is two
     /// of them and a near one is not.
     Call { first: usize },
+
+    /// A `va_list`: consecutive words from a far pointer into module memory.
+    ///
+    /// Borland's `va_list` is `void *`, which under the huge model is far, and
+    /// `va_start` sets it to the address just past the last fixed argument --
+    /// so it points into the *caller's* frame in `SS` and the words behind it
+    /// are laid out exactly as [`Args::Call`]'s are.
+    List { at: FarPtr },
 }
 
 impl Args {
@@ -50,17 +62,36 @@ impl Args {
     ///
     /// # Errors
     ///
-    /// Never, for [`Args::Call`]: those words are the frame the host was called
-    /// through, and the machine has already bounds-checked the stack. The
-    /// `Result` is for the source that reads its words out of module memory.
+    /// If a `va_list` names nothing of the module's, or walks off the end of
+    /// what it names. Neither can happen to [`Args::Call`]: those words are the
+    /// frame the host was called through.
     ///
     /// # Panics
     ///
-    /// If the module is not stopped at a call, since that is where
-    /// [`Args::Call`]'s arguments are.
+    /// [`Args::Call`] panics if the module is not stopped at a call, since that
+    /// is where its arguments are. [`Args::List`] does not need a frame at all.
     fn word(self, machine: &Machine, n: usize) -> Result<u16, ShimError> {
         match self {
             Self::Call { first } => Ok(machine.arg_u16(first + n)),
+            Self::List { at } => {
+                // A `va_list` that walks past 0xffff has left its segment,
+                // which no legitimate one does -- and wrapping the offset would
+                // read the front of the segment as though it were the back.
+                let offset = usize::from(at.offset)
+                    .checked_add(n * 2)
+                    .and_then(|offset| u16::try_from(offset).ok())
+                    .ok_or_else(|| {
+                        ShimError::Failed(format!("a va_list at {at} ran off word {n}"))
+                    })?;
+                let word = machine.resolve(
+                    FarPtr {
+                        offset,
+                        selector: at.selector,
+                    },
+                    2,
+                )?;
+                Ok(u16::from_le_bytes([word[0], word[1]]))
+            }
         }
     }
 
@@ -557,5 +588,78 @@ mod tests {
         let template = f.text("all done %");
         f.call(&[]);
         assert!(format(&f.machine, template, Args::Call { first: 0 }).is_err());
+    }
+
+    #[test]
+    fn a_va_list_reads_the_words_a_frame_walk_would() {
+        // The same format string and the same words as
+        // `a_string_leaves_the_next_argument_where_it_belongs`, from a pointer
+        // instead of from the stack -- and note there is no `f.call` at all.
+        // A `va_list` walk needs no outstanding frame, which is exactly what
+        // makes it usable from a routine whose own frame holds something else.
+        let mut f = Fixture::new();
+        let template = f.text("%s has %d");
+        let text = f.text("a kobold");
+        let list = f.words(&[text.offset, text.selector, 12]);
+
+        let (bytes, next) =
+            format(&f.machine, template, Args::List { at: list }).expect("formatted");
+        assert_eq!(String::from_utf8_lossy(&bytes), "a kobold has 12");
+        assert_eq!(next, 3, "two words for the far pointer and one for the int");
+    }
+
+    #[test]
+    fn a_va_list_and_a_frame_render_the_same_arguments_the_same_way() {
+        // Every argument width in one string: a far pointer, a long, a
+        // promoted char and an int. If the two sources ever disagree it will be
+        // about a width, so the check is worth making over all of them at once.
+        let words = |f: &mut Fixture| {
+            let text = f.text("gold");
+            vec![text.offset, text.selector, 0x86a0, 0x0001, u16::from(b'x'), 42]
+        };
+
+        let mut f = Fixture::new();
+        let template = f.text("%s|%ld|%c|%05d");
+        let args = words(&mut f);
+        f.call(&args);
+        let framed = format(&f.machine, template, Args::Call { first: 0 }).expect("formatted");
+
+        let mut g = Fixture::new();
+        let template = g.text("%s|%ld|%c|%05d");
+        let args = words(&mut g);
+        let list = g.words(&args);
+        let listed = format(&g.machine, template, Args::List { at: list }).expect("formatted");
+
+        assert_eq!(framed, listed);
+        assert_eq!(String::from_utf8_lossy(&framed.0), "gold|100000|x|00042");
+    }
+
+    #[test]
+    fn a_va_list_naming_nothing_is_an_error() {
+        // Not an empty field and not a zero. A null `va_list` is a module bug,
+        // and the host's rule everywhere else is that a pointer it cannot
+        // follow stops the module rather than inventing what was behind it.
+        let mut f = Fixture::new();
+        let template = f.text("%d");
+        let at = FarPtr::NULL;
+        assert!(format(&f.machine, template, Args::List { at }).is_err());
+    }
+
+    #[test]
+    fn a_va_list_that_walks_off_its_segment_is_an_error() {
+        // The failure a bounds check exists for: the list is real and the first
+        // conversion reads it, and the second runs past the end of what it
+        // names. Reading two bytes of nothing there would put a number in the
+        // output that no argument ever held.
+        let mut f = Fixture::new();
+        let template = f.text("%d %d");
+        let selector = f.machine.alloc_segment(2).expect("a one-word segment");
+        let at = FarPtr {
+            offset: 0,
+            selector,
+        };
+        f.machine.write(at, &7u16.to_le_bytes()).expect("fits");
+
+        assert!(format(&f.machine, template, Args::List { at }).is_err());
     }
 }

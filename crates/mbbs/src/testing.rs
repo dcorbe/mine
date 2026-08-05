@@ -95,6 +95,16 @@ impl Fixture {
         at
     }
 
+    /// Argument words in scratch memory, laid out as a `va_list` finds them.
+    ///
+    /// The same order and the same widths as [`Fixture::call`] pushes, which is
+    /// the point: a test that formats the same words both ways is a test that
+    /// the two sources agree.
+    pub fn words(&mut self, words: &[u16]) -> FarPtr {
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.bytes(&bytes, false)
+    }
+
     /// Somewhere to write, with nothing in it.
     pub fn buffer(&mut self, len: u16) -> FarPtr {
         self.bytes(&vec![0; usize::from(len)], false)
