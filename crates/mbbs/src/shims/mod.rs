@@ -12,7 +12,7 @@ pub mod text;
 use mbbs16::{Machine, Ret};
 
 use crate::Host;
-use crate::exports::MAJORBBS;
+use crate::exports::{DOSCALLS, MAJORBBS};
 use crate::globals::GLOBALS;
 
 /// -1, as a 16-bit `int`.
@@ -233,8 +233,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
 
 /// Every constant the host exports.
 ///
-/// Only one so far, and it is keyed by ordinal because nothing in the recovered
-/// sources names it. `DOSCALLS.135` is the huge shift: how far to shift a count
+/// Only one so far. `DOSCALLS.135` is the huge shift: how far to shift a count
 /// of 64 KiB chunks to get the matching selector increment. Thirteen of
 /// `WCCMMUD.DLL`'s fixups resolve it straight into the immediate of a
 /// `mov $x, %cx` that is followed by a `shl`, which is Borland's huge-pointer
@@ -249,8 +248,17 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
 /// longer: [`alloc_tiled`](mbbs16::Machine::alloc_tiled) reserves a region's
 /// descriptors as one run, and `memory::ptrtile` is tested against exactly this
 /// arithmetic. The module computes tile addresses both ways and they agree.
-const ABSOLUTES: &[(&str, &str, u16)] =
-    &[("DOSCALLS", "#135", mbbs16::SELECTOR_STEP.ilog2() as u16)];
+///
+/// It was keyed as `#135` while nothing in the recovered sources named it.
+/// Phar Lap's own `DOSCALLS.DLL` does -- `DOSHUGESHIFT` -- and `PHAPI.LIB`
+/// imports the same ordinal under Borland's spelling `__AHSHIFT`, which is the
+/// name the huge-pointer arithmetic above is written in. Both agree with what
+/// the sites do, so the key is the symbol now rather than the number.
+const ABSOLUTES: &[(&str, &str, u16)] = &[(
+    DOSCALLS,
+    "doshugeshift",
+    mbbs16::SELECTOR_STEP.ilog2() as u16,
+)];
 
 /// What the host knows about a symbol.
 ///
@@ -306,7 +314,7 @@ mod tests {
 
     #[test]
     fn the_huge_shift_steps_one_ldt_entry() {
-        let Entry::Absolute(shift) = entry("DOSCALLS", "#135") else {
+        let Entry::Absolute(shift) = entry(DOSCALLS, "doshugeshift") else {
             panic!("DOSCALLS.135 is a constant");
         };
         assert_eq!(
