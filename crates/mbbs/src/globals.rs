@@ -167,8 +167,18 @@ pub const GLOBALS: &[Global] = &[
     g("msysid", SIDSIZ),
     // BBSUTILS.H:29 -- char version[VERSIZ];
     g("version", VERSIZ),
-    // GALFILH.H:24 -- long numbyts;
+    // DSKUTL.H:23-26 -- long numfils, numbyts, numbytp, numdirs; the counters
+    // `cntdir` and `cntdirs` report through. `WCCMMUD.DLL` addresses only
+    // `numbyts`, and the other three are placed anyway for the reason `curmbk`
+    // and `bb` are: they are one routine's output, and keeping part of it
+    // Rust-side is the bug this file is shaped to prevent.
+    //
+    // `ztzone` on the line above them is not placed. It is not `cntdir`'s, and
+    // nothing in this host knows what to put in it.
+    g("numfils", LONG),
     g("numbyts", LONG),
+    g("numbytp", LONG),
+    g("numdirs", LONG),
     // SAPUTL.H:93 -- struct saunam *namtmp;
     g("namtmp", PTR),
     // USRACC.H:59 -- a pointer to the array of user IDs.
@@ -403,6 +413,23 @@ impl Globals {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
+    /// Read a global as a `long`.
+    ///
+    /// Signed, because C's `long` is: `numfils` and the rest are declared
+    /// `long` in `DSKUTL.H`, and a reader that widened them as unsigned would
+    /// report `4294967295` where the module would read `-1`.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn long(&self, machine: &Machine, name: &str) -> io::Result<i32> {
+        let at = self
+            .address(name)
+            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
+        let bytes = machine.resolve(at, 4).map_err(io::Error::other)?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     /// Read a global as a far pointer.
     ///
     /// # Errors
@@ -423,6 +450,40 @@ impl Globals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cntdirs_counters_are_placed_in_declaration_order() {
+        // DSKUTL.H:23-26 declares numfils, numbyts, numbytp, numdirs, in that
+        // order and as four longs. `cntdir` writes the first three and
+        // `cntdirs` the fourth, so all four belong in module memory whether or
+        // not this module addresses them -- WCCMMUD.DLL addresses only
+        // `numbyts`, at six sites.
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        let at = |name| g.address(name).expect("placed").offset;
+        for name in ["numfils", "numbyts", "numbytp", "numdirs"] {
+            assert_eq!(g.size(name), Some(4), "{name} is a long");
+        }
+        assert!(at("numfils") < at("numbyts"));
+        assert!(at("numbyts") < at("numbytp"));
+        assert!(at("numbytp") < at("numdirs"));
+    }
+
+    #[test]
+    fn a_long_global_reads_back_signed() {
+        // `long` is signed, and the counters are the only globals this host
+        // reads four bytes of. A reader that widened them as unsigned would
+        // agree with a writer that overflowed.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "numbyts", &(-1i32).to_le_bytes())
+            .expect("write");
+        assert_eq!(
+            f.host.globals().long(&f.machine, "numbyts").expect("read"),
+            -1
+        );
+    }
 
     #[test]
     fn the_channel_count_is_one_before_a_module_reads_it() {
