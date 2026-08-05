@@ -364,6 +364,11 @@ impl Globals {
         globals.write(machine, "nterms", &NTERMS.to_le_bytes())?;
         globals.write(machine, "hichp1", &NTERMS.to_le_bytes())?;
 
+        // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
+        // runs every module's init routine. See the test for why the zero it
+        // is born with is a lie and not a placeholder.
+        globals.write(machine, "usrnum", &(-1i16).to_le_bytes())?;
+
         Ok(globals)
     }
 
@@ -508,6 +513,21 @@ mod tests {
         let f = crate::testing::Fixture::new();
         assert_eq!(f.host.globals().word(&f.machine, "nterms").expect("nterms"), 1);
         assert_eq!(f.host.globals().word(&f.machine, "hichp1").expect("hichp1"), 1);
+    }
+
+    #[test]
+    fn nobody_is_the_current_user_before_one_connects() {
+        // `MAJORBBS.C:882` -- `usrnum=-1;`, three lines above the `inimod()`
+        // that runs every module's init routine. Zero is not "no current user":
+        // it is channel 0, and `WCCMMUD.DLL` indexes its own per-channel tables
+        // by `usrnum` at 61 sites. A module initialising with `usrnum == 0`
+        // writes into the slot belonging to whoever connects first.
+        //
+        // -1 is safe to read because `channel[]` carries sentinels for exactly
+        // this -- see `the_channel_table_has_three_sentinels_before_it`.
+        let f = crate::testing::Fixture::new();
+        let usrnum = f.host.globals().word(&f.machine, "usrnum").expect("usrnum");
+        assert_eq!(usrnum as i16, -1);
     }
 
     #[test]
