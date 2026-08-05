@@ -22,6 +22,7 @@
 
 mod arena;
 pub mod btrieve;
+pub mod clock;
 mod exports;
 mod fmt;
 pub mod fsd;
@@ -39,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
+pub use clock::{Civil, Clock};
 pub use exports::Exports;
 pub use fsd::Form;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
