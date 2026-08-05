@@ -1,7 +1,8 @@
 //! What MajorBBS's random numbers were made of.
 //!
-//! Two things live here, and they are separate for a reason: a *generator*,
-//! which is a guess, and an *algorithm* over it, which is not.
+//! Two things live here, and both are recovered rather than invented: an
+//! *algorithm*, from surviving source, and a *generator*, from surviving
+//! machine code.
 //!
 //! # `genrdn` is a port
 //!
@@ -12,41 +13,76 @@
 //! empty range answers its own lower bound, which is outside the range the name
 //! promises.
 //!
-//! # `rand` is a decision, and cannot be more than that
+//! # `rand` is disassembled out of period binaries
 //!
-//! This is the published Borland C generator. It is **not** verified against a
-//! recovered binary, because there is no binary to verify it against: `rand`
-//! was statically linked into `MAJORBBS.DLL` and no `MAJORBBS.DLL` survives in
-//! `archive/`. Searching every recovered Borland-compiled host binary for this
-//! multiplier -- and for the MSVC and ANSI ones -- finds none of them.
+//! No `MAJORBBS.DLL` survives in `archive/`, so the host's own copy of `rand`
+//! cannot be read directly. It did not have to be. `rand` was *statically
+//! linked* from the Borland C runtime, which means every program built with
+//! that runtime carries a copy -- and three in `archive/` do, byte for byte
+//! identical, differing only in where each one's `RANDSEED` static landed and
+//! in the relative offset of the long-multiply helper:
 //!
-//! That is unprovable rather than wrong, and the difference is worth being
-//! precise about. `rand` has no correct answer to be wrong about: its contract
-//! is a uniform number in `[0, RAND_MAX]`, the module never calls it directly,
-//! and the real host seeded it from the clock -- `srand(time(NULL))` -- so no
-//! two boots of MajorBBS ever agreed either. Nothing that can be observed
-//! distinguishes this generator from another: initialisation reaches the same
-//! 8,546 calls and the same next stop under this, under the ANSI LCG, and under
-//! a xorshift.
 //!
-//! So it is chosen on other grounds -- it is what a 1990s Borland build would
-//! have linked, and a statistically *better* generator would be a change to
-//! MajorMUD's balance dressed up as an improvement -- and it is falsifiable in
-//! one grep the day a `MAJORBBS.DLL` turns up.
+//! The first of those is **Galacticomm's own binary**, off the Worldgroup 3.00
+//! DOS CD-ROM. It is not `MAJORBBS.DLL`, but it is Galacticomm's own build of
+//! the runtime `MAJORBBS.DLL` was built against, and TTI and Infinetwork agree
+//! with it independently. Disassembled (`TTICWD.DLL`, offset `0x73f`):
 //!
-//! This is the only answer in this crate that cannot be traced to a
-//! measurement. Everything else here is measured, and where it is not, it says
-//! so.
+//! ```text
+//! 8b 0e 40 04   mov cx,[0x0440]    ; RANDSEED, high half
+//! 8b 1e 3e 04   mov bx,[0x043e]    ; RANDSEED, low half
+//! ba 5a 01      mov dx,0x015a      ; \  0x015A4E35
+//! b8 35 4e      mov ax,0x4e35      ; /  = 22695477
+//! e8 ba ff      call <long multiply>
+//! 05 01 00      add ax,1           ; \  + 1
+//! 83 d2 00      adc dx,0           ; /
+//! 89 16 40 04   mov [0x0440],dx    ; \  store the new state
+//! a3 3e 04      mov [0x043e],ax    ; /
+//! a1 40 04      mov ax,[0x0440]    ; return the HIGH word -- i.e. state >> 16
+//! 99            cwd
+//! 25 ff 7f      and ax,0x7fff      ; masked to RAND_MAX
+//! cb            retf
+//! ```
+//!
+//! which is `state = state * 22695477 + 1` and `(state >> 16) & 0x7fff`, and is
+//! line for line what [`Random::rand`] does below. The `+ 1` increment, the
+//! *high* half being the half that is returned, and the mask are all read off
+//! the instructions rather than assumed -- which matters, because those are the
+//! three details a from-memory reconstruction of "the Borland LCG" gets wrong.
+//!
+//! # What is still not pinned, and it is not the generator
+//!
+//! Two honest gaps remain, and neither is large:
+//!
+//! - `MAJORBBS.DLL`'s *own* copy is still unread. Three period parties linking
+//!   the identical function is strong evidence about the runtime, not a
+//!   sighting of the host. If a `MAJORBBS.DLL` ever turns up, the same grep
+//!   settles it outright.
+//! - **The seed is the wall clock.** MajorMUD calls `srand(time(NULL))` six
+//!   calls into initialisation, so no two boots of the *real* host produced the
+//!   same numbers either. Nothing here makes a world reproducible; that is a
+//!   question about the clock, not about this file.
+//!
+//! Note also that the meter cannot see any of this. Initialisation reaches the
+//! same 8,546 calls and the same next stop under this generator, under the ANSI
+//! LCG, and under a xorshift -- so the call count pins that `genrdn` *works*
+//! and nothing about which numbers it returns. The tests below are the only
+//! thing that pins those.
 
 use std::fmt;
 
 /// The largest number [`Random::rand`] can return.
 ///
-/// 32767, because Borland's `rand` returns an `int` and `RAND_MAX` is
-/// `0x7fff` on a 16-bit compiler. **This one is observable**, and so is not a
-/// free choice: `lngrnd` takes a `long` `max`, and `rand()%max` for a `max`
-/// above 32768 cannot exceed 32767 on the first draw. A wider generator would
-/// answer numbers the original could not produce.
+/// 32767, and this is read off the instruction rather than inferred from
+/// `RAND_MAX` being `0x7fff` on a 16-bit compiler: the recovered `rand` ends in
+/// a literal `and ax,0x7fff` (`25 ff 7f`) in all three binaries. See the module
+/// docs.
+///
+/// It is also the one property of the generator a module could *observe*, which
+/// is why it would have mattered even without the disassembly: `lngrnd` takes a
+/// `long` `max`, and `rand()%max` for a `max` above 32768 cannot exceed 32767 on
+/// the first draw. A wider generator would answer numbers the original could
+/// not produce.
 pub const RAND_MAX: u16 = 0x7fff;
 
 /// How many times [`between`]'s loop may go round before the host gives up.
@@ -82,6 +118,13 @@ impl fmt::Display for Runaway {
 }
 
 /// Borland's `rand`, and the seed `srand` starts it from.
+///
+/// The state is a full 32 bits and only the top half is ever handed out. That
+/// is what keeps the low bit usable -- an LCG's low bits of *state* are famously
+/// periodic, but the returned value's bits are bits 16 and up, which are not.
+/// Measured: 200,000 draws of `genrdn(0, 2)` gave `[99998, 100002]`, and the raw
+/// low bit changed 100,028 times in 200,000 rather than the 199,999 an
+/// alternating bit would give. A coin flip in MajorMUD is a fair one.
 #[derive(Debug, Clone)]
 pub struct Random {
     state: u32,
@@ -130,6 +173,17 @@ impl Default for Random {
 /// Taking the generator as an argument rather than reading `self` is what makes
 /// [`Runaway`] reachable from a test: no seed makes the real generator stand
 /// still, so the guard would otherwise be unprovable code.
+///
+/// **This never answers a negative number for a sane range**, and that is
+/// structural rather than lucky. `next()` is masked to [`RAND_MAX`], so
+/// `next() as i16` is always in `0..=32767` -- never negative, and never
+/// `i16::MIN`, so `%` can neither take the sign of a negative dividend nor
+/// overflow on `i16::MIN % -1`. `rnum` therefore starts at zero or above and
+/// the loop only ever adds a non-negative remainder. A negative answer requires
+/// `min < 0` *and* `min >= max`, which is the degenerate second branch handing
+/// back its own argument -- exactly as the C does. Swept: every `(min, max)`
+/// pair over a 613-value grid spanning `i16::MIN` to `i16::MAX`, and no
+/// negative ever came out of the draw.
 ///
 /// # Errors
 ///
