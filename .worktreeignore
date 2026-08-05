@@ -1,0 +1,29 @@
+# Ignored paths that `git worktree-link` must NOT symlink into a worktree.
+#
+# Everything gitignored is linked by default, because a worktree missing an
+# input fails silently -- two mbbs16 tests that read archive/ reported "ok" with
+# nothing run. The entries here are the exceptions, and each is one of three
+# kinds: build output, live runtime state, or a secret.
+#
+# Syntax: one glob per line, `#` for comments. A pattern containing `/` matches
+# the whole path relative to the repo root; one without matches any basename.
+# `target`, `__pycache__` and the other build caches are excluded by default and
+# do not need repeating here.
+
+# --- Live runtime state ---------------------------------------------------
+# `mud-server` defaults --state to the repo-root state.sqlite (crates/mud-server
+# /src/main.rs:31). Linked, a stray run from a worktree would write the real
+# board's accounts and saved players.
+state.sqlite
+state.sqlite-journal
+state.sqlite-wal
+
+# Written by the live-board tooling, and read back as current.
+wccmdact.ini
+
+# --- Secrets --------------------------------------------------------------
+# Live captures: the TX stream carries the account password in the clear. They
+# are root-scoped in .gitignore for that reason, and a symlink would give them a
+# second path that a wide `git add` in a worktree could reach.
+*.raw
+*_timing.log
