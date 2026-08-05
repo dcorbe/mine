@@ -12,6 +12,12 @@ docs/mirrors/
 mudbins/
 tmp/
 
+# Period MAJORBBS.EXE host binaries, extracted from archive/ for disassembly.
+# The 16-bit host is an NE *executable* that exports the API modules import --
+# there is no MAJORBBS.DLL -- so this is the primary source for every routine
+# whose C never survived. Re-extractable; see docs/MIRRORS.md.
+re/hosts/
+
 # Reverse-engineering derived artifacts (regenerable / derivative of the binary)
 re/ghidra_proj/
 re/wg_nt_ghidra/
