@@ -393,7 +393,17 @@ impl Machine {
             thunk.extend_from_slice(&tramp_linear.to_le_bytes());
             thunk.extend_from_slice(&cs64.to_le_bytes());
 
-            debug_assert!(thunk.len() <= THUNK_STRIDE, "thunk outgrew its slot");
+            // Not a `debug_assert`. A thunk that outgrew its slot writes over
+            // the start of the next one, which is a corrupted jump target
+            // rather than an error -- the module would leave 16-bit mode for an
+            // address nobody chose. This runs 513 times at construction and
+            // never again, so checking it in release costs nothing that can be
+            // measured against the fault it prevents.
+            assert!(
+                thunk.len() <= THUNK_STRIDE,
+                "thunk {slot} needs {} bytes and the stride is {THUNK_STRIDE}",
+                thunk.len(),
+            );
             bridge.write(
                 THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE,
                 &thunk,
