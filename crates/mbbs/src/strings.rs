@@ -92,7 +92,7 @@ mod tests {
         // here in the ascending order the sweep produces them: the space is
         // 0x20 and sorts last, not first.
         let white: Vec<u8> = (0..=255u8).filter(|&c| is_white(c)).collect();
-        assert_eq!(white, b"\t\n\x0b\x0c\r ".iter().copied().collect::<Vec<_>>());
+        assert_eq!(white, b"\t\n\x0b\x0c\r ".to_vec());
     }
 
     #[test]
