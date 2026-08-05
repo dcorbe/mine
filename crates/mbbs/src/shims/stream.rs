@@ -16,7 +16,10 @@
 //!
 //! `fseek`, `ftell`, `rewind`, `fwrite`, `fputs`, `fputc`, `fscanf`, `fgetc`,
 //! `getc` and `ungetc` are absent on purpose: `WCCMMUD.DLL` imports none of
-//! them. Every stream in it is read or written straight through, once.
+//! them. Every stream in it is read or written straight through, once -- and
+//! that census is what makes a stream opened `"w+"` unreadable rather than
+//! merely unread. Without a seek there is no legal transition from writing it
+//! to reading it, so there is nothing to implement.
 //!
 //! # Two of these may answer instead of refusing
 //!
@@ -51,6 +54,10 @@ use crate::stream::Mode;
 /// **Case is resolved before creating.** A write or append goes through
 /// [`Host::find`] first, so appending to `wccmmud.log` lands in an existing
 /// `WCCMMUD.LOG` instead of making a second file beside it.
+///
+/// **`mode.read` here is the base letter, deliberately.** A file that is not
+/// there is `NULL` for `r` and `r+`, and a create for `w`, `w+`, `a` and `a+` --
+/// which is `CheckOpenType`'s `O_CREAT` column and not [`Mode::readable`].
 pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
     let spelt = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(2))?).into_owned();
@@ -664,6 +671,47 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_opened_for_update_is_both_in_its_flags_and_truncates() {
+        // MajorMUD's one update stream: `fopen("log.log", "w+")` at
+        // seg 34:0x010a, and the mode is its own -- `log.log` and `w+` sit
+        // adjacent in the module's data at file offset 0xe240a. `w+` is
+        // `O_RDWR | O_CREAT | O_TRUNC` and `_F_READ | _F_WRIT`, per
+        // `CheckOpenType`'s own table at FOPEN.C:49.
+        let root = scratch("stream-update");
+        std::fs::write(root.join("LOG.LOG"), b"stale\r\n").expect("a stale log");
+
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "log.log", "w+");
+        assert_eq!(
+            flags_of(&f, fp),
+            F_READ | F_WRIT,
+            "a `+` is _F_RDWR, whatever the base letter was"
+        );
+
+        let template = f.text("a\nb\n");
+        f.invoke(
+            fprintf,
+            &[fp.offset, fp.selector, template.offset, template.selector],
+        )
+        .expect("fprintf");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+
+        // Truncated rather than appended to -- the base letter is still `w` --
+        // and still a text stream, because a bare `w+` takes `_fmode`'s
+        // default. Found as `LOG.LOG` from the module's own `log.log`, which is
+        // `Host::find`'s rule and not a second file beside it.
+        assert_eq!(
+            std::fs::read(root.join("LOG.LOG")).expect("the log"),
+            b"a\r\nb\r\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&root).expect("the directory").count(),
+            1,
+            "and not a second file beside it"
+        );
+    }
+
+    #[test]
     fn end_of_file_appears_in_the_flags_only_once_a_read_has_hit_it() {
         // An `_F_EOF` that never becomes true is a read loop with no host call
         // to refuse it. One that is set too early stops the module short.
@@ -715,10 +763,25 @@ mod tests {
     }
 
     #[test]
-    fn opening_for_update_is_refused_rather_than_treated_as_one_or_the_other() {
-        let mut f = Fixture::new();
-        let e = open(&mut f, "LINES.TXT", "r+").expect_err("a refusal");
-        assert!(e.to_string().contains("update"), "{e}");
+    fn reading_a_stream_opened_for_update_is_refused_rather_than_answered_with_the_end() {
+        // The mode opens; the read does not. `fopen`'s own documentation
+        // (FOPEN.C:261-266) says input may not directly follow output without
+        // an intervening `fseek` or `rewind`, and `WCCMMUD.DLL` imports
+        // neither, nor `ftell` -- so there is no point at which reading one of
+        // these means anything. The alternative is not an implementation, it is
+        // a silent end-of-file on a stream whose flags say `_F_READ`.
+        let mut f = Fixture::rooted(scratch("stream-update-read"));
+        let fp = opened(&mut f, "LOG.LOG", "w+");
+
+        let buffer = f.buffer(64);
+        let e = f
+            .invoke(
+                fgets,
+                &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector],
+            )
+            .expect_err("a refusal");
+        assert!(e.to_string().contains("LOG.LOG is open for update"), "{e}");
+        assert!(e.to_string().contains("fseek"), "and says why: {e}");
     }
 
     #[test]
