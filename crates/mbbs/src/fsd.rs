@@ -721,15 +721,26 @@ fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
 
     let mut out = Vec::new();
     while let Some(start) = next_token(list, at, b"ALT=", false) {
+        // `endtkn()` stops at `i < ANSLEN` and returns `token+ANSLEN` when it
+        // ran out of characters before it ran out of value, so the clamp is the
+        // *default* as well as the bound on the search. Falling through to the
+        // end of the list instead would hand back an alternate as long as the
+        // rest of the specification.
         let end = list[start..]
             .iter()
             .take(usize::from(ANSLEN))
             .position(|&c| c == 0 || c == b')' || is_space(c))
-            .map_or(list.len(), |n| start + n);
+            .map_or((start + usize::from(ANSLEN)).min(list.len()), |n| start + n);
         out.push(&list[start..end]);
-        // `nxttkn(ep, ...)` resumes at the value's terminator, so a value that
-        // ran to the end of the list must not restart the scan where it began.
-        at = end.max(start + 1);
+        // `nxttkn(ep, ...)` resumes exactly at the value's terminator, and its
+        // own loop guard stops it on `)`. Stepping even one byte past that --
+        // which an empty `ALT=` right before the `)` would do -- carries the
+        // scan on into the *next* field's option list, and the ordinals after
+        // it are then counted over somebody else's alternates.
+        //
+        // No progress guard is needed: `next_token` returns the offset one past
+        // the token it matched, so `start` is at least `at + 4` every time round.
+        at = end;
     }
     out
 }
@@ -758,21 +769,24 @@ pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8
         return None;
     }
     let wanted = crate::strings::rmvwht(answer);
-    // `bc=toupper(bufptr[0])`. An empty answer has no first character, and the
-    // original would compare against the terminator -- which no alternate
-    // starts with, since a zero-length `ALT=` is the one exception FSD.H:214
-    // calls out and it never reaches here with FFFALT set by a name.
-    let first = wanted.first()?.to_ascii_uppercase();
+    // `bc=toupper(bufptr[0])`, over a NUL-terminated buffer -- so an *empty*
+    // answer reads the terminator and `bc` is 0. That is not a degenerate case
+    // to be refused: `sameto("",tp)` is true of every alternate, so the first
+    // character is the whole of the test, and the only alternate whose first
+    // character is also 0 is a zero-length one. A blank `ALT=` is exactly how
+    // FSD.H:214 says to spell "no answer", and this is how it gets chosen.
+    let upper = |s: &[u8]| s.first().map_or(0, u8::to_ascii_uppercase);
+    let first = upper(&wanted);
 
     let mut found: Option<(u16, Vec<u8>)> = None;
     let mut matches = 0usize;
     for (i, alt) in alternates(spec, field).into_iter().enumerate() {
         // `sameto(bufptr,tp)` -- the alternate begins with the answer -- and
-        // then `bc == toupper(*tp)`, which the first is already sufficient for
-        // and which the original checks anyway.
+        // then `bc == toupper(*tp)`, which for a non-empty answer the first
+        // test already implies and which the original checks anyway.
         let same = alt.len() >= wanted.len()
             && alt[..wanted.len()].eq_ignore_ascii_case(&wanted)
-            && alt.first().is_some_and(|c| c.to_ascii_uppercase() == first);
+            && upper(alt) == first;
         if same {
             if matches == 0 {
                 found = Some((i as u16, alt.to_vec()));
@@ -1309,11 +1323,56 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_answer_matches_no_alternate() {
+    fn an_empty_answer_matches_only_a_blank_alternate() {
+        // `bc = toupper(bufptr[0])` over a NUL-terminated buffer is 0 for an
+        // empty answer, and `sameto("",tp)` is true of everything -- so the
+        // first-character test is the whole of it, and only a zero-length
+        // alternate has a zero first character.
         let spec = b"C(ALT=Black ALT=Red)";
         let form = compile(b"??????", spec, MANY);
         assert_eq!(ordinal(spec, &form.fields[0], b""), None);
         assert_eq!(ordinal(spec, &form.fields[0], b"   "), None);
+
+        // FSD.H:214: `ALT=` is how a blank answer is spelled, and it is the one
+        // alternate allowed to be a substring of every other.
+        let blank = b"C(ALT=Black ALT= ALT=Red)";
+        let form = compile(b"??????", blank, MANY);
+        assert_eq!(ordinal(blank, &form.fields[0], b""), Some((1, Vec::new())));
+    }
+
+    #[test]
+    fn an_alternate_value_stops_at_anslen_characters() {
+        // `endtkn()` bounds the value at ANSLEN and *returns* `token+ANSLEN`
+        // when it gets there. Running on to the end of the list instead would
+        // hand back an alternate as long as the rest of the specification --
+        // and `fsdord` stores its length in a `char`.
+        let long = "A".repeat(200);
+        let spec = format!("C(ALT={long}").into_bytes();
+        let form = compile(b"??????", &spec, MANY);
+        let alts = alternates(&spec, &form.fields[0]);
+        assert_eq!(alts.len(), 1);
+        assert_eq!(alts[0].len(), usize::from(ANSLEN));
+    }
+
+    #[test]
+    fn a_blank_alternate_before_the_paren_does_not_leak_into_the_next_field() {
+        // `nxttkn` resumes at the value's terminator and its loop guard stops
+        // it on `)`. Stepping even one byte past that carries the scan into the
+        // next field's options, and every ordinal after it is counted over
+        // somebody else's alternates.
+        let spec = b"C(ALT=Red ALT=) D(ALT=Blue ALT=Green)";
+        let form = compile(b"?????? ??????", spec, MANY);
+
+        let c = alternates(spec, &form.fields[0]);
+        assert_eq!(c, vec![&b"Red"[..], &b""[..]], "C has two, not three");
+        let d = alternates(spec, &form.fields[1]);
+        assert_eq!(d, vec![&b"Blue"[..], &b"Green"[..]]);
+
+        // And so the ordinals are the field's own.
+        assert_eq!(
+            ordinal(spec, &form.fields[1], b"Green"),
+            Some((1, b"Green".to_vec()))
+        );
     }
 
     #[test]
