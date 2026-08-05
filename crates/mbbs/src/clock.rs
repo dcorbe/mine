@@ -232,7 +232,9 @@ mod tests {
         let leap = Clock::pinned(951_782_400).civil().expect("in range");
         assert_eq!((leap.year, leap.month, leap.day), (2000, 2, 29));
 
-        let after = Clock::pinned(951_782_400 + 86_400).civil().expect("in range");
+        let after = Clock::pinned(951_782_400 + 86_400)
+            .civil()
+            .expect("in range");
         assert_eq!((after.year, after.month, after.day), (2000, 3, 1));
     }
 
