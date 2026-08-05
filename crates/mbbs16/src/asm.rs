@@ -60,6 +60,10 @@ pub(crate) struct Ctx {
     pub out_ax: u64,
     /// `DX` alongside it, for a `long` or far pointer returned by the module.
     pub out_dx: u64,
+    /// `BX` at the same instant. Unlike `AX` and `CX` no thunk destroys it, so
+    /// recording it here costs one instruction and nothing else. Borland's
+    /// `F_LXMUL@` takes half of one operand in it.
+    pub out_bx: u64,
     /// `CX`, which every thunk sets to say which kind it is. Distinguishing the
     /// two this way keeps `AX` free to carry a return value.
     pub out_cx: u64,
@@ -187,6 +191,7 @@ global_asm!(
 mbbs16_tramp_start:
     movq    %rax, {out_ax}(%r14)        /* a thunk index, or a return value */
     movq    %rdx, {out_dx}(%r14)
+    movq    %rbx, {out_bx}(%r14)        /* an operand of a runtime helper */
     movq    %rcx, {out_cx}(%r14)        /* which kind of thunk we came through */
     movq    %rsp, {out_sp}(%r14)        /* SP: the call frame is just above */
     movw    %ss,  {out_ss}(%r14)
@@ -203,6 +208,7 @@ mbbs16_tramp_end:
 "#,
     out_ax = const offset_of!(Ctx, out_ax),
     out_dx = const offset_of!(Ctx, out_dx),
+    out_bx = const offset_of!(Ctx, out_bx),
     out_cx = const offset_of!(Ctx, out_cx),
     out_sp = const offset_of!(Ctx, out_sp),
     out_ss = const offset_of!(Ctx, out_ss),

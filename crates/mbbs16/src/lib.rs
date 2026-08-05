@@ -130,9 +130,10 @@ pub const SELECTOR_STEP: u16 = 1 << 3;
 /// its selector explicitly.
 const THUNK_TABLE_OFFSET: usize = 0;
 
-/// Bytes per thunk. The entry needs eleven; sixteen keeps `index * STRIDE`
-/// legible against a hex dump.
-const THUNK_STRIDE: usize = 16;
+/// Bytes per thunk. The entry needs sixteen; thirty-two keeps `index * STRIDE`
+/// legible against a hex dump and leaves room for the next thing a thunk has to
+/// do before it can name itself.
+const THUNK_STRIDE: usize = 32;
 
 /// How many import thunks a module may have. The measured 16-bit API surface is
 /// 408 symbols, so this is room to spare.
@@ -154,6 +155,20 @@ pub const INITIAL_SP: u16 = 0xfff0;
 /// cdecl, so nothing can be relying on it across a call.
 const KIND_CALL: u16 = 0;
 const KIND_RETURN: u16 = 1;
+
+/// Bytes a **call** thunk pushes before it announces itself: the module's `AX`
+/// and `CX`, which it is about to overwrite.
+///
+/// The module cannot be asked to save them -- it is calling what it believes is
+/// an ordinary far routine -- and the thunk has nowhere else to put them. It
+/// cannot reach the [`Ctx`], which lives at a 64-bit address in `%r14` that
+/// compatibility mode has no encoding to name, and it cannot use `DS`, which a
+/// huge-model module moves constantly. `SS:SP` is the only memory it can be sure
+/// of.
+///
+/// [`Machine::run`] takes them straight back off and steps `SP` over them, so
+/// this number appears nowhere else: `frame_sp` means what it always meant.
+const THUNK_SAVES: u16 = 4;
 
 /// The thunk a module returns *through*. Its address is what the host pushes as
 /// the return half of the far-call frame, so `RETF` lands here.
@@ -301,6 +316,12 @@ pub struct Machine {
     /// The call frame -- `CS:IP`, two words -- sits at exactly this offset.
     frame_sp: Option<u16>,
 
+    /// The module's `AX` and `CX` at that call, recovered from what its thunk
+    /// pushed on the way through. Meaningless unless `frame_sp` is `Some`, which
+    /// is what [`Machine::ax`] and [`Machine::cx`] assert before reading them.
+    call_ax: u16,
+    call_cx: u16,
+
     /// How much CPU time one entry point may have.
     budget: Duration,
 
@@ -332,15 +353,20 @@ impl Machine {
         let tramp_linear = bridge.linear(TRAMPOLINE_OFFSET);
         bridge.write(TRAMPOLINE_OFFSET, tramp)?;
 
-        // An import thunk names itself and leaves. That is all a real one does
-        // either; the work happens on this side.
+        // An import thunk saves what it is about to destroy, names itself, and
+        // leaves. That is all a real one does either; the work happens on this
+        // side.
         //
+        //   50                    push  %ax        \  the module's own, for a
+        //   51                    push  %cx        /  shim that needs them
         //   b9 00 00              mov   $KIND_CALL, %cx
         //   b8 ii ii              mov   $index, %ax
         //   66 ea <off32> <sel>   ljmpl $CS64, $trampoline
         //
-        // The return thunk omits the second instruction, because AX is carrying
-        // the module's result and has to survive.
+        // The return thunk does neither the pushes nor the second instruction:
+        // the module's RETF has already popped its frame so there is nothing
+        // beneath to save, and AX is carrying the module's result and has to
+        // survive.
         //
         // The 0x66 is what makes any of this possible: without it `EA` in a
         // 16-bit segment takes a 16-bit offset and could not name the
@@ -354,6 +380,9 @@ impl Machine {
             };
 
             let mut thunk = Vec::with_capacity(THUNK_STRIDE);
+            if kind == KIND_CALL {
+                thunk.extend_from_slice(&[0x50, 0x51]); // push %ax; push %cx
+            }
             thunk.push(0xb9);
             thunk.extend_from_slice(&kind.to_le_bytes());
             if kind == KIND_CALL {
@@ -382,6 +411,8 @@ impl Machine {
             bridge: bridge_sel,
             ctx: Watched::new()?,
             frame_sp: None,
+            call_ax: 0,
+            call_cx: 0,
             budget: DEFAULT_BUDGET,
             poisoned: None,
         })
@@ -899,6 +930,57 @@ impl Machine {
         self.ctx.out_bp as u16
     }
 
+    /// `AX` as the module left it at the outstanding call.
+    ///
+    /// Not read from the trampoline: by the time that runs, the thunk has put
+    /// its own index in `AX`. This is what the thunk pushed before it did --
+    /// see [`THUNK_SAVES`].
+    ///
+    /// Wanted by exactly one kind of routine. Borland's 32-bit runtime helpers
+    /// take their operands in registers -- `F_LXMUL@` is `DX:AX * CX:BX` and
+    /// `F_LXLSH@` is `DX:AX` shifted by `CL` -- and a MajorBBS module imports
+    /// those from the host like anything else.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn ax(&self) -> u16 {
+        assert!(self.frame_sp.is_some(), "ax() with no outstanding call");
+        self.call_ax
+    }
+
+    /// `BX` as the module left it at the outstanding call. See [`Machine::ax`].
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn bx(&self) -> u16 {
+        assert!(self.frame_sp.is_some(), "bx() with no outstanding call");
+        self.ctx.out_bx as u16
+    }
+
+    /// `CX` as the module left it at the outstanding call. See [`Machine::ax`].
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn cx(&self) -> u16 {
+        assert!(self.frame_sp.is_some(), "cx() with no outstanding call");
+        self.call_cx
+    }
+
+    /// `DX` as the module left it at the outstanding call. See [`Machine::ax`].
+    ///
+    /// No thunk destroys `DX`, so this one comes straight off the trampoline.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn dx(&self) -> u16 {
+        assert!(self.frame_sp.is_some(), "dx() with no outstanding call");
+        self.ctx.out_dx as u16
+    }
+
     /// Cross into 16-bit mode and come back.
     fn run(&mut self, at: FarPtr, sp: u16, ret: Ret) -> io::Result<Exit> {
         let (ax, dx) = ret.registers();
@@ -955,7 +1037,6 @@ impl Machine {
         );
 
         let out_sp = self.ctx.out_sp as u16;
-        self.frame_sp = Some(out_sp);
 
         // Which thunk brought us here. The module's return value would have
         // been destroyed if the answer lived in AX, so it lives in CX.
@@ -969,6 +1050,15 @@ impl Machine {
                 dx: self.ctx.out_dx as u16,
             });
         }
+
+        // A call thunk had to destroy AX and CX to name itself, so it pushed
+        // them first, CX nearest. Take them here and step back over them, so
+        // that `frame_sp` means exactly what it has always meant -- the far-call
+        // frame, with the module's arguments just above -- and nothing that
+        // reads an argument has to know a thunk saves anything.
+        self.call_cx = self.stack().read_u16(usize::from(out_sp));
+        self.call_ax = self.stack().read_u16(usize::from(out_sp) + 2);
+        self.frame_sp = Some(out_sp + THUNK_SAVES);
 
         Ok(Exit::Call {
             index: self.ctx.out_ax as u16,
