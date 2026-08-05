@@ -87,15 +87,27 @@ fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
 /// A 16-bit offset that wrapped would name a byte near the start of the same
 /// segment, which *resolves* -- so the bounds check downstream would pass and
 /// the module would be handed a pointer into the wrong part of its own buffer.
-fn offset(base: FarPtr, by: u16) -> Result<FarPtr, ShimError> {
-    let offset = base
-        .offset
-        .checked_add(by)
+fn offset(base: FarPtr, by: usize) -> Result<FarPtr, ShimError> {
+    let offset = u16::try_from(by)
+        .ok()
+        .and_then(|by| base.offset.checked_add(by))
         .ok_or_else(|| ShimError::Failed(format!("fsd: {base} plus {by} leaves the segment")))?;
     Ok(FarPtr {
         offset,
         selector: base.selector,
     })
+}
+
+/// Where field `n`'s record starts, relative to the field array.
+///
+/// `n * sizeof(struct fsdfld)`, in arithmetic that cannot wrap. `n` has been
+/// checked against `fsdscb->numfld` before it gets here, but `numfld` is itself
+/// read out of a control block the module holds a pointer to -- so a module
+/// that wrote 60000 there could ask for field 3000, and `3000 * 23` is not a
+/// `u16`. In release that wraps and reads a `struct fsdfld` from somewhere else
+/// in the segment, which resolves, and is a plausible answer.
+fn field_at(n: u16) -> usize {
+    usize::from(n) * usize::from(fsd::FSDFLD)
 }
 
 /// An answer string, read out of module memory. `stranslen()`, `FSD.C:2061`.
@@ -120,7 +132,7 @@ fn answer_string(machine: &Machine, mut at: FarPtr) -> Result<Vec<u8>, ShimError
         if len == 0 {
             return Ok(out);
         }
-        at = offset(at, len as u16 + 1)?;
+        at = offset(at, len + 1)?;
     }
 }
 
@@ -289,11 +301,11 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     // Punctuation, then the field array, then the answer string: the same three
     // terms, in the same order, that `Form::size` added up.
     let mut bytes = form.punctuation.clone();
-    let flddat_at = bytes.len() as u16;
+    let flddat_at = bytes.len();
     for (field, (ansoff, anslen)) in form.fields.iter().zip(&installed.offsets) {
         bytes.extend_from_slice(&field.record(*ansoff, *anslen));
     }
-    let newans_at = bytes.len() as u16;
+    let newans_at = bytes.len();
     bytes.extend_from_slice(&installed.text);
     machine.write(buffer, &bytes)?;
 
@@ -352,7 +364,7 @@ fn field_record(
             block.numfld()
         )));
     }
-    let at = offset(block.flddat(), field * fsd::FSDFLD)?;
+    let at = offset(block.flddat(), field_at(field))?;
     let bytes = machine.resolve(at, usize::from(fsd::FSDFLD))?;
     let mut out = [0u8; fsd::FSDFLD as usize];
     out.copy_from_slice(bytes);
@@ -384,7 +396,10 @@ pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let field = machine.arg_u16(0);
     let (block, _) = prepared(machine, host, "fsdnan")?;
     let record = field_record(machine, &block, field, "fsdnan")?;
-    Ok(Ret::Far(offset(block.newans(), answer_offset(&record))?))
+    Ok(Ret::Far(offset(
+        block.newans(),
+        usize::from(answer_offset(&record)),
+    )?))
 }
 
 /// `int fsdord(int fldi)` -- which `ALT=` value field `fldi` holds.
@@ -421,7 +436,9 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let spec = machine.read_cstr(block.fldspc())?.to_vec();
     let ansoff = answer_offset(&record);
     let anslen = record[fsd::fld::ANSLEN];
-    let answer = machine.read_cstr(offset(block.newans(), ansoff)?)?.to_vec();
+    let answer = machine
+        .read_cstr(offset(block.newans(), usize::from(ansoff))?)?
+        .to_vec();
 
     let Some((index, canonical)) = fsd::ordinal(&spec, &field, &answer) else {
         return Ok(Ret::U16(NO));
@@ -441,29 +458,59 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     }
 
-    let tail_at = ansoff + u16::from(anslen);
-    let tail_len = block.allans().saturating_sub(tail_at);
+    // `nr = fsdscb->allans - nl - m`, which the original computes as a signed
+    // int and hands straight to `movmem`. A negative one means the control
+    // block disagrees with itself -- `allans` shorter than the answer it
+    // claims to contain -- and the original would have moved that many bytes
+    // as an unsigned count. There is nothing to salvage from it either way.
+    let tail_at = usize::from(ansoff) + usize::from(anslen);
+    let tail_len = usize::from(block.allans())
+        .checked_sub(tail_at)
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "fsdord({number}): field {number}'s answer ends at {tail_at} and the whole \
+             string is only {} bytes, so the control block is inconsistent",
+                block.allans()
+            ))
+        })?;
     let tail = machine
-        .resolve(offset(block.newans(), tail_at)?, usize::from(tail_len))?
+        .resolve(offset(block.newans(), tail_at)?, tail_len)?
         .to_vec();
     let mut rewritten = canonical.clone();
     rewritten.extend_from_slice(&tail);
-    machine.write(offset(block.newans(), ansoff)?, &rewritten)?;
+    machine.write(offset(block.newans(), usize::from(ansoff))?, &rewritten)?;
 
+    // `fldptr->anslen = anslen`. `anslen` is a `char` in the C struct and
+    // `chkalt`'s value came through `endtkn`, which clamps at ANSLEN -- so this
+    // fits, and the conversion says so rather than assuming it.
     let mut record = record;
-    record[fsd::fld::ANSLEN] = canonical.len() as u8;
-    machine.write(offset(block.flddat(), number * fsd::FSDFLD)?, &record)?;
+    record[fsd::fld::ANSLEN] = u8::try_from(canonical.len()).map_err(|_| {
+        ShimError::Failed(format!(
+            "fsdord({number}): the alternate is {} bytes and anslen is a char",
+            canonical.len()
+        ))
+    })?;
+    machine.write(offset(block.flddat(), field_at(number))?, &record)?;
 
     // `while (efptr != fldptr) { efptr->ansoff += anslen-m; efptr--; }` -- the
     // fields *after* this one, and none before.
     for later in number + 1..block.numfld() {
         let mut record = field_record(machine, &block, later, "fsdord")?;
-        let moved = (i32::from(answer_offset(&record)) + grew) as u16;
+        let moved = i32::from(answer_offset(&record)) + grew;
+        let moved = u16::try_from(moved).map_err(|_| {
+            ShimError::Failed(format!(
+                "fsdord({number}): moving field {later}'s answer by {grew} puts it at {moved}"
+            ))
+        })?;
         record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&moved.to_le_bytes());
-        machine.write(offset(block.flddat(), later * fsd::FSDFLD)?, &record)?;
+        machine.write(offset(block.flddat(), field_at(later))?, &record)?;
     }
 
-    block.set_allans(allans as u16);
+    block.set_allans(u16::try_from(allans).map_err(|_| {
+        ShimError::Failed(format!(
+            "fsdord({number}): an answer string of {allans} bytes"
+        ))
+    })?);
     machine.write(at, block.as_bytes())?;
     Ok(Ret::U16(index))
 }
@@ -510,9 +557,9 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
             && entry[..name.len()].eq_ignore_ascii_case(&name)
             && entry[name.len()] == b'='
         {
-            return Ok(Ret::Far(offset(at, name.len() as u16 + 1)?));
+            return Ok(Ret::Far(offset(at, name.len() + 1)?));
         }
-        at = offset(at, len as u16 + 1)?;
+        at = offset(at, len + 1)?;
     }
 }
 
@@ -527,6 +574,14 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `getasc` versus `getmsg` is not modelled, for the reason the `fsdroom` plan
 /// gave: the difference is line terminators, both are white space to the
 /// template scanner, and no width in a form is computed across one.
+///
+/// **`xlttxv` is not applied**, which is a content difference rather than a
+/// whitespace one -- it expands the text variables marked by a `0x01` byte. It
+/// is inherited from `fsdroom`, which compiled the form without expanding them
+/// either, so the template this returns and the template the field offsets were
+/// measured against are the same string; expanding here and not there would be
+/// worse than expanding in neither place. Neither of MajorMUD's two templates
+/// contains a `0x01`. The day one does, both call sites need it together.
 ///
 /// Its one call site, `seg 3:0x41e8`, is on the branch taken only by an ANSI
 /// user with a screen of at least 23 by 80 -- which is the branch `fsdroom`
@@ -909,6 +964,31 @@ mod tests {
     }
 
     #[test]
+    fn a_field_count_the_module_forged_cannot_index_out_of_the_segment() {
+        // `numfld` lives in the control block, which the module holds a pointer
+        // to and writes through. Forge a huge one and the bound stops nothing
+        // -- what has to stop it is that `field * 23` no longer fits a `u16`.
+        // Wrapping would read a `struct fsdfld` from elsewhere in the segment,
+        // which resolves, and hand back a plausible answer.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        let mut scb = block(&f);
+        scb.set_numfld(60000);
+        f.machine.write(at, scb.as_bytes()).expect("written");
+
+        // 3000 * 23 = 69000, which is not a u16.
+        let e = f.invoke(fsdnan, &[3000]).expect_err("refused");
+        assert!(matches!(e, ShimError::Failed(_)), "{e}");
+        let e = f.invoke(fsdord, &[3000]).expect_err("refused");
+        assert!(matches!(e, ShimError::Failed(_)), "{e}");
+    }
+
+    #[test]
     fn fsdnan_before_a_session_stops_the_module() {
         let mut f = Fixture::new();
         let e = f.invoke(fsdnan, &[0]).expect_err("refused");
@@ -973,31 +1053,69 @@ mod tests {
 
     #[test]
     fn an_answer_that_shrinks_moves_later_fields_back() {
-        // The same arithmetic with a negative difference, which the `int`
-        // subtraction in `stfans` handles and an unsigned one would not.
+        // The same arithmetic with a *negative* difference, which the signed
+        // `anslen-m` in `stfans` handles and an unsigned one would not. Reached
+        // because `chkalt` matches against `rmvwht(answer)` while the length it
+        // replaces is the raw one: "B l a c k" is nine bytes on the way in and
+        // "Black" is five on the way out.
         let mut f = Fixture::new();
-        let spec = "COLOUR(ALT=Red) NAME";
-        let _ = session(&mut f, spec, b"COLOUR=REDDISH\0NAME=Fred\0\0");
+        let spec = "COLOUR(ALT=Black) NAME";
+        let _ = session(&mut f, spec, b"COLOUR=B l a c k\0NAME=Fred\0\0");
 
         let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(before), "Fred");
+        let was = block(&f).allans();
 
-        // "REDDISH" does not begin "Red", so nothing matches and nothing moves.
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(0))));
 
-        // "Redd" does not either; "Re" does, and shrinks by five.
-        let _ = session(&mut f, spec, b"COLOUR=Re\0NAME=Fred\0\0");
-        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(0))));
+        assert_eq!(f.read(at), "Black");
         let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
-        assert_eq!(f.read(at), "Fred");
-        assert_eq!(at.offset, before.offset + 1, "\"Re\" grew to \"Red\"");
+        assert_eq!(f.read(at), "Fred", "four bytes closer, not further");
+        assert_eq!(at.offset, before.offset - 4);
+        assert_eq!(block(&f).allans(), was - 4);
+    }
+
+    #[test]
+    fn fsdord_writes_the_new_length_back_into_the_field() {
+        // `fldptr->anslen = anslen`, FSD.C:1053. `stfans` reads `m` from there
+        // on the *next* call, so a length left stale makes a second `fsdord`
+        // shift by the wrong amount and tear the answer string in half.
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
+        let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
+
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        let scb = block(&f);
+        let record = f
+            .machine
+            .resolve(scb.flddat(), usize::from(crate::fsd::FSDFLD))
+            .expect("in range");
+        assert_eq!(
+            record[crate::fsd::fld::ANSLEN],
+            5,
+            "\"Brown\", not the \"br\" that was there"
+        );
+
+        // And a second call over the now-canonical answer is a no-op that
+        // leaves everything where the first put it.
+        let Ok(Ret::Far(name)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        let allans = block(&f).allans();
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert_eq!(block(&f).allans(), allans, "nothing moved the second time");
+        let Ok(Ret::Far(again)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(again, name);
+        assert_eq!(f.read(again), "Fred");
     }
 
     #[test]
