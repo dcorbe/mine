@@ -14,11 +14,20 @@
 //! spaces are unrelated, so a table is per DLL and looking one up in another's
 //! would produce a plausible wrong name rather than an error.
 //!
-//! Two are transcribed here. `MAJORBBS` comes from the host's own
-//! `MAJORBBS.DEF`, and `GALGSBL` from the `GSBLIMP.LIB` import library that
-//! shipped beside it. Nothing names `DOSCALLS`, `PHAPI` or `GALME` yet, so
-//! their imports are reported by number -- which is honest, and is what a
-//! refusal for one of them says.
+//! Four are transcribed here, each from the thing that defines it:
+//!
+//! | DLL | source |
+//! |---|---|
+//! | `MAJORBBS` | the host's own `MAJORBBS.DEF` |
+//! | `GALGSBL` | the `GSBLIMP.LIB` import library beside it |
+//! | `GALME` | the shipped WG 1.01 `GALME.DLL`'s NE name table |
+//! | `DOSCALLS` | Phar Lap's `DOSCALLS.DLL` name table and `PHAPI.LIB` |
+//!
+//! The fifth is `PHAPI`, and it has no table because it has no ordinals. Every
+//! one of its entries in `PHAPI.LIB` is a by-name IMPDEF record and the shipped
+//! `PHAPI.DLL` is a stub that exports nothing, so a linker had no ordinal to
+//! use. That is the whole reason `WCCMMUD.DLL`'s one by-name fixup out of
+//! 22,371 is the one naming `DOSCREATEDSALIAS` -- see `docs/dll-imports.md`.
 //!
 //! # Which version's table
 //!
@@ -32,6 +41,13 @@
 //! them, and WG 1.01 and WG 2.0 agree on the name of every ordinal this module
 //! imports. So the choice is unobservable for MajorMUD, and would not be for
 //! something else.
+//!
+//! The same question was asked of the two new tables and answered the same way,
+//! by measurement rather than by assumption. `GMEDEF.DEF` in the WG 1.01 and
+//! WG 2.0 source kits agree on every ordinal WG 1.01 has -- WG 2.0 only adds
+//! `@1`, `@174`-`@199` and `@300`-`@302`. `DOSCALLS` is not keyed to the host
+//! version at all but to the extender's, and Phar Lap 3.04 and 3.12 ship
+//! different `DOSCALLS.DLL` binaries that name every ordinal identically.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -137,6 +153,12 @@ fn parse(tsv: &str) -> HashMap<u16, Box<str>> {
 /// leading underscore and is not given one. It is also the one symbol
 /// `WCCMMUD.DLL` imports by name rather than by ordinal, so both spellings have
 /// to arrive at the same entry.
+///
+/// `DOSCALLS` and `PHAPI` are far pascal, whose linkage name is the C
+/// identifier upper-cased with no underscore at all. Case is lost there and
+/// cannot be recovered mechanically, so this yields `dossetvec` for what
+/// `BSEDOS.H` spells `DosSetVec`. That is the same symbol, and the lower-case
+/// spelling is what the rest of the crate keys on.
 pub fn c_name(linkage: &str) -> Box<str> {
     let stripped = linkage.strip_prefix('_').unwrap_or(linkage);
     stripped.to_ascii_lowercase().into_boxed_str()
