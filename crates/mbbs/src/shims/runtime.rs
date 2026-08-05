@@ -119,7 +119,9 @@ pub fn f_lumod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
 
 /// The single signed pair that has no answer: `i32::MIN / -1`.
 fn overflow(name: &str, a: i32, b: i32) -> ShimError {
-    ShimError::Failed(format!("{name}({a}, {b}): the result does not fit in a long"))
+    ShimError::Failed(format!(
+        "{name}({a}, {b}): the result does not fit in a long"
+    ))
 }
 
 #[cfg(test)]
@@ -159,7 +161,10 @@ mod tests {
         assert_eq!(div(f_lumod, 0xffff_ffff, 10).unwrap(), Ret::U32(5));
 
         assert_eq!(div(f_ldiv, -1i32 as u32, 10).unwrap(), Ret::U32(0));
-        assert_eq!(div(f_lmod, -1i32 as u32, 10).unwrap(), Ret::U32(-1i32 as u32));
+        assert_eq!(
+            div(f_lmod, -1i32 as u32, 10).unwrap(),
+            Ret::U32(-1i32 as u32)
+        );
     }
 
     #[test]
@@ -167,9 +172,18 @@ mod tests {
         // `idiv` truncates toward zero, so -7/2 is -3 and not -4, and the
         // remainder takes the sign of the dividend. Rust's `/` and `%` agree,
         // which is why this is an assertion rather than an implementation.
-        assert_eq!(div(f_ldiv, -7i32 as u32, 2).unwrap(), Ret::U32(-3i32 as u32));
-        assert_eq!(div(f_lmod, -7i32 as u32, 2).unwrap(), Ret::U32(-1i32 as u32));
-        assert_eq!(div(f_ldiv, 7, -2i32 as u32).unwrap(), Ret::U32(-3i32 as u32));
+        assert_eq!(
+            div(f_ldiv, -7i32 as u32, 2).unwrap(),
+            Ret::U32(-3i32 as u32)
+        );
+        assert_eq!(
+            div(f_lmod, -7i32 as u32, 2).unwrap(),
+            Ret::U32(-1i32 as u32)
+        );
+        assert_eq!(
+            div(f_ldiv, 7, -2i32 as u32).unwrap(),
+            Ret::U32(-3i32 as u32)
+        );
         assert_eq!(div(f_lmod, 7, -2i32 as u32).unwrap(), Ret::U32(1));
     }
 

@@ -24,8 +24,8 @@ mod arena;
 pub mod btrieve;
 mod exports;
 mod fmt;
-mod globals;
 pub mod fsd;
+mod globals;
 pub mod heap;
 pub mod msg;
 mod shims;
@@ -42,7 +42,7 @@ pub use fsd::Form;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use shims::system::{Kick, Registration};
-pub use shims::{Entry, Shim, ShimError};
+pub use shims::{Cleans, Entry, Shim, ShimError};
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
@@ -495,7 +495,9 @@ impl Host {
         // whose header says it has 29,232 pages and whose body does not. That
         // file would then look installed forever after.
         let to = self.root.join(name);
-        let part = self.root.join(format!("{name}.{}.part", std::process::id()));
+        let part = self
+            .root
+            .join(format!("{name}.{}.part", std::process::id()));
         std::fs::copy(&from, &part)
             .and_then(|_| std::fs::rename(&part, &to))
             .map_err(|e| {
@@ -602,8 +604,8 @@ impl Host {
                 None => (String::new(), format!("thunk #{index}")),
             };
 
-            let shim = match shims::entry(&from, &symbol) {
-                Entry::Routine(shim) => shim,
+            let (shim, cleans) = match shims::entry(&from, &symbol) {
+                Entry::Routine(shim, cleans) => (shim, cleans),
                 Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented => {
                     let symbol = match caller(machine, module) {
                         Some(at) => format!("{symbol}, called from {at}"),
@@ -624,7 +626,12 @@ impl Host {
                 eprintln!("{:4} {symbol}", self.calls);
             }
             match shim(machine, self) {
-                Ok(ret) => exit = machine.resume(ret)?,
+                Ok(ret) => {
+                    exit = match cleans {
+                        shims::Cleans::Caller => machine.resume(ret)?,
+                        shims::Cleans::Callee(bytes) => machine.resume_cleaning(ret, bytes)?,
+                    };
+                }
                 Err(e) => {
                     let symbol = match caller(machine, module) {
                         Some(at) => format!("{symbol} ({e}), called from {at}"),
@@ -670,7 +677,7 @@ impl Host {
                 // A constant has no memory to be too small, and a routine whose
                 // address is taken in pieces is a routine -- the thunk's
                 // address is the right thing to write.
-                Entry::Absolute(_) | Entry::Routine(_) => continue,
+                Entry::Absolute(_) | Entry::Routine(..) => continue,
                 Entry::Unimplemented => Why::NotPlaced,
                 Entry::Datum => {
                     let size = self.globals.size(&name).expect("a datum is placed");
@@ -793,7 +800,7 @@ impl ImportResolver for Resolver<'_> {
             // into the fixup and nothing is ever dispatched for it.
             Entry::Datum => Some(Import::Data(self.globals.address(&name)?)),
             Entry::Absolute(value) => Some(Import::Absolute(value)),
-            Entry::Routine(_) => Some(Import::Routine),
+            Entry::Routine(..) => Some(Import::Routine),
 
             // The loader gives it a thunk anyway. That is what makes calling it
             // an event the host is told about rather than a far call into

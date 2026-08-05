@@ -30,6 +30,29 @@ pub(crate) const NO: u16 = -1i16 as u16;
 /// memory; the return value goes back in `AX` or `DX:AX`.
 pub type Shim = fn(&mut Machine, &mut Host) -> Result<Ret, ShimError>;
 
+/// Who removes a routine's arguments from the module's stack.
+///
+/// The MajorBBS API is cdecl -- the module pushes the arguments and the module
+/// pops them -- and for a long time this crate had no reason to name that,
+/// because everything it implemented was the same. Borland's 32-bit arithmetic
+/// helpers are not: they are called with four words on the stack and no
+/// `add sp` after the call.
+///
+/// Stated per routine rather than inferred, because the cost of inferring it
+/// wrongly is not a crash. A callee-cleaned routine serviced as caller-cleaned
+/// leaves its arguments behind and the module carries on with every subsequent
+/// frame shifted -- the module's own stack, quietly wrong, which is precisely
+/// the class of failure this crate refuses everywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleans {
+    /// The module pops its own arguments after the call returns. cdecl, and
+    /// what every MajorBBS routine does.
+    Caller,
+
+    /// The routine pops this many bytes of arguments before returning.
+    Callee(u16),
+}
+
 /// Why a host routine could not do what it was asked.
 ///
 /// Every variant is terminal. A shim that cannot answer has nothing safe to
@@ -63,8 +86,8 @@ impl From<mbbs16::FarPtrError> for ShimError {
 
 /// What an imported symbol is.
 pub enum Entry {
-    /// A host routine, reached by far call.
-    Routine(Shim),
+    /// A host routine, reached by far call, and who cleans up after it.
+    Routine(Shim, Cleans),
 
     /// A host global the module addresses directly. Reached by no call at all,
     /// so there is nothing to dispatch -- the address goes into the fixup at
@@ -84,78 +107,109 @@ pub enum Entry {
 /// place ordinals are written down. A different host version re-keys the whole
 /// table by itself; a table of ordinals would have to be rewritten and would
 /// look right while being wrong.
-const ROUTINES: &[(&str, &str, Shim)] = &[
+const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // Strings, numbers and the print buffer.
-    (MAJORBBS, "spr", text::spr),
-    (MAJORBBS, "sprintf", text::sprintf),
-    (MAJORBBS, "prf", text::prf),
-    (MAJORBBS, "clrprf", text::clrprf),
-    (MAJORBBS, "stzcpy", text::stzcpy),
-    (MAJORBBS, "strcpy", text::strcpy),
-    (MAJORBBS, "strlen", text::strlen),
-    (MAJORBBS, "atol", text::atol),
+    (MAJORBBS, "spr", text::spr, Cleans::Caller),
+    (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller),
+    (MAJORBBS, "prf", text::prf, Cleans::Caller),
+    (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller),
+    (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller),
+    (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller),
+    (MAJORBBS, "strlen", text::strlen, Cleans::Caller),
+    (MAJORBBS, "atol", text::atol, Cleans::Caller),
     // Message files, and the options in them.
-    (MAJORBBS, "opnmsg", msg::opnmsg),
-    (MAJORBBS, "clsmsg", msg::clsmsg),
-    (MAJORBBS, "setmbk", msg::setmbk),
-    (MAJORBBS, "rstmbk", msg::rstmbk),
-    (MAJORBBS, "stgopt", msg::stgopt),
-    (MAJORBBS, "numopt", msg::numopt),
-    (MAJORBBS, "ynopt", msg::ynopt),
-    (MAJORBBS, "chropt", msg::chropt),
-    (MAJORBBS, "tokopt", msg::tokopt),
-    (MAJORBBS, "prfmsg", msg::prfmsg),
+    (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
+    (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller),
+    (MAJORBBS, "setmbk", msg::setmbk, Cleans::Caller),
+    (MAJORBBS, "rstmbk", msg::rstmbk, Cleans::Caller),
+    (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller),
+    (MAJORBBS, "numopt", msg::numopt, Cleans::Caller),
+    (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller),
+    (MAJORBBS, "chropt", msg::chropt, Cleans::Caller),
+    (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller),
+    (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller),
     // Memory the module owns, and the leaves that move bytes about.
-    (MAJORBBS, "alcmem", memory::alcmem),
-    (MAJORBBS, "alczer", memory::alczer),
-    (MAJORBBS, "galfree", memory::galfree),
-    (MAJORBBS, "farcoreleft", memory::farcoreleft),
-    (MAJORBBS, "alctile", memory::alctile),
-    (MAJORBBS, "ptrtile", memory::ptrtile),
-    (MAJORBBS, "setmem", memory::setmem),
-    (MAJORBBS, "movmem", memory::movmem),
-    (MAJORBBS, "memcpy", memory::memcpy),
-    (MAJORBBS, "memcmp", memory::memcmp),
+    (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller),
+    (MAJORBBS, "alczer", memory::alczer, Cleans::Caller),
+    (MAJORBBS, "galfree", memory::galfree, Cleans::Caller),
+    (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller),
+    (MAJORBBS, "alctile", memory::alctile, Cleans::Caller),
+    (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller),
+    (MAJORBBS, "setmem", memory::setmem, Cleans::Caller),
+    (MAJORBBS, "movmem", memory::movmem, Cleans::Caller),
+    (MAJORBBS, "memcpy", memory::memcpy, Cleans::Caller),
+    (MAJORBBS, "memcmp", memory::memcmp, Cleans::Caller),
     // Btrieve: opening a module's data files, and which one is current.
-    (MAJORBBS, "omdbtv", btrieve::omdbtv),
-    (MAJORBBS, "opnbtv", btrieve::opnbtv),
-    (MAJORBBS, "setbtv", btrieve::setbtv),
-    (MAJORBBS, "rstbtv", btrieve::rstbtv),
-    (MAJORBBS, "cntrbtv", btrieve::cntrbtv),
+    (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
+    (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),
+    (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller),
+    (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller),
+    (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller),
     // Btrieve: reading records.
-    (MAJORBBS, "qrybtv", btrieve::qrybtv),
-    (MAJORBBS, "qnpbtv", btrieve::qnpbtv),
-    (MAJORBBS, "obtbtvl", btrieve::obtbtvl),
-    (MAJORBBS, "stpbtvl", btrieve::stpbtvl),
-    (MAJORBBS, "absbtv", btrieve::absbtv),
-    (MAJORBBS, "aabbtv", btrieve::aabbtv),
-    (MAJORBBS, "gabbtvl", btrieve::gabbtvl),
+    (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller),
+    (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller),
+    (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller),
+    (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller),
+    (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
+    (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
+    (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
     // Btrieve: the write family's guards. Neither of these writes -- each
     // reproduces what `PLBTVSTF.C` did with no file current, and refuses when
     // there is one.
-    (MAJORBBS, "invbtv", btrieve::invbtv),
-    (MAJORBBS, "delbtv", btrieve::delbtv),
+    (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
+    (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
     // Streams: the module's own files, read and written.
-    (MAJORBBS, "fopen", stream::fopen),
-    (MAJORBBS, "fclose", stream::fclose),
-    (MAJORBBS, "fgets", stream::fgets),
-    (MAJORBBS, "fread", stream::fread),
-    (MAJORBBS, "fprintf", stream::fprintf),
-    (MAJORBBS, "fflush", stream::fflush),
-    (MAJORBBS, "unlink", stream::unlink),
+    (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
+    (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
+    (MAJORBBS, "fgets", stream::fgets, Cleans::Caller),
+    (MAJORBBS, "fread", stream::fread, Cleans::Caller),
+    (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller),
+    (MAJORBBS, "fflush", stream::fflush, Cleans::Caller),
+    (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
     // The clock, the audit trail, and coming online.
-    (MAJORBBS, "access", system::access),
-    (MAJORBBS, "now", system::now),
-    (MAJORBBS, "today", system::today),
-    (MAJORBBS, "time", system::time),
-    (MAJORBBS, "srand", system::srand),
-    (MAJORBBS, "gmdnam", system::gmdnam),
-    (MAJORBBS, "shocst", system::shocst),
-    (MAJORBBS, "rtkick", system::rtkick),
-    (MAJORBBS, "fsdroom", fsd::fsdroom),
-    (MAJORBBS, "dclvda", system::dclvda),
-    (MAJORBBS, "register_module", system::register_module),
-    (MAJORBBS, "catastro", system::catastro),
+    (MAJORBBS, "access", system::access, Cleans::Caller),
+    (MAJORBBS, "now", system::now, Cleans::Caller),
+    (MAJORBBS, "today", system::today, Cleans::Caller),
+    (MAJORBBS, "time", system::time, Cleans::Caller),
+    (MAJORBBS, "srand", system::srand, Cleans::Caller),
+    (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
+    (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
+    (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
+    (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller),
+    (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
+    (
+        MAJORBBS,
+        "register_module",
+        system::register_module,
+        Cleans::Caller,
+    ),
+    (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
+    // The compiler's own runtime, which this host exports because the real one
+    // did. These four pop their own arguments -- see `runtime`.
+    (
+        MAJORBBS,
+        "f_ldiv@",
+        runtime::f_ldiv,
+        Cleans::Callee(runtime::OPERANDS),
+    ),
+    (
+        MAJORBBS,
+        "f_lmod@",
+        runtime::f_lmod,
+        Cleans::Callee(runtime::OPERANDS),
+    ),
+    (
+        MAJORBBS,
+        "f_ludiv@",
+        runtime::f_ludiv,
+        Cleans::Callee(runtime::OPERANDS),
+    ),
+    (
+        MAJORBBS,
+        "f_lumod@",
+        runtime::f_lumod,
+        Cleans::Callee(runtime::OPERANDS),
+    ),
 ];
 
 /// Every constant the host exports.
@@ -185,8 +239,11 @@ const ABSOLUTES: &[(&str, &str, u16)] =
 /// they do not, which is how a DLL with no table of its own is still addressed
 /// by something stable.
 pub fn entry(dll: &str, symbol: &str) -> Entry {
-    if let Some((_, _, shim)) = ROUTINES.iter().find(|(d, n, _)| *d == dll && *n == symbol) {
-        return Entry::Routine(*shim);
+    if let Some((_, _, shim, cleans)) = ROUTINES
+        .iter()
+        .find(|(d, n, _, _)| *d == dll && *n == symbol)
+    {
+        return Entry::Routine(*shim, *cleans);
     }
     if let Some((_, _, value)) = ABSOLUTES.iter().find(|(d, n, _)| *d == dll && *n == symbol) {
         return Entry::Absolute(*value);
@@ -245,7 +302,7 @@ mod tests {
         // They answer the same question, and a symbol in two would resolve to
         // whichever is consulted first -- a far call into globals memory, or a
         // variable at a code address. Neither fails loudly.
-        for (dll, name, _) in ROUTINES {
+        for (dll, name, _, _) in ROUTINES {
             assert!(
                 !GLOBALS.iter().any(|g| g.dll == *dll && g.name == *name),
                 "{dll}.{name} is both a routine and a global"
@@ -260,6 +317,36 @@ mod tests {
                 !GLOBALS.iter().any(|g| g.dll == *dll && g.name == *name),
                 "{dll}.{name} is both a constant and a global"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod convention {
+    use super::*;
+
+    #[test]
+    fn every_routine_but_the_borland_helpers_is_caller_cleaned() {
+        // The MajorBBS API is cdecl throughout: the module pushes, the module
+        // pops. Only the compiler's own runtime helpers differ, and there are
+        // four of them.
+        let callee: Vec<&str> = ROUTINES
+            .iter()
+            .filter(|(_, _, _, cleans)| !matches!(cleans, Cleans::Caller))
+            .map(|(_, name, _, _)| *name)
+            .collect();
+        assert_eq!(callee, ["f_ldiv@", "f_lmod@", "f_ludiv@", "f_lumod@"]);
+    }
+
+    #[test]
+    fn the_helpers_pop_two_longs() {
+        for (_, name, _, cleans) in ROUTINES {
+            if name.starts_with("f_l") {
+                assert!(
+                    matches!(cleans, Cleans::Callee(runtime::OPERANDS)),
+                    "{name} pops {cleans:?}"
+                );
+            }
         }
     }
 }
