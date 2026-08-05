@@ -70,6 +70,50 @@ pub fn tolower(c: u8) -> u8 {
     if c.is_ascii_uppercase() { c + 32 } else { c }
 }
 
+/// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
+///
+/// Ordinal 520, `seg 35:0x1da2`, and **the opposite sense from `strcmp`**: 1
+/// means equal, 0 means different. The original walks both strings folding each
+/// byte with [`tolower`] -- the relocation at `seg 35:0x1db9` resolves to
+/// ordinal 603, not 604 -- and when `stg1` reaches its terminator it answers
+/// whether `stg2` reached its own at the same moment.
+pub fn sameas(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && folded_prefix(a, b)
+}
+
+/// `int sameto(char *shorts,char *longs)` -- does `longs` **begin with**
+/// `shorts`, ignoring case.
+///
+/// Ordinal 522, `seg 35:0x1ec4`. [`sameas`]'s loop with one line removed: when
+/// `shorts` runs out it answers 1 without looking at what is left of `longs`.
+///
+/// **The short one is the first argument.** `GCOMM.H:324` names them that way
+/// and `CSREGIS.C:134` uses them that way -- `sameto("sau:inf ",dpkstg)`.
+pub fn sameto(shorts: &[u8], longs: &[u8]) -> bool {
+    shorts.len() <= longs.len() && folded_prefix(shorts, &longs[..shorts.len()])
+}
+
+/// `int samein(char *shorts,char *longs)` -- does `shorts` occur **anywhere in**
+/// `longs`, ignoring case.
+///
+/// Ordinal 521, `seg 35:0x1dfb`, and built out of [`sameto`] rather than out of
+/// a scan: it calls it at each of `strlen(longs) - strlen(shorts) + 1` offsets.
+/// That count is held in a local and compared **signed** (`jl`), so a `shorts`
+/// longer than `longs` answers 0 without reading a byte -- unsigned, it would
+/// have wrapped and walked most of a segment.
+pub fn samein(shorts: &[u8], longs: &[u8]) -> bool {
+    longs.len() >= shorts.len()
+        && (0..=longs.len() - shorts.len()).any(|i| sameto(shorts, &longs[i..]))
+}
+
+/// Whether two equal-length runs match once [`tolower`] has folded each byte.
+///
+/// The one loop `sameas` and `sameto` share; they differ only in what happens
+/// when it runs out.
+fn folded_prefix(a: &[u8], b: &[u8]) -> bool {
+    a.iter().zip(b).all(|(&x, &y)| tolower(x) == tolower(y))
+}
+
 /// `void rmvwht(char *string)` -- remove **every** whitespace character.
 ///
 /// Not a trim. The original keeps two cursors over the one buffer and compacts
@@ -130,6 +174,45 @@ mod tests {
         assert_eq!(toupper(b'a'), b'A');
         assert_eq!(tolower(b'A'), b'a');
         assert_eq!(toupper(0xe9), 0xe9, "an accented byte is not a letter here");
+    }
+
+    #[test]
+    fn sameas_is_whole_string_and_case_blind() {
+        assert!(sameas(b"LONG", b"long"));
+        assert!(sameas(b"", b""));
+        assert!(!sameas(b"long", b"longer"), "not a prefix test");
+        assert!(!sameas(b"longer", b"long"));
+        assert!(!sameas(b"", b"x"));
+        assert!(!sameas(b"x", b""));
+    }
+
+    #[test]
+    fn sameto_asks_whether_the_long_one_begins_with_the_short_one() {
+        // `GCOMM.H:324` names the arguments `shorts` and `longs` in that
+        // order, and `CSREGIS.C:134` -- `sameto("sau:inf ",dpkstg)` -- puts
+        // the literal prefix on the left. Getting this round the wrong way is
+        // the trap.
+        assert!(sameto(b"sau:inf ", b"sau:inf 1234"));
+        assert!(sameto(b"same", b"SAME"), "an exact match is a prefix");
+        assert!(sameto(b"", b"anything"), "an empty prefix always matches");
+        assert!(sameto(b"", b""));
+        assert!(!sameto(b"sau:inf ", b"sau:"), "longs runs out first");
+        assert!(!sameto(b"x", b""));
+    }
+
+    #[test]
+    fn samein_is_a_substring_test_built_out_of_sameto() {
+        assert!(samein(b"NORTH", b"go north now"));
+        assert!(samein(b"go", b"go north"), "a prefix is a substring");
+        assert!(samein(b"now", b"go north now"), "so is a suffix");
+        assert!(samein(b"", b"anything"));
+        assert!(!samein(b"south", b"go north"));
+
+        // `strlen(longs) - strlen(shorts) + 1` is zero or less under a SIGNED
+        // compare, so the loop never runs. Unsigned it would wrap and read
+        // 65,000-odd offsets past the end.
+        assert!(!samein(b"longer than", b"short"));
+        assert!(!samein(b"x", b""));
     }
 
     #[test]

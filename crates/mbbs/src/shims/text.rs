@@ -291,6 +291,31 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U32(value as u32))
 }
 
+/// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
+///
+/// **1 is equal**, which is the opposite of [`strcmp`] and the reason this
+/// family is worth reading twice. See
+/// [`strings::sameas`](crate::strings::sameas).
+pub fn sameas(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let b = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::sameas(&a, b).into()))
+}
+
+/// `int sameto(char *shorts,char *longs)` -- a prefix test, short one first.
+pub fn sameto(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let longs = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::sameto(&shorts, longs).into()))
+}
+
+/// `int samein(char *shorts,char *longs)` -- a substring test, short one first.
+pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let longs = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
+}
+
 /// `int toupper(int c)`.
 ///
 /// **Not a macro here.** Borland's macro is `_toupper`; `toupper` is a real
@@ -372,6 +397,65 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn the_same_family_answers_one_for_equal_not_strcmps_zero() {
+        // `sameas` is 1 for equal; `strcmp` is 0 for equal. Returning the
+        // wrong sense compiles, runs, and diverges 500 sites later.
+        let mut f = Fixture::new();
+        let long = f.text("LONG");
+        let lower = f.text("long");
+        let longer = f.text("longer");
+
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+        assert_eq!(
+            f.invoke(sameas, &pair(long, lower)).expect("ok"),
+            Ret::U16(1)
+        );
+        assert_eq!(
+            f.invoke(sameas, &pair(long, longer)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn sameto_takes_the_prefix_first_and_samein_takes_the_needle_first() {
+        let mut f = Fixture::new();
+        let long = f.text("long");
+        let longer = f.text("longer");
+        let ong = f.text("ONG");
+
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+        assert_eq!(
+            f.invoke(sameto, &pair(long, longer)).expect("ok"),
+            Ret::U16(1),
+            "sameto(shorts, longs): `longer` begins with `long`"
+        );
+        assert_eq!(
+            f.invoke(sameto, &pair(longer, long)).expect("ok"),
+            Ret::U16(0),
+            "and not the other way round"
+        );
+        assert_eq!(
+            f.invoke(samein, &pair(ong, longer)).expect("ok"),
+            Ret::U16(1),
+            "samein(shorts, longs): `ONG` is inside `longer`"
+        );
+        assert_eq!(
+            f.invoke(samein, &pair(longer, ong)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn the_same_family_refuses_a_pointer_naming_nothing() {
+        let mut f = Fixture::new();
+        let s = f.text("x");
+        for shim in [sameas, sameto, samein] {
+            assert!(f.invoke(shim, &[s.offset, s.selector, 0, 0]).is_err());
+            assert!(f.invoke(shim, &[0, 0, s.offset, s.selector]).is_err());
+        }
+    }
 
     #[test]
     fn toupper_folds_a_letter_and_leaves_everything_else() {
