@@ -543,6 +543,135 @@ impl fmt::Display for FormError {
 
 impl std::error::Error for FormError {}
 
+/// A field's name in the specification, whole. What `fsdans()` writes out.
+///
+/// The specification text from the field's `fspoff` up to the first NUL, white
+/// space or `(`, and **not** clamped to [`FLDNAM`] -- `fsdans()`'s copy loop
+/// (`FSD.C:514`) has no such clamp, and `maxans` was counted the same way, so
+/// truncating here would put fewer bytes in the answer string than `fsdroom`
+/// reserved room for. A name longer than `FLDNAM` is an error `fsdppc` reports
+/// and `fsdroom` refuses on, so the difference is unreachable in practice and
+/// kept anyway because the two C routines really do differ.
+fn spec_name<'a>(spec: &'a [u8], field: &Field) -> &'a [u8] {
+    let from = usize::from(field.spec_at).min(spec.len());
+    let rest = &spec[from..];
+    let end = rest
+        .iter()
+        .position(|&c| c == 0 || is_space(c) || c == b'(')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// A field's name, as `fldnmi()` reports it. `FSD.C:2155`.
+///
+/// [`spec_name`] clamped to [`FLDNAM`], because the original copies into a
+/// `char[FLDNAM+1]` and stops at `i++ < FLDNAM`.
+pub fn name_of<'a>(spec: &'a [u8], field: &Field) -> &'a [u8] {
+    let name = spec_name(spec, field);
+    &name[..name.len().min(usize::from(FLDNAM))]
+}
+
+/// Where a field's value begins in an answer string. `fsdxan()`, `FSD.C:2073`.
+///
+/// An answer string is a run of NUL-terminated `NAME=value` entries ended by an
+/// empty one, so this walks entries rather than scanning bytes.
+///
+/// `None` when the name is not there. The original says the same thing by
+/// returning a pointer to the string's final `'\0'`, which reads as `""` --
+/// the caller cannot tell the two apart, and `""` is what a missing answer
+/// means. Kept as an [`Option`] so that a caller who needs the difference has
+/// it; [`answers`] does not.
+///
+/// Matching is `sameto` -- case-insensitive -- **and then** a check that the
+/// next byte is `'='`. That second half is what stops the field `NAME` from
+/// matching the answer `NAMEX=1`.
+pub fn extract(answers: &[u8], name: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    while at < answers.len() && answers[at] != 0 {
+        let end = answers[at..]
+            .iter()
+            .position(|&c| c == 0)
+            .map_or(answers.len(), |n| at + n);
+        let entry = &answers[at..end];
+        if entry.len() > name.len()
+            && entry[..name.len()].eq_ignore_ascii_case(name)
+            && entry[name.len()] == b'='
+        {
+            return Some(at + name.len() + 1);
+        }
+        at = end + 1;
+    }
+    None
+}
+
+/// The value at `at` in an answer string: up to the next NUL.
+fn value_at(answers: &[u8], at: usize) -> &[u8] {
+    let end = answers[at..]
+        .iter()
+        .position(|&c| c == 0)
+        .map_or(answers.len(), |n| at + n);
+    &answers[at..end]
+}
+
+/// An answer string, installed over a form. What `fsdans()` leaves behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answers {
+    /// The string itself: `NAME=value\0NAME=value\0...\0`, final NUL included.
+    pub text: Vec<u8>,
+
+    /// Each field's `(ansoff, anslen)`, in field order. `ansoff` is the offset
+    /// of the *value* within [`Answers::text`], one past the `=`.
+    pub offsets: Vec<(u16, u8)>,
+
+    /// `allans`: the whole string's length, the final NUL included.
+    pub allans: u16,
+}
+
+/// Install an answer string over a form. `fsdans()`, `FSD.C:493`.
+///
+/// `old` is the caller's default answers, in the same format, and may be a lone
+/// NUL for all blank. Each field's value is looked up in `old` **by the name
+/// the specification gives it**, truncated to that field's width, and written
+/// out under that name -- so the result is keyed by the form and not by
+/// whatever the caller happened to send, and a field `old` never mentions comes
+/// out blank rather than missing.
+///
+/// A field the template had no room for has width 0 and therefore an empty
+/// answer, which is `FSD.H`'s Note 1 falling out of the arithmetic rather than
+/// being a case anyone had to write.
+///
+/// The original does all of this in one pass over the output buffer, using the
+/// name it has just written as the key to look up and overwriting that name's
+/// terminator with `=` afterwards. The result is the same string.
+pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
+    let mut text: Vec<u8> = Vec::new();
+    let mut offsets = Vec::with_capacity(form.fields.len());
+
+    for field in &form.fields {
+        let name = spec_name(spec, field);
+        text.extend_from_slice(name);
+        text.push(b'=');
+        let ansoff = text.len() as u16;
+
+        // `stzcpy(cp+1, fsdxan(oldans,np), width+1)`: at most `width`
+        // characters of the value, and a NUL after them whatever happens.
+        let value = extract(old, name).map_or(&[][..], |at| value_at(old, at));
+        let kept = value.len().min(usize::from(field.width));
+        text.extend_from_slice(&value[..kept]);
+        text.push(0);
+        offsets.push((ansoff, kept as u8));
+    }
+
+    // The extra NUL that ends the whole string. `allans` counts it.
+    text.push(0);
+    let allans = text.len() as u16;
+    Answers {
+        text,
+        offsets,
+        allans,
+    }
+}
+
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
 ///
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
@@ -969,6 +1098,109 @@ mod tests {
         // field characters and invent fields out of the borders.
         let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY);
         assert_eq!(form.in_template, 1);
+    }
+
+    #[test]
+    fn an_answer_string_is_named_values_separated_by_nuls() {
+        // The example at FSDBBS.H:202, built by hand and read back.
+        let old = b"RANK=MAJOR\0NAME=Fred\0\0";
+        assert_eq!(extract(old, b"NAME"), Some(16));
+        assert_eq!(&old[16..20], b"Fred");
+        assert_eq!(extract(old, b"RANK"), Some(5));
+    }
+
+    #[test]
+    fn a_name_is_matched_whole_and_not_as_a_prefix() {
+        // `fsdxan` takes a match only when the byte after the name is '=',
+        // which is what stops "NAME" from matching "NAMEX=1".
+        assert_eq!(extract(b"NAMEX=1\0\0", b"NAME"), None);
+        assert_eq!(extract(b"NAM=1\0\0", b"NAME"), None);
+        assert_eq!(extract(b"\0", b"NAME"), None);
+    }
+
+    #[test]
+    fn a_name_is_matched_without_regard_to_case() {
+        // `sameto` ignores case, so FSD.H:592's "all caps required" is advice.
+        assert_eq!(extract(b"name=Fred\0\0", b"NAME"), Some(5));
+    }
+
+    #[test]
+    fn installing_answers_writes_name_equals_value_per_field() {
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let a = answers(&form, b"NAME RANK", b"RANK=MAJOR\0\0");
+
+        assert_eq!(a.text, b"NAME=\0RANK=MAJOR\0\0");
+        // `ansoff` is the offset of the *value*, one past the '='.
+        assert_eq!(a.offsets, vec![(5u16, 0u8), (11, 5)]);
+        // `allans` counts the whole thing, final NUL included.
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    #[test]
+    fn an_answer_longer_than_the_field_is_truncated_to_its_width() {
+        // `stzcpy(cp+1, ..., width+1)`. A default that came through whole
+        // would overrun the buffer `fsdroom` sized.
+        let form = compile(b"??", b"A", MANY);
+        assert_eq!(form.fields[0].width, 2);
+        assert_eq!(answers(&form, b"A", b"A=abcdef\0\0").text, b"A=ab\0\0");
+    }
+
+    #[test]
+    fn a_field_the_template_has_no_room_for_gets_an_empty_answer() {
+        // FSD.H Note 1: fields in the spec but not in the template always have
+        // zero-length answers, because their width is zero.
+        let form = compile(b"??", b"A B", MANY);
+        assert_eq!(form.in_template, 1);
+        assert_eq!(
+            answers(&form, b"A B", b"A=xy\0B=zz\0\0").text,
+            b"A=xy\0B=\0\0"
+        );
+    }
+
+    #[test]
+    fn the_answer_string_never_exceeds_what_fsdroom_reserved() {
+        // `maxans` is why `fsdroom` returns what it does. If `fsdans` could
+        // produce more, every session would overrun the buffer the module
+        // allocated from the number this crate gave it.
+        let spec = b"NAME(MIN=1) RANK SERIALNO";
+        let form = compile(b"?????????? ?????? ####", spec, MANY);
+        let a = answers(
+            &form,
+            spec,
+            b"NAME=abcdefghijkl\0RANK=MAJOR\0SERIALNO=1234\0\0",
+        );
+        assert!(
+            a.allans <= form.answer_max + 1,
+            "{} answer bytes against a reserved {}",
+            a.allans,
+            form.answer_max + 1
+        );
+    }
+
+    #[test]
+    fn a_field_name_stops_at_white_space_or_an_open_paren() {
+        // `fldnmi()`, FSD.C:2155 -- the name is the spec text up to the first
+        // space or '(', and it is what both the answer string and `fsdxan` are
+        // keyed by.
+        let spec = b"A(MIN=1) BB";
+        let form = compile(b"?? ??", spec, MANY);
+        assert_eq!(name_of(spec, &form.fields[0]), b"A");
+        assert_eq!(name_of(spec, &form.fields[1]), b"BB");
+    }
+
+    #[test]
+    fn fldnmi_clamps_a_name_to_fldnam_and_fsdans_does_not() {
+        // The two C routines really do differ: `fldnmi` copies into a
+        // `char[FLDNAM+1]`, `fsdans` copies until white space. Only an
+        // over-long name shows it, and `fsdroom` refuses those -- so this
+        // records the difference rather than relying on it.
+        let spec = b"A_VERY_LONG_NAME_INDEED";
+        let form = compile(b"??", spec, MANY);
+        assert_eq!(name_of(spec, &form.fields[0]), b"A_VERY_LONG_");
+        assert_eq!(
+            answers(&form, spec, b"\0").text,
+            b"A_VERY_LONG_NAME_INDEED=\0\0"
+        );
     }
 
     #[test]
