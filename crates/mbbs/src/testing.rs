@@ -118,11 +118,26 @@ impl Fixture {
     /// Stop at a host call whose argument words are `args`, in declaration
     /// order.
     pub fn call(&mut self, args: &[u16]) {
+        self.call_with(args, [0; 4]);
+    }
+
+    /// Stop at a host call with `args` pushed and `AX`, `BX`, `CX` and `DX` set,
+    /// in that order.
+    ///
+    /// Borland's 32-bit runtime helpers take their operands in registers and put
+    /// nothing on the stack at all, so a fixture that could only push could not
+    /// reach them. The registers are loaded *after* the pushes, because the
+    /// pushes use `AX` as their scratch.
+    pub fn call_with(&mut self, args: &[u16], regs: [u16; 4]) {
         let mut code = Vec::new();
         for word in args.iter().rev() {
             code.push(0xb8); // mov $word, %ax
             code.extend_from_slice(&word.to_le_bytes());
             code.push(0x50); // push %ax
+        }
+        for (opcode, value) in [0xb8u8, 0xbb, 0xb9, 0xba].into_iter().zip(regs) {
+            code.push(opcode); // mov $value, %ax / %bx / %cx / %dx
+            code.extend_from_slice(&value.to_le_bytes());
         }
         code.extend_from_slice(&[0x9a, 0, 0, 0, 0]); // lcall $CS, $thunk 0
         let at = code.len() - 4;
@@ -140,6 +155,17 @@ impl Fixture {
     /// Push `args` and run `shim` over them.
     pub fn invoke(&mut self, shim: Shim, args: &[u16]) -> Result<Ret, ShimError> {
         self.call(args);
+        shim(&mut self.machine, &mut self.host)
+    }
+
+    /// Push `args`, set the registers, and run `shim` over both.
+    pub fn invoke_with(
+        &mut self,
+        shim: Shim,
+        args: &[u16],
+        regs: [u16; 4],
+    ) -> Result<Ret, ShimError> {
+        self.call_with(args, regs);
         shim(&mut self.machine, &mut self.host)
     }
 
