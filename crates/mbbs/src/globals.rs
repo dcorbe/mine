@@ -308,6 +308,21 @@ impl Globals {
         globals.write(machine, "prfptr", &prf.to_bytes())?;
         globals.write(machine, "_ctype", &ctype_table())?;
 
+        // MAJORBBS.C:80-81 -- `int nterms=1, hichp1=1;`. Both were set before
+        // any module's init ran, `:557` only ever adds configured groups to
+        // `nterms`, and `:569` catastros above 256. There is no path to zero,
+        // so leaving these at the zero they are born with hands the module a
+        // number the real host never produced.
+        //
+        // One is not a placeholder. `GMEOFF.C:22` is Galacticomm's *offline*
+        // host -- modules initialised with nobody connected, which is exactly
+        // what this host is -- and it declares
+        // `int nterms;  /* number of channels (always 1) */`, set by
+        // `iniogme()`. When this host learns what a channel is, that is what
+        // changes this.
+        globals.write(machine, "nterms", &1u16.to_le_bytes())?;
+        globals.write(machine, "hichp1", &1u16.to_le_bytes())?;
+
         Ok(globals)
     }
 
@@ -390,6 +405,18 @@ impl Globals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_channel_count_is_one_before_a_module_reads_it() {
+        // `MAJORBBS.C:80-81` declares both of these `=1` and the real host had
+        // them set long before any module's init ran. Zero is a value neither
+        // ever held -- and MajorMUD's initialisation multiplies `nterms` by 8
+        // and hands the result to `alczer`, so a zero here is an allocation of
+        // nothing that the module then indexes.
+        let f = crate::testing::Fixture::new();
+        assert_eq!(f.host.globals().word(&f.machine, "nterms").expect("nterms"), 1);
+        assert_eq!(f.host.globals().word(&f.machine, "hichp1").expect("hichp1"), 1);
+    }
 
     #[test]
     fn the_globals_fit_in_one_segment() {
