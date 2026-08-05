@@ -5,6 +5,11 @@
 //! anywhere in `WCCMMUD.DLL`. Every stream is read or written straight through,
 //! once. The design is `docs/plans/2026-08-04-streams.md`.
 //!
+//! One stream is neither: `_GENERATE_TOP_LIST` opens `log.log` `"w+"` at
+//! `seg 34:0x010a`, the module's only update mode. It is written like any other
+//! and reading it is refused -- see [`Streams::readable`], which is where the
+//! reason lives.
+//!
 //! # The import census does not cover this one
 //!
 //! Everywhere else in this host, what a module can ask for is bounded by what it
@@ -176,6 +181,14 @@ impl Mode {
 enum Io {
     Read(BufReader<File>),
     Write(File),
+
+    /// Opened for update -- `O_RDWR`. Written exactly like [`Self::Write`] and
+    /// deliberately **not** read: see [`Streams::readable`].
+    ///
+    /// Unbuffered, like `Write` and unlike `Read`, which is not an oversight.
+    /// A `BufReader` over a handle this host also writes through would answer
+    /// from a buffer filled before the write.
+    Update(File),
 }
 
 /// One open stream.
@@ -305,7 +318,7 @@ impl Stream {
     /// `WRITE.C:111` -- `if ((c = *sbuf++) == '\n') *tbuf++ = '\r';` -- so a
     /// `.LOG` a sysop opens in a DOS editor has DOS line endings.
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let Io::Write(file) = &mut self.io else {
+        let (Io::Write(file) | Io::Update(file)) = &mut self.io else {
             return Ok(());
         };
         if self.mode.binary {
@@ -355,16 +368,6 @@ impl Streams {
         path: &Path,
         mode: Mode,
     ) -> Result<FarPtr, String> {
-        // Parseable and refused, which is a different thing from unparseable.
-        // Nothing in the module opens for update -- none of the eleven resolved
-        // call sites has a `+` -- and a stream that read back what it had just
-        // written would need a buffering arrangement this host does not have.
-        if mode.update {
-            return Err(format!(
-                "{name} opened for update; this host reads or writes a stream, not both"
-            ));
-        }
-
         let fd = self.free_fd().ok_or_else(|| {
             format!(
                 "{name}: all {} descriptors are in use",
@@ -372,7 +375,22 @@ impl Streams {
             )
         })?;
 
-        let io = if mode.read {
+        // The base letter decides create and truncate; the `+` decides only
+        // that the handle is `O_RDWR`. `CheckOpenType`'s table, FOPEN.C:44-50:
+        // `w+` creates and truncates, `a+` creates and appends, `r+` does
+        // neither and fails if the file is not there.
+        let io = if mode.update {
+            Io::Update(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(!mode.read)
+                    .append(mode.append)
+                    .truncate(mode.write && !mode.append)
+                    .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        } else if mode.read {
             Io::Read(BufReader::new(
                 File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
             ))
@@ -469,7 +487,7 @@ impl Streams {
 
         let file = match &stream.io {
             Io::Read(reader) => reader.get_ref(),
-            Io::Write(file) => file,
+            Io::Write(file) | Io::Update(file) => file,
         };
         let at = file
             .metadata()
@@ -535,7 +553,7 @@ impl Streams {
     pub fn write(&mut self, cookie: FarPtr, bytes: &[u8]) -> Result<(), String> {
         let at = self.find(cookie)?;
         let stream = &mut self.open[at];
-        if !stream.mode.write {
+        if !stream.mode.writable() {
             return Err(format!("{} is open for reading", stream.name));
         }
         stream
@@ -568,10 +586,33 @@ impl Streams {
     }
 
     /// Where the stream `cookie` names is, given it must be readable.
+    ///
+    /// Two refusals, for two different things. The first is the module asking
+    /// to read a stream it opened `w` or `a`. The second is subtler and is why
+    /// this is not one check: an update stream **is** readable as far as its
+    /// mode and its `flags` word go, and there is still no defined moment at
+    /// which reading it would mean anything.
     fn readable(&self, cookie: FarPtr) -> Result<usize, String> {
         let at = self.find(cookie)?;
-        if !self.open[at].mode.read {
-            return Err(format!("{} is open for writing", self.open[at].name));
+        let stream = &self.open[at];
+        if !stream.mode.readable() {
+            return Err(format!("{} is open for writing", stream.name));
+        }
+
+        // `fopen`'s own documentation, FOPEN.C:261-266: "output may not be
+        // directly followed by input without an intervening fseek or rewind".
+        // `WCCMMUD.DLL` imports no `fseek`, no `ftell` and no `rewind`, so
+        // every read it could make of an update stream is one the original had
+        // no defined answer for. A host that answered anyway would be inventing
+        // behaviour, and the answer it would invent -- end of file, from
+        // `getc`'s `else` arm -- is a plausible zero rather than a visible one.
+        if matches!(stream.io, Io::Update(_)) {
+            return Err(format!(
+                "{} is open for update, and this module imports no fseek, ftell \
+                 or rewind -- so there is no point at which reading it would \
+                 mean anything",
+                stream.name
+            ));
         }
         Ok(at)
     }
