@@ -264,6 +264,8 @@ pub fn compile(template: &[u8], spec: &[u8], max_fields: u16) -> Form {
     };
     spec_scan(&mut form, spec, max_fields);
     options(&mut form, spec);
+    template_scan(&mut form, template);
+    punctuation(&mut form, template);
     form
 }
 
@@ -407,6 +409,138 @@ fn options(form: &mut Form, spec: &[u8]) {
     }
 }
 
+/// `tmpfld()`, `FSD.C:265`: record where a field landed in the template.
+fn place(form: &mut Form, index: usize, at: u16, width: u16) {
+    let width = u8::try_from(width.min(ANSLEN)).expect("ANSLEN fits in a byte");
+    let field = &mut form.fields[index];
+    field.attr = 0x07;
+    field.template_at = at;
+    field.xwidth = width;
+    field.width = width;
+    field.punctuation_at = None;
+    form.answer_max = form.answer_max.saturating_add(u16::from(width));
+}
+
+/// `tmpscn()`, `FSD.C:299`: find the field runs in the template.
+fn template_scan(form: &mut Form, template: &[u8]) {
+    let end = template
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(template.len());
+    let template = &template[..end];
+
+    let mut placed = 0usize;
+    let mut last = 0u8;
+    let mut joining = false;
+    let mut at = 0usize;
+    let mut off = 0u16;
+
+    while at < template.len() {
+        let c = template[at];
+        let kind = Kind::of(c);
+        match kind {
+            Kind::White => {
+                joining = false;
+                at += 1;
+                off += 1;
+            }
+            Kind::Dol | Kind::Exc | Kind::Pnd | Kind::Qst => {
+                // A lone field character is literal text. Two or more make a
+                // field, which is why a one-character answer is not spellable.
+                if template.get(at + 1) != Some(&c) {
+                    at += 1;
+                    off += 1;
+                    continue;
+                }
+                let mut run = 0u16;
+                while at < template.len() && template[at] == c {
+                    at += 1;
+                    run += 1;
+                }
+
+                if placed > 0 && kind.joins() && joining && last == c {
+                    // The run before this one was the same character with only
+                    // punctuation between: `###-####` is one field, not two.
+                    let field = &mut form.fields[placed - 1];
+                    let xwidth = off + run - field.template_at;
+                    let clamped = u8::try_from(xwidth.min(ANSLEN)).expect("ANSLEN is a byte");
+                    field.punctuation_at = Some(0);
+                    field.width = field
+                        .width
+                        .saturating_add(u8::try_from(run).unwrap_or(u8::MAX));
+                    field.xwidth = clamped;
+                    if xwidth > ANSLEN {
+                        field.width = clamped;
+                    }
+                    form.answer_max = form.answer_max.saturating_add(run);
+                } else if kind == Kind::Exc {
+                    form.help_len = u8::try_from(run.min(MAXHLP)).expect("fits");
+                    form.help_at = off;
+                } else if placed < form.fields.len() {
+                    place(form, placed, off, run);
+                    placed += 1;
+                    joining = true;
+                }
+                off += run;
+                last = c;
+            }
+            Kind::Slash => {
+                let before = at > 0 && template[at - 1].eq_ignore_ascii_case(&b'Y');
+                let after = template
+                    .get(at + 1)
+                    .is_some_and(|b| b.eq_ignore_ascii_case(&b'N'));
+                if off > 0 && before && after && placed < form.fields.len() {
+                    place(form, placed, off - 1, 3);
+                    last = c;
+                    let field = &mut form.fields[placed];
+                    if field.flags
+                        & (flags::MULTICHOICE
+                            | flags::ALTERNATES
+                            | flags::MINMAX
+                            | flags::NONNEGATIVE
+                            | flags::NOSPACES
+                            | flags::SECRET)
+                        != 0
+                    {
+                        let flags = field.flags;
+                        form.errors.push(format!(
+                            "Field {placed}, Y/N field cannot have options ({flags:02X})"
+                        ));
+                    }
+                    form.fields[placed].flags |= flags::MULTICHOICE | flags::ALTERNATES;
+                    placed += 1;
+                }
+                at += 1;
+                off += 1;
+            }
+            Kind::Junk | Kind::Equ => {
+                at += 1;
+                off += 1;
+            }
+        }
+    }
+    form.in_template = placed;
+}
+
+/// `embscn()`, `FSD.C:433`: build the punctuation template of each field.
+fn punctuation(form: &mut Form, template: &[u8]) {
+    let mut out: Vec<u8> = Vec::new();
+    for field in form.fields.iter_mut().take(form.in_template) {
+        let at = usize::from(field.template_at);
+        let Some(&c) = template.get(at) else { continue };
+        field.kind = c;
+        if field.punctuation_at.is_some() {
+            field.punctuation_at = Some(out.len() as u16);
+            for k in 0..usize::from(field.xwidth) {
+                let b = template.get(at + k).copied().unwrap_or(b' ');
+                out.push(if b == c || c == b'Y' { b' ' } else { b });
+            }
+            out.push(0);
+        }
+    }
+    form.punctuation = out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,5 +598,91 @@ mod tests {
     fn scanning_stops_at_the_field_limit() {
         let form = compile(b"", b"A B C D E", 3);
         assert_eq!(form.fields.len(), 3);
+    }
+
+    #[test]
+    fn a_run_of_field_characters_is_a_field_and_a_single_one_is_not() {
+        // Two or more, which is why a one-character answer cannot be spelled.
+        let form = compile(b"a ? b ?? c", b"ONE TWO", MANY);
+        assert_eq!(form.fields.len(), 2, "the spec names two");
+        assert_eq!(form.in_template, 1, "the template has room for one");
+        assert_eq!(form.fields[0].template_at, 6);
+        assert_eq!(form.fields[0].width, 2);
+        assert_eq!(form.fields[0].kind, b'?');
+    }
+
+    #[test]
+    fn white_space_separates_fields_and_punctuation_joins_them() {
+        let apart = compile(b"?? ??", b"A B", MANY);
+        assert_eq!(apart.in_template, 2);
+        assert!(apart.punctuation.is_empty());
+
+        // `###-####` is one field of seven characters spanning eight, and the
+        // punctuation template is what a session prints between the halves.
+        let joined = compile(b"Phone ###-####", b"PHONE", MANY);
+        assert_eq!(joined.in_template, 1);
+        assert_eq!(joined.fields[0].width, 7);
+        assert_eq!(joined.fields[0].xwidth, 8);
+        assert_eq!(joined.fields[0].punctuation_at, Some(0));
+        assert_eq!(joined.punctuation, b"   -    \0");
+        assert_eq!(joined.size(), Ok(48));
+    }
+
+    #[test]
+    fn dollar_runs_do_not_join_because_only_hash_and_question_are_subfields() {
+        // `TMPSFD` is `TMPPND`, so `$` is below it. Two `$$` runs with a dash
+        // between are two fields, not one -- unlike the `###-####` above.
+        let form = compile(b"$$-$$", b"A B", MANY);
+        assert_eq!(form.in_template, 2);
+        assert!(form.punctuation.is_empty());
+    }
+
+    #[test]
+    fn a_slash_between_y_and_n_makes_a_three_character_choice() {
+        let form = compile(b"Ok Y/N", b"OK", MANY);
+        assert_eq!(form.in_template, 1);
+        assert_eq!(form.fields[0].template_at, 3, "it starts at the Y");
+        assert_eq!(form.fields[0].width, 3);
+        assert_eq!(form.fields[0].kind, b'Y');
+        assert_eq!(
+            form.fields[0].flags,
+            flags::MULTICHOICE | flags::ALTERNATES,
+            "a Y/N field is a two-choice field by construction"
+        );
+    }
+
+    #[test]
+    fn a_yes_no_field_may_not_also_carry_options() {
+        let form = compile(b"Ok Y/N", b"OK(MULTICHOICE)", MANY);
+        assert_eq!(form.errors.len(), 1);
+        assert!(form.errors[0].contains("Y/N"), "{:?}", form.errors);
+    }
+
+    #[test]
+    fn a_bang_run_is_the_help_field_and_not_a_field() {
+        let form = compile(b"?? !!!!!", b"F", MANY);
+        assert_eq!(form.in_template, 1, "the help field is not one of them");
+        assert_eq!(form.help_len, 5);
+        assert_eq!(form.help_at, 3);
+    }
+
+    #[test]
+    fn high_bit_bytes_are_decoration() {
+        // MajorMUD's ANSI template is 194 bytes of box drawing, in runs. If
+        // `tmpspc[]` were indexed as a signed char those runs would read as
+        // field characters and invent fields out of the borders.
+        let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY);
+        assert_eq!(form.in_template, 1);
+    }
+
+    #[test]
+    fn the_size_is_the_three_terms_and_the_nul() {
+        let form = compile(b"?? ??", b"A B", MANY);
+        let expected = form.punctuation.len()
+            + form.fields.len() * usize::from(FSDFLD)
+            + usize::from(form.answer_max)
+            + 1;
+        assert_eq!(form.size(), Ok(expected as u16));
+        assert_eq!(form.size(), Ok(59));
     }
 }
