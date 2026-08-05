@@ -189,6 +189,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "access", system::access, Cleans::Caller),
     (MAJORBBS, "now", system::now, Cleans::Caller),
+    (MAJORBBS, "nctime", system::nctime, Cleans::Caller),
     (MAJORBBS, "today", system::today, Cleans::Caller),
     (MAJORBBS, "time", system::time, Cleans::Caller),
     (MAJORBBS, "srand", system::srand, Cleans::Caller),

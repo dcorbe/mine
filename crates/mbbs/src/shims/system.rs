@@ -5,7 +5,7 @@
 
 use mbbs16::{FarPtr, Machine, Ret};
 
-use crate::Host;
+use crate::{DateBuffers, Host};
 use crate::fmt::{Args, format};
 use crate::random::Random;
 use crate::shims::{NO, ShimError};
@@ -85,6 +85,76 @@ pub fn time(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
         machine.write(tloc, &seconds.to_le_bytes())?;
     }
     Ok(Ret::U32(seconds))
+}
+
+/// Bytes of the three date statics, measured from their spacing in
+/// `MAJORBBS-wg101.EXE`'s `DGROUP`: `0x40`, `0x49`, `0x52`.
+///
+/// `GALFIL.C:1210` corroborates the first two independently --
+/// `stzcpy(answer, nctime(dctime(nts)), 9)`.
+const DATE_LEN: u16 = 9;
+const TIME_LEN: u16 = 9;
+const EDAT_LEN: u16 = 10;
+
+/// The buffers the date routines format into, allocated the first time one of
+/// them runs.
+///
+/// See [`DateBuffers`] for why they are allocated once rather than per call.
+///
+/// # Errors
+///
+/// If the module's heap cannot give up four small blocks.
+fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimError> {
+    if let Some(already) = host.datebuf {
+        return Ok(already);
+    }
+
+    // Not a closure over both: `alloc` needs the machine mutably and so does
+    // the `write_cstr` below it.
+    let date = host.heap.alloc(machine, DATE_LEN).map_err(ShimError::Failed)?;
+    let time = host.heap.alloc(machine, TIME_LEN).map_err(ShimError::Failed)?;
+    let edat = host.heap.alloc(machine, EDAT_LEN).map_err(ShimError::Failed)?;
+    let empty = host.heap.alloc(machine, 1).map_err(ShimError::Failed)?;
+    write_cstr(machine, empty, b"", 1)?;
+
+    let all = DateBuffers {
+        date,
+        time,
+        edat,
+        empty,
+    };
+    host.datebuf = Some(all);
+    Ok(all)
+}
+
+/// `char *nctime(int time)` -- a DOS-packed time as `HH:MM:SS`.
+///
+/// No C source survives for this one. Transcribed from
+/// `MAJORBBS-wg101.EXE seg 33:0x0c56`, which is
+/// `sprintf(buf, "%02d:%02d:%02d", (t>>11)&0x1f, (t>>5)&0x3f, (t<<1)&0x3e)`
+/// and hands back the buffer. Declared at `DOSFACE.H:75`.
+///
+/// **The low five bits are two-second units and are doubled, not masked** --
+/// five bits will not hold 59, so an odd second cannot be represented at all
+/// and the routine never prints one. That is the field a reader gets wrong by
+/// working from the name instead of the instructions.
+///
+/// There is no null case: unlike [`ncdate`], `nctime(0)` formats `00:00:00`.
+///
+/// # Errors
+///
+/// If the module's heap cannot give the buffer its first time through.
+pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let at = buffers(machine, host)?.time;
+    let text = format!(
+        "{:02}:{:02}:{:02}",
+        (packed >> 11) & 0x1f,
+        (packed >> 5) & 0x3f,
+        (packed << 1) & 0x3e,
+    );
+    write_cstr(machine, at, text.as_bytes(), TIME_LEN)?;
+    Ok(Ret::Far(at))
 }
 
 /// `void srand(unsigned seed)`.
@@ -1217,5 +1287,52 @@ mod tests {
             .expect_err("refused");
         assert!(format!("{e}").contains("no appid"), "{e}");
         assert!(f.host.agents().is_empty());
+    }
+
+    #[test]
+    fn nctime_unpacks_the_three_fields_dos_packed() {
+        // 13:45:30, packed the way `now` packs it -- seconds are two-second
+        // units, so 30 seconds is 15. The unpacking is read off
+        // `MAJORBBS-wg101.EXE seg 33:0x0c56`: `sar 0xb / and 0x1f`,
+        // `sar 0x5 / and 0x3f`, and `add ax,ax / and 0x3e`.
+        let packed = (13 << 11) | (45 << 5) | 15;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(nctime, &[packed]).expect("nctime") else {
+            panic!("nctime returns a far pointer");
+        };
+        assert_eq!(f.read(at), "13:45:30");
+    }
+
+    #[test]
+    fn nctime_doubles_the_seconds_rather_than_masking_them() {
+        // The one field a reader gets wrong by reading the name instead of the
+        // instructions. Five bits will not hold 59, so what is stored is half
+        // the seconds and an odd second cannot be represented at all.
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(nctime, &[(23 << 11) | (59 << 5) | 29]).expect("nctime")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "23:59:58", "29 units is 58 seconds, not 29");
+    }
+
+    #[test]
+    fn nctime_writes_over_what_the_last_call_left() {
+        // The original formats into one static at `DGROUP:0x49`. A module
+        // holding the first pointer sees the second call's answer, and this
+        // host must not be quietly kinder about it than the thing it
+        // reproduces.
+        let mut f = Fixture::new();
+        let Ret::Far(first) = f.invoke(nctime, &[(1 << 11) | (2 << 5) | 1]).expect("nctime")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(first), "01:02:02");
+
+        let Ret::Far(second) = f.invoke(nctime, &[0]).expect("nctime") else {
+            panic!("far pointer");
+        };
+        assert_eq!(first, second, "one buffer, not two");
+        assert_eq!(f.read(first), "00:00:00", "and no null case, unlike ncdate");
     }
 }
