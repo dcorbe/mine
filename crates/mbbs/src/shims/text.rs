@@ -310,6 +310,48 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
+/// `char *strchr(char *s,int c)`.
+///
+/// Ordinal 572, `seg 1:0xcf62`. Two things the prototype hides. `c` arrives as
+/// an `int` and is compared as `mov bl,[bp+0xa]`, so **only its low byte
+/// counts**. And the scan compares each byte *before* it tests for the end
+/// (`lodsb / cmp al,bl / jz ... / and al,al / jnz`), so `strchr(s, 0)` answers
+/// a pointer to the terminator rather than `NULL`.
+pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let want = machine.arg_u16(2) as u8;
+    let text = machine.read_cstr(s)?;
+
+    if want == 0 {
+        return Ok(Ret::Far(at(s, text.len() as u16)));
+    }
+    Ok(match text.iter().position(|&b| b == want) {
+        Some(i) => Ret::Far(at(s, i as u16)),
+        None => Ret::Far(FarPtr::NULL),
+    })
+}
+
+/// `char *strstr(char *hay,char *needle)`.
+///
+/// Ordinal 584, `seg 1:0x2896`. **An empty needle answers the haystack** --
+/// the routine's first instruction after the frame is `cmp byte [es:bx],0` on
+/// the needle, and it returns `hay` -- and a needle that is not there answers
+/// `NULL`.
+pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let hay = machine.arg_far(0);
+    let needle = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let text = machine.read_cstr(hay)?;
+
+    if needle.len() > text.len() {
+        return Ok(Ret::Far(FarPtr::NULL));
+    }
+    let found = (0..=text.len() - needle.len()).find(|&i| text[i..].starts_with(&needle));
+    Ok(match found {
+        Some(i) => Ret::Far(at(hay, i as u16)),
+        None => Ret::Far(FarPtr::NULL),
+    })
+}
+
 /// `char *strcat(char *dst,char *src)`.
 ///
 /// Ordinal 571, `seg 1:0x26d0`. How much room `dst` has, only the caller knows,
@@ -466,6 +508,71 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn strchr_finds_a_byte_or_answers_null() {
+        let mut f = Fixture::new();
+        let s = f.text("go north");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'n')])
+                .expect("ok"),
+            Ret::Far(at(s, 3))
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'z')])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "absent is NULL, not the terminator"
+        );
+    }
+
+    #[test]
+    fn strchr_of_nul_answers_the_terminator_and_ignores_the_high_byte() {
+        // `mov bl,[bp+0xa]` -- only the low byte of the `int` is compared --
+        // and the scan tests each byte before it checks for the end, so
+        // searching for `\0` finds it rather than failing.
+        let mut f = Fixture::new();
+        let s = f.text("abc");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
+            Ret::Far(at(s, 3))
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0xff62])
+                .expect("ok"),
+            Ret::Far(at(s, 1)),
+            "0xff62 is searched for as 'b'"
+        );
+    }
+
+    #[test]
+    fn strstr_finds_a_run_and_an_empty_needle_finds_the_start() {
+        let mut f = Fixture::new();
+        let hay = f.text("go north now");
+        let needle = f.text("north");
+        let empty = f.text("");
+        let missing = f.text("south");
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, needle)).expect("ok"),
+            Ret::Far(at(hay, 3))
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, empty)).expect("ok"),
+            Ret::Far(hay),
+            "the routine's first test is on the needle"
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, missing)).expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(needle, hay)).expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "a needle longer than the haystack"
+        );
+    }
 
     #[test]
     fn strcat_appends_and_returns_the_destination() {

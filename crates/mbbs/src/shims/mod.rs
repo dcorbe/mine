@@ -132,6 +132,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "strcat", text::strcat, Cleans::Caller),
     (MAJORBBS, "strncat", text::strncat, Cleans::Caller),
     (MAJORBBS, "strncpy", text::strncpy, Cleans::Caller),
+    (MAJORBBS, "strchr", text::strchr, Cleans::Caller),
+    (MAJORBBS, "strstr", text::strstr, Cleans::Caller),
     // Message files, and the options in them.
     (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
     (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller),
