@@ -44,7 +44,7 @@ pub use fsd::Form;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use random::{RAND_MAX, Random, Runaway};
-pub use shims::system::{Kick, Registration};
+pub use shims::system::{Agent, Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 
@@ -171,6 +171,10 @@ pub struct Host {
     /// what the module passes back.
     modules: Vec<Registration>,
 
+    /// Every client/server agent that has come online, in registration order.
+    /// Unlike [`Host::modules`] these are *copies* -- see [`Agent`].
+    pub(crate) agents: Vec<Agent>,
+
     /// The message files that are open, and their text in module memory. Which
     /// one is *current* is not here -- that is `curmbk`, a global the module
     /// can see.
@@ -289,6 +293,7 @@ impl Host {
             random: Random::default(),
             audit: Vec::new(),
             modules: Vec::new(),
+            agents: Vec::new(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
             streams: stream::Streams::default(),
@@ -316,6 +321,17 @@ impl Host {
     /// Every module that has registered, in the order they did.
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// Every client/server agent that has registered, in the order it did.
+    ///
+    /// **Nothing dispatches to them.** An agent is one end of the Galacticomm
+    /// Client/Server protocol and the other end is a Worldgroup client, which
+    /// this host has no way to be talking to. So this is the record of what a
+    /// client/server layer would call into, in the same sense that
+    /// [`Host::kicks`] is a record of what a main loop would owe.
+    pub fn agents(&self) -> &[Agent] {
+        &self.agents
     }
 
     /// Every callback the module asked `rtkick` to run later.

@@ -14,6 +14,15 @@ use crate::shims::text::write_cstr;
 /// `MAJORBBS.H:37` -- maximum size for module names, terminator included.
 const MNMSIZ: u16 = 25;
 
+/// `GCSP.H:19` -- application id size, terminator included.
+const AIDSIZ: u16 = 9;
+
+/// Bytes of `struct agent`: the appid, then four far vectors.
+///
+/// 25, and the binary agrees: `register_agent` multiplies every index by
+/// `0x19`.
+const AGENT_SIZE: u16 = AIDSIZ + 4 * 4;
+
 /// Bytes of the buffer `gmdnam` returns a pointer into.
 ///
 /// `static char tmpbuf[40]` in the real one
@@ -264,6 +273,77 @@ pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, Sh
     Ok(Ret::U16(host.register(description, block)))
 }
 
+/// `void register_agent(struct agent *agdptr)` -- take a client/server agent
+/// online.
+///
+/// An *agent* is a module's server-side handler for a Worldgroup client, and
+/// its `appid` is the name a client addresses it by (`GCSPSRV.H:21`). MajorMUD
+/// registers exactly one, `WCCMMUD`.
+///
+/// **The record is copied, not pointed at**, and that is the one way this
+/// differs from [`register_module`]. The real routine ends in
+/// `movmem(agdptr, &agents[nagents], 25)` (seg 30:0x0121 of
+/// `MAJORBBS-wg200.EXE`) -- so the caller's block is free to go out of scope
+/// afterwards, and a host that kept the pointer would be reading whatever
+/// replaced it.
+///
+/// **Nothing dispatches to these vectors**, because dispatching needs a client
+/// and this host has none. A debt rather than a lie, on the same terms as
+/// [`Host::kicks`](crate::Host::kicks): the routine returns `void`, so it
+/// promises the module nothing.
+///
+/// Two things the real one does that this does not. It grows the table twenty
+/// slots at a time out of the *host's* heap, which the module never sees and
+/// cannot observe. And it fills a null vector with a host default -- see
+/// [`Agent`] for what those defaults are and why filling one in here would say
+/// less than leaving it `None`.
+///
+/// # Errors
+///
+/// If the block does not name 25 readable bytes, or the `appid` is empty. The
+/// second is this host's own refusal and not the original's: an agent with no
+/// name can never be addressed by a client, so no caller can mean it, and a
+/// misread argument list is what would produce one.
+pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let block = machine.arg_far(0);
+    let bytes = machine.resolve(block, usize::from(AGENT_SIZE))?;
+
+    // `appid` is a fixed-width field, so the name inside it is read bounded
+    // rather than scanned -- an agent whose name fills all nine bytes has no
+    // terminator, and scanning would run into the `read` vector.
+    let field = &bytes[..usize::from(AIDSIZ)];
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    let appid = String::from_utf8_lossy(&field[..end]).into_owned();
+    if appid.is_empty() {
+        return Err(ShimError::Failed(
+            "register_agent: an agent with no appid can never be addressed".to_owned(),
+        ));
+    }
+
+    // A vector is null when **both** its words are zero. The real routine tests
+    // it as `mov ax,[es:bx+9]; or ax,[es:bx+0xb]`, and the difference matters:
+    // offset zero is a perfectly good address, and `seg 26:0x0000` of
+    // `WCCMMUD.DLL` is the very routine that makes this call.
+    let vector = |n: usize| {
+        let at = usize::from(AIDSIZ) + n * 4;
+        let ptr = FarPtr {
+            offset: u16::from_le_bytes([bytes[at], bytes[at + 1]]),
+            selector: u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]),
+        };
+        (ptr.offset != 0 || ptr.selector != 0).then_some(ptr)
+    };
+    let agent = Agent {
+        appid,
+        read: vector(0),
+        write: vector(1),
+        xferdone: vector(2),
+        abort: vector(3),
+    };
+
+    host.agents.push(agent);
+    Ok(Ret::Void)
+}
+
 /// `void catastro(char *fmat, ...)` -- the module has given up.
 ///
 /// Stops it, deliberately. `catastro` is a module saying it cannot continue,
@@ -327,6 +407,37 @@ pub struct Registration {
     pub block: FarPtr,
 }
 
+/// A client/server agent that has been taken online.
+///
+/// A **snapshot**, unlike [`Registration`]: `register_agent` copies the
+/// caller's 25 bytes into the host's own table, so these vectors are what the
+/// module registered and not what its memory says now.
+///
+/// A `None` vector is one the module left null, and the real host would fill it
+/// with its own default at registration time -- `rejectreq` for `read` and
+/// `write` (seg 30:0x251e and 0x252f, both of which call seg 31:0x5f6), and a
+/// bare `retf` for `xferdone` and `abort`. That substitution is *not* made
+/// here, because this host has nothing to dispatch and a `None` says which
+/// vector the module actually supplied. Whoever builds the dispatcher owes
+/// those four defaults, and the table above is what they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    /// The name a client addresses this agent by. MajorMUD's is `WCCMMUD`.
+    pub appid: String,
+
+    /// Deliver a dynapak to the agent, or `None` -- which rejects the request.
+    pub read: Option<FarPtr>,
+
+    /// Take a dynapak from the agent, or `None` -- which rejects the request.
+    pub write: Option<FarPtr>,
+
+    /// A transfer finished, or `None` -- which does nothing.
+    pub xferdone: Option<FarPtr>,
+
+    /// A transfer was abandoned, or `None` -- which does nothing.
+    pub abort: Option<FarPtr>,
+}
+
 impl Registration {
     /// Where one of the nine entry points is, or `None` if the module left it
     /// null.
@@ -367,6 +478,18 @@ mod tests {
             bytes.extend_from_slice(&entry.to_bytes());
         }
         bytes.resize(usize::from(MNMSIZ) + 9 * 4, 0);
+        f.bytes(&bytes, false)
+    }
+
+    /// A `struct agent` in module memory: nine bytes of appid, then four far
+    /// vectors.
+    fn agent_block(f: &mut Fixture, appid: &str, vectors: &[FarPtr]) -> FarPtr {
+        let mut bytes = vec![0u8; usize::from(AIDSIZ)];
+        bytes[..appid.len()].copy_from_slice(appid.as_bytes());
+        for vector in vectors {
+            bytes.extend_from_slice(&vector.to_bytes());
+        }
+        bytes.resize(usize::from(AGENT_SIZE), 0);
         f.bytes(&bytes, false)
     }
 
@@ -665,5 +788,34 @@ mod tests {
             .expect_err("refused");
         assert!(format!("{e}").contains("negative delay"), "{e}");
         assert!(f.host.kicks().is_empty());
+    }
+
+    #[test]
+    fn register_agent_keeps_the_appid_and_the_four_vectors() {
+        // Measured: MajorMUD's own record, at `seg 67:0x0000` of
+        // `WCCMMUD.DLL`, is `WCCMMUD` and four vectors into its segment 26.
+        let mut f = Fixture::new();
+        let vectors: Vec<FarPtr> = [0x0069, 0x016b, 0x029c, 0x02a1]
+            .into_iter()
+            .map(|offset| FarPtr {
+                offset,
+                selector: f.machine.code_selector(),
+            })
+            .collect();
+        let block = agent_block(&mut f, "WCCMMUD", &vectors);
+
+        assert_eq!(
+            f.invoke(register_agent, &Fixture::far(block))
+                .expect("registered"),
+            Ret::Void,
+            "register_agent returns nothing"
+        );
+
+        let agent = &f.host.agents()[0];
+        assert_eq!(agent.appid, "WCCMMUD");
+        assert_eq!(agent.read, Some(vectors[0]));
+        assert_eq!(agent.write, Some(vectors[1]));
+        assert_eq!(agent.xferdone, Some(vectors[2]));
+        assert_eq!(agent.abort, Some(vectors[3]));
     }
 }

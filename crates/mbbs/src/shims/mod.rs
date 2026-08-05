@@ -189,6 +189,12 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         system::register_module,
         Cleans::Caller,
     ),
+    (
+        MAJORBBS,
+        "register_agent",
+        system::register_agent,
+        Cleans::Caller,
+    ),
     (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
