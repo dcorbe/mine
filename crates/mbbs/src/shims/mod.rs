@@ -4,6 +4,7 @@ pub mod btrieve;
 pub mod fsd;
 pub mod memory;
 pub mod msg;
+pub mod runtime;
 pub mod stream;
 pub mod system;
 pub mod text;
