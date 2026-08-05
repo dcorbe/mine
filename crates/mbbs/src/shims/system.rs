@@ -363,6 +363,59 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
     Ok(Ret::Void)
 }
 
+/// `int register_textvar(char *name, char *(*varrou)())` -- register a text
+/// variable.
+///
+/// `MAJORBBS.C:1279`, and this one has surviving source -- unlike
+/// [`register_agent`], which had to be transcribed. It is checked against the
+/// wg200 binary anyway (`seg 4:0x21b0`, ordinal 494) because the source is
+/// Worldgroup 1's and the module is built against Worldgroup 2. They agree.
+///
+/// A *text variable* is a substitution: the module hands over a name and a
+/// routine, and the routine's return value replaces that name wherever a
+/// message mentions it. MajorMUD registers exactly one, `MUDCHARINFO`.
+///
+/// **The table is module memory, not a `Vec`**, and that is the difference from
+/// [`register_agent`]. `WCCMMUD.DLL` addresses `txtvars` at ten sites and walks
+/// the table through it -- see [`TextVars`](crate::TextVars) for the access
+/// pattern that settles it.
+///
+/// **It returns the index**, which `register_agent` did not: the original ends
+/// `return(ntvars++)`, and the binary's `mov ax,[0x44]` before its `inc` is
+/// that.
+///
+/// Two things the real one does that this does not. It keeps a `ntvars` global
+/// (ordinal 861) which `WCCMMUD.DLL` never addresses, so the count stays on the
+/// Rust side and `Host::load` is the guard if that changes. And it leaves the
+/// bytes past a short name's terminator as whatever the heap last held; this
+/// zeroes the record first, which no correct reader can tell apart.
+///
+/// # Errors
+///
+/// If the name is empty, if the pointers do not name readable memory, or if the
+/// heap has no room. The empty name is this host's own refusal and not the
+/// original's -- weaker than the agent's, since `findtvar("")` could genuinely
+/// match one, and carried instead by the realistic cause being a misread
+/// argument list.
+pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let name = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    let varrou = machine.arg_far(2);
+
+    let mut table = std::mem::take(&mut host.textvars);
+    let pushed = table.push(machine, &mut host.heap, &name, varrou);
+    host.textvars = table;
+    let n = pushed?;
+
+    // The module reaches the table only through this. A host that filled the
+    // table and left the global null would have registered nothing.
+    let at = host.textvars.at().expect("a row was just added");
+    host.globals()
+        .write(machine, "txtvars", &at.to_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(Ret::U16(n))
+}
+
 /// `void catastro(char *fmat, ...)` -- the module has given up.
 ///
 /// Stops it, deliberately. `catastro` is a module saying it cannot continue,
@@ -964,6 +1017,45 @@ mod tests {
 
         assert_eq!(f.host.agents()[0].appid, "ABCDEFGHI");
         assert_eq!(f.host.agents()[0].read, Some(read));
+    }
+
+    #[test]
+    fn register_textvar_publishes_the_table_through_the_global() {
+        // Measured: MajorMUD registers one text variable, `MUDCHARINFO`, whose
+        // routine is at `seg 3:0x001e` of `WCCMMUD.DLL`. And the *global* is
+        // the point -- the module reaches the table only through `txtvars`, so
+        // a host that filled a table and left the pointer null would have
+        // registered nothing.
+        let mut f = Fixture::new();
+        let name = f.text("MUDCHARINFO");
+        let varrou = FarPtr {
+            offset: 0x001e,
+            selector: f.machine.code_selector(),
+        };
+
+        let args = [name.offset, name.selector, varrou.offset, varrou.selector];
+        assert_eq!(
+            f.invoke(register_textvar, &args).expect("registered"),
+            Ret::U16(0),
+            "the first text variable is number zero"
+        );
+
+        let published = f
+            .host
+            .globals()
+            .pointer(&f.machine, "txtvars")
+            .expect("txtvars");
+        assert_ne!(published, mbbs16::FarPtr::NULL, "the global was filled in");
+        assert_eq!(published, f.host.textvars().at().expect("a table"));
+
+        let row = f
+            .host
+            .textvars()
+            .get(&f.machine, 0)
+            .expect("readable")
+            .expect("a row");
+        assert_eq!(row.name, "MUDCHARINFO");
+        assert_eq!(row.varrou, Some(varrou));
     }
 
     #[test]

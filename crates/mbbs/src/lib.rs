@@ -182,6 +182,10 @@ pub struct Host {
     /// Unlike [`Host::modules`] these are *copies* -- see [`Agent`].
     pub(crate) agents: Vec<Agent>,
 
+    /// The text variables the module has registered. Unlike [`Host::agents`]
+    /// these live in memory the module can reach -- see [`TextVars`].
+    pub(crate) textvars: TextVars,
+
     /// The message files that are open, and their text in module memory. Which
     /// one is *current* is not here -- that is `curmbk`, a global the module
     /// can see.
@@ -302,6 +306,7 @@ impl Host {
             audit: Vec::new(),
             modules: Vec::new(),
             agents: Vec::new(),
+            textvars: TextVars::default(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
             streams: stream::Streams::default(),
@@ -356,6 +361,17 @@ impl Host {
     /// [`Host::kicks`] is a record of what a main loop would owe.
     pub fn agents(&self) -> &[Agent] {
         &self.agents
+    }
+
+    /// The text variables that have been registered.
+    ///
+    /// Unlike [`Host::agents`] and [`Host::kicks`] this is **not** only a
+    /// record: the table is real module memory and the `txtvars` global points
+    /// at it, so the module can walk it whether or not this host ever
+    /// substitutes anything. What is still owed is `findtvar` and the
+    /// substitution itself.
+    pub fn textvars(&self) -> &TextVars {
+        &self.textvars
     }
 
     /// Every callback the module asked `rtkick` to run later.
