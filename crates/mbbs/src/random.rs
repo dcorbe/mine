@@ -215,6 +215,19 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_lower_bound_is_clamped_away_rather_than_honoured() {
+        // The one place the eight lines differ from `min + rand()%(max-min)`,
+        // which is otherwise the same distribution. `rand()%max` is never
+        // negative, so it already satisfies a negative `min` and the loop never
+        // runs. Simplifying this routine to one modulo would answer -5..=2 here.
+        let mut r = Random::new(1);
+        for _ in 0..1000 {
+            let n = r.genrdn(-5, 3).expect("a number");
+            assert!((0..3).contains(&n), "{n} is outside 0..3");
+        }
+    }
+
+    #[test]
     fn the_same_seed_is_the_same_sequence() {
         // The whole point of `srand` storing anything.
         let draw = |seed| {
