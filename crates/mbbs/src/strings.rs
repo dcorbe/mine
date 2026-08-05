@@ -3,9 +3,16 @@
 //! **These have no surviving C source.** `GCOMM.H` declares them and no `.C`
 //! file in `archive/` defines them, so unlike `genrdn` -- which is a
 //! translation of `BBSUTILS.C:49` -- every routine here was read off the
-//! instructions of `MAJORBBS-wg200.EXE`, the Worldgroup host that matches
-//! MajorMUD 1.11p. `python3 re/ne_exports.py re/hosts/MAJORBBS-wg200.EXE
-//! rmvwht skpwht skpwrd depad` prints what they were transcribed from.
+//! instructions of the Worldgroup host. `python3 re/ne_exports.py
+//! re/hosts/MAJORBBS-wg101.EXE rmvwht skpwht skpwrd depad sameas sameto samein
+//! lastwd sortstgs` prints what they were transcribed from.
+//!
+//! **Which host binary hardly matters.** Every routine transcribed here is
+//! byte-for-byte identical in `MAJORBBS-wg101.EXE` and `MAJORBBS-wg200.EXE` --
+//! checked by extracting each one's bytes from both files and comparing, not
+//! assumed. The target is Worldgroup 1.01, so the citations below name wg101;
+//! the four routines that predate this file were read from wg200 and are the
+//! same instructions.
 //!
 //! # The one distinction the names hide
 //!
