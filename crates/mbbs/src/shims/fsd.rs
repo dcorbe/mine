@@ -428,6 +428,92 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::U16(index))
 }
 
+/// `char *fsdxan(char *answer, char *name)` -- a field's value, by name.
+/// `FSD.C:2073`.
+///
+/// Walks the answer string one NUL-terminated entry at a time, looking for one
+/// that begins with `name` and has `'='` immediately after it. The second test
+/// is what keeps the field `NAME` from matching the answer `NAMEX=1`; the first
+/// is `sameto`, which ignores case, so `FSD.H:592`'s "all caps required" is
+/// advice rather than a rule.
+///
+/// **Never null.** A name that is not there answers the answer string's final
+/// `'\0'` (`FSD.H:595`), which reads as `""`. MajorMUD hands all six of its
+/// results straight to `atol`, so a null would be a fault where the original
+/// produced a zero.
+///
+/// It needs no session. Six of MajorMUD's sites pass `fsdscb->newans`, but
+/// nothing here reads `fsdscb`: `FSD.H:583` files this under "call on any
+/// unprocessed answer string", and a version that demanded `fsdapr` first would
+/// refuse a call the real host answers.
+///
+/// The global `xannam` the original also sets is not modelled. Worldgroup 1.01
+/// does not export it -- there is no entry in
+/// `crates/mbbs/data/majorbbs_wg101.tsv` -- so no module can read it, and the
+/// only two routines that do, `fsdpan` and `fsddan`, are neither implemented
+/// here nor imported by `WCCMMUD.DLL`.
+///
+/// # Errors
+///
+/// If the answer string runs to the end of its segment without the empty entry
+/// that ends it, or either pointer will not resolve.
+pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let name = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let mut at = machine.arg_far(0);
+    loop {
+        let entry = machine.read_cstr(at)?;
+        if entry.is_empty() {
+            return Ok(Ret::Far(at));
+        }
+        let len = entry.len();
+        if len > name.len()
+            && entry[..name.len()].eq_ignore_ascii_case(&name)
+            && entry[name.len()] == b'='
+        {
+            return Ok(Ret::Far(offset(at, name.len() as u16 + 1)?));
+        }
+        at = offset(at, len as u16 + 1)?;
+    }
+}
+
+/// `char *fsdrft(void)` -- the template again. `FSDBBS.C:413`.
+///
+/// The original is `setmbk(fsdusr->curmbk); getasc(tmpmsg); rstmbk()`, and the
+/// point of that pair is that the answer comes from *that* message file
+/// whatever is current now. `Messages::text` takes the block explicitly, so
+/// this asks the recorded block directly; the round trip through `curmbk`
+/// arrives at the same pointer.
+///
+/// `getasc` versus `getmsg` is not modelled, for the reason the `fsdroom` plan
+/// gave: the difference is line terminators, both are white space to the
+/// template scanner, and no width in a form is computed across one.
+///
+/// Its one call site, `seg 3:0x41e8`, is on the branch taken only by an ANSI
+/// user with a screen of at least 23 by 80 -- which is the branch `fsdroom`
+/// refuses at `amode=1`. So nothing reaches this today. It is here because it
+/// is measured behaviour that costs ten lines, and leaving it out would make
+/// this family's refusals two where one is the truth.
+///
+/// # Errors
+///
+/// If no form has been sized, or the template is not in the file that was
+/// current when one was.
+pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let _ = machine;
+    let Some((block, number, _)) = host.fsdtmp else {
+        return Err(ShimError::Failed(
+            "fsdrft: no template has been compiled; FSDBBS.C:419 refreshes the one fsdroom \
+             recorded, and fsdroom has not run"
+                .into(),
+        ));
+    };
+    let at = host
+        .messages
+        .text(block, number)
+        .map_err(ShimError::Failed)?;
+    Ok(Ret::Far(at))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -927,6 +1013,162 @@ mod tests {
         let _ = session(&mut f, "NAME", b"\0");
         let e = f.invoke(fsdord, &[1]).expect_err("refused");
         assert!(format!("{e}").contains("1 fields"), "{e}");
+    }
+
+    #[test]
+    fn fsdxan_finds_a_value_by_name() {
+        let mut f = Fixture::new();
+        let answers = f.bytes(b"NAME=Fred\0RANK=MAJOR\0\0", false);
+        let name = f.text("RANK");
+        let Ok(Ret::Far(at)) = f.invoke(
+            fsdxan,
+            &[answers.offset, answers.selector, name.offset, name.selector],
+        ) else {
+            panic!("fsdxan refused")
+        };
+        assert_eq!(f.read(at), "MAJOR");
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_answers_the_final_terminator() {
+        // FSD.H:595: "otherwise return value and xannam point to final '\0' of
+        // answer string". Not NULL -- the module runs `atol` on the result, so
+        // a null pointer would be a fault where the original gave a zero.
+        let mut f = Fixture::new();
+        let answers = f.bytes(b"NAME=Fred\0\0", false);
+        let name = f.text("RANK");
+        let Ok(Ret::Far(at)) = f.invoke(
+            fsdxan,
+            &[answers.offset, answers.selector, name.offset, name.selector],
+        ) else {
+            panic!("fsdxan refused")
+        };
+        assert_eq!(f.read(at), "");
+        assert_eq!(
+            at.offset,
+            answers.offset + 10,
+            "the string's own terminator, not the first entry's"
+        );
+    }
+
+    #[test]
+    fn fsdxan_needs_no_session() {
+        // Six of MajorMUD's sites pass `fsdscb->newans`, but nothing here reads
+        // `fsdscb`: FSD.H:583 files this under "call on any unprocessed answer
+        // string". A version that required `fsdapr` would refuse a call the
+        // real host answers.
+        let mut f = Fixture::new();
+        assert!(f.host.forms().is_empty());
+        let answers = f.bytes(b"A=1\0\0", false);
+        let name = f.text("A");
+        let Ok(Ret::Far(at)) = f.invoke(
+            fsdxan,
+            &[answers.offset, answers.selector, name.offset, name.selector],
+        ) else {
+            panic!("fsdxan refused")
+        };
+        assert_eq!(f.read(at), "1");
+    }
+
+    #[test]
+    fn fsdxan_matches_a_whole_name_and_not_a_prefix_of_one() {
+        let mut f = Fixture::new();
+        let answers = f.bytes(b"NAMEX=1\0NAME=2\0\0", false);
+        let name = f.text("NAME");
+        let Ok(Ret::Far(at)) = f.invoke(
+            fsdxan,
+            &[answers.offset, answers.selector, name.offset, name.selector],
+        ) else {
+            panic!("fsdxan refused")
+        };
+        assert_eq!(f.read(at), "2", "the second entry, not the first");
+    }
+
+    #[test]
+    fn an_answer_string_that_never_ends_stops_the_module() {
+        // A segment full of non-NULs to its last byte, so there is no empty
+        // entry. The original would have walked on past it.
+        let mut f = Fixture::new();
+        let selector = f.machine.alloc_segment(8).expect("a segment");
+        let junk = FarPtr {
+            offset: 0,
+            selector,
+        };
+        f.machine.write(junk, b"xxxxxxxx").expect("fills it");
+        let name = f.text("A");
+        let e = f
+            .invoke(
+                fsdxan,
+                &[junk.offset, junk.selector, name.offset, name.selector],
+            )
+            .expect_err("refused");
+        assert!(matches!(e, ShimError::BadPointer(_)), "{e}");
+    }
+
+    #[test]
+    fn fsdrft_returns_the_template_fsdroom_compiled() {
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("ONE");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+
+        let expected = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
+        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+    }
+
+    #[test]
+    fn fsdrft_comes_back_to_its_own_message_file() {
+        // `setmbk(fsdusr->curmbk)` -- the block that was current when `fsdroom`
+        // ran, and not whichever one is current now. A host that read `curmbk`
+        // at call time would hand back a message of the wrong file, which is
+        // not hypothetical: the module `rstmbk`s four instructions after
+        // `fsdroom` returns, at seg 3:0x3f86.
+        let mut f = Fixture::new();
+        let form = open_form(&mut f);
+        let spec = f.text("ONE");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+
+        let other = f.text("SAMPLE.MSG");
+        let Ok(Ret::Far(block)) = f.invoke(crate::shims::msg::opnmsg, &Fixture::far(other)) else {
+            panic!("opnmsg refused")
+        };
+        f.invoke(crate::shims::msg::setmbk, &Fixture::far(block))
+            .expect("current");
+
+        let expected = f
+            .host
+            .messages()
+            .text(form, 0)
+            .expect("message 0 of the form's own file");
+        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+        assert_ne!(
+            expected,
+            crate::shims::msg::message(&f.machine, &f.host, 0).expect("message"),
+            "and the current file's message 0 is a different string"
+        );
+    }
+
+    #[test]
+    fn fsdrft_returns_the_template_of_the_last_form_sized() {
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("ONE");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+        f.invoke(fsdroom, &[1, spec.offset, spec.selector, 0])
+            .expect("sized");
+
+        let expected = crate::shims::msg::message(&f.machine, &f.host, 1).expect("message");
+        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+    }
+
+    #[test]
+    fn fsdrft_before_any_fsdroom_stops_the_module() {
+        let mut f = Fixture::new();
+        let e = f.invoke(fsdrft, &[]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
     #[test]
