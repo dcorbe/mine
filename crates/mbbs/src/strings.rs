@@ -352,6 +352,43 @@ mod tests {
     }
 
     #[test]
+    fn sortstgs_moves_equal_strings_the_way_a_shell_sort_does() {
+        // The property that justifies transcribing this instead of calling
+        // `sort_by`, and the only test that can tell the two apart. Four
+        // pointers, three of them to equal strings, so what is observable is
+        // *which* pointer lands where.
+        //
+        // gap 2: cmp(items[1], items[3]) is "b" against "a", so they swap and
+        // `b` travels two places at once -- and equal elements that a stable
+        // sort would have left alone are reordered around it.
+        let mut items = [
+            Tagged(b"a", 'A'),
+            Tagged(b"b", 'B'),
+            Tagged(b"a", 'C'),
+            Tagged(b"a", 'D'),
+        ];
+        sortstgs(&mut items, |x, y| strcmp(x.0, y.0));
+        let order: String = items.iter().map(|t| t.1).collect();
+        assert_eq!(order, "ADCB", "the shell sort's own permutation");
+
+        let mut items = [
+            Tagged(b"a", 'A'),
+            Tagged(b"b", 'B'),
+            Tagged(b"a", 'C'),
+            Tagged(b"a", 'D'),
+        ];
+        items.sort_by(|x, y| strcmp(x.0, y.0).cmp(&0));
+        let stable: String = items.iter().map(|t| t.1).collect();
+        assert_eq!(stable, "ACDB", "which a stable sort does not agree with");
+    }
+
+    /// A string and a label, so a test can see which of two equal strings
+    /// moved. Equality of the *strings* is what the sort compares; the label
+    /// rides along and is never looked at.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Tagged(&'static [u8], char);
+
+    #[test]
     fn sortstgs_handles_every_size_its_gap_sequence_degenerates_on() {
         for n in 0..12usize {
             let reversed: Vec<Vec<u8>> = (0..n).rev().map(|i| vec![b'a' + i as u8]).collect();

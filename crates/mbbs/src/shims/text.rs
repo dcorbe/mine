@@ -424,11 +424,15 @@ pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// Ordinal 584, `seg 1:0x2896`. **An empty needle answers the haystack** --
 /// the routine's first instruction after the frame is `cmp byte [es:bx],0` on
-/// the needle, and it returns `hay` -- and a needle that is not there answers
-/// `NULL`.
+/// the needle, and the path it takes returns `hay` **without reading it**, so
+/// the check comes before the haystack does here too. A needle that is not
+/// there answers `NULL`.
 pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     let hay = machine.arg_far(0);
     let needle = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    if needle.is_empty() {
+        return Ok(Ret::Far(hay));
+    }
     let text = machine.read_cstr(hay)?;
 
     if needle.len() > text.len() {
@@ -582,10 +586,13 @@ fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError>
 /// A pointer `n` bytes into the string `ptr` names.
 ///
 /// The one piece of arithmetic every routine here that answers a `char *` does,
-/// and the reason it does not need checking: `n` always comes from a successful
-/// [`Machine::read_cstr`], which only succeeds when the terminator is inside
-/// the segment. So `ptr.offset + n` is at worst the last byte of a segment that
-/// is at most 64 KiB, and cannot wrap the `u16`.
+/// and the reason it does not need checking: **`ptr.offset + n` never passes
+/// the terminator of a string that has already been read**. A successful
+/// [`Machine::read_cstr`] puts that terminator inside the segment, a segment is
+/// at most 64 KiB, and so the sum is at most `0xffff`. That covers `n` taken
+/// from a string's length and equally the
+/// `at(end, 1)` in [`strtok`], where `end` is a delimiter -- strictly before
+/// the terminator, so one past it still is not past.
 ///
 /// The selector is the caller's own. Rebuilding it from anywhere else would
 /// hand the module an address into the wrong segment.
@@ -682,6 +689,20 @@ mod tests {
         for num in [0u16, 1, (-4i16) as u16] {
             assert!(matches!(f.invoke(sortstgs, &[0, 0, num]), Ok(Ret::Void)));
         }
+    }
+
+    #[test]
+    fn sortstgs_refuses_a_slot_that_names_nothing() {
+        // The array itself is readable and one of the strings in it is not.
+        // Sorting by a comparison the host cannot make is exactly the
+        // plausible answer this crate refuses.
+        let mut f = Fixture::new();
+        let one = f.text("only");
+        let array = f.words(&[one.offset, one.selector, 0, 0]);
+        assert!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 2])
+                .is_err()
+        );
     }
 
     #[test]
@@ -792,6 +813,31 @@ mod tests {
             panic!("char *")
         };
         assert_eq!(f.read(p), "c", "a non-null string replaces the cursor");
+    }
+
+    #[test]
+    fn strtok_with_no_delimiters_answers_the_whole_string() {
+        // The delimiter walk is `while (*p != 0)`, so an empty set exits at
+        // once and nothing is ever a delimiter: one token, the whole line.
+        let mut f = Fixture::new();
+        let line = f.text("go north");
+        let empty = f.text("");
+        let Ret::Far(p) = f
+            .invoke(
+                strtok,
+                &[line.offset, line.selector, empty.offset, empty.selector],
+            )
+            .expect("ok")
+        else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "go north");
+        assert_eq!(
+            f.invoke(strtok, &[0, 0, empty.offset, empty.selector])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "and then there is no more"
+        );
     }
 
     #[test]
@@ -986,6 +1032,52 @@ mod tests {
     }
 
     #[test]
+    fn strncat_clamps_unsigned_despite_its_int_prototype() {
+        // The clamp is `cmp ax,[bp+0xe] / jna` -- an UNSIGNED compare, though
+        // `GCOMM.H` calls the argument an `int`. Reading it signed would make
+        // a large `maxlen` negative and clamp the copy to nothing.
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 0x8000];
+        f.invoke(strncat, &args).expect("ok");
+        assert_eq!(f.read(dst), "go north", "0x8000 is 32,768, not -32,768");
+    }
+
+    #[test]
+    fn strncat_of_nothing_writes_only_a_terminator_already_there() {
+        // `maxlen` of zero copies nothing, and the terminator the routine
+        // writes itself goes at `dst[dstlen + n]` -- which with `n` of zero is
+        // the terminator `dst` already had. So nothing past the string moves,
+        // and in particular the byte *after* it is not cleared.
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"go \0##", false);
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
+        f.invoke(strncat, &args).expect("ok");
+        assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"go \0##");
+    }
+
+    #[test]
+    fn strchr_on_an_empty_string_finds_only_its_terminator() {
+        let mut f = Fixture::new();
+        let s = f.text("");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
+            Ret::Far(s),
+            "the terminator is at offset zero"
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'a')])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
     fn the_writers_refuse_to_run_off_the_end_of_a_segment() {
         // How much room a destination has, only the caller knows -- so the
         // only bound the host can apply is the segment's, and it must be an
@@ -1020,6 +1112,20 @@ mod tests {
             )
             .is_err(),
             "and so does `go` plus `overlong`"
+        );
+        assert!(
+            f.invoke(
+                strncat,
+                &[
+                    near_end.offset,
+                    near_end.selector,
+                    src.offset,
+                    src.selector,
+                    100
+                ]
+            )
+            .is_err(),
+            "and so does appending a clamped copy of it"
         );
     }
 
