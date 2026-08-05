@@ -157,6 +157,44 @@ pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
+/// `char *ncdate(int date)` -- a DOS-packed date as `MM/DD/YY`.
+///
+/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c02`;
+/// declared at `DOSFACE.H:74`.
+///
+/// **Date zero is not a date, and the original says so** by returning a
+/// separate empty string at `DS:0x82` *without touching its buffer* -- so a
+/// result taken earlier is still standing after a null date goes through.
+/// Reproduced here, because the alternative reading, formatting `00/00/00`, is
+/// a date that is wrong rather than one that is absent.
+///
+/// The year is `% 100`, so nothing downstream can tell 2007 from 2107. That
+/// limitation is the original's, not this host's -- `seg 33:0x0c26` divides by
+/// `0x64` and keeps the remainder.
+///
+/// # Errors
+///
+/// If the module's heap cannot give the buffer its first time through.
+pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let all = buffers(machine, host)?;
+
+    // `or cx,cx / jnz` at `seg 33:0x0c10`, and the branch it does not take
+    // writes nothing at all.
+    if packed == 0 {
+        return Ok(Ret::Far(all.empty));
+    }
+
+    let text = format!(
+        "{:02}/{:02}/{:02}",
+        (packed >> 5) & 0xf,
+        packed & 0x1f,
+        (((packed >> 9) & 0x7f) + 1980) % 100,
+    );
+    write_cstr(machine, all.date, text.as_bytes(), DATE_LEN)?;
+    Ok(Ret::Far(all.date))
+}
+
 /// `void srand(unsigned seed)`.
 ///
 /// MajorMUD calls this once, six calls into initialisation, with the low word
@@ -1334,5 +1372,67 @@ mod tests {
         };
         assert_eq!(first, second, "one buffer, not two");
         assert_eq!(f.read(first), "00:00:00", "and no null case, unlike ncdate");
+    }
+
+    #[test]
+    fn ncdate_is_month_day_and_a_two_digit_year() {
+        // 2026-08-05, packed the way `today` packs it.
+        let packed = ((2026 - 1980) << 9) | (8 << 5) | 5;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "08/05/26");
+    }
+
+    #[test]
+    fn ncdate_of_zero_is_empty_and_leaves_the_buffer_alone() {
+        // `seg 33:0x0c14` returns `DS:0x82` -- a different address from the
+        // buffer at `DS:0x40` -- and it never writes. So a result taken earlier
+        // is still standing afterwards, which a shim formatting "00/00/00"
+        // would have destroyed.
+        let mut f = Fixture::new();
+        let Ret::Far(real) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        else {
+            panic!("far pointer");
+        };
+        let Ret::Far(none) = f.invoke(ncdate, &[0]).expect("ncdate") else {
+            panic!("far pointer");
+        };
+        assert_ne!(none, real, "the empty string is not the buffer");
+        assert_eq!(f.read(none), "");
+        assert_eq!(f.read(real), "08/05/26", "a null date did not overwrite it");
+    }
+
+    #[test]
+    fn ncdate_wraps_the_year_at_a_century() {
+        // 2107 is the last year seven bits reach: 127 + 1980. `idiv 100` leaves
+        // 7, so the string is a bare "07" and a caller cannot tell it from
+        // 2007. That is the original's limitation, reproduced.
+        let packed = (127 << 9) | (12 << 5) | 31;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "12/31/07");
+    }
+
+    #[test]
+    fn the_date_and_time_buffers_are_not_the_same_block() {
+        // Three statics in the original, at DGROUP 0x40, 0x49 and 0x52. A
+        // module may hold an ncdate result across an nctime call, so sharing
+        // one block here would corrupt it in a way nothing else would catch.
+        let mut f = Fixture::new();
+        let Ret::Far(date) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        else {
+            panic!("far pointer");
+        };
+        let Ret::Far(time) = f.invoke(nctime, &[(13 << 11) | (45 << 5) | 15]).expect("nctime")
+        else {
+            panic!("far pointer");
+        };
+        assert_ne!(date, time);
+        assert_eq!(f.read(date), "08/05/26", "the date survived the time");
+        assert_eq!(f.read(time), "13:45:30");
     }
 }
