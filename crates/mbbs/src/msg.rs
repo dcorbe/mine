@@ -346,11 +346,8 @@ impl Messages {
 
         let cookie = self.arena.reserve(machine, MSGBLK)?;
         let count = u16::try_from(file.len()).map_err(|_| {
-            io::Error::other(format!(
-                "{name} has {} messages, which is more \
-                than a 16-bit msgcnt holds",
-                file.len()
-            ))
+            io::Error::other(format!("{name} has {} messages, which is more \
+                than a 16-bit msgcnt holds", file.len()))
         })?;
 
         // `lngcnt` and `msgcnt` are the last two `int`s of the struct.

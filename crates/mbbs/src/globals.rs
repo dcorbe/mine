@@ -414,14 +414,8 @@ mod tests {
         // and hands the result to `alczer`, so a zero here is an allocation of
         // nothing that the module then indexes.
         let f = crate::testing::Fixture::new();
-        assert_eq!(
-            f.host.globals().word(&f.machine, "nterms").expect("nterms"),
-            1
-        );
-        assert_eq!(
-            f.host.globals().word(&f.machine, "hichp1").expect("hichp1"),
-            1
-        );
+        assert_eq!(f.host.globals().word(&f.machine, "nterms").expect("nterms"), 1);
+        assert_eq!(f.host.globals().word(&f.machine, "hichp1").expect("hichp1"), 1);
     }
 
     #[test]

@@ -49,8 +49,8 @@ pub fn opnmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             host.root.display()
         ))
     })?;
-    let bytes =
-        std::fs::read(&path).map_err(|e| ShimError::Failed(format!("{}: {e}", path.display())))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ShimError::Failed(format!("{}: {e}", path.display())))?;
     let file = MsgFile::parse(&name, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
 
     let cookie = host
@@ -365,11 +365,7 @@ mod tests {
         f.invoke(setmbk, &Fixture::far(first)).expect("set");
         assert_eq!(curmbk(&f), first);
         f.invoke(rstmbk, &[]).expect("restored");
-        assert_eq!(
-            curmbk(&f),
-            second,
-            "back to what opening OTHER made current"
-        );
+        assert_eq!(curmbk(&f), second, "back to what opening OTHER made current");
     }
 
     #[test]
@@ -435,8 +431,7 @@ mod tests {
 
         f.invoke(stgopt, &[2]).expect("another option");
         let other = f.text("OTHER.MSG");
-        f.invoke(opnmsg, &Fixture::far(other))
-            .expect("another file");
+        f.invoke(opnmsg, &Fixture::far(other)).expect("another file");
         let template = f.text("noise %d");
         f.invoke(text::prf, &[template.offset, template.selector, 7])
             .expect("some output");
@@ -448,10 +443,7 @@ mod tests {
     fn numopt_reads_the_number_off_the_end_of_the_prompt() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert_eq!(
-            f.invoke(numopt, &[2, 0, 32767]).expect("read"),
-            Ret::U16(60)
-        );
+        assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
     }
 
     #[test]
@@ -517,15 +509,7 @@ mod tests {
         ];
         assert_eq!(f.invoke(tokopt, &args).expect("matched"), Ret::U16(3));
 
-        let short = [
-            7,
-            high.offset,
-            high.selector,
-            medium.offset,
-            medium.selector,
-            0,
-            0,
-        ];
+        let short = [7, high.offset, high.selector, medium.offset, medium.selector, 0, 0];
         assert!(f.invoke(tokopt, &short).is_err(), "NONE is in neither");
     }
 
@@ -580,8 +564,7 @@ mod tests {
         f.invoke(rstmbk, &[]).expect("back to the first");
         f.invoke(rstmbk, &[]).expect("back to none");
 
-        f.invoke(clsmsg, &Fixture::far(second))
-            .expect("no longer in use");
+        f.invoke(clsmsg, &Fixture::far(second)).expect("no longer in use");
         assert!(
             f.invoke(setmbk, &Fixture::far(second)).is_err(),
             "a closed block is not one to set"

@@ -112,10 +112,9 @@ pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     // Word 2: the far pointer before it is two words, not one.
     let index = machine.arg_u16(2);
 
-    let region = host
-        .heap
-        .region(base.selector)
-        .ok_or_else(|| ShimError::Failed(format!("ptrtile: {base:?} is not a tiled region")))?;
+    let region = host.heap.region(base.selector).ok_or_else(|| {
+        ShimError::Failed(format!("ptrtile: {base:?} is not a tiled region"))
+    })?;
     if index >= region.qty {
         return Err(ShimError::Failed(format!(
             "ptrtile: tile {index} of a {}-tile region",
@@ -293,8 +292,7 @@ mod tests {
 
         let shift = mbbs16::SELECTOR_STEP.ilog2();
         for index in 0..8u16 {
-            let Ret::Far(asked) = f
-                .invoke(ptrtile, &[base.offset, base.selector, index])
+            let Ret::Far(asked) = f.invoke(ptrtile, &[base.offset, base.selector, index])
                 .expect("in range")
             else {
                 panic!("pointer")
@@ -356,9 +354,7 @@ mod tests {
 
         // And a pointer that is not a region at all.
         let heap = f.invoke(alcmem, &[64]).expect("a");
-        let Ret::Far(heap) = heap else {
-            panic!("pointer")
-        };
+        let Ret::Far(heap) = heap else { panic!("pointer") };
         assert!(f.invoke(ptrtile, &[heap.offset, heap.selector, 0]).is_err());
     }
 
@@ -382,11 +378,8 @@ mod tests {
         let mut f = Fixture::new();
         let src = f.bytes(b"source", false);
         let dst = f.bytes(b"DEST!!", false);
-        f.invoke(
-            movmem,
-            &[src.offset, src.selector, dst.offset, dst.selector, 6],
-        )
-        .expect("moved");
+        f.invoke(movmem, &[src.offset, src.selector, dst.offset, dst.selector, 6])
+            .expect("moved");
         assert_eq!(
             f.machine.resolve(dst, 6).expect("readable"),
             b"source",
@@ -401,11 +394,8 @@ mod tests {
         let dst = f.bytes(b"DEST!!", false);
         let src = f.bytes(b"source", false);
         assert_eq!(
-            f.invoke(
-                memcpy,
-                &[dst.offset, dst.selector, src.offset, src.selector, 6]
-            )
-            .expect("copied"),
+            f.invoke(memcpy, &[dst.offset, dst.selector, src.offset, src.selector, 6])
+                .expect("copied"),
             Ret::Far(dst)
         );
         assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"source");

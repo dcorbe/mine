@@ -554,10 +554,7 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text("  the quick brown fox  ");
         assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
-        assert_eq!(
-            f.machine.read_cstr(at).expect("a string"),
-            b"thequickbrownfox"
-        );
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
     }
 
     #[test]
@@ -656,10 +653,7 @@ mod tests {
             .expect("margc");
 
         assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
-        assert_eq!(
-            f.machine.read_cstr(line).expect("a string"),
-            b"look at this"
-        );
+        assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
     }
 
     #[test]

@@ -8,8 +8,8 @@ use mbbs16::{FarPtr, Machine, Ret};
 use crate::Host;
 use crate::fmt::{Args, format};
 use crate::random::Random;
-use crate::shims::text::write_cstr;
 use crate::shims::{NO, ShimError};
+use crate::shims::text::write_cstr;
 
 /// `MAJORBBS.H:37` -- maximum size for module names, terminator included.
 const MNMSIZ: u16 = 25;
