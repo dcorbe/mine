@@ -5,7 +5,7 @@ use mbbs16::{FarPtr, Machine, Ret};
 use crate::Host;
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
-use crate::shims::ShimError;
+use crate::shims::{NO, ShimError};
 
 /// This channel's session control block, allocating it on first use.
 ///
@@ -345,6 +345,87 @@ pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let (block, _) = prepared(machine, host, "fsdnan")?;
     let record = field_record(machine, &block, field, "fsdnan")?;
     Ok(Ret::Far(offset(block.newans(), answer_offset(&record))?))
+}
+
+/// `int fsdord(int fldi)` -- which `ALT=` value field `fldi` holds.
+/// `FSD.C:2244`.
+///
+/// `-1` when nothing matches, **and when more than one does**: `chkalt` counts
+/// its matches and `fsdord` reports only an unequivocal one (`FSD.H:655`). A
+/// host that resolved `"B"` against `ALT=Black ALT=Brown` to the first would be
+/// picking a hair colour for the player.
+///
+/// It is not a query. On a match the answer is rewritten in the alternate's own
+/// spelling -- which is what `FSD.H:656` means by "in that case, answer is
+/// available via `fsdnan(fldi)`" -- and if that changed its length, every later
+/// field's `ansoff` and the string's `allans` move with it. `stfans()`,
+/// `FSD.C:1036`.
+///
+/// The field is read back out of the module's own array rather than out of
+/// [`Host::forms`], because the module edits it: fourteen sites set `FFFAVD`.
+///
+/// MajorMUD calls this three times -- `HAIR_LEN`, `HAIR_COL` and `EYE_COL`,
+/// fields 22, 23 and 24 -- and stores each answer as one byte of the character
+/// record, at `+0x6cd`, `+0x6ce` and `+0x6d0`.
+///
+/// # Errors
+///
+/// If no session has been prepared, `fldi` is not a field of it, or the
+/// rewritten answer string would not fit the room `fsdroom` reserved.
+pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let number = machine.arg_u16(0);
+    let (mut block, at) = prepared(machine, host, "fsdord")?;
+    let record = field_record(machine, &block, number, "fsdord")?;
+    let field = fsd::Field::from_record(&record);
+
+    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let ansoff = answer_offset(&record);
+    let anslen = record[fsd::fld::ANSLEN];
+    let answer = machine.read_cstr(offset(block.newans(), ansoff)?)?.to_vec();
+
+    let Some((index, canonical)) = fsd::ordinal(&spec, &field, &answer) else {
+        return Ok(Ret::U16(NO));
+    };
+
+    // `stfans()`, FSD.C:1036: put the canonical spelling back, shift what
+    // follows it, and push every later field's `ansoff` along by the
+    // difference.
+    let grew = canonical.len() as i32 - i32::from(anslen);
+    let allans = i32::from(block.allans()) + grew;
+    let room = i32::from(block.maxans()) + 1;
+    if allans > room {
+        return Err(ShimError::Failed(format!(
+            "fsdord({number}): the alternate \"{}\" does not fit -- the answer string would \
+             be {allans} bytes and fsdroom reserved {room}",
+            String::from_utf8_lossy(&canonical)
+        )));
+    }
+
+    let tail_at = ansoff + u16::from(anslen);
+    let tail_len = block.allans().saturating_sub(tail_at);
+    let tail = machine
+        .resolve(offset(block.newans(), tail_at)?, usize::from(tail_len))?
+        .to_vec();
+    let mut rewritten = canonical.clone();
+    rewritten.extend_from_slice(&tail);
+    machine.write(offset(block.newans(), ansoff)?, &rewritten)?;
+
+    let mut record = record;
+    record[fsd::fld::ANSLEN] = canonical.len() as u8;
+    machine.write(offset(block.flddat(), number * fsd::FSDFLD)?, &record)?;
+
+    // `while (efptr != fldptr) { efptr->ansoff += anslen-m; efptr--; }` -- the
+    // fields *after* this one, and none before.
+    for later in number + 1..block.numfld() {
+        let mut record = field_record(machine, &block, later, "fsdord")?;
+        let moved = (i32::from(answer_offset(&record)) + grew) as u16;
+        record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&moved.to_le_bytes());
+        machine.write(offset(block.flddat(), later * fsd::FSDFLD)?, &record)?;
+    }
+
+    block.set_allans(allans as u16);
+    machine.write(at, block.as_bytes())?;
+    Ok(Ret::U16(index))
 }
 
 #[cfg(test)]
@@ -714,6 +795,138 @@ mod tests {
             .expect("sized");
         let e = f.invoke(fsdnan, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdapr"), "{e}");
+    }
+
+    #[test]
+    fn fsdord_answers_the_position_of_the_alternate_chosen() {
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let _ = session(&mut f, spec, b"COLOUR=Brown\0\0");
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+    }
+
+    #[test]
+    fn an_answer_matching_nothing_answers_minus_one() {
+        // FSD.H:653: "-1 if no match". The one place in this family where a
+        // number that is not an ordinal is an honest answer.
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Black ALT=Red)";
+        let _ = session(&mut f, spec, b"COLOUR=Green\0\0");
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+    }
+
+    #[test]
+    fn a_matched_answer_is_rewritten_in_full_and_later_fields_move() {
+        // `stfans()`. "br" becomes "Brown", three bytes longer, and every field
+        // after this one has its `ansoff` pushed along by three. A `fsdord`
+        // that returned the ordinal without doing this would leave `fsdnan`
+        // reading the middle of somebody else's answer.
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
+        let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
+
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(before), "Fred");
+        let was = block(&f).allans();
+
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "Brown", "FSD.H:656");
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "Fred", "still readable, three bytes further on");
+        assert_eq!(at.offset, before.offset + 3);
+        assert_eq!(block(&f).allans(), was + 3);
+    }
+
+    #[test]
+    fn an_answer_that_shrinks_moves_later_fields_back() {
+        // The same arithmetic with a negative difference, which the `int`
+        // subtraction in `stfans` handles and an unsigned one would not.
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Red) NAME";
+        let _ = session(&mut f, spec, b"COLOUR=REDDISH\0NAME=Fred\0\0");
+
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(before), "Fred");
+
+        // "REDDISH" does not begin "Red", so nothing matches and nothing moves.
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+
+        // "Redd" does not either; "Re" does, and shrinks by five.
+        let _ = session(&mut f, spec, b"COLOUR=Re\0NAME=Fred\0\0");
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(0))));
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "Fred");
+        assert_eq!(at.offset, before.offset + 1, "\"Re\" grew to \"Red\"");
+    }
+
+    #[test]
+    fn fsdord_reads_the_flags_the_module_left_and_not_the_host_s_copy() {
+        // The module edits `flddat[i].flags`. Clear FFFALT there and `chkalt`
+        // must bail on its first line, whatever `Host::forms` still says.
+        let mut f = Fixture::new();
+        let spec = "COLOUR(ALT=Black ALT=Red)";
+        let _ = session(&mut f, spec, b"COLOUR=Red\0\0");
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+
+        let scb = block(&f);
+        let mut record = [0u8; crate::fsd::FSDFLD as usize];
+        record.copy_from_slice(
+            f.machine
+                .resolve(scb.flddat(), usize::from(crate::fsd::FSDFLD))
+                .expect("in range"),
+        );
+        record[crate::fsd::fld::FLAGS] &= !crate::fsd::flags::ALTERNATES;
+        f.machine.write(scb.flddat(), &record).expect("written");
+
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+        assert!(
+            f.host.forms()[0].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
+            "the host's own copy still says otherwise, which is the point"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_would_outgrow_the_buffer_stops_the_module() {
+        // `stfans` moves bytes with no bound of its own, and the buffer is the
+        // one `fsdroom` sized -- `maxans` counted each field's width, not the
+        // length of its longest alternate. FSD.H:218 warns callers off; this
+        // refuses rather than write past the end of the module's memory.
+        let mut f = Fixture::new();
+        let long = "A".repeat(60);
+        let spec = format!("C(ALT={long})");
+        let _ = session_over(&mut f, 1, &spec, b"C=A\0\0");
+        let e = f.invoke(fsdord, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains("does not fit"), "{e}");
+    }
+
+    #[test]
+    fn fsdord_on_a_field_with_no_alternates_answers_minus_one() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=Fred\0\0");
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+    }
+
+    #[test]
+    fn fsdord_outside_the_form_stops_the_module() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let e = f.invoke(fsdord, &[1]).expect_err("refused");
+        assert!(format!("{e}").contains("1 fields"), "{e}");
     }
 
     #[test]

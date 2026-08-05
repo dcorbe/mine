@@ -272,6 +272,30 @@ impl Field {
         out[fld::ANSLEN] = anslen;
         out
     }
+
+    /// A field read back out of the 23 bytes it occupies in module memory.
+    ///
+    /// The inverse of [`Field::record`], and the reason it exists is that the
+    /// array in the session buffer is the module's: `WCCMMUD.DLL` sets
+    /// `FFFAVD` on fourteen of its fields, so a routine that consulted the
+    /// host's own [`Form`] instead would be reading flags the module had since
+    /// changed.
+    ///
+    /// `ansoff` and `anslen` are not returned. They belong to the answer string
+    /// rather than to the field, and a caller that needs them has the record.
+    pub fn from_record(record: &[u8; FSDFLD as usize]) -> Self {
+        let mbpoff = i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]);
+        Self {
+            width: record[fld::WIDTH],
+            xwidth: record[fld::XWIDTH],
+            attr: record[fld::ATTR],
+            flags: record[fld::FLAGS],
+            kind: record[fld::FLDTYP],
+            spec_at: u16::from_le_bytes([record[fld::FSPOFF], record[fld::FSPOFF + 1]]),
+            template_at: u16::from_le_bytes([record[fld::TMPOFF], record[fld::TMPOFF + 1]]),
+            punctuation_at: (mbpoff >= 0).then_some(mbpoff as u16),
+        }
+    }
 }
 
 /// `struct fsdscb`, as a block of bytes with named members.
@@ -1494,6 +1518,22 @@ mod tests {
             i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
             0
         );
+    }
+
+    #[test]
+    fn a_field_survives_a_round_trip_through_its_record() {
+        // `from_record` is what `fsdord` reads the module's own field array
+        // with, so it has to give back what `record` put in -- flags and all,
+        // since the module edits those.
+        for form in [
+            compile(b"Ok Y/N", b"OK", MANY),
+            compile(b"###-####", b"P", MANY),
+            compile(b"?? ??", b"A(SECRET) B(MULTICHOICE ALT=x)", MANY),
+        ] {
+            for field in &form.fields {
+                assert_eq!(&Field::from_record(&field.record(41, 7)), field);
+            }
+        }
     }
 
     #[test]
