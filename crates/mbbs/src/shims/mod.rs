@@ -300,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn the_two_fsd_routines_that_need_a_screen_are_not_implemented() {
+        // `fsdbkg` clears an ANSI screen and runs `fsddsp`, a display engine;
+        // `fsdego` puts a user into an entry session and arranges for the
+        // module's own callbacks to run on keystrokes. There is no channel, no
+        // screen, and no re-entrant call back into module code. Both stop the
+        // module and name themselves, which is the answer -- see the `shims::fsd`
+        // module documentation.
+        assert!(matches!(entry(MAJORBBS, "fsdbkg"), Entry::Unimplemented));
+        assert!(matches!(entry(MAJORBBS, "fsdego"), Entry::Unimplemented));
+    }
+
+    #[test]
     fn an_unknown_symbol_is_unimplemented() {
         // `dinsbtv` is the insert that writing records needs, and is
         // deliberately absent: nothing in this host writes to a Btrieve file

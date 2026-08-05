@@ -1,4 +1,44 @@
-//! Full-Screen Data Entry: sizing a form the host cannot yet run.
+//! Full-Screen Data Entry: the form, the session, and the screen there is not.
+//!
+//! FSD is the subsystem behind MajorMUD's character-creation screens. Eight of
+//! its routines are imported by `WCCMMUD.DLL`; six are here.
+//!
+//! # The three pieces of state, and where each one lives
+//!
+//! - **The compiled form** -- fields, widths, punctuation templates, `maxans`
+//!   -- is host-side, in [`Host::forms`], put there by [`fsdroom`]. The real
+//!   host leaves it in `prfbuf` for [`fsdapr`] to copy out (`FSDBBS.C:131`, and
+//!   `FSDBBS.H:109` warns that those bytes must survive in between); this host
+//!   does not, so an intervening `prf` cannot corrupt a form here.
+//! - **`struct fsdscb`** is in a segment of the host's, and the `fsdscb` global
+//!   points at it. Not host-side: the module dereferences that global at 55
+//!   sites and *writes* through it -- fourteen `flddat[i].flags |= FFFAVD` from
+//!   `seg 3:0x4344` on, marking the fields a player may see but not type into,
+//!   and reading them back at `seg 3:0x374a` to choose a branch.
+//! - **The session** -- punctuation, the `struct fsdfld` array, the answer
+//!   string -- is in the buffer the module hands [`fsdapr`], laid out in the
+//!   order [`crate::fsd::Form::size`] added up.
+//!
+//! # What is not here, and why
+//!
+//! `fsdbkg` (`FSDBBS.C:185`) writes an ANSI clear-screen, then calls `btutsw`,
+//! `btulok` and `btuoes` against a channel and `fsddsp` to draw every field of
+//! the form. `fsdego` (`FSDBBS.C:196`) starts an entry session: it sets
+//! `usrptr->state` and `->substt`, installs `fsdchi` as the channel's
+//! character-input handler through `btuchi`, and arranges for the module's own
+//! `fldvfy` and `whndun` -- two far pointers into module code, pushed at
+//! `seg 3:0x4463` -- to be called back as keystrokes arrive.
+//!
+//! Neither is a display routine that could be stubbed into silence. They need a
+//! connected user, a terminal, and a way for the host to re-enter module code,
+//! and this host has none of the three: `Machine::call` is the top-level entry
+//! and a shim already holds `&mut Machine`, so there is no re-entrant
+//! host-to-module call in this design at all. Both are therefore left out of
+//! `ROUTINES`, which stops the module and names the routine and the address it
+//! was called from -- the right answer, and one that needs no code.
+//!
+//! `fsdroom`'s `amode == 1`, the full-screen entry mode both of them serve, is
+//! refused for the same reason one step earlier.
 
 use mbbs16::{FarPtr, Machine, Ret};
 
