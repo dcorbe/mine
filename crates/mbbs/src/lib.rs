@@ -165,6 +165,9 @@ pub struct Host {
     /// single `RANDSEED` and every caller pulls from the same stream.
     pub(crate) random: Random,
 
+    /// What `now`, `today` and `time` answer from. See [`Clock`].
+    clock: Clock,
+
     /// Every line `shocst` has been given.
     audit: Vec<String>,
 
@@ -293,6 +296,7 @@ impl Host {
             },
             prf_end,
             random: Random::default(),
+            clock: Clock::system()?,
             audit: Vec::new(),
             modules: Vec::new(),
             agents: Vec::new(),
@@ -323,6 +327,22 @@ impl Host {
     /// Every module that has registered, in the order they did.
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// The clock `now`, `today` and `time` answer from.
+    pub fn clock(&self) -> Clock {
+        self.clock
+    }
+
+    /// Freeze the clock, or hand the host a different one.
+    ///
+    /// **A pinned clock is what makes a run reproducible.** MajorMUD seeds its
+    /// generator with `srand(time(NULL))` six calls into initialisation, so
+    /// without this no test can assert what the module *built* -- only how many
+    /// calls it took to build it. See [`Clock`] for the hazard a frozen clock
+    /// carries.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
     }
 
     /// Every client/server agent that has registered, in the order it did.

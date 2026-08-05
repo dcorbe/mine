@@ -34,30 +34,49 @@ const MDF_LINE: u16 = 40;
 ///
 /// `DOSFACE.H:73`. Hours in bits 15..11, minutes in 10..5, and *two-second*
 /// units in 4..0, because five bits will not hold sixty.
-pub fn now(_: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let t = local_time()?;
+///
+/// # Errors
+///
+/// If the host's clock cannot say what time it is.
+pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let t = host.clock().civil().map_err(ShimError::Failed)?;
     Ok(Ret::U16(
-        ((t.tm_hour as u16) << 11) | ((t.tm_min as u16) << 5) | (t.tm_sec as u16 / 2),
+        ((t.hour as u16) << 11) | ((t.minute as u16) << 5) | (t.second as u16 / 2),
     ))
 }
 
 /// `int today(void)` -- the date, packed as DOS packs it.
 ///
 /// Years since 1980 in bits 15..9, month in 8..5, day in 4..0.
-pub fn today(_: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let t = local_time()?;
-    let year = (t.tm_year + 1900 - 1980).max(0) as u16;
+///
+/// # Errors
+///
+/// If the host's clock cannot say what day it is, or the year is one those
+/// seven bits will not hold. The old shim clamped with `.max(0)`, which turned
+/// 1970 into 1980 -- a date that is wrong rather than absent, and the one
+/// outcome this crate exists to avoid.
+pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let t = host.clock().civil().map_err(ShimError::Failed)?;
+    if !(1980..=2107).contains(&t.year) {
+        return Err(ShimError::Failed(format!(
+            "today: {} is not a year DOS can pack into seven bits",
+            t.year
+        )));
+    }
+    let year = (t.year - 1980) as u16;
     Ok(Ret::U16(
-        (year << 9) | ((t.tm_mon as u16 + 1) << 5) | (t.tm_mday as u16),
+        (year << 9) | ((t.month as u16) << 5) | (t.day as u16),
     ))
 }
 
 /// `long time(long *tloc)` -- seconds since 1970, and stored if asked.
-pub fn time(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .as_secs() as u32;
+///
+/// # Errors
+///
+/// If the host's clock cannot say, or `tloc` names memory the module does not
+/// own.
+pub fn time(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let seconds = host.clock().epoch().map_err(ShimError::Failed)?;
 
     // A null pointer is how C spells "do not store it", and is the ordinary
     // case rather than an error.
@@ -357,23 +376,6 @@ pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     )))
 }
 
-/// Now, in the local timezone, as the C library breaks it down.
-fn local_time() -> Result<libc::tm, ShimError> {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .as_secs() as libc::time_t;
-
-    // SAFETY: `localtime_r` fills the caller's `tm` and touches nothing else.
-    // The zeroed struct is a valid `tm` for it to overwrite.
-    let mut out: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { libc::localtime_r(&seconds, &mut out) };
-    if ok.is_null() {
-        return Err(ShimError::Failed("the local time is unknown".to_owned()));
-    }
-    Ok(out)
-}
-
 /// A module routine the host has been asked to run later.
 ///
 /// `rtkick(delay, dstrou)` is a **one-shot** timer: `dstrou` runs once, `delay`
@@ -512,6 +514,68 @@ mod tests {
         assert!((1..=12).contains(&month), "{month}");
         assert!((1..=31).contains(&day), "{day}");
         assert!(year >= 2020, "{year}");
+    }
+
+    /// MajorMUD 1.11p's build stamp: `Dec 30 2005 14:20:05` UTC.
+    const BUILD: u32 = 1_135_952_405;
+
+    #[test]
+    fn a_pinned_clock_packs_the_instant_it_was_pinned_to() {
+        // Both numbers are derived rather than observed:
+        //   today = (2005-1980)<<9 | 12<<5 | 30 = 13214
+        //   now   = 14<<11 | 20<<5 | 5/2        = 29314
+        // and the seconds field is *two-second units*, so 5 packs as 2.
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(BUILD));
+
+        assert_eq!(f.invoke(today, &[]).expect("today"), Ret::U16(13214));
+        assert_eq!(f.invoke(now, &[]).expect("now"), Ret::U16(29314));
+        assert_eq!(f.invoke(time, &[0, 0]).expect("time"), Ret::U32(BUILD));
+    }
+
+    #[test]
+    fn all_three_describe_one_instant() {
+        // The bug this rules out: three independent `SystemTime::now()` calls,
+        // which is what these shims used to be. Under a pin they cannot drift,
+        // and `time` is the one that has to agree with the other two rather
+        // than merely be plausible.
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(BUILD));
+
+        let Ret::U32(seconds) = f.invoke(time, &[0, 0]).expect("time") else {
+            panic!("time returns a long");
+        };
+        let civil = crate::Clock::pinned(seconds).civil().expect("in range");
+
+        let Ret::U16(date) = f.invoke(today, &[]).expect("today") else {
+            panic!("today returns an int");
+        };
+        assert_eq!(u32::from(date >> 9) + 1980, civil.year as u32);
+        assert_eq!(u32::from((date >> 5) & 0x0f), civil.month);
+        assert_eq!(u32::from(date & 0x1f), civil.day);
+    }
+
+    #[test]
+    fn a_year_dos_cannot_pack_is_refused_rather_than_clamped() {
+        // `today` has seven bits for `year - 1980`. The old shim wrote
+        // `.max(0)`, which turned 1970 into 1980 and handed the module a date
+        // that was wrong rather than absent -- the one outcome this crate is
+        // built to avoid.
+        //
+        // Only the lower bound can be reached. A `u32` of epoch seconds runs
+        // out on 2106-02-07, so the 2107 ceiling those seven bits impose is
+        // unreachable while the clock is a `u32` -- the check is there because
+        // the format has the limit, not because a test can provoke it.
+        let mut f = Fixture::new();
+
+        f.host.set_clock(crate::Clock::pinned(0));
+        let e = f.invoke(today, &[]).expect_err("1970 is not a DOS year");
+        assert!(format!("{e}").contains("1970"), "{e}");
+
+        // The last second a `u32` can hold is still inside the range, so the
+        // ceiling stays a refusal nothing trips over.
+        f.host.set_clock(crate::Clock::pinned(u32::MAX));
+        assert!(f.invoke(today, &[]).is_ok(), "2106 is a DOS year");
     }
 
     #[test]
