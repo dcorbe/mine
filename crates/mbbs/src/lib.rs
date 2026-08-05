@@ -154,9 +154,12 @@ pub struct Host {
     /// Where the print buffer ends, so `prf` can refuse to run past it.
     prf_end: u16,
 
-    /// What `srand` was last given. `rand` is not implemented, so nothing
-    /// consumes it yet -- but discarding it would make `srand` a lie.
-    seed: u16,
+    /// What `srand` started, and what `genrdn` draws from.
+    ///
+    /// One generator for the whole host, because that is what a C program
+    /// linked against one copy of the runtime had: `srand` and `rand` share a
+    /// single `RANDSEED` and every caller pulls from the same stream.
+    pub(crate) random: Random,
 
     /// Every line `shocst` has been given.
     audit: Vec<String>,
@@ -281,7 +284,7 @@ impl Host {
                 selector,
             },
             prf_end,
-            seed: 0,
+            random: Random::default(),
             audit: Vec::new(),
             modules: Vec::new(),
             messages: msg::Messages::default(),

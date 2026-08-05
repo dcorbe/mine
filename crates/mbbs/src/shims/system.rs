@@ -7,6 +7,7 @@ use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
 use crate::fmt::format;
+use crate::random::Random;
 use crate::shims::{NO, ShimError};
 use crate::shims::text::write_cstr;
 
@@ -60,12 +61,30 @@ pub fn time(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
 /// `void srand(unsigned seed)`.
 ///
-/// Kept rather than used: `rand` is not implemented, so a module that calls it
-/// is stopped by name. Storing the seed is still what `srand` does, and init
-/// calls it.
+/// MajorMUD calls this once, six calls into initialisation, with the low word
+/// of `time()` -- so the seed is the wall clock and no two runs of the real host
+/// agreed either. See [`mbbs::random`](crate::random).
 pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    host.seed = machine.arg_u16(0);
+    host.random = Random::new(machine.arg_u16(0));
     Ok(Ret::Void)
+}
+
+/// `int genrdn(int min, int max)` -- a random number in `[min, max)`.
+///
+/// The upper bound is exclusive and the routine's own comment says so. See
+/// [`between`](crate::random::between), which is the ported algorithm; this is
+/// only the two arguments and the draw.
+///
+/// # Errors
+///
+/// If the generator stops generating. See
+/// [`Runaway`](crate::random::Runaway).
+pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (min, max) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as i16);
+    host.random
+        .genrdn(min, max)
+        .map(|n| Ret::U16(n as u16))
+        .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
 /// `int access(char *path, int amode)` -- is this file there, and may I use it?
@@ -538,10 +557,49 @@ mod tests {
     }
 
     #[test]
-    fn srand_keeps_the_seed() {
+    fn srand_starts_the_generator_over() {
+        // What `srand` is *for*. The seed was stored and unused from step 7
+        // until now; this is the first test that can see it do anything.
         let mut f = Fixture::new();
         f.invoke(srand, &[0x1234]).expect("seeded");
-        assert_eq!(f.host.seed, 0x1234);
+        let first: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
+
+        f.invoke(srand, &[0x1234]).expect("seeded again");
+        let again: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
+        assert_eq!(first, again);
+
+        f.invoke(srand, &[0x1235]).expect("a different seed");
+        let other: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
+        assert_ne!(first, other);
+    }
+
+    #[test]
+    fn genrdn_answers_inside_the_range_the_module_asked_for() {
+        // Measured: the two calls initialisation makes are both
+        // `genrdn(0, 343)`, so this is that call, a thousand times over.
+        let mut f = Fixture::new();
+        f.invoke(srand, &[40615]).expect("seeded");
+        for _ in 0..1000 {
+            let Ret::U16(n) = f.invoke(genrdn, &[0, 343]).expect("a number") else {
+                panic!("genrdn returns an int");
+            };
+            assert!(n < 343, "{n} is outside 0..343");
+        }
+    }
+
+    #[test]
+    fn genrdn_draws_rather_than_repeating() {
+        // A shim that read its arguments and returned one of them would pass
+        // the bounds check above.
+        let mut f = Fixture::new();
+        f.invoke(srand, &[40615]).expect("seeded");
+        let drawn: std::collections::HashSet<u16> = (0..100)
+            .map(|_| match f.invoke(genrdn, &[0, 343]).expect("a number") {
+                Ret::U16(n) => n,
+                other => panic!("genrdn returns an int, not {other:?}"),
+            })
+            .collect();
+        assert!(drawn.len() > 50, "100 draws gave {} values", drawn.len());
     }
 
     #[test]

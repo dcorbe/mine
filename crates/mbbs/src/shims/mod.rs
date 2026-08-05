@@ -172,6 +172,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "today", system::today, Cleans::Caller),
     (MAJORBBS, "time", system::time, Cleans::Caller),
     (MAJORBBS, "srand", system::srand, Cleans::Caller),
+    (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller),
     (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
     (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
