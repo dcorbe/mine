@@ -52,6 +52,42 @@ pub struct Civil {
     pub second: u32,
 }
 
+impl Civil {
+    /// The date, packed the way DOS packs it: years since 1980 in bits 15..9,
+    /// month in 8..5, day in 4..0.
+    ///
+    /// What `today` returns, what `ncdate` and `ncedat` take apart, and the high
+    /// half of what `getdtd` reports for a file. One function rather than three
+    /// copies of the shift, because the three had no reason to disagree and
+    /// every reason to be read together.
+    ///
+    /// # Errors
+    ///
+    /// If the year is outside 1980..=2107, which seven bits cannot hold. The
+    /// old inline version clamped, which turned 1970 into 1980 -- a date that is
+    /// wrong rather than absent.
+    pub fn dos_date(&self) -> Result<u16, String> {
+        if !(1980..=2107).contains(&self.year) {
+            return Err(format!(
+                "{} is not a year DOS can pack into seven bits",
+                self.year
+            ));
+        }
+        let year = (self.year - 1980) as u16;
+        Ok((year << 9) | ((self.month as u16) << 5) | (self.day as u16))
+    }
+
+    /// The time, packed the way DOS packs it: hours in bits 15..11, minutes in
+    /// 10..5, and **two-second units** in 4..0.
+    ///
+    /// Five bits will not hold 59, so the seconds are halved and an odd second
+    /// cannot be represented at all -- which is why `nctime` doubles them back
+    /// and never prints one. Cannot fail: every field of a [`Civil`] fits.
+    pub fn dos_time(&self) -> u16 {
+        ((self.hour as u16) << 11) | ((self.minute as u16) << 5) | (self.second as u16 / 2)
+    }
+}
+
 /// The clock the host answers `now`, `today` and `time` from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clock {

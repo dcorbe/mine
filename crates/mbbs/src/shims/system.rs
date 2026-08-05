@@ -40,9 +40,7 @@ const MDF_LINE: u16 = 40;
 /// If the host's clock cannot say what time it is.
 pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let t = host.clock().civil().map_err(ShimError::Failed)?;
-    Ok(Ret::U16(
-        ((t.hour as u16) << 11) | ((t.minute as u16) << 5) | (t.second as u16 / 2),
-    ))
+    Ok(Ret::U16(t.dos_time()))
 }
 
 /// `int today(void)` -- the date, packed as DOS packs it.
@@ -57,16 +55,10 @@ pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// outcome this crate exists to avoid.
 pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let t = host.clock().civil().map_err(ShimError::Failed)?;
-    if !(1980..=2107).contains(&t.year) {
-        return Err(ShimError::Failed(format!(
-            "today: {} is not a year DOS can pack into seven bits",
-            t.year
-        )));
-    }
-    let year = (t.year - 1980) as u16;
-    Ok(Ret::U16(
-        (year << 9) | ((t.month as u16) << 5) | (t.day as u16),
-    ))
+    let packed = t
+        .dos_date()
+        .map_err(|why| ShimError::Failed(format!("today: {why}")))?;
+    Ok(Ret::U16(packed))
 }
 
 /// `long time(long *tloc)` -- seconds since 1970, and stored if asked.
