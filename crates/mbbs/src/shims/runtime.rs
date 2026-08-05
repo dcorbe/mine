@@ -117,6 +117,37 @@ pub fn f_lumod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
     }
 }
 
+/// The `long` a module passed in `DX:AX`, high half in `DX`.
+fn dxax(machine: &Machine) -> u32 {
+    u32::from(machine.ax()) | (u32::from(machine.dx()) << 16)
+}
+
+/// `long F_LXMUL@(void)` -- `DX:AX * CX:BX`, answered in `DX:AX`.
+///
+/// The most-called import in `WCCMMUD.DLL`: 124 sites, and not one of them puts
+/// anything on the stack. `CX:BX` is one 32-bit operand with its high half in
+/// `CX`, which 66 of those sites say out loud by building it as `push dx;
+/// push ax` ... `pop bx; pop cx`.
+///
+/// **Signed or unsigned is not a question this routine answers.** The low 32
+/// bits of a 32x32 product are the same either way, which is why Worldgroup 1.01
+/// exports `F_LDIV@`/`F_LUDIV@` and `F_LXRSH@`/`F_LXURSH@` as signed and
+/// unsigned pairs and exports exactly one multiply. It wraps, and wrapping is
+/// right for both.
+///
+/// What is not reproduced: whatever the real helper left in the flags for a
+/// product that did not fit. No call site reads one -- all 124 store `DX:AX`,
+/// add to it, or overwrite `AX` at once -- and this host has no way to hand a
+/// flag back regardless.
+///
+/// # Errors
+///
+/// None. Multiplication modulo 2^32 is total.
+pub fn f_lxmul(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+    let cxbx = u32::from(machine.bx()) | (u32::from(machine.cx()) << 16);
+    Ok(Ret::U32(dxax(machine).wrapping_mul(cxbx)))
+}
+
 /// The single signed pair that has no answer: `i32::MIN / -1`.
 fn overflow(name: &str, a: i32, b: i32) -> ShimError {
     ShimError::Failed(format!(
@@ -195,6 +226,52 @@ mod tests {
             let e = div(shim, 1, 0).expect_err("refused");
             assert!(format!("{e}").contains("zero"), "{e}");
         }
+    }
+
+    /// Set `DX:AX` and `CX:BX` the way a module does, and run `shim`.
+    fn regs(shim: crate::shims::Shim, dxax: u32, cxbx: u32) -> Result<Ret, ShimError> {
+        let mut f = Fixture::new();
+        let regs = [
+            dxax as u16,         // AX
+            cxbx as u16,         // BX
+            (cxbx >> 16) as u16, // CX
+            (dxax >> 16) as u16, // DX
+        ];
+        f.invoke_with(shim, &[], regs)
+    }
+
+    #[test]
+    fn the_multiply_takes_its_operands_from_registers_and_nothing_else() {
+        // Measured: `mov cx,[es:bx+0x611]; mov bx,[es:bx+0x60f]; xor dx,dx;
+        // mov ax,0xa; call F_LXMUL@` -- a coin count times its denomination.
+        // The high half of each operand is in the *second* register of its
+        // pair, and reading a pair backwards multiplies numbers that are off by
+        // 65,536 without failing.
+        assert_eq!(
+            regs(f_lxmul, 10, 0x0001_0002).unwrap(),
+            Ret::U32(0x000a_0014)
+        );
+        assert_eq!(regs(f_lxmul, 1_000_000, 25).unwrap(), Ret::U32(25_000_000));
+    }
+
+    #[test]
+    fn the_multiply_keeps_the_low_thirty_two_bits_and_no_more() {
+        // There is one `F_LXMUL@` and no `F_LXUMUL@`, because for the low half
+        // of the product signed and unsigned agree. So the routine wraps, and
+        // these are the same multiplication read two ways.
+        assert_eq!(
+            regs(f_lxmul, 0x0001_0000, 0x0001_0000).unwrap(),
+            Ret::U32(0)
+        );
+        assert_eq!(
+            regs(f_lxmul, -3i32 as u32, 7).unwrap(),
+            Ret::U32(-21i32 as u32)
+        );
+        assert_eq!(
+            regs(f_lxmul, 0xffff_ffff, 0xffff_ffff).unwrap(),
+            Ret::U32(1),
+            "as unsigned this overflows and as signed it is (-1)*(-1)"
+        );
     }
 
     #[test]
