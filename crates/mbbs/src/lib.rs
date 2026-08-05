@@ -558,6 +558,39 @@ impl Host {
         &self.users
     }
 
+    /// `void alcvda(void)` -- give every channel its volatile data area.
+    ///
+    /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init
+    /// routine has run, because `dclvda` is what decides the size and it is
+    /// still being called until then. Not part of [`Host::new`] for that
+    /// reason: a host that allocated at construction would size the area off a
+    /// `vdasiz` of zero and every `vdaptr` the module read would be null.
+    ///
+    ///
+    /// `vdaptr` is left pointing at channel 0, matching `vdarea=vdaoff(0)` at
+    /// `:1374`; `curusr` is what re-points it per channel afterwards. `vdatmp`
+    /// is a block of its own and not a slot, because `fsdapr` is handed both at
+    /// once and they must not be the same bytes.
+    ///
+    /// Doing nothing when `vdasiz` is zero is the original's own `if`, and it
+    /// is load-bearing here: this heap refuses an allocation of nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room.
+    pub fn alcvda(&mut self, machine: &mut Machine) -> io::Result<()> {
+        let size = self.globals.word(machine, "vdasiz")?;
+        if size == 0 {
+            return Ok(());
+        }
+        self.users.alcvda(machine, &mut self.heap, size)?;
+        let area = self.users.vda(0).expect("channel 0, just allocated");
+        let temp = self.heap.alloc(machine, size).map_err(io::Error::other)?;
+        self.globals.write(machine, "vdaptr", &area.to_bytes())?;
+        self.globals.write(machine, "vdatmp", &temp.to_bytes())?;
+        Ok(())
+    }
+
     /// How many host calls this host has serviced.
     pub fn calls(&self) -> u64 {
         self.calls

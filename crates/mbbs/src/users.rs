@@ -96,6 +96,10 @@ pub struct Users {
     /// `int *channel` -- and this one points [`SENTINELS`] words *into* its own
     /// allocation, exactly as `MAJORBBS.C:741-743` left it.
     channels: FarPtr,
+    /// `vdahdl`, `MAJORBBS.C:1373` -- one volatile data area per channel, and
+    /// how big each is. `None` until `alcvda`, which cannot run until every
+    /// module's `dclvda` has been counted.
+    vda: Option<(FarPtr, u16)>,
 }
 
 /// Words `MAJORBBS.C:740` puts *before* `channel[0]`, so that `channel[-1]`,
@@ -175,7 +179,36 @@ impl Users {
             extra,
             accounts,
             channels,
+            vda: None,
         })
+    }
+
+    /// Allocate `size` bytes of volatile data area per channel.
+    ///
+    /// `vdahdl=alcblok(nterms,vdasiz)`, `MAJORBBS.C:1373`. **Not zeroed**, and
+    /// that is deliberate: `alcblok` has no recovered source, but both of its
+    /// other callers initialise every slot themselves right afterwards --
+    /// `ACCOUNT.C:111-113` with a `setmem(...,0)` loop and `GALFILU.C:296` with
+    /// `nlibaxs=-1` -- which they would not do if the block came back clean.
+    /// `MAJORBBS.C:1373` does neither, so a module reading its volatile data
+    /// area before writing it read whatever was there, and it reads the same
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room.
+    pub fn alcvda(
+        &mut self,
+        machine: &mut Machine,
+        heap: &mut crate::Heap,
+        size: u16,
+    ) -> io::Result<()> {
+        let bytes = size
+            .checked_mul(self.terms)
+            .ok_or_else(|| io::Error::other(format!("{} channels of {size} bytes", self.terms)))?;
+        let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
+        self.vda = Some((at, size));
+        Ok(())
     }
 
     /// How many channels there are.
@@ -207,6 +240,17 @@ impl Users {
     /// that does not exist.
     pub fn account(&self, unum: i16) -> Option<FarPtr> {
         self.nth(self.accounts, USRACC, unum)
+    }
+
+    /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if there
+    /// is no such channel or [`Users::alcvda`] has not run.
+    ///
+    /// `MAJORBBS.C:1380`. Null before `alcvda` is the answer the real host's
+    /// `vdaoff` gave too, because `vdahdl` was still null: every module's
+    /// `dclvda` has to be counted before the size is known.
+    pub fn vda(&self, unum: i16) -> Option<FarPtr> {
+        let (base, size) = self.vda?;
+        self.nth(base, size, unum)
     }
 
     /// The `unum`th slot of a table of `each`-byte entries, or `None` if there
@@ -388,5 +432,49 @@ mod tests {
         let at = f.host.globals().pointer(&f.machine, "channel").expect("channel");
         let bytes = f.machine.resolve(at, 2).expect("readable");
         assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 0);
+    }
+
+    #[test]
+    fn the_volatile_data_area_is_not_allocated_until_after_init() {
+        // `MAJORBBS.C:896` calls `alcvda()` *after* `inimod()`, because
+        // `dclvda` is still accumulating `vdasiz` while modules initialise.
+        // Null through init is not an omission -- it is the order the real host
+        // ran in, and a host that allocated in `Host::new` would size the area
+        // off a `vdasiz` of zero.
+        let f = crate::testing::Fixture::new();
+        assert_eq!(
+            f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
+            mbbs16::FarPtr::NULL
+        );
+    }
+
+    #[test]
+    fn alcvda_gives_every_channel_an_area_and_the_host_a_spare() {
+        // `vdahdl=alcblok(nterms,vdasiz)` and `vdatmp=alcmem(vdasiz)`. `vdatmp`
+        // is a separate block, not a slot -- `fsdapr(vdaptr, vdasiz, vdatmp)`
+        // hands the FSD both at once and they must not be the same bytes.
+        let mut f = crate::testing::Fixture::new();
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.alcvda(&mut f.machine).expect("allocated");
+
+        let g = f.host.globals();
+        let area = g.pointer(&f.machine, "vdaptr").expect("vdaptr");
+        let temp = g.pointer(&f.machine, "vdatmp").expect("vdatmp");
+        assert_ne!(area, mbbs16::FarPtr::NULL);
+        assert_ne!(temp, mbbs16::FarPtr::NULL);
+        assert_ne!(area, temp, "the area and the scratch copy are two blocks");
+        assert_eq!(area, f.host.users().vda(0).expect("channel 0"));
+    }
+
+    #[test]
+    fn alcvda_does_nothing_when_no_module_declared_a_size() {
+        // The `if (vdasiz != 0)` guard. Allocating zero bytes is an error this
+        // heap refuses outright, so the guard is load-bearing and not decorative.
+        let mut f = crate::testing::Fixture::new();
+        f.host.alcvda(&mut f.machine).expect("nothing to do");
+        assert_eq!(
+            f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
+            mbbs16::FarPtr::NULL
+        );
     }
 }
