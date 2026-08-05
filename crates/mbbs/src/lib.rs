@@ -106,6 +106,28 @@ impl std::fmt::Display for MissingGlobal {
     }
 }
 
+/// Where the date-and-time routines format, once one of them has needed to.
+///
+/// One block per routine rather than one shared block, because the original had
+/// three separate statics and a module may hold an `ncdate` result across an
+/// `nctime` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DateBuffers {
+    /// 9 bytes: `MM/DD/YY` and its terminator.
+    pub(crate) date: FarPtr,
+
+    /// 9 bytes: `HH:MM:SS` and its terminator.
+    pub(crate) time: FarPtr,
+
+    /// 10 bytes: `DD-Mon-YY` and its terminator.
+    pub(crate) edat: FarPtr,
+
+    /// One byte, always NUL. What `ncdate(0)` returns -- and a **different**
+    /// address from `date`, so a null date leaves an earlier result standing,
+    /// exactly as `seg 33:0x0c14` does by never writing at all.
+    pub(crate) empty: FarPtr,
+}
+
 /// Why a module could not be loaded.
 #[derive(Debug)]
 pub enum LoadError {
@@ -166,6 +188,19 @@ pub struct Host {
     /// Starts null, so a `strtok(NULL, ...)` with no `strtok(s, ...)` before it
     /// stops the module rather than reading whatever happened to be there.
     pub(crate) strtok: FarPtr,
+
+    /// Where `ncdate`, `nctime` and `ncedat` format, once one of them has run.
+    ///
+    /// `MAJORBBS.EXE` keeps these as statics in its own `DGROUP` -- 9 bytes at
+    /// `0x40`, 9 at `0x49`, 10 at `0x52`, and a lone NUL at `0x82`. **They are
+    /// allocated once and reused, because the aliasing is observable**: the
+    /// pointer one call returns names a string the next call overwrites, and a
+    /// host allocating afresh each time would hand back three live strings
+    /// where the original had one.
+    ///
+    /// `None` until something needs them. Allocating in [`Host::new`] would put
+    /// four blocks on the heap of a module that may never ask the time.
+    pub(crate) datebuf: Option<DateBuffers>,
 
     /// The line buffer `gmdnam` returns a pointer into.
     mdf: FarPtr,
@@ -324,6 +359,7 @@ impl Host {
             },
             spr_next: 0,
             strtok: FarPtr::NULL,
+            datebuf: None,
             mdf: FarPtr {
                 offset: spr_bytes as u16,
                 selector,
