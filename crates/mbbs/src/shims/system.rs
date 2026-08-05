@@ -818,4 +818,33 @@ mod tests {
         assert_eq!(agent.xferdone, Some(vectors[2]));
         assert_eq!(agent.abort, Some(vectors[3]));
     }
+
+    #[test]
+    fn an_agent_is_copied_rather_than_pointed_at() {
+        // The opposite of `register_module`, and measured: `register_agent`
+        // ends in `movmem(agdptr, &agents[nagents], 25)`, so the caller's block
+        // is the host's to forget. A host that kept the pointer would report
+        // whatever the module later put there.
+        let mut f = Fixture::new();
+        let read = FarPtr {
+            offset: 0x0069,
+            selector: f.machine.code_selector(),
+        };
+        let block = agent_block(&mut f, "WCCMMUD", &[read]);
+        f.invoke(register_agent, &Fixture::far(block))
+            .expect("registered");
+
+        let at = FarPtr {
+            offset: block.offset,
+            selector: block.selector,
+        };
+        f.machine.write(at, b"OVERWRIT\0").expect("in bounds");
+
+        assert_eq!(
+            f.host.agents()[0].appid,
+            "WCCMMUD",
+            "the copy is the host's, and the module cannot change it"
+        );
+        assert_eq!(f.host.agents()[0].read, Some(read));
+    }
 }
