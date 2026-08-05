@@ -1,11 +1,46 @@
 //! Full-Screen Data Entry: sizing a form the host cannot yet run.
 
-use mbbs16::{Machine, Ret};
+use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::ShimError;
+
+/// This channel's session control block, allocating it on first use.
+///
+/// `inifsdscb()`, `FSDBBS.C:64`. The real one is
+/// `alczer(nterms*sizeof(struct fsdbbs))` out of the *host's* heap; this is a
+/// segment of its own, so that a module writing past what it was given cannot
+/// reach the globals, and so that the module's heap accounting does not report
+/// a host allocation as one of the module's.
+///
+/// Only the `struct fsdscb` prefix of `struct fsdbbs` is modelled. The rest --
+/// the `ainscb`, `curmbk`, `tmpmsg`, `amode`, `flags` and `whndun` members --
+/// belongs to the entry session and to `fsdusr`, which no module imports.
+fn control_block(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimError> {
+    if let Some(at) = host.fsdscb {
+        return Ok(at);
+    }
+    let selector = machine
+        .alloc_segment(usize::from(fsd::FSDSCB))
+        .map_err(|e| ShimError::Failed(format!("fsdroom: no room for a session block: {e}")))?;
+    let at = FarPtr {
+        offset: 0,
+        selector,
+    };
+    host.globals()
+        .write(machine, "fsdscb", &at.to_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.fsdscb = Some(at);
+    Ok(at)
+}
+
+/// Read the session control block out of module memory.
+fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
+    let bytes = machine.resolve(at, usize::from(fsd::FSDSCB))?;
+    fsd::Scb::from_bytes(bytes).map_err(|e| ShimError::Failed(e.to_string()))
+}
 
 /// `int fsdroom(int tmpmsg, char *fldspc, int amode)` -- how big is this form?
 ///
@@ -79,6 +114,33 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let size = form
         .size()
         .map_err(|e| ShimError::Failed(format!("fsdroom: {e}")))?;
+
+    // `fsdppc()`'s outputs go into the session control block, where `fsdapr`
+    // and the module itself read them. `flddat` and `mbpunc` are *not* set
+    // here: the real host leaves them pointing into `prfbuf` (`FSDBBS.C:131`)
+    // for `fsdapr` to copy out of, and this host keeps the parse in
+    // `Host::forms` instead -- see the module documentation above.
+    let at = control_block(machine, host)?;
+    let mut block = read_block(machine, at)?;
+    block.set_fldspc(machine.arg_far(1));
+    block.set_numfld(form.fields.len() as u16);
+    block.set_numtpl(form.in_template as u16);
+    block.set_mbleng(form.punctuation.len() as u16);
+    block.set_maxans(form.answer_max);
+    block.set_hlplen(form.help_len);
+    block.set_hlpoff(form.help_at);
+    machine.write(at, block.as_bytes())?;
+
+    // `fsdusr->{curmbk,tmpmsg,amode}`, `FSDBBS.C:134`, for `fsdrft` to come
+    // back to. The block is read now rather than at `fsdrft` time because the
+    // module will have `rstmbk`'d by then -- it does so four instructions after
+    // this call, at `seg 3:0x3f86`.
+    let block = host
+        .globals()
+        .pointer(machine, "curmbk")
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.fsdtmp = Some((block, number, amode));
+
     host.forms.push(form);
     Ok(Ret::U16(size))
 }
@@ -124,6 +186,69 @@ mod tests {
             panic!("expected one form, got {:?}", f.host.forms())
         };
         assert_eq!(form.fields.len(), 2);
+    }
+
+    #[test]
+    fn fsdroom_points_the_fsdscb_global_at_a_block_it_filled_in() {
+        // `inifsdscb()` + `setfsd(usrnum)`, FSDBBS.C:125-129. The module tests
+        // `fsdscb` for null at seg 3:0x430f and bails to `rstmbk` when it is,
+        // so leaving it zero would be a decision and not an omission.
+        let mut f = Fixture::new();
+        let _ = open(&mut f);
+        let spec = f.text("ONE TWO");
+
+        assert_eq!(
+            f.host
+                .globals()
+                .pointer(&f.machine, "fsdscb")
+                .expect("placed"),
+            FarPtr::NULL,
+            "null until a form has been sized"
+        );
+
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        assert_ne!(at, FarPtr::NULL);
+
+        let block = read_block(&f.machine, at).expect("readable");
+        assert_eq!(block.numfld(), 2);
+        assert_eq!(
+            block.fldspc(),
+            spec,
+            "the module's own copy of the spec, not a host one"
+        );
+        assert_eq!(block.maxans(), f.host.forms()[0].answer_max);
+        assert_eq!(block.mbleng(), f.host.forms()[0].punctuation.len() as u16);
+    }
+
+    #[test]
+    fn a_second_form_reuses_the_one_control_block() {
+        // `inifsdscb()` allocates only `if (fsdtbl == NULL)`, and `nterms` is
+        // one here. A segment per call would leak an LDT entry a form.
+        let mut f = Fixture::new();
+        let _ = open(&mut f);
+        let spec = f.text("ONE");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+        let first = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+        let second = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        assert_eq!(first, second);
     }
 
     #[test]
