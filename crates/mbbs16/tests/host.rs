@@ -256,3 +256,11 @@ fn a_long_argument_reads_back_as_one_value() {
 
     machine.resume(Ret::Void).expect("resumed");
 }
+
+#[test]
+fn a_machine_that_is_not_in_a_call_has_no_frame() {
+    // `sp()` panics here, deliberately -- a shim asking is a bug. The refusal
+    // path asks about machines in any state, so it gets the honest answer.
+    let machine = Machine::new().expect("16-bit machine");
+    assert_eq!(machine.frame_sp(), None);
+}

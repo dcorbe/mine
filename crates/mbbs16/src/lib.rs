@@ -841,6 +841,16 @@ impl Machine {
         }
     }
 
+    /// `SP` as the module left it, or `None` if it is not stopped at a call.
+    ///
+    /// [`Machine::sp`] is this without the `None`, and panics instead: a shim
+    /// reading its own arguments is always inside a call, so an absent frame
+    /// there is a host bug worth crashing for. Anything that inspects a machine
+    /// it did not put in that state wants this one.
+    pub fn frame_sp(&self) -> Option<u16> {
+        self.frame_sp
+    }
+
     /// The module's `SP` at the outstanding call, before the call frame.
     ///
     /// Worth checking in tests: a module that is being resumed with the wrong
