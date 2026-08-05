@@ -162,6 +162,31 @@ pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
+/// `void rtkick(int delay, void (*dstrou)())` -- run this later.
+///
+/// The host remembers it and **nothing runs it**, because running it needs a
+/// main loop and a clock that this host does not have. That is a debt rather
+/// than a lie: `rtkick` returns `void`, so it promises the caller nothing at
+/// call time, and a module cannot observe a second that never passes. See
+/// [`Host::kicks`] for what the main loop will read when there is one.
+///
+/// # Errors
+///
+/// If `delay` is negative, which no caller can mean and a misread argument
+/// list would produce.
+pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let delay = machine.arg_u16(0);
+    if delay & 0x8000 != 0 {
+        return Err(ShimError::Failed(format!(
+            "rtkick: a negative delay ({} seconds)",
+            delay as i16
+        )));
+    }
+    let dstrou = machine.arg_far(1);
+    host.kicks.push(Kick { delay, dstrou });
+    Ok(Ret::Void)
+}
+
 /// `void dclvda(int size)` -- declare how much volatile data area this module
 /// needs.
 ///
@@ -248,6 +273,27 @@ fn local_time() -> Result<libc::tm, ShimError> {
         return Err(ShimError::Failed("the local time is unknown".to_owned()));
     }
     Ok(out)
+}
+
+/// A module routine the host has been asked to run later.
+///
+/// `rtkick(delay, dstrou)` is a **one-shot** timer: `dstrou` runs once, `delay`
+/// seconds from the call, and a callback that wants to keep going re-arms
+/// itself. `GALMJD.C:180` registers `mjdrtk` with `rtkick(1,mjdrtk)` and
+/// `GALMJD.C:1106` is that same call *inside* `mjdrtk` -- which is only
+/// necessary, and only correct, if a kick fires once.
+///
+/// `delay` is kept as it was given rather than converted to a deadline. This
+/// host has no clock to measure one against, and inventing an epoch here would
+/// commit the future main loop to whichever one this file guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kick {
+    /// Seconds from registration until it is due. `0` means the next tick.
+    pub delay: u16,
+
+    /// The module routine to call. Far, and into the module's own code -- the
+    /// one MajorMUD registers is an `INTERNALREF` to its NE segment 6.
+    pub dstrou: FarPtr,
 }
 
 /// A module that has been taken online.
@@ -496,5 +542,70 @@ mod tests {
         let mut f = Fixture::new();
         f.invoke(srand, &[0x1234]).expect("seeded");
         assert_eq!(f.host.seed, 0x1234);
+    }
+
+    #[test]
+    fn rtkick_remembers_the_callback_and_when_it_is_due() {
+        let mut f = Fixture::new();
+        let dstrou = FarPtr {
+            offset: 0x0a21,
+            selector: 0x0067,
+        };
+
+        let args = [1, dstrou.offset, dstrou.selector];
+        assert!(matches!(f.invoke(rtkick, &args), Ok(Ret::Void)));
+
+        assert_eq!(f.host.kicks(), [Kick { delay: 1, dstrou }]);
+    }
+
+    #[test]
+    fn kicks_are_kept_in_the_order_they_were_registered() {
+        // `prcrtk` runs them in list order, and the real host's list is a
+        // queue appended at the tail, so two kicks due in the same second run
+        // in the order they were asked for. Nothing depends on that yet; it is
+        // cheaper to be right now than to discover it from a bug later.
+        let mut f = Fixture::new();
+        let first = FarPtr {
+            offset: 0x1111,
+            selector: 0x0067,
+        };
+        let second = FarPtr {
+            offset: 0x2222,
+            selector: 0x0067,
+        };
+
+        f.invoke(rtkick, &[5, first.offset, first.selector])
+            .expect("first");
+        f.invoke(rtkick, &[5, second.offset, second.selector])
+            .expect("second");
+
+        assert_eq!(
+            f.host.kicks(),
+            [
+                Kick {
+                    delay: 5,
+                    dstrou: first
+                },
+                Kick {
+                    delay: 5,
+                    dstrou: second
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_negative_delay_is_refused_rather_than_stored() {
+        // `int delay` is signed and "call this 32,769 seconds ago" is not a
+        // thing a caller can mean. The realistic cause is the host reading the
+        // arguments in the wrong order, which this catches at the call rather
+        // than as a stored pointer nobody looks at until there is a main loop.
+        let mut f = Fixture::new();
+
+        let e = f
+            .invoke(rtkick, &[0xffff, 0x0a21, 0x0067])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("negative delay"), "{e}");
+        assert!(f.host.kicks().is_empty());
     }
 }

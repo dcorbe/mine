@@ -39,7 +39,7 @@ use std::path::PathBuf;
 pub use exports::Exports;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
 pub use heap::{Config, Heap, Region};
-pub use shims::system::Registration;
+pub use shims::system::{Kick, Registration};
 pub use shims::{Entry, Shim, ShimError};
 
 use mbbs16::{
@@ -195,6 +195,10 @@ pub struct Host {
     /// reports once for the routine that produced it.
     noted: HashSet<String>,
 
+    /// Every callback `rtkick` has been asked to run later, in the order it
+    /// was asked. **Nothing runs them.** See [`Host::kicks`].
+    pub(crate) kicks: Vec<Kick>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -278,6 +282,7 @@ impl Host {
             installed: Vec::new(),
             notes: Vec::new(),
             noted: HashSet::new(),
+            kicks: Vec::new(),
             heap: Heap::new(Config::default()),
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
@@ -297,6 +302,21 @@ impl Host {
     /// Every module that has registered, in the order they did.
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// Every callback the module asked `rtkick` to run later.
+    ///
+    /// **This host never runs them**, and that is the one thing to know about
+    /// this list. `rtkick` is a one-shot timer measured in seconds; the real
+    /// host ran `prcrtk()` once per elapsed second from its main loop
+    /// (`MAJORBBS.C:476-480`) and this host has neither loop nor second.
+    ///
+    /// So this is a record of what a main loop would owe, not a queue that is
+    /// being served. MajorMUD registers exactly one during initialisation -- a
+    /// one-second heartbeat into its own segment 6 -- and until something runs
+    /// it, MajorMUD is a world that has been built and never started.
+    pub fn kicks(&self) -> &[Kick] {
+        &self.kicks
     }
 
     /// The message files that are open.
