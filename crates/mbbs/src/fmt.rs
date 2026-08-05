@@ -323,7 +323,12 @@ fn pointer(machine: &Machine, args: Args, near: bool, at: usize) -> Result<FarPt
     }
 }
 
-fn signed(machine: &Machine, args: Args, spec: &Spec, at: usize) -> Result<(i64, usize), ShimError> {
+fn signed(
+    machine: &Machine,
+    args: Args,
+    spec: &Spec,
+    at: usize,
+) -> Result<(i64, usize), ShimError> {
     if spec.long {
         Ok((i64::from(args.long(machine, at)? as i32), 2))
     } else {
@@ -615,7 +620,14 @@ mod tests {
         // about a width, so the check is worth making over all of them at once.
         let words = |f: &mut Fixture| {
             let text = f.text("gold");
-            vec![text.offset, text.selector, 0x86a0, 0x0001, u16::from(b'x'), 42]
+            vec![
+                text.offset,
+                text.selector,
+                0x86a0,
+                0x0001,
+                u16::from(b'x'),
+                42,
+            ]
         };
 
         let mut f = Fixture::new();
