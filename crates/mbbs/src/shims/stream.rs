@@ -1,7 +1,15 @@
-//! The seven stream routines, over a `FILE *` the module holds.
+//! The nine file routines, seven of them over a `FILE *` the module holds.
 //!
 //! Borland's, re-exported by `MAJORBBS.DLL`:
 //!
+//!
+//! And two of Galacticomm's own, from `DSKUTL.H`, which ask about a file
+//! rather than holding one open:
+//!
+//!
+//! `getdtd` takes a descriptor this crate handed out; `cntdir` takes a path and
+//! never opens anything, and leaves its whole answer in three host globals.
+//! What a *name* is -- the eleven bytes DOS matched on -- is [`crate::dos`]'s.
 //!
 //! What a stream *is* -- the struct, the modes, the text translation -- is
 //! [`crate::stream`]'s. This is the part that knows about the module.
@@ -25,6 +33,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
+use crate::dos;
 use crate::fmt::{Args, format};
 use crate::shims::{NO, ShimError};
 use crate::stream::Mode;
@@ -267,6 +276,96 @@ pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .map_err(|why| ShimError::Failed(format!("getdtd: {why}")))?;
 
     Ok(Ret::U32((u32::from(date) << 16) | u32::from(civil.dos_time())))
+}
+
+/// `void cntdir(char *path)` -- count the files and bytes a spec names.
+///
+/// `DSKUTL.H:56-58`, and no C source survives. It returns nothing: everything it
+/// produces it leaves in the globals `numfils`, `numbyts` and `numbytp`, which
+/// `DSKUTL.H:23-26` declares and which live in module memory. Four recovered
+/// call sites pin the semantics -- `ACCOUNT.C:98`, `BBSRIP.C:314`,
+/// `GALMHS.C:366` and `CHANDIR.C:98` -- and between them they establish that
+/// `numfils` counts what a `fnd1st`/`fndnxt` loop would have returned, that a
+/// bare filename is a legal spec, and that a spec matching nothing is
+/// `numfils == 0` rather than a failure.
+///
+/// **`numdirs` is not touched.** That one is `cntdirs`'s, which `WCCMMUD.DLL`
+/// does not import.
+///
+/// # `numbytp` is `numbyts`, knowingly
+///
+/// The original's `numbytp` is the *physical* count: each file rounded up to the
+/// drive's cluster, `clfit(size, clsize(drive))`. This host has no clusters and
+/// no drive whose geometry would make one rounding true rather than another, so
+/// it reports the logical size for both and says so here. Inventing a cluster
+/// size would make up a number; leaving `numbytp` at whatever the last call put
+/// there would be the same invention with worse timing. `WCCMMUD.DLL` addresses
+/// `numbyts` at six sites and `numbytp` at none, so nothing this host runs can
+/// tell the difference.
+///
+/// # Errors
+///
+/// If the spec names a directory ([`Host::dos_name`]'s rule, the same one
+/// `fopen` and `unlink` keep), if it is a wildcard with no extension
+/// ([`dos::Name::spec`]'s), if the module's directory cannot be read, or if the
+/// total will not fit in the `long` the module reads it as.
+///
+/// A directory that will not open is a refusal and not a zero, because "no such
+/// file" and "nobody looked" are the same answer to a module and only one of
+/// them is true.
+pub fn cntdir(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
+    let spec =
+        dos::Name::spec(name).map_err(|why| ShimError::Failed(format!("cntdir({named}): {why}")))?;
+
+    let failed =
+        |what: &str, e: std::io::Error| ShimError::Failed(format!("cntdir({named}): {what}: {e}"));
+    let entries =
+        std::fs::read_dir(&host.root).map_err(|e| failed(&host.root.display().to_string(), e))?;
+
+    let mut files: i32 = 0;
+    let mut bytes: u64 = 0;
+    for entry in entries {
+        let entry = entry.map_err(|e| failed(&host.root.display().to_string(), e))?;
+        let found = entry.file_name();
+        let found = found.to_string_lossy();
+
+        // Not a refusal: a name DOS could not have written down is one no
+        // `fnd1st` loop could have returned. See `dos::Name::parse`.
+        let Some(found) = dos::Name::parse(&found) else {
+            continue;
+        };
+        if !spec.matches(&found) {
+            continue;
+        }
+
+        // Through the path rather than the entry, so a symlink is measured as
+        // the file it names -- which is what `fopen` on the same name would
+        // open.
+        let path = entry.path();
+        let metadata =
+            std::fs::metadata(&path).map_err(|e| failed(&path.display().to_string(), e))?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        files += 1;
+        bytes += metadata.len();
+    }
+
+    let bytes = i32::try_from(bytes)
+        .map_err(|_| ShimError::Failed(format!("cntdir({named}): {bytes} bytes is not a long")))?;
+
+    let write = |machine: &mut Machine, host: &Host, name: &str, value: i32| {
+        host.globals()
+            .write(machine, name, &value.to_le_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))
+    };
+    write(machine, host, "numfils", files)?;
+    write(machine, host, "numbyts", bytes)?;
+    write(machine, host, "numbytp", bytes)?;
+    Ok(Ret::Void)
 }
 
 #[cfg(test)]
@@ -860,5 +959,94 @@ mod tests {
         let mut f = Fixture::new();
         let e = f.invoke(getdtd, &[99]).expect_err("refused");
         assert!(format!("{e}").contains("no open stream"), "{e}");
+    }
+
+    /// A fixture over a directory with known contents, and the three counters
+    /// after `cntdir` has run over `spec`.
+    fn counted(f: &mut Fixture, spec: &str) -> (i32, i32, i32) {
+        let at = f.text(spec);
+        let args = Fixture::far(at);
+        assert!(matches!(
+            f.invoke(cntdir, &args).expect("cntdir"),
+            Ret::Void
+        ));
+        let read = |name| f.host.globals().long(&f.machine, name).expect(name);
+        (read("numfils"), read("numbyts"), read("numbytp"))
+    }
+
+    /// The three 1,024-byte `.DAT` files, one 433-byte `.MSG` and one 48-byte
+    /// `.MSG` from `tests/data`, somewhere a test may add to.
+    fn directory(name: &str) -> std::path::PathBuf {
+        scratch_with(
+            name,
+            &["SAMPLE.DAT", "OTHER.DAT", "EMPTY.DAT", "SAMPLE.MSG", "OTHER.MSG"],
+        )
+    }
+
+    #[test]
+    fn cntdir_of_one_name_is_one_file_and_its_size() {
+        // ACCOUNT.C:98 passes a bare filename with no wildcard in it at all,
+        // and reads `numfils` to find out whether it exists.
+        let mut f = Fixture::rooted(directory("cntdir-one"));
+        assert_eq!(counted(&mut f, "SAMPLE.DAT"), (1, 1024, 1024));
+    }
+
+    #[test]
+    fn cntdir_matches_case_insensitively_as_dos_did() {
+        // The module's own spec is the lower-case `wccupdat.dat`, and every file
+        // beside it on disk is upper case.
+        let mut f = Fixture::rooted(directory("cntdir-case"));
+        assert_eq!(counted(&mut f, "sample.dat"), (1, 1024, 1024));
+    }
+
+    #[test]
+    fn cntdir_of_a_file_that_is_not_there_is_zero_and_not_a_refusal() {
+        // `numfils == 0` is the answer three of the four recovered call sites
+        // are looking for. Refusing would tell the module nothing it can act on.
+        let mut f = Fixture::rooted(directory("cntdir-absent"));
+        assert_eq!(counted(&mut f, "NOSUCH.DAT"), (0, 0, 0));
+    }
+
+    #[test]
+    fn cntdir_sums_a_wildcard() {
+        let mut f = Fixture::rooted(directory("cntdir-wild"));
+        assert_eq!(counted(&mut f, "*.DAT"), (3, 3072, 3072));
+        assert_eq!(counted(&mut f, "*.MSG"), (2, 481, 481));
+        assert_eq!(counted(&mut f, "SAMPLE.*"), (2, 1457, 1457));
+        assert_eq!(counted(&mut f, "*.*"), (5, 3553, 3553));
+    }
+
+    #[test]
+    fn cntdir_replaces_the_last_answer_rather_than_adding_to_it() {
+        // Every recovered caller calls it and reads immediately. A host that
+        // accumulated would be right the first time and wrong forever after.
+        let mut f = Fixture::rooted(directory("cntdir-again"));
+        assert_eq!(counted(&mut f, "*.DAT"), (3, 3072, 3072));
+        assert_eq!(counted(&mut f, "SAMPLE.DAT"), (1, 1024, 1024));
+    }
+
+    #[test]
+    fn cntdir_skips_what_dos_could_not_have_seen() {
+        // The module's directory on this host is a Linux one, and may hold
+        // names no `fnd1st` loop could ever have returned -- `tmp/` really does
+        // hold `slumpos.json` and `control_run.out`. Counting them would report
+        // files the module cannot open by the name it was given.
+        let at = directory("cntdir-alien");
+        std::fs::write(at.join("slumpos.json"), b"0123456789").expect("written");
+        std::fs::create_dir(at.join("SUBDIR.D")).expect("a subdirectory");
+        let mut f = Fixture::rooted(at);
+        assert_eq!(counted(&mut f, "*.*"), (5, 3553, 3553));
+    }
+
+    #[test]
+    fn cntdir_refuses_a_directory_and_an_ambiguous_wildcard() {
+        // The first is `Host::dos_name`'s rule, the same one `fopen` and
+        // `unlink` keep. The second is `dos::Name::spec`'s.
+        let mut f = Fixture::rooted(directory("cntdir-refuse"));
+        for spec in ["D:\\MUD\\*.DAT", "SUBDIR\\*.*", "*"] {
+            let at = f.text(spec);
+            let args = Fixture::far(at);
+            assert!(f.invoke(cntdir, &args).is_err(), "{spec}");
+        }
     }
 }

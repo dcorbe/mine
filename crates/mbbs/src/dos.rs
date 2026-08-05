@@ -112,8 +112,7 @@ impl Name {
 /// Pack one field to exactly `N` bytes, or `None` if it is not one.
 fn field<const N: usize>(text: &str, wild: bool) -> Option<[u8; N]> {
     let mut out = [b' '; N];
-    let mut at = 0;
-    for c in text.chars() {
+    for (at, c) in text.chars().enumerate() {
         match c {
             // The rest of the field, and the rest of the text is not read:
             // `AB*CD` is `AB??????`, which is DOS's expansion and not a
@@ -133,7 +132,6 @@ fn field<const N: usize>(text: &str, wild: bool) -> Option<[u8; N]> {
             return None;
         }
         out[at] = c.to_ascii_uppercase() as u8;
-        at += 1;
     }
     Some(out)
 }

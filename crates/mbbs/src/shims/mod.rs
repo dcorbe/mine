@@ -187,6 +187,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "fflush", stream::fflush, Cleans::Caller),
     (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
     (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller),
+    (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "access", system::access, Cleans::Caller),
     (MAJORBBS, "now", system::now, Cleans::Caller),
