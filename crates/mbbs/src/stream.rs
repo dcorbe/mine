@@ -81,6 +81,11 @@ pub(crate) const FIRST_FD: u8 = 5;
 /// What `fopen`'s mode string asked for.
 ///
 /// `r`, `w` or `a`, then at most one `+` and at most one of `t` or `b`.
+///
+/// **`read`, `write` and `append` are the base letter, not the access.** They
+/// are what decides `O_CREAT` and `O_TRUNC`, which is why the `+` does not
+/// fold into them. Ask [`Self::readable`] and [`Self::writable`] for what the
+/// module may actually do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mode {
     pub read: bool,
@@ -139,6 +144,28 @@ impl Mode {
             binary: binary.unwrap_or(false),
         })
     }
+
+    /// Whether the module may read this stream.
+    ///
+    /// **Not `self.read`.** `read`, `write` and `append` are the base *letter*,
+    /// and a `+` adds the other direction without disturbing it -- `w+` has
+    /// `read == false` and is readable all the same. That is what `_F_RDWR`
+    /// means at `FOPEN.C:107`, and reading the field instead of asking this
+    /// would report `_F_WRIT` alone for the one update stream the module opens.
+    pub fn readable(&self) -> bool {
+        self.read || self.update
+    }
+
+    /// Whether the module may write this stream.
+    ///
+    /// The mirror of [`Self::readable`], and the one with teeth: a plain `r+`
+    /// read through `self.write` would be told it is open for reading, and a
+    /// host that let it through on the field alone would write nothing and say
+    /// nothing. Neither mode occurs in `WCCMMUD.DLL`; both are one call site
+    /// away from occurring.
+    pub fn writable(&self) -> bool {
+        self.write || self.update
+    }
 }
 
 /// An open file, and how the module is reading or writing it.
@@ -173,12 +200,18 @@ struct Stream {
 
 impl Stream {
     /// The `flags` word the module should see.
+    ///
+    /// Both direction bits for an update stream, which is `_F_RDWR` --
+    /// `CheckOpenType` sets `_F_READ | _F_WRIT` for every mode with a `+`, and
+    /// `STDIO.H:63` names the pair.
     fn flags(&self) -> u16 {
-        let mut bits = if self.mode.read {
-            flags::READ
-        } else {
-            flags::WRIT
-        };
+        let mut bits = 0;
+        if self.mode.readable() {
+            bits |= flags::READ;
+        }
+        if self.mode.writable() {
+            bits |= flags::WRIT;
+        }
         if self.mode.binary {
             bits |= flags::BIN;
         }
@@ -576,9 +609,39 @@ mod tests {
 
     #[test]
     fn every_mode_the_module_uses_parses() {
-        // The eleven resolved `fopen` call sites, between them.
-        for used in ["w", "a", "rt", "wt", "at", "rb"] {
+        // Every mode-shaped string in `re/WCCMMUD.DLL`, by occurrence: `r` 17,
+        // `a` 12, `rt` 5, `w` 4, `wt` 3, `at` 2, `rb` 1, and `w+` once at file
+        // offset 0xe2412 -- the only update mode in the module.
+        for used in ["w", "a", "rt", "wt", "at", "rb", "w+"] {
             Mode::parse(used).unwrap_or_else(|e| panic!("{used}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_plus_adds_the_other_direction_without_changing_the_base_letter() {
+        // `CheckOpenType`, FOPEN.C:100-108 -- "same modes, but both read and
+        // write". The base letter still decides create and truncate, so it has
+        // to survive the `+` rather than be overwritten by it.
+        let w = Mode::parse("w+").expect("a mode");
+        assert!(w.write && !w.read, "the base letter is still `w`");
+        assert!(w.readable() && w.writable(), "and a `+` is both");
+
+        let r = Mode::parse("r+").expect("a mode");
+        assert!(r.read && !r.write, "the base letter is still `r`");
+        assert!(r.readable() && r.writable(), "and a `+` is both");
+
+        let a = Mode::parse("a+").expect("a mode");
+        assert!(a.append, "the base letter is still `a`");
+        assert!(a.readable() && a.writable());
+    }
+
+    #[test]
+    fn a_mode_without_a_plus_is_one_direction_only() {
+        let r = Mode::parse("rt").expect("a mode");
+        assert!(r.readable() && !r.writable());
+        for one_way in ["wt", "at", "w", "a"] {
+            let m = Mode::parse(one_way).expect("a mode");
+            assert!(m.writable() && !m.readable(), "{one_way}");
         }
     }
 
