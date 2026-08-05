@@ -477,13 +477,35 @@ pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `n` bytes and pads the rest of `n` with NUL, so a source of `n` characters
 /// or more leaves the destination **unterminated**. Exactly `n` bytes are
 /// written every time, which is what makes the bound checkable at all.
+///
+/// **The source need not be terminated.** `repne scasb` is issued with
+/// `cx = n`, so the scan reads at most `n` bytes and stops; a blank-padded
+/// fixed-width field with no NUL in it is precisely what this routine is for,
+/// and refusing one would stop a module the real host served.
 pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     let dst = machine.arg_far(0);
     let n = usize::from(machine.arg_u16(4));
-    let text = machine.read_cstr(machine.arg_far(2))?;
+    if n == 0 {
+        // All three `rep` prefixes are no-ops, so the original dereferences
+        // neither pointer. Same reason `stzcpy` returns early on a zero.
+        return Ok(Ret::Far(dst));
+    }
+
+    // What the scan could touch. `n` bytes if they are all inside the segment;
+    // otherwise the original only got away with it because a terminator
+    // stopped it first, and `read_cstr` is the reader that insists on one.
+    let src = machine.arg_far(2);
+    let text = match machine.resolve(src, n) {
+        Ok(bytes) => bytes,
+        Err(_) => machine.read_cstr(src)?,
+    };
+    let take = text
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(text.len())
+        .min(n);
 
     let mut out = vec![0u8; n];
-    let take = text.len().min(n);
     out[..take].copy_from_slice(&text[..take]);
     machine.write(dst, &out)?;
     Ok(Ret::Far(dst))
@@ -890,6 +912,64 @@ mod tests {
             f.machine.resolve(dst, 8).expect("readable"),
             b"ab\0\0\0\0##",
             "six bytes written, the last four of them NUL"
+        );
+    }
+
+    #[test]
+    fn strncpy_does_not_require_the_source_to_be_terminated() {
+        // `repne scasb` with `cx = n` reads **at most n bytes**. A source with
+        // no terminator in it is the case this routine exists for -- a
+        // blank-padded fixed-width field -- and refusing one would stop a
+        // module the real host served.
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let scratch = dst.selector;
+
+        // Six non-zero bytes hard against the end of a 4,096-byte segment, so
+        // there is no terminator between the source and the end of what it
+        // names.
+        let src = FarPtr {
+            offset: 4090,
+            selector: scratch,
+        };
+        f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.machine.resolve(dst, 8).expect("readable"), b"xxxx####");
+    }
+
+    #[test]
+    fn strncpy_of_nothing_touches_neither_pointer() {
+        // `rep` with `cx = 0` is a no-op three times over, so the original
+        // dereferences nothing at all -- the same reason `stzcpy` returns
+        // early on a `num` of zero.
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.invoke(strncpy, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
+    fn strncpy_still_refuses_a_source_it_would_have_to_read_past() {
+        // The other half of the same rule: the scan is bounded by `n`, so an
+        // `n` that reaches past the end of the source's segment with no
+        // terminator in the way is a read the original could not have made
+        // either.
+        let mut f = Fixture::new();
+        let dst = f.buffer(64);
+        let src = FarPtr {
+            offset: 4090,
+            selector: dst.selector,
+        };
+        f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
+        assert!(
+            f.invoke(
+                strncpy,
+                &[dst.offset, dst.selector, src.offset, src.selector, 32]
+            )
+            .is_err()
         );
     }
 
