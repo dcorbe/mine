@@ -76,7 +76,7 @@ const CTRL_Z: u8 = 0x1a;
 /// host does not implement and a module must not be handed. Starting past them
 /// also means **a zeroed `FILE` cannot be mistaken for one of ours**: `fd` 0 in
 /// an uninitialised struct reads as `stdin` rather than as a live stream.
-const FIRST_FD: u8 = 5;
+pub(crate) const FIRST_FD: u8 = 5;
 
 /// What `fopen`'s mode string asked for.
 ///
@@ -410,6 +410,41 @@ impl Streams {
     /// If `cookie` names no open stream.
     pub fn name(&self, cookie: FarPtr) -> Result<&str, String> {
         Ok(&self.open[self.find(cookie)?].name)
+    }
+
+    /// When the file behind `fd` was last written, in seconds since 1970.
+    ///
+    /// **Keyed by descriptor rather than by `FILE *`**, because the one caller
+    /// is `getdtd`, whose argument is `fileno(fp)` -- and `fileno` is a Borland
+    /// macro that reads `FILE.fd` directly and never reaches this host. So the
+    /// module hands over a number this crate assigned and nothing else.
+    ///
+    /// Taken from the open handle, not from the path, which is what DOS's
+    /// `AH=57h` does: it takes a handle and cannot be fooled by a rename
+    /// between the `fopen` and the ask.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, or the file will not say when it was
+    /// written, or it was written before 1970.
+    pub fn modified(&self, fd: u8) -> Result<u32, String> {
+        let stream = self
+            .open
+            .iter()
+            .find(|s| s.fd == fd)
+            .ok_or_else(|| format!("fd {fd} names no open stream"))?;
+
+        let file = match &stream.io {
+            Io::Read(reader) => reader.get_ref(),
+            Io::Write(file) => file,
+        };
+        let at = file
+            .metadata()
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("{}: {e}", stream.name))?;
+        at.duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .map_err(|_| format!("{} was written before 1970", stream.name))
     }
 
     /// A line, or `None` if the stream ended before one could start.

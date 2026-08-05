@@ -219,6 +219,56 @@ pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::U16(0))
 }
 
+/// `long getdtd(int fhdl)` -- when a file was last written, DOS-packed.
+///
+/// `DSKUTL.H:79`, and no C source survives. Transcribed from
+/// `MAJORBBS-wg101.EXE seg 33:0x16cb`, which fills a Borland `union REGS` with
+/// `AX = 0x5700` and `BX = fhdl`, calls `intdos`, and returns `DX:AX` from what
+/// comes back -- **`DX` is the date and `AX` the time**, which is what DOS's
+/// `AH=57h AL=00h` reports in `DX` and `CX`.
+///
+/// So the `long` is `(date << 16) | time`, and the module takes it apart in
+/// exactly that order. `_BEGIN_UPDATING`
+/// (`re/exports/WCCMMUD_decompiled.c:57759`) does:
+///
+/// ```text
+/// uVar4 = getdtd(*(byte *)(fp + 4));           // fileno(fp); FD is 4
+/// nctime((int)uVar4);                          // the low half is the time
+/// ncdate((int)((ulong)uVar4 >> 0x10));         // the high half is the date
+/// ```
+///
+/// which is an independent confirmation of the halves, of `FD`, and of what
+/// those two routines take.
+///
+/// **The argument is a descriptor, not a `FILE *`.** `fileno` is a Borland
+/// macro that reads `FILE.fd` and never reaches this host, so the number
+/// arriving here is one this crate handed out. See [`crate::stream`].
+///
+/// # Errors
+///
+/// If `fhdl` names no open stream, if the file will not say when it was
+/// written, or if it was written outside the years DOS can pack. The original
+/// returned whatever DOS left in the registers and could not tell a bad handle
+/// from a real answer; this host stops instead.
+pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let fd = machine.arg_u16(0);
+    let fd = u8::try_from(fd).map_err(|_| ShimError::Failed(format!("getdtd: fd {fd} is not one")))?;
+
+    let at = host.streams().modified(fd).map_err(ShimError::Failed)?;
+
+    // Through the host's own calendar rather than `localtime_r`, for the reason
+    // the clock exists: `TZ` would make this answer depend on the environment
+    // the test runs in. See [`crate::clock`].
+    let civil = crate::clock::Clock::pinned(at)
+        .civil()
+        .map_err(ShimError::Failed)?;
+    let date = civil
+        .dos_date()
+        .map_err(|why| ShimError::Failed(format!("getdtd: {why}")))?;
+
+    Ok(Ret::U32((u32::from(date) << 16) | u32::from(civil.dos_time())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +805,60 @@ mod tests {
         let named = f.text("WCCRECOV.FLG");
         assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
         assert!(!root.join("WCCRECOV.FLG").exists());
+    }
+
+    #[test]
+    fn getdtd_puts_the_date_in_the_high_half_and_the_time_in_the_low() {
+        // The half that matters. `seg 33:0x16f4` takes DX from the REGS block's
+        // dx and AX from its cx, and `_BEGIN_UPDATING` hands the low half to
+        // nctime and the high half to ncdate -- so getting these the wrong way
+        // round produces two plausible strings, both wrong, and no error.
+        let root = scratch_with("stream-getdtd", &["LINES.TXT"]);
+        let mut f = Fixture::rooted(root.clone());
+        let _fp = opened(&mut f, "LINES.TXT", "r");
+
+        let Ret::U32(packed) = f
+            .invoke(getdtd, &[u16::from(crate::stream::FIRST_FD)])
+            .expect("getdtd")
+        else {
+            panic!("getdtd returns a long");
+        };
+
+        let at = std::fs::metadata(root.join("LINES.TXT"))
+            .and_then(|m| m.modified())
+            .expect("the file this test just made")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs() as u32;
+        let civil = crate::clock::Clock::pinned(at).civil().expect("a calendar");
+
+        assert_eq!(
+            packed >> 16,
+            u32::from(civil.dos_date().expect("a year DOS can hold")),
+            "the high half is the date"
+        );
+        assert_eq!(
+            packed & 0xffff,
+            u32::from(civil.dos_time()),
+            "the low half is the time"
+        );
+
+        // And independently of the packing: a file written moments ago cannot
+        // predate DOS. Catches a wholesale mistake that the two halves above
+        // would agree on, since both sides compute them the same way.
+        assert!(
+            (packed >> 16) >> 9 >= 1,
+            "a file written now is not from 1980"
+        );
+    }
+
+    #[test]
+    fn getdtd_refuses_a_descriptor_nothing_opened() {
+        // The original filled a REGS block and returned whatever DOS left
+        // behind, so a stale handle came back as a date. There is nothing to
+        // report here but the absence.
+        let mut f = Fixture::new();
+        let e = f.invoke(getdtd, &[99]).expect_err("refused");
+        assert!(format!("{e}").contains("no open stream"), "{e}");
     }
 }
