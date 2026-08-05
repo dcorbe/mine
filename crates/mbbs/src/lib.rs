@@ -366,6 +366,18 @@ impl Host {
         let mut heap = Heap::new(Config::default());
         let users = users::Users::new(machine, &mut heap, globals::NTERMS)?;
 
+        // `MAJORBBS.H:345` declares `struct user *user` -- the *head* of the
+        // array, not a slot. The module never asks the host for a channel's
+        // record; it loads this pointer and indexes off it itself, at 58 sites
+        // of `_user_625 + usrnum * 0x29`. So it has to be a real far pointer
+        // before the module's first access, and pointing it at channel 0 is
+        // pointing it at the array.
+        //
+        // `extusr` and `uablok` get no such line, because neither is a global
+        // this host places: `WCCMMUD.DLL` imports neither, and reaches an
+        // account record only by calling `uacoff`.
+        globals.write(machine, "user", &users.head().to_bytes())?;
+
         Ok(Self {
             exports: Exports::wg101(),
             globals,

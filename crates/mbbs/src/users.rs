@@ -285,4 +285,17 @@ mod tests {
         let bytes = f.machine.resolve(at, usize::from(USER)).expect("readable");
         assert!(bytes.iter().all(|b| *b == 0), "a fresh channel is all zero");
     }
+
+    #[test]
+    fn the_user_global_points_at_channel_zero() {
+        // `MAJORBBS.H:345` declares `struct user *user`, and the module indexes
+        // off it rather than being handed a slot: `_user_625 + usrnum * 0x29`.
+        // Null here is not "no users" -- it is a segment-zero dereference at
+        // the module's first `user[0].state`.
+        let f = crate::testing::Fixture::new();
+        let head = f.host.globals().pointer(&f.machine, "user").expect("user");
+        assert_ne!(head, mbbs16::FarPtr::NULL, "the module dereferences this");
+        assert_eq!(head, f.host.users().slot(0).expect("channel 0"));
+        assert_eq!(head, f.host.users().head());
+    }
 }
