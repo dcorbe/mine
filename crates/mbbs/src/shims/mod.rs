@@ -229,6 +229,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
     // The current user: the two routines that turn a channel number into the
     // slot it names.
+    (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
     (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
