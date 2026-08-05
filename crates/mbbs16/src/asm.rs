@@ -55,6 +55,20 @@ pub(crate) struct Ctx {
     /// Also callee-saved: a shim must hand back the `DS` the module had.
     pub ds: u64,
 
+    /// `BX` and `CX` as the module had them at the call, handed straight back.
+    ///
+    /// cdecl makes both scratch, so no compiled *cdecl* caller depends on them
+    /// -- but not everything a module imports from this host is one. Borland's
+    /// runtime helpers have clobber sets its code generator knows and works
+    /// around: `F_SCOPY@` was `rep movsb`, which destroys `CX`, `SI` and `DI`
+    /// and leaves `BX` alone, so a caller may hold a live value in `BX` across
+    /// it.
+    ///
+    /// These two must be loaded *after* `SS` and `SP`, because the entry
+    /// sequence uses `%rcx` and `%rbx` as the scratch that gets those there.
+    pub bx: u64,
+    pub cx: u64,
+
     /// `AX` when the trampoline was reached: a thunk index on the way in, or a
     /// module's return value on the way out.
     pub out_ax: u64,
@@ -153,6 +167,9 @@ mbbs16_enter:
     movw    %cx, %ss                    /* paired with the next instruction: */
     movq    %rbx, %rsp                  /* MOV SS's shadow covers the gap */
 
+    movq    {bx}(%r14), %rbx            /* BX and CX as the module had them,  */
+    movq    {cx}(%r14), %rcx            /* now the two are done being scratch */
+
     ljmpl   *(%r14)                     /* into 16-bit mode */
 1:
     popq    %r15
@@ -164,6 +181,8 @@ mbbs16_enter:
     retq
 "#,
     ax = const offset_of!(Ctx, ax),
+    bx = const offset_of!(Ctx, bx),
+    cx = const offset_of!(Ctx, cx),
     ds = const offset_of!(Ctx, ds),
     dx = const offset_of!(Ctx, dx),
     si = const offset_of!(Ctx, si),

@@ -99,6 +99,37 @@ fn each_call_reports_its_own_registers() {
 }
 
 #[test]
+fn a_host_call_hands_bx_and_cx_back_as_the_module_had_them() {
+    // Not because cdecl says so -- it makes both scratch -- but because these
+    // are not only cdecl routines. Borland's runtime helpers have clobber sets
+    // its code generator knows: `F_SCOPY@` was `rep movsb` and destroyed `CX`,
+    // `SI` and `DI`, and touched `BX` not at all. So a compiled caller may keep
+    // a live value in `BX` across one, and until this test the module got the
+    // host's leftovers instead -- `CX` holding the stack selector and `BX` the
+    // `SP` the host resumed with, both of which look like data.
+    let mut machine = Machine::new().expect("16-bit machine");
+    let mut code = loads(&machine, 0x1111, 0x2222, 0x3333, 0x4444);
+    code.pop(); // drop the `lret` and report the two registers instead
+    code.extend_from_slice(&[
+        0x89, 0xd8, // mov ax,bx
+        0x89, 0xca, // mov dx,cx
+        0xcb, // lret
+    ]);
+    park(&mut machine, &code);
+
+    // A return value in DX:AX, which is what a helper answers with, must not
+    // stop BX and CX coming back.
+    let exit = machine.resume(Ret::U32(0xdead_beef)).expect("resumed");
+    assert_eq!(
+        exit,
+        Exit::Returned {
+            ax: 0x2222,
+            dx: 0x3333
+        }
+    );
+}
+
+#[test]
 fn reading_a_register_outside_a_call_panics() {
     // Rather than reporting whatever the last call left. A shim always has an
     // outstanding call, so an absent frame here is a host bug.

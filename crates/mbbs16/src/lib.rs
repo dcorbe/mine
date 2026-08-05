@@ -644,9 +644,12 @@ impl Machine {
         self.frame_sp = None;
         self.ctx.out_ax = 0;
         self.ctx.out_dx = 0;
+        self.ctx.out_bx = 0;
         self.ctx.out_si = 0;
         self.ctx.out_di = 0;
         self.ctx.out_bp = 0;
+        self.call_ax = 0;
+        self.call_cx = 0;
 
         // A module starts with DS naming its own data segment. After that it is
         // whatever the module last had, since DS is callee-saved.
@@ -1002,6 +1005,17 @@ impl Machine {
         self.ctx.bp = self.ctx.out_bp;
         self.ctx.ds = self.ctx.out_ds;
 
+        // BX and CX go back too, which cdecl does not require of a callee.
+        // Not everything a module imports is a cdecl routine: Borland's own
+        // runtime helpers have clobber sets its code generator knows, and
+        // `F_SCOPY@` -- `rep movsb`, which never touches BX -- is one a caller
+        // may hold a live value across. Preserving is the safe direction of
+        // that argument, since no caller can depend on a register being
+        // *destroyed*. Without this the module resumed with the host's scratch:
+        // CX naming the stack segment and BX holding SP.
+        self.ctx.bx = self.ctx.out_bx;
+        self.ctx.cx = u64::from(self.call_cx);
+
         // The trampoline writes SS as a bare 16-bit store, so the rest of the
         // slot has to start clean.
         self.ctx.out_sp = 0;
@@ -1056,9 +1070,21 @@ impl Machine {
         // that `frame_sp` means exactly what it has always meant -- the far-call
         // frame, with the module's arguments just above -- and nothing that
         // reads an argument has to know a thunk saves anything.
+        //
+        // Stepping back can only leave the segment if the module called out
+        // with `SP` already within four bytes of the top, which is a module
+        // that has underflowed its own stack. In release `out_sp + 4` would
+        // wrap to near zero and `arg_u16` would go on to read the *bottom* of
+        // the stack segment and report plausible arguments, so this is checked
+        // rather than assumed.
+        let frame = out_sp.checked_add(THUNK_SAVES).ok_or_else(|| {
+            io::Error::other(format!(
+                "the module called out at SP={out_sp:#06x}, so its stack has underflowed"
+            ))
+        })?;
         self.call_cx = self.stack().read_u16(usize::from(out_sp));
         self.call_ax = self.stack().read_u16(usize::from(out_sp) + 2);
-        self.frame_sp = Some(out_sp + THUNK_SAVES);
+        self.frame_sp = Some(frame);
 
         Ok(Exit::Call {
             index: self.ctx.out_ax as u16,
