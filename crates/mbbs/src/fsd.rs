@@ -672,6 +672,93 @@ pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
     }
 }
 
+/// The synthetic option list a `Y/N` field gets. `foptkn()`, `FSD.C:135`.
+///
+/// A `Y/N` field may not carry options of its own -- `tmpscn` calls that an
+/// error -- so its alternates come from here, and its ordinals are `NO=0` and
+/// `YES=1` from a string that appears nowhere in the module's specification.
+/// The substitution is keyed on `fldtyp == 'Y'`, which `embscn` sets, so it
+/// fires for every caller after `fsdppc` and for none before.
+const YES_NO: &[u8] = b"(ALT=NO ALT=YES)";
+
+/// Every `ALT=` value of one field, in the order the specification lists them.
+///
+/// A value ends at white space, `)` or the terminator, and never runs past
+/// [`ANSLEN`] characters -- `endtkn()`, `FSD.C:148`.
+fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
+    let (list, mut at) = if field.kind == b'Y' {
+        (YES_NO, 1usize)
+    } else {
+        match option_list(spec, field) {
+            Some(at) => (spec, at),
+            None => return Vec::new(),
+        }
+    };
+
+    let mut out = Vec::new();
+    while let Some(start) = next_token(list, at, b"ALT=", false) {
+        let end = list[start..]
+            .iter()
+            .take(usize::from(ANSLEN))
+            .position(|&c| c == 0 || c == b')' || is_space(c))
+            .map_or(list.len(), |n| start + n);
+        out.push(&list[start..end]);
+        // `nxttkn(ep, ...)` resumes at the value's terminator, so a value that
+        // ran to the end of the list must not restart the scan where it began.
+        at = end.max(start + 1);
+    }
+    out
+}
+
+/// Which alternate value an answer is. `chkalt(0)` then `fsdord()`,
+/// `FSD.C:965` and `FSD.C:2244`.
+///
+/// Returns the ordinal **and the alternate's own spelling**, because the
+/// original does not merely report: on an unequivocal match it copies the full
+/// alternate back over the answer, which is what `FSD.H:656` means by "in that
+/// case, answer is available via `fsdnan(fldi)`". A caller that drops the
+/// second half of the pair has not finished doing what `fsdord` does.
+///
+/// `None` when the field has no alternates, when nothing matches, **and when
+/// more than one does**. Ambiguity is not a near miss here: `"B"` against
+/// `ALT=Black ALT=Brown` picks neither, and a host that took the first would be
+/// choosing on the player's behalf. `FSD.H:655` -- "only returns 0..N-1 if
+/// unequivocal match".
+///
+/// The answer is matched as a *prefix*, after every white-space character in it
+/// has been removed -- `rmvwht`, which is not a trim. So `" b l "` finds
+/// `Black`.
+pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8>)> {
+    // `if (!(fldptr->flags&FFFALT) || foptkn("ALT=",0) == NULL) return 0;`
+    if field.flags & flags::ALTERNATES == 0 {
+        return None;
+    }
+    let wanted = crate::strings::rmvwht(answer);
+    // `bc=toupper(bufptr[0])`. An empty answer has no first character, and the
+    // original would compare against the terminator -- which no alternate
+    // starts with, since a zero-length `ALT=` is the one exception FSD.H:214
+    // calls out and it never reaches here with FFFALT set by a name.
+    let first = wanted.first()?.to_ascii_uppercase();
+
+    let mut found: Option<(u16, Vec<u8>)> = None;
+    let mut matches = 0usize;
+    for (i, alt) in alternates(spec, field).into_iter().enumerate() {
+        // `sameto(bufptr,tp)` -- the alternate begins with the answer -- and
+        // then `bc == toupper(*tp)`, which the first is already sufficient for
+        // and which the original checks anyway.
+        let same = alt.len() >= wanted.len()
+            && alt[..wanted.len()].eq_ignore_ascii_case(&wanted)
+            && alt.first().is_some_and(|c| c.to_ascii_uppercase() == first);
+        if same {
+            if matches == 0 {
+                found = Some((i as u16, alt.to_vec()));
+            }
+            matches += 1;
+        }
+    }
+    if matches == 1 { found } else { None }
+}
+
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
 ///
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
@@ -781,13 +868,11 @@ fn next_token(list: &[u8], from: usize, token: &[u8], word: bool) -> Option<usiz
     None
 }
 
-/// `foptkn()`, `FSD.C:127`: find `token` among one field's options.
+/// Where a field's option list begins: one past its `(`. `foptkn()`'s scan.
 ///
-/// The `fldtyp == 'Y'` branch of the original substitutes a synthetic
-/// `(ALT=NO ALT=YES)` list. It cannot fire from here: `chkops` clears `fldtyp`
-/// on the line above its first call, and only `embscn` ever sets it. It exists
-/// for the entry-session callers this host does not have.
-fn field_token(spec: &[u8], field: &Field, token: &[u8], word: bool) -> Option<usize> {
+/// `None` when the field has no options at all, which is a name followed by
+/// white space or the end of the specification rather than by `(`.
+fn option_list(spec: &[u8], field: &Field) -> Option<usize> {
     let mut at = usize::from(field.spec_at);
     while at < spec.len() && spec[at] != b'(' {
         if spec[at] == 0 || is_space(spec[at]) {
@@ -795,10 +880,17 @@ fn field_token(spec: &[u8], field: &Field, token: &[u8], word: bool) -> Option<u
         }
         at += 1;
     }
-    if at >= spec.len() {
-        return None;
-    }
-    next_token(spec, at + 1, token, word)
+    if at >= spec.len() { None } else { Some(at + 1) }
+}
+
+/// `foptkn()`, `FSD.C:127`: find `token` among one field's options.
+///
+/// The `fldtyp == 'Y'` branch of the original substitutes a synthetic
+/// `(ALT=NO ALT=YES)` list. It cannot fire from here: `chkops` clears `fldtyp`
+/// on the line above its first call, and only `embscn` ever sets it. Where it
+/// *does* fire is [`alternates`], which runs after `fsdppc` has finished.
+fn field_token(spec: &[u8], field: &Field, token: &[u8], word: bool) -> Option<usize> {
+    next_token(spec, option_list(spec, field)?, token, word)
 }
 
 /// `chkops()`, `FSD.C:230`: read each field's options into its flags.
@@ -1098,6 +1190,106 @@ mod tests {
         // field characters and invent fields out of the borders.
         let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY);
         assert_eq!(form.in_template, 1);
+    }
+
+    #[test]
+    fn an_answer_matching_one_alternate_gives_its_position() {
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"Brown"),
+            Some((1, b"Brown".to_vec()))
+        );
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"Red"),
+            Some((2, b"Red".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_prefix_is_enough_and_the_canonical_spelling_comes_back() {
+        // `sameto(bufptr,tp)`: the alternate must *begin* with the answer, and
+        // when exactly one does, `chkalt` copies the full alternate back over
+        // it. That is why FSD.H:656 can say "answer is available via
+        // fsdnan(fldi)" -- it has rewritten it.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"br"),
+            Some((1, b"Brown".to_vec()))
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_answer_matches_nothing() {
+        // "Black" and "Brown" both begin with "B". Two matches is not an
+        // answer, and returning the first would pick a hair colour for the
+        // player.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(ordinal(spec, &form.fields[0], b"B"), None);
+    }
+
+    #[test]
+    fn white_space_inside_the_answer_is_removed_before_matching() {
+        // `rmvwht(bufptr)` -- every space, not merely the outer ones.
+        let spec = b"C(ALT=Black ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b" R e d "),
+            Some((1, b"Red".to_vec()))
+        );
+    }
+
+    #[test]
+    fn the_ordinal_counts_every_alternate_and_not_just_the_matching_ones() {
+        // `i++` runs on every iteration of chkalt's loop, so the ordinal is a
+        // position in the option list. Counting only candidates would number
+        // the last of five as 0.
+        let spec = b"C(ALT=Aa ALT=Bb ALT=Cc ALT=Dd ALT=Ee)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"Ee"),
+            Some((4, b"Ee".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_field_with_no_alternates_has_no_ordinal() {
+        let spec = b"C(MIN=1 MAX=9)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(ordinal(spec, &form.fields[0], b"5"), None);
+
+        let bare = b"C";
+        let form = compile(b"??????", bare, MANY);
+        assert_eq!(ordinal(bare, &form.fields[0], b"5"), None);
+    }
+
+    #[test]
+    fn a_yes_no_field_uses_the_synthetic_option_list() {
+        // `foptkn()`, FSD.C:135: `fldtyp == 'Y'` substitutes
+        // "(ALT=NO ALT=YES)" for the field's own options, which a Y/N field
+        // does not have and may not have. So NO is 0 and YES is 1, from a
+        // string that appears nowhere in the module's field specification.
+        let spec = b"OK";
+        let form = compile(b"Ok Y/N", spec, MANY);
+        assert_eq!(form.fields[0].kind, b'Y');
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"YES"),
+            Some((1, b"YES".to_vec()))
+        );
+        assert_eq!(
+            ordinal(spec, &form.fields[0], b"n"),
+            Some((0, b"NO".to_vec()))
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_matches_no_alternate() {
+        let spec = b"C(ALT=Black ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(ordinal(spec, &form.fields[0], b""), None);
+        assert_eq!(ordinal(spec, &form.fields[0], b"   "), None);
     }
 
     #[test]
