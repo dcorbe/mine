@@ -316,6 +316,16 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
+/// `int strcmp(char *s1,char *s2)` -- **0 is equal**, unlike [`sameas`].
+///
+/// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
+/// byte difference, not a sign, and MajorMUD's 48 sites test it both ways.
+pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let b = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::strcmp(&a, b) as u16))
+}
+
 /// `int toupper(int c)`.
 ///
 /// **Not a macro here.** Borland's macro is `_toupper`; `toupper` is a real
@@ -397,6 +407,29 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn strcmp_returns_the_difference_and_zero_for_equal() {
+        let mut f = Fixture::new();
+        let short = f.text("kobold");
+        let long = f.text("koboldy");
+        let same = f.text("kobold");
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+
+        assert_eq!(
+            f.invoke(strcmp, &pair(short, long)).expect("ok"),
+            Ret::U16((-121i16) as u16),
+            "the terminator against 'y'"
+        );
+        assert_eq!(
+            f.invoke(strcmp, &pair(long, short)).expect("ok"),
+            Ret::U16(121)
+        );
+        assert_eq!(
+            f.invoke(strcmp, &pair(short, same)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
 
     #[test]
     fn the_same_family_answers_one_for_equal_not_strcmps_zero() {

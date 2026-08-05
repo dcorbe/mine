@@ -106,6 +106,29 @@ pub fn samein(shorts: &[u8], longs: &[u8]) -> bool {
         && (0..=longs.len() - shorts.len()).any(|i| sameto(shorts, &longs[i..]))
 }
 
+/// `int strcmp(char *s1,char *s2)`.
+///
+/// Ordinal 573, `seg 1:0x2714`. Borland's is `repe cmpsb` over `strlen(s2) + 1`
+/// bytes -- the terminator included, which is what makes a prefix compare
+/// against the byte that follows it -- and then `sub ax,bx` with **both high
+/// bytes cleared**. So the answer is the *unsigned* byte difference at the
+/// first mismatch, somewhere in -255..255, and not merely a sign.
+///
+/// `a` and `b` are the strings without their terminators, which is why the loop
+/// runs one position past `b`.
+pub fn strcmp(a: &[u8], b: &[u8]) -> i16 {
+    for i in 0..=b.len() {
+        // Past the end of either is its terminator, and the loop stops at the
+        // first difference -- so at most one step past the shorter one.
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return i16::from(x) - i16::from(y);
+        }
+    }
+    0
+}
+
 /// Whether two equal-length runs match once [`tolower`] has folded each byte.
 ///
 /// The one loop `sameas` and `sameto` share; they differ only in what happens
@@ -213,6 +236,26 @@ mod tests {
         // 65,000-odd offsets past the end.
         assert!(!samein(b"longer than", b"short"));
         assert!(!samein(b"x", b""));
+    }
+
+    #[test]
+    fn strcmp_answers_the_byte_difference_and_not_merely_a_sign() {
+        assert_eq!(strcmp(b"abc", b"abc"), 0);
+        assert_eq!(strcmp(b"", b""), 0);
+        assert_eq!(strcmp(b"abc", b"abd"), -1);
+        assert_eq!(strcmp(b"abd", b"abc"), 1);
+        assert_eq!(strcmp(b"ab", b"abc"), -99, "the terminator against 'c'");
+        assert_eq!(strcmp(b"abc", b"ab"), 99);
+        assert_eq!(strcmp(b"", b"a"), -97);
+    }
+
+    #[test]
+    fn strcmp_compares_bytes_unsigned() {
+        // `mov al,[si-1]` with `ah` and `bh` cleared before the `sub`. Read
+        // signed, 0x80 would be negative and this would come out the other way.
+        assert_eq!(strcmp(b"\x80", b"\x01"), 127);
+        assert_eq!(strcmp(b"\x01", b"\x80"), -127);
+        assert_eq!(strcmp(b"\xff", b"\x01"), 254, "the widest it can be");
     }
 
     #[test]
