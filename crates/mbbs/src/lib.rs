@@ -154,6 +154,19 @@ pub struct Host {
     spr: FarPtr,
     spr_next: usize,
 
+    /// Where `strtok` left off.
+    ///
+    /// `MAJORBBS.EXE` keeps this as one far `char *` in its own `DGROUP`, at
+    /// offset `0x18a8` -- `seg 1:0x24f4` sets it, advances it and reads it back
+    /// through `les bx,[0x18a8]`. It is not an exported symbol, so no module
+    /// can see or reset it, and there is exactly one of it for every module and
+    /// every channel. That is safe only because MajorBBS schedules
+    /// cooperatively, and it is what the real host did.
+    ///
+    /// Starts null, so a `strtok(NULL, ...)` with no `strtok(s, ...)` before it
+    /// stops the module rather than reading whatever happened to be there.
+    pub(crate) strtok: FarPtr,
+
     /// The line buffer `gmdnam` returns a pointer into.
     mdf: FarPtr,
 
@@ -296,6 +309,7 @@ impl Host {
                 selector,
             },
             spr_next: 0,
+            strtok: FarPtr::NULL,
             mdf: FarPtr {
                 offset: spr_bytes as u16,
                 selector,

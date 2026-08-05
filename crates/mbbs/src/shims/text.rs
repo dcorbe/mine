@@ -187,24 +187,18 @@ pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the one that arrived. See [`strings::skpwht`](crate::strings::skpwht) for
 /// why a tab does not count.
 pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
-    let text = machine.read_cstr(at)?;
+    let cp = machine.arg_far(0);
+    let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwht(text) as u16;
-    Ok(Ret::Far(FarPtr {
-        offset: at.offset + n,
-        selector: at.selector,
-    }))
+    Ok(Ret::Far(at(cp, n)))
 }
 
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
 pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
-    let text = machine.read_cstr(at)?;
+    let cp = machine.arg_far(0);
+    let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwrd(text) as u16;
-    Ok(Ret::Far(FarPtr {
-        offset: at.offset + n,
-        selector: at.selector,
-    }))
+    Ok(Ret::Far(at(cp, n)))
 }
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
@@ -291,6 +285,281 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U32(value as u32))
 }
 
+/// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
+///
+/// **1 is equal**, which is the opposite of [`strcmp`] and the reason this
+/// family is worth reading twice. See
+/// [`strings::sameas`](crate::strings::sameas).
+pub fn sameas(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let b = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::sameas(&a, b).into()))
+}
+
+/// `int sameto(char *shorts,char *longs)` -- a prefix test, short one first.
+pub fn sameto(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let longs = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::sameto(&shorts, longs).into()))
+}
+
+/// `int samein(char *shorts,char *longs)` -- a substring test, short one first.
+pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let longs = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
+}
+
+/// `char *lastwd(char *string)` -- the last word, in the caller's own buffer.
+///
+/// See [`strings::lastwd`](crate::strings::lastwd). It writes nothing, and the
+/// selector it answers is the one that arrived.
+pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let n = crate::strings::lastwd(machine.read_cstr(s)?) as u16;
+    Ok(Ret::Far(at(s, n)))
+}
+
+/// `void sortstgs(char *stgs[],int num)` -- sort an array of `char *` in place.
+///
+/// `num` is a signed `int` and the original's `gap = num / 2` is tested with a
+/// signed compare, so **anything below two returns before the array is read**.
+/// That is why a `num` of zero with a null array is not an error here either --
+/// the real one never dereferences it.
+///
+/// The pointers move; the strings do not. See
+/// [`strings::sortstgs`](crate::strings::sortstgs) for why the sort is
+/// transcribed rather than delegated.
+pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let array = machine.arg_far(0);
+    let num = machine.arg_u16(2) as i16;
+    if num < 2 {
+        return Ok(Ret::Void);
+    }
+    let num = usize::from(num as u16);
+
+    let slots = machine.resolve(array, num * 4)?.to_vec();
+    let mut items: Vec<(FarPtr, Vec<u8>)> = Vec::with_capacity(num);
+    for slot in slots.chunks_exact(4) {
+        let ptr = FarPtr::from_bytes([slot[0], slot[1], slot[2], slot[3]]);
+        items.push((ptr, machine.read_cstr(ptr)?.to_vec()));
+    }
+    crate::strings::sortstgs(&mut items, |a, b| crate::strings::strcmp(&a.1, &b.1));
+
+    let out: Vec<u8> = items.iter().flat_map(|(ptr, _)| ptr.to_bytes()).collect();
+    machine.write(array, &out)?;
+    Ok(Ret::Void)
+}
+
+/// `char *strtok(char *s,char *delim)` -- the next token, destructively.
+///
+/// Ordinal 585, `seg 1:0x24f4`. Three things worth naming:
+///
+/// * **The state is the host's.** A non-null `s` sets it, a null `s` continues
+///   from it, and nothing the module can address holds it. See
+///   [`Host::strtok`].
+/// * **It writes into the caller's string**, putting a terminator over the
+///   delimiter that ended each token. What it answers is a pointer into that
+///   same buffer.
+/// * **A run of delimiters is one gap**, because the leading-delimiter skip and
+///   the token scan are separate loops; a string of nothing else answers
+///   `NULL`.
+///
+/// The original walks a byte at a time through `les bx,[0x18a8]`. Reading the
+/// remainder once with [`Machine::read_cstr`] is the same bytes and one bounds
+/// check -- and it is what turns a cursor left dangling by a `galfree` into
+/// [`ShimError::BadPointer`] rather than a token made of rubbish.
+pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let delims = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    if s != FarPtr::NULL {
+        host.strtok = s;
+    }
+
+    let cursor = host.strtok;
+    let rest = machine.read_cstr(cursor)?;
+    let Some(start) = rest.iter().position(|b| !delims.contains(b)) else {
+        // Nothing but delimiters. The cursor ends on the terminator, so every
+        // later call answers NULL too.
+        host.strtok = at(cursor, rest.len() as u16);
+        return Ok(Ret::Far(FarPtr::NULL));
+    };
+    let token_len = rest[start..].len();
+    let ends_at = rest[start..].iter().position(|b| delims.contains(b));
+
+    let token = at(cursor, start as u16);
+    match ends_at {
+        Some(n) => {
+            let end = at(token, n as u16);
+            machine.write(end, &[0])?;
+            host.strtok = at(end, 1);
+        }
+        None => host.strtok = at(token, token_len as u16),
+    }
+    Ok(Ret::Far(token))
+}
+
+/// `char *strchr(char *s,int c)`.
+///
+/// Ordinal 572, `seg 1:0xcf62`. Two things the prototype hides. `c` arrives as
+/// an `int` and is compared as `mov bl,[bp+0xa]`, so **only its low byte
+/// counts**. And the scan compares each byte *before* it tests for the end
+/// (`lodsb / cmp al,bl / jz ... / and al,al / jnz`), so `strchr(s, 0)` answers
+/// a pointer to the terminator rather than `NULL`.
+pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let want = machine.arg_u16(2) as u8;
+    let text = machine.read_cstr(s)?;
+
+    if want == 0 {
+        return Ok(Ret::Far(at(s, text.len() as u16)));
+    }
+    Ok(match text.iter().position(|&b| b == want) {
+        Some(i) => Ret::Far(at(s, i as u16)),
+        None => Ret::Far(FarPtr::NULL),
+    })
+}
+
+/// `char *strstr(char *hay,char *needle)`.
+///
+/// Ordinal 584, `seg 1:0x2896`. **An empty needle answers the haystack** --
+/// the routine's first instruction after the frame is `cmp byte [es:bx],0` on
+/// the needle, and the path it takes returns `hay` **without reading it**, so
+/// the check comes before the haystack does here too. A needle that is not
+/// there answers `NULL`.
+pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let hay = machine.arg_far(0);
+    let needle = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    if needle.is_empty() {
+        return Ok(Ret::Far(hay));
+    }
+    let text = machine.read_cstr(hay)?;
+
+    if needle.len() > text.len() {
+        return Ok(Ret::Far(FarPtr::NULL));
+    }
+    let found = (0..=text.len() - needle.len()).find(|&i| text[i..].starts_with(&needle));
+    Ok(match found {
+        Some(i) => Ret::Far(at(hay, i as u16)),
+        None => Ret::Far(FarPtr::NULL),
+    })
+}
+
+/// `char *strcat(char *dst,char *src)`.
+///
+/// Ordinal 571, `seg 1:0x26d0`. How much room `dst` has, only the caller knows,
+/// so the bound is the segment's -- the same limit [`fill`] applies to
+/// `sprintf`, and for the same reason.
+pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let end = machine.read_cstr(dst)?.len() as u16;
+    let text = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    fill(machine, at(dst, end), &text)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `char *strncat(char *dst,char *src,int maxlen)`.
+///
+/// Ordinal 580, `seg 1:0x236a`: `strlen`, `strlen`, clamp to `maxlen`, `movmem`,
+/// then a terminator the routine writes itself at `dst[dstlen + n]`. So at most
+/// `maxlen + 1` bytes land past the end of `dst` and -- unlike [`strncpy`] --
+/// the result is always terminated.
+pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let end = machine.read_cstr(dst)?.len() as u16;
+    let max = usize::from(machine.arg_u16(4));
+    let text = machine.read_cstr(machine.arg_far(2))?;
+    let text = text[..text.len().min(max)].to_vec();
+    fill(machine, at(dst, end), &text)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `char *strncpy(char *dst,char *src,unsigned n)`.
+///
+/// Ordinal 582, `seg 1:0x2815`, and **not** [`stzcpy`] -- which is
+/// Galacticomm's answer to this routine's one flaw. `strncpy` copies at most
+/// `n` bytes and pads the rest of `n` with NUL, so a source of `n` characters
+/// or more leaves the destination **unterminated**. Exactly `n` bytes are
+/// written every time, which is what makes the bound checkable at all.
+///
+/// **The source need not be terminated.** `repne scasb` is issued with
+/// `cx = n`, so the scan reads at most `n` bytes and stops; a blank-padded
+/// fixed-width field with no NUL in it is precisely what this routine is for,
+/// and refusing one would stop a module the real host served.
+pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let n = usize::from(machine.arg_u16(4));
+    if n == 0 {
+        // All three `rep` prefixes are no-ops, so the original dereferences
+        // neither pointer. Same reason `stzcpy` returns early on a zero.
+        return Ok(Ret::Far(dst));
+    }
+
+    // What the scan could touch. `n` bytes if they are all inside the segment;
+    // otherwise the original only got away with it because a terminator
+    // stopped it first, and `read_cstr` is the reader that insists on one.
+    let src = machine.arg_far(2);
+    let text = match machine.resolve(src, n) {
+        Ok(bytes) => bytes,
+        Err(_) => machine.read_cstr(src)?,
+    };
+    let take = text
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(text.len())
+        .min(n);
+
+    let mut out = vec![0u8; n];
+    out[..take].copy_from_slice(&text[..take]);
+    machine.write(dst, &out)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `int strcmp(char *s1,char *s2)` -- **0 is equal**, unlike [`sameas`].
+///
+/// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
+/// byte difference, not a sign, and MajorMUD's 48 sites test it both ways.
+pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let b = machine.read_cstr(machine.arg_far(2))?;
+    Ok(Ret::U16(crate::strings::strcmp(&a, b) as u16))
+}
+
+/// `int toupper(int c)`.
+///
+/// **Not a macro here.** Borland's macro is `_toupper`; `toupper` is a real
+/// routine in the runtime, which is why `WCCMMUD.DLL` has 530 *call sites* for
+/// ordinal 604 rather than 530 inlined subtractions.
+///
+/// Two things the prototype does not say, both read off `seg 1:0x54a9`. `-1` is
+/// compared *before* the ctype table is indexed and returned unchanged, so EOF
+/// survives as a full word. Everything else is `mov al,cl; mov ah,0` -- cut to
+/// its low byte and zero-extended back -- so `toupper(0x161)` is `toupper('a')`
+/// and answers `0x41`, not `0x141`.
+pub fn toupper(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::toupper)))
+}
+
+/// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
+/// `sameto` and `samein` fold with.
+pub fn tolower(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::tolower)))
+}
+
+/// The `int` wrapper both case-folding routines share: EOF through untouched,
+/// everything else truncated to a byte and zero-extended back.
+fn fold(c: u16, by: fn(u8) -> u8) -> u16 {
+    /// What `cmp cx,0xffff` compares against, and the one argument that is not
+    /// truncated.
+    const EOF: u16 = -1i16 as u16;
+
+    if c == EOF {
+        EOF
+    } else {
+        u16::from(by(c as u8))
+    }
+}
+
 /// Put `text` and its terminator where a caller's `char *` points.
 ///
 /// How big the buffer is, only the caller knows -- `sprintf` and `vsprintf` are
@@ -312,6 +581,26 @@ fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError>
     bytes.push(0);
     machine.write(at, &bytes)?;
     Ok(())
+}
+
+/// A pointer `n` bytes into the string `ptr` names.
+///
+/// The one piece of arithmetic every routine here that answers a `char *` does,
+/// and the reason it does not need checking: **`ptr.offset + n` never passes
+/// the terminator of a string that has already been read**. A successful
+/// [`Machine::read_cstr`] puts that terminator inside the segment, a segment is
+/// at most 64 KiB, and so the sum is at most `0xffff`. That covers `n` taken
+/// from a string's length and equally the
+/// `at(end, 1)` in [`strtok`], where `end` is a delimiter -- strictly before
+/// the terminator, so one past it still is not past.
+///
+/// The selector is the caller's own. Rebuilding it from anywhere else would
+/// hand the module an address into the wrong segment.
+fn at(ptr: FarPtr, n: u16) -> FarPtr {
+    FarPtr {
+        offset: ptr.offset + n,
+        selector: ptr.selector,
+    }
 }
 
 /// Write `text` and its terminator at `at`, refusing to exceed `capacity`.
@@ -337,6 +626,648 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn lastwd_answers_a_pointer_into_the_callers_own_string() {
+        let mut f = Fixture::new();
+        let s = f.text("SHORT MESSAGES LONG");
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+            panic!("lastwd returns char *");
+        };
+        assert_eq!(p.selector, s.selector);
+        assert_eq!(f.read(p), "LONG");
+        assert_eq!(f.read(s), "SHORT MESSAGES LONG", "and changes nothing");
+    }
+
+    #[test]
+    fn lastwd_leaves_the_trailing_padding_where_it_found_it() {
+        let mut f = Fixture::new();
+        let s = f.text("go north  ");
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "north  ", "skipped, not stripped");
+    }
+
+    #[test]
+    fn sortstgs_rewrites_the_array_of_pointers_in_place() {
+        let mut f = Fixture::new();
+        let pear = f.text("pear");
+        let apple = f.text("apple");
+        let fig = f.text("fig");
+        let array = f.words(&[
+            pear.offset,
+            pear.selector,
+            apple.offset,
+            apple.selector,
+            fig.offset,
+            fig.selector,
+        ]);
+
+        assert!(matches!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 3]),
+            Ok(Ret::Void)
+        ));
+        let bytes = f.machine.resolve(array, 12).expect("readable").to_vec();
+        let got: Vec<FarPtr> = bytes
+            .chunks_exact(4)
+            .map(|c| FarPtr::from_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![apple, fig, pear],
+            "the pointers moved, not the text"
+        );
+    }
+
+    #[test]
+    fn sortstgs_of_fewer_than_two_reads_nothing_at_all() {
+        // `gap = num/2` under a signed compare, so 1, 0 and any negative return
+        // before the array is touched. That is why a null array is not an
+        // error here -- the real one never dereferences it either.
+        let mut f = Fixture::new();
+        for num in [0u16, 1, (-4i16) as u16] {
+            assert!(matches!(f.invoke(sortstgs, &[0, 0, num]), Ok(Ret::Void)));
+        }
+    }
+
+    #[test]
+    fn sortstgs_refuses_a_slot_that_names_nothing() {
+        // The array itself is readable and one of the strings in it is not.
+        // Sorting by a comparison the host cannot make is exactly the
+        // plausible answer this crate refuses.
+        let mut f = Fixture::new();
+        let one = f.text("only");
+        let array = f.words(&[one.offset, one.selector, 0, 0]);
+        assert!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 2])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sortstgs_refuses_an_array_that_leaves_its_segment() {
+        let mut f = Fixture::new();
+        let one = f.text("only");
+        let array = f.words(&[one.offset, one.selector]);
+        // Two pointers named, one present, and the rest of the segment is not
+        // the module's to claim.
+        assert!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 900])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn strtok_walks_a_line_and_then_says_there_is_no_more() {
+        // The state is the host's -- `MAJORBBS.EXE` keeps one far pointer at
+        // `DGROUP:0x18a8` and no module can see it -- so the later calls pass
+        // NULL and the host has to remember where it got to.
+        let mut f = Fixture::new();
+        let line = f.text("go  north now");
+        let delim = f.text(" ");
+        let first = [line.offset, line.selector, delim.offset, delim.selector];
+        let again = [0, 0, delim.offset, delim.selector];
+
+        let Ret::Far(one) = f.invoke(strtok, &first).expect("ok") else {
+            panic!("strtok returns char *");
+        };
+        assert_eq!(f.read(one), "go");
+
+        let Ret::Far(two) = f.invoke(strtok, &again).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(two), "north", "a run of two spaces is one gap");
+
+        let Ret::Far(three) = f.invoke(strtok, &again).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(three), "now");
+
+        assert_eq!(
+            f.invoke(strtok, &again).expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+        assert_eq!(
+            f.invoke(strtok, &again).expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "and it stays exhausted"
+        );
+    }
+
+    #[test]
+    fn strtok_writes_a_terminator_over_the_delimiter_it_consumed() {
+        // It is destructive, and the module depends on that: the token it
+        // answers is a pointer into the caller's own buffer, terminated in
+        // place by `mov byte [es:bx],0x0`.
+        let mut f = Fixture::new();
+        let line = f.text("a,b");
+        let delim = f.text(",");
+
+        f.invoke(
+            strtok,
+            &[line.offset, line.selector, delim.offset, delim.selector],
+        )
+        .expect("ok");
+        assert_eq!(
+            f.machine.resolve(line, 4).expect("readable"),
+            b"a\0b\0",
+            "the comma became a terminator"
+        );
+    }
+
+    #[test]
+    fn strtok_of_nothing_but_delimiters_answers_null() {
+        let mut f = Fixture::new();
+        let line = f.text(",,,");
+        let delim = f.text(",");
+        assert_eq!(
+            f.invoke(
+                strtok,
+                &[line.offset, line.selector, delim.offset, delim.selector]
+            )
+            .expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
+    fn strtok_restarts_when_it_is_given_a_string() {
+        let mut f = Fixture::new();
+        let first = f.text("a b");
+        let second = f.text("c d");
+        let delim = f.text(" ");
+
+        f.invoke(
+            strtok,
+            &[first.offset, first.selector, delim.offset, delim.selector],
+        )
+        .expect("ok");
+        let Ret::Far(p) = f
+            .invoke(
+                strtok,
+                &[second.offset, second.selector, delim.offset, delim.selector],
+            )
+            .expect("ok")
+        else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "c", "a non-null string replaces the cursor");
+    }
+
+    #[test]
+    fn strtok_with_no_delimiters_answers_the_whole_string() {
+        // The delimiter walk is `while (*p != 0)`, so an empty set exits at
+        // once and nothing is ever a delimiter: one token, the whole line.
+        let mut f = Fixture::new();
+        let line = f.text("go north");
+        let empty = f.text("");
+        let Ret::Far(p) = f
+            .invoke(
+                strtok,
+                &[line.offset, line.selector, empty.offset, empty.selector],
+            )
+            .expect("ok")
+        else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "go north");
+        assert_eq!(
+            f.invoke(strtok, &[0, 0, empty.offset, empty.selector])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "and then there is no more"
+        );
+    }
+
+    #[test]
+    fn strtok_with_no_previous_call_refuses_rather_than_inventing_a_token() {
+        // The real one reads through whatever `DGROUP:0x18a8` happens to hold.
+        // Here that starts null, and a pointer naming nothing is an error.
+        let mut f = Fixture::new();
+        let delim = f.text(" ");
+        assert!(
+            f.invoke(strtok, &[0, 0, delim.offset, delim.selector])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn strchr_finds_a_byte_or_answers_null() {
+        let mut f = Fixture::new();
+        let s = f.text("go north");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'n')])
+                .expect("ok"),
+            Ret::Far(at(s, 3))
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'z')])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "absent is NULL, not the terminator"
+        );
+    }
+
+    #[test]
+    fn strchr_of_nul_answers_the_terminator_and_ignores_the_high_byte() {
+        // `mov bl,[bp+0xa]` -- only the low byte of the `int` is compared --
+        // and the scan tests each byte before it checks for the end, so
+        // searching for `\0` finds it rather than failing.
+        let mut f = Fixture::new();
+        let s = f.text("abc");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
+            Ret::Far(at(s, 3))
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0xff62])
+                .expect("ok"),
+            Ret::Far(at(s, 1)),
+            "0xff62 is searched for as 'b'"
+        );
+    }
+
+    #[test]
+    fn strstr_finds_a_run_and_an_empty_needle_finds_the_start() {
+        let mut f = Fixture::new();
+        let hay = f.text("go north now");
+        let needle = f.text("north");
+        let empty = f.text("");
+        let missing = f.text("south");
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, needle)).expect("ok"),
+            Ret::Far(at(hay, 3))
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, empty)).expect("ok"),
+            Ret::Far(hay),
+            "the routine's first test is on the needle"
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(hay, missing)).expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+        assert_eq!(
+            f.invoke(strstr, &pair(needle, hay)).expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "a needle longer than the haystack"
+        );
+    }
+
+    #[test]
+    fn strcat_appends_and_returns_the_destination() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector];
+        assert_eq!(f.invoke(strcat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "go north");
+    }
+
+    #[test]
+    fn strncpy_pads_to_n_and_does_not_terminate_a_full_buffer() {
+        // The difference from `stzcpy`, which is Galacticomm's answer to this
+        // routine: `stzcpy` always terminates and `strncpy` does not.
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let src = f.text("abcdefgh");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
+
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("readable"),
+            b"abcd####",
+            "four copied, no terminator, and the rest of the buffer untouched"
+        );
+    }
+
+    #[test]
+    fn strncpy_fills_the_whole_of_n_when_the_source_is_shorter() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let src = f.text("ab");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 6];
+
+        f.invoke(strncpy, &args).expect("ok");
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("readable"),
+            b"ab\0\0\0\0##",
+            "six bytes written, the last four of them NUL"
+        );
+    }
+
+    #[test]
+    fn strncpy_does_not_require_the_source_to_be_terminated() {
+        // `repne scasb` with `cx = n` reads **at most n bytes**. A source with
+        // no terminator in it is the case this routine exists for -- a
+        // blank-padded fixed-width field -- and refusing one would stop a
+        // module the real host served.
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let scratch = dst.selector;
+
+        // Six non-zero bytes hard against the end of a 4,096-byte segment, so
+        // there is no terminator between the source and the end of what it
+        // names.
+        let src = FarPtr {
+            offset: 4090,
+            selector: scratch,
+        };
+        f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.machine.resolve(dst, 8).expect("readable"), b"xxxx####");
+    }
+
+    #[test]
+    fn strncpy_of_nothing_touches_neither_pointer() {
+        // `rep` with `cx = 0` is a no-op three times over, so the original
+        // dereferences nothing at all -- the same reason `stzcpy` returns
+        // early on a `num` of zero.
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.invoke(strncpy, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
+    fn strncpy_still_refuses_a_source_it_would_have_to_read_past() {
+        // The other half of the same rule: the scan is bounded by `n`, so an
+        // `n` that reaches past the end of the source's segment with no
+        // terminator in the way is a read the original could not have made
+        // either.
+        let mut f = Fixture::new();
+        let dst = f.buffer(64);
+        let src = FarPtr {
+            offset: 4090,
+            selector: dst.selector,
+        };
+        f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
+        assert!(
+            f.invoke(
+                strncpy,
+                &[dst.offset, dst.selector, src.offset, src.selector, 32]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strncat_clamps_the_source_and_terminates_it_itself() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("northwards");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
+        assert_eq!(f.invoke(strncat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "go north", "five of the source, then a NUL");
+    }
+
+    #[test]
+    fn strncat_clamps_unsigned_despite_its_int_prototype() {
+        // The clamp is `cmp ax,[bp+0xe] / jna` -- an UNSIGNED compare, though
+        // `GCOMM.H` calls the argument an `int`. Reading it signed would make
+        // a large `maxlen` negative and clamp the copy to nothing.
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 0x8000];
+        f.invoke(strncat, &args).expect("ok");
+        assert_eq!(f.read(dst), "go north", "0x8000 is 32,768, not -32,768");
+    }
+
+    #[test]
+    fn strncat_of_nothing_writes_only_a_terminator_already_there() {
+        // `maxlen` of zero copies nothing, and the terminator the routine
+        // writes itself goes at `dst[dstlen + n]` -- which with `n` of zero is
+        // the terminator `dst` already had. So nothing past the string moves,
+        // and in particular the byte *after* it is not cleared.
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"go \0##", false);
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
+        f.invoke(strncat, &args).expect("ok");
+        assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"go \0##");
+    }
+
+    #[test]
+    fn strchr_on_an_empty_string_finds_only_its_terminator() {
+        let mut f = Fixture::new();
+        let s = f.text("");
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
+            Ret::Far(s),
+            "the terminator is at offset zero"
+        );
+        assert_eq!(
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'a')])
+                .expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
+    fn the_writers_refuse_to_run_off_the_end_of_a_segment() {
+        // How much room a destination has, only the caller knows -- so the
+        // only bound the host can apply is the segment's, and it must be an
+        // error rather than a truncated copy or a wrapped offset.
+        let mut f = Fixture::new();
+        let src = f.text("overlong");
+        let scratch = src.selector;
+        let near_end = FarPtr {
+            offset: 4090,
+            selector: scratch,
+        };
+        f.machine.write(near_end, b"go\0").expect("still inside");
+
+        assert!(
+            f.invoke(
+                strncpy,
+                &[
+                    near_end.offset,
+                    near_end.selector,
+                    src.offset,
+                    src.selector,
+                    100
+                ]
+            )
+            .is_err(),
+            "100 bytes at 4090 leaves a 4096-byte segment"
+        );
+        assert!(
+            f.invoke(
+                strcat,
+                &[near_end.offset, near_end.selector, src.offset, src.selector]
+            )
+            .is_err(),
+            "and so does `go` plus `overlong`"
+        );
+        assert!(
+            f.invoke(
+                strncat,
+                &[
+                    near_end.offset,
+                    near_end.selector,
+                    src.offset,
+                    src.selector,
+                    100
+                ]
+            )
+            .is_err(),
+            "and so does appending a clamped copy of it"
+        );
+    }
+
+    #[test]
+    fn strcmp_returns_the_difference_and_zero_for_equal() {
+        let mut f = Fixture::new();
+        let short = f.text("kobold");
+        let long = f.text("koboldy");
+        let same = f.text("kobold");
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+
+        assert_eq!(
+            f.invoke(strcmp, &pair(short, long)).expect("ok"),
+            Ret::U16((-121i16) as u16),
+            "the terminator against 'y'"
+        );
+        assert_eq!(
+            f.invoke(strcmp, &pair(long, short)).expect("ok"),
+            Ret::U16(121)
+        );
+        assert_eq!(
+            f.invoke(strcmp, &pair(short, same)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn the_same_family_answers_one_for_equal_not_strcmps_zero() {
+        // `sameas` is 1 for equal; `strcmp` is 0 for equal. Returning the
+        // wrong sense compiles, runs, and diverges 500 sites later.
+        let mut f = Fixture::new();
+        let long = f.text("LONG");
+        let lower = f.text("long");
+        let longer = f.text("longer");
+
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+        assert_eq!(
+            f.invoke(sameas, &pair(long, lower)).expect("ok"),
+            Ret::U16(1)
+        );
+        assert_eq!(
+            f.invoke(sameas, &pair(long, longer)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn sameto_takes_the_prefix_first_and_samein_takes_the_needle_first() {
+        let mut f = Fixture::new();
+        let long = f.text("long");
+        let longer = f.text("longer");
+        let ong = f.text("ONG");
+
+        let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
+        assert_eq!(
+            f.invoke(sameto, &pair(long, longer)).expect("ok"),
+            Ret::U16(1),
+            "sameto(shorts, longs): `longer` begins with `long`"
+        );
+        assert_eq!(
+            f.invoke(sameto, &pair(longer, long)).expect("ok"),
+            Ret::U16(0),
+            "and not the other way round"
+        );
+        assert_eq!(
+            f.invoke(samein, &pair(ong, longer)).expect("ok"),
+            Ret::U16(1),
+            "samein(shorts, longs): `ONG` is inside `longer`"
+        );
+        assert_eq!(
+            f.invoke(samein, &pair(longer, ong)).expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn the_same_family_refuses_a_pointer_naming_nothing() {
+        let mut f = Fixture::new();
+        let s = f.text("x");
+        for shim in [sameas, sameto, samein] {
+            assert!(f.invoke(shim, &[s.offset, s.selector, 0, 0]).is_err());
+            assert!(f.invoke(shim, &[0, 0, s.offset, s.selector]).is_err());
+        }
+    }
+
+    #[test]
+    fn toupper_folds_a_letter_and_leaves_everything_else() {
+        let mut f = Fixture::new();
+        for (input, want) in [
+            (u16::from(b'a'), u16::from(b'A')),
+            (u16::from(b'A'), u16::from(b'A')),
+            (u16::from(b'7'), u16::from(b'7')),
+            (0, 0),
+        ] {
+            assert_eq!(f.invoke(toupper, &[input]).expect("folded"), Ret::U16(want));
+        }
+        assert_eq!(
+            f.invoke(tolower, &[u16::from(b'Z')]).expect("folded"),
+            Ret::U16(u16::from(b'z'))
+        );
+    }
+
+    #[test]
+    fn toupper_passes_eof_through_and_truncates_everything_else() {
+        // `cmp cx,0xffff` happens before the table is indexed, so EOF is the
+        // one argument that survives as a full word. Every other `int` is cut
+        // to its low byte: `toupper(0x161)` is `toupper('a')`.
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(toupper, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(tolower, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(toupper, &[0x161]).expect("cut"), Ret::U16(0x41));
+        assert_eq!(f.invoke(tolower, &[0xff41]).expect("cut"), Ret::U16(0x61));
+    }
+
+    #[test]
+    fn case_folding_agrees_with_the_ctype_table_the_host_placed() {
+        // Two sources of case-folding is a bug waiting to happen. The module
+        // indexes `_ctype` itself -- it imports it as the `__CTYPE` datum --
+        // and the real `toupper` reads that same table. This sweeps all 256
+        // bytes and asserts the transcription and the placed bytes agree, so
+        // that a change to either is caught here rather than 500 sites later.
+        let f = Fixture::new();
+        let at = f
+            .host
+            .globals()
+            .address("_ctype")
+            .expect("_ctype is placed");
+        let table = f.machine.resolve(at, 257).expect("257 bytes").to_vec();
+        for c in 0..=255u8 {
+            let bits = table[usize::from(c) + 1];
+            assert_eq!(
+                bits & 0x08 != 0,
+                crate::strings::toupper(c) != c,
+                "_IS_LOW disagrees about {c:#04x}"
+            );
+            assert_eq!(
+                bits & 0x04 != 0,
+                crate::strings::tolower(c) != c,
+                "_IS_UPP disagrees about {c:#04x}"
+            );
+        }
+    }
 
     #[test]
     fn stzcpy_truncates_and_always_terminates() {

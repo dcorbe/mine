@@ -3,9 +3,16 @@
 //! **These have no surviving C source.** `GCOMM.H` declares them and no `.C`
 //! file in `archive/` defines them, so unlike `genrdn` -- which is a
 //! translation of `BBSUTILS.C:49` -- every routine here was read off the
-//! instructions of `MAJORBBS-wg200.EXE`, the Worldgroup host that matches
-//! MajorMUD 1.11p. `python3 re/ne_exports.py re/hosts/MAJORBBS-wg200.EXE
-//! rmvwht skpwht skpwrd depad` prints what they were transcribed from.
+//! instructions of the Worldgroup host. `python3 re/ne_exports.py
+//! re/hosts/MAJORBBS-wg101.EXE rmvwht skpwht skpwrd depad sameas sameto samein
+//! lastwd sortstgs` prints what they were transcribed from.
+//!
+//! **Which host binary hardly matters.** Every routine transcribed here is
+//! byte-for-byte identical in `MAJORBBS-wg101.EXE` and `MAJORBBS-wg200.EXE` --
+//! checked by extracting each one's bytes from both files and comparing, not
+//! assumed. The target is Worldgroup 1.01, so the citations below name wg101;
+//! the four routines that predate this file were read from wg200 and are the
+//! same instructions.
 //!
 //! # The one distinction the names hide
 //!
@@ -37,6 +44,162 @@
 /// with the high bit set, which matters because MajorMUD's text is full of both.
 pub fn is_white(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// `int toupper(int c)`, for the byte the host actually indexes with.
+///
+/// Ordinal 604, `seg 1:0x54a9`. The original tests **bit 3 of the ctype table**
+/// -- `test byte [es:bx+0x1a09],0x8`, Borland's `_IS_LOW` -- and subtracts 32
+/// when it is set. Nothing above 127 carries a flag in that table, so **only
+/// the 26 ASCII lowercase letters fold** and MajorMUD's high-bit text passes
+/// through untouched.
+///
+/// The `int`-level behaviour -- EOF, and the truncation of everything else to
+/// a byte -- is [`crate::shims::text::toupper`]'s, because it is the `int` that
+/// the argument arrives as and this is the byte the table is indexed with.
+pub fn toupper(c: u8) -> u8 {
+    if c.is_ascii_lowercase() { c - 32 } else { c }
+}
+
+/// `int tolower(int c)` -- ordinal 603, `seg 1:0x5473`, and [`toupper`]'s
+/// mirror instruction for instruction: bit 2 (`_IS_UPP`), plus 32.
+///
+/// This is the routine `sameas`, `sameto` and `samein` fold with -- their
+/// relocation records resolve to ordinal 603, not 604.
+pub fn tolower(c: u8) -> u8 {
+    if c.is_ascii_uppercase() { c + 32 } else { c }
+}
+
+/// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
+///
+/// Ordinal 520, `seg 35:0x1da2`, and **the opposite sense from `strcmp`**: 1
+/// means equal, 0 means different. The original walks both strings folding each
+/// byte with [`tolower`] -- the relocation at `seg 35:0x1db9` resolves to
+/// ordinal 603, not 604 -- and when `stg1` reaches its terminator it answers
+/// whether `stg2` reached its own at the same moment.
+pub fn sameas(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && folded_prefix(a, b)
+}
+
+/// `int sameto(char *shorts,char *longs)` -- does `longs` **begin with**
+/// `shorts`, ignoring case.
+///
+/// Ordinal 522, `seg 35:0x1ec4`. [`sameas`]'s loop with one line removed: when
+/// `shorts` runs out it answers 1 without looking at what is left of `longs`.
+///
+/// **The short one is the first argument.** `GCOMM.H:324` names them that way
+/// and `CSREGIS.C:134` uses them that way -- `sameto("sau:inf ",dpkstg)`.
+pub fn sameto(shorts: &[u8], longs: &[u8]) -> bool {
+    shorts.len() <= longs.len() && folded_prefix(shorts, &longs[..shorts.len()])
+}
+
+/// `int samein(char *shorts,char *longs)` -- does `shorts` occur **anywhere in**
+/// `longs`, ignoring case.
+///
+/// Ordinal 521, `seg 35:0x1dfb`, and built out of [`sameto`] rather than out of
+/// a scan: it calls it at each of `strlen(longs) - strlen(shorts) + 1` offsets.
+/// That count is held in a local and compared **signed** (`jl`), so a `shorts`
+/// longer than `longs` answers 0 without reading a byte -- unsigned, it would
+/// have wrapped and walked most of a segment.
+pub fn samein(shorts: &[u8], longs: &[u8]) -> bool {
+    longs.len() >= shorts.len()
+        && (0..=longs.len() - shorts.len()).any(|i| sameto(shorts, &longs[i..]))
+}
+
+/// `int strcmp(char *s1,char *s2)`.
+///
+/// Ordinal 573, `seg 1:0x2714`. Borland's is `repe cmpsb` over `strlen(s2) + 1`
+/// bytes -- the terminator included, which is what makes a prefix compare
+/// against the byte that follows it -- and then `sub ax,bx` with **both high
+/// bytes cleared**. So the answer is the *unsigned* byte difference at the
+/// first mismatch, somewhere in -255..255, and not merely a sign.
+///
+/// `a` and `b` are the strings without their terminators, which is why the loop
+/// runs one position past `b`.
+pub fn strcmp(a: &[u8], b: &[u8]) -> i16 {
+    for i in 0..=b.len() {
+        // Past the end of either is its terminator, and the loop stops at the
+        // first difference -- so at most one step past the shorter one.
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        if x != y {
+            return i16::from(x) - i16::from(y);
+        }
+    }
+    0
+}
+
+/// `char *lastwd(char *string)` -- how far to the start of the last word.
+///
+/// Ordinal 381, `seg 34:0x12fd`. Two backward walks from the last character:
+/// over the trailing whitespace, then over the word itself. Each stops dead at
+/// the start of the string and answers it, which is what makes an empty string,
+/// an all-whitespace string and a single word all answer offset zero.
+///
+/// **Nothing is written.** The trailing whitespace is skipped over, not
+/// removed -- `lastwd("go north  ")` answers `"north  "` -- and `depad` is the
+/// routine that truncates.
+///
+/// The whitespace set is [`is_white`], `_ctype` bit 0, the same set `rmvwht`
+/// and `depad` test and not the literal `0x20` that `skpwht` does.
+pub fn lastwd(s: &[u8]) -> usize {
+    let Some(mut p) = s.len().checked_sub(1) else {
+        return 0;
+    };
+    while is_white(s[p]) {
+        if p == 0 {
+            return 0;
+        }
+        p -= 1;
+    }
+    while !is_white(s[p]) {
+        if p == 0 {
+            return 0;
+        }
+        p -= 1;
+    }
+    p + 1
+}
+
+/// `void sortstgs(char *stgs[],int num)` -- the shell sort itself.
+///
+/// Ordinal 558, `seg 36:0x096d`, transcribed rather than handed to
+/// [`slice::sort_by`]: a shell sort is not stable, so which of two equal
+/// strings ends up where is observable, and only the original's own gap
+/// sequence answers that the same way.
+///
+/// The comparison is a far call whose relocation resolves to `seg 1:0x2714` =
+/// [`strcmp`], so the order is **case-sensitive** and by unsigned byte.
+///
+/// A `num` below two makes `gap` zero and the original returns having read
+/// nothing; the caller refuses those before it reads the array at all, so the
+/// loop here is only what remains once `gap` is known positive.
+pub fn sortstgs<T>(items: &mut [T], mut cmp: impl FnMut(&T, &T) -> i16) {
+    let mut gap = items.len() / 2;
+    while gap > 0 {
+        for i in gap..items.len() {
+            let mut j = i - gap;
+            // The original breaks out of the whole `j` loop the moment a pair
+            // is already in order -- `jng` past the swap -- rather than merely
+            // stopping this comparison.
+            while cmp(&items[j], &items[j + gap]) > 0 {
+                items.swap(j, j + gap);
+                match j.checked_sub(gap) {
+                    Some(next) => j = next,
+                    None => break,
+                }
+            }
+        }
+        gap /= 2;
+    }
+}
+
+/// Whether two equal-length runs match once [`tolower`] has folded each byte.
+///
+/// The one loop `sameas` and `sameto` share; they differ only in what happens
+/// when it runs out.
+fn folded_prefix(a: &[u8], b: &[u8]) -> bool {
+    a.iter().zip(b).all(|(&x, &y)| tolower(x) == tolower(y))
 }
 
 /// `void rmvwht(char *string)` -- remove **every** whitespace character.
@@ -84,6 +247,159 @@ pub fn depad(s: &[u8]) -> (usize, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_folding_covers_the_ascii_letters_and_nothing_else() {
+        // `_ctype` carries `_IS_LOW` and `_IS_UPP` on the 26 ASCII letters and
+        // on nothing at all above 127. MajorMUD's text is full of high-bit
+        // bytes and not one of them folds.
+        let folded: Vec<u8> = (0..=255u8).filter(|&c| toupper(c) != c).collect();
+        assert_eq!(folded, (b'a'..=b'z').collect::<Vec<u8>>());
+
+        let folded: Vec<u8> = (0..=255u8).filter(|&c| tolower(c) != c).collect();
+        assert_eq!(folded, (b'A'..=b'Z').collect::<Vec<u8>>());
+
+        assert_eq!(toupper(b'a'), b'A');
+        assert_eq!(tolower(b'A'), b'a');
+        assert_eq!(toupper(0xe9), 0xe9, "an accented byte is not a letter here");
+    }
+
+    #[test]
+    fn sameas_is_whole_string_and_case_blind() {
+        assert!(sameas(b"LONG", b"long"));
+        assert!(sameas(b"", b""));
+        assert!(!sameas(b"long", b"longer"), "not a prefix test");
+        assert!(!sameas(b"longer", b"long"));
+        assert!(!sameas(b"", b"x"));
+        assert!(!sameas(b"x", b""));
+    }
+
+    #[test]
+    fn sameto_asks_whether_the_long_one_begins_with_the_short_one() {
+        // `GCOMM.H:324` names the arguments `shorts` and `longs` in that
+        // order, and `CSREGIS.C:134` -- `sameto("sau:inf ",dpkstg)` -- puts
+        // the literal prefix on the left. Getting this round the wrong way is
+        // the trap.
+        assert!(sameto(b"sau:inf ", b"sau:inf 1234"));
+        assert!(sameto(b"same", b"SAME"), "an exact match is a prefix");
+        assert!(sameto(b"", b"anything"), "an empty prefix always matches");
+        assert!(sameto(b"", b""));
+        assert!(!sameto(b"sau:inf ", b"sau:"), "longs runs out first");
+        assert!(!sameto(b"x", b""));
+    }
+
+    #[test]
+    fn samein_is_a_substring_test_built_out_of_sameto() {
+        assert!(samein(b"NORTH", b"go north now"));
+        assert!(samein(b"go", b"go north"), "a prefix is a substring");
+        assert!(samein(b"now", b"go north now"), "so is a suffix");
+        assert!(samein(b"", b"anything"));
+        assert!(!samein(b"south", b"go north"));
+
+        // `strlen(longs) - strlen(shorts) + 1` is zero or less under a SIGNED
+        // compare, so the loop never runs. Unsigned it would wrap and read
+        // 65,000-odd offsets past the end.
+        assert!(!samein(b"longer than", b"short"));
+        assert!(!samein(b"x", b""));
+    }
+
+    #[test]
+    fn strcmp_answers_the_byte_difference_and_not_merely_a_sign() {
+        assert_eq!(strcmp(b"abc", b"abc"), 0);
+        assert_eq!(strcmp(b"", b""), 0);
+        assert_eq!(strcmp(b"abc", b"abd"), -1);
+        assert_eq!(strcmp(b"abd", b"abc"), 1);
+        assert_eq!(strcmp(b"ab", b"abc"), -99, "the terminator against 'c'");
+        assert_eq!(strcmp(b"abc", b"ab"), 99);
+        assert_eq!(strcmp(b"", b"a"), -97);
+    }
+
+    #[test]
+    fn strcmp_compares_bytes_unsigned() {
+        // `mov al,[si-1]` with `ah` and `bh` cleared before the `sub`. Read
+        // signed, 0x80 would be negative and this would come out the other way.
+        assert_eq!(strcmp(b"\x80", b"\x01"), 127);
+        assert_eq!(strcmp(b"\x01", b"\x80"), -127);
+        assert_eq!(strcmp(b"\xff", b"\x01"), 254, "the widest it can be");
+    }
+
+    #[test]
+    fn lastwd_finds_the_start_of_the_last_word() {
+        // `MAJORBBS.C:535` is `sameas(lastwd(getmsg(SHORTM)),"LONG")` -- the
+        // last word of a configuration line.
+        assert_eq!(lastwd(b"go north"), 3);
+        assert_eq!(lastwd(b"SHORT MESSAGES LONG"), 15);
+        assert_eq!(lastwd(b"word"), 0, "one word starts at the start");
+        assert_eq!(lastwd(b""), 0);
+        assert_eq!(lastwd(b"   "), 0, "nothing but whitespace");
+    }
+
+    #[test]
+    fn lastwd_skips_the_trailing_whitespace_without_removing_it() {
+        // It writes nothing at all. `depad` is the routine that truncates;
+        // this one answers a pointer and leaves the padding behind it in place.
+        assert_eq!(lastwd(b"go north  "), 3);
+        assert_eq!(lastwd(b"go\tnorth\r\n"), 3, "the whole is_white set");
+    }
+
+    #[test]
+    fn sortstgs_orders_by_strcmp_and_so_is_case_sensitive() {
+        // The comparison is a far call whose relocation resolves to
+        // `seg 1:0x2714` = `strcmp`, not `sameas`. Uppercase sorts first.
+        let mut items: Vec<&[u8]> = vec![b"pear", b"Apple", b"apple"];
+        sortstgs(&mut items, |a, b| strcmp(a, b));
+        assert_eq!(items, vec![&b"Apple"[..], &b"apple"[..], &b"pear"[..]]);
+    }
+
+    #[test]
+    fn sortstgs_moves_equal_strings_the_way_a_shell_sort_does() {
+        // The property that justifies transcribing this instead of calling
+        // `sort_by`, and the only test that can tell the two apart. Four
+        // pointers, three of them to equal strings, so what is observable is
+        // *which* pointer lands where.
+        //
+        // gap 2: cmp(items[1], items[3]) is "b" against "a", so they swap and
+        // `b` travels two places at once -- and equal elements that a stable
+        // sort would have left alone are reordered around it.
+        let mut items = [
+            Tagged(b"a", 'A'),
+            Tagged(b"b", 'B'),
+            Tagged(b"a", 'C'),
+            Tagged(b"a", 'D'),
+        ];
+        sortstgs(&mut items, |x, y| strcmp(x.0, y.0));
+        let order: String = items.iter().map(|t| t.1).collect();
+        assert_eq!(order, "ADCB", "the shell sort's own permutation");
+
+        let mut items = [
+            Tagged(b"a", 'A'),
+            Tagged(b"b", 'B'),
+            Tagged(b"a", 'C'),
+            Tagged(b"a", 'D'),
+        ];
+        items.sort_by(|x, y| strcmp(x.0, y.0).cmp(&0));
+        let stable: String = items.iter().map(|t| t.1).collect();
+        assert_eq!(stable, "ACDB", "which a stable sort does not agree with");
+    }
+
+    /// A string and a label, so a test can see which of two equal strings
+    /// moved. Equality of the *strings* is what the sort compares; the label
+    /// rides along and is never looked at.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Tagged(&'static [u8], char);
+
+    #[test]
+    fn sortstgs_handles_every_size_its_gap_sequence_degenerates_on() {
+        for n in 0..12usize {
+            let reversed: Vec<Vec<u8>> = (0..n).rev().map(|i| vec![b'a' + i as u8]).collect();
+            let mut items: Vec<&[u8]> = reversed.iter().map(Vec::as_slice).collect();
+            sortstgs(&mut items, |a, b| strcmp(a, b));
+
+            let want: Vec<Vec<u8>> = (0..n).map(|i| vec![b'a' + i as u8]).collect();
+            let want: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
+            assert_eq!(items, want, "n = {n}");
+        }
+    }
 
     #[test]
     fn whitespace_is_the_c_isspace_set_and_nothing_else() {
