@@ -13,7 +13,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::fmt::format;
+use crate::fmt::{Args, format};
 use crate::shims::ShimError;
 
 /// Bytes in one of `spr`'s rotating buffers.
@@ -33,7 +33,7 @@ pub const SPR_BUFFERS: usize = 4;
 /// The module keeps the pointer, so the buffer has to outlive the call and the
 /// rotation has to be wide enough that the next few calls do not tread on it.
 pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), 2)?;
+    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
     let at = host.next_spr_buffer();
     write_cstr(machine, at, &text, SPR_BYTES)?;
     Ok(Ret::Far(at))
@@ -46,7 +46,7 @@ pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// segment's, which is the only limit the host can see.
 pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     let buffer = machine.arg_far(0);
-    let (text, _) = format(machine, machine.arg_far(2), 4)?;
+    let (text, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
     let len = text.len();
     machine.write(buffer, &text)?;
     machine.write(
@@ -66,7 +66,7 @@ pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the module moves it itself, and a host that cached it would append over
 /// whatever the module had written.
 pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), 2)?;
+    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
     append(machine, host, &text)?;
     Ok(Ret::Void)
 }

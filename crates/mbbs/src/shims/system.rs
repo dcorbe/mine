@@ -6,7 +6,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::fmt::format;
+use crate::fmt::{Args, format};
 use crate::random::Random;
 use crate::shims::{NO, ShimError};
 use crate::shims::text::write_cstr;
@@ -200,7 +200,7 @@ pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// and the console; this keeps it, and [`Host::audit`] is where it can be read.
 pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let headline = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let (detail, _) = format(machine, machine.arg_far(2), 4)?;
+    let (detail, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
     host.audit.push(format!(
         "{}: {}",
         String::from_utf8_lossy(&headline),
@@ -422,7 +422,7 @@ pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, S
 /// and a host that formatted the message and returned would be resuming code
 /// that has already decided it is in an impossible state.
 pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), 2)?;
+    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
     Err(ShimError::Failed(format!(
         "catastro: {}",
         String::from_utf8_lossy(&text)

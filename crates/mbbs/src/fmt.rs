@@ -27,6 +27,61 @@ use mbbs16::{FarPtr, Machine};
 
 use crate::shims::ShimError;
 
+/// Where a `printf` walk reads its arguments from.
+///
+/// `printf` and `vprintf` are one engine over two argument sources, and the
+/// only thing that differs between them is where word `n` of the variadic list
+/// is found. Naming the source rather than passing a word index keeps that the
+/// *only* difference: every conversion, width and pointer rule below is written
+/// once, and both spellings get the same one.
+#[derive(Debug, Clone, Copy)]
+pub enum Args {
+    /// The outstanding call's own stack, from argument word `first` on.
+    ///
+    /// What `prf`, `spr`, `sprintf`, `fprintf`, `shocst` and `prfmsg` have: the
+    /// variadic arguments follow the fixed ones in the same frame. `first`
+    /// counts argument *words* and not arguments, because a far `char *` is two
+    /// of them and a near one is not.
+    Call { first: usize },
+}
+
+impl Args {
+    /// Word `n` of the variadic list, counting from its first word.
+    ///
+    /// # Errors
+    ///
+    /// Never, for [`Args::Call`]: those words are the frame the host was called
+    /// through, and the machine has already bounds-checked the stack. The
+    /// `Result` is for the source that reads its words out of module memory.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call, since that is where
+    /// [`Args::Call`]'s arguments are.
+    fn word(self, machine: &Machine, n: usize) -> Result<u16, ShimError> {
+        match self {
+            Self::Call { first } => Ok(machine.arg_u16(first + n)),
+        }
+    }
+
+    /// Words `n` and `n + 1` as one 32-bit value, low half first.
+    ///
+    /// A `long`, and also the shape a far pointer arrives in. Which of the two
+    /// a given argument is depends on the format string, so the choice belongs
+    /// to the walk.
+    fn long(self, machine: &Machine, n: usize) -> Result<u32, ShimError> {
+        Ok(u32::from(self.word(machine, n)?) | (u32::from(self.word(machine, n + 1)?) << 16))
+    }
+
+    /// Words `n` and `n + 1` as a far pointer: offset first, then selector.
+    fn far(self, machine: &Machine, n: usize) -> Result<FarPtr, ShimError> {
+        Ok(FarPtr {
+            offset: self.word(machine, n)?,
+            selector: self.word(machine, n + 1)?,
+        })
+    }
+}
+
 /// One `%...` conversion, as parsed.
 #[derive(Debug, Default, Clone, Copy)]
 struct Spec {
@@ -44,31 +99,31 @@ struct Spec {
     near: bool,
 }
 
-/// Format `template` with the arguments that follow word `first` of the
-/// outstanding call.
+/// Format `template` with the arguments `args` names.
 ///
-/// Returns the bytes, and the argument word just past the last one consumed --
-/// which is what a caller needs when the format string is not the last fixed
-/// argument, and what a test needs to check that the walk consumed what it
-/// should.
+/// Returns the bytes, and how many argument words the walk consumed -- which is
+/// what a test needs to check that a conversion took the width it should. A
+/// conversion that consumes the wrong number does not fail; it shifts every
+/// argument after it, and the output looks like data.
 ///
 /// # Errors
 ///
 /// If the format string or a `%s` argument names memory outside the module's
-/// segments, or the format asks for a conversion this does not implement.
+/// segments, if a `va_list` walks off its own segment, or if the format asks
+/// for a conversion this does not implement.
 ///
 /// # Panics
 ///
-/// If the module is not stopped at a call, since that is where the arguments
-/// are.
+/// If `args` is [`Args::Call`] and the module is not stopped at a call, since
+/// that is where those arguments are.
 pub fn format(
     machine: &Machine,
     template: FarPtr,
-    first: usize,
+    args: Args,
 ) -> Result<(Vec<u8>, usize), ShimError> {
     let template = machine.read_cstr(template)?.to_vec();
     let mut out = Vec::new();
-    let mut arg = first;
+    let mut arg = 0usize;
     let mut rest = template.as_slice();
 
     while let Some((&byte, tail)) = rest.split_first() {
@@ -78,7 +133,7 @@ pub fn format(
             continue;
         }
 
-        let (spec, conv, tail) = parse(rest, machine, &mut arg)?;
+        let (spec, conv, tail) = parse(rest, machine, args, &mut arg)?;
         rest = tail;
 
         match conv {
@@ -86,40 +141,40 @@ pub fn format(
             b'c' => {
                 // A `char` promotes to `int` before it is pushed, so it arrives
                 // as a whole word and the low half is the character.
-                let value = machine.arg_u16(arg) as u8;
+                let value = args.word(machine, arg)? as u8;
                 arg += 1;
                 pad(&mut out, &[value], &spec);
             }
             b's' => {
-                let at = pointer(machine, spec.near, arg);
+                let at = pointer(machine, args, spec.near, arg)?;
                 arg += if spec.near { 1 } else { 2 };
                 let text = machine.read_cstr(at)?;
                 let text = &text[..spec.precision.unwrap_or(text.len()).min(text.len())];
                 pad(&mut out, text, &spec);
             }
             b'p' => {
-                let at = pointer(machine, false, arg);
+                let at = pointer(machine, args, false, arg)?;
                 arg += 2;
                 let text = format!("{:04X}:{:04X}", at.selector, at.offset);
                 pad(&mut out, text.as_bytes(), &spec);
             }
             b'd' | b'i' => {
-                let (value, size) = signed(machine, &spec, arg);
+                let (value, size) = signed(machine, args, &spec, arg)?;
                 arg += size;
                 out.extend_from_slice(&integer(value.unsigned_abs(), value < 0, 10, false, &spec));
             }
             b'u' => {
-                let (value, size) = unsigned(machine, &spec, arg);
+                let (value, size) = unsigned(machine, args, &spec, arg)?;
                 arg += size;
                 out.extend_from_slice(&integer(value, false, 10, false, &spec));
             }
             b'o' => {
-                let (value, size) = unsigned(machine, &spec, arg);
+                let (value, size) = unsigned(machine, args, &spec, arg)?;
                 arg += size;
                 out.extend_from_slice(&integer(value, false, 8, false, &spec));
             }
             b'x' | b'X' => {
-                let (value, size) = unsigned(machine, &spec, arg);
+                let (value, size) = unsigned(machine, args, &spec, arg)?;
                 arg += size;
                 out.extend_from_slice(&integer(value, false, 16, conv == b'X', &spec));
             }
@@ -145,6 +200,7 @@ pub fn format(
 fn parse<'a>(
     mut rest: &'a [u8],
     machine: &Machine,
+    args: Args,
     arg: &mut usize,
 ) -> Result<(Spec, u8, &'a [u8]), ShimError> {
     let mut spec = Spec::default();
@@ -166,7 +222,7 @@ fn parse<'a>(
 
     if rest.first() == Some(&b'*') {
         // A negative width means left-aligned, which is how C spells it.
-        let n = machine.arg_u16(*arg) as i16;
+        let n = args.word(machine, *arg)? as i16;
         *arg += 1;
         if n < 0 {
             spec.left = true;
@@ -182,7 +238,7 @@ fn parse<'a>(
     if rest.first() == Some(&b'.') {
         rest = &rest[1..];
         if rest.first() == Some(&b'*') {
-            spec.precision = Some(machine.arg_u16(*arg) as usize);
+            spec.precision = Some(args.word(machine, *arg)? as usize);
             *arg += 1;
             rest = &rest[1..];
         } else {
@@ -223,32 +279,37 @@ fn digits(rest: &[u8]) -> (Option<usize>, &[u8]) {
 }
 
 /// The pointer at argument word `at`.
-fn pointer(machine: &Machine, near: bool, at: usize) -> FarPtr {
+fn pointer(machine: &Machine, args: Args, near: bool, at: usize) -> Result<FarPtr, ShimError> {
     if near {
         // A near pointer is an offset into the module's own globals, which is
         // the segment its `DS` names.
-        FarPtr {
-            offset: machine.arg_u16(at),
+        Ok(FarPtr {
+            offset: args.word(machine, at)?,
             selector: machine.data_selector(),
-        }
+        })
     } else {
-        machine.arg_far(at)
+        args.far(machine, at)
     }
 }
 
-fn signed(machine: &Machine, spec: &Spec, at: usize) -> (i64, usize) {
+fn signed(machine: &Machine, args: Args, spec: &Spec, at: usize) -> Result<(i64, usize), ShimError> {
     if spec.long {
-        (i64::from(machine.arg_u32(at) as i32), 2)
+        Ok((i64::from(args.long(machine, at)? as i32), 2))
     } else {
-        (i64::from(machine.arg_u16(at) as i16), 1)
+        Ok((i64::from(args.word(machine, at)? as i16), 1))
     }
 }
 
-fn unsigned(machine: &Machine, spec: &Spec, at: usize) -> (u64, usize) {
+fn unsigned(
+    machine: &Machine,
+    args: Args,
+    spec: &Spec,
+    at: usize,
+) -> Result<(u64, usize), ShimError> {
     if spec.long {
-        (u64::from(machine.arg_u32(at)), 2)
+        Ok((u64::from(args.long(machine, at)?), 2))
     } else {
-        (u64::from(machine.arg_u16(at)), 1)
+        Ok((u64::from(args.word(machine, at)?), 1))
     }
 }
 
@@ -339,13 +400,14 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text(template);
         f.call(args);
-        let (bytes, _) = format(&f.machine, at, 0).expect("formatted");
+        let (bytes, _) = format(&f.machine, at, Args::Call { first: 0 }).expect("formatted");
         assert_eq!(String::from_utf8_lossy(&bytes), expect, "{template:?}");
     }
 
     /// The rendering, and the argument word the walk stopped at.
     fn walk(f: &Fixture, template: FarPtr) -> (String, usize) {
-        let (bytes, next) = format(&f.machine, template, 0).expect("formatted");
+        let (bytes, next) =
+            format(&f.machine, template, Args::Call { first: 0 }).expect("formatted");
         (String::from_utf8_lossy(&bytes).into_owned(), next)
     }
 
@@ -486,7 +548,7 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%f");
         f.call(&[0, 0, 0, 0]);
-        assert!(format(&f.machine, template, 0).is_err());
+        assert!(format(&f.machine, template, Args::Call { first: 0 }).is_err());
     }
 
     #[test]
@@ -494,6 +556,6 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("all done %");
         f.call(&[]);
-        assert!(format(&f.machine, template, 0).is_err());
+        assert!(format(&f.machine, template, Args::Call { first: 0 }).is_err());
     }
 }

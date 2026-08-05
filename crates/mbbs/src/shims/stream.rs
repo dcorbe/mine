@@ -25,7 +25,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::fmt::format;
+use crate::fmt::{Args, format};
 use crate::shims::{NO, ShimError};
 use crate::stream::Mode;
 
@@ -160,7 +160,7 @@ pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
 /// with a destination.
 ///
-/// [`crate::fmt::format`]'s `first` is an **absolute** word index into the call
+/// [`crate::fmt::Args::Call`]'s `first` is an **absolute** word index into the call
 /// frame, so it is 4: the far `FILE *` is words 0-1 and the far template words
 /// 2-3. The same layout `sprintf` has, and unlike `prfmsg`, whose fixed argument
 /// is one word.
@@ -171,7 +171,7 @@ pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// both modes, which is what makes it comparable with `sprintf`.
 pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let cookie = machine.arg_far(0);
-    let (text, _) = format(machine, machine.arg_far(2), 4)?;
+    let (text, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
     host.streams
         .write(cookie, &text)
         .map_err(|e| ShimError::Failed(format!("fprintf: {e}")))?;

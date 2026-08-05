@@ -21,7 +21,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::fmt::format;
+use crate::fmt::{Args, format};
 use crate::msg::{MsgFile, value};
 use crate::shims::{ShimError, text};
 
@@ -246,7 +246,7 @@ pub fn tokopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// and not the far pointer `prf`'s first argument is.
 pub fn prfmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let at = message(machine, host, machine.arg_u16(0))?;
-    let (text, _) = format(machine, at, 1)?;
+    let (text, _) = format(machine, at, Args::Call { first: 1 })?;
     text::append(machine, host, &text)?;
     Ok(Ret::Void)
 }
