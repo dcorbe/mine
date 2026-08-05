@@ -37,6 +37,7 @@ pub mod stream;
 #[cfg(test)]
 mod testing;
 pub mod textvar;
+pub mod users;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
