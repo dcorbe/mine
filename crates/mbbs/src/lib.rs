@@ -319,9 +319,11 @@ impl Host {
     /// (`MAJORBBS.C:476-480`) and this host has neither loop nor second.
     ///
     /// So this is a record of what a main loop would owe, not a queue that is
-    /// being served. MajorMUD registers exactly one during initialisation -- a
-    /// one-second heartbeat into its own segment 6 -- and until something runs
-    /// it, MajorMUD is a world that has been built and never started.
+    /// being served. MajorMUD registers two during initialisation -- a
+    /// one-second heartbeat into its own segment 6, and a second one-second
+    /// callback into segment 10, which is the last thing it does before it asks
+    /// for a random number -- and until something runs them, MajorMUD is a world
+    /// that has been built and never started.
     pub fn kicks(&self) -> &[Kick] {
         &self.kicks
     }
