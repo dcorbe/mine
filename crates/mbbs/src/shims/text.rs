@@ -202,6 +202,45 @@ pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(removed))
 }
 
+/// `void rstrin(void)` -- put back the separators that parsing overwrote.
+///
+/// MajorBBS tokenises a command line in place: each separator becomes a `\0`,
+/// `margv` points at the words and `margn` at where each one ended.
+/// `MAJORBBS.H:384` says so -- "array of ptrs to word ends, for rstrin()" --
+/// and this walks that array writing a space back at each.
+///
+/// **The bound is `margc - 1` and the comparison is signed**, which is why a
+/// `margc` of zero writes nothing rather than looping 65,535 times. Read off
+/// `seg 4:0x5bde` in `MAJORBBS.EXE`; the routine sets up no `bp` frame at all,
+/// which is what settles that it takes no arguments -- the whole of its input
+/// is these two globals.
+pub fn rstrin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let margc = host
+        .globals()
+        .word(machine, "margc")
+        .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
+    let margn = host
+        .globals()
+        .address("margn")
+        .ok_or_else(|| ShimError::Failed("margn is not placed".into()))?;
+
+    for i in 0..(margc - 1).max(0) as u16 {
+        let slot = FarPtr {
+            offset: margn.offset + i * 4,
+            selector: margn.selector,
+        };
+        // `resolve` is how this crate reads raw bytes out of module memory --
+        // `read_cstr` is for strings and there is no buffer-filling `read`.
+        let bytes = machine.resolve(slot, 4)?;
+        let end = FarPtr {
+            offset: u16::from_le_bytes([bytes[0], bytes[1]]),
+            selector: u16::from_le_bytes([bytes[2], bytes[3]]),
+        };
+        machine.write(end, b" ")?;
+    }
+    Ok(Ret::Void)
+}
+
 /// `long atol(char *s)`.
 ///
 /// Leading whitespace, an optional sign, then digits until something that is
@@ -544,5 +583,51 @@ mod tests {
         };
         assert_eq!(n, 0, "leading padding is not padding");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  text");
+    }
+
+    #[test]
+    fn rstrin_puts_back_the_separators_that_parsing_replaced() {
+        // `margn` holds pointers to where each word ended -- the bytes that
+        // were spaces before the parser wrote NULs over them. `rstrin` restores
+        // margc-1 of them, which is one per gap between margc words.
+        let mut f = Fixture::new();
+        let line = f.text("look\0at\0this");
+        let margn = f.host.globals().address("margn").expect("margn");
+
+        // Two separators, at offsets 4 and 7.
+        let ends = [line.offset + 4, line.offset + 7];
+        for (i, off) in ends.iter().enumerate() {
+            let slot = mbbs16::FarPtr {
+                offset: margn.offset + (i as u16) * 4,
+                selector: margn.selector,
+            };
+            let bytes = [
+                off.to_le_bytes()[0],
+                off.to_le_bytes()[1],
+                line.selector.to_le_bytes()[0],
+                line.selector.to_le_bytes()[1],
+            ];
+            f.machine.write(slot, &bytes).expect("margn slot");
+        }
+        f.host
+            .globals()
+            .write(&mut f.machine, "margc", &3u16.to_le_bytes())
+            .expect("margc");
+
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
+    }
+
+    #[test]
+    fn rstrin_with_nothing_parsed_writes_nothing() {
+        // The original's bound is `margc - 1` under a SIGNED compare, so a
+        // margc of zero writes nothing. Unsigned, it would loop 65,535 times
+        // and scribble over whatever margn happened to contain.
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "margc", &0u16.to_le_bytes())
+            .expect("margc");
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
     }
 }

@@ -120,6 +120,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "skpwht", text::skpwht, Cleans::Caller),
     (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller),
     (MAJORBBS, "depad", text::depad, Cleans::Caller),
+    (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller),
     (MAJORBBS, "atol", text::atol, Cleans::Caller),
     // Message files, and the options in them.
     (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
