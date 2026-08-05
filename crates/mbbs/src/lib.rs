@@ -240,6 +240,20 @@ pub struct Host {
     /// [`Host::forms`].
     pub(crate) forms: Vec<Form>,
 
+    /// Where `struct fsdscb` lives, once `fsdroom` has needed one.
+    ///
+    /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them and only
+    /// `if (fsdtbl == NULL)`; `nterms` is one here. `None` until the first
+    /// `fsdroom`, because the module *tests* the `fsdscb` global for null --
+    /// `seg 3:0x430f` -- and takes another path when it is.
+    pub(crate) fsdscb: Option<FarPtr>,
+
+    /// Which message block `fsdroom` last read a template out of, which
+    /// template, and in which mode. `fsdusr->{curmbk,tmpmsg,amode}`,
+    /// `FSDBBS.C:134`, and Rust-side rather than in module memory because
+    /// `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
+    pub(crate) fsdtmp: Option<(FarPtr, u16, i16)>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -329,6 +343,8 @@ impl Host {
             noted: HashSet::new(),
             kicks: Vec::new(),
             forms: Vec::new(),
+            fsdscb: None,
+            fsdtmp: None,
             heap: Heap::new(Config::default()),
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
