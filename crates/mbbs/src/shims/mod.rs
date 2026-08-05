@@ -183,6 +183,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
     (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller),
+    (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller),
     (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
     (
         MAJORBBS,

@@ -42,6 +42,48 @@ fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
     fsd::Scb::from_bytes(bytes).map_err(|e| ShimError::Failed(e.to_string()))
 }
 
+/// A pointer `by` bytes past `base`, refusing rather than wrapping.
+///
+/// A 16-bit offset that wrapped would name a byte near the start of the same
+/// segment, which *resolves* -- so the bounds check downstream would pass and
+/// the module would be handed a pointer into the wrong part of its own buffer.
+fn offset(base: FarPtr, by: u16) -> Result<FarPtr, ShimError> {
+    let offset = base
+        .offset
+        .checked_add(by)
+        .ok_or_else(|| ShimError::Failed(format!("fsd: {base} plus {by} leaves the segment")))?;
+    Ok(FarPtr {
+        offset,
+        selector: base.selector,
+    })
+}
+
+/// An answer string, read out of module memory. `stranslen()`, `FSD.C:2061`.
+///
+/// Not a C string: it is a run of NUL-terminated entries ended by an empty one,
+/// so `read_cstr` is called once per entry rather than once. The bytes returned
+/// include the final empty entry's NUL, which is what makes [`fsd::extract`]
+/// stop.
+///
+/// # Errors
+///
+/// If the run reaches the end of its segment without the empty entry that ends
+/// it -- which is what a pointer to something that is not an answer string
+/// does. The original would have walked on into whatever followed.
+fn answer_string(machine: &Machine, mut at: FarPtr) -> Result<Vec<u8>, ShimError> {
+    let mut out = Vec::new();
+    loop {
+        let entry = machine.read_cstr(at)?;
+        let len = entry.len();
+        out.extend_from_slice(entry);
+        out.push(0);
+        if len == 0 {
+            return Ok(out);
+        }
+        at = offset(at, len as u16 + 1)?;
+    }
+}
+
 /// `int fsdroom(int tmpmsg, char *fldspc, int amode)` -- how big is this form?
 ///
 /// The size is **measured**, by compiling the template and the field
@@ -145,6 +187,91 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     Ok(Ret::U16(size))
 }
 
+/// `void fsdapr(char *sesbuf, int sbleng, char *answers)` -- lay the session
+/// out. `FSDBBS.C:157`.
+///
+/// The buffer is the one the module allocated from the number `fsdroom`
+/// returned, and it gets the three things a session needs, in that order and
+/// with no padding: the embedded-punctuation templates, the array of
+/// `struct fsdfld`, and the answer string. `fsdscb->mbpunc`, `->flddat` and
+/// `->newans` are pointed into it, and from that moment the module reads its
+/// own answers through them -- eight `fsdnan` sites, three `fsdord`, six
+/// `fsdxan`, and fourteen writes to `flddat[i].flags`.
+///
+/// MajorMUD calls it once, at `seg 3:0x41aa`, as
+/// `fsdapr(vdaptr, vdasiz, vdatmp)`: the channel's volatile data area, sized by
+/// the `dclvda` that `fsdroom`'s answer fed at initialisation.
+///
+/// **Where the parse comes from is this host's one deviation.** The real
+/// `fsdroom` leaves `mbpunc` at `prfbuf` and `flddat` at `prfbuf+MBPMAX` and
+/// this copies them out, which is why `FSDBBS.H:109` warns that those bytes
+/// must go untouched in between. This host kept the compiled form in
+/// [`Host::forms`] instead, so the copy comes from there. The bytes written
+/// into `sesbuf` are the same bytes; what differs is that an intervening `prf`
+/// cannot corrupt them, which makes this strictly harder to break than the
+/// original rather than differently behaved.
+///
+/// # Errors
+///
+/// If no form has been sized; if the module's buffer is smaller than the size
+/// `fsdroom` told it, which the real host answered with `catastro`; or if the
+/// buffer or the answer string will not resolve.
+pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let buffer = machine.arg_far(0);
+    let length = machine.arg_u16(2);
+    let defaults = machine.arg_far(3);
+
+    let Some(form) = host.forms.last().cloned() else {
+        return Err(ShimError::Failed(
+            "fsdapr: no form has been sized, and FSDBBS.H:245 has this called after fsdroom()"
+                .into(),
+        ));
+    };
+    let needed = form
+        .size()
+        .map_err(|e| ShimError::Failed(format!("fsdapr: {e}")))?;
+    if length < needed {
+        return Err(ShimError::Failed(format!(
+            "fsdapr: a session over this form needs {needed} bytes and the module offered \
+             {length}, which is {} byte(s) too small",
+            needed - length
+        )));
+    }
+
+    let at = host
+        .fsdscb
+        .ok_or_else(|| ShimError::Failed("fsdapr: no session control block".into()))?;
+    let mut block = read_block(machine, at)?;
+    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let old = answer_string(machine, defaults)?;
+    let installed = fsd::answers(&form, &spec, &old);
+
+    // Punctuation, then the field array, then the answer string: the same three
+    // terms, in the same order, that `Form::size` added up.
+    let mut bytes = form.punctuation.clone();
+    let flddat_at = bytes.len() as u16;
+    for (field, (ansoff, anslen)) in form.fields.iter().zip(&installed.offsets) {
+        bytes.extend_from_slice(&field.record(*ansoff, *anslen));
+    }
+    let newans_at = bytes.len() as u16;
+    bytes.extend_from_slice(&installed.text);
+    machine.write(buffer, &bytes)?;
+
+    block.set_mbpunc(buffer);
+    block.set_flddat(offset(buffer, flddat_at)?);
+    block.set_newans(offset(buffer, newans_at)?);
+    block.set_allans(installed.allans);
+    // `FSDBBS.C:180`. The one member a caller is invited to change afterwards
+    // (`FSDBBS.H:127`), which is why it is set here and not in `fsdroom`.
+    block.set_crsatr(0x70);
+    machine.write(at, block.as_bytes())?;
+
+    // `clrprf(); prf("")`, FSDBBS.C:181. `FSDBBS.H:117` tells callers to do
+    // their own prf'ing *after* this, for exactly this reason.
+    crate::shims::text::clrprf(machine, host)?;
+    Ok(Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +313,264 @@ mod tests {
             panic!("expected one form, got {:?}", f.host.forms())
         };
         assert_eq!(form.fields.len(), 2);
+    }
+
+    /// Open `FSDFORM.MSG` and make it current.
+    ///
+    /// `SAMPLE.MSG`'s message 0 is the bare word `SAMPLE`, so every field
+    /// compiled against it has width zero and no answer can be longer than
+    /// nothing. A session needs a template with field runs in it, which is
+    /// what this file is: four thirty-character `?` runs as message 0, and a
+    /// `###-####` as message 1.
+    fn open_form(f: &mut Fixture) -> FarPtr {
+        let name = f.text("FSDFORM.MSG");
+        let block = f
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .expect("opened");
+        match block {
+            Ret::Far(at) => at,
+            other => panic!("opnmsg returned {other:?}"),
+        }
+    }
+
+    /// Size a form over `spec`, then lay a session out over `defaults`.
+    ///
+    /// Returns the session buffer and its size, which is what the module
+    /// itself holds after the `dclvda`/`alcmem` pair that `fsdroom` feeds.
+    fn session(f: &mut Fixture, spec: &str, defaults: &[u8]) -> (FarPtr, u16) {
+        session_over(f, 0, spec, defaults)
+    }
+
+    /// [`session`], over a named message of `FSDFORM.MSG`.
+    fn session_over(f: &mut Fixture, message: u16, spec: &str, defaults: &[u8]) -> (FarPtr, u16) {
+        let _ = open_form(f);
+        let spec = f.text(spec);
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[message, spec.offset, spec.selector, 0])
+        else {
+            panic!("fsdroom refused")
+        };
+        let buffer = f.buffer(size);
+        let defaults = f.bytes(defaults, false);
+        f.invoke(
+            fsdapr,
+            &[
+                buffer.offset,
+                buffer.selector,
+                size,
+                defaults.offset,
+                defaults.selector,
+            ],
+        )
+        .expect("prepared");
+        (buffer, size)
+    }
+
+    /// The session control block, as it stands.
+    fn block(f: &Fixture) -> crate::fsd::Scb {
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        read_block(&f.machine, at).expect("readable")
+    }
+
+    #[test]
+    fn fsdapr_lays_punctuation_then_fields_then_answers_into_the_buffer() {
+        let mut f = Fixture::new();
+        let (buffer, _) = session(&mut f, "ONE TWO", b"\0");
+        let scb = block(&f);
+
+        assert_eq!(scb.mbpunc(), buffer);
+        assert_eq!(scb.flddat().offset, buffer.offset + scb.mbleng());
+        assert_eq!(
+            scb.newans().offset,
+            buffer.offset + scb.mbleng() + scb.numfld() * crate::fsd::FSDFLD
+        );
+        assert_eq!(scb.crsatr(), 0x70, "FSDBBS.C:180");
+        assert_eq!(scb.numfld(), f.host.forms()[0].fields.len() as u16);
+        assert_eq!(scb.allans(), b"ONE=\0TWO=\0\0".len() as u16);
+    }
+
+    #[test]
+    fn the_field_array_is_where_the_module_indexes_it() {
+        // The module reaches `flddat[i].flags` as `[flddat + 23*i + 12]` --
+        // fourteen sites from seg 3:0x4344 on. This is that arithmetic, run
+        // against a form whose flags are known.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A B(SECRET)", b"\0");
+        let scb = block(&f);
+
+        let stride = usize::from(crate::fsd::FSDFLD);
+        let bytes = f
+            .machine
+            .resolve(scb.flddat(), stride * 2)
+            .expect("in range");
+        assert_eq!(bytes[crate::fsd::fld::FLAGS], 0, "A has no options");
+        assert_eq!(
+            bytes[stride + crate::fsd::fld::FLAGS],
+            crate::fsd::flags::SECRET
+        );
+    }
+
+    #[test]
+    fn the_field_array_starts_after_the_punctuation_and_not_at_the_buffer() {
+        // Every other session here compiles a form with no embedded
+        // punctuation, so `mbleng` is 0 and `buffer + mbleng` is `buffer` --
+        // which makes a `flddat` set to the buffer itself indistinguishable
+        // from a correct one. Message 1 of FSDFORM.MSG is `Phone: ###-####`,
+        // whose one field joins, so `mbleng` is nine and the two differ.
+        let mut f = Fixture::new();
+        let (buffer, _) = session_over(&mut f, 1, "PHONE", b"PHONE=5551234\0\0");
+        let scb = block(&f);
+
+        assert_eq!(scb.mbleng(), 9, "\"   -    \" and its NUL");
+        assert_ne!(scb.flddat(), buffer);
+        assert_eq!(scb.flddat().offset, buffer.offset + 9);
+
+        // And the punctuation really is at the front of the buffer, which is
+        // what `fsdscb->mbpunc = sesbuf` means.
+        let punctuation = f.machine.resolve(buffer, 9).expect("in range");
+        assert_eq!(punctuation, b"   -    \0");
+
+        // The field's `mbpoff` names an offset into that array, not into the
+        // template.
+        let record = f
+            .machine
+            .resolve(scb.flddat(), usize::from(crate::fsd::FSDFLD))
+            .expect("in range");
+        let mbpoff = i16::from_le_bytes([
+            record[crate::fsd::fld::MBPOFF],
+            record[crate::fsd::fld::MBPOFF + 1],
+        ]);
+        assert_eq!(mbpoff, 0);
+        assert_eq!(record[crate::fsd::fld::WIDTH], 7, "seven digits");
+        assert_eq!(record[crate::fsd::fld::XWIDTH], 8, "spanning eight");
+    }
+
+    #[test]
+    fn the_session_buffer_is_exactly_as_big_as_fsdroom_said() {
+        // `fsdroom` returns `mbleng + numfld*23 + maxans + 1`, and this writes
+        // those same three runs. If the two ever disagreed the module would
+        // have allocated to one number and been written to by another.
+        let mut f = Fixture::new();
+        let (buffer, size) = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
+        let scb = block(&f);
+        let used = scb.newans().offset - buffer.offset + scb.allans();
+        assert!(used <= size, "{used} bytes written into a buffer of {size}");
+    }
+
+    #[test]
+    fn a_buffer_smaller_than_the_session_needs_stops_the_module() {
+        // `catastro`, FSDBBS.C:171. A host that carried on would write the
+        // answer string past the end of the channel's volatile data area.
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("ONE TWO");
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
+            panic!("fsdroom refused")
+        };
+        let buffer = f.buffer(size);
+        let defaults = f.bytes(b"\0", false);
+        let e = f
+            .invoke(
+                fsdapr,
+                &[
+                    buffer.offset,
+                    buffer.selector,
+                    size - 1,
+                    defaults.offset,
+                    defaults.selector,
+                ],
+            )
+            .expect_err("refused");
+        assert!(format!("{e}").contains("1 byte(s) too small"), "{e}");
+    }
+
+    #[test]
+    fn fsdapr_before_any_fsdroom_stops_the_module() {
+        // FSDBBS.H:245: "call after fsdroom()". The real host would have read
+        // an uninitialised control block; there is nothing here to read and
+        // nothing plausible to invent.
+        let mut f = Fixture::new();
+        let buffer = f.buffer(64);
+        let defaults = f.bytes(b"\0", false);
+        let e = f
+            .invoke(
+                fsdapr,
+                &[
+                    buffer.offset,
+                    buffer.selector,
+                    64,
+                    defaults.offset,
+                    defaults.selector,
+                ],
+            )
+            .expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
+    }
+
+    #[test]
+    fn a_defaults_pointer_that_is_not_an_answer_string_stops_the_module() {
+        // A segment filled to its last byte with non-NULs, so there is no
+        // empty entry to end the run. `stranslen` would have walked on into
+        // whatever followed it.
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("ONE");
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
+            panic!("fsdroom refused")
+        };
+        let buffer = f.buffer(size);
+
+        let selector = f.machine.alloc_segment(8).expect("a segment");
+        let junk = FarPtr {
+            offset: 0,
+            selector,
+        };
+        f.machine.write(junk, b"xxxxxxxx").expect("fills it");
+
+        let e = f
+            .invoke(
+                fsdapr,
+                &[
+                    buffer.offset,
+                    buffer.selector,
+                    size,
+                    junk.offset,
+                    junk.selector,
+                ],
+            )
+            .expect_err("refused");
+        assert!(matches!(e, ShimError::BadPointer(_)), "{e}");
+    }
+
+    #[test]
+    fn fsdapr_empties_the_print_buffer() {
+        // `clrprf(); prf("")` -- FSDBBS.C:181. FSDBBS.H:117 tells callers to do
+        // their own prf'ing after fsdapr for exactly this reason.
+        let mut f = Fixture::new();
+        let _ = open(&mut f);
+        let text = f.text("something queued");
+        f.invoke(crate::shims::text::prf, &[text.offset, text.selector])
+            .expect("printed");
+        assert_eq!(f.read(f.host.globals().prf_buffer()), "something queued");
+
+        let _ = session(&mut f, "ONE", b"\0");
+        assert_eq!(f.read(f.host.globals().prf_buffer()), "");
+    }
+
+    #[test]
+    fn defaults_land_in_the_answer_string_under_the_form_s_own_names() {
+        let mut f = Fixture::new();
+        let (buffer, _) = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
+        let scb = block(&f);
+        let text = f
+            .machine
+            .resolve(scb.newans(), usize::from(scb.allans()))
+            .expect("in range");
+        assert_eq!(text, b"NAME=\0RANK=MAJOR\0\0");
+        assert!(scb.newans().offset > buffer.offset);
     }
 
     #[test]
