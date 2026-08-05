@@ -310,6 +310,54 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
+/// `char *strtok(char *s,char *delim)` -- the next token, destructively.
+///
+/// Ordinal 585, `seg 1:0x24f4`. Three things worth naming:
+///
+/// * **The state is the host's.** A non-null `s` sets it, a null `s` continues
+///   from it, and nothing the module can address holds it. See
+///   [`Host::strtok`].
+/// * **It writes into the caller's string**, putting a terminator over the
+///   delimiter that ended each token. What it answers is a pointer into that
+///   same buffer.
+/// * **A run of delimiters is one gap**, because the leading-delimiter skip and
+///   the token scan are separate loops; a string of nothing else answers
+///   `NULL`.
+///
+/// The original walks a byte at a time through `les bx,[0x18a8]`. Reading the
+/// remainder once with [`Machine::read_cstr`] is the same bytes and one bounds
+/// check -- and it is what turns a cursor left dangling by a `galfree` into
+/// [`ShimError::BadPointer`] rather than a token made of rubbish.
+pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let delims = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    if s != FarPtr::NULL {
+        host.strtok = s;
+    }
+
+    let cursor = host.strtok;
+    let rest = machine.read_cstr(cursor)?;
+    let Some(start) = rest.iter().position(|b| !delims.contains(b)) else {
+        // Nothing but delimiters. The cursor ends on the terminator, so every
+        // later call answers NULL too.
+        host.strtok = at(cursor, rest.len() as u16);
+        return Ok(Ret::Far(FarPtr::NULL));
+    };
+    let token_len = rest[start..].len();
+    let ends_at = rest[start..].iter().position(|b| delims.contains(b));
+
+    let token = at(cursor, start as u16);
+    match ends_at {
+        Some(n) => {
+            let end = at(token, n as u16);
+            machine.write(end, &[0])?;
+            host.strtok = at(end, 1);
+        }
+        None => host.strtok = at(token, token_len as u16),
+    }
+    Ok(Ret::Far(token))
+}
+
 /// `char *strchr(char *s,int c)`.
 ///
 /// Ordinal 572, `seg 1:0xcf62`. Two things the prototype hides. `c` arrives as
@@ -508,6 +556,115 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn strtok_walks_a_line_and_then_says_there_is_no_more() {
+        // The state is the host's -- `MAJORBBS.EXE` keeps one far pointer at
+        // `DGROUP:0x18a8` and no module can see it -- so the later calls pass
+        // NULL and the host has to remember where it got to.
+        let mut f = Fixture::new();
+        let line = f.text("go  north now");
+        let delim = f.text(" ");
+        let first = [line.offset, line.selector, delim.offset, delim.selector];
+        let again = [0, 0, delim.offset, delim.selector];
+
+        let Ret::Far(one) = f.invoke(strtok, &first).expect("ok") else {
+            panic!("strtok returns char *");
+        };
+        assert_eq!(f.read(one), "go");
+
+        let Ret::Far(two) = f.invoke(strtok, &again).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(two), "north", "a run of two spaces is one gap");
+
+        let Ret::Far(three) = f.invoke(strtok, &again).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(three), "now");
+
+        assert_eq!(
+            f.invoke(strtok, &again).expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+        assert_eq!(
+            f.invoke(strtok, &again).expect("ok"),
+            Ret::Far(FarPtr::NULL),
+            "and it stays exhausted"
+        );
+    }
+
+    #[test]
+    fn strtok_writes_a_terminator_over_the_delimiter_it_consumed() {
+        // It is destructive, and the module depends on that: the token it
+        // answers is a pointer into the caller's own buffer, terminated in
+        // place by `mov byte [es:bx],0x0`.
+        let mut f = Fixture::new();
+        let line = f.text("a,b");
+        let delim = f.text(",");
+
+        f.invoke(
+            strtok,
+            &[line.offset, line.selector, delim.offset, delim.selector],
+        )
+        .expect("ok");
+        assert_eq!(
+            f.machine.resolve(line, 4).expect("readable"),
+            b"a\0b\0",
+            "the comma became a terminator"
+        );
+    }
+
+    #[test]
+    fn strtok_of_nothing_but_delimiters_answers_null() {
+        let mut f = Fixture::new();
+        let line = f.text(",,,");
+        let delim = f.text(",");
+        assert_eq!(
+            f.invoke(
+                strtok,
+                &[line.offset, line.selector, delim.offset, delim.selector]
+            )
+            .expect("ok"),
+            Ret::Far(FarPtr::NULL)
+        );
+    }
+
+    #[test]
+    fn strtok_restarts_when_it_is_given_a_string() {
+        let mut f = Fixture::new();
+        let first = f.text("a b");
+        let second = f.text("c d");
+        let delim = f.text(" ");
+
+        f.invoke(
+            strtok,
+            &[first.offset, first.selector, delim.offset, delim.selector],
+        )
+        .expect("ok");
+        let Ret::Far(p) = f
+            .invoke(
+                strtok,
+                &[second.offset, second.selector, delim.offset, delim.selector],
+            )
+            .expect("ok")
+        else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "c", "a non-null string replaces the cursor");
+    }
+
+    #[test]
+    fn strtok_with_no_previous_call_refuses_rather_than_inventing_a_token() {
+        // The real one reads through whatever `DGROUP:0x18a8` happens to hold.
+        // Here that starts null, and a pointer naming nothing is an error.
+        let mut f = Fixture::new();
+        let delim = f.text(" ");
+        assert!(
+            f.invoke(strtok, &[0, 0, delim.offset, delim.selector])
+                .is_err()
+        );
+    }
 
     #[test]
     fn strchr_finds_a_byte_or_answers_null() {
@@ -1024,7 +1181,10 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text("  the quick brown fox  ");
         assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
-        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
+        assert_eq!(
+            f.machine.read_cstr(at).expect("a string"),
+            b"thequickbrownfox"
+        );
     }
 
     #[test]
@@ -1123,7 +1283,10 @@ mod tests {
             .expect("margc");
 
         assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
-        assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
+        assert_eq!(
+            f.machine.read_cstr(line).expect("a string"),
+            b"look at this"
+        );
     }
 
     #[test]
