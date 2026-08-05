@@ -38,6 +38,7 @@ use std::io;
 use std::path::PathBuf;
 
 pub use exports::Exports;
+pub use fsd::Form;
 pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use shims::system::{Kick, Registration};
@@ -200,6 +201,10 @@ pub struct Host {
     /// was asked. **Nothing runs them.** See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick>,
 
+    /// Every form `fsdroom` has sized, in the order it was asked. See
+    /// [`Host::forms`].
+    pub(crate) forms: Vec<Form>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -284,6 +289,7 @@ impl Host {
             notes: Vec::new(),
             noted: HashSet::new(),
             kicks: Vec::new(),
+            forms: Vec::new(),
             heap: Heap::new(Config::default()),
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
@@ -318,6 +324,20 @@ impl Host {
     /// it, MajorMUD is a world that has been built and never started.
     pub fn kicks(&self) -> &[Kick] {
         &self.kicks
+    }
+
+    /// Every form the module asked `fsdroom` to size.
+    ///
+    /// A record rather than a session. The real host keeps one control block
+    /// per channel and overwrites it on each call; this keeps them all, because
+    /// what a caller can usefully ask this host is "what did initialisation
+    /// size?" and not "what is channel 0 in the middle of?".
+    ///
+    /// **Nothing fills one in.** A form is a screen and a user, and this host
+    /// has neither -- so these are the shapes of the two screens MajorMUD would
+    /// have put a new player through, measured and then set down.
+    pub fn forms(&self) -> &[Form] {
+        &self.forms
     }
 
     /// The message files that are open.

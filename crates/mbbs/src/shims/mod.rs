@@ -1,6 +1,7 @@
 //! What sits behind each import, and what to do when nothing does.
 
 pub mod btrieve;
+pub mod fsd;
 pub mod memory;
 pub mod msg;
 pub mod stream;

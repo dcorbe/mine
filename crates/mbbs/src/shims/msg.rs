@@ -265,7 +265,7 @@ fn set_current(machine: &mut Machine, host: &Host, block: FarPtr) -> Result<(), 
 }
 
 /// Where message `n` of the current block was interned.
-fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
+pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
     let block = current(machine, host)?;
     host.messages.text(block, n).map_err(ShimError::Failed)
 }
