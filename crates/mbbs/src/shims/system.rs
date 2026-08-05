@@ -1059,6 +1059,151 @@ mod tests {
     }
 
     #[test]
+    fn a_second_text_variable_moves_the_table_and_the_first_survives() {
+        // The table grows one record at a time, so registering a second one
+        // reallocates. Two things have to hold: the first row's bytes come with
+        // it, and the global points at where they went. An implementation that
+        // allocated and forgot to copy would pass every test in Task 5.
+        let mut f = Fixture::new();
+        let first = f.text("MUDCHARINFO");
+        let second = f.text("USERID");
+        let a = FarPtr {
+            offset: 0x001e,
+            selector: f.machine.code_selector(),
+        };
+        let b = FarPtr {
+            offset: 0x0200,
+            selector: f.machine.code_selector(),
+        };
+
+        assert_eq!(
+            f.invoke(
+                register_textvar,
+                &[first.offset, first.selector, a.offset, a.selector]
+            )
+            .expect("registered"),
+            Ret::U16(0)
+        );
+        assert_eq!(
+            f.invoke(
+                register_textvar,
+                &[second.offset, second.selector, b.offset, b.selector]
+            )
+            .expect("registered"),
+            Ret::U16(1),
+            "the index counts up"
+        );
+
+        assert_eq!(f.host.textvars().len(), 2);
+        let published = f
+            .host
+            .globals()
+            .pointer(&f.machine, "txtvars")
+            .expect("txtvars");
+        assert_eq!(published, f.host.textvars().at().expect("a table"));
+
+        let row0 = f
+            .host
+            .textvars()
+            .get(&f.machine, 0)
+            .expect("readable")
+            .expect("a row");
+        assert_eq!(row0.name, "MUDCHARINFO", "the first row came along");
+        assert_eq!(row0.varrou, Some(a));
+
+        let row1 = f
+            .host
+            .textvars()
+            .get(&f.machine, 1)
+            .expect("readable")
+            .expect("a row");
+        assert_eq!(row1.name, "USERID");
+        assert_eq!(row1.varrou, Some(b));
+
+        assert_eq!(
+            f.host.textvars().get(&f.machine, 2).expect("readable"),
+            None,
+            "and there is no third"
+        );
+    }
+
+    #[test]
+    fn a_name_too_long_for_the_field_is_truncated_rather_than_refused() {
+        // `stzcpy(name, name, TVRSIZ)` and not `strncpy`: at most fifteen
+        // characters, always terminated. The sixteenth would leave the field
+        // unterminated and running into `varrou`, which is the bug `stzcpy`
+        // exists to avoid -- so the original truncates, and so does this.
+        let mut f = Fixture::new();
+        let name = f.text("ABCDEFGHIJKLMNOPQRST");
+        let varrou = FarPtr {
+            offset: 0x001e,
+            selector: f.machine.code_selector(),
+        };
+
+        f.invoke(
+            register_textvar,
+            &[name.offset, name.selector, varrou.offset, varrou.selector],
+        )
+        .expect("registered");
+
+        let row = f
+            .host
+            .textvars()
+            .get(&f.machine, 0)
+            .expect("readable")
+            .expect("a row");
+        assert_eq!(row.name, "ABCDEFGHIJKLMNO", "fifteen and a terminator");
+        assert_eq!(row.varrou, Some(varrou), "and varrou was not written over");
+    }
+
+    #[test]
+    fn a_null_routine_is_stored_rather_than_refused() {
+        // The opposite of `register_agent`'s null vectors, and measured: the
+        // module tests `varrou` before calling it -- `mov ax,[es:bx+0x10]` then
+        // `or ax,[es:bx+0x12]` at `seg 23:0x22f5` -- so a null one is a row
+        // that produces nothing, not a row that is wrong.
+        let mut f = Fixture::new();
+        let name = f.text("MUDCHARINFO");
+
+        f.invoke(register_textvar, &[name.offset, name.selector, 0, 0])
+            .expect("registered");
+
+        let row = f
+            .host
+            .textvars()
+            .get(&f.machine, 0)
+            .expect("readable")
+            .expect("a row");
+        assert_eq!(row.name, "MUDCHARINFO");
+        assert_eq!(row.varrou, None);
+        assert_eq!(f.host.textvars().len(), 1, "it is still a row");
+    }
+
+    #[test]
+    fn a_text_variable_with_no_name_is_refused() {
+        // This host's own refusal, and a weaker one than the agent's empty
+        // `appid`: `findtvar("")` could genuinely match this. What carries it
+        // is that a name arriving empty is a misread argument list, and a
+        // nameless row in a table nobody prints is expensive to find later.
+        let mut f = Fixture::new();
+        let name = f.text("");
+
+        let e = f
+            .invoke(register_textvar, &[name.offset, name.selector, 0x1e, 0x67])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("no name"), "{e}");
+        assert!(f.host.textvars().is_empty());
+        assert_eq!(
+            f.host
+                .globals()
+                .pointer(&f.machine, "txtvars")
+                .expect("txtvars"),
+            mbbs16::FarPtr::NULL,
+            "and nothing was published"
+        );
+    }
+
+    #[test]
     fn an_agent_with_no_appid_is_refused() {
         // This host's own refusal and not the original's. A client addresses an
         // agent by its appid, so an empty one is an agent nobody can reach --
