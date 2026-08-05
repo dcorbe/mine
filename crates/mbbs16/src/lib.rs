@@ -630,7 +630,28 @@ impl Machine {
     ///
     /// The call frame is dropped -- `SP` moves up over the `CS:IP` the far call
     /// pushed -- but the arguments are left alone, because cdecl makes cleaning
-    /// them the module's job.
+    /// them the module's job. That is what every MajorBBS routine uses; for the
+    /// ones that pop their own, see
+    /// [`resume_cleaning`](Machine::resume_cleaning).
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+        self.resume_cleaning(ret, 0)
+    }
+
+    /// Resume, dropping `bytes` of the module's arguments as well.
+    ///
+    /// For an import that pops its own arguments. Borland's 32-bit arithmetic
+    /// helpers do -- `f_lumod@` and its family are called with four words on the
+    /// stack and no `add sp` after the call -- and servicing one of those with
+    /// [`resume`](Machine::resume) is not a crash but something worse: the
+    /// module carries on with eight bytes of rubbish under its stack pointer and
+    /// every frame after it is shifted.
+    ///
+    /// `bytes` is what the *module* pushed, so it does not include the far
+    /// return address; `0` is exactly [`resume`](Machine::resume).
     ///
     /// This is where an overrun spent on host code is caught. A watchdog tick
     /// that arrives while the host is servicing an import proves the budget is
@@ -641,7 +662,7 @@ impl Machine {
     /// # Panics
     ///
     /// If the module is not stopped at a call.
-    pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+    pub fn resume_cleaning(&mut self, ret: Ret, bytes: u16) -> io::Result<Exit> {
         let sp = self
             .frame_sp
             .expect("resume() with no outstanding call to resume from");
@@ -668,7 +689,7 @@ impl Machine {
             });
         }
 
-        self.run(at, sp + 4, ret)
+        self.run(at, sp + 4 + bytes, ret)
     }
 
     /// Read the `n`th 16-bit argument of the outstanding call.
