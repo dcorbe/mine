@@ -46,17 +46,32 @@ pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// segment's, which is the only limit the host can see.
 pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     let buffer = machine.arg_far(0);
-    let (text, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
-    let len = text.len();
-    machine.write(buffer, &text)?;
-    machine.write(
-        FarPtr {
-            offset: buffer.offset.wrapping_add(len as u16),
-            selector: buffer.selector,
-        },
-        &[0],
-    )?;
-    Ok(Ret::U16(len as u16))
+    let template = machine.arg_far(2);
+    let (text, _) = format(machine, template, Args::Call { first: 4 })?;
+    fill(machine, buffer, &text)?;
+    Ok(Ret::U16(text.len() as u16))
+}
+
+/// `int vsprintf(char *buf, const char *fmat, va_list ap)` -- format into the
+/// caller's buffer from an argument list it was handed, and return how many
+/// bytes that took.
+///
+/// [`sprintf`] with the arguments somewhere else, and deliberately nothing
+/// more: both go through the same [`crate::fmt::format`], so a conversion that
+/// is right in one is right in the other.
+///
+/// Borland's `va_list` is `void *`, far under the huge model, which is why both
+/// of MajorMUD's call sites clean six words rather than five. What it points at
+/// is the caller's own frame in `SS` -- `va_start` is `lea ax,[bp+0x0a]` at
+/// `seg 32:0x0b79`, the word past the last fixed argument -- so the words
+/// behind it are laid out exactly as this routine's own would be.
+pub fn vsprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let buffer = machine.arg_far(0);
+    let template = machine.arg_far(2);
+    let list = machine.arg_far(4);
+    let (text, _) = format(machine, template, Args::List { at: list })?;
+    fill(machine, buffer, &text)?;
+    Ok(Ret::U16(text.len() as u16))
 }
 
 /// `void prf(char *fmat, ...)` -- append to the channel's output.
@@ -274,6 +289,29 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
         value = value.wrapping_neg();
     }
     Ok(Ret::U32(value as u32))
+}
+
+/// Put `text` and its terminator where a caller's `char *` points.
+///
+/// How big the buffer is, only the caller knows -- `sprintf` and `vsprintf` are
+/// told an address and nothing else. The bounds check is therefore the
+/// segment's, which is the only limit the host can see, and it is one check
+/// because the terminator goes out in the same write as the text. That is not
+/// only tidier: computing the terminator's own address means adding to a `u16`
+/// offset, and a buffer near the end of its segment wraps that addition round
+/// to the front.
+///
+/// [`write_cstr`] is the other half of this pair, for the buffers this host
+/// owns and whose capacity it therefore knows enough to refuse.
+///
+/// # Errors
+///
+/// If the text and its terminator do not fit in the segment `at` names.
+fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError> {
+    let mut bytes = text.to_vec();
+    bytes.push(0);
+    machine.write(at, &bytes)?;
+    Ok(())
 }
 
 /// Write `text` and its terminator at `at`, refusing to exceed `capacity`.
@@ -629,5 +667,74 @@ mod tests {
             .write(&mut f.machine, "margc", &0u16.to_le_bytes())
             .expect("margc");
         assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+    }
+
+    #[test]
+    fn vsprintf_formats_from_the_list_it_is_handed() {
+        let mut f = Fixture::new();
+        let out = f.buffer(64);
+        let template = f.text("%s the %s, level %d");
+        let who = f.text("rangerdan");
+        let what = f.text("Ranger");
+        let list = f.words(&[who.offset, who.selector, what.offset, what.selector, 21]);
+
+        let ret = f
+            .invoke(
+                vsprintf,
+                &[
+                    out.offset,
+                    out.selector,
+                    template.offset,
+                    template.selector,
+                    list.offset,
+                    list.selector,
+                ],
+            )
+            .expect("formatted");
+
+        assert_eq!(f.read(out), "rangerdan the Ranger, level 21");
+        assert!(matches!(ret, Ret::U16(30)), "{ret:?}");
+    }
+
+    #[test]
+    fn vsprintf_terminates_what_it_wrote() {
+        // The buffer starts full of a byte that is not a terminator, so a
+        // missing NUL would be visible rather than papered over by a fixture
+        // that happened to hand out zeroed memory.
+        let mut f = Fixture::new();
+        let out = f.bytes(&[b'#'; 16], false);
+        let template = f.text("%d");
+        let list = f.words(&[7]);
+
+        f.invoke(
+            vsprintf,
+            &[
+                out.offset,
+                out.selector,
+                template.offset,
+                template.selector,
+                list.offset,
+                list.selector,
+            ],
+        )
+        .expect("formatted");
+
+        assert_eq!(f.read(out), "7");
+    }
+
+    #[test]
+    fn vsprintf_refuses_a_list_it_cannot_follow() {
+        let mut f = Fixture::new();
+        let out = f.buffer(16);
+        let template = f.text("%d");
+        let args = [
+            out.offset,
+            out.selector,
+            template.offset,
+            template.selector,
+            0,
+            0,
+        ];
+        assert!(f.invoke(vsprintf, &args).is_err());
     }
 }

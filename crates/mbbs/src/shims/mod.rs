@@ -111,6 +111,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // Strings, numbers and the print buffer.
     (MAJORBBS, "spr", text::spr, Cleans::Caller),
     (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller),
+    (MAJORBBS, "vsprintf", text::vsprintf, Cleans::Caller),
     (MAJORBBS, "prf", text::prf, Cleans::Caller),
     (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller),
     (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller),
