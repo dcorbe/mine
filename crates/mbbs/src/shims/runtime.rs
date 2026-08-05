@@ -148,6 +148,58 @@ pub fn f_lxmul(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
     Ok(Ret::U32(dxax(machine).wrapping_mul(cxbx)))
 }
 
+/// The shift count a module passed, which is `CL` and never `CX`.
+///
+/// # Errors
+///
+/// If it is 32 or more. See [`f_lxlsh`].
+fn count(name: &str, machine: &Machine) -> Result<u32, ShimError> {
+    let cl = machine.cx() as u8;
+    if cl >= 32 {
+        return Err(ShimError::Failed(format!(
+            "{name}(.., {cl}): a shift of 32 or more has no established answer"
+        )));
+    }
+    Ok(u32::from(cl))
+}
+
+/// `long F_LXLSH@(void)` -- `DX:AX` shifted left by `CL`, answered in `DX:AX`.
+///
+/// Three call sites, all of them building a 64-bit bit-set out of two `long`s.
+/// `CH` is not set at any of them, so the count is `CL` and the high byte is
+/// whatever happened to be there.
+///
+/// # Errors
+///
+/// If the count is 32 or more, which no reachable call site produces. The
+/// bounded one, `seg 27:0x0c93`, refuses `n < 1` and `n > 0x40` before calling
+/// and then shifts by `n - 1` or `n - 33`; the other two use a literal 11. What
+/// the real helper did past 31 is not recorded anywhere this project has --
+/// Borland's runtime source is not in `archive/galacticomm/`, which holds only
+/// the `.DEF` that names it -- and the two plausible implementations disagree: a
+/// `shl ax,1 / rcl dx,1` loop answers zero, and a 286 masking `CL` to five bits
+/// answers `value << (n & 31)`. Picking one would be a guess that reads as an
+/// answer.
+pub fn f_lxlsh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+    let by = count("f_lxlsh@", machine)?;
+    Ok(Ret::U32(dxax(machine) << by))
+}
+
+/// `unsigned long F_LXURSH@(void)` -- `DX:AX` shifted right by `CL`, logically.
+///
+/// The `U` is the whole of the difference: Worldgroup exports the arithmetic
+/// shift separately as `F_LXRSH@` at ordinal 660, and `WCCMMUD.DLL` does not
+/// import it. Corroborated at `seg 8:0x0120`, where the next statement does the
+/// same job 16 bits wide with an unsigned `shr ax,0xb`.
+///
+/// # Errors
+///
+/// As [`f_lxlsh`].
+pub fn f_lxursh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+    let by = count("f_lxursh@", machine)?;
+    Ok(Ret::U32(dxax(machine) >> by))
+}
+
 /// The single signed pair that has no answer: `i32::MIN / -1`.
 fn overflow(name: &str, a: i32, b: i32) -> ShimError {
     ShimError::Failed(format!(
@@ -272,6 +324,65 @@ mod tests {
             Ret::U32(1),
             "as unsigned this overflows and as signed it is (-1)*(-1)"
         );
+    }
+
+    /// Set `DX:AX` and a shift count in `CL`, and run `shim`.
+    fn shift(shim: crate::shims::Shim, value: u32, count: u8) -> Result<Ret, ShimError> {
+        let mut f = Fixture::new();
+        // CH is deliberately not zero: no call site sets it, so a shim that read
+        // CX rather than CL would shift by an enormous number.
+        let cx = u16::from_le_bytes([count, 0xff]);
+        let regs = [value as u16, 0, cx, (value >> 16) as u16];
+        f.invoke_with(shim, &[], regs)
+    }
+
+    #[test]
+    fn the_shifts_take_the_count_from_cl_alone() {
+        // Measured: `add cl,0xdf; xor dx,dx; mov ax,0x1; call F_LXLSH@` builds a
+        // 64-bit flag word as two longs. CH is never set at any of the seven
+        // sites, so only CL can be the count.
+        assert_eq!(shift(f_lxlsh, 1, 11).unwrap(), Ret::U32(1 << 11));
+        assert_eq!(shift(f_lxlsh, 1, 31).unwrap(), Ret::U32(1 << 31));
+        assert_eq!(shift(f_lxursh, 0x8000_0000, 31).unwrap(), Ret::U32(1));
+    }
+
+    #[test]
+    fn the_right_shift_is_logical_and_not_arithmetic() {
+        // `F_LXURSH@` is the unsigned one -- Worldgroup exports `F_LXRSH@` at
+        // 660 for the signed shift and this module does not import it. An
+        // arithmetic shift would answer 0xffffffff to both of these.
+        assert_eq!(
+            shift(f_lxursh, 0xffff_ffff, 1).unwrap(),
+            Ret::U32(0x7fff_ffff)
+        );
+        assert_eq!(shift(f_lxursh, 0xffff_ffff, 31).unwrap(), Ret::U32(1));
+    }
+
+    #[test]
+    fn shifting_by_nothing_is_the_value_back() {
+        assert_eq!(
+            shift(f_lxlsh, 0xdead_beef, 0).unwrap(),
+            Ret::U32(0xdead_beef)
+        );
+        assert_eq!(
+            shift(f_lxursh, 0xdead_beef, 0).unwrap(),
+            Ret::U32(0xdead_beef)
+        );
+    }
+
+    #[test]
+    fn shifting_a_long_off_the_end_is_refused_rather_than_guessed() {
+        // A count of 32 or more has two defensible answers -- zero, from a
+        // software `shl ax,1 / rcl dx,1` loop, or the value shifted by
+        // `count & 31`, from a 286 masking CL -- and Borland's runtime source is
+        // not in the archive to settle it. Every reachable call site is bounded
+        // to 0..=31, so this is a guard that should never fire.
+        for shim in [f_lxlsh, f_lxursh] {
+            let e = shift(shim, 1, 32).expect_err("refused");
+            assert!(format!("{e}").contains("32"), "{e}");
+            let e = shift(shim, 1, 255).expect_err("refused");
+            assert!(format!("{e}").contains("255"), "{e}");
+        }
     }
 
     #[test]
