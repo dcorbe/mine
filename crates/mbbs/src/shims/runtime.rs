@@ -140,15 +140,22 @@ pub fn f_lumod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
     }
 }
 
-/// The `long` a module passed in `DX:AX`, high half in `DX`.
+/// The `DX:AX` pair a module called with, as one 32-bit value with the high
+/// half in `DX`.
+///
+/// An operand for the helpers that take one there, and for `f_scopy@` -- which
+/// takes none -- the answer, because handing those two registers back untouched
+/// is what "returns nothing" has to mean for it.
 fn dxax(machine: &Machine) -> u32 {
     u32::from(machine.ax()) | (u32::from(machine.dx()) << 16)
 }
 
 /// `long F_LXMUL@(void)` -- `DX:AX * CX:BX`, answered in `DX:AX`.
 ///
-/// The most-called import in `WCCMMUD.DLL`: 124 sites, and not one of them puts
-/// anything on the stack. `CX:BX` is one 32-bit operand with its high half in
+/// The most-called of the eight helpers by a wide margin -- 124 sites, against
+/// 54 for the next -- though not of the module's imports at large, where
+/// `re/ne_imports.py` puts it eighteenth. Not one of the 124 puts anything on
+/// the stack. `CX:BX` is one 32-bit operand with its high half in
 /// `CX`, which 66 of those sites say out loud by building it as `push dx;
 /// push ax` ... `pop bx; pop cx`.
 ///
@@ -212,8 +219,9 @@ pub fn f_lxlsh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
 ///
 /// The `U` is the whole of the difference: Worldgroup exports the arithmetic
 /// shift separately as `F_LXRSH@` at ordinal 660, and `WCCMMUD.DLL` does not
-/// import it. Corroborated at `seg 8:0x0120`, where the next statement does the
-/// same job 16 bits wide with an unsigned `shr ax,0xb`.
+/// import it. Corroborated at `seg 8:0x0120`, where the surrounding code shifts
+/// unsigned -- the next statement is `mov ax,[bp+0xc]; shr ax,0xb`, an `shr` and
+/// not an `sar`, though on a different variable and a different count.
 ///
 /// # Errors
 ///
@@ -260,15 +268,21 @@ pub const POINTERS: u16 = 8;
 /// *destroyed*.
 ///
 /// The real routine was `rep movsb`, so it also advanced `SI` and `DI` and left
-/// `CX` at zero. This one leaves all three alone, which is the safe direction of
-/// the same argument.
+/// `CX` at zero. This one leaves all three as the module had them -- `mbbs16`
+/// hands `SI`, `DI`, `BX` and `CX` back across every host call -- which is the
+/// safe direction of the same argument. `BX` is the one that matters: `rep
+/// movsb` never touched it, so Borland's code generator is entitled to keep a
+/// live value there across this call, and it is preserved for that reason
+/// rather than by cdecl, which makes it scratch.
 ///
 /// # Errors
 ///
 /// If either pointer names nothing of the module's or the copy would leave a
 /// segment, and if the two ranges overlap -- `rep movsb` smears a forward
 /// overlap where a buffered copy would not, and no struct assignment produces
-/// one.
+/// one. Overlap is judged on the selectors being equal, which is the same
+/// question as the segments being the same one only because every selector this
+/// host hands out carries the same low three bits.
 pub fn f_scopy(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
     let source = machine.arg_far(0);
     let dest = machine.arg_far(2);
@@ -286,9 +300,7 @@ pub fn f_scopy(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
     let bytes = machine.resolve(source, len)?.to_vec();
     machine.write(dest, &bytes)?;
 
-    Ok(Ret::U32(
-        u32::from(machine.ax()) | (u32::from(machine.dx()) << 16),
-    ))
+    Ok(Ret::U32(dxax(machine)))
 }
 
 /// The single signed pair that has no answer: `i32::MIN / -1`.
@@ -470,11 +482,15 @@ mod tests {
         // `count & 31`, from a 286 masking CL -- and Borland's runtime source is
         // not in the archive to settle it. Every reachable call site is bounded
         // to 0..=31, so this is a guard that should never fire.
+        //
+        // The counts are matched with their surrounding punctuation because
+        // `CH` is 0xff in this fixture: a shim that read `CX` would report
+        // 65,312 rather than 32, and a bare `contains("32")` would accept that.
         for shim in [f_lxlsh, f_lxursh] {
             let e = shift(shim, 1, 32).expect_err("refused");
-            assert!(format!("{e}").contains("32"), "{e}");
+            assert!(format!("{e}").contains(", 32)"), "{e}");
             let e = shift(shim, 1, 255).expect_err("refused");
-            assert!(format!("{e}").contains("255"), "{e}");
+            assert!(format!("{e}").contains(", 255)"), "{e}");
         }
     }
 
@@ -540,26 +556,29 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_that_runs_off_a_segment_is_refused() {
-        // The bound is the destination segment's own limit, which is the only
-        // place it is known. A host that copied anyway would be writing into
-        // whatever the loader put next.
+    fn a_copy_that_runs_off_a_segment_is_refused_at_either_end() {
+        // The bound is each segment's own limit, which is the only place it is
+        // known. A host that copied anyway would be reading whatever followed
+        // the source, or writing over whatever followed the destination.
+        //
+        // Both directions, because they are refused by different calls --
+        // `resolve` for the source and `write` for the destination -- and a
+        // four-byte segment of its own keeps each refusal about a length rather
+        // than about the two ranges meeting in the fixture's shared scratch.
         let mut f = Fixture::new();
-        let source = f.bytes(&[b'z'; 8], false);
-
-        // A segment of its own, so what is refused is its length and not the
-        // two ranges meeting -- the fixture's scratch holds both otherwise.
-        let selector = f.machine.alloc_segment(4).expect("a four-byte segment");
-        let dest = FarPtr {
+        let small = FarPtr {
             offset: 0,
-            selector,
+            selector: f.machine.alloc_segment(4).expect("a four-byte segment"),
         };
-        let args = [Fixture::far(source), Fixture::far(dest)].concat();
+        let roomy = f.bytes(&[b'z'; 8], false);
 
-        let e = f
-            .invoke_with(f_scopy, &args, [0, 0, 8, 0])
-            .expect_err("refused");
-        assert!(format!("{e}").contains("runs past the end"), "{e}");
+        for (source, dest, end) in [(roomy, small, "destination"), (small, roomy, "source")] {
+            let args = [Fixture::far(source), Fixture::far(dest)].concat();
+            let e = f
+                .invoke_with(f_scopy, &args, [0, 0, 8, 0])
+                .expect_err("refused");
+            assert!(format!("{e}").contains("runs past the end"), "{end}: {e}");
+        }
     }
 
     #[test]
