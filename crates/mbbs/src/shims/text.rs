@@ -187,24 +187,18 @@ pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the one that arrived. See [`strings::skpwht`](crate::strings::skpwht) for
 /// why a tab does not count.
 pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
-    let text = machine.read_cstr(at)?;
+    let cp = machine.arg_far(0);
+    let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwht(text) as u16;
-    Ok(Ret::Far(FarPtr {
-        offset: at.offset + n,
-        selector: at.selector,
-    }))
+    Ok(Ret::Far(at(cp, n)))
 }
 
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
 pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
-    let text = machine.read_cstr(at)?;
+    let cp = machine.arg_far(0);
+    let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwrd(text) as u16;
-    Ok(Ret::Far(FarPtr {
-        offset: at.offset + n,
-        selector: at.selector,
-    }))
+    Ok(Ret::Far(at(cp, n)))
 }
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
@@ -316,6 +310,54 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
+/// `char *strcat(char *dst,char *src)`.
+///
+/// Ordinal 571, `seg 1:0x26d0`. How much room `dst` has, only the caller knows,
+/// so the bound is the segment's -- the same limit [`fill`] applies to
+/// `sprintf`, and for the same reason.
+pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let end = machine.read_cstr(dst)?.len() as u16;
+    let text = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    fill(machine, at(dst, end), &text)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `char *strncat(char *dst,char *src,int maxlen)`.
+///
+/// Ordinal 580, `seg 1:0x236a`: `strlen`, `strlen`, clamp to `maxlen`, `movmem`,
+/// then a terminator the routine writes itself at `dst[dstlen + n]`. So at most
+/// `maxlen + 1` bytes land past the end of `dst` and -- unlike [`strncpy`] --
+/// the result is always terminated.
+pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let end = machine.read_cstr(dst)?.len() as u16;
+    let max = usize::from(machine.arg_u16(4));
+    let text = machine.read_cstr(machine.arg_far(2))?;
+    let text = text[..text.len().min(max)].to_vec();
+    fill(machine, at(dst, end), &text)?;
+    Ok(Ret::Far(dst))
+}
+
+/// `char *strncpy(char *dst,char *src,unsigned n)`.
+///
+/// Ordinal 582, `seg 1:0x2815`, and **not** [`stzcpy`] -- which is
+/// Galacticomm's answer to this routine's one flaw. `strncpy` copies at most
+/// `n` bytes and pads the rest of `n` with NUL, so a source of `n` characters
+/// or more leaves the destination **unterminated**. Exactly `n` bytes are
+/// written every time, which is what makes the bound checkable at all.
+pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let dst = machine.arg_far(0);
+    let n = usize::from(machine.arg_u16(4));
+    let text = machine.read_cstr(machine.arg_far(2))?;
+
+    let mut out = vec![0u8; n];
+    let take = text.len().min(n);
+    out[..take].copy_from_slice(&text[..take]);
+    machine.write(dst, &out)?;
+    Ok(Ret::Far(dst))
+}
+
 /// `int strcmp(char *s1,char *s2)` -- **0 is equal**, unlike [`sameas`].
 ///
 /// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
@@ -384,6 +426,23 @@ fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError>
     Ok(())
 }
 
+/// A pointer `n` bytes into the string `ptr` names.
+///
+/// The one piece of arithmetic every routine here that answers a `char *` does,
+/// and the reason it does not need checking: `n` always comes from a successful
+/// [`Machine::read_cstr`], which only succeeds when the terminator is inside
+/// the segment. So `ptr.offset + n` is at worst the last byte of a segment that
+/// is at most 64 KiB, and cannot wrap the `u16`.
+///
+/// The selector is the caller's own. Rebuilding it from anywhere else would
+/// hand the module an address into the wrong segment.
+fn at(ptr: FarPtr, n: u16) -> FarPtr {
+    FarPtr {
+        offset: ptr.offset + n,
+        selector: ptr.selector,
+    }
+}
+
 /// Write `text` and its terminator at `at`, refusing to exceed `capacity`.
 pub fn write_cstr(
     machine: &mut Machine,
@@ -407,6 +466,100 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn strcat_appends_and_returns_the_destination() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("north");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector];
+        assert_eq!(f.invoke(strcat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "go north");
+    }
+
+    #[test]
+    fn strncpy_pads_to_n_and_does_not_terminate_a_full_buffer() {
+        // The difference from `stzcpy`, which is Galacticomm's answer to this
+        // routine: `stzcpy` always terminates and `strncpy` does not.
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let src = f.text("abcdefgh");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
+
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("readable"),
+            b"abcd####",
+            "four copied, no terminator, and the rest of the buffer untouched"
+        );
+    }
+
+    #[test]
+    fn strncpy_fills_the_whole_of_n_when_the_source_is_shorter() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(&[b'#'; 8], false);
+        let src = f.text("ab");
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 6];
+
+        f.invoke(strncpy, &args).expect("ok");
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("readable"),
+            b"ab\0\0\0\0##",
+            "six bytes written, the last four of them NUL"
+        );
+    }
+
+    #[test]
+    fn strncat_clamps_the_source_and_terminates_it_itself() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"go \0").expect("seeded");
+        let src = f.text("northwards");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
+        assert_eq!(f.invoke(strncat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.read(dst), "go north", "five of the source, then a NUL");
+    }
+
+    #[test]
+    fn the_writers_refuse_to_run_off_the_end_of_a_segment() {
+        // How much room a destination has, only the caller knows -- so the
+        // only bound the host can apply is the segment's, and it must be an
+        // error rather than a truncated copy or a wrapped offset.
+        let mut f = Fixture::new();
+        let src = f.text("overlong");
+        let scratch = src.selector;
+        let near_end = FarPtr {
+            offset: 4090,
+            selector: scratch,
+        };
+        f.machine.write(near_end, b"go\0").expect("still inside");
+
+        assert!(
+            f.invoke(
+                strncpy,
+                &[
+                    near_end.offset,
+                    near_end.selector,
+                    src.offset,
+                    src.selector,
+                    100
+                ]
+            )
+            .is_err(),
+            "100 bytes at 4090 leaves a 4096-byte segment"
+        );
+        assert!(
+            f.invoke(
+                strcat,
+                &[near_end.offset, near_end.selector, src.offset, src.selector]
+            )
+            .is_err(),
+            "and so does `go` plus `overlong`"
+        );
+    }
 
     #[test]
     fn strcmp_returns_the_difference_and_zero_for_equal() {

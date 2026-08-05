@@ -129,6 +129,9 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "sameto", text::sameto, Cleans::Caller),
     (MAJORBBS, "samein", text::samein, Cleans::Caller),
     (MAJORBBS, "strcmp", text::strcmp, Cleans::Caller),
+    (MAJORBBS, "strcat", text::strcat, Cleans::Caller),
+    (MAJORBBS, "strncat", text::strncat, Cleans::Caller),
+    (MAJORBBS, "strncpy", text::strncpy, Cleans::Caller),
     // Message files, and the options in them.
     (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
     (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller),
