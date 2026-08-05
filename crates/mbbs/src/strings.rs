@@ -129,6 +129,71 @@ pub fn strcmp(a: &[u8], b: &[u8]) -> i16 {
     0
 }
 
+/// `char *lastwd(char *string)` -- how far to the start of the last word.
+///
+/// Ordinal 381, `seg 34:0x12fd`. Two backward walks from the last character:
+/// over the trailing whitespace, then over the word itself. Each stops dead at
+/// the start of the string and answers it, which is what makes an empty string,
+/// an all-whitespace string and a single word all answer offset zero.
+///
+/// **Nothing is written.** The trailing whitespace is skipped over, not
+/// removed -- `lastwd("go north  ")` answers `"north  "` -- and `depad` is the
+/// routine that truncates.
+///
+/// The whitespace set is [`is_white`], `_ctype` bit 0, the same set `rmvwht`
+/// and `depad` test and not the literal `0x20` that `skpwht` does.
+pub fn lastwd(s: &[u8]) -> usize {
+    let Some(mut p) = s.len().checked_sub(1) else {
+        return 0;
+    };
+    while is_white(s[p]) {
+        if p == 0 {
+            return 0;
+        }
+        p -= 1;
+    }
+    while !is_white(s[p]) {
+        if p == 0 {
+            return 0;
+        }
+        p -= 1;
+    }
+    p + 1
+}
+
+/// `void sortstgs(char *stgs[],int num)` -- the shell sort itself.
+///
+/// Ordinal 558, `seg 36:0x096d`, transcribed rather than handed to
+/// [`slice::sort_by`]: a shell sort is not stable, so which of two equal
+/// strings ends up where is observable, and only the original's own gap
+/// sequence answers that the same way.
+///
+/// The comparison is a far call whose relocation resolves to `seg 1:0x2714` =
+/// [`strcmp`], so the order is **case-sensitive** and by unsigned byte.
+///
+/// A `num` below two makes `gap` zero and the original returns having read
+/// nothing; the caller refuses those before it reads the array at all, so the
+/// loop here is only what remains once `gap` is known positive.
+pub fn sortstgs<T>(items: &mut [T], mut cmp: impl FnMut(&T, &T) -> i16) {
+    let mut gap = items.len() / 2;
+    while gap > 0 {
+        for i in gap..items.len() {
+            let mut j = i - gap;
+            // The original breaks out of the whole `j` loop the moment a pair
+            // is already in order -- `jng` past the swap -- rather than merely
+            // stopping this comparison.
+            while cmp(&items[j], &items[j + gap]) > 0 {
+                items.swap(j, j + gap);
+                match j.checked_sub(gap) {
+                    Some(next) => j = next,
+                    None => break,
+                }
+            }
+        }
+        gap /= 2;
+    }
+}
+
 /// Whether two equal-length runs match once [`tolower`] has folded each byte.
 ///
 /// The one loop `sameas` and `sameto` share; they differ only in what happens
@@ -256,6 +321,47 @@ mod tests {
         assert_eq!(strcmp(b"\x80", b"\x01"), 127);
         assert_eq!(strcmp(b"\x01", b"\x80"), -127);
         assert_eq!(strcmp(b"\xff", b"\x01"), 254, "the widest it can be");
+    }
+
+    #[test]
+    fn lastwd_finds_the_start_of_the_last_word() {
+        // `MAJORBBS.C:535` is `sameas(lastwd(getmsg(SHORTM)),"LONG")` -- the
+        // last word of a configuration line.
+        assert_eq!(lastwd(b"go north"), 3);
+        assert_eq!(lastwd(b"SHORT MESSAGES LONG"), 15);
+        assert_eq!(lastwd(b"word"), 0, "one word starts at the start");
+        assert_eq!(lastwd(b""), 0);
+        assert_eq!(lastwd(b"   "), 0, "nothing but whitespace");
+    }
+
+    #[test]
+    fn lastwd_skips_the_trailing_whitespace_without_removing_it() {
+        // It writes nothing at all. `depad` is the routine that truncates;
+        // this one answers a pointer and leaves the padding behind it in place.
+        assert_eq!(lastwd(b"go north  "), 3);
+        assert_eq!(lastwd(b"go\tnorth\r\n"), 3, "the whole is_white set");
+    }
+
+    #[test]
+    fn sortstgs_orders_by_strcmp_and_so_is_case_sensitive() {
+        // The comparison is a far call whose relocation resolves to
+        // `seg 1:0x2714` = `strcmp`, not `sameas`. Uppercase sorts first.
+        let mut items: Vec<&[u8]> = vec![b"pear", b"Apple", b"apple"];
+        sortstgs(&mut items, |a, b| strcmp(a, b));
+        assert_eq!(items, vec![&b"Apple"[..], &b"apple"[..], &b"pear"[..]]);
+    }
+
+    #[test]
+    fn sortstgs_handles_every_size_its_gap_sequence_degenerates_on() {
+        for n in 0..12usize {
+            let reversed: Vec<Vec<u8>> = (0..n).rev().map(|i| vec![b'a' + i as u8]).collect();
+            let mut items: Vec<&[u8]> = reversed.iter().map(Vec::as_slice).collect();
+            sortstgs(&mut items, |a, b| strcmp(a, b));
+
+            let want: Vec<Vec<u8>> = (0..n).map(|i| vec![b'a' + i as u8]).collect();
+            let want: Vec<&[u8]> = want.iter().map(Vec::as_slice).collect();
+            assert_eq!(items, want, "n = {n}");
+        }
     }
 
     #[test]

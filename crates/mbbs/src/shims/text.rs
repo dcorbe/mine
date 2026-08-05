@@ -310,6 +310,47 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
+/// `char *lastwd(char *string)` -- the last word, in the caller's own buffer.
+///
+/// See [`strings::lastwd`](crate::strings::lastwd). It writes nothing, and the
+/// selector it answers is the one that arrived.
+pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let s = machine.arg_far(0);
+    let n = crate::strings::lastwd(machine.read_cstr(s)?) as u16;
+    Ok(Ret::Far(at(s, n)))
+}
+
+/// `void sortstgs(char *stgs[],int num)` -- sort an array of `char *` in place.
+///
+/// `num` is a signed `int` and the original's `gap = num / 2` is tested with a
+/// signed compare, so **anything below two returns before the array is read**.
+/// That is why a `num` of zero with a null array is not an error here either --
+/// the real one never dereferences it.
+///
+/// The pointers move; the strings do not. See
+/// [`strings::sortstgs`](crate::strings::sortstgs) for why the sort is
+/// transcribed rather than delegated.
+pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let array = machine.arg_far(0);
+    let num = machine.arg_u16(2) as i16;
+    if num < 2 {
+        return Ok(Ret::Void);
+    }
+    let num = usize::from(num as u16);
+
+    let slots = machine.resolve(array, num * 4)?.to_vec();
+    let mut items: Vec<(FarPtr, Vec<u8>)> = Vec::with_capacity(num);
+    for slot in slots.chunks_exact(4) {
+        let ptr = FarPtr::from_bytes([slot[0], slot[1], slot[2], slot[3]]);
+        items.push((ptr, machine.read_cstr(ptr)?.to_vec()));
+    }
+    crate::strings::sortstgs(&mut items, |a, b| crate::strings::strcmp(&a.1, &b.1));
+
+    let out: Vec<u8> = items.iter().flat_map(|(ptr, _)| ptr.to_bytes()).collect();
+    machine.write(array, &out)?;
+    Ok(Ret::Void)
+}
+
 /// `char *strtok(char *s,char *delim)` -- the next token, destructively.
 ///
 /// Ordinal 585, `seg 1:0x24f4`. Three things worth naming:
@@ -556,6 +597,83 @@ pub fn write_cstr(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn lastwd_answers_a_pointer_into_the_callers_own_string() {
+        let mut f = Fixture::new();
+        let s = f.text("SHORT MESSAGES LONG");
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+            panic!("lastwd returns char *");
+        };
+        assert_eq!(p.selector, s.selector);
+        assert_eq!(f.read(p), "LONG");
+        assert_eq!(f.read(s), "SHORT MESSAGES LONG", "and changes nothing");
+    }
+
+    #[test]
+    fn lastwd_leaves_the_trailing_padding_where_it_found_it() {
+        let mut f = Fixture::new();
+        let s = f.text("go north  ");
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+            panic!("char *")
+        };
+        assert_eq!(f.read(p), "north  ", "skipped, not stripped");
+    }
+
+    #[test]
+    fn sortstgs_rewrites_the_array_of_pointers_in_place() {
+        let mut f = Fixture::new();
+        let pear = f.text("pear");
+        let apple = f.text("apple");
+        let fig = f.text("fig");
+        let array = f.words(&[
+            pear.offset,
+            pear.selector,
+            apple.offset,
+            apple.selector,
+            fig.offset,
+            fig.selector,
+        ]);
+
+        assert!(matches!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 3]),
+            Ok(Ret::Void)
+        ));
+        let bytes = f.machine.resolve(array, 12).expect("readable").to_vec();
+        let got: Vec<FarPtr> = bytes
+            .chunks_exact(4)
+            .map(|c| FarPtr::from_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            got,
+            vec![apple, fig, pear],
+            "the pointers moved, not the text"
+        );
+    }
+
+    #[test]
+    fn sortstgs_of_fewer_than_two_reads_nothing_at_all() {
+        // `gap = num/2` under a signed compare, so 1, 0 and any negative return
+        // before the array is touched. That is why a null array is not an
+        // error here -- the real one never dereferences it either.
+        let mut f = Fixture::new();
+        for num in [0u16, 1, (-4i16) as u16] {
+            assert!(matches!(f.invoke(sortstgs, &[0, 0, num]), Ok(Ret::Void)));
+        }
+    }
+
+    #[test]
+    fn sortstgs_refuses_an_array_that_leaves_its_segment() {
+        let mut f = Fixture::new();
+        let one = f.text("only");
+        let array = f.words(&[one.offset, one.selector]);
+        // Two pointers named, one present, and the rest of the segment is not
+        // the module's to claim.
+        assert!(
+            f.invoke(sortstgs, &[array.offset, array.selector, 900])
+                .is_err()
+        );
+    }
 
     #[test]
     fn strtok_walks_a_line_and_then_says_there_is_no_more() {
@@ -1181,10 +1299,7 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text("  the quick brown fox  ");
         assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
-        assert_eq!(
-            f.machine.read_cstr(at).expect("a string"),
-            b"thequickbrownfox"
-        );
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
     }
 
     #[test]
@@ -1283,10 +1398,7 @@ mod tests {
             .expect("margc");
 
         assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
-        assert_eq!(
-            f.machine.read_cstr(line).expect("a string"),
-            b"look at this"
-        );
+        assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
     }
 
     #[test]
