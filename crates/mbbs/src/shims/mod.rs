@@ -149,6 +149,7 @@ const ROUTINES: &[(&str, &str, Shim)] = &[
     (MAJORBBS, "srand", system::srand),
     (MAJORBBS, "gmdnam", system::gmdnam),
     (MAJORBBS, "shocst", system::shocst),
+    (MAJORBBS, "rtkick", system::rtkick),
     (MAJORBBS, "dclvda", system::dclvda),
     (MAJORBBS, "register_module", system::register_module),
     (MAJORBBS, "catastro", system::catastro),
