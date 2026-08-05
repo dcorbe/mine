@@ -30,6 +30,7 @@ pub mod heap;
 pub mod msg;
 pub mod random;
 mod shims;
+pub mod strings;
 pub mod stream;
 #[cfg(test)]
 mod testing;
@@ -45,6 +46,7 @@ pub use heap::{Config, Heap, Region};
 pub use random::{RAND_MAX, Random, Runaway};
 pub use shims::system::{Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
+pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
