@@ -25,6 +25,7 @@ pub mod btrieve;
 mod exports;
 mod fmt;
 mod globals;
+pub mod fsd;
 pub mod heap;
 pub mod msg;
 mod shims;
