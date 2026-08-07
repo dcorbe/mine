@@ -904,14 +904,18 @@ impl Host {
         // (`MAJORBBS.C:4290`) does.
         self.point_curusr(machine, chan).map_err(shim_io)?;
 
+        // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
+        // only the `!= 3` guard on `shomal()` (the operator console, out of
+        // scope) is conditional. `status` is a placed global
+        // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
+        // at 2 sites); writing it only on the non-CRSTG path left the
+        // module reading a stale value on the CRSTG path -- zero on a
+        // fresh host, or a leftover `OUTMT` from an earlier poll.
+        self.globals()
+            .write(machine, "status", &status.to_le_bytes())?;
+
         if status == gsbl::Gsbl::CRSTG {
             self.get_input(machine, chan).map_err(shim_io)?;
-        } else {
-            // `status` is a placed global (`globals.rs:107`) that `stsrou`
-            // reads -- `WCCMMUD.DLL` imports it at 2 sites, and it has to be
-            // written before entry 2 is called, not after.
-            self.globals()
-                .write(machine, "status", &status.to_le_bytes())?;
         }
 
         // Same borrow trap as `connect`: read the entry pointer out of
@@ -1431,5 +1435,27 @@ mod tests {
         let module = f.minimal_module();
         f.host.gsbl_mut().push_input(0, b"look\r");
         assert!(f.host.poll(&mut f.machine, &module).is_err());
+    }
+
+    /// R20: `MAJORBBS.C:152` writes `status` unconditionally; only `shomal()`
+    /// (out of scope) is behind the `!= 3` guard. Writing it only on the
+    /// non-CRSTG path left `stsrou` reading a stale value on the CRSTG path.
+    #[test]
+    fn poll_writes_the_status_global_on_the_crstg_path_too() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        // No module registered, so this errors after `point_curusr` and the
+        // `status` write have already run -- which is exactly what is being
+        // checked.
+        let _ = f.host.poll(&mut f.machine, &module);
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            crate::gsbl::Gsbl::CRSTG as u16,
+            "status must be written before dispatch, not only off the CRSTG path"
+        );
     }
 }
