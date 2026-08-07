@@ -210,11 +210,12 @@ impl Gsbl {
     /// The other half of the boundary. Raises `OUTMT` if `btuoes` asked for it
     /// and this drain is what emptied the buffer.
     ///
-    /// Finding 7 (not fixed) -- **do not call this mid-line while
-    /// `width != 0`.** [`Channel::wrap`] recovers a trailing partial word by
-    /// looking back into `output`; draining it out from under a line in
-    /// progress changes what a later wrap on that line would see. See the
-    /// invariant documented on `wrap` for why this is left alone.
+    /// Safe to call at any point, including mid-line. It was not always: while
+    /// [`Channel::wrap`] recovered a trailing partial word by looking back
+    /// into `output`, a drain landing between two `btuxmt` calls moved the
+    /// break, and the bytes a channel emitted depended on when a socket task
+    /// happened to run. `transmit` now wraps inside a buffer of its own and
+    /// commits once, so there is nothing here to disturb.
     pub fn drain_output(&mut self, chan: i16) -> Vec<u8> {
         let Some(c) = self.channel_mut(chan) else {
             return Vec::new();
@@ -387,9 +388,35 @@ impl Channel {
     /// per-byte capacity check and measured only once, at the end, against a
     /// snapshot to roll back to.
     fn transmit(&mut self, bytes: &[u8]) {
-        let snapshot = self.output.clone();
-        let column_before = self.column;
-        let supplied_lf_before = self.supplied_lf;
+        // Built here and committed at the end, rather than pushed straight at
+        // `self.output`. Two things fall out of that, and the second is the
+        // reason:
+        //
+        // 1. R6's all-or-nothing overflow is a length check on `out` instead
+        //    of cloning the whole ring to restore from.
+        // 2. `wrap` looks back for the trailing partial word **inside `out`**,
+        //    which nothing else can touch. It used to look back into
+        //    `self.output`, which `drain_output` empties whenever the
+        //    transport runs -- so the same input produced different bytes
+        //    depending on when a socket task was scheduled.
+        //
+        // That this is also what real GSBL does was worked out from the
+        // capture rather than assumed. A streaming wrapper that held only a
+        // pending space would break mid-word, and `re/oracle/accept-run1.raw`
+        // shows it does not: the line ending `...ards. You hear the` (77
+        // characters) is followed by `clash`, not by a split word. So GSBL
+        // knew the whole word's length -- which it can, because `btuxmt` is
+        // handed a complete string. It wraps within that string, carrying
+        // only `column` across calls.
+        //
+        // The limitation that buys: a word split across two `btuxmt` calls
+        // cannot be rejoined, so it breaks at the call boundary. MajorMUD
+        // flushes whole `prfbuf` blocks through `_TELL_USER`, so it does not
+        // arise -- and a deterministic break is worth more than an
+        // opportunistic one that a drain can move.
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
+        let mut column = self.column;
+        let mut supplied_lf = self.supplied_lf;
 
         for &byte in bytes {
             match byte {
@@ -402,27 +429,27 @@ impl Channel {
                     // ours, so a module byte stream that already spells out
                     // `\r\n` -- even split across two `transmit` calls --
                     // does not get a second one.
-                    self.output.push_back(b'\r');
-                    self.output.push_back(b'\n');
-                    self.column = 0;
-                    self.supplied_lf = true;
+                    out.push(b'\r');
+                    out.push(b'\n');
+                    column = 0;
+                    supplied_lf = true;
                     continue;
                 }
-                b'\n' if self.supplied_lf => {
+                b'\n' if supplied_lf => {
                     // The other half of a module's own explicit `\r\n` --
                     // already on the wire as the LF we supplied above.
-                    self.supplied_lf = false;
+                    supplied_lf = false;
                     continue;
                 }
                 b'\n' => {
-                    self.output.push_back(b'\n');
+                    out.push(b'\n');
                     continue;
                 }
                 _ => {}
             }
-            self.supplied_lf = false;
-            if self.width != 0 && self.column >= self.width {
-                self.wrap();
+            supplied_lf = false;
+            if self.width != 0 && column >= self.width {
+                Self::wrap(&mut out, &mut column, self.width);
                 if byte == b' ' {
                     // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
                     // *becomes* the break `wrap()` just inserted, so it is
@@ -431,20 +458,24 @@ impl Channel {
                     continue;
                 }
             }
-            self.output.push_back(byte);
+            out.push(byte);
             // R10: with the default width of 0, wrap() is never called and
             // nothing but a CR ever resets column -- so a long enough
             // channel-lifetime of unwrapped output must not panic once it
             // passes u16::MAX bytes since the last CR.
-            self.column = self.column.saturating_add(1);
+            column = column.saturating_add(1);
         }
 
-        if self.output.len() > OUTSIZ {
-            self.output = snapshot;
-            self.column = column_before;
-            self.supplied_lf = supplied_lf_before;
+        // R6, guide `btuxmt` CAUTIONS page 191: a string that will not fit is
+        // not output *at all*, and a status 253 is queued. Nothing above this
+        // line has touched the channel, so there is nothing to roll back.
+        if self.output.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
+            return;
         }
+        self.output.extend(out);
+        self.column = column;
+        self.supplied_lf = supplied_lf;
     }
 
     /// Break the line, moving a partial word down with it.
@@ -467,31 +498,31 @@ impl Channel {
     /// same problem. Real GSBL gets away with this because a 2400-baud UART
     /// never empties the buffer faster than the module fills it. Leave the
     /// fix to whoever builds the transport.
-    fn wrap(&mut self) {
+    fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16) {
         let mut word = Vec::new();
-        while let Some(&back) = self.output.back() {
+        while let Some(&back) = out.last() {
             if back == b' ' || back == b'\n' || back == b'\r' {
                 break;
             }
             word.push(back);
-            self.output.pop_back();
+            out.pop();
             // A word as long as the whole line has no boundary to break on, so
             // break it where the margin falls -- losing it would be worse.
-            if word.len() >= usize::from(self.width) {
+            if word.len() >= usize::from(width) {
                 for byte in word.drain(..).rev() {
-                    self.output.push_back(byte);
+                    out.push(byte);
                 }
                 break;
             }
         }
-        while self.output.back() == Some(&b' ') {
-            self.output.pop_back();
+        while out.last() == Some(&b' ') {
+            out.pop();
         }
-        self.output.extend(b"\r\n");
-        self.column = 0;
+        out.extend(b"\r\n");
+        *column = 0;
         for byte in word.into_iter().rev() {
-            self.output.push_back(byte);
-            self.column += 1;
+            out.push(byte);
+            *column += 1;
         }
     }
 }
@@ -499,6 +530,49 @@ impl Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes a channel emits do not depend on when the transport ran.
+    ///
+    /// This is the test the original wrap could not pass. `wrap` recovered the
+    /// trailing partial word by popping it back off `output` -- so a drain
+    /// landing between two `btuxmt` calls took the word away and the break
+    /// moved. Under a tokio transport that is a socket task's scheduling
+    /// deciding what the user sees, which would have looked like a flaky test
+    /// rather than a design fault.
+    ///
+    /// The halves matter. A word has to *straddle* the boundary for the drain
+    /// to be able to steal it -- `"the quick " + "brown fox"` breaks on a space
+    /// that lives in the second half either way, and passes even on the broken
+    /// implementation. Here `"wor"` is in the first half and `"ldsomething"` in
+    /// the second, so the old `wrap` could only move down the part it could
+    /// still see.
+    #[test]
+    fn output_is_the_same_whether_or_not_the_transport_drained_mid_line() {
+        let halves: [&[u8]; 2] = [b"hello wor", b"ldsomethinglong end"];
+
+        // Drained only at the end.
+        let mut whole = Gsbl::new(1);
+        whole.channel_mut(0).expect("channel 0").width = 20;
+        for half in halves {
+            whole.transmit(0, half);
+        }
+        let undrained = whole.drain_output(0);
+
+        // Drained between the two calls, then concatenated.
+        let mut split = Gsbl::new(1);
+        split.channel_mut(0).expect("channel 0").width = 20;
+        let mut drained = Vec::new();
+        for half in halves {
+            split.transmit(0, half);
+            drained.extend(split.drain_output(0));
+        }
+
+        assert_eq!(
+            String::from_utf8_lossy(&drained),
+            String::from_utf8_lossy(&undrained),
+            "a drain between two btuxmt calls changed the bytes"
+        );
+    }
 
     #[test]
     fn a_fresh_channel_has_the_defaults_gsbl_gave_it() {
