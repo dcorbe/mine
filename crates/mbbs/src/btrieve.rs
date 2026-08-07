@@ -366,6 +366,17 @@ pub struct Block {
 
     /// Where the file is positioned.
     cursor: Cursor,
+
+    /// Whether a write has happened since the index pages last agreed with the
+    /// data. Set by [`Self::insert`] and [`Self::update`], cleared by
+    /// [`Self::reindex`].
+    ///
+    /// The host never reads an index page -- `records()` page-walks and sorts
+    /// -- so nothing *needs* this flag to answer a module correctly. It exists
+    /// for the file itself: a real Btrieve or MBBSEmu could open it later, and
+    /// `clsbtv` calls `reindex` exactly when this is true so that a file
+    /// leaving this host's reach never leaves with a stale index behind it.
+    dirty: bool,
 }
 
 impl Block {
@@ -442,6 +453,11 @@ impl Block {
         self.records.as_ref()
     }
 
+    /// Whether a write has happened since the index pages were last rebuilt.
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
+
     /// The record the cursor names, if it names one.
     pub fn current(&self) -> Option<&Record> {
         let records = self.records.as_ref()?;
@@ -516,6 +532,7 @@ impl Block {
         if matches!(slot, pages::Slot::NewPage { .. }) {
             self.geometry.pages += 1;
         }
+        self.dirty = true;
 
         Ok(position)
     }
@@ -563,6 +580,101 @@ impl Block {
             .update(&self.keys, position, bytes.to_vec())
             .map_err(|why| BtvError { file: name, why })?;
 
+        self.dirty = true;
+
+        Ok(())
+    }
+
+    /// Rebuild every key's leaf index page from the records already in memory,
+    /// in that key's order, and update the file control record's per-key
+    /// record count to match.
+    ///
+    /// The host never reads these pages back -- `records()` page-walks and
+    /// sorts, which is [`keys`]'s whole design. But a file this host wrote is
+    /// a file a real Btrieve, or MBBSEmu, could later open, and an index that
+    /// disagrees with the data behind it is exactly the silent corruption this
+    /// crate refuses to produce anywhere else. `clsbtv` calls this when
+    /// [`Self::dirty`] is set, which is the flush point the design names.
+    ///
+    /// # Errors
+    ///
+    /// If the records have never been loaded, a key's entries do not fit in a
+    /// single leaf page (see [`pages::index_pages`]), or the file cannot be
+    /// written.
+    pub fn reindex(&mut self) -> Result<(), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        let records = self.records.as_ref().ok_or_else(|| {
+            fail("reindex called before the records were loaded".to_owned())
+        })?;
+
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+
+        // Just the first page: every field this touches -- the key
+        // definitions and their record counts -- lives well inside it (see
+        // `fcr::KEYS`), and reading the whole file to reindex a 43 MB one
+        // would defeat the point of writing one page at a time.
+        let mut fcr = std::fs::read(&self.path).map_err(|e| {
+            fail(format!("{}: {e}", self.path.display()))
+        })?;
+        fcr.truncate(usize::from(self.geometry.page));
+
+        for key in &self.keys {
+            let entries: Vec<(Vec<u8>, u32)> = (0..records.ordered_len(key.number).unwrap_or(0))
+                .map(|n| {
+                    let record = records.ordered(key.number, n).expect("in range");
+                    (key.extract(&record.bytes), record.position)
+                })
+                .collect();
+
+            let mut page = pages::index_pages(layout, &entries)
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?
+                .pop()
+                .expect("index_pages always returns at least one page");
+
+            let definition = pages::fcr::KEYS + usize::from(key.number) * pages::fcr::KEY_WIDTH;
+            let root_at = definition + pages::fcr::KEY_ROOT;
+            let root = pages::long(&fcr[root_at..root_at + 4]);
+
+            // `index_pages` leaves the page number zero; this is the
+            // allocation `index_pages`'s own doc comment says the caller
+            // does, and in this crate it is always the key's existing root.
+            let mut header = pages::Header::decode(&page[..6]);
+            header.number = root;
+            page[..6].copy_from_slice(&header.encode());
+
+            pages::write_page(&self.path, layout, root, &page)
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+
+            let count = u32::try_from(entries.len())
+                .map_err(|_| fail(format!("key {}: more than four billion entries", key.number)))?;
+            let records_at = definition + pages::fcr::KEY_RECORDS;
+            fcr[records_at..records_at + 4].copy_from_slice(&pages::to_long(count));
+        }
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| fail(format!("{}: {e}", self.path.display())))?;
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&fcr))
+            .map_err(|e| {
+                fail(format!(
+                    "{}: writing the file control record: {e}",
+                    self.path.display()
+                ))
+            })?;
+
+        self.dirty = false;
         Ok(())
     }
 }
@@ -691,6 +803,7 @@ impl Btrieve {
             key,
             records: None,
             cursor: Cursor::Nowhere,
+            dirty: false,
         });
         Ok(block)
     }
@@ -1011,6 +1124,7 @@ mod tests {
             key: FarPtr::NULL,
             records: None,
             cursor: Cursor::Nowhere,
+            dirty: false,
         }
     }
 
@@ -1083,6 +1197,142 @@ mod tests {
         let e = block.update(999, &record(1)).expect_err("nothing is there");
         assert_eq!(e.file, "SCRATCH.DAT");
         assert!(e.why.contains("999"), "{e}");
+    }
+
+    /// A file shaped like `seed`'s but at a real page size -- 512 bytes, the
+    /// minimum an actual Btrieve file uses (`Geometry::read` refuses smaller).
+    /// `seed`'s 64-byte pages are for the write tests above, which never touch
+    /// a key definition; `reindex` does, and a key definition at `0x110`
+    /// needs a page with room for one. Key 0 is given a root: page 1, one of
+    /// the three index pages below the one data page.
+    fn seed_indexed(dir: &Path) -> PathBuf {
+        let (page, physical, pages) = (512usize, 20usize, 5usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[0x08..0x0a].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&16u16.to_le_bytes());
+        bytes[0x18..0x1a].copy_from_slice(&(physical as u16).to_le_bytes());
+        bytes[0x1e..0x20].copy_from_slice(&4u16.to_le_bytes());
+        bytes[0x26..0x2a].copy_from_slice(&pages::to_long(pages as u32));
+        for number in 1..pages {
+            let header = pages::Header {
+                number: number as u32,
+                data: number == 4,
+                stamp: 0,
+            };
+            bytes[number * page..number * page + 6].copy_from_slice(&header.encode());
+        }
+        bytes[0x110..0x114].copy_from_slice(&pages::to_long(1));
+        let path = dir.join("INDEXED.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    /// A `Block` over `seed_indexed`'s file.
+    fn block_indexed(path: PathBuf) -> Block {
+        let geometry = Geometry {
+            version: Version::V5,
+            page: 512,
+            keys: 1,
+            reclen: 16,
+            physical: 20,
+            records: 0,
+            pages: 5,
+            variable: false,
+        };
+        let keys = vec![Key {
+            number: 0,
+            segments: vec![keys::Segment {
+                offset: 0,
+                length: 2,
+                kind: keys::Kind::Signed,
+                descending: false,
+            }],
+            duplicates: false,
+        }];
+        Block {
+            name: "INDEXED.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FarPtr::NULL,
+            maxlen: 16,
+            data: FarPtr::NULL,
+            key: FarPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn an_insert_leaves_the_block_dirty_and_reindex_clears_it() {
+        let dir = crate::testing::scratch("block-reindex-dirty-flag");
+        let path = seed_indexed(&dir);
+        let mut block = block_indexed(path);
+        assert!(!block.dirty(), "nothing written yet");
+
+        block.insert(&record(1)).expect("insert");
+        assert!(block.dirty(), "an insert leaves the index stale");
+
+        block.reindex().expect("reindexes");
+        assert!(!block.dirty(), "reindex brings the index back in step");
+    }
+
+    #[test]
+    fn reindex_before_the_records_are_loaded_is_refused() {
+        let dir = crate::testing::scratch("block-reindex-unloaded");
+        let path = seed_indexed(&dir);
+        let mut block = block_indexed(path);
+
+        let e = block.reindex().expect_err("nothing has been read yet");
+        assert!(e.why.contains("loaded"), "{e}");
+    }
+
+    /// The rebuild survives a fresh read of the *file*, not just the
+    /// in-memory model -- reindex's whole point is that the bytes on disk
+    /// agree with the records, and only reading them back proves that.
+    #[test]
+    fn reindex_writes_a_leaf_page_that_decodes_to_the_records_key_order() {
+        let dir = crate::testing::scratch("block-reindex-leaf-page");
+        let path = seed_indexed(&dir);
+        let mut block = block_indexed(path.clone());
+
+        // Out of key order on purpose: 3, 1, 2. Key order is 1, 2, 3.
+        let first = block.insert(&record(3)).expect("insert");
+        let second = block.insert(&record(1)).expect("insert");
+        let third = block.insert(&record(2)).expect("insert");
+
+        block.reindex().expect("reindexes");
+
+        let bytes = std::fs::read(&path).expect("read back");
+
+        // The file control record's key-0 record count, at `fcr::KEY_RECORDS`
+        // within the key-0 definition.
+        let definition = pages::fcr::KEYS;
+        let count_at = definition + pages::fcr::KEY_RECORDS;
+        assert_eq!(
+            pages::long(&bytes[count_at..count_at + 4]),
+            3,
+            "the key's record count follows the rebuild, not the file's old one"
+        );
+
+        // Page 1 is a 512-byte leaf: 16 bytes of header, then three 10-byte
+        // entries (a 2-byte key plus 8 bytes of pointers) in key order.
+        let page = &bytes[512..1024];
+        assert!(!pages::Header::decode(&page[..6]).data, "still an index page");
+        assert_eq!(u16::from_le_bytes([page[6], page[7]]), 3, "three entries");
+
+        let entry = |n: usize| {
+            let at = 16 + n * 10;
+            let key = u16::from_le_bytes([page[at], page[at + 1]]);
+            let position = pages::long(&page[at + 2..at + 6]);
+            (key, position)
+        };
+        assert_eq!(entry(0), (1, second), "1 sorts first");
+        assert_eq!(entry(1), (2, third), "2 sorts second");
+        assert_eq!(entry(2), (3, first), "3 sorts last");
     }
 
     #[test]

@@ -356,6 +356,119 @@ pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, St
     Ok(out)
 }
 
+/// Bytes of header at the start of a leaf index page, before its first entry.
+///
+/// Measured off `WCCRACE.DAT` and `WCCCLASS.DAT`, the only two shipped files
+/// whose index fits one leaf page end to end (thirteen and fifteen records,
+/// both a two-byte key): four bytes of the same [`Header`] a data page opens
+/// with -- number, then flags with the data bit clear -- then two bytes that
+/// equalled the entry count in both measurements, then eight bytes of
+/// `0xffffffff` that a leaf with no siblings should hold. `docs/plans/
+/// 2026-08-07-btrieve-writes.md`, Task 6, has the raw bytes.
+pub const INDEX_HEADER: usize = 16;
+
+/// Bytes of one index entry past its key: a record pointer, then a child
+/// pointer that is [`NOWHERE`] on every leaf entry -- a leaf has no children.
+pub const INDEX_ENTRY_TAIL: usize = 8;
+
+/// Emit the leaf pages for one key, from records already in that key's order.
+///
+/// `entries` is `(key bytes, record position)` pairs, already sorted --
+/// [`Records`](super::Records) has already done that, and this does not
+/// re-sort them.
+///
+/// Returns one page image per leaf, [`layout.page`](Layout::page) bytes each,
+/// with the page number left zero: the caller allocates page numbers -- in
+/// this crate, always the key's existing root -- and patches
+/// [`Header::encode`] over the first six bytes before writing.
+///
+/// # Errors
+///
+/// If the entries do not fit in a single page. **That is a stop, not a
+/// fallback.** Splitting into interior pages needs a fill-factor policy
+/// nothing in the surviving record specifies, and inventing one would produce
+/// a file that looks valid and orders wrongly -- see `docs/plans/
+/// 2026-08-07-btrieve-writes.md`, Task 6, for the measurement this boundary
+/// is drawn from: nine of the eleven files MajorMUD ships with records need
+/// more than one leaf page, and this refuses every one of them rather than
+/// guess at how Btrieve would have split them.
+pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<Vec<u8>>, String> {
+    let width = entries.first().map_or(0, |(key, _)| key.len() + INDEX_ENTRY_TAIL);
+    let used = INDEX_HEADER + width * entries.len();
+    if used > usize::from(layout.page) {
+        return Err(format!(
+            "{} entries of {width} bytes need {used} bytes of index, and a page \
+             holds only {}: an interior page would be needed and this host does \
+             not build one",
+            entries.len(),
+            layout.page,
+        ));
+    }
+
+    let mut page = vec![0u8; usize::from(layout.page)];
+    page[..usize::from(HEADER)].copy_from_slice(
+        &Header {
+            number: 0,
+            data: false,
+            stamp: 0,
+        }
+        .encode(),
+    );
+    let count = u16::try_from(entries.len())
+        .map_err(|_| format!("{} entries, more than a u16 counts", entries.len()))?;
+    page[6..8].copy_from_slice(&count.to_le_bytes());
+    page[8..12].copy_from_slice(&to_long(NOWHERE));
+    page[12..16].copy_from_slice(&to_long(NOWHERE));
+
+    let mut offset = INDEX_HEADER;
+    for (key, position) in entries {
+        page[offset..offset + key.len()].copy_from_slice(key);
+        let tail = offset + key.len();
+        page[tail..tail + 4].copy_from_slice(&to_long(*position));
+        page[tail + 4..tail + 8].copy_from_slice(&to_long(NOWHERE));
+        offset += key.len() + INDEX_ENTRY_TAIL;
+    }
+
+    Ok(vec![page])
+}
+
+/// Overwrite an existing page's bytes in place.
+///
+/// Unlike [`write_record`], which may extend the file for a new data page,
+/// this only ever writes into a page already inside the file. Every key's
+/// root page exists from the moment the file is created -- virgin
+/// `WCCUSERS.DAT` roots its three keys at pages 1, 2 and 3, exactly its three
+/// non-data pages -- so [`Block::reindex`](super::Block::reindex) never has
+/// to allocate one.
+///
+/// # Errors
+///
+/// If `bytes` is not exactly one page, or the file cannot be opened, sought
+/// or written.
+pub fn write_page(
+    path: &std::path::Path,
+    layout: Layout,
+    number: u32,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if bytes.len() != usize::from(layout.page) {
+        return Err(format!(
+            "{} bytes for a page of {}",
+            bytes.len(),
+            layout.page
+        ));
+    }
+
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+        .and_then(|_| file.write_all(bytes))
+        .map_err(|e| format!("{}: page {number}: {e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +788,100 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read back");
         assert_eq!(long(&bytes[0x10..0x14]), NOWHERE, "the free list is empty now");
         assert_eq!(&bytes[first as usize..first as usize + 16], &[9; 16]);
+    }
+
+    /// A 64-byte page, the same size the write tests above use: sixteen bytes
+    /// of leaf header leave 48 for entries, and a 2-byte key entry is ten
+    /// bytes wide, so four fit and a fifth does not.
+    fn index_layout() -> Layout {
+        Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        }
+    }
+
+    #[test]
+    fn entries_that_fit_one_page_produce_a_single_leaf_that_decodes_back() {
+        let layout = index_layout();
+        let entries = vec![(vec![1u8, 0], 100u32), (vec![2u8, 0], 200u32)];
+
+        let built = index_pages(layout, &entries).expect("two entries fit easily");
+
+        assert_eq!(built.len(), 1);
+        let page = &built[0];
+        assert_eq!(page.len(), 64);
+
+        let header = Header::decode(&page[..6]);
+        assert!(!header.data, "an index page is not a data page");
+        assert_eq!(
+            u16::from_le_bytes([page[6], page[7]]),
+            2,
+            "the entry count"
+        );
+        assert_eq!(long(&page[8..12]), NOWHERE, "no sibling leaf before this one");
+        assert_eq!(long(&page[12..16]), NOWHERE, "no sibling leaf after it");
+
+        // First entry: key, then record pointer, then a leaf's NOWHERE child.
+        assert_eq!(&page[16..18], &[1, 0]);
+        assert_eq!(long(&page[18..22]), 100);
+        assert_eq!(long(&page[22..26]), NOWHERE, "a leaf's child pointer");
+
+        // Second entry follows immediately, ten bytes later.
+        assert_eq!(&page[26..28], &[2, 0]);
+        assert_eq!(long(&page[28..32]), 200);
+    }
+
+    #[test]
+    fn no_entries_is_a_valid_empty_leaf() {
+        let layout = index_layout();
+        let built = index_pages(layout, &[]).expect("an empty key still has a root page");
+        assert_eq!(built.len(), 1);
+        assert_eq!(u16::from_le_bytes([built[0][6], built[0][7]]), 0);
+    }
+
+    /// The boundary Task 6 draws: an interior page is refused rather than
+    /// built. Four ten-byte entries fit in this page's 48 bytes of room; a
+    /// fifth does not.
+    #[test]
+    fn entries_that_do_not_fit_one_page_are_refused() {
+        let layout = index_layout();
+        let entries: Vec<(Vec<u8>, u32)> =
+            (0..5u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
+
+        let e = index_pages(layout, &entries).expect_err("five ten-byte entries need 66 bytes");
+        assert!(e.contains("interior"), "{e}");
+    }
+
+    #[test]
+    fn a_page_at_the_boundary_still_fits() {
+        let layout = index_layout();
+        let entries: Vec<(Vec<u8>, u32)> =
+            (0..4u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
+
+        let built = index_pages(layout, &entries).expect("four ten-byte entries need exactly 56");
+        assert_eq!(built.len(), 1);
+    }
+
+    #[test]
+    fn write_page_overwrites_an_existing_page_without_touching_the_rest() {
+        let dir = crate::testing::scratch("pages-write-page");
+        let path = seed(&dir);
+        let layout = index_layout();
+
+        let mut image = vec![0xabu8; usize::from(layout.page)];
+        write_page(&path, layout, 2, &image).expect("page 2 already exists");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(&bytes[2 * 64..3 * 64], image.as_slice());
+        assert_ne!(
+            &bytes[1 * 64..2 * 64],
+            image.as_slice(),
+            "only the targeted page changed"
+        );
+
+        image[0] = 0xff;
+        let e = write_page(&path, layout, 2, &image[..63]).expect_err("short by one byte");
+        assert!(e.contains("63"), "{e}");
     }
 }
