@@ -113,6 +113,151 @@ impl Gsbl {
             .ok()
             .and_then(|i| self.channels.get_mut(i))
     }
+
+    /// `CRSTG` -- a CR-terminated input string is available (guide, `btusts`
+    /// page 155, status 3).
+    pub const CRSTG: i16 = 3;
+
+    /// `INBLK` -- byte-count-triggered input data is available (status 4).
+    pub const INBLK: i16 = 4;
+
+    /// `OUTMT` -- the output buffer went from not-empty to empty (status 5).
+    /// Only ever raised when `btuoes` has enabled it.
+    pub const OUTMT: i16 = 5;
+
+    /// Bytes have arrived from the terminal.
+    ///
+    /// This is half of the boundary: a tokio task reading a socket and a test
+    /// holding a literal both arrive here, and there is no second path to keep
+    /// honest.
+    ///
+    /// A channel that does not exist silently discards, because the caller is
+    /// the host's own transport rather than the module -- there is nobody to
+    /// return an error code to, and a socket for a channel that was never
+    /// allocated is the transport's bug, not the module's.
+    pub fn push_input(&mut self, chan: i16, bytes: &[u8]) {
+        let Some(c) = self.channel_mut(chan) else {
+            return;
+        };
+        for &byte in bytes {
+            c.take(byte);
+        }
+    }
+
+    /// The next status for a channel, oldest first, or `None`.
+    ///
+    /// This is `btusts`. The guide: the status buffer is a FIFO, so btusts hands back codes in the order they arose.
+    pub fn next_status(&mut self, chan: i16) -> Option<i16> {
+        self.channel_mut(chan)?.status.pop_front()
+    }
+
+    /// The completed line, taken -- this is what `btuinp` hands the module.
+    pub fn take_line(&mut self, chan: i16) -> Option<Vec<u8>> {
+        self.channel_mut(chan)?.ready.take()
+    }
+
+    /// Everything queued for the terminal, taken.
+    ///
+    /// The other half of the boundary. Raises `OUTMT` if `btuoes` asked for it
+    /// and this drain is what emptied the buffer.
+    pub fn drain_output(&mut self, chan: i16) -> Vec<u8> {
+        let Some(c) = self.channel_mut(chan) else {
+            return Vec::new();
+        };
+        if c.output.is_empty() {
+            return Vec::new();
+        }
+        let out: Vec<u8> = c.output.drain(..).collect();
+        if c.oes {
+            c.status.push_back(Self::OUTMT);
+        }
+        out
+    }
+
+    /// The first channel with a status waiting, or `None`.
+    ///
+    /// This is `btuscn`. The guide: it finds channels whose status code is non-zero and answers -1 when there are none. The `-1` is
+    /// left to the caller; `None` is what Rust says.
+    pub fn scan(&self) -> Option<i16> {
+        self.channels
+            .iter()
+            .position(|c| !c.status.is_empty())
+            .map(|i| i as i16)
+    }
+}
+
+impl Channel {
+    /// One byte, through the guide's ASCII input pipeline.
+    ///
+    /// The guide (`btuchi`) numbers eleven steps. Five of them have no setter
+    /// `WCCMMUD.DLL` calls and no meaning on a socket -- parity and framing
+    /// checks, XON/XOFF, the output-abort character, and the translate table --
+    /// so what is left is lockout, mode, backspace, terminator, length limit,
+    /// capacity and echo, **in that order**. The order is the guide's, and it
+    /// is why a backspace can be echoed while a byte past `maxinl` is not.
+    fn take(&mut self, byte: u8) {
+        // 2. Input lockout. The byte never happened.
+        if self.locked {
+            return;
+        }
+
+        // 3. Binary mode. None of the ASCII processing applies -- a CR in
+        //    binary mode is a byte like any other.
+        if self.trigger != 0 {
+            if self.input.len() < INPSIZ {
+                self.input.push_back(byte);
+            }
+            if self.input.len() >= usize::from(self.trigger) {
+                self.status.push_back(Gsbl::INBLK);
+            }
+            return;
+        }
+
+        match byte {
+            // 7. Backspace. At column zero there is nothing to erase and
+            //    nothing to echo -- the guide's default is to leave the
+            //    terminal alone rather than move its cursor off the line.
+            0x08 => {
+                if self.line.pop().is_some() && self.echo {
+                    self.output.extend(b"\x08 \x08");
+                }
+            }
+
+            // 8. Line terminator. The line is complete.
+            b'\r' => {
+                self.ready = Some(std::mem::take(&mut self.line));
+                self.status.push_back(Gsbl::CRSTG);
+                if self.echo {
+                    self.output.extend(b"\r\n");
+                }
+            }
+
+            // A linefeed is not a terminator. Every telnet client sends CRLF,
+            // and treating the LF as a second terminator would hand the module
+            // an empty command after every real one.
+            b'\n' => {}
+
+            _ => {
+                // 9. Line length limit, then 10. buffer capacity. A byte that
+                //    does not fit is dropped, and dropping it silently is the
+                //    point: the module set the limit and does not want to hear
+                //    about what exceeded it.
+                if self.maxinl != 0 && self.line.len() >= usize::from(self.maxinl) {
+                    return;
+                }
+                if self.line.len() >= INPSIZ {
+                    return;
+                }
+                self.line.push(byte);
+
+                // 11. Echo, last, so that only a byte actually accepted is
+                //     shown back.
+                if self.echo {
+                    self.output.push_back(byte);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +280,96 @@ mod tests {
         let g = Gsbl::new(1);
         assert!(g.channel(1).is_none());
         assert!(g.channel(-1).is_none());
+    }
+
+    #[test]
+    fn a_line_is_ready_only_once_the_terminator_arrives() {
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"loo");
+        assert_eq!(g.next_status(0), None, "no status until the CR");
+        g.push_input(0, b"k\r");
+        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+    }
+
+    #[test]
+    fn the_status_fifo_is_drained_in_order_and_only_once() {
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"a\rb\r");
+        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(0), None, "two lines, two statuses, no more");
+    }
+
+    #[test]
+    fn a_linefeed_after_a_return_is_not_a_second_line() {
+        // A telnet client sends CRLF. Treating the LF as a terminator would
+        // hand the module an empty command after every real one.
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"look\r\n");
+        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(0), None);
+    }
+
+    #[test]
+    fn backspace_removes_a_byte_and_does_nothing_at_column_zero() {
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"\x08");
+        g.push_input(0, b"lookk\x08\r");
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+    }
+
+    #[test]
+    fn a_locked_channel_discards_what_arrives() {
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").locked = true;
+        g.push_input(0, b"look\r");
+        assert_eq!(g.next_status(0), None);
+        assert_eq!(g.take_line(0), None);
+    }
+
+    #[test]
+    fn btumil_drops_what_would_not_fit_rather_than_truncating_the_line() {
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").maxinl = 4;
+        g.push_input(0, b"lookout\r");
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+    }
+
+    #[test]
+    fn echo_puts_what_arrived_back_on_the_wire_and_silence_does_not() {
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"hi");
+        assert_eq!(g.drain_output(0), b"hi".to_vec());
+
+        g.channel_mut(0).expect("channel 0").echo = false;
+        g.push_input(0, b"hi");
+        assert!(g.drain_output(0).is_empty());
+    }
+
+    #[test]
+    fn an_echoed_backspace_erases_the_character_on_the_terminal() {
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"a\x08");
+        assert_eq!(g.drain_output(0), b"a\x08 \x08".to_vec());
+    }
+
+    #[test]
+    fn a_byte_count_trigger_raises_status_four_and_leaves_the_bytes_raw() {
+        // Binary mode: none of the ASCII processing applies, not even the
+        // terminator -- a CR is just a byte.
+        const INBLK: i16 = 4;
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").trigger = 3;
+        g.push_input(0, b"a\rb");
+        assert_eq!(g.next_status(0), Some(INBLK));
+        assert_eq!(g.take_line(0), None, "binary input is not a line");
+    }
+
+    #[test]
+    fn pushing_to_a_channel_that_does_not_exist_is_a_no_op() {
+        let mut g = Gsbl::new(1);
+        g.push_input(9, b"look\r");
+        assert_eq!(g.next_status(9), None);
     }
 }
