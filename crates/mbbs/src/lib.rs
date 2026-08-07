@@ -331,18 +331,6 @@ pub struct Host {
     trace: bool,
 }
 
-/// A [`ShimError`] as an [`io::Error`].
-///
-/// `ShimError` implements `Display` and not `std::error::Error` -- it is
-/// meant to be handed to [`Host::stop`], which poisons the machine and names
-/// it, not chained through `?`. [`Host::connect`] and [`Host::poll`] call
-/// straight into [`Host::connect_state`], [`Host::point_curusr`] and
-/// [`Host::get_input`], which predate them and already answer in
-/// `Result<_, ShimError>`, so this is the one place that boundary is crossed.
-fn shim_io(e: ShimError) -> io::Error {
-    io::Error::other(e.to_string())
-}
-
 /// Where in the module the call being refused came from, as a place you can
 /// look up in a disassembly.
 ///
@@ -821,10 +809,16 @@ impl Host {
     /// never called one either, so there is no [`Outcome`] to report for a
     /// call that never happened.
     ///
+    /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
+    /// poisons the machine and comes back as `Outcome::Stopped`, the same
+    /// policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
     /// # Errors
     ///
-    /// If `chan` names no channel, a write runs off a segment, no module has
-    /// registered, or the module cannot be entered.
+    /// If no module has registered. (A malformed `chan`, a write running off
+    /// a segment, or the module being unenterable all poison the machine and
+    /// come back as `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
     pub fn connect(
         &mut self,
         machine: &mut Machine,
@@ -832,7 +826,9 @@ impl Host {
         chan: i16,
         who: &users::Connection,
     ) -> io::Result<Option<Outcome>> {
-        self.connect_state(machine, chan, who).map_err(shim_io)?;
+        if let Err(e) = self.connect_state(machine, chan, who) {
+            return self.shim_stop(machine, "connect_state", e).map(Some);
+        }
 
         // `Registration::entry` borrows `self.modules()` immutably, and
         // `self.run` needs `self` mutably right after -- so the pointer is
@@ -841,7 +837,11 @@ impl Host {
             let registered = self.modules().first().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
             })?;
-            registered.entry(machine, 0).map_err(shim_io)?
+            registered.entry(machine, 0)
+        };
+        let lonrou = match lonrou {
+            Ok(lonrou) => lonrou,
+            Err(e) => return self.shim_stop(machine, "lonrou lookup", e).map(Some),
         };
         let Some(lonrou) = lonrou else {
             // R24: a null `lonrou` is legal -- the real host checked
@@ -874,10 +874,16 @@ impl Host {
     /// supplies no entry point for the one that would have been called --
     /// none of those is a module call, so there is no [`Outcome`] to report.
     ///
+    /// R21: a `ShimError` out of `point_curusr`, `get_input` or the entry
+    /// lookup poisons the machine and comes back as `Outcome::Stopped`, the
+    /// same policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
     /// # Errors
     ///
-    /// If `chan` names no channel, a write runs off a segment, no module has
-    /// registered, or the module cannot be entered.
+    /// If no module has registered. (A write running off a segment, or the
+    /// module being unenterable, poisons the machine and comes back as
+    /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
     pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
         // R23: a status this host does not dispatch (`OVRFLW`, say) is not
         // the same fact as "nothing queued" -- looping past it here, rather
@@ -915,7 +921,9 @@ impl Host {
             // deliberately does not have. `vdaptr` is not named there at all;
             // `point_curusr` sets it because the real host's own `curusr`
             // (`MAJORBBS.C:4290`) does.
-            self.point_curusr(machine, chan).map_err(shim_io)?;
+            if let Err(e) = self.point_curusr(machine, chan) {
+                return self.shim_stop(machine, "point_curusr", e).map(Some);
+            }
 
             // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
             // only the `!= 3` guard on `shomal()` (the operator console, out of
@@ -927,8 +935,10 @@ impl Host {
             self.globals()
                 .write(machine, "status", &status.to_le_bytes())?;
 
-            if status == gsbl::Gsbl::CRSTG {
-                self.get_input(machine, chan).map_err(shim_io)?;
+            if status == gsbl::Gsbl::CRSTG
+                && let Err(e) = self.get_input(machine, chan)
+            {
+                return self.shim_stop(machine, "get_input", e).map(Some);
             }
 
             // Same borrow trap as `connect`: read the entry pointer out of
@@ -938,7 +948,11 @@ impl Host {
                 let registered = self.modules().first().ok_or_else(|| {
                     io::Error::other("no module has registered, so there is nothing to enter")
                 })?;
-                registered.entry(machine, entry_index).map_err(shim_io)?
+                registered.entry(machine, entry_index)
+            };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
             };
             let Some(entry) = entry else {
                 // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
@@ -1261,6 +1275,41 @@ impl Host {
         Ok(Outcome::Stopped(poison))
     }
 
+    /// Cross a `ShimError` from [`Host::connect`] or [`Host::poll`]'s own
+    /// internal calls into a poisoned machine, the same way [`Host::run`]
+    /// does for a `ShimError` a shim it dispatched through a thunk returns.
+    ///
+    /// `connect_state`, `point_curusr` and `get_input` predate `connect`/
+    /// `poll` and already answer in `Result<_, ShimError>`, reached directly
+    /// rather than through a thunk -- so `run`'s own crossing does not cover
+    /// them, and this is the only other place a `ShimError` becomes an
+    /// `Outcome`. Refusing plausible-but-wrong state is this crate's whole
+    /// ethic; leaving the machine runnable after `connect_state` half-wrote
+    /// an account record, or after `point_curusr` pointed `usrnum` at the
+    /// wrong channel, would be a hole in it -- so this does what `run` does
+    /// for the identical failure reached through a thunk: poison and answer
+    /// `Outcome::Stopped`, rather than an `Err` that leaves the machine
+    /// runnable.
+    ///
+    /// `where_` names the call that failed, since none of the three is an
+    /// imported symbol with a DLL of its own to report. The
+    /// `BadPointer`/`Failed` distinction survives into the poison's
+    /// `symbol` rather than being flattened through `Display` alone --
+    /// `ShimError` has no `Error` impl to recover it from afterwards.
+    fn shim_stop(&self, machine: &mut Machine, where_: &str, e: ShimError) -> io::Result<Outcome> {
+        let symbol = match &e {
+            ShimError::BadPointer(_) => format!("{where_}: bad pointer, {e}"),
+            ShimError::Failed(_) => format!("{where_}: {e}"),
+        };
+        self.stop(
+            machine,
+            Poison::Unimplemented {
+                module: "mbbs".to_owned(),
+                symbol,
+            },
+        )
+    }
+
     /// The C name of an imported symbol, or something that identifies it when
     /// the host has no name for it.
     fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
@@ -1562,5 +1611,44 @@ mod tests {
             .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
             .expect("connect_state ran and there was nothing to call");
         assert_eq!(outcome, None, "no lonrou means no call happened");
+    }
+
+    /// R21: a `ShimError` out of `connect_state` must poison the machine and
+    /// come back as `Outcome::Stopped`, the same policy `Host::run` applies
+    /// to a `ShimError` from a shim it dispatched through a thunk -- not an
+    /// `Err` that leaves the machine free to be called again on state that
+    /// never finished writing.
+    #[test]
+    fn a_shim_error_in_connect_poisons_the_machine_rather_than_leaving_it_runnable() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let past = f.host.gsbl().terms() as i16;
+
+        let outcome = f
+            .host
+            .connect(&mut f.machine, &module, past, &Connection::ansi("rangerdan"))
+            .expect("connect_state's failure is a stop, not a panic");
+        match outcome {
+            Some(crate::Outcome::Stopped(mbbs16::Poison::Unimplemented { symbol, .. })) => {
+                assert!(
+                    symbol.contains("connect_state"),
+                    "the poison should name what failed: {symbol}"
+                );
+            }
+            other => panic!("expected a named stop: {other:?}"),
+        }
+
+        assert!(
+            f.machine.poisoned().is_some(),
+            "a ShimError in connect must leave the machine unrunnable"
+        );
+        let entry = mbbs16::FarPtr {
+            offset: 0,
+            selector: f.machine.code_selector(),
+        };
+        assert!(
+            f.machine.call(entry, &[]).is_err(),
+            "a poisoned machine must refuse to be entered again"
+        );
     }
 }
