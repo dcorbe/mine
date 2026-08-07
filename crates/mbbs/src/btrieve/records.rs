@@ -97,43 +97,58 @@ impl Records {
             )));
         }
 
+        let mut me = Self {
+            records,
+            order: Vec::new(),
+            rank: Vec::new(),
+            ties: Vec::new(),
+        };
+        me.reindex(keys);
+        Ok(me)
+    }
+
+    /// Re-derive `order`, `rank` and `ties` from `records`, for the given keys.
+    ///
+    /// Re-sorted rather than spliced: at these record counts a sort is cheap,
+    /// and a splice is the kind of thing that is right for a year and then is
+    /// not. `read` calls this once after walking the pages, and `insert`,
+    /// `update` and `delete` each call it again after touching `records` --
+    /// one derivation, so the two cannot drift.
+    fn reindex(&mut self, keys: &[Key]) {
         let mut order = Vec::with_capacity(keys.len());
         let mut rank = Vec::with_capacity(keys.len());
         let mut ties = Vec::with_capacity(keys.len());
         for key in keys {
-            let mut sorted: Vec<usize> = (0..records.len()).collect();
+            let mut sorted: Vec<usize> = (0..self.records.len()).collect();
             // Ties broken by physical position, so the order is total: two
             // records with the same duplicate key must still come out in the
             // same sequence every run, or `qnxbtv` would step somewhere else on
             // a second pass over the same file. See [`Self::ties`] for what
             // that tie-break is and is not.
             sorted.sort_by(|a, b| {
-                match key.compare(&records[*a].bytes, &records[*b].bytes) {
-                    Ordering::Equal => records[*a].position.cmp(&records[*b].position),
+                match key.compare(&self.records[*a].bytes, &self.records[*b].bytes) {
+                    Ordering::Equal => self.records[*a].position.cmp(&self.records[*b].position),
                     other => other,
                 }
             });
-            let mut places = vec![0usize; records.len()];
+            let mut places = vec![0usize; self.records.len()];
             for (place, record) in sorted.iter().enumerate() {
                 places[*record] = place;
             }
             let tied = sorted
                 .windows(2)
                 .filter(|pair| {
-                    key.compare(&records[pair[0]].bytes, &records[pair[1]].bytes) == Ordering::Equal
+                    key.compare(&self.records[pair[0]].bytes, &self.records[pair[1]].bytes)
+                        == Ordering::Equal
                 })
                 .count();
             order.push(sorted);
             rank.push(places);
             ties.push(tied);
         }
-
-        Ok(Self {
-            records,
-            order,
-            rank,
-            ties,
-        })
+        self.order = order;
+        self.rank = rank;
+        self.ties = ties;
     }
 
     /// How many records share a key value with the record before them, per key.
@@ -215,6 +230,62 @@ impl Records {
             return false;
         };
         keys[usize::from(key)].compare_value(&record.bytes, value) == Ordering::Equal
+    }
+
+    /// Add a record at a position nothing else occupies.
+    ///
+    /// # Errors
+    ///
+    /// If `position` already holds a record.
+    pub fn insert(&mut self, keys: &[Key], position: u32, bytes: Vec<u8>) -> Result<(), String> {
+        if self.records.iter().any(|r| r.position == position) {
+            return Err(format!("position {position} already holds a record"));
+        }
+        self.records.push(Record { position, bytes });
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Replace the bytes of the record at `position`, leaving it where it is.
+    ///
+    /// An update is in place: Btrieve's opcode 3 rewrites the record the file
+    /// is positioned on, so `absbtv` answers the same before and after. Only
+    /// the key orders move.
+    ///
+    /// # Errors
+    ///
+    /// If `position` holds no record.
+    pub fn update(&mut self, keys: &[Key], position: u32, bytes: Vec<u8>) -> Result<(), String> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|r| r.position == position)
+            .ok_or_else(|| format!("position {position} holds no record"))?;
+        record.bytes = bytes;
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Remove the record at `position`.
+    ///
+    /// # Errors
+    ///
+    /// If `position` holds no record.
+    pub fn delete(&mut self, keys: &[Key], position: u32) -> Result<(), String> {
+        let index = self
+            .records
+            .iter()
+            .position(|r| r.position == position)
+            .ok_or_else(|| format!("position {position} holds no record"))?;
+        self.records.remove(index);
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Every position currently holding a record, for
+    /// [`Layout::next_slot`](super::pages::Layout::next_slot).
+    pub fn positions(&self) -> Vec<u32> {
+        self.records.iter().map(|r| r.position).collect()
     }
 }
 
@@ -538,5 +609,132 @@ mod tests {
 
         assert!(records.matches(&parsed, 0, 1, &[3, 0]));
         assert!(!records.matches(&parsed, 0, 1, &[4, 0]));
+    }
+
+    #[test]
+    fn an_inserted_record_appears_in_physical_and_in_key_order() {
+        let bytes = of(&[1, 3]);
+        let mut records = read("INSERT.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("INSERT.DAT", &bytes, 1).expect("keys");
+        let position = slot(2); // the third slot of the page, unused by [1, 3]
+
+        records.insert(&parsed, position, record(2)).expect("inserts");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.physical(2).expect("appended at the end").bytes[0],
+            2,
+            "physical order is file order, and an insert is the newest thing in the file"
+        );
+        assert_eq!(
+            records.ordered(0, 1).expect("the middle of the key order").bytes[0],
+            2,
+            "2 sorts between 1 and 3"
+        );
+        assert_eq!(records.find_physical(position), Some(2));
+    }
+
+    #[test]
+    fn inserting_into_a_position_that_already_holds_a_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("OCCUPIED.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("OCCUPIED.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(0).expect("first").position;
+
+        assert!(records.insert(&parsed, position, record(2)).is_err());
+    }
+
+    #[test]
+    fn an_updated_record_keeps_its_position_and_moves_in_key_order() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("UPDATE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("UPDATE.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(0).expect("first, holding key 1").position;
+
+        records.update(&parsed, position, record(9)).expect("updates");
+
+        assert_eq!(
+            records.physical(0).expect("still first physically").position,
+            position,
+            "an update rewrites the record the file is positioned on -- absbtv must \
+             answer the same before and after"
+        );
+        assert_eq!(records.physical(0).expect("same slot").bytes[0], 9);
+        assert_eq!(
+            records.ordered(0, 2).expect("now sorts last").bytes[0],
+            9,
+            "9 is greater than 2 and 3"
+        );
+    }
+
+    #[test]
+    fn updating_a_position_that_holds_no_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("MISSING.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("MISSING.DAT", &bytes, 1).expect("keys");
+
+        // The module is entitled to be wrong; the host is not entitled to
+        // invent a record.
+        assert!(records.update(&parsed, slot(5), record(2)).is_err());
+    }
+
+    #[test]
+    fn a_deleted_record_leaves_physical_order_and_every_key_order() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("DELETE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("DELETE.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(1).expect("the middle record, key 2").position;
+
+        records.delete(&parsed, position).expect("deletes");
+
+        assert_eq!(records.len(), 2);
+        assert!(records.find_physical(position).is_none());
+        for n in 0..records.len() {
+            assert_ne!(
+                records.ordered(0, n).expect("in order").bytes[0],
+                2,
+                "the deleted record is gone from key order too"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_position_that_holds_no_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("GONE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("GONE.DAT", &bytes, 1).expect("keys");
+
+        assert!(records.delete(&parsed, slot(5)).is_err());
+    }
+
+    /// `ties` is how this host reports the one Btrieve divergence it cannot
+    /// check: duplicates come out in file-position order here and in
+    /// insertion order in Btrieve. Inserting two records with the same key
+    /// value must make the count say so rather than let the difference be
+    /// silent.
+    #[test]
+    fn inserting_a_duplicate_key_is_counted_as_a_tie() {
+        let bytes = of(&[1]);
+        let mut records = read("TIES.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("TIES.DAT", &bytes, 1).expect("keys");
+        assert_eq!(records.ties()[0], 0);
+
+        records.insert(&parsed, slot(1), record(1)).expect("inserts");
+
+        assert_eq!(records.ties()[0], 1);
+    }
+
+    #[test]
+    fn positions_lists_every_record_currently_held() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("POSITIONS.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("POSITIONS.DAT", &bytes, 1).expect("keys");
+        let doomed = records.physical(1).expect("middle").position;
+
+        records.delete(&parsed, doomed).expect("deletes");
+
+        let positions = records.positions();
+        assert_eq!(positions.len(), 2);
+        assert!(!positions.contains(&doomed));
     }
 }
