@@ -574,13 +574,33 @@ impl Block {
     /// unconditionally would let a module scribble over whatever bytes happen
     /// to be there, free-list link or otherwise.
     ///
+    /// `bytes` must be exactly `self.geometry.reclen` long, refused rather
+    /// than padded. [`Self::insert`] pads a short buffer with zero because
+    /// there is nothing at a fresh slot to lose; an update writes over a
+    /// record that already exists, and `pages::write_record` pads to
+    /// `physical` unconditionally, so a short buffer here would silently
+    /// zero-fill the tail of whatever was there. That is a live data-loss
+    /// path once `dupdbtv` calls this.
+    ///
     /// # Errors
     ///
-    /// If the records cannot be read, `position` holds no record, or the file
-    /// cannot be written.
+    /// If `bytes` is not exactly `reclen` long, the records cannot be read,
+    /// `position` holds no record, or the file cannot be written.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
         let name = self.name.clone();
+
+        if bytes.len() != usize::from(self.geometry.reclen) {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "a {}-byte record for a {}-byte slot -- update refuses rather than \
+                     zero-fill the tail of whatever was there",
+                    bytes.len(),
+                    self.geometry.reclen
+                ),
+            });
+        }
 
         let records = self.records.as_ref().expect("just loaded");
         if records.find_physical(position).is_none() {
@@ -1301,6 +1321,36 @@ mod tests {
         let e = block.update(999, &record(1)).expect_err("nothing is there");
         assert_eq!(e.file, "SCRATCH.DAT");
         assert!(e.why.contains("999"), "{e}");
+    }
+
+    /// I4: `write_record` pads to `physical` unconditionally, so an update
+    /// with fewer bytes than the file's own `reclen` used to zero-fill the
+    /// tail of whatever record was already there, silently. `dupdbtv` always
+    /// calls `Block::update` with a fixed-length buffer, but the refusal
+    /// belongs at this boundary rather than trusted to every future caller.
+    #[test]
+    fn an_update_shorter_than_reclen_is_refused_rather_than_zero_filling_the_tail() {
+        let dir = crate::testing::scratch("block-update-refuses-short-buffer");
+        let path = seed(&dir);
+        let mut block = block(path);
+        let position = block.insert(&record(1)).expect("insert");
+
+        // `record` is 16 bytes, the file's own reclen; 10 is short.
+        let short = vec![9u8; 10];
+        let e = block
+            .update(position, &short)
+            .expect_err("10 bytes for a 16-byte record");
+        assert!(e.why.contains("10") && e.why.contains("16"), "{e}");
+
+        // Refusing left the original record intact, on disk as well as in
+        // the model.
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        let record = reread
+            .find_physical(position)
+            .and_then(|at| reread.physical(at))
+            .expect("still there");
+        assert_eq!(record.bytes[0], 1, "not overwritten by the refused update");
     }
 
     /// A file shaped like `seed`'s but at a real page size -- 512 bytes, the
