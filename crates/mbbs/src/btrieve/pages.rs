@@ -414,8 +414,16 @@ pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, St
 /// 2026-08-07-btrieve-writes.md`, Task 6, has the raw bytes.
 pub const INDEX_HEADER: usize = 16;
 
-/// Bytes of one index entry past its key: a record pointer, then a child
-/// pointer that is [`NOWHERE`] on every leaf entry -- a leaf has no children.
+/// Bytes of one index entry past its key: a record pointer, then a second
+/// four-byte field.
+///
+/// Not a child pointer in the sense the name would suggest elsewhere in this
+/// format -- a leaf has no children -- and not [`NOWHERE`] on every entry
+/// either. Measured off both `WCCRACE.DAT` (13 entries) and `WCCCLASS.DAT`
+/// (15 entries): every entry but the page's **last** carries `0xffffffff`
+/// there, and the last carries zero instead. Two of two measurements agree,
+/// and [`index_pages`] matches the pattern rather than the simpler one this
+/// constant's name implies.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
 /// Emit the leaf pages for one key, from records already in that key's order.
@@ -468,11 +476,16 @@ pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<Vec
     page[12..16].copy_from_slice(&to_long(NOWHERE));
 
     let mut offset = INDEX_HEADER;
-    for (key, position) in entries {
+    for (index, (key, position)) in entries.iter().enumerate() {
         page[offset..offset + key.len()].copy_from_slice(key);
         let tail = offset + key.len();
         page[tail..tail + 4].copy_from_slice(&to_long(*position));
-        page[tail + 4..tail + 8].copy_from_slice(&to_long(NOWHERE));
+        // Every entry but the page's last carries NOWHERE in its second
+        // four bytes; the last carries zero instead. See
+        // [`INDEX_ENTRY_TAIL`]'s doc comment for the measurement this comes
+        // from.
+        let last = index + 1 == entries.len();
+        page[tail + 4..tail + 8].copy_from_slice(&to_long(if last { 0 } else { NOWHERE }));
         offset += key.len() + INDEX_ENTRY_TAIL;
     }
 
@@ -932,9 +945,63 @@ mod tests {
         assert_eq!(long(&page[18..22]), 100);
         assert_eq!(long(&page[22..26]), NOWHERE, "a leaf's child pointer");
 
-        // Second entry follows immediately, ten bytes later.
+        // Second entry follows immediately, ten bytes later -- and being the
+        // page's last, its tail is zero rather than NOWHERE. C2: measured off
+        // both WCCRACE.DAT and WCCCLASS.DAT, and the field this decoder never
+        // checked before, so a wrong encoder here had nothing to catch it.
         assert_eq!(&page[26..28], &[2, 0]);
         assert_eq!(long(&page[28..32]), 200);
+        assert_eq!(long(&page[32..36]), 0, "the page's last entry's tail, unlike every other entry's");
+    }
+
+    /// C2, pinned against the actual bytes measured out of `WCCRACE.DAT`
+    /// page 1 (see `docs/plans/2026-08-07-btrieve-writes.md`'s C2 write-up):
+    /// entry 11 (second to last of 13) reads `0c 00 | 00 00 80 09 | ff ff ff
+    /// ff` and entry 12 (the last) reads `0d 00 | 00 00 06 0a | 00 00 00
+    /// 00` -- the same key and record-pointer shape, but a **zero** tail
+    /// instead of [`NOWHERE`]. This builds the same 13-entry, 2-byte-key
+    /// leaf `WCCRACE.DAT` holds, with those two entries' real measured key
+    /// and record pointer, and checks both byte-for-byte -- independent of
+    /// `tmp/`'s presence, so it runs even where the shipped files do not.
+    #[test]
+    fn index_pages_matches_wccrace_dats_measured_last_two_entries() {
+        let layout = wccrace_index_layout();
+        let mut entries: Vec<(Vec<u8>, u32)> =
+            (0u16..11).map(|n| (n.to_le_bytes().to_vec(), u32::from(n))).collect();
+        entries.push((0x000cu16.to_le_bytes().to_vec(), 0x0000_0980));
+        entries.push((0x000du16.to_le_bytes().to_vec(), 0x0000_0a06));
+        assert_eq!(entries.len(), 13);
+
+        let built = index_pages(layout, &entries).expect("13 entries fit one leaf");
+        let page = &built[0];
+
+        let second_to_last = INDEX_HEADER + 11 * (2 + INDEX_ENTRY_TAIL);
+        assert_eq!(&page[second_to_last..second_to_last + 2], &[0x0c, 0x00], "entry 11's key");
+        assert_eq!(long(&page[second_to_last + 2..second_to_last + 6]), 0x0000_0980);
+        assert_eq!(
+            &page[second_to_last + 6..second_to_last + 10],
+            &[0xff, 0xff, 0xff, 0xff],
+            "entry 11's tail, measured as NOWHERE"
+        );
+
+        let last = INDEX_HEADER + 12 * (2 + INDEX_ENTRY_TAIL);
+        assert_eq!(&page[last..last + 2], &[0x0d, 0x00], "entry 12's key");
+        assert_eq!(long(&page[last + 2..last + 6]), 0x0000_0a06);
+        assert_eq!(
+            &page[last + 6..last + 10],
+            &[0x00, 0x00, 0x00, 0x00],
+            "entry 12's tail, measured as zero -- only the page's last entry differs"
+        );
+    }
+
+    /// `WCCRACE.DAT`'s own shape: 512-byte pages, 13 entries of a 2-byte key
+    /// fit `INDEX_HEADER` (16) plus `13 * 10 = 130` bytes, 146 of 512.
+    fn wccrace_index_layout() -> Layout {
+        Layout {
+            page: 512,
+            physical: 126,
+            pages: 6,
+        }
     }
 
     #[test]
