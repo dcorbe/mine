@@ -28,6 +28,7 @@ mod exports;
 mod fmt;
 pub mod fsd;
 mod globals;
+pub mod gsbl;
 pub mod heap;
 pub mod msg;
 pub mod random;
@@ -246,6 +247,9 @@ pub struct Host {
     /// Which one *is* current is `bb`, for the same reason.
     pub(crate) btrieve: btrieve::Btrieve,
 
+    /// The terminal channels. See [`gsbl`].
+    pub(crate) gsbl: gsbl::Gsbl,
+
     /// The streams that are open. No notion of a current one -- `fopen` hands
     /// back a `FILE *` and every routine takes it, so there is no `curmbk` or
     /// `bb` equivalent to keep in module memory.
@@ -403,6 +407,7 @@ impl Host {
             textvars: TextVars::default(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
+            gsbl: gsbl::Gsbl::new(globals::NTERMS),
             streams: stream::Streams::default(),
             installed: Vec::new(),
             notes: Vec::new(),
@@ -556,6 +561,11 @@ impl Host {
     /// The per-channel tables. See [`Users`].
     pub fn users(&self) -> &Users {
         &self.users
+    }
+
+    /// The terminal channels.
+    pub fn gsbl(&self) -> &gsbl::Gsbl {
+        &self.gsbl
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
