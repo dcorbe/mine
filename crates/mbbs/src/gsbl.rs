@@ -196,6 +196,12 @@ impl Gsbl {
     ///
     /// The other half of the boundary. Raises `OUTMT` if `btuoes` asked for it
     /// and this drain is what emptied the buffer.
+    ///
+    /// Finding 7 (not fixed) -- **do not call this mid-line while
+    /// `width != 0`.** [`Channel::wrap`] recovers a trailing partial word by
+    /// looking back into `output`; draining it out from under a line in
+    /// progress changes what a later wrap on that line would see. See the
+    /// invariant documented on `wrap` for why this is left alone.
     pub fn drain_output(&mut self, chan: i16) -> Vec<u8> {
         let Some(c) = self.channel_mut(chan) else {
             return Vec::new();
@@ -399,6 +405,13 @@ impl Channel {
             self.supplied_lf = false;
             if self.width != 0 && self.column >= self.width {
                 self.wrap();
+                if byte == b' ' {
+                    // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
+                    // *becomes* the break `wrap()` just inserted, so it is
+                    // consumed here rather than carried onto the new line as
+                    // a leading indent.
+                    continue;
+                }
             }
             self.output.push_back(byte);
             self.column += 1;
@@ -416,6 +429,22 @@ impl Channel {
     ///
     /// Word wrap rather than a hard break: the guide calls `btutsw` wrapping output at word boundaries, and a host that broke mid-word would split every name the
     /// module printed near the margin.
+    ///
+    /// Finding 7 (not fixed) -- **invariant: do not drain `output` mid-line
+    /// while `width != 0`.** This recovers the trailing partial word by
+    /// popping it back off `output` itself, so whatever the current line has
+    /// written so far has to still be there. Nothing drains mid-line today --
+    /// [`Gsbl::drain_output`] always takes the whole buffer, and that only
+    /// ever happens after any wrap for the text so far has already run -- so
+    /// this is correct as the host is driven now. A transport that flushes to
+    /// a socket on its own schedule rather than only when the module finishes
+    /// a line would make this look-back scheduling-dependent, and the bytes
+    /// it emits would stop being deterministic. Every obvious fix trades one
+    /// bug for another: holding the pending word never sends a prompt lacking
+    /// a trailing CR (`[HP=100]:`), and draining only complete lines has the
+    /// same problem. Real GSBL gets away with this because a 2400-baud UART
+    /// never empties the buffer faster than the module fills it. Leave the
+    /// fix to whoever builds the transport.
     fn wrap(&mut self) {
         let mut word = Vec::new();
         while let Some(&back) = self.output.back() {
@@ -635,6 +664,19 @@ mod tests {
         g.channel_mut(0).expect("channel 0").width = 4;
         g.transmit(0, b"abcdefg");
         assert_eq!(g.drain_output(0), b"abcd\r\nefg".to_vec());
+    }
+
+    #[test]
+    fn a_space_that_lands_on_the_wrap_boundary_is_consumed_not_carried() {
+        // R9, guide btutsw page 172: word wrap works by turning a space into a carriage return -- so when the space itself is the byte
+        // that pushes the column past the width, it must become the break,
+        // not survive as a leading-space indent on the new line. This is the
+        // one case where the byte that triggers `wrap()` is a space rather
+        // than the next word's first letter.
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").width = 10;
+        g.transmit(0, b"0123456789 abc");
+        assert_eq!(g.drain_output(0), b"0123456789\r\nabc".to_vec());
     }
 
     #[test]
