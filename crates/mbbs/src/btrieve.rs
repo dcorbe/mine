@@ -591,15 +591,24 @@ impl Block {
         let name = self.name.clone();
 
         if bytes.len() != usize::from(self.geometry.reclen) {
-            return Err(BtvError {
-                file: name,
-                why: format!(
+            let why = if self.geometry.variable {
+                format!(
+                    "holds variable-length records up to {} bytes, and this host does \
+                     not write them -- the {}-byte buffer the module opened it with is \
+                     what a variable-length read needs (see opnbtv's doc comment), not \
+                     something opcode 3 can write back as one fixed-length slot",
+                    self.geometry.reclen,
+                    bytes.len()
+                )
+            } else {
+                format!(
                     "a {}-byte record for a {}-byte slot -- update refuses rather than \
                      zero-fill the tail of whatever was there",
                     bytes.len(),
                     self.geometry.reclen
-                ),
-            });
+                )
+            };
+            return Err(BtvError { file: name, why });
         }
 
         let records = self.records.as_ref().expect("just loaded");

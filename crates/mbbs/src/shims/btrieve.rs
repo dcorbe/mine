@@ -458,6 +458,20 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// `dinsbtv`'s `:603` -- see that routine's doc for why this host stops the
 /// module rather than faulting. 1 for success, 0 for a duplicate-key
 /// violation, everything else `catastro`'d.
+///
+/// # A file opened for more than its own `reclen` cannot be written here
+///
+/// `WCCTEXT.DAT` holds 22-byte records and the module opens it for 2,022 --
+/// see [`opnbtv`]'s doc comment on the two directions that number can
+/// diverge from a file's own record length. Reading through that gap is
+/// ordinary: the extra bytes are the buffer a variable-length read needs.
+/// Writing through it is not: [`Block::update`](crate::btrieve::Block::update)
+/// refuses a buffer that is not exactly the file's own `reclen`, because it
+/// has no way to know how many of the buffer's bytes are the record this
+/// module meant to write and how many are read-buffer padding it should not
+/// commit to disk. This host does not write variable-length records at all
+/// -- there is no module call in `WCCMMUD.DLL` that would let this be
+/// exercised, only the possibility if one existed.
 pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
         ShimError::Failed(
@@ -545,6 +559,21 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// file to close. A later `setbtv` on the stale pointer then fails to find
 /// an open file -- a module bug getting caught, rather than silently
 /// resolving to whatever this host puts in that slot next.
+///
+/// # The ten-deep `setbtv` stack is not purged either
+///
+/// Only `bb` is written here -- nothing in [`Btrieve`](crate::btrieve::Btrieve)
+/// touches its stack on a close. If an earlier `setbtv` pushed this block's
+/// pointer there before some other `setbtv` made a different file current,
+/// closing this one now leaves that pointer sitting in the stack, unexamined.
+/// A later `rstbtv` that pops down to it -- see
+/// [`Btrieve::restore`](crate::btrieve::Btrieve::restore) -- writes it into
+/// `bb` with no check that the block it names still exists, for the same
+/// reason `restore` hands back an empty stack's null without complaint: the
+/// original never validated either end of that call. Whichever routine reads
+/// `bb` next gets the same "not an open Btrieve file" the paragraph above
+/// describes -- a module bug getting caught, rather than silently resolving
+/// to whatever this host puts in that slot next.
 ///
 /// # The guard is a re-entrancy guard, and fifteen closes in a row need it
 ///
