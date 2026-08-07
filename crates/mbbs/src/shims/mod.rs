@@ -174,11 +174,15 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
     (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
     (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
-    // Btrieve: the write family's guards. Neither of these writes -- each
-    // reproduces what `PLBTVSTF.C` did with no file current, and refuses when
-    // there is one.
+    // Btrieve: the write family. `dinsbtv` and `dupdbtv` write; `invbtv` and
+    // `delbtv` reproduce what `PLBTVSTF.C` did with no file current, and
+    // refuse when there is one; `clsbtv` flushes the index and gives four
+    // allocations back.
+    (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
+    (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
     (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
     (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
+    (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
     // Streams: the module's own files, read and written.
     (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
     (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
@@ -194,6 +198,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "now", system::now, Cleans::Caller),
     (MAJORBBS, "nctime", system::nctime, Cleans::Caller),
     (MAJORBBS, "ncdate", system::ncdate, Cleans::Caller),
+    (MAJORBBS, "cofdat", system::cofdat, Cleans::Caller),
+    (MAJORBBS, "ncedat", system::ncedat, Cleans::Caller),
     (MAJORBBS, "today", system::today, Cleans::Caller),
     (MAJORBBS, "time", system::time, Cleans::Caller),
     (MAJORBBS, "srand", system::srand, Cleans::Caller),
@@ -358,11 +364,6 @@ mod tests {
 
     #[test]
     fn an_unknown_symbol_is_unimplemented() {
-        // `dinsbtv` is the insert that writing records needs, and is
-        // deliberately absent: nothing in this host writes to a Btrieve file
-        // yet, so a module that saves a character is stopped rather than
-        // appearing to work.
-        assert!(matches!(entry(MAJORBBS, "dinsbtv"), Entry::Unimplemented));
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
     }
 

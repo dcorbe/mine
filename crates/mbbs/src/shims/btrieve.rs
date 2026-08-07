@@ -10,10 +10,10 @@
 //!                dupdbtv  23    qnpbtv    7
 //! ```
 //!
-//! Seventeen symbols over 716 sites. **Fourteen are here**: opening and
-//! choosing a file, reading records out of it, and the two write routines that
-//! have something to answer when no file is current. The three that are not are
-//! `dinsbtv`, `dupdbtv` and `clsbtv`.
+//! Seventeen symbols over 716 sites, and all seventeen are here: opening and
+//! choosing a file, reading records out of it, the two guards that answer
+//! rather than write, `dinsbtv`/`dupdbtv`, which write, and `clsbtv`, which
+//! flushes the index and gives four allocations back.
 //!
 //! **Initialisation uses six of the twelve, and reads exactly one record's
 //! worth**, measured by `crates/mbbs/tests/wccmmud.rs` against the module
@@ -28,11 +28,15 @@
 //! with is Galacticomm's own `PLBTVSTF.C`, which is quoted rather than
 //! paraphrased wherever it decided something.
 //!
-//! # Nothing here writes, and two routines say so by name
+//! # `dinsbtv` and `dupdbtv` write; `invbtv` and `delbtv` still only say they
+//! # would
 //!
-//! A module that saves a character gets a refusal, rather than a host that
-//! appears to work and loses the data. That is the whole reason the write
-//! family is refused rather than stubbed.
+//! A module that saves a character now gets an honest insert or update --
+//! [`dinsbtv`] calls [`Block::insert`](crate::btrieve::Block::insert) and
+//! [`dupdbtv`] calls [`Block::update`](crate::btrieve::Block::update).
+//! `invbtv` and `delbtv` do not write yet, so a module that reaches either of
+//! them with a file current gets a refusal rather than a host that appears to
+//! work and loses the data.
 //!
 //! [`invbtv`] and [`delbtv`] are nonetheless *present*, because refusing is
 //! only half of what the real host did. Both are guarded with
@@ -49,9 +53,12 @@
 //! `setbtv` handed a null. Whichever module-side pointer is still zero, the
 //! guard is the same guard and the insert is discarded either way.
 //!
-//! With a file current they refuse and name it. `dinsbtv` and `dupdbtv` have no
-//! guard at all -- `:603` and `:555` read `bb->reclen` first -- so they refuse
-//! either way, which is what leaving them unbound already does.
+//! With a file current, `invbtv` and `delbtv` refuse and name it. `dinsbtv`
+//! and `dupdbtv` have no guard at all -- `:603` and `:555` read `bb->reclen`
+//! first, so the real host faulted with no file current rather than
+//! answering. This host stops the module instead of faulting, which is the
+//! same outcome honestly reached and a deliberately different shape from
+//! `invbtv`/`delbtv`'s quiet no-op.
 //!
 //! # What every routine does when no file is current
 //!
@@ -338,6 +345,354 @@ pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         "delbtv from {}, and nothing in this host writes to a Btrieve file",
         file.name()
     )))
+}
+
+/// `int dinsbtv(void *recptr)` -- insert a new record into the current file.
+///
+/// `PLBTVSTF.C:598`:
+///
+///
+/// # No `bb == NULL` guard
+///
+/// Unlike [`invbtv`] and [`delbtv`], `:598` reads `bb->reclen` before
+/// checking anything, so the real host faulted with no file current. This
+/// host stops the module and says so instead -- the same outcome honestly
+/// reached, and a deliberately different shape from the two routines that do
+/// answer quietly with no file current.
+///
+/// # Length, and the one difference from `dupdbtv`
+///
+/// `length` is `bb->reclen` -- [`Block::maxlen`](crate::btrieve::Block::maxlen),
+/// the number the *module* passed to `opnbtv`, not the file's own record
+/// length; the two are allowed to differ. The Btrieve call always passes key
+/// number 0. [`dupdbtv`] passes `bb->lastkn` instead, and that is the only
+/// difference between the two calls.
+///
+/// # The return convention
+///
+/// 1 for success, 0 for Btrieve status 5 -- a duplicate-key violation on a key
+/// that does not permit them -- and everything else `catastro`'d, so this
+/// host stops the module on anything else. `_GENERATE_TOP_LIST` branches on
+/// the 0/1, so answering 0 rather than refusing is the only way a module that
+/// legitimately collides keeps running. [`duplicate_key`] is where this host
+/// re-derives the same answer Btrieve's TSR would have: it has no TSR to ask,
+/// so it asks whether a record with this value is already in that key's
+/// order.
+pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let block = positioned(machine, host, "dinsbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "dinsbtv with no Btrieve file current -- PLBTVSTF.C:598 has no \
+             guard and reads bb->reclen before checking anything, so the \
+             real host faulted here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let length = file.maxlen();
+    let recptr = machine.arg_far(0);
+    let recptr = match recptr == Btrieve::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        note_duplicate_key(host, "dinsbtv", &name, key, &value);
+        return Ok(Ret::U16(0));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Btrieve's Insert establishes currency on the record it just created --
+    // `PLBTVSTF.C:626` passes a hardcoded key number of 0 to the underlying
+    // Btrieve call (unlike dupdbtv, which threads `bb->lastkn` through), so
+    // this positions in key 0's order specifically. Before this, `dinsbtv`
+    // never touched the cursor, so the file stayed wherever it happened to
+    // be positioned before the insert -- accidentally right when the new
+    // record sorted before the cursor, and wrong when it sorted after.
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let physical = records
+        .find_physical(position)
+        .expect("insert just wrote this position");
+    let cursor = match records.place_in(0, physical) {
+        Some(at) => Cursor::Ordered { key: 0, at },
+        None => Cursor::Physical { at: physical },
+    };
+    file.seek_to(cursor);
+
+    Ok(Ret::U16(1))
+}
+
+/// `int dupdbtv(void *recptr)` -- update the record the file is positioned
+/// on.
+///
+/// `PLBTVSTF.C:550` -- identical to [`dinsbtv`] except opcode 3, and the
+/// Btrieve call's fourth argument is `bb->lastkn` rather than a hardcoded 0.
+/// That argument names which key's position Btrieve's own bookkeeping
+/// continues from; it plays no part in *which record* gets rewritten or in
+/// which keys are checked for a collision; the record is always the one the
+/// cursor names and every key that forbids duplicates is checked, exactly as
+/// in [`dinsbtv`]. So the difference has nothing left to reproduce once
+/// there is no Btrieve TSR to hand it to, and this host does not thread it
+/// through anywhere -- see [`duplicate_key`].
+///
+/// # Opcode 3 updates the record the file is positioned on
+///
+/// Unlike `dinsbtv`, which makes a new record, this rewrites the one
+/// [`Cursor`] names. `Cursor::Nowhere` stops the module: nothing has
+/// positioned the file, so there is no record to update, and writing to a
+/// guessed one is exactly the failure mode this crate exists to prevent.
+/// `Cursor::Ordered`/`Cursor::Physical` resolve through
+/// [`Block::current`](crate::btrieve::Block::current) to a file position,
+/// which is what [`Block::update`](crate::btrieve::Block::update) takes.
+///
+/// This is what `_GENERATE_TOP_LIST` does: `absbtv` to learn the position,
+/// `gabbtv` to position the file there, then `dupdbtv`.
+///
+/// # No `bb == NULL` guard, and the same return convention as `dinsbtv`
+///
+/// `:555` reads `bb->reclen` before checking anything, the same shape as
+/// `dinsbtv`'s `:603` -- see that routine's doc for why this host stops the
+/// module rather than faulting. 1 for success, 0 for a duplicate-key
+/// violation, everything else `catastro`'d.
+///
+/// # A file opened for more than its own `reclen` cannot be written here
+///
+/// `WCCTEXT.DAT` holds 22-byte records and the module opens it for 2,022 --
+/// see [`opnbtv`]'s doc comment on the two directions that number can
+/// diverge from a file's own record length. Reading through that gap is
+/// ordinary: the extra bytes are the buffer a variable-length read needs.
+/// Writing through it is not: [`Block::update`](crate::btrieve::Block::update)
+/// refuses a buffer that is not exactly the file's own `reclen`, because it
+/// has no way to know how many of the buffer's bytes are the record this
+/// module meant to write and how many are read-buffer padding it should not
+/// commit to disk. This host does not write variable-length records at all
+/// -- there is no module call in `WCCMMUD.DLL` that would let this be
+/// exercised, only the possibility if one existed.
+pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "dupdbtv with no Btrieve file current -- PLBTVSTF.C:550 has no \
+             guard and reads bb->reclen before checking anything, so the \
+             real host faulted here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "dupdbtv on {}, which is not positioned on a record -- \
+                 opcode 3 updates the record the file is positioned on, and \
+                 nothing has positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+    let length = file.maxlen();
+    let recptr = machine.arg_far(0);
+    let recptr = match recptr == Btrieve::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        note_duplicate_key(host, "dupdbtv", &name, key, &value);
+        return Ok(Ret::U16(0));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Btrieve's opcode 3 maintains currency on the record it just rewrote.
+    // `Cursor::Ordered` is an ordinal into a key's *sorted* order, and
+    // `Block::update` (via `Records::update`) just re-sorted every key's
+    // order as part of the write -- so the ordinal the cursor held before
+    // the call is very likely to name a different record now (see this
+    // test module's `dupdbtv_maintains_currency_on_the_record_it_rewrote_...`
+    // for a measured example: index 4 of key order was Troll before an
+    // update moved Troll to index 6, and after the update it was Elf).
+    // `position` itself did not move -- an update rewrites in place -- so
+    // the cursor is re-derived from it rather than carried forward:
+    // `find_physical` gets back to physical order, and `place_in` re-derives
+    // the ordinal in whichever key the cursor was already following. A
+    // `Physical` cursor needs no correction, because physical order is
+    // insertion order and an update does not touch it -- but it is still
+    // fine to fall through to `Physical` below if the key the cursor was on
+    // is not one `place_in` recognises.
+    if let Cursor::Ordered { key, .. } = file.cursor() {
+        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+        let physical = records
+            .find_physical(position)
+            .expect("update just wrote this position");
+        let cursor = match records.place_in(key, physical) {
+            Some(at) => Cursor::Ordered { key, at },
+            None => Cursor::Physical { at: physical },
+        };
+        file.seek_to(cursor);
+    }
+
+    Ok(Ret::U16(1))
+}
+
+/// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
+///
+/// `PLBTVSTF.C:632`, quoted in full because every line of it does something:
+///
+///
+/// # `bb=bbp` happens first, and it is unconditional
+///
+/// `&&` only short-circuits its *right* operand, so `bb=bbp` runs as part of
+/// evaluating `goodptr(bb=bbp)` whichever way the guard then goes. Closing a
+/// file makes it current on the way out -- and when the guard succeeds, `bb`
+/// is left naming a block this call is about to free. That is reproduced
+/// rather than tidied up: [`Btrieve::close`](crate::btrieve::Btrieve::close)
+/// takes `at` as a plain argument and never reads `bb` itself, precisely so
+/// this routine can write `bb` before anything decides whether there is a
+/// file to close. A later `setbtv` on the stale pointer then fails to find
+/// an open file -- a module bug getting caught, rather than silently
+/// resolving to whatever this host puts in that slot next.
+///
+/// # The ten-deep `setbtv` stack is not purged either
+///
+/// Only `bb` is written here -- nothing in [`Btrieve`](crate::btrieve::Btrieve)
+/// touches its stack on a close. If an earlier `setbtv` pushed this block's
+/// pointer there before some other `setbtv` made a different file current,
+/// closing this one now leaves that pointer sitting in the stack, unexamined.
+/// A later `rstbtv` that pops down to it -- see
+/// [`Btrieve::restore`](crate::btrieve::Btrieve::restore) -- writes it into
+/// `bb` with no check that the block it names still exists, for the same
+/// reason `restore` hands back an empty stack's null without complaint: the
+/// original never validated either end of that call. Whichever routine reads
+/// `bb` next gets the same "not an open Btrieve file" the paragraph above
+/// describes -- a module bug getting caught, rather than silently resolving
+/// to whatever this host puts in that slot next.
+///
+/// # The guard is a re-entrancy guard, and fifteen closes in a row need it
+///
+/// `bb->filnam != NULL` is the second half of the guard, and it is what
+/// makes a second `clsbtv` of the same block do nothing at all --
+/// [`Btrieve::close`](crate::btrieve::Btrieve::close) nulls the field before
+/// it frees anything, and a second read of the same bytes still finds it
+/// null. `_LJNGAME_FINROU` (`re/exports/WCCMMUD_named.c:10688`) closes
+/// fifteen files back to back, so double-close is a shape the original
+/// expected rather than a bug to guard against.
+///
+/// # The index is rebuilt here, and this is the flush point
+///
+/// `(*btvuptr)(1,0,0,0,0)` is Btrieve's own Close, which flushed whatever the
+/// TSR had buffered. This host has no TSR and buffers nothing -- every write
+/// [`dinsbtv`] and [`dupdbtv`] make lands on disk immediately -- except the
+/// one thing deliberately deferred: the B-tree index, marked
+/// [`dirty`](crate::btrieve::Block::dirty) by both of them and left stale
+/// until now. [`Btrieve::close`](crate::btrieve::Btrieve::close) rebuilds it
+/// exactly when the block is dirty, and stops the module if that fails -- a
+/// file leaving this host's reach with an index that disagrees with its data
+/// is exactly what [`reindex`](crate::btrieve::Block::reindex) exists to
+/// prevent.
+///
+/// A block that was never written is never reindexed, and that is not
+/// merely tidy: [`pages::index_pages`](crate::btrieve::pages::index_pages)
+/// refuses any key needing more than one leaf page, which is nine of the
+/// eleven shipped files that hold records -- `WCCITEMS`, `WCCTEXT` and
+/// `WCCSPELS` among them. Reindexing an untouched `WCCITEMS` on close would
+/// stop the module the first time it closed one; the `dirty` flag is what
+/// keeps a clean close from ever asking.
+///
+/// # Four allocations come back
+///
+/// The key buffer, the record buffer, the file name and the block itself --
+/// all four came off the module's heap in [`opnbtv`], and all four go back
+/// here rather than leaking a tiled descriptor per close, which would fail a
+/// long-running board rather than this one.
+pub fn clsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let bbp = machine.arg_far(0);
+
+    // Unconditional, and before anything below decides whether there is a
+    // file to close -- see this routine's doc comment.
+    set_current(machine, host, bbp)?;
+
+    let Host { btrieve, heap, .. } = host;
+    btrieve
+        .close(machine, heap, bbp)
+        .map_err(|e| ShimError::Failed(format!("clsbtv: {e}")))?;
+    Ok(Ret::Void)
+}
+
+/// Whether `bytes` collides with an existing record on a key that does not
+/// permit duplicates.
+///
+/// Returns the colliding key's number and the value that collided, or `None`
+/// if there is no collision. `exclude`, for [`dupdbtv`], is the file position
+/// of the record being replaced -- its own current key values are not a
+/// collision with themselves; [`dinsbtv`] has no such record and passes
+/// `None`.
+///
+/// `PLBTVSTF.C` never computes this: it hands the record to Btrieve and reads
+/// back status 5 if the TSR already had one. This host has no TSR, so it asks
+/// the same question of the records already read into memory -- a record
+/// with this value is a collision if [`Records::seek`](crate::btrieve::Records::seek)
+/// lands on one that [`Records::matches`](crate::btrieve::Records::matches) it exactly.
+///
+/// The caller is the one who notes it -- see [`note_duplicate_key`] -- because
+/// only the caller knows whether this is an insert or an update.
+fn duplicate_key(
+    host: &mut Host,
+    block: FarPtr,
+    bytes: &[u8],
+    exclude: Option<u32>,
+) -> Result<Option<(u16, Vec<u8>)>, ShimError> {
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let keys = file.keys().to_vec();
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    for key in &keys {
+        if key.duplicates {
+            continue;
+        }
+        let value = key.extract(bytes);
+        let at = records.seek(&keys, key.number, &value);
+        if !records.matches(&keys, key.number, at, &value) {
+            continue;
+        }
+        let existing = records.ordered(key.number, at).expect("just matched");
+        if Some(existing.position) == exclude {
+            continue;
+        }
+        return Ok(Some((key.number, value)));
+    }
+    Ok(None)
+}
+
+/// Say that a duplicate-key collision made a write answer 0 instead of
+/// happening.
+///
+/// A duplicate-key answer of 0 is exactly the case where `_GENERATE_TOP_LIST`
+/// silently skips a character -- see [`duplicate_key`], whose result this
+/// reports. Every call here names a different key and a different colliding
+/// value, so this is [`Host::note`] rather than [`Host::note_once`]: the
+/// `note_once` routines ([`note_no_file`], the setbtv-stack-overflow note in
+/// [`push`]) exist to collapse *identical* lines a tight loop would otherwise
+/// repeat thousands of times, and this is neither identical from one call to
+/// the next nor called anywhere near that often -- `_GENERATE_TOP_LIST` calls
+/// [`dinsbtv`]/[`dupdbtv`] at most once per character on the board. The value
+/// is printed as raw bytes, the same `{:02x?}` this crate already uses for a
+/// file-control-record mismatch in [`crate::btrieve::Btrieve::open`], because
+/// a key can be text, a number, or several segments of both.
+fn note_duplicate_key(host: &mut Host, who: &str, name: &str, key: u16, value: &[u8]) {
+    host.note(format!(
+        "{who} on {name} refused a record: key {key} already holds {value:02x?}, \
+         and that key does not permit duplicates -- this call answers 0 rather \
+         than writing, and whichever record it was is silently skipped by \
+         whoever asked for the write"
+    ));
 }
 
 /// What a Btrieve operation code asks for.
@@ -2025,6 +2380,427 @@ mod tests {
         let e = f.invoke(delbtv, &[]).expect_err("nothing here writes");
         assert!(e.to_string().contains("delbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
+    }
+
+    // # `dinsbtv`, which does write
+    //
+    // `SAMPLE.DAT` has one key -- a two-byte signed number at offset 0 -- and
+    // it does not permit duplicates, which is what makes it enough to test a
+    // collision against.
+
+    /// A 64-byte `SAMPLE.DAT`-shaped record: the key at offset 0, a
+    /// NUL-terminated name from offset 2, the rest zero.
+    fn sample_record(key: i16, name: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[..2].copy_from_slice(&key.to_le_bytes());
+        let name = name.as_bytes();
+        bytes[2..2 + name.len()].copy_from_slice(name);
+        bytes
+    }
+
+    #[test]
+    fn dinsbtv_inserts_a_record_and_it_is_readable_afterwards() {
+        let dir = crate::testing::scratch_with("dinsbtv-insert", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+            Ret::U16(1)
+        );
+
+        // Re-read from disk with a fresh host, which is the check that
+        // matters -- an in-memory model that agrees with itself proves
+        // nothing.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(99), 0, 5), "the new record is there");
+        assert_eq!(
+            g.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "Zorro"
+        );
+    }
+
+    #[test]
+    fn dinsbtv_refuses_a_record_colliding_on_a_key_without_duplicates() {
+        // `PLBTVSTF.C:610` maps Btrieve status 5 to a 0, not a `catastro` --
+        // `_GENERATE_TOP_LIST` branches on the 0/1, so a collision has to be
+        // an answer rather than a refusal.
+        let dir = crate::testing::scratch_with("dinsbtv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 5 already belongs to Troll"
+        );
+        assert_eq!(
+            f.invoke(cntrbtv, &[]).expect("counts"),
+            Ret::U32(7),
+            "and nothing was written"
+        );
+    }
+
+    /// Important: a duplicate-key answer of 0 is exactly the case where
+    /// `_GENERATE_TOP_LIST` silently skips a character, and before this
+    /// `duplicate_key` computed which key collided and both callers threw
+    /// it away with `.is_some()` -- nothing said which file, which key, or
+    /// what value collided. This crate's convention elsewhere (`note_no_file`,
+    /// the `ties` note, the `setbtv` overflow note) is to report exactly
+    /// this class of quiet divergence -- see `note_duplicate_key`.
+    #[test]
+    fn dinsbtv_notes_which_key_and_value_collided() {
+        let dir = crate::testing::scratch_with("dinsbtv-collide-notes", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 5 already belongs to Troll"
+        );
+
+        // SAMPLE.DAT's one key is key 0, and 5 as a little-endian i16 is
+        // `[05, 00]` -- the same `{:02x?}` this crate already uses for raw
+        // bytes in `crate::btrieve::Btrieve::open`'s file-control-record note.
+        assert_eq!(
+            f.host.notes(),
+            &[
+                "dinsbtv on SAMPLE.DAT refused a record: key 0 already holds \
+                 [05, 00], and that key does not permit duplicates -- this \
+                 call answers 0 rather than writing, and whichever record it \
+                 was is silently skipped by whoever asked for the write"
+            ]
+        );
+    }
+
+    /// Same as `dinsbtv_notes_which_key_and_value_collided`, but through
+    /// `dupdbtv`'s opcode-3 path -- the note names the routine that made the
+    /// call, so the two must read differently.
+    #[test]
+    fn dupdbtv_notes_which_key_and_value_collided() {
+        let dir = crate::testing::scratch_with("dupdbtv-collide-notes", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 6 already belongs to Elf"
+        );
+
+        assert_eq!(
+            f.host.notes(),
+            &[
+                "dupdbtv on SAMPLE.DAT refused a record: key 0 already holds \
+                 [06, 00], and that key does not permit duplicates -- this \
+                 call answers 0 rather than writing, and whichever record it \
+                 was is silently skipped by whoever asked for the write"
+            ]
+        );
+    }
+
+    /// Important: `dinsbtv` used to leave the cursor wherever it happened to
+    /// be, rather than moving it onto the record it just inserted. Probed
+    /// both directions, because the bug was direction-dependent: inserting a
+    /// key that sorts before the cursor happened to land the (untouched)
+    /// cursor on the new record by accident, and inserting one that sorts
+    /// after it left the cursor on the old record, which is wrong. Btrieve's
+    /// Insert establishes currency on the new record in both cases.
+    #[test]
+    fn dinsbtv_establishes_currency_on_the_new_record_regardless_of_sort_direction() {
+        for key in [0u16, 9u16] {
+            let dir = crate::testing::scratch_with(
+                &format!("dinsbtv-currency-{key}"),
+                &["SAMPLE.DAT"],
+            );
+            let mut f = Fixture::rooted(dir.clone());
+            open(&mut f, "SAMPLE.DAT", 64);
+            assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+
+            let recptr = f.bytes(&sample_record(key as i16, "Newcomer"), false);
+            assert_eq!(
+                f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+                Ret::U16(1)
+            );
+            let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+                panic!("absbtv returns a long");
+            };
+
+            // Independent of the cursor this test is checking: a fresh
+            // fixture over the same directory, positioned on the new record
+            // by its own key -- `dinsbtv` writes to disk immediately, so
+            // this reads back exactly what landed there.
+            let mut g = Fixture::rooted(dir);
+            open(&mut g, "SAMPLE.DAT", 64);
+            assert!(
+                acquire(&mut g, Some(key), 0, 5),
+                "the record dinsbtv just inserted, found by its own key"
+            );
+            let Ret::U32(expected) = g.invoke(absbtv, &[]).expect("position") else {
+                panic!("absbtv returns a long");
+            };
+
+            assert_eq!(
+                after, expected,
+                "key {key}: dinsbtv must leave the cursor on the record it just \
+                 inserted, not wherever it happened to be positioned before"
+            );
+        }
+    }
+
+    #[test]
+    fn dinsbtv_with_no_file_current_stops_the_module() {
+        // `PLBTVSTF.C:598` has no `bb == NULL` guard and reads `bb->reclen`
+        // immediately, so the real host faulted with no file current. This
+        // host stops the module instead of faulting -- the same outcome
+        // honestly reached, and a different shape from `invbtv`/`delbtv`,
+        // which answer quietly with no file current.
+        let mut f = nothing_current();
+        let e = f.invoke(dinsbtv, &[0, 0]).expect_err("no file current");
+        assert!(e.to_string().contains("dinsbtv"), "{e}");
+    }
+
+    // # `dupdbtv`, which updates the record the cursor names
+    //
+    // `SAMPLE.DAT`'s seven records, keyed 1 through 7: Human, Gnome,
+    // Halfling, Dwarf, Troll, Elf, Half-Ogre.
+
+    #[test]
+    fn dupdbtv_updates_the_record_the_cursor_names_and_it_is_readable_afterwards() {
+        let dir = crate::testing::scratch_with("dupdbtv-update", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let Ret::U32(before) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        let recptr = f.bytes(&sample_record(5, "TROLLX"), false);
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            Ret::U16(1)
+        );
+
+        // An update is in place: `absbtv` answers the same before and after.
+        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert_eq!(before, after, "opcode 3 rewrites the record in place");
+
+        // Re-read from disk with a fresh host, which is the check that
+        // matters -- an in-memory model that agrees with itself proves
+        // nothing.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(5), 0, 5), "still key 5");
+        assert_eq!(
+            g.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "TROLLX"
+        );
+        assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    /// Critical: `Cursor::Ordered { key, at }` is an ordinal into a key's
+    /// *sorted* order, and `Block::update` (via `Records::update`)
+    /// re-sorts that order every time it runs -- so an ordinal left
+    /// standing from before the write is a bet that the update did not
+    /// change where the record sorts. Renaming Troll's key from 5 to
+    /// something that sorts after every other record (Half-Ogre is the
+    /// highest at 7) loses that bet: before the fix, `absbtv` after this
+    /// `dupdbtv` answered Elf's position, because index 4 of key order --
+    /// where Troll used to sit -- is Elf's slot once Troll has moved to the
+    /// end.
+    #[test]
+    fn dupdbtv_maintains_currency_on_the_record_it_rewrote_even_when_its_key_moves() {
+        let dir = crate::testing::scratch_with(
+            "dupdbtv-currency-follows-the-move",
+            &["SAMPLE.DAT"],
+        );
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let Ret::U32(troll) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        // 8 sorts after every one of SAMPLE.DAT's keys (1..=7), so Troll
+        // moves from the middle of key order to the very end.
+        let recptr = f.bytes(&sample_record(8, "TrollX"), false);
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            Ret::U16(1)
+        );
+
+        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert_eq!(
+            after, troll,
+            "opcode 3 maintains currency on the record it rewrote, wherever \
+             its key now sorts -- not on whatever else landed on the old ordinal"
+        );
+    }
+
+    #[test]
+    fn dupdbtv_refuses_when_the_new_key_collides_with_a_different_record() {
+        // Positioned on Troll (key 5); the buffer to write back names Elf's
+        // key (6) instead. `exclude` in `duplicate_key` only excuses a
+        // record from colliding with *itself* -- Elf is a different record,
+        // so this is a real duplicate-key violation.
+        let dir = crate::testing::scratch_with("dupdbtv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 6 already belongs to Elf"
+        );
+
+        // Nothing was written: Troll is still findable by its own key.
+        assert!(acquire(&mut f, Some(5), 0, 5), "Troll is unchanged");
+        assert_eq!(
+            f.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "Troll"
+        );
+        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    #[test]
+    fn dupdbtv_with_nothing_positioned_stops_the_module() {
+        // Cursor::Nowhere: the file is current but nothing has positioned it,
+        // so there is no record for opcode 3 to update. Writing to a guessed
+        // one is exactly the failure this crate exists to prevent.
+        let dir = crate::testing::scratch_with("dupdbtv-unpositioned", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(1, "Nobody"), false);
+
+        let e = f
+            .invoke(dupdbtv, &Fixture::far(recptr))
+            .expect_err("nothing has positioned the file");
+        assert!(e.to_string().contains("dupdbtv"), "{e}");
+    }
+
+    #[test]
+    fn dupdbtv_with_no_file_current_stops_the_module() {
+        // `PLBTVSTF.C:550` has the same no-guard shape as `dinsbtv`.
+        let mut f = nothing_current();
+        let e = f.invoke(dupdbtv, &[0, 0]).expect_err("no file current");
+        assert!(e.to_string().contains("dupdbtv"), "{e}");
+    }
+
+    // # `clsbtv`, which rebuilds the index and gives four allocations back
+    //
+    // `SAMPLE.DAT` and `OTHER.DAT` are hand-built fixtures with no real index
+    // root -- `key 0`'s root page is `0`, which `reindex` refuses rather than
+    // write over the file control record. That is fine for every test below:
+    // none of them ever dirties a block before closing it, so `reindex` is
+    // never asked to run. The case where it *is* asked -- a dirty block with
+    // a real root -- is `close_reindexes_a_dirty_block_but_never_a_clean_one`
+    // in `crate::btrieve`'s own tests, which has `seed_indexed`'s properly
+    // rooted fixture to use instead.
+
+    #[test]
+    fn clsbtv_closes_a_file_and_gives_its_four_allocations_back() {
+        let dir = crate::testing::scratch_with("clsbtv-close", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        let key = f.host.btrieve.block(block).expect("open").key();
+        let data = f.host.btrieve.block(block).expect("open").data();
+        let filnam = FarPtr {
+            offset: field(&f, block, 128),
+            selector: field(&f, block, 130),
+        };
+        assert!(f.host.heap.block(key).is_some(), "the key buffer is allocated");
+        assert!(f.host.heap.block(data).is_some(), "the record buffer is allocated");
+        assert!(f.host.heap.block(filnam).is_some(), "the name is allocated");
+        assert!(f.host.heap.block(block).is_some(), "the block itself is allocated");
+
+        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+
+        assert!(
+            f.host.btrieve.files().iter().all(|b| b.block() != block),
+            "the block is gone from the open files"
+        );
+        assert_eq!(
+            bb(&f),
+            block,
+            "closing a file makes it current on the way out, per PLBTVSTF.C:637"
+        );
+
+        assert!(f.host.heap.block(key).is_none(), "the key buffer came back");
+        assert!(f.host.heap.block(data).is_none(), "the record buffer came back");
+        assert!(f.host.heap.block(filnam).is_none(), "the name came back");
+        assert!(f.host.heap.block(block).is_none(), "the block itself came back");
+    }
+
+    #[test]
+    fn clsbtv_on_an_already_closed_block_does_nothing() {
+        let dir = crate::testing::scratch_with("clsbtv-double-close", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+        // A second close of the same pointer: `filnam` is already null, so
+        // `PLBTVSTF.C:637`'s guard is false and nothing runs -- in
+        // particular nothing tries to free what the first close already
+        // gave back, which would be a double free if it did.
+        f.invoke(clsbtv, &Fixture::far(block))
+            .expect("a no-op, not an error");
+        assert_eq!(
+            bb(&f),
+            block,
+            "bb is written whether or not there was anything to close"
+        );
+    }
+
+    #[test]
+    fn clsbtv_leaves_a_clean_block_completely_untouched() {
+        // `OTHER.DAT` is never written to, so a close of it must leave the
+        // file byte-for-byte as it was -- not merely unchanged in meaning,
+        // but never opened for writing at all. `index_pages` refuses any
+        // key needing more than one leaf page, which is most of the files
+        // MajorMUD ships records in, and `dirty` is the only thing standing
+        // between a clean close and that refusal -- see
+        // `close_reindexes_a_dirty_block_but_never_a_clean_one` for the case
+        // where the block *is* dirty.
+        let dir = crate::testing::scratch_with("clsbtv-clean-untouched", &["OTHER.DAT"]);
+        let path = dir.join("OTHER.DAT");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut f = Fixture::rooted(dir);
+        let other = open(&mut f, "OTHER.DAT", 32);
+        f.invoke(clsbtv, &Fixture::far(other)).expect("closes");
+
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(before, after, "a clean close never touches the file");
     }
 
     #[test]

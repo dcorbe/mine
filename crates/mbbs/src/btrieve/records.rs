@@ -97,43 +97,58 @@ impl Records {
             )));
         }
 
+        let mut me = Self {
+            records,
+            order: Vec::new(),
+            rank: Vec::new(),
+            ties: Vec::new(),
+        };
+        me.reindex(keys);
+        Ok(me)
+    }
+
+    /// Re-derive `order`, `rank` and `ties` from `records`, for the given keys.
+    ///
+    /// Re-sorted rather than spliced: at these record counts a sort is cheap,
+    /// and a splice is the kind of thing that is right for a year and then is
+    /// not. `read` calls this once after walking the pages, and `insert`,
+    /// `update` and `delete` each call it again after touching `records` --
+    /// one derivation, so the two cannot drift.
+    fn reindex(&mut self, keys: &[Key]) {
         let mut order = Vec::with_capacity(keys.len());
         let mut rank = Vec::with_capacity(keys.len());
         let mut ties = Vec::with_capacity(keys.len());
         for key in keys {
-            let mut sorted: Vec<usize> = (0..records.len()).collect();
+            let mut sorted: Vec<usize> = (0..self.records.len()).collect();
             // Ties broken by physical position, so the order is total: two
             // records with the same duplicate key must still come out in the
             // same sequence every run, or `qnxbtv` would step somewhere else on
             // a second pass over the same file. See [`Self::ties`] for what
             // that tie-break is and is not.
             sorted.sort_by(|a, b| {
-                match key.compare(&records[*a].bytes, &records[*b].bytes) {
-                    Ordering::Equal => records[*a].position.cmp(&records[*b].position),
+                match key.compare(&self.records[*a].bytes, &self.records[*b].bytes) {
+                    Ordering::Equal => self.records[*a].position.cmp(&self.records[*b].position),
                     other => other,
                 }
             });
-            let mut places = vec![0usize; records.len()];
+            let mut places = vec![0usize; self.records.len()];
             for (place, record) in sorted.iter().enumerate() {
                 places[*record] = place;
             }
             let tied = sorted
                 .windows(2)
                 .filter(|pair| {
-                    key.compare(&records[pair[0]].bytes, &records[pair[1]].bytes) == Ordering::Equal
+                    key.compare(&self.records[pair[0]].bytes, &self.records[pair[1]].bytes)
+                        == Ordering::Equal
                 })
                 .count();
             order.push(sorted);
             rank.push(places);
             ties.push(tied);
         }
-
-        Ok(Self {
-            records,
-            order,
-            rank,
-            ties,
-        })
+        self.order = order;
+        self.rank = rank;
+        self.ties = ties;
     }
 
     /// How many records share a key value with the record before them, per key.
@@ -216,6 +231,87 @@ impl Records {
         };
         keys[usize::from(key)].compare_value(&record.bytes, value) == Ordering::Equal
     }
+
+    /// Add a record at a position nothing else occupies.
+    ///
+    /// Inserted in position order, not appended. [`Self::records`] is file
+    /// order -- what `walk` produces and what a fresh read always agrees
+    /// with -- and the two are the same thing only while every insert lands
+    /// after every existing record. [`pages::Layout::next_slot`]'s free
+    /// list is checked first, ahead of a gap or a new page, so a position
+    /// *lower* than records already in the file is not a hypothetical: it
+    /// is what any insert into a file with a non-empty free list does. This
+    /// keeps `records` sorted by position unconditionally, which `delete`
+    /// and `update` already preserve by construction (`remove` keeps the
+    /// order of what is left; `update` mutates a record in place), so the
+    /// invariant holds for the whole lifetime of a `Records`.
+    ///
+    /// [`pages::Layout::next_slot`]: super::pages::Layout::next_slot
+    ///
+    /// # Errors
+    ///
+    /// If `position` already holds a record.
+    pub fn insert(&mut self, keys: &[Key], position: u32, bytes: Vec<u8>) -> Result<(), String> {
+        if self.records.iter().any(|r| r.position == position) {
+            return Err(format!("position {position} already holds a record"));
+        }
+        let at = self.records.partition_point(|r| r.position < position);
+        self.records.insert(at, Record { position, bytes });
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Replace the bytes of the record at `position`, leaving it where it is.
+    ///
+    /// An update is in place: Btrieve's opcode 3 rewrites the record the file
+    /// is positioned on, so `absbtv` answers the same before and after. Only
+    /// the key orders move.
+    ///
+    /// # Errors
+    ///
+    /// If `position` holds no record.
+    pub fn update(&mut self, keys: &[Key], position: u32, bytes: Vec<u8>) -> Result<(), String> {
+        let record = self
+            .records
+            .iter_mut()
+            .find(|r| r.position == position)
+            .ok_or_else(|| format!("position {position} holds no record"))?;
+        record.bytes = bytes;
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Remove the record at `position`.
+    ///
+    /// `pub(crate)` rather than `pub`: this only removes `position` from the
+    /// in-memory model, and there is no `Block::delete` yet to remove the
+    /// on-disk slot or add it to the free list. Calling this alone would
+    /// take `position` out of [`Self::positions`] while the slot on disk is
+    /// still live -- `Layout::next_slot`'s free-list-then-existing-gap
+    /// search does not consult the free list on disk either, so nothing
+    /// stops `next_slot` from handing that same still-live position back as
+    /// `Slot::Existing` and having a later insert overwrite it. Widen this
+    /// once `Block::delete` exists to keep the two in step.
+    ///
+    /// # Errors
+    ///
+    /// If `position` holds no record.
+    pub(crate) fn delete(&mut self, keys: &[Key], position: u32) -> Result<(), String> {
+        let index = self
+            .records
+            .iter()
+            .position(|r| r.position == position)
+            .ok_or_else(|| format!("position {position} holds no record"))?;
+        self.records.remove(index);
+        self.reindex(keys);
+        Ok(())
+    }
+
+    /// Every position currently holding a record, for
+    /// [`Layout::next_slot`](super::pages::Layout::next_slot).
+    pub fn positions(&self) -> Vec<u32> {
+        self.records.iter().map(|r| r.position).collect()
+    }
 }
 
 /// Walk the data pages and collect every live record.
@@ -262,16 +358,9 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             let start = (u32::from(PAGE_HEADER) + physical * slot) as usize;
             let record = &buffer[start..start + geometry.physical as usize];
 
-            // An unused slot is all zero except for four bytes of free-list
-            // pointer, and slots are filled from the front -- so the first one
-            // ends the page rather than being skipped. A record too short to
-            // hold a pointer has no pointer to check, and being all zero is the
-            // whole of the evidence.
-            let empty = match record.len() {
-                0..4 => record.iter().all(|b| *b == 0),
-                _ => record[4..].iter().all(|b| *b == 0) && pointer(record) < size,
-            };
-            if empty {
+            // Slots are filled from the front -- so the first empty one ends
+            // the page rather than being skipped. See [`looks_empty`].
+            if looks_empty(record, size) {
                 break;
             }
             records.push(Record {
@@ -296,7 +385,7 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
         .and_then(|_| file.read_exact(&mut head))
         .map_err(|e| format!("reading the free list: {e}"))?;
 
-    let mut next = pointer(&head);
+    let mut next = super::pages::long(&head);
     while next != NOWHERE {
         if next + 4 > size {
             return Err(format!(
@@ -312,30 +401,36 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
         file.seek(SeekFrom::Start(u64::from(next)))
             .and_then(|_| file.read_exact(&mut link))
             .map_err(|e| format!("following the free list: {e}"))?;
-        next = pointer(&link);
+        next = super::pages::long(&link);
     }
     Ok(dead)
 }
 
-/// A record pointer: four bytes, **high word first**, the same shape the record
-/// count in the file control record is.
-fn pointer(bytes: &[u8]) -> u32 {
-    (u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
-        | u32::from(u16::from_le_bytes([bytes[2], bytes[3]]))
+/// Whether a slot's bytes would be read as unused rather than as a record.
+///
+/// An unused slot is all zero except for four bytes of free-list pointer, and
+/// a record too short to hold one has no pointer to check, so being all zero
+/// is the whole of the evidence for it. `size` is the file's size in bytes,
+/// which bounds what a plausible pointer looks like.
+///
+/// [`pages::write_record`](super::pages::write_record) calls this too, on the
+/// bytes it is about to write padded to the physical length -- the same test
+/// [`walk`] applies when it later decides whether that slot holds a record.
+/// A write that satisfied this predicate would be unreadable the moment it
+/// landed, and everything after it in the page with it, so it is refused
+/// before it is written rather than accepted and discovered corrupt on the
+/// next read. See C1 in `docs/plans/2026-08-07-btrieve-writes.md`.
+pub(crate) fn looks_empty(record: &[u8], size: u32) -> bool {
+    match record.len() {
+        0..4 => record.iter().all(|b| *b == 0),
+        _ => record[4..].iter().all(|b| *b == 0) && super::pages::long(record) < size,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::btrieve::keys;
-
-    #[test]
-    fn a_record_pointer_is_two_words_high_first() {
-        // The same encoding as the record count, and the same trap: read as a
-        // little-endian `u32`, `WCCITEMS`'s free list head of 0x325806 becomes
-        // 0x06580032 and points past the end of the file.
-        assert_eq!(pointer(&[0x32, 0x00, 0x06, 0x58]), 0x0032_5806);
-    }
 
     /// Bytes of a record in these fixtures.
     ///
@@ -538,5 +633,235 @@ mod tests {
 
         assert!(records.matches(&parsed, 0, 1, &[3, 0]));
         assert!(!records.matches(&parsed, 0, 1, &[4, 0]));
+    }
+
+    #[test]
+    fn an_inserted_record_appears_in_physical_and_in_key_order() {
+        let bytes = of(&[1, 3]);
+        let mut records = read("INSERT.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("INSERT.DAT", &bytes, 1).expect("keys");
+        let position = slot(2); // the third slot of the page, unused by [1, 3]
+
+        records.insert(&parsed, position, record(2)).expect("inserts");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.physical(2).expect("appended at the end").bytes[0],
+            2,
+            "physical order is file order, and an insert is the newest thing in the file"
+        );
+        assert_eq!(
+            records.ordered(0, 1).expect("the middle of the key order").bytes[0],
+            2,
+            "2 sorts between 1 and 3"
+        );
+        assert_eq!(records.find_physical(position), Some(2));
+    }
+
+    /// I3: `insert` used to `push`, so physical order was insertion order.
+    /// The two agree only while every insert appends -- which is all
+    /// `WCCUSERS`'s empty free list ever exercises. `WCCITEMS`'s free-list
+    /// head is `0x325806`, a position *lower* than records already in the
+    /// file, so its inserts do not append: they land in a low slot a
+    /// deletion freed. This reproduces that shape without needing
+    /// `WCCITEMS` itself -- a free slot before both live records -- and
+    /// checks both halves: the in-memory model right after the insert, and
+    /// a completely independent fresh read of the same write from disk.
+    #[test]
+    fn an_insert_through_a_free_slot_at_a_low_position_agrees_with_a_fresh_read() {
+        let bytes = file(512, RECLEN, &[&record(1), &record(3)], &[slot(0)]);
+        let dir = crate::testing::scratch("btv-rec-freeslot");
+        let path = dir.join("FREESLOT.DAT");
+        std::fs::write(&path, &bytes).expect("written");
+
+        let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry");
+        let fcr = std::fs::read(&path).expect("read");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let mut records =
+            Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("reads");
+
+        // Baseline: the two live records, in file order.
+        assert_eq!(records.physical(0).expect("first").position, slot(1));
+        assert_eq!(records.physical(1).expect("second").position, slot(2));
+
+        // The model, in isolation: insert at `slot(0)`, below both.
+        records.insert(&parsed, slot(0), record(9)).expect("inserts");
+        assert_eq!(
+            records.physical(0).expect("lowest position sorts first").position,
+            slot(0),
+            "the model is in file order, not insertion order"
+        );
+        assert_eq!(records.physical(0).expect("first").bytes[0], 9);
+        assert_eq!(records.physical(1).expect("second").position, slot(1));
+        assert_eq!(records.physical(2).expect("third").position, slot(2));
+
+        // The same write, actually made -- through the free slot the
+        // fixture built, whose link already terminates the list at
+        // `NOWHERE` -- and read back completely fresh, independent of the
+        // `records` model above.
+        let layout = crate::btrieve::pages::Layout {
+            page: geometry.page,
+            physical: geometry.physical,
+            pages: geometry.pages,
+        };
+        crate::btrieve::pages::write_record(
+            &path,
+            layout,
+            crate::btrieve::pages::Slot::Free(slot(0)),
+            &record(9),
+            3,
+        )
+        .expect("writes");
+
+        let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry after the write");
+        let fcr = std::fs::read(&path).expect("read again");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let reread =
+            Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("a fresh read");
+
+        assert_eq!(reread.len(), 3);
+        assert_eq!(
+            reread.physical(0).expect("first").position,
+            slot(0),
+            "a fresh read is always file order"
+        );
+        assert_eq!(reread.physical(0).expect("first").bytes[0], 9);
+        assert_eq!(reread.physical(1).expect("second").position, slot(1));
+        assert_eq!(reread.physical(2).expect("third").position, slot(2));
+    }
+
+    #[test]
+    fn inserting_into_a_position_that_already_holds_a_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("OCCUPIED.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("OCCUPIED.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(0).expect("first").position;
+
+        assert!(records.insert(&parsed, position, record(2)).is_err());
+    }
+
+    #[test]
+    fn an_updated_record_keeps_its_position_and_moves_in_key_order() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("UPDATE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("UPDATE.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(0).expect("first, holding key 1").position;
+
+        records.update(&parsed, position, record(9)).expect("updates");
+
+        assert_eq!(
+            records.physical(0).expect("still first physically").position,
+            position,
+            "an update rewrites the record the file is positioned on -- absbtv must \
+             answer the same before and after"
+        );
+        assert_eq!(records.physical(0).expect("same slot").bytes[0], 9);
+        assert_eq!(
+            records.ordered(0, 2).expect("now sorts last").bytes[0],
+            9,
+            "9 is greater than 2 and 3"
+        );
+    }
+
+    #[test]
+    fn updating_a_position_that_holds_no_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("MISSING.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("MISSING.DAT", &bytes, 1).expect("keys");
+
+        // The module is entitled to be wrong; the host is not entitled to
+        // invent a record.
+        assert!(records.update(&parsed, slot(5), record(2)).is_err());
+    }
+
+    #[test]
+    fn a_deleted_record_leaves_physical_order_and_every_key_order() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("DELETE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("DELETE.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(1).expect("the middle record, key 2").position;
+
+        records.delete(&parsed, position).expect("deletes");
+
+        assert_eq!(records.len(), 2);
+        assert!(records.find_physical(position).is_none());
+        for n in 0..records.len() {
+            assert_ne!(
+                records.ordered(0, n).expect("in order").bytes[0],
+                2,
+                "the deleted record is gone from key order too"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_position_that_holds_no_record_is_refused() {
+        let bytes = of(&[1]);
+        let mut records = read("GONE.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("GONE.DAT", &bytes, 1).expect("keys");
+
+        assert!(records.delete(&parsed, slot(5)).is_err());
+    }
+
+    /// I8: why `delete` is `pub(crate)` rather than `pub`. It only ever
+    /// touches the in-memory model -- there is no `Block::delete` yet to
+    /// free the slot on disk or add it to the free list -- so a caller with
+    /// access to this alone could take `position` out of
+    /// [`Records::positions`] while the slot behind it is still live on
+    /// disk, and a later `Layout::next_slot` would hand that same position
+    /// back as `Slot::Existing` for a write to overwrite. This demonstrates
+    /// the gap directly: deleting from the model leaves the underlying bytes
+    /// completely untouched, so a fresh read of them still finds the record
+    /// the model just forgot.
+    #[test]
+    fn deleting_from_the_model_alone_does_not_touch_the_file() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("MODEL-ONLY.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("MODEL-ONLY.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(1).expect("the middle record").position;
+
+        records.delete(&parsed, position).expect("deletes from the model");
+        assert!(
+            records.positions().iter().all(|p| *p != position),
+            "the model has forgotten it"
+        );
+
+        // The bytes this came from were never written to -- a fresh read of
+        // exactly the same file content still finds all three records,
+        // including the one the model just forgot.
+        let reread = read("MODEL-ONLY.DAT", &bytes).expect("reads again");
+        assert_eq!(reread.len(), 3, "the file itself was never touched");
+        assert!(reread.find_physical(position).is_some());
+    }
+
+    /// `ties` is how this host reports the one Btrieve divergence it cannot
+    /// check: duplicates come out in file-position order here and in
+    /// insertion order in Btrieve. Inserting two records with the same key
+    /// value must make the count say so rather than let the difference be
+    /// silent.
+    #[test]
+    fn inserting_a_duplicate_key_is_counted_as_a_tie() {
+        let bytes = of(&[1]);
+        let mut records = read("TIES.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("TIES.DAT", &bytes, 1).expect("keys");
+        assert_eq!(records.ties()[0], 0);
+
+        records.insert(&parsed, slot(1), record(1)).expect("inserts");
+
+        assert_eq!(records.ties()[0], 1);
+    }
+
+    #[test]
+    fn positions_lists_every_record_currently_held() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("POSITIONS.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("POSITIONS.DAT", &bytes, 1).expect("keys");
+        let doomed = records.physical(1).expect("middle").position;
+
+        records.delete(&parsed, doomed).expect("deletes");
+
+        let positions = records.positions();
+        assert_eq!(positions.len(), 2);
+        assert!(!positions.contains(&doomed));
     }
 }

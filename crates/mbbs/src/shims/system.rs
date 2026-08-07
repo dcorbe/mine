@@ -187,6 +187,156 @@ pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(all.date))
 }
 
+/// Days before each month in a non-leap year, measured -- not reasoned out --
+/// at `DGROUP:0x68` of `MAJORBBS-wg101.EXE`: 13 words, index 0 unused and
+/// 1..=12 the running total of days before that month. The table ends exactly
+/// where the empty-string constant (`0x82`) and [`ncdate`]'s own format string
+/// (`0x83`) begin, which is independent corroboration that this is where it
+/// starts and how long it is.
+const CUMULATIVE_DAYS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+/// `int cofdat(int date)` -- a DOS-packed date as a day count, so that two
+/// dates can be subtracted to find how many days apart they are.
+///
+/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0e9e`
+/// (ordinal 134, twelve call sites); the fields unpack exactly as [`ncdate`]'s
+/// do:
+///
+/// ```text
+/// year  = (date >> 9) & 0x7f      years since 1980
+/// month = (date >> 5) & 0xf
+/// day   =  date       & 0x1f
+///
+/// days  = year * 365
+///       + (year + 3) / 4                leap days strictly before this year
+///       + CUMULATIVE_DAYS[month]
+///       + (month > 2 && year % 4 == 0)  this year's leap day, once it has passed
+///       + day
+///       - 1
+/// ```
+///
+/// **1980 is year 0, and it is itself a leap year.** `(year + 3) / 4` counts
+/// leap years strictly *before* the current one, so 1980's own leap day never
+/// shows up in that term -- it is what the trailing `month > 2 && year % 4 ==
+/// 0` adds, and only once 29 February has actually gone by. Get the `+ 3`
+/// wrong and every single date still formats fine through [`ncdate`], because
+/// nothing here touches that routine, while every *difference* comes out one
+/// day off.
+///
+/// # Errors
+///
+/// If `date` unpacks to a month the table has no entry for. The four-bit field
+/// can hold 13..=15; `CUMULATIVE_DAYS` only has indices 0..=12, and the real
+/// host would read whatever bytes happen to follow it -- the empty-string
+/// constant and then [`ncdate`]'s format string -- and call the result a day
+/// count. This host refuses instead.
+///
+/// # This routine is unreachable by any test in this crate
+///
+/// Its callers are the polling routines, which nothing here drives yet. A flat
+/// meter after this commit is not this shim breaking -- it is this shim never
+/// running.
+pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let year = i64::from((packed >> 9) & 0x7f);
+    let month = usize::from((packed >> 5) & 0xf);
+    let day = i64::from(packed & 0x1f);
+
+    let cumulative = *CUMULATIVE_DAYS
+        .get(month)
+        .ok_or_else(|| ShimError::Failed(format!("cofdat: {month} is not a month")))?;
+    let leap_before = (year + 3) / 4;
+    let leap_this_year = i64::from(month > 2 && year % 4 == 0);
+
+    let days = year * 365 + leap_before + i64::from(cumulative) + leap_this_year + day - 1;
+    Ok(Ret::U16(days as u16))
+}
+
+/// `moname[][4]`, `DOSFACE.H:71` -- sixteen four-byte entries, measured at
+/// **NE segment 88** of `MAJORBBS-wg101.EXE` (file offset `0xc9a00`), DGROUP
+/// offset `0x00`. Segment 88 is this module's real DGROUP: it is what the
+/// relocation on the `mov ax,0xffff` at `seg 33:0x0c9f` (immediately before
+/// the `mov ds,ax` that `ncedat` runs before indexing this table) targets.
+///
+/// The measured bytes:
+///
+/// `000\0JAN\0FEB\0MAR\0APR\0MAY\0JUN\0JUL\0AUG\0SEP\0OCT\0NOV\0DEC\0XXX\0XXX\0XXX\0`
+///
+/// Upper case, and sixteen entries rather than twelve: slot 0 is a `"000"`
+/// sentinel and slots 13..=15 are `"XXX"`, which is exactly what a table built
+/// for a 4-bit index (0..=15) with no bounds check needs. See [`ncedat`] for
+/// why this table is indexed directly rather than `month - 1`, and how a
+/// previous version of this comment cited an address that was never in this
+/// segment.
+const MONAME: [&str; 16] = [
+    "000", "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    "XXX", "XXX", "XXX",
+];
+
+/// `char *ncedat(int date)` -- a DOS-packed date as `DD-MON-YY`, e.g.
+/// `07-AUG-26`.
+///
+/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c98`
+/// (ordinal 429, seven call sites); the fields unpack exactly as [`cofdat`]'s
+/// do. The call it builds is
+/// `spr(buf, "%02d-%s-%02d", day, moname[month], (year + 0x7bc) % 100)` --
+/// `0x7bc` is 1980, and the format string (`DGROUP:0xa1`) is the same static
+/// [`ncdate`] and [`nctime`] already measured.
+///
+/// **`moname[month]`, not `moname[month - 1]`.** The disassembly is
+///
+/// ```text
+/// mov ax, cx          ; cx is the packed date
+/// sar ax, 5
+/// and ax, 0xf          ; month, 0..=15
+/// shl ax, 2            ; * 4 (entry size)
+/// add ax, 0             ; base of moname is 0, not moname - 4
+/// ```
+///
+/// -- base `0`, not `moname`'s address minus one entry. `month = 8` (August)
+/// reaches byte offset `0x20` into [`MONAME`], which is slot 8 (`AUG`), not
+/// slot 7. A previous version of this comment claimed a `month - 1` index and
+/// a 12-entry table; both were wrong. See [`MONAME`] for where the table
+/// actually lives and why it has 16 entries, not 12.
+///
+/// **There is no null case, and `ncedat` is total.** The disassembly goes
+/// straight from `mov cx,[bp+6]` into the shifts -- no `or cx,cx` guard
+/// anywhere -- so `ncedat(0)` does not hand back an empty string the way
+/// [`ncdate`] does. It computes `month = 0`, which is `moname[0]`, the `"000"`
+/// sentinel: `ncedat(0)` is `"00-000-80"`. Likewise `month` in `13..=15` is
+/// `moname[13..=15]`, `"XXX"`. A previous version of this shim refused those
+/// four values, reasoning that `moname` had only 12 entries and month 0 read
+/// into an unrelated weekday table one slot before it -- built on the same
+/// wrong address as the `month - 1` mistake above. Once the table is measured
+/// correctly, every 4-bit value has a real, in-bounds answer, and refusing
+/// four of them was refusing behaviour the original host actually has.
+///
+/// # Errors
+///
+/// If the module's heap cannot give the buffer its first time through.
+///
+/// # This routine is unreachable by any test in this crate
+///
+/// Its callers are the polling routines, which nothing here drives yet. A flat
+/// meter after this commit is not this shim breaking -- it is this shim never
+/// running.
+pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let all = buffers(machine, host)?;
+
+    let month = usize::from((packed >> 5) & 0xf);
+    let name = MONAME[month];
+
+    let text = format!(
+        "{:02}-{}-{:02}",
+        packed & 0x1f,
+        name,
+        (((packed >> 9) & 0x7f) + 1980) % 100,
+    );
+    write_cstr(machine, all.edat, text.as_bytes(), EDAT_LEN)?;
+    Ok(Ret::Far(all.edat))
+}
+
 /// `void srand(unsigned seed)`.
 ///
 /// MajorMUD calls this once, six calls into initialisation, with the low word
@@ -1426,5 +1576,166 @@ mod tests {
         assert_ne!(date, time);
         assert_eq!(f.read(date), "08/05/26", "the date survived the time");
         assert_eq!(f.read(time), "13:45:30");
+    }
+
+    #[test]
+    fn cofdat_of_two_new_years_is_a_year_apart() {
+        // 1 Jan 1980 -> 1 Jan 1981 crosses 1980's own leap day, so the gap is
+        // 366, not 365. Hand-computable, and the first place `(year+3)/4`
+        // could be off by one and still leave every formatted date correct.
+        let mut f = Fixture::new();
+        let Ret::U16(d1980) = f.invoke(cofdat, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(d1981 - d1980, 366);
+    }
+
+    #[test]
+    fn cofdat_of_two_new_years_that_do_not_cross_a_leap_day_is_365() {
+        let mut f = Fixture::new();
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(d1982) = f.invoke(cofdat, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(d1982 - d1981, 365);
+    }
+
+    #[test]
+    fn cofdat_of_28_feb_and_1_mar_in_a_leap_year_is_2() {
+        // Year 20 is 2000 -- divisible by 4, so 29 Feb falls between them.
+        let mut f = Fixture::new();
+        let Ret::U16(feb28) = f.invoke(cofdat, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(mar1) = f.invoke(cofdat, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(mar1 - feb28, 2);
+    }
+
+    /// Every test above this one only asserts a *difference* between two
+    /// `cofdat` results, and every one of them is in the first quarter
+    /// (months 1..=3). A uniform offset in the formula -- the `- 1` at the
+    /// end, say, off by a constant rather than by a leap day -- cancels out
+    /// of every difference and would be invisible to all four. Cross-checked
+    /// against a real proleptic-Gregorian day count (Python's
+    /// `datetime.date`), not hand-derived, so this cannot share whatever
+    /// mistake derived the formula in the first place.
+    #[test]
+    fn cofdat_of_7_aug_2026_is_17_020_days_since_1_jan_1980() {
+        // Day 7, month 8 (August), year 46 -- the same date `ncedat`'s own
+        // tests use, formatted `07-Aug-26`. `datetime.date(2026, 8, 7) -
+        // datetime.date(1980, 1, 1)` is 17,020 days.
+        let mut f = Fixture::new();
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(days, 17_020);
+    }
+
+    #[test]
+    fn cofdat_of_31_dec_2026_is_17_166_days_since_1_jan_1980() {
+        // The latest month the table actually holds -- nothing above this
+        // exercises month 12, or anything past March. `datetime.date(2026,
+        // 12, 31) - datetime.date(1980, 1, 1)` is 17,166 days.
+        let mut f = Fixture::new();
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(days, 17_166);
+    }
+
+    #[test]
+    fn cofdat_refuses_a_month_the_table_has_no_entry_for() {
+        // The four-bit field can hold 13..=15; `CUMULATIVE_DAYS` only has
+        // 0..=12. The real host would read into the empty-string constant and
+        // `ncdate`'s own format string and call it a day count -- this host
+        // refuses instead.
+        let mut f = Fixture::new();
+        let e = f
+            .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("13"), "{e}");
+    }
+
+    #[test]
+    fn ncedat_spells_the_month() {
+        // Day 7, month 8 (August), year 46 (2026) -- the plan's own example.
+        // Upper case: `moname` is `AUG`, not `Aug` -- measured at NE segment
+        // 88, DGROUP:0x00, of `MAJORBBS-wg101.EXE`.
+        let packed = (46 << 9) | (8 << 5) | 7;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "07-AUG-26");
+    }
+
+    #[test]
+    fn ncedat_wraps_the_year_at_a_century() {
+        let packed = (127 << 9) | (12 << 5) | 31;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "31-DEC-07");
+    }
+
+    #[test]
+    fn ncedat_is_total_month_zero_is_the_sentinel_not_a_refusal() {
+        // No `or cx,cx` guard in the disassembly, and `moname[0]` is a real,
+        // measured slot -- the `"000"` sentinel -- not one array element
+        // before the table. `ncedat(0)` unpacks to day 0, month 0, year 80.
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[0]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "00-000-80");
+    }
+
+    #[test]
+    fn ncedat_is_total_months_past_december_are_xxx_not_a_refusal() {
+        // The 4-bit field can hold 13..=15; `moname` has real slots there
+        // too, `"XXX"` each -- table shape, not an out-of-bounds read.
+        let packed = (0 << 9) | (13 << 5) | 1;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "01-XXX-80");
+    }
+
+    #[test]
+    fn ncedat_writes_over_what_the_last_call_left() {
+        let mut f = Fixture::new();
+        let Ret::Far(first) = f
+            .invoke(ncedat, &[(46 << 9) | (8 << 5) | 7])
+            .expect("ncedat")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(first), "07-AUG-26");
+
+        let Ret::Far(second) = f
+            .invoke(ncedat, &[(20 << 9) | (3 << 5) | 1])
+            .expect("ncedat")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(first, second, "one buffer, not two");
+        assert_eq!(f.read(second), "01-MAR-00");
     }
 }
