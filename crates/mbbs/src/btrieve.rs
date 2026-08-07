@@ -647,7 +647,8 @@ impl Block {
     /// # Errors
     ///
     /// If the records have never been loaded, a key's entries do not fit in a
-    /// single leaf page (see [`pages::index_pages`]), or the file cannot be
+    /// single leaf page (see [`pages::index_pages`]), a key's root page is `0`
+    /// or outside the file (see [`Key::definition`]), or the file cannot be
     /// written.
     pub fn reindex(&mut self) -> Result<(), BtvError> {
         let name = self.name.clone();
@@ -688,9 +689,27 @@ impl Block {
                 .pop()
                 .expect("index_pages always returns at least one page");
 
-            let definition = pages::fcr::KEYS + usize::from(key.number) * pages::fcr::KEY_WIDTH;
+            // `key.definition`, not `key.number`: a multi-segment key's root
+            // and record count live at its *first* definition, and the two
+            // indices only coincide when no earlier key has more than one
+            // segment. See [`Key::definition`].
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
             let root_at = definition + pages::fcr::KEY_ROOT;
             let root = pages::long(&fcr[root_at..root_at + 4]);
+
+            // Page 0 is the file control record, never a key's root, and a
+            // root has to name a page the file actually has. Refused
+            // regardless of whether `key.definition` above is right: this is
+            // the guard that stands even if it is subtly wrong, and it is
+            // what stops a continuation definition's meaningless root field
+            // (measured as `0` off the shipped files) from writing a leaf
+            // over the file control record.
+            if root == 0 || root >= self.geometry.pages {
+                return Err(fail(format!(
+                    "key {}: root page {root} is not inside a {}-page file",
+                    key.number, self.geometry.pages
+                )));
+            }
 
             // `index_pages` leaves the page number zero; this is the
             // allocation `index_pages`'s own doc comment says the caller
@@ -1153,6 +1172,7 @@ mod tests {
         };
         let keys = vec![Key {
             number: 0,
+            definition: 0,
             segments: vec![keys::Segment {
                 offset: 0,
                 length: 2,
@@ -1397,6 +1417,7 @@ mod tests {
         };
         let keys = vec![Key {
             number: 0,
+            definition: 0,
             segments: vec![keys::Segment {
                 offset: 0,
                 length: 2,
@@ -1487,6 +1508,161 @@ mod tests {
         assert_eq!(entry(0), (1, second), "1 sorts first");
         assert_eq!(entry(1), (2, third), "2 sorts second");
         assert_eq!(entry(2), (3, first), "3 sorts last");
+    }
+
+    /// I7, part 1: a file like `seed_indexed`'s but with **two** keys, where
+    /// key 0 has two segments (`ANOSEG`, definitions 0 and 1) and key 1 is a
+    /// single segment -- `WCCITOWN.DAT`'s shape with the segmented key moved
+    /// **first** instead of last, which is the order no shipped file uses and
+    /// the one `reindex` got wrong.
+    ///
+    /// Definition 0 is key 0's real root, page 1. Definition 1 is key 0's
+    /// continuation segment; measured off the shipped files, a continuation
+    /// definition's own root field is `0`, so that is what this puts there.
+    /// Definition 2 is key 1's real root, page 2 -- **not** page 1, which is
+    /// `key.number * KEY_WIDTH` (`1 * 30`) would have landed on by reading
+    /// definition 1 instead.
+    fn seed_two_keys_segmented_first(dir: &Path) -> PathBuf {
+        let (page, physical, pages) = (512usize, 20usize, 5usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[0x08..0x0a].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[0x14..0x16].copy_from_slice(&2u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&16u16.to_le_bytes());
+        bytes[0x18..0x1a].copy_from_slice(&(physical as u16).to_le_bytes());
+        bytes[0x1e..0x20].copy_from_slice(&4u16.to_le_bytes());
+        bytes[0x26..0x2a].copy_from_slice(&pages::to_long(pages as u32));
+        for number in 1..pages {
+            let header = pages::Header {
+                number: number as u32,
+                data: number == 4,
+                stamp: 0,
+            };
+            bytes[number * page..number * page + 6].copy_from_slice(&header.encode());
+        }
+        bytes[0x110..0x114].copy_from_slice(&pages::to_long(1));
+        let def1 = 0x110 + pages::fcr::KEY_WIDTH;
+        bytes[def1..def1 + 4].copy_from_slice(&pages::to_long(0));
+        let def2 = 0x110 + 2 * pages::fcr::KEY_WIDTH;
+        bytes[def2..def2 + 4].copy_from_slice(&pages::to_long(2));
+        let path = dir.join("TWOKEY.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    /// A `Block` over `seed_two_keys_segmented_first`'s file: key 0 has two
+    /// segments and `definition: 0`; key 1 has one segment, `number: 1` but
+    /// `definition: 2`.
+    fn block_two_keys(path: PathBuf) -> Block {
+        let geometry = Geometry {
+            version: Version::V5,
+            page: 512,
+            keys: 2,
+            reclen: 16,
+            physical: 20,
+            records: 0,
+            pages: 5,
+            variable: false,
+        };
+        let segment = |offset| keys::Segment {
+            offset,
+            length: 2,
+            kind: keys::Kind::Signed,
+            descending: false,
+        };
+        let keys = vec![
+            Key {
+                number: 0,
+                definition: 0,
+                segments: vec![segment(0), segment(2)],
+                duplicates: false,
+            },
+            Key {
+                number: 1,
+                definition: 2,
+                segments: vec![segment(4)],
+                duplicates: false,
+            },
+        ];
+        Block {
+            name: "TWOKEY.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FarPtr::NULL,
+            maxlen: 16,
+            data: FarPtr::NULL,
+            key: FarPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    fn reindex_uses_a_keys_own_definition_not_its_number_for_the_root() {
+        let dir = crate::testing::scratch("block-reindex-definition-not-number");
+        let path = seed_two_keys_segmented_first(&dir);
+        let mut block = block_two_keys(path.clone());
+
+        block.records().expect("reads -- no records yet");
+        block.reindex().expect("reindexes both keys at their own roots");
+
+        let bytes = std::fs::read(&path).expect("read back");
+
+        // Key 1's leaf landed on its own root, page 2 -- not page 1, which
+        // reading `key.number` (1) instead of `key.definition` (2) would
+        // have targeted, clobbering key 0's own root.
+        let page2 = &bytes[2 * 512..3 * 512];
+        let header2 = pages::Header::decode(&page2[..6]);
+        assert_eq!(header2.number, 2);
+        assert!(!header2.data, "still an index page");
+
+        // And key 0's own root, page 1, is untouched by key 1's rebuild.
+        let page1 = &bytes[512..1024];
+        let header1 = pages::Header::decode(&page1[..6]);
+        assert_eq!(header1.number, 1);
+
+        // The file control record itself was not clobbered.
+        assert_eq!(&bytes[..4], &[0, 0, 0, 0], "still a v5 marker, not a page header");
+        assert_eq!(u16::from_le_bytes([bytes[0x16], bytes[0x17]]), 16, "reclen untouched");
+    }
+
+    /// I7, part 2: the guard that holds even if `key.definition` were
+    /// somehow still wrong. A root of `0` names the file control record
+    /// itself, and `reindex` must refuse it outright rather than write a
+    /// leaf over it.
+    #[test]
+    fn reindex_refuses_a_root_of_zero_rather_than_write_over_the_file_control_record() {
+        let dir = crate::testing::scratch("block-reindex-root-zero");
+        let path = seed_indexed(&dir);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[0x110..0x114].copy_from_slice(&pages::to_long(0));
+        std::fs::write(&path, &bytes).expect("corrupt the root to page 0");
+
+        let mut block = block_indexed(path.clone());
+        block.records().expect("reads");
+        let e = block.reindex().expect_err("a root of page 0 is refused");
+        assert!(e.why.contains("0"), "{e}");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, bytes, "a refused reindex touches nothing");
+    }
+
+    /// The other half of the same guard: a root naming a page the file does
+    /// not have at all.
+    #[test]
+    fn reindex_refuses_a_root_past_the_end_of_the_file() {
+        let dir = crate::testing::scratch("block-reindex-root-out-of-range");
+        let path = seed_indexed(&dir);
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[0x110..0x114].copy_from_slice(&pages::to_long(99));
+        std::fs::write(&path, &bytes).expect("corrupt the root past the end");
+
+        let mut block = block_indexed(path.clone());
+        block.records().expect("reads");
+        let e = block.reindex().expect_err("page 99 does not exist in a 5-page file");
+        assert!(e.why.contains("99"), "{e}");
     }
 
     #[test]

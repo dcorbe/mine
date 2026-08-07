@@ -217,7 +217,24 @@ fn byte(field: &[u8], i: usize) -> u8 {
 /// One key: the segments to compare, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
+    /// The key's ordinal among the file's keys, `0..count` -- what `qrybtv`
+    /// and the acquire family name a key by, and what indexes
+    /// [`Records::order`](super::records::Records)/`rank`.
     pub number: u16,
+
+    /// Which key *definition* this key's first segment starts at, `0..`
+    /// however many definitions the file has -- **not the same number as
+    /// [`Self::number`] once any earlier key has more than one segment**.
+    /// `WCCBANKS.DAT` is one key over two definitions and `WCCITOWN.DAT` is
+    /// two keys over three, and both happen to put their multi-segment key
+    /// last, which is the only reason `number` and `definition` agree for
+    /// every file MajorMUD ships. This is where a key's root page and
+    /// per-key record count live in the file control record --
+    /// `fcr::KEYS + definition * fcr::KEY_WIDTH` -- because only the first
+    /// definition of a multi-segment key carries them; a continuation
+    /// definition's own root field is not meaningful.
+    pub definition: u16,
+
     pub segments: Vec<Segment>,
     /// Whether two records may carry the same value.
     pub duplicates: bool,
@@ -307,12 +324,20 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
     let mut keys: Vec<Key> = Vec::with_capacity(usize::from(count));
     let mut segments = Vec::new();
     let mut definitions = 0usize;
+    // Where the key currently being assembled started -- its first
+    // segment's definition index, which is where its root page and record
+    // count live (see [`Key::definition`]). Set fresh each time `segments`
+    // is empty, i.e. at the start of a new key.
+    let mut start_definition = 0usize;
 
     while keys.len() < usize::from(count) {
         if definitions >= SEGMAX {
             return Err(fail(format!(
                 "more than {SEGMAX} key segments, which is more than a file has"
             )));
+        }
+        if segments.is_empty() {
+            start_definition = definitions;
         }
         let start = BASE + definitions * WIDTH;
         let definition = fcr.get(start..start + WIDTH).ok_or_else(|| {
@@ -375,6 +400,7 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
         if attributes & flag::ANOSEG == 0 {
             keys.push(Key {
                 number: keys.len() as u16,
+                definition: start_definition as u16,
                 segments: std::mem::take(&mut segments),
                 duplicates: attributes & flag::DUPLICATES != 0,
             });
@@ -459,6 +485,36 @@ mod tests {
         assert_eq!(keys[0].segments[1].kind, Kind::Signed);
     }
 
+    /// I7: `Key::number` is the key's ordinal; `Key::definition` is where its
+    /// first segment lives among the file's *definitions*. `WCCBANKS.DAT` and
+    /// `WCCITOWN.DAT` both put their one multi-segment key last, which is the
+    /// only reason `number` and `definition` happen to agree for every file
+    /// MajorMUD ships. This puts the segmented key **first** instead --
+    /// definitions 0 and 1 are key 0's two segments, definition 2 is key 1 --
+    /// so `keys[1].definition` (2) has to disagree with `keys[1].number` (1)
+    /// for the fix to be doing anything.
+    #[test]
+    fn a_keys_definition_is_where_its_first_segment_starts_even_after_a_segmented_key() {
+        let keys = parse(
+            "REORDERED.DAT",
+            &fcr(&[
+                definition(flag::EXTENDED | flag::ANOSEG, 0, 30, 0x0b),
+                definition(flag::EXTENDED, 30, 4, 0x01),
+                definition(flag::EXTENDED, 34, 2, 0x0e),
+            ]),
+            2,
+        )
+        .expect("parses");
+
+        assert_eq!(keys.len(), 2);
+        assert_eq!((keys[0].number, keys[0].definition), (0, 0));
+        assert_eq!(
+            (keys[1].number, keys[1].definition),
+            (1, 2),
+            "key 1's own definition is index 2, not its key number 1"
+        );
+    }
+
     #[test]
     fn a_type_this_host_cannot_order_is_refused_by_name() {
         // A `date` key sorted as though it were text would be in the right
@@ -489,6 +545,7 @@ mod tests {
     fn named(kind: Kind, length: u16) -> Key {
         Key {
             number: 0,
+            definition: 0,
             segments: vec![Segment {
                 offset: 0,
                 length,
@@ -555,6 +612,7 @@ mod tests {
     fn segments_are_compared_in_turn() {
         let key = Key {
             number: 0,
+            definition: 0,
             segments: vec![
                 Segment {
                     offset: 0,
@@ -588,6 +646,7 @@ mod tests {
         // the second segment out of the first one's bytes.
         let key = Key {
             number: 0,
+            definition: 0,
             segments: vec![
                 Segment {
                     offset: 10,
