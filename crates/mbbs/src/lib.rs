@@ -1479,10 +1479,17 @@ mod tests {
     fn connect_with_no_module_registered_is_an_error_not_a_panic() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
+        let err = f
+            .host
+            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .expect_err("no module has registered");
+        // R19: `is_err()` alone cannot tell this apart from a ShimError out
+        // of `connect_state` or the `lonrou` lookup -- both are wrong for
+        // different reasons and both would satisfy it. The text pins which
+        // one this is.
         assert!(
-            f.host
-                .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
-                .is_err()
+            err.to_string().contains("no module has registered"),
+            "expected the missing-registration message, got: {err}"
         );
     }
 
@@ -1509,7 +1516,17 @@ mod tests {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         f.host.gsbl_mut().push_input(0, b"look\r");
-        assert!(f.host.poll(&mut f.machine, &module).is_err());
+        let err = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("no module has registered");
+        // R19: same reasoning as the `connect` test above -- `is_err()`
+        // cannot distinguish this from a `ShimError` out of `point_curusr`,
+        // `get_input` or the entry lookup, each a different failure.
+        assert!(
+            err.to_string().contains("no module has registered"),
+            "expected the missing-registration message, got: {err}"
+        );
     }
 
     /// R20: `MAJORBBS.C:152` writes `status` unconditionally; only `shomal()`
