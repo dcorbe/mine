@@ -38,6 +38,12 @@ pub struct Channel {
     /// Statuses waiting for `btusts`, oldest first. The guide calls this a
     /// first-in-first-out structure and says so explicitly.
     pub(crate) status: VecDeque<i16>,
+    /// How far along the current output line the terminal's cursor is.
+    ///
+    /// Per channel and not per call. MajorMUD builds a screen from many `prf`
+    /// calls flushed by many `btuxmt`s, so a wrap decided from the length of
+    /// one call alone would be decided from the wrong number.
+    pub(crate) column: u16,
 
     /// `btutsw` -- output word-wrap width. Zero means no wrapping.
     pub width: u16,
@@ -67,6 +73,7 @@ impl Default for Channel {
             ready: None,
             output: VecDeque::new(),
             status: VecDeque::new(),
+            column: 0,
             width: 0,
             maxinl: 0,
             echo: true,
@@ -184,6 +191,29 @@ impl Gsbl {
             .position(|c| !c.status.is_empty())
             .map(|i| i as i16)
     }
+
+    /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
+    ///
+    /// Silently discards for a channel that does not exist; the shim checks the
+    /// range and returns `-11` before ever reaching here.
+    pub fn transmit(&mut self, chan: i16, bytes: &[u8]) {
+        let Some(c) = self.channel_mut(chan) else {
+            return;
+        };
+        c.transmit(bytes);
+    }
+
+    /// `btuxct` -- binary output, exactly as given.
+    pub fn transmit_raw(&mut self, chan: i16, bytes: &[u8]) {
+        let Some(c) = self.channel_mut(chan) else {
+            return;
+        };
+        for &byte in bytes {
+            if c.output.len() < OUTSIZ {
+                c.output.push_back(byte);
+            }
+        }
+    }
 }
 
 impl Channel {
@@ -256,6 +286,60 @@ impl Channel {
                     self.output.push_back(byte);
                 }
             }
+        }
+    }
+
+    /// ASCII output, wrapped at `width`.
+    fn transmit(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\r' || byte == b'\n' {
+                if self.output.len() < OUTSIZ {
+                    self.output.push_back(byte);
+                }
+                if byte == b'\r' {
+                    self.column = 0;
+                }
+                continue;
+            }
+            if self.width != 0 && self.column >= self.width {
+                self.wrap();
+            }
+            if self.output.len() < OUTSIZ {
+                self.output.push_back(byte);
+                self.column += 1;
+            }
+        }
+    }
+
+    /// Break the line, moving a partial word down with it.
+    ///
+    /// Word wrap rather than a hard break: the guide calls `btutsw` wrapping output at word boundaries, and a host that broke mid-word would split every name the
+    /// module printed near the margin.
+    fn wrap(&mut self) {
+        let mut word = Vec::new();
+        while let Some(&back) = self.output.back() {
+            if back == b' ' || back == b'\n' || back == b'\r' {
+                break;
+            }
+            word.push(back);
+            self.output.pop_back();
+            // A word as long as the whole line has no boundary to break on, so
+            // break it where the margin falls -- losing it would be worse.
+            if word.len() >= usize::from(self.width) {
+                for byte in word.drain(..).rev() {
+                    self.output.push_back(byte);
+                }
+                break;
+            }
+        }
+        while self.output.back() == Some(&b' ') {
+            self.output.pop_back();
+        }
+        self.output.extend(b"\r\n");
+        self.column = 0;
+        for byte in word.into_iter().rev() {
+            self.output.push_back(byte);
+            self.column += 1;
         }
     }
 }
@@ -371,5 +455,59 @@ mod tests {
         let mut g = Gsbl::new(1);
         g.push_input(9, b"look\r");
         assert_eq!(g.next_status(9), None);
+    }
+
+    #[test]
+    fn ascii_output_with_no_width_is_passed_through_unchanged() {
+        let mut g = Gsbl::new(1);
+        g.transmit(0, b"the quick brown fox");
+        assert_eq!(g.drain_output(0), b"the quick brown fox".to_vec());
+    }
+
+    #[test]
+    fn ascii_output_wraps_on_a_word_boundary_at_the_btutsw_width() {
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").width = 10;
+        g.transmit(0, b"the quick brown fox");
+        assert_eq!(g.drain_output(0), b"the quick\r\nbrown fox".to_vec());
+    }
+
+    #[test]
+    fn a_word_longer_than_the_width_is_broken_rather_than_lost() {
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").width = 4;
+        g.transmit(0, b"abcdefg");
+        assert_eq!(g.drain_output(0), b"abcd\r\nefg".to_vec());
+    }
+
+    #[test]
+    fn an_explicit_return_resets_the_column() {
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").width = 10;
+        g.transmit(0, b"ab\r\ncd ef");
+        assert_eq!(g.drain_output(0), b"ab\r\ncd ef".to_vec());
+    }
+
+    #[test]
+    fn binary_output_ignores_the_width_entirely() {
+        // The guide, btuxmt page 189: none of these features apply to btuxct.
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").width = 4;
+        g.transmit_raw(0, b"abcdefg");
+        assert_eq!(g.drain_output(0), b"abcdefg".to_vec());
+    }
+
+    #[test]
+    fn draining_an_empty_buffer_raises_nothing_even_with_btuoes_on() {
+        // Status 5 is "the output data buffer makes a transition from being
+        // not empty to being empty". No transition, no status.
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").oes = true;
+        assert!(g.drain_output(0).is_empty());
+        assert_eq!(g.next_status(0), None);
+
+        g.transmit(0, b"x");
+        let _ = g.drain_output(0);
+        assert_eq!(g.next_status(0), Some(Gsbl::OUTMT));
     }
 }
