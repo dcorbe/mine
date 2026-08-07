@@ -568,6 +568,12 @@ impl Host {
         &self.gsbl
     }
 
+    /// The terminal channels, mutably. The transport pushes bytes in and drains
+    /// them out through this.
+    pub fn gsbl_mut(&mut self) -> &mut gsbl::Gsbl {
+        &mut self.gsbl
+    }
+
     /// `void alcvda(void)` -- give every channel its volatile data area.
     ///
     /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init

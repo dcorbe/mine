@@ -2,6 +2,7 @@
 
 pub mod btrieve;
 pub mod fsd;
+pub mod gsbl;
 pub mod memory;
 pub mod msg;
 pub mod runtime;
@@ -13,7 +14,7 @@ pub mod user;
 use mbbs16::{Machine, Ret};
 
 use crate::Host;
-use crate::exports::{DOSCALLS, MAJORBBS};
+use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
 use crate::globals::GLOBALS;
 
 /// -1, as a 16-bit `int`.
@@ -271,6 +272,22 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         runtime::f_scopy,
         Cleans::Callee(runtime::POINTERS),
     ),
+    // The GSBL terminal layer. Fourteen routines, seventy-seven call sites,
+    // none of them reached by initialisation.
+    (GALGSBL, "btutsw", gsbl::btutsw, Cleans::Caller),
+    (GALGSBL, "btuxct", gsbl::btuxct, Cleans::Caller),
+    (GALGSBL, "btuxnf", gsbl::btuxnf, Cleans::Caller),
+    (GALGSBL, "btuxmt", gsbl::btuxmt, Cleans::Caller),
+    (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller),
+    (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller),
+    (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller),
+    (GALGSBL, "btucli", gsbl::btucli, Cleans::Caller),
+    (GALGSBL, "btuinj", gsbl::btuinj, Cleans::Caller),
+    (GALGSBL, "btutrg", gsbl::btutrg, Cleans::Caller),
+    (GALGSBL, "btuech", gsbl::btuech, Cleans::Caller),
+    (GALGSBL, "btumil", gsbl::btumil, Cleans::Caller),
+    (GALGSBL, "btuibw", gsbl::btuibw, Cleans::Caller),
+    (GALGSBL, "btuica", gsbl::btuica, Cleans::Caller),
 ];
 
 /// Every constant the host exports.
@@ -364,6 +381,15 @@ mod tests {
         // appearing to work.
         assert!(matches!(entry(MAJORBBS, "dinsbtv"), Entry::Unimplemented));
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
+    }
+
+    #[test]
+    fn the_gsbl_routines_are_reached_under_galgsbl_and_not_under_majorbbs() {
+        // Ordinals collide across DLLs -- GALGSBL.72 is `bturno` and
+        // MAJORBBS.72 is something else entirely -- so a routine registered
+        // under the wrong module name would be dispatched for the wrong import.
+        assert!(matches!(entry(GALGSBL, "btuxmt"), Entry::Routine(..)));
+        assert!(matches!(entry(MAJORBBS, "btuxmt"), Entry::Unimplemented));
     }
 
     #[test]
