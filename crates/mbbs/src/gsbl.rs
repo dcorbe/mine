@@ -31,8 +31,13 @@ pub struct Channel {
     pub(crate) input: VecDeque<u8>,
     /// The line being assembled, without its terminator.
     pub(crate) line: Vec<u8>,
-    /// A completed line, waiting for `btuinp` to take it.
-    pub(crate) ready: Option<Vec<u8>>,
+    /// Completed lines, oldest first, waiting for `btuinp` to take them.
+    ///
+    /// More than one can queue up: a client that pipelines -- a paste, a
+    /// macro, or this repo's own `mmc` -- can land two CR-terminated lines in
+    /// one `push_input` call. A single `Option` here would let the second
+    /// line silently overwrite the first before the module ever saw it.
+    pub(crate) ready: VecDeque<Vec<u8>>,
     /// Bytes queued for the terminal.
     pub(crate) output: VecDeque<u8>,
     /// Statuses waiting for `btusts`, oldest first. The guide calls this a
@@ -76,7 +81,7 @@ impl Default for Channel {
         Self {
             input: VecDeque::new(),
             line: Vec::new(),
-            ready: None,
+            ready: VecDeque::new(),
             output: VecDeque::new(),
             status: VecDeque::new(),
             column: 0,
@@ -165,9 +170,10 @@ impl Gsbl {
         self.channel_mut(chan)?.status.pop_front()
     }
 
-    /// The completed line, taken -- this is what `btuinp` hands the module.
+    /// The oldest completed line, taken -- this is what `btuinp` hands the
+    /// module. If more than one line is queued, the rest wait their turn.
     pub fn take_line(&mut self, chan: i16) -> Option<Vec<u8>> {
-        self.channel_mut(chan)?.ready.take()
+        self.channel_mut(chan)?.ready.pop_front()
     }
 
     /// Everything queued for the terminal, taken.
@@ -292,7 +298,7 @@ impl Channel {
 
             // 8. Line terminator. The line is complete.
             b'\r' => {
-                self.ready = Some(std::mem::take(&mut self.line));
+                self.ready.push_back(std::mem::take(&mut self.line));
                 self.status.push_back(Gsbl::CRSTG);
                 if self.echo {
                     self.output.extend(b"\r\n");
@@ -436,11 +442,22 @@ mod tests {
 
     #[test]
     fn the_status_fifo_is_drained_in_order_and_only_once() {
+        // R3: this test used to pass while silently destroying "a" -- it
+        // asserted the two statuses and never the lines, so a `ready` that
+        // let the second line overwrite the first went unnoticed. Both lines
+        // must survive, in order.
         let mut g = Gsbl::new(1);
         g.push_input(0, b"a\rb\r");
         assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
         assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
         assert_eq!(g.next_status(0), None, "two lines, two statuses, no more");
+        assert_eq!(
+            g.take_line(0).as_deref(),
+            Some(&b"a"[..]),
+            "the first line must still be here, not overwritten by the second"
+        );
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"b"[..]));
+        assert_eq!(g.take_line(0), None);
     }
 
     #[test]

@@ -157,7 +157,7 @@ pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         let c = g.channel_mut(chan).expect("in range");
         c.input.clear();
         c.line.clear();
-        c.ready = None;
+        c.ready.clear();
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -178,16 +178,22 @@ pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btuibw(int chan)` -- input bytes waiting.
 ///
 /// Everything not yet handed to the module: raw binary-mode bytes, the line
-/// still being typed, and a completed line nobody has taken. The guide's use
-/// case is peeking at keystrokes without consuming them, which is only
-/// answerable if a half-typed line counts.
+/// still being typed, and every completed line nobody has taken yet (R3: more
+/// than one can queue up). The guide's use case is peeking at keystrokes without consuming them, which is only answerable if a half-typed line
+/// counts.
+///
+/// Finding 11 (not fixed): this undercounts a queued line by one relative to
+/// real GSBL, which keeps the CR in its buffer; this host stores lines
+/// without their terminator. Only matters if the module compares the count
+/// against a length it computed itself -- it does not.
 pub fn btuibw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
     if chan < 0 || chan >= host.gsbl().terms() as i16 {
         return Ok(Ret::U16(OUT_OF_RANGE));
     }
     let c = host.gsbl().channel(chan).expect("in range");
-    let waiting = c.input.len() + c.line.len() + c.ready.as_ref().map_or(0, Vec::len);
+    let waiting: usize =
+        c.input.len() + c.line.len() + c.ready.iter().map(Vec::len).sum::<usize>();
     Ok(Ret::U16(waiting as u16))
 }
 
