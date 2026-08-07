@@ -187,6 +187,71 @@ pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(all.date))
 }
 
+/// Days before each month in a non-leap year, measured -- not reasoned out --
+/// at `DGROUP:0x68` of `MAJORBBS-wg101.EXE`: 13 words, index 0 unused and
+/// 1..=12 the running total of days before that month. The table ends exactly
+/// where the empty-string constant (`0x82`) and [`ncdate`]'s own format string
+/// (`0x83`) begin, which is independent corroboration that this is where it
+/// starts and how long it is.
+const CUMULATIVE_DAYS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+/// `int cofdat(int date)` -- a DOS-packed date as a day count, so that two
+/// dates can be subtracted to find how many days apart they are.
+///
+/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0e9e`
+/// (ordinal 134, twelve call sites); the fields unpack exactly as [`ncdate`]'s
+/// do:
+///
+/// ```text
+/// year  = (date >> 9) & 0x7f      years since 1980
+/// month = (date >> 5) & 0xf
+/// day   =  date       & 0x1f
+///
+/// days  = year * 365
+///       + (year + 3) / 4                leap days strictly before this year
+///       + CUMULATIVE_DAYS[month]
+///       + (month > 2 && year % 4 == 0)  this year's leap day, once it has passed
+///       + day
+///       - 1
+/// ```
+///
+/// **1980 is year 0, and it is itself a leap year.** `(year + 3) / 4` counts
+/// leap years strictly *before* the current one, so 1980's own leap day never
+/// shows up in that term -- it is what the trailing `month > 2 && year % 4 ==
+/// 0` adds, and only once 29 February has actually gone by. Get the `+ 3`
+/// wrong and every single date still formats fine through [`ncdate`], because
+/// nothing here touches that routine, while every *difference* comes out one
+/// day off.
+///
+/// # Errors
+///
+/// If `date` unpacks to a month the table has no entry for. The four-bit field
+/// can hold 13..=15; `CUMULATIVE_DAYS` only has indices 0..=12, and the real
+/// host would read whatever bytes happen to follow it -- the empty-string
+/// constant and then [`ncdate`]'s format string -- and call the result a day
+/// count. This host refuses instead.
+///
+/// # This routine is unreachable by any test in this crate
+///
+/// Its callers are the polling routines, which nothing here drives yet. A flat
+/// meter after this commit is not this shim breaking -- it is this shim never
+/// running.
+pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let year = i64::from((packed >> 9) & 0x7f);
+    let month = usize::from((packed >> 5) & 0xf);
+    let day = i64::from(packed & 0x1f);
+
+    let cumulative = *CUMULATIVE_DAYS
+        .get(month)
+        .ok_or_else(|| ShimError::Failed(format!("cofdat: {month} is not a month")))?;
+    let leap_before = (year + 3) / 4;
+    let leap_this_year = i64::from(month > 2 && year % 4 == 0);
+
+    let days = year * 365 + leap_before + i64::from(cumulative) + leap_this_year + day - 1;
+    Ok(Ret::U16(days as u16))
+}
+
 /// `void srand(unsigned seed)`.
 ///
 /// MajorMUD calls this once, six calls into initialisation, with the low word
@@ -1426,5 +1491,64 @@ mod tests {
         assert_ne!(date, time);
         assert_eq!(f.read(date), "08/05/26", "the date survived the time");
         assert_eq!(f.read(time), "13:45:30");
+    }
+
+    #[test]
+    fn cofdat_of_two_new_years_is_a_year_apart() {
+        // 1 Jan 1980 -> 1 Jan 1981 crosses 1980's own leap day, so the gap is
+        // 366, not 365. Hand-computable, and the first place `(year+3)/4`
+        // could be off by one and still leave every formatted date correct.
+        let mut f = Fixture::new();
+        let Ret::U16(d1980) = f.invoke(cofdat, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(d1981 - d1980, 366);
+    }
+
+    #[test]
+    fn cofdat_of_two_new_years_that_do_not_cross_a_leap_day_is_365() {
+        let mut f = Fixture::new();
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(d1982) = f.invoke(cofdat, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(d1982 - d1981, 365);
+    }
+
+    #[test]
+    fn cofdat_of_28_feb_and_1_mar_in_a_leap_year_is_2() {
+        // Year 20 is 2000 -- divisible by 4, so 29 Feb falls between them.
+        let mut f = Fixture::new();
+        let Ret::U16(feb28) = f.invoke(cofdat, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        let Ret::U16(mar1) = f.invoke(cofdat, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(mar1 - feb28, 2);
+    }
+
+    #[test]
+    fn cofdat_refuses_a_month_the_table_has_no_entry_for() {
+        // The four-bit field can hold 13..=15; `CUMULATIVE_DAYS` only has
+        // 0..=12. The real host would read into the empty-string constant and
+        // `ncdate`'s own format string and call it a day count -- this host
+        // refuses instead.
+        let mut f = Fixture::new();
+        let e = f
+            .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("13"), "{e}");
     }
 }
