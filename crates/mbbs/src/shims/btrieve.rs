@@ -10,10 +10,10 @@
 //!                dupdbtv  23    qnpbtv    7
 //! ```
 //!
-//! Seventeen symbols over 716 sites. **Fifteen are here**: opening and
+//! Seventeen symbols over 716 sites. **Sixteen are here**: opening and
 //! choosing a file, reading records out of it, the two guards that answer
-//! rather than write, and `dinsbtv`, which writes. The two that are not are
-//! `dupdbtv` and `clsbtv`.
+//! rather than write, and `dinsbtv`/`dupdbtv`, which write. The one that is
+//! not is `clsbtv`.
 //!
 //! **Initialisation uses six of the twelve, and reads exactly one record's
 //! worth**, measured by `crates/mbbs/tests/wccmmud.rs` against the module
@@ -28,13 +28,15 @@
 //! with is Galacticomm's own `PLBTVSTF.C`, which is quoted rather than
 //! paraphrased wherever it decided something.
 //!
-//! # `dinsbtv` writes; `invbtv` and `delbtv` still only say they would
+//! # `dinsbtv` and `dupdbtv` write; `invbtv` and `delbtv` still only say they
+//! # would
 //!
-//! A module that saves a character now gets an honest insert -- [`dinsbtv`]
-//! calls [`Block::insert`](crate::btrieve::Block::insert). `invbtv` and
-//! `delbtv` do not write yet, so a module that reaches either of them with a
-//! file current gets a refusal rather than a host that appears to work and
-//! loses the data.
+//! A module that saves a character now gets an honest insert or update --
+//! [`dinsbtv`] calls [`Block::insert`](crate::btrieve::Block::insert) and
+//! [`dupdbtv`] calls [`Block::update`](crate::btrieve::Block::update).
+//! `invbtv` and `delbtv` do not write yet, so a module that reaches either of
+//! them with a file current gets a refusal rather than a host that appears to
+//! work and loses the data.
 //!
 //! [`invbtv`] and [`delbtv`] are nonetheless *present*, because refusing is
 //! only half of what the real host did. Both are guarded with
@@ -401,6 +403,77 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(Ret::U16(1))
+}
+
+/// `int dupdbtv(void *recptr)` -- update the record the file is positioned
+/// on.
+///
+/// `PLBTVSTF.C:550` -- identical to [`dinsbtv`] except opcode 3, and the
+/// Btrieve call's fourth argument is `bb->lastkn` rather than a hardcoded 0.
+/// That argument names which key's position Btrieve's own bookkeeping
+/// continues from; it plays no part in *which record* gets rewritten or in
+/// which keys are checked for a collision; the record is always the one the
+/// cursor names and every key that forbids duplicates is checked, exactly as
+/// in [`dinsbtv`]. So the difference has nothing left to reproduce once
+/// there is no Btrieve TSR to hand it to, and this host does not thread it
+/// through anywhere -- see [`duplicate_key`].
+///
+/// # Opcode 3 updates the record the file is positioned on
+///
+/// Unlike `dinsbtv`, which makes a new record, this rewrites the one
+/// [`Cursor`] names. `Cursor::Nowhere` stops the module: nothing has
+/// positioned the file, so there is no record to update, and writing to a
+/// guessed one is exactly the failure mode this crate exists to prevent.
+/// `Cursor::Ordered`/`Cursor::Physical` resolve through
+/// [`Block::current`](crate::btrieve::Block::current) to a file position,
+/// which is what [`Block::update`](crate::btrieve::Block::update) takes.
+///
+/// This is what `_GENERATE_TOP_LIST` does: `absbtv` to learn the position,
+/// `gabbtv` to position the file there, then `dupdbtv`.
+///
+/// # No `bb == NULL` guard, and the same return convention as `dinsbtv`
+///
+/// `:555` reads `bb->reclen` before checking anything, the same shape as
+/// `dinsbtv`'s `:603` -- see that routine's doc for why this host stops the
+/// module rather than faulting. 1 for success, 0 for a duplicate-key
+/// violation, everything else `catastro`'d.
+pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "dupdbtv with no Btrieve file current -- PLBTVSTF.C:550 has no \
+             guard and reads bb->reclen before checking anything, so the \
+             real host faulted here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "dupdbtv on {}, which is not positioned on a record -- \
+                 opcode 3 updates the record the file is positioned on, and \
+                 nothing has positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+    let length = file.maxlen();
+    let recptr = machine.arg_far(0);
+    let recptr = match recptr == Btrieve::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+
+    if duplicate_key(host, block, &bytes, Some(position))?.is_some() {
+        return Ok(Ret::U16(0));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(Ret::U16(1))
 }
 
@@ -2208,6 +2281,107 @@ mod tests {
         let mut f = nothing_current();
         let e = f.invoke(dinsbtv, &[0, 0]).expect_err("no file current");
         assert!(e.to_string().contains("dinsbtv"), "{e}");
+    }
+
+    // # `dupdbtv`, which updates the record the cursor names
+    //
+    // `SAMPLE.DAT`'s seven records, keyed 1 through 7: Human, Gnome,
+    // Halfling, Dwarf, Troll, Elf, Half-Ogre.
+
+    #[test]
+    fn dupdbtv_updates_the_record_the_cursor_names_and_it_is_readable_afterwards() {
+        let dir = crate::testing::scratch_with("dupdbtv-update", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let Ret::U32(before) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        let recptr = f.bytes(&sample_record(5, "TROLLX"), false);
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            Ret::U16(1)
+        );
+
+        // An update is in place: `absbtv` answers the same before and after.
+        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert_eq!(before, after, "opcode 3 rewrites the record in place");
+
+        // Re-read from disk with a fresh host, which is the check that
+        // matters -- an in-memory model that agrees with itself proves
+        // nothing.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(5), 0, 5), "still key 5");
+        assert_eq!(
+            g.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "TROLLX"
+        );
+        assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    #[test]
+    fn dupdbtv_refuses_when_the_new_key_collides_with_a_different_record() {
+        // Positioned on Troll (key 5); the buffer to write back names Elf's
+        // key (6) instead. `exclude` in `duplicate_key` only excuses a
+        // record from colliding with *itself* -- Elf is a different record,
+        // so this is a real duplicate-key violation.
+        let dir = crate::testing::scratch_with("dupdbtv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 6 already belongs to Elf"
+        );
+
+        // Nothing was written: Troll is still findable by its own key.
+        assert!(acquire(&mut f, Some(5), 0, 5), "Troll is unchanged");
+        assert_eq!(
+            f.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "Troll"
+        );
+        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    #[test]
+    fn dupdbtv_with_nothing_positioned_stops_the_module() {
+        // Cursor::Nowhere: the file is current but nothing has positioned it,
+        // so there is no record for opcode 3 to update. Writing to a guessed
+        // one is exactly the failure this crate exists to prevent.
+        let dir = crate::testing::scratch_with("dupdbtv-unpositioned", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(1, "Nobody"), false);
+
+        let e = f
+            .invoke(dupdbtv, &Fixture::far(recptr))
+            .expect_err("nothing has positioned the file");
+        assert!(e.to_string().contains("dupdbtv"), "{e}");
+    }
+
+    #[test]
+    fn dupdbtv_with_no_file_current_stops_the_module() {
+        // `PLBTVSTF.C:550` has the same no-guard shape as `dinsbtv`.
+        let mut f = nothing_current();
+        let e = f.invoke(dupdbtv, &[0, 0]).expect_err("no file current");
+        assert!(e.to_string().contains("dupdbtv"), "{e}");
     }
 
     #[test]
