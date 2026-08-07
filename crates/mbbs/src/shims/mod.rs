@@ -124,6 +124,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller),
     (MAJORBBS, "depad", text::depad, Cleans::Caller),
     (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller),
+    (MAJORBBS, "parsin", text::parsin, Cleans::Caller),
     (MAJORBBS, "atol", text::atol, Cleans::Caller),
     (MAJORBBS, "toupper", text::toupper, Cleans::Caller),
     (MAJORBBS, "tolower", text::tolower, Cleans::Caller),

@@ -209,6 +209,15 @@ pub struct Host {
     /// The line buffer `gmdnam` returns a pointer into.
     mdf: FarPtr,
 
+    /// One NUL byte the host owns and keeps, forever.
+    ///
+    /// `parsin`'s `margv[0]=""` on an empty line points at a string literal in
+    /// Galacticomm's own data segment -- memory this host has none of, since
+    /// there is no host-side copy of `MAJORBBS.EXE` running. This is that
+    /// literal's stand-in: the module dereferences `margv[0]` unguarded, and a
+    /// `FarPtr::NULL` there is a segment-zero read rather than an empty string.
+    empty: FarPtr,
+
     /// Where the print buffer ends, so `prf` can refuse to run past it.
     prf_end: u16,
 
@@ -357,11 +366,11 @@ impl Host {
         let prf_end = OUTBSZ;
 
         // One segment for everything the host hands a module a pointer into and
-        // then keeps: `spr`'s four buffers and `gmdnam`'s line. Separate from
-        // the globals so that a module overrunning one of these cannot reach
-        // `usrnum`.
+        // then keeps: `spr`'s four buffers, `gmdnam`'s line, and one NUL byte
+        // for `parsin`'s empty-line `margv[0]`. Separate from the globals so
+        // that a module overrunning one of these cannot reach `usrnum`.
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
-        let selector = machine.alloc_segment(spr_bytes + 64)?;
+        let selector = machine.alloc_segment(spr_bytes + 64 + 1)?;
 
         // The per-channel tables come off the module heap, because the real
         // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
@@ -396,6 +405,10 @@ impl Host {
             datebuf: None,
             mdf: FarPtr {
                 offset: spr_bytes as u16,
+                selector,
+            },
+            empty: FarPtr {
+                offset: spr_bytes as u16 + 64,
                 selector,
             },
             prf_end,
@@ -741,6 +754,11 @@ impl Host {
     /// The line buffer `gmdnam` writes into.
     fn mdf_buffer(&self) -> FarPtr {
         self.mdf
+    }
+
+    /// One NUL byte the host owns and keeps. See [`Host::empty`].
+    fn empty_string(&self) -> FarPtr {
+        self.empty
     }
 
     /// One past the last byte `prf` may write.
