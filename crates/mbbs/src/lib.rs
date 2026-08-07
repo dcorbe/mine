@@ -54,7 +54,7 @@ pub use shims::system::{Agent, Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
-pub use users::Users;
+pub use users::{Connection, Users};
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
@@ -639,6 +639,121 @@ impl Host {
             .expect("margv is placed, or parsin above would already have failed");
         let bytes = machine.resolve(margv, 4)?;
         Ok(FarPtr::from_bytes(bytes.try_into().expect("4 bytes")))
+    }
+
+    /// Point the four globals that name "the current channel" -- `usrnum`,
+    /// `usrptr`, `usaptr` and `vdaptr` -- at `uno`.
+    ///
+    /// `MAJORBBS.C:4290`'s `curusr`, minus the range check: every caller here
+    /// already knows `uno` is a channel that exists, for a different reason
+    /// each. [`shims::user::curusr`] checked it itself, because an
+    /// out-of-range `uno` there is the documented silent no-op
+    /// (`MAJORBBS.C:4293`) and not a failure. [`Host::connect_state`] gets
+    /// its answer from [`Users::account`] failing first. Factored out so
+    /// both call one piece of code rather than keep two that can drift.
+    ///
+    /// # Errors
+    ///
+    /// If `uno` names no channel, or a write runs off a segment.
+    pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: i16) -> Result<(), ShimError> {
+        let slot = self
+            .users()
+            .slot(uno)
+            .ok_or_else(|| ShimError::Failed(format!("point_curusr({uno}): there is no such channel")))?;
+        let account = self
+            .users()
+            .account(uno)
+            .expect("in range, so it has a record");
+        let vda = self.users().vda(uno).unwrap_or(FarPtr::NULL);
+
+        self.globals()
+            .write(machine, "usrnum", &uno.to_le_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "usrptr", &slot.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "usaptr", &account.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "vdaptr", &vda.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        Ok(())
+    }
+
+    /// Plant a connecting user's account record and channel state, and make
+    /// the channel current.
+    ///
+    /// Writes what a real board's `loadup()` would have read out of
+    /// `bbsusr.dat` -- this host has no accounts and none are being grown
+    /// here; see [`users::Connection`]. `usrcls`, `state` and `substt` are
+    /// all written as zero: that is already what a freshly allocated slot
+    /// reads as (`Users::new`'s `alczer` zeroed it), and it is what
+    /// [`Host::connect`] (Task 8) then hands to the module's own `lonrou` to
+    /// set for real. Written anyway, rather than left to the allocator's
+    /// zero, so the state a connecting channel is in is something this
+    /// function visibly does and not an accident of history.
+    ///
+    /// # Errors
+    ///
+    /// If `chan` names no channel, or a write runs off a segment.
+    pub fn connect_state(
+        &mut self,
+        machine: &mut Machine,
+        chan: i16,
+        who: &users::Connection,
+    ) -> Result<(), ShimError> {
+        let account = self.users().account(chan).ok_or_else(|| {
+            ShimError::Failed(format!("connect_state({chan}): there is no such channel"))
+        })?;
+        let slot = self
+            .users()
+            .slot(chan)
+            .expect("in range, so it has a user slot too");
+
+        // `UIDSIZ` (`UStructs.h:10`) is 30, and `psword` starts immediately
+        // after `userid` in the record -- a longer name is truncated rather
+        // than overrunning it.
+        const UIDSIZ: usize = 30;
+        let userid = who.userid.as_bytes();
+        let take = userid.len().min(UIDSIZ);
+        let at = FarPtr {
+            offset: account.offset + users::usracc::USERID as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &userid[..take])?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::ANSIFL as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[u8::from(who.ansi)])?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::SCNWID as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[who.width])?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::SCNFSE as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[who.height])?;
+
+        for (field, value) in [
+            (users::user::USRCLS, 0u16),
+            (users::user::STATE, 0u16),
+            (users::user::SUBSTT, 0u16),
+        ] {
+            let at = FarPtr {
+                offset: slot.offset + field,
+                selector: slot.selector,
+            };
+            machine.write(at, &value.to_le_bytes())?;
+        }
+
+        self.point_curusr(machine, chan)
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.

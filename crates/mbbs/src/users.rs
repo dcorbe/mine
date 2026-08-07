@@ -61,6 +61,12 @@ pub const USRACC: u16 = 338;
 /// and is what the arithmetic between these is made of, but a constant nothing
 /// indexes by is a constant nothing checks.
 pub mod user {
+    /// `int usrcls` -- the class of channel this is (console, remote, etc).
+    /// `MAJORBBS.H:74`'s GCV2 layout puts it first. The module itself never
+    /// reads it -- the host does, to decide what a channel is before any
+    /// module gets a look -- so there is no call site to cite, only the
+    /// header's own field order.
+    pub const USRCLS: u16 = 0;
     /// `int state` -- the module number in effect on this channel. Assigned the
     /// module's own state number at 14 sites.
     pub const STATE: u16 = 6;
@@ -75,6 +81,67 @@ pub mod user {
     /// `char lcstat` -- LAN channel state, and the odd byte that makes the
     /// stride 41 and not 42.
     pub const LCSTAT: u16 = 40;
+}
+
+/// Field offsets within `struct usracc` (`UStructs.h:20`, v10 SDK).
+///
+/// Only the four the module reads. **`UIDSIZ` is 30 here, not the 10 of the
+/// v6 header** -- every offset below moves if that is got wrong, and nothing
+/// would report it except the module quietly taking a different branch.
+///
+/// Independently derived, not copied: adding up `UStructs.h:21-34` under the
+/// same byte alignment `struct user` uses (`userid[30]`, `psword[10]`,
+/// `usrnam[30]`, `usrad1..4[30]` each, `usrpho[16]`, then the two one-byte
+/// flags `systyp` and `usrprf`) lands `ansifl` at 208 (`0xd0`), `scnwid` at
+/// 209 (`0xd1`) and -- skipping the one-byte `scnbrk` nothing here reads --
+/// `scnfse` at 211 (`0xd3`). Continuing the same sum through `birthd` totals
+/// exactly 301 declared bytes, which is what `USRACC.H:22`'s
+/// `#define USRACCSPARE (338-301)` says it should be -- so the total and the
+/// three offsets confirm each other.
+pub mod usracc {
+    /// `sizeof(struct usracc)`. `USRACC.H:22`'s `(338-301)` writes the total
+    /// down, which is why this is 338 and not a sum.
+    pub const SIZE: usize = 338;
+    /// `char userid[30]` -- and what `obtbtvl` keys the character lookup on.
+    pub const USERID: usize = 0x00;
+    /// `char ansifl` -- bit 0 is `ANSON`.
+    pub const ANSIFL: usize = 0xd0;
+    /// `char scnwid` -- screen width in columns.
+    pub const SCNWID: usize = 0xd1;
+    /// `char scnfse` -- screen length for full-screen stuff.
+    pub const SCNFSE: usize = 0xd3;
+}
+
+/// What a connecting user is.
+///
+/// On a real board `bbsusr.dat` decided these and `loadup()` read them. This
+/// host has no accounts and is not going to grow them here -- the goal is
+/// running a module headless, and the module cannot tell where the bytes came
+/// from. It reads `usaptr` and has no way to ask.
+pub struct Connection {
+    /// `usracc.userid`. Keys the character lookup. Truncated to `UIDSIZ`
+    /// (30) bytes if longer -- `psword` starts immediately after `userid`
+    /// in the record, and a name that ran into it would corrupt the next
+    /// field rather than merely being cut short.
+    pub userid: String,
+    /// `usracc.ansifl` bit `ANSON`.
+    pub ansi: bool,
+    /// `usracc.scnwid`. MajorMUD wants at least 80.
+    pub width: u8,
+    /// `usracc.scnfse`. MajorMUD wants at least 23.
+    pub height: u8,
+}
+
+impl Connection {
+    /// An ANSI terminal of the size MajorMUD's full-screen path requires.
+    pub fn ansi(userid: &str) -> Self {
+        Self {
+            userid: userid.to_string(),
+            ansi: true,
+            width: 80,
+            height: 24,
+        }
+    }
 }
 
 /// The per-channel tables, and where each one starts.
@@ -476,5 +543,64 @@ mod tests {
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
             mbbs16::FarPtr::NULL
         );
+    }
+
+    #[test]
+    fn a_connection_lands_on_the_bytes_the_module_gates_its_output_on() {
+        // WCCMMUD_named.c:11201 --
+        //   if ((usaptr[0xd0] & 1) == 0 || usaptr[0xd3] < 0x17 || usaptr[0xd1] < 0x50)
+        // Fail any of the three and MajorMUD prints the degraded rendering.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .expect("channel 0");
+        let at = f.host.users().account(0).expect("channel 0");
+        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+
+        assert_eq!(&rec[..9], b"rangerdan", "userid keys the character lookup");
+        assert_eq!(rec[usracc::ANSIFL] & 1, 1, "ANSON");
+        assert!(rec[usracc::SCNWID] >= 0x50, "80 columns");
+        assert!(rec[usracc::SCNFSE] >= 0x17, "23 rows");
+    }
+
+    #[test]
+    fn a_connection_names_the_channel_the_module_will_run_on() {
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .expect("channel 0");
+        let at = f.host.users().slot(0).expect("channel 0");
+        let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
+        assert_eq!(rec[user::STATE as usize], 0, "state is set by connect()");
+        assert_eq!(rec[user::SUBSTT as usize], 0);
+    }
+
+    #[test]
+    fn a_userid_longer_than_uidsiz_is_truncated_rather_than_overrunning_psword() {
+        // `UIDSIZ` (`UStructs.h:10`) is 30 and `psword` starts immediately
+        // after `userid` in the record. A connection whose name is longer
+        // than that must lose the tail of the name, not spill into the
+        // password field that follows it.
+        let mut f = crate::testing::Fixture::new();
+        let long = "a".repeat(40);
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi(&long))
+            .expect("channel 0");
+        let at = f.host.users().account(0).expect("channel 0");
+        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+
+        assert_eq!(&rec[..30], vec![b'a'; 30].as_slice(), "exactly UIDSIZ bytes of it");
+        assert!(
+            rec[30..40].iter().all(|&b| b == 0),
+            "nothing past userid was written -- psword starts at 30 and stays zero: {:?}",
+            &rec[30..40]
+        );
+    }
+
+    #[test]
+    fn connect_state_refuses_a_channel_that_does_not_exist() {
+        let mut f = crate::testing::Fixture::new();
+        let past = f.host.users().terms() as i16;
+        assert!(f.host.connect_state(&mut f.machine, past, &Connection::ansi("rangerdan")).is_err());
     }
 }

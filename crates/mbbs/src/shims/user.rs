@@ -58,31 +58,21 @@ pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// -- but here doing nothing *is* the documented behaviour and callers depend
 /// on it. It is recorded in [`Host::notes`] instead, once, so that a run in
 /// which it happens is not silent.
+///
+/// The four writes themselves are [`Host::point_curusr`] -- [`Host::connect_state`]
+/// needs the identical repointing when a channel connects, and this is the
+/// one of the two callers that also owns the silent-no-op behaviour, so the
+/// range check stays here and the body that does not vary moved out.
 pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let uno = machine.arg_u16(0) as i16;
-    let Some(slot) = host.users().slot(uno) else {
+    if host.users().slot(uno).is_none() {
         host.note_once(
             "curusr",
             format!("curusr({uno}): there is no such channel, so nothing changed"),
         );
         return Ok(Ret::Void);
-    };
-    let account = host
-        .users()
-        .account(uno)
-        .expect("in range, so it has a record");
-    let vda = host.users().vda(uno).unwrap_or(mbbs16::FarPtr::NULL);
-
-    let globals = host.globals();
-    let mut set = |name: &str, bytes: &[u8]| {
-        globals
-            .write(machine, name, bytes)
-            .map_err(|e| ShimError::Failed(format!("curusr: {e}")))
-    };
-    set("usrnum", &uno.to_le_bytes())?;
-    set("usrptr", &slot.to_bytes())?;
-    set("usaptr", &account.to_bytes())?;
-    set("vdaptr", &vda.to_bytes())?;
+    }
+    host.point_curusr(machine, uno)?;
     Ok(Ret::Void)
 }
 
