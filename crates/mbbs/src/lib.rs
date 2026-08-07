@@ -849,6 +849,83 @@ impl Host {
         self.run(machine, module, lonrou, &[])
     }
 
+    /// Service one channel that has something to report.
+    ///
+    /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
+    /// out -- the `usrptr->class` switch, `RING`/`CMDOK`, `rstchn`, `dwopr`,
+    /// `prcrtk` and `hdlinp`'s fallback to `module00` are all MajorBBS and not
+    /// the module, and none of them are here:
+    ///
+    /// ```text
+    /// scan() -> a channel with a status
+    ///   status 3 (CRSTG)  -> curusr(chan), getin(), then entry 1 (sttrou)
+    ///   status 4 (INBLK)
+    ///      or 5 (OUTMT)   -> curusr(chan), write the `status` global, entry 2 (stsrou)
+    ///   anything else     -> a note, and no call
+    /// ```
+    ///
+    /// Returns `None` if no channel has a status waiting, or if the one that
+    /// did raised a status nothing here dispatches -- either way there is no
+    /// module call to report an [`Outcome`] for.
+    ///
+    /// # Errors
+    ///
+    /// If `chan` names no channel, a write runs off a segment, no module has
+    /// registered, or the module cannot be entered.
+    pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
+        let Some(chan) = self.gsbl().scan() else {
+            return Ok(None);
+        };
+
+        // Popped before either entry point is called, not after -- a
+        // `sttrou` that re-enters through `hdlinp` must not see its own
+        // status still queued.
+        let status = self
+            .gsbl_mut()
+            .next_status(chan)
+            .expect("scan just found a channel with one");
+
+        let entry_index = match status {
+            gsbl::Gsbl::CRSTG => 1,
+            gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
+            other => {
+                self.note(format!(
+                    "poll: channel {chan} raised status {other}, which nothing here dispatches"
+                ));
+                return Ok(None);
+            }
+        };
+
+        // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
+        // `MAJORBBS.C:157` points both, and `usaptr`/`vdaptr` with them,
+        // before every dispatch.
+        self.point_curusr(machine, chan).map_err(shim_io)?;
+
+        if status == gsbl::Gsbl::CRSTG {
+            self.get_input(machine, chan).map_err(shim_io)?;
+        } else {
+            // `status` is a placed global (`globals.rs:107`) that `stsrou`
+            // reads -- `WCCMMUD.DLL` imports it at 2 sites, and it has to be
+            // written before entry 2 is called, not after.
+            self.globals()
+                .write(machine, "status", &status.to_le_bytes())?;
+        }
+
+        // Same borrow trap as `connect`: read the entry pointer out of
+        // `self.modules()` and let that borrow end before `self.run` needs
+        // `self` mutably.
+        let entry = {
+            let registered = self.modules().first().ok_or_else(|| {
+                io::Error::other("no module has registered, so there is nothing to enter")
+            })?;
+            registered.entry(machine, entry_index).map_err(shim_io)?
+        };
+        let Some(entry) = entry else {
+            return Ok(Some(Outcome::Returned { ax: 0, dx: 0 }));
+        };
+        self.run(machine, module, entry, &[]).map(Some)
+    }
+
     /// `void alcvda(void)` -- give every channel its volatile data area.
     ///
     /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init
@@ -1325,5 +1402,31 @@ mod tests {
                 .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
                 .is_err()
         );
+    }
+
+    /// No status queued, no channel to service, nothing to call.
+    #[test]
+    fn poll_with_nothing_queued_returns_none_and_calls_nothing() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let before = f.host.calls();
+        assert!(
+            f.host
+                .poll(&mut f.machine, &module)
+                .expect("no fault")
+                .is_none()
+        );
+        assert_eq!(f.host.calls(), before, "nothing was dispatched");
+    }
+
+    /// A status is queued, but `poll` still needs somewhere to deliver it --
+    /// and here, as in [`connect_with_no_module_registered_is_an_error_not_a_panic`],
+    /// there is a `Module` but nothing has registered.
+    #[test]
+    fn poll_with_a_status_queued_but_no_module_registered_is_an_error_not_a_panic() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        assert!(f.host.poll(&mut f.machine, &module).is_err());
     }
 }
