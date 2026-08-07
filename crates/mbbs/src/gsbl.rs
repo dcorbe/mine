@@ -63,6 +63,12 @@ pub struct Channel {
     /// which never asks the far end to pause.
     pub xon: u8,
     pub xoff: u8,
+
+    /// Set when the last byte written was a CR whose LF this host supplied, so
+    /// that a module sending an explicit `\r\n` does not get two linefeeds.
+    /// On `Channel` rather than local to `transmit` because the pair can arrive
+    /// in two calls -- MajorMUD flushes whatever `prf` happened to accumulate.
+    pub(crate) supplied_lf: bool,
 }
 
 impl Default for Channel {
@@ -82,6 +88,7 @@ impl Default for Channel {
             oes: false,
             xon: 0,
             xoff: 0,
+            supplied_lf: false,
         }
     }
 }
@@ -292,15 +299,41 @@ impl Channel {
     /// ASCII output, wrapped at `width`.
     fn transmit(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if byte == b'\r' || byte == b'\n' {
-                if self.output.len() < OUTSIZ {
-                    self.output.push_back(byte);
-                }
-                if byte == b'\r' {
+            match byte {
+                b'\r' => {
+                    // R1 -- guide, `btulfd` page 114: the default on channel
+                    // initialisation is that an explicit LF is necessary
+                    // after every CR to move to the next line, and
+                    // `WCCMMUD.DLL` never calls `btulfd` or `btuhcr`, so the
+                    // default stands. `supplied_lf` remembers that this LF is
+                    // ours, so a module byte stream that already spells out
+                    // `\r\n` -- even split across two `transmit` calls --
+                    // does not get a second one.
+                    if self.output.len() < OUTSIZ {
+                        self.output.push_back(b'\r');
+                    }
+                    if self.output.len() < OUTSIZ {
+                        self.output.push_back(b'\n');
+                    }
                     self.column = 0;
+                    self.supplied_lf = true;
+                    continue;
                 }
-                continue;
+                b'\n' if self.supplied_lf => {
+                    // The other half of a module's own explicit `\r\n` --
+                    // already on the wire as the LF we supplied above.
+                    self.supplied_lf = false;
+                    continue;
+                }
+                b'\n' => {
+                    if self.output.len() < OUTSIZ {
+                        self.output.push_back(b'\n');
+                    }
+                    continue;
+                }
+                _ => {}
             }
+            self.supplied_lf = false;
             if self.width != 0 && self.column >= self.width {
                 self.wrap();
             }
@@ -495,6 +528,33 @@ mod tests {
         g.channel_mut(0).expect("channel 0").width = 4;
         g.transmit_raw(0, b"abcdefg");
         assert_eq!(g.drain_output(0), b"abcdefg".to_vec());
+    }
+
+    #[test]
+    fn a_bare_cr_from_the_module_reaches_the_wire_as_crlf() {
+        // R1, guide `btulfd` page 114: the default on channel init is that an
+        // explicit LF is required after every CR, and WCCMMUD.DLL never
+        // calls btulfd/btuhcr to change that default.
+        let mut g = Gsbl::new(1);
+        g.transmit(0, b"line\r");
+        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+    }
+
+    #[test]
+    fn an_explicit_crlf_from_the_module_does_not_become_crlf_lf() {
+        let mut g = Gsbl::new(1);
+        g.transmit(0, b"line\r\n");
+        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+    }
+
+    #[test]
+    fn an_explicit_crlf_split_across_two_transmit_calls_does_not_double_the_lf() {
+        // MajorMUD flushes whatever `prf` happened to accumulate, so the CR
+        // and its LF are not guaranteed to arrive in the same btuxmt() call.
+        let mut g = Gsbl::new(1);
+        g.transmit(0, b"line\r");
+        g.transmit(0, b"\n");
+        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
     }
 
     #[test]
