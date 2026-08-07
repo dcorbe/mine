@@ -873,64 +873,72 @@ impl Host {
     /// If `chan` names no channel, a write runs off a segment, no module has
     /// registered, or the module cannot be entered.
     pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
-        let Some(chan) = self.gsbl().scan() else {
-            return Ok(None);
-        };
-
-        // Popped before either entry point is called, not after -- a
-        // `sttrou` that re-enters through `hdlinp` must not see its own
-        // status still queued.
-        let status = self
-            .gsbl_mut()
-            .next_status(chan)
-            .expect("scan just found a channel with one");
-
-        let entry_index = match status {
-            gsbl::Gsbl::CRSTG => 1,
-            gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
-            other => {
-                self.note(format!(
-                    "poll: channel {chan} raised status {other}, which nothing here dispatches"
-                ));
+        // R23: a status this host does not dispatch (`OVRFLW`, say) is not
+        // the same fact as "nothing queued" -- looping past it here, rather
+        // than answering `Ok(None)` for it, keeps that distinction from
+        // leaking into the return value. A driver written
+        // `while host.poll(..)?.is_some() {}` would otherwise stop dead on
+        // one undispatched status with a `CRSTG` still queued behind it.
+        loop {
+            let Some(chan) = self.gsbl().scan() else {
                 return Ok(None);
+            };
+
+            // Popped before either entry point is called, not after -- a
+            // `sttrou` that re-enters through `hdlinp` must not see its own
+            // status still queued.
+            let status = self
+                .gsbl_mut()
+                .next_status(chan)
+                .expect("scan just found a channel with one");
+
+            let entry_index = match status {
+                gsbl::Gsbl::CRSTG => 1,
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
+                other => {
+                    self.note(format!(
+                        "poll: channel {chan} raised status {other}, which nothing here dispatches"
+                    ));
+                    continue;
+                }
+            };
+
+            // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
+            // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
+            // every dispatch -- `:157` is the `usrptr->class` switch this host
+            // deliberately does not have. `vdaptr` is not named there at all;
+            // `point_curusr` sets it because the real host's own `curusr`
+            // (`MAJORBBS.C:4290`) does.
+            self.point_curusr(machine, chan).map_err(shim_io)?;
+
+            // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
+            // only the `!= 3` guard on `shomal()` (the operator console, out of
+            // scope) is conditional. `status` is a placed global
+            // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
+            // at 2 sites); writing it only on the non-CRSTG path left the
+            // module reading a stale value on the CRSTG path -- zero on a
+            // fresh host, or a leftover `OUTMT` from an earlier poll.
+            self.globals()
+                .write(machine, "status", &status.to_le_bytes())?;
+
+            if status == gsbl::Gsbl::CRSTG {
+                self.get_input(machine, chan).map_err(shim_io)?;
             }
-        };
 
-        // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
-        // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
-        // every dispatch -- `:157` is the `usrptr->class` switch this host
-        // deliberately does not have. `vdaptr` is not named there at all;
-        // `point_curusr` sets it because the real host's own `curusr`
-        // (`MAJORBBS.C:4290`) does.
-        self.point_curusr(machine, chan).map_err(shim_io)?;
-
-        // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
-        // only the `!= 3` guard on `shomal()` (the operator console, out of
-        // scope) is conditional. `status` is a placed global
-        // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
-        // at 2 sites); writing it only on the non-CRSTG path left the
-        // module reading a stale value on the CRSTG path -- zero on a
-        // fresh host, or a leftover `OUTMT` from an earlier poll.
-        self.globals()
-            .write(machine, "status", &status.to_le_bytes())?;
-
-        if status == gsbl::Gsbl::CRSTG {
-            self.get_input(machine, chan).map_err(shim_io)?;
+            // Same borrow trap as `connect`: read the entry pointer out of
+            // `self.modules()` and let that borrow end before `self.run` needs
+            // `self` mutably.
+            let entry = {
+                let registered = self.modules().first().ok_or_else(|| {
+                    io::Error::other("no module has registered, so there is nothing to enter")
+                })?;
+                registered.entry(machine, entry_index).map_err(shim_io)?
+            };
+            let Some(entry) = entry else {
+                return Ok(Some(Outcome::Returned { ax: 0, dx: 0 }));
+            };
+            return self.run(machine, module, entry, &[]).map(Some);
         }
-
-        // Same borrow trap as `connect`: read the entry pointer out of
-        // `self.modules()` and let that borrow end before `self.run` needs
-        // `self` mutably.
-        let entry = {
-            let registered = self.modules().first().ok_or_else(|| {
-                io::Error::other("no module has registered, so there is nothing to enter")
-            })?;
-            registered.entry(machine, entry_index).map_err(shim_io)?
-        };
-        let Some(entry) = entry else {
-            return Ok(Some(Outcome::Returned { ax: 0, dx: 0 }));
-        };
-        self.run(machine, module, entry, &[]).map(Some)
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
@@ -1456,6 +1464,36 @@ mod tests {
                 .expect("status is placed"),
             crate::gsbl::Gsbl::CRSTG as u16,
             "status must be written before dispatch, not only off the CRSTG path"
+        );
+    }
+
+    /// R23: an undispatched status ahead of a dispatchable one must not read
+    /// as "nothing queued". `Ok(None)` is what `poll` answers when there is
+    /// truly nothing to report; a driver written
+    /// `while host.poll(..)?.is_some() {}` would stop dead on the first
+    /// `OVRFLW` otherwise, with the CRSTG behind it never serviced.
+    #[test]
+    fn poll_loops_past_an_undispatched_status_to_the_dispatchable_one_behind_it() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host
+            .gsbl_mut()
+            .channel_mut(0)
+            .expect("chan 0")
+            .status
+            .push_back(crate::gsbl::Gsbl::OVRFLW);
+        f.host.gsbl_mut().push_input(0, b"look\r");
+
+        // No module is registered, so `poll` errors -- but only once it
+        // reaches the CRSTG dispatch, which it does only if the `OVRFLW`
+        // ahead of it did not make `poll` stop and answer `Ok(None)`.
+        let err = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("the CRSTG behind the OVRFLW is still there to dispatch");
+        assert!(
+            err.to_string().contains("no module has registered"),
+            "expected to reach the CRSTG dispatch past the OVRFLW: {err}"
         );
     }
 }
