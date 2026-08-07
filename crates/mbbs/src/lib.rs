@@ -897,8 +897,11 @@ impl Host {
         };
 
         // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
-        // `MAJORBBS.C:157` points both, and `usaptr`/`vdaptr` with them,
-        // before every dispatch.
+        // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
+        // every dispatch -- `:157` is the `usrptr->class` switch this host
+        // deliberately does not have. `vdaptr` is not named there at all;
+        // `point_curusr` sets it because the real host's own `curusr`
+        // (`MAJORBBS.C:4290`) does.
         self.point_curusr(machine, chan).map_err(shim_io)?;
 
         if status == gsbl::Gsbl::CRSTG {
