@@ -331,6 +331,18 @@ pub struct Host {
     trace: bool,
 }
 
+/// A [`ShimError`] as an [`io::Error`].
+///
+/// `ShimError` implements `Display` and not `std::error::Error` -- it is
+/// meant to be handed to [`Host::stop`], which poisons the machine and names
+/// it, not chained through `?`. [`Host::connect`] and [`Host::poll`] call
+/// straight into [`Host::connect_state`], [`Host::point_curusr`] and
+/// [`Host::get_input`], which predate them and already answer in
+/// `Result<_, ShimError>`, so this is the one place that boundary is crossed.
+fn shim_io(e: ShimError) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
 /// Where in the module the call being refused came from, as a place you can
 /// look up in a disassembly.
 ///
@@ -347,18 +359,6 @@ pub struct Host {
 /// outstanding call, a stack that will not resolve, or a selector this module
 /// does not own. A wrong address costs more than no address -- it sends someone
 /// to a real instruction that had nothing to do with it.
-/// A [`ShimError`] as an [`io::Error`].
-///
-/// `ShimError` implements `Display` and not `std::error::Error` -- it is
-/// meant to be handed to [`Host::stop`], which poisons the machine and names
-/// it, not chained through `?`. [`Host::connect`] and [`Host::poll`] call
-/// straight into [`Host::connect_state`], [`Host::point_curusr`] and
-/// [`Host::get_input`], which predate them and already answer in
-/// `Result<_, ShimError>`, so this is the one place that boundary is crossed.
-fn shim_io(e: ShimError) -> io::Error {
-    io::Error::other(e.to_string())
-}
-
 fn caller(machine: &Machine, module: &Module) -> Option<String> {
     let frame = FarPtr {
         offset: machine.frame_sp()?,
