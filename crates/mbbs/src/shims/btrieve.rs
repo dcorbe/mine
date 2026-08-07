@@ -10,10 +10,10 @@
 //!                dupdbtv  23    qnpbtv    7
 //! ```
 //!
-//! Seventeen symbols over 716 sites. **Fourteen are here**: opening and
-//! choosing a file, reading records out of it, and the two write routines that
-//! have something to answer when no file is current. The three that are not are
-//! `dinsbtv`, `dupdbtv` and `clsbtv`.
+//! Seventeen symbols over 716 sites. **Fifteen are here**: opening and
+//! choosing a file, reading records out of it, the two guards that answer
+//! rather than write, and `dinsbtv`, which writes. The two that are not are
+//! `dupdbtv` and `clsbtv`.
 //!
 //! **Initialisation uses six of the twelve, and reads exactly one record's
 //! worth**, measured by `crates/mbbs/tests/wccmmud.rs` against the module
@@ -28,11 +28,13 @@
 //! with is Galacticomm's own `PLBTVSTF.C`, which is quoted rather than
 //! paraphrased wherever it decided something.
 //!
-//! # Nothing here writes, and two routines say so by name
+//! # `dinsbtv` writes; `invbtv` and `delbtv` still only say they would
 //!
-//! A module that saves a character gets a refusal, rather than a host that
-//! appears to work and loses the data. That is the whole reason the write
-//! family is refused rather than stubbed.
+//! A module that saves a character now gets an honest insert -- [`dinsbtv`]
+//! calls [`Block::insert`](crate::btrieve::Block::insert). `invbtv` and
+//! `delbtv` do not write yet, so a module that reaches either of them with a
+//! file current gets a refusal rather than a host that appears to work and
+//! loses the data.
 //!
 //! [`invbtv`] and [`delbtv`] are nonetheless *present*, because refusing is
 //! only half of what the real host did. Both are guarded with
@@ -49,9 +51,12 @@
 //! `setbtv` handed a null. Whichever module-side pointer is still zero, the
 //! guard is the same guard and the insert is discarded either way.
 //!
-//! With a file current they refuse and name it. `dinsbtv` and `dupdbtv` have no
-//! guard at all -- `:603` and `:555` read `bb->reclen` first -- so they refuse
-//! either way, which is what leaving them unbound already does.
+//! With a file current, `invbtv` and `delbtv` refuse and name it. `dinsbtv`
+//! and `dupdbtv` have no guard at all -- `:603` and `:555` read `bb->reclen`
+//! first, so the real host faulted with no file current rather than
+//! answering. This host stops the module instead of faulting, which is the
+//! same outcome honestly reached and a deliberately different shape from
+//! `invbtv`/`delbtv`'s quiet no-op.
 //!
 //! # What every routine does when no file is current
 //!
@@ -338,6 +343,106 @@ pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         "delbtv from {}, and nothing in this host writes to a Btrieve file",
         file.name()
     )))
+}
+
+/// `int dinsbtv(void *recptr)` -- insert a new record into the current file.
+///
+/// `PLBTVSTF.C:598`:
+///
+///
+/// # No `bb == NULL` guard
+///
+/// Unlike [`invbtv`] and [`delbtv`], `:598` reads `bb->reclen` before
+/// checking anything, so the real host faulted with no file current. This
+/// host stops the module and says so instead -- the same outcome honestly
+/// reached, and a deliberately different shape from the two routines that do
+/// answer quietly with no file current.
+///
+/// # Length, and the one difference from `dupdbtv`
+///
+/// `length` is `bb->reclen` -- [`Block::maxlen`](crate::btrieve::Block::maxlen),
+/// the number the *module* passed to `opnbtv`, not the file's own record
+/// length; the two are allowed to differ. The Btrieve call always passes key
+/// number 0. [`dupdbtv`] passes `bb->lastkn` instead, and that is the only
+/// difference between the two calls.
+///
+/// # The return convention
+///
+/// 1 for success, 0 for Btrieve status 5 -- a duplicate-key violation on a key
+/// that does not permit them -- and everything else `catastro`'d, so this
+/// host stops the module on anything else. `_GENERATE_TOP_LIST` branches on
+/// the 0/1, so answering 0 rather than refusing is the only way a module that
+/// legitimately collides keeps running. [`duplicate_key`] is where this host
+/// re-derives the same answer Btrieve's TSR would have: it has no TSR to ask,
+/// so it asks whether a record with this value is already in that key's
+/// order.
+pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let block = positioned(machine, host, "dinsbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "dinsbtv with no Btrieve file current -- PLBTVSTF.C:598 has no \
+             guard and reads bb->reclen before checking anything, so the \
+             real host faulted here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let length = file.maxlen();
+    let recptr = machine.arg_far(0);
+    let recptr = match recptr == Btrieve::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+
+    if duplicate_key(host, block, &bytes, None)?.is_some() {
+        return Ok(Ret::U16(0));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(Ret::U16(1))
+}
+
+/// Whether `bytes` collides with an existing record on a key that does not
+/// permit duplicates.
+///
+/// Returns the colliding key's number, or `None` if there is no collision.
+/// `exclude`, for [`dupdbtv`], is the file position of the record being
+/// replaced -- its own current key values are not a collision with
+/// themselves; [`dinsbtv`] has no such record and passes `None`.
+///
+/// `PLBTVSTF.C` never computes this: it hands the record to Btrieve and reads
+/// back status 5 if the TSR already had one. This host has no TSR, so it asks
+/// the same question of the records already read into memory -- a record
+/// with this value is a collision if [`Records::seek`](crate::btrieve::Records::seek)
+/// lands on one that [`Records::matches`](crate::btrieve::Records::matches) it exactly.
+fn duplicate_key(
+    host: &mut Host,
+    block: FarPtr,
+    bytes: &[u8],
+    exclude: Option<u32>,
+) -> Result<Option<u16>, ShimError> {
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let keys = file.keys().to_vec();
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    for key in &keys {
+        if key.duplicates {
+            continue;
+        }
+        let value = key.extract(bytes);
+        let at = records.seek(&keys, key.number, &value);
+        if !records.matches(&keys, key.number, at, &value) {
+            continue;
+        }
+        let existing = records.ordered(key.number, at).expect("just matched");
+        if Some(existing.position) == exclude {
+            continue;
+        }
+        return Ok(Some(key.number));
+    }
+    Ok(None)
 }
 
 /// What a Btrieve operation code asks for.
@@ -2025,6 +2130,84 @@ mod tests {
         let e = f.invoke(delbtv, &[]).expect_err("nothing here writes");
         assert!(e.to_string().contains("delbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
+    }
+
+    // # `dinsbtv`, which does write
+    //
+    // `SAMPLE.DAT` has one key -- a two-byte signed number at offset 0 -- and
+    // it does not permit duplicates, which is what makes it enough to test a
+    // collision against.
+
+    /// A 64-byte `SAMPLE.DAT`-shaped record: the key at offset 0, a
+    /// NUL-terminated name from offset 2, the rest zero.
+    fn sample_record(key: i16, name: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[..2].copy_from_slice(&key.to_le_bytes());
+        let name = name.as_bytes();
+        bytes[2..2 + name.len()].copy_from_slice(name);
+        bytes
+    }
+
+    #[test]
+    fn dinsbtv_inserts_a_record_and_it_is_readable_afterwards() {
+        let dir = crate::testing::scratch_with("dinsbtv-insert", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+            Ret::U16(1)
+        );
+
+        // Re-read from disk with a fresh host, which is the check that
+        // matters -- an in-memory model that agrees with itself proves
+        // nothing.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(99), 0, 5), "the new record is there");
+        assert_eq!(
+            g.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "Zorro"
+        );
+    }
+
+    #[test]
+    fn dinsbtv_refuses_a_record_colliding_on_a_key_without_duplicates() {
+        // `PLBTVSTF.C:610` maps Btrieve status 5 to a 0, not a `catastro` --
+        // `_GENERATE_TOP_LIST` branches on the 0/1, so a collision has to be
+        // an answer rather than a refusal.
+        let dir = crate::testing::scratch_with("dinsbtv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 5 already belongs to Troll"
+        );
+        assert_eq!(
+            f.invoke(cntrbtv, &[]).expect("counts"),
+            Ret::U32(7),
+            "and nothing was written"
+        );
+    }
+
+    #[test]
+    fn dinsbtv_with_no_file_current_stops_the_module() {
+        // `PLBTVSTF.C:598` has no `bb == NULL` guard and reads `bb->reclen`
+        // immediately, so the real host faulted with no file current. This
+        // host stops the module instead of faulting -- the same outcome
+        // honestly reached, and a different shape from `invbtv`/`delbtv`,
+        // which answer quietly with no file current.
+        let mut f = nothing_current();
+        let e = f.invoke(dinsbtv, &[0, 0]).expect_err("no file current");
+        assert!(e.to_string().contains("dinsbtv"), "{e}");
     }
 
     #[test]

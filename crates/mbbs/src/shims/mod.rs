@@ -174,9 +174,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
     (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
     (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
-    // Btrieve: the write family's guards. Neither of these writes -- each
-    // reproduces what `PLBTVSTF.C` did with no file current, and refuses when
+    // Btrieve: the write family. `dinsbtv` writes; `invbtv` and `delbtv`
+    // reproduce what `PLBTVSTF.C` did with no file current, and refuse when
     // there is one.
+    (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
     (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
     (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
     // Streams: the module's own files, read and written.
@@ -358,11 +359,6 @@ mod tests {
 
     #[test]
     fn an_unknown_symbol_is_unimplemented() {
-        // `dinsbtv` is the insert that writing records needs, and is
-        // deliberately absent: nothing in this host writes to a Btrieve file
-        // yet, so a module that saves a character is stopped rather than
-        // appearing to work.
-        assert!(matches!(entry(MAJORBBS, "dinsbtv"), Entry::Unimplemented));
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
     }
 
