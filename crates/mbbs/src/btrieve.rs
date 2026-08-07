@@ -379,6 +379,25 @@ pub struct Block {
     dirty: bool,
 }
 
+/// Make `bytes` exactly `reclen` long: padded with zero if shorter, cut off
+/// if longer.
+///
+/// `records::walk` always stores exactly `geometry.reclen` bytes for a
+/// record, because that is all it reads out of a slot. A model that kept a
+/// caller's buffer at whatever length the caller handed over -- `dinsbtv`
+/// passes `bb->reclen`, [`Block::maxlen`], the *module's* own idea of the
+/// record length, which is allowed to differ from the file's -- would hold a
+/// record of a different length than a re-read of the same file produces,
+/// and `Key::extract`/`Key::compare` would then see different bytes before
+/// and after the cache is dropped. [`Block::insert`] calls this on its way
+/// into both the write and the model, which is the one place both have to
+/// agree.
+fn normalized(bytes: &[u8], reclen: u16) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out.resize(usize::from(reclen), 0);
+    out
+}
+
 impl Block {
     /// What the module named this file.
     pub fn name(&self) -> &str {
@@ -479,6 +498,14 @@ impl Block {
     /// it to the model. A write that fails partway leaves the model agreeing
     /// with whatever is actually on disk, never with a slot nothing wrote.
     ///
+    /// `bytes` is normalised to `self.geometry.reclen` before either of those
+    /// happens -- see [`normalized`]. `dinsbtv` passes `bb->reclen`
+    /// (`Self::maxlen`), the *module's* number, which is allowed to differ
+    /// from the file's own `reclen`; without this, the model would hold the
+    /// caller's buffer verbatim while `records::walk` always stores exactly
+    /// `geometry.reclen` bytes, and the two would disagree the moment the
+    /// cache is dropped and the file is read again.
+    ///
     /// `self.geometry` is updated last: `records` always grows by one, and
     /// `pages` grows by one only when the slot was a new page. Both fields are
     /// `Copy` and are what the next `Records::read` bounds its walk by, so
@@ -492,6 +519,7 @@ impl Block {
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
         let name = self.name.clone();
+        let bytes = normalized(bytes, self.geometry.reclen);
 
         let layout = pages::Layout {
             page: self.geometry.page,
@@ -513,7 +541,7 @@ impl Block {
         })?;
         let slot = layout.next_slot(&positions, free, &data);
 
-        pages::write_record(&self.path, layout, slot, bytes, count).map_err(|why| BtvError {
+        pages::write_record(&self.path, layout, slot, &bytes, count).map_err(|why| BtvError {
             file: name.clone(),
             why,
         })?;
@@ -522,7 +550,7 @@ impl Block {
         self.records
             .as_mut()
             .expect("just loaded")
-            .insert(&self.keys, position, bytes.to_vec())
+            .insert(&self.keys, position, bytes)
             .map_err(|why| BtvError {
                 file: name.clone(),
                 why,
@@ -1165,6 +1193,49 @@ mod tests {
         for position in [first, second, third] {
             assert!(reread.find_physical(position).is_some());
         }
+    }
+
+    /// I3: `dinsbtv` passes `bb->reclen` -- `Block::maxlen`, the module's own
+    /// idea of the record length -- which the plan says is allowed to differ
+    /// from the file's own `reclen`. `Block::insert` used to store the
+    /// caller's buffer verbatim while `records::walk` always stores exactly
+    /// `geometry.reclen` bytes, so the in-memory record and the on-disk one
+    /// would have different lengths and `Key::extract`/`Key::compare` would
+    /// see different bytes before and after the cache is dropped.
+    #[test]
+    fn insert_normalizes_to_the_files_own_reclen_not_the_callers_buffer() {
+        let dir = crate::testing::scratch("block-insert-normalizes-to-reclen");
+        let path = seed(&dir);
+        let mut block = block(path);
+
+        // 20 bytes: the slot's physical length, standing in for a module
+        // whose own `bb->reclen` is wider than the file's 16-byte `reclen`.
+        // Bytes 16..20 are past the file's own record and must not survive
+        // into the model.
+        let mut bytes = vec![0u8; 20];
+        bytes[..2].copy_from_slice(&7u16.to_le_bytes());
+        bytes[16..20].copy_from_slice(&[0xaa; 4]);
+
+        let position = block.insert(&bytes).expect("inserts");
+
+        let stored = block
+            .loaded()
+            .and_then(|records| records.physical(0))
+            .expect("in memory")
+            .bytes
+            .clone();
+        assert_eq!(stored.len(), 16, "normalized to the file's reclen, not the caller's 20");
+
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        let reread_record = reread
+            .find_physical(position)
+            .and_then(|at| reread.physical(at))
+            .expect("still there");
+        assert_eq!(
+            reread_record.bytes, stored,
+            "the model matches exactly what a re-read produces"
+        );
     }
 
     /// C1: reproduces the reviewer's probe. Two records written into a
