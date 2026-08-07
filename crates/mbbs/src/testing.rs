@@ -241,7 +241,7 @@ pub fn minimal_module_bytes() -> Vec<u8> {
     out.extend_from_slice(&nrtab);
 
     // The one segment's data, on a sector boundary, with no relocations.
-    while out.len() % SECTOR != 0 {
+    while !out.len().is_multiple_of(SECTOR) {
         out.push(0);
     }
     let sector = (out.len() / SECTOR) as u16;
