@@ -10,10 +10,10 @@
 //!                dupdbtv  23    qnpbtv    7
 //! ```
 //!
-//! Seventeen symbols over 716 sites. **Sixteen are here**: opening and
+//! Seventeen symbols over 716 sites, and all seventeen are here: opening and
 //! choosing a file, reading records out of it, the two guards that answer
-//! rather than write, and `dinsbtv`/`dupdbtv`, which write. The one that is
-//! not is `clsbtv`.
+//! rather than write, `dinsbtv`/`dupdbtv`, which write, and `clsbtv`, which
+//! flushes the index and gives four allocations back.
 //!
 //! **Initialisation uses six of the twelve, and reads exactly one record's
 //! worth**, measured by `crates/mbbs/tests/wccmmud.rs` against the module
@@ -475,6 +475,75 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(Ret::U16(1))
+}
+
+/// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
+///
+/// `PLBTVSTF.C:632`, quoted in full because every line of it does something:
+///
+///
+/// # `bb=bbp` happens first, and it is unconditional
+///
+/// `&&` only short-circuits its *right* operand, so `bb=bbp` runs as part of
+/// evaluating `goodptr(bb=bbp)` whichever way the guard then goes. Closing a
+/// file makes it current on the way out -- and when the guard succeeds, `bb`
+/// is left naming a block this call is about to free. That is reproduced
+/// rather than tidied up: [`Btrieve::close`](crate::btrieve::Btrieve::close)
+/// takes `at` as a plain argument and never reads `bb` itself, precisely so
+/// this routine can write `bb` before anything decides whether there is a
+/// file to close. A later `setbtv` on the stale pointer then fails to find
+/// an open file -- a module bug getting caught, rather than silently
+/// resolving to whatever this host puts in that slot next.
+///
+/// # The guard is a re-entrancy guard, and fifteen closes in a row need it
+///
+/// `bb->filnam != NULL` is the second half of the guard, and it is what
+/// makes a second `clsbtv` of the same block do nothing at all --
+/// [`Btrieve::close`](crate::btrieve::Btrieve::close) nulls the field before
+/// it frees anything, and a second read of the same bytes still finds it
+/// null. `_LJNGAME_FINROU` (`re/exports/WCCMMUD_named.c:10688`) closes
+/// fifteen files back to back, so double-close is a shape the original
+/// expected rather than a bug to guard against.
+///
+/// # The index is rebuilt here, and this is the flush point
+///
+/// `(*btvuptr)(1,0,0,0,0)` is Btrieve's own Close, which flushed whatever the
+/// TSR had buffered. This host has no TSR and buffers nothing -- every write
+/// [`dinsbtv`] and [`dupdbtv`] make lands on disk immediately -- except the
+/// one thing deliberately deferred: the B-tree index, marked
+/// [`dirty`](crate::btrieve::Block::dirty) by both of them and left stale
+/// until now. [`Btrieve::close`](crate::btrieve::Btrieve::close) rebuilds it
+/// exactly when the block is dirty, and stops the module if that fails -- a
+/// file leaving this host's reach with an index that disagrees with its data
+/// is exactly what [`reindex`](crate::btrieve::Block::reindex) exists to
+/// prevent.
+///
+/// A block that was never written is never reindexed, and that is not
+/// merely tidy: [`pages::index_pages`](crate::btrieve::pages::index_pages)
+/// refuses any key needing more than one leaf page, which is nine of the
+/// eleven shipped files that hold records -- `WCCITEMS`, `WCCTEXT` and
+/// `WCCSPELS` among them. Reindexing an untouched `WCCITEMS` on close would
+/// stop the module the first time it closed one; the `dirty` flag is what
+/// keeps a clean close from ever asking.
+///
+/// # Four allocations come back
+///
+/// The key buffer, the record buffer, the file name and the block itself --
+/// all four came off the module's heap in [`opnbtv`], and all four go back
+/// here rather than leaking a tiled descriptor per close, which would fail a
+/// long-running board rather than this one.
+pub fn clsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let bbp = machine.arg_far(0);
+
+    // Unconditional, and before anything below decides whether there is a
+    // file to close -- see this routine's doc comment.
+    set_current(machine, host, bbp)?;
+
+    let Host { btrieve, heap, .. } = host;
+    btrieve
+        .close(machine, heap, bbp)
+        .map_err(|e| ShimError::Failed(format!("clsbtv: {e}")))?;
+    Ok(Ret::Void)
 }
 
 /// Whether `bytes` collides with an existing record on a key that does not
@@ -2382,6 +2451,94 @@ mod tests {
         let mut f = nothing_current();
         let e = f.invoke(dupdbtv, &[0, 0]).expect_err("no file current");
         assert!(e.to_string().contains("dupdbtv"), "{e}");
+    }
+
+    // # `clsbtv`, which rebuilds the index and gives four allocations back
+    //
+    // `SAMPLE.DAT` and `OTHER.DAT` are hand-built fixtures with no real index
+    // root -- `key 0`'s root page is `0`, which `reindex` refuses rather than
+    // write over the file control record. That is fine for every test below:
+    // none of them ever dirties a block before closing it, so `reindex` is
+    // never asked to run. The case where it *is* asked -- a dirty block with
+    // a real root -- is `close_reindexes_a_dirty_block_but_never_a_clean_one`
+    // in `crate::btrieve`'s own tests, which has `seed_indexed`'s properly
+    // rooted fixture to use instead.
+
+    #[test]
+    fn clsbtv_closes_a_file_and_gives_its_four_allocations_back() {
+        let dir = crate::testing::scratch_with("clsbtv-close", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        let key = f.host.btrieve.block(block).expect("open").key();
+        let data = f.host.btrieve.block(block).expect("open").data();
+        let filnam = FarPtr {
+            offset: field(&f, block, 128),
+            selector: field(&f, block, 130),
+        };
+        assert!(f.host.heap.block(key).is_some(), "the key buffer is allocated");
+        assert!(f.host.heap.block(data).is_some(), "the record buffer is allocated");
+        assert!(f.host.heap.block(filnam).is_some(), "the name is allocated");
+        assert!(f.host.heap.block(block).is_some(), "the block itself is allocated");
+
+        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+
+        assert!(
+            f.host.btrieve.files().iter().all(|b| b.block() != block),
+            "the block is gone from the open files"
+        );
+        assert_eq!(
+            bb(&f),
+            block,
+            "closing a file makes it current on the way out, per PLBTVSTF.C:637"
+        );
+
+        assert!(f.host.heap.block(key).is_none(), "the key buffer came back");
+        assert!(f.host.heap.block(data).is_none(), "the record buffer came back");
+        assert!(f.host.heap.block(filnam).is_none(), "the name came back");
+        assert!(f.host.heap.block(block).is_none(), "the block itself came back");
+    }
+
+    #[test]
+    fn clsbtv_on_an_already_closed_block_does_nothing() {
+        let dir = crate::testing::scratch_with("clsbtv-double-close", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+        // A second close of the same pointer: `filnam` is already null, so
+        // `PLBTVSTF.C:637`'s guard is false and nothing runs -- in
+        // particular nothing tries to free what the first close already
+        // gave back, which would be a double free if it did.
+        f.invoke(clsbtv, &Fixture::far(block))
+            .expect("a no-op, not an error");
+        assert_eq!(
+            bb(&f),
+            block,
+            "bb is written whether or not there was anything to close"
+        );
+    }
+
+    #[test]
+    fn clsbtv_leaves_a_clean_block_completely_untouched() {
+        // `OTHER.DAT` is never written to, so a close of it must leave the
+        // file byte-for-byte as it was -- not merely unchanged in meaning,
+        // but never opened for writing at all. `index_pages` refuses any
+        // key needing more than one leaf page, which is most of the files
+        // MajorMUD ships records in, and `dirty` is the only thing standing
+        // between a clean close and that refusal -- see
+        // `close_reindexes_a_dirty_block_but_never_a_clean_one` for the case
+        // where the block *is* dirty.
+        let dir = crate::testing::scratch_with("clsbtv-clean-untouched", &["OTHER.DAT"]);
+        let path = dir.join("OTHER.DAT");
+        let before = std::fs::read(&path).expect("read before");
+
+        let mut f = Fixture::rooted(dir);
+        let other = open(&mut f, "OTHER.DAT", 32);
+        f.invoke(clsbtv, &Fixture::far(other)).expect("closes");
+
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(before, after, "a clean close never touches the file");
     }
 
     #[test]

@@ -176,11 +176,13 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
     // Btrieve: the write family. `dinsbtv` and `dupdbtv` write; `invbtv` and
     // `delbtv` reproduce what `PLBTVSTF.C` did with no file current, and
-    // refuse when there is one.
+    // refuse when there is one; `clsbtv` flushes the index and gives four
+    // allocations back.
     (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
     (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
     (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
     (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
+    (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
     // Streams: the module's own files, read and written.
     (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
     (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),

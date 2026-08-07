@@ -995,6 +995,103 @@ impl Btrieve {
         &self.open
     }
 
+    /// Close `at`, as everything in `PLBTVSTF.C:632` *after* `bb=bbp` does.
+    ///
+    ///
+    /// `bb=bbp` is [`shims::btrieve::clsbtv`](crate::shims::btrieve::clsbtv)'s
+    /// job, not this one's -- `bb` is a module global this type does not
+    /// touch, and it has to be written whether or not anything below finds a
+    /// file to close. What is here is the guard and everything behind it.
+    ///
+    /// Returns whether `at` named an open file. `false` is not an error: it
+    /// is what a second `clsbtv` of the same block answers, and what a
+    /// pointer that was never opened answers too -- `PLBTVSTF.C` could not
+    /// tell those two apart either.
+    ///
+    /// # The guard is read out of module memory, not out of [`Self::open`]
+    ///
+    /// `bb->filnam != NULL` is measured the way the original measured it:
+    /// four bytes at `at`'s own `field::FILNAM`. Reading it that way rather
+    /// than asking whether `at` is still in [`Self::open`] is what makes a
+    /// second close a genuine no-op and not merely one this type happens to
+    /// agree with -- the first close nulls those four bytes before it frees
+    /// anything, and [`Heap::free`](crate::Heap::free) never clears what it
+    /// frees (see its own doc comment), so a second read of the same address
+    /// still finds them null even after the block itself has been given
+    /// back.
+    ///
+    /// # Errors
+    ///
+    /// If `at` is not null, names a filename that is not null, but is not a
+    /// file this host has open -- module memory that looks like an open
+    /// block but is not one, which nothing in this crate can honour. If the
+    /// block is dirty and [`Block::reindex`] fails: this is the flush point
+    /// the whole design rests on, and a file going out of this host's reach
+    /// with an index that disagrees with its data is exactly what `reindex`
+    /// exists to prevent. Or if any of the four allocations cannot be freed.
+    pub fn close(
+        &mut self,
+        machine: &mut Machine,
+        heap: &mut crate::Heap,
+        at: FarPtr,
+    ) -> Result<bool, BtvError> {
+        if at == FarPtr::NULL {
+            // `goodptr(bb=bbp)` is false for a null `bbp`.
+            return Ok(false);
+        }
+
+        let filnam_at = FarPtr {
+            offset: at.offset + field::FILNAM,
+            selector: at.selector,
+        };
+        let bytes = machine.resolve(filnam_at, 4).map_err(|e| BtvError {
+            file: format!("{at}"),
+            why: e.to_string(),
+        })?;
+        let filnam = FarPtr::from_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if filnam == FarPtr::NULL {
+            // Either a second close of a block already closed, or a pointer
+            // that never named one. `bb->filnam != NULL` is false either
+            // way, and so is this.
+            return Ok(false);
+        }
+
+        let index = self.find(at).map_err(|why| BtvError {
+            file: format!("{at}"),
+            why,
+        })?;
+        let name = self.open[index].name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        // `bb->filnam=NULL` -- written before anything is freed, exactly
+        // where `PLBTVSTF.C:639` writes it, so the re-entrancy guard above
+        // holds from here on regardless of what happens next.
+        machine
+            .write(filnam_at, &FarPtr::NULL.to_bytes())
+            .map_err(|e| fail(e.to_string()))?;
+
+        // The flush point. A block that was never written is never
+        // reindexed -- which is not merely tidy, it is load-bearing:
+        // `pages::index_pages` refuses any key needing more than one leaf
+        // page, and nine of MajorMUD's eleven files with records need one.
+        // Reindexing every close rather than only a dirty one would stop the
+        // module on the first `WCCITEMS` or `WCCTEXT` it closed.
+        if self.open[index].dirty {
+            self.open[index].reindex()?;
+        }
+
+        let block = self.open.remove(index);
+        heap.free(block.key).map_err(fail)?;
+        heap.free(block.data).map_err(fail)?;
+        heap.free(filnam).map_err(fail)?;
+        heap.free(block.block).map_err(fail)?;
+
+        Ok(true)
+    }
+
     fn find(&self, at: FarPtr) -> Result<usize, String> {
         self.open
             .iter()
@@ -1769,6 +1866,112 @@ mod tests {
         block.records().expect("reads");
         let e = block.reindex().expect_err("page 99 does not exist in a 5-page file");
         assert!(e.why.contains("99"), "{e}");
+    }
+
+    /// The record count stored in key 0's own definition -- `fcr::KEY_RECORDS`
+    /// at `0x110 + 0x04`. Only [`Block::reindex`] ever writes it; an ordinary
+    /// insert or update does not, which is what makes it a witness to whether
+    /// a close actually rebuilt the index rather than merely not erroring.
+    fn key_records(path: &Path) -> u32 {
+        let bytes = std::fs::read(path).expect("read the file back");
+        pages::long(&bytes[0x114..0x118])
+    }
+
+    /// Register `seed_indexed`'s block as a real open file: allocate its four
+    /// module-memory pieces on a real heap and write `field::FILNAM` the way
+    /// [`Btrieve::open`] does, then push it directly rather than going
+    /// through `keys::parse` -- `seed_indexed`'s key definition has no real
+    /// attributes, only a root, and `block_indexed`'s hand-built [`Key`]
+    /// already describes it correctly. Returns the pointer a module's `bb`
+    /// would hold.
+    fn open_indexed(
+        machine: &mut Machine,
+        heap: &mut crate::Heap,
+        btrieve: &mut Btrieve,
+        path: PathBuf,
+    ) -> FarPtr {
+        let mut block = block_indexed(path);
+
+        let filnam = heap.alloc(machine, 12).expect("alloc filnam");
+        machine.write(filnam, b"INDEXED.DAT\0").expect("write filnam");
+
+        let data = heap.alloc(machine, block.maxlen).expect("alloc data");
+        machine
+            .write(data, &vec![0u8; usize::from(block.maxlen)])
+            .expect("write data");
+
+        let key = heap.alloc(machine, 3).expect("alloc key");
+        machine.write(key, &[0u8; 3]).expect("write key");
+
+        let at = heap.alloc(machine, field::SIZE).expect("alloc block");
+        let mut image = vec![0u8; usize::from(field::SIZE)];
+        let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
+            let start = usize::from(offset);
+            image[start..start + bytes.len()].copy_from_slice(bytes);
+        };
+        put(&mut image, field::FILNAM, &filnam.to_bytes());
+        put(&mut image, field::DATA, &data.to_bytes());
+        put(&mut image, field::KEY, &key.to_bytes());
+        machine.write(at, &image).expect("write block");
+
+        block.block = at;
+        block.data = data;
+        block.key = key;
+        btrieve.open.push(block);
+        at
+    }
+
+    /// I4: `close` must call `reindex` exactly when the block is dirty, and
+    /// not otherwise -- `pages::index_pages` refuses any key needing more
+    /// than one leaf page, which is nine of MajorMUD's eleven files with
+    /// records, and the `dirty` flag is the only thing standing between a
+    /// clean close of one of those and that refusal.
+    #[test]
+    fn close_reindexes_a_dirty_block_but_never_a_clean_one() {
+        let mut machine = Machine::new().expect("a 16-bit machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let mut btrieve = Btrieve::default();
+
+        // Dirty: an insert alone never touches a key's own record count --
+        // only `reindex` does. That field moving from 0 to 1 is proof the
+        // rebuild ran, not merely that the close did not error.
+        let dirty_path = seed_indexed(&crate::testing::scratch("btrieve-close-reindex-dirty"));
+        let dirty = open_indexed(&mut machine, &mut heap, &mut btrieve, dirty_path.clone());
+        btrieve
+            .block_mut(dirty)
+            .expect("open")
+            .insert(&record(1))
+            .expect("insert");
+        assert_eq!(
+            key_records(&dirty_path),
+            0,
+            "an insert alone leaves the key's own count alone"
+        );
+
+        btrieve
+            .close(&mut machine, &mut heap, dirty)
+            .expect("closes, and reindexes on the way");
+        assert_eq!(
+            key_records(&dirty_path),
+            1,
+            "closing a dirty block rebuilds the index"
+        );
+
+        // Clean: a second file with the same shape and the same real index
+        // root, never written to. If `close` reindexed regardless of
+        // `dirty`, this would still succeed -- the fixture's one entry fits
+        // on one leaf page -- but its bytes would change, because
+        // `index_pages` does not promise to reproduce Btrieve's own byte
+        // layout (see `pages::index_pages`'s doc comment). Byte-for-byte
+        // identical is only possible if `reindex` was never called.
+        let clean_path = seed_indexed(&crate::testing::scratch("btrieve-close-reindex-clean"));
+        let before = std::fs::read(&clean_path).expect("read before");
+        let clean = open_indexed(&mut machine, &mut heap, &mut btrieve, clean_path.clone());
+        btrieve
+            .close(&mut machine, &mut heap, clean)
+            .expect("closes without ever asking to reindex");
+        let after = std::fs::read(&clean_path).expect("read after");
+        assert_eq!(before, after, "a clean close never touches the file");
     }
 
     #[test]
