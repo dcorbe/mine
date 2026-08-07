@@ -669,12 +669,11 @@ impl Block {
 
         // Just the first page: every field this touches -- the key
         // definitions and their record counts -- lives well inside it (see
-        // `fcr::KEYS`), and reading the whole file to reindex a 43 MB one
+        // `fcr::KEYS`), and reading the whole file to reindex an 80 MB one
         // would defeat the point of writing one page at a time.
-        let mut fcr = std::fs::read(&self.path).map_err(|e| {
+        let mut fcr = read_head(&self.path, usize::from(self.geometry.page)).map_err(|e| {
             fail(format!("{}: {e}", self.path.display()))
         })?;
-        fcr.truncate(usize::from(self.geometry.page));
 
         for key in &self.keys {
             let entries: Vec<(Vec<u8>, u32)> = (0..records.ordered_len(key.number).unwrap_or(0))
@@ -1450,6 +1449,61 @@ mod tests {
             cursor: Cursor::Nowhere,
             dirty: false,
         }
+    }
+
+    /// Bytes this process has read at the syscall level, from `/proc/self/io`'s
+    /// `rchar` -- counted whether or not the bytes came off disk, which is
+    /// exactly what distinguishes "read the first page" from "read the whole
+    /// file and throw most of it away".
+    fn bytes_read_by_this_process() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/io").expect("/proc/self/io");
+        stat.lines()
+            .find_map(|line| line.strip_prefix("rchar:"))
+            .expect("an rchar line")
+            .trim()
+            .parse()
+            .expect("rchar is a number")
+    }
+
+    /// I1: `reindex` touches only the file control record, and must cost the
+    /// same whether the file behind it is 2.5 KB or 80 MB -- `WCCUPDAT.DAT`
+    /// is real at 80 MB, and a `reindex` that read the whole thing before
+    /// truncating to one page would defeat the point of writing one page at
+    /// a time.
+    ///
+    /// Grows `seed_indexed`'s file to a **sparse** 64 MiB with `set_len` --
+    /// free on any filesystem that supports holes, since nothing is written
+    /// to the new range -- then measures how many bytes `reindex` itself
+    /// reads via `/proc/self/io`, which counts a sparse hole's zeroed bytes
+    /// the same as any other: a whole-file read shows up as tens of millions
+    /// of bytes; reading a handful of pages does not. A wall-clock budget
+    /// would have worked too, but on this host reading a sparse gigabyte
+    /// measured at barely half a second either way -- not a reliable
+    /// tripwire under a parallel test run -- while the byte count is exact.
+    #[test]
+    fn reindex_does_not_read_the_whole_file_to_rebuild_one_page() {
+        let dir = crate::testing::scratch("block-reindex-sparse-file");
+        let path = seed_indexed(&dir);
+        let mut block = block_indexed(path.clone());
+        block.insert(&record(1)).expect("insert");
+
+        let grown = 64 * 1024 * 1024;
+        let big = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open to grow");
+        big.set_len(grown).expect("grow the file sparsely");
+        drop(big);
+
+        let before = bytes_read_by_this_process();
+        block.reindex().expect("reindexes without reading the sparse tail");
+        let read = bytes_read_by_this_process().saturating_sub(before);
+
+        assert!(
+            read < 1024 * 1024,
+            "reindex read {read} bytes off a {grown}-byte file -- it read more \
+             than the first page"
+        );
     }
 
     #[test]
