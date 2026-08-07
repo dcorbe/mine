@@ -223,15 +223,36 @@ impl Gsbl {
     }
 }
 
+/// The default input translate table, `btuxlt` page 184.
+///
+/// In force whether or not anyone calls `btuxlt` -- which `WCCMMUD.DLL` never
+/// does. `None` is a character the table drops entirely: every control
+/// character except backspace and CR, once the high bit (which the guide says
+/// is "always translated to 0") has already been stripped. This is also why a
+/// bare LF never reaches the terminator match below -- LF is a dropped
+/// control character, not a special case of it.
+fn translate(byte: u8) -> Option<u8> {
+    // the high bit is always cleared, before anything else
+    match byte & 0x7f {
+        0x08 => Some(0x08),         // backspace, as itself
+        0x0d => Some(0x0d),         // carriage return, as itself
+        0x7f => Some(0x08),         // RUBOUT is a backspace on terminals without one
+        b @ 0x20..=0x7e => Some(b), // printable, as themselves
+        _ => None,                  // every other control character is ignored
+    }
+}
+
 impl Channel {
     /// One byte, through the guide's ASCII input pipeline.
     ///
-    /// The guide (`btuchi`) numbers eleven steps. Five of them have no setter
+    /// The guide (`btuchi`) numbers eleven steps. Four of them have no setter
     /// `WCCMMUD.DLL` calls and no meaning on a socket -- parity and framing
-    /// checks, XON/XOFF, the output-abort character, and the translate table --
-    /// so what is left is lockout, mode, backspace, terminator, length limit,
-    /// capacity and echo, **in that order**. The order is the guide's, and it
-    /// is why a backspace can be echoed while a byte past `maxinl` is not.
+    /// checks, XON/XOFF, and the output-abort character -- so what is left is
+    /// lockout, mode, **the default translate table**, backspace, terminator,
+    /// length limit, capacity and echo, **in that order**. The order is the
+    /// guide's, and it is why a backspace can be echoed while a byte past
+    /// `maxinl` is not, and why DEL becomes a backspace before the backspace
+    /// step ever sees it.
     fn take(&mut self, byte: u8) {
         // 2. Input lockout. The byte never happened.
         if self.locked {
@@ -249,6 +270,15 @@ impl Channel {
             }
             return;
         }
+
+        // 6. The default input translate table. Not optional: it is what
+        //    turns DEL into a backspace for terminals without one, drops
+        //    every other control character (a telnet client's CR NUL would
+        //    otherwise leak a NUL into the next command), and strips the
+        //    high bit (telnet IAC, 0xFF, would otherwise land in the line).
+        let Some(byte) = translate(byte) else {
+            return;
+        };
 
         match byte {
             // 7. Backspace. At column zero there is nothing to erase and
@@ -268,11 +298,6 @@ impl Channel {
                     self.output.extend(b"\r\n");
                 }
             }
-
-            // A linefeed is not a terminator. Every telnet client sends CRLF,
-            // and treating the LF as a second terminator would hand the module
-            // an empty command after every real one.
-            b'\n' => {}
 
             _ => {
                 // 9. Line length limit, then 10. buffer capacity. A byte that
@@ -434,6 +459,34 @@ mod tests {
         g.push_input(0, b"\x08");
         g.push_input(0, b"lookk\x08\r");
         assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+    }
+
+    #[test]
+    fn del_is_translated_to_backspace() {
+        // R2, guide btuxlt page 184: RUBOUT (ASCII 127) becomes BACKSPACE, a concession to old terminals without a backspace key. Every modern terminal emulator's Backspace key
+        // sends 0x7F.
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"lookx\x7f\x7f\r");
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"loo"[..]));
+    }
+
+    #[test]
+    fn control_characters_other_than_backspace_and_cr_are_ignored() {
+        // R2, guide btuxlt page 184: every other control character is dropped. An RFC 854 client's CR NUL would otherwise leak the NUL
+        // into the next command.
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"lo\x00\x07\x1bok\r"); // NUL, BEL, ESC
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+    }
+
+    #[test]
+    fn the_high_bit_is_stripped_before_translation() {
+        // R2, guide btuxlt page 184: the high bit is always cleared. Telnet IAC (0xFF) would otherwise land in the
+        // command line; here a stray high-bit byte becomes the ASCII
+        // character underneath it (0xE9 & 0x7F == 0x69 == 'i').
+        let mut g = Gsbl::new(1);
+        g.push_input(0, b"look\xe9ng\r");
+        assert_eq!(g.take_line(0).as_deref(), Some(&b"looking"[..]));
     }
 
     #[test]
