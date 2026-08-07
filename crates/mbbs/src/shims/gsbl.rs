@@ -112,18 +112,37 @@ pub fn btutrg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 }
 
 /// `int btuxnf(int chan, int xon, int xoff, ...)` -- the XON and XOFF
-/// characters. Varargs: the module cleans 3 words at six sites and 6 at eight
-/// others, but only the first three are ever read here.
+/// characters, and (R5, guide `btuxnf` page 193) page mode. A **negative**
+/// `xoff` selects page mode and adds two more arguments: `cnt`, the number of
+/// lines to show before pausing, and `stg`, the pause message -- which is why
+/// the module cleans 3 words at six call sites (plain flow control) and 6 at
+/// eight others (page mode). Those two are only read when `xoff` says to
+/// expect them, never a blind read of the variadic tail.
+///
+/// Page mode itself is **not implemented** -- see `Channel::page_lines`.
+/// `cnt` and the pause message are recorded so they are not lost, and
+/// pagination is a driver problem (Batch C of this plan), not a GSBL one.
 pub fn btuxnf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, xon, xoff) = (
         machine.arg_u16(0) as i16,
         machine.arg_u16(1),
-        machine.arg_u16(2),
+        machine.arg_u16(2) as i16,
     );
+    let page = if xoff < 0 {
+        let cnt = machine.arg_u16(3);
+        let stg = machine.arg_far(4);
+        Some((cnt, machine.read_cstr(stg)?.to_vec()))
+    } else {
+        None
+    };
     Ok(match on_channel(host, chan, |g| {
         let c = g.channel_mut(chan).expect("in range");
         c.xon = xon as u8;
         c.xoff = xoff as u8;
+        if let Some((cnt, message)) = page {
+            c.page_lines = cnt;
+            c.page_message = Some(message);
+        }
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -382,6 +401,35 @@ mod tests {
             Ret::U16(4),
             "nothing was drained -- the bytes are still there to ask for again"
         );
+    }
+
+    #[test]
+    fn btuxnf_with_a_negative_xoff_records_the_page_parameters_without_paginating() {
+        // R5, guide btuxnf page 193: a negative xoff selects page mode and
+        // adds cnt/stg -- measured from the DLL's own six-word call sites:
+        // btuxnf(usrnum, 0, 0xffed, 0x16, <far ptr to "Hit any key...">).
+        // Pagination is deliberately not implemented; this only pins that
+        // the parameters are not lost.
+        let mut f = Fixture::new();
+        let msg = f.text("Hit any key to continue...");
+        f.invoke(btuxnf, &[0, 0, 0xffed, 22, msg.offset, msg.selector])
+            .expect("ok");
+        let c = f.host.gsbl().channel(0).expect("chan 0");
+        assert_eq!(c.xoff, 0xed, "the low byte still lands, negative or not");
+        assert_eq!(c.page_lines, 22);
+        assert_eq!(
+            c.page_message.as_deref(),
+            Some(b"Hit any key to continue...".as_slice())
+        );
+    }
+
+    #[test]
+    fn btuxnf_with_a_positive_xoff_records_no_page_parameters() {
+        let mut f = Fixture::new();
+        f.invoke(btuxnf, &[0, 0, 19]).expect("ok");
+        let c = f.host.gsbl().channel(0).expect("chan 0");
+        assert_eq!(c.page_lines, 0);
+        assert_eq!(c.page_message, None);
     }
 
     #[test]

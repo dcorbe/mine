@@ -79,6 +79,17 @@ pub struct Channel {
     pub xon: u8,
     pub xoff: u8,
 
+    /// `btuxnf`'s page-mode parameters (R5, guide page 193): a negative
+    /// `xoff` selects page mode, and `cnt` is how many lines to show before
+    /// pausing. Recorded so the values are not lost, but **pagination itself
+    /// is not implemented** -- it needs the driver Batch C of this plan
+    /// builds, which decides when a screen's worth of lines has gone out.
+    pub(crate) page_lines: u16,
+    /// `btuxnf`'s page-mode parameters (R5, guide page 193): the pause
+    /// message shown between screens, e.g. `"Hit any key to continue..."`.
+    /// Recorded, not acted on -- see `page_lines`.
+    pub(crate) page_message: Option<Vec<u8>>,
+
     /// Set when the last byte written was a CR whose LF this host supplied, so
     /// that a module sending an explicit `\r\n` does not get two linefeeds.
     /// On `Channel` rather than local to `transmit` because the pair can arrive
@@ -104,6 +115,8 @@ impl Default for Channel {
             oes: false,
             xon: 0,
             xoff: 0,
+            page_lines: 0,
+            page_message: None,
             supplied_lf: false,
         }
     }
