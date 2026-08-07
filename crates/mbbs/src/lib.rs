@@ -817,6 +817,10 @@ impl Host {
     /// `MAJORBBS.C:558`'s `lonstf()` called for every registered module. Only
     /// one module is registered here, so this calls the one.
     ///
+    /// Returns `None` if the module supplies no `lonrou` -- the real host
+    /// never called one either, so there is no [`Outcome`] to report for a
+    /// call that never happened.
+    ///
     /// # Errors
     ///
     /// If `chan` names no channel, a write runs off a segment, no module has
@@ -827,7 +831,7 @@ impl Host {
         module: &Module,
         chan: i16,
         who: &users::Connection,
-    ) -> io::Result<Outcome> {
+    ) -> io::Result<Option<Outcome>> {
         self.connect_state(machine, chan, who).map_err(shim_io)?;
 
         // `Registration::entry` borrows `self.modules()` immutably, and
@@ -840,13 +844,14 @@ impl Host {
             registered.entry(machine, 0).map_err(shim_io)?
         };
         let Some(lonrou) = lonrou else {
-            // A null `lonrou` is legal -- the real host checked
-            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling. It
-            // means the module wants no logon hook, not that anything is
-            // wrong.
-            return Ok(Outcome::Returned { ax: 0, dx: 0 });
+            // R24: a null `lonrou` is legal -- the real host checked
+            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
+            // and it means no call happened, not that one returned zero.
+            // `None` says that honestly; a fabricated `Returned { ax: 0,
+            // dx: 0 }` would claim a call this host never made.
+            return Ok(None);
         };
-        self.run(machine, module, lonrou, &[])
+        self.run(machine, module, lonrou, &[]).map(Some)
     }
 
     /// Service one channel that has something to report.
@@ -864,9 +869,10 @@ impl Host {
     ///   anything else     -> a note, and no call
     /// ```
     ///
-    /// Returns `None` if no channel has a status waiting, or if the one that
-    /// did raised a status nothing here dispatches -- either way there is no
-    /// module call to report an [`Outcome`] for.
+    /// Returns `None` if no channel has a status waiting, if the one that
+    /// did raised a status nothing here dispatches, or if the module
+    /// supplies no entry point for the one that would have been called --
+    /// none of those is a module call, so there is no [`Outcome`] to report.
     ///
     /// # Errors
     ///
@@ -935,7 +941,19 @@ impl Host {
                 registered.entry(machine, entry_index).map_err(shim_io)?
             };
             let Some(entry) = entry else {
-                return Ok(Some(Outcome::Returned { ax: 0, dx: 0 }));
+                // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
+                // the input", which the module never answered here -- a
+                // fabricated `Returned { ax: 0, dx: 0 }` would claim a call
+                // that never happened. On the CRSTG path `get_input` above
+                // has already taken the line, so a module with no `sttrou`
+                // silently drops every command; not implementing
+                // `module00`'s fallback is in scope, dropping the line
+                // without a word about it is not.
+                self.note(format!(
+                    "poll: channel {chan} has no entry {entry_index} registered; \
+                     status {status} was serviced with no module call"
+                ));
+                continue;
             };
             return self.run(machine, module, entry, &[]).map(Some);
         }
@@ -1495,5 +1513,54 @@ mod tests {
             err.to_string().contains("no module has registered"),
             "expected to reach the CRSTG dispatch past the OVRFLW: {err}"
         );
+    }
+
+    /// R24: a module that registers but supplies no `sttrou` must not make
+    /// `poll` fabricate `Returned { ax: 0, dx: 0 }` for a call that never
+    /// happened -- and the CRSTG line `get_input` already took must leave a
+    /// note behind, not disappear silently.
+    #[test]
+    fn poll_notes_rather_than_fabricates_when_the_registered_module_has_no_sttrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        // A `struct module` block: a name, then nine far pointers, all left
+        // null -- a module that registers but supplies no entry points at
+        // all, `sttrou` included.
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        let notes_before = f.host.notes().len();
+        let outcome = f.host.poll(&mut f.machine, &module).expect("no fault");
+
+        assert_eq!(outcome, None, "no sttrou means no call happened");
+        assert!(
+            f.host.notes().len() > notes_before,
+            "a command dropped for lack of an entry point must leave a note"
+        );
+    }
+
+    /// R24: the same fabrication, on `connect`'s side -- a module that
+    /// registers with no `lonrou` at all must answer `None`, not a
+    /// `Returned { ax: 0, dx: 0 }` for a `lonrou` call that never happened.
+    #[test]
+    fn connect_answers_none_rather_than_fabricates_when_lonrou_is_null() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+
+        let outcome = f
+            .host
+            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .expect("connect_state ran and there was nothing to call");
+        assert_eq!(outcome, None, "no lonrou means no call happened");
     }
 }
