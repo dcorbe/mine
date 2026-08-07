@@ -711,17 +711,36 @@ impl Host {
             .slot(chan)
             .expect("in range, so it has a user slot too");
 
-        // `UIDSIZ` (`UStructs.h:10`) is 30, and `psword` starts immediately
-        // after `userid` in the record -- a longer name is truncated rather
-        // than overrunning it.
+        // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
+        // the header's own comment says so -- so at most 29 characters fit
+        // and byte 29 must stay a NUL; `psword` starts immediately after
+        // `userid` in the record, at 30, and a longer name is truncated
+        // rather than overrunning it.
+        //
+        // The whole field is zeroed before the name is written in, not just
+        // the bytes the name occupies. `connect_state` can run again on a
+        // channel that already held a user -- Task 8/9's driver reuses
+        // channels rather than allocating a fresh one per connection -- and
+        // writing only `take` bytes would leave the tail of a longer, earlier
+        // name sitting past the new one. `userid` is what `obtbtvl` keys the
+        // character lookup on (`WCCMMUD_named.c:9847`), so that tail is not
+        // cosmetic: "dan" over "rangerdan" reads back as "dangerdan" and the
+        // module finds a stranger's character.
+        //
+        // Only `userid` is reset here, not the account's other 308 bytes.
+        // Whether a reused channel should clear the whole record is a real
+        // question, but it belongs with `lofrou`/disconnect -- there is no
+        // disconnect in this plan to decide it against.
         const UIDSIZ: usize = 30;
         let userid = who.userid.as_bytes();
-        let take = userid.len().min(UIDSIZ);
+        let take = userid.len().min(UIDSIZ - 1);
+        let mut field = [0u8; UIDSIZ];
+        field[..take].copy_from_slice(&userid[..take]);
         let at = FarPtr {
             offset: account.offset + users::usracc::USERID as u16,
             selector: account.selector,
         };
-        machine.write(at, &userid[..take])?;
+        machine.write(at, &field)?;
 
         let at = FarPtr {
             offset: account.offset + users::usracc::ANSIFL as u16,

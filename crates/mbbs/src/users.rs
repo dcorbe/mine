@@ -577,10 +577,12 @@ mod tests {
 
     #[test]
     fn a_userid_longer_than_uidsiz_is_truncated_rather_than_overrunning_psword() {
-        // `UIDSIZ` (`UStructs.h:10`) is 30 and `psword` starts immediately
-        // after `userid` in the record. A connection whose name is longer
-        // than that must lose the tail of the name, not spill into the
-        // password field that follows it.
+        // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
+        // the comment says so -- so only 29 characters fit and byte 29 must
+        // be the NUL. `psword` starts immediately after `userid` in the
+        // record, at 30; a connection whose name is longer than that must
+        // lose the tail of the name, not spill into the password field that
+        // follows it.
         let mut f = crate::testing::Fixture::new();
         let long = "a".repeat(40);
         f.host
@@ -589,11 +591,38 @@ mod tests {
         let at = f.host.users().account(0).expect("channel 0");
         let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
 
-        assert_eq!(&rec[..30], vec![b'a'; 30].as_slice(), "exactly UIDSIZ bytes of it");
+        assert_eq!(&rec[..29], vec![b'a'; 29].as_slice(), "29 characters, not 30");
+        assert_eq!(rec[29], 0, "byte 29 is the trailing zero UIDSIZ counts in");
         assert!(
             rec[30..40].iter().all(|&b| b == 0),
             "nothing past userid was written -- psword starts at 30 and stays zero: {:?}",
             &rec[30..40]
+        );
+    }
+
+    #[test]
+    fn a_shorter_second_userid_does_not_leave_the_first_ones_tail_behind() {
+        // R13: connect_state only ever `take` bytes, so a channel reused by a
+        // shorter name kept whatever the longer, earlier name left behind --
+        // "rangerdan" then "dan" read back as "dangerdan". `userid` is what
+        // `obtbtvl` keys the character lookup on (`WCCMMUD_named.c:9847`), so
+        // that splice hands the second user someone else's identity.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .expect("channel 0, first connect");
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("dan"))
+            .expect("channel 0, second connect");
+
+        let at = f.host.users().account(0).expect("channel 0");
+        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+
+        assert_eq!(&rec[..3], b"dan", "the second userid");
+        assert!(
+            rec[3..30].iter().all(|&b| b == 0),
+            "no tail of \"rangerdan\" survives past the new name: {:?}",
+            &rec[3..30]
         );
     }
 
