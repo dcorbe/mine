@@ -1864,6 +1864,33 @@ mod tests {
         let end1 = read_ptr(&f.machine, slot(margn, 1));
         assert_eq!(end0.offset - input.offset, 3);
         assert_eq!(end1.offset - input.offset, 7);
+
+        // margn[margc-1] -- the slot the early-return path inside the inner
+        // loop is the one that fills, because "gold" runs straight into
+        // `input`'s own terminator with no trailing separator of its own.
+        // `rstrin` reads exactly this slot for the last gap; miss it here and
+        // a test can be self-consistent while `rstrin` still writes a space
+        // through a stale pointer.
+        let end2 = read_ptr(&f.machine, slot(margn, 2));
+        assert_eq!(end2.offset - input.offset, 12, "the early-return path's margn write");
+
+        // The other way margn[margc-1] gets filled: trailing whitespace after
+        // the last word, which the *outer* tail reaches instead of the inner
+        // loop's early return. Same slot, different path -- both must land on
+        // the true separator, not on whatever the early-return path would
+        // have written.
+        let mut f = Fixture::new();
+        let input = f.host.globals().address("input").expect("input");
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold  ")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
+
+        let margn = f.host.globals().address("margn").expect("margn");
+        let end2 = read_ptr(&f.machine, slot(margn, 2));
+        assert_eq!(end2.offset - input.offset, 12, "the outer-tail path's margn write");
     }
 
     #[test]
