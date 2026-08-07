@@ -186,14 +186,24 @@ impl Layout {
     /// [`records::walk`](super::records) stops reading a page at the first slot
     /// that is neither live nor free, so a gap would hide every record behind
     /// it.
+    ///
+    /// I2: `taken` is sorted once here rather than probed with `.contains` on
+    /// every slot of every data page -- for a file the shape of `WCCUPDAT.DAT`
+    /// (38,754 records, one slot per page) the unsorted version was a linear
+    /// scan of up to 38,754 positions inside a loop over up to 39,211 pages,
+    /// roughly 1.5 billion comparisons for a single insert. Sorting once and
+    /// binary-searching is `O(records log records + pages)` instead, and the
+    /// caller sees no difference: same inputs, same [`Slot`] out.
     pub fn next_slot(self, taken: &[u32], free: Option<u32>, data: &[u32]) -> Slot {
         if let Some(at) = free {
             return Slot::Free(at);
         }
+        let mut sorted = taken.to_vec();
+        sorted.sort_unstable();
         for page in data {
             for slot in 0..self.per_page() {
                 let at = self.position(*page, slot);
-                if !taken.contains(&at) {
+                if sorted.binary_search(&at).is_err() {
                     return Slot::Existing(at);
                 }
             }
@@ -693,6 +703,69 @@ mod tests {
         assert_eq!(
             layout.next_slot(&taken, None, &[2, 3, 4, 5]),
             Slot::Existing(2 * 512 + 6 + 126)
+        );
+    }
+
+    /// `next_slot` sorts its own copy of `taken` (I2); a naive `sort` followed
+    /// by `binary_search` would give the right answer only if the caller
+    /// already handed it a sorted slice. Nothing about the signature says
+    /// that, `Records::positions` does not sort, and this hands `taken` in
+    /// descending order -- the opposite of the file's own page order -- to
+    /// make sure the answer does not depend on the order the caller happened
+    /// to build it in.
+    #[test]
+    fn next_slot_does_not_care_what_order_taken_arrives_in() {
+        let layout = Layout {
+            page: 512,
+            physical: 126,
+            pages: 6,
+        };
+        assert_eq!(layout.per_page(), 4, "four 126-byte records fit a 512-byte page");
+
+        // Every slot of pages 2 and 3 taken -- eight positions -- handed over
+        // highest-first, the opposite of the order a sorted scan would want.
+        let mut taken: Vec<u32> = [2u32, 3]
+            .iter()
+            .flat_map(|&page| (0..4).map(move |slot| layout.position(page, slot)))
+            .collect();
+        taken.reverse();
+
+        assert_eq!(
+            layout.next_slot(&taken, None, &[2, 3, 4, 5]),
+            Slot::Existing(4 * 512 + 6),
+            "pages 2 and 3 are full regardless of the order taken lists them in"
+        );
+    }
+
+    /// I2: the cost this exists to bound. 100,000 data pages, one slot each,
+    /// all but the last taken -- close to the shape of `WCCUPDAT.DAT`
+    /// (38,754 records, 39,211 pages, one slot per page). Confirmed against
+    /// the pre-fix `.contains` scan by reverting this method and rerunning
+    /// this test: 36.5 seconds in the same `cargo test` debug build that
+    /// runs the fixed version in 0.03 seconds. A half-second budget leaves
+    /// three orders of magnitude of room on the pass side while still
+    /// catching a regression back to the linear scan.
+    #[test]
+    fn next_slot_stays_fast_at_wccupdats_scale() {
+        let layout = Layout {
+            page: 2048,
+            physical: 2015,
+            pages: 100_001,
+        };
+        // Pages 1..=100,000 all exist and hold records; every one but the
+        // last (100,000) has its one slot taken.
+        let data: Vec<u32> = (1..=100_000).collect();
+        let taken: Vec<u32> = (1..100_000).map(|page| layout.position(page, 0)).collect();
+
+        let start = std::time::Instant::now();
+        let slot = layout.next_slot(&taken, None, &data);
+        let elapsed = start.elapsed();
+
+        assert_eq!(slot, Slot::Existing(layout.position(100_000, 0)));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "next_slot took {elapsed:?} over 100,000 pages -- the O(records^2) \
+             scan is back"
         );
     }
 
