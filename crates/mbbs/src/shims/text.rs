@@ -294,6 +294,22 @@ pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                     // buffer's own terminator, with no separator of its own
                     // to turn into one -- so `setmem` never runs, and
                     // nothing past this NUL is touched.
+                    //
+                    // R18: `None` and `Some(0)` are not the same event.
+                    // `Some(0)` is the normal case, hitting `input`'s own
+                    // terminator. `None` is `i` having walked off the end of
+                    // `buf` with no terminator in it at all -- reachable only
+                    // if the module wrote `input` itself and called `parsin`
+                    // directly, since `Host::get_input` always terminates
+                    // within `size - 1`. The C this is transcribed from was
+                    // worse: it had no bound at all and would have walked
+                    // arbitrarily far past the buffer looking for a NUL that
+                    // might not exist. Here `i` cannot exceed `buf.len()` --
+                    // the very first out-of-bounds index returns `None` and
+                    // this arm returns immediately -- so `margn[margc-1]`
+                    // lands at `input`'s own end, which is `margv[0]`'s own
+                    // low byte: `globals.rs:565` places `margv` immediately
+                    // after `input`.
                     margn_ends.push(i as u16);
                     return write_parse(
                         machine,
