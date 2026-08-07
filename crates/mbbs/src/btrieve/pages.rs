@@ -307,6 +307,55 @@ pub fn write_record(
         .map_err(|e| fail("writing the file control record", e))
 }
 
+/// The free list's head, or `None` if it is empty.
+///
+/// Reads only the four bytes at [`fcr::FREE`]. `Block::insert` calls this
+/// itself rather than trusting a copy of the geometry it might be holding,
+/// because the free list is exactly the kind of thing an earlier write in the
+/// same session already changed.
+///
+/// # Errors
+///
+/// If the file cannot be opened or read.
+pub fn free_head(path: &std::path::Path) -> Result<Option<u32>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut bytes = [0u8; 4];
+    file.seek(SeekFrom::Start(fcr::FREE as u64))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(|e| format!("{}: reading the free-list head: {e}", path.display()))?;
+
+    let head = long(&bytes);
+    Ok((head != NOWHERE).then_some(head))
+}
+
+/// The number of every page that holds records, lowest first.
+///
+/// Reads just the six-byte header of each page rather than the whole file:
+/// [`Layout::next_slot`] only needs to know which pages are data pages, not
+/// what is in them.
+///
+/// # Errors
+///
+/// If the file cannot be opened, or a page's header cannot be read.
+pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut header = [0u8; HEADER as usize];
+    let mut out = Vec::new();
+    for number in 1..layout.pages {
+        file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+            .and_then(|_| file.read_exact(&mut header))
+            .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
+        if Header::decode(&header).data {
+            out.push(number);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +585,72 @@ mod tests {
             "the highest page in use grew"
         );
         assert_eq!(long(&bytes[0x1a..0x1e]), 2);
+    }
+
+    /// `Block::insert` needs the free-list head before it can call
+    /// [`Layout::next_slot`], and the seed file starts with none.
+    #[test]
+    fn free_head_reads_none_from_a_virgin_file() {
+        let dir = crate::testing::scratch("pages-free-head-empty");
+        let path = seed(&dir);
+        assert_eq!(free_head(&path).expect("reads"), None);
+    }
+
+    /// Once something is on the free list, its position is the head.
+    #[test]
+    fn free_head_reads_the_position_the_fcr_names() {
+        let dir = crate::testing::scratch("pages-free-head-set");
+        let path = seed(&dir);
+        let at = 4 * 64 + 6; // page 4, slot 0.
+
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[0x10..0x14].copy_from_slice(&to_long(at));
+        std::fs::write(&path, &bytes).expect("seed a free list");
+
+        assert_eq!(free_head(&path).expect("reads"), Some(at));
+    }
+
+    /// `Block::insert` needs to know which pages already hold records, and the
+    /// seed file has exactly one -- page 4, the others are index pages.
+    #[test]
+    fn data_pages_lists_only_pages_with_the_data_bit_set() {
+        let dir = crate::testing::scratch("pages-data-pages");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+
+        assert_eq!(data_pages(&path, layout).expect("reads"), vec![4]);
+    }
+
+    /// A page appended by `write_record` is picked up the next time
+    /// `data_pages` is asked, because `Block::insert` re-derives it fresh on
+    /// every call rather than caching it.
+    #[test]
+    fn data_pages_sees_a_page_appended_since_it_was_last_asked() {
+        let dir = crate::testing::scratch("pages-data-pages-grown");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        write_record(
+            &path,
+            layout,
+            Slot::NewPage {
+                number: 5,
+                position: layout.position(5, 0),
+            },
+            &[1; 16],
+            1,
+        )
+        .expect("grow the file by a page");
+
+        let grown = Layout { pages: 6, ..layout };
+        assert_eq!(data_pages(&path, grown).expect("reads"), vec![4, 5]);
     }
 
     /// Reusing a free slot moves the head along to whatever the slot pointed at.

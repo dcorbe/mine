@@ -451,6 +451,120 @@ impl Block {
             Cursor::Physical { at } => records.physical(at),
         }
     }
+
+    /// Add a record, choosing its slot and writing it.
+    ///
+    /// Returns the file position it went to, which is what `absbtv` would
+    /// answer for it.
+    ///
+    /// In order: load the model, choose a slot from the model's own positions
+    /// plus what is on disk, write the record to disk with the record count
+    /// **after** the insert, then -- only once the write has succeeded -- add
+    /// it to the model. A write that fails partway leaves the model agreeing
+    /// with whatever is actually on disk, never with a slot nothing wrote.
+    ///
+    /// `self.geometry` is updated last: `records` always grows by one, and
+    /// `pages` grows by one only when the slot was a new page. Both fields are
+    /// `Copy` and are what the next `Records::read` bounds its walk by, so
+    /// leaving either stale here would make a later re-read of this same file
+    /// -- after the cache is dropped -- silently wrong rather than merely
+    /// inconvenient. See `a_block_that_writes_is_readable_after_its_cache_is_dropped`.
+    ///
+    /// # Errors
+    ///
+    /// If the records cannot be read, or the file cannot be written.
+    pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
+        self.records()?;
+        let name = self.name.clone();
+
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+
+        let (positions, count) = {
+            let records = self.records.as_ref().expect("just loaded");
+            (records.positions(), records.len() as u32 + 1)
+        };
+        let free = pages::free_head(&self.path).map_err(|why| BtvError {
+            file: name.clone(),
+            why,
+        })?;
+        let data = pages::data_pages(&self.path, layout).map_err(|why| BtvError {
+            file: name.clone(),
+            why,
+        })?;
+        let slot = layout.next_slot(&positions, free, &data);
+
+        pages::write_record(&self.path, layout, slot, bytes, count).map_err(|why| BtvError {
+            file: name.clone(),
+            why,
+        })?;
+
+        let position = slot.position();
+        self.records
+            .as_mut()
+            .expect("just loaded")
+            .insert(&self.keys, position, bytes.to_vec())
+            .map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
+
+        self.geometry.records = count;
+        if matches!(slot, pages::Slot::NewPage { .. }) {
+            self.geometry.pages += 1;
+        }
+
+        Ok(position)
+    }
+
+    /// Replace the record at `position`.
+    ///
+    /// An update is in place: it neither adds a slot nor a page, so
+    /// `self.geometry` is untouched. Existence is checked against the model
+    /// **before** anything is written, because `position` is a module's word
+    /// for a file offset and not a slot this layer chose -- writing to it
+    /// unconditionally would let a module scribble over whatever bytes happen
+    /// to be there, free-list link or otherwise.
+    ///
+    /// # Errors
+    ///
+    /// If the records cannot be read, `position` holds no record, or the file
+    /// cannot be written.
+    pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
+        self.records()?;
+        let name = self.name.clone();
+
+        let records = self.records.as_ref().expect("just loaded");
+        if records.find_physical(position).is_none() {
+            return Err(BtvError {
+                file: name,
+                why: format!("position {position} holds no record"),
+            });
+        }
+        let count = records.len() as u32;
+
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+        pages::write_record(&self.path, layout, pages::Slot::Existing(position), bytes, count)
+            .map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
+
+        self.records
+            .as_mut()
+            .expect("just loaded")
+            .update(&self.keys, position, bytes.to_vec())
+            .map_err(|why| BtvError { file: name, why })?;
+
+        Ok(())
+    }
 }
 
 /// Every Btrieve file the host has open, and the stack of which is current.
@@ -833,6 +947,142 @@ mod tests {
     #[test]
     fn a_file_shorter_than_one_page_is_refused_rather_than_read_past() {
         assert!(read("STUB.DAT", &[0u8; 64]).is_err());
+    }
+
+    /// A file laid out like virgin `WCCUSERS.DAT` but small enough to read at a
+    /// glance: 64-byte pages holding two 20-byte records each, five pages, one
+    /// of which (page 4) is a data page. Mirrors `pages::tests::seed`.
+    fn seed(dir: &Path) -> PathBuf {
+        let (page, physical, pages) = (64usize, 20usize, 5usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[0x08..0x0a].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&16u16.to_le_bytes());
+        bytes[0x18..0x1a].copy_from_slice(&(physical as u16).to_le_bytes());
+        bytes[0x1e..0x20].copy_from_slice(&4u16.to_le_bytes());
+        bytes[0x26..0x2a].copy_from_slice(&pages::to_long(pages as u32));
+        // Page 4 is the data page; 1..4 are index pages.
+        for number in 1..pages {
+            let header = pages::Header {
+                number: number as u32,
+                data: number == 4,
+                stamp: 0,
+            };
+            bytes[number * page..number * page + 6].copy_from_slice(&header.encode());
+        }
+        let path = dir.join("SCRATCH.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    /// A `Block` over `seed`'s file, built directly rather than through
+    /// `Btrieve::open` -- this test has no module and no heap, only the file
+    /// and the geometry a real `opnbtv` would have read out of it.
+    fn block(path: PathBuf) -> Block {
+        let geometry = Geometry {
+            version: Version::V5,
+            page: 64,
+            keys: 1,
+            reclen: 16,
+            physical: 20,
+            records: 0,
+            pages: 5,
+            variable: false,
+        };
+        let keys = vec![Key {
+            number: 0,
+            segments: vec![keys::Segment {
+                offset: 0,
+                length: 2,
+                kind: keys::Kind::Signed,
+                descending: false,
+            }],
+            duplicates: false,
+        }];
+        Block {
+            name: "SCRATCH.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FarPtr::NULL,
+            maxlen: 16,
+            data: FarPtr::NULL,
+            key: FarPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+        }
+    }
+
+    /// A 16-byte record whose two-byte key is `n`.
+    fn record(n: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16];
+        bytes[..2].copy_from_slice(&n.to_le_bytes());
+        bytes
+    }
+
+    /// The trap the plan names: `geometry` is a `Copy` struct held by value on
+    /// `Block`, and `walk()` reads `geometry.records` and `geometry.pages` on
+    /// the next `Records::read`. A `Block` that writes without updating its own
+    /// copy would re-read the file wrongly the moment something drops the
+    /// cache -- so this drops the cache and reads again, rather than trusting
+    /// the in-memory model to agree with itself.
+    ///
+    /// Three inserts rather than one: page 4 holds two slots, so the third has
+    /// nowhere to go but a fresh page, which is the other half of the trap --
+    /// `geometry.pages` has to grow too, or the re-read never looks at page 5
+    /// at all.
+    #[test]
+    fn a_block_that_writes_is_readable_after_its_cache_is_dropped() {
+        let dir = crate::testing::scratch("block-write-persists");
+        let path = seed(&dir);
+        let mut block = block(path);
+
+        let first = block.insert(&record(1)).expect("first insert");
+        let second = block.insert(&record(2)).expect("second insert");
+        let third = block.insert(&record(3)).expect("third insert");
+
+        assert_eq!(block.geometry.records, 3, "the model's count is not stale");
+        assert_eq!(block.geometry.pages, 6, "the third insert grew the file by a page");
+
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 3, "all three records survive a fresh read");
+        for position in [first, second, third] {
+            assert!(reread.find_physical(position).is_some());
+        }
+    }
+
+    #[test]
+    fn an_update_keeps_the_position_and_the_records_count() {
+        let dir = crate::testing::scratch("block-update-persists");
+        let path = seed(&dir);
+        let mut block = block(path);
+        let position = block.insert(&record(1)).expect("insert");
+
+        block.update(position, &record(9)).expect("update");
+        assert_eq!(block.geometry.records, 1, "an update changes no count");
+        assert_eq!(block.geometry.pages, 5, "and grows no page");
+
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 1);
+        assert_eq!(
+            reread.find_physical(position).and_then(|at| reread.physical(at)).expect("still there").bytes[0],
+            9,
+            "the new bytes, not the old, come back off disk"
+        );
+    }
+
+    #[test]
+    fn updating_a_position_that_holds_no_record_is_refused_by_the_block() {
+        let dir = crate::testing::scratch("block-update-refused");
+        let path = seed(&dir);
+        let mut block = block(path);
+
+        let e = block.update(999, &record(1)).expect_err("nothing is there");
+        assert_eq!(e.file, "SCRATCH.DAT");
+        assert!(e.why.contains("999"), "{e}");
     }
 
     #[test]
