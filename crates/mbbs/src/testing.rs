@@ -173,4 +173,115 @@ impl Fixture {
     pub fn far(at: FarPtr) -> [u16; 2] {
         [at.offset, at.selector]
     }
+
+    /// Load [`minimal_module_bytes`] into this fixture's host.
+    ///
+    /// `Host::connect` and `Host::poll` both take a `&mbbs16::Module`, whether
+    /// or not the branch under test ever reads it, and `Host::load` is the
+    /// only way to produce one -- there is no `Default`, no test constructor,
+    /// nothing but real NE bytes in. A test of "no module has registered"
+    /// still needs a module to *pass*, just not one that has registered.
+    pub fn minimal_module(&mut self) -> mbbs16::Module {
+        self.host
+            .load(&mut self.machine, &minimal_module_bytes())
+            .expect("a minimal module loads")
+    }
+}
+
+/// The smallest NE image [`mbbs16::Machine::load_ne`] accepts: one data
+/// segment, no imports, no exports beyond its own name. See
+/// [`Fixture::minimal_module`].
+///
+/// Built by hand rather than borrowed from `mbbs16/tests/ne.rs`'s builder,
+/// which is private to that crate's own test binary and cannot be imported
+/// from here. The field offsets are the NE header's, the same ones
+/// `NeImage::parse` reads them back from.
+pub fn minimal_module_bytes() -> Vec<u8> {
+    const ALIGN: u16 = 4;
+    const SECTOR: usize = 1 << ALIGN;
+
+    fn pstring(name: &str, ordinal: u16) -> Vec<u8> {
+        let mut out = vec![name.len() as u8];
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&ordinal.to_le_bytes());
+        out
+    }
+
+    // No imports at all, so the table is only its own leading empty string.
+    let impnames = vec![0u8];
+
+    // The module's own name, then a terminator -- no exports.
+    let mut restab = pstring("TESTMOD", 0);
+    restab.push(0);
+
+    // A description, then a terminator.
+    let mut nrtab = pstring("a test module", 0);
+    nrtab.push(0);
+
+    // No entries at all: a bundle count of zero ends the table immediately.
+    let entrytab = vec![0u8];
+
+    let mut out = vec![0u8; 0x80];
+    out[0..2].copy_from_slice(b"MZ");
+    out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    out[0x40..0x42].copy_from_slice(b"NE");
+
+    // One segment row, filled in once its data is placed.
+    let segtab = 0x80;
+    out.resize(segtab + 8, 0);
+
+    let modtab = out.len(); // no imported modules, so nothing follows here
+    let imptab = out.len();
+    out.extend_from_slice(&impnames);
+    let restab_at = out.len();
+    out.extend_from_slice(&restab);
+    let entrytab_at = out.len();
+    out.extend_from_slice(&entrytab);
+    let nrtab_at = out.len();
+    out.extend_from_slice(&nrtab);
+
+    // The one segment's data, on a sector boundary, with no relocations.
+    while out.len() % SECTOR != 0 {
+        out.push(0);
+    }
+    let sector = (out.len() / SECTOR) as u16;
+    let data = [0u8; 4];
+    out.extend_from_slice(&data);
+
+    out[segtab..segtab + 2].copy_from_slice(&sector.to_le_bytes());
+    out[segtab + 2..segtab + 4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    out[segtab + 4..segtab + 6].copy_from_slice(&0x0001u16.to_le_bytes()); // a data segment
+    out[segtab + 6..segtab + 8].copy_from_slice(&(data.len() as u16).to_le_bytes());
+
+    let w = |out: &mut Vec<u8>, at: usize, v: u16| {
+        out[0x40 + at..0x40 + at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    w(&mut out, 0x04, (entrytab_at - 0x40) as u16);
+    w(&mut out, 0x06, entrytab.len() as u16);
+    w(&mut out, 0x0c, 0x8001); // a single-data library
+    w(&mut out, 0x0e, 1); // autodata: the one segment
+    w(&mut out, 0x1c, 1); // segment count
+    w(&mut out, 0x1e, 0); // imported module count
+    w(&mut out, 0x20, nrtab.len() as u16);
+    w(&mut out, 0x22, (segtab - 0x40) as u16);
+    w(&mut out, 0x26, (restab_at - 0x40) as u16);
+    w(&mut out, 0x28, (modtab - 0x40) as u16);
+    w(&mut out, 0x2a, (imptab - 0x40) as u16);
+    w(&mut out, 0x32, ALIGN);
+    out[0x40 + 0x2c..0x40 + 0x30].copy_from_slice(&(nrtab_at as u32).to_le_bytes());
+    out[0x40 + 0x36] = 0x02;
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_minimal_module_loads() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        assert_eq!(module.segment_count(), 1);
+    }
 }

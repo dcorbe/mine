@@ -347,6 +347,18 @@ pub struct Host {
 /// outstanding call, a stack that will not resolve, or a selector this module
 /// does not own. A wrong address costs more than no address -- it sends someone
 /// to a real instruction that had nothing to do with it.
+/// A [`ShimError`] as an [`io::Error`].
+///
+/// `ShimError` implements `Display` and not `std::error::Error` -- it is
+/// meant to be handed to [`Host::stop`], which poisons the machine and names
+/// it, not chained through `?`. [`Host::connect`] and [`Host::poll`] call
+/// straight into [`Host::connect_state`], [`Host::point_curusr`] and
+/// [`Host::get_input`], which predate them and already answer in
+/// `Result<_, ShimError>`, so this is the one place that boundary is crossed.
+fn shim_io(e: ShimError) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
 fn caller(machine: &Machine, module: &Module) -> Option<String> {
     let frame = FarPtr {
         offset: machine.frame_sp()?,
@@ -796,6 +808,45 @@ impl Host {
         }
 
         self.point_curusr(machine, chan)
+    }
+
+    /// Put a channel into the module's state machine and let the module know.
+    ///
+    /// `connect_state` writes what a real board's `loadup()` would have read
+    /// out of `bbsusr.dat`; `lonrou` is the module's own logon hook, which
+    /// `MAJORBBS.C:558`'s `lonstf()` called for every registered module. Only
+    /// one module is registered here, so this calls the one.
+    ///
+    /// # Errors
+    ///
+    /// If `chan` names no channel, a write runs off a segment, no module has
+    /// registered, or the module cannot be entered.
+    pub fn connect(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: i16,
+        who: &users::Connection,
+    ) -> io::Result<Outcome> {
+        self.connect_state(machine, chan, who).map_err(shim_io)?;
+
+        // `Registration::entry` borrows `self.modules()` immutably, and
+        // `self.run` needs `self` mutably right after -- so the pointer is
+        // read out here and the borrow ends before `run` is ever reached.
+        let lonrou = {
+            let registered = self.modules().first().ok_or_else(|| {
+                io::Error::other("no module has registered, so there is nothing to enter")
+            })?;
+            registered.entry(machine, 0).map_err(shim_io)?
+        };
+        let Some(lonrou) = lonrou else {
+            // A null `lonrou` is legal -- the real host checked
+            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling. It
+            // means the module wants no logon hook, not that anything is
+            // wrong.
+            return Ok(Outcome::Returned { ax: 0, dx: 0 });
+        };
+        self.run(machine, module, lonrou, &[])
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
@@ -1252,5 +1303,27 @@ impl ImportResolver for Resolver<'_> {
             // nothing.
             Entry::Unimplemented => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::Fixture;
+    use crate::users::Connection;
+
+    /// `connect` needs a `&Module` whether or not this path ever reads it --
+    /// [`Fixture::minimal_module`] loads one, but loading is not registering,
+    /// so `f.host.modules()` is still empty and `connect` has nothing to
+    /// enter. The full path, with a module that does register, is Task 10's
+    /// integration test.
+    #[test]
+    fn connect_with_no_module_registered_is_an_error_not_a_panic() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        assert!(
+            f.host
+                .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+                .is_err()
+        );
     }
 }
