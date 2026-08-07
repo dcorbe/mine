@@ -1167,6 +1167,39 @@ mod tests {
         }
     }
 
+    /// C1: reproduces the reviewer's probe. Two records written into a
+    /// scratch file, the second one all zero, used to leave
+    /// `Records::read` answering `"the header says 2 records and walking
+    /// the pages found 0"` -- `walk` reads the all-zero record as an empty
+    /// slot, `break`s the page, and both records vanish, because a slot on
+    /// a real free list is skipped rather than ending the page and a
+    /// live-but-empty-looking slot is not on the free list. `Block::insert`
+    /// must refuse the second record outright rather than write a file its
+    /// own reader then refuses to read.
+    #[test]
+    fn insert_refuses_a_record_that_would_make_its_own_reader_fail() {
+        let dir = crate::testing::scratch("block-insert-refuses-empty-lookalike");
+        let path = seed(&dir);
+        let mut block = block(path);
+
+        let first = block.insert(&record(1)).expect("a live record");
+
+        let e = block
+            .insert(&[0u8; 16])
+            .expect_err("an all-zero record decodes as an empty slot");
+        assert!(e.why.contains("empty"), "{e}");
+
+        // The refusal did not touch the model or the count.
+        assert_eq!(block.geometry.records, 1, "the refused insert did not count");
+
+        // And the file itself is still exactly what the reviewer's probe
+        // checked: `Records::read` finds the one live record, not zero.
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 1, "the file was never corrupted");
+        assert!(reread.find_physical(first).is_some());
+    }
+
     #[test]
     fn an_update_keeps_the_position_and_the_records_count() {
         let dir = crate::testing::scratch("block-update-persists");

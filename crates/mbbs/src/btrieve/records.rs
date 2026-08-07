@@ -333,16 +333,9 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             let start = (u32::from(PAGE_HEADER) + physical * slot) as usize;
             let record = &buffer[start..start + geometry.physical as usize];
 
-            // An unused slot is all zero except for four bytes of free-list
-            // pointer, and slots are filled from the front -- so the first one
-            // ends the page rather than being skipped. A record too short to
-            // hold a pointer has no pointer to check, and being all zero is the
-            // whole of the evidence.
-            let empty = match record.len() {
-                0..4 => record.iter().all(|b| *b == 0),
-                _ => record[4..].iter().all(|b| *b == 0) && pointer(record) < size,
-            };
-            if empty {
+            // Slots are filled from the front -- so the first empty one ends
+            // the page rather than being skipped. See [`looks_empty`].
+            if looks_empty(record, size) {
                 break;
             }
             records.push(Record {
@@ -393,6 +386,27 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
 fn pointer(bytes: &[u8]) -> u32 {
     (u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
         | u32::from(u16::from_le_bytes([bytes[2], bytes[3]]))
+}
+
+/// Whether a slot's bytes would be read as unused rather than as a record.
+///
+/// An unused slot is all zero except for four bytes of free-list pointer, and
+/// a record too short to hold one has no pointer to check, so being all zero
+/// is the whole of the evidence for it. `size` is the file's size in bytes,
+/// which bounds what a plausible pointer looks like.
+///
+/// [`pages::write_record`](super::pages::write_record) calls this too, on the
+/// bytes it is about to write padded to the physical length -- the same test
+/// [`walk`] applies when it later decides whether that slot holds a record.
+/// A write that satisfied this predicate would be unreadable the moment it
+/// landed, and everything after it in the page with it, so it is refused
+/// before it is written rather than accepted and discovered corrupt on the
+/// next read. See C1 in `docs/plans/2026-08-07-btrieve-writes.md`.
+pub(crate) fn looks_empty(record: &[u8], size: u32) -> bool {
+    match record.len() {
+        0..4 => record.iter().all(|b| *b == 0),
+        _ => record[4..].iter().all(|b| *b == 0) && pointer(record) < size,
+    }
 }
 
 #[cfg(test)]

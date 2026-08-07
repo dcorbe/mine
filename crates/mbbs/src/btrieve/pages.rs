@@ -218,8 +218,9 @@ impl Layout {
 ///
 /// # Errors
 ///
-/// If `bytes` is longer than the slot it would go in, or if the file cannot
-/// be opened, sought or written.
+/// If `bytes` is longer than the slot it would go in, if the file cannot be
+/// opened, sought or written, or if the record would read back as an empty
+/// slot (see [`records::looks_empty`](super::records::looks_empty)).
 pub fn write_record(
     path: &std::path::Path,
     layout: Layout,
@@ -255,6 +256,34 @@ pub fn write_record(
 
     let mut slack = vec![0u8; usize::from(layout.physical)];
     slack[..bytes.len()].copy_from_slice(bytes);
+
+    // The file's size once this write lands -- one page larger for a slot on
+    // a page that does not exist yet, unchanged otherwise -- which is the
+    // same `size` a later `records::walk` would compute when it decides
+    // whether this slot is empty. Checked, and refused, before any byte of
+    // it is written: a record that would be unreadable the moment it landed
+    // must not land at all, and everything behind it in the page would be
+    // unreadable too.
+    let current = file
+        .metadata()
+        .map_err(|e| fail("reading the file's size", e))?
+        .len();
+    let prospective = match slot {
+        Slot::NewPage { number, .. } => u64::from(number + 1) * u64::from(layout.page),
+        Slot::Free(_) | Slot::Existing(_) => current,
+    };
+    let size = u32::try_from(prospective)
+        .map_err(|_| format!("{}: a file larger than four gigabytes", path.display()))?;
+    if super::records::looks_empty(&slack, size) {
+        return Err(format!(
+            "{}: a record padded to {} bytes would read back as an empty slot -- its \
+             bytes past the first four are all zero and its first four, read as a \
+             record pointer, land inside a {size}-byte file -- so it and every record \
+             behind it in the page would be unreadable",
+            path.display(),
+            layout.physical
+        ));
+    }
 
     // A reused slot's first four bytes are the free list's next link, and they
     // have to be read before the record overwrites them.
@@ -704,6 +733,36 @@ mod tests {
             &[0, 0, 0, 0],
             "the refused write touched nothing"
         );
+    }
+
+    /// C1: a record that, once padded to the physical length, would read back
+    /// as an empty slot must be refused before it is written -- not written
+    /// and then discovered corrupt the next time `records::walk` runs. An
+    /// all-zero 16-byte record is the simplest instance: `record[4..]` is all
+    /// zero and its first four bytes, read as a pointer, are `0`, which is
+    /// less than any file this format can produce.
+    #[test]
+    fn a_record_that_would_read_back_as_empty_is_refused() {
+        let dir = crate::testing::scratch("pages-write-refuses-empty-lookalike");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let at = layout.position(4, 0);
+
+        let e = write_record(&path, layout, Slot::Existing(at), &[0u8; 16], 1)
+            .expect_err("an all-zero record decodes as an empty slot");
+        assert!(e.contains("empty"), "{e}");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            &bytes[at as usize..at as usize + 4],
+            &[0, 0, 0, 0],
+            "the refused write touched nothing -- it was already zero"
+        );
+        assert_eq!(long(&bytes[0x1a..0x1e]), 0, "the record count was not bumped either");
     }
 
     /// The eight-times case: the file has no room and grows.
