@@ -714,8 +714,19 @@ impl Block {
             // `index_pages` leaves the page number zero; this is the
             // allocation `index_pages`'s own doc comment says the caller
             // does, and in this crate it is always the key's existing root.
+            //
+            // The stamp comes from the page this overwrites, not from
+            // `index_pages`, which always emits zero there: `Header::stamp`'s
+            // doc comment says it is preserved rather than interpreted, and
+            // preserving it means reading it before it is gone. C3: measured
+            // as 13 on `WCCRACE.DAT` page 1 and 42 on `WCCCLASS.DAT` page 1 --
+            // neither zero, so writing zero unconditionally was a loss this
+            // host could see in its own fixtures once it checked.
+            let existing = pages::page_header(&self.path, layout, root)
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
             let mut header = pages::Header::decode(&page[..6]);
             header.number = root;
+            header.stamp = existing.stamp;
             page[..6].copy_from_slice(&header.encode());
 
             pages::write_page(&self.path, layout, root, &page)
@@ -1508,6 +1519,33 @@ mod tests {
         assert_eq!(entry(0), (1, second), "1 sorts first");
         assert_eq!(entry(1), (2, third), "2 sorts second");
         assert_eq!(entry(2), (3, first), "3 sorts last");
+    }
+
+    /// C3: `Header::stamp`'s doc comment says the stamp is preserved rather
+    /// than interpreted, and `seed_indexed` gives every page a stamp of
+    /// zero -- which a bug that always writes zero cannot be told apart
+    /// from the right answer. This seeds key 0's root with a nonzero stamp
+    /// first, so a rebuild that clobbers it has something to be caught by.
+    #[test]
+    fn reindex_carries_the_roots_stamp_forward_rather_than_zeroing_it() {
+        let dir = crate::testing::scratch("block-reindex-preserves-stamp");
+        let path = seed_indexed(&dir);
+
+        let mut bytes = std::fs::read(&path).expect("read");
+        let mut header = pages::Header::decode(&bytes[512..518]);
+        header.stamp = 141;
+        bytes[512..518].copy_from_slice(&header.encode());
+        std::fs::write(&path, &bytes).expect("seed a nonzero stamp on key 0's root");
+
+        let mut block = block_indexed(path.clone());
+        block.insert(&record(1)).expect("insert");
+        block.reindex().expect("reindexes");
+
+        let after = std::fs::read(&path).expect("read back");
+        let header = pages::Header::decode(&after[512..518]);
+        assert_eq!(header.stamp, 141, "the root's stamp must survive a rebuild");
+        assert_eq!(header.number, 1, "and still names itself page 1");
+        assert!(!header.data, "still an index page");
     }
 
     /// I7, part 1: a file like `seed_indexed`'s but with **two** keys, where

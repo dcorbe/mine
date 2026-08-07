@@ -492,6 +492,28 @@ pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<Vec
     Ok(vec![page])
 }
 
+/// The six-byte header of a page already in the file, read on its own rather
+/// than as part of the page it heads.
+///
+/// [`Block::reindex`](super::Block::reindex) calls this on a key's root page
+/// before it overwrites that page: [`Header::stamp`]'s doc comment says the
+/// stamp is preserved rather than interpreted, and the only way to preserve
+/// it across a rebuild is to read what is there before writing over it.
+///
+/// # Errors
+///
+/// If the file cannot be opened, or the page cannot be read.
+pub fn page_header(path: &std::path::Path, layout: Layout, number: u32) -> Result<Header, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut header = [0u8; HEADER as usize];
+    file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+        .and_then(|_| file.read_exact(&mut header))
+        .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
+    Ok(Header::decode(&header))
+}
+
 /// Overwrite an existing page's bytes in place.
 ///
 /// Unlike [`write_record`], which may extend the file for a new data page,
