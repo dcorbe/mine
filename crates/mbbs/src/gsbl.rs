@@ -155,6 +155,11 @@ impl Gsbl {
     /// Only ever raised when `btuoes` has enabled it.
     pub const OUTMT: i16 = 5;
 
+    /// `OVRFLW` -- data output circular-buffer overflow (status 253). Guide,
+    /// `btuxmt` CAUTIONS, page 191: when the string does not fit in the output buffer, btuxmt returns 0, queues status 253 for btusts, and outputs none of the string `btuxct`
+    /// (page 182) says the same of a block that will not fit.
+    pub const OVRFLW: i16 = 253;
+
     /// Bytes have arrived from the terminal.
     ///
     /// This is half of the boundary: a tokio task reading a socket and a test
@@ -228,15 +233,19 @@ impl Gsbl {
     }
 
     /// `btuxct` -- binary output, exactly as given.
+    ///
+    /// R6, guide page 182: a block that will not fit is not truncated into
+    /// what room remains -- none of it goes out, and status 253 (`OVRFLW`) is
+    /// queued instead.
     pub fn transmit_raw(&mut self, chan: i16, bytes: &[u8]) {
         let Some(c) = self.channel_mut(chan) else {
             return;
         };
-        for &byte in bytes {
-            if c.output.len() < OUTSIZ {
-                c.output.push_back(byte);
-            }
+        if c.output.len() + bytes.len() > OUTSIZ {
+            c.status.push_back(Self::OVRFLW);
+            return;
         }
+        c.output.extend(bytes.iter().copied());
     }
 }
 
@@ -346,7 +355,18 @@ impl Channel {
     }
 
     /// ASCII output, wrapped at `width`.
+    ///
+    /// R6, guide `btuxmt` CAUTIONS page 191: an oversized call is atomic.
+    /// Either the whole transformed block -- CRLF expansion, wrap breaks and
+    /// all -- fits in `OUTSIZ`, or none of it is committed and `OVRFLW` is
+    /// queued instead. That is why bytes are pushed below without a
+    /// per-byte capacity check and measured only once, at the end, against a
+    /// snapshot to roll back to.
     fn transmit(&mut self, bytes: &[u8]) {
+        let snapshot = self.output.clone();
+        let column_before = self.column;
+        let supplied_lf_before = self.supplied_lf;
+
         for &byte in bytes {
             match byte {
                 b'\r' => {
@@ -358,12 +378,8 @@ impl Channel {
                     // ours, so a module byte stream that already spells out
                     // `\r\n` -- even split across two `transmit` calls --
                     // does not get a second one.
-                    if self.output.len() < OUTSIZ {
-                        self.output.push_back(b'\r');
-                    }
-                    if self.output.len() < OUTSIZ {
-                        self.output.push_back(b'\n');
-                    }
+                    self.output.push_back(b'\r');
+                    self.output.push_back(b'\n');
                     self.column = 0;
                     self.supplied_lf = true;
                     continue;
@@ -375,9 +391,7 @@ impl Channel {
                     continue;
                 }
                 b'\n' => {
-                    if self.output.len() < OUTSIZ {
-                        self.output.push_back(b'\n');
-                    }
+                    self.output.push_back(b'\n');
                     continue;
                 }
                 _ => {}
@@ -386,10 +400,15 @@ impl Channel {
             if self.width != 0 && self.column >= self.width {
                 self.wrap();
             }
-            if self.output.len() < OUTSIZ {
-                self.output.push_back(byte);
-                self.column += 1;
-            }
+            self.output.push_back(byte);
+            self.column += 1;
+        }
+
+        if self.output.len() > OUTSIZ {
+            self.output = snapshot;
+            self.column = column_before;
+            self.supplied_lf = supplied_lf_before;
+            self.status.push_back(Gsbl::OVRFLW);
         }
     }
 
@@ -660,6 +679,36 @@ mod tests {
         g.transmit(0, b"line\r");
         g.transmit(0, b"\n");
         assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+    }
+
+    #[test]
+    fn an_oversized_ascii_write_emits_nothing_and_queues_overflow() {
+        // R6, guide btuxmt CAUTIONS page 191: btuxmt returns 0, queues status 253 for btusts, and outputs none of the string. Not truncated to what room remains -- nothing at all.
+        let mut g = Gsbl::new(1);
+        let huge = vec![b'x'; OUTSIZ + 1];
+        g.transmit(0, &huge);
+        assert!(g.drain_output(0).is_empty());
+        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+    }
+
+    #[test]
+    fn an_oversized_binary_write_emits_nothing_and_queues_overflow_too() {
+        // guide btuxct CAUTIONS page 182-183: the same rule for btuxct().
+        let mut g = Gsbl::new(1);
+        let huge = vec![b'x'; OUTSIZ + 1];
+        g.transmit_raw(0, &huge);
+        assert!(g.drain_output(0).is_empty());
+        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+    }
+
+    #[test]
+    fn an_overflowing_write_does_not_disturb_what_was_already_buffered() {
+        let mut g = Gsbl::new(1);
+        g.transmit(0, b"still here");
+        let huge = vec![b'x'; OUTSIZ + 1];
+        g.transmit(0, &huge);
+        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+        assert_eq!(g.drain_output(0), b"still here".to_vec());
     }
 
     #[test]
