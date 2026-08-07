@@ -891,7 +891,29 @@ impl Host {
         // leaking into the return value. A driver written
         // `while host.poll(..)?.is_some() {}` would otherwise stop dead on
         // one undispatched status with a `CRSTG` still queued behind it.
+        // Every iteration consumes exactly one status, so this cannot
+        // legitimately run more times than there were statuses queued. The
+        // bound is not for the legitimate case.
+        //
+        // Both `continue` arms below allocate a note, and the status queue is
+        // deliberately unbounded (see `gsbl::Channel::status`). So an edit that
+        // stops consuming turns this loop into something that eats the machine
+        // instead of failing a test -- which is not hypothetical: a mutation
+        // that peeked instead of popping reached 4.7 GB resident and the global
+        // OOM killer took the session down with it. A host bug should cost a
+        // red test, not the box.
+        const SPINS: usize = 1024;
+        let mut spins = 0usize;
+
         loop {
+            spins += 1;
+            if spins > SPINS {
+                return Err(io::Error::other(format!(
+                    "poll went round {SPINS} times without dispatching to the module: \
+                     a status is being read but not consumed"
+                )));
+            }
+
             let Some(chan) = self.gsbl().scan() else {
                 return Ok(None);
             };
@@ -1494,6 +1516,44 @@ mod tests {
     }
 
     /// No status queued, no channel to service, nothing to call.
+    #[test]
+    /// A status that is read but never consumed must cost a red test, not the
+    /// machine.
+    ///
+    /// This is the guard, exercised the only way it can be without mutating
+    /// `poll` itself: queue more undispatched statuses than the bound. Each is
+    /// consumed normally, so the loop is doing the right thing and still trips
+    /// -- which is what makes the bound observable at all.
+    ///
+    /// The mutation this exists for -- peeking instead of popping -- reached
+    /// 4.7 GB resident on a 7.5 GB box and the OOM killer took the whole
+    /// session with it, because both `continue` arms allocate a note.
+    #[test]
+    fn poll_refuses_to_spin_forever_on_a_status_nothing_consumes() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        // 253 is OVRFLW -- a real status this host queues and does not
+        // dispatch, so every one takes the `continue` arm.
+        for _ in 0..1100 {
+            f.host
+                .gsbl_mut()
+                .channel_mut(0)
+                .expect("channel 0")
+                .status
+                .push_back(crate::gsbl::Gsbl::OVRFLW);
+        }
+
+        let e = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("the guard trips rather than looping");
+        assert!(
+            e.to_string().contains("not consumed"),
+            "the error says what happened: {e}"
+        );
+    }
+
     #[test]
     fn poll_with_nothing_queued_returns_none_and_calls_nothing() {
         let mut f = Fixture::new();
