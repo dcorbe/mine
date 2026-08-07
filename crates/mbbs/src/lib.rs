@@ -615,8 +615,13 @@ impl Host {
         machine: &mut Machine,
         chan: i16,
     ) -> Result<FarPtr, ShimError> {
-        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
-
+        // R16: resolve everything that can fail before touching the channel.
+        // `take_line` pops the ready queue -- if the line were taken first and
+        // `input` then turned out not to be placed, the user's line would be
+        // gone with nothing to retry. `input` not being placed cannot happen
+        // in practice (`Globals::new` places it unconditionally), but the
+        // ordering is what makes that true by construction rather than by
+        // coincidence of what `Globals::new` currently does.
         let input = self
             .globals()
             .address("input")
@@ -626,6 +631,8 @@ impl Host {
                 .size("input")
                 .expect("input is placed, its address just resolved"),
         );
+
+        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
         let take = line.len().min(size - 1);
         let mut bytes = line[..take].to_vec();
         bytes.push(0);
