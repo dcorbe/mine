@@ -42,7 +42,17 @@ pub struct Channel {
     pub(crate) output: VecDeque<u8>,
     /// Statuses waiting for `btusts`, oldest first. The guide calls this a
     /// first-in-first-out structure and says so explicitly.
+    ///
+    /// Finding 13 (not fixed): real GSBL's status buffer holds 31 bytes and
+    /// overflows to status 254 once it fills. This one is unbounded. That is
+    /// the safer failure of the two -- growing a `VecDeque` never loses a
+    /// status the module is going to wait on forever, where a fixed cap would
+    /// have to choose something to drop.
     pub(crate) status: VecDeque<i16>,
+    /// Bytes received in binary mode (`btutrg`) since the last `INBLK` status
+    /// was queued. Counts toward the *next* block, independent of how much of
+    /// `input` the module has actually drained -- see R4.
+    pub(crate) since_trigger: u16,
     /// How far along the current output line the terminal's cursor is.
     ///
     /// Per channel and not per call. MajorMUD builds a screen from many `prf`
@@ -84,6 +94,7 @@ impl Default for Channel {
             ready: VecDeque::new(),
             output: VecDeque::new(),
             status: VecDeque::new(),
+            since_trigger: 0,
             column: 0,
             width: 0,
             maxinl: 0,
@@ -271,8 +282,15 @@ impl Channel {
             if self.input.len() < INPSIZ {
                 self.input.push_back(byte);
             }
-            if self.input.len() >= usize::from(self.trigger) {
+            // R4, guide btutrg page 167: every further nbyt input bytes raise the same status again -- one INBLK per block
+            // of `trigger` bytes received, not one for every byte for as
+            // long as the buffer happens to hold at least `trigger` bytes.
+            // The `while` (not `if`) is what makes a block of `2 * trigger`
+            // bytes arriving in one push_input queue two statuses.
+            self.since_trigger += 1;
+            while self.since_trigger >= self.trigger {
                 self.status.push_back(Gsbl::INBLK);
+                self.since_trigger -= self.trigger;
             }
             return;
         }
@@ -551,6 +569,23 @@ mod tests {
         g.push_input(0, b"a\rb");
         assert_eq!(g.next_status(0), Some(INBLK));
         assert_eq!(g.take_line(0), None, "binary input is not a line");
+    }
+
+    #[test]
+    fn status_four_is_raised_once_per_block_not_once_per_buffered_byte() {
+        // R4, guide btutrg page 167: every further nbyt input bytes raise the same status again. 100 bytes at a 20-byte trigger is five
+        // blocks and five statuses -- not eighty-one, which is what
+        // `input.len() >= trigger` re-firing on every byte past the
+        // threshold used to produce.
+        let mut g = Gsbl::new(1);
+        g.channel_mut(0).expect("channel 0").trigger = 20;
+        g.push_input(0, &[0u8; 100]);
+        let mut count = 0;
+        while let Some(status) = g.next_status(0) {
+            assert_eq!(status, Gsbl::INBLK);
+            count += 1;
+        }
+        assert_eq!(count, 5);
     }
 
     #[test]
