@@ -29,6 +29,7 @@
 //! `crates/mbbs/tests/btrieve.rs`.
 
 pub mod keys;
+pub mod pages;
 pub mod records;
 
 use std::fmt;
