@@ -1008,27 +1008,34 @@ impl Btrieve {
     /// pointer that was never opened answers too -- `PLBTVSTF.C` could not
     /// tell those two apart either.
     ///
-    /// # The guard is read out of module memory, not out of [`Self::open`]
+    /// # The guard is `at` in [`Self::open`], not `bb->filnam` in module memory
     ///
-    /// `bb->filnam != NULL` is measured the way the original measured it:
-    /// four bytes at `at`'s own `field::FILNAM`. Reading it that way rather
-    /// than asking whether `at` is still in [`Self::open`] is what makes a
-    /// second close a genuine no-op and not merely one this type happens to
-    /// agree with -- the first close nulls those four bytes before it frees
-    /// anything, and [`Heap::free`](crate::Heap::free) never clears what it
-    /// frees (see its own doc comment), so a second read of the same address
-    /// still finds them null even after the block itself has been given
-    /// back.
+    /// `PLBTVSTF.C` measures `bb->filnam != NULL`, and an earlier version of
+    /// this measured it the same way: four bytes at `at`'s own
+    /// `field::FILNAM`, on the theory that the first close nulls them before
+    /// it frees anything and a second read of the same address would still
+    /// find them null. That theory holds only until something else
+    /// allocates over the span -- [`Heap::free`](crate::Heap::free) never
+    /// clears what it frees (see its own doc comment), so those four bytes
+    /// are only reliably null until a later, unrelated `alcmem` reuses that
+    /// memory for something with a non-null value in the same position, at
+    /// which point a *second* close of an already-closed block reads
+    /// garbage that looks like an open file and fails looking it up in
+    /// [`Self::open`] -- a module bug in disguise, not a refusal this crate
+    /// intends. `self.open` is the authoritative record of what is actually
+    /// open, and asking it directly cannot be fooled by whatever the heap
+    /// has done with the memory since. `PLBTVSTF.C` could not tell a closed
+    /// block from one never opened either way, so this is at least as
+    /// faithful as reading `bb->filnam` was, and it does not share that
+    /// method's failure mode.
     ///
     /// # Errors
     ///
-    /// If `at` is not null, names a filename that is not null, but is not a
-    /// file this host has open -- module memory that looks like an open
-    /// block but is not one, which nothing in this crate can honour. If the
-    /// block is dirty and [`Block::reindex`] fails: this is the flush point
-    /// the whole design rests on, and a file going out of this host's reach
-    /// with an index that disagrees with its data is exactly what `reindex`
-    /// exists to prevent. Or if any of the four allocations cannot be freed.
+    /// If the block is dirty and [`Block::reindex`] fails: this is the flush
+    /// point the whole design rests on, and a file going out of this host's
+    /// reach with an index that disagrees with its data is exactly what
+    /// `reindex` exists to prevent. Or if any of the four allocations cannot
+    /// be freed.
     pub fn close(
         &mut self,
         machine: &mut Machine,
@@ -1040,35 +1047,32 @@ impl Btrieve {
             return Ok(false);
         }
 
-        let filnam_at = FarPtr {
-            offset: at.offset + field::FILNAM,
-            selector: at.selector,
-        };
-        let bytes = machine.resolve(filnam_at, 4).map_err(|e| BtvError {
-            file: format!("{at}"),
-            why: e.to_string(),
-        })?;
-        let filnam = FarPtr::from_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if filnam == FarPtr::NULL {
-            // Either a second close of a block already closed, or a pointer
-            // that never named one. `bb->filnam != NULL` is false either
-            // way, and so is this.
+        // Either a second close of a block already closed, or a pointer
+        // that never named one. `self.open` cannot tell those two apart
+        // either, and does not need to -- both answer `false` here, exactly
+        // as `bb->filnam != NULL` being false answered for both in
+        // `PLBTVSTF.C`.
+        let Ok(index) = self.find(at) else {
             return Ok(false);
-        }
-
-        let index = self.find(at).map_err(|why| BtvError {
-            file: format!("{at}"),
-            why,
-        })?;
+        };
         let name = self.open[index].name.clone();
         let fail = |why: String| BtvError {
             file: name.clone(),
             why,
         };
 
-        // `bb->filnam=NULL` -- written before anything is freed, exactly
-        // where `PLBTVSTF.C:639` writes it, so the re-entrancy guard above
-        // holds from here on regardless of what happens next.
+        let filnam_at = FarPtr {
+            offset: at.offset + field::FILNAM,
+            selector: at.selector,
+        };
+        let bytes = machine.resolve(filnam_at, 4).map_err(|e| fail(e.to_string()))?;
+        let filnam = FarPtr::from_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+        // `bb->filnam=NULL` -- still written, and still before anything is
+        // freed, exactly where `PLBTVSTF.C:639` writes it. A module that
+        // reads its own `bb->filnam` after this call sees what the original
+        // left there; this host just no longer *relies* on reading it back
+        // to decide whether there was a file to close.
         machine
             .write(filnam_at, &FarPtr::NULL.to_bytes())
             .map_err(|e| fail(e.to_string()))?;
@@ -1972,6 +1976,51 @@ mod tests {
             .expect("closes without ever asking to reindex");
         let after = std::fs::read(&clean_path).expect("read after");
         assert_eq!(before, after, "a clean close never touches the file");
+    }
+
+    /// C5: the re-entrancy guard used to be `bb->filnam != NULL`, read out of
+    /// module memory the first close already freed. [`crate::Heap::free`]
+    /// never clears what it frees (see its own doc comment), so that read
+    /// stayed reliably null only until something else allocated over the
+    /// same span -- reproduced here with eight `Heap::alloc(256)` calls, the
+    /// same shape `alcmem` makes, run after the first close. Before the fix
+    /// the second close found garbage where `bb->filnam` used to be null,
+    /// tried to look up a block already removed from [`Self::open`], and
+    /// stopped the module with "is not an open Btrieve file" -- a module
+    /// bug in disguise -- instead of the quiet no-op a real double close is.
+    #[test]
+    fn close_is_a_quiet_no_op_the_second_time_even_after_the_heap_reuses_its_span() {
+        let mut machine = Machine::new().expect("a 16-bit machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let mut btrieve = Btrieve::default();
+
+        let path = seed_indexed(&crate::testing::scratch(
+            "btrieve-close-reentrancy-heap-reuse",
+        ));
+        let at = open_indexed(&mut machine, &mut heap, &mut btrieve, path);
+
+        assert!(
+            btrieve.close(&mut machine, &mut heap, at).expect("closes"),
+            "the first close finds an open file"
+        );
+
+        // The same shape of traffic `alcmem` makes, and enough of it to land
+        // on the span the closed block's own `struct btvblk` used to occupy
+        // -- and, critically, written into, the way a module actually uses
+        // memory it was just handed. `Heap::alloc` alone only reserves
+        // address space; it is the write that leaves non-null garbage where
+        // `bb->filnam` used to read as null.
+        for _ in 0..8 {
+            let block = heap.alloc(&mut machine, 256).expect("alcmem-shaped traffic");
+            machine
+                .write(block, &[0xaau8; 256])
+                .expect("a module writes into what it was just given");
+        }
+
+        let second = btrieve
+            .close(&mut machine, &mut heap, at)
+            .expect("a second close of the same pointer must be a quiet no-op");
+        assert!(!second, "nothing was open the second time");
     }
 
     #[test]
