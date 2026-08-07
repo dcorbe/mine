@@ -252,6 +252,72 @@ pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(days as u16))
 }
 
+/// `moname[][4]`, `DOSFACE.H:71` -- three-letter month abbreviations and a NUL,
+/// measured at `DGROUP:0xb9b7` of `MAJORBBS-wg101.EXE`: `Jan` through `Dec`.
+const MONAME: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `char *ncedat(int date)` -- a DOS-packed date as `DD-Mon-YY`, e.g.
+/// `07-Aug-26`.
+///
+/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c98`
+/// (ordinal 429, seven call sites); the fields unpack exactly as [`cofdat`]'s
+/// do. The call it builds is
+/// `spr(buf, "%02d-%s-%02d", day, moname[month - 1], (year + 0x7bc) % 100)` --
+/// `0x7bc` is 1980, and the format string (`DGROUP:0xa1`) and `moname`
+/// (`DGROUP:0xb9b7`) are the same statics [`ncdate`] and [`nctime`] already
+/// measured.
+///
+/// **`month - 1`, not `month`.** The operand the disassembly adds to
+/// `month * 4` is not `moname`'s address but `moname`'s address *minus one
+/// entry* -- the usual trick for indexing a 0-based array with a 1-based
+/// field without a runtime subtraction. `month = 8` (August) therefore reaches
+/// `moname[7]`, not `moname[8]`.
+///
+/// **There is no null case, and that is not a kindness.** The disassembly goes
+/// straight from `mov cx,[bp+6]` into the shifts -- no `or cx,cx` guard
+/// anywhere -- so `ncedat(0)` does not hand back an empty string the way
+/// [`ncdate`] does. It computes `month = 0`, and `moname[month - 1]` lands one
+/// array element *before* the table, in bytes that belong to a weekday-name
+/// table `moname` happens to sit right after
+/// (`...aturday\0Jan\0Feb\0...` at `DGROUP:0xb9af`). The real host prints part
+/// of "Saturday" as a month name. Nothing in this crate has that weekday
+/// table, and reproducing four borrowed bytes as though they meant something
+/// would be inventing behaviour rather than transcribing it, so this shim
+/// refuses `month == 0` instead. See `Errors`.
+///
+/// # Errors
+///
+/// If the module's heap cannot give the buffer its first time through, or
+/// `date` unpacks to a month `moname` cannot answer for -- `0` (see above) or
+/// `13..=15` (past `Dec`, into whatever data happens to follow the table).
+///
+/// # This routine is unreachable by any test in this crate
+///
+/// Its callers are the polling routines, which nothing here drives yet. A flat
+/// meter after this commit is not this shim breaking -- it is this shim never
+/// running.
+pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let packed = machine.arg_u16(0);
+    let all = buffers(machine, host)?;
+
+    let month = usize::from((packed >> 5) & 0xf);
+    let name = month
+        .checked_sub(1)
+        .and_then(|i| MONAME.get(i))
+        .ok_or_else(|| ShimError::Failed(format!("ncedat: {month} is not a month")))?;
+
+    let text = format!(
+        "{:02}-{}-{:02}",
+        packed & 0x1f,
+        name,
+        (((packed >> 9) & 0x7f) + 1980) % 100,
+    );
+    write_cstr(machine, all.edat, text.as_bytes(), EDAT_LEN)?;
+    Ok(Ret::Far(all.edat))
+}
+
 /// `void srand(unsigned seed)`.
 ///
 /// MajorMUD calls this once, six calls into initialisation, with the low word
@@ -1550,5 +1616,60 @@ mod tests {
             .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
             .expect_err("refused");
         assert!(format!("{e}").contains("13"), "{e}");
+    }
+
+    #[test]
+    fn ncedat_spells_the_month() {
+        // Day 7, month 8 (August), year 46 (2026) -- the plan's own example.
+        let packed = (46 << 9) | (8 << 5) | 7;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "07-Aug-26");
+    }
+
+    #[test]
+    fn ncedat_wraps_the_year_at_a_century() {
+        let packed = (127 << 9) | (12 << 5) | 31;
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(at), "31-Dec-07");
+    }
+
+    #[test]
+    fn ncedat_of_zero_has_no_null_case_and_is_refused() {
+        // Unlike `ncdate`, there is no `or cx,cx` guard in the disassembly --
+        // `ncedat(0)` unpacks to month 0, which is one array element before
+        // `moname`. Reproducing whatever bytes are there in the real binary
+        // (part of an unrelated weekday-name table) would be inventing
+        // behaviour this crate has no data for, so this shim refuses instead
+        // of formatting a plausible-looking lie.
+        let mut f = Fixture::new();
+        let e = f.invoke(ncedat, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains('0'), "{e}");
+    }
+
+    #[test]
+    fn ncedat_writes_over_what_the_last_call_left() {
+        let mut f = Fixture::new();
+        let Ret::Far(first) = f
+            .invoke(ncedat, &[(46 << 9) | (8 << 5) | 7])
+            .expect("ncedat")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(f.read(first), "07-Aug-26");
+
+        let Ret::Far(second) = f
+            .invoke(ncedat, &[(20 << 9) | (3 << 5) | 1])
+            .expect("ncedat")
+        else {
+            panic!("far pointer");
+        };
+        assert_eq!(first, second, "one buffer, not two");
+        assert_eq!(f.read(second), "01-Mar-00");
     }
 }
