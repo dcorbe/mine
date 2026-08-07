@@ -339,10 +339,15 @@ impl Channel {
             }
 
             _ => {
-                // 9. Line length limit, then 10. buffer capacity. A byte that
-                //    does not fit is dropped, and dropping it silently is the
-                //    point: the module set the limit and does not want to hear
-                //    about what exceeded it.
+                // 9. Line length limit, then 10. buffer capacity. A byte
+                //    that does not fit is dropped -- neither stored nor
+                //    echoed. R8: the guide (`btumil`, page 122) says this
+                //    also queues status 251 ("Data Input Circular-Buffer
+                //    Overflow", page 163), which this host does not queue.
+                //    That is a legitimate omission, not a reading of the
+                //    spec -- the guide itself calls 251 a condition that
+                //    "can be safely ignored" (page 163), not one the module
+                //    depends on hearing about.
                 if self.maxinl != 0 && self.line.len() >= usize::from(self.maxinl) {
                     return;
                 }
