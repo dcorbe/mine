@@ -402,7 +402,25 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+    let position = file.insert(&bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Btrieve's Insert establishes currency on the record it just created --
+    // `PLBTVSTF.C:626` passes a hardcoded key number of 0 to the underlying
+    // Btrieve call (unlike dupdbtv, which threads `bb->lastkn` through), so
+    // this positions in key 0's order specifically. Before this, `dinsbtv`
+    // never touched the cursor, so the file stayed wherever it happened to
+    // be positioned before the insert -- accidentally right when the new
+    // record sorted before the cursor, and wrong when it sorted after.
+    let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let physical = records
+        .find_physical(position)
+        .expect("insert just wrote this position");
+    let cursor = match records.place_in(0, physical) {
+        Some(at) => Cursor::Ordered { key: 0, at },
+        None => Cursor::Physical { at: physical },
+    };
+    file.seek_to(cursor);
+
     Ok(Ret::U16(1))
 }
 
@@ -474,6 +492,35 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Btrieve's opcode 3 maintains currency on the record it just rewrote.
+    // `Cursor::Ordered` is an ordinal into a key's *sorted* order, and
+    // `Block::update` (via `Records::update`) just re-sorted every key's
+    // order as part of the write -- so the ordinal the cursor held before
+    // the call is very likely to name a different record now (see this
+    // test module's `dupdbtv_maintains_currency_on_the_record_it_rewrote_...`
+    // for a measured example: index 4 of key order was Troll before an
+    // update moved Troll to index 6, and after the update it was Elf).
+    // `position` itself did not move -- an update rewrites in place -- so
+    // the cursor is re-derived from it rather than carried forward:
+    // `find_physical` gets back to physical order, and `place_in` re-derives
+    // the ordinal in whichever key the cursor was already following. A
+    // `Physical` cursor needs no correction, because physical order is
+    // insertion order and an update does not touch it -- but it is still
+    // fine to fall through to `Physical` below if the key the cursor was on
+    // is not one `place_in` recognises.
+    if let Cursor::Ordered { key, .. } = file.cursor() {
+        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+        let physical = records
+            .find_physical(position)
+            .expect("update just wrote this position");
+        let cursor = match records.place_in(key, physical) {
+            Some(at) => Cursor::Ordered { key, at },
+            None => Cursor::Physical { at: physical },
+        };
+        file.seek_to(cursor);
+    }
+
     Ok(Ret::U16(1))
 }
 
@@ -2340,6 +2387,55 @@ mod tests {
         );
     }
 
+    /// Important: `dinsbtv` used to leave the cursor wherever it happened to
+    /// be, rather than moving it onto the record it just inserted. Probed
+    /// both directions, because the bug was direction-dependent: inserting a
+    /// key that sorts before the cursor happened to land the (untouched)
+    /// cursor on the new record by accident, and inserting one that sorts
+    /// after it left the cursor on the old record, which is wrong. Btrieve's
+    /// Insert establishes currency on the new record in both cases.
+    #[test]
+    fn dinsbtv_establishes_currency_on_the_new_record_regardless_of_sort_direction() {
+        for key in [0u16, 9u16] {
+            let dir = crate::testing::scratch_with(
+                &format!("dinsbtv-currency-{key}"),
+                &["SAMPLE.DAT"],
+            );
+            let mut f = Fixture::rooted(dir.clone());
+            open(&mut f, "SAMPLE.DAT", 64);
+            assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+
+            let recptr = f.bytes(&sample_record(key as i16, "Newcomer"), false);
+            assert_eq!(
+                f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+                Ret::U16(1)
+            );
+            let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+                panic!("absbtv returns a long");
+            };
+
+            // Independent of the cursor this test is checking: a fresh
+            // fixture over the same directory, positioned on the new record
+            // by its own key -- `dinsbtv` writes to disk immediately, so
+            // this reads back exactly what landed there.
+            let mut g = Fixture::rooted(dir);
+            open(&mut g, "SAMPLE.DAT", 64);
+            assert!(
+                acquire(&mut g, Some(key), 0, 5),
+                "the record dinsbtv just inserted, found by its own key"
+            );
+            let Ret::U32(expected) = g.invoke(absbtv, &[]).expect("position") else {
+                panic!("absbtv returns a long");
+            };
+
+            assert_eq!(
+                after, expected,
+                "key {key}: dinsbtv must leave the cursor on the record it just \
+                 inserted, not wherever it happened to be positioned before"
+            );
+        }
+    }
+
     #[test]
     fn dinsbtv_with_no_file_current_stops_the_module() {
         // `PLBTVSTF.C:598` has no `bb == NULL` guard and reads `bb->reclen`
@@ -2395,6 +2491,48 @@ mod tests {
             "TROLLX"
         );
         assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    /// Critical: `Cursor::Ordered { key, at }` is an ordinal into a key's
+    /// *sorted* order, and `Block::update` (via `Records::update`)
+    /// re-sorts that order every time it runs -- so an ordinal left
+    /// standing from before the write is a bet that the update did not
+    /// change where the record sorts. Renaming Troll's key from 5 to
+    /// something that sorts after every other record (Half-Ogre is the
+    /// highest at 7) loses that bet: before the fix, `absbtv` after this
+    /// `dupdbtv` answered Elf's position, because index 4 of key order --
+    /// where Troll used to sit -- is Elf's slot once Troll has moved to the
+    /// end.
+    #[test]
+    fn dupdbtv_maintains_currency_on_the_record_it_rewrote_even_when_its_key_moves() {
+        let dir = crate::testing::scratch_with(
+            "dupdbtv-currency-follows-the-move",
+            &["SAMPLE.DAT"],
+        );
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let Ret::U32(troll) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        // 8 sorts after every one of SAMPLE.DAT's keys (1..=7), so Troll
+        // moves from the middle of key order to the very end.
+        let recptr = f.bytes(&sample_record(8, "TrollX"), false);
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            Ret::U16(1)
+        );
+
+        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        assert_eq!(
+            after, troll,
+            "opcode 3 maintains currency on the record it rewrote, wherever \
+             its key now sorts -- not on whatever else landed on the old ordinal"
+        );
     }
 
     #[test]
