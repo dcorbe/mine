@@ -232,6 +232,14 @@ pub fn btuxct(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
 /// `int btuica(int chan, char *rdbptr, int max)` -- take up to `max` bytes of
 /// count-triggered input, and return how many were taken.
+///
+/// R12: resolve the destination *before* draining the channel. Draining
+/// first and writing second means a bad pointer's `?` propagates only after
+/// the bytes are already gone from `input` -- a write that never happened,
+/// having destroyed the data it was supposed to deliver. `machine.resolve`
+/// with the exact length `machine.write` will use validates the same bounds
+/// without mutating anything, so if it succeeds, the write after the drain
+/// cannot fail.
 pub fn btuica(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
     let at = machine.arg_far(1);
@@ -239,10 +247,16 @@ pub fn btuica(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     if chan < 0 || chan >= host.gsbl().terms() as i16 {
         return Ok(Ret::U16(OUT_OF_RANGE));
     }
-    let c = host.gsbl_mut().channel_mut(chan).expect("in range");
+    let c = host.gsbl().channel(chan).expect("in range");
     let take = usize::from(max).min(c.input.len());
+
+    machine.resolve(at, take)?;
+
+    let c = host.gsbl_mut().channel_mut(chan).expect("in range");
     let bytes: Vec<u8> = c.input.drain(..take).collect();
-    machine.write(at, &bytes)?;
+    machine
+        .write(at, &bytes)
+        .expect("resolve above already validated this exact pointer and length");
     Ok(Ret::U16(take as u16))
 }
 
@@ -347,6 +361,26 @@ mod tests {
             f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(2),
             "what was copied is consumed"
+        );
+    }
+
+    #[test]
+    fn btuica_does_not_drain_input_when_the_destination_pointer_is_bad() {
+        // R12: draining before validating the write destination meant a bad
+        // pointer's error arrived after the bytes it was supposed to deliver
+        // were already gone. Selector 0xdead names no segment of this
+        // module's, so resolve (and the write it would otherwise attempt)
+        // must fail -- and the bytes must still be waiting to be asked for
+        // again.
+        let mut f = Fixture::new();
+        f.host.gsbl_mut().channel_mut(0).expect("chan 0").trigger = 99;
+        f.host.gsbl_mut().push_input(0, b"abcd");
+        let ret = f.invoke(btuica, &[0, 0, 0xdead, 4]);
+        assert!(ret.is_err(), "a destination that resolves to nothing must fail");
+        assert_eq!(
+            f.invoke(btuibw, &[0]).expect("counted"),
+            Ret::U16(4),
+            "nothing was drained -- the bytes are still there to ask for again"
         );
     }
 
