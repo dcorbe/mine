@@ -3,14 +3,16 @@
 //! [`records`](super::records) reads a file into memory and knows nothing about
 //! where the bytes were. This is the layer that knows: which page a record
 //! position lives on, which slot in it, where the next free slot is, and which
-//! six fields of the file control record change when a record is written.
+//! four fields of the file control record change when a record is written --
+//! [`fcr::FREE`], the record count ([`fcr::RECORDS_HIGH`]/[`fcr::RECORDS_LOW`]),
+//! [`fcr::HIGHEST`] and [`fcr::PAGES`].
 //!
 //! Everything here is measured off the eighteen files MajorMUD ships rather than
 //! taken from a specification, because no specification for the v5 on-disk
 //! format survives. Where a field's meaning was settled by comparing several
 //! files, the comparison is in the doc comment.
 //!
-//! # High word first, five times
+//! # High word first, six times
 //!
 //! Record pointers, the free-list head, the record count, the total page count,
 //! a page's own number and a key's root page are all four-byte quantities stored
@@ -150,8 +152,18 @@ pub struct Layout {
 
 impl Layout {
     /// How many records fit in one page.
+    ///
+    /// Zero rather than a panic if `physical` is zero -- a length no real
+    /// file has, but nothing upstream of here refuses one before it reaches
+    /// this division. Zero slots per page is also the right answer for it:
+    /// no record fits, so [`next_slot`](Self::next_slot) moves straight past
+    /// every existing page to a new one instead of looping forever trying to
+    /// find room that was never there.
     pub fn per_page(self) -> u32 {
-        u32::from((self.page - HEADER) / self.physical)
+        if self.physical == 0 {
+            return 0;
+        }
+        u32::from(self.page.saturating_sub(HEADER) / self.physical)
     }
 
     /// The file position of a slot.
@@ -352,7 +364,8 @@ pub fn write_record(
     if let Slot::NewPage { number, .. } = slot {
         fcr[fcr::PAGES..fcr::PAGES + 4].copy_from_slice(&to_long(number + 1));
         let highest = u16::from_le_bytes([fcr[fcr::HIGHEST], fcr[fcr::HIGHEST + 1]]);
-        let grown = u16::try_from(number).map_err(|_| "a file of more than 65,535 pages".to_owned())?;
+        let grown = u16::try_from(number)
+            .map_err(|_| "a file of more than 65,535 pages".to_owned())?;
         if grown > highest {
             fcr[fcr::HIGHEST..fcr::HIGHEST + 2].copy_from_slice(&grown.to_le_bytes());
         }
@@ -417,11 +430,11 @@ pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, St
 ///
 /// Measured off `WCCRACE.DAT` and `WCCCLASS.DAT`, the only two shipped files
 /// whose index fits one leaf page end to end (thirteen and fifteen records,
-/// both a two-byte key): four bytes of the same [`Header`] a data page opens
+/// both a two-byte key): six bytes of the same [`Header`] a data page opens
 /// with -- number, then flags with the data bit clear -- then two bytes that
 /// equalled the entry count in both measurements, then eight bytes of
-/// `0xffffffff` that a leaf with no siblings should hold. `docs/plans/
-/// 2026-08-07-btrieve-writes.md`, Task 6, has the raw bytes.
+/// `0xffffffff` that a leaf with no siblings should hold. 6 + 2 + 8 = 16.
+/// `docs/plans/2026-08-07-btrieve-writes.md`, Task 6, has the raw bytes.
 pub const INDEX_HEADER: usize = 16;
 
 /// Bytes of one index entry past its key: a record pointer, then a second
@@ -1046,7 +1059,11 @@ mod tests {
         // checked before, so a wrong encoder here had nothing to catch it.
         assert_eq!(&page[26..28], &[2, 0]);
         assert_eq!(long(&page[28..32]), 200);
-        assert_eq!(long(&page[32..36]), 0, "the page's last entry's tail, unlike every other entry's");
+        assert_eq!(
+            long(&page[32..36]),
+            0,
+            "the page's last entry's tail, unlike every other entry's"
+        );
     }
 
     /// C2, pinned against the actual bytes measured out of `WCCRACE.DAT`

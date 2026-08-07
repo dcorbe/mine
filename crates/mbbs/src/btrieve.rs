@@ -676,7 +676,17 @@ impl Block {
         })?;
 
         for key in &self.keys {
-            let entries: Vec<(Vec<u8>, u32)> = (0..records.ordered_len(key.number).unwrap_or(0))
+            // `unwrap_or(0)` would treat a key number `Records` was never
+            // built with the same as a key with no records, and write an
+            // empty leaf over its root instead of saying it does not know
+            // the key. This crate refuses to guess; refuse here too.
+            let len = records.ordered_len(key.number).ok_or_else(|| {
+                fail(format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                ))
+            })?;
+            let entries: Vec<(Vec<u8>, u32)> = (0..len)
                 .map(|n| {
                     let record = records.ordered(key.number, n).expect("in range");
                     (key.extract(&record.bytes), record.position)
@@ -1336,7 +1346,11 @@ mod tests {
         let reread = block.records().expect("a fresh read from disk");
         assert_eq!(reread.len(), 1);
         assert_eq!(
-            reread.find_physical(position).and_then(|at| reread.physical(at)).expect("still there").bytes[0],
+            reread
+                .find_physical(position)
+                .and_then(|at| reread.physical(at))
+                .expect("still there")
+                .bytes[0],
             9,
             "the new bytes, not the old, come back off disk"
         );
