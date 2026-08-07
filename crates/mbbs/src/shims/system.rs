@@ -1624,6 +1624,40 @@ mod tests {
         assert_eq!(mar1 - feb28, 2);
     }
 
+    /// Every test above this one only asserts a *difference* between two
+    /// `cofdat` results, and every one of them is in the first quarter
+    /// (months 1..=3). A uniform offset in the formula -- the `- 1` at the
+    /// end, say, off by a constant rather than by a leap day -- cancels out
+    /// of every difference and would be invisible to all four. Cross-checked
+    /// against a real proleptic-Gregorian day count (Python's
+    /// `datetime.date`), not hand-derived, so this cannot share whatever
+    /// mistake derived the formula in the first place.
+    #[test]
+    fn cofdat_of_7_aug_2026_is_17_020_days_since_1_jan_1980() {
+        // Day 7, month 8 (August), year 46 -- the same date `ncedat`'s own
+        // tests use, formatted `07-Aug-26`. `datetime.date(2026, 8, 7) -
+        // datetime.date(1980, 1, 1)` is 17,020 days.
+        let mut f = Fixture::new();
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(days, 17_020);
+    }
+
+    #[test]
+    fn cofdat_of_31_dec_2026_is_17_166_days_since_1_jan_1980() {
+        // The latest month the table actually holds -- nothing above this
+        // exercises month 12, or anything past March. `datetime.date(2026,
+        // 12, 31) - datetime.date(1980, 1, 1)` is 17,166 days.
+        let mut f = Fixture::new();
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
+        else {
+            panic!("cofdat returns an int");
+        };
+        assert_eq!(days, 17_166);
+    }
+
     #[test]
     fn cofdat_refuses_a_month_the_table_has_no_entry_for() {
         // The four-bit field can hold 13..=15; `CUMULATIVE_DAYS` only has

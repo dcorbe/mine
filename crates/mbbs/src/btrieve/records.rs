@@ -385,7 +385,7 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
         .and_then(|_| file.read_exact(&mut head))
         .map_err(|e| format!("reading the free list: {e}"))?;
 
-    let mut next = pointer(&head);
+    let mut next = super::pages::long(&head);
     while next != NOWHERE {
         if next + 4 > size {
             return Err(format!(
@@ -401,16 +401,9 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
         file.seek(SeekFrom::Start(u64::from(next)))
             .and_then(|_| file.read_exact(&mut link))
             .map_err(|e| format!("following the free list: {e}"))?;
-        next = pointer(&link);
+        next = super::pages::long(&link);
     }
     Ok(dead)
-}
-
-/// A record pointer: four bytes, **high word first**, the same shape the record
-/// count in the file control record is.
-fn pointer(bytes: &[u8]) -> u32 {
-    (u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16)
-        | u32::from(u16::from_le_bytes([bytes[2], bytes[3]]))
 }
 
 /// Whether a slot's bytes would be read as unused rather than as a record.
@@ -430,7 +423,7 @@ fn pointer(bytes: &[u8]) -> u32 {
 pub(crate) fn looks_empty(record: &[u8], size: u32) -> bool {
     match record.len() {
         0..4 => record.iter().all(|b| *b == 0),
-        _ => record[4..].iter().all(|b| *b == 0) && pointer(record) < size,
+        _ => record[4..].iter().all(|b| *b == 0) && super::pages::long(record) < size,
     }
 }
 
@@ -438,14 +431,6 @@ pub(crate) fn looks_empty(record: &[u8], size: u32) -> bool {
 mod tests {
     use super::*;
     use crate::btrieve::keys;
-
-    #[test]
-    fn a_record_pointer_is_two_words_high_first() {
-        // The same encoding as the record count, and the same trap: read as a
-        // little-endian `u32`, `WCCITEMS`'s free list head of 0x325806 becomes
-        // 0x06580032 and points past the end of the file.
-        assert_eq!(pointer(&[0x32, 0x00, 0x06, 0x58]), 0x0032_5806);
-    }
 
     /// Bytes of a record in these fixtures.
     ///

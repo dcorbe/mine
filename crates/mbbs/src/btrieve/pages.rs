@@ -176,7 +176,15 @@ impl Layout {
     ///
     /// A position that is not a slot is a module handing back a record pointer
     /// it invented, and it must not be silently rounded to a nearby record.
+    ///
+    /// `physical` guarded the same way [`Self::per_page`] is: zero is not a
+    /// length any real file has, but nothing upstream refuses one before it
+    /// would reach this division, and no position is on a slot boundary of a
+    /// layout with no slots.
     pub fn slot_of(self, position: u32) -> Option<(u32, u32)> {
+        if self.physical == 0 {
+            return None;
+        }
         let page = position / u32::from(self.page);
         let within = position % u32::from(self.page);
         let offset = within.checked_sub(u32::from(HEADER))?;
@@ -449,16 +457,21 @@ pub const INDEX_HEADER: usize = 16;
 /// constant's name implies.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
-/// Emit the leaf pages for one key, from records already in that key's order.
+/// Emit the leaf page for one key, from records already in that key's order.
 ///
 /// `entries` is `(key bytes, record position)` pairs, already sorted --
 /// [`Records`](super::Records) has already done that, and this does not
 /// re-sort them.
 ///
-/// Returns one page image per leaf, [`layout.page`](Layout::page) bytes each,
-/// with the page number left zero: the caller allocates page numbers -- in
-/// this crate, always the key's existing root -- and patches
-/// [`Header::encode`] over the first six bytes before writing.
+/// Returns one page image, [`layout.page`](Layout::page) bytes, with the page
+/// number left zero: the caller allocates page numbers -- in this crate,
+/// always the key's existing root -- and patches [`Header::encode`] over the
+/// first six bytes before writing.
+///
+/// **One page, not a `Vec` of them.** `Err` is the only other outcome -- see
+/// below -- so there is no shape in which this returns anything but exactly
+/// one page, and every caller immediately un-wraps a one-element `Vec` to get
+/// at it.
 ///
 /// # Errors
 ///
@@ -470,7 +483,7 @@ pub const INDEX_ENTRY_TAIL: usize = 8;
 /// is drawn from: nine of the eleven files MajorMUD ships with records need
 /// more than one leaf page, and this refuses every one of them rather than
 /// guess at how Btrieve would have split them.
-pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<Vec<u8>>, String> {
+pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
     let width = entries.first().map_or(0, |(key, _)| key.len() + INDEX_ENTRY_TAIL);
     let used = INDEX_HEADER + width * entries.len();
     if used > usize::from(layout.page) {
@@ -512,7 +525,7 @@ pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<Vec
         offset += key.len() + INDEX_ENTRY_TAIL;
     }
 
-    Ok(vec![page])
+    Ok(page)
 }
 
 /// The six-byte header of a page already in the file, read on its own rather
@@ -578,13 +591,14 @@ pub fn write_page(
 mod tests {
     use super::*;
 
-    /// The five places this format writes a `u32` high half first.
+    /// The six places this format writes a `u32` high half first.
     ///
-    /// Record pointers, the free-list head, the record count, the page count and
-    /// a page's own number all use it. Read as a plain little-endian `u32`,
-    /// `WCCITEMS`'s free-list head of `0x325806` becomes `0x06580032` and points
-    /// past the end of the file -- a wrong number rather than an error, which is
-    /// why this is pinned separately from anything that uses it.
+    /// Record pointers, the free-list head, the record count, the total page
+    /// count, a page's own number and a key's root page all use it. Read as a
+    /// plain little-endian `u32`, `WCCITEMS`'s free-list head of `0x325806`
+    /// becomes `0x06580032` and points past the end of the file -- a wrong
+    /// number rather than an error, which is why this is pinned separately
+    /// from anything that uses it.
     #[test]
     fn a_long_in_this_format_is_two_words_high_first() {
         assert_eq!(long(&[0x32, 0x00, 0x06, 0x58]), 0x0032_5806);
@@ -1032,10 +1046,8 @@ mod tests {
         let layout = index_layout();
         let entries = vec![(vec![1u8, 0], 100u32), (vec![2u8, 0], 200u32)];
 
-        let built = index_pages(layout, &entries).expect("two entries fit easily");
+        let page = index_pages(layout, &entries).expect("two entries fit easily");
 
-        assert_eq!(built.len(), 1);
-        let page = &built[0];
         assert_eq!(page.len(), 64);
 
         let header = Header::decode(&page[..6]);
@@ -1084,8 +1096,7 @@ mod tests {
         entries.push((0x000du16.to_le_bytes().to_vec(), 0x0000_0a06));
         assert_eq!(entries.len(), 13);
 
-        let built = index_pages(layout, &entries).expect("13 entries fit one leaf");
-        let page = &built[0];
+        let page = index_pages(layout, &entries).expect("13 entries fit one leaf");
 
         let second_to_last = INDEX_HEADER + 11 * (2 + INDEX_ENTRY_TAIL);
         assert_eq!(&page[second_to_last..second_to_last + 2], &[0x0c, 0x00], "entry 11's key");
@@ -1119,9 +1130,8 @@ mod tests {
     #[test]
     fn no_entries_is_a_valid_empty_leaf() {
         let layout = index_layout();
-        let built = index_pages(layout, &[]).expect("an empty key still has a root page");
-        assert_eq!(built.len(), 1);
-        assert_eq!(u16::from_le_bytes([built[0][6], built[0][7]]), 0);
+        let page = index_pages(layout, &[]).expect("an empty key still has a root page");
+        assert_eq!(u16::from_le_bytes([page[6], page[7]]), 0);
     }
 
     /// The boundary Task 6 draws: an interior page is refused rather than
@@ -1143,8 +1153,8 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (0..4u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let built = index_pages(layout, &entries).expect("four ten-byte entries need exactly 56");
-        assert_eq!(built.len(), 1);
+        let page = index_pages(layout, &entries).expect("four ten-byte entries need exactly 56");
+        assert_eq!(page.len(), usize::from(layout.page));
     }
 
     #[test]

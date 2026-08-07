@@ -228,7 +228,12 @@ impl Geometry {
             keys: word(at::KEYS),
             reclen,
             physical,
-            records: (u32::from(word(at::RECORDS_HIGH)) << 16) | u32::from(word(at::RECORDS_LOW)),
+            // RECORDS_HIGH and RECORDS_LOW are two separate fields (see
+            // `pages::write_record`'s doc comment on why `to_long` cannot
+            // write them in one store), but they sit adjacent, so the range
+            // between them is the same four-byte, high-word-first quantity
+            // `pages::long` decodes everywhere else.
+            records: pages::long(&bytes[at::RECORDS_HIGH..at::RECORDS_LOW + 2]),
             pages: (size / u64::from(page)) as u32,
             variable,
         })
@@ -725,9 +730,7 @@ impl Block {
                 .collect();
 
             let mut page = pages::index_pages(layout, &entries)
-                .map_err(|why| fail(format!("key {}: {why}", key.number)))?
-                .pop()
-                .expect("index_pages always returns at least one page");
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
 
             // `key.definition`, not `key.number`: a multi-segment key's root
             // and record count live at its *first* definition, and the two
