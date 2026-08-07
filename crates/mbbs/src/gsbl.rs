@@ -414,7 +414,11 @@ impl Channel {
                 }
             }
             self.output.push_back(byte);
-            self.column += 1;
+            // R10: with the default width of 0, wrap() is never called and
+            // nothing but a CR ever resets column -- so a long enough
+            // channel-lifetime of unwrapped output must not panic once it
+            // passes u16::MAX bytes since the last CR.
+            self.column = self.column.saturating_add(1);
         }
 
         if self.output.len() > OUTSIZ {
@@ -721,6 +725,20 @@ mod tests {
         g.transmit(0, b"line\r");
         g.transmit(0, b"\n");
         assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+    }
+
+    #[test]
+    fn column_does_not_overflow_when_width_is_unset() {
+        // R10: width stays 0 (the default), so wrap() is never called and
+        // nothing resets column -- a plain `column += 1` would panic on
+        // overflow (debug builds check this) long before finishing a call
+        // this large. The call itself is bigger than OUTSIZ and rolls back
+        // (R6), which is not what this test is about; it only cares that
+        // accumulating column that far did not panic on the way there.
+        let mut g = Gsbl::new(1);
+        let long = vec![b'x'; 70_000];
+        g.transmit(0, &long);
+        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
     }
 
     #[test]
