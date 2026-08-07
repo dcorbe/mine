@@ -205,6 +205,108 @@ impl Layout {
     }
 }
 
+/// Write one record into a slot, and update every header field that changes.
+///
+/// `records` is the file's record count **after** this write; the caller knows
+/// it because the caller owns the in-memory model. Passing it in rather than
+/// incrementing what is on disk means a write cannot drift from the model it is
+/// supposed to be persisting.
+///
+/// The record is padded to the physical length with zeros. Btrieve's padding is
+/// not specified anywhere that survives, and zero is what every unused tail byte
+/// in the shipped files holds.
+///
+/// # Errors
+///
+/// If the file cannot be opened, sought or written.
+pub fn write_record(
+    path: &std::path::Path,
+    layout: Layout,
+    slot: Slot,
+    bytes: &[u8],
+    records: u32,
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let fail = |what: &str, e: std::io::Error| format!("{}: {what}: {e}", path.display());
+
+    // A reused slot's first four bytes are the free list's next link, and they
+    // have to be read before the record overwrites them.
+    let mut head = None;
+    if let Slot::Free(at) = slot {
+        let mut link = [0u8; 4];
+        file.seek(SeekFrom::Start(u64::from(at)))
+            .and_then(|_| file.read_exact(&mut link))
+            .map_err(|e| fail("reading a free slot's link", e))?;
+        head = Some(long(&link));
+    }
+
+    // A new page is written whole -- header, then the record, then zeros --
+    // because the file has to grow to reach it at all.
+    if let Slot::NewPage { number, .. } = slot {
+        let mut page = vec![0u8; usize::from(layout.page)];
+        page[..usize::from(HEADER)].copy_from_slice(
+            &Header {
+                number,
+                data: true,
+                stamp: 0,
+            }
+            .encode(),
+        );
+        file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+            .and_then(|_| file.write_all(&page))
+            .map_err(|e| fail("appending a page", e))?;
+    }
+
+    let mut slack = vec![0u8; usize::from(layout.physical)];
+    slack[..bytes.len()].copy_from_slice(bytes);
+    file.seek(SeekFrom::Start(u64::from(slot.position())))
+        .and_then(|_| file.write_all(&slack))
+        .map_err(|e| fail("writing a record", e))?;
+
+    // Page 0 -- the file control record -- rather than a hard-coded 512: a real
+    // Btrieve file's page is always at least 512 bytes (see `btrieve.rs`'s
+    // `FCR` constant), but the field offsets used below are all well inside a
+    // page of any size this format uses, including the 64-byte pages the tests
+    // below use to keep the fixture readable.
+    let mut fcr = vec![0u8; usize::from(layout.page)];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut fcr))
+        .map_err(|e| fail("reading the file control record", e))?;
+
+    // The record count is stored as two separate u16 fields, `RECORDS_HIGH` at
+    // 0x1a and `RECORDS_LOW` at 0x1c, and `to_long` writing all four bytes at
+    // `RECORDS_HIGH` only reaches `RECORDS_LOW` because the two fields happen to
+    // sit adjacent in the FCR. That is a coincidence of this layout, not a
+    // guarantee -- do not "simplify" this into a plain little-endian `u32`
+    // store, and do not assume any other field is secretly two halves like this
+    // one is. `FREE` and `PAGES` are each already a single four-byte quantity,
+    // high word first (see [`long`]).
+    fcr[fcr::RECORDS_HIGH..fcr::RECORDS_HIGH + 4].copy_from_slice(&to_long(records));
+    if let Some(next) = head {
+        fcr[fcr::FREE..fcr::FREE + 4].copy_from_slice(&to_long(next));
+    }
+    if let Slot::NewPage { number, .. } = slot {
+        fcr[fcr::PAGES..fcr::PAGES + 4].copy_from_slice(&to_long(number + 1));
+        let highest = u16::from_le_bytes([fcr[fcr::HIGHEST], fcr[fcr::HIGHEST + 1]]);
+        let grown = u16::try_from(number).map_err(|_| "a file of more than 65,535 pages".to_owned())?;
+        if grown > highest {
+            fcr[fcr::HIGHEST..fcr::HIGHEST + 2].copy_from_slice(&grown.to_le_bytes());
+        }
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&fcr))
+        .and_then(|_| file.flush())
+        .map_err(|e| fail("writing the file control record", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +450,115 @@ mod tests {
             layout.next_slot(&taken, None, &[2, 3, 4, 5]),
             Slot::Existing(2 * 512 + 6 + 126)
         );
+    }
+
+    /// A file laid out like virgin `WCCUSERS.DAT` but small enough to read at a
+    /// glance: 64-byte pages holding one 20-byte record each, five pages, one of
+    /// which (page 4) is a data page.
+    fn seed(dir: &std::path::Path) -> std::path::PathBuf {
+        let (page, physical, pages) = (64usize, 20usize, 5usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[0x08..0x0a].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&to_long(NOWHERE));
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&16u16.to_le_bytes());
+        bytes[0x18..0x1a].copy_from_slice(&(physical as u16).to_le_bytes());
+        bytes[0x1e..0x20].copy_from_slice(&4u16.to_le_bytes());
+        bytes[0x26..0x2a].copy_from_slice(&to_long(pages as u32));
+        // Page 4 is the data page; 1..4 are index pages.
+        for number in 1..pages {
+            let header = Header {
+                number: number as u32,
+                data: number == 4,
+                stamp: 0,
+            };
+            bytes[number * page..number * page + 6].copy_from_slice(&header.encode());
+        }
+        let path = dir.join("SCRATCH.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    #[test]
+    fn a_record_written_into_the_only_data_page_reads_back() {
+        let dir = crate::testing::scratch("pages-write-existing-slot");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let at = layout.position(4, 0);
+
+        write_record(&path, layout, Slot::Existing(at), &[0xab; 16], 1).expect("write");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(&bytes[at as usize..at as usize + 16], &[0xab; 16]);
+        assert_eq!(long(&bytes[0x1a..0x1e]), 1, "the header counts the record");
+        assert_eq!(bytes.len(), 64 * 5, "no page was added");
+    }
+
+    /// The eight-times case: the file has no room and grows.
+    #[test]
+    fn a_record_that_does_not_fit_grows_the_file_by_a_page() {
+        let dir = crate::testing::scratch("pages-write-grows-a-page");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        write_record(&path, layout, Slot::Existing(layout.position(4, 0)), &[1; 16], 1)
+            .expect("first");
+
+        let grown = Layout { pages: 5, ..layout };
+        write_record(
+            &path,
+            grown,
+            Slot::NewPage {
+                number: 5,
+                position: grown.position(5, 0),
+            },
+            &[2; 16],
+            2,
+        )
+        .expect("second");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(bytes.len(), 64 * 6, "the file grew by exactly one page");
+        let header = Header::decode(&bytes[5 * 64..5 * 64 + 6]);
+        assert_eq!(header.number, 5);
+        assert!(header.data, "a page holding records has bit 15 set");
+        assert_eq!(long(&bytes[0x26..0x2a]), 6, "the page count grew");
+        assert_eq!(
+            u16::from_le_bytes([bytes[0x1e], bytes[0x1f]]),
+            5,
+            "the highest page in use grew"
+        );
+        assert_eq!(long(&bytes[0x1a..0x1e]), 2);
+    }
+
+    /// Reusing a free slot moves the head along to whatever the slot pointed at.
+    #[test]
+    fn taking_a_free_slot_moves_the_head_to_its_link() {
+        let dir = crate::testing::scratch("pages-write-reuses-free-slot");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let first = layout.position(4, 0);
+        // Put one slot on the free list, chaining to nothing.
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[0x10..0x14].copy_from_slice(&to_long(first));
+        bytes[first as usize..first as usize + 4].copy_from_slice(&to_long(NOWHERE));
+        std::fs::write(&path, &bytes).expect("seed the free list");
+
+        write_record(&path, layout, Slot::Free(first), &[9; 16], 1).expect("write");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(long(&bytes[0x10..0x14]), NOWHERE, "the free list is empty now");
+        assert_eq!(&bytes[first as usize..first as usize + 16], &[9; 16]);
     }
 }
