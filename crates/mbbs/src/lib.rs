@@ -128,7 +128,10 @@ pub(crate) struct DateBuffers {
 
     /// One byte, always NUL. What `ncdate(0)` returns -- and a **different**
     /// address from `date`, so a null date leaves an earlier result standing,
-    /// exactly as `seg 33:0x0c14` does by never writing at all.
+    /// exactly as `seg 33:0x0c14` does by never writing at all. Written
+    /// explicitly at `shims/system.rs:110` rather than trusted to the heap's
+    /// zero-fill -- see [`Host::empty`] for the sibling that exists for the
+    /// module's first instruction instead of its first date call.
     pub(crate) empty: FarPtr,
 }
 
@@ -216,6 +219,10 @@ pub struct Host {
     /// there is no host-side copy of `MAJORBBS.EXE` running. This is that
     /// literal's stand-in: the module dereferences `margv[0]` unguarded, and a
     /// `FarPtr::NULL` there is a segment-zero read rather than an empty string.
+    ///
+    /// Written explicitly in [`Host::new`] rather than trusted to the
+    /// allocator's zero-fill -- see [`DateBuffers::empty`] for the sibling
+    /// that gets the same treatment for the same reason, lazily instead.
     empty: FarPtr,
 
     /// Where the print buffer ends, so `prf` can refuse to run past it.
@@ -392,6 +399,18 @@ impl Host {
         globals.write(machine, "user", &users.head().to_bytes())?;
         globals.write(machine, "channel", &users.channels().to_bytes())?;
 
+        // R17: written explicitly rather than left to `alloc_segment`'s
+        // `mmap(MAP_ANONYMOUS)` zero-fill. `DateBuffers`'s own empty byte gets
+        // the identical write at `shims/system.rs:110` -- two facilities for
+        // one NUL because they cannot be the same one: this one must exist
+        // before the module's first instruction, and that one is allocated
+        // lazily off the heap the first time a date routine runs.
+        let empty = FarPtr {
+            offset: spr_bytes as u16 + 64,
+            selector,
+        };
+        machine.write(empty, &[0])?;
+
         Ok(Self {
             exports: Exports::wg101(),
             globals,
@@ -407,10 +426,7 @@ impl Host {
                 offset: spr_bytes as u16,
                 selector,
             },
-            empty: FarPtr {
-                offset: spr_bytes as u16 + 64,
-                selector,
-            },
+            empty,
             prf_end,
             random: Random::default(),
             clock: Clock::system()?,
