@@ -108,6 +108,103 @@ impl Header {
     }
 }
 
+/// Where the next record is going.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// A slot the free list gave back. Its first four bytes are the next link
+    /// and the caller has to move the head along before overwriting them.
+    Free(u32),
+
+    /// An unused slot in a page that already holds records.
+    Existing(u32),
+
+    /// A page that does not exist yet, and the first slot of it.
+    NewPage { number: u32, position: u32 },
+}
+
+impl Slot {
+    /// Where the record goes, whichever kind of slot it is.
+    pub fn position(self) -> u32 {
+        match self {
+            Self::Free(at) | Self::Existing(at) => at,
+            Self::NewPage { position, .. } => position,
+        }
+    }
+}
+
+/// A file's page geometry: enough to turn a record position into a page and a
+/// slot, and back.
+///
+/// A narrower thing than [`Geometry`](super::Geometry) on purpose. This layer
+/// has no business knowing a file's record count or version, and a function that
+/// takes only what it needs cannot be given a stale copy of what it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Bytes per page.
+    pub page: u16,
+    /// Bytes per record slot -- the physical length, not the logical one.
+    pub physical: u16,
+    /// How many pages the file currently is.
+    pub pages: u32,
+}
+
+impl Layout {
+    /// How many records fit in one page.
+    pub fn per_page(self) -> u32 {
+        u32::from((self.page - HEADER) / self.physical)
+    }
+
+    /// The file position of a slot.
+    pub fn position(self, page: u32, slot: u32) -> u32 {
+        u32::from(self.page) * page + u32::from(HEADER) + u32::from(self.physical) * slot
+    }
+
+    /// Which page and slot a file position is, or `None` if it is not on a slot
+    /// boundary.
+    ///
+    /// A position that is not a slot is a module handing back a record pointer
+    /// it invented, and it must not be silently rounded to a nearby record.
+    pub fn slot_of(self, position: u32) -> Option<(u32, u32)> {
+        let page = position / u32::from(self.page);
+        let within = position % u32::from(self.page);
+        let offset = within.checked_sub(u32::from(HEADER))?;
+        if offset % u32::from(self.physical) != 0 {
+            return None;
+        }
+        let slot = offset / u32::from(self.physical);
+        (slot < self.per_page()).then_some((page, slot))
+    }
+
+    /// Where the next inserted record goes.
+    ///
+    /// `taken` is every position currently holding a live record, `free` is the
+    /// head of the free list if there is one, and `data` is the number of every
+    /// page that holds records, lowest first.
+    ///
+    /// The order -- free list, then a gap in an existing page, then a new page
+    /// -- is the original's. Slots are filled from the front of a page because
+    /// [`records::walk`](super::records) stops reading a page at the first slot
+    /// that is neither live nor free, so a gap would hide every record behind
+    /// it.
+    pub fn next_slot(self, taken: &[u32], free: Option<u32>, data: &[u32]) -> Slot {
+        if let Some(at) = free {
+            return Slot::Free(at);
+        }
+        for page in data {
+            for slot in 0..self.per_page() {
+                let at = self.position(*page, slot);
+                if !taken.contains(&at) {
+                    return Slot::Existing(at);
+                }
+            }
+        }
+        Slot::NewPage {
+            number: self.pages,
+            position: self.position(self.pages, 0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +255,98 @@ mod tests {
         let header = Header::decode(&[0x00, 0x00, 0x01, 0x00, 0x0d, 0x00]);
         assert!(!header.data);
         assert_eq!(header.stamp, 13);
+    }
+
+    /// `tmp/WCCUSERS.DAT` as shipped, which is this plan's subject: 2,048-byte
+    /// pages holding one 2,006-byte record each, five pages of which exactly one
+    /// (page 4) holds records.
+    fn wccusers() -> Layout {
+        Layout {
+            page: 2048,
+            physical: 2006,
+            pages: 5,
+        }
+    }
+
+    #[test]
+    fn a_slot_is_a_page_a_header_and_a_stride() {
+        let layout = wccusers();
+        assert_eq!(layout.per_page(), 1, "2048 less six bytes holds one 2006");
+        // Page 4, slot 0.
+        assert_eq!(layout.position(4, 0), 4 * 2048 + 6);
+        assert_eq!(layout.slot_of(4 * 2048 + 6), Some((4, 0)));
+    }
+
+    /// Four records to a 512-byte page, which is `WCCRACE.DAT`'s shape.
+    #[test]
+    fn several_slots_to_a_page_are_spaced_by_the_physical_length() {
+        let layout = Layout {
+            page: 512,
+            physical: 126,
+            pages: 6,
+        };
+        assert_eq!(layout.per_page(), 4);
+        assert_eq!(layout.position(2, 0), 2 * 512 + 6);
+        assert_eq!(layout.position(2, 3), 2 * 512 + 6 + 126 * 3);
+        assert_eq!(layout.slot_of(2 * 512 + 6 + 126 * 3), Some((2, 3)));
+        // A position that is not on a slot boundary is not a slot.
+        assert_eq!(layout.slot_of(2 * 512 + 7), None);
+    }
+
+    /// The free list wins, because that is what the original did -- and the live
+    /// board's `WCCUSERS.DB` proves it, with `id` gaps at 3, 5, 7 and 8 where
+    /// deleted characters' slots were handed out again.
+    #[test]
+    fn a_free_slot_is_used_before_a_fresh_one() {
+        let layout = wccusers();
+        let free = 4 * 2048 + 6;
+        assert_eq!(
+            layout.next_slot(&[], Some(free), &[4]),
+            Slot::Free(free),
+            "a free slot is taken before anything else"
+        );
+    }
+
+    /// Virgin `WCCUSERS.DAT`: nothing free, one data page, no records in it.
+    #[test]
+    fn the_first_record_of_an_empty_file_goes_in_the_one_data_page() {
+        let layout = wccusers();
+        assert_eq!(
+            layout.next_slot(&[], None, &[4]),
+            Slot::Existing(4 * 2048 + 6)
+        );
+    }
+
+    /// One record in, one slot per page, no page has room -- so the file grows.
+    /// This is the case nine characters hits eight times.
+    #[test]
+    fn a_full_file_grows_by_a_page() {
+        let layout = wccusers();
+        let taken = [4 * 2048 + 6];
+        assert_eq!(
+            layout.next_slot(&taken, None, &[4]),
+            Slot::NewPage {
+                number: 5,
+                position: 5 * 2048 + 6,
+            },
+            "page 5 is one past the end of a five-page file"
+        );
+    }
+
+    /// Slots must be filled from the front of a page, because `walk` stops at the
+    /// first slot that is neither live nor free -- so a gap hides every record
+    /// behind it. With slot 0 of a four-slot page taken, the answer is slot 1.
+    #[test]
+    fn slots_are_filled_from_the_front_of_a_page() {
+        let layout = Layout {
+            page: 512,
+            physical: 126,
+            pages: 6,
+        };
+        let taken = [2 * 512 + 6];
+        assert_eq!(
+            layout.next_slot(&taken, None, &[2, 3, 4, 5]),
+            Slot::Existing(2 * 512 + 6 + 126)
+        );
     }
 }
