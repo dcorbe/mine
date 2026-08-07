@@ -268,10 +268,20 @@ impl Records {
 
     /// Remove the record at `position`.
     ///
+    /// `pub(crate)` rather than `pub`: this only removes `position` from the
+    /// in-memory model, and there is no `Block::delete` yet to remove the
+    /// on-disk slot or add it to the free list. Calling this alone would
+    /// take `position` out of [`Self::positions`] while the slot on disk is
+    /// still live -- `Layout::next_slot`'s free-list-then-existing-gap
+    /// search does not consult the free list on disk either, so nothing
+    /// stops `next_slot` from handing that same still-live position back as
+    /// `Slot::Existing` and having a later insert overwrite it. Widen this
+    /// once `Block::delete` exists to keep the two in step.
+    ///
     /// # Errors
     ///
     /// If `position` holds no record.
-    pub fn delete(&mut self, keys: &[Key], position: u32) -> Result<(), String> {
+    pub(crate) fn delete(&mut self, keys: &[Key], position: u32) -> Result<(), String> {
         let index = self
             .records
             .iter()
@@ -719,6 +729,37 @@ mod tests {
         let parsed = keys::parse("GONE.DAT", &bytes, 1).expect("keys");
 
         assert!(records.delete(&parsed, slot(5)).is_err());
+    }
+
+    /// I8: why `delete` is `pub(crate)` rather than `pub`. It only ever
+    /// touches the in-memory model -- there is no `Block::delete` yet to
+    /// free the slot on disk or add it to the free list -- so a caller with
+    /// access to this alone could take `position` out of
+    /// [`Records::positions`] while the slot behind it is still live on
+    /// disk, and a later `Layout::next_slot` would hand that same position
+    /// back as `Slot::Existing` for a write to overwrite. This demonstrates
+    /// the gap directly: deleting from the model leaves the underlying bytes
+    /// completely untouched, so a fresh read of them still finds the record
+    /// the model just forgot.
+    #[test]
+    fn deleting_from_the_model_alone_does_not_touch_the_file() {
+        let bytes = of(&[1, 2, 3]);
+        let mut records = read("MODEL-ONLY.DAT", &bytes).expect("reads");
+        let parsed = keys::parse("MODEL-ONLY.DAT", &bytes, 1).expect("keys");
+        let position = records.physical(1).expect("the middle record").position;
+
+        records.delete(&parsed, position).expect("deletes from the model");
+        assert!(
+            records.positions().iter().all(|p| *p != position),
+            "the model has forgotten it"
+        );
+
+        // The bytes this came from were never written to -- a fresh read of
+        // exactly the same file content still finds all three records,
+        // including the one the model just forgot.
+        let reread = read("MODEL-ONLY.DAT", &bytes).expect("reads again");
+        assert_eq!(reread.len(), 3, "the file itself was never touched");
+        assert!(reread.find_physical(position).is_some());
     }
 
     /// `ties` is how this host reports the one Btrieve divergence it cannot
