@@ -86,6 +86,29 @@ pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
+/// `char *getin(void)` -- get input, parse it, and hand back the first
+/// argument.
+///
+/// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
+///
+///
+/// **Returns `char *margv[0]`, not `void`** -- a shim answering `Ret::Void`
+/// here would hand the module a null pointer it dereferences unguarded.
+///
+/// Takes no arguments of its own: like the original, it works off `usrnum`,
+/// the channel `curusr` last made current. The sequence itself --
+/// `paccin()` then `parsin()` -- is [`Host::get_input`], because
+/// [`Host::poll`](crate::Host::poll) needs it too and this is the one call
+/// site among the two that has an argument stack to read from at all.
+pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let chan = host
+        .globals()
+        .word(machine, "usrnum")
+        .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
+    let margv0 = host.get_input(machine, chan)?;
+    Ok(Ret::Far(margv0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +200,43 @@ mod tests {
             "notes: {:?}",
             f.host.notes()
         );
+    }
+
+    #[test]
+    fn getin_takes_a_ready_line_and_hands_back_its_first_argument() {
+        let mut f = Fixture::new();
+        f.invoke(curusr, &[0]).expect("channel 0");
+        f.host.gsbl_mut().push_input(0, b"get all gold\r");
+
+        let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
+            panic!("getin returns char *margv[0]");
+        };
+
+        // `input` holds the line, NUL-terminated -- and `getin` did not just
+        // copy the bytes, it ran them through `parsin`: `margc` is right and
+        // `margv[0]` is the pointer `parsin` produced, not a guess at it.
+        let input = f.host.globals().address("input").expect("input");
+        assert_eq!(f.machine.read_cstr(input).expect("terminated"), b"get");
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
+        // `margv[0]` points at "get" itself -- the start of `input`, since
+        // the first word begins right there.
+        assert_eq!(margv0, input);
+        assert_eq!(f.machine.read_cstr(margv0).expect("readable"), b"get");
+    }
+
+    #[test]
+    fn getin_on_a_channel_with_no_ready_line_still_returns_a_readable_margv_zero() {
+        // Nothing pushed, and no `\r` arrived -- there is no completed line to
+        // take. `getin` must not fault, and the module still dereferences
+        // `margv[0]` unguarded on whatever it gets back.
+        let mut f = Fixture::new();
+        f.invoke(curusr, &[0]).expect("channel 0");
+
+        let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
+            panic!("getin returns char *margv[0]");
+        };
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
+        assert_ne!(margv0, mbbs16::FarPtr::NULL);
+        assert_eq!(f.machine.read_cstr(margv0).expect("readable"), b"");
     }
 }

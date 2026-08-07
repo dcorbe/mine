@@ -587,6 +587,60 @@ impl Host {
         &mut self.gsbl
     }
 
+    /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
+    /// `char *margv[0]`.
+    ///
+    /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
+    ///
+    ///
+    /// `paccin` is `inplen=btuinp(usrnum,input)` followed by `paccit()` --
+    /// the modem monitor and the profanity check, both BBS-shaped and out of
+    /// scope. This host's `paccin` is `btuinp` and nothing else: take the
+    /// channel's completed line (an empty one if none is ready, which is
+    /// exactly the byte string an empty line already is) and write it,
+    /// NUL-terminated, into `input`. `btuinp` is not itself a shim --
+    /// `WCCMMUD.DLL` imports it only on the 32-bit side -- so it has no
+    /// argument stack to read; what it does is folded in here.
+    ///
+    /// Shared rather than inlined into the `getin` shim because
+    /// [`Host::poll`] (Task 9) needs the identical sequence and must not have
+    /// to fake a call frame to reach it.
+    ///
+    /// # Errors
+    ///
+    /// If `input`, `margv` or `margn` are not placed, or a write runs off a
+    /// segment.
+    pub(crate) fn get_input(
+        &mut self,
+        machine: &mut Machine,
+        chan: i16,
+    ) -> Result<FarPtr, ShimError> {
+        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
+
+        let input = self
+            .globals()
+            .address("input")
+            .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+        let size = usize::from(
+            self.globals()
+                .size("input")
+                .expect("input is placed, its address just resolved"),
+        );
+        let take = line.len().min(size - 1);
+        let mut bytes = line[..take].to_vec();
+        bytes.push(0);
+        machine.write(input, &bytes)?;
+
+        shims::text::parsin(machine, self)?;
+
+        let margv = self
+            .globals()
+            .address("margv")
+            .expect("margv is placed, or parsin above would already have failed");
+        let bytes = machine.resolve(margv, 4)?;
+        Ok(FarPtr::from_bytes(bytes.try_into().expect("4 bytes")))
+    }
+
     /// `void alcvda(void)` -- give every channel its volatile data area.
     ///
     /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init

@@ -233,6 +233,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // slot it names.
     (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
     (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
+    (MAJORBBS, "getin", user::getin, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
     (
