@@ -218,7 +218,8 @@ impl Layout {
 ///
 /// # Errors
 ///
-/// If the file cannot be opened, sought or written.
+/// If `bytes` is longer than the slot it would go in, or if the file cannot
+/// be opened, sought or written.
 pub fn write_record(
     path: &std::path::Path,
     layout: Layout,
@@ -228,6 +229,22 @@ pub fn write_record(
 ) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
+    // Checked before anything is opened: `slack[..bytes.len()]` below would
+    // panic on a buffer longer than the slot, and this crate's rule is that a
+    // routine which cannot act honestly stops rather than proceeding --
+    // including by panicking. `Block::update` and `Block::insert` normalise
+    // to the file's own `reclen` before calling this, so an oversized buffer
+    // reaching here is a bug in a caller, not a module input; naming both
+    // lengths is what makes that caller findable.
+    if bytes.len() > usize::from(layout.physical) {
+        return Err(format!(
+            "{}: a {}-byte record does not fit a {}-byte physical slot",
+            path.display(),
+            bytes.len(),
+            layout.physical
+        ));
+    }
+
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -235,6 +252,9 @@ pub fn write_record(
         .map_err(|e| format!("{}: {e}", path.display()))?;
 
     let fail = |what: &str, e: std::io::Error| format!("{}: {what}: {e}", path.display());
+
+    let mut slack = vec![0u8; usize::from(layout.physical)];
+    slack[..bytes.len()].copy_from_slice(bytes);
 
     // A reused slot's first four bytes are the free list's next link, and they
     // have to be read before the record overwrites them.
@@ -264,8 +284,6 @@ pub fn write_record(
             .map_err(|e| fail("appending a page", e))?;
     }
 
-    let mut slack = vec![0u8; usize::from(layout.physical)];
-    slack[..bytes.len()].copy_from_slice(bytes);
     file.seek(SeekFrom::Start(u64::from(slot.position())))
         .and_then(|_| file.write_all(&slack))
         .map_err(|e| fail("writing a record", e))?;
@@ -658,6 +676,34 @@ mod tests {
         assert_eq!(&bytes[at as usize..at as usize + 16], &[0xab; 16]);
         assert_eq!(long(&bytes[0x1a..0x1e]), 1, "the header counts the record");
         assert_eq!(bytes.len(), 64 * 5, "no page was added");
+    }
+
+    /// I5: `slack[..bytes.len()].copy_from_slice(bytes)` used to panic when
+    /// `bytes` was longer than the slot. This crate's rule is that a routine
+    /// which cannot act honestly stops rather than proceeding -- including by
+    /// panicking -- and `write_record` already returns `Result`, so there was
+    /// no reason for this one case to be a crash instead of an `Err`.
+    #[test]
+    fn a_record_longer_than_its_slot_is_an_error_not_a_panic() {
+        let dir = crate::testing::scratch("pages-write-refuses-oversized-record");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let at = layout.position(4, 0);
+
+        let e = write_record(&path, layout, Slot::Existing(at), &[7u8; 21], 1)
+            .expect_err("21 bytes do not fit a 20-byte physical slot");
+        assert!(e.contains("21") && e.contains("20"), "{e}");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            &bytes[at as usize..at as usize + 4],
+            &[0, 0, 0, 0],
+            "the refused write touched nothing"
+        );
     }
 
     /// The eight-times case: the file has no room and grows.
