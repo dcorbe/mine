@@ -397,7 +397,9 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     };
     let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
 
-    if duplicate_key(host, block, &bytes, None)?.is_some() {
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        note_duplicate_key(host, "dinsbtv", &name, key, &value);
         return Ok(Ret::U16(0));
     }
 
@@ -486,7 +488,9 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     };
     let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
 
-    if duplicate_key(host, block, &bytes, Some(position))?.is_some() {
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        note_duplicate_key(host, "dupdbtv", &name, key, &value);
         return Ok(Ret::U16(0));
     }
 
@@ -596,22 +600,26 @@ pub fn clsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// Whether `bytes` collides with an existing record on a key that does not
 /// permit duplicates.
 ///
-/// Returns the colliding key's number, or `None` if there is no collision.
-/// `exclude`, for [`dupdbtv`], is the file position of the record being
-/// replaced -- its own current key values are not a collision with
-/// themselves; [`dinsbtv`] has no such record and passes `None`.
+/// Returns the colliding key's number and the value that collided, or `None`
+/// if there is no collision. `exclude`, for [`dupdbtv`], is the file position
+/// of the record being replaced -- its own current key values are not a
+/// collision with themselves; [`dinsbtv`] has no such record and passes
+/// `None`.
 ///
 /// `PLBTVSTF.C` never computes this: it hands the record to Btrieve and reads
 /// back status 5 if the TSR already had one. This host has no TSR, so it asks
 /// the same question of the records already read into memory -- a record
 /// with this value is a collision if [`Records::seek`](crate::btrieve::Records::seek)
 /// lands on one that [`Records::matches`](crate::btrieve::Records::matches) it exactly.
+///
+/// The caller is the one who notes it -- see [`note_duplicate_key`] -- because
+/// only the caller knows whether this is an insert or an update.
 fn duplicate_key(
     host: &mut Host,
     block: FarPtr,
     bytes: &[u8],
     exclude: Option<u32>,
-) -> Result<Option<u16>, ShimError> {
+) -> Result<Option<(u16, Vec<u8>)>, ShimError> {
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let keys = file.keys().to_vec();
     let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -629,9 +637,33 @@ fn duplicate_key(
         if Some(existing.position) == exclude {
             continue;
         }
-        return Ok(Some(key.number));
+        return Ok(Some((key.number, value)));
     }
     Ok(None)
+}
+
+/// Say that a duplicate-key collision made a write answer 0 instead of
+/// happening.
+///
+/// A duplicate-key answer of 0 is exactly the case where `_GENERATE_TOP_LIST`
+/// silently skips a character -- see [`duplicate_key`], whose result this
+/// reports. Every call here names a different key and a different colliding
+/// value, so this is [`Host::note`] rather than [`Host::note_once`]: the
+/// `note_once` routines ([`note_no_file`], the setbtv-stack-overflow note in
+/// [`push`]) exist to collapse *identical* lines a tight loop would otherwise
+/// repeat thousands of times, and this is neither identical from one call to
+/// the next nor called anywhere near that often -- `_GENERATE_TOP_LIST` calls
+/// [`dinsbtv`]/[`dupdbtv`] at most once per character on the board. The value
+/// is printed as raw bytes, the same `{:02x?}` this crate already uses for a
+/// file-control-record mismatch in [`crate::btrieve::Btrieve::open`], because
+/// a key can be text, a number, or several segments of both.
+fn note_duplicate_key(host: &mut Host, who: &str, name: &str, key: u16, value: &[u8]) {
+    host.note(format!(
+        "{who} on {name} refused a record: key {key} already holds {value:02x?}, \
+         and that key does not permit duplicates -- this call answers 0 rather \
+         than writing, and whichever record it was is silently skipped by \
+         whoever asked for the write"
+    ));
 }
 
 /// What a Btrieve operation code asks for.
@@ -2384,6 +2416,69 @@ mod tests {
             f.invoke(cntrbtv, &[]).expect("counts"),
             Ret::U32(7),
             "and nothing was written"
+        );
+    }
+
+    /// Important: a duplicate-key answer of 0 is exactly the case where
+    /// `_GENERATE_TOP_LIST` silently skips a character, and before this
+    /// `duplicate_key` computed which key collided and both callers threw
+    /// it away with `.is_some()` -- nothing said which file, which key, or
+    /// what value collided. This crate's convention elsewhere (`note_no_file`,
+    /// the `ties` note, the `setbtv` overflow note) is to report exactly
+    /// this class of quiet divergence -- see `note_duplicate_key`.
+    #[test]
+    fn dinsbtv_notes_which_key_and_value_collided() {
+        let dir = crate::testing::scratch_with("dinsbtv-collide-notes", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 5 already belongs to Troll"
+        );
+
+        // SAMPLE.DAT's one key is key 0, and 5 as a little-endian i16 is
+        // `[05, 00]` -- the same `{:02x?}` this crate already uses for raw
+        // bytes in `crate::btrieve::Btrieve::open`'s file-control-record note.
+        assert_eq!(
+            f.host.notes(),
+            &[
+                "dinsbtv on SAMPLE.DAT refused a record: key 0 already holds \
+                 [05, 00], and that key does not permit duplicates -- this \
+                 call answers 0 rather than writing, and whichever record it \
+                 was is silently skipped by whoever asked for the write"
+            ]
+        );
+    }
+
+    /// Same as `dinsbtv_notes_which_key_and_value_collided`, but through
+    /// `dupdbtv`'s opcode-3 path -- the note names the routine that made the
+    /// call, so the two must read differently.
+    #[test]
+    fn dupdbtv_notes_which_key_and_value_collided() {
+        let dir = crate::testing::scratch_with("dupdbtv-collide-notes", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            Ret::U16(0),
+            "key 6 already belongs to Elf"
+        );
+
+        assert_eq!(
+            f.host.notes(),
+            &[
+                "dupdbtv on SAMPLE.DAT refused a record: key 0 already holds \
+                 [06, 00], and that key does not permit duplicates -- this \
+                 call answers 0 rather than writing, and whichever record it \
+                 was is silently skipped by whoever asked for the write"
+            ]
         );
     }
 
