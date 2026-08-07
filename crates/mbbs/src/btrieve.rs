@@ -506,6 +506,12 @@ impl Block {
     /// `geometry.reclen` bytes, and the two would disagree the moment the
     /// cache is dropped and the file is read again.
     ///
+    /// **Variable-length files refuse instead.** Normalising is right when
+    /// `reclen` really is the length of every record; on a variable-length
+    /// file it is not, and cutting a real record down to it is the same
+    /// silent truncation [`Self::update`] already refuses for exactly this
+    /// reason. See [`Self::update`]'s doc comment.
+    ///
     /// `self.geometry` is updated last: `records` always grows by one, and
     /// `pages` grows by one only when the slot was a new page. Both fields are
     /// `Copy` and are what the next `Records::read` bounds its walk by, so
@@ -515,10 +521,26 @@ impl Block {
     ///
     /// # Errors
     ///
-    /// If the records cannot be read, or the file cannot be written.
+    /// If the records cannot be read, the file holds variable-length
+    /// records, or the file cannot be written.
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
         let name = self.name.clone();
+
+        if self.geometry.variable {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "holds variable-length records up to {} bytes, and this host does \
+                     not write them -- inserting this {}-byte buffer would silently \
+                     truncate it to fit the file's own reclen, the same wrong answer \
+                     update already refuses to give",
+                    self.geometry.reclen,
+                    bytes.len()
+                ),
+            });
+        }
+
         let bytes = normalized(bytes, self.geometry.reclen);
 
         let layout = pages::Layout {
@@ -1365,6 +1387,36 @@ mod tests {
         }
     }
 
+    /// I2: variable-length files must refuse `insert`, not truncate into it.
+    /// `normalized` (below) exists for the fixed-length case -- see
+    /// [`insert_normalizes_to_the_files_own_reclen_not_the_callers_buffer`] --
+    /// where `reclen` really is every record's length and padding or cutting
+    /// to it is correct. On a variable-length file `reclen` is not that; it
+    /// is the same number `Block::update` already refuses to write over for
+    /// exactly this reason (see its doc comment). Before this fix,
+    /// `dinsbtv` on `WCCTEXT.DAT` would silently cut a 2,022-byte buffer down
+    /// to a 22-byte `reclen` and answer 1, success -- the next task writes
+    /// `WCCTEXT`, and that is not a plausible answer to give it.
+    #[test]
+    fn insert_refuses_a_variable_length_file_rather_than_truncate() {
+        let dir = crate::testing::scratch("block-insert-refuses-variable-length");
+        let path = seed(&dir);
+        let mut block = block(path);
+        block.geometry.variable = true;
+
+        let long = vec![7u8; 2022];
+        let e = block
+            .insert(&long)
+            .expect_err("a variable-length file refuses insert, the same as update");
+        assert!(e.why.contains("variable-length"), "{e}");
+
+        // The refusal did not touch the model, the count, or the file.
+        assert_eq!(block.geometry.records, 0, "the refused insert did not count");
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 0, "nothing was written");
+    }
+
     /// I3: `dinsbtv` passes `bb->reclen` -- `Block::maxlen`, the module's own
     /// idea of the record length -- which the plan says is allowed to differ
     /// from the file's own `reclen`. `Block::insert` used to store the
@@ -1372,6 +1424,10 @@ mod tests {
     /// `geometry.reclen` bytes, so the in-memory record and the on-disk one
     /// would have different lengths and `Key::extract`/`Key::compare` would
     /// see different bytes before and after the cache is dropped.
+    ///
+    /// This is the fixed-length case -- see
+    /// [`insert_refuses_a_variable_length_file_rather_than_truncate`] for why
+    /// the same normalising is wrong on a variable-length file.
     #[test]
     fn insert_normalizes_to_the_files_own_reclen_not_the_callers_buffer() {
         let dir = crate::testing::scratch("block-insert-normalizes-to-reclen");
