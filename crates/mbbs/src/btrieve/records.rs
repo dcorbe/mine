@@ -234,6 +234,20 @@ impl Records {
 
     /// Add a record at a position nothing else occupies.
     ///
+    /// Inserted in position order, not appended. [`Self::records`] is file
+    /// order -- what `walk` produces and what a fresh read always agrees
+    /// with -- and the two are the same thing only while every insert lands
+    /// after every existing record. [`pages::Layout::next_slot`]'s free
+    /// list is checked first, ahead of a gap or a new page, so a position
+    /// *lower* than records already in the file is not a hypothetical: it
+    /// is what any insert into a file with a non-empty free list does. This
+    /// keeps `records` sorted by position unconditionally, which `delete`
+    /// and `update` already preserve by construction (`remove` keeps the
+    /// order of what is left; `update` mutates a record in place), so the
+    /// invariant holds for the whole lifetime of a `Records`.
+    ///
+    /// [`pages::Layout::next_slot`]: super::pages::Layout::next_slot
+    ///
     /// # Errors
     ///
     /// If `position` already holds a record.
@@ -241,7 +255,8 @@ impl Records {
         if self.records.iter().any(|r| r.position == position) {
             return Err(format!("position {position} already holds a record"));
         }
-        self.records.push(Record { position, bytes });
+        let at = self.records.partition_point(|r| r.position < position);
+        self.records.insert(at, Record { position, bytes });
         self.reindex(keys);
         Ok(())
     }
@@ -656,6 +671,78 @@ mod tests {
             "2 sorts between 1 and 3"
         );
         assert_eq!(records.find_physical(position), Some(2));
+    }
+
+    /// I3: `insert` used to `push`, so physical order was insertion order.
+    /// The two agree only while every insert appends -- which is all
+    /// `WCCUSERS`'s empty free list ever exercises. `WCCITEMS`'s free-list
+    /// head is `0x325806`, a position *lower* than records already in the
+    /// file, so its inserts do not append: they land in a low slot a
+    /// deletion freed. This reproduces that shape without needing
+    /// `WCCITEMS` itself -- a free slot before both live records -- and
+    /// checks both halves: the in-memory model right after the insert, and
+    /// a completely independent fresh read of the same write from disk.
+    #[test]
+    fn an_insert_through_a_free_slot_at_a_low_position_agrees_with_a_fresh_read() {
+        let bytes = file(512, RECLEN, &[&record(1), &record(3)], &[slot(0)]);
+        let dir = crate::testing::scratch("btv-rec-freeslot");
+        let path = dir.join("FREESLOT.DAT");
+        std::fs::write(&path, &bytes).expect("written");
+
+        let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry");
+        let fcr = std::fs::read(&path).expect("read");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let mut records =
+            Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("reads");
+
+        // Baseline: the two live records, in file order.
+        assert_eq!(records.physical(0).expect("first").position, slot(1));
+        assert_eq!(records.physical(1).expect("second").position, slot(2));
+
+        // The model, in isolation: insert at `slot(0)`, below both.
+        records.insert(&parsed, slot(0), record(9)).expect("inserts");
+        assert_eq!(
+            records.physical(0).expect("lowest position sorts first").position,
+            slot(0),
+            "the model is in file order, not insertion order"
+        );
+        assert_eq!(records.physical(0).expect("first").bytes[0], 9);
+        assert_eq!(records.physical(1).expect("second").position, slot(1));
+        assert_eq!(records.physical(2).expect("third").position, slot(2));
+
+        // The same write, actually made -- through the free slot the
+        // fixture built, whose link already terminates the list at
+        // `NOWHERE` -- and read back completely fresh, independent of the
+        // `records` model above.
+        let layout = crate::btrieve::pages::Layout {
+            page: geometry.page,
+            physical: geometry.physical,
+            pages: geometry.pages,
+        };
+        crate::btrieve::pages::write_record(
+            &path,
+            layout,
+            crate::btrieve::pages::Slot::Free(slot(0)),
+            &record(9),
+            3,
+        )
+        .expect("writes");
+
+        let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry after the write");
+        let fcr = std::fs::read(&path).expect("read again");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let reread =
+            Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("a fresh read");
+
+        assert_eq!(reread.len(), 3);
+        assert_eq!(
+            reread.physical(0).expect("first").position,
+            slot(0),
+            "a fresh read is always file order"
+        );
+        assert_eq!(reread.physical(0).expect("first").bytes[0], 9);
+        assert_eq!(reread.physical(1).expect("second").position, slot(1));
+        assert_eq!(reread.physical(2).expect("third").position, slot(2));
     }
 
     #[test]
