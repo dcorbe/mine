@@ -171,10 +171,14 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     // file's. They are allowed to differ, and **the two directions are not the
     // same thing**, which is why they are reported differently.
     //
-    // Opening for *more* is ordinary: `WCCTEXT.DAT` holds variable-length
-    // records up to 22 bytes and MajorMUD opens it for 2022, which is the
-    // buffer a variable-length read needs. `movmem(gpbptr,recptr,dbflen)`
-    // copies what Btrieve returned, and so does [`deliver`]. They agree.
+    // Opening for *more* than a **variable-length** file's logical record is
+    // not a mismatch at all -- it is the only correct thing to do.
+    // `WCCTEXT.DAT`'s logical record is 22 bytes and every one of its records
+    // is 22 plus a 2,000-byte fragment; MajorMUD opens it for exactly 2,022.
+    // `movmem(gpbptr,recptr,dbflen)` copies what Btrieve returned, and so does
+    // [`deliver`], and what Btrieve returns is the reassembled record. So this
+    // is reported as the arithmetic it is rather than as a divergence -- which
+    // is what it was noted as while only the fixed part was read.
     //
     // Opening for *less* is where this host and the original part company.
     // Btrieve answered a read on a too-short buffer with status 22;
@@ -193,10 +197,19 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             maxlen.saturating_sub(1)
         ));
     } else if maxlen > geometry.reclen {
-        host.note(format!(
-            "{name} holds {}-byte records and the module opened it for {maxlen}",
-            geometry.reclen
-        ));
+        host.note(match geometry.variable {
+            true => format!(
+                "{name} holds variable-length records of {} fixed bytes and a fragment \
+                 chain, and the module opened it for {maxlen} -- room for {} bytes of \
+                 body",
+                geometry.reclen,
+                maxlen - geometry.reclen
+            ),
+            false => format!(
+                "{name} holds {}-byte records and the module opened it for {maxlen}",
+                geometry.reclen
+            ),
+        });
     }
 
     let block = {
@@ -1821,6 +1834,17 @@ mod tests {
         let long = f.host.notes().last().expect("noted").clone();
         assert!(long.contains("SAMPLE.DAT"), "{long}");
         assert!(!long.contains("truncated"), "nothing is lost either way: {long}");
+
+        // And on a *variable-length* file, opening long is not a mismatch at
+        // all: the extra bytes are where the fragment chain goes. `WCCTEXT` is
+        // 22 and 2,000; this is the same arithmetic on a smaller file.
+        let dir = crate::testing::scratch("btv-shim-variable-note");
+        variable_file(&dir, "VARIABLE.DAT", &[1u8, 0, 0, 0, 0, 0, 0, 0], b"a body");
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "VARIABLE.DAT", 14);
+        let variable = f.host.notes().last().expect("noted").clone();
+        assert!(variable.contains("fragment chain"), "{variable}");
+        assert!(variable.contains("6 bytes of body"), "{variable}");
     }
 
     #[test]
@@ -1864,6 +1888,93 @@ mod tests {
     /// Where `bb->data` is, for a file the test just opened.
     fn buffer(f: &Fixture, block: FarPtr) -> FarPtr {
         f.host.btrieve().block(block).expect("open").data()
+    }
+
+    /// A whole variable-length Btrieve file, three pages, holding one record
+    /// whose body lives in a fragment on the third.
+    ///
+    /// The shape `WCCTEXT.DAT` has, scaled down: a fixed part, four bytes of
+    /// pointer to a page and a fragment, and a variable page whose one
+    /// fragment starts at `0x0c`. Written rather than copied because
+    /// `WCCTEXT.DAT` is MajorMUD's and not in the repository.
+    fn variable_file(dir: &std::path::Path, name: &str, fixed: &[u8], body: &[u8]) {
+        const PAGE: usize = 512;
+        let reclen = fixed.len() as u16;
+        let physical = reclen + 4;
+        let mut out = vec![0u8; PAGE * 3];
+
+        out[6] = 0;
+        out[7] = 4;
+        out[0x08..0x0a].copy_from_slice(&(PAGE as u16).to_le_bytes());
+        out[0x10..0x14].copy_from_slice(&[0xff; 4]); // an empty free list
+        out[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        out[0x16..0x18].copy_from_slice(&reclen.to_le_bytes());
+        out[0x18..0x1a].copy_from_slice(&physical.to_le_bytes());
+        out[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes()); // one record
+        out[0x38] = 0xff;
+        out[0x106..0x108].copy_from_slice(&1u16.to_le_bytes()); // variable-length
+
+        // One key: two bytes at offset 0, the same definition the record
+        // tests use.
+        let key = 0x110;
+        out[key + 0x08..key + 0x0a].copy_from_slice(&(1u16 << 8).to_le_bytes());
+        out[key + 0x16..key + 0x18].copy_from_slice(&2u16.to_le_bytes());
+        out[key + 0x1c] = 0x0f;
+
+        // Page 1: a data page, holding the fixed part and a pointer to page 2.
+        out[PAGE + 5] |= 0x80;
+        out[PAGE + 6..PAGE + 6 + fixed.len()].copy_from_slice(fixed);
+        let pointer = PAGE + 6 + fixed.len();
+        out[pointer..pointer + 4].copy_from_slice(&[0x00, 0x02, 0x00, 0x00]);
+
+        // Page 2: a variable page, one fragment, starting at 0x0c.
+        let at = PAGE * 2;
+        out[at..at + 2].copy_from_slice(&0u16.to_le_bytes());
+        out[at + 2..at + 4].copy_from_slice(&2u16.to_le_bytes());
+        out[at + 6..at + 10].copy_from_slice(&[0xff; 4]);
+        out[at + 0x0a..at + 0x0c].copy_from_slice(&1u16.to_le_bytes());
+        out[at + 0x0c..at + 0x0c + body.len()].copy_from_slice(body);
+        out[at + PAGE - 2..at + PAGE].copy_from_slice(&0x000cu16.to_le_bytes());
+        let end = 0x0cu16 + body.len() as u16;
+        out[at + PAGE - 4..at + PAGE - 2].copy_from_slice(&end.to_le_bytes());
+
+        std::fs::write(dir.join(name), out).expect("written");
+    }
+
+    /// **The whole point of following the fragment chain**: what reaches the
+    /// module's buffer is the fixed part *and* the body, at the length the
+    /// module opened the file for.
+    ///
+    /// `WCCTEXT.DAT` is 22 bytes of fixed record and 2,000 of fragment, and
+    /// `opnbtv("WCCTEXT.DAT", 2022)` is what MajorMUD asks for -- the two agree
+    /// exactly, which is an independent check on the reassembly: 2,018 or 2,026
+    /// would mean the four-byte next-pointer prefix was handled wrong by one
+    /// hop. This is that arithmetic in miniature, end to end through `obtbtvl`.
+    #[test]
+    fn a_variable_length_record_reaches_the_module_whole_and_not_just_its_fixed_part() {
+        let dir = crate::testing::scratch("btv-shim-variable");
+        let fixed = [0x01u8, 0x00, b'h', b'e', b'a', b'd', 0x00, 0x00];
+        let body = b"and the rest of it, on another page";
+        variable_file(&dir, "VARIABLE.DAT", &fixed, body);
+
+        let mut f = Fixture::rooted(dir);
+        let maxlen = (fixed.len() + body.len()) as u16;
+        let block = open(&mut f, "VARIABLE.DAT", maxlen);
+
+        assert!(acquire(&mut f, Some(1), 0, 5), "the record with key 1");
+
+        let at = buffer(&f, block);
+        let got = f.machine.resolve(at, maxlen.into()).expect("the module's buffer");
+        assert_eq!(
+            &got[..fixed.len()],
+            &fixed,
+            "the fixed part is unchanged"
+        );
+        assert_eq!(
+            &got[fixed.len()..],
+            body,
+            "and the fragment follows it, rather than zeros"
+        );
     }
 
     #[test]
