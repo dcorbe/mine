@@ -23,6 +23,10 @@ re/ghidra_proj/
 re/wg_nt_ghidra/
 re/wccmmpls_ghidra/
 re/wg_nt_ref/
+# Pervasive Btrieve 6.15 engine: staged binaries, Ghidra project and the 1.6 MB
+# of decompiled C. Regenerable -- re-run tools/btrieve-oracle/ and the
+# analyzeHeadless invocation recorded in docs/plans/2026-08-08-btrieve-real-oracle.md.
+re/btrieve_ghidra/
 re/exports/*
 !re/exports/gang_house_description_files.txt
 re/__pycache__/
@@ -55,3 +59,6 @@ state.sqlite-journal
 state.sqlite-wal
 __pycache__/
 wccmdact.ini
+
+# Build artifact of tools/btrieve-oracle/build.sh
+tools/btrieve-oracle/btrvprobe.exe
