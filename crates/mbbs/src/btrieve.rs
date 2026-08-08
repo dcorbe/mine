@@ -609,33 +609,52 @@ impl Block {
     /// zero-fill the tail of whatever was there. That is a live data-loss
     /// path once `dupdbtv` calls this.
     ///
+    /// **Variable-length files refuse, whatever the buffer's length.** The
+    /// four bytes between `reclen` and `physical` in such a file's slot are
+    /// Btrieve's pointer to the record's first variable fragment, and
+    /// `write_record` pads to `physical`, so any write here unlinks them. An
+    /// earlier version refused only a buffer that was not `reclen` long, which
+    /// misses the case that actually occurs: `Records::read` yields the fixed
+    /// part alone, exactly `reclen` bytes, so a caller that reads a record and
+    /// writes it back went straight through. Genuine Btrieve 6.15 then refused
+    /// the whole of `WCCTEXT.VIR` with status 54 -- see
+    /// [`an_update_of_a_variable_length_file_is_refused_rather_than_unlinking_its_fragments`].
+    ///
     /// # Errors
     ///
-    /// If `bytes` is not exactly `reclen` long, the records cannot be read,
-    /// `position` holds no record, or the file cannot be written.
+    /// If the file holds variable-length records, `bytes` is not exactly
+    /// `reclen` long, the records cannot be read, `position` holds no record,
+    /// or the file cannot be written.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
         let name = self.name.clone();
 
-        if bytes.len() != usize::from(self.geometry.reclen) {
-            let why = if self.geometry.variable {
-                format!(
+        if self.geometry.variable {
+            return Err(BtvError {
+                file: name,
+                why: format!(
                     "holds variable-length records up to {} bytes, and this host does \
-                     not write them -- the {}-byte buffer the module opened it with is \
-                     what a variable-length read needs (see opnbtv's doc comment), not \
-                     something opcode 3 can write back as one fixed-length slot",
+                     not write them -- writing this {}-byte buffer would pad the slot \
+                     out to its {} physical bytes and zero the pointer to the record's \
+                     variable part, unlinking the fragment chain the rest of the file \
+                     is threaded on",
                     self.geometry.reclen,
-                    bytes.len()
-                )
-            } else {
-                format!(
+                    bytes.len(),
+                    self.geometry.physical
+                ),
+            });
+        }
+
+        if bytes.len() != usize::from(self.geometry.reclen) {
+            return Err(BtvError {
+                file: name,
+                why: format!(
                     "a {}-byte record for a {}-byte slot -- update refuses rather than \
                      zero-fill the tail of whatever was there",
                     bytes.len(),
                     self.geometry.reclen
-                )
-            };
-            return Err(BtvError { file: name, why });
+                ),
+            });
         }
 
         let records = self.records.as_ref().expect("just loaded");
@@ -1604,6 +1623,81 @@ mod tests {
             .and_then(|at| reread.physical(at))
             .expect("still there");
         assert_eq!(record.bytes[0], 1, "not overwritten by the refused update");
+    }
+
+    /// A variable-length file's slot is `physical` bytes wide and only `reclen`
+    /// of them are the record; the four behind them are Btrieve's pointer to
+    /// the record's first variable fragment. An update must not write over
+    /// them, and the only way not to is to refuse the file.
+    ///
+    /// **Found by the real Btrieve 6.15 engine, not by reasoning.** The wash in
+    /// `docs/plans/2026-08-08-oracle-wash.md` had this host update one record
+    /// of `WCCTEXT.VIR` -- the one variable-length file of the eighteen -- and
+    /// close it, then handed the result to the engine, which refused the whole
+    /// file at the very first `GET_FIRST`: status 54, *variable page error*.
+    /// Not the one record; every record, because the fragment chain the file's
+    /// variable pages are threaded on had a link zeroed. A byte diff against
+    /// the same file merely reindexed confirms it: two bytes changed, the one
+    /// the test meant to flip and one of the four behind the record.
+    ///
+    /// The refusal that already existed did not catch it. `Block::update`
+    /// refuses a variable-length file whose buffer is not `reclen` long, which
+    /// anticipates a module passing a whole variable-length record. But
+    /// `Records::read` yields the **fixed part only**, exactly `reclen` bytes,
+    /// so anything that reads a record and writes it back -- which is what
+    /// `dupdbtv` does -- passes straight through that guard and into
+    /// `write_record`, which pads to `physical`. The guard has to be the file's
+    /// shape, not the buffer's length, the same as [`Block::insert`]'s.
+    #[test]
+    fn an_update_of_a_variable_length_file_is_refused_rather_than_unlinking_its_fragments() {
+        let dir = crate::testing::scratch("block-update-refuses-variable-length");
+        let path = seed(&dir);
+        let mut block = block(path.clone());
+
+        // Written while the file is still fixed-length, because that is the
+        // only way this fixture can get a record onto a page; what makes it a
+        // variable-length record is the four bytes behind it, written next.
+        let position = block.insert(&record(1)).expect("insert");
+
+        // The fragment pointer, in the padding between `reclen` (16) and
+        // `physical` (20). A literal, not a value derived from the geometry
+        // under test: 16 and 20 are what `seed` and `block` chose, and a check
+        // computed from `block.geometry` would move whenever they did.
+        let pointer = [0x03u8, 0x00, 0x02, 0x00];
+        let tail = position as usize + 16;
+        let mut bytes = std::fs::read(&path).expect("read");
+        bytes[tail..tail + 4].copy_from_slice(&pointer);
+        std::fs::write(&path, &bytes).expect("write the fragment pointer");
+
+        // Now it is the file WCCTEXT is: the same slots, four of whose bytes
+        // belong to Btrieve rather than to the record.
+        block.geometry.variable = true;
+        block.records = None;
+
+        let whole = block
+            .records()
+            .expect("reads")
+            .find_physical(position)
+            .and_then(|at| block.records.as_ref().expect("loaded").physical(at))
+            .expect("still there")
+            .bytes
+            .clone();
+        assert_eq!(whole.len(), 16, "a read yields the fixed part, which is reclen");
+
+        let e = block
+            .update(position, &whole)
+            .expect_err("a variable-length file refuses update, the same as insert");
+        assert!(e.why.contains("variable-length"), "{e}");
+
+        // The harm, not just the verdict: the four bytes behind the record are
+        // what the engine follows to the record's variable part, and a refusal
+        // that still wrote them would be no refusal at all.
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            &after[tail..tail + 4],
+            &pointer,
+            "the fragment pointer was overwritten"
+        );
     }
 
     /// A file shaped like `seed`'s but at a real page size -- 512 bytes, the
