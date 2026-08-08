@@ -181,6 +181,20 @@ impl From<io::Error> for LoadError {
     }
 }
 
+/// One `haskey` call: what was asked, on whose behalf, and what it got.
+///
+/// See [`Host::keys_asked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query {
+    /// The channel, from `usrnum`. `-1` when nobody was on one.
+    pub chan: i16,
+    /// The lock name, as the module passed it -- **not** uppercased. What the
+    /// sysop configured is more useful to read than what it folded to.
+    pub lock: String,
+    /// What the host answered.
+    pub answer: bool,
+}
+
 /// One MajorBBS host.
 pub struct Host {
     exports: &'static Exports,
@@ -334,6 +348,9 @@ pub struct Host {
     /// and `ACCOUNT.C:109`. See [`Users`].
     pub(crate) users: Users,
 
+    /// Every lock a module has asked about, in order. See [`Host::keys_asked`].
+    asked: Vec<Query>,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
@@ -459,6 +476,7 @@ impl Host {
             fsdtmp: None,
             heap,
             users,
+            asked: Vec::new(),
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
@@ -625,7 +643,30 @@ impl Host {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
-    pub(crate) fn asked_for_key(&mut self, _chan: i16, _lock: &str, _answer: bool) {}
+    /// Every lock a module has asked about, in order. **Scaffolding.**
+    ///
+    /// This exists because nothing in this tree yet knows which locks a given
+    /// board configures. The lock names are sysop-editable text in the
+    /// module's `.MSG` -- `PLAYKEY {USER}` is a default, not a measurement --
+    /// and most call sites are guarded by `if (lockname[0] != '\0')`, so which
+    /// ones a module actually asks about is a property of the installed
+    /// configuration and not of the DLL.
+    ///
+    /// Reading the sequence off a real run is what this is for. It is a
+    /// candidate for removal once the tests that use it can discriminate
+    /// without it; see `docs/plans/2026-08-07-haskey-design.md`.
+    pub fn keys_asked(&self) -> &[Query] {
+        &self.asked
+    }
+
+    /// Record a `haskey` call. See [`Host::keys_asked`].
+    pub(crate) fn asked_for_key(&mut self, chan: i16, lock: &str, answer: bool) {
+        self.asked.push(Query {
+            chan,
+            lock: lock.to_string(),
+            answer,
+        });
+    }
 
     /// The terminal channels.
     pub fn gsbl(&self) -> &gsbl::Gsbl {
@@ -1791,5 +1832,31 @@ mod tests {
             f.machine.call(entry, &[]).is_err(),
             "a poisoned machine must refuse to be entered again"
         );
+    }
+
+    #[test]
+    fn the_host_records_every_lock_a_module_asked_about() {
+        let mut f = Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
+
+        // Lowercase deliberately: M19 (record the uppercased lock instead of
+        // what the module passed) is invisible unless one of these locks
+        // isn't already uppercase.
+        for lock in ["USER", "wccsysop"] {
+            let at = f.text(lock);
+            f.invoke(crate::shims::user::haskey, &Fixture::far(at))
+                .expect("answered");
+        }
+
+        let asked = f.host.keys_asked();
+        assert_eq!(asked.len(), 2);
+        assert_eq!((asked[0].chan, asked[0].lock.as_str(), asked[0].answer), (0, "USER", true));
+        assert_eq!((asked[1].chan, asked[1].lock.as_str(), asked[1].answer), (0, "wccsysop", false));
     }
 }
