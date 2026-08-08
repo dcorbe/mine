@@ -434,27 +434,33 @@ pub fn data_pages(path: &std::path::Path, layout: Layout) -> Result<Vec<u32>, St
     Ok(out)
 }
 
-/// Bytes of header at the start of a leaf index page, before its first entry.
+/// Bytes of header at the start of an index page, before its first entry.
 ///
-/// Measured off `WCCRACE.DAT` and `WCCCLASS.DAT`, the only two shipped files
-/// whose index fits one leaf page end to end (thirteen and fifteen records,
-/// both a two-byte key): six bytes of the same [`Header`] a data page opens
-/// with -- number, then flags with the data bit clear -- then two bytes that
-/// equalled the entry count in both measurements, then eight bytes of
-/// `0xffffffff` that a leaf with no siblings should hold. 6 + 2 + 8 = 16.
-/// `docs/plans/2026-08-07-btrieve-writes.md`, Task 6, has the raw bytes.
+/// Six bytes of the same [`Header`] a data page opens with — number, then flags
+/// with the data bit clear — then two bytes of entry count, then two child page
+/// numbers: the **rightmost** child at offset 8 and the **leftmost** at offset
+/// 12. 6 + 2 + 4 + 4 = 16.
+///
+/// Both child slots are [`NOWHERE`] on a leaf, which is why the two files whose
+/// whole index fits one page — `WCCRACE.DAT` and `WCCCLASS.DAT` — read
+/// `0xffffffff` there and an earlier reading of this constant called them
+/// sibling pointers. They are not. `WCCITEMS.VIR` page 131 holds 2045 and 130,
+/// and walking from them reaches every one of that file's 1,950 records exactly
+/// once. See `docs/plans/2026-08-07-btrieve-interior-pages-design.md`.
 pub const INDEX_HEADER: usize = 16;
 
-/// Bytes of one index entry past its key: a record pointer, then a second
-/// four-byte field.
+/// Bytes of one index entry past its key: a record pointer, then a child page.
 ///
-/// Not a child pointer in the sense the name would suggest elsewhere in this
-/// format -- a leaf has no children -- and not [`NOWHERE`] on every entry
-/// either. Measured off both `WCCRACE.DAT` (13 entries) and `WCCCLASS.DAT`
-/// (15 entries): every entry but the page's **last** carries `0xffffffff`
-/// there, and the last carries zero instead. Two of two measurements agree,
-/// and [`index_pages`] matches the pattern rather than the simpler one this
-/// constant's name implies.
+/// The record pointer names a live record — **an interior entry indexes a
+/// record just as a leaf entry does**, which is why a traversal of the whole
+/// tree visits every record exactly once, and why the eleven shipped files that
+/// hold records yield exactly as many index entries as they have records.
+///
+/// The child page holds keys **greater** than this entry's, and is [`NOWHERE`]
+/// on a leaf. The **last** entry of any page carries zero there instead: a node
+/// with `n` keys has `n+1` children, and the last of them lives in the page
+/// header at offset 8 rather than in an entry. That zero is a placeholder, not
+/// a pointer to page 0.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
 /// Emit the leaf page for one key, from records already in that key's order.
