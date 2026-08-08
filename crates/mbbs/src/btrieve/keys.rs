@@ -249,6 +249,21 @@ impl Key {
         self.segments.iter().map(|s| s.length).sum()
     }
 
+    /// This key, as an index page needs to measure it.
+    ///
+    /// [`Self::length`] alone is not enough to size an index entry -- a key that
+    /// permits duplicates carries four more bytes per entry -- and passing a
+    /// bare length is what let four separate places in
+    /// [`pages`](super::pages) each get that wrong in the same way. This is the
+    /// only way to build a [`Shape`](super::pages::Shape) from a key, so the
+    /// duplicates term travels with the length rather than beside it.
+    pub fn shape(&self) -> super::pages::Shape {
+        super::pages::Shape {
+            length: usize::from(self.length()),
+            duplicates: self.duplicates,
+        }
+    }
+
     /// The key bytes of a record, segments concatenated.
     pub fn extract(&self, record: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(usize::from(self.length()));

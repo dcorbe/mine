@@ -470,6 +470,110 @@ pub const INDEX_HEADER: usize = 16;
 /// page buys nothing it needs.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
+/// Bytes of index page header the *engine* counts before the first entry.
+///
+/// The engine frames a page as twelve bytes of header followed by entries of
+/// `[child page][key][record pointer]`; this module folds that leading child
+/// pointer into [`INDEX_HEADER`] and puts the trailing one on the entry
+/// instead. **The two framings describe the same bytes** — `count` entries
+/// occupy `12 + count * (key + 8)` either way — but only this one divides a
+/// page correctly, because the leading child of the first entry is real
+/// capacity and [`INDEX_HEADER`] spends it on the header.
+///
+/// `W32MKDE.EXE`, decompiled at `re/btrieve_ghidra/exports/W32MKDE_decompiled.c`
+/// :18412, sizes a page as `(pageSize - 0xc) / entrySize`.
+pub const INDEX_PAGE_HEADER: usize = 12;
+
+/// A key, as much of it as sizing an index page needs.
+///
+/// This exists so that the width of an index entry has **one** spelling. It had
+/// four — `decode_index_page`, `build_index`, `push_node` and `number_pages`
+/// each wrote `key_length + INDEX_ENTRY_TAIL` out by hand — and a fifth in
+/// `crates/mbbs/tests/btrieve.rs`. Every one of them was missing the same term,
+/// and a bare `key_length: usize` parameter is what let them be: the caller had
+/// nothing to pass that could have carried the rest of the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// The key's total width in bytes, summed over its segments —
+    /// [`Key::length`](super::keys::Key::length).
+    pub length: usize,
+
+    /// Whether more than one record may carry this key value.
+    ///
+    /// **A duplicate-permitting key's index entries are four bytes wider**, and
+    /// this is the whole reason a bare length is not enough to size a page.
+    pub duplicates: bool,
+}
+
+impl Shape {
+    /// Bytes of one index entry: the key, its record pointer, and a child page.
+    ///
+    /// Four more when the key permits duplicates. Measured against the stored
+    /// entry size at key descriptor `+0x0c` in all 40 keys of the 32 shipped
+    /// files, and derived independently from `W32MKDE_decompiled.c`:18398-18410,
+    /// where the engine computes `keyLen + 8` and then `keyLen + 0xc` if the
+    /// key's attribute bit 0 is set.
+    #[must_use]
+    pub fn entry_size(&self) -> usize {
+        self.length + if self.duplicates { 12 } else { 8 }
+    }
+
+    /// How many entries of this key fit one page.
+    ///
+    /// Matches the engine's own `maxEntries`, stored at key descriptor `+0x0e`,
+    /// on all 40 shipped keys.
+    #[must_use]
+    pub fn capacity(&self, page: u16) -> usize {
+        usize::from(page).saturating_sub(INDEX_PAGE_HEADER) / self.entry_size().max(1)
+    }
+}
+
+/// The refusal every populated duplicate-key index path shares.
+///
+/// A duplicate-permitting key's index entry is four bytes wider, and those four
+/// bytes are **not** slack at the end of the entry. The engine lays a *linked
+/// duplicates* entry out as
+///
+/// ```text
+///     [child page][key bytes][head of chain][tail of chain]
+/// ```
+///
+/// where the last slot -- the one a unique key uses as its record pointer -- is
+/// the *last* record carrying this key value, and the inserted slot is the
+/// *first*. For a unique key the two collapse onto one field, which is why the
+/// engine's own walkers need no special case and why this host's decoder has
+/// been reading dup entries as though they were unique ones without noticing.
+/// Decompiled at `re/btrieve_ghidra/exports/W32MKDE_decompiled.c`: the entry is
+/// built at :16457-16462, strided at :11788-11800, and the two ends are picked
+/// apart by Get-First and Get-Last at :11895-11903.
+///
+/// **Two consequences make this a feature rather than an offset fix, which is
+/// why it is refused here instead of implemented:**
+///
+/// 1. A linked-duplicates index holds **one entry per distinct key value**, not
+///    one per record. The invariant the rest of this module is built on -- that
+///    a tree's entry count equals the file's record count -- does not hold.
+/// 2. The chain itself lives **inside the records**, as a `[prev][next]` pair of
+///    record addresses at the offset the key descriptor stores at `+0x12`,
+///    which is why such a file's physical record is eight bytes longer than its
+///    logical one (`WCCUSERS` 1998 -> 2006). Building the index therefore means
+///    writing the records too, which [`build_index`] cannot do and should not.
+///
+/// So this refuses rather than guesses. A wrong guess writes an index Btrieve
+/// reads as a plausible wrong order, which is the failure this whole module is
+/// built to avoid -- see the note on [`Kind`](super::keys::Kind). Refusing costs
+/// a loud error at the first character written to `WCCUSERS`; guessing costs a
+/// character file that reads back subtly shuffled.
+fn unplaced_duplicate_bytes(shape: Shape) -> String {
+    format!(
+        "a duplicate-permitting key of {} bytes has {}-byte index entries \
+         holding a chain this host does not maintain; refusing rather than \
+         writing an index Btrieve would read in the wrong order",
+        shape.length,
+        shape.entry_size()
+    )
+}
+
 /// One index page, decoded.
 ///
 /// The same shape whether the page is a leaf or an interior node — the format
@@ -530,13 +634,17 @@ impl IndexPage {
 /// past the end of the page. Both mean the caller is looking at something that
 /// is not an index page for this key, and neither is worth panicking over
 /// during a walk of a file another program wrote.
-pub fn decode_index_page(page: &[u8], key_length: usize) -> Result<IndexPage, String> {
+pub fn decode_index_page(page: &[u8], shape: Shape) -> Result<IndexPage, String> {
     if page.len() < INDEX_HEADER {
         return Err(format!("{} bytes is not an index page", page.len()));
     }
     let header = Header::decode(&page[..usize::from(HEADER)]);
     let count = usize::from(u16::from_le_bytes([page[6], page[7]]));
-    let width = key_length + INDEX_ENTRY_TAIL;
+    if shape.duplicates && count != 0 {
+        return Err(unplaced_duplicate_bytes(shape));
+    }
+    let key_length = shape.length;
+    let width = shape.entry_size();
     // The **last** entry may be four bytes short. Its child field is a
     // placeholder nothing reads (see `INDEX_ENTRY_TAIL`), and when a leaf fills
     // a page exactly Btrieve does not write it -- `WCCSPELS.VIR` page 1 is the
@@ -616,7 +724,7 @@ pub fn walk(
     path: &std::path::Path,
     layout: Layout,
     root: u32,
-    key_length: usize,
+    shape: Shape,
 ) -> Result<Walk, String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -660,7 +768,7 @@ pub fn walk(
             file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
                 .and_then(|_| file.read_exact(&mut bytes))
                 .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
-            let page = decode_index_page(&bytes, key_length)
+            let page = decode_index_page(&bytes, shape)
                 .map_err(|e| format!("page {number}: {e}"))?;
 
             let leftmost = (!page.leaf()).then_some(page.leftmost);
@@ -717,6 +825,13 @@ pub struct Built {
     pub nodes: Vec<Node>,
     /// Index into [`Self::nodes`] of the root.
     pub root: usize,
+    /// The key these pages index.
+    ///
+    /// Carried rather than re-derived: [`number_pages`] used to recover the
+    /// entry width from the *first entry's* key length, which is a different
+    /// quantity that merely happens to agree for a fixed-width key, and which
+    /// could not have carried the duplicates term at all.
+    pub shape: Shape,
 }
 
 /// Build a key's whole tree from records already in that key's order.
@@ -741,13 +856,21 @@ pub struct Built {
 pub fn build_index(
     layout: Layout,
     entries: &[(Vec<u8>, u32)],
-    key_length: usize,
+    shape: Shape,
 ) -> Result<Built, String> {
-    let width = key_length + INDEX_ENTRY_TAIL;
-    let cap = usize::from(layout.page).saturating_sub(INDEX_HEADER) / width.max(1);
+    // An empty index is laid out the same whether the key permits duplicates or
+    // not -- there are no entries to place the four unknown bytes in. That is
+    // not a technicality: all four shipped duplicate-key files hold zero
+    // records, so this is the case that has to keep working.
+    if shape.duplicates && !entries.is_empty() {
+        return Err(unplaced_duplicate_bytes(shape));
+    }
+    let width = shape.entry_size();
+    let cap = shape.capacity(layout.page);
     if cap == 0 {
         return Err(format!(
-            "an entry of {width} bytes does not fit a page of {} with a {INDEX_HEADER}-byte header",
+            "an entry of {width} bytes does not fit a page of {} with a \
+             {INDEX_PAGE_HEADER}-byte header",
             layout.page
         ));
     }
@@ -758,7 +881,7 @@ pub fn build_index(
 
     let root = loop {
         if items.len() <= cap {
-            break push_node(&mut nodes, layout, key_length, items, children);
+            break push_node(&mut nodes, layout, shape, items, children);
         }
 
         // The fewest nodes that hold `items` with one separator between each
@@ -783,7 +906,7 @@ pub fn build_index(
                 consumed += size + 1;
                 slice
             };
-            level.push(push_node(&mut nodes, layout, key_length, mine, theirs));
+            level.push(push_node(&mut nodes, layout, shape, mine, theirs));
             if n + 1 < count {
                 promoted.push(items[taken].clone());
                 taken += 1;
@@ -794,7 +917,7 @@ pub fn build_index(
         children = level;
     };
 
-    Ok(Built { nodes, root })
+    Ok(Built { nodes, root, shape })
 }
 
 /// Serialise one node and add it to the arena, returning its index.
@@ -805,7 +928,7 @@ pub fn build_index(
 fn push_node(
     nodes: &mut Vec<Node>,
     layout: Layout,
-    key_length: usize,
+    shape: Shape,
     entries: Vec<(Vec<u8>, u32)>,
     children: Vec<usize>,
 ) -> usize {
@@ -836,9 +959,20 @@ fn push_node(
         // has `n+1` children and the last of them lives in the header at offset
         // 8, so this slot is never a pointer. Every other slot is left empty
         // for `number_pages`, which is also exactly what a leaf keeps.
-        let child = if n + 1 == entries.len() { 0 } else { NOWHERE };
-        image[tail + 4..tail + 8].copy_from_slice(&to_long(child));
-        at += key_length + INDEX_ENTRY_TAIL;
+        //
+        // AND IT MAY NOT FIT. A page packed to the engine's own capacity ends
+        // `INDEX_HEADER + cap * entry` bytes in, which is up to four past the
+        // page, because `INDEX_HEADER` folds in a leading child pointer the
+        // engine counts as capacity. Btrieve writes exactly this shape --
+        // `WCCSPELS.VIR` page 1 declares fifty ten-byte entries in a 512-byte
+        // page and its last entry ends after its record pointer. This host
+        // never produced it while it packed one entry short of capacity;
+        // `decode_index_page` has tolerated it on the read side all along.
+        if tail + 8 <= image.len() {
+            let child = if n + 1 == entries.len() { 0 } else { NOWHERE };
+            image[tail + 4..tail + 8].copy_from_slice(&to_long(child));
+        }
+        at += shape.entry_size();
     }
 
     nodes.push(Node {
@@ -908,14 +1042,11 @@ pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)
         image[..usize::from(HEADER)].copy_from_slice(&header.encode());
 
         if !node.children.is_empty() {
-            let width = node
-                .entries
-                .first()
-                .map_or(0, |(key, _)| key.len() + INDEX_ENTRY_TAIL);
+            let width = built.shape.entry_size();
             image[8..12].copy_from_slice(&to_long(placed[node.children[node.entries.len()]]));
             image[12..16].copy_from_slice(&to_long(placed[node.children[0]]));
             for n in 0..node.entries.len().saturating_sub(1) {
-                let tail = INDEX_HEADER + n * width + node.entries[n].0.len() + 4;
+                let tail = INDEX_HEADER + n * width + built.shape.length + 4;
                 image[tail..tail + 4].copy_from_slice(&to_long(placed[node.children[n + 1]]));
             }
         }
@@ -1009,6 +1140,129 @@ pub fn write_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key of `length` bytes that forbids duplicates.
+    ///
+    /// Every index fixture in this module is one, and that is the gap this
+    /// module's tests still have rather than a convenience: every shipped file
+    /// that holds records has a unique key, so there is no measured sample of a
+    /// populated duplicate index anywhere to build a fixture from. See
+    /// [`unplaced_duplicate_bytes`].
+    fn unique(length: usize) -> Shape {
+        Shape {
+            length,
+            duplicates: false,
+        }
+    }
+
+    /// Every distinct key shape the shipped files hold, and what Btrieve itself
+    /// says an index entry and a page of them measure.
+    ///
+    /// `(page, key length, duplicates, entry size, entries per page)`. The last
+    /// two columns are **not** this host's arithmetic: they are read straight
+    /// out of the file, from the key descriptor's `+0x0c` and `+0x0e`, which is
+    /// where the engine stores the answers it computed when it built the file.
+    /// Sixteen distinct shapes, reduced from the 40 keys of the 32 files in
+    /// `tmp/`, spanning all five page lengths in use and both settings of the
+    /// duplicates bit.
+    ///
+    /// This is the whole point of the table: the numbers have an author other
+    /// than the code under test. A capacity this host computes for itself can
+    /// only be checked against a formula, and the formula was wrong.
+    const SHIPPED_KEY_SHAPES: &[(u16, usize, bool, usize, usize)] = &[
+        (4096, 8, false, 16, 255),  // NEWMP001.VIR key 0
+        (1536, 4, false, 12, 127),  // WCCACMSR.DAT key 0
+        (1024, 30, false, 38, 26),  // WCCACTS.DAT  key 0
+        (512, 34, true, 46, 10),    // WCCBANKS.DAT key 0, two segments
+        (1536, 2, false, 10, 152),  // WCCCLASS.DAT key 0
+        (512, 20, false, 28, 17),   // WCCGANGS.DAT key 0
+        (512, 4, true, 16, 31),     // WCCGANGS.DAT key 1
+        (1536, 5, true, 17, 89),    // WCCITOWN.DAT key 1, two segments
+        (1536, 8, false, 16, 95),   // WCCMP001.DAT key 0
+        (512, 4, false, 12, 41),    // WCCMSG.DAT   key 0
+        (512, 2, false, 10, 50),    // WCCRACE.DAT  key 0
+        (2048, 18, false, 26, 78),  // WCCTEXT.DAT  key 0, the variable file
+        (2048, 4, false, 12, 169),  // WCCUPDAT.DAT key 0
+        (2048, 30, false, 38, 53),  // WCCUSERS.DAT key 0
+        (2048, 4, true, 16, 127),   // WCCUSERS.DAT key 2, the character file
+        (2048, 11, false, 19, 107), // WCCUSERS.VIR key 1
+    ];
+
+    /// A duplicate key with records in it is refused, and an empty one is not.
+    ///
+    /// Both halves matter. All four shipped duplicate-key files hold zero
+    /// records, so `Block::reindex` runs over them on every close and must keep
+    /// working -- a blanket refusal would regress `WCCUSERS`, `WCCGANGS`,
+    /// `WCCITOWN` and `WCCBANKS` from "rebuilds an empty tree" to "cannot be
+    /// closed". The refusal has to arrive exactly when the first record does.
+    #[test]
+    fn a_duplicate_key_is_refused_only_once_it_has_something_to_index() {
+        let layout = index_layout();
+        let duplicate = Shape {
+            length: 2,
+            duplicates: true,
+        };
+
+        build_index(layout, &[], duplicate).expect("an empty duplicate index is still empty");
+
+        let e = build_index(layout, &[(vec![1u8, 0], 100)], duplicate)
+            .expect_err("one record is enough to need the chain");
+        assert!(e.contains("chain"), "{e}");
+
+        // And the reader refuses the same page rather than reading the chain's
+        // tail as a child page number, which is what it used to do.
+        let mut page = vec![0u8; usize::from(layout.page)];
+        page[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let e = decode_index_page(&page, duplicate).expect_err("a populated duplicate page");
+        assert!(e.contains("chain"), "{e}");
+    }
+
+    /// An index entry is as wide as Btrieve says it is, duplicates included.
+    ///
+    /// The four duplicate-permitting keys are what this pins that nothing else
+    /// did. All four files hold **zero records**, so every index fixture in this
+    /// crate was drawn from a key that forbids duplicates, and a builder that
+    /// never added the four bytes agreed with a decoder that never expected
+    /// them. The first character written to `WCCUSERS` is where that stops
+    /// being free.
+    #[test]
+    fn an_index_entry_is_as_wide_as_the_shipped_files_say() {
+        for (page, length, duplicates, entry_size, _) in SHIPPED_KEY_SHAPES {
+            let shape = Shape {
+                length: *length,
+                duplicates: *duplicates,
+            };
+            assert_eq!(
+                shape.entry_size(),
+                *entry_size,
+                "a {length}-byte {} key in a {page}-byte page",
+                if *duplicates { "duplicate" } else { "unique" }
+            );
+        }
+    }
+
+    /// A page holds as many entries as Btrieve says it does.
+    ///
+    /// Two independent errors used to live here and they pull in opposite
+    /// directions, so a table with only one kind of key in it could have caught
+    /// neither: dividing `page - 16` rather than `page - 12` under-counts by one
+    /// on six of these shapes, and omitting the duplicate term over-counts by up
+    /// to a third on the other four.
+    #[test]
+    fn a_page_holds_as_many_entries_as_the_shipped_files_say() {
+        for (page, length, duplicates, _, per_page) in SHIPPED_KEY_SHAPES {
+            let shape = Shape {
+                length: *length,
+                duplicates: *duplicates,
+            };
+            assert_eq!(
+                shape.capacity(*page),
+                *per_page,
+                "a {length}-byte {} key in a {page}-byte page",
+                if *duplicates { "duplicate" } else { "unique" }
+            );
+        }
+    }
 
     /// The six places this format writes a `u32` high half first.
     ///
@@ -1465,7 +1719,7 @@ mod tests {
         let layout = index_layout();
         let entries = vec![(vec![1u8, 0], 100u32), (vec![2u8, 0], 200u32)];
 
-        let built = build_index(layout, &entries, 2).expect("two entries fit easily");
+        let built = build_index(layout, &entries, unique(2)).expect("two entries fit easily");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
 
@@ -1522,7 +1776,7 @@ mod tests {
         entries.push((0x000du16.to_le_bytes().to_vec(), 0x0000_0a06));
         assert_eq!(entries.len(), 13);
 
-        let built = build_index(layout, &entries, 2).expect("13 entries fit one leaf");
+        let built = build_index(layout, &entries, unique(2)).expect("13 entries fit one leaf");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
 
@@ -1558,7 +1812,8 @@ mod tests {
     #[test]
     fn no_entries_is_a_valid_empty_leaf() {
         let layout = index_layout();
-        let built = build_index(layout, &[], 2).expect("an empty key still has a root page");
+        let built =
+            build_index(layout, &[], unique(2)).expect("an empty key still has a root page");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
         assert_eq!(u16::from_le_bytes([page[6], page[7]]), 0);
@@ -1566,22 +1821,22 @@ mod tests {
 
     /// **What this host used to refuse, it now builds.**
     ///
-    /// The same five entries into the same 48 bytes of room that
-    /// `index_pages` rejected with "an interior page would be needed and this
-    /// host does not build one". Five entries at a capacity of four split into
-    /// two leaves of two with the entry between them promoted -- three nodes,
-    /// and all five entries still present exactly once.
+    /// A 64-byte page holds `(64 - 12) / 10 = 5` ten-byte entries, so six of
+    /// them split into two leaves with the entry between them promoted -- three
+    /// nodes, and all six entries still present exactly once.
     ///
     /// This test is the retired refusal, kept pointing the other way, and it
     /// pairs with `a_page_at_the_boundary_still_fits` on either side of the
-    /// capacity boundary.
+    /// capacity boundary. **Both moved by one when the capacity was corrected**
+    /// from `page - 16` to the engine's `page - 12`; a pair that straddles a
+    /// boundary is only worth having if it straddles the real one.
     #[test]
     fn entries_that_do_not_fit_one_page_become_a_tree() {
         let layout = index_layout();
         let entries: Vec<(Vec<u8>, u32)> =
-            (0..5u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
+            (0..6u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let built = build_index(layout, &entries, 2).expect("what index_pages refused");
+        let built = build_index(layout, &entries, unique(2)).expect("what index_pages refused");
 
         assert_eq!(built.nodes.len(), 3, "two leaves and a root");
         assert_eq!(
@@ -1590,19 +1845,35 @@ mod tests {
             "one separator between two leaves"
         );
         let total: usize = built.nodes.iter().map(|n| n.entries.len()).sum();
-        assert_eq!(total, 5, "every entry is in exactly one node");
+        assert_eq!(total, 6, "every entry is in exactly one node");
     }
 
+    /// The full side of the boundary, and the full-leaf shape with it.
+    ///
+    /// Five ten-byte entries are exactly a 64-byte page's capacity, and the
+    /// fifth one's child slot would end at byte 66. Btrieve omits it and so
+    /// does this host -- the same shape as `WCCSPELS.VIR` page 1, which is the
+    /// shipped sample of a leaf filled exactly. Before the capacity was
+    /// corrected this host packed one entry short and could never produce it,
+    /// so the tolerance `decode_index_page` has always had for it was never
+    /// exercised against anything this host wrote.
     #[test]
     fn a_page_at_the_boundary_still_fits() {
         let layout = index_layout();
         let entries: Vec<(Vec<u8>, u32)> =
-            (0..4u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
+            (0..5u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let built = build_index(layout, &entries, 2).expect("four ten-byte entries need exactly 56");
+        let built =
+            build_index(layout, &entries, unique(2)).expect("five entries need exactly 62");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
         assert_eq!(page.len(), usize::from(layout.page));
+
+        // The page decodes back to all five, which is what makes the omitted
+        // trailing child a shape rather than a truncation.
+        let decoded = decode_index_page(page, unique(2)).expect("a full leaf is not a corrupt one");
+        assert_eq!(decoded.entries.len(), 5);
+        assert_eq!(decoded.entries[4].0, vec![4u8, 0], "the last entry survives");
     }
 
     #[test]
@@ -1664,7 +1935,7 @@ mod tests {
             0x00, 0x00, 0x07, 0x01, // child page 263
         ]);
 
-        let decoded = decode_index_page(&page, 4).expect("a well-formed page");
+        let decoded = decode_index_page(&page, unique(4)).expect("a well-formed page");
         assert_eq!(decoded.number, 131);
         assert_eq!(decoded.stamp, 0x1229);
         assert_eq!(decoded.leftmost, 130);
@@ -1707,7 +1978,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // the last entry's slot is unused, not NOWHERE
         ]);
 
-        let decoded = decode_index_page(&page, 2).expect("a well-formed page");
+        let decoded = decode_index_page(&page, unique(2)).expect("a well-formed page");
         assert!(decoded.leaf(), "no leftmost child means a leaf");
         assert_eq!(decoded.entries[0].2, NOWHERE);
         assert_eq!(decoded.entries[1].2, 0, "the last entry's child slot is a placeholder");
@@ -1735,7 +2006,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // no leftmost child -- as zero, not NOWHERE
         ]);
 
-        let decoded = decode_index_page(&page, 4).expect("a well-formed page");
+        let decoded = decode_index_page(&page, unique(4)).expect("a well-formed page");
         assert!(decoded.leaf(), "page 0 can never be a child, so zero means none");
         assert!(decoded.entries.is_empty());
     }
@@ -1747,7 +2018,7 @@ mod tests {
     fn a_count_that_does_not_fit_the_page_is_refused() {
         let mut page = vec![0u8; 512];
         page[6..8].copy_from_slice(&500u16.to_le_bytes());
-        let e = decode_index_page(&page, 2).expect_err("500 entries do not fit 512 bytes");
+        let e = decode_index_page(&page, unique(2)).expect_err("500 entries do not fit 512 bytes");
         assert!(e.contains("500"), "{e}");
     }
 
@@ -1775,7 +2046,8 @@ mod tests {
         page[506..508].copy_from_slice(&710u16.to_le_bytes());
         page[508..512].copy_from_slice(&to_long(193_542));
 
-        let decoded = decode_index_page(&page, 2).expect("a full leaf is not a corrupt one");
+        let decoded =
+            decode_index_page(&page, unique(2)).expect("a full leaf is not a corrupt one");
         assert!(decoded.leaf());
         assert_eq!(decoded.entries.len(), 50);
         assert_eq!(
@@ -1835,7 +2107,7 @@ mod tests {
         }
         std::fs::write(&path, &file).expect("writes");
 
-        let walk = walk(&path, layout, 1, 2).expect("walks");
+        let walk = walk(&path, layout, 1, unique(2)).expect("walks");
         assert_eq!(
             walk.entries,
             vec![
@@ -1868,7 +2140,7 @@ mod tests {
         ]);
         std::fs::write(&path, &file).expect("writes");
 
-        let e = walk(&path, layout, 1, 2).expect_err("a self-referential root");
+        let e = walk(&path, layout, 1, unique(2)).expect_err("a self-referential root");
         assert!(e.contains("twice"), "{e}");
     }
 
@@ -1887,7 +2159,7 @@ mod tests {
         ]);
         std::fs::write(&path, &file).expect("writes");
 
-        let walk = walk(&path, layout, 1, 2).expect("walks");
+        let walk = walk(&path, layout, 1, unique(2)).expect("walks");
         assert!(walk.entries.is_empty());
         assert_eq!(walk.pages, vec![1], "the root itself is still owned");
     }
@@ -1906,7 +2178,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=4).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, 2).expect("four entries fit");
+        let built = build_index(layout, &entries, unique(2)).expect("four entries fit");
         assert_eq!(built.nodes.len(), 1, "one page, so one node");
         assert_eq!(built.root, 0, "the root is the only node");
 
@@ -1942,7 +2214,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, 2).expect("nine entries, three pages");
+        let built = build_index(layout, &entries, unique(2)).expect("nine entries, three pages");
         assert_eq!(built.nodes.len(), 3, "two leaves and a root");
 
         let root = &built.nodes[built.root];
@@ -1964,7 +2236,7 @@ mod tests {
         // the stage where it means something.
         assert_eq!(root.children, vec![0, 1], "the two leaves, in push order");
 
-        let decoded = decode_index_page(&root.image, 2).expect("decodes");
+        let decoded = decode_index_page(&root.image, unique(2)).expect("decodes");
         assert_eq!(decoded.entries.len(), 1);
         assert_eq!(decoded.leftmost, NOWHERE, "empty until number_pages fills it");
         assert_eq!(decoded.rightmost, NOWHERE, "empty until number_pages fills it");
@@ -1979,7 +2251,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=200).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, 2).expect("200 entries");
+        let built = build_index(layout, &entries, unique(2)).expect("200 entries");
         let mut depth = 0usize;
         let mut at = built.root;
         while !built.nodes[at].children.is_empty() {
@@ -1991,7 +2263,11 @@ mod tests {
         // three edges from root to leaf. The assertion is `>= 2` because what
         // this test is for is that the builder recurses at all, not that it
         // lands on one particular shape.
-        assert!(depth >= 2, "200 entries into pages of 4 needs more than two levels, got {}", depth + 1);
+        assert!(
+            depth >= 2,
+            "200 entries into pages of 5 needs more than two levels, got {}",
+            depth + 1
+        );
 
         let total: usize = built.nodes.iter().map(|n| n.entries.len()).sum();
         assert_eq!(total, 200, "every entry is in exactly one node");
@@ -2002,7 +2278,8 @@ mod tests {
     #[test]
     fn a_key_too_wide_for_a_page_is_refused() {
         let layout = Layout { page: 32, physical: 16, pages: 4 };
-        let e = build_index(layout, &[(vec![0u8; 40], 1)], 40).expect_err("40 + 8 > 32 - 16");
+        let e = build_index(layout, &[(vec![0u8; 40], 1)], unique(40))
+            .expect_err("40 + 8 > 32 - 12");
         assert!(e.contains("does not fit"), "{e}");
     }
 
@@ -2018,12 +2295,12 @@ mod tests {
         let layout = Layout { page: 64, physical: 16, pages: 16 };
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
-        let built = build_index(layout, &entries, 2).expect("three nodes");
+        let built = build_index(layout, &entries, unique(2)).expect("three nodes");
 
         let placed = number_pages(&built, &[7, 3, 5]).expect("three numbers for three nodes");
         assert_eq!(placed[0].0, 7, "the root takes the first number given");
 
-        let root = decode_index_page(&placed[0].1, 2).expect("decodes");
+        let root = decode_index_page(&placed[0].1, unique(2)).expect("decodes");
         assert_eq!(root.number, 7, "and the header says so");
         assert!(
             !root.leaf(),
@@ -2047,7 +2324,7 @@ mod tests {
         let layout = Layout { page: 64, physical: 16, pages: 16 };
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
-        let built = build_index(layout, &entries, 2).expect("three nodes");
+        let built = build_index(layout, &entries, unique(2)).expect("three nodes");
 
         let e = number_pages(&built, &[7, 3]).expect_err("three nodes, two pages");
         assert!(e.contains('3') && e.contains('2'), "{e}");
