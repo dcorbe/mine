@@ -395,6 +395,17 @@ fn caller(machine: &Machine, module: &Module) -> Option<String> {
     Some(format!("seg {segment}:{:#06x}", offset.wrapping_sub(5)))
 }
 
+/// What `poll` does with a status.
+///
+/// Two shapes, not one index: `CRSTG`, `INBLK` and `OUTMT` reach an entry point
+/// the module registered at init, and `POLSTS` reaches a callback it installed
+/// at runtime. There is no entry-point number for the second, which is why this
+/// is an enum and not the `usize` it used to be.
+enum Dispatch {
+    Entry(usize),
+    Poll,
+}
+
 impl Host {
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
@@ -978,6 +989,54 @@ impl Host {
         self.run(machine, module, lonrou, &[]).map(Some)
     }
 
+    /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
+    ///
+    ///
+    /// The routine takes no arguments and its return value is discarded, as
+    /// `(*usrptr->polrou)()` discards it. `poll` has already pointed `curusr`
+    /// and written `status`, so it runs with `usrnum`, `usrptr`, `usaptr` and
+    /// `vdaptr` correct.
+    ///
+    /// `polrou` is read again after the call rather than remembered: a routine
+    /// that called `stop_polling` on itself must not be re-armed, and that is
+    /// the *only* thing the second read is for.
+    ///
+    /// Returns `None` when the channel is not polling -- a status left over
+    /// from a `begin_polling` the module has since undone. No call happened, so
+    /// there is no [`Outcome`] to report and R24 forbids inventing one.
+    fn dopoll(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: i16,
+    ) -> io::Result<Option<Outcome>> {
+        let rou = match self.users.polrou(machine, chan) {
+            Ok(Some(rou)) => rou,
+            Ok(None) => return Ok(None),
+            Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+        };
+
+        self.inpolr = Some(chan);
+        let outcome = self.run(machine, module, rou, &[]);
+        // Cleared before the `?`, so a machine that malfunctioned does not leave
+        // `inpolr` naming a channel that is no longer running anything. The
+        // original does the same from the `longjmp` landings at
+        // `MAJORBBS.C:2488` and `:4150`.
+        self.inpolr = None;
+        let outcome = outcome?;
+
+        if matches!(outcome, Outcome::Returned { .. }) {
+            match self.users.polrou(machine, chan) {
+                Ok(Some(_)) => {
+                    self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
+                }
+                Ok(None) => {}
+                Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+            }
+        }
+        Ok(Some(outcome))
+    }
+
     /// Service one channel that has something to report.
     ///
     /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
@@ -1050,9 +1109,10 @@ impl Host {
                 .next_status(chan)
                 .expect("scan just found a channel with one");
 
-            let entry_index = match status {
-                gsbl::Gsbl::CRSTG => 1,
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
+            let dispatch = match status {
+                gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => Dispatch::Entry(2),
+                gsbl::Gsbl::POLSTS => Dispatch::Poll,
                 other => {
                     self.note(format!(
                         "poll: channel {chan} raised status {other}, which nothing here dispatches"
@@ -1080,6 +1140,17 @@ impl Host {
             // fresh host, or a leftover `OUTMT` from an earlier poll.
             self.globals()
                 .write(machine, "status", &status.to_le_bytes())?;
+
+            let entry_index = match dispatch {
+                // A polling routine is not an entry point and has no index. The
+                // arm diverges either way, so the `match` still yields the index
+                // the `Entry` arm carries.
+                Dispatch::Poll => match self.dopoll(machine, module, chan)? {
+                    Some(outcome) => return Ok(Some(outcome)),
+                    None => continue,
+                },
+                Dispatch::Entry(index) => index,
+            };
 
             if status == gsbl::Gsbl::CRSTG
                 && let Err(e) = self.get_input(machine, chan)
@@ -1615,6 +1686,8 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
+    use crate::{Outcome, gsbl};
+    use mbbs16::FarPtr;
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --
     /// [`Fixture::minimal_module`] loads one, but loading is not registering,
@@ -1907,6 +1980,127 @@ mod tests {
             f.host.users().polrou(&f.machine, 0).expect("channel 0"),
             None,
             "the new user must not inherit the old user's poll routine"
+        );
+    }
+
+    /// A polling routine is a `void (*)(void)`, so the smallest real one is a
+    /// single `retf`. `load_code` puts it somewhere the machine will execute
+    /// and `code_ptr` addresses it.
+    fn polling_fixture() -> (crate::testing::Fixture, mbbs16::Module, FarPtr) {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+        let rou = f.machine.code_ptr(0);
+        (f, module, rou)
+    }
+
+    #[test]
+    fn a_polling_channel_is_serviced_and_re_arms_itself() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { .. })),
+            "the routine ran and returned, got {outcome:?}"
+        );
+        assert_eq!(
+            f.host.globals().word(&f.machine, "status").expect("read"),
+            192,
+            "the module reads `status`, and POLSTS is written like any other"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            Some(gsbl::Gsbl::POLSTS),
+            "still polling on return, so dopoll re-armed it"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "re-armed ONCE -- a second status here doubles every tick"
+        );
+        assert_eq!(f.host.inpolr, None, "cleared on the way out");
+    }
+
+    /// The case a remembered copy of `polrou` would get wrong. The routine is
+    /// real 16-bit code that zeroes its own `user[0].polrou` and returns, so
+    /// `dopoll`'s re-arm check has to be a fresh read of emulated memory.
+    #[test]
+    fn a_routine_that_stops_polling_itself_is_not_re_armed() {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+        let slot = f.host.users().slot(0).expect("channel 0");
+        let lo = slot.offset + crate::users::user::POLROU;
+
+        // mov ax, <selector>       B8 ss ss
+        // mov es, ax               8E C0
+        // mov word ptr es:[lo], 0  26 C7 06 lo lo 00 00
+        // mov word ptr es:[lo+2],0 26 C7 06 hi hi 00 00
+        // retf                     CB
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&slot.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc0]);
+        for offset in [lo, lo + 2] {
+            code.extend_from_slice(&[0x26, 0xc7, 0x06]);
+            code.extend_from_slice(&offset.to_le_bytes());
+            code.extend_from_slice(&[0x00, 0x00]);
+        }
+        code.push(0xcb);
+        f.machine.load_code(&code).expect("fits");
+        let rou = f.machine.code_ptr(0);
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { .. })),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "the routine cleared it mid-call"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "so nothing was re-armed and the channel goes quiet"
+        );
+    }
+
+    /// `begin_polling` injects, the module calls `stop_polling` before the pass
+    /// that would have serviced it, and the status arrives with nothing to
+    /// call. The original's whole handling is `if (usrptr->polrou != NULL)`.
+    #[test]
+    fn a_stale_polling_status_is_consumed_without_a_module_call() {
+        let (mut f, module, _rou) = polling_fixture();
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let before = f.host.calls();
+        let notes = f.host.notes().len();
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert_eq!(outcome, None, "no call happened, so there is no Outcome");
+        assert_eq!(f.host.calls(), before, "and nothing was serviced");
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "the status is consumed, not left to spin"
+        );
+        assert_eq!(
+            f.host.notes().len(),
+            notes,
+            "and it is not noted -- this is the normal path, not an anomaly"
         );
     }
 }
