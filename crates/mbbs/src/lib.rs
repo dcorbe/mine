@@ -87,17 +87,42 @@ pub enum Outcome {
 
 /// Which of `struct module`'s two disconnect vectors a disconnect runs.
 ///
-/// They are disjoint paths, not stages of one. `aschup()` -- the `huprou`
-/// sweep, `MAJORBBS.C:4608` -- is called from exactly one place in the whole
-/// host, `loscar()` at `:4581`, and a graceful logoff never passes through it:
+/// **They are sequential stages of one path, not two disjoint paths.** An
+/// earlier version of this comment claimed the opposite, and the claim was
+/// wrong in a way worth spelling out, because the reasoning that produced it
+/// looks sound: `aschup()` -- the `huprou` sweep, `MAJORBBS.C:4607-4637` -- is
+/// indeed called from exactly one place in the whole host, `loscar()` at
+/// `:4581`. What does not follow is that a graceful logoff avoids it.
+///
+/// `loscar` has a second entry. `MAJORBBS.C:39` puts it in **`module00`'s own
+/// `huprou` slot**, and `imdrop` (`:3423`) calls `module00.huprou` whenever
+/// `usrptr->class > SUPIPG`. `nxtlof` sets `class = SUPLOF` at `:4074`, and
+/// `MAJORBBS.H:164-166` makes that 5 against `SUPIPG`'s 3. So the test is true
+/// for every logging-off user and the graceful path converges:
 ///
 /// ```text
-/// graceful /x     byenow -> BYEBYE -> lofrou sweep -> finbye -> imdrop -> rstchn
-/// carrier loss    loscar -> aschup (huprou sweep) ------------------------> rstchn
+/// /x -> xitter -> bgnlof -> nxtlof sweep -> "Logoff self" (:4100)
+///    -> finlof -> byenow(SEEYA) -> setbbye -> finbye -> imdrop
+///    -> module00.huprou == loscar -> aschup [huprou sweep] -> rstchn
+///
+/// carrier loss ------------------> loscar -> aschup [huprou sweep] -> rstchn
 /// ```
+///
+/// # What this host does instead, and why it is still right
+///
+/// [`Host::logoff`] runs the `lofrou` stage and stops; it does not go on to
+/// call `huprou`. For MajorMUD that loses nothing, and it was checked rather
+/// than assumed: `_LJNGAME_LOFROU` (`WCCMMUD_named.c:12628-12639`) already does
+/// `_CLEAR_FORGET_LIST`, `_CLEANUP_WHEN_USER_LEAVES`, `_SAVE_PLAYER` and
+/// `_CLEAR_PLAYER`, and `_LJNGAME_HUPROU`'s body is gated at `:12681` on the
+/// player record it just cleared, so the second stage would find nothing to do.
+///
+/// That is a deliberate omission for *this* module, not a general truth. A
+/// second module whose `huprou` does work its `lofrou` does not would need the
+/// stage restored. Do not read the enum as saying the two are alternatives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Vector {
-    /// `lofrou`, reached through `bgnlof`/`nxtlof` (`MAJORBBS.C:4055-4104`).
+    /// `lofrou`, reached through `bgnlof`/`nxtlof` (`MAJORBBS.C:4067-4105`).
     Logoff,
 
     /// `huprou`, reached through `loscar`/`aschup`.
@@ -1225,8 +1250,8 @@ impl Host {
 
     /// Lost carrier: hand the channel to the module's `huprou`, then reset it.
     ///
-    /// `loscar()` -> `aschup()` -> `rstchn()`, `MAJORBBS.C:4563-4593` and
-    /// `:4608-4635`. This is what a closed socket raises, and `aschup` is the
+    /// `loscar()` -> `aschup()` -> `rstchn()`, `MAJORBBS.C:4562-4605` and
+    /// `:4607-4637`. This is what a closed socket raises, and `aschup` is the
     /// only caller of the `huprou` sweep in the entire host -- a graceful
     /// logoff does not pass through here. See [`Vector`].
     ///
@@ -1257,7 +1282,7 @@ impl Host {
     /// Graceful logoff: hand the channel to the module's `lofrou`, then reset
     /// it.
     ///
-    /// `bgnlof`/`nxtlof`, `MAJORBBS.C:4055-4104`. The original's sweep walks
+    /// `bgnlof`/`nxtlof`, `MAJORBBS.C:4054-4105`. The original's sweep walks
     /// every registered module and falls back to `go2mnu(JSTRET)` -- the
     /// menuing system, which is out of scope here. With one module the sweep's
     /// loop body never runs at all (`:4076` skips `i == lofstt`, and `lofstt` is the
@@ -1348,15 +1373,15 @@ impl Host {
         // is refused rather than discarded. `huprou` is `void` and has no
         // protocol, so its words are not read.
         let outcome = match (vector, outcome) {
-            (Vector::Logoff, Some(Outcome::Returned { ax, .. })) if ax != 0 => {
+            (Vector::Logoff, Some(Outcome::Returned { ax, .. })) if ax == 1 => {
                 Some(self.stop(
                     machine,
                     Poison::Unimplemented {
                         module: "mbbs".to_owned(),
                         symbol: format!(
-                            "lofrou returned {}, and this host has neither another \
-                             logoff pass to give it nor a menuing system to return \
-                             it to (MAJORBBS.C:4087, :4100)",
+                            "lofrou returned {}, asking to be called again, and this \
+                             host has no second logoff pass to give it \
+                             (MAJORBBS.C:4100)",
                             ax as i16
                         ),
                     },
@@ -2893,14 +2918,15 @@ mod tests {
 
     #[test]
     fn a_lofrou_that_asks_to_be_called_again_is_refused_by_name() {
-        // `nxtlof`'s protocol, `MAJORBBS.C:4100-4101`: for the module the user
-        // is *in* -- the only one a one-module host has -- the test is
-        // `if ((*lofrou)() != 1) go2mnu(JSTRET)`, so 1 is "I am not finished".
-        // A one-module headless host can honour neither that nor the sweep's
-        // -1 (`:4087-4089`), and a silent discard would leave the module
-        // believing a dialogue
-        // is in progress. House rule: a host that cannot answer poisons with
-        // its own name.
+        // `nxtlof`'s protocol, `MAJORBBS.C:4100`: for the module the user is
+        // *in* -- the only one a one-module host has -- the test is
+        // `if ((*lofrou)() != 1) go2mnu(JSTRET)`, so 1 and only 1 is "I am not
+        // finished, hold the channel". A one-module headless host has no second
+        // pass to give, and a silent discard would leave the module believing a
+        // dialogue is in progress. House rule: a host that cannot answer poisons
+        // with its own name. See
+        // `a_lofrou_that_abandons_the_sweep_is_taken_at_its_word_like_any_non_one`
+        // for why the refusal is `== 1` and not `!= 0`.
         let (mut f, module, chan) = connected_with(|_| vec![(4, returns_stub(1))]);
 
         let outcome = f
@@ -2916,14 +2942,36 @@ mod tests {
             poison.to_string().contains("lofrou"),
             "the refusal must name the routine: {poison}"
         );
+
+        // `disconnect`'s doc calls the reset "last, and unconditionally". Until
+        // this line nothing held it to that on the stopping path: wrapping the
+        // tail in `if !matches!(outcome, Some(Outcome::Stopped(_)))` left all
+        // 754 tests green. A refused `lofrou` is still a channel nobody is on.
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "the channel was reset even though the disconnect ended in a stop"
+        );
     }
 
-    /// The other half of the protocol, and the value an `ax != 0` test and an
-    /// `ax == 1` test disagree about. `-1` is `nxtlof`'s "abandon the sweep and
-    /// go to the menu" (`MAJORBBS.C:4087-4089`), which this host has no more of an
-    /// answer for than it has for 1.
+    /// `-1` is **not** refused, and getting here took a correction.
+    ///
+    /// The refusal was written as `ax != 0`, reasoning from `nxtlof`'s loop:
+    /// `1` means "call me again" (`MAJORBBS.C:4087`) and `-1` means "abandon
+    /// and go to the menu" (`:4089`). But with one module that loop body never
+    /// executes -- `:4076` skips `i == lofstt` and `lofstt` is the only module
+    /// there is -- so the operative line is the self-call at `:4100`:
+    ///
+    ///
+    /// Against that test `0`, `-1` and `42` are the same answer: finished, go
+    /// to the menu. Only `1` says "hold the channel, I am not done", and only
+    /// that is something this host cannot honour. "Go to the menu" for a
+    /// headless host collapses to "the logoff is over", which is exactly the
+    /// `rstchn` that follows -- so it is accepted rather than refused.
+    ///
+    /// Refusing `-1` as well would have been this host inventing a distinction
+    /// the original does not draw at the only line it reaches.
     #[test]
-    fn a_lofrou_that_abandons_the_sweep_is_refused_by_name() {
+    fn a_lofrou_that_abandons_the_sweep_is_taken_at_its_word_like_any_non_one() {
         let (mut f, module, chan) = connected_with(|_| vec![(4, returns_stub(0xffff))]);
 
         let outcome = f
@@ -2932,12 +2980,14 @@ mod tests {
             .expect("logoff")
             .expect("lofrou was called");
 
-        let Outcome::Stopped(poison) = outcome else {
-            panic!("a lofrou abandoning the sweep must stop, got {outcome:?}");
-        };
+        assert_eq!(
+            outcome,
+            Outcome::Returned { ax: 0xffff, dx: 0 },
+            "-1 is not 1, so `:4100` sends it to the menu like any other value"
+        );
         assert!(
-            poison.to_string().contains("lofrou"),
-            "the refusal must name the routine: {poison}"
+            f.host.users().keys(chan).is_none(),
+            "and the channel was still reset"
         );
     }
 
@@ -3038,7 +3088,7 @@ mod tests {
     /// `struct module` (`MAJORBBS.H:241-252`) is `descrp`, `lonrou`, `sttrou`,
     /// `stsrou`, `injrou`, `lofrou`, `huprou` -- so `lofrou` is entry 4 and
     /// `huprou` is entry 5, and the two disconnects are disjoint paths rather
-    /// than stages of one: `aschup` (`:4608`) sweeps `huprou` and is called
+    /// than stages of one: `aschup` (`:4607`) sweeps `huprou` and is called
     /// only from `loscar` (`:4581`), while `lofrou` is reached only through
     /// `bgnlof`. Asserted by what *ran*, not by which pointer was read.
     #[test]
