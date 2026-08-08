@@ -631,6 +631,114 @@ pub fn decode_index_page(page: &[u8], key_length: usize) -> Result<IndexPage, St
     })
 }
 
+/// The most levels a tree may have before a walk gives up.
+///
+/// Not a property of the format. A backstop: the deepest shipped file is three
+/// levels (`docs/plans/2026-08-07-btrieve-interior-pages-design.md`), and a
+/// file claiming more than this is corrupt in a way that would otherwise cost
+/// the box its memory before it cost anyone an error message.
+const MAX_DEPTH: usize = 32;
+
+/// What walking a key's tree found.
+#[derive(Debug)]
+pub struct Walk {
+    /// Every `(key bytes, record position)` in the tree, in key order.
+    pub entries: Vec<(Vec<u8>, u32)>,
+    /// The page numbers the tree occupies, **root first**.
+    ///
+    /// `Block::reindex` rebuilds into exactly these numbers, which is what
+    /// keeps a rebuild from growing the file every time it runs.
+    pub pages: Vec<u32>,
+}
+
+/// Walk one key's tree from its root.
+///
+/// In-order: the leftmost child's subtree, then for each entry the entry itself
+/// followed by the subtree of the child that entry names — except the last
+/// entry, whose subtree is the one the page header's rightmost slot names.
+///
+/// # Errors
+///
+/// If the file cannot be read, a page number is outside the file or zero (page
+/// 0 is the file control record and never part of a tree), a page appears
+/// twice, the tree is deeper than [`MAX_DEPTH`], or a page does not decode.
+pub fn walk(
+    path: &std::path::Path,
+    layout: Layout,
+    root: u32,
+    key_length: usize,
+) -> Result<Walk, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out = Walk {
+        entries: Vec::new(),
+        pages: Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+
+    // An explicit stack rather than recursion: `MAX_DEPTH` bounds the tree, but
+    // a page holds hundreds of entries and each one pushes a frame, so the
+    // recursive shape is bounded by the *file* rather than by the depth.
+    //
+    // Each frame is a page and how far through its entries the walk has got.
+    struct Frame {
+        page: IndexPage,
+        at: usize,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut next = Some(root);
+
+    loop {
+        // Descend as far left as this subtree goes.
+        while let Some(number) = next.take() {
+            if number == 0 || number >= layout.pages {
+                return Err(format!(
+                    "page {number} is not inside a {}-page file",
+                    layout.pages
+                ));
+            }
+            if !seen.insert(number) {
+                return Err(format!("page {number} appears twice in the tree"));
+            }
+            if stack.len() >= MAX_DEPTH {
+                return Err(format!("the tree is more than {MAX_DEPTH} levels deep"));
+            }
+            out.pages.push(number);
+
+            let mut bytes = vec![0u8; usize::from(layout.page)];
+            file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|e| format!("{}: page {number}: {e}", path.display()))?;
+            let page = decode_index_page(&bytes, key_length)
+                .map_err(|e| format!("page {number}: {e}"))?;
+
+            let leftmost = (!page.leaf()).then_some(page.leftmost);
+            stack.push(Frame { page, at: 0 });
+            next = leftmost;
+        }
+
+        // Take the next entry off the deepest unfinished page.
+        let Some(frame) = stack.last_mut() else {
+            return Ok(out);
+        };
+        if frame.at == frame.page.entries.len() {
+            stack.pop();
+            continue;
+        }
+        let (key, position, child) = &frame.page.entries[frame.at];
+        out.entries.push((key.clone(), *position));
+        frame.at += 1;
+        if !frame.page.leaf() {
+            next = Some(if frame.at == frame.page.entries.len() {
+                frame.page.rightmost
+            } else {
+                *child
+            });
+        }
+    }
+}
+
 /// The six-byte header of a page already in the file, read on its own rather
 /// than as part of the page it heads.
 ///
@@ -1404,5 +1512,112 @@ mod tests {
         page[6..8].copy_from_slice(&500u16.to_le_bytes());
         let e = decode_index_page(&page, 2).expect_err("500 entries do not fit 512 bytes");
         assert!(e.contains("500"), "{e}");
+    }
+
+    /// A two-level tree, built by hand and walked.
+    ///
+    /// Three pages: root 1 with one entry, leaves 2 and 3. In-order that is
+    /// leaf 2's keys, then the root's own key, then leaf 3's — because the
+    /// root's entry is itself a record, sorting between its two children.
+    ///
+    /// Built by hand rather than by `build_index` on purpose: a walker tested
+    /// only against the builder's output agrees with the builder about any
+    /// mistake they share.
+    #[test]
+    fn a_walk_returns_the_tree_in_key_order() {
+        let dir = crate::testing::scratch("pages-walk-two-levels");
+        let path = dir.join("TREE.DAT");
+        let layout = Layout { page: 512, physical: 16, pages: 4 };
+
+        let mut file = vec![0u8; 512 * 4];
+        // Root, page 1: one entry (key 20), leftmost child 2, rightmost 3.
+        let root = 512;
+        file[root..root + 16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x03, 0x00, // rightmost, page 3
+            0x00, 0x00, 0x02, 0x00, // leftmost, page 2
+        ]);
+        // Built with `to_long` rather than a hand-written literal. This fixture
+        // is scaffolding for the *traversal order*, not an oracle for the byte
+        // encoding -- that is already pinned by
+        // `a_long_in_this_format_is_two_words_high_first` and by
+        // `an_interior_page_decodes_to_its_children`, whose bytes came off a
+        // real file. A hand-transposed pointer here would fail this test for a
+        // reason that has nothing to do with what it is checking.
+        file[root + 16..root + 18].copy_from_slice(&20u16.to_le_bytes());
+        file[root + 18..root + 22].copy_from_slice(&to_long(3000));
+        file[root + 22..root + 26].copy_from_slice(&to_long(0)); // last entry, placeholder
+        // Leaves, pages 2 and 3.
+        for (number, keys) in [(2u32, [10u16, 15]), (3, [25, 30])] {
+            let at = 512 * number as usize;
+            file[at..at + 16].copy_from_slice(&[
+                0x00, 0x00, number as u8, 0x00, 0x00, 0x00, 0x02, 0x00,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ]);
+            for (n, key) in keys.iter().enumerate() {
+                let e = at + 16 + n * 10;
+                file[e..e + 2].copy_from_slice(&key.to_le_bytes());
+                file[e + 2..e + 6].copy_from_slice(&to_long(u32::from(*key) * 100));
+                file[e + 6..e + 10]
+                    .copy_from_slice(&to_long(if n == 1 { 0 } else { NOWHERE }));
+            }
+        }
+        std::fs::write(&path, &file).expect("writes");
+
+        let walk = walk(&path, layout, 1, 2).expect("walks");
+        assert_eq!(
+            walk.entries,
+            vec![
+                (vec![10, 0], 1000),
+                (vec![15, 0], 1500),
+                (vec![20, 0], 3000),
+                (vec![25, 0], 2500),
+                (vec![30, 0], 3000),
+            ],
+            "the root's own entry sorts between its two children"
+        );
+        assert_eq!(walk.pages, vec![1, 2, 3], "root first, then in walk order");
+    }
+
+    /// A tree that points at itself is refused rather than walked forever.
+    ///
+    /// This is the guard that keeps a corrupt file from becoming an unbounded
+    /// allocation. It is cheap and it has a real failure mode behind it.
+    #[test]
+    fn a_cycle_in_the_tree_is_refused() {
+        let dir = crate::testing::scratch("pages-walk-cycle");
+        let path = dir.join("LOOP.DAT");
+        let layout = Layout { page: 512, physical: 16, pages: 2 };
+
+        let mut file = vec![0u8; 512 * 2];
+        file[512..512 + 16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x00, // rightmost child is itself
+            0x00, 0x00, 0x01, 0x00, // leftmost child is itself
+        ]);
+        std::fs::write(&path, &file).expect("writes");
+
+        let e = walk(&path, layout, 1, 2).expect_err("a self-referential root");
+        assert!(e.contains("twice"), "{e}");
+    }
+
+    /// A key with no records still has a root page, and walking it is empty
+    /// rather than an error. `Block::reindex` hits this on every virgin file.
+    #[test]
+    fn a_walk_of_an_empty_root_is_empty() {
+        let dir = crate::testing::scratch("pages-walk-empty");
+        let path = dir.join("EMPTY.DAT");
+        let layout = Layout { page: 512, physical: 16, pages: 2 };
+
+        let mut file = vec![0u8; 512 * 2];
+        file[512..512 + 16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ]);
+        std::fs::write(&path, &file).expect("writes");
+
+        let walk = walk(&path, layout, 1, 2).expect("walks");
+        assert!(walk.entries.is_empty());
+        assert_eq!(walk.pages, vec![1], "the root itself is still owned");
     }
 }
