@@ -42,6 +42,7 @@
 /* Btrieve operation codes, Btrieve Programmer's Reference (1998). */
 #define B_OPEN       0
 #define B_CLOSE      1
+#define B_INSERT     2
 #define B_GET_EQUAL  5
 #define B_GET_NEXT   6
 #define B_GET_FIRST 12
@@ -413,6 +414,61 @@ static void cmd_create(const char *path)
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
+/*
+ * Insert `count` records whose key values collide in groups of three.
+ *
+ * A unique-keyed insert can never exercise the duplicate-chain code this rig
+ * exists to measure, so `value = index / 3` makes records 0,1,2 share key 0,
+ * 3,4,5 share key 1, and so on -- 30 records land on 10 distinct key values.
+ * Bytes 4..12 of the 12-byte record carry the ordinal (not part of the key)
+ * so `dump` can tell the three records in a group apart.
+ */
+static void cmd_insert(const char *path, int count)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[12];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int i, st;
+    unsigned failures = 0;
+
+    st = open_file(posblk, path, MODE_NORMAL);
+    if (st != ST_OK)
+        die("open", st);
+
+    for (i = 0; i < count; i++) {
+        DWORD value = (DWORD)(i / 3);
+
+        record[0] = (unsigned char)(value & 0xff);
+        record[1] = (unsigned char)((value >> 8) & 0xff);
+        record[2] = (unsigned char)((value >> 16) & 0xff);
+        record[3] = (unsigned char)((value >> 24) & 0xff);
+        memset(record + 4, 0, 8);
+        record[4] = (unsigned char)(i & 0xff);
+        record[5] = (unsigned char)((i >> 8) & 0xff);
+
+        /* B_INSERT derives the key value from the record itself at the
+         * position the file spec declared; the key buffer here is an OUTPUT
+         * -- the engine writes back the key it extracted -- not an input, so
+         * it starts zeroed rather than pre-filled. */
+        dlen = sizeof record;
+        memset(keybuf, 0, sizeof keybuf);
+        st = btrcall(B_INSERT, posblk, record, &dlen, keybuf,
+                    sizeof keybuf - 1, (char)0);
+        printf("insert %3d key %lu: status %d (%s)\n",
+               i, (unsigned long)value, st, status_name(st));
+        if (st != ST_OK)
+            failures++;
+    }
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+
+    if (failures) {
+        fprintf(stderr, "FAIL: %u of %d inserts did not return OK\n", failures, count);
+        exit(1);
+    }
+}
+
 /* Walk the whole file in key order via GET_FIRST/GET_NEXT and check the key
  * sequence is non-decreasing. Reports the count the engine actually yields. */
 static void cmd_walk(const char *path, int keynum)
@@ -754,14 +810,15 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend|keys|dump|create> <file.VIR> [keynum]\n"
+            "usage: btrvprobe <stat|walk|descend|keys|dump|create|insert> <file.VIR> [keynum|count]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
             "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
             "  keys     print every KEY in index order, for diffing two files\n"
             "  dump     print every record's BYTES, in key order, as hex\n"
             "  create   create a 12-byte-record file with one duplicate,\n"
-            "           descending, 4-byte key (WCCUSERS key 2, minus the rest)\n");
+            "           descending, 4-byte key (WCCUSERS key 2, minus the rest)\n"
+            "  insert   insert <count> records; key values collide in groups of 3\n");
         return 2;
     }
     cmd  = argv[1];
@@ -793,6 +850,13 @@ int main(int argc, char **argv)
         cmd_dump(path, keynum);
     else if (!strcmp(cmd, "create"))
         cmd_create(path);
+    else if (!strcmp(cmd, "insert")) {
+        if (argc < 4) {
+            fprintf(stderr, "FAIL: insert needs a record count\n");
+            return 2;
+        }
+        cmd_insert(path, keynum);   /* argv[3], already parsed as `keynum` above */
+    }
     else {
         fprintf(stderr, "FAIL: unknown command %s\n", cmd);
         return 2;

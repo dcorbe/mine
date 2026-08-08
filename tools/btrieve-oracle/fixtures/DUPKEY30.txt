@@ -1,0 +1,154 @@
+DUPKEY30.DAT -- a synthetic duplicate-key file, built by the real engine.
+
+WHY THIS EXISTS
+
+Nothing MajorMUD ships can exercise a duplicate-permitting index: every
+record-holding file has a unique key (crates/mbbs/tests/btrieve.rs's FILES
+table shows duplicate-shaped `phys` deltas on WCCUSERS/WCCBANKS/WCCGANGS/
+WCCITOWN, but none of those files can be re-created from scratch and none
+holds records with colliding keys to walk). WCCUSERS key 2 is experience --
+4 bytes at record offset 60, descending, duplicates permitted -- and every
+newly created MajorMUD character has exp 0, so every character save collides
+on it. This host could not write such an index (crates/mbbs/src/btrieve/
+pages.rs:531) and no existing harness could prove an implementation, because
+there was nothing on hand for the real engine to have built one out of.
+
+DUPKEY30.DAT is that missing input: a 12-byte-record file with one 4-byte,
+descending, duplicate-permitting key (WCCUSERS key 2's shape, minus the other
+59+ fields), holding 30 records whose key values collide in groups of three
+(`value = index / 3`, so keys 0..9 each own exactly 3 records).
+
+REGENERATE IT
+
+    sh tools/btrieve-oracle/build.sh
+    cd tools/btrieve-oracle
+    # Pick a name never used before in this Wine prefix -- see the file
+    # header comment in btrvprobe.c: the Microkernel caches pages by path
+    # and outlives its clients, so reusing a name serves stale pages.
+    WINEPREFIX=$HOME/.btrieve-wine wine btrvprobe.exe create 'C:\btrieve\<unique>.DAT'
+    WINEPREFIX=$HOME/.btrieve-wine wine btrvprobe.exe insert 'C:\btrieve\<unique>.DAT' 30
+    WINEPREFIX=$HOME/.btrieve-wine wine btrvprobe.exe stat   'C:\btrieve\<unique>.DAT'
+    WINEPREFIX=$HOME/.btrieve-wine wine btrvprobe.exe keys   'C:\btrieve\<unique>.DAT' 0
+    WINEPREFIX=$HOME/.btrieve-wine wine btrvprobe.exe dump   'C:\btrieve\<unique>.DAT' 0
+    cp "$HOME/.btrieve-wine/drive_c/btrieve/<unique>.DAT" tools/btrieve-oracle/fixtures/DUPKEY30.DAT
+
+This copy was built as C:\btrieve\DUPK20.DAT (2026-08-08); the `stat` output
+below is that run with the path line normalized to the fixture's name.
+
+THE TWO MEASUREMENTS
+
+1. Distinct key values. `keys` walks records via B_GET_FIRST/B_GET_NEXT, and
+   for a duplicate-permitting key that operation visits every record in the
+   chain (standard, documented Btrieve behaviour) -- so it prints 30 lines,
+   not 10. All 30 inserts returned status 0 (OK), which is itself evidence
+   duplicates are permitted: if they were not, the 2nd and 3rd insert of
+   each group of three would have come back status 5 ("duplicate key
+   value"), and none did. `sort DUPKEY30-keys.txt | uniq -c` collapses the
+   30 lines to exactly 10 distinct values, each appearing exactly 3 times
+   consecutively -- 30 records over 10 distinct key values, confirmed, just
+   not as a literal 10-line `keys` output. Reading raw index-page bytes to
+   count physical index *entries* directly (rather than inferring from a
+   record-level walk) would need a page-level reader this rig does not have;
+   out of scope for Task 6/7.
+
+2. Physical record length. `stat`'s `reclen` field reads 12 on this file
+   both before any records existed (Task 6) and after all 30 were inserted
+   (below) -- NOT 20. `dump`'s `dlen` also reads 12 for every record. Real
+   Btrieve's own STAT reply reports the DECLARED logical length; it does not
+   surface whatever the engine stores physically on the data page. So the
+   design's "20, not 12" prediction cannot be confirmed or refuted through
+   `stat` or `dump` as built here -- both instruments are blind to it.
+
+   Reading the raw page bytes directly (a one-off Python script against this
+   file, not a btrvprobe command, and not committed) settles it anyway: the
+   three records sharing key value 9 sit at byte offsets 4192, 4214 and 4236
+   in page 8 -- a stride of exactly 22 bytes per record, not the declared 12.
+   A throwaway comparison file, built the same way but with the duplicates
+   bit cleared (unique key, same reclen 12, same pagesize), showed a stride
+   of 14 bytes instead. The delta -- 22 - 14 = 8 -- is exactly the
+   [prev][next] chain pair `pages.rs:531` predicts, sitting on top of a
+   2-byte per-record slot header that both files carry regardless of
+   duplicates (14 = 12 + 2; 22 = 12 + 2 + 8) and that has nothing to do with
+   this question. So the underlying "12 logical + 8-byte chain pair" claim
+   is confirmed at the byte level, against a file the real engine wrote --
+   crates/mbbs/tests/btrieve.rs's existing `phys` column already assumes
+   exactly this delta for WCCUSERS/WCCBANKS/WCCGANGS/WCCITOWN (1998->2006,
+   72->80, 253->261, 65->73, all +8) -- but neither `stat` nor `dump`
+   reports it, so this fixture cannot prove it by itself; the raw bytes can.
+
+=== stat ===
+file        C:\btrieve\DUPKEY30.DAT
+reclen      12
+pagesize    512
+indexes     1 (raw 0x6001)
+records     30
+flags       0x0000
+allocations 0
+key 0       pos=1 len=4 flags=0x0145 approx=10 type=14 segments=1
+
+=== keys 0 ===
+09000000
+09000000
+09000000
+08000000
+08000000
+08000000
+07000000
+07000000
+07000000
+06000000
+06000000
+06000000
+05000000
+05000000
+05000000
+04000000
+04000000
+04000000
+03000000
+03000000
+03000000
+02000000
+02000000
+02000000
+01000000
+01000000
+01000000
+00000000
+00000000
+00000000
+
+=== dump 0 ===
+0 12 090000001b00000000000000
+1 12 090000001c00000000000000
+2 12 090000001d00000000000000
+3 12 080000001800000000000000
+4 12 080000001900000000000000
+5 12 080000001a00000000000000
+6 12 070000001500000000000000
+7 12 070000001600000000000000
+8 12 070000001700000000000000
+9 12 060000001200000000000000
+10 12 060000001300000000000000
+11 12 060000001400000000000000
+12 12 050000000f00000000000000
+13 12 050000001000000000000000
+14 12 050000001100000000000000
+15 12 040000000c00000000000000
+16 12 040000000d00000000000000
+17 12 040000000e00000000000000
+18 12 030000000900000000000000
+19 12 030000000a00000000000000
+20 12 030000000b00000000000000
+21 12 020000000600000000000000
+22 12 020000000700000000000000
+23 12 020000000800000000000000
+24 12 010000000300000000000000
+25 12 010000000400000000000000
+26 12 010000000500000000000000
+27 12 000000000000000000000000
+28 12 000000000100000000000000
+29 12 000000000200000000000000
+dumped      30
+stat says   30
+DUMP OK
