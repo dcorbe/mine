@@ -10,9 +10,11 @@
 //! the two routines that hold the index still.
 
 use mbbs16::{Machine, Ret};
+use mbbs16::FarPtr;
 
 use super::ShimError;
 use crate::Host;
+use crate::gsbl::Gsbl;
 
 /// `struct usracc *uacoff(int unum)` -- the channel's account record.
 ///
@@ -174,6 +176,54 @@ pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     };
     host.asked_for_key(unum, &lock, answer);
     Ok(Ret::U16(answer.into()))
+}
+
+/// `void begin_polling(int unum, void (*rouptr)())` -- start calling `rouptr`
+/// for channel `unum` every time the host comes round. `MAJORBBS.C:1183`:
+///
+///
+/// The `inpolr` half of that guard is the one worth understanding.
+/// [`Host::dopoll`] re-injects `POLSTS` when a polling routine returns still
+/// polling, so a `begin_polling` issued from *inside* a polling routine would,
+/// without it, queue a second status for the same tick -- and then two, and
+/// then four. The queue is deliberately unbounded (`gsbl::Channel::status`), so
+/// the failure mode is the machine, not a wrong answer.
+///
+/// # Errors
+///
+/// If `unum` names no channel, or `rouptr` is NULL. The original stored a NULL
+/// -- making the call a `stop_polling` with one wasted status -- but all nine
+/// of `WCCMMUD.DLL`'s call sites pass a real routine and the only computed one
+/// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a NULL here
+/// is a module bug this host can name.
+pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let unum = machine.arg_u16(0) as i16;
+    let rouptr = machine.arg_far(1);
+    if rouptr == FarPtr::NULL {
+        return Err(ShimError::Failed(format!(
+            "begin_polling({unum}): a null polling routine"
+        )));
+    }
+    if host.users().polrou(machine, unum)?.is_none() && host.inpolr != Some(unum) {
+        host.gsbl_mut().inject(unum, Gsbl::POLSTS);
+    }
+    host.users.set_polrou(machine, unum, Some(rouptr))
+        .map(|()| Ret::Void)
+}
+
+/// `void stop_polling(int unum)` -- `user[unum].polrou=NULL`.
+/// `MAJORBBS.C:1194`, which is that one line.
+///
+/// No status is withdrawn. A `POLSTS` already queued arrives with nothing to
+/// call, and [`Host::dopoll`] does nothing with it -- which is the original's
+/// entire handling of that case.
+///
+/// # Errors
+///
+/// If `unum` names no channel.
+pub fn stop_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let unum = machine.arg_u16(0) as i16;
+    host.users.set_polrou(machine, unum, None).map(|()| Ret::Void)
 }
 
 /// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
@@ -431,5 +481,116 @@ mod tests {
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(1), "matched case-insensitively");
         assert_eq!(f.read(lock), "user", "and left the module's string alone");
+    }
+
+    /// `MAJORBBS.C:1183`. The status is what makes the channel tick; the store
+    /// is what makes it tick *into the right routine*.
+    #[test]
+    fn begin_polling_installs_the_routine_and_injects_one_status() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou)
+        );
+        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
+        assert_eq!(f.host.gsbl_mut().next_status(0), None, "exactly one");
+    }
+
+    /// The guard that keeps the status queue from doubling every tick.
+    /// `dopoll` re-injects on return, so a `begin_polling` from *inside* a
+    /// polling routine must not inject as well.
+    #[test]
+    fn begin_polling_injects_nothing_while_that_channel_is_inside_its_poll_routine() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        f.host.inpolr = Some(0);
+
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou),
+            "the routine is still installed"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "but nothing is injected -- dopoll will do that on return"
+        );
+    }
+
+    /// An already-polling channel is already going to be serviced.
+    #[test]
+    fn begin_polling_injects_nothing_when_the_channel_is_already_polling() {
+        let mut f = Fixture::new();
+        let first = f.machine.code_ptr(0);
+        let second = f.machine.code_ptr(1);
+
+        f.invoke(begin_polling, &[0, first.offset, first.selector])
+            .expect("installed");
+        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
+
+        f.invoke(begin_polling, &[0, second.offset, second.selector])
+            .expect("replaced");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(second),
+            "the new routine replaces the old one"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "and no second status is queued"
+        );
+    }
+
+    #[test]
+    fn stop_polling_clears_the_routine_and_injects_nothing() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+        let _ = f.host.gsbl_mut().next_status(0);
+
+        f.invoke(stop_polling, &[0]).expect("stopped");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None
+        );
+        assert_eq!(f.host.gsbl_mut().next_status(0), None);
+    }
+
+    #[test]
+    fn polling_a_channel_that_does_not_exist_is_refused() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        assert!(
+            f.invoke(begin_polling, &[1, rou.offset, rou.selector])
+                .is_err(),
+            "nterms is 1, so channel 1 does not exist"
+        );
+        assert!(f.invoke(stop_polling, &[1]).is_err());
+    }
+
+    /// All nine call sites pass a real pointer, and the one computed pointer
+    /// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a whole
+    /// NULL here is a module bug rather than a compact `stop_polling`.
+    #[test]
+    fn a_null_polling_routine_is_refused_rather_than_installed() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(begin_polling, &[0, 0, 0]).is_err());
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "and nothing is injected on the way out"
+        );
     }
 }

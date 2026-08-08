@@ -187,7 +187,7 @@ pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, status) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as i16);
     Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").status.push_back(status);
+        g.inject(chan, status);
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),

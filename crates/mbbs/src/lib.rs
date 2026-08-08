@@ -83,6 +83,47 @@ pub enum Outcome {
     Stopped(Poison),
 }
 
+/// Why [`Host::cycle`] stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// No status queued and no timer outstanding: nothing can happen until the
+    /// transport delivers something. A driver should block on the socket here,
+    /// not call `cycle` again.
+    Idle,
+
+    /// `max` passes were made and there is still work. `polling` is whether any
+    /// channel has a polling routine installed -- the module genuinely running,
+    /// where spinning is legitimate. `next_kick` is the soonest countdown in
+    /// the kicktable.
+    ///
+    /// A driver must not spin on `Bound { polling: false, next_kick: Some(_) }`
+    /// under a system clock: `prcrtk` cannot do anything before the next whole
+    /// second, so it should sleep to it. See
+    /// `docs/plans/2026-08-08-polling-design.md`.
+    Bound {
+        polling: bool,
+        next_kick: Option<u16>,
+    },
+
+    /// The module stopped, on the pass it stopped on.
+    Stopped(Poison),
+}
+
+/// What one [`Host::cycle`] run did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cycles {
+    /// Passes made, at most `max`. The host's own share of
+    /// [`Host::clock_reads`], since each pass reads the clock once.
+    pub iterations: usize,
+
+    /// Module calls made: polling routines, entry points, and fired kicks.
+    /// **The meter.**
+    pub dispatched: usize,
+
+    /// Why it stopped.
+    pub ended: Ended,
+}
+
 /// A global the module addresses that the host cannot place.
 ///
 /// Not a warning. A datum the host does not have would be given a *thunk* --
@@ -351,10 +392,29 @@ pub struct Host {
     /// Every lock a module has asked about, in order. See [`Host::keys_asked`].
     asked: Vec<Query>,
 
+    /// The channel whose polling routine is running right now, or `None`.
+    ///
+    /// `inpolr`, `MAJORBBS.C:322`, with the original's `-1` as `None`. Rust-side
+    /// because `WCCMMUD.DLL` neither imports it nor reads it -- unlike `polrou`,
+    /// which it does.
+    pub(crate) inpolr: Option<i16>,
+
+    /// The last whole second [`Host::prcrtk`] has been run for.
+    ///
+    /// `tcklst`, `MAJORBBS.C:476`. `None` until the first [`Host::cycle`] pass,
+    /// which syncs it to the clock and fires nothing: a counter starting at zero
+    /// would make that first pass catch up from 1970, which is about 1.1 billion
+    /// `prcrtk` rounds. The original had no equivalent because `ticker` was a
+    /// free-running counter that both ends of the comparison read.
+    tcklst: Option<u32>,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
     calls: u64,
+
+    /// How many times anything has read the clock. See [`Host::clock_reads`].
+    clock_reads: u64,
 
     /// Whether to print each call as it is serviced. See [`Host::set_trace`].
     trace: bool,
@@ -386,6 +446,17 @@ fn caller(machine: &Machine, module: &Module) -> Option<String> {
     let selector = u16::from_le_bytes([bytes[2], bytes[3]]);
     let segment = module.segment_at(selector)?;
     Some(format!("seg {segment}:{:#06x}", offset.wrapping_sub(5)))
+}
+
+/// What `poll` does with a status.
+///
+/// Two shapes, not one index: `CRSTG`, `INBLK` and `OUTMT` reach an entry point
+/// the module registered at init, and `POLSTS` reaches a callback it installed
+/// at runtime. There is no entry-point number for the second, which is why this
+/// is an enum and not the `usize` it used to be.
+enum Dispatch {
+    Entry(usize),
+    Poll,
 }
 
 impl Host {
@@ -477,7 +548,10 @@ impl Host {
             heap,
             users,
             asked: Vec::new(),
+            inpolr: None,
+            tcklst: None,
             calls: 0,
+            clock_reads: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
     }
@@ -497,9 +571,29 @@ impl Host {
         &self.modules
     }
 
-    /// The clock `now`, `today` and `time` answer from.
-    pub fn clock(&self) -> Clock {
+    /// What time it is, and one step later than the last time anyone asked.
+    ///
+    /// **Reading the clock moves it**, under [`Clock::stepped`]. The returned
+    /// value is a frozen snapshot, so `now`'s `.civil()` and `time`'s `.epoch()`
+    /// stay consistent within one call; it is the *next* read that has moved.
+    /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
+    /// only a counter for them.
+    pub fn clock(&mut self) -> Clock {
+        self.clock = self.clock.advanced();
+        self.clock_reads += 1;
         self.clock
+    }
+
+    /// How many times the clock has been read, host and module together.
+    ///
+    /// Under [`Clock::stepped`] a read is also a step, so how far invented time
+    /// has run is a function of how often the module looked at it -- a property
+    /// of the module, which no host-side argument bounds. This is how the size
+    /// of that is measured instead of argued about, the way
+    /// [`Host::keys_asked`] measures locks. The host's own share of these is
+    /// [`Cycles::iterations`]; the rest is the module's.
+    pub fn clock_reads(&self) -> u64 {
+        self.clock_reads
     }
 
     /// Freeze the clock, or hand the host a different one.
@@ -883,6 +977,12 @@ impl Host {
         // not inherit the first one's access.
         self.users.set_keys(chan, who.keys.clone());
 
+        // A channel that already held a user may still hold that user's polling
+        // routine, and `polrou` is a pointer into module code installed for
+        // *them*. Cleared for the same reason `userid` above is zeroed whole:
+        // this function runs again on a reused channel.
+        self.users.set_polrou(machine, chan, None)?;
+
         // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
         // byte is at offset 0x14. Read-modify-write on that one bit: the rest
         // of the byte is the module's, `WCCMMUD.DLL` sets and tests masks 2, 4
@@ -964,6 +1064,100 @@ impl Host {
         self.run(machine, module, lonrou, &[]).map(Some)
     }
 
+    /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
+    ///
+    ///
+    /// The routine takes no arguments and its return value is discarded, as
+    /// `(*usrptr->polrou)()` discards it. `poll` has already pointed `curusr`
+    /// and written `status`, so it runs with `usrnum`, `usrptr`, `usaptr` and
+    /// `vdaptr` correct.
+    ///
+    /// `polrou` is read again after the call rather than remembered: a routine
+    /// that called `stop_polling` on itself must not be re-armed, and that is
+    /// the *only* thing the second read is for.
+    ///
+    /// Returns `None` when the channel is not polling -- a status left over
+    /// from a `begin_polling` the module has since undone. No call happened, so
+    /// there is no [`Outcome`] to report and R24 forbids inventing one.
+    fn dopoll(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: i16,
+    ) -> io::Result<Option<Outcome>> {
+        let rou = match self.users.polrou(machine, chan) {
+            Ok(Some(rou)) => rou,
+            Ok(None) => return Ok(None),
+            Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+        };
+
+        self.inpolr = Some(chan);
+        let outcome = self.run(machine, module, rou, &[]);
+        // Cleared before the `?`, so a machine that malfunctioned does not leave
+        // `inpolr` naming a channel that is no longer running anything. The
+        // original does the same from the `longjmp` landings at
+        // `MAJORBBS.C:2488` and `:4150`.
+        self.inpolr = None;
+        let outcome = outcome?;
+
+        if matches!(outcome, Outcome::Returned { .. }) {
+            match self.users.polrou(machine, chan) {
+                Ok(Some(_)) => {
+                    self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
+                }
+                Ok(None) => {}
+                Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+            }
+        }
+        Ok(Some(outcome))
+    }
+
+    /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
+    ///
+    ///
+    /// Called once per elapsed second, never once per pass -- see
+    /// [`Host::cycle`].
+    ///
+    /// Every due entry is taken out of the table *before* any of them runs.
+    /// `GALMJD.C:1106` re-arms `mjdrtk` from inside `mjdrtk`, so a callback
+    /// pushes onto the list being walked; draining first puts the re-armed kick
+    /// in the next round, which is where the original's free-slot scan puts it
+    /// too.
+    ///
+    /// `fired` is added to rather than assigned, so a caller can accumulate
+    /// across the rounds of one catch-up.
+    ///
+    /// Returns the poison if a callback stopped the machine, and `None`
+    /// otherwise. A callback's return value is discarded, as `prcrtk` discards
+    /// it.
+    fn prcrtk(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<Poison>> {
+        let mut due = Vec::new();
+        self.kicks.retain_mut(|kick| {
+            // `rtkick` refuses a zero delay, so no live entry can underflow.
+            kick.delay -= 1;
+            if kick.delay == 0 {
+                due.push(*kick);
+                false
+            } else {
+                true
+            }
+        });
+
+        for kick in due {
+            *fired += 1;
+            match self.run(machine, module, kick.dstrou, &[])? {
+                Outcome::Stopped(poison) => return Ok(Some(poison)),
+                Outcome::Returned { .. } => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Service one channel that has something to report.
     ///
     /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
@@ -1036,9 +1230,10 @@ impl Host {
                 .next_status(chan)
                 .expect("scan just found a channel with one");
 
-            let entry_index = match status {
-                gsbl::Gsbl::CRSTG => 1,
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
+            let dispatch = match status {
+                gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => Dispatch::Entry(2),
+                gsbl::Gsbl::POLSTS => Dispatch::Poll,
                 other => {
                     self.note(format!(
                         "poll: channel {chan} raised status {other}, which nothing here dispatches"
@@ -1066,6 +1261,17 @@ impl Host {
             // fresh host, or a leftover `OUTMT` from an earlier poll.
             self.globals()
                 .write(machine, "status", &status.to_le_bytes())?;
+
+            let entry_index = match dispatch {
+                // A polling routine is not an entry point and has no index. The
+                // arm diverges either way, so the `match` still yields the index
+                // the `Entry` arm carries.
+                Dispatch::Poll => match self.dopoll(machine, module, chan)? {
+                    Some(outcome) => return Ok(Some(outcome)),
+                    None => continue,
+                },
+                Dispatch::Entry(index) => index,
+            };
 
             if status == gsbl::Gsbl::CRSTG
                 && let Err(e) = self.get_input(machine, chan)
@@ -1103,6 +1309,110 @@ impl Host {
             };
             return self.run(machine, module, entry, &[]).map(Some);
         }
+    }
+
+    /// Turn the main loop until something says stop.
+    ///
+    /// `MAJORBBS.C:417-480`, minus everything this host has already declined --
+    /// `syscyc`/`prctask` (`:423`), `chncyc` (`:474`), `shomal`, and the
+    /// `usrptr->class` switch. What is left is: service one status if any, then
+    /// catch the tick counter up to the clock, running [`Host::prcrtk`] once per
+    /// elapsed second.
+    ///
+    /// **`max` bounds passes, not dispatches.** The real loop keeps spinning
+    /// when `btuscn()` finds nothing, and that spin is not waste -- it is what
+    /// lets timers come due. A bound on dispatches would make a module that
+    /// stopped polling to wait on a timer return zero work forever.
+    ///
+    /// This never sleeps. One thread owns the `Machine`, so a sleep here would
+    /// be a sleep the socket cannot interrupt; the caller owns all blocking and
+    /// [`Ended`] carries what it needs to decide.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered, or the machine malfunctions. A module that
+    /// stops is [`Ended::Stopped`], not an error.
+    pub fn cycle(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        max: usize,
+    ) -> io::Result<Cycles> {
+        let mut iterations = 0;
+        let mut dispatched = 0;
+
+        while iterations < max {
+            iterations += 1;
+
+            if self.gsbl().scan().is_some() {
+                match self.poll(machine, module)? {
+                    Some(Outcome::Stopped(poison)) => {
+                        return Ok(Cycles {
+                            iterations,
+                            dispatched,
+                            ended: Ended::Stopped(poison),
+                        });
+                    }
+                    Some(Outcome::Returned { .. }) => dispatched += 1,
+                    // A status that dispatched nothing: a stale `POLSTS`, or an
+                    // entry point the module never registered. `poll` has
+                    // consumed it either way.
+                    None => {}
+                }
+            }
+
+            // `MAJORBBS.C:476`, with two changes the original did not need.
+            // `get_or_insert` is the first pass syncing rather than catching up
+            // from 1970, and `<` is where the original had `!=`: `ticker` could
+            // only wrap, a system clock can be set backwards, and `!=` would
+            // then run about four billion rounds firing timers on every one.
+            let now = self.clock().epoch().map_err(io::Error::other)?;
+            let mut last = *self.tcklst.get_or_insert(now);
+            if now < last {
+                self.note(format!(
+                    "cycle: the clock went backwards, {last} to {now}; resyncing without firing"
+                ));
+                last = now;
+            }
+            let mut rounds = 0;
+            while last < now {
+                last += 1;
+                rounds += 1;
+                if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
+                    // Written back before the early return: the rounds already
+                    // run must not run again on the next `cycle`.
+                    self.tcklst = Some(last);
+                    return Ok(Cycles {
+                        iterations,
+                        dispatched,
+                        ended: Ended::Stopped(poison),
+                    });
+                }
+            }
+            self.tcklst = Some(last);
+            if rounds > 1 {
+                self.note(format!(
+                    "cycle: {rounds} seconds of timers in one pass -- the host stalled"
+                ));
+            }
+
+            if self.gsbl().scan().is_none() && self.kicks.is_empty() {
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    ended: Ended::Idle,
+                });
+            }
+        }
+
+        let polling = (0..self.users.terms() as i16)
+            .any(|chan| matches!(self.users.polrou(machine, chan), Ok(Some(_))));
+        let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+        Ok(Cycles {
+            iterations,
+            dispatched,
+            ended: Ended::Bound { polling, next_kick },
+        })
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
@@ -1601,6 +1911,8 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
+    use crate::{Clock, Ended, Kick, Outcome, gsbl};
+    use mbbs16::FarPtr;
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --
     /// [`Fixture::minimal_module`] loads one, but loading is not registering,
@@ -1862,5 +2174,364 @@ mod tests {
         assert_eq!(asked.len(), 2);
         assert_eq!((asked[0].chan, asked[0].lock.as_str(), asked[0].answer), (0, "USER", true));
         assert_eq!((asked[1].chan, asked[1].lock.as_str(), asked[1].answer), (0, "wccsysop", false));
+    }
+
+    /// The driver reuses channels rather than allocating one per connection --
+    /// which is why `connect_state` already zeroes the whole `userid` field
+    /// rather than only the bytes it writes. A stale `polrou` is the same bug
+    /// with a worse blast radius: the next user's channel would tick into the
+    /// previous user's game routine.
+    #[test]
+    fn connecting_clears_a_polling_routine_the_last_user_left_behind() {
+        let mut f = crate::testing::Fixture::new();
+        let stale = mbbs16::FarPtr {
+            offset: 0x2184,
+            selector: 0x1010,
+        };
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(stale))
+            .expect("channel 0");
+
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::users::Connection::ansi("somebodyelse"),
+            )
+            .expect("connected");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "the new user must not inherit the old user's poll routine"
+        );
+    }
+
+    /// A polling routine is a `void (*)(void)`, so the smallest real one is a
+    /// single `retf`. `load_code` puts it somewhere the machine will execute
+    /// and `code_ptr` addresses it.
+    fn polling_fixture() -> (crate::testing::Fixture, mbbs16::Module, FarPtr) {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+        let rou = f.machine.code_ptr(0);
+        (f, module, rou)
+    }
+
+    #[test]
+    fn a_polling_channel_is_serviced_and_re_arms_itself() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { .. })),
+            "the routine ran and returned, got {outcome:?}"
+        );
+        assert_eq!(
+            f.host.globals().word(&f.machine, "status").expect("read"),
+            192,
+            "the module reads `status`, and POLSTS is written like any other"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            Some(gsbl::Gsbl::POLSTS),
+            "still polling on return, so dopoll re-armed it"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "re-armed ONCE -- a second status here doubles every tick"
+        );
+        assert_eq!(f.host.inpolr, None, "cleared on the way out");
+    }
+
+    /// The case a remembered copy of `polrou` would get wrong. The routine is
+    /// real 16-bit code that zeroes its own `user[0].polrou` and returns, so
+    /// `dopoll`'s re-arm check has to be a fresh read of emulated memory.
+    #[test]
+    fn a_routine_that_stops_polling_itself_is_not_re_armed() {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+        let slot = f.host.users().slot(0).expect("channel 0");
+        let lo = slot.offset + crate::users::user::POLROU;
+
+        // mov ax, <selector>       B8 ss ss
+        // mov es, ax               8E C0
+        // mov word ptr es:[lo], 0  26 C7 06 lo lo 00 00
+        // mov word ptr es:[lo+2],0 26 C7 06 hi hi 00 00
+        // retf                     CB
+        let mut code = vec![0xb8];
+        code.extend_from_slice(&slot.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc0]);
+        for offset in [lo, lo + 2] {
+            code.extend_from_slice(&[0x26, 0xc7, 0x06]);
+            code.extend_from_slice(&offset.to_le_bytes());
+            code.extend_from_slice(&[0x00, 0x00]);
+        }
+        code.push(0xcb);
+        f.machine.load_code(&code).expect("fits");
+        let rou = f.machine.code_ptr(0);
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { .. })),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "the routine cleared it mid-call"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "so nothing was re-armed and the channel goes quiet"
+        );
+    }
+
+    /// `begin_polling` injects, the module calls `stop_polling` before the pass
+    /// that would have serviced it, and the status arrives with nothing to
+    /// call. The original's whole handling is `if (usrptr->polrou != NULL)`.
+    #[test]
+    fn a_stale_polling_status_is_consumed_without_a_module_call() {
+        let (mut f, module, _rou) = polling_fixture();
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let before = f.host.calls();
+        let notes = f.host.notes().len();
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+
+        assert_eq!(outcome, None, "no call happened, so there is no Outcome");
+        assert_eq!(f.host.calls(), before, "and nothing was serviced");
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "the status is consumed, not left to spin"
+        );
+        assert_eq!(
+            f.host.notes().len(),
+            notes,
+            "and it is not noted -- this is the normal path, not an anomaly"
+        );
+    }
+
+    /// Every read steps the clock, the module's and the host's alike, so the
+    /// count is the only honest way to say how much invented time has passed.
+    /// Pinned by the same logic as `keys_asked`: a number that moves when
+    /// behaviour changes.
+    #[test]
+    fn every_read_of_a_stepped_clock_moves_it_and_is_counted() {
+        let mut f = crate::testing::Fixture::new();
+        f.host.set_clock(Clock::stepped(1_135_952_405, 500));
+        assert_eq!(f.host.clock_reads(), 0);
+
+        assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405), "half a second in");
+        assert_eq!(f.host.clock().epoch(), Ok(1_135_952_406), "and a whole one");
+        assert_eq!(f.host.clock_reads(), 2);
+    }
+
+    #[test]
+    fn a_pinned_clock_reads_the_same_instant_however_often_it_is_asked() {
+        let mut f = crate::testing::Fixture::new();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        for _ in 0..100 {
+            assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405));
+        }
+        assert_eq!(f.host.clock_reads(), 100, "counted even though it did not move");
+    }
+
+    #[test]
+    fn prcrtk_counts_down_and_fires_exactly_once() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 2, dstrou: rou });
+
+        let mut fired = 0;
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 0, "one second in, a two-second kick has not fired");
+        assert_eq!(f.host.kicks().len(), 1);
+
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 1, "the second round fires it");
+        assert!(f.host.kicks().is_empty(), "and takes it out of the table");
+
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 1, "a one-shot fires once -- GALMJD.C:1106 re-arms by hand");
+    }
+
+    /// `GALMJD.C:1106` calls `rtkick(1,mjdrtk)` from inside `mjdrtk`, so a
+    /// callback pushes onto the very table being walked. The due entries come
+    /// out before any of them runs, which puts a re-armed kick in the *next*
+    /// round -- the same place the original's free-slot scan puts it.
+    #[test]
+    fn a_kick_that_re_arms_itself_belongs_to_the_next_round() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 1, dstrou: rou });
+
+        let mut fired = 0;
+        f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran");
+        assert_eq!(fired, 1);
+
+        // What the callback would have done, done here because a `retf` cannot
+        // call a shim from inside this fixture.
+        f.host.kicks.push(Kick { delay: 1, dstrou: rou });
+        assert_eq!(f.host.kicks().len(), 1, "armed again, not fired again");
+
+        f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran");
+        assert_eq!(fired, 2, "and it fires on the round after");
+    }
+
+    #[test]
+    fn a_cycle_with_nothing_to_do_ends_idle_without_burning_the_bound() {
+        let (mut f, module, _rou) = polling_fixture();
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        assert_eq!(cycles.ended, Ended::Idle);
+        assert_eq!(cycles.dispatched, 0);
+        assert_eq!(cycles.iterations, 1, "it works that out on the first pass");
+    }
+
+    #[test]
+    fn a_polling_channel_ticks_until_the_bound_and_says_it_is_still_polling() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.users.set_polrou(&mut f.machine, 0, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
+
+        assert_eq!(cycles.iterations, 20, "the bound is what stopped it");
+        assert_eq!(cycles.dispatched, 20, "one tick a pass, self-sustaining");
+        assert_eq!(
+            cycles.ended,
+            Ended::Bound { polling: true, next_kick: None }
+        );
+        // The status queue must not have grown while all that happened.
+        assert_eq!(f.host.gsbl_mut().next_status(0), Some(gsbl::Gsbl::POLSTS));
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "exactly one status outstanding after 20 ticks, not 21 and not 2^20"
+        );
+    }
+
+    /// A kick cannot come due under a pin, so a stepping clock is what makes
+    /// this reachable at all.
+    #[test]
+    fn a_kick_comes_due_on_its_own_once_the_clock_moves() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::stepped(1_135_952_405, 500));
+        f.host.kicks.push(Kick { delay: 2, dstrou: rou });
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 1, "the kick fired, once");
+        assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
+        assert_eq!(
+            cycles.iterations, 4,
+            "two reads to the second, two seconds to the kick"
+        );
+    }
+
+    #[test]
+    fn nothing_polling_and_a_timer_pending_is_what_the_transport_must_sleep_on() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 60, dstrou: rou });
+        // A pinned clock: no second can elapse, so the kick can never come due
+        // and the loop can only run out of passes.
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 5).expect("cycled");
+
+        assert_eq!(
+            cycles.ended,
+            Ended::Bound { polling: false, next_kick: Some(60) },
+            "which is exactly what _UPDATE_POLLING_ROUTINE leaves behind"
+        );
+        assert_eq!(cycles.dispatched, 0);
+    }
+
+    /// `MAJORBBS.C:476` is `while (tcklst != ticker)`, which was safe only
+    /// because `ticker` was an unsigned counter that could not go backwards. A
+    /// system clock can -- NTP, a manual set -- and `!=` would then run about
+    /// four billion rounds, firing timers on every one.
+    #[test]
+    fn a_clock_that_goes_backwards_resyncs_instead_of_firing_four_billion_rounds() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        let _ = f.host.cycle(&mut f.machine, &module, 1).expect("cycled");
+
+        f.host.kicks.push(Kick { delay: 1, dstrou: rou });
+        f.host.set_clock(Clock::pinned(1_135_952_000));
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 3).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 0, "going backwards fires nothing");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("backwards")),
+            "and it does not happen in silence: {:?}",
+            f.host.notes()
+        );
+    }
+
+    /// `tcklst` starts unset rather than at zero. Zero would make the first pass
+    /// catch up from 1970 -- about 1.1 billion `prcrtk` rounds, each one walking
+    /// the whole kicktable.
+    #[test]
+    fn the_first_pass_syncs_the_tick_counter_rather_than_catching_up_from_1970() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.kicks.push(Kick { delay: 2, dstrou: rou });
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 3).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 0, "no second has elapsed yet");
+        assert_eq!(
+            f.host.kicks().first().map(|kick| kick.delay),
+            Some(2),
+            "and the kick has not been counted down at all"
+        );
+    }
+
+    /// What a `cycle` pass costs, reported and asserted by nothing.
+    ///
+    /// Two numbers matter and they are very different: an idle pass is a scan,
+    /// a clock read and an integer compare, while a dispatching pass is a full
+    /// emulated 16-bit call. Under a system clock an idle pass is also a
+    /// busy-wait, which is why `Ended::Idle` exists for a driver to block on.
+    ///
+    /// Deliberately asserts nothing. Throughput on a shared box is not stable
+    /// enough to pin, and a flaky meter is worse than no meter.
+    #[test]
+    #[ignore = "timing, not a meter"]
+    fn what_a_cycle_pass_costs() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 30_000, dstrou: rou });
+        f.host.set_clock(Clock::stepped(1_135_952_405, 1));
+
+        let n = 100_000;
+        let at = std::time::Instant::now();
+        let idle = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let each = at.elapsed() / idle.iterations as u32;
+        eprintln!("{} idle passes, {each:?} each", idle.iterations);
+
+        let (mut f, module, rou) = polling_fixture();
+        f.host.users.set_polrou(&mut f.machine, 0, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let at = std::time::Instant::now();
+        let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let each = at.elapsed() / busy.iterations as u32;
+        eprintln!("{} dispatching passes, {each:?} each", busy.iterations);
     }
 }

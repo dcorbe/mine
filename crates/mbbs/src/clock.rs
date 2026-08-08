@@ -91,8 +91,18 @@ impl Civil {
 /// The clock the host answers `now`, `today` and `time` from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clock {
-    /// The instant, or `None` to read the wall each time.
-    at: Option<u32>,
+    /// The instant in **milliseconds** since the epoch, or `None` to read the
+    /// wall each time.
+    ///
+    /// Milliseconds rather than seconds only so that [`Clock::stepped`] can
+    /// advance by less than a second; [`Clock::epoch`] still answers in whole
+    /// seconds and every caller still sees the same instant it always did.
+    at: Option<u64>,
+
+    /// Milliseconds a read adds. `0` is a clock that does not move, which is
+    /// both [`Clock::pinned`] and (meaninglessly, since it reads the wall)
+    /// [`Clock::system`].
+    step: u32,
 
     /// Seconds to add to the epoch to get what the wall clock reads. Positive
     /// east of Greenwich.
@@ -120,6 +130,7 @@ impl Clock {
         }
         Ok(Self {
             at: None,
+            step: 0,
             offset: out.tm_gmtoff as i32,
         })
     }
@@ -130,8 +141,39 @@ impl Clock {
     /// Greenwich.
     pub fn pinned(at: u32) -> Self {
         Self {
-            at: Some(at),
+            at: Some(u64::from(at) * 1000),
+            step: 0,
             offset: 0,
+        }
+    }
+
+    /// A clock frozen at `at` that moves `step_millis` forward every time it is
+    /// read.
+    ///
+    /// For [`crate::Host::cycle`], which cannot make an `rtkick` come due under
+    /// a pin: `prcrtk` runs once per elapsed second and under `Clock::pinned` no
+    /// second ever elapses. See `docs/plans/2026-08-08-polling-design.md`.
+    ///
+    /// The step is charged on every read, the host's own included, and
+    /// [`crate::Host::clock_reads`] is what makes the size of that visible.
+    pub fn stepped(at: u32, step_millis: u32) -> Self {
+        Self {
+            at: Some(u64::from(at) * 1000),
+            step: step_millis,
+            offset: 0,
+        }
+    }
+
+    /// This clock, one step later. A no-op for a frozen clock, and for a system
+    /// clock, which is already moving on its own.
+    #[must_use]
+    pub fn advanced(self) -> Self {
+        match self.at {
+            Some(at) => Self {
+                at: Some(at.saturating_add(u64::from(self.step))),
+                ..self
+            },
+            None => self,
         }
     }
 
@@ -149,7 +191,7 @@ impl Clock {
     /// If this is a system clock and the machine's is before 1970.
     pub fn epoch(&self) -> Result<u32, String> {
         match self.at {
-            Some(at) => Ok(at),
+            Some(at) => Ok((at / 1000) as u32),
             None => SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
@@ -290,5 +332,28 @@ mod tests {
         // Later than the day this was written, and not obviously wrong.
         assert!(seconds > 1_750_000_000, "{seconds}");
         assert!(c.civil().expect("in range").year >= 2025);
+    }
+
+    #[test]
+    fn a_stepped_clock_advances_and_a_pinned_one_does_not() {
+        let pinned = Clock::pinned(1_135_952_405);
+        assert_eq!(pinned.advanced().epoch(), Ok(1_135_952_405), "frozen stays frozen");
+
+        // 50 ms a read: twenty reads to the second, and nineteen that change
+        // nothing an `epoch()` caller can see.
+        let mut c = Clock::stepped(1_135_952_405, 50);
+        for _ in 0..19 {
+            c = c.advanced();
+            assert_eq!(c.epoch(), Ok(1_135_952_405), "still inside the first second");
+        }
+        c = c.advanced();
+        assert_eq!(c.epoch(), Ok(1_135_952_406), "the twentieth read crosses it");
+    }
+
+    #[test]
+    fn a_stepped_clock_still_breaks_down_to_a_civil_time() {
+        let c = Clock::stepped(1_135_952_405, 1000).advanced();
+        let civil = c.civil().expect("broken down");
+        assert_eq!(civil.second, 6, "1_135_952_405 is :05, one second on is :06");
     }
 }

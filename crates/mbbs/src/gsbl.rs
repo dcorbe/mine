@@ -173,6 +173,11 @@ impl Gsbl {
     /// (page 182) says the same of a block that will not fit.
     pub const OVRFLW: i16 = 253;
 
+    /// `POLSTS` -- the polling status code, `MAJORBBS.H:232`, "like CYCLE, but
+    /// auto". `begin_polling` injects one and `dopoll` re-injects after every
+    /// call, which is the whole mechanism by which a polling channel ticks.
+    pub const POLSTS: i16 = 192;
+
     /// Bytes have arrived from the terminal.
     ///
     /// This is half of the boundary: a tokio task reading a socket and a test
@@ -197,6 +202,23 @@ impl Gsbl {
     /// This is `btusts`. The guide: the status buffer is a FIFO, so btusts hands back codes in the order they arose.
     pub fn next_status(&mut self, chan: i16) -> Option<i16> {
         self.channel_mut(chan)?.status.pop_front()
+    }
+
+    /// Put a status where [`Gsbl::scan`] will find it. `false` if there is no
+    /// such channel.
+    ///
+    /// This is `btuinj`, reached two ways: the module calls it through the shim
+    /// of that name, and the host calls it directly to re-arm a polling channel
+    /// (`MAJORBBS.C:3267`). One method rather than two copies of the push, so
+    /// they cannot come to disagree about what "inject" means.
+    pub fn inject(&mut self, chan: i16, status: i16) -> bool {
+        match self.channel_mut(chan) {
+            Some(c) => {
+                c.status.push_back(status);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The oldest completed line, taken -- this is what `btuinp` hands the
@@ -875,5 +897,15 @@ mod tests {
         g.transmit(0, b"x");
         let _ = g.drain_output(0);
         assert_eq!(g.next_status(0), Some(Gsbl::OUTMT));
+    }
+
+    #[test]
+    fn a_status_can_be_injected_from_the_host_side_and_out_of_range_is_refused() {
+        let mut g = Gsbl::new(1);
+        assert!(g.inject(0, Gsbl::POLSTS), "channel 0 exists");
+        assert_eq!(g.next_status(0), Some(Gsbl::POLSTS));
+        assert_eq!(g.next_status(0), None, "one inject, one status");
+        assert!(!g.inject(1, Gsbl::POLSTS), "channel 1 does not exist at nterms 1");
+        assert!(!g.inject(-1, Gsbl::POLSTS), "and neither does -1");
     }
 }
