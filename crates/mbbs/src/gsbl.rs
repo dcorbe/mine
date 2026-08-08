@@ -942,6 +942,89 @@ mod tests {
     }
 
     #[test]
+    fn the_guides_own_worked_example_renders_the_way_the_guide_prints_it() {
+        // Printed pages 174-175: Galacticomm set `btutsw(chan,20)`, transmitted
+        // a known paragraph, and printed the expected screen. It is the only
+        // assertion in this file answerable from the specification rather than
+        // from this host measuring itself, and nothing used it until a review
+        // went looking.
+        //
+        // The guide's example also sets `btuhcr(chan,13)` and `btuscr(chan,10)`,
+        // making its `\n`s *soft* carriage returns -- and its own rule is that
+        // "when output word wrap has taken place in a paragraph, all subsequent
+        // soft carriage returns are converted into spaces". This host has
+        // neither `btuhcr` nor `btuscr` (`WCCMMUD.DLL` imports neither), so the
+        // soft CRs are supplied here already converted, which is the same input
+        // the guide's own machinery would hand the wrapper.
+        //
+        // This is the assertion that fails on the code as it stood before the
+        // carry fix: the old `transmit` produced `theEngelmann` and
+        // `westernNorth`. The defect was never MajorMUD-specific -- it failed
+        // Galacticomm's published example.
+        let mut g = one();
+        g.channel_mut(chan()).width = 20;
+        g.transmit(chan(), b"The blue form of the Engelmann Spruce ");
+        g.transmit(chan(), b"is native to the mountains of western ");
+        g.transmit(chan(), b"North America.");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "The blue form of\r\nthe Engelmann\r\nSpruce is native to\r\nthe mountains of\r\nwestern North\r\nAmerica.",
+            "the guide's printed rendering, pages 174-175"
+        );
+    }
+
+    #[test]
+    fn only_a_space_becomes_the_break_and_a_tab_is_part_of_the_word() {
+        // Guide page 172 defines a word as a run of non-space characters,
+        // so a TAB belongs to the word and has to survive the wrap. Widening
+        // the predicate to `is_ascii_whitespace()` reads as a tidy
+        // generalisation, eats the TAB, and passed all 765 tests before this
+        // existed.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"0123456789\tabc");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "0123456789\r\n\tabc",
+            "only 0x20 is the character word wrap is allowed to convert"
+        );
+    }
+
+    #[test]
+    fn every_trailing_space_is_stripped_at_the_break_not_merely_one() {
+        // `wrap`'s strip loop is `while`, not `if`, and the carry fix makes its
+        // territory more reachable: a space this host now *keeps* can be
+        // followed by another space arriving at the margin. Weakening the loop
+        // to a single pop puts a trailing space on the wire and passed all 765
+        // tests.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"abcdefgh  x");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "abcdefgh\r\nx",
+            "no line goes out with a trailing space"
+        );
+    }
+
+    #[test]
+    fn wrap_does_not_pop_a_line_ending_back_into_the_word_it_carries() {
+        // `wrap`'s look-back stops on `\n` and `\r` as well as on a space, and
+        // that guard is live rather than defensive: `transmit`'s bare-LF arm
+        // pushes the byte *without* resetting `column`, so `out` can hold a
+        // line ending mid-line. Drop the two line-ending cases and `wrap` pops
+        // its own CRLF back into a "word" -- green across all 765 tests.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"abc\ndefghijk");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "abc\n\r\ndefghijk",
+            "the break lands after the LF, not inside the text before it"
+        );
+    }
+
+    #[test]
     fn a_word_carried_down_by_the_wrap_keeps_the_space_that_followed_it() {
         // The other half of R9, and the half that was wrong. When `wrap` carries
         // a partial word onto the new line, the space that triggered the wrap is
@@ -1054,6 +1137,30 @@ mod tests {
             String::from_utf8_lossy(&g.drain_output(chan())),
             "12345\r\nthis is\r\nok now",
             "the restored space is a column of the new line"
+        );
+    }
+
+    #[test]
+    fn a_second_call_can_carry_a_word_it_began_itself() {
+        // The companion to the test below, and the correction to a tempting
+        // over-generalisation: "`out` is fresh per call, so a cross-call wrap
+        // can never carry" is FALSE. A fresh `out` only guarantees nothing to
+        // carry when the wrap fires on a call's *first* byte. Here the second
+        // call writes `s` before reaching the margin, so `wrap` finds a partial
+        // word of its own making and carries it.
+        //
+        // The mid-word split at the boundary (`thi` | `s`) is the documented
+        // `transmit` limitation -- GSBL was handed whole strings and this host
+        // is handed whatever `prf` accumulated. The carry fix improves it
+        // rather than causing it: before the fix this produced `sis`.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 thi");
+        g.transmit(chan(), b"s is");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345 thi\r\ns is",
+            "a word begun in this call is carried like any other"
         );
     }
 
