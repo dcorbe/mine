@@ -351,6 +351,13 @@ pub struct Host {
     /// Every lock a module has asked about, in order. See [`Host::keys_asked`].
     asked: Vec<Query>,
 
+    /// The channel whose polling routine is running right now, or `None`.
+    ///
+    /// `inpolr`, `MAJORBBS.C:322`, with the original's `-1` as `None`. Rust-side
+    /// because `WCCMMUD.DLL` neither imports it nor reads it -- unlike `polrou`,
+    /// which it does.
+    pub(crate) inpolr: Option<i16>,
+
     /// How many host calls have been serviced. The progress meter: with an
     /// unfinished host, how far a module gets before it asks for something
     /// that is not there is a number rather than an impression.
@@ -477,6 +484,7 @@ impl Host {
             heap,
             users,
             asked: Vec::new(),
+            inpolr: None,
             calls: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
