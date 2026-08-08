@@ -363,6 +363,9 @@ pub struct Host {
     /// that is not there is a number rather than an impression.
     calls: u64,
 
+    /// How many times anything has read the clock. See [`Host::clock_reads`].
+    clock_reads: u64,
+
     /// Whether to print each call as it is serviced. See [`Host::set_trace`].
     trace: bool,
 }
@@ -497,6 +500,7 @@ impl Host {
             asked: Vec::new(),
             inpolr: None,
             calls: 0,
+            clock_reads: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
         })
     }
@@ -516,9 +520,29 @@ impl Host {
         &self.modules
     }
 
-    /// The clock `now`, `today` and `time` answer from.
-    pub fn clock(&self) -> Clock {
+    /// What time it is, and one step later than the last time anyone asked.
+    ///
+    /// **Reading the clock moves it**, under [`Clock::stepped`]. The returned
+    /// value is a frozen snapshot, so `now`'s `.civil()` and `time`'s `.epoch()`
+    /// stay consistent within one call; it is the *next* read that has moved.
+    /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
+    /// only a counter for them.
+    pub fn clock(&mut self) -> Clock {
+        self.clock = self.clock.advanced();
+        self.clock_reads += 1;
         self.clock
+    }
+
+    /// How many times the clock has been read, host and module together.
+    ///
+    /// Under [`Clock::stepped`] a read is also a step, so how far invented time
+    /// has run is a function of how often the module looked at it -- a property
+    /// of the module, which no host-side argument bounds. This is how the size
+    /// of that is measured instead of argued about, the way
+    /// [`Host::keys_asked`] measures locks. The host's own share of these is
+    /// [`Cycles::iterations`]; the rest is the module's.
+    pub fn clock_reads(&self) -> u64 {
+        self.clock_reads
     }
 
     /// Freeze the clock, or hand the host a different one.
@@ -1686,7 +1710,7 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Outcome, gsbl};
+    use crate::{Clock, Outcome, gsbl};
     use mbbs16::FarPtr;
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --
@@ -2102,5 +2126,30 @@ mod tests {
             notes,
             "and it is not noted -- this is the normal path, not an anomaly"
         );
+    }
+
+    /// Every read steps the clock, the module's and the host's alike, so the
+    /// count is the only honest way to say how much invented time has passed.
+    /// Pinned by the same logic as `keys_asked`: a number that moves when
+    /// behaviour changes.
+    #[test]
+    fn every_read_of_a_stepped_clock_moves_it_and_is_counted() {
+        let mut f = crate::testing::Fixture::new();
+        f.host.set_clock(Clock::stepped(1_135_952_405, 500));
+        assert_eq!(f.host.clock_reads(), 0);
+
+        assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405), "half a second in");
+        assert_eq!(f.host.clock().epoch(), Ok(1_135_952_406), "and a whole one");
+        assert_eq!(f.host.clock_reads(), 2);
+    }
+
+    #[test]
+    fn a_pinned_clock_reads_the_same_instant_however_often_it_is_asked() {
+        let mut f = crate::testing::Fixture::new();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        for _ in 0..100 {
+            assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405));
+        }
+        assert_eq!(f.host.clock_reads(), 100, "counted even though it did not move");
     }
 }
