@@ -84,6 +84,55 @@ impl KeySet {
         self
     }
 
+    /// Does this channel hold the key to this lock? `gen_haskey`,
+    /// `LOCKNKEY.C:167`.
+    ///
+    /// A lock is not always one name. `loknam` (`:532`) permits `&` and `|`
+    /// inside one, so every sysop-configured lock in `WCCMMUD.MSG` can be an
+    /// expression -- `SYSOPKEY {wccsysop|master}` is legal, and none of the
+    /// shipped defaults use it. The grammar has three properties, all of them
+    /// worth reproducing exactly because reproducing them *wrongly* is
+    /// indistinguishable from working until one configuration flips a gate:
+    ///
+    /// **No precedence.** The original walks the string with
+    /// `strpbrk(lock,"&|")` and folds each operand into a single accumulator
+    /// as it goes, so `A|B&C` is `(A|B)&C`.
+    ///
+    /// **No short-circuit.** `low_haskey` runs on every operand whatever the
+    /// accumulator holds. It made no difference to the answer even in the
+    /// original; it mattered because a pseudokey handler could have side
+    /// effects.
+    ///
+    /// **Empty operands are true.** `low_haskey` returns 1 for an empty lock,
+    /// so `"A&"` is `A && 1` and a trailing separator grants rather than
+    /// denies.
+    ///
+    /// The seed is the last of the four. `op` starts as `'\0'`, whose `evlexp`
+    /// case (`:637`) is `retval = val2`, so the first operand *replaces* the
+    /// initial accumulator rather than combining with it.
+    pub fn evaluate(&self, lock: &str) -> bool {
+        let mut sofar = false;
+        let mut op = None;
+        let mut rest = lock;
+        while let Some(at) = rest.find(['&', '|']) {
+            let value = self.holds(&rest[..at]);
+            sofar = match op {
+                Some('&') => sofar && value,
+                Some('|') => sofar || value,
+                // `evlexp`'s default: the first operand seeds the fold.
+                _ => value,
+            };
+            op = rest[at..].chars().next();
+            rest = &rest[at + 1..];
+        }
+        let value = self.holds(rest);
+        match op {
+            Some('&') => sofar && value,
+            Some('|') => sofar || value,
+            _ => value,
+        }
+    }
+
     /// Does this channel hold the key to one lock name?
     ///
     /// `low_haskey`, `LOCKNKEY.C:187`, minus the two branches that cannot
@@ -163,5 +212,72 @@ mod tests {
         let none = KeySet::default();
         assert!(!none.holds("USER"));
         assert!(!none.holds("WCCSYSOP"));
+    }
+
+    #[test]
+    fn an_expression_folds_left_to_right_with_no_precedence() {
+        // The whole point of this test. `gen_haskey` walks the string with
+        // `strpbrk(lock,"&|")` and folds each operand into one accumulator as it
+        // goes, so `A|B&C` is `(A|B)&C` -- NOT `A|(B&C)`.
+        //
+        // A=1, B=0, C=0 is the case that tells them apart:
+        //   (A|B)&C = (1|0)&0 = 0        <- correct
+        //   A|(B&C) = 1|(0&0) = 1        <- what a precedence-aware parser says
+        let keys = KeySet::new(["A"]);
+        assert!(!keys.evaluate("A|B&C"), "(A|B)&C, not A|(B&C)");
+
+        // And the mirror, so the test cannot pass by always answering 0:
+        //   (A&B)|C = (1&0)|1 = 1
+        let keys = KeySet::new(["A", "C"]);
+        assert!(keys.evaluate("A&B|C"));
+    }
+
+    #[test]
+    fn the_first_operand_seeds_the_fold_rather_than_combining_with_zero() {
+        // `op` starts as '\0', and `evlexp`'s default case is `retval = val2` --
+        // so the first operand replaces the accumulator instead of being ANDed or
+        // ORed with the initial `vsofar = 0`. Get this wrong and every expression
+        // answers 0.
+        assert!(KeySet::new(["A"]).evaluate("A"));
+        assert!(KeySet::new(["A"]).evaluate("A|B"));
+    }
+
+    #[test]
+    fn an_empty_operand_is_true_so_a_trailing_separator_grants() {
+        // Each operand goes through `low_haskey`, whose `lock[0] == '\0'` check
+        // returns 1. So the empty operands below all evaluate to 1:
+        //   "A&"  -> A && 1  -> A
+        //   "&A"  -> 1 seeded, then 1 && A -> A
+        //   "|"   -> 1 seeded, then 1 || 1 -> 1
+        let has_a = KeySet::new(["A"]);
+        let has_nothing = KeySet::default();
+
+        assert!(has_a.evaluate("A&"), "A && 1");
+        assert!(!has_nothing.evaluate("A&"), "0 && 1");
+        assert!(has_a.evaluate("&A"), "1 && A");
+        assert!(!has_nothing.evaluate("&A"), "1 && 0");
+        assert!(has_nothing.evaluate("|"), "1 || 1, on a channel holding nothing");
+    }
+
+    #[test]
+    fn a_wholly_empty_lock_is_true() {
+        // `strpbrk` finds no separator, so the loop never runs and the whole
+        // string goes to `low_haskey` as one operand -- which returns 1 for an
+        // empty one. This is the same fact `an_empty_lock_is_no_lock...` pins for
+        // `holds`, restated at the level the module actually calls.
+        assert!(KeySet::default().evaluate(""));
+    }
+
+    #[test]
+    fn every_operand_is_evaluated_and_case_folded() {
+        // No short-circuit in `gen_haskey`: `low_haskey` runs on every operand
+        // regardless of what the accumulator already is. Unobservable in the
+        // answer here -- it mattered because pseudokeys had side effects -- so
+        // what this pins is that later operands are really parsed and folded,
+        // not skipped once the answer is settled.
+        let keys = KeySet::new(["alpha", "beta"]);
+        assert!(keys.evaluate("ALPHA&BETA"));
+        assert!(keys.evaluate("alpha&beta"));
+        assert!(!keys.evaluate("alpha&gamma"));
     }
 }
