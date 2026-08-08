@@ -528,6 +528,103 @@ pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<u8>
     Ok(page)
 }
 
+/// One index page, decoded.
+///
+/// The same shape whether the page is a leaf or an interior node — the format
+/// does not mark which it is, and [`Self::leaf`] is the test. See
+/// `docs/plans/2026-08-07-btrieve-interior-pages-design.md`, "The format, as
+/// measured", for where every field came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexPage {
+    /// The page's own number, from its [`Header`].
+    pub number: u32,
+    /// Btrieve's modification counter, preserved rather than interpreted.
+    pub stamp: u16,
+    /// The child holding keys greater than the last entry's, or [`NOWHERE`].
+    ///
+    /// A node with `n` keys has `n+1` children. This is the last of them, and
+    /// it lives here rather than in the last entry because the last entry's own
+    /// child slot is a zero placeholder.
+    pub rightmost: u32,
+    /// The child holding keys less than the first entry's, or [`NOWHERE`].
+    pub leftmost: u32,
+    /// `(key bytes, record position, child page)`, in key order.
+    ///
+    /// The child is [`NOWHERE`] on a leaf, and zero on the last entry of any
+    /// page. **The key is a real record's key** — an interior entry names a
+    /// record just as a leaf entry does, which is why a traversal visits every
+    /// record exactly once.
+    pub entries: Vec<(Vec<u8>, u32, u32)>,
+}
+
+impl IndexPage {
+    /// Whether this page has no children.
+    ///
+    /// Byte 5 is **not** a discriminator: `WCCITEMS.VIR`'s root (page 131) and
+    /// its leaf page 2045 both carry `0x12` there. The absence of a leftmost
+    /// child is what distinguishes them.
+    ///
+    /// **Zero counts as absent, not as page 0.** Page 0 is the file control
+    /// record and can never be a tree node, so a zero in a child slot means the
+    /// same thing [`NOWHERE`] does. The format uses both: a *virgin* root page
+    /// -- `WCCUSERS.VIR` pages 1, 2 and 3, and `WCCGANGS.VIR` pages 1 and 2 --
+    /// reads `ffffffff` at offset 8 and `00000000` at offset 12. Reading that
+    /// zero as a page number sends a walk into the file control record, and
+    /// every file this host has ever written starts out in exactly that shape.
+    #[must_use]
+    pub fn leaf(&self) -> bool {
+        self.leftmost == NOWHERE || self.leftmost == 0
+    }
+}
+
+/// Decode one index page.
+///
+/// `key_length` is the key's total width in bytes — [`Key::length`](super::keys::Key::length).
+/// It cannot be recovered from the page, which is why it is a parameter.
+///
+/// # Errors
+///
+/// If `page` is shorter than [`INDEX_HEADER`], or the entry count would run
+/// past the end of the page. Both mean the caller is looking at something that
+/// is not an index page for this key, and neither is worth panicking over
+/// during a walk of a file another program wrote.
+pub fn decode_index_page(page: &[u8], key_length: usize) -> Result<IndexPage, String> {
+    if page.len() < INDEX_HEADER {
+        return Err(format!("{} bytes is not an index page", page.len()));
+    }
+    let header = Header::decode(&page[..usize::from(HEADER)]);
+    let count = usize::from(u16::from_le_bytes([page[6], page[7]]));
+    let width = key_length + INDEX_ENTRY_TAIL;
+    let used = INDEX_HEADER + count * width;
+    if used > page.len() {
+        return Err(format!(
+            "a count of {count} entries of {width} bytes needs {used} bytes, and \
+             the page is {}",
+            page.len()
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    for n in 0..count {
+        let at = INDEX_HEADER + n * width;
+        let key = page[at..at + key_length].to_vec();
+        let tail = at + key_length;
+        entries.push((
+            key,
+            long(&page[tail..tail + 4]),
+            long(&page[tail + 4..tail + 8]),
+        ));
+    }
+
+    Ok(IndexPage {
+        number: header.number,
+        stamp: header.stamp,
+        rightmost: long(&page[8..12]),
+        leftmost: long(&page[12..16]),
+        entries,
+    })
+}
+
 /// The six-byte header of a page already in the file, read on its own rather
 /// than as part of the page it heads.
 ///
@@ -1177,5 +1274,129 @@ mod tests {
         image[0] = 0xff;
         let e = write_page(&path, layout, 2, &image[..63]).expect_err("short by one byte");
         assert!(e.contains("63"), "{e}");
+    }
+
+    /// **The interior page, from the bytes `WCCITEMS.VIR` page 131 holds.**
+    ///
+    /// Measured, not constructed: the first two entries of that file's root,
+    /// which is an interior page with 29 entries. `0x0083` is the page's own
+    /// number, 131. `0x07fd` and `0x0082` at offsets 8 and 12 are the rightmost
+    /// and leftmost child, pages 2045 and 130. The first entry is key `81`, the
+    /// record at file position 101,382, and child page 197.
+    ///
+    /// This is the fixture the whole plan rests on, so it is a literal rather
+    /// than a read of `tmp/` — a test that needs the data files is a test that
+    /// silently passes without them.
+    ///
+    /// All sixteen header bytes are the real page's, including its count of 29.
+    /// Only the first two entries carry measured bytes; the other 27 are left
+    /// zero. That is deliberate — **the count field is what drives the decode**,
+    /// not how much data looks meaningful, and asserting 29 here is what pins
+    /// that. A decoder that stopped at the first zero-filled entry would be
+    /// wrong on any page Btrieve had deleted from.
+    #[test]
+    fn an_interior_page_decodes_to_its_children() {
+        let mut page = vec![0u8; 1536];
+        page[..16].copy_from_slice(&[
+            0x00, 0x00, 0x83, 0x00, // number 131, high word first
+            0x29, 0x12, //             stamp 0x1229, data bit clear
+            0x1d, 0x00, //             29 entries
+            0x00, 0x00, 0xfd, 0x07, // rightmost child, page 2045
+            0x00, 0x00, 0x82, 0x00, // leftmost child, page 130
+        ]);
+        page[16..40].copy_from_slice(&[
+            0x51, 0x00, 0x00, 0x00, // key 81
+            0x01, 0x00, 0x06, 0x8c, // record at 101,382
+            0x00, 0x00, 0xc5, 0x00, // child page 197
+            0x9c, 0x00, 0x00, 0x00, // key 156
+            0x03, 0x00, 0x06, 0x1e, // record at 204,294
+            0x00, 0x00, 0x07, 0x01, // child page 263
+        ]);
+
+        let decoded = decode_index_page(&page, 4).expect("a well-formed page");
+        assert_eq!(decoded.number, 131);
+        assert_eq!(decoded.stamp, 0x1229);
+        assert_eq!(decoded.leftmost, 130);
+        assert_eq!(decoded.rightmost, 2045);
+        assert!(!decoded.leaf(), "a page with children is not a leaf");
+        assert_eq!(
+            decoded.entries.len(),
+            29,
+            "the header's count drives the decode, not how many entries carry \
+             measured bytes"
+        );
+        assert_eq!(decoded.entries[0], (vec![0x51, 0, 0, 0], 101_382, 197));
+        assert_eq!(decoded.entries[1], (vec![0x9c, 0, 0, 0], 204_294, 263));
+    }
+
+    /// A leaf says so by having no children, and the format says that three
+    /// times over: both header slots and every entry tail are `NOWHERE`.
+    ///
+    /// The one exception is the **last** entry, whose tail is zero rather than
+    /// `NOWHERE` — a node with `n` keys has `n+1` children and the last of them
+    /// lives in the header at offset 8, so the last entry's own slot is unused.
+    /// Measured on `WCCITEMS.VIR` page 130 and page 197, and on the two files
+    /// whose whole index is one leaf.
+    #[test]
+    fn a_leaf_page_has_no_children_anywhere() {
+        let mut page = vec![0u8; 512];
+        page[..16].copy_from_slice(&[
+            0x00, 0x00, 0x05, 0x00, // page 5
+            0x00, 0x00, //             no stamp
+            0x02, 0x00, //             2 entries
+            0xff, 0xff, 0xff, 0xff, // no rightmost child
+            0xff, 0xff, 0xff, 0xff, // no leftmost child
+        ]);
+        page[16..36].copy_from_slice(&[
+            0x07, 0x00, //             key 7
+            0x00, 0x00, 0x02, 0x06, // record at 518
+            0xff, 0xff, 0xff, 0xff, // no child
+            0x09, 0x00, //             key 9
+            0x00, 0x00, 0x02, 0x1a, // record at 538
+            0x00, 0x00, 0x00, 0x00, // the last entry's slot is unused, not NOWHERE
+        ]);
+
+        let decoded = decode_index_page(&page, 2).expect("a well-formed page");
+        assert!(decoded.leaf(), "no leftmost child means a leaf");
+        assert_eq!(decoded.entries[0].2, NOWHERE);
+        assert_eq!(decoded.entries[1].2, 0, "the last entry's child slot is a placeholder");
+    }
+
+    /// **A virgin root is a leaf, and it does not say so the same way.**
+    ///
+    /// Measured off `WCCUSERS.VIR` page 1, byte for byte: `NOWHERE` at offset 8
+    /// and **zero** at offset 12. Page 0 is the file control record and can
+    /// never be a child, so both mean "no child" -- but a `leaf()` that tests
+    /// only for `NOWHERE` calls this an interior page and sends a walk into the
+    /// file control record.
+    ///
+    /// This is the shape every file this host writes starts in, `WCCUSERS.DAT`
+    /// included, so getting it wrong breaks the populated meter and not some
+    /// edge case.
+    #[test]
+    fn a_virgin_root_reads_as_a_leaf_even_though_its_slots_disagree() {
+        let mut page = vec![0u8; 2048];
+        page[..16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, // page 1
+            0x00, 0x00, //             no stamp
+            0x00, 0x00, //             no entries
+            0xff, 0xff, 0xff, 0xff, // no rightmost child
+            0x00, 0x00, 0x00, 0x00, // no leftmost child -- as zero, not NOWHERE
+        ]);
+
+        let decoded = decode_index_page(&page, 4).expect("a well-formed page");
+        assert!(decoded.leaf(), "page 0 can never be a child, so zero means none");
+        assert!(decoded.entries.is_empty());
+    }
+
+    /// A count that runs off the end of the page is a refusal, not a panic.
+    /// This is the guard that stops a corrupt or misidentified page from
+    /// indexing out of bounds during a walk.
+    #[test]
+    fn a_count_that_does_not_fit_the_page_is_refused() {
+        let mut page = vec![0u8; 512];
+        page[6..8].copy_from_slice(&500u16.to_le_bytes());
+        let e = decode_index_page(&page, 2).expect_err("500 entries do not fit 512 bytes");
+        assert!(e.contains("500"), "{e}");
     }
 }
