@@ -168,10 +168,11 @@ struct Header {
     /// How many fragments the page holds.
     fragments: u16,
 
-    /// The next variable page with free space, or [`NO_PAGE`]. See
-    /// [`FREE_CHAIN`] -- read so that it is accounted for, never followed.
+    /// The next variable page with free space, if there is one. See
+    /// [`FREE_CHAIN`] -- read so that the four bytes are accounted for rather
+    /// than mistaken for payload or for the fragment count, never followed.
     #[allow(dead_code, reason = "the write side's free list; decoded so the field is not payload")]
-    free_chain: u32,
+    free_chain: Option<u32>,
 }
 
 impl Header {
@@ -196,7 +197,10 @@ impl Header {
         Ok(Self {
             number,
             fragments,
-            free_chain: super::pages::long(&page[FREE_CHAIN..FREE_CHAIN + 4]),
+            free_chain: match super::pages::long(&page[FREE_CHAIN..FREE_CHAIN + 4]) {
+                NO_PAGE => None,
+                page => Some(page),
+            },
         })
     }
 }
@@ -727,6 +731,6 @@ mod tests {
         let header = Header::read(&bytes, 0x1234).expect("a header");
         assert_eq!(header.number, 0x1234);
         assert_eq!(header.fragments, 1);
-        assert_eq!(header.free_chain, NO_PAGE, "no page after it has room");
+        assert_eq!(header.free_chain, None, "no page after it has room");
     }
 }
