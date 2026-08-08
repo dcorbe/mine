@@ -883,6 +883,12 @@ impl Host {
         // not inherit the first one's access.
         self.users.set_keys(chan, who.keys.clone());
 
+        // A channel that already held a user may still hold that user's polling
+        // routine, and `polrou` is a pointer into module code installed for
+        // *them*. Cleared for the same reason `userid` above is zeroed whole:
+        // this function runs again on a reused channel.
+        self.users.set_polrou(machine, chan, None)?;
+
         // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
         // byte is at offset 0x14. Read-modify-write on that one bit: the rest
         // of the byte is the module's, `WCCMMUD.DLL` sets and tests masks 2, 4
@@ -1862,5 +1868,37 @@ mod tests {
         assert_eq!(asked.len(), 2);
         assert_eq!((asked[0].chan, asked[0].lock.as_str(), asked[0].answer), (0, "USER", true));
         assert_eq!((asked[1].chan, asked[1].lock.as_str(), asked[1].answer), (0, "wccsysop", false));
+    }
+
+    /// The driver reuses channels rather than allocating one per connection --
+    /// which is why `connect_state` already zeroes the whole `userid` field
+    /// rather than only the bytes it writes. A stale `polrou` is the same bug
+    /// with a worse blast radius: the next user's channel would tick into the
+    /// previous user's game routine.
+    #[test]
+    fn connecting_clears_a_polling_routine_the_last_user_left_behind() {
+        let mut f = crate::testing::Fixture::new();
+        let stale = mbbs16::FarPtr {
+            offset: 0x2184,
+            selector: 0x1010,
+        };
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(stale))
+            .expect("channel 0");
+
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::users::Connection::ansi("somebodyelse"),
+            )
+            .expect("connected");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "the new user must not inherit the old user's poll routine"
+        );
     }
 }
