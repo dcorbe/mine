@@ -67,6 +67,9 @@ mod scb {
 mod fld {
     pub const WIDTH: u16 = 9;
     pub const XWIDTH: u16 = 10;
+    /// `char attr`. Off the ANSI path it is always 0x07, so nothing prints it;
+    /// named here because the offsets after it are only checkable as a run.
+    #[allow(dead_code)]
     pub const ATTR: u16 = 11;
     pub const FLAGS: u16 = 12;
     pub const FLDTYP: u16 = 13;
@@ -75,18 +78,26 @@ mod fld {
     pub const MBPOFF: u16 = 18;
 }
 
-/// A deliberately small form, so that every number can be checked by hand.
-///
-/// Not MajorMUD's character sheet: this asks whether host code *runs*, and a
-/// 24-field template would confuse a failure to run with a failure to agree.
-const SPEC: &[u8] = b"NAME AGE(MIN=1, MAX=120)\0";
-const TEMPLATE: &[u8] = b"Name: ???????? Age: ###\0";
+/// MajorMUD's own field specification, extracted by
+/// `cargo run -p mbbs --example fsd_inputs`. Gitignored: it is module content.
+const SPEC_FILE: &str = "tmp/fsd-spec.bin";
 
 fn main() -> std::io::Result<()> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("re/hosts/MAJORBBS-mbbstd.EXE");
     let file = std::fs::read(&path)?;
+
+    // Inputs: MajorMUD's own, extracted to gitignored files by the mbbs-side
+    // helper. Passed as argv[1] = template file, defaulting to template 7.
+    let template_file = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "tmp/fsd-template-7.bin".to_string());
+    let mut spec = std::fs::read(SPEC_FILE)?;
+    spec.push(0);
+    let mut template = std::fs::read(&template_file)?;
+    template.push(0);
+    println!("spec {} bytes, template {} bytes from {template_file}", spec.len(), template.len());
 
     let mut machine = Machine::new()?;
     // Every import a thunk: if host code reaches PHAPI, GALGSBL or DOSCALLS we
@@ -110,13 +121,13 @@ fn main() -> std::io::Result<()> {
     // One working segment, laid out by hand. Everything the host will write
     // through `fsdscb` lives here, so a stray write lands in our memory and not
     // in the host's data.
-    const FIELDS: u16 = 16;
+    const FIELDS: u16 = 64;
     let scb_off = 0u16;
     let punct_off = scb_off + FSDSCB;
     let flddat_off = punct_off + MBPMAX;
     let spec_off = flddat_off + FIELDS * FSDFLD;
-    let template_off = spec_off + SPEC.len() as u16;
-    let total = usize::from(template_off) + TEMPLATE.len();
+    let template_off = spec_off + spec.len() as u16;
+    let total = usize::from(template_off) + template.len();
 
     let work = machine.alloc_segment(total)?;
     let at = |offset: u16| FarPtr {
@@ -124,8 +135,8 @@ fn main() -> std::io::Result<()> {
         selector: work,
     };
 
-    machine.write(at(spec_off), SPEC)?;
-    machine.write(at(template_off), TEMPLATE)?;
+    machine.write(at(spec_off), &spec)?;
+    machine.write(at(template_off), &template)?;
 
     // `struct fsdscb`, zeroed, then the three pointers `fsdppc` reads.
     machine.write(at(scb_off), &vec![0u8; usize::from(FSDSCB)])?;
@@ -140,17 +151,21 @@ fn main() -> std::io::Result<()> {
     // Point the global at it. The module tests this for null.
     machine.write(fsdscb_at, &at(scb_off).to_bytes())?;
 
-    println!("calling _FSDPPC(template, ascn=0) ...");
+    println!("calling _FSDPPC(template, ascn={}) ...", std::env::args().nth(2).unwrap_or_else(|| "0".into()));
     let templt = at(template_off);
-    let exit = machine.call(fsdppc, &[templt.offset, templt.selector, 0])?;
+    let exit = machine.call(fsdppc, &[templt.offset, templt.selector, std::env::args().nth(2).map_or(0, |a| a.parse().unwrap_or(0))])?;
 
     match exit {
         Exit::Returned { ax, .. } => {
             println!("Returned: {} error(s)\n", ax as i16);
             report(&machine, at(scb_off), at(flddat_off))?;
         }
-        Exit::Call { .. } => {
-            println!("Call out to an import: {exit:?}");
+        Exit::Call { index } => {
+            let who = module
+                .import(index)
+                .map(|i| format!("{}.{:?}", i.module, i.symbol))
+                .unwrap_or_else(|| format!("thunk {index}, no import site"));
+            println!("Call out to an import: {who}");
             println!("  -- host code reached one of its own imports. Which symbol");
             println!("     it is decides whether this is stubbable or fatal.");
         }
@@ -182,19 +197,21 @@ fn report(machine: &Machine, scb_at: FarPtr, flddat_at: FarPtr) -> std::io::Resu
     };
 
     let numfld = word(scb_at, scb::NUMFLD)?;
-    println!("numfld {numfld}");
-    println!("numtpl {}", word(scb_at, scb::NUMTPL)?);
-    println!("mbleng {}", word(scb_at, scb::MBLENG)?);
-    println!("maxans {}", word(scb_at, scb::MAXANS)?);
+    println!(
+        "numfld {numfld}  numtpl {}  mbleng {}  maxans {}",
+        word(scb_at, scb::NUMTPL)?,
+        word(scb_at, scb::MBLENG)?,
+        word(scb_at, scb::MAXANS)?
+    );
 
-    for n in 0..numfld.min(16) {
+    for n in 0..numfld.min(64) {
         let f = FarPtr {
             offset: flddat_at.offset + n * FSDFLD,
             selector: flddat_at.selector,
         };
         println!(
-            "  field {n}: fspoff {:3} tmpoff {:3} width {:3} xwidth {:3} mbpoff {:6} \
-             flags {:#04x} type {:?} attr {:#04x}",
+            "  field {n:2}: fspoff {:4} tmpoff {:5} width {:3} xwidth {:3} mbpoff {:6} \
+             flags {:#04x} type {:?}",
             word(f, fld::FSPOFF)? as i16,
             word(f, fld::TMPOFF)? as i16,
             byte(f, fld::WIDTH)?,
@@ -202,7 +219,6 @@ fn report(machine: &Machine, scb_at: FarPtr, flddat_at: FarPtr) -> std::io::Resu
             word(f, fld::MBPOFF)? as i16,
             byte(f, fld::FLAGS)?,
             byte(f, fld::FLDTYP)? as char,
-            byte(f, fld::ATTR)?,
         );
     }
     Ok(())
