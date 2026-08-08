@@ -45,6 +45,7 @@
 #define B_GET_EQUAL  5
 #define B_GET_NEXT   6
 #define B_GET_FIRST 12
+#define B_CREATE    14
 #define B_STAT      15
 #define B_STOP      25
 
@@ -340,6 +341,74 @@ static void cmd_stat(const char *path)
                i, keys[first].position, length, keys[first].flags,
                (unsigned long)keys[first].approx_count, keys[first].ext_type, segments);
     }
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/*
+ * Create a file with one duplicate-permitting, descending, 4-byte key.
+ *
+ * B_CREATE takes the filename in the KEY buffer, exactly as B_OPEN does (see
+ * open_file() above), and the file specification in the DATA buffer: one
+ * FileSpec followed by one KeySpec per key segment -- the same layout B_STAT
+ * *returns*, so this reuses those structs rather than declaring new ones
+ * (Task 6 of docs/plans/2026-08-08-fsd-oracle-implementation.md).
+ *
+ * The shape hardcoded here is not general-purpose; it is WCCUSERS key 2 minus
+ * everything this rig does not need. WCCUSERS key 2 is experience: 4 bytes at
+ * record offset 60 (position 61, 1-based), descending, duplicates permitted --
+ * every newly created MajorMUD character has exp 0, so every save collides on
+ * it. This file drops the other 59+ fields WCCUSERS carries and keeps only
+ * that key, at position 1 of a 12-byte record, so a duplicate-chain index can
+ * be measured without a whole character record to build around.
+ */
+static void cmd_create(const char *path)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    DWORD dlen = sizeof data;
+    int st;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = 12;      /* 4-byte key + an 8-byte tag; see cmd_insert() */
+    fs->pagesize = 512;   /* smallest legal page; nothing here needs more */
+    /* One key. Not the 0x4001-shaped value fs_indexes() has to mask out of a
+     * STAT reply -- that flag bit is something the engine sets when it
+     * REPORTS a file, not something a caller sets when it SPECIFIES one. */
+    fs->indexes_raw = 1;
+
+    ks->position = 1;               /* 1-based; struct comment above open_file() */
+    ks->length = 4;
+    /* Bit 0 (0x01) = duplicates permitted, bit 6 (0x40) = descending, bit 8
+     * (0x0100) = EXTTYPE. Without EXTTYPE the engine ignores ext_type below
+     * and creates a classic type-0 (string) key instead -- measured: a first
+     * version left it unset, and the resulting file's STAT reply read back
+     * type=0 despite ext_type having been sent as 14. Confirmed against a
+     * working B_CREATE caller, not guessed: DUP/MODIFIABLE/BIN/NUL/SEGMENT/
+     * SEQ/DEC/SUP/EXTTYPE are `docs/mirrors/github-syntax53-Nightmare-Redux/
+     * modBtrieve.bas:34-49`, and `modUpdateFile.bas:717,721` sets
+     * `KeyFlags = EXTTYPE` with `ExtDataType = 15` on a real create call
+     * whose FileSpec/KeySpec field layout (`modFieldmaps.bas:710-728`) lines
+     * up byte-for-byte with the struct here. */
+    ks->flags = 0x0141;
+    ks->ext_type = KT_UNSIGNED_BINARY;   /* 14; matches WCCUSERS key 2's type */
+
+    /* Key-number argument 0 means "fail if the file already exists" rather
+     * than -1's "overwrite". The Microkernel caches pages by path and outlives
+     * its clients (see the file header comment); if a stale file is sitting
+     * under this name, that must surface as an error, not a silent reuse of
+     * whatever the cache remembers. */
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != ST_OK)
+        die("create", st);
 
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
@@ -685,12 +754,14 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend|keys|dump> <file.VIR> [keynum]\n"
+            "usage: btrvprobe <stat|walk|descend|keys|dump|create> <file.VIR> [keynum]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
             "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
             "  keys     print every KEY in index order, for diffing two files\n"
-            "  dump     print every record's BYTES, in key order, as hex\n");
+            "  dump     print every record's BYTES, in key order, as hex\n"
+            "  create   create a 12-byte-record file with one duplicate,\n"
+            "           descending, 4-byte key (WCCUSERS key 2, minus the rest)\n");
         return 2;
     }
     cmd  = argv[1];
@@ -720,6 +791,8 @@ int main(int argc, char **argv)
         cmd_keys(path, keynum);
     else if (!strcmp(cmd, "dump"))
         cmd_dump(path, keynum);
+    else if (!strcmp(cmd, "create"))
+        cmd_create(path);
     else {
         fprintf(stderr, "FAIL: unknown command %s\n", cmd);
         return 2;
