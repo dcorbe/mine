@@ -349,6 +349,32 @@ impl Gsbl {
             .find(|&index| !self.channels[usize::from(index)].status.is_empty())
     }
 
+    /// `bturst` -- reset a channel to its initial default conditions.
+    ///
+    /// The guide, `bturst` page 138: it returns the channel, hardware and software alike, to its power-on defaults; because the default switch-hook state is on-hook, it is also the documented way to hang up.
+    ///
+    /// The hardware half does not exist here -- no Xecom, Hayes, X.25 or LAN
+    /// board -- which is also why the routine's return value is dropped rather
+    /// than reproduced: it is a hardware-category discriminant
+    /// (`MAJORBBS.C:3503`) that the real host switches on only to pick the baud
+    /// rate, handshake and protocol calls that follow. The software half is
+    /// every byte and every setting on this [`Channel`], and that is what this
+    /// restores.
+    ///
+    /// # Why a channel that keeps its buffers is a bug
+    ///
+    /// `dftrst` calls `bturst(usrnum)` at `MAJORBBS.C:3503`, after the three
+    /// `setmem` clears that [`Host::rstchn`](crate::Host::rstchn) reproduces.
+    /// Leaving it out means a recycled channel carries the previous player's
+    /// half-assembled input line, undrained output, queued statuses, column
+    /// position, and their `btutsw` width / `btumil` / `btuech` / `btulok`
+    /// settings into the next player's session -- their half-typed command
+    /// arriving as somebody else's first input. At one channel there is never
+    /// a next player, which is why this was invisible.
+    pub fn reset(&mut self, chan: Chan) {
+        *self.channel_mut(chan) = Channel::default();
+    }
+
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
     pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
         self.channel_mut(chan).transmit(bytes);

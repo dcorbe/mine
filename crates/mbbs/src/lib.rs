@@ -1118,6 +1118,11 @@ impl Host {
         ] {
             machine.write(at, &vec![0u8; usize::from(len)])?;
         }
+        // `bturst(usrnum)`, `MAJORBBS.C:3503` -- the last thing `dftrst` does
+        // that this host has anything to do. Without it the three `setmem`s
+        // above clear the module's view of the channel while GSBL's view keeps
+        // the previous player's buffers and terminal settings.
+        self.gsbl.reset(chan);
         Ok(())
     }
 
@@ -2145,6 +2150,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_reset_channel_keeps_none_of_the_previous_players_gsbl_state() {
+        // `dftrst` does not stop at the three `setmem`s: `MAJORBBS.C:3503` is
+        // `switch (rc=bturst(usrnum))`, and the guide (`bturst`, page 138) says
+        // it "completely resets a channel, in both hardware and software, to its
+        // initial default conditions."
+        //
+        // Clearing the module's three records while GSBL keeps its own is the
+        // worst shape this could take: the module believes nobody is there and
+        // the channel still holds a half-typed command, which then arrives as
+        // the *next* player's first input. Nothing observes it at one channel,
+        // because there is never a next player.
+        let mut f = Fixture::new();
+        let chan = f.console();
+
+        // Every kind of state a channel carries: queued input, a partial line,
+        // undrained output, a queued status, and terminal settings.
+        f.host.gsbl_mut().push_input(chan, b"who\rhalf-typed");
+        f.host.gsbl_mut().inject(chan, gsbl::Gsbl::CRSTG);
+        {
+            let c = f.host.gsbl_mut().channel_mut(chan);
+            c.width = 40;
+            c.echo = false;
+            c.locked = true;
+        }
+        f.host.gsbl_mut().transmit(chan, b"a line the previous player never read");
+
+        assert!(f.host.gsbl().pending(), "the channel is dirty before the reset");
+
+        f.host.rstchn(&mut f.machine, chan).expect("reset");
+
+        let c = f.host.gsbl().channel(chan);
+        assert_eq!(c.width, 0, "btutsw width");
+        assert!(c.echo, "btuech is on by default");
+        assert!(!c.locked, "btulok");
+        assert!(
+            !f.host.gsbl().pending(),
+            "a queued status survived the reset"
+        );
+        assert!(
+            f.host.gsbl_mut().drain_output(chan).is_empty(),
+            "the previous player's undrained output survived the reset"
+        );
     }
 
     #[test]
