@@ -61,7 +61,7 @@ dump() {   # dump <dir> <name> <keynum> <tag>
     seq=$((seq + 1))
     as="$RUN-$seq-$file"
     cp "$dir/$file" "$WORK/$as"
-    ( cd "$WORK" && timeout "$LIMIT" wine btrvprobe.exe dump "C:\\btrieve\\$as" "$keynum" \
+    ( cd "$WORK" && timeout "$LIMIT" wine btrvprobe.exe keys "C:\\btrieve\\$as" "$keynum" \
         2>"$OUT/$tag.err" ) > "$OUT/$tag.keys"
     rm -f "$WORK/$as"
 

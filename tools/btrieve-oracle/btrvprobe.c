@@ -550,11 +550,15 @@ static void cmd_descend(const char *path, int keynum)
  * `walk` reports only the first and last key, so two files can agree on both
  * endpoints and on the record count while disagreeing about everything in
  * between -- which is exactly what a wrong key comparator produces, since a
- * permutation of the middle preserves the extremes. Diffing two dumps is what
- * closes that: the shipped file against the same file reindexed by this host,
- * with the real engine reading both.
+ * permutation of the middle preserves the extremes. Diffing two of these is
+ * what closes that: the shipped file against the same file reindexed by this
+ * host, with the real engine reading both. `compare.sh` drives it.
+ *
+ * This is the KEYS; `dump` below is the RECORDS. Two questions, two commands:
+ * an index can name the right records in the wrong order, and a reader can
+ * reassemble the wrong bytes for records the index names correctly.
  */
-static void cmd_dump(const char *path, int keynum)
+static void cmd_keys(const char *path, int keynum)
 {
     static unsigned char data[DATA_SIZE];
     char posblk[POSBLK_SIZE];
@@ -593,7 +597,82 @@ static void cmd_dump(const char *path, int keynum)
     }
     if (st != ST_END_OF_FILE)
         die("get_next", st);
+
+    /* Both counts, so a caller can tell a coherent reading from an incoherent
+     * one. It is not hypothetical: the Microkernel caches pages by path and
+     * outlives its clients, and presenting two different files under one name
+     * made it yield 2,861 keys out of a file whose own stat, on this same
+     * open, said 1,950. See the note in sweep.sh. */
     fprintf(stderr, "dumped %lu keys of %lu\n", count, (unsigned long)fs.records);
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/*
+ * Print every record the engine yields, in key order, as hex.
+ *
+ * WHY: `walk` and `descend` check the engine's KEYS against ours. Neither
+ * looks at a single byte of a record's data, which is exactly what
+ * variable-length reassembly gets wrong -- a reader that followed the fragment
+ * chain to the wrong page, or kept the four-byte next-pointer prefix as
+ * payload, would pass both while handing the module the wrong text.
+ *
+ * The engine returns the FULL reassembled record here: `dlen` comes back as
+ * the length Btrieve actually produced, 2022 for WCCTEXT (22 of fixed record
+ * and 2000 of fragment), not the 22 a naive reader stops at. That makes this a
+ * byte-exact oracle for crates/mbbs/src/btrieve/variable.rs.
+ *
+ * The output is one line per record: the ordinal, the length the engine
+ * reported, and the bytes. Deliberately dumb and diffable -- 3467 records of
+ * 2022 bytes is 14 MB of hex, which is nothing, and any encoding cleverness
+ * here would be a second place for a bug to hide.
+ */
+static void cmd_dump(const char *path, int keynum)
+{
+    static unsigned char data[DATA_SIZE];
+    char posblk[POSBLK_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    FileSpec fs;
+    KeySpec keys[24];
+    DWORD dlen;
+    unsigned long count = 0, i;
+    int st;
+
+    st = open_file(posblk, path, MODE_READ_ONLY);
+    if (st != ST_OK)
+        die("open", st);
+    st = stat_file(posblk, &fs, keys, 24);
+    if (st != ST_OK)
+        die("stat", st);
+
+    dlen = DATA_SIZE;
+    memset(keybuf, 0, sizeof keybuf);
+    st = btrcall(B_GET_FIRST, posblk, data, &dlen, keybuf,
+                 sizeof keybuf - 1, (char)keynum);
+
+    while (st == ST_OK) {
+        printf("%lu %lu ", count, (unsigned long)dlen);
+        for (i = 0; i < dlen; i++)
+            printf("%02x", data[i]);
+        printf("\n");
+        count++;
+
+        dlen = DATA_SIZE;
+        st = btrcall(B_GET_NEXT, posblk, data, &dlen, keybuf,
+                     sizeof keybuf - 1, (char)keynum);
+    }
+
+    /* Same trap `descend` fell into: a run that died partway would otherwise
+     * print a plausible prefix and exit 0. */
+    if (st != ST_END_OF_FILE) {
+        fprintf(stderr, "dumped %lu (stopped early)\n", count);
+        die("get_next", st);
+    }
+    fprintf(stderr, "dumped      %lu\n", count);
+    fprintf(stderr, "stat says   %lu\n", (unsigned long)fs.records);
+    fprintf(stderr, "%s\n", count == fs.records ? "DUMP OK" : "DUMP MISMATCH");
+    if (count != fs.records)
+        exit(1);
 
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
@@ -606,11 +685,12 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend|dump> <file.VIR> [keynum]\n"
+            "usage: btrvprobe <stat|walk|descend|keys|dump> <file.VIR> [keynum]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
             "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
-            "  dump     print every key in index order, for diffing two files\n");
+            "  keys     print every KEY in index order, for diffing two files\n"
+            "  dump     print every record's BYTES, in key order, as hex\n");
         return 2;
     }
     cmd  = argv[1];
@@ -636,6 +716,8 @@ int main(int argc, char **argv)
         cmd_walk(path, keynum);
     else if (!strcmp(cmd, "descend"))
         cmd_descend(path, keynum);
+    else if (!strcmp(cmd, "keys"))
+        cmd_keys(path, keynum);
     else if (!strcmp(cmd, "dump"))
         cmd_dump(path, keynum);
     else {

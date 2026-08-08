@@ -218,13 +218,11 @@ fn forge_a_corpus_the_real_engine_can_read() {
                 let record = records.ordered(0, 0).ok_or("no first record")?;
                 (record.position, record.bytes.clone())
             };
-            if bytes.len() != reclen {
-                // A variable-length file: `update` refuses these, and rightly.
-                return Err(format!(
-                    "record is {} bytes and reclen is {reclen}",
-                    bytes.len()
-                ));
-            }
+            // No length pre-check: whether this buffer may be written back is
+            // `Block::update`'s judgement, not the forge's, and letting the
+            // forge decide would hide the answer it is here to collect. A
+            // variable-length file's record comes back longer than `reclen`
+            // (the fixed part plus its fragments) and `update` refuses it.
             for key in &keys {
                 for segment in &key.segments {
                     let end = usize::from(segment.offset) + usize::from(segment.length);
