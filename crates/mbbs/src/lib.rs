@@ -604,6 +604,29 @@ impl Host {
         &self.users
     }
 
+    /// `user[unum].usrcls` -- what kind of channel this is.
+    ///
+    /// Zero for every channel this host makes, which is neither `ONLINE` nor
+    /// `BBSPRV`. Read rather than assumed because `low_haskey` branches on it.
+    ///
+    /// # Errors
+    ///
+    /// If `unum` names no channel, or the read runs off a segment.
+    pub fn class(&self, machine: &Machine, unum: i16) -> Result<u16, ShimError> {
+        let slot = self
+            .users()
+            .slot(unum)
+            .ok_or_else(|| ShimError::Failed(format!("class({unum}): there is no such channel")))?;
+        let at = FarPtr {
+            offset: slot.offset + users::user::USRCLS,
+            selector: slot.selector,
+        };
+        let bytes = machine.resolve(at, 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    pub(crate) fn asked_for_key(&mut self, _chan: i16, _lock: &str, _answer: bool) {}
+
     /// The terminal channels.
     pub fn gsbl(&self) -> &gsbl::Gsbl {
         &self.gsbl
