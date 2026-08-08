@@ -22,6 +22,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::keys::Key;
+use super::variable::{Chain, Pages, Pointer};
 use super::{BtvError, Geometry};
 
 /// Bytes of header at the start of a data page, before the first record.
@@ -46,7 +47,17 @@ pub struct Record {
     /// any order.
     pub position: u32,
 
-    /// The record itself, logical length.
+    /// The record itself.
+    ///
+    /// Exactly `geometry.reclen` bytes for a fixed-length file. For a
+    /// variable-length one it is the logical record **and** everything its
+    /// fragment chain holds, concatenated -- which is what Btrieve itself
+    /// hands back and what the module's buffer is sized for. `WCCTEXT`'s
+    /// records are 22 bytes of fixed part and 2,000 of fragment, and MajorMUD
+    /// opens the file for 2,022.
+    ///
+    /// Every key of every file MajorMUD ships lies inside the fixed part, so
+    /// [`Key::extract`] and [`Key::compare`] see the same bytes either way.
     pub bytes: Vec<u8>,
 }
 
@@ -332,6 +343,11 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     let mut records = Vec::with_capacity(geometry.records as usize);
     let mut buffer = vec![0u8; geometry.page as usize];
 
+    // A second page-sized buffer, for the fragment pages a variable-length
+    // record's chain jumps to. Separate from `buffer` because the walk is
+    // still standing on the data page it found the record in.
+    let mut fragment = vec![0u8; geometry.page as usize];
+
     // Page 0 is the file control record, so records start at page 1.
     for number in 1..geometry.pages {
         let at = page * number;
@@ -363,14 +379,64 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             if looks_empty(record, size) {
                 break;
             }
-            records.push(Record {
-                position,
-                bytes: record[..geometry.reclen as usize].to_vec(),
+
+            let mut bytes = record[..geometry.reclen as usize].to_vec();
+
+            // A variable-length record is its fixed part and then whatever the
+            // four bytes after it point at. The pointer is copied out before
+            // the chain is followed, because following it reads other pages
+            // into a buffer of its own and `record` is a slice of this one.
+            let pointer = geometry.variable.then(|| {
+                let at = usize::from(geometry.reclen);
+                Pointer::decode([record[at], record[at + 1], record[at + 2], record[at + 3]])
             });
+            if let Some(pointer) = pointer {
+                let mut source = Chained {
+                    file: &mut file,
+                    buffer: &mut fragment,
+                    pages: geometry.pages,
+                };
+                Chain::follow(&mut source, pointer, &mut bytes)
+                    .map_err(|why| format!("the record at {position}: {why}"))?;
+            }
+
+            records.push(Record { position, bytes });
         }
     }
 
     Ok(records)
+}
+
+/// Whole pages of an open file, for [`Chain::follow`].
+///
+/// Built per record and borrowing both the file and one reusable page buffer,
+/// so following 3,467 chains allocates nothing: the buffer belongs to
+/// [`walk`], which is also the reason this cannot simply own its own.
+struct Chained<'a> {
+    file: &'a mut std::fs::File,
+    buffer: &'a mut Vec<u8>,
+    pages: u32,
+}
+
+impl Pages for Chained<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        // Page 0 is the file control record and never holds fragments;
+        // checking the bound here names the file's own shape in the error
+        // rather than letting a seek past the end come back as "unexpected end
+        // of file".
+        if number == 0 || number >= self.pages {
+            return Err(format!(
+                "a fragment on page {number}, and the file is {} pages",
+                self.pages
+            ));
+        }
+        let at = u64::from(number) * self.buffer.len() as u64;
+        self.file
+            .seek(SeekFrom::Start(at))
+            .and_then(|_| self.file.read_exact(self.buffer))
+            .map_err(|e| format!("page {number}: {e}"))?;
+        Ok(self.buffer)
+    }
 }
 
 /// Every record slot on the free list.

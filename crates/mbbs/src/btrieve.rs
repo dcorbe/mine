@@ -31,6 +31,7 @@
 pub mod keys;
 pub mod pages;
 pub mod records;
+mod variable;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -67,9 +68,19 @@ mod at {
     pub const RECORDS_LOW: usize = 0x1c;
     /// `0xff` when the file holds variable-length records.
     pub const VARIABLE_MARK: usize = 0x38;
-    /// User flags. Bit 0 is variable-length records.
+    /// User flags. Bit 0 is variable-length records, bit 3 is compression.
     pub const USRFLGS: usize = 0x106;
 }
+
+/// Bit 0 of [`at::USRFLGS`]: the file holds variable-length records.
+const VARIABLE: u16 = 1 << 0;
+
+/// Bit 3 of [`at::USRFLGS`]: the record data is compressed.
+///
+/// No file MajorMUD ships sets it -- all 32 in `tmp/` were checked -- and this
+/// host has no decompressor. A file that set it would otherwise be read as a
+/// fragment chain over compressed bytes and hand the module plausible garbage.
+const COMPRESSED: u16 = 1 << 3;
 
 /// Which Btrieve wrote the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,13 +223,38 @@ impl Geometry {
         // against each other because either alone could be something else: bit
         // 0 of the user flags, and the `0xff` marker. All eighteen files agree,
         // and `WCCTEXT` is the one where both say yes.
-        let variable = word(at::USRFLGS) & 1 != 0;
+        let usrflgs = word(at::USRFLGS);
+        let variable = usrflgs & VARIABLE != 0;
         if variable != (bytes[at::VARIABLE_MARK] == 0xff) {
             return Err(fail(format!(
                 "user flags say variable-length records is {variable}, and the \
                  marker at {:#x} says {}",
                 at::VARIABLE_MARK,
                 !variable
+            )));
+        }
+
+        // Compression is a separate encoding of the record body, on top of the
+        // fragment chain, and nothing here can undo it. Refused rather than
+        // read: the alternative is handing a module 2,000 bytes of compressed
+        // stream that parses as text just well enough not to be noticed.
+        if usrflgs & COMPRESSED != 0 {
+            return Err(fail(format!(
+                "user flags {usrflgs:#06x} say the record data is compressed, and this \
+                 host has no decompressor"
+            )));
+        }
+
+        // Where a variable-length record's chain begins: the four bytes after
+        // the logical record, inside the physical one. A file that says it has
+        // variable-length records and leaves no room for the pointer is
+        // describing something this cannot read.
+        if variable && physical - reclen < 4 {
+            return Err(fail(format!(
+                "variable-length records whose {physical}-byte slot leaves only {} bytes \
+                 after the {reclen}-byte record, and the pointer to the first fragment \
+                 needs four",
+                physical - reclen
             )));
         }
 
@@ -2221,11 +2257,52 @@ mod tests {
 
     #[test]
     fn the_two_witnesses_to_variable_length_records_must_agree() {
-        let mut bytes = file(512, 100, 100, 0, 2);
+        // 104 rather than 100: a variable-length file's physical slot has to
+        // leave room for the four-byte pointer to the first fragment, which is
+        // checked below in its own right.
+        let mut bytes = file(512, 100, 104, 0, 2);
         bytes[at::USRFLGS] = 1;
         assert!(read("HALF.DAT", &bytes).is_err(), "flag set, marker not");
 
         bytes[at::VARIABLE_MARK] = 0xff;
         assert!(read("BOTH.DAT", &bytes).expect("reads").variable);
+    }
+
+    /// The four bytes after the logical record are where a variable-length
+    /// record's chain begins. A file with fewer has nowhere to put one, and
+    /// reading it would decode a pointer out of the padding of the next field.
+    #[test]
+    fn a_variable_length_file_with_no_room_for_a_fragment_pointer_is_refused() {
+        for physical in [100u16, 101, 102, 103] {
+            let mut bytes = file(512, 100, physical, 0, 2);
+            bytes[at::USRFLGS] = 1;
+            bytes[at::VARIABLE_MARK] = 0xff;
+            let e = read("NOROOM.DAT", &bytes)
+                .expect_err("there is no room for a fragment pointer");
+            assert!(e.why.contains("needs four"), "{e}");
+        }
+
+        // And four is enough, which is exactly what `WCCTEXT` has spare.
+        let mut bytes = file(512, 100, 104, 0, 2);
+        bytes[at::USRFLGS] = 1;
+        bytes[at::VARIABLE_MARK] = 0xff;
+        assert!(read("ROOM.DAT", &bytes).expect("reads").variable);
+    }
+
+    /// Compressed record data is a second encoding this host cannot undo, and
+    /// no file MajorMUD ships sets the bit. Refusing is the difference between
+    /// stopping the module and handing it 2,000 bytes of compression stream.
+    #[test]
+    fn a_file_whose_records_are_compressed_is_refused_rather_than_read() {
+        let mut bytes = file(512, 100, 100, 0, 2);
+        bytes[at::USRFLGS] = 0x08;
+        let e = read("PACKED.DAT", &bytes).expect_err("nothing here decompresses");
+        assert!(e.why.contains("compressed"), "{e}");
+
+        // Bit 3 alone, not "any flag at all": bit 1 and bit 2 are somebody
+        // else's and are read as before.
+        let mut ordinary = file(512, 100, 100, 0, 2);
+        ordinary[at::USRFLGS] = 0x06;
+        assert!(!read("PLAIN.DAT", &ordinary).expect("reads").variable);
     }
 }
