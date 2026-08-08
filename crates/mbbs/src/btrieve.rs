@@ -682,10 +682,9 @@ impl Block {
     ///
     /// # Errors
     ///
-    /// If the records have never been loaded, a key's entries do not fit in a
-    /// single leaf page (see [`pages::index_pages`]), a key's root page is `0`
-    /// or outside the file (see [`Key::definition`]), or the file cannot be
-    /// written.
+    /// If the records have never been loaded, a key's root page is `0` or
+    /// outside the file (see [`Key::definition`]), a key's tree cannot be
+    /// walked, or no entry fits a page, or the file cannot be written.
     pub fn reindex(&mut self) -> Result<(), BtvError> {
         let name = self.name.clone();
         let fail = |why: String| BtvError {
@@ -711,6 +710,10 @@ impl Block {
             fail(format!("{}: {e}", self.path.display()))
         })?;
 
+        // The file may grow while reindexing, and every page number written
+        // below is checked against how big it is *now*.
+        let mut total = self.geometry.pages;
+
         for key in &self.keys {
             // `unwrap_or(0)` would treat a key number `Records` was never
             // built with the same as a key with no records, and write an
@@ -729,9 +732,6 @@ impl Block {
                 })
                 .collect();
 
-            let mut page = pages::index_pages(layout, &entries)
-                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
-
             // `key.definition`, not `key.number`: a multi-segment key's root
             // and record count live at its *first* definition, and the two
             // indices only coincide when no earlier key has more than one
@@ -745,40 +745,80 @@ impl Block {
             // regardless of whether `key.definition` above is right: this is
             // the guard that stands even if it is subtly wrong, and it is
             // what stops a continuation definition's meaningless root field
-            // (measured as `0` off the shipped files) from writing a leaf
+            // (measured as `0` off the shipped files) from writing a page
             // over the file control record.
-            if root == 0 || root >= self.geometry.pages {
+            if root == 0 || root >= total {
                 return Err(fail(format!(
-                    "key {}: root page {root} is not inside a {}-page file",
-                    key.number, self.geometry.pages
+                    "key {}: root page {root} is not inside a {total}-page file",
+                    key.number
                 )));
             }
 
-            // `index_pages` leaves the page number zero; this is the
-            // allocation `index_pages`'s own doc comment says the caller
-            // does, and in this crate it is always the key's existing root.
-            //
-            // The stamp comes from the page this overwrites, not from
-            // `index_pages`, which always emits zero there: `Header::stamp`'s
-            // doc comment says it is preserved rather than interpreted, and
-            // preserving it means reading it before it is gone. C3: measured
-            // as 13 on `WCCRACE.DAT` page 1 and 42 on `WCCCLASS.DAT` page 1 --
-            // neither zero, so writing zero unconditionally was a loss this
-            // host could see in its own fixtures once it checked.
-            let existing = pages::page_header(&self.path, layout, root)
-                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
-            let mut header = pages::Header::decode(&page[..6]);
-            header.number = root;
-            header.stamp = existing.stamp;
-            page[..6].copy_from_slice(&header.encode());
+            let layout = pages::Layout { pages: total, ..layout };
+            let key_length = usize::from(key.length());
 
-            pages::write_page(&self.path, layout, root, &page)
+            // What the key's index occupies now. Rebuilding into these same
+            // numbers is what keeps a file from growing by a whole index every
+            // time it is closed, and it keeps `KEY_ROOT` correct without
+            // rewriting it -- `number_pages` puts the root on `owned[0]`.
+            let owned = pages::walk(&self.path, layout, root, key_length)
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?
+                .pages;
+
+            let built = pages::build_index(layout, &entries, key_length)
                 .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+
+            // Grow only if the new tree needs more pages than the old one had.
+            // Surplus pages are left where they are: there is no sample of page
+            // reclamation in any shipped file, and inventing one would write a
+            // structure a real Btrieve reads and this host guessed at. See
+            // `docs/plans/2026-08-07-btrieve-interior-pages-design.md`.
+            let grown_before = total;
+            let mut numbers = owned;
+            while numbers.len() < built.nodes.len() {
+                let number = pages::append_page(&self.path, pages::Layout { pages: total, ..layout })
+                    .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+                numbers.push(number);
+                total += 1;
+            }
+            let layout = pages::Layout { pages: total, ..layout };
+
+            for (number, mut image) in pages::number_pages(&built, &numbers)
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?
+            {
+                // `Header::stamp`'s doc comment says the stamp is preserved
+                // rather than interpreted, and preserving it means reading it
+                // before it is gone. A page this reindex just appended has no
+                // stamp to preserve, and reading it back would cost a seek to
+                // learn zero -- `grown_before` is the boundary between the two.
+                if number < grown_before {
+                    let existing = pages::page_header(&self.path, layout, number)
+                        .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+                    let mut header = pages::Header::decode(&image[..6]);
+                    header.stamp = existing.stamp;
+                    image[..6].copy_from_slice(&header.encode());
+                }
+
+                pages::write_page(&self.path, layout, number, &image)
+                    .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+            }
 
             let count = u32::try_from(entries.len())
                 .map_err(|_| fail(format!("key {}: more than four billion entries", key.number)))?;
             let records_at = definition + pages::fcr::KEY_RECORDS;
             fcr[records_at..records_at + 4].copy_from_slice(&pages::to_long(count));
+        }
+
+        // The page count, if this reindex grew the file. `HIGHEST` is the
+        // highest page number, one less than the count -- the same relation
+        // `Layout::stamp` maintains when a data page is appended.
+        if total != self.geometry.pages {
+            fcr[pages::fcr::PAGES..pages::fcr::PAGES + 4].copy_from_slice(&pages::to_long(total));
+            let highest = u16::try_from(total - 1)
+                .map_err(|_| fail("a file of more than 65,535 pages".to_owned()))?;
+            fcr[pages::fcr::HIGHEST..pages::fcr::HIGHEST + 2]
+                .copy_from_slice(&highest.to_le_bytes());
+            self.geometry.pages = total;
         }
 
         use std::io::{Seek, SeekFrom, Write};
@@ -1634,6 +1674,87 @@ mod tests {
         }
     }
 
+    /// A `Block` over `seed_indexed`'s file holding `n` records, inserted out
+    /// of key order.
+    ///
+    /// `seed_indexed`'s key is a two-byte signed integer over a 512-byte page,
+    /// so a page holds `(512 - 16) / (2 + 8) = 49` entries and 400 records need
+    /// nine leaves under a root — two levels, and eight page numbers this file
+    /// does not have yet. That is the growth path as well as the tree path.
+    ///
+    /// Out of order on purpose, and deterministically so: odd keys ascending,
+    /// then even. A builder that preserved insertion order rather than key
+    /// order would pass against a file seeded in order.
+    fn block_with_many_records(dir: &Path, n: u16) -> Block {
+        let path = seed_indexed(dir);
+        let mut block = block_indexed(path);
+        let odd = (1..=n).filter(|k| k % 2 == 1);
+        let even = (1..=n).filter(|k| k % 2 == 0);
+        for key in odd.chain(even) {
+            block.insert(&record(key)).expect("insert");
+        }
+        block
+    }
+
+    /// **The wall this whole plan is about.**
+    ///
+    /// More entries than one page holds used to be a refusal out of
+    /// `index_pages` that propagated through `clsbtv`. Now it is a tree, and
+    /// walking it back gives the same order the records went in.
+    #[test]
+    fn reindex_writes_a_tree_when_the_entries_do_not_fit_one_page() {
+        let dir = crate::testing::scratch("block-reindex-multi-page");
+        let mut block = block_with_many_records(&dir, 400);
+
+        block.reindex().expect("reindexes into a tree");
+
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let key = &block.keys[0];
+        let fcr = read_head(&block.path, usize::from(block.geometry.page)).expect("reads");
+        let root_at = pages::fcr::KEYS
+            + usize::from(key.definition) * pages::fcr::KEY_WIDTH
+            + pages::fcr::KEY_ROOT;
+        let root = pages::long(&fcr[root_at..root_at + 4]);
+
+        let walk = pages::walk(&block.path, layout, root, usize::from(key.length()))
+            .expect("the tree this host just wrote is walkable");
+        assert_eq!(walk.entries.len(), 400, "every record is in the tree once");
+        assert!(walk.pages.len() > 1, "400 records do not fit one page");
+
+        let records = block.records.as_ref().expect("loaded");
+        for (n, (value, position)) in walk.entries.iter().enumerate() {
+            let record = records.ordered(key.number, n).expect("in range");
+            assert_eq!(*position, record.position, "entry {n} names the wrong record");
+            assert_eq!(*value, key.extract(&record.bytes), "entry {n} holds the wrong key");
+        }
+    }
+
+    /// Rebuilding a file this host already indexed changes nothing.
+    ///
+    /// This is the invariant that reuse buys and an allocator could not: page
+    /// numbers are stable, so a second reindex over unchanged records is a
+    /// byte-for-byte no-op. It is **not** a claim that this host reproduces
+    /// Btrieve's own splits -- it does not, and does not need to.
+    ///
+    /// Almost any mistake in the builder, the numbering or the walk breaks it,
+    /// which is why it is here rather than a page-count assertion.
+    #[test]
+    fn reindexing_twice_over_the_same_records_writes_the_same_bytes() {
+        let dir = crate::testing::scratch("block-reindex-idempotent");
+        let mut block = block_with_many_records(&dir, 400);
+
+        block.reindex().expect("first");
+        let once = std::fs::read(&block.path).expect("readable");
+        block.reindex().expect("second");
+        let twice = std::fs::read(&block.path).expect("readable");
+
+        assert_eq!(once, twice, "a rebuild of unchanged records is a no-op");
+    }
+
     /// Bytes this process has read at the syscall level, from `/proc/self/io`'s
     /// `rchar` -- counted whether or not the bytes came off disk, which is
     /// exactly what distinguishes "read the first page" from "read the whole
@@ -1663,6 +1784,13 @@ mod tests {
     /// would have worked too, but on this host reading a sparse gigabyte
     /// measured at barely half a second either way -- not a reliable
     /// tripwire under a parallel test run -- while the byte count is exact.
+    ///
+    /// The bound is now a function of the *old* index's shape, not just the
+    /// control record: `reindex` walks the key's existing tree before
+    /// rebuilding it, so the cost here is one page per node of that old tree
+    /// plus the control record -- for this test's single inserted record, one
+    /// 512-byte root plus the 512-byte control record, nowhere near the
+    /// threshold below.
     #[test]
     fn reindex_does_not_read_the_whole_file_to_rebuild_one_page() {
         let dir = crate::testing::scratch("block-reindex-sparse-file");
