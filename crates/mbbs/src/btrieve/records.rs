@@ -396,7 +396,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
                     buffer: &mut fragment,
                     pages: geometry.pages,
                 };
-                Chain::follow(&mut source, pointer, &mut bytes)
+                Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
                     .map_err(|why| format!("the record at {position}: {why}"))?;
             }
 

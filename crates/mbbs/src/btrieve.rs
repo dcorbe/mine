@@ -72,15 +72,35 @@ mod at {
     pub const USRFLGS: usize = 0x106;
 }
 
-/// Bit 0 of [`at::USRFLGS`]: the file holds variable-length records.
-const VARIABLE: u16 = 1 << 0;
-
-/// Bit 3 of [`at::USRFLGS`]: the record data is compressed.
+/// Bits of [`at::USRFLGS`], and what each adds to a record's physical length.
 ///
-/// No file MajorMUD ships sets it -- all 32 in `tmp/` were checked -- and this
-/// host has no decompressor. A file that set it would otherwise be read as a
-/// fragment chain over compressed bytes and hand the module plausible garbage.
-const COMPRESSED: u16 = 1 << 3;
+/// The engine builds the physical length one flag at a time -- decompiled at
+/// `re/btrieve_ghidra/exports/W32MKDE_decompiled.c:17798` (`FUN_0041e3f0`):
+/// variable-length adds four bytes of fragment pointer, blank truncation adds
+/// a trailing-blank count after it, and compression and v6 add more. **So the
+/// fragment pointer is at the logical record length whichever other flags are
+/// set**, and mislocating it by the two bytes of a blank count is the failure
+/// this names rather than assumes away.
+mod flag {
+    /// The file holds variable-length records.
+    pub const VARIABLE: u16 = 1 << 0;
+
+    /// Trailing blanks are stripped from each record and counted instead.
+    ///
+    /// Two more bytes of physical record, after the fragment pointer, and a
+    /// read has to put the blanks back. Nothing in `tmp/` sets it -- all 32
+    /// files were checked -- so there is nothing to check an implementation
+    /// against, and it is refused rather than ignored: ignoring it returns
+    /// every record short by however many spaces it ended with.
+    pub const BLANK_TRUNCATION: u16 = 1 << 1;
+
+    /// The record data is compressed.
+    ///
+    /// No file MajorMUD ships sets it either, and this host has no
+    /// decompressor. A file that set it would otherwise be read as a fragment
+    /// chain over compressed bytes and hand the module plausible garbage.
+    pub const COMPRESSED: u16 = 1 << 3;
+}
 
 /// Which Btrieve wrote the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +244,7 @@ impl Geometry {
         // 0 of the user flags, and the `0xff` marker. All eighteen files agree,
         // and `WCCTEXT` is the one where both say yes.
         let usrflgs = word(at::USRFLGS);
-        let variable = usrflgs & VARIABLE != 0;
+        let variable = usrflgs & flag::VARIABLE != 0;
         if variable != (bytes[at::VARIABLE_MARK] == 0xff) {
             return Err(fail(format!(
                 "user flags say variable-length records is {variable}, and the \
@@ -238,10 +258,22 @@ impl Geometry {
         // fragment chain, and nothing here can undo it. Refused rather than
         // read: the alternative is handing a module 2,000 bytes of compressed
         // stream that parses as text just well enough not to be noticed.
-        if usrflgs & COMPRESSED != 0 {
+        if usrflgs & flag::COMPRESSED != 0 {
             return Err(fail(format!(
                 "user flags {usrflgs:#06x} say the record data is compressed, and this \
                  host has no decompressor"
+            )));
+        }
+
+        // Blank truncation is the other thing that lengthens a physical record,
+        // and it lengthens it *after* the fragment pointer. Refused rather than
+        // ignored: a record read without putting the blanks back is short by
+        // however many spaces it ended with, silently.
+        if usrflgs & flag::BLANK_TRUNCATION != 0 {
+            return Err(fail(format!(
+                "user flags {usrflgs:#06x} say trailing blanks are truncated and counted, \
+                 and this host does not put them back -- every record would come out short \
+                 by the spaces it ended with"
             )));
         }
 
@@ -255,6 +287,20 @@ impl Geometry {
                  after the {reclen}-byte record, and the pointer to the first fragment \
                  needs four",
                 physical - reclen
+            )));
+        }
+
+        // A v6 file's fragments are laid out differently -- every one carries a
+        // next-pointer, and the `0x8000` entry bit does not decide
+        // (`W32MKDE_decompiled.c:19045`). `Version` was parsed and never
+        // consulted until here, which is exactly how the v5 rule would have
+        // been applied to a v6 file without anything saying so. Refused at open
+        // time; `variable::Chain::follow` refuses again on its own account.
+        if variable && version != Version::V5 {
+            return Err(fail(format!(
+                "variable-length records in a {version:?} file, whose fragments do not \
+                 follow the v5 rule this host reads them by, and there is no v6 \
+                 variable-length file to check an implementation of that against"
             )));
         }
 
@@ -2299,10 +2345,42 @@ mod tests {
         let e = read("PACKED.DAT", &bytes).expect_err("nothing here decompresses");
         assert!(e.why.contains("compressed"), "{e}");
 
-        // Bit 3 alone, not "any flag at all": bit 1 and bit 2 are somebody
-        // else's and are read as before.
+        // Bit 3 alone, not "any flag at all": bit 2 is somebody else's and is
+        // read as before.
         let mut ordinary = file(512, 100, 100, 0, 2);
-        ordinary[at::USRFLGS] = 0x06;
+        ordinary[at::USRFLGS] = 0x04;
         assert!(!read("PLAIN.DAT", &ordinary).expect("reads").variable);
+    }
+
+    /// Blank truncation lengthens the physical record *after* the fragment
+    /// pointer (`W32MKDE_decompiled.c:17798`), and a read has to put the
+    /// stripped spaces back. Nothing here does, so every record would come out
+    /// short with nothing saying so.
+    #[test]
+    fn a_file_whose_trailing_blanks_are_truncated_is_refused_rather_than_read() {
+        let mut bytes = file(512, 100, 102, 0, 2);
+        bytes[at::USRFLGS] = 0x02;
+        let e = read("BLANKS.DAT", &bytes).expect_err("the blanks are not put back");
+        assert!(e.why.contains("trailing blanks"), "{e}");
+    }
+
+    /// A v6 file's fragments do not follow the v5 rule
+    /// (`W32MKDE_decompiled.c:19045`), and `Version` had been parsed and never
+    /// consulted anywhere -- which is exactly how the v5 rule would have been
+    /// applied to a v6 file silently.
+    #[test]
+    fn a_btrieve_6_file_of_variable_length_records_is_refused() {
+        let mut bytes = file(512, 100, 104, 0, 2);
+        bytes[..2].copy_from_slice(b"FC");
+        bytes[at::USRFLGS] = 0x01;
+        bytes[at::VARIABLE_MARK] = 0xff;
+        let e = read("SIX.DAT", &bytes).expect_err("v6 fragments are laid out differently");
+        assert!(e.why.contains("V6"), "{e}");
+
+        // And a v6 file of *fixed*-length records is still read, which is what
+        // `NEWMP001.VIR` is.
+        let mut fixed = file(512, 100, 100, 0, 2);
+        fixed[..2].copy_from_slice(b"FC");
+        assert_eq!(read("SIXFIXED.DAT", &fixed).expect("reads").version, Version::V6);
     }
 }
