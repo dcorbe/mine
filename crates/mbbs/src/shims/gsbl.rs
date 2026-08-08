@@ -23,6 +23,7 @@ use mbbs16::{Machine, Ret};
 
 use super::ShimError;
 use crate::Host;
+use crate::chan::Chan;
 
 /// `-11`: "channel number is out of range". See the module docs for why `-10`
 /// cannot happen.
@@ -33,19 +34,26 @@ pub(crate) const OUT_OF_RANGE: u16 = -11i16 as u16;
 /// Every one of the fourteen begins this way, so it is written once. The
 /// alternative -- fourteen copies of the same bound check -- is fourteen places
 /// for one of them to be missing.
+///
+/// `body` is handed the [`Chan`] this minted rather than being left to find the
+/// channel again from the raw number. Every one of these used to do that, and
+/// every one of them ended `.expect("in range")` -- fourteen assertions that the
+/// check two lines above had happened, which is what having the check and the
+/// use in different types buys you.
 fn on_channel<T>(
     host: &mut Host,
     chan: i16,
-    body: impl FnOnce(&mut crate::gsbl::Gsbl) -> T,
+    body: impl FnOnce(&mut crate::gsbl::Gsbl, Chan) -> T,
 ) -> Option<T> {
-    (chan >= 0 && chan < host.gsbl().terms() as i16).then(|| body(host.gsbl_mut()))
+    let chan = host.gsbl().terms().chan(chan)?;
+    Some(body(host.gsbl_mut(), chan))
 }
 
 /// `int btutsw(int chan, int width)` -- output word-wrap width. Zero disables.
 pub fn btutsw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, width) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").width = width;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).width = width;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -56,8 +64,8 @@ pub fn btutsw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// disables the limit.
 pub fn btumil(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, maxinl) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").maxinl = maxinl;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).maxinl = maxinl;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -67,8 +75,8 @@ pub fn btumil(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btuech(int chan, int onoff)` -- echo input back to the terminal.
 pub fn btuech(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").echo = onoff != 0;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).echo = onoff != 0;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -79,8 +87,8 @@ pub fn btuech(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// discarded while locked.
 pub fn btulok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").locked = onoff != 0;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).locked = onoff != 0;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -91,8 +99,8 @@ pub fn btulok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// empties.
 pub fn btuoes(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").oes = onoff != 0;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).oes = onoff != 0;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -103,8 +111,8 @@ pub fn btuoes(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// mode; non-zero switches to binary mode and sets the block size.
 pub fn btutrg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, nbyt) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    Ok(match on_channel(host, chan, |g| {
-        g.channel_mut(chan).expect("in range").trigger = nbyt;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).trigger = nbyt;
     }) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -135,8 +143,8 @@ pub fn btuxnf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     } else {
         None
     };
-    Ok(match on_channel(host, chan, |g| {
-        let c = g.channel_mut(chan).expect("in range");
+    Ok(match on_channel(host, chan, |g, chan| {
+        let c = g.channel_mut(chan);
         c.xon = xon as u8;
         c.xoff = xoff as u8;
         if let Some((cnt, message)) = page {
@@ -152,8 +160,8 @@ pub fn btuxnf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btuclo(int chan)` -- throw away output that has not gone out yet.
 pub fn btuclo(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
-    Ok(match on_channel(host, chan, |g| {
-        let c = g.channel_mut(chan).expect("in range");
+    Ok(match on_channel(host, chan, |g, chan| {
+        let c = g.channel_mut(chan);
         c.output.clear();
         c.column = 0;
     }) {
@@ -172,8 +180,8 @@ pub fn btuclo(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// diverge from every real board.
 pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
-    Ok(match on_channel(host, chan, |g| {
-        let c = g.channel_mut(chan).expect("in range");
+    Ok(match on_channel(host, chan, |g, chan| {
+        let c = g.channel_mut(chan);
         c.input.clear();
         c.line.clear();
         c.ready.clear();
@@ -186,7 +194,7 @@ pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btuinj(int chan, int status)` -- inject a status code into the FIFO.
 pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, status) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as i16);
-    Ok(match on_channel(host, chan, |g| {
+    Ok(match on_channel(host, chan, |g, chan| {
         g.inject(chan, status);
     }) {
         Some(()) => Ret::U16(0),
@@ -207,10 +215,10 @@ pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// against a length it computed itself -- it does not.
 pub fn btuibw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
-    if chan < 0 || chan >= host.gsbl().terms() as i16 {
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
-    }
-    let c = host.gsbl().channel(chan).expect("in range");
+    };
+    let c = host.gsbl().channel(chan);
     let waiting: usize =
         c.input.len() + c.line.len() + c.ready.iter().map(Vec::len).sum::<usize>();
     Ok(Ret::U16(waiting as u16))
@@ -224,9 +232,9 @@ pub fn btuibw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 pub fn btuxmt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = machine.arg_u16(0) as i16;
     let at = machine.arg_far(1);
-    if chan < 0 || chan >= host.gsbl().terms() as i16 {
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
-    }
+    };
     let text = machine.read_cstr(at)?.to_vec();
     host.gsbl_mut().transmit(chan, &text);
     Ok(Ret::U16(0))
@@ -241,9 +249,9 @@ pub fn btuxmt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 pub fn btuxct(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (chan, nbyt) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
     let at = machine.arg_far(2);
-    if chan < 0 || chan >= host.gsbl().terms() as i16 {
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
-    }
+    };
     let data = machine.resolve(at, usize::from(nbyt))?.to_vec();
     host.gsbl_mut().transmit_raw(chan, &data);
     Ok(Ret::U16(0))
@@ -263,15 +271,15 @@ pub fn btuica(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let chan = machine.arg_u16(0) as i16;
     let at = machine.arg_far(1);
     let max = machine.arg_u16(3);
-    if chan < 0 || chan >= host.gsbl().terms() as i16 {
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
-    }
-    let c = host.gsbl().channel(chan).expect("in range");
+    };
+    let c = host.gsbl().channel(chan);
     let take = usize::from(max).min(c.input.len());
 
     machine.resolve(at, take)?;
 
-    let c = host.gsbl_mut().channel_mut(chan).expect("in range");
+    let c = host.gsbl_mut().channel_mut(chan);
     let bytes: Vec<u8> = c.input.drain(..take).collect();
     machine
         .write(at, &bytes)
@@ -289,7 +297,7 @@ mod tests {
     #[test]
     fn every_routine_refuses_a_channel_out_of_range() {
         let mut f = Fixture::new();
-        let past = f.host.gsbl().terms();
+        let past = f.host.gsbl().terms().count();
         for (name, ret) in [
             ("btutsw", f.invoke(btutsw, &[past, 80])),
             ("btumil", f.invoke(btumil, &[past, 40])),
@@ -313,12 +321,13 @@ mod tests {
     #[test]
     fn btuxmt_transmits_and_btutsw_is_what_wraps_it() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(btutsw, &[0, 10]).expect("width set");
         let text = f.text("the quick brown fox");
         f.invoke(btuxmt, &[0, text.offset, text.selector])
             .expect("transmitted");
         assert_eq!(
-            f.host.gsbl_mut().drain_output(0),
+            f.host.gsbl_mut().drain_output(console),
             b"the quick\r\nbrown fox".to_vec()
         );
     }
@@ -328,17 +337,19 @@ mod tests {
         // Binary: the length is an argument, not a NUL scan, so an embedded
         // zero is data.
         let mut f = Fixture::new();
+        let console = f.console();
         let data = f.bytes(&[b'a', 0, b'b'], false);
         f.invoke(btuxct, &[0, 3, data.offset, data.selector])
             .expect("transmitted");
-        assert_eq!(f.host.gsbl_mut().drain_output(0), vec![b'a', 0, b'b']);
+        assert_eq!(f.host.gsbl_mut().drain_output(console), vec![b'a', 0, b'b']);
     }
 
     #[test]
     fn btuibw_counts_what_is_waiting_and_btucli_throws_it_away() {
         let mut f = Fixture::new();
-        f.host.gsbl_mut().channel_mut(0).expect("chan 0").trigger = 99;
-        f.host.gsbl_mut().push_input(0, b"abcd");
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).trigger = 99;
+        f.host.gsbl_mut().push_input(console, b"abcd");
         assert_eq!(f.invoke(btuibw, &[0]).expect("counted"), Ret::U16(4));
         f.invoke(btucli, &[0]).expect("cleared");
         assert_eq!(f.invoke(btuibw, &[0]).expect("counted"), Ret::U16(0));
@@ -347,25 +358,28 @@ mod tests {
     #[test]
     fn btuclo_throws_away_output_that_has_not_gone_out() {
         let mut f = Fixture::new();
+        let console = f.console();
         let text = f.text("wasted");
         f.invoke(btuxmt, &[0, text.offset, text.selector])
             .expect("transmitted");
         f.invoke(btuclo, &[0]).expect("cleared");
-        assert!(f.host.gsbl_mut().drain_output(0).is_empty());
+        assert!(f.host.gsbl_mut().drain_output(console).is_empty());
     }
 
     #[test]
     fn btuinj_puts_a_status_where_the_host_will_find_it() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(btuinj, &[0, 3]).expect("injected");
-        assert_eq!(f.host.gsbl_mut().next_status(0), Some(3));
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(3));
     }
 
     #[test]
     fn btuica_copies_what_is_waiting_up_to_the_maximum_it_was_given() {
         let mut f = Fixture::new();
-        f.host.gsbl_mut().channel_mut(0).expect("chan 0").trigger = 99;
-        f.host.gsbl_mut().push_input(0, b"abcdef");
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).trigger = 99;
+        f.host.gsbl_mut().push_input(console, b"abcdef");
         let buf = f.buffer(16);
         let ret = f
             .invoke(btuica, &[0, buf.offset, buf.selector, 4])
@@ -392,8 +406,9 @@ mod tests {
         // must fail -- and the bytes must still be waiting to be asked for
         // again.
         let mut f = Fixture::new();
-        f.host.gsbl_mut().channel_mut(0).expect("chan 0").trigger = 99;
-        f.host.gsbl_mut().push_input(0, b"abcd");
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).trigger = 99;
+        f.host.gsbl_mut().push_input(console, b"abcd");
         let ret = f.invoke(btuica, &[0, 0, 0xdead, 4]);
         assert!(ret.is_err(), "a destination that resolves to nothing must fail");
         assert_eq!(
@@ -411,10 +426,11 @@ mod tests {
         // Pagination is deliberately not implemented; this only pins that
         // the parameters are not lost.
         let mut f = Fixture::new();
+        let console = f.console();
         let msg = f.text("Hit any key to continue...");
         f.invoke(btuxnf, &[0, 0, 0xffed, 22, msg.offset, msg.selector])
             .expect("ok");
-        let c = f.host.gsbl().channel(0).expect("chan 0");
+        let c = f.host.gsbl().channel(console);
         assert_eq!(c.xoff, 0xed, "the low byte still lands, negative or not");
         assert_eq!(c.page_lines, 22);
         assert_eq!(
@@ -426,8 +442,9 @@ mod tests {
     #[test]
     fn btuxnf_with_a_positive_xoff_records_no_page_parameters() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(btuxnf, &[0, 0, 19]).expect("ok");
-        let c = f.host.gsbl().channel(0).expect("chan 0");
+        let c = f.host.gsbl().channel(console);
         assert_eq!(c.page_lines, 0);
         assert_eq!(c.page_message, None);
     }
@@ -435,6 +452,7 @@ mod tests {
     #[test]
     fn the_settings_reach_the_channel() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(btutsw, &[0, 80]).expect("ok");
         f.invoke(btumil, &[0, 40]).expect("ok");
         f.invoke(btuech, &[0, 0]).expect("ok");
@@ -443,7 +461,7 @@ mod tests {
         f.invoke(btutrg, &[0, 8]).expect("ok");
         f.invoke(btuxnf, &[0, 17, 19]).expect("ok");
 
-        let c = f.host.gsbl().channel(0).expect("chan 0");
+        let c = f.host.gsbl().channel(console);
         assert_eq!(c.width, 80);
         assert_eq!(c.maxinl, 40);
         assert!(!c.echo, "btuech(chan, 0) turns echo off");
@@ -458,9 +476,10 @@ mod tests {
         // The guide's own CAUTIONS. Clearing the status too would be tidier
         // and would not be GSBL.
         let mut f = Fixture::new();
-        f.host.gsbl_mut().push_input(0, b"look\r");
+        let console = f.console();
+        f.host.gsbl_mut().push_input(console, b"look\r");
         f.invoke(btucli, &[0]).expect("cleared");
-        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::CRSTG));
-        assert_eq!(f.host.gsbl_mut().take_line(0), None);
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::CRSTG));
+        assert_eq!(f.host.gsbl_mut().take_line(console), None);
     }
 }

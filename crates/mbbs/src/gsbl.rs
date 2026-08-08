@@ -17,6 +17,8 @@
 
 use std::collections::VecDeque;
 
+use crate::chan::{Chan, Terms};
+
 /// How much a channel can hold in each direction.
 ///
 /// The real host sized these with `btusiz`/`btulsz` from `INPSIZ` and `OUTSIZ`
@@ -124,37 +126,51 @@ impl Default for Channel {
 
 /// Every channel this host has.
 pub struct Gsbl {
+    /// The bound these channels were built from, and the only thing that mints
+    /// a [`Chan`] for them. Held rather than recovered from `channels.len()` so
+    /// that it is *the same value* [`Users`](crate::Users) was sized by -- see
+    /// [`crate::chan`] for what those two agreeing by convention cost.
+    terms: Terms,
     channels: Vec<Channel>,
 }
 
 impl Gsbl {
-    /// `terms` channels, each with GSBL's own defaults.
-    pub fn new(terms: u16) -> Self {
+    /// One channel for each terminal `terms` names, with GSBL's own defaults.
+    pub fn new(terms: Terms) -> Self {
         Self {
-            channels: (0..terms).map(|_| Channel::default()).collect(),
+            terms,
+            channels: (0..terms.count()).map(|_| Channel::default()).collect(),
         }
     }
 
-    /// How many channels there are.
-    pub fn terms(&self) -> u16 {
-        self.channels.len() as u16
+    /// How many channels there are -- and the only thing that names one.
+    pub fn terms(&self) -> Terms {
+        self.terms
     }
 
-    /// One channel, or `None` if `chan` names none.
+    /// One channel.
     ///
-    /// Every channel in range is *defined* -- `Host::new` allocates them all and
+    /// Infallible, because a [`Chan`] is the proof that the bound was asked.
+    /// Every channel is also *defined* -- `Host::new` allocates them all and
     /// this host has no `btudef` -- so the guide's `-10` "channel is not
-    /// defined" is unreachable and `-11` "out of range" is the only refusal a
-    /// shim can make.
-    pub fn channel(&self, chan: i16) -> Option<&Channel> {
-        usize::try_from(chan).ok().and_then(|i| self.channels.get(i))
+    /// defined" is unreachable, and `-11` "out of range" is the only refusal a
+    /// shim can make. A shim makes it by failing to mint a `Chan` at all.
+    ///
+    /// # Panics
+    ///
+    /// If `chan` came from a larger [`Terms`] than this `Gsbl` was built from.
+    /// That is not an out-of-range channel number; it is two bounds inside one
+    /// host, which is the thing [`crate::chan`] exists to make unrepresentable.
+    /// A panic naming it beats an `Option` that call sites discard -- which is
+    /// exactly what the old signature got.
+    pub fn channel(&self, chan: Chan) -> &Channel {
+        &self.channels[chan.index()]
     }
 
-    /// One channel, mutably.
-    pub fn channel_mut(&mut self, chan: i16) -> Option<&mut Channel> {
-        usize::try_from(chan)
-            .ok()
-            .and_then(|i| self.channels.get_mut(i))
+    /// One channel, mutably. Infallible for the same reason as
+    /// [`Gsbl::channel`], and panics for the same one.
+    pub fn channel_mut(&mut self, chan: Chan) -> &mut Channel {
+        &mut self.channels[chan.index()]
     }
 
     /// `CRSTG` -- a CR-terminated input string is available (guide, `btusts`
@@ -184,47 +200,45 @@ impl Gsbl {
     /// holding a literal both arrive here, and there is no second path to keep
     /// honest.
     ///
-    /// A channel that does not exist silently discards, because the caller is
-    /// the host's own transport rather than the module -- there is nobody to
-    /// return an error code to, and a socket for a channel that was never
-    /// allocated is the transport's bug, not the module's.
-    pub fn push_input(&mut self, chan: i16, bytes: &[u8]) {
-        let Some(c) = self.channel_mut(chan) else {
-            return;
-        };
+    /// A socket for a channel that was never allocated is the transport's bug
+    /// rather than the module's, and it is now caught one step earlier: the
+    /// transport has to mint a [`Chan`] from [`Gsbl::terms`] before it can call
+    /// this at all, and that is where a channel that does not exist is refused.
+    pub fn push_input(&mut self, chan: Chan, bytes: &[u8]) {
+        let c = self.channel_mut(chan);
         for &byte in bytes {
             c.take(byte);
         }
     }
 
-    /// The next status for a channel, oldest first, or `None`.
+    /// The next status for a channel, oldest first, or `None` if none is
+    /// waiting.
     ///
     /// This is `btusts`. The guide: the status buffer is a FIFO, so btusts hands back codes in the order they arose.
-    pub fn next_status(&mut self, chan: i16) -> Option<i16> {
-        self.channel_mut(chan)?.status.pop_front()
+    pub fn next_status(&mut self, chan: Chan) -> Option<i16> {
+        self.channel_mut(chan).status.pop_front()
     }
 
-    /// Put a status where [`Gsbl::scan`] will find it. `false` if there is no
-    /// such channel.
+    /// Put a status where [`Gsbl::scan`] will find it.
     ///
     /// This is `btuinj`, reached two ways: the module calls it through the shim
     /// of that name, and the host calls it directly to re-arm a polling channel
     /// (`MAJORBBS.C:3267`). One method rather than two copies of the push, so
     /// they cannot come to disagree about what "inject" means.
-    pub fn inject(&mut self, chan: i16, status: i16) -> bool {
-        match self.channel_mut(chan) {
-            Some(c) => {
-                c.status.push_back(status);
-                true
-            }
-            None => false,
-        }
+    ///
+    /// It used to answer `bool` -- `false` for a channel `Gsbl` did not have --
+    /// and both host-side callers dropped the answer on the floor. They were
+    /// right to, in the sense that the case could not arise; they were wrong to
+    /// in the sense that nothing said so. There is no answer to drop now,
+    /// because a [`Chan`] cannot name a channel this `Gsbl` lacks.
+    pub fn inject(&mut self, chan: Chan, status: i16) {
+        self.channel_mut(chan).status.push_back(status);
     }
 
     /// The oldest completed line, taken -- this is what `btuinp` hands the
     /// module. If more than one line is queued, the rest wait their turn.
-    pub fn take_line(&mut self, chan: i16) -> Option<Vec<u8>> {
-        self.channel_mut(chan)?.ready.pop_front()
+    pub fn take_line(&mut self, chan: Chan) -> Option<Vec<u8>> {
+        self.channel_mut(chan).ready.pop_front()
     }
 
     /// Everything queued for the terminal, taken.
@@ -238,10 +252,8 @@ impl Gsbl {
     /// break, and the bytes a channel emitted depended on when a socket task
     /// happened to run. `transmit` now wraps inside a buffer of its own and
     /// commits once, so there is nothing here to disturb.
-    pub fn drain_output(&mut self, chan: i16) -> Vec<u8> {
-        let Some(c) = self.channel_mut(chan) else {
-            return Vec::new();
-        };
+    pub fn drain_output(&mut self, chan: Chan) -> Vec<u8> {
+        let c = self.channel_mut(chan);
         if c.output.is_empty() {
             return Vec::new();
         }
@@ -256,22 +268,30 @@ impl Gsbl {
     ///
     /// This is `btuscn`. The guide: it finds channels whose status code is non-zero and answers -1 when there are none. The `-1` is
     /// left to the caller; `None` is what Rust says.
-    pub fn scan(&self) -> Option<i16> {
+    ///
+    /// The [`Chan`] it hands back is minted from this `Gsbl`'s own [`Terms`],
+    /// so a channel found here is a channel every other table keyed by the same
+    /// `Terms` also has. That is the whole point: `Host::poll` used to scan with
+    /// `Gsbl`'s bound and then index `Users` with the result, which was correct
+    /// only for as long as the two bounds happened to match.
+    pub fn scan(&self) -> Option<Chan> {
         self.channels
             .iter()
             .position(|c| !c.status.is_empty())
-            .map(|i| i as i16)
+            // Through the same mint every other caller uses, rather than a
+            // private constructor: `i` indexes `channels`, `channels` is
+            // `terms.count()` long, so this cannot refuse -- and if it ever
+            // does, the two have come apart and that is worth a panic.
+            .map(|i| {
+                self.terms
+                    .chan(i as i16)
+                    .expect("scan indexed its own channels")
+            })
     }
 
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
-    ///
-    /// Silently discards for a channel that does not exist; the shim checks the
-    /// range and returns `-11` before ever reaching here.
-    pub fn transmit(&mut self, chan: i16, bytes: &[u8]) {
-        let Some(c) = self.channel_mut(chan) else {
-            return;
-        };
-        c.transmit(bytes);
+    pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
+        self.channel_mut(chan).transmit(bytes);
     }
 
     /// `btuxct` -- binary output, exactly as given.
@@ -279,10 +299,8 @@ impl Gsbl {
     /// R6, guide page 182: a block that will not fit is not truncated into
     /// what room remains -- none of it goes out, and status 253 (`OVRFLW`) is
     /// queued instead.
-    pub fn transmit_raw(&mut self, chan: i16, bytes: &[u8]) {
-        let Some(c) = self.channel_mut(chan) else {
-            return;
-        };
+    pub fn transmit_raw(&mut self, chan: Chan, bytes: &[u8]) {
+        let c = self.channel_mut(chan);
         if c.output.len() + bytes.len() > OUTSIZ {
             c.status.push_back(Self::OVRFLW);
             return;
@@ -553,6 +571,18 @@ impl Channel {
 mod tests {
     use super::*;
 
+    /// A one-channel `Gsbl`, which is what every test here wants.
+    fn one() -> Gsbl {
+        Gsbl::new(Terms::new(1))
+    }
+
+    /// Its only channel. Minted from a `Terms` of the same size `one()` builds,
+    /// so it indexes that `Gsbl` -- the pairing these tests used to make by
+    /// writing the literal `0` and trusting it.
+    fn chan() -> Chan {
+        Terms::new(1).chan(0).expect("a one-channel host has channel zero")
+    }
+
     /// The bytes a channel emits do not depend on when the transport ran.
     ///
     /// This is the test the original wrap could not pass. `wrap` recovered the
@@ -573,20 +603,20 @@ mod tests {
         let halves: [&[u8]; 2] = [b"hello wor", b"ldsomethinglong end"];
 
         // Drained only at the end.
-        let mut whole = Gsbl::new(1);
-        whole.channel_mut(0).expect("channel 0").width = 20;
+        let mut whole = one();
+        whole.channel_mut(chan()).width = 20;
         for half in halves {
-            whole.transmit(0, half);
+            whole.transmit(chan(), half);
         }
-        let undrained = whole.drain_output(0);
+        let undrained = whole.drain_output(chan());
 
         // Drained between the two calls, then concatenated.
-        let mut split = Gsbl::new(1);
-        split.channel_mut(0).expect("channel 0").width = 20;
+        let mut split = one();
+        split.channel_mut(chan()).width = 20;
         let mut drained = Vec::new();
         for half in halves {
-            split.transmit(0, half);
-            drained.extend(split.drain_output(0));
+            split.transmit(chan(), half);
+            drained.extend(split.drain_output(chan()));
         }
 
         assert_eq!(
@@ -598,8 +628,8 @@ mod tests {
 
     #[test]
     fn a_fresh_channel_has_the_defaults_gsbl_gave_it() {
-        let g = Gsbl::new(1);
-        let c = g.channel(0).expect("channel 0");
+        let g = one();
+        let c = g.channel(chan());
         assert_eq!(c.width, 0, "btutsw default: no word wrap");
         assert_eq!(c.maxinl, 0, "btumil default: no line limit");
         assert!(c.echo, "btuech default: echo on");
@@ -607,21 +637,25 @@ mod tests {
         assert_eq!(c.trigger, 0, "btutrg default: ASCII mode");
     }
 
+    /// The refusal moved out of `Gsbl` and into the mint, so this is where it
+    /// is asserted now -- there is no longer a `Gsbl` method that can be handed
+    /// a channel it does not have.
     #[test]
-    fn a_channel_outside_nterms_is_out_of_range() {
-        let g = Gsbl::new(1);
-        assert!(g.channel(1).is_none());
-        assert!(g.channel(-1).is_none());
+    fn a_channel_outside_nterms_cannot_even_be_named() {
+        let terms = one().terms();
+        assert!(terms.chan(1).is_none());
+        assert!(terms.chan(-1).is_none());
+        assert!(terms.chan(0).is_some(), "and channel zero still is");
     }
 
     #[test]
     fn a_line_is_ready_only_once_the_terminator_arrives() {
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"loo");
-        assert_eq!(g.next_status(0), None, "no status until the CR");
-        g.push_input(0, b"k\r");
-        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+        let mut g = one();
+        g.push_input(chan(), b"loo");
+        assert_eq!(g.next_status(chan()), None, "no status until the CR");
+        g.push_input(chan(), b"k\r");
+        assert_eq!(g.next_status(chan()), Some(Gsbl::CRSTG));
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"look"[..]));
     }
 
     #[test]
@@ -630,54 +664,54 @@ mod tests {
         // asserted the two statuses and never the lines, so a `ready` that
         // let the second line overwrite the first went unnoticed. Both lines
         // must survive, in order.
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"a\rb\r");
-        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
-        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
-        assert_eq!(g.next_status(0), None, "two lines, two statuses, no more");
+        let mut g = one();
+        g.push_input(chan(), b"a\rb\r");
+        assert_eq!(g.next_status(chan()), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(chan()), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(chan()), None, "two lines, two statuses, no more");
         assert_eq!(
-            g.take_line(0).as_deref(),
+            g.take_line(chan()).as_deref(),
             Some(&b"a"[..]),
             "the first line must still be here, not overwritten by the second"
         );
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"b"[..]));
-        assert_eq!(g.take_line(0), None);
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"b"[..]));
+        assert_eq!(g.take_line(chan()), None);
     }
 
     #[test]
     fn a_linefeed_after_a_return_is_not_a_second_line() {
         // A telnet client sends CRLF. Treating the LF as a terminator would
         // hand the module an empty command after every real one.
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"look\r\n");
-        assert_eq!(g.next_status(0), Some(Gsbl::CRSTG));
-        assert_eq!(g.next_status(0), None);
+        let mut g = one();
+        g.push_input(chan(), b"look\r\n");
+        assert_eq!(g.next_status(chan()), Some(Gsbl::CRSTG));
+        assert_eq!(g.next_status(chan()), None);
     }
 
     #[test]
     fn backspace_removes_a_byte_and_does_nothing_at_column_zero() {
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"\x08");
-        g.push_input(0, b"lookk\x08\r");
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+        let mut g = one();
+        g.push_input(chan(), b"\x08");
+        g.push_input(chan(), b"lookk\x08\r");
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"look"[..]));
     }
 
     #[test]
     fn del_is_translated_to_backspace() {
         // R2, guide btuxlt page 184: RUBOUT (ASCII 127) becomes BACKSPACE, a concession to old terminals without a backspace key. Every modern terminal emulator's Backspace key
         // sends 0x7F.
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"lookx\x7f\x7f\r");
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"loo"[..]));
+        let mut g = one();
+        g.push_input(chan(), b"lookx\x7f\x7f\r");
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"loo"[..]));
     }
 
     #[test]
     fn control_characters_other_than_backspace_and_cr_are_ignored() {
         // R2, guide btuxlt page 184: every other control character is dropped. An RFC 854 client's CR NUL would otherwise leak the NUL
         // into the next command.
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"lo\x00\x07\x1bok\r"); // NUL, BEL, ESC
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+        let mut g = one();
+        g.push_input(chan(), b"lo\x00\x07\x1bok\r"); // NUL, BEL, ESC
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"look"[..]));
     }
 
     #[test]
@@ -685,44 +719,44 @@ mod tests {
         // R2, guide btuxlt page 184: the high bit is always cleared. Telnet IAC (0xFF) would otherwise land in the
         // command line; here a stray high-bit byte becomes the ASCII
         // character underneath it (0xE9 & 0x7F == 0x69 == 'i').
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"look\xe9ng\r");
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"looking"[..]));
+        let mut g = one();
+        g.push_input(chan(), b"look\xe9ng\r");
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"looking"[..]));
     }
 
     #[test]
     fn a_locked_channel_discards_what_arrives() {
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").locked = true;
-        g.push_input(0, b"look\r");
-        assert_eq!(g.next_status(0), None);
-        assert_eq!(g.take_line(0), None);
+        let mut g = one();
+        g.channel_mut(chan()).locked = true;
+        g.push_input(chan(), b"look\r");
+        assert_eq!(g.next_status(chan()), None);
+        assert_eq!(g.take_line(chan()), None);
     }
 
     #[test]
     fn btumil_drops_what_would_not_fit_rather_than_truncating_the_line() {
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").maxinl = 4;
-        g.push_input(0, b"lookout\r");
-        assert_eq!(g.take_line(0).as_deref(), Some(&b"look"[..]));
+        let mut g = one();
+        g.channel_mut(chan()).maxinl = 4;
+        g.push_input(chan(), b"lookout\r");
+        assert_eq!(g.take_line(chan()).as_deref(), Some(&b"look"[..]));
     }
 
     #[test]
     fn echo_puts_what_arrived_back_on_the_wire_and_silence_does_not() {
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"hi");
-        assert_eq!(g.drain_output(0), b"hi".to_vec());
+        let mut g = one();
+        g.push_input(chan(), b"hi");
+        assert_eq!(g.drain_output(chan()), b"hi".to_vec());
 
-        g.channel_mut(0).expect("channel 0").echo = false;
-        g.push_input(0, b"hi");
-        assert!(g.drain_output(0).is_empty());
+        g.channel_mut(chan()).echo = false;
+        g.push_input(chan(), b"hi");
+        assert!(g.drain_output(chan()).is_empty());
     }
 
     #[test]
     fn an_echoed_backspace_erases_the_character_on_the_terminal() {
-        let mut g = Gsbl::new(1);
-        g.push_input(0, b"a\x08");
-        assert_eq!(g.drain_output(0), b"a\x08 \x08".to_vec());
+        let mut g = one();
+        g.push_input(chan(), b"a\x08");
+        assert_eq!(g.drain_output(chan()), b"a\x08 \x08".to_vec());
     }
 
     #[test]
@@ -730,11 +764,11 @@ mod tests {
         // Binary mode: none of the ASCII processing applies, not even the
         // terminator -- a CR is just a byte.
         const INBLK: i16 = 4;
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").trigger = 3;
-        g.push_input(0, b"a\rb");
-        assert_eq!(g.next_status(0), Some(INBLK));
-        assert_eq!(g.take_line(0), None, "binary input is not a line");
+        let mut g = one();
+        g.channel_mut(chan()).trigger = 3;
+        g.push_input(chan(), b"a\rb");
+        assert_eq!(g.next_status(chan()), Some(INBLK));
+        assert_eq!(g.take_line(chan()), None, "binary input is not a line");
     }
 
     #[test]
@@ -743,45 +777,47 @@ mod tests {
         // blocks and five statuses -- not eighty-one, which is what
         // `input.len() >= trigger` re-firing on every byte past the
         // threshold used to produce.
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").trigger = 20;
-        g.push_input(0, &[0u8; 100]);
+        let mut g = one();
+        g.channel_mut(chan()).trigger = 20;
+        g.push_input(chan(), &[0u8; 100]);
         let mut count = 0;
-        while let Some(status) = g.next_status(0) {
+        while let Some(status) = g.next_status(chan()) {
             assert_eq!(status, Gsbl::INBLK);
             count += 1;
         }
         assert_eq!(count, 5);
     }
 
+    /// The transport used to be able to call `push_input(9, ..)` on a
+    /// one-channel host and have it quietly vanish. It cannot reach the call at
+    /// all now: there is no channel 9 to name.
     #[test]
-    fn pushing_to_a_channel_that_does_not_exist_is_a_no_op() {
-        let mut g = Gsbl::new(1);
-        g.push_input(9, b"look\r");
-        assert_eq!(g.next_status(9), None);
+    fn a_transport_cannot_push_to_a_channel_that_does_not_exist() {
+        let g = one();
+        assert!(g.terms().chan(9).is_none());
     }
 
     #[test]
     fn ascii_output_with_no_width_is_passed_through_unchanged() {
-        let mut g = Gsbl::new(1);
-        g.transmit(0, b"the quick brown fox");
-        assert_eq!(g.drain_output(0), b"the quick brown fox".to_vec());
+        let mut g = one();
+        g.transmit(chan(), b"the quick brown fox");
+        assert_eq!(g.drain_output(chan()), b"the quick brown fox".to_vec());
     }
 
     #[test]
     fn ascii_output_wraps_on_a_word_boundary_at_the_btutsw_width() {
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").width = 10;
-        g.transmit(0, b"the quick brown fox");
-        assert_eq!(g.drain_output(0), b"the quick\r\nbrown fox".to_vec());
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"the quick brown fox");
+        assert_eq!(g.drain_output(chan()), b"the quick\r\nbrown fox".to_vec());
     }
 
     #[test]
     fn a_word_longer_than_the_width_is_broken_rather_than_lost() {
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").width = 4;
-        g.transmit(0, b"abcdefg");
-        assert_eq!(g.drain_output(0), b"abcd\r\nefg".to_vec());
+        let mut g = one();
+        g.channel_mut(chan()).width = 4;
+        g.transmit(chan(), b"abcdefg");
+        assert_eq!(g.drain_output(chan()), b"abcd\r\nefg".to_vec());
     }
 
     #[test]
@@ -791,27 +827,27 @@ mod tests {
         // not survive as a leading-space indent on the new line. This is the
         // one case where the byte that triggers `wrap()` is a space rather
         // than the next word's first letter.
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").width = 10;
-        g.transmit(0, b"0123456789 abc");
-        assert_eq!(g.drain_output(0), b"0123456789\r\nabc".to_vec());
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"0123456789 abc");
+        assert_eq!(g.drain_output(chan()), b"0123456789\r\nabc".to_vec());
     }
 
     #[test]
     fn an_explicit_return_resets_the_column() {
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").width = 10;
-        g.transmit(0, b"ab\r\ncd ef");
-        assert_eq!(g.drain_output(0), b"ab\r\ncd ef".to_vec());
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"ab\r\ncd ef");
+        assert_eq!(g.drain_output(chan()), b"ab\r\ncd ef".to_vec());
     }
 
     #[test]
     fn binary_output_ignores_the_width_entirely() {
         // The guide, btuxmt page 189: none of these features apply to btuxct.
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").width = 4;
-        g.transmit_raw(0, b"abcdefg");
-        assert_eq!(g.drain_output(0), b"abcdefg".to_vec());
+        let mut g = one();
+        g.channel_mut(chan()).width = 4;
+        g.transmit_raw(chan(), b"abcdefg");
+        assert_eq!(g.drain_output(chan()), b"abcdefg".to_vec());
     }
 
     #[test]
@@ -819,26 +855,26 @@ mod tests {
         // R1, guide `btulfd` page 114: the default on channel init is that an
         // explicit LF is required after every CR, and WCCMMUD.DLL never
         // calls btulfd/btuhcr to change that default.
-        let mut g = Gsbl::new(1);
-        g.transmit(0, b"line\r");
-        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+        let mut g = one();
+        g.transmit(chan(), b"line\r");
+        assert_eq!(g.drain_output(chan()), b"line\r\n".to_vec());
     }
 
     #[test]
     fn an_explicit_crlf_from_the_module_does_not_become_crlf_lf() {
-        let mut g = Gsbl::new(1);
-        g.transmit(0, b"line\r\n");
-        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+        let mut g = one();
+        g.transmit(chan(), b"line\r\n");
+        assert_eq!(g.drain_output(chan()), b"line\r\n".to_vec());
     }
 
     #[test]
     fn an_explicit_crlf_split_across_two_transmit_calls_does_not_double_the_lf() {
         // MajorMUD flushes whatever `prf` happened to accumulate, so the CR
         // and its LF are not guaranteed to arrive in the same btuxmt() call.
-        let mut g = Gsbl::new(1);
-        g.transmit(0, b"line\r");
-        g.transmit(0, b"\n");
-        assert_eq!(g.drain_output(0), b"line\r\n".to_vec());
+        let mut g = one();
+        g.transmit(chan(), b"line\r");
+        g.transmit(chan(), b"\n");
+        assert_eq!(g.drain_output(chan()), b"line\r\n".to_vec());
     }
 
     #[test]
@@ -849,63 +885,65 @@ mod tests {
         // this large. The call itself is bigger than OUTSIZ and rolls back
         // (R6), which is not what this test is about; it only cares that
         // accumulating column that far did not panic on the way there.
-        let mut g = Gsbl::new(1);
+        let mut g = one();
         let long = vec![b'x'; 70_000];
-        g.transmit(0, &long);
-        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+        g.transmit(chan(), &long);
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
     }
 
     #[test]
     fn an_oversized_ascii_write_emits_nothing_and_queues_overflow() {
         // R6, guide btuxmt CAUTIONS page 191: btuxmt returns 0, queues status 253 for btusts, and outputs none of the string. Not truncated to what room remains -- nothing at all.
-        let mut g = Gsbl::new(1);
+        let mut g = one();
         let huge = vec![b'x'; OUTSIZ + 1];
-        g.transmit(0, &huge);
-        assert!(g.drain_output(0).is_empty());
-        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+        g.transmit(chan(), &huge);
+        assert!(g.drain_output(chan()).is_empty());
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
     }
 
     #[test]
     fn an_oversized_binary_write_emits_nothing_and_queues_overflow_too() {
         // guide btuxct CAUTIONS page 182-183: the same rule for btuxct().
-        let mut g = Gsbl::new(1);
+        let mut g = one();
         let huge = vec![b'x'; OUTSIZ + 1];
-        g.transmit_raw(0, &huge);
-        assert!(g.drain_output(0).is_empty());
-        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
+        g.transmit_raw(chan(), &huge);
+        assert!(g.drain_output(chan()).is_empty());
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
     }
 
     #[test]
     fn an_overflowing_write_does_not_disturb_what_was_already_buffered() {
-        let mut g = Gsbl::new(1);
-        g.transmit(0, b"still here");
+        let mut g = one();
+        g.transmit(chan(), b"still here");
         let huge = vec![b'x'; OUTSIZ + 1];
-        g.transmit(0, &huge);
-        assert_eq!(g.next_status(0), Some(Gsbl::OVRFLW));
-        assert_eq!(g.drain_output(0), b"still here".to_vec());
+        g.transmit(chan(), &huge);
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
+        assert_eq!(g.drain_output(chan()), b"still here".to_vec());
     }
 
     #[test]
     fn draining_an_empty_buffer_raises_nothing_even_with_btuoes_on() {
         // Status 5 is "the output data buffer makes a transition from being
         // not empty to being empty". No transition, no status.
-        let mut g = Gsbl::new(1);
-        g.channel_mut(0).expect("channel 0").oes = true;
-        assert!(g.drain_output(0).is_empty());
-        assert_eq!(g.next_status(0), None);
+        let mut g = one();
+        g.channel_mut(chan()).oes = true;
+        assert!(g.drain_output(chan()).is_empty());
+        assert_eq!(g.next_status(chan()), None);
 
-        g.transmit(0, b"x");
-        let _ = g.drain_output(0);
-        assert_eq!(g.next_status(0), Some(Gsbl::OUTMT));
+        g.transmit(chan(), b"x");
+        let _ = g.drain_output(chan());
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OUTMT));
     }
 
+    /// `inject` no longer answers whether the channel existed, because it can
+    /// no longer be asked about one that does not. The two host-side callers
+    /// -- `begin_polling` and `Host::dopoll` -- discarded that answer, which is
+    /// the loose thread this type was introduced to cut.
     #[test]
-    fn a_status_can_be_injected_from_the_host_side_and_out_of_range_is_refused() {
-        let mut g = Gsbl::new(1);
-        assert!(g.inject(0, Gsbl::POLSTS), "channel 0 exists");
-        assert_eq!(g.next_status(0), Some(Gsbl::POLSTS));
-        assert_eq!(g.next_status(0), None, "one inject, one status");
-        assert!(!g.inject(1, Gsbl::POLSTS), "channel 1 does not exist at nterms 1");
-        assert!(!g.inject(-1, Gsbl::POLSTS), "and neither does -1");
+    fn a_status_can_be_injected_from_the_host_side() {
+        let mut g = one();
+        g.inject(chan(), Gsbl::POLSTS);
+        assert_eq!(g.next_status(chan()), Some(Gsbl::POLSTS));
+        assert_eq!(g.next_status(chan()), None, "one inject, one status");
     }
 }

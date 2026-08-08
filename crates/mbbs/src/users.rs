@@ -46,6 +46,7 @@ use std::io;
 use mbbs16::{FarPtr, Machine};
 
 use crate::ShimError;
+use crate::chan::{Chan, Terms};
 
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
 /// `0x29` the module strides by, not arithmetic from the declaration.
@@ -191,8 +192,10 @@ impl Connection {
 /// the module can address: `WCCMMUD.DLL` imports neither, and reaches the
 /// account block only through `uacoff`.
 pub struct Users {
-    /// How many channels there are: `nterms`.
-    terms: u16,
+    /// How many channels there are: `nterms`, and the only thing that mints a
+    /// [`Chan`] for these tables. The same value
+    /// [`Gsbl`](crate::gsbl::Gsbl) was built from -- see [`crate::chan`].
+    terms: Terms,
     /// `struct user *user` -- the head of the array the module indexes itself.
     users: FarPtr,
     /// `struct extusr *extusr`.
@@ -238,11 +241,12 @@ impl Users {
     /// # Errors
     ///
     /// If the heap has no room.
-    pub fn new(machine: &mut Machine, heap: &mut crate::Heap, terms: u16) -> io::Result<Self> {
+    pub fn new(machine: &mut Machine, heap: &mut crate::Heap, terms: Terms) -> io::Result<Self> {
+        let count = terms.count();
         let mut block = |each: u16| -> io::Result<FarPtr> {
             let bytes = each
-                .checked_mul(terms)
-                .ok_or_else(|| io::Error::other(format!("{terms} channels of {each} bytes")))?;
+                .checked_mul(count)
+                .ok_or_else(|| io::Error::other(format!("{count} channels of {each} bytes")))?;
             let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
             machine
                 .write(at, &vec![0u8; usize::from(bytes)])
@@ -265,10 +269,10 @@ impl Users {
         // that yields -1 rather than whatever precedes the block. That matters
         // because `usrnum` is -1 whenever nobody is on a channel, and
         // `channel[usrnum]` is what a module puts in a log line.
-        let words = terms
+        let words = count
             .checked_add(SENTINELS)
             .and_then(|words| words.checked_mul(2))
-            .ok_or_else(|| io::Error::other(format!("{terms} channels of channel[]")))?;
+            .ok_or_else(|| io::Error::other(format!("{count} channels of channel[]")))?;
         let base = heap.alloc(machine, words).map_err(io::Error::other)?;
         machine
             .write(base, &vec![0xffu8; usize::from(words)])
@@ -301,7 +305,7 @@ impl Users {
             accounts,
             channels,
             vda: None,
-            keys: vec![None; usize::from(terms)],
+            keys: vec![None; usize::from(count)],
         })
     }
 
@@ -325,16 +329,17 @@ impl Users {
         heap: &mut crate::Heap,
         size: u16,
     ) -> io::Result<()> {
+        let count = self.terms.count();
         let bytes = size
-            .checked_mul(self.terms)
-            .ok_or_else(|| io::Error::other(format!("{} channels of {size} bytes", self.terms)))?;
+            .checked_mul(count)
+            .ok_or_else(|| io::Error::other(format!("{count} channels of {size} bytes")))?;
         let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
         self.vda = Some((at, size));
         Ok(())
     }
 
-    /// How many channels there are.
-    pub fn terms(&self) -> u16 {
+    /// How many channels there are -- and the only thing that names one.
+    pub fn terms(&self) -> Terms {
         self.terms
     }
 
@@ -348,47 +353,46 @@ impl Users {
         self.channels
     }
 
-    /// `&user[unum]`, or `None` for a channel that does not exist.
-    pub fn slot(&self, unum: i16) -> Option<FarPtr> {
+    /// `&user[unum]`.
+    pub fn slot(&self, unum: Chan) -> FarPtr {
         self.nth(self.users, USER, unum)
     }
 
-    /// `&extusr[unum]`, or `None` for a channel that does not exist.
-    pub fn extra(&self, unum: i16) -> Option<FarPtr> {
+    /// `&extusr[unum]`.
+    pub fn extra(&self, unum: Chan) -> FarPtr {
         self.nth(self.extra, EXTUSR, unum)
     }
 
-    /// `uacoff(unum)` -- the channel's account record, or `None` for a channel
-    /// that does not exist.
-    pub fn account(&self, unum: i16) -> Option<FarPtr> {
+    /// `uacoff(unum)` -- the channel's account record.
+    pub fn account(&self, unum: Chan) -> FarPtr {
         self.nth(self.accounts, USRACC, unum)
     }
 
-    /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if there
-    /// is no such channel or [`Users::alcvda`] has not run.
+    /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if
+    /// [`Users::alcvda`] has not run.
     ///
     /// `MAJORBBS.C:1380`. Null before `alcvda` is the answer the real host's
     /// `vdaoff` gave too, because `vdahdl` was still null: every module's
     /// `dclvda` has to be counted before the size is known.
-    pub fn vda(&self, unum: i16) -> Option<FarPtr> {
+    ///
+    /// That is now the *only* thing a `None` here means. It used to mean either
+    /// that or "no such channel", and a caller could not tell which.
+    pub fn vda(&self, unum: Chan) -> Option<FarPtr> {
         let (base, size) = self.vda?;
-        self.nth(base, size, unum)
+        Some(self.nth(base, size, unum))
     }
 
-    /// What channel `unum` is allowed to do, or `None` if it never logged on
-    /// -- or if there is no such channel.
-    pub fn keys(&self, unum: i16) -> Option<&crate::KeySet> {
-        self.index(unum).and_then(|at| self.keys[at].as_ref())
+    /// What channel `unum` is allowed to do, or `None` if it never logged on.
+    ///
+    /// As with [`Users::vda`], the `None` now carries one meaning instead of
+    /// two.
+    pub fn keys(&self, unum: Chan) -> Option<&crate::KeySet> {
+        self.keys[unum.index()].as_ref()
     }
 
     /// Give channel `unum` a keyring. What `loadkeys()` did at logon.
-    ///
-    /// A channel that does not exist is a silent no-op, matching
-    /// [`Users::nth`]'s bound and `curusr`'s.
-    pub fn set_keys(&mut self, unum: i16, keys: crate::KeySet) {
-        if let Some(at) = self.index(unum) {
-            self.keys[at] = Some(keys);
-        }
+    pub fn set_keys(&mut self, unum: Chan, keys: crate::KeySet) {
+        self.keys[unum.index()] = Some(keys);
     }
 
     /// `user[unum].polrou` -- the channel's polling routine, or `None` for
@@ -401,9 +405,9 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// If `unum` names no channel, or the read runs off the segment.
-    pub fn polrou(&self, machine: &Machine, unum: i16) -> Result<Option<FarPtr>, ShimError> {
-        let bytes = machine.resolve(self.polrou_at(unum)?, 4)?;
+    /// If the read runs off the segment.
+    pub fn polrou(&self, machine: &Machine, unum: Chan) -> Result<Option<FarPtr>, ShimError> {
+        let bytes = machine.resolve(self.polrou_at(unum), 4)?;
         let rou = FarPtr::from_bytes(bytes.try_into().expect("4 bytes"));
         Ok((rou != FarPtr::NULL).then_some(rou))
     }
@@ -412,52 +416,51 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// If `unum` names no channel, or the write runs off the segment.
+    /// If the write runs off the segment.
     pub fn set_polrou(
         &mut self,
         machine: &mut Machine,
-        unum: i16,
+        unum: Chan,
         rou: Option<FarPtr>,
     ) -> Result<(), ShimError> {
-        let at = self.polrou_at(unum)?;
-        machine.write(at, &rou.unwrap_or(FarPtr::NULL).to_bytes())?;
+        machine.write(self.polrou_at(unum), &rou.unwrap_or(FarPtr::NULL).to_bytes())?;
         Ok(())
     }
 
     /// `&user[unum].polrou`.
-    ///
-    /// A channel that does not exist is an error here and a silent no-op in
-    /// [`Users::set_keys`], and the difference is deliberate: `set_keys` is
-    /// reached from `curusr`, whose documented behaviour for a bad channel is
-    /// to do nothing (`MAJORBBS.C:4293`), while every caller of this one is a
-    /// routine the module handed a channel number to.
-    fn polrou_at(&self, unum: i16) -> Result<FarPtr, ShimError> {
-        let slot = self
-            .slot(unum)
-            .ok_or_else(|| ShimError::Failed(format!("polrou({unum}): there is no such channel")))?;
-        Ok(FarPtr {
+    fn polrou_at(&self, unum: Chan) -> FarPtr {
+        let slot = self.slot(unum);
+        FarPtr {
             offset: slot.offset + user::POLROU,
             selector: slot.selector,
-        })
+        }
     }
 
-    /// `unum` as an index, or `None` if there is no such channel.
+    /// The `unum`th slot of a table of `each`-byte entries.
     ///
-    /// The same bound [`Users::nth`] applies -- `MAJORBBS.C:4293`'s
-    /// `if (0 <= uno && uno < nterms)` -- stated once so the four tables
-    /// cannot come to disagree about which channels exist.
-    fn index(&self, unum: i16) -> Option<usize> {
-        (unum >= 0 && unum < i16::try_from(self.terms).ok()?).then_some(unum as usize)
-    }
-
-    /// The `unum`th slot of a table of `each`-byte entries, or `None` if there
-    /// is no such channel.
-    fn nth(&self, base: FarPtr, each: u16, unum: i16) -> Option<FarPtr> {
-        let unum = u16::try_from(self.index(unum)?).ok()?;
-        Some(FarPtr {
-            offset: base.offset.checked_add(each.checked_mul(unum)?)?,
+    /// `MAJORBBS.C:4293`'s `if (0 <= uno && uno < nterms)` used to live here,
+    /// restated once per table. It lives in [`Terms::chan`] now, and a [`Chan`]
+    /// is what is left of having asked it.
+    ///
+    /// # Panics
+    ///
+    /// If the slot does not fit in the segment. Unreachable for a `Chan` of
+    /// this `Users`' own [`Terms`]: [`Users::new`] allocated `each * terms`
+    /// bytes at `base` and that allocation succeeded, so every offset below it
+    /// is addressable. A panic here means `unum` came from a larger `Terms`
+    /// than the one that sized these tables.
+    fn nth(&self, base: FarPtr, each: u16, unum: Chan) -> FarPtr {
+        let offset = u16::try_from(unum.index())
+            .ok()
+            .and_then(|unum| each.checked_mul(unum))
+            .and_then(|into| base.offset.checked_add(into))
+            .unwrap_or_else(|| {
+                panic!("channel {unum} is past the end of a table of {each}-byte slots")
+            });
+        FarPtr {
+            offset,
             selector: base.selector,
-        })
+        }
     }
 }
 
@@ -524,11 +527,14 @@ mod tests {
     fn every_channel_gets_a_slot_in_all_three_tables() {
         let f = crate::testing::Fixture::new();
         let users = f.host.users();
-        assert_eq!(users.terms(), 1, "one channel, as `nterms` says");
-        for unum in 0..users.terms() as i16 {
-            assert!(users.slot(unum).is_some(), "user[{unum}]");
-            assert!(users.extra(unum).is_some(), "extusr[{unum}]");
-            assert!(users.account(unum).is_some(), "uacoff({unum})");
+        assert_eq!(users.terms().count(), 1, "one channel, as `nterms` says");
+        for unum in users.terms().all() {
+            // Every one of these is infallible now, so what is left to assert
+            // is that the slots are distinct and inside the tables -- which
+            // `nth`'s own panic covers. The loop stands as the statement that
+            // every channel `terms` names has a slot in all three.
+            assert_ne!(users.slot(unum), users.extra(unum), "user[{unum}] vs extusr[{unum}]");
+            assert_ne!(users.slot(unum), users.account(unum), "user[{unum}] vs uacoff({unum})");
         }
     }
 
@@ -540,28 +546,35 @@ mod tests {
         // invisible until the day `nterms` moved.
         let mut machine = mbbs16::Machine::new().expect("machine");
         let mut heap = crate::Heap::new(crate::Config::default());
-        let users = Users::new(&mut machine, &mut heap, 4).expect("four channels");
-        let at = |n| users.slot(n).expect("placed").offset;
+        let terms = Terms::new(4);
+        let users = Users::new(&mut machine, &mut heap, terms).expect("four channels");
+        let ch = |n| terms.chan(n).expect("one of the four");
+        let at = |n| users.slot(ch(n)).offset;
         assert_eq!(at(1) - at(0), USER);
         assert_eq!(at(3) - at(2), USER);
         assert_eq!(
-            users.account(1).expect("placed").offset - users.account(0).expect("placed").offset,
+            users.account(ch(1)).offset - users.account(ch(0)).offset,
             USRACC
         );
     }
 
     #[test]
-    fn a_channel_that_does_not_exist_has_no_slot() {
+    fn a_channel_that_does_not_exist_cannot_be_named() {
         // `curusr`'s guard is `0 <= uno && uno < nterms`, so out of range has
         // to be answerable as *absent* rather than as some address. A table
         // that returned a pointer here would hand the module the bytes after
         // the last channel and call them channel 1.
+        //
+        // The guard is `Terms::chan` now, asked once, instead of one copy per
+        // table -- so this asserts that nothing past the end can be named at
+        // all, rather than that four separate lookups each said `None`.
         let f = crate::testing::Fixture::new();
-        let users = f.host.users();
-        assert!(users.slot(-1).is_none(), "there is no channel -1");
-        assert!(users.slot(users.terms() as i16).is_none(), "one past the end");
-        assert!(users.account(-1).is_none());
-        assert!(users.extra(-1).is_none());
+        let terms = f.host.users().terms();
+        assert!(terms.chan(-1).is_none(), "there is no channel -1");
+        assert!(
+            terms.chan(terms.count() as i16).is_none(),
+            "one past the end"
+        );
     }
 
     #[test]
@@ -571,7 +584,8 @@ mod tests {
         // whose `state` came up as whatever the heap last held would be in some
         // module the module never entered.
         let f = crate::testing::Fixture::new();
-        let at = f.host.users().slot(0).expect("channel 0");
+        let console = f.console();
+        let at = f.host.users().slot(console);
         let bytes = f.machine.resolve(at, usize::from(USER)).expect("readable");
         assert!(bytes.iter().all(|b| *b == 0), "a fresh channel is all zero");
     }
@@ -583,9 +597,10 @@ mod tests {
         // Null here is not "no users" -- it is a segment-zero dereference at
         // the module's first `user[0].state`.
         let f = crate::testing::Fixture::new();
+        let console = f.console();
         let head = f.host.globals().pointer(&f.machine, "user").expect("user");
         assert_ne!(head, mbbs16::FarPtr::NULL, "the module dereferences this");
-        assert_eq!(head, f.host.users().slot(0).expect("channel 0"));
+        assert_eq!(head, f.host.users().slot(console));
         assert_eq!(head, f.host.users().head());
     }
 
@@ -645,6 +660,7 @@ mod tests {
         // is a separate block, not a slot -- `fsdapr(vdaptr, vdasiz, vdatmp)`
         // hands the FSD both at once and they must not be the same bytes.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
         f.host.alcvda(&mut f.machine).expect("allocated");
 
@@ -654,7 +670,7 @@ mod tests {
         assert_ne!(area, mbbs16::FarPtr::NULL);
         assert_ne!(temp, mbbs16::FarPtr::NULL);
         assert_ne!(area, temp, "the area and the scratch copy are two blocks");
-        assert_eq!(area, f.host.users().vda(0).expect("channel 0"));
+        assert_eq!(area, f.host.users().vda(console).expect("allocated"));
     }
 
     #[test]
@@ -675,10 +691,11 @@ mod tests {
         //   if ((usaptr[0xd0] & 1) == 0 || usaptr[0xd3] < 0x17 || usaptr[0xd1] < 0x50)
         // Fail any of the three and MajorMUD prints the degraded rendering.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0");
-        let at = f.host.users().account(0).expect("channel 0");
+        let at = f.host.users().account(console);
         let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
 
         assert_eq!(&rec[..9], b"rangerdan", "userid keys the character lookup");
@@ -690,10 +707,11 @@ mod tests {
     #[test]
     fn a_connection_names_the_channel_the_module_will_run_on() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0");
-        let at = f.host.users().slot(0).expect("channel 0");
+        let at = f.host.users().slot(console);
         let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
         assert_eq!(rec[user::STATE as usize], 0, "state is set by connect()");
         assert_eq!(rec[user::SUBSTT as usize], 0);
@@ -708,11 +726,12 @@ mod tests {
         // lose the tail of the name, not spill into the password field that
         // follows it.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let long = "a".repeat(40);
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi(&long))
+            .connect_state(&mut f.machine, console, &Connection::ansi(&long))
             .expect("channel 0");
-        let at = f.host.users().account(0).expect("channel 0");
+        let at = f.host.users().account(console);
         let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
 
         assert_eq!(&rec[..29], vec![b'a'; 29].as_slice(), "29 characters, not 30");
@@ -732,14 +751,15 @@ mod tests {
         // `obtbtvl` keys the character lookup on (`WCCMMUD_named.c:9847`), so
         // that splice hands the second user someone else's identity.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0, first connect");
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("dan"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("dan"))
             .expect("channel 0, second connect");
 
-        let at = f.host.users().account(0).expect("channel 0");
+        let at = f.host.users().account(console);
         let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
 
         assert_eq!(&rec[..3], b"dan", "the second userid");
@@ -750,11 +770,14 @@ mod tests {
         );
     }
 
+    /// `connect_state` no longer has a refusal of its own to make -- the caller
+    /// cannot name a channel past the end to hand it. This asserts the refusal
+    /// where it lives now.
     #[test]
-    fn connect_state_refuses_a_channel_that_does_not_exist() {
-        let mut f = crate::testing::Fixture::new();
-        let past = f.host.users().terms() as i16;
-        assert!(f.host.connect_state(&mut f.machine, past, &Connection::ansi("rangerdan")).is_err());
+    fn a_channel_past_the_end_cannot_be_connected_because_it_cannot_be_named() {
+        let f = crate::testing::Fixture::new();
+        let terms = f.host.users().terms();
+        assert!(terms.chan(terms.count() as i16).is_none());
     }
 
     #[test]
@@ -763,16 +786,18 @@ mod tests {
         // channel that logged on holding nothing, and `low_haskey` answers the
         // two differently; see `shims::user::haskey`.
         let f = crate::testing::Fixture::new();
-        assert!(f.host.users().keys(0).is_none());
+        let console = f.console();
+        assert!(f.host.users().keys(console).is_none());
     }
 
     #[test]
     fn connecting_gives_the_channel_the_keys_it_arrived_with() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let who = Connection::ansi("rangerdan").with_keys(["USER"]);
-        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+        f.host.connect_state(&mut f.machine, console, &who).expect("channel 0");
 
-        let keys = f.host.users().keys(0).expect("the channel logged on");
+        let keys = f.host.users().keys(console).expect("the channel logged on");
         assert!(keys.evaluate("USER"));
         assert!(!keys.evaluate("WCCSYSOP"));
     }
@@ -785,11 +810,12 @@ mod tests {
         // is true for a channel holding nothing and false for one that never
         // logged on.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0");
 
-        let keys = f.host.users().keys(0).expect("logged on, holding nothing");
+        let keys = f.host.users().keys(console).expect("logged on, holding nothing");
         assert!(keys.evaluate(""), "an empty lock is true once logged on");
         assert!(!keys.evaluate("USER"));
     }
@@ -800,22 +826,23 @@ mod tests {
         // that already held a user, and the second user must not inherit the
         // first one's access.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &Connection::ansi("sysop").with_keys(["USER", "WCCSYSOP"]),
             )
             .expect("first connect");
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &Connection::ansi("guest").with_keys(["USER"]),
             )
             .expect("second connect");
 
-        let keys = f.host.users().keys(0).expect("logged on");
+        let keys = f.host.users().keys(console).expect("logged on");
         assert!(keys.evaluate("USER"));
         assert!(!keys.evaluate("WCCSYSOP"), "the sysop's key did not survive");
     }
@@ -827,10 +854,11 @@ mod tests {
         // 0x10, so this bit is host-private -- written for fidelity, and because
         // a host that kept the flag only in Rust would have `user.flags` lying.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let who = Connection::ansi("root").with_keys(["USER"]).master(true);
-        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+        f.host.connect_state(&mut f.machine, console, &who).expect("channel 0");
 
-        let at = f.host.users().slot(0).expect("channel 0");
+        let at = f.host.users().slot(console);
         let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
         assert_eq!(rec[user::FLAGS as usize] & 0x40, 0x40);
     }
@@ -843,16 +871,17 @@ mod tests {
         // direction matters too: a channel reused by a non-master must not keep
         // the last user's master flag.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &Connection::ansi("root").master(true),
             )
             .expect("first connect");
 
         // Whatever the module had set in the rest of the byte.
-        let at = f.host.users().slot(0).expect("channel 0");
+        let at = f.host.users().slot(console);
         let flags = mbbs16::FarPtr {
             offset: at.offset + user::FLAGS,
             selector: at.selector,
@@ -861,7 +890,7 @@ mod tests {
         f.machine.write(flags, &[was | 0x16]).expect("in bounds");
 
         f.host
-            .connect_state(&mut f.machine, 0, &Connection::ansi("guest"))
+            .connect_state(&mut f.machine, console, &Connection::ansi("guest"))
             .expect("second connect");
 
         let now = f.machine.resolve(flags, 1).expect("in bounds")[0];
@@ -872,23 +901,24 @@ mod tests {
     #[test]
     fn polrou_round_trips_through_the_bytes_the_module_reads() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let rou = mbbs16::FarPtr {
             offset: 0x2184,
             selector: 0x1010,
         };
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             None,
             "a fresh slot is NULL, because alczer zeroed it"
         );
 
         f.host
             .users
-            .set_polrou(&mut f.machine, 0, Some(rou))
+            .set_polrou(&mut f.machine, console, Some(rou))
             .expect("channel 0");
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             Some(rou)
         );
 
@@ -902,7 +932,7 @@ mod tests {
         // only prove the accessor agrees with itself. The literal is the
         // independent statement of `MAJORBBS.H:90`'s offset that makes a wrong
         // `POLROU` observable.
-        let slot = f.host.users().slot(0).expect("channel 0");
+        let slot = f.host.users().slot(console);
         let at = mbbs16::FarPtr {
             offset: slot.offset + 0x24,
             selector: slot.selector,
@@ -915,7 +945,7 @@ mod tests {
 
         f.host
             .users
-            .set_polrou(&mut f.machine, 0, None)
+            .set_polrou(&mut f.machine, console, None)
             .expect("channel 0");
         assert_eq!(
             f.machine.resolve(at, 4).expect("in the slot"),
@@ -924,10 +954,14 @@ mod tests {
         );
     }
 
+    /// Likewise: `polrou` used to answer `Err` for a channel that did not
+    /// exist, and now cannot be asked about one. Its `Err` is a segment fault
+    /// and nothing else.
     #[test]
-    fn polrou_refuses_a_channel_that_does_not_exist() {
+    fn polrou_cannot_be_asked_about_a_channel_that_does_not_exist() {
         let f = crate::testing::Fixture::new();
-        assert!(f.host.users().polrou(&f.machine, 1).is_err(), "nterms is 1");
-        assert!(f.host.users().polrou(&f.machine, -1).is_err());
+        let terms = f.host.users().terms();
+        assert!(terms.chan(1).is_none(), "nterms is 1");
+        assert!(terms.chan(-1).is_none());
     }
 }

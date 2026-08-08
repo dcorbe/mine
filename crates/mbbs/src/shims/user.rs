@@ -30,11 +30,12 @@ use crate::gsbl::Gsbl;
 /// class of quiet wrongness this crate refuses, so the module stops instead.
 pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let unum = machine.arg_u16(0) as i16;
-    let at = host
+    let chan = host
         .users()
-        .account(unum)
+        .terms()
+        .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("uacoff({unum}): there is no such channel")))?;
-    Ok(Ret::Far(at))
+    Ok(Ret::Far(host.users().account(chan)))
 }
 
 /// `void curusr(int uno)` -- make `uno` the current channel.
@@ -67,14 +68,14 @@ pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// range check stays here and the body that does not vary moved out.
 pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let uno = machine.arg_u16(0) as i16;
-    if host.users().slot(uno).is_none() {
+    let Some(chan) = host.users().terms().chan(uno) else {
         host.note_once(
             "curusr",
             format!("curusr({uno}): there is no such channel, so nothing changed"),
         );
         return Ok(Ret::Void);
-    }
-    host.point_curusr(machine, uno)?;
+    };
+    host.point_curusr(machine, chan)?;
     Ok(Ret::Void)
 }
 
@@ -93,10 +94,15 @@ pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// [`Host::poll`](crate::Host::poll) needs it too and this is the one call
 /// site among the two that has an argument stack to read from at all.
 pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = host
+    let usrnum = host
         .globals()
         .word(machine, "usrnum")
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(usrnum)
+        .ok_or_else(|| ShimError::Failed(format!("getin: usrnum {usrnum} names no channel")))?;
     let margv0 = host.get_input(machine, chan)?;
     Ok(Ret::Far(margv0))
 }
@@ -155,23 +161,22 @@ pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .word(machine, "usrnum")
         .map_err(|e| ShimError::Failed(format!("haskey: usrnum: {e}")))? as i16;
 
-    let answer = match host.users().keys(unum) {
-        Some(keys) => keys.evaluate(&lock),
-        // `LOCKNKEY.C:194`. Two cases arrive here and they are not the same
-        // one, which is why this is not a bare `false`:
-        None => match host.users().slot(unum) {
+    // `LOCKNKEY.C:194`. Three cases, and they are not the same one -- which is
+    // why this is not a bare `false`. The outermost is "no such channel":
+    // `usrnum` is -1 for as long as nobody is on one (`MAJORBBS.C:740`'s
+    // sentinels exist for exactly that value), and there is nobody to hold a
+    // key. **Not** an error: asking `Host::class` there would stop the module
+    // over a state the real host was in whenever the board was idle.
+    let answer = match host.users().terms().chan(unum) {
+        None => false,
+        Some(chan) => match host.users().keys(chan) {
+            Some(keys) => keys.evaluate(&lock),
             // A channel that exists but never logged on -- `keys == NULL`.
             // Answered by class, and `usrcls` is 0 here, so it refuses; the
             // comparison is written out rather than folded away so that it
             // starts telling the truth on its own the day this host grows an
             // internal channel.
-            Some(_) => host.class(machine, unum)? == BBSPRV,
-            // No such channel. `usrnum` is -1 for as long as nobody is on one
-            // (`MAJORBBS.C:740`'s sentinels exist for exactly that value), and
-            // there is nobody to hold a key. **Not** an error: asking
-            // `Host::class` here would stop the module over a state the real
-            // host was in whenever the board was idle.
-            None => false,
+            None => host.class(machine, chan)? == BBSPRV,
         },
     };
     host.asked_for_key(unum, &lock, answer);
@@ -204,10 +209,20 @@ pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
             "begin_polling({unum}): a null polling routine"
         )));
     }
-    if host.users().polrou(machine, unum)?.is_none() && host.inpolr != Some(unum) {
-        host.gsbl_mut().inject(unum, Gsbl::POLSTS);
+    // One `Chan`, minted once, and then used to reach both `Users` and `Gsbl`.
+    // That is the whole of the fix: these two lines used to resolve the channel
+    // through `Users`' bound and then inject into `Gsbl`'s, which named the same
+    // channel only for as long as the two tables were the same length -- and
+    // `inject`'s `false` for "no such channel" was discarded right here.
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("begin_polling({unum}): there is no such channel")))?;
+    if host.users().polrou(machine, chan)?.is_none() && host.inpolr != Some(chan) {
+        host.gsbl_mut().inject(chan, Gsbl::POLSTS);
     }
-    host.users.set_polrou(machine, unum, Some(rouptr))
+    host.users.set_polrou(machine, chan, Some(rouptr))
         .map(|()| Ret::Void)
 }
 
@@ -223,7 +238,12 @@ pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
 /// If `unum` names no channel.
 pub fn stop_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let unum = machine.arg_u16(0) as i16;
-    host.users.set_polrou(machine, unum, None).map(|()| Ret::Void)
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("stop_polling({unum}): there is no such channel")))?;
+    host.users.set_polrou(machine, chan, None).map(|()| Ret::Void)
 }
 
 /// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
@@ -237,10 +257,11 @@ mod tests {
     #[test]
     fn uacoff_hands_back_the_channels_account_record() {
         let mut f = Fixture::new();
+        let console = f.console();
         let Ret::Far(at) = f.invoke(uacoff, &[0]).expect("channel 0") else {
             panic!("uacoff returns a pointer");
         };
-        assert_eq!(at, f.host.users().account(0).expect("channel 0"));
+        assert_eq!(at, f.host.users().account(console));
     }
 
     #[test]
@@ -250,24 +271,25 @@ mod tests {
         // There is no answer here that is not a lie, so the module stops.
         let mut f = Fixture::new();
         assert!(f.invoke(uacoff, &[-1i16 as u16]).is_err());
-        let past = f.host.users().terms();
+        let past = f.host.users().terms().count();
         assert!(f.invoke(uacoff, &[past]).is_err());
     }
 
     #[test]
     fn curusr_repoints_every_global_that_names_the_current_channel() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(curusr, &[0]).expect("channel 0");
 
         let g = f.host.globals();
         assert_eq!(g.word(&f.machine, "usrnum").expect("usrnum") as i16, 0);
         assert_eq!(
             g.pointer(&f.machine, "usrptr").expect("usrptr"),
-            f.host.users().slot(0).expect("channel 0")
+            f.host.users().slot(console)
         );
         assert_eq!(
             g.pointer(&f.machine, "usaptr").expect("usaptr"),
-            f.host.users().account(0).expect("channel 0")
+            f.host.users().account(console)
         );
     }
 
@@ -279,6 +301,7 @@ mod tests {
         // at that point. `WCCMMUD.DLL` tests `usrptr` for null in two places;
         // handing it a pointer to nothing would be worse than handing it zero.
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(curusr, &[0]).expect("channel 0");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
@@ -290,7 +313,7 @@ mod tests {
         f.invoke(curusr, &[0]).expect("channel 0 again");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            f.host.users().vda(0).expect("channel 0")
+            f.host.users().vda(console).expect("allocated")
         );
     }
 
@@ -325,8 +348,9 @@ mod tests {
     #[test]
     fn getin_takes_a_ready_line_and_hands_back_its_first_argument() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.invoke(curusr, &[0]).expect("channel 0");
-        f.host.gsbl_mut().push_input(0, b"get all gold\r");
+        f.host.gsbl_mut().push_input(console, b"get all gold\r");
 
         let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
             panic!("getin returns char *margv[0]");
@@ -363,10 +387,11 @@ mod tests {
     #[test]
     fn haskey_answers_for_the_channel_usrnum_names() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
             )
             .expect("channel 0");
@@ -417,10 +442,11 @@ mod tests {
         // second channel to catch that with, so the discriminator has to be a
         // channel that *would* answer differently if it were the one read.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
             )
             .expect("channel 0");
@@ -445,10 +471,11 @@ mod tests {
         // covered above -- plus an expression, which only works if the whole
         // string arrived.
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
             )
             .expect("channel 0");
@@ -467,10 +494,11 @@ mod tests {
         // shim uppercases a host-side copy instead. Pinned so the deviation is a
         // decision with a test rather than something a later reader "fixes".
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
             )
             .expect("channel 0");
@@ -488,17 +516,18 @@ mod tests {
     #[test]
     fn begin_polling_installs_the_routine_and_injects_one_status() {
         let mut f = Fixture::new();
+        let console = f.console();
         let rou = f.machine.code_ptr(0);
 
         f.invoke(begin_polling, &[0, rou.offset, rou.selector])
             .expect("installed");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             Some(rou)
         );
-        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
-        assert_eq!(f.host.gsbl_mut().next_status(0), None, "exactly one");
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::POLSTS));
+        assert_eq!(f.host.gsbl_mut().next_status(console), None, "exactly one");
     }
 
     /// The guard that keeps the status queue from doubling every tick.
@@ -507,19 +536,20 @@ mod tests {
     #[test]
     fn begin_polling_injects_nothing_while_that_channel_is_inside_its_poll_routine() {
         let mut f = Fixture::new();
+        let console = f.console();
         let rou = f.machine.code_ptr(0);
-        f.host.inpolr = Some(0);
+        f.host.inpolr = Some(console);
 
         f.invoke(begin_polling, &[0, rou.offset, rou.selector])
             .expect("installed");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             Some(rou),
             "the routine is still installed"
         );
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "but nothing is injected -- dopoll will do that on return"
         );
@@ -529,23 +559,24 @@ mod tests {
     #[test]
     fn begin_polling_injects_nothing_when_the_channel_is_already_polling() {
         let mut f = Fixture::new();
+        let console = f.console();
         let first = f.machine.code_ptr(0);
         let second = f.machine.code_ptr(1);
 
         f.invoke(begin_polling, &[0, first.offset, first.selector])
             .expect("installed");
-        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::POLSTS));
 
         f.invoke(begin_polling, &[0, second.offset, second.selector])
             .expect("replaced");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             Some(second),
             "the new routine replaces the old one"
         );
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "and no second status is queued"
         );
@@ -554,18 +585,19 @@ mod tests {
     #[test]
     fn stop_polling_clears_the_routine_and_injects_nothing() {
         let mut f = Fixture::new();
+        let console = f.console();
         let rou = f.machine.code_ptr(0);
         f.invoke(begin_polling, &[0, rou.offset, rou.selector])
             .expect("installed");
-        let _ = f.host.gsbl_mut().next_status(0);
+        let _ = f.host.gsbl_mut().next_status(console);
 
         f.invoke(stop_polling, &[0]).expect("stopped");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             None
         );
-        assert_eq!(f.host.gsbl_mut().next_status(0), None);
+        assert_eq!(f.host.gsbl_mut().next_status(console), None);
     }
 
     #[test]
@@ -586,9 +618,10 @@ mod tests {
     #[test]
     fn a_null_polling_routine_is_refused_rather_than_installed() {
         let mut f = Fixture::new();
+        let console = f.console();
         assert!(f.invoke(begin_polling, &[0, 0, 0]).is_err());
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "and nothing is injected on the way out"
         );
