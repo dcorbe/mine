@@ -575,12 +575,20 @@ impl Channel {
             }
             supplied_lf = false;
             if self.width != 0 && column >= self.width {
-                Self::wrap(&mut out, &mut column, self.width);
-                if byte == b' ' {
+                let carried = Self::wrap(&mut out, &mut column, self.width);
+                if byte == b' ' && carried == 0 {
                     // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
                     // *becomes* the break `wrap()` just inserted, so it is
                     // consumed here rather than carried onto the new line as
                     // a leading indent.
+                    //
+                    // Only when `wrap()` carried nothing, though. When it moved
+                    // a partial word down, this space is not the break: it is
+                    // the separator *after* the word that just moved, and
+                    // consuming it glues that word to the next one. Measured
+                    // against the real module as `thisis`, `andthese`,
+                    // `Streetslead` -- one space lost per wrapped line of the
+                    // first paragraph of world text this host ever drew.
                     continue;
                 }
             }
@@ -609,6 +617,15 @@ impl Channel {
     /// Word wrap rather than a hard break: the guide calls `btutsw` wrapping output at word boundaries, and a host that broke mid-word would split every name the
     /// module printed near the margin.
     ///
+    /// Returns **how many bytes it carried onto the new line**, which the
+    /// caller needs in order to decide the fate of the byte that triggered the
+    /// wrap: only a wrap that carried nothing may swallow a triggering SPACE
+    /// (R9). A word at least `width` long has no boundary to break on, so it is
+    /// pushed back and broken at the margin, carrying nothing -- which means
+    /// the answer is always below `width`, and the SPACE a caller writes after
+    /// a carried word therefore always fits on the new line without itself
+    /// re-triggering the wrap.
+    ///
     /// Finding 7 (not fixed) -- **invariant: do not drain `output` mid-line
     /// while `width != 0`.** This recovers the trailing partial word by
     /// popping it back off `output` itself, so whatever the current line has
@@ -624,7 +641,7 @@ impl Channel {
     /// same problem. Real GSBL gets away with this because a 2400-baud UART
     /// never empties the buffer faster than the module fills it. Leave the
     /// fix to whoever builds the transport.
-    fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16) {
+    fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16) -> u16 {
         let mut word = Vec::new();
         while let Some(&back) = out.last() {
             if back == b' ' || back == b'\n' || back == b'\r' {
@@ -650,6 +667,11 @@ impl Channel {
             out.push(byte);
             *column += 1;
         }
+        // The loop above counted the carried word into `*column` from zero, so
+        // the new column *is* the carried length. Reported rather than left for
+        // the caller to recompute: it cannot be re-derived from `out` once the
+        // caller has pushed the triggering byte onto it.
+        *column
     }
 }
 
@@ -917,6 +939,177 @@ mod tests {
         g.channel_mut(chan()).width = 10;
         g.transmit(chan(), b"0123456789 abc");
         assert_eq!(g.drain_output(chan()), b"0123456789\r\nabc".to_vec());
+    }
+
+    #[test]
+    fn a_word_carried_down_by_the_wrap_keeps_the_space_that_followed_it() {
+        // The other half of R9, and the half that was wrong. When `wrap` carries
+        // a partial word onto the new line, the space that triggered the wrap is
+        // the separator *after* that word -- consuming it glues the next word
+        // on. Measured against the real module: a MajorMUD room description came
+        // out "thisis the centre of Silvermere."
+        //
+        // Asserted as a string rather than the byte vector the tests above use:
+        // the whole difference is one 0x20, and a `[49, 50, ...]` diff does not
+        // show it.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 this is");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345\r\nthis is",
+            "the carried word keeps its trailing separator"
+        );
+    }
+
+    #[test]
+    fn a_word_carried_down_by_the_wrap_is_not_glued_to_a_following_letter() {
+        // The same carry as above, but the byte that triggered the wrap is not a
+        // space -- so R9 never applied and this shape was always right. Pinned
+        // because the fix is a condition on that byte, and a fix written the
+        // wrong way round (`carried != 0` consuming instead of keeping) would
+        // eat this `e` and lose a letter rather than a space.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 abcdefgh");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345\r\nabcdefgh",
+            "the trigger byte was a letter, so it is carried, never consumed"
+        );
+    }
+
+    #[test]
+    fn a_single_byte_word_carried_down_by_the_wrap_keeps_its_space() {
+        // The smallest carry there is: one byte. `wrap` reports 1, and a fix
+        // that reported the carry off by one would read that as nothing carried
+        // and glue `9x`.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345678 9 x");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345678\r\n9 x",
+            "a one-byte carry is still a carry"
+        );
+    }
+
+    #[test]
+    fn the_longest_possible_carry_leaves_room_for_the_space_it_kept() {
+        // The largest carry there is. A carried word is at most `width - 1`
+        // bytes -- a word `width` long or longer is pushed back and broken at
+        // the margin, carrying nothing -- so the space this now keeps can always
+        // be written without itself re-triggering the wrap. Here the carry is
+        // exactly 9 of a width of 10: the space lands on the last column, and it
+        // is the *next* byte that wraps, where `wrap` finds a line ending in a
+        // space, carries nothing, and R9 applies again.
+        //
+        // The leading `\r\n` is not this fix: `wrap` strips the trailing spaces
+        // of what is left after it lifts the word off, and here that is the
+        // line's only other byte. It comes out identically without the fix.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b" abcdefghi jk");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "\r\nabcdefghi\r\njk",
+            "a width-1 carry plus its space fills the line exactly"
+        );
+    }
+
+    #[test]
+    fn two_wraps_in_one_call_each_keep_their_own_separator() {
+        // One `transmit` can wrap many times, and `column` is not reset between
+        // them -- so a fix that only got the first wrap right would still glue
+        // the rest of a paragraph. This is the reduced form of what the real
+        // module drew: three wraps, three lost spaces.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 this is here");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345\r\nthis is\r\nhere",
+            "two wraps, and neither eats a separator it did not create"
+        );
+    }
+
+    #[test]
+    fn the_space_a_wrap_restores_occupies_a_column_like_any_other() {
+        // The space is *written*, not merely not-swallowed, so it takes a column
+        // and the next break falls one byte earlier than it otherwise would.
+        //
+        // This is the one thing none of the tests above can see. A fix that
+        // pushed the byte and forgot the `column += 1` -- an easy one to write,
+        // since the path it replaces was a `continue` that skipped the
+        // increment -- produces byte-identical output for every input where the
+        // line wraps only once more, and was measured passing all seven of
+        // them. Two wraps after the restored space is what exposes it: at the
+        // second wrap the line reads `this is ok`, ten columns exactly, so `ok`
+        // is carried and the break lands before it. Under-count the space and
+        // the line is allowed an eleventh column and the break lands after it.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 this is ok now");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345\r\nthis is\r\nok now",
+            "the restored space is a column of the new line"
+        );
+    }
+
+    #[test]
+    fn a_wrap_at_the_start_of_a_second_call_still_consumes_its_space() {
+        // `column` crosses a `transmit` boundary but `out` does not: the second
+        // call's `wrap` looks back into an empty buffer, finds no partial word,
+        // and carries nothing -- so R9 holds and the space becomes the break.
+        // That is the right answer here and not merely a limitation: the first
+        // call filled the line to the width exactly, so the space really is at
+        // the margin.
+        //
+        // Pinned because it is the one wrap where nothing can be carried for a
+        // reason other than the word's length, and the fix must not start
+        // emitting a leading space on the new line.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 this");
+        g.transmit(chan(), b" is");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345 this\r\nis",
+            "nothing to carry across the call boundary, so R9 still applies"
+        );
+    }
+
+    #[test]
+    fn a_carried_word_does_not_disturb_the_module_s_own_crlf() {
+        // R1's `supplied_lf` is cleared before the width check, so a wrap that
+        // now writes a space instead of swallowing one must not leave the CR/LF
+        // bookkeeping in a state that doubles the module's own linefeed.
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"12345 this is\r\nx");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "12345\r\nthis is\r\nx",
+            "the module's explicit CRLF is still emitted exactly once"
+        );
+    }
+
+    #[test]
+    fn a_second_space_at_the_wrap_survives_as_an_indent_on_the_new_line() {
+        // R9 consumes the space that *becomes* the break, and only that one. A
+        // second space behind it is at column 0 of the new line, below the
+        // width, and is written like any other byte. Unchanged by the fix --
+        // pinned so that "the space is kept when a word was carried" is not
+        // mistaken for "spaces at a wrap are kept".
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"0123456789  x");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "0123456789\r\n x",
+            "one space became the break; the other is ordinary output"
+        );
     }
 
     #[test]
