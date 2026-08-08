@@ -297,34 +297,56 @@ impl Gsbl {
     /// `Gsbl`'s bound and then index `Users` with the result, which was correct
     /// only for as long as the two bounds happened to match.
     pub fn scan(&mut self) -> Option<Chan> {
-        let count = self.terms.count();
-        for step in 0..count {
-            let index = (self.next + step) % count;
-            if !self.channels[usize::from(index)].status.is_empty() {
-                self.next = (index + 1) % count;
-                // Through the same mint every other caller uses, rather than a
-                // private constructor: `index` is below `terms.count()`, so
-                // this cannot refuse -- and if it ever does, the two have come
-                // apart and that is worth a panic.
-                return Some(
-                    self.terms
-                        .chan(index as i16)
-                        .expect("scan indexed its own channels"),
-                );
-            }
-        }
-        None
+        let index = self.peek()?;
+        // Past the channel that *required service*, not past wherever this scan
+        // started looking. With an idle channel between two busy ones the two
+        // differ, and advancing from the cursor would leave it short by the size
+        // of the gap -- so the channel past the gap would take two turns a
+        // round. Both spellings pass a test suite whose channels are adjacent,
+        // which is how this survived review once.
+        self.next = (index + 1) % self.terms.count();
+        // Through the same mint every other caller uses, rather than a private
+        // constructor: `index` is below `terms.count()`, so this cannot refuse
+        // -- and if it ever does, the two have come apart and that is worth a
+        // panic.
+        Some(
+            self.terms
+                .chan(index as i16)
+                .expect("scan indexed its own channels"),
+        )
     }
 
     /// Whether any channel has a status waiting, without advancing the rotation.
     ///
-    /// [`Host::cycle`](crate::Host::cycle) tests before
-    /// [`Host::poll`](crate::Host::poll) takes. Were that test to advance the
-    /// cursor, every second channel would be skipped -- a starvation bug
-    /// introduced by the fix for a starvation bug.
+    /// [`Host::cycle`](crate::Host::cycle) asks this to decide whether it is
+    /// idle. Were the question to advance the cursor, every second channel
+    /// would be skipped -- a starvation bug introduced by the fix for a
+    /// starvation bug.
+    ///
+    /// Answering a wrong `false` is the dangerous direction: the host reports
+    /// [`Ended::Idle`](crate::Ended) and stops while a channel still holds a
+    /// queued status.
     #[must_use]
     pub fn pending(&self) -> bool {
-        self.channels.iter().any(|c| !c.status.is_empty())
+        self.peek().is_some()
+    }
+
+    /// The channel [`Gsbl::scan`] would name, without naming it.
+    ///
+    /// The rotation's search with the cursor move left out, so that `scan` and
+    /// [`Gsbl::pending`] cannot come to disagree about what counts as work.
+    /// They spelled the predicate separately once, and a `pending` that read
+    /// only channel zero passed all 739 tests.
+    ///
+    /// `self.next + step` cannot overflow: [`Terms::new`] caps a count at
+    /// `i16::MAX`, so both terms are below 32,767 and the sum is below
+    /// `u16::MAX`. That cap is three units of headroom away from being
+    /// load-bearing, and it lives in another module -- hence this sentence.
+    fn peek(&self) -> Option<u16> {
+        let count = self.terms.count();
+        (0..count)
+            .map(|step| (self.next + step) % count)
+            .find(|&index| !self.channels[usize::from(index)].status.is_empty())
     }
 
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
@@ -1030,6 +1052,60 @@ mod tests {
         assert_eq!(gsbl.scan().map(Chan::number), Some(0));
         gsbl.next_status(zero).expect("popped");
         assert_eq!(gsbl.scan(), None, "every queue is empty");
+    }
+
+    #[test]
+    fn a_channel_other_than_the_first_is_enough_to_be_pending() {
+        // `pending` is the whole of `Host::cycle`'s idle test: answering "no"
+        // while a channel still holds a status is how the host stops with work
+        // queued. At one channel the only channel *is* channel 0, so an
+        // implementation that looks no further is indistinguishable there --
+        // and wrong the moment there are two. A `pending` reading only
+        // `channels[0]` passed all 739 tests before this existed, because the
+        // one test that touched it injected into channel 0 as well, and
+        // nothing anywhere asserted `pending()` was ever false.
+        let terms = Terms::new(3);
+        let mut gsbl = Gsbl::new(terms);
+        let two = terms.chan(2).expect("channel 2");
+
+        assert!(!gsbl.pending(), "a fresh host has nothing to service");
+        gsbl.inject(two, Gsbl::CRSTG);
+        assert!(gsbl.pending(), "channel 2's status is work like any other");
+        gsbl.next_status(two).expect("popped");
+        assert!(!gsbl.pending(), "and it stops being work once taken");
+    }
+
+    #[test]
+    fn the_cursor_resumes_after_the_channel_it_returned_not_where_it_started() {
+        // Guide, `btuscn` page 144: subsequent calls resume at the channel after the last one reported -- following the channel that *required
+        // service*, not following wherever this scan began looking. With an
+        // idle channel between two busy ones, advancing from the old cursor
+        // instead leaves it short by the size of the gap, and the channel past
+        // the gap takes two turns a round.
+        //
+        // Every other rotation test here uses adjacent channels, where
+        // `next + 1` and `index + 1` are the same number, or drains its queues
+        // so the divergence never changes an answer. This one keeps both
+        // channels busy across a gap, which is the only shape that tells them
+        // apart.
+        let terms = Terms::new(3);
+        let mut gsbl = Gsbl::new(terms);
+        let zero = terms.chan(0).expect("channel 0");
+        let two = terms.chan(2).expect("channel 2");
+
+        for _ in 0..6 {
+            gsbl.inject(zero, Gsbl::CRSTG);
+            gsbl.inject(two, Gsbl::CRSTG);
+        }
+
+        let served: Vec<i16> = (0..6)
+            .map(|_| {
+                let chan = gsbl.scan().expect("a channel with a status");
+                gsbl.next_status(chan).expect("the status scan just found");
+                chan.number()
+            })
+            .collect();
+        assert_eq!(served, vec![0, 2, 0, 2, 0, 2], "one turn each, per round");
     }
 
     #[test]

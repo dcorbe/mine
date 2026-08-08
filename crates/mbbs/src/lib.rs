@@ -1416,21 +1416,26 @@ impl Host {
         while iterations < max {
             iterations += 1;
 
-            if self.gsbl().pending() {
-                match self.poll(machine, module)? {
-                    Some(Outcome::Stopped(poison)) => {
-                        return Ok(Cycles {
-                            iterations,
-                            dispatched,
-                            ended: Ended::Stopped(poison),
-                        });
-                    }
-                    Some(Outcome::Returned { .. }) => dispatched += 1,
-                    // A status that dispatched nothing: a stale `POLSTS`, or an
-                    // entry point the module never registered. `poll` has
-                    // consumed it either way.
-                    None => {}
+            // No `pending()` guard here, and deliberately. `Host::poll`'s first
+            // act is the same scan, and it returns `Ok(None)` before touching
+            // the module or the machine when that scan finds nothing -- so a
+            // guard testing the identical predicate could only agree with it.
+            // It was written as one, and review found that mutating the guard
+            // away left all 739 tests passing, which is what unobservable looks
+            // like.
+            match self.poll(machine, module)? {
+                Some(Outcome::Stopped(poison)) => {
+                    return Ok(Cycles {
+                        iterations,
+                        dispatched,
+                        ended: Ended::Stopped(poison),
+                    });
                 }
+                Some(Outcome::Returned { .. }) => dispatched += 1,
+                // A status that dispatched nothing: a stale `POLSTS`, or an
+                // entry point the module never registered. `poll` has
+                // consumed it either way.
+                None => {}
             }
 
             // `MAJORBBS.C:476`, with two changes the original did not need.
