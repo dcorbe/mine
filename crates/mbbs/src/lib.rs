@@ -1290,7 +1290,7 @@ impl Host {
                 )));
             }
 
-            let Some(chan) = self.gsbl().scan() else {
+            let Some(chan) = self.gsbl_mut().scan() else {
                 return Ok(None);
             };
 
@@ -1416,7 +1416,7 @@ impl Host {
         while iterations < max {
             iterations += 1;
 
-            if self.gsbl().scan().is_some() {
+            if self.gsbl().pending() {
                 match self.poll(machine, module)? {
                     Some(Outcome::Stopped(poison)) => {
                         return Ok(Cycles {
@@ -1468,7 +1468,7 @@ impl Host {
                 ));
             }
 
-            if self.gsbl().scan().is_none() && self.kicks.is_empty() {
+            if !self.gsbl().pending() && self.kicks.is_empty() {
                 return Ok(Cycles {
                     iterations,
                     dispatched,

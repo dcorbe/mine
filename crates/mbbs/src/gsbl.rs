@@ -132,6 +132,20 @@ pub struct Gsbl {
     /// [`crate::chan`] for what those two agreeing by convention cost.
     terms: Terms,
     channels: Vec<Channel>,
+    /// Where the next [`Gsbl::scan`] starts looking.
+    ///
+    /// `btuscn`'s own rotation. The guide (`btuscn`, page 144) says a scan
+    /// "resume[s] scanning with the channel immediately following, so that all
+    /// channels have the same priority", and `MAJORBBS.C:419-427` corroborates
+    /// it: `lstunm` is "last user-number returned by `btuscn()`"
+    /// (`MAJORBBS.C:325`), and `if (newunm <= lstunm) (*syscyc)()` fires the
+    /// system cycle on the *wrap*, a test that means nothing unless the scan
+    /// rotates.
+    ///
+    /// Lives here rather than on `Host` because it is GSBL's state, not the
+    /// main loop's -- the original kept its own cursor and handed out the
+    /// result.
+    next: u16,
 }
 
 impl Gsbl {
@@ -140,6 +154,7 @@ impl Gsbl {
         Self {
             terms,
             channels: (0..terms.count()).map(|_| Channel::default()).collect(),
+            next: 0,
         }
     }
 
@@ -264,29 +279,52 @@ impl Gsbl {
         out
     }
 
-    /// The first channel with a status waiting, or `None`.
+    /// The next channel needing service, advancing the rotation.
     ///
     /// This is `btuscn`. The guide: it finds channels whose status code is non-zero and answers -1 when there are none. The `-1` is
     /// left to the caller; `None` is what Rust says.
+    ///
+    /// Each answer moves the cursor past the channel it named, so a channel
+    /// that always has work cannot hold the others out -- the guide again,
+    /// `btuscn` page 144: each later call resumes the scan at the channel after the last one reported, so no channel outranks another. See [`Gsbl::next`] for the corroborating C.
+    ///
+    /// Takes `&mut self` because the rotation is the point. To ask *whether*
+    /// anything is waiting without consuming a turn, use [`Gsbl::pending`].
     ///
     /// The [`Chan`] it hands back is minted from this `Gsbl`'s own [`Terms`],
     /// so a channel found here is a channel every other table keyed by the same
     /// `Terms` also has. That is the whole point: `Host::poll` used to scan with
     /// `Gsbl`'s bound and then index `Users` with the result, which was correct
     /// only for as long as the two bounds happened to match.
-    pub fn scan(&self) -> Option<Chan> {
-        self.channels
-            .iter()
-            .position(|c| !c.status.is_empty())
-            // Through the same mint every other caller uses, rather than a
-            // private constructor: `i` indexes `channels`, `channels` is
-            // `terms.count()` long, so this cannot refuse -- and if it ever
-            // does, the two have come apart and that is worth a panic.
-            .map(|i| {
-                self.terms
-                    .chan(i as i16)
-                    .expect("scan indexed its own channels")
-            })
+    pub fn scan(&mut self) -> Option<Chan> {
+        let count = self.terms.count();
+        for step in 0..count {
+            let index = (self.next + step) % count;
+            if !self.channels[usize::from(index)].status.is_empty() {
+                self.next = (index + 1) % count;
+                // Through the same mint every other caller uses, rather than a
+                // private constructor: `index` is below `terms.count()`, so
+                // this cannot refuse -- and if it ever does, the two have come
+                // apart and that is worth a panic.
+                return Some(
+                    self.terms
+                        .chan(index as i16)
+                        .expect("scan indexed its own channels"),
+                );
+            }
+        }
+        None
+    }
+
+    /// Whether any channel has a status waiting, without advancing the rotation.
+    ///
+    /// [`Host::cycle`](crate::Host::cycle) tests before
+    /// [`Host::poll`](crate::Host::poll) takes. Were that test to advance the
+    /// cursor, every second channel would be skipped -- a starvation bug
+    /// introduced by the fix for a starvation bug.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        self.channels.iter().any(|c| !c.status.is_empty())
     }
 
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
@@ -945,5 +983,74 @@ mod tests {
         g.inject(chan(), Gsbl::POLSTS);
         assert_eq!(g.next_status(chan()), Some(Gsbl::POLSTS));
         assert_eq!(g.next_status(chan()), None, "one inject, one status");
+    }
+
+    #[test]
+    fn two_busy_channels_are_served_alternately_rather_than_by_number() {
+        // The guide, `btuscn`: subsequent calls resume at the channel after the last one reported, so no channel outranks another. First-fit passes every other test in this file and starves
+        // channel 1 here, which is the whole reason this one exists.
+        let terms = Terms::new(2);
+        let mut gsbl = Gsbl::new(terms);
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+
+        // Both channels permanently have work, which is the starvation case.
+        for _ in 0..4 {
+            gsbl.inject(zero, Gsbl::CRSTG);
+            gsbl.inject(one, Gsbl::CRSTG);
+        }
+
+        let served: Vec<u16> = (0..4)
+            .map(|_| {
+                let chan = gsbl.scan().expect("a channel with a status");
+                gsbl.next_status(chan).expect("the status scan just found");
+                chan.number() as u16
+            })
+            .collect();
+        assert_eq!(served, vec![0, 1, 0, 1], "equal priority, not first-fit");
+    }
+
+    #[test]
+    fn the_rotation_wraps_and_skips_channels_with_nothing_queued() {
+        let terms = Terms::new(3);
+        let mut gsbl = Gsbl::new(terms);
+        let zero = terms.chan(0).expect("channel 0");
+        let two = terms.chan(2).expect("channel 2");
+
+        gsbl.inject(zero, Gsbl::CRSTG);
+        gsbl.inject(two, Gsbl::CRSTG);
+        gsbl.inject(zero, Gsbl::CRSTG);
+
+        assert_eq!(gsbl.scan().map(Chan::number), Some(0));
+        gsbl.next_status(zero).expect("popped");
+        // Channel 1 has nothing, so the scan passes over it rather than stalling.
+        assert_eq!(gsbl.scan().map(Chan::number), Some(2));
+        gsbl.next_status(two).expect("popped");
+        // Past the end, so it wraps to nought.
+        assert_eq!(gsbl.scan().map(Chan::number), Some(0));
+        gsbl.next_status(zero).expect("popped");
+        assert_eq!(gsbl.scan(), None, "every queue is empty");
+    }
+
+    #[test]
+    fn asking_whether_anything_is_pending_does_not_advance_the_rotation() {
+        // `Host::cycle` tests before `Host::poll` takes. If the test advanced
+        // the cursor, every other channel would be skipped -- a starvation bug
+        // introduced by the fix for a starvation bug.
+        let terms = Terms::new(2);
+        let mut gsbl = Gsbl::new(terms);
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        gsbl.inject(zero, Gsbl::CRSTG);
+        gsbl.inject(one, Gsbl::CRSTG);
+
+        assert!(gsbl.pending());
+        assert!(gsbl.pending());
+        assert!(gsbl.pending());
+        assert_eq!(
+            gsbl.scan().map(Chan::number),
+            Some(0),
+            "three tests did not consume channel 0's turn"
+        );
     }
 }
