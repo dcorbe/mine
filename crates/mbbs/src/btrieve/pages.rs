@@ -470,77 +470,6 @@ pub const INDEX_HEADER: usize = 16;
 /// page buys nothing it needs.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
-/// Emit the leaf page for one key, from records already in that key's order.
-///
-/// `entries` is `(key bytes, record position)` pairs, already sorted --
-/// [`Records`](super::Records) has already done that, and this does not
-/// re-sort them.
-///
-/// Returns one page image, [`layout.page`](Layout::page) bytes, with the page
-/// number left zero: the caller allocates page numbers -- in this crate,
-/// always the key's existing root -- and patches [`Header::encode`] over the
-/// first six bytes before writing.
-///
-/// **One page, not a `Vec` of them.** `Err` is the only other outcome -- see
-/// below -- so there is no shape in which this returns anything but exactly
-/// one page, and every caller immediately un-wraps a one-element `Vec` to get
-/// at it.
-///
-/// # Errors
-///
-/// If the entries do not fit in a single page. **That is a stop, not a
-/// fallback.** Splitting into interior pages needs a fill-factor policy
-/// nothing in the surviving record specifies, and inventing one would produce
-/// a file that looks valid and orders wrongly -- see `docs/plans/
-/// 2026-08-07-btrieve-writes.md`, Task 6, for the measurement this boundary
-/// is drawn from: nine of the eleven files MajorMUD ships with records need
-/// more than one leaf page, and this refuses every one of them rather than
-/// guess at how Btrieve would have split them.
-pub fn index_pages(layout: Layout, entries: &[(Vec<u8>, u32)]) -> Result<Vec<u8>, String> {
-    let width = entries.first().map_or(0, |(key, _)| key.len() + INDEX_ENTRY_TAIL);
-    let used = INDEX_HEADER + width * entries.len();
-    if used > usize::from(layout.page) {
-        return Err(format!(
-            "{} entries of {width} bytes need {used} bytes of index, and a page \
-             holds only {}: an interior page would be needed and this host does \
-             not build one",
-            entries.len(),
-            layout.page,
-        ));
-    }
-
-    let mut page = vec![0u8; usize::from(layout.page)];
-    page[..usize::from(HEADER)].copy_from_slice(
-        &Header {
-            number: 0,
-            data: false,
-            stamp: 0,
-        }
-        .encode(),
-    );
-    let count = u16::try_from(entries.len())
-        .map_err(|_| format!("{} entries, more than a u16 counts", entries.len()))?;
-    page[6..8].copy_from_slice(&count.to_le_bytes());
-    page[8..12].copy_from_slice(&to_long(NOWHERE));
-    page[12..16].copy_from_slice(&to_long(NOWHERE));
-
-    let mut offset = INDEX_HEADER;
-    for (index, (key, position)) in entries.iter().enumerate() {
-        page[offset..offset + key.len()].copy_from_slice(key);
-        let tail = offset + key.len();
-        page[tail..tail + 4].copy_from_slice(&to_long(*position));
-        // Every entry but the page's last carries NOWHERE in its second
-        // four bytes; the last carries zero instead. See
-        // [`INDEX_ENTRY_TAIL`]'s doc comment for the measurement this comes
-        // from.
-        let last = index + 1 == entries.len();
-        page[tail + 4..tail + 8].copy_from_slice(&to_long(if last { 0 } else { NOWHERE }));
-        offset += key.len() + INDEX_ENTRY_TAIL;
-    }
-
-    Ok(page)
-}
-
 /// One index page, decoded.
 ///
 /// The same shape whether the page is a leaf or an interior node — the format
@@ -1525,7 +1454,9 @@ mod tests {
         let layout = index_layout();
         let entries = vec![(vec![1u8, 0], 100u32), (vec![2u8, 0], 200u32)];
 
-        let page = index_pages(layout, &entries).expect("two entries fit easily");
+        let built = build_index(layout, &entries, 2).expect("two entries fit easily");
+        assert_eq!(built.nodes.len(), 1, "these entries fit one page");
+        let page = &built.nodes[built.root].image;
 
         assert_eq!(page.len(), 64);
 
@@ -1536,8 +1467,8 @@ mod tests {
             2,
             "the entry count"
         );
-        assert_eq!(long(&page[8..12]), NOWHERE, "no sibling leaf before this one");
-        assert_eq!(long(&page[12..16]), NOWHERE, "no sibling leaf after it");
+        assert_eq!(long(&page[8..12]), NOWHERE, "no rightmost child -- a leaf has none");
+        assert_eq!(long(&page[12..16]), NOWHERE, "no leftmost child -- a leaf has none");
 
         // First entry: key, then record pointer, then a leaf's NOWHERE child.
         assert_eq!(&page[16..18], &[1, 0]);
@@ -1566,8 +1497,13 @@ mod tests {
     /// leaf `WCCRACE.DAT` holds, with those two entries' real measured key
     /// and record pointer, and checks both byte-for-byte -- independent of
     /// `tmp/`'s presence, so it runs even where the shipped files do not.
+    ///
+    /// **The load-bearing one.** Pinned against bytes measured off a real
+    /// file rather than derived from this crate's own encoder, so a decoder
+    /// and encoder that agree with each other but are wrong the same way
+    /// still cannot pass this.
     #[test]
-    fn index_pages_matches_wccrace_dats_measured_last_two_entries() {
+    fn a_built_leaf_matches_wccrace_dats_measured_last_two_entries() {
         let layout = wccrace_index_layout();
         let mut entries: Vec<(Vec<u8>, u32)> =
             (0u16..11).map(|n| (n.to_le_bytes().to_vec(), u32::from(n))).collect();
@@ -1575,7 +1511,9 @@ mod tests {
         entries.push((0x000du16.to_le_bytes().to_vec(), 0x0000_0a06));
         assert_eq!(entries.len(), 13);
 
-        let page = index_pages(layout, &entries).expect("13 entries fit one leaf");
+        let built = build_index(layout, &entries, 2).expect("13 entries fit one leaf");
+        assert_eq!(built.nodes.len(), 1, "these entries fit one page");
+        let page = &built.nodes[built.root].image;
 
         let second_to_last = INDEX_HEADER + 11 * (2 + INDEX_ENTRY_TAIL);
         assert_eq!(&page[second_to_last..second_to_last + 2], &[0x0c, 0x00], "entry 11's key");
@@ -1609,21 +1547,39 @@ mod tests {
     #[test]
     fn no_entries_is_a_valid_empty_leaf() {
         let layout = index_layout();
-        let page = index_pages(layout, &[]).expect("an empty key still has a root page");
+        let built = build_index(layout, &[], 2).expect("an empty key still has a root page");
+        assert_eq!(built.nodes.len(), 1, "these entries fit one page");
+        let page = &built.nodes[built.root].image;
         assert_eq!(u16::from_le_bytes([page[6], page[7]]), 0);
     }
 
-    /// The boundary Task 6 draws: an interior page is refused rather than
-    /// built. Four ten-byte entries fit in this page's 48 bytes of room; a
-    /// fifth does not.
+    /// **What this host used to refuse, it now builds.**
+    ///
+    /// The same five entries into the same 48 bytes of room that
+    /// `index_pages` rejected with "an interior page would be needed and this
+    /// host does not build one". Five entries at a capacity of four split into
+    /// two leaves of two with the entry between them promoted -- three nodes,
+    /// and all five entries still present exactly once.
+    ///
+    /// This test is the retired refusal, kept pointing the other way, and it
+    /// pairs with `a_page_at_the_boundary_still_fits` on either side of the
+    /// capacity boundary.
     #[test]
-    fn entries_that_do_not_fit_one_page_are_refused() {
+    fn entries_that_do_not_fit_one_page_become_a_tree() {
         let layout = index_layout();
         let entries: Vec<(Vec<u8>, u32)> =
             (0..5u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let e = index_pages(layout, &entries).expect_err("five ten-byte entries need 66 bytes");
-        assert!(e.contains("interior"), "{e}");
+        let built = build_index(layout, &entries, 2).expect("what index_pages refused");
+
+        assert_eq!(built.nodes.len(), 3, "two leaves and a root");
+        assert_eq!(
+            built.nodes[built.root].entries.len(),
+            1,
+            "one separator between two leaves"
+        );
+        let total: usize = built.nodes.iter().map(|n| n.entries.len()).sum();
+        assert_eq!(total, 5, "every entry is in exactly one node");
     }
 
     #[test]
@@ -1632,7 +1588,9 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (0..4u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let page = index_pages(layout, &entries).expect("four ten-byte entries need exactly 56");
+        let built = build_index(layout, &entries, 2).expect("four ten-byte entries need exactly 56");
+        assert_eq!(built.nodes.len(), 1, "these entries fit one page");
+        let page = &built.nodes[built.root].image;
         assert_eq!(page.len(), usize::from(layout.page));
     }
 
@@ -1923,8 +1881,9 @@ mod tests {
         assert_eq!(walk.pages, vec![1], "the root itself is still owned");
     }
 
-    /// Entries that fit one page still build one page, byte for byte what
-    /// `index_pages` built before there was a tree.
+    /// Entries that fit one page still build one page, byte for byte the leaf
+    /// `index_pages` built before there was a tree -- `index_pages` is gone
+    /// (Task 9), so the comparison is against a literal instead.
     ///
     /// This is the regression guard for `WCCRACE.DAT` and `WCCCLASS.DAT`, whose
     /// rebuilt root pages are byte-identical to the shipped ones
@@ -1939,11 +1898,24 @@ mod tests {
         let built = build_index(layout, &entries, 2).expect("four entries fit");
         assert_eq!(built.nodes.len(), 1, "one page, so one node");
         assert_eq!(built.root, 0, "the root is the only node");
-        assert_eq!(
-            built.nodes[0].image,
-            index_pages(layout, &entries).expect("the old builder agrees"),
-            "the one-page case must not have moved"
-        );
+
+        // A leaf's own shape: six bytes of header, then a count of 4, then
+        // both child slots NOWHERE (a leaf has none), then the four entries --
+        // key, position high-word-first, and NOWHERE except the last entry's
+        // tail, which is the zero placeholder every node's last entry carries.
+        let mut expected = vec![0u8; 512];
+        expected[6..8].copy_from_slice(&4u16.to_le_bytes());
+        expected[8..12].copy_from_slice(&to_long(NOWHERE));
+        expected[12..16].copy_from_slice(&to_long(NOWHERE));
+        for (n, (key, position)) in entries.iter().enumerate() {
+            let at = INDEX_HEADER + n * 10;
+            expected[at..at + 2].copy_from_slice(key);
+            expected[at + 2..at + 6].copy_from_slice(&to_long(*position));
+            let last = n + 1 == entries.len();
+            expected[at + 6..at + 10].copy_from_slice(&to_long(if last { 0 } else { NOWHERE }));
+        }
+
+        assert_eq!(built.nodes[0].image, expected, "the one-page case must not have moved");
     }
 
     /// Two levels, and the shape is the one the format uses.
