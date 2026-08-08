@@ -107,6 +107,10 @@ fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimEr
     let time = host.heap.alloc(machine, TIME_LEN).map_err(ShimError::Failed)?;
     let edat = host.heap.alloc(machine, EDAT_LEN).map_err(ShimError::Failed)?;
     let empty = host.heap.alloc(machine, 1).map_err(ShimError::Failed)?;
+    // Written explicitly rather than trusted to the heap's zero-fill -- see
+    // `Host::empty` (`lib.rs:212`) for the sibling that gets the same
+    // treatment eagerly, in `Host::new`, because it has to exist before this
+    // one would ever be allocated.
     write_cstr(machine, empty, b"", 1)?;
 
     let all = DateBuffers {

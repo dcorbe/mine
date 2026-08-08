@@ -211,6 +211,203 @@ pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(removed))
 }
 
+/// `void parsin(void)` -- parse `input` into `margv[]`.
+///
+/// **Not in the v6 host source.** `MAJORBBS.C`'s `getin()` folds this
+/// parsing inline; the routine `WCCMMUD.DLL` imports is Worldgroup's own,
+/// split out at
+/// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3376`:
+///
+///
+/// Four things this does that a from-scratch splitter would not, and each is
+/// load-bearing:
+///
+/// 1. **It fills `margn[]`, not just `margv[]`.** `margn[i]` points at the NUL
+///    that replaced word `i`'s separator. [`rstrin`] already reads `margn` to
+///    put the spaces back, at **every** exit -- including the early `return`
+///    inside the inner loop, which is the common case: a line with no
+///    trailing whitespace never reaches the function's tail at all.
+/// 2. **It sets `inplen`** to the offset of the last word's terminator from
+///    the start of `input`.
+/// 3. **It zeroes the tail of `input`** past the last word -- but only on the
+///    path that falls through to the function's end. That path is reached
+///    only when the line has trailing whitespace after its last word; the
+///    early return does not run it, because there is nothing stale left to
+///    clear when the word ended at the buffer's own terminator.
+/// 4. **On an empty line it sets `margv[0]` to an empty string, not to
+///    null.** The module reads `margv[0]` unguarded, so this host keeps one
+///    NUL byte of its own for the purpose -- see [`Host::empty`].
+pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let input = host
+        .globals()
+        .address("input")
+        .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+    let size = usize::from(
+        host.globals()
+            .size("input")
+            .ok_or_else(|| ShimError::Failed("input is not placed".into()))?,
+    );
+    let margv = host
+        .globals()
+        .address("margv")
+        .ok_or_else(|| ShimError::Failed("margv is not placed".into()))?;
+    let margn = host
+        .globals()
+        .address("margn")
+        .ok_or_else(|| ShimError::Failed("margn is not placed".into()))?;
+
+    let mut buf = machine.resolve(input, size)?.to_vec();
+
+    let mut margv_ends: Vec<u16> = Vec::new(); // offsets into `buf`
+    let mut margn_ends: Vec<u16> = Vec::new(); // offsets into `buf`
+
+    // `inpptr = input - 1`. Every step below pre-increments before testing,
+    // exactly as the C does, which is not a stylistic match: after a
+    // separator is overwritten with a NUL, the outer loop's own
+    // `while (*++inpptr == ' ')` has to step *past* that NUL before it looks
+    // at anything, or it reads the byte it just wrote and mistakes it for the
+    // end of the line.
+    let mut i: isize = -1;
+
+    loop {
+        // `while (*++inpptr == ' ') {}`
+        loop {
+            i += 1;
+            if buf.get(i as usize) != Some(&b' ') {
+                break;
+            }
+        }
+        // `if (*inpptr == '\0') { break; }`
+        if buf.get(i as usize).copied().unwrap_or(0) == 0 {
+            break;
+        }
+        // `margv[margc] = inpptr;`
+        margv_ends.push(i as u16);
+
+        // `while (*++inpptr != ' ') { if (*inpptr == '\0') { ...; return; } }`
+        loop {
+            i += 1;
+            match buf.get(i as usize).copied() {
+                Some(b' ') => break,
+                None | Some(0) => {
+                    // The early return. A word that runs straight into the
+                    // buffer's own terminator, with no separator of its own
+                    // to turn into one -- so `setmem` never runs, and
+                    // nothing past this NUL is touched.
+                    //
+                    // R18: `None` and `Some(0)` are not the same event.
+                    // `Some(0)` is the normal case, hitting `input`'s own
+                    // terminator. `None` is `i` having walked off the end of
+                    // `buf` with no terminator in it at all -- reachable only
+                    // if the module wrote `input` itself and called `parsin`
+                    // directly, since `Host::get_input` always terminates
+                    // within `size - 1`. The C this is transcribed from was
+                    // worse: it had no bound at all and would have walked
+                    // arbitrarily far past the buffer looking for a NUL that
+                    // might not exist. Here `i` cannot exceed `buf.len()` --
+                    // the very first out-of-bounds index returns `None` and
+                    // this arm returns immediately -- so `margn[margc-1]`
+                    // lands at `input`'s own end, which is `margv[0]`'s own
+                    // low byte: `globals.rs:565` places `margv` immediately
+                    // after `input`.
+                    margn_ends.push(i as u16);
+                    return write_parse(
+                        machine,
+                        host,
+                        input,
+                        margv,
+                        margn,
+                        &buf,
+                        &margv_ends,
+                        &margn_ends,
+                        i as u16,
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        // `*inpptr = '\0'; margn[margc++] = inpptr;`
+        buf[i as usize] = 0;
+        margn_ends.push(i as u16);
+    }
+
+    let inplen = match margn_ends.last().copied() {
+        Some(last) => {
+            for byte in &mut buf[usize::from(last)..] {
+                *byte = 0;
+            }
+            last
+        }
+        None => 0,
+    };
+    write_parse(
+        machine,
+        host,
+        input,
+        margv,
+        margn,
+        &buf,
+        &margv_ends,
+        &margn_ends,
+        inplen,
+    )
+}
+
+/// The tail every exit of [`parsin`] shares: write the (possibly modified)
+/// input buffer back, then `margc`, `inplen`, `margv[]` and `margn[]`.
+#[allow(clippy::too_many_arguments)]
+fn write_parse(
+    machine: &mut Machine,
+    host: &mut Host,
+    input: FarPtr,
+    margv: FarPtr,
+    margn: FarPtr,
+    buf: &[u8],
+    margv_ends: &[u16],
+    margn_ends: &[u16],
+    inplen: u16,
+) -> Result<Ret, ShimError> {
+    machine.write(input, buf)?;
+
+    let margc = margv_ends.len() as u16;
+    host.globals()
+        .write(machine, "margc", &margc.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.globals()
+        .write(machine, "inplen", &inplen.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    if margc == 0 {
+        let empty = host.empty_string();
+        machine.write(margv, &empty.to_bytes())?;
+        return Ok(Ret::Void);
+    }
+
+    for (n, &at) in margv_ends.iter().enumerate() {
+        let word = FarPtr {
+            offset: input.offset + at,
+            selector: input.selector,
+        };
+        let slot = FarPtr {
+            offset: margv.offset + n as u16 * 4,
+            selector: margv.selector,
+        };
+        machine.write(slot, &word.to_bytes())?;
+    }
+    for (n, &at) in margn_ends.iter().enumerate() {
+        let end = FarPtr {
+            offset: input.offset + at,
+            selector: input.selector,
+        };
+        let slot = FarPtr {
+            offset: margn.offset + n as u16 * 4,
+            selector: margn.selector,
+        };
+        machine.write(slot, &end.to_bytes())?;
+    }
+    Ok(Ret::Void)
+}
+
 /// `void rstrin(void)` -- put back the separators that parsing overwrote.
 ///
 /// MajorBBS tokenises a command line in place: each separator becomes a `\0`,
@@ -1598,6 +1795,182 @@ mod tests {
             .write(&mut f.machine, "margc", &0u16.to_le_bytes())
             .expect("margc");
         assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+    }
+
+    /// A far pointer, read out of module memory at `at`.
+    fn read_ptr(machine: &mbbs16::Machine, at: FarPtr) -> FarPtr {
+        let bytes = machine.resolve(at, 4).expect("readable");
+        FarPtr::from_bytes(bytes.try_into().expect("4 bytes"))
+    }
+
+    /// The `n`th slot of `margv` or `margn`, each an array of far pointers.
+    fn slot(base: FarPtr, n: u16) -> FarPtr {
+        FarPtr {
+            offset: base.offset + n * 4,
+            selector: base.selector,
+        }
+    }
+
+    #[test]
+    fn parsin_splits_the_input_buffer_into_margv() {
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
+        let margv = f.host.globals().address("margv").expect("margv");
+        assert_eq!(f.read(read_ptr(&f.machine, slot(margv, 0))), "get");
+        assert_eq!(f.read(read_ptr(&f.machine, slot(margv, 1))), "all");
+        assert_eq!(f.read(read_ptr(&f.machine, slot(margv, 2))), "gold");
+    }
+
+    #[test]
+    fn parsin_collapses_runs_of_separators() {
+        // "get   all" is two arguments, not four -- the three spaces between
+        // them are one gap, not three empty ones.
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get   all")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 2);
+        let margv = f.host.globals().address("margv").expect("margv");
+        assert_eq!(f.read(read_ptr(&f.machine, slot(margv, 0))), "get");
+        assert_eq!(f.read(read_ptr(&f.machine, slot(margv, 1))), "all");
+    }
+
+    #[test]
+    fn parsin_on_an_empty_line_points_margv_zero_at_an_empty_string() {
+        // The module reads `margv[0]` unguarded, so it must be a readable
+        // pointer -- never null, and never a stack temporary that stops being
+        // valid after this call returns.
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
+        let margv = f.host.globals().address("margv").expect("margv");
+        let at = read_ptr(&f.machine, slot(margv, 0));
+        assert_ne!(at, FarPtr::NULL, "margv[0] must not be null");
+        assert_eq!(f.machine.read_cstr(at).expect("readable"), b"");
+    }
+
+    #[test]
+    fn parsin_records_where_each_word_ended_so_rstrin_can_undo_it() {
+        // margn[i] is the NUL that replaced word i's separator -- offset 3 for
+        // the space after "get", offset 7 for the one after "all".
+        let mut f = Fixture::new();
+        let input = f.host.globals().address("input").expect("input");
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        let margn = f.host.globals().address("margn").expect("margn");
+        let end0 = read_ptr(&f.machine, slot(margn, 0));
+        let end1 = read_ptr(&f.machine, slot(margn, 1));
+        assert_eq!(end0.offset - input.offset, 3);
+        assert_eq!(end1.offset - input.offset, 7);
+
+        // margn[margc-1] -- the slot the early-return path inside the inner
+        // loop is the one that fills, because "gold" runs straight into
+        // `input`'s own terminator with no trailing separator of its own.
+        // `rstrin` reads exactly this slot for the last gap; miss it here and
+        // a test can be self-consistent while `rstrin` still writes a space
+        // through a stale pointer.
+        let end2 = read_ptr(&f.machine, slot(margn, 2));
+        assert_eq!(end2.offset - input.offset, 12, "the early-return path's margn write");
+
+        // The other way margn[margc-1] gets filled: trailing whitespace after
+        // the last word, which the *outer* tail reaches instead of the inner
+        // loop's early return. Same slot, different path -- both must land on
+        // the true separator, not on whatever the early-return path would
+        // have written.
+        let mut f = Fixture::new();
+        let input = f.host.globals().address("input").expect("input");
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold  ")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
+
+        let margn = f.host.globals().address("margn").expect("margn");
+        let end2 = read_ptr(&f.machine, slot(margn, 2));
+        assert_eq!(end2.offset - input.offset, 12, "the outer-tail path's margn write");
+    }
+
+    #[test]
+    fn rstrin_puts_back_exactly_what_parsin_took_apart() {
+        // The round trip, and the test that catches a `parsin` which is
+        // self-consistent but disagrees with the `rstrin` already shipped:
+        // parse "get all gold", call `rstrin`, and read `input` back as one
+        // string.
+        let mut f = Fixture::new();
+        let input = f.host.globals().address("input").expect("input");
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+
+        assert_eq!(f.machine.read_cstr(input).expect("a string"), b"get all gold");
+    }
+
+    #[test]
+    fn parsin_sets_inplen_to_the_length_it_consumed() {
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "input", b"get all gold")
+            .expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        // The offset of the terminating NUL from the start of `input` -- the
+        // early-return path inside the inner loop is what sets this, since
+        // "gold" has no trailing space.
+        assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 12);
+    }
+
+    #[test]
+    fn parsin_zeros_the_tail_of_input_past_trailing_whitespace_and_stale_bytes() {
+        // Reachable only through the *outer* tail -- `if (margc != 0) { ...
+        // setmem(...) }` -- and not through the inner loop's early return,
+        // because trailing spaces after the last word mean the terminating
+        // NUL is only found once the outer loop resumes skipping spaces.
+        // `input` is 256 bytes and nothing clears it between commands, so a
+        // shorter line leaves the previous, longer one sitting past its own
+        // terminator; a `parsin` that forgot the `setmem` would leave that
+        // stale tail for the module to read as though it were part of this
+        // line.
+        let mut f = Fixture::new();
+        let input = f.host.globals().address("input").expect("input");
+        let size = usize::from(f.host.globals().size("input").expect("input"));
+        let mut buf = vec![0xffu8; size];
+        buf[..7].copy_from_slice(b"gold   ");
+        buf[7] = 0;
+        f.machine.write(input, &buf).expect("input with a stale tail");
+
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 1);
+        assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 4);
+        let bytes = f.machine.resolve(input, size).expect("readable");
+        assert_eq!(&bytes[..4], b"gold");
+        assert!(
+            bytes[4..].iter().all(|&b| b == 0),
+            "trailing spaces and everything stale past them are zeroed"
+        );
     }
 
     #[test]

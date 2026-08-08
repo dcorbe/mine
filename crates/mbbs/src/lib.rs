@@ -28,6 +28,7 @@ mod exports;
 mod fmt;
 pub mod fsd;
 mod globals;
+pub mod gsbl;
 pub mod heap;
 pub mod msg;
 pub mod random;
@@ -63,7 +64,7 @@ pub use shims::system::{Agent, Kick, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
-pub use users::Users;
+pub use users::{Connection, Users};
 
 use mbbs16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
@@ -137,7 +138,10 @@ pub(crate) struct DateBuffers {
 
     /// One byte, always NUL. What `ncdate(0)` returns -- and a **different**
     /// address from `date`, so a null date leaves an earlier result standing,
-    /// exactly as `seg 33:0x0c14` does by never writing at all.
+    /// exactly as `seg 33:0x0c14` does by never writing at all. Written
+    /// explicitly at `shims/system.rs:110` rather than trusted to the heap's
+    /// zero-fill -- see [`Host::empty`] for the sibling that exists for the
+    /// module's first instruction instead of its first date call.
     pub(crate) empty: FarPtr,
 }
 
@@ -218,6 +222,19 @@ pub struct Host {
     /// The line buffer `gmdnam` returns a pointer into.
     mdf: FarPtr,
 
+    /// One NUL byte the host owns and keeps, forever.
+    ///
+    /// `parsin`'s `margv[0]=""` on an empty line points at a string literal in
+    /// Galacticomm's own data segment -- memory this host has none of, since
+    /// there is no host-side copy of `MAJORBBS.EXE` running. This is that
+    /// literal's stand-in: the module dereferences `margv[0]` unguarded, and a
+    /// `FarPtr::NULL` there is a segment-zero read rather than an empty string.
+    ///
+    /// Written explicitly in [`Host::new`] rather than trusted to the
+    /// allocator's zero-fill -- see [`DateBuffers::empty`] for the sibling
+    /// that gets the same treatment for the same reason, lazily instead.
+    empty: FarPtr,
+
     /// Where the print buffer ends, so `prf` can refuse to run past it.
     prf_end: u16,
 
@@ -255,6 +272,9 @@ pub struct Host {
     /// The Btrieve files that are open, and the stack of which is current.
     /// Which one *is* current is `bb`, for the same reason.
     pub(crate) btrieve: btrieve::Btrieve,
+
+    /// The terminal channels. See [`gsbl`].
+    pub(crate) gsbl: gsbl::Gsbl,
 
     /// The streams that are open. No notion of a current one -- `fopen` hands
     /// back a `FILE *` and every routine takes it, so there is no `curmbk` or
@@ -363,11 +383,11 @@ impl Host {
         let prf_end = OUTBSZ;
 
         // One segment for everything the host hands a module a pointer into and
-        // then keeps: `spr`'s four buffers and `gmdnam`'s line. Separate from
-        // the globals so that a module overrunning one of these cannot reach
-        // `usrnum`.
+        // then keeps: `spr`'s four buffers, `gmdnam`'s line, and one NUL byte
+        // for `parsin`'s empty-line `margv[0]`. Separate from the globals so
+        // that a module overrunning one of these cannot reach `usrnum`.
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
-        let selector = machine.alloc_segment(spr_bytes + 64)?;
+        let selector = machine.alloc_segment(spr_bytes + 64 + 1)?;
 
         // The per-channel tables come off the module heap, because the real
         // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
@@ -389,6 +409,18 @@ impl Host {
         globals.write(machine, "user", &users.head().to_bytes())?;
         globals.write(machine, "channel", &users.channels().to_bytes())?;
 
+        // R17: written explicitly rather than left to `alloc_segment`'s
+        // `mmap(MAP_ANONYMOUS)` zero-fill. `DateBuffers`'s own empty byte gets
+        // the identical write at `shims/system.rs:110` -- two facilities for
+        // one NUL because they cannot be the same one: this one must exist
+        // before the module's first instruction, and that one is allocated
+        // lazily off the heap the first time a date routine runs.
+        let empty = FarPtr {
+            offset: spr_bytes as u16 + 64,
+            selector,
+        };
+        machine.write(empty, &[0])?;
+
         Ok(Self {
             exports: Exports::wg101(),
             globals,
@@ -404,6 +436,7 @@ impl Host {
                 offset: spr_bytes as u16,
                 selector,
             },
+            empty,
             prf_end,
             random: Random::default(),
             clock: Clock::system()?,
@@ -413,6 +446,7 @@ impl Host {
             textvars: TextVars::default(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
+            gsbl: gsbl::Gsbl::new(globals::NTERMS),
             streams: stream::Streams::default(),
             installed: Vec::new(),
             notes: Vec::new(),
@@ -566,6 +600,409 @@ impl Host {
     /// The per-channel tables. See [`Users`].
     pub fn users(&self) -> &Users {
         &self.users
+    }
+
+    /// The terminal channels.
+    pub fn gsbl(&self) -> &gsbl::Gsbl {
+        &self.gsbl
+    }
+
+    /// The terminal channels, mutably. The transport pushes bytes in and drains
+    /// them out through this.
+    pub fn gsbl_mut(&mut self) -> &mut gsbl::Gsbl {
+        &mut self.gsbl
+    }
+
+    /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
+    /// `char *margv[0]`.
+    ///
+    /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
+    ///
+    ///
+    /// `paccin` is `inplen=btuinp(usrnum,input)` followed by `paccit()` --
+    /// the modem monitor and the profanity check, both BBS-shaped and out of
+    /// scope. This host's `paccin` is `btuinp` and nothing else: take the
+    /// channel's completed line (an empty one if none is ready, which is
+    /// exactly the byte string an empty line already is) and write it,
+    /// NUL-terminated, into `input`. `btuinp` is not itself a shim --
+    /// `WCCMMUD.DLL` imports it only on the 32-bit side -- so it has no
+    /// argument stack to read; what it does is folded in here.
+    ///
+    /// Shared rather than inlined into the `getin` shim because
+    /// [`Host::poll`] (Task 9) needs the identical sequence and must not have
+    /// to fake a call frame to reach it.
+    ///
+    /// # Errors
+    ///
+    /// If `input`, `margv` or `margn` are not placed, or a write runs off a
+    /// segment.
+    pub(crate) fn get_input(
+        &mut self,
+        machine: &mut Machine,
+        chan: i16,
+    ) -> Result<FarPtr, ShimError> {
+        // R16: resolve everything that can fail before touching the channel.
+        // `take_line` pops the ready queue -- if the line were taken first and
+        // `input` then turned out not to be placed, the user's line would be
+        // gone with nothing to retry. `input` not being placed cannot happen
+        // in practice (`Globals::new` places it unconditionally), but the
+        // ordering is what makes that true by construction rather than by
+        // coincidence of what `Globals::new` currently does.
+        let input = self
+            .globals()
+            .address("input")
+            .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+        let size = usize::from(
+            self.globals()
+                .size("input")
+                .expect("input is placed, its address just resolved"),
+        );
+
+        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
+        let take = line.len().min(size - 1);
+        let mut bytes = line[..take].to_vec();
+        bytes.push(0);
+        machine.write(input, &bytes)?;
+
+        shims::text::parsin(machine, self)?;
+
+        let margv = self
+            .globals()
+            .address("margv")
+            .expect("margv is placed, or parsin above would already have failed");
+        let bytes = machine.resolve(margv, 4)?;
+        Ok(FarPtr::from_bytes(bytes.try_into().expect("4 bytes")))
+    }
+
+    /// Point the four globals that name "the current channel" -- `usrnum`,
+    /// `usrptr`, `usaptr` and `vdaptr` -- at `uno`.
+    ///
+    /// `MAJORBBS.C:4290`'s `curusr`, minus the range check: every caller here
+    /// already knows `uno` is a channel that exists, for a different reason
+    /// each. [`shims::user::curusr`] checked it itself, because an
+    /// out-of-range `uno` there is the documented silent no-op
+    /// (`MAJORBBS.C:4293`) and not a failure. [`Host::connect_state`] gets
+    /// its answer from [`Users::account`] failing first. Factored out so
+    /// both call one piece of code rather than keep two that can drift.
+    ///
+    /// # Errors
+    ///
+    /// If `uno` names no channel, or a write runs off a segment.
+    pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: i16) -> Result<(), ShimError> {
+        let slot = self
+            .users()
+            .slot(uno)
+            .ok_or_else(|| ShimError::Failed(format!("point_curusr({uno}): there is no such channel")))?;
+        let account = self
+            .users()
+            .account(uno)
+            .expect("in range, so it has a record");
+        let vda = self.users().vda(uno).unwrap_or(FarPtr::NULL);
+
+        self.globals()
+            .write(machine, "usrnum", &uno.to_le_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "usrptr", &slot.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "usaptr", &account.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write(machine, "vdaptr", &vda.to_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        Ok(())
+    }
+
+    /// Plant a connecting user's account record and channel state, and make
+    /// the channel current.
+    ///
+    /// Writes what a real board's `loadup()` would have read out of
+    /// `bbsusr.dat` -- this host has no accounts and none are being grown
+    /// here; see [`users::Connection`]. `usrcls`, `state` and `substt` are
+    /// all written as zero: that is already what a freshly allocated slot
+    /// reads as (`Users::new`'s `alczer` zeroed it), and it is what
+    /// [`Host::connect`] (Task 8) then hands to the module's own `lonrou` to
+    /// set for real. Written anyway, rather than left to the allocator's
+    /// zero, so the state a connecting channel is in is something this
+    /// function visibly does and not an accident of history.
+    ///
+    /// # Errors
+    ///
+    /// If `chan` names no channel, or a write runs off a segment.
+    pub fn connect_state(
+        &mut self,
+        machine: &mut Machine,
+        chan: i16,
+        who: &users::Connection,
+    ) -> Result<(), ShimError> {
+        let account = self.users().account(chan).ok_or_else(|| {
+            ShimError::Failed(format!("connect_state({chan}): there is no such channel"))
+        })?;
+        let slot = self
+            .users()
+            .slot(chan)
+            .expect("in range, so it has a user slot too");
+
+        // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
+        // the header's own comment says so -- so at most 29 characters fit
+        // and byte 29 must stay a NUL; `psword` starts immediately after
+        // `userid` in the record, at 30, and a longer name is truncated
+        // rather than overrunning it.
+        //
+        // The whole field is zeroed before the name is written in, not just
+        // the bytes the name occupies. `connect_state` can run again on a
+        // channel that already held a user -- Task 8/9's driver reuses
+        // channels rather than allocating a fresh one per connection -- and
+        // writing only `take` bytes would leave the tail of a longer, earlier
+        // name sitting past the new one. `userid` is what `obtbtvl` keys the
+        // character lookup on (`WCCMMUD_named.c:9847`), so that tail is not
+        // cosmetic: "dan" over "rangerdan" reads back as "dangerdan" and the
+        // module finds a stranger's character.
+        //
+        // Only `userid` is reset here, not the account's other 308 bytes.
+        // Whether a reused channel should clear the whole record is a real
+        // question, but it belongs with `lofrou`/disconnect -- there is no
+        // disconnect in this plan to decide it against.
+        const UIDSIZ: usize = 30;
+        let userid = who.userid.as_bytes();
+        let take = userid.len().min(UIDSIZ - 1);
+        let mut field = [0u8; UIDSIZ];
+        field[..take].copy_from_slice(&userid[..take]);
+        let at = FarPtr {
+            offset: account.offset + users::usracc::USERID as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &field)?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::ANSIFL as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[u8::from(who.ansi)])?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::SCNWID as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[who.width])?;
+
+        let at = FarPtr {
+            offset: account.offset + users::usracc::SCNFSE as u16,
+            selector: account.selector,
+        };
+        machine.write(at, &[who.height])?;
+
+        for (field, value) in [
+            (users::user::USRCLS, 0u16),
+            (users::user::STATE, 0u16),
+            (users::user::SUBSTT, 0u16),
+        ] {
+            let at = FarPtr {
+                offset: slot.offset + field,
+                selector: slot.selector,
+            };
+            machine.write(at, &value.to_le_bytes())?;
+        }
+
+        self.point_curusr(machine, chan)
+    }
+
+    /// Put a channel into the module's state machine and let the module know.
+    ///
+    /// `connect_state` writes what a real board's `loadup()` would have read
+    /// out of `bbsusr.dat`; `lonrou` is the module's own logon hook, which
+    /// `MAJORBBS.C:558`'s `lonstf()` called for every registered module. Only
+    /// one module is registered here, so this calls the one.
+    ///
+    /// Returns `None` if the module supplies no `lonrou` -- the real host
+    /// never called one either, so there is no [`Outcome`] to report for a
+    /// call that never happened.
+    ///
+    /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
+    /// poisons the machine and comes back as `Outcome::Stopped`, the same
+    /// policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered. (A malformed `chan`, a write running off
+    /// a segment, or the module being unenterable all poison the machine and
+    /// come back as `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
+    pub fn connect(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: i16,
+        who: &users::Connection,
+    ) -> io::Result<Option<Outcome>> {
+        if let Err(e) = self.connect_state(machine, chan, who) {
+            return self.shim_stop(machine, "connect_state", e).map(Some);
+        }
+
+        // `Registration::entry` borrows `self.modules()` immutably, and
+        // `self.run` needs `self` mutably right after -- so the pointer is
+        // read out here and the borrow ends before `run` is ever reached.
+        let lonrou = {
+            let registered = self.modules().first().ok_or_else(|| {
+                io::Error::other("no module has registered, so there is nothing to enter")
+            })?;
+            registered.entry(machine, 0)
+        };
+        let lonrou = match lonrou {
+            Ok(lonrou) => lonrou,
+            Err(e) => return self.shim_stop(machine, "lonrou lookup", e).map(Some),
+        };
+        let Some(lonrou) = lonrou else {
+            // R24: a null `lonrou` is legal -- the real host checked
+            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
+            // and it means no call happened, not that one returned zero.
+            // `None` says that honestly; a fabricated `Returned { ax: 0,
+            // dx: 0 }` would claim a call this host never made.
+            return Ok(None);
+        };
+        self.run(machine, module, lonrou, &[]).map(Some)
+    }
+
+    /// Service one channel that has something to report.
+    ///
+    /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
+    /// out -- the `usrptr->class` switch, `RING`/`CMDOK`, `rstchn`, `dwopr`,
+    /// `prcrtk` and `hdlinp`'s fallback to `module00` are all MajorBBS and not
+    /// the module, and none of them are here:
+    ///
+    /// ```text
+    /// scan() -> a channel with a status
+    ///   status 3 (CRSTG)  -> curusr(chan), getin(), then entry 1 (sttrou)
+    ///   status 4 (INBLK)
+    ///      or 5 (OUTMT)   -> curusr(chan), write the `status` global, entry 2 (stsrou)
+    ///   anything else     -> a note, and no call
+    /// ```
+    ///
+    /// Returns `None` if no channel has a status waiting, if the one that
+    /// did raised a status nothing here dispatches, or if the module
+    /// supplies no entry point for the one that would have been called --
+    /// none of those is a module call, so there is no [`Outcome`] to report.
+    ///
+    /// R21: a `ShimError` out of `point_curusr`, `get_input` or the entry
+    /// lookup poisons the machine and comes back as `Outcome::Stopped`, the
+    /// same policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered. (A write running off a segment, or the
+    /// module being unenterable, poisons the machine and comes back as
+    /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
+    pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
+        // R23: a status this host does not dispatch (`OVRFLW`, say) is not
+        // the same fact as "nothing queued" -- looping past it here, rather
+        // than answering `Ok(None)` for it, keeps that distinction from
+        // leaking into the return value. A driver written
+        // `while host.poll(..)?.is_some() {}` would otherwise stop dead on
+        // one undispatched status with a `CRSTG` still queued behind it.
+        // Every iteration consumes exactly one status, so this cannot
+        // legitimately run more times than there were statuses queued. The
+        // bound is not for the legitimate case.
+        //
+        // Both `continue` arms below allocate a note, and the status queue is
+        // deliberately unbounded (see `gsbl::Channel::status`). So an edit that
+        // stops consuming turns this loop into something that eats the machine
+        // instead of failing a test -- which is not hypothetical: a mutation
+        // that peeked instead of popping reached 4.7 GB resident and the global
+        // OOM killer took the session down with it. A host bug should cost a
+        // red test, not the box.
+        const SPINS: usize = 1024;
+        let mut spins = 0usize;
+
+        loop {
+            spins += 1;
+            if spins > SPINS {
+                return Err(io::Error::other(format!(
+                    "poll went round {SPINS} times without dispatching to the module: \
+                     a status is being read but not consumed"
+                )));
+            }
+
+            let Some(chan) = self.gsbl().scan() else {
+                return Ok(None);
+            };
+
+            // Popped before either entry point is called, not after -- a
+            // `sttrou` that re-enters through `hdlinp` must not see its own
+            // status still queued.
+            let status = self
+                .gsbl_mut()
+                .next_status(chan)
+                .expect("scan just found a channel with one");
+
+            let entry_index = match status {
+                gsbl::Gsbl::CRSTG => 1,
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => 2,
+                other => {
+                    self.note(format!(
+                        "poll: channel {chan} raised status {other}, which nothing here dispatches"
+                    ));
+                    continue;
+                }
+            };
+
+            // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
+            // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
+            // every dispatch -- `:157` is the `usrptr->class` switch this host
+            // deliberately does not have. `vdaptr` is not named there at all;
+            // `point_curusr` sets it because the real host's own `curusr`
+            // (`MAJORBBS.C:4290`) does.
+            if let Err(e) = self.point_curusr(machine, chan) {
+                return self.shim_stop(machine, "point_curusr", e).map(Some);
+            }
+
+            // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
+            // only the `!= 3` guard on `shomal()` (the operator console, out of
+            // scope) is conditional. `status` is a placed global
+            // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
+            // at 2 sites); writing it only on the non-CRSTG path left the
+            // module reading a stale value on the CRSTG path -- zero on a
+            // fresh host, or a leftover `OUTMT` from an earlier poll.
+            self.globals()
+                .write(machine, "status", &status.to_le_bytes())?;
+
+            if status == gsbl::Gsbl::CRSTG
+                && let Err(e) = self.get_input(machine, chan)
+            {
+                return self.shim_stop(machine, "get_input", e).map(Some);
+            }
+
+            // Same borrow trap as `connect`: read the entry pointer out of
+            // `self.modules()` and let that borrow end before `self.run` needs
+            // `self` mutably.
+            let entry = {
+                let registered = self.modules().first().ok_or_else(|| {
+                    io::Error::other("no module has registered, so there is nothing to enter")
+                })?;
+                registered.entry(machine, entry_index)
+            };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
+            };
+            let Some(entry) = entry else {
+                // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
+                // the input", which the module never answered here -- a
+                // fabricated `Returned { ax: 0, dx: 0 }` would claim a call
+                // that never happened. On the CRSTG path `get_input` above
+                // has already taken the line, so a module with no `sttrou`
+                // silently drops every command; not implementing
+                // `module00`'s fallback is in scope, dropping the line
+                // without a word about it is not.
+                self.note(format!(
+                    "poll: channel {chan} has no entry {entry_index} registered; \
+                     status {status} was serviced with no module call"
+                ));
+                continue;
+            };
+            return self.run(machine, module, entry, &[]).map(Some);
+        }
     }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
@@ -737,6 +1174,11 @@ impl Host {
         self.mdf
     }
 
+    /// One NUL byte the host owns and keeps. See [`Host::empty`].
+    fn empty_string(&self) -> FarPtr {
+        self.empty
+    }
+
     /// One past the last byte `prf` may write.
     fn prf_end(&self) -> u16 {
         self.prf_end
@@ -863,6 +1305,41 @@ impl Host {
         machine.poison(reason)?;
         let poison = machine.poisoned().expect("just poisoned").clone();
         Ok(Outcome::Stopped(poison))
+    }
+
+    /// Cross a `ShimError` from [`Host::connect`] or [`Host::poll`]'s own
+    /// internal calls into a poisoned machine, the same way [`Host::run`]
+    /// does for a `ShimError` a shim it dispatched through a thunk returns.
+    ///
+    /// `connect_state`, `point_curusr` and `get_input` predate `connect`/
+    /// `poll` and already answer in `Result<_, ShimError>`, reached directly
+    /// rather than through a thunk -- so `run`'s own crossing does not cover
+    /// them, and this is the only other place a `ShimError` becomes an
+    /// `Outcome`. Refusing plausible-but-wrong state is this crate's whole
+    /// ethic; leaving the machine runnable after `connect_state` half-wrote
+    /// an account record, or after `point_curusr` pointed `usrnum` at the
+    /// wrong channel, would be a hole in it -- so this does what `run` does
+    /// for the identical failure reached through a thunk: poison and answer
+    /// `Outcome::Stopped`, rather than an `Err` that leaves the machine
+    /// runnable.
+    ///
+    /// `where_` names the call that failed, since none of the three is an
+    /// imported symbol with a DLL of its own to report. The
+    /// `BadPointer`/`Failed` distinction survives into the poison's
+    /// `symbol` rather than being flattened through `Display` alone --
+    /// `ShimError` has no `Error` impl to recover it from afterwards.
+    fn shim_stop(&self, machine: &mut Machine, where_: &str, e: ShimError) -> io::Result<Outcome> {
+        let symbol = match &e {
+            ShimError::BadPointer(_) => format!("{where_}: bad pointer, {e}"),
+            ShimError::Failed(_) => format!("{where_}: {e}"),
+        };
+        self.stop(
+            machine,
+            Poison::Unimplemented {
+                module: "mbbs".to_owned(),
+                symbol,
+            },
+        )
     }
 
     /// The C name of an imported symbol, or something that identifies it when
@@ -1017,5 +1494,248 @@ impl ImportResolver for Resolver<'_> {
             // nothing.
             Entry::Unimplemented => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::Fixture;
+    use crate::users::Connection;
+
+    /// `connect` needs a `&Module` whether or not this path ever reads it --
+    /// [`Fixture::minimal_module`] loads one, but loading is not registering,
+    /// so `f.host.modules()` is still empty and `connect` has nothing to
+    /// enter. The full path, with a module that does register, is Task 10's
+    /// integration test.
+    #[test]
+    fn connect_with_no_module_registered_is_an_error_not_a_panic() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let err = f
+            .host
+            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .expect_err("no module has registered");
+        // R19: `is_err()` alone cannot tell this apart from a ShimError out
+        // of `connect_state` or the `lonrou` lookup -- both are wrong for
+        // different reasons and both would satisfy it. The text pins which
+        // one this is.
+        assert!(
+            err.to_string().contains("no module has registered"),
+            "expected the missing-registration message, got: {err}"
+        );
+    }
+
+    /// No status queued, no channel to service, nothing to call.
+    #[test]
+    /// A status that is read but never consumed must cost a red test, not the
+    /// machine.
+    ///
+    /// This is the guard, exercised the only way it can be without mutating
+    /// `poll` itself: queue more undispatched statuses than the bound. Each is
+    /// consumed normally, so the loop is doing the right thing and still trips
+    /// -- which is what makes the bound observable at all.
+    ///
+    /// The mutation this exists for -- peeking instead of popping -- reached
+    /// 4.7 GB resident on a 7.5 GB box and the OOM killer took the whole
+    /// session with it, because both `continue` arms allocate a note.
+    #[test]
+    fn poll_refuses_to_spin_forever_on_a_status_nothing_consumes() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        // 253 is OVRFLW -- a real status this host queues and does not
+        // dispatch, so every one takes the `continue` arm.
+        for _ in 0..1100 {
+            f.host
+                .gsbl_mut()
+                .channel_mut(0)
+                .expect("channel 0")
+                .status
+                .push_back(crate::gsbl::Gsbl::OVRFLW);
+        }
+
+        let e = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("the guard trips rather than looping");
+        assert!(
+            e.to_string().contains("not consumed"),
+            "the error says what happened: {e}"
+        );
+    }
+
+    #[test]
+    fn poll_with_nothing_queued_returns_none_and_calls_nothing() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let before = f.host.calls();
+        assert!(
+            f.host
+                .poll(&mut f.machine, &module)
+                .expect("no fault")
+                .is_none()
+        );
+        assert_eq!(f.host.calls(), before, "nothing was dispatched");
+    }
+
+    /// A status is queued, but `poll` still needs somewhere to deliver it --
+    /// and here, as in [`connect_with_no_module_registered_is_an_error_not_a_panic`],
+    /// there is a `Module` but nothing has registered.
+    #[test]
+    fn poll_with_a_status_queued_but_no_module_registered_is_an_error_not_a_panic() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        let err = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("no module has registered");
+        // R19: same reasoning as the `connect` test above -- `is_err()`
+        // cannot distinguish this from a `ShimError` out of `point_curusr`,
+        // `get_input` or the entry lookup, each a different failure.
+        assert!(
+            err.to_string().contains("no module has registered"),
+            "expected the missing-registration message, got: {err}"
+        );
+    }
+
+    /// R20: `MAJORBBS.C:152` writes `status` unconditionally; only `shomal()`
+    /// (out of scope) is behind the `!= 3` guard. Writing it only on the
+    /// non-CRSTG path left `stsrou` reading a stale value on the CRSTG path.
+    #[test]
+    fn poll_writes_the_status_global_on_the_crstg_path_too() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        // No module registered, so this errors after `point_curusr` and the
+        // `status` write have already run -- which is exactly what is being
+        // checked.
+        let _ = f.host.poll(&mut f.machine, &module);
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            crate::gsbl::Gsbl::CRSTG as u16,
+            "status must be written before dispatch, not only off the CRSTG path"
+        );
+    }
+
+    /// R23: an undispatched status ahead of a dispatchable one must not read
+    /// as "nothing queued". `Ok(None)` is what `poll` answers when there is
+    /// truly nothing to report; a driver written
+    /// `while host.poll(..)?.is_some() {}` would stop dead on the first
+    /// `OVRFLW` otherwise, with the CRSTG behind it never serviced.
+    #[test]
+    fn poll_loops_past_an_undispatched_status_to_the_dispatchable_one_behind_it() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        f.host
+            .gsbl_mut()
+            .channel_mut(0)
+            .expect("chan 0")
+            .status
+            .push_back(crate::gsbl::Gsbl::OVRFLW);
+        f.host.gsbl_mut().push_input(0, b"look\r");
+
+        // No module is registered, so `poll` errors -- but only once it
+        // reaches the CRSTG dispatch, which it does only if the `OVRFLW`
+        // ahead of it did not make `poll` stop and answer `Ok(None)`.
+        let err = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("the CRSTG behind the OVRFLW is still there to dispatch");
+        assert!(
+            err.to_string().contains("no module has registered"),
+            "expected to reach the CRSTG dispatch past the OVRFLW: {err}"
+        );
+    }
+
+    /// R24: a module that registers but supplies no `sttrou` must not make
+    /// `poll` fabricate `Returned { ax: 0, dx: 0 }` for a call that never
+    /// happened -- and the CRSTG line `get_input` already took must leave a
+    /// note behind, not disappear silently.
+    #[test]
+    fn poll_notes_rather_than_fabricates_when_the_registered_module_has_no_sttrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        // A `struct module` block: a name, then nine far pointers, all left
+        // null -- a module that registers but supplies no entry points at
+        // all, `sttrou` included.
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+
+        f.host.gsbl_mut().push_input(0, b"look\r");
+        let notes_before = f.host.notes().len();
+        let outcome = f.host.poll(&mut f.machine, &module).expect("no fault");
+
+        assert_eq!(outcome, None, "no sttrou means no call happened");
+        assert!(
+            f.host.notes().len() > notes_before,
+            "a command dropped for lack of an entry point must leave a note"
+        );
+    }
+
+    /// R24: the same fabrication, on `connect`'s side -- a module that
+    /// registers with no `lonrou` at all must answer `None`, not a
+    /// `Returned { ax: 0, dx: 0 }` for a `lonrou` call that never happened.
+    #[test]
+    fn connect_answers_none_rather_than_fabricates_when_lonrou_is_null() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+
+        let outcome = f
+            .host
+            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .expect("connect_state ran and there was nothing to call");
+        assert_eq!(outcome, None, "no lonrou means no call happened");
+    }
+
+    /// R21: a `ShimError` out of `connect_state` must poison the machine and
+    /// come back as `Outcome::Stopped`, the same policy `Host::run` applies
+    /// to a `ShimError` from a shim it dispatched through a thunk -- not an
+    /// `Err` that leaves the machine free to be called again on state that
+    /// never finished writing.
+    #[test]
+    fn a_shim_error_in_connect_poisons_the_machine_rather_than_leaving_it_runnable() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let past = f.host.gsbl().terms() as i16;
+
+        let outcome = f
+            .host
+            .connect(&mut f.machine, &module, past, &Connection::ansi("rangerdan"))
+            .expect("connect_state's failure is a stop, not a panic");
+        match outcome {
+            Some(crate::Outcome::Stopped(mbbs16::Poison::Unimplemented { symbol, .. })) => {
+                assert!(
+                    symbol.contains("connect_state"),
+                    "the poison should name what failed: {symbol}"
+                );
+            }
+            other => panic!("expected a named stop: {other:?}"),
+        }
+
+        assert!(
+            f.machine.poisoned().is_some(),
+            "a ShimError in connect must leave the machine unrunnable"
+        );
+        let entry = mbbs16::FarPtr {
+            offset: 0,
+            selector: f.machine.code_selector(),
+        };
+        assert!(
+            f.machine.call(entry, &[]).is_err(),
+            "a poisoned machine must refuse to be entered again"
+        );
     }
 }
