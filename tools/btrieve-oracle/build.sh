@@ -7,7 +7,14 @@
 # this machine should inherit that.
 set -e
 
-REPO=$(git rev-parse --show-toplevel)
+# Resolved from this script's own location, NOT from `git rev-parse
+# --show-toplevel`, which answers about the CURRENT DIRECTORY. Running
+# `sh .worktrees/x/tools/btrieve-oracle/build.sh` from the main checkout used
+# that answer to compile the main checkout's btrvprobe.c and install it over
+# the worktree's, and the next sweep then measured the wrong program while
+# reporting the worktree's paths. The script knows where it lives; use that.
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+REPO=$HERE
 PREFIX=${BTRIEVE_WINEPREFIX:-$HOME/.btrieve-wine}
 ENGINE=$REPO/docs/mirrors/github-syntax53-Nightmare-Redux
 WORK=$PREFIX/drive_c/btrieve

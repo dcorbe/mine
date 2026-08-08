@@ -104,6 +104,47 @@ static unsigned fs_indexes(const FileSpec *fs)
     return fs->indexes_raw & 0x00FF;
 }
 
+/* Key flag bit 4: this spec is one segment of a key that continues into the
+ * next spec. Btrieve's stat reply carries one KeySpec PER SEGMENT, but the
+ * count in the file spec is per KEY -- measured on WCCBANKS.VIR, which reports
+ * `indexes 1` and one spec with this bit set, and is one key of two segments
+ * (a 30-byte name and a 4-byte integer). So key N is NOT spec[N] once any
+ * earlier key has more than one segment, and its length is not spec[N].length
+ * either. This is the same distinction `crates/mbbs/src/btrieve/keys.rs` draws
+ * between a key's `number` and its `definition`.
+ *
+ * A first version of this program indexed spec[N] directly. Nothing caught it,
+ * because every MajorMUD file with a segmented key holds zero records -- so it
+ * would have gone wrong for the first file this host ever wrote records into.
+ */
+#define KFLG_SEGMENTED 0x0010
+
+/* Where key `keynum` starts in the spec array, and how long it is in total.
+ * Returns 0 if the file has no such key. */
+static int key_extent(const KeySpec *specs, unsigned specs_len, unsigned keys,
+                      unsigned keynum, unsigned *first, unsigned *length,
+                      unsigned *segments)
+{
+    unsigned i = 0, k;
+
+    for (k = 0; k < keys; k++) {
+        unsigned start = i, len = 0, n = 0;
+        do {
+            if (i >= specs_len)
+                return 0;
+            len += specs[i].length;
+            n++;
+        } while (specs[i++].flags & KFLG_SEGMENTED);
+        if (k == keynum) {
+            *first = start;
+            *length = len;
+            *segments = n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static const char *status_name(int st)
 {
     switch (st) {
@@ -257,7 +298,12 @@ static int stat_file(char *posblk, FileSpec *fs, KeySpec *keys, unsigned max_key
         return st;
 
     memcpy(fs, data, sizeof *fs);
-    n = fs_indexes(fs) < max_keys ? fs_indexes(fs) : max_keys;
+    /* Every spec that fits, not one per key: a segmented key occupies more than
+     * one, and `key_extent` needs to see them all to add up its length. The
+     * reply is bounded by DATA_SIZE and `max_keys` is the caller's array. */
+    n = max_keys;
+    if (sizeof(FileSpec) + n * sizeof(KeySpec) > DATA_SIZE)
+        n = (DATA_SIZE - sizeof(FileSpec)) / sizeof(KeySpec);
     for (i = 0; i < n; i++)
         memcpy(&keys[i], data + sizeof(FileSpec) + i * sizeof(KeySpec), sizeof(KeySpec));
     return ST_OK;
@@ -286,10 +332,14 @@ static void cmd_stat(const char *path)
     printf("records     %lu\n", (unsigned long)fs.records);
     printf("flags       0x%04x\n", fs.flags);
     printf("allocations %u\n", fs.allocations);
-    for (i = 0; i < fs_indexes(&fs) && i < 24; i++)
-        printf("key %u       pos=%u len=%u flags=0x%04x approx=%lu type=%u\n",
-               i, keys[i].position, keys[i].length, keys[i].flags,
-               (unsigned long)keys[i].approx_count, keys[i].ext_type);
+    for (i = 0; i < fs_indexes(&fs) && i < 24; i++) {
+        unsigned first, length, segments;
+        if (!key_extent(keys, 24, fs_indexes(&fs), i, &first, &length, &segments))
+            break;
+        printf("key %u       pos=%u len=%u flags=0x%04x approx=%lu type=%u segments=%u\n",
+               i, keys[first].position, length, keys[first].flags,
+               (unsigned long)keys[first].approx_count, keys[first].ext_type, segments);
+    }
 
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
@@ -305,7 +355,7 @@ static void cmd_walk(const char *path, int keynum)
     KeySpec keys[24];
     DWORD dlen;
     unsigned long count = 0, regressions = 0;
-    unsigned klen;
+    unsigned klen, first, length = 0, segments = 0;
     enum collation coll;
     int st, have_prev = 0;
 
@@ -315,9 +365,17 @@ static void cmd_walk(const char *path, int keynum)
     st = stat_file(posblk, &fs, keys, 24);
     if (st != ST_OK)
         die("stat", st);
-    klen = (keynum >= 0 && (unsigned)keynum < fs_indexes(&fs)) ? keys[keynum].length : 0;
-    coll = (keynum >= 0 && (unsigned)keynum < fs_indexes(&fs))
-         ? collation_of(keys[keynum].ext_type, klen) : COLL_UNKNOWN;
+    klen = 0;
+    coll = COLL_UNKNOWN;
+    first = 0;
+    if (keynum >= 0 && key_extent(keys, 24, fs_indexes(&fs), (unsigned)keynum,
+                                  &first, &length, &segments)) {
+        klen = length;
+        /* A segmented key's collation is per segment; this program only knows
+         * how to order a single one, and reports "not checked" rather than
+         * manufacturing violations out of a whole-blob compare. */
+        coll = segments == 1 ? collation_of(keys[first].ext_type, klen) : COLL_UNKNOWN;
+    }
 
     dlen = DATA_SIZE;
     memset(keybuf, 0, sizeof keybuf);
@@ -358,8 +416,8 @@ static void cmd_walk(const char *path, int keynum)
         print_key(prev, klen);
         printf("\n");
     }
-    printf("key         %d (len %u, type %u, %s)\n", keynum, klen,
-           keys[keynum < 0 ? 0 : keynum].ext_type, collation_name(coll));
+    printf("key         %d (len %u, %u segment(s), type %u, %s)\n", keynum, klen,
+           segments, keys[first].ext_type, collation_name(coll));
     printf("walked      %lu\n", count);
     printf("stat says   %lu\n", (unsigned long)fs.records);
     printf("regressions %lu%s\n", regressions,
@@ -385,9 +443,9 @@ static void cmd_descend(const char *path, int keynum)
     FileSpec fs;
     KeySpec keys[24];
     DWORD dlen;
-    unsigned long count = 0, i, misses = 0;
-    unsigned klen;
-    int st, collect_status;
+    unsigned long count = 0, i, misses = 0, wrong_record = 0;
+    unsigned klen, koff, first, segments;
+    int st, collect_status, checkable;
 
     st = open_file(posblk, path, MODE_READ_ONLY);
     if (st != ST_OK)
@@ -395,11 +453,28 @@ static void cmd_descend(const char *path, int keynum)
     st = stat_file(posblk, &fs, keys, 24);
     if (st != ST_OK)
         die("stat", st);
-    if (keynum < 0 || (unsigned)keynum >= fs_indexes(&fs)) {
+    if (keynum < 0 || !key_extent(keys, 24, fs_indexes(&fs), (unsigned)keynum,
+                                  &first, &klen, &segments)) {
         fprintf(stderr, "FAIL: key %d out of range, file has %u\n", keynum, fs_indexes(&fs));
         exit(1);
     }
-    klen = keys[keynum].length;
+
+    /*
+     * GET_EQUAL succeeding only proves the engine reached SOME leaf entry
+     * carrying the key. It does not prove the entry names the right record: an
+     * index whose entries hold the correct key values but the wrong record
+     * positions descends perfectly and hands back the wrong row, and a builder
+     * that paired keys with positions incorrectly is exactly the bug this
+     * program exists to catch. So the record itself is checked -- the key field
+     * of what came back must equal what was asked for.
+     *
+     * `position` is the key's 1-based byte offset within the record. It is only
+     * usable when the key is a single segment: a segmented key's bytes are not
+     * contiguous in the record, so the check is declined rather than performed
+     * wrongly. No MajorMUD file that holds records has a segmented key.
+     */
+    koff = keys[first].position ? keys[first].position - 1 : 0;
+    checkable = keys[first].position != 0 && segments == 1;
 
     keyvals = malloc((size_t)fs.records * klen + klen);
     if (!keyvals) {
@@ -438,20 +513,88 @@ static void cmd_descend(const char *path, int keynum)
                 print_key(keyvals + i * klen, klen);
                 printf(": status %d (%s)\n", st, status_name(st));
             }
+            continue;
+        }
+        if (checkable && dlen >= koff + klen
+            && memcmp(data + koff, keyvals + i * klen, klen) != 0) {
+            wrong_record++;
+            if (wrong_record <= 5) {
+                printf("  WRONG RECORD for key ");
+                print_key(keyvals + i * klen, klen);
+                printf(": record carries ");
+                print_key(data + koff, klen);
+                printf("\n");
+            }
         }
     }
 
-    printf("key         %d (len %u)\n", keynum, klen);
+    printf("key         %d (len %u, at byte %u)\n", keynum, klen, koff);
     printf("collected   %lu\n", count);
     printf("stat says   %lu\n", (unsigned long)fs.records);
     printf("collect end %d (%s)\n", collect_status, status_name(collect_status));
     printf("descents    %lu\n", count);
     printf("failures    %lu\n", misses);
-    printf("%s\n", (misses == 0 && count == fs.records
+    printf("wrong rec   %lu%s\n", wrong_record,
+           checkable ? "" : " (segmented key -- record not checked)");
+    printf("%s\n", (misses == 0 && wrong_record == 0 && count == fs.records
                      && collect_status == ST_END_OF_FILE)
                     ? "DESCEND OK" : "DESCEND MISMATCH");
 
     free(keyvals);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/*
+ * Print every key in the index's order, one hex value per line.
+ *
+ * `walk` reports only the first and last key, so two files can agree on both
+ * endpoints and on the record count while disagreeing about everything in
+ * between -- which is exactly what a wrong key comparator produces, since a
+ * permutation of the middle preserves the extremes. Diffing two dumps is what
+ * closes that: the shipped file against the same file reindexed by this host,
+ * with the real engine reading both.
+ */
+static void cmd_dump(const char *path, int keynum)
+{
+    static unsigned char data[DATA_SIZE];
+    char posblk[POSBLK_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    FileSpec fs;
+    KeySpec keys[24];
+    DWORD dlen;
+    unsigned long count = 0;
+    unsigned klen, first, segments, i;
+    int st;
+
+    st = open_file(posblk, path, MODE_READ_ONLY);
+    if (st != ST_OK)
+        die("open", st);
+    st = stat_file(posblk, &fs, keys, 24);
+    if (st != ST_OK)
+        die("stat", st);
+    if (keynum < 0 || !key_extent(keys, 24, fs_indexes(&fs), (unsigned)keynum,
+                                  &first, &klen, &segments)) {
+        fprintf(stderr, "FAIL: key %d out of range, file has %u\n", keynum, fs_indexes(&fs));
+        exit(1);
+    }
+
+    dlen = DATA_SIZE;
+    memset(keybuf, 0, sizeof keybuf);
+    st = btrcall(B_GET_FIRST, posblk, data, &dlen, keybuf,
+                 sizeof keybuf - 1, (char)keynum);
+    while (st == ST_OK) {
+        for (i = 0; i < klen; i++)
+            printf("%02x", keybuf[i]);
+        printf("\n");
+        count++;
+        dlen = DATA_SIZE;
+        st = btrcall(B_GET_NEXT, posblk, data, &dlen, keybuf,
+                     sizeof keybuf - 1, (char)keynum);
+    }
+    if (st != ST_END_OF_FILE)
+        die("get_next", st);
+    fprintf(stderr, "dumped %lu keys of %lu\n", count, (unsigned long)fs.records);
+
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
@@ -463,10 +606,11 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend> <file.VIR> [keynum]\n"
+            "usage: btrvprobe <stat|walk|descend|dump> <file.VIR> [keynum]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
-            "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n");
+            "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
+            "  dump     print every key in index order, for diffing two files\n");
         return 2;
     }
     cmd  = argv[1];
@@ -492,6 +636,8 @@ int main(int argc, char **argv)
         cmd_walk(path, keynum);
     else if (!strcmp(cmd, "descend"))
         cmd_descend(path, keynum);
+    else if (!strcmp(cmd, "dump"))
+        cmd_dump(path, keynum);
     else {
         fprintf(stderr, "FAIL: unknown command %s\n", cmd);
         return 2;
