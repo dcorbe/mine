@@ -35,8 +35,18 @@ pub mod random;
 mod shims;
 pub mod strings;
 pub mod stream;
-#[cfg(test)]
-mod testing;
+/// Not `#[cfg(test)]`: `crates/mbbs/tests/wccmmud.rs` is a separate crate that
+/// links against this one built *without* `cfg(test)` (integration tests
+/// never see items gated that way), so this has to be an ordinary `pub mod`
+/// for `wccmmud.rs` to reach [`testing::scratch`] rather than keep its own
+/// copy of it.
+///
+/// `#[doc(hidden)]`: it has to be reachable, not advertised. [`testing::scratch`]
+/// calls `remove_dir_all` on the path it is given, which belongs in a test
+/// harness's hands and nowhere near the release public API a caller of this
+/// crate as a library would see documented.
+#[doc(hidden)]
+pub mod testing;
 pub mod textvar;
 pub mod users;
 
