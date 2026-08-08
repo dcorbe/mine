@@ -1061,6 +1061,52 @@ impl Host {
         Ok(Some(outcome))
     }
 
+    /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
+    ///
+    ///
+    /// Called once per elapsed second, never once per pass -- see
+    /// [`Host::cycle`].
+    ///
+    /// Every due entry is taken out of the table *before* any of them runs.
+    /// `GALMJD.C:1106` re-arms `mjdrtk` from inside `mjdrtk`, so a callback
+    /// pushes onto the list being walked; draining first puts the re-armed kick
+    /// in the next round, which is where the original's free-slot scan puts it
+    /// too.
+    ///
+    /// `fired` is added to rather than assigned, so a caller can accumulate
+    /// across the rounds of one catch-up.
+    ///
+    /// Returns the poison if a callback stopped the machine, and `None`
+    /// otherwise. A callback's return value is discarded, as `prcrtk` discards
+    /// it.
+    fn prcrtk(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<Poison>> {
+        let mut due = Vec::new();
+        self.kicks.retain_mut(|kick| {
+            // `rtkick` refuses a zero delay, so no live entry can underflow.
+            kick.delay -= 1;
+            if kick.delay == 0 {
+                due.push(*kick);
+                false
+            } else {
+                true
+            }
+        });
+
+        for kick in due {
+            *fired += 1;
+            match self.run(machine, module, kick.dstrou, &[])? {
+                Outcome::Stopped(poison) => return Ok(Some(poison)),
+                Outcome::Returned { .. } => {}
+            }
+        }
+        Ok(None)
+    }
+
     /// Service one channel that has something to report.
     ///
     /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
@@ -1710,7 +1756,7 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Outcome, gsbl};
+    use crate::{Clock, Kick, Outcome, gsbl};
     use mbbs16::FarPtr;
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --
@@ -2151,5 +2197,45 @@ mod tests {
             assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405));
         }
         assert_eq!(f.host.clock_reads(), 100, "counted even though it did not move");
+    }
+
+    #[test]
+    fn prcrtk_counts_down_and_fires_exactly_once() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 2, dstrou: rou });
+
+        let mut fired = 0;
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 0, "one second in, a two-second kick has not fired");
+        assert_eq!(f.host.kicks().len(), 1);
+
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 1, "the second round fires it");
+        assert!(f.host.kicks().is_empty(), "and takes it out of the table");
+
+        assert_eq!(f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 1, "a one-shot fires once -- GALMJD.C:1106 re-arms by hand");
+    }
+
+    /// `GALMJD.C:1106` calls `rtkick(1,mjdrtk)` from inside `mjdrtk`, so a
+    /// callback pushes onto the very table being walked. The due entries come
+    /// out before any of them runs, which puts a re-armed kick in the *next*
+    /// round -- the same place the original's free-slot scan puts it.
+    #[test]
+    fn a_kick_that_re_arms_itself_belongs_to_the_next_round() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 1, dstrou: rou });
+
+        let mut fired = 0;
+        f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran");
+        assert_eq!(fired, 1);
+
+        // What the callback would have done, done here because a `retf` cannot
+        // call a shim from inside this fixture.
+        f.host.kicks.push(Kick { delay: 1, dstrou: rou });
+        assert_eq!(f.host.kicks().len(), 1, "armed again, not fired again");
+
+        f.host.prcrtk(&mut f.machine, &module, &mut fired).expect("ran");
+        assert_eq!(fired, 2, "and it fires on the round after");
     }
 }
