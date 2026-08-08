@@ -2218,6 +2218,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reset_clears_the_channel_it_names_and_leaves_its_neighbours_alone() {
+        // The two tests above share a shape, and three real defects fit through
+        // it. Every assertion either of them makes is about the *target*
+        // channel, the first runs on a one-channel host where "the wrong
+        // channel" cannot be spelled at all, and the only block ever observed
+        // dirty beforehand is `usracc` -- `connect_state` writes no non-zero
+        // byte into `user` or `extusr`, and `Users::new` zeroed both, so those
+        // two assertions were checking zero against zero. Measured, not
+        // supposed: with only those two tests, all 743 passed while
+        //
+        //   * `rstchn` cleared `usracc` and left `user` and `extusr` alone,
+        //   * `rstchn` cleared *every* channel rather than the one named --
+        //     one player disconnecting wipes the record of everyone still on,
+        //   * `Users::clear_keys` ignored its argument and freed channel 0's
+        //     keyring whichever channel was being reset.
+        //
+        // So: three channels, all three dirtied in all three blocks and given
+        // keyrings, the *middle* one reset, and both neighbours asserted
+        // byte-for-byte afterwards. A gap on each side, because an off-by-one
+        // in either direction lands on a channel that is being watched.
+        let mut f = Fixture::rooted_with_terms(testing::data(), Terms::new(3));
+        let chans: Vec<crate::Chan> = f.host.users().terms().all().collect();
+
+        // The mark is per channel, so "untouched" is a stronger claim than
+        // "non-zero": a neighbour holding another channel's mark would fail
+        // too.
+        let mark = |chan: crate::Chan| 0xa0u8 | chan.index() as u8;
+        for &chan in &chans {
+            let who = users::Connection::ansi("rangerdan").with_keys(["PLAYKEY"]);
+            f.host
+                .connect_state(&mut f.machine, chan, &who)
+                .expect("a user on every channel");
+            for (at, len) in [
+                (f.host.users().slot(chan), users::USER),
+                (f.host.users().extra(chan), users::EXTUSR),
+                (f.host.users().account(chan), users::USRACC),
+            ] {
+                f.machine
+                    .write(at, &vec![mark(chan); usize::from(len)])
+                    .expect("a whole record to dirty");
+            }
+        }
+
+        let middle = chans[1];
+        f.host.rstchn(&mut f.machine, middle).expect("reset");
+
+        for (what, at, len) in [
+            ("user", f.host.users().slot(middle), users::USER),
+            ("extusr", f.host.users().extra(middle), users::EXTUSR),
+            ("usracc", f.host.users().account(middle), users::USRACC),
+        ] {
+            let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "channel 1's {what} still holds {} non-zero bytes after rstchn",
+                bytes.iter().filter(|&&b| b != 0).count()
+            );
+        }
+        assert!(
+            f.host.users().keys(middle).is_none(),
+            "the reset channel's keyring is gone"
+        );
+
+        for &chan in [&chans[0], &chans[2]] {
+            for (what, at, len) in [
+                ("user", f.host.users().slot(chan), users::USER),
+                ("extusr", f.host.users().extra(chan), users::EXTUSR),
+                ("usracc", f.host.users().account(chan), users::USRACC),
+            ] {
+                let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
+                assert!(
+                    bytes.iter().all(|&b| b == mark(chan)),
+                    "resetting channel 1 reached channel {chan}'s {what}"
+                );
+            }
+            assert!(
+                f.host.users().keys(chan).is_some(),
+                "channel {chan} was never reset and still holds its keyring"
+            );
+        }
+    }
+
     /// `connect` needs a `&Module` whether or not this path ever reads it --
     /// [`Fixture::minimal_module`] loads one, but loading is not registering,
     /// so `f.host.modules()` is still empty and `connect` has nothing to
