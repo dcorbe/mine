@@ -998,9 +998,11 @@ impl Host {
         // module finds a stranger's character.
         //
         // Only `userid` is reset here, not the account's other 308 bytes.
-        // Whether a reused channel should clear the whole record is a real
-        // question, but it belongs with `lofrou`/disconnect -- there is no
-        // disconnect in this plan to decide it against.
+        // Whether a reused channel should clear the whole record was an open
+        // question; it is not open any more. `dftrst` clears all of it, and
+        // [`Host::rstchn`] is where that happens -- at startup over every
+        // channel and at the tail of every disconnect, so a channel arriving
+        // here has already been emptied by whoever left it.
         const UIDSIZ: usize = 30;
         let userid = who.userid.as_bytes();
         let take = userid.len().min(UIDSIZ - 1);
@@ -1078,6 +1080,45 @@ impl Host {
         machine.write(at, &[now])?;
 
         self.point_curusr(machine, chan)
+    }
+
+    /// Completely reset a channel: `rstchn`, via its default handler `dftrst`.
+    ///
+    ///
+    /// `MAJORBBS.C:3487-3500`. Everything after those five lines is hardware:
+    /// `rcdbaud`, `lincst`, `bturst` and the `switch` over its return code
+    /// exist to bring a *modem* channel back up, and this host has no channel
+    /// hardware to reset. `mnuusr` is zeroed there too and is not here: it
+    /// belongs to the menuing subsystem, whose `muusrs` table this host does
+    /// not have and whose absence is deliberate. `gcsprst` is the
+    /// client/server reset, which this host has nothing to reset.
+    ///
+    /// # Why this is one routine and not two
+    ///
+    /// The original calls this from two places that look unrelated: startup
+    /// (`:908-911`, over every channel, right after `alcvda`) and the tail of
+    /// both disconnect paths. That is not a coincidence -- it is what makes "a
+    /// channel nobody has used" and "a channel just freed" the *same state by
+    /// construction*. [`Host::connect_state`] used to note that whether a
+    /// reused channel should clear its whole record was an open question; it is
+    /// not open, it is answered here, and the answer is "all of it".
+    ///
+    /// At one channel none of this is observable, because no second user ever
+    /// arrives to inherit the first one's bytes.
+    ///
+    /// # Errors
+    ///
+    /// If a write runs off a segment.
+    pub fn rstchn(&mut self, machine: &mut Machine, chan: Chan) -> Result<(), ShimError> {
+        self.users.clear_keys(chan);
+        for (at, len) in [
+            (self.users.slot(chan), users::USER),
+            (self.users.extra(chan), users::EXTUSR),
+            (self.users.account(chan), users::USRACC),
+        ] {
+            machine.write(at, &vec![0u8; usize::from(len)])?;
+        }
+        Ok(())
     }
 
     /// Put a channel into the module's state machine and let the module know.
@@ -1548,6 +1589,14 @@ impl Host {
     /// If the volatile data areas cannot be allocated.
     pub fn finish_init(&mut self, machine: &mut Machine) -> io::Result<()> {
         self.alcvda(machine)?;
+        // `MAJORBBS.C:908-911`, the next thing the real host does after
+        // `alcvda()`: reset every channel. See [`Host::rstchn`] for why startup
+        // and disconnect share one routine. The order is `:896` then `:908` and
+        // not the other way about.
+        for chan in self.users.terms().all() {
+            self.rstchn(machine, chan)
+                .map_err(|e| io::Error::other(format!("rstchn({chan}): {e}")))?;
+        }
         self.inited = true;
         Ok(())
     }
@@ -2096,6 +2145,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn resetting_a_channel_leaves_nothing_of_the_previous_user_behind() {
+        // `dftrst`, `MAJORBBS.C:3487-3500`. The bug this prevents is a channel
+        // handed to a second player while still holding the first player's
+        // account bytes -- invisible at one channel, because there is never a
+        // second player to hand it to.
+        let mut f = Fixture::new();
+        let chan = f.console();
+
+        let who = users::Connection::ansi("rangerdan").with_keys(["PLAYKEY"]);
+        f.host
+            .connect_state(&mut f.machine, chan, &who)
+            .expect("a user on the channel");
+
+        // Prove the channel is dirty before the reset, so the assertions after
+        // it are testing the reset rather than an allocator's zero.
+        let account = f.host.users().account(chan);
+        assert_eq!(
+            f.machine.resolve(account, 9).expect("account"),
+            b"rangerdan",
+            "the userid is really there before rstchn runs"
+        );
+        assert!(f.host.users().keys(chan).is_some(), "and so is a keyring");
+
+        f.host.rstchn(&mut f.machine, chan).expect("reset");
+
+        for (what, at, len) in [
+            ("user", f.host.users().slot(chan), users::USER),
+            ("extusr", f.host.users().extra(chan), users::EXTUSR),
+            ("usracc", f.host.users().account(chan), users::USRACC),
+        ] {
+            let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "{what} still holds {} non-zero bytes after rstchn",
+                bytes.iter().filter(|&&b| b != 0).count()
+            );
+        }
+
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "freekey() leaves NULL, not an empty keyring -- \
+             `usrptr->keys != NULL` is what MAJORBBS.C:3492 tests"
+        );
+    }
+
+    #[test]
+    fn every_channel_is_reset_when_the_host_finishes_starting_up() {
+        // `MAJORBBS.C:908-911` -- the reset loop runs over every channel right
+        // after alcvda. A channel the host has never touched and a channel just
+        // freed must be the same state, and this is what makes them so.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host = Host::new(&mut machine, testing::data(), Terms::new(3)).expect("host");
+
+        // Dirty a channel *before* finish_init, the way a heap that does not
+        // zero would have left it.
+        let chan = host.users().terms().chan(2).expect("channel 2");
+        let account = host.users().account(chan);
+        machine.write(account, &[0xffu8; 16]).expect("dirty it");
+
+        host.finish_init(&mut machine).expect("finished starting up");
+
+        let bytes = machine
+            .resolve(host.users().account(chan), 16)
+            .expect("account");
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "finish_init did not reset channel 2"
+        );
     }
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --

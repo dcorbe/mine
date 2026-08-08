@@ -405,6 +405,17 @@ impl Users {
         self.keys[unum.index()] = Some(keys);
     }
 
+    /// Drop this channel's keyring entirely.
+    ///
+    /// `freekey()`, as `dftrst` calls it (`MAJORBBS.C:3492-3494`, guarded by
+    /// `if (usrptr->keys != NULL)`). **Not the same as an empty
+    /// [`KeySet`](crate::KeySet)**: the original tests the pointer for null, so
+    /// "no keyring" and "a keyring holding nothing" are different states -- see
+    /// the field's own documentation -- and this produces the first.
+    pub fn clear_keys(&mut self, unum: Chan) {
+        self.keys[unum.index()] = None;
+    }
+
     /// `user[unum].polrou` -- the channel's polling routine, or `None` for
     /// NULL.
     ///
