@@ -1,6 +1,7 @@
 //! What sits behind each import, and what to do when nothing does.
 
 pub mod btrieve;
+pub mod credits;
 pub mod fsd;
 pub mod gsbl;
 pub mod memory;
@@ -243,6 +244,13 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
     (MAJORBBS, "getin", user::getin, Cleans::Caller),
     (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+    // Billing, which this host does not do. Both answer yes; `shims::credits`
+    // is where that decision is written down. `Cleans::Caller` is measured --
+    // `re/ne_arity.py` reads `add sp,8` after all three `otstcrd` sites and
+    // `add sp,0Ah` after all three `odedcrd` sites, matching `USRACC.H`'s
+    // `(int, long, int)` and `(int, long, int, int)` exactly.
+    (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller),
+    (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
     (
