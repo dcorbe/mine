@@ -856,17 +856,17 @@ impl Block {
             }
 
             let layout = pages::Layout { pages: total, ..layout };
-            let key_length = usize::from(key.length());
+            let shape = key.shape();
 
             // What the key's index occupies now. Rebuilding into these same
             // numbers is what keeps a file from growing by a whole index every
             // time it is closed, and it keeps `KEY_ROOT` correct without
             // rewriting it -- `number_pages` puts the root on `owned[0]`.
-            let owned = pages::walk(&self.path, layout, root, key_length)
+            let owned = pages::walk(&self.path, layout, root, shape)
                 .map_err(|why| fail(format!("key {}: {why}", key.number)))?
                 .pages;
 
-            let built = pages::build_index(layout, &entries, key_length)
+            let built = pages::build_index(layout, &entries, shape)
                 .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
 
             // Grow only if the new tree needs more pages than the old one had.
@@ -1914,7 +1914,7 @@ mod tests {
             + pages::fcr::KEY_ROOT;
         let root = pages::long(&fcr[root_at..root_at + 4]);
 
-        let walk = pages::walk(&block.path, layout, root, usize::from(key.length()))
+        let walk = pages::walk(&block.path, layout, root, key.shape())
             .expect("the tree this host just wrote is walkable");
         assert_eq!(walk.entries.len(), 400, "every record is in the tree once");
         assert!(walk.pages.len() > 1, "400 records do not fit one page");
