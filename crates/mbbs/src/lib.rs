@@ -2503,4 +2503,35 @@ mod tests {
             "and the kick has not been counted down at all"
         );
     }
+
+    /// What a `cycle` pass costs, reported and asserted by nothing.
+    ///
+    /// Two numbers matter and they are very different: an idle pass is a scan,
+    /// a clock read and an integer compare, while a dispatching pass is a full
+    /// emulated 16-bit call. Under a system clock an idle pass is also a
+    /// busy-wait, which is why `Ended::Idle` exists for a driver to block on.
+    ///
+    /// Deliberately asserts nothing. Throughput on a shared box is not stable
+    /// enough to pin, and a flaky meter is worse than no meter.
+    #[test]
+    #[ignore = "timing, not a meter"]
+    fn what_a_cycle_pass_costs() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 30_000, dstrou: rou });
+        f.host.set_clock(Clock::stepped(1_135_952_405, 1));
+
+        let n = 100_000;
+        let at = std::time::Instant::now();
+        let idle = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let each = at.elapsed() / idle.iterations as u32;
+        eprintln!("{} idle passes, {each:?} each", idle.iterations);
+
+        let (mut f, module, rou) = polling_fixture();
+        f.host.users.set_polrou(&mut f.machine, 0, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let at = std::time::Instant::now();
+        let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
+        let each = at.elapsed() / busy.iterations as u32;
+        eprintln!("{} dispatching passes, {each:?} each", busy.iterations);
+    }
 }
