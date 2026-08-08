@@ -484,6 +484,16 @@ pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     }
     let dstrou = machine.arg_far(1);
+    if delay == 0 {
+        // `RTKICK.C:50`'s free-slot marker is `countr == 0`, and `:65` skips any
+        // entry holding it -- so the original writes this kick into a slot that
+        // remains free and never runs it. Recording nothing is that behaviour;
+        // a zero entry in this `Vec` would instead never expire.
+        host.note(format!(
+            "rtkick: a zero delay for {dstrou:?}, which RTKICK.C would never fire"
+        ));
+        return Ok(Ret::Void);
+    }
     host.kicks.push(Kick { delay, dstrou });
     Ok(Ret::Void)
 }
@@ -696,7 +706,9 @@ pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// commit the future main loop to whichever one this file guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kick {
-    /// Seconds from registration until it is due. `0` means the next tick.
+    /// Seconds yet to go, counted down one per elapsed second by
+    /// [`crate::Host::prcrtk`]. Never `0`: `rtkick` refuses to record a
+    /// zero-delay kick, because `RTKICK.C` would never have fired it.
     pub delay: u16,
 
     /// The module routine to call. Far, and into the module's own code -- the
@@ -1159,6 +1171,28 @@ mod tests {
             .expect_err("refused");
         assert!(format!("{e}").contains("negative delay"), "{e}");
         assert!(f.host.kicks().is_empty());
+    }
+
+    /// `RTKICK.C:50` uses `countr == 0` as the *free-slot* marker and `:65`
+    /// skips any entry holding it, so `rtkick(0, f)` writes a zero into a slot
+    /// that stays free and `f` never runs. The `Vec` here has no free-slot
+    /// encoding, so the faithful translation is to record nothing at all --
+    /// keeping a zero entry would also wedge `Ended::Bound`'s `next_kick` at
+    /// `Some(0)` and stop the loop ever reaching `Idle`.
+    #[test]
+    fn a_zero_delay_kick_is_noted_and_never_recorded() {
+        let mut f = Fixture::new();
+        let dstrou = f.machine.code_ptr(0);
+        assert!(matches!(
+            f.invoke(rtkick, &[0, dstrou.offset, dstrou.selector]),
+            Ok(Ret::Void)
+        ));
+        assert!(f.host.kicks().is_empty(), "RTKICK.C would never fire it");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("rtkick")),
+            "and it does not happen in silence: {:?}",
+            f.host.notes()
+        );
     }
 
     #[test]

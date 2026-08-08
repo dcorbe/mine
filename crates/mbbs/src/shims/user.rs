@@ -10,9 +10,11 @@
 //! the two routines that hold the index still.
 
 use mbbs16::{Machine, Ret};
+use mbbs16::FarPtr;
 
 use super::ShimError;
 use crate::Host;
+use crate::gsbl::Gsbl;
 
 /// `struct usracc *uacoff(int unum)` -- the channel's account record.
 ///
@@ -98,6 +100,134 @@ pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let margv0 = host.get_input(machine, chan)?;
     Ok(Ret::Far(margv0))
 }
+
+/// `int haskey(char *lock)` -- does the current user hold the key to this lock?
+///
+/// `LOCKNKEY.C:254`, which is one line:
+///
+///
+/// The current user is taken from `usrnum` rather than from anything this host
+/// remembers, because that is what the original read: a module that moved
+/// `curusr` gets the answer for the channel it moved to. `WCCMMUD.DLL` calls
+/// this at 61 sites and imports none of the subsystem's other twenty-nine
+/// routines -- it asks, never grants, and never asks about anyone else.
+///
+/// The expression grammar and the key test are [`crate::KeySet::evaluate`].
+/// Two of `low_haskey`'s branches are answered here instead, because they are
+/// about the channel rather than about the keys:
+///
+/// `keys == NULL` (`:194`) -- a channel nobody has logged onto -- answers
+/// `class == BBSPRV`, not 0, and the check comes *before* the empty-lock check
+/// that would otherwise grant. `connect_state` writes `usrcls` as 0, which is
+/// neither `ONLINE` (1) nor `BBSPRV` (2, `MAJORBBS.H:163`), so it refuses; the
+/// comparison is written out rather than folded into a `false` so that it
+/// starts telling the truth on its own the day this host grows an internal
+/// channel.
+///
+/// `scnpsk` (`:213`), the pseudokey scan, is **not** reproduced. It walks an
+/// array `register_pseudok` (`:47`) fills, and `WCCMMUD.DLL` never calls
+/// `register_pseudok` -- so the array is empty and the scan cannot return
+/// anything but -1. If a second module ever registers one, this is a real gap.
+///
+/// # A deliberate infidelity
+///
+/// `low_haskey` reaches `lockbit(lock,0)`, which opens with `strupr(lock)` and
+/// uppercases the caller's string **in place** -- the module's own static
+/// config data. This shim does not: it takes `&Machine`, folds a host-side
+/// copy, and leaves module memory alone. Three reasons, recorded because this
+/// is the first place this crate is knowingly unfaithful to a measured byte.
+///
+/// It is unobservable to this module: those lock strings live in a table at
+/// `seg 0x1258` and reach `haskey` and nothing else -- no `prf`, no `strcpy`,
+/// no comparison. It is not consistent even in the original, because
+/// `flags&MASTER` returns before `lockbit` is reached, so a master-flagged
+/// user's lock strings never get uppercased at all. And writing into a
+/// module's static data from a predicate is a side effect nobody would design
+/// on purpose; it is C's in-place API leaking through an interface that is
+/// otherwise pure.
+pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let lock = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let lock = String::from_utf8_lossy(&lock);
+    // `globals()` reports `io::Error` and `ShimError` has no `From` for it, so
+    // the map_err is the house pattern here -- see `shims/fsd.rs:72`.
+    let unum = host
+        .globals()
+        .word(machine, "usrnum")
+        .map_err(|e| ShimError::Failed(format!("haskey: usrnum: {e}")))? as i16;
+
+    let answer = match host.users().keys(unum) {
+        Some(keys) => keys.evaluate(&lock),
+        // `LOCKNKEY.C:194`. Two cases arrive here and they are not the same
+        // one, which is why this is not a bare `false`:
+        None => match host.users().slot(unum) {
+            // A channel that exists but never logged on -- `keys == NULL`.
+            // Answered by class, and `usrcls` is 0 here, so it refuses; the
+            // comparison is written out rather than folded away so that it
+            // starts telling the truth on its own the day this host grows an
+            // internal channel.
+            Some(_) => host.class(machine, unum)? == BBSPRV,
+            // No such channel. `usrnum` is -1 for as long as nobody is on one
+            // (`MAJORBBS.C:740`'s sentinels exist for exactly that value), and
+            // there is nobody to hold a key. **Not** an error: asking
+            // `Host::class` here would stop the module over a state the real
+            // host was in whenever the board was idle.
+            None => false,
+        },
+    };
+    host.asked_for_key(unum, &lock, answer);
+    Ok(Ret::U16(answer.into()))
+}
+
+/// `void begin_polling(int unum, void (*rouptr)())` -- start calling `rouptr`
+/// for channel `unum` every time the host comes round. `MAJORBBS.C:1183`:
+///
+///
+/// The `inpolr` half of that guard is the one worth understanding.
+/// [`Host::dopoll`] re-injects `POLSTS` when a polling routine returns still
+/// polling, so a `begin_polling` issued from *inside* a polling routine would,
+/// without it, queue a second status for the same tick -- and then two, and
+/// then four. The queue is deliberately unbounded (`gsbl::Channel::status`), so
+/// the failure mode is the machine, not a wrong answer.
+///
+/// # Errors
+///
+/// If `unum` names no channel, or `rouptr` is NULL. The original stored a NULL
+/// -- making the call a `stop_polling` with one wasted status -- but all nine
+/// of `WCCMMUD.DLL`'s call sites pass a real routine and the only computed one
+/// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a NULL here
+/// is a module bug this host can name.
+pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let unum = machine.arg_u16(0) as i16;
+    let rouptr = machine.arg_far(1);
+    if rouptr == FarPtr::NULL {
+        return Err(ShimError::Failed(format!(
+            "begin_polling({unum}): a null polling routine"
+        )));
+    }
+    if host.users().polrou(machine, unum)?.is_none() && host.inpolr != Some(unum) {
+        host.gsbl_mut().inject(unum, Gsbl::POLSTS);
+    }
+    host.users.set_polrou(machine, unum, Some(rouptr))
+        .map(|()| Ret::Void)
+}
+
+/// `void stop_polling(int unum)` -- `user[unum].polrou=NULL`.
+/// `MAJORBBS.C:1194`, which is that one line.
+///
+/// No status is withdrawn. A `POLSTS` already queued arrives with nothing to
+/// call, and [`Host::dopoll`] does nothing with it -- which is the original's
+/// entire handling of that case.
+///
+/// # Errors
+///
+/// If `unum` names no channel.
+pub fn stop_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let unum = machine.arg_u16(0) as i16;
+    host.users.set_polrou(machine, unum, None).map(|()| Ret::Void)
+}
+
+/// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
+const BBSPRV: u16 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -228,5 +358,239 @@ mod tests {
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
         assert_ne!(margv0, mbbs16::FarPtr::NULL);
         assert_eq!(f.machine.read_cstr(margv0).expect("readable"), b"");
+    }
+
+    #[test]
+    fn haskey_answers_for_the_channel_usrnum_names() {
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
+
+        let lock = f.text("USER");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(1));
+
+        let lock = f.text("WCCSYSOP");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(0));
+    }
+
+    #[test]
+    fn haskey_refuses_everything_on_a_channel_that_never_logged_on() {
+        // `low_haskey`'s first check: `keys == NULL` answers `class == BBSPRV`,
+        // and `connect_state` writes `usrcls` as 0. The empty lock is the case
+        // that matters -- it is true for a logged-on channel holding nothing and
+        // false here, because the null check comes first.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &0i16.to_le_bytes())
+            .expect("usrnum is placed");
+
+        let lock = f.text("");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(0), "not 1 -- the null check comes first");
+    }
+
+    #[test]
+    fn haskey_refuses_when_no_channel_is_current() {
+        // `usrnum` is -1 for as long as nobody is on a channel. There is no
+        // keyring to consult and the answer is 0, not a panic and not a stop.
+        //
+        // Channel 0 is connected first, holding the very key that is asked
+        // about, and *then* `usrnum` is moved off it. That is what makes this
+        // test say something about `usrnum` rather than only about -1: with
+        // channel 0 empty, a shim that ignored `usrnum` and always read
+        // channel 0 would answer 0 here too -- for the wrong reason -- and
+        // this assertion would pass against it. At `nterms == 1` there is no
+        // second channel to catch that with, so the discriminator has to be a
+        // channel that *would* answer differently if it were the one read.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &(-1i16).to_le_bytes())
+            .expect("usrnum is placed");
+
+        let lock = f.text("USER");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(0));
+    }
+
+    #[test]
+    fn haskey_reads_the_lock_out_of_module_memory_rather_than_assuming_one() {
+        // The argument is a far pointer to a NUL-terminated string in the
+        // module's own memory, pushed cdecl. A shim that read the wrong words
+        // would still answer *something*, so the discriminating test is two
+        // different locks with different answers through the same call path --
+        // covered above -- plus an expression, which only works if the whole
+        // string arrived.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
+
+        let lock = f.text("USER|WCCSYSOP");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(1));
+    }
+
+    #[test]
+    fn haskey_does_not_uppercase_the_module_s_own_string() {
+        // The deliberate infidelity. `lockbit` (LOCKNKEY.C:439) opens with
+        // `strupr(lock)`, mutating the caller's static config data in place; this
+        // shim uppercases a host-side copy instead. Pinned so the deviation is a
+        // decision with a test rather than something a later reader "fixes".
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
+
+        let lock = f.text("user");
+        let got = f
+            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .expect("answered");
+        assert_eq!(got, mbbs16::Ret::U16(1), "matched case-insensitively");
+        assert_eq!(f.read(lock), "user", "and left the module's string alone");
+    }
+
+    /// `MAJORBBS.C:1183`. The status is what makes the channel tick; the store
+    /// is what makes it tick *into the right routine*.
+    #[test]
+    fn begin_polling_installs_the_routine_and_injects_one_status() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou)
+        );
+        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
+        assert_eq!(f.host.gsbl_mut().next_status(0), None, "exactly one");
+    }
+
+    /// The guard that keeps the status queue from doubling every tick.
+    /// `dopoll` re-injects on return, so a `begin_polling` from *inside* a
+    /// polling routine must not inject as well.
+    #[test]
+    fn begin_polling_injects_nothing_while_that_channel_is_inside_its_poll_routine() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        f.host.inpolr = Some(0);
+
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou),
+            "the routine is still installed"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "but nothing is injected -- dopoll will do that on return"
+        );
+    }
+
+    /// An already-polling channel is already going to be serviced.
+    #[test]
+    fn begin_polling_injects_nothing_when_the_channel_is_already_polling() {
+        let mut f = Fixture::new();
+        let first = f.machine.code_ptr(0);
+        let second = f.machine.code_ptr(1);
+
+        f.invoke(begin_polling, &[0, first.offset, first.selector])
+            .expect("installed");
+        assert_eq!(f.host.gsbl_mut().next_status(0), Some(crate::gsbl::Gsbl::POLSTS));
+
+        f.invoke(begin_polling, &[0, second.offset, second.selector])
+            .expect("replaced");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(second),
+            "the new routine replaces the old one"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "and no second status is queued"
+        );
+    }
+
+    #[test]
+    fn stop_polling_clears_the_routine_and_injects_nothing() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+            .expect("installed");
+        let _ = f.host.gsbl_mut().next_status(0);
+
+        f.invoke(stop_polling, &[0]).expect("stopped");
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None
+        );
+        assert_eq!(f.host.gsbl_mut().next_status(0), None);
+    }
+
+    #[test]
+    fn polling_a_channel_that_does_not_exist_is_refused() {
+        let mut f = Fixture::new();
+        let rou = f.machine.code_ptr(0);
+        assert!(
+            f.invoke(begin_polling, &[1, rou.offset, rou.selector])
+                .is_err(),
+            "nterms is 1, so channel 1 does not exist"
+        );
+        assert!(f.invoke(stop_polling, &[1]).is_err());
+    }
+
+    /// All nine call sites pass a real pointer, and the one computed pointer
+    /// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a whole
+    /// NULL here is a module bug rather than a compact `stop_polling`.
+    #[test]
+    fn a_null_polling_routine_is_refused_rather_than_installed() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(begin_polling, &[0, 0, 0]).is_err());
+        assert_eq!(
+            f.host.gsbl_mut().next_status(0),
+            None,
+            "and nothing is injected on the way out"
+        );
     }
 }

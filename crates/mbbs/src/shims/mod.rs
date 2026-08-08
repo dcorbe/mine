@@ -209,6 +209,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
     (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
+    (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller),
+    (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller),
     (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller),
     (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller),
     (MAJORBBS, "fsdnan", fsd::fsdnan, Cleans::Caller),
@@ -240,6 +242,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
     (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
     (MAJORBBS, "getin", user::getin, Cleans::Caller),
+    (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
     (

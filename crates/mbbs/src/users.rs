@@ -45,6 +45,8 @@ use std::io;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::ShimError;
+
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
 /// `0x29` the module strides by, not arithmetic from the declaration.
 pub const USER: u16 = 41;
@@ -78,6 +80,15 @@ pub mod user {
     pub const FLAGS: u16 = 0x14;
     /// `int crdrat` -- credit-consumption rate. Assigned at `+0x1a`.
     pub const CRDRAT: u16 = 0x1a;
+    /// `void (*polrou)()` -- the channel's current polling routine, or NULL.
+    /// `MAJORBBS.H:90`, four bytes.
+    ///
+    /// **The module reads this one.** `WCCMMUD_named.c:12241` indexes
+    /// `user[usrnum]` by hand and tests `+0x24` and `+0x26` for zero before
+    /// calling `begin_polling`, so unlike the keyring at offset 2 this field
+    /// cannot live Rust-side. See
+    /// `docs/plans/2026-08-08-polling-design.md`.
+    pub const POLROU: u16 = 0x24;
     /// `char lcstat` -- LAN channel state, and the odd byte that makes the
     /// stride 41 and not 42.
     pub const LCSTAT: u16 = 40;
@@ -130,6 +141,13 @@ pub struct Connection {
     pub width: u8,
     /// `usracc.scnfse`. MajorMUD wants at least 23.
     pub height: u8,
+    /// What this user is allowed to do.
+    ///
+    /// Empty unless a caller says otherwise, and deliberately so: the login
+    /// method decides access, and a default that granted anything would make
+    /// every test's access an accident of this struct rather than a statement
+    /// at the call site. See [`Connection::with_keys`].
+    pub keys: crate::KeySet,
 }
 
 impl Connection {
@@ -140,7 +158,28 @@ impl Connection {
             ansi: true,
             width: 80,
             height: 24,
+            keys: crate::KeySet::default(),
         }
+    }
+
+    /// The keys this user holds.
+    ///
+    /// This is the seam the whole design turns on. A real board resolved keys
+    /// at logon, out of `bbsk.dat`, before any module could ask -- so keys
+    /// belong to whatever authenticated the user, and this host has no opinion
+    /// about where they came from. A DOS door, a PAM stack, a local keys file
+    /// and a `bbsk.dat` reader are all just things that build a
+    /// [`Connection`].
+    pub fn with_keys(mut self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.keys = crate::KeySet::new(keys);
+        self
+    }
+
+    /// Give this user the master flag. **Read [`crate::KeySet::master`] first**
+    /// -- it grants every lock, including the ones that ban you.
+    pub fn master(mut self, yes: bool) -> Self {
+        self.keys = std::mem::take(&mut self.keys).master(yes);
+        self
     }
 }
 
@@ -167,6 +206,21 @@ pub struct Users {
     /// how big each is. `None` until `alcvda`, which cannot run until every
     /// module's `dclvda` has been counted.
     vda: Option<(FarPtr, u16)>,
+    /// `usrptr->keys` -- what each channel is allowed to do.
+    ///
+    /// The fourth per-channel table, and the only one that does not live in
+    /// module memory. `LOCKNKEY.C` kept a bitset here, indexed by `lockbit`'s
+    /// interned lock array; `WCCMMUD.DLL` imports neither that field nor any
+    /// routine that reads it, so there is nothing to be faithful *to* at the
+    /// byte level and this is a [`crate::KeySet`] instead. See `keys.rs`.
+    ///
+    /// `None` is `keys == NULL`: a channel nobody has logged onto.
+    /// `Some(empty)` is a channel that logged on holding nothing. The two are
+    /// different answers, not the same one -- `low_haskey` (`LOCKNKEY.C:194`)
+    /// tests the null before it tests the lock, so a never-logged-on channel
+    /// refuses even an empty lock. `loadkeys()` allocated unconditionally, so
+    /// the `None`-to-`Some` transition is exactly logon.
+    keys: Vec<Option<crate::KeySet>>,
 }
 
 /// Words `MAJORBBS.C:740` puts *before* `channel[0]`, so that `channel[-1]`,
@@ -247,6 +301,7 @@ impl Users {
             accounts,
             channels,
             vda: None,
+            keys: vec![None; usize::from(terms)],
         })
     }
 
@@ -320,18 +375,87 @@ impl Users {
         self.nth(base, size, unum)
     }
 
+    /// What channel `unum` is allowed to do, or `None` if it never logged on
+    /// -- or if there is no such channel.
+    pub fn keys(&self, unum: i16) -> Option<&crate::KeySet> {
+        self.index(unum).and_then(|at| self.keys[at].as_ref())
+    }
+
+    /// Give channel `unum` a keyring. What `loadkeys()` did at logon.
+    ///
+    /// A channel that does not exist is a silent no-op, matching
+    /// [`Users::nth`]'s bound and `curusr`'s.
+    pub fn set_keys(&mut self, unum: i16, keys: crate::KeySet) {
+        if let Some(at) = self.index(unum) {
+            self.keys[at] = Some(keys);
+        }
+    }
+
+    /// `user[unum].polrou` -- the channel's polling routine, or `None` for
+    /// NULL.
+    ///
+    /// Read out of emulated memory every time rather than cached: the whole
+    /// point of the check `dopoll` makes after calling a polling routine is
+    /// that the routine may have called `stop_polling` on itself while it ran,
+    /// and a remembered copy would not have noticed.
+    ///
+    /// # Errors
+    ///
+    /// If `unum` names no channel, or the read runs off the segment.
+    pub fn polrou(&self, machine: &Machine, unum: i16) -> Result<Option<FarPtr>, ShimError> {
+        let bytes = machine.resolve(self.polrou_at(unum)?, 4)?;
+        let rou = FarPtr::from_bytes(bytes.try_into().expect("4 bytes"));
+        Ok((rou != FarPtr::NULL).then_some(rou))
+    }
+
+    /// Install or clear channel `unum`'s polling routine.
+    ///
+    /// # Errors
+    ///
+    /// If `unum` names no channel, or the write runs off the segment.
+    pub fn set_polrou(
+        &mut self,
+        machine: &mut Machine,
+        unum: i16,
+        rou: Option<FarPtr>,
+    ) -> Result<(), ShimError> {
+        let at = self.polrou_at(unum)?;
+        machine.write(at, &rou.unwrap_or(FarPtr::NULL).to_bytes())?;
+        Ok(())
+    }
+
+    /// `&user[unum].polrou`.
+    ///
+    /// A channel that does not exist is an error here and a silent no-op in
+    /// [`Users::set_keys`], and the difference is deliberate: `set_keys` is
+    /// reached from `curusr`, whose documented behaviour for a bad channel is
+    /// to do nothing (`MAJORBBS.C:4293`), while every caller of this one is a
+    /// routine the module handed a channel number to.
+    fn polrou_at(&self, unum: i16) -> Result<FarPtr, ShimError> {
+        let slot = self
+            .slot(unum)
+            .ok_or_else(|| ShimError::Failed(format!("polrou({unum}): there is no such channel")))?;
+        Ok(FarPtr {
+            offset: slot.offset + user::POLROU,
+            selector: slot.selector,
+        })
+    }
+
+    /// `unum` as an index, or `None` if there is no such channel.
+    ///
+    /// The same bound [`Users::nth`] applies -- `MAJORBBS.C:4293`'s
+    /// `if (0 <= uno && uno < nterms)` -- stated once so the four tables
+    /// cannot come to disagree about which channels exist.
+    fn index(&self, unum: i16) -> Option<usize> {
+        (unum >= 0 && unum < i16::try_from(self.terms).ok()?).then_some(unum as usize)
+    }
+
     /// The `unum`th slot of a table of `each`-byte entries, or `None` if there
     /// is no such channel.
-    ///
-    /// The bound is `curusr`'s own -- `MAJORBBS.C:4293`'s
-    /// `if (0 <= uno && uno < nterms)` -- and it is stated here once so that
-    /// the three tables cannot come to disagree about which channels exist.
     fn nth(&self, base: FarPtr, each: u16, unum: i16) -> Option<FarPtr> {
-        if unum < 0 || unum >= i16::try_from(self.terms).ok()? {
-            return None;
-        }
+        let unum = u16::try_from(self.index(unum)?).ok()?;
         Some(FarPtr {
-            offset: base.offset.checked_add(each.checked_mul(unum as u16)?)?,
+            offset: base.offset.checked_add(each.checked_mul(unum)?)?,
             selector: base.selector,
         })
     }
@@ -631,5 +755,179 @@ mod tests {
         let mut f = crate::testing::Fixture::new();
         let past = f.host.users().terms() as i16;
         assert!(f.host.connect_state(&mut f.machine, past, &Connection::ansi("rangerdan")).is_err());
+    }
+
+    #[test]
+    fn a_channel_nobody_connected_to_has_no_keyring_at_all() {
+        // `usrptr->keys == NULL` -- `loadkeys()` has not run. Distinct from a
+        // channel that logged on holding nothing, and `low_haskey` answers the
+        // two differently; see `shims::user::haskey`.
+        let f = crate::testing::Fixture::new();
+        assert!(f.host.users().keys(0).is_none());
+    }
+
+    #[test]
+    fn connecting_gives_the_channel_the_keys_it_arrived_with() {
+        let mut f = crate::testing::Fixture::new();
+        let who = Connection::ansi("rangerdan").with_keys(["USER"]);
+        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+
+        let keys = f.host.users().keys(0).expect("the channel logged on");
+        assert!(keys.evaluate("USER"));
+        assert!(!keys.evaluate("WCCSYSOP"));
+    }
+
+    #[test]
+    fn connecting_with_no_keys_is_a_keyring_holding_nothing_not_the_absence_of_one() {
+        // `loadkeys()` (LOCKNKEY.C:97) allocates unconditionally, even for a user
+        // whose `bbsk.dat` record is blank -- so `keys` goes non-NULL at logon
+        // whatever the user holds. The distinction is observable: an empty lock
+        // is true for a channel holding nothing and false for one that never
+        // logged on.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .expect("channel 0");
+
+        let keys = f.host.users().keys(0).expect("logged on, holding nothing");
+        assert!(keys.evaluate(""), "an empty lock is true once logged on");
+        assert!(!keys.evaluate("USER"));
+    }
+
+    #[test]
+    fn a_reconnecting_channel_does_not_keep_the_previous_users_keys() {
+        // R13's shape, for the keyring: `connect_state` runs again on a channel
+        // that already held a user, and the second user must not inherit the
+        // first one's access.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("sysop").with_keys(["USER", "WCCSYSOP"]),
+            )
+            .expect("first connect");
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("guest").with_keys(["USER"]),
+            )
+            .expect("second connect");
+
+        let keys = f.host.users().keys(0).expect("logged on");
+        assert!(keys.evaluate("USER"));
+        assert!(!keys.evaluate("WCCSYSOP"), "the sysop's key did not survive");
+    }
+
+    #[test]
+    fn the_master_flag_lands_on_the_bit_majorbbs_h_names() {
+        // MASTER is 0x40 in the low byte of `user.flags`, offset 0x14
+        // (MAJORBBS.H:206). WCCMMUD tests that byte only with masks 2, 4 and
+        // 0x10, so this bit is host-private -- written for fidelity, and because
+        // a host that kept the flag only in Rust would have `user.flags` lying.
+        let mut f = crate::testing::Fixture::new();
+        let who = Connection::ansi("root").with_keys(["USER"]).master(true);
+        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+
+        let at = f.host.users().slot(0).expect("channel 0");
+        let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
+        assert_eq!(rec[user::FLAGS as usize] & 0x40, 0x40);
+    }
+
+    #[test]
+    fn connecting_without_the_master_flag_clears_it_and_leaves_its_neighbours() {
+        // Read-modify-write on bit 0x40 alone. The other bits of `flags` are the
+        // module's -- WCCMMUD sets and tests 2, 4, 0x10 in this same byte -- and
+        // a whole-field store would clear them out from under it. The clear
+        // direction matters too: a channel reused by a non-master must not keep
+        // the last user's master flag.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("root").master(true),
+            )
+            .expect("first connect");
+
+        // Whatever the module had set in the rest of the byte.
+        let at = f.host.users().slot(0).expect("channel 0");
+        let flags = mbbs16::FarPtr {
+            offset: at.offset + user::FLAGS,
+            selector: at.selector,
+        };
+        let was = f.machine.resolve(flags, 1).expect("in bounds")[0];
+        f.machine.write(flags, &[was | 0x16]).expect("in bounds");
+
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("guest"))
+            .expect("second connect");
+
+        let now = f.machine.resolve(flags, 1).expect("in bounds")[0];
+        assert_eq!(now & 0x40, 0, "the master flag is cleared");
+        assert_eq!(now & 0x16, 0x16, "the module's own bits survive");
+    }
+
+    #[test]
+    fn polrou_round_trips_through_the_bytes_the_module_reads() {
+        let mut f = crate::testing::Fixture::new();
+        let rou = mbbs16::FarPtr {
+            offset: 0x2184,
+            selector: 0x1010,
+        };
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "a fresh slot is NULL, because alczer zeroed it"
+        );
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou)
+        );
+
+        // What `WCCMMUD_named.c:12241` actually reads: the two words at
+        // `user[unum] + 0x24` and `+ 0x26`.
+        //
+        // `0x24` is written out rather than taken from `user::POLROU`, and that
+        // is the whole point of this assertion. An address derived from the
+        // constant under test moves when the constant moves, so the write and
+        // the check stay in agreement no matter how wrong both are -- it can
+        // only prove the accessor agrees with itself. The literal is the
+        // independent statement of `MAJORBBS.H:90`'s offset that makes a wrong
+        // `POLROU` observable.
+        let slot = f.host.users().slot(0).expect("channel 0");
+        let at = mbbs16::FarPtr {
+            offset: slot.offset + 0x24,
+            selector: slot.selector,
+        };
+        assert_eq!(
+            f.machine.resolve(at, 4).expect("in the slot"),
+            &[0x84, 0x21, 0x10, 0x10],
+            "offset then selector, little-endian"
+        );
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, None)
+            .expect("channel 0");
+        assert_eq!(
+            f.machine.resolve(at, 4).expect("in the slot"),
+            &[0, 0, 0, 0],
+            "NULL is four zero bytes, which is what the module tests for"
+        );
+    }
+
+    #[test]
+    fn polrou_refuses_a_channel_that_does_not_exist() {
+        let f = crate::testing::Fixture::new();
+        assert!(f.host.users().polrou(&f.machine, 1).is_err(), "nterms is 1");
+        assert!(f.host.users().polrou(&f.machine, -1).is_err());
     }
 }
