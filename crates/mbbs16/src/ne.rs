@@ -128,10 +128,6 @@ pub enum NeError {
     /// -- so this is a clear refusal rather than a guess.
     Moveable,
 
-    /// An OSFIXUP relocation: a floating-point fixup for the 8087 emulator.
-    /// Also absent from every module measured.
-    OsFixup { kind: u16 },
-
     /// A relocation source type the format does not define.
     UnknownSource { source: u8 },
 
@@ -185,9 +181,6 @@ impl fmt::Display for NeError {
                 "the relocation chain at {offset:#06x} in segment {segment} does not end"
             ),
             Self::Moveable => write!(f, "moveable segments are not supported"),
-            Self::OsFixup { kind } => {
-                write!(f, "OSFIXUP relocation of type {kind} is not supported")
-            }
             Self::UnknownSource { source } => {
                 write!(
                     f,
@@ -309,6 +302,20 @@ pub enum Target {
 
     /// A symbol in another module, by ordinal or by name.
     Import { module: u16, symbol: Symbol },
+
+    /// A floating-point emulator fixup, which this loader carries but does not
+    /// apply.
+    ///
+    /// The linker has already written the emulator interrupt at the site; a real
+    /// loader rewrites it to native 8087 instructions when a coprocessor is
+    /// present. Leaving it alone keeps the emulator path, and the emulator is
+    /// not implemented -- so a module that actually computes a float will fault
+    /// on the interrupt and name itself, which is the answer. Refusing the file
+    /// at load time instead costs 210 segments to avoid 50 sites:
+    /// `MAJORBBS-mbbstd.EXE` has 50 of these among 10,234 relocations, kinds 4-6
+    /// (`FIERQQ`/`FIDRQQ`/`FIWRQQ`), and none of the FSD or screen-library code
+    /// touches them.
+    OsFixup { kind: u16 },
 }
 
 /// How an imported symbol is named. Ordinals are the usual case by a very wide
@@ -579,7 +586,7 @@ fn parse_relocation(r: &Reader<'_>, at: usize, imptab: usize) -> Result<Relocati
             module: lo,
             symbol: Symbol::Name(r.pstring("imported name", imptab + usize::from(hi))?.0),
         },
-        TGT_OSFIXUP => return Err(NeError::OsFixup { kind: lo }),
+        TGT_OSFIXUP => Target::OsFixup { kind: lo },
         _ => unreachable!("TGT_MASK is two bits and all four are handled"),
     };
 
@@ -857,8 +864,9 @@ impl Machine {
     /// # Errors
     ///
     /// If the file is not a well-formed NE module, if it needs something this
-    /// loader refuses (a moveable segment, an OSFIXUP), or if a segment cannot
-    /// be mapped.
+    /// loader refuses (a moveable segment), or if a segment cannot be mapped. An
+    /// OSFIXUP relocation is not one of these: it is carried, not applied, and
+    /// costs the load nothing (see [`Target::OsFixup`]).
     pub fn load_ne(&mut self, file: &[u8], imports: &dyn ImportResolver) -> io::Result<Module> {
         let image = NeImage::parse(file)?;
         self.map_ne(&image, file, imports).map_err(io::Error::from)
@@ -944,6 +952,11 @@ impl Machine {
                             }
                         }
                     }
+
+                    // Not applied, so not counted: `applied` is a count of sites
+                    // this loader wrote, and claiming one it deliberately left
+                    // alone would make the total disagree with the image.
+                    Target::OsFixup { .. } => continue,
                 };
 
                 apply(&mut self.segments[first + i], (i + 1) as u16, reloc, value)?;

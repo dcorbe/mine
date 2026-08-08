@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use mbbs16::{Exit, FarPtr, Import, Machine, NeError, NeImage, Ret, Symbol};
+use mbbs16::{Exit, FarPtr, Import, Machine, NeError, NeImage, Ret, Symbol, Target};
 
 /// Logical sector alignment, as a shift count. Four rather than the usual nine
 /// so a two-segment test module is a few hundred bytes instead of a few
@@ -452,6 +452,57 @@ fn every_relocation_combination_the_real_module_uses_applies() {
 
     // A data import consumes no thunk at all: only the three routines did.
     assert_eq!(module.imports().len(), 3);
+}
+
+/// An OSFIXUP relocation is parsed and carried, not refused.
+///
+/// Target type 3 is the floating-point emulator fixup. A real image can carry a
+/// handful among thousands of ordinary fixups -- `MAJORBBS-mbbstd.EXE` has 50 of
+/// 10,234 -- and refusing the file over them costs the whole binary to save
+/// nothing. The site is left as the image had it, which is the emulator
+/// interrupt the linker already wrote there.
+#[test]
+fn an_osfixup_relocation_is_carried_rather_than_refused() {
+    // Built directly from `Reloc`'s raw fields rather than a new helper: those
+    // fields already are the record's eight bytes (source, flags, offset, lo,
+    // hi), so there is nothing an "image with a relocation" helper would add.
+    // Source OFFSET (5), flags 0x03 (TGT_OSFIXUP, no ADDITIVE bit), fixup kind 5
+    // (FIDRQQ).
+    let ne = Ne {
+        segments: vec![
+            Seg::code(vec![0u8; 0x10]).with(&[Reloc {
+                source: OFFSET,
+                flags: 0x03,
+                offset: 0x00,
+                lo: 5,
+                hi: 0,
+            }]),
+            Seg::data(vec![0; 16]),
+        ],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let image = NeImage::parse(&ne.finish()).expect("an OSFIXUP does not refuse the file");
+    let relocs = &image.segments[0].relocations;
+    assert_eq!(relocs.len(), 1);
+    assert_eq!(relocs[0].target, Target::OsFixup { kind: 5 });
+
+    // And it loads: the site is untouched, still exactly the zero byte the
+    // synthetic segment started with, because it was carried and not applied.
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+    assert_eq!(
+        module.relocations_applied(),
+        0,
+        "an OSFIXUP site is not one this loader wrote"
+    );
+    let code_sel = module.segment_selector(1).unwrap();
+    assert_eq!(
+        word(&machine, code_sel, 0x00),
+        0,
+        "the site is left exactly as the image had it"
+    );
 }
 
 /// The case `WCCMMUD.DLL` cannot check. Every non-additive chain in it is one
