@@ -286,18 +286,25 @@ fn ctype_table() -> [u8; CTYPE_LEN as usize] {
 /// notice, which is the one way this guess is observable.
 pub const OUTBSZ: u16 = 4096;
 
-/// How many channels this host has: `nterms`.
+/// The single-channel case: what `nterms` is on a host with only its console.
+///
+/// **Not "how many channels this host has"** -- a host has as many as the
+/// caller handed [`Host::new`](crate::Host::new), which takes a
+/// [`Terms`](crate::Terms) and reads no constant of its own. What this is
+/// instead is the *one-channel* shape, and it is worth a name for two reasons:
+/// it is what `MAJORBBS.C:80` and `GMEOFF.C:23` say the offline host always
+/// has, and it is the count every meter in this crate was measured against.
+/// `Terms::new(NTERMS)` at a call site says "one channel, deliberately" where a
+/// bare `1` would say nothing.
 ///
 /// `nterms` is what the module bounds its own loops by -- and what `curusr`'s
 /// `uno < nterms` guard admits -- so a per-channel table shorter than `nterms`
-/// is a table the module indexes past the end of, with no error anywhere.
-///
-/// This is the one place the number is written down. `Host::new` reads it once,
-/// into a [`Terms`](crate::Terms), and everything sized by channel is sized
-/// from that value: this global, the four tables in
-/// [`Users`](crate::Users), and [`Gsbl`](crate::gsbl::Gsbl)'s channels. They
-/// used to reach for this constant separately, which is how three copies of one
-/// number came to agree only by convention -- see [`crate::chan`].
+/// is a table the module indexes past the end of, with no error anywhere. That
+/// is why the count reaches the globals, [`Users`](crate::Users)' tables and
+/// [`Gsbl`](crate::gsbl::Gsbl)'s channels as one `Terms` value threaded from
+/// one place, rather than as three separate reads of this constant, which is
+/// how three copies of one number came to agree only by convention -- see
+/// [`crate::chan`].
 ///
 /// One is not a placeholder; see the `nterms` write in [`Globals::new`] for
 /// where that comes from.

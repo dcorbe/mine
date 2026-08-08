@@ -365,14 +365,32 @@ pub struct Host {
 
     /// Every form `fsdroom` has sized, in the order it was asked. See
     /// [`Host::forms`].
+    ///
+    /// **Flat, and owed a channel key.** See [`Host::fsdscb`](Host#structfield.fsdscb).
     pub(crate) forms: Vec<Form>,
 
     /// Where `struct fsdscb` lives, once `fsdroom` has needed one.
     ///
-    /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them and only
-    /// `if (fsdtbl == NULL)`; `nterms` is one here. `None` until the first
-    /// `fsdroom`, because the module *tests* the `fsdscb` global for null --
-    /// `seg 3:0x430f` -- and takes another path when it is.
+    /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them, and the real
+    /// `setfsd(chan)` exists precisely to select among them. `None` until the
+    /// first `fsdroom`, because the module *tests* the `fsdscb` global for
+    /// null -- `seg 3:0x430f` -- and takes another path when it is.
+    ///
+    /// # This is one control block and it should be `nterms` of them
+    ///
+    /// This field and [`forms`](Host#structfield.forms) above are both flat.
+    /// That was a *fact* while `Host::new` fixed the count at one; since the
+    /// count became a caller's input it is a **debt**, and the capability to
+    /// trip it shipped with that change. Two channels in the full-screen data
+    /// entry subsystem at once would share one control block and interleave
+    /// their answers into a single `newans`.
+    ///
+    /// Not fixed here because the FSD is out of scope for the multi-channel
+    /// work -- a *returning* player reaches the realm without touching a single
+    /// `fsd*` routine, which is why raising the count did not have to wait for
+    /// it -- so nothing in this crate can currently reach the hazard. It is
+    /// recorded rather than repaired, and keying both by [`Chan`] belongs with
+    /// whoever builds the form engine.
     pub(crate) fsdscb: Option<FarPtr>,
 
     /// Which message block `fsdroom` last read a template out of, which
@@ -470,9 +488,22 @@ impl Host {
     /// will be able to address.
     ///
     /// `root` is the directory the module's own files live in, and `terms` is
-    /// how many channels it serves -- the count is the caller's to choose,
-    /// because this crate has no business deciding how many players a board
-    /// takes.
+    /// how many channels it serves.
+    ///
+    /// **The count is an input because it was one in the original.**
+    /// `MAJORBBS.C:557` accumulates `nterms` per configured channel group --
+    /// `nterms+=numopt(msg+NUMBR1,1,256)`, whose `1` is the floor -- `:569`
+    /// catastros above 256, and `:845-866` walks the groups that result,
+    /// raising `hichp1` at `:861` and filling `channel[]` at `:862`. It was
+    /// never a constant the host chose for itself. [`NTERMS`](crate::NTERMS)
+    /// names the one-channel case -- `MAJORBBS.C:80`'s initialiser and
+    /// `GMEOFF.C:23`'s offline host, which is the shape every meter in this
+    /// crate was measured against.
+    ///
+    /// There is deliberately no two-argument form defaulting to one channel. A
+    /// caller who wanted four and got one would find out at the first
+    /// `Terms::chan(1)` that returned `None`, which is a long way from the
+    /// mistake; requiring the argument makes it a compile error instead.
     ///
     /// # Errors
     ///
@@ -1997,7 +2028,7 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing};
+    use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing, users};
     use mbbs16::{FarPtr, Machine};
 
     #[test]
@@ -2025,6 +2056,41 @@ mod tests {
             host.users().terms().chan(4).is_none(),
             "and there is no fifth"
         );
+
+        // Everything above reads a *declared* count. That is not enough, and
+        // the gap was found by mutation rather than argued: sizing
+        // `Users::new`'s three blocks from `globals::NTERMS` while still
+        // recording the caller's `terms` leaves `Users::terms()` answering four
+        // over tables one record long, and **all 736 tests passed**. Silent in
+        // exactly the direction `crate::chan` calls dangerous, and the
+        // `Gsbl` direction was already covered by `Host::new`'s three-way
+        // assert while this one was not.
+        //
+        // So this writes through every channel's `user` slot and checks the
+        // neighbouring blocks did not move under it. Four slots span
+        // `4 * 41` bytes from the base; a block sized for one channel is 41,
+        // so the write runs off the end of it and into whatever the heap
+        // handed out next. Alignment cannot save it -- 123 bytes of overrun is
+        // wider than any padding between two heap blocks.
+        let sentinel = [0xffu8; users::USER as usize];
+        for chan in host.users().terms().all() {
+            machine
+                .write(host.users().slot(chan), &sentinel)
+                .expect("every channel has a whole user record to write");
+        }
+        for chan in host.users().terms().all() {
+            for (what, at, len) in [
+                ("extusr", host.users().extra(chan), users::EXTUSR),
+                ("usracc", host.users().account(chan), users::USRACC),
+            ] {
+                let bytes = machine.resolve(at, usize::from(len)).expect(what);
+                assert!(
+                    bytes.iter().all(|&b| b == 0),
+                    "writing the four user records reached channel {chan}'s {what}, \
+                     so the tables are not four channels long"
+                );
+            }
+        }
     }
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --

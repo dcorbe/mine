@@ -293,7 +293,17 @@ impl Users {
 
         // `MAJORBBS.C:878` -- `channel[usrnum]=0` with `usrnum` still zero,
         // the local console. Reached only when no hardware channel groups are
-        // configured, which is this host: one channel, no serial board.
+        // configured, which is this host: no serial board.
+        //
+        // Only channel zero is written. Every other entry keeps the `-1` the
+        // whole block was filled with, which is the same value the three
+        // sentinels in front of it carry -- so at more than one channel a read
+        // of `channel[1]` is indistinguishable from a read of `channel[-1]`.
+        // Harmless for MajorMUD, which does not import `channel` (ordinal 97)
+        // at all, and left as it is rather than invented: the real host filled
+        // these in from configured channel groups, and this host has none to
+        // read. Whoever gives this host real hardware or a real transport owes
+        // the rest of the array.
         machine
             .write(channels, &0i16.to_le_bytes())
             .map_err(io::Error::other)?;

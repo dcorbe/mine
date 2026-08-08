@@ -64,9 +64,10 @@ impl Terms {
     /// # Panics
     ///
     /// If `count` is zero, or above `i16::MAX`. Neither is reachable from
-    /// `MAJORBBS.C`: `:80` starts `nterms` at one, `:568` refuses to lower it
-    /// and `:569` catastros above 256, so there is no path to a board with no
-    /// channels. A zero here would make every `Chan` unmintable and every
+    /// `MAJORBBS.C`: `:80` starts `nterms` at one, `:557` accumulates it per
+    /// channel group as `numopt(msg+NUMBR1,1,256)` -- a floor of one, not zero
+    /// -- and `:569` catastros above 256, so there is no path to a board with
+    /// no channels. A zero here would make every `Chan` unmintable and every
     /// per-channel table empty, which is not a configuration -- it is a host
     /// that cannot do anything, discovered one confusing `None` at a time.
     #[must_use]
