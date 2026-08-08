@@ -65,7 +65,12 @@ impl Fixture {
     /// [`scratch_with`] -- which must not be the checked-in one.
     pub fn rooted(root: PathBuf) -> Self {
         let mut machine = Machine::new().expect("16-bit machine");
-        let host = Host::new(&mut machine, root).expect("host");
+        let mut host = Host::new(&mut machine, root).expect("host");
+        // A fixture stands for a host that has finished starting up, because
+        // that is the only state a channel may connect to -- see
+        // `Host::finish_init`. With no module to `dclvda`, `vdasiz` is zero
+        // here and this allocates nothing; what it does is set the flag.
+        host.finish_init(&mut machine).expect("finished starting up");
         let scratch = machine.alloc_segment(4096).expect("scratch");
         Self {
             machine,
