@@ -879,7 +879,18 @@ pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)
     let mut stack = vec![built.root];
     while let Some(at) = stack.pop() {
         order.push(at);
-        // Reversed so the leftmost child is visited first.
+        // Reversed so the leftmost child is visited first -- a stack pops in
+        // reverse order, so this is what makes the walk leftmost-first rather
+        // than rightmost-first.
+        //
+        // **Not cosmetic.** This order must match the order [`walk`] pushes
+        // into `Walk::pages`, because `Block::reindex` feeds `walk`'s output
+        // straight back in here as the numbers to reuse. If the two disagree,
+        // node *k* is handed a different page than it occupied, and reindexing
+        // an unchanged file rewrites it into a different shape instead of being
+        // a no-op. `reindexing_twice_over_the_same_records_writes_the_same_bytes`
+        // catches it, and dropping this `.rev()` alone is enough to make that
+        // test fail -- measured, not assumed.
         for child in built.nodes[at].children.iter().rev() {
             stack.push(*child);
         }
