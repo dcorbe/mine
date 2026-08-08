@@ -420,6 +420,10 @@ pub struct Host {
 
     /// Whether to print each call as it is serviced. See [`Host::set_trace`].
     trace: bool,
+
+    /// Whether [`Host::finish_init`] has run. See it for why this is checked
+    /// rather than assumed.
+    inited: bool,
 }
 
 /// Where in the module the call being refused came from, as a place you can
@@ -587,6 +591,7 @@ impl Host {
             calls: 0,
             clock_reads: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
+            inited: false,
         })
     }
 
@@ -926,6 +931,16 @@ impl Host {
         chan: Chan,
         who: &users::Connection,
     ) -> Result<(), ShimError> {
+        // The module reads `vdatmp` before it draws, so a channel connected to
+        // a host that never allocated one fails silently much later and
+        // somewhere else. See [`Host::finish_init`].
+        if !self.inited {
+            return Err(ShimError::Failed(
+                "connect: this host has not run finish_init, so no channel has a \
+                 volatile data area yet"
+                    .to_owned(),
+            ));
+        }
         let account = self.users().account(chan);
         let slot = self.users().slot(chan);
 
@@ -1458,6 +1473,43 @@ impl Host {
     /// # Errors
     ///
     /// If the heap has no room.
+    /// Every module has initialised: finish the host's own setup.
+    ///
+    /// `MAJORBBS.C:896`. The real host runs `inimod()` over every module and
+    /// then, on the next line, `alcvda()` -- in that order and not the other,
+    /// because `dclvda` is still accumulating `vdasiz` while modules
+    /// initialise. A host that allocated in [`Host::new`] would size every
+    /// volatile data area off a `vdasiz` of zero.
+    ///
+    /// # Why this is a step the caller must take, and why forgetting it is refused
+    ///
+    /// [`Host::alcvda`] was correct, complete and tested for weeks while
+    /// **nothing in the crate called it** -- every caller was a test. Nothing
+    /// failed. `vdasiz` reached 1,961 from `WCCMMUD.DLL`'s own `dclvda` and
+    /// `vdaptr`/`vdatmp` stayed null, and the module noticed long before this
+    /// host did: `_EDIT_CHARACTER_STATS` tests `vdatmp` before it draws
+    /// anything and returns silently when it is null. Character creation took
+    /// the player's answer, computed the whole character, resolved its title,
+    /// and stopped without printing a byte or advancing its substate.
+    ///
+    /// That cost days to find, because a *global* the module reads is invisible
+    /// to a host-call trace -- the signature is "every routine it reaches is
+    /// implemented and it still does nothing". So this host refuses to
+    /// [`connect`](Self::connect) a channel until this has run, which turns the
+    /// whole class of mistake into an error message naming the step.
+    ///
+    /// Idempotent, and doing nothing when no module declared a size is
+    /// `alcvda`'s own `if (vdasiz != 0)`.
+    ///
+    /// # Errors
+    ///
+    /// If the volatile data areas cannot be allocated.
+    pub fn finish_init(&mut self, machine: &mut Machine) -> io::Result<()> {
+        self.alcvda(machine)?;
+        self.inited = true;
+        Ok(())
+    }
+
     pub fn alcvda(&mut self, machine: &mut Machine) -> io::Result<()> {
         let size = self.globals.word(machine, "vdasiz")?;
         if size == 0 {

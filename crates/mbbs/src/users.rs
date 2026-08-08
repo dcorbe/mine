@@ -673,6 +673,56 @@ mod tests {
         assert_eq!(area, f.host.users().vda(console).expect("allocated"));
     }
 
+    /// The step that was missing, and the guard that makes forgetting it loud.
+    ///
+    /// `Host::alcvda` was correct and complete for weeks, and nothing in the
+    /// crate ever called it -- every caller was a test. The cost was not an
+    /// error: `vdatmp` stayed null, and MajorMUD's `_EDIT_CHARACTER_STATS`
+    /// tests that pointer before it draws anything and returns silently when it
+    /// is null. Character creation took the player's answer, computed the whole
+    /// character, and stopped without a word. **A missing step that produces a
+    /// silent wall is worse than one that produces a crash**, so this refuses.
+    #[test]
+    fn a_host_that_never_finished_initialising_refuses_to_connect() {
+        // Deliberately NOT a `Fixture`: a fixture has finished starting up,
+        // which is the whole point of this test's opposite.
+        let mut machine = mbbs16::Machine::new().expect("16-bit machine");
+        let mut host = crate::Host::new(&mut machine, crate::testing::data()).expect("host");
+        let console = host.users().terms().chan(0).expect("channel zero");
+        let who = Connection::ansi("someone");
+
+        let e = host
+            .connect_state(&mut machine, console, &who)
+            .expect_err("a host that skipped finish_init");
+        assert!(e.to_string().contains("finish_init"), "{e}");
+
+        host.finish_init(&mut machine).expect("finished");
+        host.connect_state(&mut machine, console, &who)
+            .expect("and now it connects");
+    }
+
+    /// Finishing initialisation is what allocates the volatile data areas.
+    ///
+    /// `MAJORBBS.C:896` runs `alcvda()` immediately after `inimod()`, because
+    /// `dclvda` is still accumulating `vdasiz` while modules initialise.
+    #[test]
+    fn finishing_initialisation_allocates_what_dclvda_asked_for() {
+        let mut f = crate::testing::Fixture::new();
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.finish_init(&mut f.machine).expect("finished");
+
+        let g = f.host.globals();
+        assert_ne!(
+            g.pointer(&f.machine, "vdatmp").expect("vdatmp"),
+            mbbs16::FarPtr::NULL,
+            "vdatmp is the pointer MajorMUD gates character creation on"
+        );
+        assert_ne!(
+            g.pointer(&f.machine, "vdaptr").expect("vdaptr"),
+            mbbs16::FarPtr::NULL
+        );
+    }
+
     #[test]
     fn alcvda_does_nothing_when_no_module_declared_a_size() {
         // The `if (vdasiz != 0)` guard. Allocating zero bytes is an error this
