@@ -984,6 +984,29 @@ pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)
     Ok(out)
 }
 
+/// Append one zeroed page to a file and return its number.
+///
+/// Does **not** update the file control record's page count. The caller holds
+/// that page and writes it once; see [`Block::reindex`](super::Block::reindex).
+///
+/// # Errors
+///
+/// If the file cannot be opened or written.
+pub fn append_page(path: &std::path::Path, layout: Layout) -> Result<u32, String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let number = layout.pages;
+    file.seek(SeekFrom::Start(u64::from(number) * u64::from(layout.page)))
+        .and_then(|_| file.write_all(&vec![0u8; usize::from(layout.page)]))
+        .and_then(|_| file.flush())
+        .map_err(|e| format!("{}: appending page {number}: {e}", path.display()))?;
+    Ok(number)
+}
+
 /// The six-byte header of a page already in the file, read on its own rather
 /// than as part of the page it heads.
 ///
@@ -2045,5 +2068,27 @@ mod tests {
 
         let e = number_pages(&built, &[7, 3]).expect_err("three nodes, two pages");
         assert!(e.contains('3') && e.contains('2'), "{e}");
+    }
+
+    /// Growth appends a zeroed page and says which number it got.
+    ///
+    /// The file control record is **not** touched here -- `Block::reindex`
+    /// already holds the first page in memory and writes it once at the end,
+    /// and two writers of the same bytes is how a file control record gets
+    /// half-updated.
+    #[test]
+    fn appending_a_page_grows_the_file_by_exactly_one() {
+        let dir = crate::testing::scratch("pages-append");
+        let path = dir.join("GROW.DAT");
+        std::fs::write(&path, vec![0u8; 512 * 3]).expect("writes");
+        let layout = Layout { page: 512, physical: 16, pages: 3 };
+
+        let number = append_page(&path, layout).expect("appends");
+        assert_eq!(number, 3, "the next page after 0, 1 and 2");
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat").len(),
+            512 * 4,
+            "exactly one page longer"
+        );
     }
 }
