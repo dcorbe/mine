@@ -357,7 +357,23 @@ mod tests {
     fn haskey_refuses_when_no_channel_is_current() {
         // `usrnum` is -1 for as long as nobody is on a channel. There is no
         // keyring to consult and the answer is 0, not a panic and not a stop.
+        //
+        // Channel 0 is connected first, holding the very key that is asked
+        // about, and *then* `usrnum` is moved off it. That is what makes this
+        // test say something about `usrnum` rather than only about -1: with
+        // channel 0 empty, a shim that ignored `usrnum` and always read
+        // channel 0 would answer 0 here too -- for the wrong reason -- and
+        // this assertion would pass against it. At `nterms == 1` there is no
+        // second channel to catch that with, so the discriminator has to be a
+        // channel that *would* answer differently if it were the one read.
         let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &crate::Connection::ansi("rangerdan").with_keys(["USER"]),
+            )
+            .expect("channel 0");
         f.host
             .globals()
             .write(&mut f.machine, "usrnum", &(-1i16).to_le_bytes())
