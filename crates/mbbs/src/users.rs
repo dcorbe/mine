@@ -130,6 +130,13 @@ pub struct Connection {
     pub width: u8,
     /// `usracc.scnfse`. MajorMUD wants at least 23.
     pub height: u8,
+    /// What this user is allowed to do.
+    ///
+    /// Empty unless a caller says otherwise, and deliberately so: the login
+    /// method decides access, and a default that granted anything would make
+    /// every test's access an accident of this struct rather than a statement
+    /// at the call site. See [`Connection::with_keys`].
+    pub keys: crate::KeySet,
 }
 
 impl Connection {
@@ -140,7 +147,28 @@ impl Connection {
             ansi: true,
             width: 80,
             height: 24,
+            keys: crate::KeySet::default(),
         }
+    }
+
+    /// The keys this user holds.
+    ///
+    /// This is the seam the whole design turns on. A real board resolved keys
+    /// at logon, out of `bbsk.dat`, before any module could ask -- so keys
+    /// belong to whatever authenticated the user, and this host has no opinion
+    /// about where they came from. A DOS door, a PAM stack, a local keys file
+    /// and a `bbsk.dat` reader are all just things that build a
+    /// [`Connection`].
+    pub fn with_keys(mut self, keys: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        self.keys = crate::KeySet::new(keys);
+        self
+    }
+
+    /// Give this user the master flag. **Read [`crate::KeySet::master`] first**
+    /// -- it grants every lock, including the ones that ban you.
+    pub fn master(mut self, yes: bool) -> Self {
+        self.keys = std::mem::take(&mut self.keys).master(yes);
+        self
     }
 }
 
@@ -167,6 +195,21 @@ pub struct Users {
     /// how big each is. `None` until `alcvda`, which cannot run until every
     /// module's `dclvda` has been counted.
     vda: Option<(FarPtr, u16)>,
+    /// `usrptr->keys` -- what each channel is allowed to do.
+    ///
+    /// The fourth per-channel table, and the only one that does not live in
+    /// module memory. `LOCKNKEY.C` kept a bitset here, indexed by `lockbit`'s
+    /// interned lock array; `WCCMMUD.DLL` imports neither that field nor any
+    /// routine that reads it, so there is nothing to be faithful *to* at the
+    /// byte level and this is a [`crate::KeySet`] instead. See `keys.rs`.
+    ///
+    /// `None` is `keys == NULL`: a channel nobody has logged onto.
+    /// `Some(empty)` is a channel that logged on holding nothing. The two are
+    /// different answers, not the same one -- `low_haskey` (`LOCKNKEY.C:194`)
+    /// tests the null before it tests the lock, so a never-logged-on channel
+    /// refuses even an empty lock. `loadkeys()` allocated unconditionally, so
+    /// the `None`-to-`Some` transition is exactly logon.
+    keys: Vec<Option<crate::KeySet>>,
 }
 
 /// Words `MAJORBBS.C:740` puts *before* `channel[0]`, so that `channel[-1]`,
@@ -247,6 +290,7 @@ impl Users {
             accounts,
             channels,
             vda: None,
+            keys: vec![None; usize::from(terms)],
         })
     }
 
@@ -320,18 +364,37 @@ impl Users {
         self.nth(base, size, unum)
     }
 
+    /// What channel `unum` is allowed to do, or `None` if it never logged on
+    /// -- or if there is no such channel.
+    pub fn keys(&self, unum: i16) -> Option<&crate::KeySet> {
+        self.index(unum).and_then(|at| self.keys[at].as_ref())
+    }
+
+    /// Give channel `unum` a keyring. What `loadkeys()` did at logon.
+    ///
+    /// A channel that does not exist is a silent no-op, matching
+    /// [`Users::nth`]'s bound and `curusr`'s.
+    pub fn set_keys(&mut self, unum: i16, keys: crate::KeySet) {
+        if let Some(at) = self.index(unum) {
+            self.keys[at] = Some(keys);
+        }
+    }
+
+    /// `unum` as an index, or `None` if there is no such channel.
+    ///
+    /// The same bound [`Users::nth`] applies -- `MAJORBBS.C:4293`'s
+    /// `if (0 <= uno && uno < nterms)` -- stated once so the four tables
+    /// cannot come to disagree about which channels exist.
+    fn index(&self, unum: i16) -> Option<usize> {
+        (unum >= 0 && unum < i16::try_from(self.terms).ok()?).then_some(unum as usize)
+    }
+
     /// The `unum`th slot of a table of `each`-byte entries, or `None` if there
     /// is no such channel.
-    ///
-    /// The bound is `curusr`'s own -- `MAJORBBS.C:4293`'s
-    /// `if (0 <= uno && uno < nterms)` -- and it is stated here once so that
-    /// the three tables cannot come to disagree about which channels exist.
     fn nth(&self, base: FarPtr, each: u16, unum: i16) -> Option<FarPtr> {
-        if unum < 0 || unum >= i16::try_from(self.terms).ok()? {
-            return None;
-        }
+        let unum = u16::try_from(self.index(unum)?).ok()?;
         Some(FarPtr {
-            offset: base.offset.checked_add(each.checked_mul(unum as u16)?)?,
+            offset: base.offset.checked_add(each.checked_mul(unum)?)?,
             selector: base.selector,
         })
     }
@@ -631,5 +694,117 @@ mod tests {
         let mut f = crate::testing::Fixture::new();
         let past = f.host.users().terms() as i16;
         assert!(f.host.connect_state(&mut f.machine, past, &Connection::ansi("rangerdan")).is_err());
+    }
+
+    #[test]
+    fn a_channel_nobody_connected_to_has_no_keyring_at_all() {
+        // `usrptr->keys == NULL` -- `loadkeys()` has not run. Distinct from a
+        // channel that logged on holding nothing, and `low_haskey` answers the
+        // two differently; see `shims::user::haskey`.
+        let f = crate::testing::Fixture::new();
+        assert!(f.host.users().keys(0).is_none());
+    }
+
+    #[test]
+    fn connecting_gives_the_channel_the_keys_it_arrived_with() {
+        let mut f = crate::testing::Fixture::new();
+        let who = Connection::ansi("rangerdan").with_keys(["USER"]);
+        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+
+        let keys = f.host.users().keys(0).expect("the channel logged on");
+        assert!(keys.evaluate("USER"));
+        assert!(!keys.evaluate("WCCSYSOP"));
+    }
+
+    #[test]
+    fn connecting_with_no_keys_is_a_keyring_holding_nothing_not_the_absence_of_one() {
+        // `loadkeys()` (LOCKNKEY.C:97) allocates unconditionally, even for a user
+        // whose `bbsk.dat` record is blank -- so `keys` goes non-NULL at logon
+        // whatever the user holds. The distinction is observable: an empty lock
+        // is true for a channel holding nothing and false for one that never
+        // logged on.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("rangerdan"))
+            .expect("channel 0");
+
+        let keys = f.host.users().keys(0).expect("logged on, holding nothing");
+        assert!(keys.evaluate(""), "an empty lock is true once logged on");
+        assert!(!keys.evaluate("USER"));
+    }
+
+    #[test]
+    fn a_reconnecting_channel_does_not_keep_the_previous_users_keys() {
+        // R13's shape, for the keyring: `connect_state` runs again on a channel
+        // that already held a user, and the second user must not inherit the
+        // first one's access.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("sysop").with_keys(["USER", "WCCSYSOP"]),
+            )
+            .expect("first connect");
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("guest").with_keys(["USER"]),
+            )
+            .expect("second connect");
+
+        let keys = f.host.users().keys(0).expect("logged on");
+        assert!(keys.evaluate("USER"));
+        assert!(!keys.evaluate("WCCSYSOP"), "the sysop's key did not survive");
+    }
+
+    #[test]
+    fn the_master_flag_lands_on_the_bit_majorbbs_h_names() {
+        // MASTER is 0x40 in the low byte of `user.flags`, offset 0x14
+        // (MAJORBBS.H:206). WCCMMUD tests that byte only with masks 2, 4 and
+        // 0x10, so this bit is host-private -- written for fidelity, and because
+        // a host that kept the flag only in Rust would have `user.flags` lying.
+        let mut f = crate::testing::Fixture::new();
+        let who = Connection::ansi("root").with_keys(["USER"]).master(true);
+        f.host.connect_state(&mut f.machine, 0, &who).expect("channel 0");
+
+        let at = f.host.users().slot(0).expect("channel 0");
+        let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
+        assert_eq!(rec[user::FLAGS as usize] & 0x40, 0x40);
+    }
+
+    #[test]
+    fn connecting_without_the_master_flag_clears_it_and_leaves_its_neighbours() {
+        // Read-modify-write on bit 0x40 alone. The other bits of `flags` are the
+        // module's -- WCCMMUD sets and tests 2, 4, 0x10 in this same byte -- and
+        // a whole-field store would clear them out from under it. The clear
+        // direction matters too: a channel reused by a non-master must not keep
+        // the last user's master flag.
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                0,
+                &Connection::ansi("root").master(true),
+            )
+            .expect("first connect");
+
+        // Whatever the module had set in the rest of the byte.
+        let at = f.host.users().slot(0).expect("channel 0");
+        let flags = mbbs16::FarPtr {
+            offset: at.offset + user::FLAGS,
+            selector: at.selector,
+        };
+        let was = f.machine.resolve(flags, 1).expect("in bounds")[0];
+        f.machine.write(flags, &[was | 0x16]).expect("in bounds");
+
+        f.host
+            .connect_state(&mut f.machine, 0, &Connection::ansi("guest"))
+            .expect("second connect");
+
+        let now = f.machine.resolve(flags, 1).expect("in bounds")[0];
+        assert_eq!(now & 0x40, 0, "the master flag is cleared");
+        assert_eq!(now & 0x16, 0x16, "the module's own bits survive");
     }
 }

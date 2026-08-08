@@ -807,6 +807,35 @@ impl Host {
             machine.write(at, &value.to_le_bytes())?;
         }
 
+        // `loadkeys()`, `LOCKNKEY.C:88`. On a real board this read `bbsk.dat`
+        // and a `&CLASS` keyring record; here the keys arrived with the
+        // connection, because whatever authenticated the user is what knows
+        // them. Set unconditionally, so a channel reused by a second user does
+        // not inherit the first one's access.
+        self.users.set_keys(chan, who.keys.clone());
+
+        // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
+        // byte is at offset 0x14. Read-modify-write on that one bit: the rest
+        // of the byte is the module's, `WCCMMUD.DLL` sets and tests masks 2, 4
+        // and 0x10 in it, and `connect_state` runs again on a channel that
+        // already held a user. A whole-field store would clear the module's
+        // bits out from under it.
+        //
+        // Host-private in practice -- the module never tests 0x40 -- but the
+        // bit is real and `user.flags` should not lie about it.
+        const MASTER: u8 = 0x40;
+        let at = FarPtr {
+            offset: slot.offset + users::user::FLAGS,
+            selector: slot.selector,
+        };
+        let was = machine.resolve(at, 1)?[0];
+        let now = if who.keys.is_master() {
+            was | MASTER
+        } else {
+            was & !MASTER
+        };
+        machine.write(at, &[now])?;
+
         self.point_curusr(machine, chan)
     }
 

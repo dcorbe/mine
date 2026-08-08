@@ -84,6 +84,12 @@ impl KeySet {
         self
     }
 
+    /// Whether the master flag is set, for the host to mirror into
+    /// `user.flags`. See [`KeySet::master`].
+    pub fn is_master(&self) -> bool {
+        self.master
+    }
+
     /// Does this channel hold the key to this lock? `gen_haskey`,
     /// `LOCKNKEY.C:167`.
     ///
