@@ -45,6 +45,8 @@ use std::io;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::ShimError;
+
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
 /// `0x29` the module strides by, not arithmetic from the declaration.
 pub const USER: u16 = 41;
@@ -78,6 +80,15 @@ pub mod user {
     pub const FLAGS: u16 = 0x14;
     /// `int crdrat` -- credit-consumption rate. Assigned at `+0x1a`.
     pub const CRDRAT: u16 = 0x1a;
+    /// `void (*polrou)()` -- the channel's current polling routine, or NULL.
+    /// `MAJORBBS.H:90`, four bytes.
+    ///
+    /// **The module reads this one.** `WCCMMUD_named.c:12241` indexes
+    /// `user[usrnum]` by hand and tests `+0x24` and `+0x26` for zero before
+    /// calling `begin_polling`, so unlike the keyring at offset 2 this field
+    /// cannot live Rust-side. See
+    /// `docs/plans/2026-08-08-polling-design.md`.
+    pub const POLROU: u16 = 0x24;
     /// `char lcstat` -- LAN channel state, and the odd byte that makes the
     /// stride 41 and not 42.
     pub const LCSTAT: u16 = 40;
@@ -378,6 +389,56 @@ impl Users {
         if let Some(at) = self.index(unum) {
             self.keys[at] = Some(keys);
         }
+    }
+
+    /// `user[unum].polrou` -- the channel's polling routine, or `None` for
+    /// NULL.
+    ///
+    /// Read out of emulated memory every time rather than cached: the whole
+    /// point of the check `dopoll` makes after calling a polling routine is
+    /// that the routine may have called `stop_polling` on itself while it ran,
+    /// and a remembered copy would not have noticed.
+    ///
+    /// # Errors
+    ///
+    /// If `unum` names no channel, or the read runs off the segment.
+    pub fn polrou(&self, machine: &Machine, unum: i16) -> Result<Option<FarPtr>, ShimError> {
+        let bytes = machine.resolve(self.polrou_at(unum)?, 4)?;
+        let rou = FarPtr::from_bytes(bytes.try_into().expect("4 bytes"));
+        Ok((rou != FarPtr::NULL).then_some(rou))
+    }
+
+    /// Install or clear channel `unum`'s polling routine.
+    ///
+    /// # Errors
+    ///
+    /// If `unum` names no channel, or the write runs off the segment.
+    pub fn set_polrou(
+        &mut self,
+        machine: &mut Machine,
+        unum: i16,
+        rou: Option<FarPtr>,
+    ) -> Result<(), ShimError> {
+        let at = self.polrou_at(unum)?;
+        machine.write(at, &rou.unwrap_or(FarPtr::NULL).to_bytes())?;
+        Ok(())
+    }
+
+    /// `&user[unum].polrou`.
+    ///
+    /// A channel that does not exist is an error here and a silent no-op in
+    /// [`Users::set_keys`], and the difference is deliberate: `set_keys` is
+    /// reached from `curusr`, whose documented behaviour for a bad channel is
+    /// to do nothing (`MAJORBBS.C:4293`), while every caller of this one is a
+    /// routine the module handed a channel number to.
+    fn polrou_at(&self, unum: i16) -> Result<FarPtr, ShimError> {
+        let slot = self
+            .slot(unum)
+            .ok_or_else(|| ShimError::Failed(format!("polrou({unum}): there is no such channel")))?;
+        Ok(FarPtr {
+            offset: slot.offset + user::POLROU,
+            selector: slot.selector,
+        })
     }
 
     /// `unum` as an index, or `None` if there is no such channel.
@@ -806,5 +867,67 @@ mod tests {
         let now = f.machine.resolve(flags, 1).expect("in bounds")[0];
         assert_eq!(now & 0x40, 0, "the master flag is cleared");
         assert_eq!(now & 0x16, 0x16, "the module's own bits survive");
+    }
+
+    #[test]
+    fn polrou_round_trips_through_the_bytes_the_module_reads() {
+        let mut f = crate::testing::Fixture::new();
+        let rou = mbbs16::FarPtr {
+            offset: 0x2184,
+            selector: 0x1010,
+        };
+
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            None,
+            "a fresh slot is NULL, because alczer zeroed it"
+        );
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, Some(rou))
+            .expect("channel 0");
+        assert_eq!(
+            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            Some(rou)
+        );
+
+        // What `WCCMMUD_named.c:12241` actually reads: the two words at
+        // `user[unum] + 0x24` and `+ 0x26`.
+        //
+        // `0x24` is written out rather than taken from `user::POLROU`, and that
+        // is the whole point of this assertion. An address derived from the
+        // constant under test moves when the constant moves, so the write and
+        // the check stay in agreement no matter how wrong both are -- it can
+        // only prove the accessor agrees with itself. The literal is the
+        // independent statement of `MAJORBBS.H:90`'s offset that makes a wrong
+        // `POLROU` observable.
+        let slot = f.host.users().slot(0).expect("channel 0");
+        let at = mbbs16::FarPtr {
+            offset: slot.offset + 0x24,
+            selector: slot.selector,
+        };
+        assert_eq!(
+            f.machine.resolve(at, 4).expect("in the slot"),
+            &[0x84, 0x21, 0x10, 0x10],
+            "offset then selector, little-endian"
+        );
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, 0, None)
+            .expect("channel 0");
+        assert_eq!(
+            f.machine.resolve(at, 4).expect("in the slot"),
+            &[0, 0, 0, 0],
+            "NULL is four zero bytes, which is what the module tests for"
+        );
+    }
+
+    #[test]
+    fn polrou_refuses_a_channel_that_does_not_exist() {
+        let f = crate::testing::Fixture::new();
+        assert!(f.host.users().polrou(&f.machine, 1).is_err(), "nterms is 1");
+        assert!(f.host.users().polrou(&f.machine, -1).is_err());
     }
 }
