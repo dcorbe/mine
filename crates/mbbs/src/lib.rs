@@ -643,18 +643,23 @@ impl Host {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
-    /// Every lock a module has asked about, in order. **Scaffolding.**
+    /// Every lock a module has asked about, in order.
     ///
-    /// This exists because nothing in this tree yet knows which locks a given
-    /// board configures. The lock names are sysop-editable text in the
-    /// module's `.MSG` -- `PLAYKEY {USER}` is a default, not a measurement --
-    /// and most call sites are guarded by `if (lockname[0] != '\0')`, so which
-    /// ones a module actually asks about is a property of the installed
-    /// configuration and not of the DLL.
+    /// The lock names are sysop-editable text in the module's `.MSG` --
+    /// `PLAYKEY {USER}` is a default, not a measurement -- and most call
+    /// sites are guarded by `if (lockname[0] != '\0')`, so which ones a
+    /// module actually asks about is a property of the installed
+    /// configuration and not of the DLL. Reading the sequence off a real run
+    /// is the only way to know it.
     ///
-    /// Reading the sequence off a real run is what this is for. It is a
-    /// candidate for removal once the tests that use it can discriminate
-    /// without it; see `docs/plans/2026-08-07-haskey-design.md`.
+    /// This is how `a_connected_channel_takes_a_command_and_answers`
+    /// (`tests/wccmmud.rs`) pins which gates the module walked and what each
+    /// answered, rather than trusting the call count alone. A key set that
+    /// grants too much still moves that count while quietly putting the
+    /// module on a different branch -- MajorMUD's namespace has negative
+    /// locks -- and that is not hypothetical here: two of the five locks the
+    /// meter test's run asks about are ban keys, and a mutation that answered
+    /// every lock `true` was caught by the call count moving, not by luck.
     pub fn keys_asked(&self) -> &[Query] {
         &self.asked
     }
