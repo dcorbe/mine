@@ -469,19 +469,25 @@ impl Host {
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
     ///
-    /// `root` is the directory the module's own files live in.
+    /// `root` is the directory the module's own files live in, and `terms` is
+    /// how many channels it serves -- the count is the caller's to choose,
+    /// because this crate has no business deciding how many players a board
+    /// takes.
     ///
     /// # Errors
     ///
     /// If the globals or the host's buffers cannot be mapped.
-    pub fn new(machine: &mut Machine, root: impl Into<PathBuf>) -> io::Result<Self> {
+    pub fn with_terms(
+        machine: &mut Machine,
+        root: impl Into<PathBuf>,
+        terms: Terms,
+    ) -> io::Result<Self> {
         // Every table this host keys by channel is sized from this one binding:
         // the `nterms` global the module reads, `Users`' four tables, and
-        // `Gsbl`'s channels. It is deliberately a `let` and not three reads of
-        // `globals::NTERMS` -- see `crate::chan` for what the three separate
-        // reads cost, and for the measurement that showed one of the two
-        // directions of disagreement was completely silent.
-        let terms = Terms::new(globals::NTERMS);
+        // `Gsbl`'s channels. It is deliberately one parameter and not three
+        // reads of `globals::NTERMS` -- see `crate::chan` for what the three
+        // separate reads cost, and for the measurement that showed one of the
+        // two directions of disagreement was completely silent.
         let globals = Globals::new(machine, terms)?;
         let prf_end = OUTBSZ;
 
@@ -593,6 +599,21 @@ impl Host {
             trace: std::env::var_os("MBBS_TRACE").is_some(),
             inited: false,
         })
+    }
+
+    /// A host with a single channel: the local console and nothing else.
+    ///
+    /// `MAJORBBS.C:80` starts `nterms` at one and `GMEOFF.C:22` says the
+    /// offline host always has exactly that, so this is the shape every
+    /// existing meter in this crate was measured against. Kept as a named
+    /// constructor rather than a defaulted parameter so that a caller who
+    /// wants one channel says so, and `with_terms` has no second meaning.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::with_terms`].
+    pub fn new(machine: &mut Machine, root: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::with_terms(machine, root, Terms::new(globals::NTERMS))
     }
 
     /// The host's globals.
@@ -1991,8 +2012,35 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Ended, Kick, Outcome, gsbl};
-    use mbbs16::FarPtr;
+    use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing};
+    use mbbs16::{FarPtr, Machine};
+
+    #[test]
+    fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {
+        // The three authorities `Host::new` asserts against each other -- `Users`'
+        // tables, `Gsbl`'s channels, and the `nterms` word in module memory -- must
+        // all follow the count the caller passed, not a constant this crate reads
+        // for itself. Four channels rather than two so that an off-by-one in the
+        // table sizing cannot coincide with the count.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let host = Host::with_terms(&mut machine, testing::data(), Terms::new(4)).expect("host");
+
+        assert_eq!(host.users().terms().count(), 4, "Users' tables");
+        assert_eq!(host.gsbl().terms().count(), 4, "Gsbl's channels");
+        assert_eq!(
+            host.globals().word(&machine, "nterms").expect("nterms"),
+            4,
+            "what the module bounds its own loops by"
+        );
+        assert!(
+            host.users().terms().chan(3).is_some(),
+            "the fourth channel is nameable"
+        );
+        assert!(
+            host.users().terms().chan(4).is_none(),
+            "and there is no fifth"
+        );
+    }
 
     /// `connect` needs a `&Module` whether or not this path ever reads it --
     /// [`Fixture::minimal_module`] loads one, but loading is not registering,

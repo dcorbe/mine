@@ -64,8 +64,16 @@ impl Fixture {
     /// For the few shims that *write* into a module's directory -- see
     /// [`scratch_with`] -- which must not be the checked-in one.
     pub fn rooted(root: PathBuf) -> Self {
+        Self::rooted_with_terms(root, crate::Terms::new(crate::globals::NTERMS))
+    }
+
+    /// A host over a directory of the test's choosing, with `terms` channels.
+    ///
+    /// The multi-channel entry point. Everything [`Fixture::rooted`] documents
+    /// applies.
+    pub fn rooted_with_terms(root: PathBuf, terms: crate::Terms) -> Self {
         let mut machine = Machine::new().expect("16-bit machine");
-        let mut host = Host::new(&mut machine, root).expect("host");
+        let mut host = Host::with_terms(&mut machine, root, terms).expect("host");
         // A fixture stands for a host that has finished starting up, because
         // that is the only state a channel may connect to -- see
         // `Host::finish_init`. With no module to `dclvda`, `vdasiz` is zero
