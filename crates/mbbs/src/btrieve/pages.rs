@@ -920,6 +920,70 @@ fn push_node(
     nodes.len() - 1
 }
 
+/// Place a built tree on real pages.
+///
+/// `numbers[0]` becomes the root — in this crate always the key's existing
+/// root, so that the file control record's `KEY_ROOT` never has to be
+/// rewritten. The rest are handed out in the order [`walk`] would visit the
+/// nodes, so that rebuilding an unchanged file twice produces the same bytes
+/// both times.
+///
+/// Returns `(page number, image)` pairs, root first.
+///
+/// # Errors
+///
+/// If there are fewer numbers than nodes.
+pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+    if numbers.len() < built.nodes.len() {
+        return Err(format!(
+            "{} nodes need {} page numbers and only {} were given",
+            built.nodes.len(),
+            built.nodes.len(),
+            numbers.len()
+        ));
+    }
+
+    // Node index -> page number, assigned in walk order so the assignment is
+    // stable across rebuilds of the same data.
+    let mut placed = vec![0u32; built.nodes.len()];
+    let mut order = Vec::with_capacity(built.nodes.len());
+    let mut stack = vec![built.root];
+    while let Some(at) = stack.pop() {
+        order.push(at);
+        // Reversed so the leftmost child is visited first.
+        for child in built.nodes[at].children.iter().rev() {
+            stack.push(*child);
+        }
+    }
+    for (n, at) in order.iter().enumerate() {
+        placed[*at] = numbers[n];
+    }
+
+    let mut out = Vec::with_capacity(built.nodes.len());
+    for at in &order {
+        let node = &built.nodes[*at];
+        let mut image = node.image.clone();
+        let mut header = Header::decode(&image[..usize::from(HEADER)]);
+        header.number = placed[*at];
+        image[..usize::from(HEADER)].copy_from_slice(&header.encode());
+
+        if !node.children.is_empty() {
+            let width = node
+                .entries
+                .first()
+                .map_or(0, |(key, _)| key.len() + INDEX_ENTRY_TAIL);
+            image[8..12].copy_from_slice(&to_long(placed[node.children[node.entries.len()]]));
+            image[12..16].copy_from_slice(&to_long(placed[node.children[0]]));
+            for n in 0..node.entries.len().saturating_sub(1) {
+                let tail = INDEX_HEADER + n * width + node.entries[n].0.len() + 4;
+                image[tail..tail + 4].copy_from_slice(&to_long(placed[node.children[n + 1]]));
+            }
+        }
+        out.push((placed[*at], image));
+    }
+    Ok(out)
+}
+
 /// The six-byte header of a page already in the file, read on its own rather
 /// than as part of the page it heads.
 ///
@@ -1934,5 +1998,52 @@ mod tests {
         let layout = Layout { page: 32, physical: 16, pages: 4 };
         let e = build_index(layout, &[(vec![0u8; 40], 1)], 40).expect_err("40 + 8 > 32 - 16");
         assert!(e.contains("does not fit"), "{e}");
+    }
+
+    /// Numbering keeps the root where it was, and rewrites every child slot
+    /// from a node index to a page number.
+    ///
+    /// The root keeping its number is what lets `Block::reindex` leave the file
+    /// control record's `KEY_ROOT` alone: one fewer shared field written, on a
+    /// format where every extra written field is another way to corrupt a file
+    /// a real Btrieve will open.
+    #[test]
+    fn numbering_puts_the_root_first_and_resolves_every_child() {
+        let layout = Layout { page: 64, physical: 16, pages: 16 };
+        let entries: Vec<(Vec<u8>, u32)> =
+            (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
+        let built = build_index(layout, &entries, 2).expect("three nodes");
+
+        let placed = number_pages(&built, &[7, 3, 5]).expect("three numbers for three nodes");
+        assert_eq!(placed[0].0, 7, "the root takes the first number given");
+
+        let root = decode_index_page(&placed[0].1, 2).expect("decodes");
+        assert_eq!(root.number, 7, "and the header says so");
+        assert!(
+            !root.leaf(),
+            "numbering is what turns a built node into a page, and only now is \
+             leaf() a question worth asking of it"
+        );
+        let kids = std::collections::HashSet::from([root.leftmost, root.rightmost]);
+        assert_eq!(
+            kids,
+            std::collections::HashSet::from([3, 5]),
+            "both children resolved to real pages"
+        );
+        assert!(!kids.contains(&0), "no node index survived numbering");
+    }
+
+    /// Fewer numbers than nodes is a refusal. `Block::reindex` allocates the
+    /// shortfall before calling; this is the guard that stops a miscount from
+    /// writing a tree with a dangling child.
+    #[test]
+    fn numbering_refuses_to_place_more_nodes_than_it_has_pages_for() {
+        let layout = Layout { page: 64, physical: 16, pages: 16 };
+        let entries: Vec<(Vec<u8>, u32)> =
+            (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
+        let built = build_index(layout, &entries, 2).expect("three nodes");
+
+        let e = number_pages(&built, &[7, 3]).expect_err("three nodes, two pages");
+        assert!(e.contains('3') && e.contains('2'), "{e}");
     }
 }
