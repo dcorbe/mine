@@ -75,6 +75,21 @@ impl Fixture {
         }
     }
 
+    /// This host's local console: channel zero, minted from the host's own
+    /// [`Terms`](crate::Terms).
+    ///
+    /// Tests used to write the literal `0` and rely on it meaning the same
+    /// channel to `Users` and to `Gsbl`. It did, but nothing said so -- which is
+    /// the convention [`crate::chan`] replaced. Taking the channel from the host
+    /// under test means a test cannot name a channel that host does not have.
+    pub fn console(&self) -> crate::Chan {
+        self.host
+            .users()
+            .terms()
+            .chan(0)
+            .expect("every host has a channel zero")
+    }
+
     /// A NUL-terminated string in scratch memory the module can address.
     pub fn text(&mut self, s: &str) -> FarPtr {
         self.bytes(s.as_bytes(), true)

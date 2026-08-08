@@ -22,6 +22,7 @@
 
 mod arena;
 pub mod btrieve;
+pub mod chan;
 pub mod clock;
 pub mod dos;
 mod exports;
@@ -55,6 +56,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
+pub use chan::{Chan, Terms};
 pub use clock::{Civil, Clock};
 pub use exports::Exports;
 pub use fsd::Form;
@@ -397,7 +399,7 @@ pub struct Host {
     /// `inpolr`, `MAJORBBS.C:322`, with the original's `-1` as `None`. Rust-side
     /// because `WCCMMUD.DLL` neither imports it nor reads it -- unlike `polrou`,
     /// which it does.
-    pub(crate) inpolr: Option<i16>,
+    pub(crate) inpolr: Option<Chan>,
 
     /// The last whole second [`Host::prcrtk`] has been run for.
     ///
@@ -469,7 +471,14 @@ impl Host {
     ///
     /// If the globals or the host's buffers cannot be mapped.
     pub fn new(machine: &mut Machine, root: impl Into<PathBuf>) -> io::Result<Self> {
-        let globals = Globals::new(machine)?;
+        // Every table this host keys by channel is sized from this one binding:
+        // the `nterms` global the module reads, `Users`' four tables, and
+        // `Gsbl`'s channels. It is deliberately a `let` and not three reads of
+        // `globals::NTERMS` -- see `crate::chan` for what the three separate
+        // reads cost, and for the measurement that showed one of the two
+        // directions of disagreement was completely silent.
+        let terms = Terms::new(globals::NTERMS);
+        let globals = Globals::new(machine, terms)?;
         let prf_end = OUTBSZ;
 
         // One segment for everything the host hands a module a pointer into and
@@ -484,7 +493,32 @@ impl Host {
         // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
         // module allocates from. So the heap has to exist before they do.
         let mut heap = Heap::new(Config::default());
-        let users = users::Users::new(machine, &mut heap, globals::NTERMS)?;
+        let users = users::Users::new(machine, &mut heap, terms)?;
+
+        // The three authorities, checked against each other once.
+        //
+        // `Chan` makes a channel of one bound unusable against a table of
+        // another, but it does not by itself make a *construction* error
+        // visible: at `nterms == 1` nothing ever mints the channel-1 handle that
+        // would panic, so building `Gsbl` one channel longer than `Users` still
+        // passed all 688 tests. Measured, not assumed -- the same mutation was
+        // run before this line existed and after it, and only the second one
+        // went red. Without it the divergence waits for a real second channel
+        // and arrives as `point_curusr` refusing a channel `Gsbl::scan` just
+        // handed out, which reads as a module fault.
+        //
+        // `nterms` is read back out of module memory rather than compared to
+        // `terms`, because what the module bounds its loops by is the word in
+        // the segment, not the value this function meant to write there.
+        let gsbl = gsbl::Gsbl::new(terms);
+        let nterms = globals
+            .word(machine, "nterms")
+            .map_err(|e| io::Error::other(format!("nterms: {e}")))?;
+        assert_eq!(
+            (users.terms(), gsbl.terms(), nterms),
+            (terms, terms, terms.count()),
+            "the host's channel tables and the module's `nterms` disagree"
+        );
 
         // `MAJORBBS.H:345` declares `struct user *user` -- the *head* of the
         // array, not a slot. The module never asks the host for a channel's
@@ -536,7 +570,7 @@ impl Host {
             textvars: TextVars::default(),
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
-            gsbl: gsbl::Gsbl::new(globals::NTERMS),
+            gsbl,
             streams: stream::Streams::default(),
             installed: Vec::new(),
             notes: Vec::new(),
@@ -723,12 +757,9 @@ impl Host {
     ///
     /// # Errors
     ///
-    /// If `unum` names no channel, or the read runs off a segment.
-    pub fn class(&self, machine: &Machine, unum: i16) -> Result<u16, ShimError> {
-        let slot = self
-            .users()
-            .slot(unum)
-            .ok_or_else(|| ShimError::Failed(format!("class({unum}): there is no such channel")))?;
+    /// If the read runs off a segment.
+    pub fn class(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
+        let slot = self.users().slot(unum);
         let at = FarPtr {
             offset: slot.offset + users::user::USRCLS,
             selector: slot.selector,
@@ -804,7 +835,7 @@ impl Host {
     pub(crate) fn get_input(
         &mut self,
         machine: &mut Machine,
-        chan: i16,
+        chan: Chan,
     ) -> Result<FarPtr, ShimError> {
         // R16: resolve everything that can fail before touching the channel.
         // `take_line` pops the ready queue -- if the line were taken first and
@@ -852,20 +883,14 @@ impl Host {
     ///
     /// # Errors
     ///
-    /// If `uno` names no channel, or a write runs off a segment.
-    pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: i16) -> Result<(), ShimError> {
-        let slot = self
-            .users()
-            .slot(uno)
-            .ok_or_else(|| ShimError::Failed(format!("point_curusr({uno}): there is no such channel")))?;
-        let account = self
-            .users()
-            .account(uno)
-            .expect("in range, so it has a record");
+    /// If a write runs off a segment.
+    pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: Chan) -> Result<(), ShimError> {
+        let slot = self.users().slot(uno);
+        let account = self.users().account(uno);
         let vda = self.users().vda(uno).unwrap_or(FarPtr::NULL);
 
         self.globals()
-            .write(machine, "usrnum", &uno.to_le_bytes())
+            .write(machine, "usrnum", &uno.number().to_le_bytes())
             .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
         self.globals()
             .write(machine, "usrptr", &slot.to_bytes())
@@ -898,16 +923,11 @@ impl Host {
     pub fn connect_state(
         &mut self,
         machine: &mut Machine,
-        chan: i16,
+        chan: Chan,
         who: &users::Connection,
     ) -> Result<(), ShimError> {
-        let account = self.users().account(chan).ok_or_else(|| {
-            ShimError::Failed(format!("connect_state({chan}): there is no such channel"))
-        })?;
-        let slot = self
-            .users()
-            .slot(chan)
-            .expect("in range, so it has a user slot too");
+        let account = self.users().account(chan);
+        let slot = self.users().slot(chan);
 
         // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
         // the header's own comment says so -- so at most 29 characters fit
@@ -1033,7 +1053,7 @@ impl Host {
         &mut self,
         machine: &mut Machine,
         module: &Module,
-        chan: i16,
+        chan: Chan,
         who: &users::Connection,
     ) -> io::Result<Option<Outcome>> {
         if let Err(e) = self.connect_state(machine, chan, who) {
@@ -1083,7 +1103,7 @@ impl Host {
         &mut self,
         machine: &mut Machine,
         module: &Module,
-        chan: i16,
+        chan: Chan,
     ) -> io::Result<Option<Outcome>> {
         let rou = match self.users.polrou(machine, chan) {
             Ok(Some(rou)) => rou,
@@ -1405,7 +1425,10 @@ impl Host {
             }
         }
 
-        let polling = (0..self.users.terms() as i16)
+        let polling = self
+            .users
+            .terms()
+            .all()
             .any(|chan| matches!(self.users.polrou(machine, chan), Ok(Some(_))));
         let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
         Ok(Cycles {
@@ -1441,7 +1464,12 @@ impl Host {
             return Ok(());
         }
         self.users.alcvda(machine, &mut self.heap, size)?;
-        let area = self.users.vda(0).expect("channel 0, just allocated");
+        let console = self
+            .users
+            .terms()
+            .chan(0)
+            .expect("every host has a channel zero");
+        let area = self.users.vda(console).expect("just allocated");
         let temp = self.heap.alloc(machine, size).map_err(io::Error::other)?;
         self.globals.write(machine, "vdaptr", &area.to_bytes())?;
         self.globals.write(machine, "vdatmp", &temp.to_bytes())?;
@@ -1922,10 +1950,11 @@ mod tests {
     #[test]
     fn connect_with_no_module_registered_is_an_error_not_a_panic() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
         let err = f
             .host
-            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .connect(&mut f.machine, &module, console, &Connection::ansi("rangerdan"))
             .expect_err("no module has registered");
         // R19: `is_err()` alone cannot tell this apart from a ShimError out
         // of `connect_state` or the `lonrou` lookup -- both are wrong for
@@ -1951,6 +1980,7 @@ mod tests {
     #[test]
     fn poll_refuses_to_spin_forever_on_a_status_nothing_consumes() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
 
         // 253 is OVRFLW -- a real status this host queues and does not
@@ -1958,8 +1988,7 @@ mod tests {
         for _ in 0..1100 {
             f.host
                 .gsbl_mut()
-                .channel_mut(0)
-                .expect("channel 0")
+                .channel_mut(console)
                 .status
                 .push_back(crate::gsbl::Gsbl::OVRFLW);
         }
@@ -1995,8 +2024,9 @@ mod tests {
     #[test]
     fn poll_with_a_status_queued_but_no_module_registered_is_an_error_not_a_panic() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
-        f.host.gsbl_mut().push_input(0, b"look\r");
+        f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
             .host
             .poll(&mut f.machine, &module)
@@ -2016,8 +2046,9 @@ mod tests {
     #[test]
     fn poll_writes_the_status_global_on_the_crstg_path_too() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
-        f.host.gsbl_mut().push_input(0, b"look\r");
+        f.host.gsbl_mut().push_input(console, b"look\r");
         // No module registered, so this errors after `point_curusr` and the
         // `status` write have already run -- which is exactly what is being
         // checked.
@@ -2040,14 +2071,14 @@ mod tests {
     #[test]
     fn poll_loops_past_an_undispatched_status_to_the_dispatchable_one_behind_it() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
         f.host
             .gsbl_mut()
-            .channel_mut(0)
-            .expect("chan 0")
+            .channel_mut(console)
             .status
             .push_back(crate::gsbl::Gsbl::OVRFLW);
-        f.host.gsbl_mut().push_input(0, b"look\r");
+        f.host.gsbl_mut().push_input(console, b"look\r");
 
         // No module is registered, so `poll` errors -- but only once it
         // reaches the CRSTG dispatch, which it does only if the `OVRFLW`
@@ -2069,6 +2100,7 @@ mod tests {
     #[test]
     fn poll_notes_rather_than_fabricates_when_the_registered_module_has_no_sttrou() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
 
         // A `struct module` block: a name, then nine far pointers, all left
@@ -2080,7 +2112,7 @@ mod tests {
         f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
 
-        f.host.gsbl_mut().push_input(0, b"look\r");
+        f.host.gsbl_mut().push_input(console, b"look\r");
         let notes_before = f.host.notes().len();
         let outcome = f.host.poll(&mut f.machine, &module).expect("no fault");
 
@@ -2097,6 +2129,7 @@ mod tests {
     #[test]
     fn connect_answers_none_rather_than_fabricates_when_lonrou_is_null() {
         let mut f = Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
@@ -2106,57 +2139,32 @@ mod tests {
 
         let outcome = f
             .host
-            .connect(&mut f.machine, &module, 0, &Connection::ansi("rangerdan"))
+            .connect(&mut f.machine, &module, console, &Connection::ansi("rangerdan"))
             .expect("connect_state ran and there was nothing to call");
         assert_eq!(outcome, None, "no lonrou means no call happened");
     }
 
-    /// R21: a `ShimError` out of `connect_state` must poison the machine and
-    /// come back as `Outcome::Stopped`, the same policy `Host::run` applies
-    /// to a `ShimError` from a shim it dispatched through a thunk -- not an
-    /// `Err` that leaves the machine free to be called again on state that
-    /// never finished writing.
-    #[test]
-    fn a_shim_error_in_connect_poisons_the_machine_rather_than_leaving_it_runnable() {
-        let mut f = Fixture::new();
-        let module = f.minimal_module();
-        let past = f.host.gsbl().terms() as i16;
-
-        let outcome = f
-            .host
-            .connect(&mut f.machine, &module, past, &Connection::ansi("rangerdan"))
-            .expect("connect_state's failure is a stop, not a panic");
-        match outcome {
-            Some(crate::Outcome::Stopped(mbbs16::Poison::Unimplemented { symbol, .. })) => {
-                assert!(
-                    symbol.contains("connect_state"),
-                    "the poison should name what failed: {symbol}"
-                );
-            }
-            other => panic!("expected a named stop: {other:?}"),
-        }
-
-        assert!(
-            f.machine.poisoned().is_some(),
-            "a ShimError in connect must leave the machine unrunnable"
-        );
-        let entry = mbbs16::FarPtr {
-            offset: 0,
-            selector: f.machine.code_selector(),
-        };
-        assert!(
-            f.machine.call(entry, &[]).is_err(),
-            "a poisoned machine must refuse to be entered again"
-        );
-    }
+    // R21 -- "a `ShimError` out of `connect_state` poisons the machine and comes
+    // back as `Outcome::Stopped`" -- had a test here. It drove that failure by
+    // handing `connect` a channel past `nterms`, which `Chan` has made an
+    // unrepresentable state, so the test was deleted rather than rewritten into
+    // something that no longer exercised what it named.
+    //
+    // **The `shim_stop` arm in `Host::connect` is consequently untested.** It is
+    // still reachable -- `connect_state` writes into the account record, and a
+    // write off the end of a segment is a `ShimError` -- but nothing reachable
+    // through `Host::new` puts a table there, so there is no honest way to drive
+    // it from here. `Host::run`'s own tests still cover the policy for the shim
+    // path; what is no longer covered is this call site applying it.
 
     #[test]
     fn the_host_records_every_lock_a_module_asked_about() {
         let mut f = Fixture::new();
+        let console = f.console();
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &Connection::ansi("rangerdan").with_keys(["USER"]),
             )
             .expect("channel 0");
@@ -2184,25 +2192,26 @@ mod tests {
     #[test]
     fn connecting_clears_a_polling_routine_the_last_user_left_behind() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let stale = mbbs16::FarPtr {
             offset: 0x2184,
             selector: 0x1010,
         };
         f.host
             .users
-            .set_polrou(&mut f.machine, 0, Some(stale))
+            .set_polrou(&mut f.machine, console, Some(stale))
             .expect("channel 0");
 
         f.host
             .connect_state(
                 &mut f.machine,
-                0,
+                console,
                 &crate::users::Connection::ansi("somebodyelse"),
             )
             .expect("connected");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             None,
             "the new user must not inherit the old user's poll routine"
         );
@@ -2222,11 +2231,12 @@ mod tests {
     #[test]
     fn a_polling_channel_is_serviced_and_re_arms_itself() {
         let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
         f.host
             .users
-            .set_polrou(&mut f.machine, 0, Some(rou))
+            .set_polrou(&mut f.machine, console, Some(rou))
             .expect("channel 0");
-        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -2240,12 +2250,12 @@ mod tests {
             "the module reads `status`, and POLSTS is written like any other"
         );
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             Some(gsbl::Gsbl::POLSTS),
             "still polling on return, so dopoll re-armed it"
         );
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "re-armed ONCE -- a second status here doubles every tick"
         );
@@ -2258,8 +2268,9 @@ mod tests {
     #[test]
     fn a_routine_that_stops_polling_itself_is_not_re_armed() {
         let mut f = crate::testing::Fixture::new();
+        let console = f.console();
         let module = f.minimal_module();
-        let slot = f.host.users().slot(0).expect("channel 0");
+        let slot = f.host.users().slot(console);
         let lo = slot.offset + crate::users::user::POLROU;
 
         // mov ax, <selector>       B8 ss ss
@@ -2281,9 +2292,9 @@ mod tests {
 
         f.host
             .users
-            .set_polrou(&mut f.machine, 0, Some(rou))
+            .set_polrou(&mut f.machine, console, Some(rou))
             .expect("channel 0");
-        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -2292,12 +2303,12 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(
-            f.host.users().polrou(&f.machine, 0).expect("channel 0"),
+            f.host.users().polrou(&f.machine, console).expect("channel 0"),
             None,
             "the routine cleared it mid-call"
         );
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "so nothing was re-armed and the channel goes quiet"
         );
@@ -2309,7 +2320,8 @@ mod tests {
     #[test]
     fn a_stale_polling_status_is_consumed_without_a_module_call() {
         let (mut f, module, _rou) = polling_fixture();
-        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let console = f.console();
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
         let before = f.host.calls();
         let notes = f.host.notes().len();
 
@@ -2318,7 +2330,7 @@ mod tests {
         assert_eq!(outcome, None, "no call happened, so there is no Outcome");
         assert_eq!(f.host.calls(), before, "and nothing was serviced");
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "the status is consumed, not left to spin"
         );
@@ -2406,8 +2418,9 @@ mod tests {
     #[test]
     fn a_polling_channel_ticks_until_the_bound_and_says_it_is_still_polling() {
         let (mut f, module, rou) = polling_fixture();
-        f.host.users.set_polrou(&mut f.machine, 0, Some(rou)).expect("channel 0");
-        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
 
         let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
 
@@ -2418,9 +2431,9 @@ mod tests {
             Ended::Bound { polling: true, next_kick: None }
         );
         // The status queue must not have grown while all that happened.
-        assert_eq!(f.host.gsbl_mut().next_status(0), Some(gsbl::Gsbl::POLSTS));
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
         assert_eq!(
-            f.host.gsbl_mut().next_status(0),
+            f.host.gsbl_mut().next_status(console),
             None,
             "exactly one status outstanding after 20 ticks, not 21 and not 2^20"
         );
@@ -2527,8 +2540,9 @@ mod tests {
         eprintln!("{} idle passes, {each:?} each", idle.iterations);
 
         let (mut f, module, rou) = polling_fixture();
-        f.host.users.set_polrou(&mut f.machine, 0, Some(rou)).expect("channel 0");
-        f.host.gsbl_mut().inject(0, gsbl::Gsbl::POLSTS);
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
         let at = std::time::Instant::now();
         let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
         let each = at.elapsed() / busy.iterations as u32;

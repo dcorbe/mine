@@ -288,12 +288,16 @@ pub const OUTBSZ: u16 = 4096;
 
 /// How many channels this host has: `nterms`.
 ///
-/// Written into the `nterms` global below, and used again by
-/// [`Users::new`](crate::Users::new) to size the per-channel tables. **The two
-/// must agree.** `nterms` is what the module bounds its own loops by -- and
-/// what `curusr`'s `uno < nterms` guard admits -- so a table shorter than
-/// `nterms` is a table the module indexes past the end of, with no error
-/// anywhere.
+/// `nterms` is what the module bounds its own loops by -- and what `curusr`'s
+/// `uno < nterms` guard admits -- so a per-channel table shorter than `nterms`
+/// is a table the module indexes past the end of, with no error anywhere.
+///
+/// This is the one place the number is written down. `Host::new` reads it once,
+/// into a [`Terms`](crate::Terms), and everything sized by channel is sized
+/// from that value: this global, the four tables in
+/// [`Users`](crate::Users), and [`Gsbl`](crate::gsbl::Gsbl)'s channels. They
+/// used to reach for this constant separately, which is how three copies of one
+/// number came to agree only by convention -- see [`crate::chan`].
 ///
 /// One is not a placeholder; see the `nterms` write in [`Globals::new`] for
 /// where that comes from.
@@ -315,7 +319,7 @@ impl Globals {
     /// # Errors
     ///
     /// If the segments cannot be mapped.
-    pub fn new(machine: &mut Machine) -> io::Result<Self> {
+    pub fn new(machine: &mut Machine, terms: crate::Terms) -> io::Result<Self> {
         let mut offsets = HashMap::with_capacity(GLOBALS.len());
         let mut sizes = HashMap::with_capacity(GLOBALS.len());
         let mut at = 0u16;
@@ -361,8 +365,12 @@ impl Globals {
         // `int nterms;  /* number of channels (always 1) */`, set by
         // `iniogme()`. When this host learns what a channel is, that is what
         // changes this.
-        globals.write(machine, "nterms", &NTERMS.to_le_bytes())?;
-        globals.write(machine, "hichp1", &NTERMS.to_le_bytes())?;
+        //
+        // `terms` is passed in rather than read from `NTERMS` here, so that the
+        // number the module sees and the number the host's tables are sized by
+        // are the same value and not two reads of one constant.
+        globals.write(machine, "nterms", &terms.count().to_le_bytes())?;
+        globals.write(machine, "hichp1", &terms.count().to_le_bytes())?;
 
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
