@@ -359,7 +359,7 @@ impl Globals {
         // so leaving these at the zero they are born with hands the module a
         // number the real host never produced.
         //
-        // One is not a placeholder. `GMEOFF.C:22` is Galacticomm's *offline*
+        // One is not a placeholder. `GMEOFF.C:23` is Galacticomm's *offline*
         // host -- modules initialised with nobody connected, which is exactly
         // what this host is -- and it declares
         // `int nterms;  /* number of channels (always 1) */`, set by

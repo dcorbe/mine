@@ -60,7 +60,7 @@ pub use chan::{Chan, Terms};
 pub use clock::{Civil, Clock};
 pub use exports::Exports;
 pub use fsd::Form;
-pub use globals::{GLOBALS, Global, Globals, OUTBSZ};
+pub use globals::{GLOBALS, Global, Globals, NTERMS, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use keys::KeySet;
 pub use random::{RAND_MAX, Random, Runaway};
@@ -477,7 +477,7 @@ impl Host {
     /// # Errors
     ///
     /// If the globals or the host's buffers cannot be mapped.
-    pub fn with_terms(
+    pub fn new(
         machine: &mut Machine,
         root: impl Into<PathBuf>,
         terms: Terms,
@@ -599,21 +599,6 @@ impl Host {
             trace: std::env::var_os("MBBS_TRACE").is_some(),
             inited: false,
         })
-    }
-
-    /// A host with a single channel: the local console and nothing else.
-    ///
-    /// `MAJORBBS.C:80` starts `nterms` at one and `GMEOFF.C:22` says the
-    /// offline host always has exactly that, so this is the shape every
-    /// existing meter in this crate was measured against. Kept as a named
-    /// constructor rather than a defaulted parameter so that a caller who
-    /// wants one channel says so, and `with_terms` has no second meaning.
-    ///
-    /// # Errors
-    ///
-    /// As [`Host::with_terms`].
-    pub fn new(machine: &mut Machine, root: impl Into<PathBuf>) -> io::Result<Self> {
-        Self::with_terms(machine, root, Terms::new(globals::NTERMS))
     }
 
     /// The host's globals.
@@ -2023,7 +2008,7 @@ mod tests {
         // for itself. Four channels rather than two so that an off-by-one in the
         // table sizing cannot coincide with the count.
         let mut machine = Machine::new().expect("16-bit machine");
-        let host = Host::with_terms(&mut machine, testing::data(), Terms::new(4)).expect("host");
+        let host = Host::new(&mut machine, testing::data(), Terms::new(4)).expect("host");
 
         assert_eq!(host.users().terms().count(), 4, "Users' tables");
         assert_eq!(host.gsbl().terms().count(), 4, "Gsbl's channels");
