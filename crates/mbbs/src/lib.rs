@@ -85,6 +85,47 @@ pub enum Outcome {
     Stopped(Poison),
 }
 
+/// Which of `struct module`'s two disconnect vectors a disconnect runs.
+///
+/// They are disjoint paths, not stages of one. `aschup()` -- the `huprou`
+/// sweep, `MAJORBBS.C:4608` -- is called from exactly one place in the whole
+/// host, `loscar()` at `:4581`, and a graceful logoff never passes through it:
+///
+/// ```text
+/// graceful /x     byenow -> BYEBYE -> lofrou sweep -> finbye -> imdrop -> rstchn
+/// carrier loss    loscar -> aschup (huprou sweep) ------------------------> rstchn
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vector {
+    /// `lofrou`, reached through `bgnlof`/`nxtlof` (`MAJORBBS.C:4055-4104`).
+    Logoff,
+
+    /// `huprou`, reached through `loscar`/`aschup`.
+    Hangup,
+}
+
+impl Vector {
+    /// Its position in `struct module` after `descrp`, which is what
+    /// [`Registration::entry`] takes.
+    ///
+    /// `MAJORBBS.H:241-252` fixes the order: `descrp`, `lonrou`, `sttrou`,
+    /// `stsrou`, `injrou`, `lofrou`, `huprou`, `mcurou`, `dlarou`, `finrou`.
+    fn entry(self) -> usize {
+        match self {
+            Vector::Logoff => 4,
+            Vector::Hangup => 5,
+        }
+    }
+
+    /// The C name, for anything this host has to refuse by name.
+    fn name(self) -> &'static str {
+        match self {
+            Vector::Logoff => "lofrou",
+            Vector::Hangup => "huprou",
+        }
+    }
+}
+
 /// Why [`Host::cycle`] stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
@@ -1180,6 +1221,154 @@ impl Host {
             return Ok(None);
         };
         self.run(machine, module, lonrou, &[]).map(Some)
+    }
+
+    /// Lost carrier: hand the channel to the module's `huprou`, then reset it.
+    ///
+    /// `loscar()` -> `aschup()` -> `rstchn()`, `MAJORBBS.C:4563-4593` and
+    /// `:4608-4635`. This is what a closed socket raises, and `aschup` is the
+    /// only caller of the `huprou` sweep in the entire host -- a graceful
+    /// logoff does not pass through here. See [`Vector`].
+    ///
+    /// MajorMUD's `_LJNGAME_HUPROU` (`re/exports/WCCMMUD_named.c:12646`) is the
+    /// substantial one: `_GET_PLAYER`, `_CLEAR_FORGET_LIST` and `_SAVE_PLAYER`
+    /// unconditionally, and then -- gated on `user[usrnum].substt >= 0x82`, in
+    /// the Realm -- it works the room, dropping carried items and announcing
+    /// the departure through `_TELL_GAME`, whose loop is bounded by `nterms`.
+    /// It is a `void` routine, so its [`Outcome::Returned`] words are whatever
+    /// it happened to leave behind rather than an answer.
+    ///
+    /// Returns `None` if the module supplies no `huprou`. **The reset happens
+    /// either way** -- `loscar` reaches `rstchn` at `:4593` whether or not
+    /// `aschup` found a routine to call.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered.
+    pub fn hangup(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: Chan,
+    ) -> io::Result<Option<Outcome>> {
+        self.disconnect(machine, module, chan, Vector::Hangup)
+    }
+
+    /// Graceful logoff: hand the channel to the module's `lofrou`, then reset
+    /// it.
+    ///
+    /// `bgnlof`/`nxtlof`, `MAJORBBS.C:4055-4104`. The original's sweep walks
+    /// every registered module and falls back to `go2mnu(JSTRET)` -- the
+    /// menuing system, which is out of scope here. With one module the sweep's
+    /// loop body never runs at all (`:4076` skips `i == lofstt`, and `lofstt` is the
+    /// only module there is), so it collapses to the self-call at `:4100-4101`
+    /// and `go2mnu` never arises.
+    ///
+    /// That self-call is `if ((*lofrou)() != 1) go2mnu(JSTRET);`, so **`1` is
+    /// the only value the original distinguishes for a one-module host**: it
+    /// means "I am not finished", and the channel stays in the module's logoff
+    /// state for another pass. This host has no logoff state to stay in, so a
+    /// `1` is refused with a named stop rather than discarded -- a silent
+    /// discard would leave the module believing a multi-pass dialogue is in
+    /// progress. `-1`, the sweep's "abandon and return to the menu" (`:4087-4089`),
+    /// is refused on the same terms: it names the menuing system this host
+    /// does not have, and mapping it onto `0` would be a guess. MajorMUD's own
+    /// `_LJNGAME_LOFROU` (`re/exports/WCCMMUD_named.c:12628`) returns 0, which
+    /// is exactly why the refusal has to exist rather than be assumed
+    /// unreachable.
+    ///
+    /// Returns `None` if the module supplies no `lofrou`. As with
+    /// [`Host::hangup`], the reset happens either way.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered.
+    pub fn logoff(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: Chan,
+    ) -> io::Result<Option<Outcome>> {
+        self.disconnect(machine, module, chan, Vector::Logoff)
+    }
+
+    /// What [`Host::hangup`] and [`Host::logoff`] have in common: point the
+    /// channel, call its vector if the module supplied one, then reset it.
+    ///
+    /// The order is the contract. The routine runs **first**, while the channel
+    /// still holds the departing player -- `_LJNGAME_HUPROU` opens with
+    /// `_GET_PLAYER(usrnum)` and goes on to `_SAVE_PLAYER`, and a `rstchn` that
+    /// ran before it would hand the module a zeroed record to save. The reset
+    /// runs **last, and unconditionally**: a null vector means no call
+    /// happened, not that the channel stays occupied, and `loscar` reaches
+    /// `rstchn` either way.
+    ///
+    /// R21: a `ShimError` out of `point_curusr` or the entry lookup poisons the
+    /// machine and comes back as [`Outcome::Stopped`], matching
+    /// [`Host::connect`].
+    fn disconnect(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: Chan,
+        vector: Vector,
+    ) -> io::Result<Option<Outcome>> {
+        if let Err(e) = self.point_curusr(machine, chan) {
+            return self.shim_stop(machine, "point_curusr", e).map(Some);
+        }
+
+        // `Registration::entry` borrows `self.modules()` immutably and
+        // `self.run` needs `self` mutably right after, so the pointer is read
+        // out here and the borrow ends before `run` is ever reached -- the same
+        // discipline `Host::connect` follows.
+        let rou = {
+            let registered = self.modules().first().ok_or_else(|| {
+                io::Error::other("no module has registered, so there is nothing to disconnect from")
+            })?;
+            registered.entry(machine, vector.entry())
+        };
+        let rou = match rou {
+            Ok(rou) => rou,
+            Err(e) => {
+                let where_ = format!("{} lookup", vector.name());
+                return self.shim_stop(machine, &where_, e).map(Some);
+            }
+        };
+
+        // R24: a null vector is legal -- `aschup` tests
+        // `(rouptr=module[i]->huprou) != NULL` (`:4623`) and `bgnlof` tests
+        // `module[usrptr->state]->lofrou == NULL` -- and it means no call
+        // happened, not that one returned zero.
+        let outcome = match rou {
+            Some(rou) => Some(self.run(machine, module, rou, &[])?),
+            None => None,
+        };
+
+        // `nxtlof`'s protocol; see [`Host::logoff`] for why a non-zero return
+        // is refused rather than discarded. `huprou` is `void` and has no
+        // protocol, so its words are not read.
+        let outcome = match (vector, outcome) {
+            (Vector::Logoff, Some(Outcome::Returned { ax, .. })) if ax != 0 => {
+                Some(self.stop(
+                    machine,
+                    Poison::Unimplemented {
+                        module: "mbbs".to_owned(),
+                        symbol: format!(
+                            "lofrou returned {}, and this host has neither another \
+                             logoff pass to give it nor a menuing system to return \
+                             it to (MAJORBBS.C:4087, :4100)",
+                            ax as i16
+                        ),
+                    },
+                )?)
+            }
+            (_, outcome) => outcome,
+        };
+
+        if let Err(e) = self.rstchn(machine, chan) {
+            return self.shim_stop(machine, "rstchn", e).map(Some);
+        }
+        Ok(outcome)
     }
 
     /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
@@ -2551,6 +2740,384 @@ mod tests {
             .connect(&mut f.machine, &module, console, &Connection::ansi("rangerdan"))
             .expect("connect_state ran and there was nothing to call");
         assert_eq!(outcome, None, "no lonrou means no call happened");
+    }
+
+    /// Register a `struct module` whose entry points are these `(index,
+    /// vector)` pairs, and null everywhere else.
+    ///
+    /// `index` is the position in `struct module` after `descrp` --
+    /// [`Registration::entry`]'s own numbering, which `MAJORBBS.H:241-252`
+    /// fixes: 0 `lonrou`, 1 `sttrou`, 2 `stsrou`, 3 `injrou`, 4 `lofrou`,
+    /// 5 `huprou`.
+    fn register_module_with(f: &mut Fixture, entries: &[(usize, FarPtr)]) {
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        for (n, at) in entries {
+            let field = 25 + n * 4;
+            bytes[field..field + 4].copy_from_slice(&at.to_bytes());
+        }
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+    }
+
+    /// 16-bit code that stores `mark` at `at` and returns, leaving `AX` alone.
+    ///
+    /// `AX` is the reason the selector goes through `BX`: `lofrou` returns an
+    /// `int`, a non-zero one is refused by name, and a stub that loaded its
+    /// selector through `AX` the way the rest of this file's stubs do would be
+    /// indistinguishable from a module asking to be called again.
+    /// [`Machine::call`] zeroes `AX` before every entry, so a stub that never
+    /// touches it returns zero.
+    fn marker_stub(at: FarPtr, mark: u8) -> Vec<u8> {
+        let mut code = vec![0xbb]; // mov bx, <selector>
+        code.extend_from_slice(&at.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc3]); // mov es, bx
+        code.extend_from_slice(&[0x26, 0xc6, 0x06]); // mov byte ptr es:[at], mark
+        code.extend_from_slice(&at.offset.to_le_bytes());
+        code.push(mark);
+        code.push(0xcb); // retf
+        code
+    }
+
+    /// 16-bit code that returns `ax` and does nothing else.
+    fn returns_stub(ax: u16) -> Vec<u8> {
+        let mut code = vec![0xb8]; // mov ax, <ax>
+        code.extend_from_slice(&ax.to_le_bytes());
+        code.push(0xcb); // retf
+        code
+    }
+
+    /// 16-bit code that returns the first byte of the account record `usaptr`
+    /// names.
+    ///
+    /// What a disconnect routine can see of the channel it was handed. Read
+    /// through the *global* rather than a planted address, so it answers two
+    /// questions at once: whether `point_curusr` pointed at this channel, and
+    /// whether the record still held its user when the routine ran. A `rstchn`
+    /// that ran first would leave this reading zero, and MajorMUD's own
+    /// `huprou` opens with `_GET_PLAYER(usrnum)`.
+    fn reads_usaptr_stub(f: &Fixture) -> Vec<u8> {
+        let usaptr = f
+            .host
+            .globals()
+            .address("usaptr")
+            .expect("usaptr is placed");
+        let mut code = vec![0xb8]; // mov ax, <globals selector>
+        code.extend_from_slice(&usaptr.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xd8]); // mov ds, ax
+        code.extend_from_slice(&[0xc4, 0x1e]); // les bx, [usaptr]
+        code.extend_from_slice(&usaptr.offset.to_le_bytes());
+        code.extend_from_slice(&[0x26, 0x8a, 0x07]); // mov al, es:[bx]
+        code.extend_from_slice(&[0xb4, 0x00]); // mov ah, 0
+        code.push(0xcb); // retf
+        code
+    }
+
+    /// A host with `build`'s stubs installed as the disconnect vectors they
+    /// name, a module registered pointing at them, and `rangerdan` connected to
+    /// the console with a keyring.
+    ///
+    /// `build` is handed the fixture rather than the stubs being passed in
+    /// ready-made: a selector belongs to the `Machine` that minted it, so a
+    /// stub built against one fixture and run in another addresses whatever
+    /// that selector happens to name there.
+    ///
+    /// The stubs are loaded **after** `register_module`, because
+    /// [`Fixture::invoke`] builds its own trampoline in the same scratch code
+    /// segment and `load_code` always writes at offset zero -- registering
+    /// second would overwrite them.
+    fn connected_with(
+        build: impl FnOnce(&Fixture) -> Vec<(usize, Vec<u8>)>,
+    ) -> (Fixture, mbbs16::Module, crate::Chan) {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let mut code = Vec::new();
+        let mut vectors = Vec::new();
+        for (n, stub) in build(&f) {
+            vectors.push((n, f.machine.code_ptr(code.len() as u16)));
+            code.extend_from_slice(&stub);
+        }
+        register_module_with(&mut f, &vectors);
+        f.machine.load_code(&code).expect("the stubs fit");
+
+        f.host
+            .connect_state(
+                &mut f.machine,
+                console,
+                &Connection::ansi("rangerdan").with_keys(["PLAYKEY"]),
+            )
+            .expect("a user on the channel");
+        (f, module, console)
+    }
+
+    #[test]
+    fn hanging_up_a_channel_with_no_huprou_still_resets_it() {
+        // A null vector is legal -- `aschup` tests
+        // `(rouptr=module[i]->huprou) != NULL` before calling
+        // (`MAJORBBS.C:4623`) -- and means no call happened, not that one
+        // returned zero. The reset at the tail is unconditional: `loscar`
+        // reaches `rstchn` either way (`:4593`).
+        let (mut f, module, chan) = connected_with(|_| Vec::new());
+        assert!(
+            f.host.users().keys(chan).is_some(),
+            "a keyring before the hangup, so the assertion after it means something"
+        );
+
+        let outcome = f.host.hangup(&mut f.machine, &module, chan).expect("hangup");
+
+        assert_eq!(outcome, None, "no huprou means no call happened");
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "the channel was reset even though nothing was called"
+        );
+    }
+
+    #[test]
+    fn logging_off_a_channel_with_no_lofrou_still_resets_it() {
+        // `bgnlof`, `MAJORBBS.C:4057`: a null `lofrou` goes straight to
+        // `go2mnu(JSTRET)`, the menuing system this host does not have -- and
+        // whose absence a headless host answers by finishing the disconnect.
+        let (mut f, module, chan) = connected_with(|_| Vec::new());
+
+        let outcome = f.host.logoff(&mut f.machine, &module, chan).expect("logoff");
+
+        assert_eq!(outcome, None, "no lofrou means no call happened");
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "the channel was reset even though nothing was called"
+        );
+    }
+
+    #[test]
+    fn a_lofrou_that_asks_to_be_called_again_is_refused_by_name() {
+        // `nxtlof`'s protocol, `MAJORBBS.C:4100-4101`: for the module the user
+        // is *in* -- the only one a one-module host has -- the test is
+        // `if ((*lofrou)() != 1) go2mnu(JSTRET)`, so 1 is "I am not finished".
+        // A one-module headless host can honour neither that nor the sweep's
+        // -1 (`:4087-4089`), and a silent discard would leave the module
+        // believing a dialogue
+        // is in progress. House rule: a host that cannot answer poisons with
+        // its own name.
+        let (mut f, module, chan) = connected_with(|_| vec![(4, returns_stub(1))]);
+
+        let outcome = f
+            .host
+            .logoff(&mut f.machine, &module, chan)
+            .expect("logoff")
+            .expect("lofrou was called");
+
+        let Outcome::Stopped(poison) = outcome else {
+            panic!("a lofrou asking for another pass must stop, got {outcome:?}");
+        };
+        assert!(
+            poison.to_string().contains("lofrou"),
+            "the refusal must name the routine: {poison}"
+        );
+    }
+
+    /// The other half of the protocol, and the value an `ax != 0` test and an
+    /// `ax == 1` test disagree about. `-1` is `nxtlof`'s "abandon the sweep and
+    /// go to the menu" (`MAJORBBS.C:4087-4089`), which this host has no more of an
+    /// answer for than it has for 1.
+    #[test]
+    fn a_lofrou_that_abandons_the_sweep_is_refused_by_name() {
+        let (mut f, module, chan) = connected_with(|_| vec![(4, returns_stub(0xffff))]);
+
+        let outcome = f
+            .host
+            .logoff(&mut f.machine, &module, chan)
+            .expect("logoff")
+            .expect("lofrou was called");
+
+        let Outcome::Stopped(poison) = outcome else {
+            panic!("a lofrou abandoning the sweep must stop, got {outcome:?}");
+        };
+        assert!(
+            poison.to_string().contains("lofrou"),
+            "the refusal must name the routine: {poison}"
+        );
+    }
+
+    /// And the value that is *not* refused, which is what keeps the refusal
+    /// from being "every logoff stops". MajorMUD's own `_LJNGAME_LOFROU`
+    /// (`re/exports/WCCMMUD_named.c:12628`) returns 0.
+    #[test]
+    fn a_lofrou_that_has_finished_is_taken_at_its_word() {
+        let (mut f, module, chan) = connected_with(|_| vec![(4, returns_stub(0))]);
+
+        let outcome = f.host.logoff(&mut f.machine, &module, chan).expect("logoff");
+
+        assert_eq!(
+            outcome,
+            Some(Outcome::Returned { ax: 0, dx: 0 }),
+            "0 is 'I am done', the only answer this host can act on"
+        );
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "and the channel is reset after it"
+        );
+    }
+
+    /// The ordering, stated as something the module can observe rather than as
+    /// a comment about the order of two statements.
+    #[test]
+    fn a_disconnect_routine_runs_before_the_channel_is_reset() {
+        let (mut f, module, chan) = connected_with(|f| vec![(5, reads_usaptr_stub(f))]);
+
+        let outcome = f.host.hangup(&mut f.machine, &module, chan).expect("hangup");
+
+        assert_eq!(
+            outcome,
+            Some(Outcome::Returned {
+                ax: u16::from(b'r'),
+                dx: 0
+            }),
+            "huprou read `rangerdan`'s first byte through usaptr -- a reset that \
+             ran first would hand the module a zeroed record, which is what \
+             MajorMUD's `_GET_PLAYER(usrnum)` would then load"
+        );
+        assert!(
+            f.host.users().keys(chan).is_none(),
+            "and the reset still happened, after the call"
+        );
+    }
+
+    /// The one documented `Err` on either path. A host with nothing registered
+    /// has no `struct module` to read a vector out of, and answering `Ok(None)`
+    /// -- which is what "the module supplied no vector" means -- would say a
+    /// module had been asked and had nothing to offer.
+    #[test]
+    fn disconnecting_with_no_module_registered_is_an_error_not_a_silent_none() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        assert!(
+            f.host.hangup(&mut f.machine, &module, console).is_err(),
+            "hangup with no module registered"
+        );
+        assert!(
+            f.host.logoff(&mut f.machine, &module, console).is_err(),
+            "logoff with no module registered"
+        );
+    }
+
+    /// Which entry point a disconnect ran, as the index that entry point
+    /// stamped into memory. `None` if neither ran.
+    fn vector_that_ran(hangup: bool) -> Option<u8> {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+        let mark = f.buffer(1);
+
+        let lofrou = f.machine.code_ptr(0);
+        let mut code = marker_stub(mark, 4);
+        let huprou = f.machine.code_ptr(code.len() as u16);
+        code.extend_from_slice(&marker_stub(mark, 5));
+
+        register_module_with(&mut f, &[(4, lofrou), (5, huprou)]);
+        f.machine.load_code(&code).expect("both stubs fit");
+        f.host
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
+            .expect("a user on the channel");
+
+        if hangup {
+            f.host.hangup(&mut f.machine, &module, console)
+        } else {
+            f.host.logoff(&mut f.machine, &module, console)
+        }
+        .expect("disconnected");
+
+        let stamped = f.machine.resolve(mark, 1).expect("the marker")[0];
+        (stamped != 0).then_some(stamped)
+    }
+
+    /// `struct module` (`MAJORBBS.H:241-252`) is `descrp`, `lonrou`, `sttrou`,
+    /// `stsrou`, `injrou`, `lofrou`, `huprou` -- so `lofrou` is entry 4 and
+    /// `huprou` is entry 5, and the two disconnects are disjoint paths rather
+    /// than stages of one: `aschup` (`:4608`) sweeps `huprou` and is called
+    /// only from `loscar` (`:4581`), while `lofrou` is reached only through
+    /// `bgnlof`. Asserted by what *ran*, not by which pointer was read.
+    #[test]
+    fn hangup_runs_huprou_and_logoff_runs_lofrou() {
+        assert_eq!(
+            vector_that_ran(true),
+            Some(5),
+            "hangup runs huprou, `struct module`'s sixth entry point"
+        );
+        assert_eq!(
+            vector_that_ran(false),
+            Some(4),
+            "logoff runs lofrou, its fifth"
+        );
+    }
+
+    /// Three channels, and the one that disconnects is the middle one.
+    ///
+    /// Every other test here is a one-channel fixture asserting about channel
+    /// zero, where "reset the channel it was given" and "reset channel zero"
+    /// and "reset every channel" are the same sentence. They are not the same
+    /// sentence at three, and neither is "the routine saw the departing
+    /// player's record".
+    #[test]
+    fn hanging_up_one_channel_leaves_every_other_channel_alone() {
+        let mut f = Fixture::rooted_with_terms(testing::data(), Terms::new(3));
+        let module = f.minimal_module();
+        let stub = reads_usaptr_stub(&f);
+        let huprou = f.machine.code_ptr(0);
+        register_module_with(&mut f, &[(5, huprou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        let terms = f.host.users().terms();
+        let chans: Vec<crate::Chan> = (0..3)
+            .map(|n| terms.chan(n).expect("three channels"))
+            .collect();
+        for (chan, who) in chans.iter().zip(["rangerdan", "Kaimon", "Mireko"]) {
+            f.host
+                .connect_state(
+                    &mut f.machine,
+                    *chan,
+                    &Connection::ansi(who).with_keys(["PLAYKEY"]),
+                )
+                .expect("a user on the channel");
+        }
+
+        let outcome = f
+            .host
+            .hangup(&mut f.machine, &module, chans[1])
+            .expect("hangup");
+
+        assert_eq!(
+            outcome,
+            Some(Outcome::Returned {
+                ax: u16::from(b'K'),
+                dx: 0
+            }),
+            "huprou ran with usaptr on channel 1 -- `Kaimon`, not `rangerdan`"
+        );
+        assert!(
+            f.host.users().keys(chans[1]).is_none(),
+            "channel 1 was reset"
+        );
+        for (chan, who) in [(chans[0], "rangerdan"), (chans[2], "Mireko")] {
+            assert!(
+                f.host.users().keys(chan).is_some(),
+                "{who}'s keyring survived a hangup on another channel"
+            );
+            let account = f.host.users().account(chan);
+            let bytes = f
+                .machine
+                .resolve(account, who.len())
+                .expect("the account record");
+            assert_eq!(
+                std::str::from_utf8(bytes).expect("an ASCII userid"),
+                who,
+                "{who}'s account record survived a hangup on another channel"
+            );
+        }
     }
 
     // R21 -- "a `ShimError` out of `connect_state` poisons the machine and comes
