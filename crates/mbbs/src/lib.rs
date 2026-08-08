@@ -1620,8 +1620,6 @@ mod tests {
         );
     }
 
-    /// No status queued, no channel to service, nothing to call.
-    #[test]
     /// A status that is read but never consumed must cost a red test, not the
     /// machine.
     ///
@@ -1659,6 +1657,7 @@ mod tests {
         );
     }
 
+    /// No status queued, no channel to service, nothing to call.
     #[test]
     fn poll_with_nothing_queued_returns_none_and_calls_nothing() {
         let mut f = Fixture::new();
