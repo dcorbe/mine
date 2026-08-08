@@ -461,6 +461,13 @@ pub const INDEX_HEADER: usize = 16;
 /// with `n` keys has `n+1` children, and the last of them lives in the page
 /// header at offset 8 rather than in an entry. That zero is a placeholder, not
 /// a pointer to page 0.
+///
+/// When a leaf fills its page exactly, those four placeholder bytes are not
+/// written at all -- `WCCSPELS.VIR` page 1 declares fifty ten-byte entries in a
+/// 512-byte page, which is four bytes more than fits, and the last entry ends
+/// after its record pointer. A reader must tolerate it; this host's own
+/// [`build_index`] does not produce it, because packing one extra entry per
+/// page buys nothing it needs.
 pub const INDEX_ENTRY_TAIL: usize = 8;
 
 /// Emit the leaf page for one key, from records already in that key's order.
@@ -601,7 +608,17 @@ pub fn decode_index_page(page: &[u8], key_length: usize) -> Result<IndexPage, St
     let header = Header::decode(&page[..usize::from(HEADER)]);
     let count = usize::from(u16::from_le_bytes([page[6], page[7]]));
     let width = key_length + INDEX_ENTRY_TAIL;
-    let used = INDEX_HEADER + count * width;
+    // The **last** entry may be four bytes short. Its child field is a
+    // placeholder nothing reads (see `INDEX_ENTRY_TAIL`), and when a leaf fills
+    // a page exactly Btrieve does not write it -- `WCCSPELS.VIR` page 1 is the
+    // one page in all eleven shipped files that does, and it is four bytes
+    // shy of the full width. So only `key + position` is required of the last
+    // entry.
+    let used = if count == 0 {
+        INDEX_HEADER
+    } else {
+        INDEX_HEADER + (count - 1) * width + key_length + 4
+    };
     if used > page.len() {
         return Err(format!(
             "a count of {count} entries of {width} bytes needs {used} bytes, and \
@@ -615,11 +632,15 @@ pub fn decode_index_page(page: &[u8], key_length: usize) -> Result<IndexPage, St
         let at = INDEX_HEADER + n * width;
         let key = page[at..at + key_length].to_vec();
         let tail = at + key_length;
-        entries.push((
-            key,
-            long(&page[tail..tail + 4]),
-            long(&page[tail + 4..tail + 8]),
-        ));
+        // Zero rather than a read when the child field was never written: that
+        // is the value the last entry's slot carries when it *is* written, so
+        // the two spellings of "no child here" decode alike.
+        let child = if tail + 8 <= page.len() {
+            long(&page[tail + 4..tail + 8])
+        } else {
+            0
+        };
+        entries.push((key, long(&page[tail..tail + 4]), child));
     }
 
     Ok(IndexPage {
@@ -1512,6 +1533,40 @@ mod tests {
         page[6..8].copy_from_slice(&500u16.to_le_bytes());
         let e = decode_index_page(&page, 2).expect_err("500 entries do not fit 512 bytes");
         assert!(e.contains("500"), "{e}");
+    }
+
+    /// **A leaf that fills its page exactly is four bytes short, and legal.**
+    ///
+    /// Measured off `WCCSPELS.VIR` page 1, the only page in all eleven shipped
+    /// files that does this. Fifty entries of ten bytes declared in a 512-byte
+    /// page needs 516 — but the last entry's child field is a placeholder
+    /// nothing reads, so Btrieve does not write it, and `16 + 49 * 10 + 6`
+    /// is 512 on the nose.
+    ///
+    /// A decoder that demands the full width for the last entry refuses a file
+    /// Btrieve itself wrote.
+    #[test]
+    fn a_leaf_that_fills_its_page_exactly_may_omit_the_last_child() {
+        let mut page = vec![0u8; 512];
+        page[..16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, // page 1
+            0x30, 0x05, //             stamp 0x0530, data bit clear
+            0x32, 0x00, //             50 entries -- 16 + 50*10 = 516 > 512
+            0xff, 0xff, 0xff, 0xff, //
+            0xff, 0xff, 0xff, 0xff, // a leaf
+        ]);
+        // The last entry, at offset 506, has six bytes and no more.
+        page[506..508].copy_from_slice(&710u16.to_le_bytes());
+        page[508..512].copy_from_slice(&to_long(193_542));
+
+        let decoded = decode_index_page(&page, 2).expect("a full leaf is not a corrupt one");
+        assert!(decoded.leaf());
+        assert_eq!(decoded.entries.len(), 50);
+        assert_eq!(
+            decoded.entries[49],
+            (vec![0xc6, 0x02], 193_542, 0),
+            "the absent child reads as the placeholder it would have held"
+        );
     }
 
     /// A two-level tree, built by hand and walked.
