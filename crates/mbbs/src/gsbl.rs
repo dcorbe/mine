@@ -209,7 +209,7 @@ impl Gsbl {
     ///
     /// This is `btuinj`, reached two ways: the module calls it through the shim
     /// of that name, and the host calls it directly to re-arm a polling channel
-    /// (`MAJORBBS.C:3266`). One method rather than two copies of the push, so
+    /// (`MAJORBBS.C:3267`). One method rather than two copies of the push, so
     /// they cannot come to disagree about what "inject" means.
     pub fn inject(&mut self, chan: i16, status: i16) -> bool {
         match self.channel_mut(chan) {
