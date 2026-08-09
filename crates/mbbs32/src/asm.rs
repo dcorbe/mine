@@ -54,6 +54,28 @@
 //! still carries `fs = 0`, which is a no-op for the *selector*; it is
 //! [`enter`]'s job, not the assembly's, to make it a no-op for `FS_BASE` too.
 //!
+//! **`DS` and `ES` are loaded from `SS` before the jump, unconditionally, and
+//! this was also measured rather than assumed -- the second thing the first
+//! version of this file got wrong.** Neither `mbbs16` nor `compat32.c`/
+//! `compat32_fault.c` needed to think about this: `mbbs16` always had a real
+//! `DS` to load (a module's `DGROUP`), and both C references only ever touch
+//! memory through `FS` or not at all. A fresh host thread's `DS`/`ES` carry
+//! the null selector -- harmless in 64-bit long mode, which ignores
+//! data-segment bases for addressing entirely -- but 32-bit compatibility
+//! mode is full legacy protected mode, where an absent segment faults *any*
+//! access through it, at *any* address, mapped or not. `DllMain` needs this
+//! immediately: `rep stos` zeroing its own BSS addresses through `ES`, and
+//! practically everything else it does addresses through `DS`. This one was
+//! caught by `tib.rs`'s own end-to-end test, and only because its TIB and
+//! stack mappings happened to land adjacent in memory -- `FS:[4]` resolved
+//! correctly, so the *next* instruction was the first ordinary, unprefixed
+//! access, and that is where it faulted. `ordinary_memory_access_through_ds_works`
+//! below is the test that would have caught it directly. Since `SS` is
+//! already known both present and flat (`compat32_fault.c` measured it
+//! unchanged across a fault), it costs nothing to reuse its selector for
+//! `DS`/`ES`, and it needs no restore afterward for the same reason `mbbs16`'s
+//! `DS` needs none: irrelevant to addressing once we are back in 64-bit mode.
+//!
 //! **The far jump target is `0x23`, not an LDT selector**, and the way back is
 //! `0x33` (read at runtime by [`current_cs`], not hardcoded, for the same
 //! reason `mbbs16` does not hardcode it). Both are Linux's fixed GDT entries
@@ -206,6 +228,10 @@ mbbs32_enter_raw:
     movw    %fs, %r12w                  /* the host's FS, for the way back */
     movzwl  {fs}(%r14), %ecx            /* the module's, or 0 if it has none */
     movw    %cx, %fs
+
+    movw    %ss, %cx                    /* DS and ES need a REAL descriptor too --  */
+    movw    %cx, %ds                    /* see the module doc comment. SS is already */
+    movw    %cx, %es                    /* known good and flat, so borrow its selector */
 
     movl    {eax}(%r14), %eax           /* the call's return value, EAX or EDX:EAX */
     movl    {edx}(%r14), %edx
@@ -430,6 +456,50 @@ mod tests {
         unsafe { enter(&mut ctx) };
 
         assert_eq!(ctx.out_eax, 0xc0_ffee, "EAX did not carry the value back");
+    }
+
+    /// Ordinary `DS`-relative memory access must work in entered code, not
+    /// only `FS`-prefixed access -- neither test above touches memory at all,
+    /// and `tib.rs`'s own test caught the gap this closes only by coincidence
+    /// of address layout (its TIB and stack mappings happened to land
+    /// adjacent, so `FS`-relative addressing alone got far enough to fault on
+    /// the very next, unprefixed instruction).
+    ///
+    /// `DS` (and `ES`) on a fresh host thread carry the null selector --
+    /// harmless in 64-bit long mode, where the CPU ignores data-segment bases
+    /// entirely, but fatal the instant 32-bit compatibility mode tries to use
+    /// one: an absent segment faults *any* access through it, at *any*
+    /// address, mapped or not. `mbbs32_enter_raw` loads `DS`/`ES` from `SS`
+    /// (already known flat and valid -- `compat32_fault.c` measured it
+    /// unchanged) before the jump; this test is what would have caught it
+    /// directly, without needing two mappings to happen to land adjacent.
+    #[test]
+    fn ordinary_memory_access_through_ds_works() {
+        const SENTINEL_OFFSET: usize = 3072; // well clear of trampoline + code
+        const SENTINEL: u32 = 0x1357_9bdf;
+
+        let (mut mapping, code_addr) = low_mapping_with(|tramp_addr| {
+            let sentinel_addr = tramp_addr + SENTINEL_OFFSET as u32;
+            let mut code = vec![0xa1u8]; // mov eax, moffs32 -- DS-relative, no prefix
+            code.extend_from_slice(&sentinel_addr.to_le_bytes());
+            code.extend_from_slice(&ljmp_back(tramp_addr));
+            code
+        });
+        mapping.as_mut_slice()[SENTINEL_OFFSET..SENTINEL_OFFSET + 4]
+            .copy_from_slice(&SENTINEL.to_le_bytes());
+
+        let mut ctx = Ctx {
+            target_offset: code_addr,
+            target_selector: USER32_CS,
+            ..Default::default()
+        };
+        // SAFETY: as `a_hand_assembled_mov_and_far_jump_arrives_in_eax`.
+        unsafe { enter(&mut ctx) };
+
+        assert_eq!(
+            ctx.out_eax, SENTINEL,
+            "DS did not resolve to a working flat segment"
+        );
     }
 
     /// The registers 32-bit cdecl treats as callee-saved must arrive as
