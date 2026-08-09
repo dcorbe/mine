@@ -45,6 +45,7 @@
 //! crate's note for the measurement behind that.
 
 mod asm;
+mod fault;
 mod image;
 mod map;
 mod pe;

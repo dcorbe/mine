@@ -165,6 +165,20 @@ pub(crate) struct Ctx {
     /// whatever `cdecl` return address and arguments are on it -- is just
     /// above.
     pub out_esp: u32,
+
+    /// The signal that stopped the module, or `0` if the crossing ended by
+    /// reaching the trampoline normally. Set only by `crate::fault::handler`
+    /// -- never by the assembly above, which has no branch that touches it --
+    /// so `0` is a reliable "no fault happened" sentinel for
+    /// [`crate::Machine::run`] to test.
+    pub out_signo: u64,
+
+    /// Linear `EIP` at the moment of the fault, meaningless unless
+    /// `out_signo != 0`. Unlike `mbbs16::asm::Ctx`'s `out_cs`/`out_ip`, this
+    /// needs no segment base added: 32-bit compat mode here always runs flat,
+    /// so the value the CPU pushed already is the address a disassembly of
+    /// the image is annotated with.
+    pub out_eip: u32,
 }
 
 impl Ctx {
