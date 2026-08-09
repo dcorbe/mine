@@ -1498,5 +1498,17 @@ mod tests {
 
         assert_eq!(g.next_status(one), Some(Gsbl::POLSTS));
         assert!(!g.polling_armed(one), "taken, so no longer armed");
+
+        // A POLSTS behind another status is still an arming. This is the
+        // ordinary case in the Realm, not a corner: a channel whose player
+        // typed a line holds CRSTG ahead of its poll, and `refill_polls` runs
+        // on every driver wake. A front-only reading would answer `false`
+        // here, inject a second POLSTS, and grow the queue by one per wake --
+        // which is the whole leak this query exists to prevent.
+        g.inject(zero, Gsbl::POLSTS);
+        assert!(
+            g.polling_armed(zero),
+            "CRSTG is queued ahead of it, and it is armed all the same"
+        );
     }
 }
