@@ -14,6 +14,17 @@
 //! the four routines that predate this file were read from wg200 and are the
 //! same instructions.
 //!
+//! # Two of them were called rather than read
+//!
+//! [`all_digits`] and [`strcmpi`] came in for the FSD's field checks, and both
+//! are cheap leaves with one string argument, so they were measured instead of
+//! disassembled: `cargo run -p mbbs16 --example alldgs` and `--example
+//! stricmp` call the genuine host's own copies over probe sets chosen to
+//! separate every plausible implementation from every other one. The doc
+//! comment on each says which probes decided what. A measurement is worth more
+//! than a transcription only when the probes are adversarial, so those probe
+//! lists are part of the evidence and not decoration.
+//!
 //! # The one distinction the names hide
 //!
 //! [`rmvwht`] tests Borland's **ctype table**; [`skpwht`] tests a **literal
@@ -127,6 +138,70 @@ pub fn strcmp(a: &[u8], b: &[u8]) -> i16 {
         }
     }
     0
+}
+
+/// `int strcmpi(char *s1,char *s2)` -- [`strcmp`] with the case folded away.
+///
+/// Borland's `strcmpi` is its `stricmp`, ordinal 576, `seg 1:0x47f1`. This one
+/// was measured rather than disassembled: `cargo run -p mbbs16 --example
+/// stricmp` calls the genuine host's copy over the pairs that distinguish every
+/// plausible implementation from every other one.
+///
+/// **It folds up.** The six bytes between `'Z'` and `'a'` -- `[ \ ] ^ _` and
+/// the backquote -- are what make the direction observable, and every one of
+/// them is typeable into an FSD field. `stricmp("_","A")` and `stricmp("_","a")`
+/// both answer 30, which is `0x5f - 0x41` either way: the *letter* is being
+/// raised. Folding down would have put `'_'` below `'a'` instead of above it,
+/// and a `MIN=`/`MAX=` range spanning one of the six would order the wrong way.
+///
+/// The fold is [`toupper`]'s -- the 26 ASCII lowercase letters and nothing
+/// else. `stricmp("\xe0","\xc0")` answers 32, the raw difference untouched, so
+/// no high-bit byte is a letter here either.
+///
+/// # Why an `Ordering` where [`strcmp`] returns the byte difference
+///
+/// Not a style choice: the magnitude is **not** simply the folded byte
+/// difference, and returning one would mean modelling an asymmetry that no
+/// caller can see. When the left string runs out first the host compares the
+/// right byte *unfolded* -- `stricmp("ab","abc")` is -99 (against `'c'`) while
+/// `stricmp("ab","abC")` is -67 (against `'C'`) -- but when the right runs out
+/// first the left byte *is* folded, `stricmp("abc","ab")` and
+/// `stricmp("abC","ab")` both answering 67.
+///
+/// The sign is unaffected by that in every case, because a string that ran out
+/// is smaller whichever byte it is measured against. `chkmin`/`chkmax`
+/// (`FSD.C:913`, `:947`) use the sign and nothing else, so an `Ordering` is
+/// exactly the part of the answer that is both meaningful and faithful.
+///
+/// It compares *strings*: for a `#` field `"9"` is greater than `"10"`. Only a
+/// `$` field goes through `sscanf("%ld")` and compares numerically.
+pub fn strcmpi(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    // Unsigned, byte for byte, shorter-is-smaller -- which is what comparing
+    // against the terminator amounts to. No allocation: the fold is applied as
+    // the two runs are walked in step.
+    a.iter()
+        .map(|&c| toupper(c))
+        .cmp(b.iter().map(|&c| toupper(c)))
+}
+
+/// `int alldgs(char *string)` -- is every character a decimal digit?
+///
+/// `GCOMM.H:345` declares it and no recovered `.C` file defines it, so this is
+/// measured from the genuine host at `46:0` by `cargo run -p mbbs16 --example
+/// alldgs` rather than inferred.
+///
+/// **The empty string answers true**, and that is the part that matters:
+/// `chktyp` (`FSD.C:874`) tests a `#` field with a bare `alldgs(bufptr)` and a
+/// `$` field with `strlen(cp) > 0 && alldgs(cp)`, an asymmetry that is only
+/// coherent if an empty answer passes the first and fails the second.
+///
+/// Everything else is literal. A sign is not a digit -- which is why `chktyp`'s
+/// `$` case strips the leading `-` itself -- and neither is leading or trailing
+/// whitespace. `"/"` and `":"` bracket the range and both answer 0, and so do
+/// `0x80`, `0xb2` and `0xff`, so Borland's signed-`char` `isdigit` table
+/// indexing never comes into it and there is nothing here but the ASCII digits.
+pub fn all_digits(s: &[u8]) -> bool {
+    s.iter().all(u8::is_ascii_digit)
 }
 
 /// `char *lastwd(char *string)` -- how far to the start of the last word.
@@ -321,6 +396,110 @@ mod tests {
         assert_eq!(strcmp(b"\x80", b"\x01"), 127);
         assert_eq!(strcmp(b"\x01", b"\x80"), -127);
         assert_eq!(strcmp(b"\xff", b"\x01"), 254, "the widest it can be");
+    }
+
+    /// `alldgs`, `GCOMM.H:345`. Measured from the genuine host, not inferred:
+    /// `cargo run -p mbbs16 --example alldgs` prints every line asserted here.
+    ///
+    /// The empty string is the one that matters. `chktyp` (`FSD.C:874`) tests a
+    /// `#` field with a bare `alldgs(bufptr)` and a `$` field with
+    /// `strlen(cp) > 0 && alldgs(cp)`, and that asymmetry is only coherent if
+    /// an empty answer passes the first and fails the second. It does.
+    #[test]
+    fn all_digits_is_what_the_genuine_host_says_it_is() {
+        assert!(all_digits(b""), "the empty string is all-digits");
+        assert!(all_digits(b"0"));
+        assert!(all_digits(b"9"));
+        assert!(all_digits(b"007"));
+        assert!(all_digits(b"12345678901234567890"), "no length limit, no overflow");
+
+        // A sign is not a digit, which is exactly why `chktyp`'s `$` case
+        // strips the minus itself before it asks.
+        assert!(!all_digits(b"-1"));
+        assert!(!all_digits(b"+1"));
+        // Nor is whitespace, on either end. "All" means all, not "a prefix".
+        assert!(!all_digits(b" "));
+        assert!(!all_digits(b" 1"));
+        assert!(!all_digits(b"1 "));
+        assert!(!all_digits(b"\t"));
+        assert!(!all_digits(b"1.0"));
+        assert!(!all_digits(b"a"));
+        assert!(!all_digits(b"1a"));
+        assert!(!all_digits(b"a1"));
+    }
+
+    /// The four bytes a wrong `alldgs` would disagree on, all measured.
+    ///
+    /// `/` and `:` bracket `'0'..'9'` and catch a range check written with the
+    /// wrong comparison. The high-bit three catch the other hazard: Borland's
+    /// `isdigit` indexes `_ctype` with a *signed* `char`, so a byte above 0x7f
+    /// reads before the start of that table and could answer anything. The
+    /// host says 0 to all five, so "every byte is an ASCII digit" is the whole
+    /// of it and no table has to be modelled.
+    #[test]
+    fn all_digits_stops_at_the_edges_of_the_ascii_digits() {
+        assert!(!all_digits(b"/"), "'0' - 1");
+        assert!(!all_digits(b":"), "'9' + 1");
+        assert!(!all_digits(b"\x80"));
+        assert!(!all_digits(b"\xb2"), "superscript two is not a digit here");
+        assert!(!all_digits(b"\xff"));
+    }
+
+    /// `strcmpi` -- Borland's case-insensitive `strcmp`. `chkmin`/`chkmax` use
+    /// it to order *strings*, including strings of digits, which is why "9" is
+    /// greater than "10" for a `#` field and not for a `$` one.
+    #[test]
+    fn strcmpi_orders_without_regard_to_case() {
+        use std::cmp::Ordering;
+        assert_eq!(strcmpi(b"abc", b"ABC"), Ordering::Equal);
+        assert_eq!(strcmpi(b"ABC", b"abd"), Ordering::Less);
+        assert_eq!(strcmpi(b"b", b"A"), Ordering::Greater);
+        assert_eq!(strcmpi(b"A", b"b"), Ordering::Less);
+        assert_eq!(strcmpi(b"ab", b"abc"), Ordering::Less, "a prefix sorts first");
+        assert_eq!(strcmpi(b"abc", b"ab"), Ordering::Greater);
+        assert_eq!(strcmpi(b"", b""), Ordering::Equal);
+        assert_eq!(strcmpi(b"", b"a"), Ordering::Less);
+        assert_eq!(strcmpi(b"a", b""), Ordering::Greater);
+        assert_eq!(strcmpi(b"9", b"10"), Ordering::Greater, "string order, not numeric");
+    }
+
+    /// **It folds up, not down**, and the six bytes between `'Z'` and `'a'` are
+    /// what make that observable. Measured by
+    /// `cargo run -p mbbs16 --example stricmp`.
+    ///
+    /// `'_'` is 0x5f. Folding up, it is compared against `'A'` = 0x41 and is
+    /// *greater*; folding down it would be compared against `'a'` = 0x61 and be
+    /// *smaller*. The host answers 30 to both `stricmp("_","A")` and
+    /// `stricmp("_","a")` -- 0x5f - 0x41 either way -- so the letter is being
+    /// raised, not the underscore lowered. Every one of these six is typeable
+    /// into an FSD field, so a `MIN=`/`MAX=` range spanning one orders
+    /// differently under the wrong fold.
+    #[test]
+    fn strcmpi_folds_up_so_the_between_case_bytes_outrank_the_letters() {
+        use std::cmp::Ordering;
+        for &between in &[b"[", b"\\", b"]", b"^", b"_", b"`"] {
+            assert_eq!(strcmpi(between, b"A"), Ordering::Greater, "{between:?} vs A");
+            assert_eq!(
+                strcmpi(between, b"a"),
+                Ordering::Greater,
+                "{between:?} vs a -- the same answer, which is what pins the direction"
+            );
+        }
+    }
+
+    /// The fold stops at ASCII, so the host's high-bit text orders by raw byte.
+    ///
+    /// `stricmp("\xe0","\xc0")` and `stricmp("\xe9","\xc9")` both answer 32 --
+    /// the difference untouched -- so nothing above 0x7f is a letter to this
+    /// routine, the same way nothing above 0x7f carries a `_ctype` flag for
+    /// [`toupper`]. And the comparison is unsigned: 0x80 outranks 0x01.
+    #[test]
+    fn strcmpi_folds_only_the_ascii_letters_and_compares_unsigned() {
+        use std::cmp::Ordering;
+        assert_eq!(strcmpi(b"\xe0", b"\xc0"), Ordering::Greater);
+        assert_eq!(strcmpi(b"\xe9", b"\xc9"), Ordering::Greater);
+        assert_eq!(strcmpi(b"\x80", b"\x01"), Ordering::Greater);
+        assert_eq!(strcmpi(b"\x01", b"\x80"), Ordering::Less);
     }
 
     #[test]

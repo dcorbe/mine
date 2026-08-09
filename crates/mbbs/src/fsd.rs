@@ -31,7 +31,7 @@
 //! At `ascn=0` every one of those branches is skipped and the whole of
 //! `fsdppc` is a pure function of two byte strings, which is what this is.
 //!
-//! # Two overflows of the original are not reproduced
+//! # Overflows of the original are not reproduced
 //!
 //! `tmpfld()` takes its `width` as a `char` and `xwidth` is a `char`, so in the
 //! original a field run longer than 127 characters wraps *before* being clamped
@@ -39,6 +39,11 @@
 //! is then added to `maxans` as a subtraction. This clamps instead. No template
 //! in evidence comes near it: the longest run in either of MajorMUD's is 61,
 //! and a field wider than a screen is not a thing a form can mean.
+//!
+//! The third is `stranslen`'s `int`, which [`put_answer`] refuses rather than
+//! wraps. That one has been watched happen -- `tests/fsd_oracle.rs` calls the
+//! genuine `_FSDPAN` on either side of the boundary and the far side really
+//! does write the new value over the tail it should have moved.
 
 use std::fmt;
 
@@ -109,6 +114,19 @@ pub mod scb {
     pub const HLPOFF: u16 = 40;
     /// `int allans` -- the answer string's current length.
     pub const ALLANS: u16 = 42;
+    /// `char flags` -- the entry session's own flags, `FSD.H:397-403`.
+    ///
+    /// The one piece of entry-session working storage named here, and named
+    /// because [`super::move_field`]'s `wrap` argument is where its `FSDANS`
+    /// (0x10) bit ends up: a caller with a live session reads it from this
+    /// offset. Everything else between `state` at 44 and `maxy` at 165 is
+    /// deliberately absent -- see the note above.
+    ///
+    /// 157 is not read off the header alone. `fsdent()` and `fsdlin()` are the
+    /// two routines whose first act is to set it (`FSD.C:828`, `:838`), and in
+    /// `MAJORBBS-mbbstd.EXE` they are `mov byte [es:bx+0x9d],0x10` at
+    /// `28:0x12e1` and `mov byte [es:bx+0x9d],0x0` at `28:0x132c`.
+    pub const FLAGS: u16 = 157;
 }
 
 /// Where each member of `struct fsdfld` sits. `FSD.H:247`.
@@ -487,10 +505,26 @@ pub mod flags {
     pub const MINMAX: u8 = 0x04;
     /// Does not accept spaces.
     pub const NOSPACES: u8 = 0x08;
+    /// `FFFCHG` -- the field has changed this session. `FSD.H:270`.
+    ///
+    /// Written by the entry session rather than by `fsdppc`, which is why
+    /// nothing in this module sets it: `fsdent()` and friends raise it when
+    /// `stfans` reports a change, and `fsdprc()`'s caller reads it back to find
+    /// out which answers to save.
+    pub const CHANGED: u8 = 0x10;
     /// No negative numbers allowed.
     pub const NONNEGATIVE: u8 = 0x20;
     /// Entry needs to be secret.
     pub const SECRET: u8 = 0x40;
+    /// `FFFAVD` -- avoid this field when moving or displaying. `FSD.H:273`.
+    ///
+    /// The one flag on this list that the **module** sets rather than the
+    /// specification: fourteen sites in `WCCMMUD.DLL` do
+    /// `or byte [flddat + 23*i + 12], 0x80` on its own character sheet, which
+    /// is how a field is shown but not typed into. [`move_field`] is what acts
+    /// on it, and `fsddsp` (`FSD.C:770`) blanks such a field rather than
+    /// displaying its answer.
+    pub const AVOID: u8 = 0x80;
 }
 
 /// A compiled form: what a data-entry session over one template will need.
@@ -637,6 +671,147 @@ fn value_at(answers: &[u8], at: usize) -> &[u8] {
     &answers[at..end]
 }
 
+/// The length of an answer string, its final double NUL included.
+/// `stranslen()`, `FSD.C:2061`.
+///
+/// Entries are walked, not bytes: each one costs `strlen+1`, and the empty
+/// entry that ends the string costs the 1 added at the end. So `b"A=1\0\0"`
+/// measures 5 and the empty answer string -- `fsdans`'s own `""`, `FSD.H:475`
+/// -- measures 1.
+///
+/// **A zero-length entry *is* the terminator**, wherever it appears. The C's
+/// loop condition is `*anstg != '\0'` and nothing else, so `b"\0A=1\0\0"`
+/// measures 1 and everything after that first NUL is unreachable. Measured: the
+/// genuine host's `_STRANSLEN` answers 1. The same fact read the other way is
+/// that a trailing byte does not have to be there -- `b"\0\0"` also measures 1,
+/// so the "double NUL" of the comment is the *entry's* terminator followed by
+/// the *string's*, not a pair this has to find.
+///
+/// **The C returns an `int`.** `stranslen` accumulates into `si` and returns
+/// `si+1` (`28:0x36a2`), so an answer string of 32768 bytes or more comes back
+/// negative -- and `fsdpan` tests that result with a signed `jng`. This returns
+/// the true length; [`put_answer`] is where the difference has to be dealt
+/// with, and says what it does about it.
+///
+/// # Panics
+///
+/// If the string does not terminate inside the slice. The C reads on until it
+/// finds a NUL somewhere in the segment, so there is no length here that would
+/// be the right answer, and a made-up one is worse than a stop.
+pub fn answer_len(answers: &[u8]) -> usize {
+    let mut at = 0usize;
+    loop {
+        let end = answers[at..]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "an answer string ends with an empty entry, and from \
+                     offset {at} these {} bytes hold no NUL at all: {:02x?}",
+                    answers.len() - at,
+                    &answers[at..]
+                )
+            });
+        if end == 0 {
+            return at + 1;
+        }
+        at += end + 1;
+    }
+}
+
+/// Put a value into an answer string, replacing whatever was there.
+/// `fsdpan()`, `FSD.C:2092`.
+///
+/// Two branches, and `fsdxan` picks between them. A name already in the string
+/// has its value replaced where it stands, every later entry sliding along by
+/// the difference in length; a name that is not there gets a whole
+/// `NAME=value` entry appended at the end, over the terminator, with a fresh
+/// terminator after it.
+///
+/// The name is written **as given** in that second case. Matching folds case
+/// and writing does not, so `put_answer(a, b"eye_col", b"Violet")` on a string
+/// with no such name leaves a lower-case entry that the next lookup still
+/// finds. `sameto` is where the fold happens (`FSD.C:2085`): the genuine host's
+/// is at `104:0` and folds each pair of bytes through `tolower` (`1:0x2a38`),
+/// which is a `ctype` table lookup whose upper-case set is exactly `A`-`Z`. So
+/// [`extract`]'s `eq_ignore_ascii_case` is the same function, and `A[C` does
+/// not match `A{C` however tempting the 0x20 between them looks.
+///
+/// # The C is a buffer and this is a `Vec`
+///
+/// `FSD.C:2094` says the answer string "must have room for the new value" and
+/// leaves the room to the caller. Growing a `Vec` is this port's answer to that
+/// requirement, and the price is the assertion below: the `Vec` has to *be* the
+/// answer string. The C's `movmem` moves `stranslen(vp+nold+1)` bytes, which
+/// stops at the string's own terminator, where a splice moves everything to the
+/// end of the `Vec` -- and those are the same bytes only when nothing follows
+/// the terminator.
+///
+/// # `name` and `value` are C strings
+///
+/// `strlen`, `strcpy` and `sprintf`'s `%s` all stop at the first NUL, so
+/// `put_answer(a, b"A", b"xy\0zw")` stores `xy`, and a `name` with a NUL in it
+/// is the part before it. Measured against the genuine host rather than
+/// assumed, as in [`store`].
+///
+/// # Panics
+///
+/// If `answers` is not a well-formed answer string, or if the part of it that
+/// follows the entry being replaced is longer than an `int` can count. The
+/// second is the C's own limit and not this port's: `nstr=stranslen(vp+nold+1)`
+/// is an `int` and `if (nstr > 0 ...)` is a **signed** test -- `or dx,dx / jng`
+/// at `28:0x37b6` -- so past 32767 the genuine host stops moving the tail and
+/// `strcpy` writes the new value over whatever happened to follow it. That is a
+/// corruption rather than a behaviour, so it is refused here the way the module
+/// doc's two `tmpfld` overflows are. `tests/fsd_oracle.rs` holds the
+/// measurement that says the host really does it.
+pub fn put_answer(answers: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    assert_eq!(
+        answer_len(answers),
+        answers.len(),
+        "a {}-byte buffer holding a {}-byte answer string: the C splices with \
+         `movmem(vp+nold+1,vp+nnew+1,stranslen(vp+nold+1))`, which moves the \
+         string and stops, and a splice here moves the whole `Vec`. The two \
+         are the same edit only while nothing follows the terminator",
+        answers.len(),
+        answer_len(answers)
+    );
+    // `n=strlen(name)` in `fsdxan`, `nnew=strlen(value)` in `fsdpan`.
+    let name = c_str(name);
+    let value = c_str(value);
+
+    match extract(answers, name) {
+        // `nold=strlen(vp)`; the tail from `vp+nold+1` to the terminator slides
+        // by `nnew-nold`, and `strcpy(vp,value)` puts the value in. One splice
+        // is both `movmem`s.
+        Some(at) => {
+            let old = value_at(answers, at).len();
+            let tail = answer_len(&answers[at + old + 1..]);
+            assert!(
+                tail <= i16::MAX as usize,
+                "{tail} bytes follow the {:?} entry, and `nstr` is an `int` the \
+                 genuine host tests with `jng`: past {} it stops moving the \
+                 tail and writes the new value over the head of it instead",
+                String::from_utf8_lossy(name),
+                i16::MAX
+            );
+            answers.splice(at..at + old, value.iter().copied());
+        }
+        // `sprintf(xannam,"%s=%s%c",name,value,'\0')`, where `xannam` is the
+        // string's final NUL: the entry lands on top of it, and the `%c` is the
+        // terminator that ends the string again. `sprintf`'s own NUL is the
+        // entry's.
+        None => {
+            answers.truncate(answers.len() - 1);
+            answers.extend_from_slice(name);
+            answers.push(b'=');
+            answers.extend_from_slice(value);
+            answers.push(0);
+            answers.push(0);
+        }
+    }
+}
+
 /// An answer string, installed over a form. What `fsdans()` leaves behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answers {
@@ -696,6 +871,84 @@ pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
     }
 }
 
+/// Splice one field's answer into the answer string. `stfans()`, `FSD.C:1036`.
+///
+/// Returns whether the answer differs from the one that was there. That is what
+/// the entry session counts as a change, and it is why the comparison happens
+/// **before** anything is written: after the splice the old answer is gone and
+/// the question can no longer be asked.
+///
+/// # Changing one answer's length moves every later one
+///
+/// The answers all live end to end in one string, so a longer answer pushes
+/// every later `ansoff` along and a shorter one pulls them back. The C walks
+/// backwards from `flddat[numfld-1]` to `fldptr` adding `anslen-m` to each
+/// (`FSD.C:1054-1058`), which is a `while (efptr != fldptr)` and therefore
+/// leaves the stored field itself alone -- its answer starts where it always
+/// did, only its length changed. Storing into the **last** field runs the loop
+/// zero times, and that is the boundary worth naming rather than a special
+/// case.
+///
+/// `allans` moves by the same delta, because the tail the C's first `movmem`
+/// shifts is `allans-nl-m` bytes -- the rest of the string, terminators
+/// included.
+///
+/// # The answer is a C string and the stored length is a byte
+///
+/// `anslen=strlen(bufptr)`, so an embedded NUL ends the answer: storing
+/// `"DA\0N"` stores `"DA"`, and storing `"DA\0N"` over an existing `"DA"`
+/// reports **no** change. `strcmp` decides the rest, so the comparison is
+/// case-sensitive.
+///
+/// `fldptr->anslen` is one byte (`FSD.H:262`) and the genuine host reads it
+/// back zero-extended -- `mov al,es:[bx+0x16] / mov ah,0` at `28:0x19bd`, so
+/// that build's `char` is unsigned. A 256-byte answer therefore stores a length
+/// of 0 while the offsets move by the full 256. Reproduced rather than
+/// corrected: the arithmetic is the C's, in the C's 16-bit `int`.
+///
+/// # Panics
+///
+/// If `field` is not one of `answers.offsets`, or if `allans` and the string's
+/// own length have come apart. The C has no such check -- `stfans` would walk
+/// `flddat` past `fldptr` and never find it, adding the delta to whatever
+/// follows the array until it faulted -- which is exactly why this one does.
+pub fn store(answers: &mut Answers, field: usize, answer: &[u8]) -> bool {
+    assert_eq!(
+        usize::from(answers.allans),
+        answers.text.len(),
+        "an answer string of {} bytes with allans={}: the two are the same \
+         number in the C, where `newans` is the buffer and `allans` its used \
+         length, and the splice arithmetic below is `allans-nl-m` in one place \
+         and the string's own tail in another",
+        answers.text.len(),
+        answers.allans
+    );
+    // `anslen=strlen(bufptr)`, once, and everything downstream is over that.
+    let answer = c_str(answer);
+    let (at, was) = answers.offsets[field];
+    let (at, was) = (usize::from(at), usize::from(was));
+
+    // `rc=(anslen != fldptr->anslen || strcmp(bufptr,fsdscb->newans+nl) != 0)`.
+    // The second half reads the old answer as a C string rather than as
+    // `anslen` bytes, and the two are the same only while the stored length and
+    // the string agree.
+    let changed = answer.len() != was || c_str(&answers.text[at..]) != answer;
+
+    // The two `movmem`s: shift the tail to make room (or close the gap), then
+    // copy the answer in. A splice is both.
+    answers.text.splice(at..at + was, answer.iter().copied());
+
+    // `fldptr->anslen=anslen`, a byte store from an `int`.
+    answers.offsets[field].1 = answer.len() as u8;
+    // `anslen-m` in a 16-bit `int`.
+    let delta = (answer.len() as i32 - was as i32) as i16;
+    for later in &mut answers.offsets[field + 1..] {
+        later.0 = later.0.wrapping_add_signed(delta);
+    }
+    answers.allans = answers.allans.wrapping_add_signed(delta);
+    changed
+}
+
 /// The synthetic option list a `Y/N` field gets. `foptkn()`, `FSD.C:135`.
 ///
 /// A `Y/N` field may not carry options of its own -- `tmpscn` calls that an
@@ -705,33 +958,64 @@ pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
 /// fires for every caller after `fsdppc` and for none before.
 const YES_NO: &[u8] = b"(ALT=NO ALT=YES)";
 
-/// Every `ALT=` value of one field, in the order the specification lists them.
+/// The option list `foptkn()` searches for one field, and where it starts.
+///
+/// The whole of `foptkn()` (`FSD.C:127`) bar its final `nxttkn` call, including
+/// the substitution the `fldtyp == 'Y'` branch makes: a `Y/N` field's options
+/// come from [`YES_NO`] and not from the specification, so `MIN=` and `MAX=`
+/// are unfindable on one however its name was written. That is not a corner --
+/// `chkops` sets `FFFMMX` from the *specification*, before `embscn` has made
+/// the field a `Y`, so a `Y/N` field really can arrive at [`min_ok`] with the
+/// flag set and no minimum to be found.
+///
+/// `None` when the field has no option list at all. The offset is into the
+/// returned list, which is [`YES_NO`] rather than `spec` for a `Y/N` field.
+fn option_list_of<'a>(spec: &'a [u8], field: &Field) -> Option<(&'a [u8], usize)> {
+    if field.kind == b'Y' {
+        Some((YES_NO, 1))
+    } else {
+        option_list(spec, field).map(|at| (spec, at))
+    }
+}
+
+/// One option's value: from `start` to its terminator. `endtkn(tp,0)`,
+/// `FSD.C:148`.
 ///
 /// A value ends at white space, `)` or the terminator, and never runs past
-/// [`ANSLEN`] characters -- `endtkn()`, `FSD.C:148`.
+/// [`ANSLEN`] characters. The clamp is the *default* as well as the bound on
+/// the search -- `endtkn` returns `token+ANSLEN` when it ran out of characters
+/// before it ran out of value -- so falling through to the end of the list
+/// instead would hand back a value as long as the rest of the specification.
+fn token_value(list: &[u8], start: usize) -> &[u8] {
+    let end = list[start..]
+        .iter()
+        .take(usize::from(ANSLEN))
+        .position(|&c| c == 0 || c == b')' || is_space(c))
+        .map_or((start + usize::from(ANSLEN)).min(list.len()), |n| start + n);
+    &list[start..end]
+}
+
+/// `foptkn()` then `endtkn(tp,0)`: what one option of one field is set to.
+///
+/// `None` when the field has no options, or has options but not this one --
+/// the two cases the C spells `foptkn(...) == NULL`, which is what both
+/// [`min_ok`] and [`max_ok`] test.
+fn option_value<'a>(spec: &'a [u8], field: &Field, token: &[u8], word: bool) -> Option<&'a [u8]> {
+    let (list, at) = option_list_of(spec, field)?;
+    let start = next_token(list, at, token, word)?;
+    Some(token_value(list, start))
+}
+
+/// Every `ALT=` value of one field, in the order the specification lists them.
 fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
-    let (list, mut at) = if field.kind == b'Y' {
-        (YES_NO, 1usize)
-    } else {
-        match option_list(spec, field) {
-            Some(at) => (spec, at),
-            None => return Vec::new(),
-        }
+    let Some((list, mut at)) = option_list_of(spec, field) else {
+        return Vec::new();
     };
 
     let mut out = Vec::new();
     while let Some(start) = next_token(list, at, b"ALT=", false) {
-        // `endtkn()` stops at `i < ANSLEN` and returns `token+ANSLEN` when it
-        // ran out of characters before it ran out of value, so the clamp is the
-        // *default* as well as the bound on the search. Falling through to the
-        // end of the list instead would hand back an alternate as long as the
-        // rest of the specification.
-        let end = list[start..]
-            .iter()
-            .take(usize::from(ANSLEN))
-            .position(|&c| c == 0 || c == b')' || is_space(c))
-            .map_or((start + usize::from(ANSLEN)).min(list.len()), |n| start + n);
-        out.push(&list[start..end]);
+        let value = token_value(list, start);
+        out.push(value);
         // `nxttkn(ep, ...)` resumes exactly at the value's terminator, and its
         // own loop guard stops it on `)`. Stepping even one byte past that --
         // which an empty `ALT=` right before the `)` would do -- carries the
@@ -740,7 +1024,7 @@ fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
         //
         // No progress guard is needed: `next_token` returns the offset one past
         // the token it matched, so `start` is at least `at + 4` every time round.
-        at = end;
+        at = start + value.len();
     }
     out
 }
@@ -795,6 +1079,343 @@ pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8
         }
     }
     if matches == 1 { found } else { None }
+}
+
+/// Is this answer consistent with the field's type? `chktyp()`, `FSD.C:861`.
+///
+/// One of the four checks a candidate answer has to pass, and the only one that
+/// looks at `fldtyp` at all -- `chkmin`, `chkmax` and `chkalt` are separate
+/// passes over the same buffer. So a `false` here is not "the answer is
+/// invalid", it is "the answer is not of this field's *shape*".
+///
+/// # A multiple-choice field says no to everything
+///
+/// `FFFMCH` makes the `?`/`Y` arm answer `false` whatever the answer is,
+/// including an empty one. That is deliberate and it is the normal case: the
+/// answer to a multiple-choice field is supposed to arrive from its `ALT=`
+/// list, which is [`ordinal`]'s job, and `chkalt` is what installs it. Every
+/// `Y/N` field is multiple-choice by construction -- `tmpfld` sets `FFFMCH` on
+/// the field the `/` makes -- so `type_ok` is `false` for every typed answer to
+/// every `Y/N` field on this host, `YES` included.
+///
+/// # The arms disagree about what they ignore
+///
+/// `FFFNSP` is read only by the `?`/`Y` arm, so a space in a `#` or `$` field
+/// is refused by the digit test rather than by `FFFNSP`, and setting `NOSPACES`
+/// on a numeric field changes nothing. `FFFMCH` is likewise read only there, so
+/// a multiple-choice `$` field accepts a typed number. Neither is an asymmetry
+/// worth tidying: the C reads each flag in exactly one arm.
+///
+/// # The answer is a C string
+///
+/// `bufptr` is one, and `strchr` and `alldgs` both stop at its terminator, so
+/// an embedded NUL ends the answer as far as this check is concerned rather
+/// than being a byte in it. Measured, not assumed: the genuine host's `chktyp`
+/// accepts `"12\0ab"` in a `#` field and accepts `"ab\0 c"` in a `NOSPACES`
+/// one.
+///
+/// # A field the template had no room for passes
+///
+/// The C's `switch` has no `default` and `rc` is initialised to 1, so a
+/// `fldtyp` that is none of `Y ? # $` is consistent with everything. That arm
+/// is reachable: `chkops` zeroes every field's `fldtyp` and only `embscn` fills
+/// it in, and `embscn` stops at `numtpl` -- so a field the specification names
+/// and the template has no run for keeps `fldtyp == 0` and answers `true` here.
+pub fn type_ok(field: &Field, answer: &[u8]) -> bool {
+    let answer = c_str(answer);
+    match field.kind {
+        b'Y' | b'?' => {
+            field.flags & flags::MULTICHOICE == 0
+                && (field.flags & flags::NOSPACES == 0 || !answer.contains(&b' '))
+        }
+        b'#' => crate::strings::all_digits(answer),
+        b'$' => {
+            // `cp=bufptr; if (*cp == '-') cp++;` -- one sign, and only at the
+            // front. `strlen(cp) > 0` is then what stops a lone `-`, and it is
+            // the whole of the difference between `$` and `#`.
+            let digits = answer.strip_prefix(b"-").unwrap_or(answer);
+            !digits.is_empty() && crate::strings::all_digits(digits)
+        }
+        _ => true,
+    }
+}
+
+/// A candidate answer as the C sees it: up to its first NUL.
+///
+/// `bufptr` is a `char *` and every routine that reads it -- `strchr`,
+/// `alldgs`, `strlen`, `strcmpi`, `sscanf` -- stops at the terminator. A Rust
+/// slice does not, so the truncation has to be written down. Measured rather
+/// than assumed: the genuine host's `chktyp` accepts `"12\0ab"` in a `#` field,
+/// and its `chkmin` reads `"ab\0cd"` as two characters long.
+fn c_str(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&c| c == 0) {
+        Some(nul) => &s[..nul],
+        None => s,
+    }
+}
+
+/// `sscanf(s,"%ld",&n)`, as far as [`min_ok`] and [`max_ok`] need it.
+///
+/// A C `long` here is 32 bits, so this one is too. Two of `sscanf`'s edges are
+/// deliberately not reproduced, because both are undefined behaviour rather
+/// than behaviour:
+///
+/// * **Nothing to convert.** C leaves the target untouched, so the original
+///   compares against whatever the stack held. This answers zero.
+/// * **Overflow.** This saturates. A `MIN=` beyond a 32-bit `long` is outside
+///   what either side can be said to mean.
+fn as_long(s: &[u8]) -> i32 {
+    let mut at = 0usize;
+    while at < s.len() && is_space(s[at]) {
+        at += 1;
+    }
+    let negative = s.get(at) == Some(&b'-');
+    if negative || s.get(at) == Some(&b'+') {
+        at += 1;
+    }
+    let magnitude = s[at..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0i32, |n, &c| {
+            n.saturating_mul(10).saturating_add(i32::from(c - b'0'))
+        });
+    if negative { -magnitude } else { magnitude }
+}
+
+/// `MIN=` read as a minimum **length**, or `None` if it cannot be one.
+///
+/// `FSD.C:903-905`: all digits, at most two of them, and no greater than the
+/// field's width. Each of the three is load-bearing and the third is the one
+/// that surprises -- `MIN=99` on a two-wide field is a *value*, not a length.
+///
+/// The result fits a `u8` because two digits cannot exceed 99.
+fn as_length(min: &[u8], width: u8) -> Option<u8> {
+    if !crate::strings::all_digits(min) || min.len() > 2 {
+        return None;
+    }
+    // `atoi(tp)` over at most two digits. An empty `MIN=` reaches here -- both
+    // `alldgs("")` and `atoi("")` are happy with it -- and asks for a minimum
+    // length of zero, which every answer meets.
+    let ml = min.iter().fold(0u8, |n, &c| n * 10 + (c - b'0'));
+    (ml <= width).then_some(ml)
+}
+
+/// Is the answer at or above the field's `MIN=`? `chkmin()`, `FSD.C:887`.
+///
+/// # The `?` arm falls through, and that is the whole of this routine
+///
+/// A `?` field's `MIN=` is a minimum **length** when [`as_length`] can read it
+/// as one, and a minimum **value** otherwise: `FSD.C:911-912` is a `case '?'`
+/// that runs off the end of its block into `case '#'`, deliberately and
+/// unmarked. A port that made the `?` arm complete in itself is right on every
+/// input anyone would think to try and wrong on `MIN=100` for a four-wide
+/// field, where the C compares `"100"` against the answer as text.
+///
+/// # Only `$` is arithmetic
+///
+/// `?` and `#` go through `strcmpi`, which compares *strings*: for a `#` field
+/// `"9"` is greater than `"10"`, and a `MIN=9` therefore refuses `10`. Only a
+/// `$` field reaches `sscanf("%ld")`. That is not a bug being preserved for its
+/// own sake -- it is what makes `MIN=` usable on an alphabetic field at all.
+///
+/// # `Err` carries the message, because the message is the behaviour
+///
+/// The C writes it into `chkemg` (`FSD.C:29`) and the entry engine displays it,
+/// so the wording, the quoting and the truncation are all observable. The
+/// truncation is `%0.*s` with a precision of `MAXHLP-17`, and the genuine
+/// host's `sprintf` overruns `chkemg` by exactly the terminating NUL when it
+/// bites -- 15 characters of prose, two quotes and 63 of value is 80, and
+/// `chkemg` is 80 bytes. Not reproduced: a `String` has no such edge.
+///
+/// # A `Y/N` field has no minimum whatever its flags say
+///
+/// `foptkn` substitutes `(ALT=NO ALT=YES)` for a `Y` field's option list, so
+/// the `MIN=` its specification carried is unfindable. See [`option_list_of`].
+pub fn min_ok(spec: &[u8], field: &Field, answer: &[u8]) -> Result<(), String> {
+    if field.flags & flags::MINMAX == 0 {
+        return Ok(());
+    }
+    let Some(min) = option_value(spec, field, b"MIN=", false) else {
+        return Ok(());
+    };
+    let answer = c_str(answer);
+
+    if field.kind == b'?'
+        && let Some(ml) = as_length(min, field.width)
+    {
+        return if answer.len() >= usize::from(ml) {
+            Ok(())
+        } else {
+            Err(format!("Enter at least {ml} character(s)"))
+        };
+    }
+
+    match field.kind {
+        // The fallthrough: `?` arrives here when its `MIN=` was not a length.
+        b'?' | b'#' => {
+            if crate::strings::strcmpi(min, answer).is_le() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Enter at least \"{}\"",
+                    String::from_utf8_lossy(&min[..min.len().min(usize::from(MAXHLP) - 17)])
+                ))
+            }
+        }
+        b'$' => {
+            let (want, got) = (as_long(min), as_long(answer));
+            if want <= got {
+                Ok(())
+            } else {
+                Err(format!("Enter at least {want}"))
+            }
+        }
+        // `Y`, and a field the template had no run for. The C's `switch` has no
+        // `default` and `rc` starts at 1, so neither has a minimum.
+        _ => Ok(()),
+    }
+}
+
+/// Is the answer at or below the field's `MAX=`? `chkmax()`, `FSD.C:931`.
+///
+/// Everything [`min_ok`] says about `strcmpi` versus `sscanf`, about `Err`
+/// carrying the message, and about `Y/N`, holds here too. The one difference is
+/// the one worth naming: **there is no fallthrough**. `case '?'` and `case '#'`
+/// share a single arm outright (`FSD.C:944-945`), so a `MAX=` is never read as
+/// a maximum length and `MAX=3` on a `?` field refuses every answer that sorts
+/// after `"3"` however short it is.
+///
+/// Its message truncates at `MAXHLP-23` rather than `MAXHLP-17`, the prose
+/// being six characters longer.
+pub fn max_ok(spec: &[u8], field: &Field, answer: &[u8]) -> Result<(), String> {
+    if field.flags & flags::MINMAX == 0 {
+        return Ok(());
+    }
+    let Some(max) = option_value(spec, field, b"MAX=", false) else {
+        return Ok(());
+    };
+    let answer = c_str(answer);
+
+    match field.kind {
+        b'?' | b'#' => {
+            if crate::strings::strcmpi(max, answer).is_ge() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Enter no higher than \"{}\"",
+                    String::from_utf8_lossy(&max[..max.len().min(usize::from(MAXHLP) - 23)])
+                ))
+            }
+        }
+        b'$' => {
+            let (want, got) = (as_long(max), as_long(answer));
+            if got <= want {
+                Ok(())
+            } else {
+                Err(format!("Enter no higher than {want}"))
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `vldfld()` -- bring a proposed field number into range, or refuse.
+/// `FSD.C:662`.
+///
+/// `wrap` is the C's `udwrap && fsdscb->flags&FSDANS`, which is two pieces of
+/// state neither of them this routine's argument: `udwrap` is a file-scope
+/// `int` initialised to 1 (`FSD.C:36`) that the host exposes for a sysop to
+/// turn off, and `FSDANS` (0x10, `FSD.H:402`) is set by `fsdent()` and cleared
+/// by `fsdlin()`. Both terms matter and both are parameters here rather than
+/// globals, because a global would make this untestable and would put session
+/// state in a module that has none.
+///
+/// # The refusal and the last field are the same number in the C
+///
+/// `vldfld` says "no" by returning -1, and its wrapping arm computes
+/// `numtpl-1`. On a form with no fields in the template at all those are the
+/// same value, so a below-zero field number on such a form is refused **even
+/// with wrapping on** -- not because anything tests for it, but because the
+/// arithmetic collides with the sentinel. [`None`] here is that collision kept
+/// rather than tidied away.
+///
+/// The other end does not collide: `fldn >= numtpl` on an empty template wraps
+/// to field 0, which is a field the template has no room for and which
+/// [`move_field`] will then read the flags of. That is the original's
+/// behaviour and not an oversight of this port.
+fn valid_field(form: &Form, field: i32, wrap: bool) -> Option<usize> {
+    let last = form.in_template as i32;
+    if field < 0 {
+        // `numtpl-1`, and `-1` is the refusal. An empty template makes them one
+        // and the same, so this is not `wrap.then(...)` on its own.
+        wrap.then_some(last - 1).filter(|n| *n >= 0).map(|n| n as usize)
+    } else if field >= last {
+        wrap.then_some(0usize)
+    } else {
+        Some(field as usize)
+    }
+}
+
+/// `movfld()` -- the first usable field at or beyond `field`, stepping by
+/// `inc`. `FSD.C:675`.
+///
+/// "Usable" means not flagged [`flags::AVOID`]. `resort` is what comes back
+/// when there is nowhere to go: off the end of a form that does not wrap, or a
+/// walk that came back to where it started.
+///
+/// # `resort` is an `Option`, and the C is why
+///
+/// The original's `resort` is an `int`, and three of its six call sites pass
+/// **-1** as one (`FSD.C:1344`, `:1363`, `:1906`) and test the answer against
+/// -1 afterwards: "move there, and tell me if there is no there". The other
+/// three pass a real field number (`:829`, `:840`, `:1199`) and use it
+/// unconditionally. A `usize` cannot say the first thing and a bare `i32`
+/// makes every caller re-check the range before indexing, so the two are one
+/// [`Option`] here: [`None`] is the -1, and it comes back only when the caller
+/// put it in.
+///
+/// `inc` may be 0. `hopfld` (`FSD.C:1363`) passes it to mean "that field or
+/// nothing", and it works because a zero step lands on `flast` immediately.
+///
+/// # Why it terminates
+///
+/// Only because of the two comparisons at `FSD.C:689-690`. Stepping by ±1 with
+/// `wrap` on visits every field forever, so the loop is bounded by noticing
+/// that it has returned to the field it was asked about (`fldi == fldn`) or
+/// that the step did not move (`fldi == flast`). Drop either and a form whose
+/// fields are all avoided does not answer `resort`, it does not answer at all.
+///
+/// Note which numbers those are. `fldi == fldn` compares against the **raw
+/// argument**, which may be the -1 or the past-the-end value that was wrapped
+/// on the way in and therefore may match nothing; `fldi == flast` compares
+/// against the previous position, which is what catches a single-field form.
+///
+/// # Panics
+///
+/// If the walk reaches a field index `form.fields` does not have. That is
+/// reachable only through the `numtpl > fields.len()` inconsistency the C reads
+/// past the end of the array on, and a panic is the better of the two.
+pub fn move_field(
+    form: &Form,
+    field: i32,
+    inc: i32,
+    resort: Option<usize>,
+    wrap: bool,
+) -> Option<usize> {
+    let Some(mut at) = valid_field(form, field, wrap) else {
+        return resort;
+    };
+    let mut last = at;
+    while form.fields[at].flags & flags::AVOID != 0 {
+        match valid_field(form, at as i32 + inc, wrap) {
+            Some(next) if next as i32 != field && next != last => {
+                last = next;
+                at = next;
+            }
+            _ => return resort,
+        }
+    }
+    Some(at)
 }
 
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
@@ -1452,6 +2073,251 @@ mod tests {
         );
     }
 
+    /// `stfans()`, `FSD.C:1036`. A longer answer pushes every later answer
+    /// along, and `allans` grows by the same delta.
+    #[test]
+    fn storing_a_longer_answer_moves_every_later_offset() {
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let mut a = answers(&form, b"NAME RANK", b"\0");
+        assert_eq!(a.offsets, vec![(5u16, 0u8), (11, 0)]);
+
+        assert!(store(&mut a, 0, b"DAN"), "the answer changed");
+
+        assert_eq!(a.text, b"NAME=DAN\0RANK=\0\0");
+        assert_eq!(a.offsets, vec![(5, 3), (14, 0)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// Shorter works the same way in the other direction.
+    #[test]
+    fn storing_a_shorter_answer_pulls_every_later_offset_back() {
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let mut a = answers(&form, b"NAME RANK", b"NAME=DANIEL\0\0");
+        assert_eq!(a.offsets, vec![(5u16, 6u8), (17, 0)]);
+
+        assert!(store(&mut a, 0, b"DAN"));
+
+        assert_eq!(a.text, b"NAME=DAN\0RANK=\0\0");
+        assert_eq!(a.offsets, vec![(5, 3), (14, 0)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// The return value is "did it change", and it is the whole reason the
+    /// engine can count changes (`chgcnt`) without diffing the string itself.
+    #[test]
+    fn storing_the_same_answer_reports_no_change() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
+        assert!(!store(&mut a, 0, b"DAN"));
+        assert_eq!(a.text, b"NAME=DAN\0\0", "and nothing moved");
+    }
+
+    /// An answer of the same length and different content is still a change,
+    /// and it is the only shape that says so *only* through the `strcmp` half
+    /// of `FSD.C:1049`.
+    #[test]
+    fn a_same_length_answer_is_compared_byte_by_byte() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
+        assert!(store(&mut a, 0, b"dan"), "strcmp is case-sensitive");
+        assert_eq!(a.text, b"NAME=dan\0\0");
+    }
+
+    /// The backwards walk's boundary: `efptr` starts at the last field, so
+    /// storing into that field runs the loop zero times. `allans` still moves.
+    #[test]
+    fn storing_into_the_last_field_moves_nothing_after_it() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut a = answers(&form, b"A B C", b"\0");
+        assert_eq!(a.offsets, vec![(2u16, 0u8), (5, 0), (8, 0)]);
+
+        assert!(store(&mut a, 2, b"zz"));
+
+        assert_eq!(a.text, b"A=\0B=\0C=zz\0\0");
+        assert_eq!(a.offsets, vec![(2, 0), (5, 0), (8, 2)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// The fields *before* the stored one do not move either -- the walk stops
+    /// at `fldptr` rather than running to the front of the array.
+    #[test]
+    fn storing_into_a_middle_field_leaves_the_earlier_ones_alone() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut a = answers(&form, b"A B C", b"A=xx\0C=yy\0\0");
+        assert_eq!(a.offsets, vec![(2u16, 2u8), (7, 0), (10, 2)]);
+
+        assert!(store(&mut a, 1, b"q"));
+
+        assert_eq!(a.text, b"A=xx\0B=q\0C=yy\0\0");
+        assert_eq!(a.offsets, vec![(2, 2), (7, 1), (11, 2)]);
+    }
+
+    /// `anslen=strlen(bufptr)`: an embedded NUL ends the answer, so what is
+    /// stored is the prefix and an answer whose prefix is already there is not
+    /// a change.
+    #[test]
+    fn an_embedded_nul_ends_the_answer_being_stored() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DA\0\0");
+        assert!(!store(&mut a, 0, b"DA\0NIEL"), "strlen stops at the NUL");
+        assert_eq!(a.text, b"NAME=DA\0\0");
+
+        assert!(store(&mut a, 0, b"\0DA"), "an answer that begins with one");
+        assert_eq!(a.text, b"NAME=\0\0");
+        assert_eq!(a.offsets, vec![(5, 0)]);
+    }
+
+    /// `stranslen` walks entries, so its answer is a count of entries and
+    /// their terminators plus the string's own.
+    #[test]
+    fn an_answer_strings_length_counts_every_terminator() {
+        assert_eq!(answer_len(b"\0"), 1, "the empty answer string, fsdans's \"\"");
+        assert_eq!(answer_len(b"A=1\0\0"), 5, "one entry");
+        assert_eq!(answer_len(b"A=1\0B=22\0C=\0\0"), 13, "three");
+        assert_eq!(answer_len(b"NOEQUALS\0\0"), 10, "an entry need not have '='");
+    }
+
+    /// The loop condition is `*anstg != '\0'` and nothing else, so the first
+    /// empty entry ends the string wherever it is -- and a byte after the
+    /// terminator is not part of it.
+    #[test]
+    fn a_zero_length_entry_is_the_terminator() {
+        assert_eq!(answer_len(b"\0A=1\0\0"), 1, "unreachable entries are not counted");
+        assert_eq!(answer_len(b"\0\0"), 1, "and neither is a spare NUL");
+        assert_eq!(answer_len(b"A=1\0\0B=2\0\0"), 5);
+    }
+
+    /// The C reads on past the slice; there is no length here that would be
+    /// right, so this stops instead of inventing one.
+    #[test]
+    #[should_panic(expected = "hold no NUL at all")]
+    fn an_answer_string_that_does_not_terminate_is_a_panic() {
+        answer_len(b"A=1");
+    }
+
+    #[test]
+    #[should_panic(expected = "hold no NUL at all")]
+    fn an_answer_string_missing_only_its_terminator_is_a_panic() {
+        answer_len(b"A=1\0");
+    }
+
+    /// The replace branch: the value goes in where it stood and everything
+    /// after it slides, in both directions.
+    #[test]
+    fn putting_a_value_over_one_that_is_there_moves_the_rest() {
+        let mut a = b"A=1234\0B=22\0C=3\0\0".to_vec();
+        put_answer(&mut a, b"A", b"9");
+        assert_eq!(a, b"A=9\0B=22\0C=3\0\0", "shorter");
+
+        put_answer(&mut a, b"B", b"abcde");
+        assert_eq!(a, b"A=9\0B=abcde\0C=3\0\0", "longer");
+
+        put_answer(&mut a, b"C", b"7");
+        assert_eq!(a, b"A=9\0B=abcde\0C=7\0\0", "the last one, same length");
+
+        put_answer(&mut a, b"B", b"");
+        assert_eq!(a, b"A=9\0B=\0C=7\0\0", "emptied");
+    }
+
+    /// The append branch: `sprintf` writes over the terminator and puts a new
+    /// one after the entry, so the string grows by `strlen(name)+strlen(value)+2`.
+    #[test]
+    fn putting_a_value_no_name_carries_appends_an_entry() {
+        let mut a = b"\0".to_vec();
+        put_answer(&mut a, b"A", b"1");
+        assert_eq!(a, b"A=1\0\0", "onto the empty answer string");
+
+        put_answer(&mut a, b"B", b"");
+        assert_eq!(a, b"A=1\0B=\0\0", "an empty value is still an entry");
+
+        put_answer(&mut a, b"eye_col", b"Violet");
+        assert_eq!(a, b"A=1\0B=\0eye_col=Violet\0\0", "the name as it was given");
+        put_answer(&mut a, b"EYE_COL", b"Green");
+        assert_eq!(
+            a, b"A=1\0B=\0eye_col=Green\0\0",
+            "and found again whichever way it is spelled, `sameto` folding case"
+        );
+    }
+
+    /// `xannam[n] == '='` is the second half of the match, and it is what stops
+    /// a name from matching an entry it is merely a prefix of.
+    #[test]
+    fn a_name_that_is_a_prefix_of_another_matches_neither() {
+        let mut a = b"NAMEX=1\0NAME=2\0\0".to_vec();
+        put_answer(&mut a, b"NAME", b"9");
+        assert_eq!(a, b"NAMEX=1\0NAME=9\0\0");
+
+        let mut a = b"NAMEX=1\0\0".to_vec();
+        put_answer(&mut a, b"NAME", b"9");
+        assert_eq!(a, b"NAMEX=1\0NAME=9\0\0", "so the name is not there at all");
+    }
+
+    /// `fsdxan` returns on its first hit, which is the same rule `fsdans`
+    /// follows: of a duplicate name the earlier answer prevails.
+    #[test]
+    fn putting_a_value_replaces_the_first_of_two_entries_of_a_name() {
+        let mut a = b"CLASS=Warrior\0CLASS=Thief\0\0".to_vec();
+        put_answer(&mut a, b"CLASS", b"Mage");
+        assert_eq!(a, b"CLASS=Mage\0CLASS=Thief\0\0");
+    }
+
+    /// `strlen`, `strcpy` and `%s` all stop at the first NUL.
+    #[test]
+    fn an_embedded_nul_ends_the_name_and_the_value_being_put() {
+        let mut a = b"A=1\0B=2\0\0".to_vec();
+        put_answer(&mut a, b"A", b"xy\0zw");
+        assert_eq!(a, b"A=xy\0B=2\0\0", "the value is what precedes the NUL");
+
+        let mut a = b"AB=1\0\0".to_vec();
+        put_answer(&mut a, b"A\0B", b"9");
+        assert_eq!(a, b"AB=1\0A=9\0\0", "and the name is `A`, which is not `AB`");
+    }
+
+    /// Past 32767 bytes of tail the genuine host stops moving it and splices
+    /// over it instead, because `nstr` is an `int` and the guard is signed.
+    /// That is a corruption rather than a behaviour: this refuses. The
+    /// measurement that says the host really does it is in
+    /// `tests/fsd_oracle.rs`, which is where the number comes from.
+    #[test]
+    #[should_panic(expected = "stops moving the tail")]
+    fn a_tail_no_int_can_count_is_refused() {
+        let mut a = with_tail(i16::MAX as usize + 1);
+        put_answer(&mut a, b"A", b"22");
+    }
+
+    /// One byte less is inside what an `int` can count, and then the two agree.
+    #[test]
+    fn a_tail_an_int_can_still_count_is_spliced() {
+        let mut a = with_tail(i16::MAX as usize);
+        let tail = a[4..].to_vec();
+
+        put_answer(&mut a, b"A", b"22");
+
+        assert_eq!(&a[..5], b"A=22\0");
+        assert_eq!(&a[5..], &tail[..], "the whole of it moved up one byte");
+    }
+
+    /// `A=1` and then one entry big enough that `stranslen` of everything after
+    /// the first is exactly `tail`.
+    fn with_tail(tail: usize) -> Vec<u8> {
+        let mut a = b"A=1\0".to_vec();
+        a.extend_from_slice(b"B=");
+        a.resize(4 + tail - 2, b'x');
+        a.push(0);
+        a.push(0);
+        assert_eq!(answer_len(&a[4..]), tail, "the tail this was built for");
+        a
+    }
+
+    /// A `Vec` that is not exactly the answer string would splice bytes the C's
+    /// `movmem` never touches, so it is refused rather than guessed at.
+    #[test]
+    #[should_panic(expected = "the same edit only while nothing follows")]
+    fn putting_a_value_into_a_buffer_that_is_not_an_answer_string_is_a_panic() {
+        let mut a = b"A=1\0\0spare room".to_vec();
+        put_answer(&mut a, b"A", b"9");
+    }
+
     #[test]
     fn a_field_name_stops_at_white_space_or_an_open_paren() {
         // `fldnmi()`, FSD.C:2155 -- the name is the spec text up to the first
@@ -1625,5 +2491,336 @@ mod tests {
             + 1;
         assert_eq!(form.size(), Ok(expected as u16));
         assert_eq!(form.size(), Ok(59));
+    }
+
+    /// `chktyp()`, `FSD.C:861`. A multiple-choice field rejects *any* typed
+    /// answer -- the answer has to have come from the `ALT=` list, and getting
+    /// there is `chkalt`'s job, not this one's.
+    #[test]
+    fn a_multiple_choice_field_rejects_a_typed_answer_outright() {
+        let form = compile(b"??????", b"COLOUR(MULTICHOICE ALT=RED ALT=BLUE)", MANY);
+        assert_eq!(form.fields[0].flags & flags::MULTICHOICE, flags::MULTICHOICE);
+        assert!(!type_ok(&form.fields[0], b"RED"), "not even a listed one");
+        assert!(!type_ok(&form.fields[0], b""), "not even an empty one");
+    }
+
+    /// Every `Y/N` field is one, which is what makes the arm's `false` normal
+    /// rather than exceptional.
+    #[test]
+    fn a_yes_no_field_rejects_a_typed_answer_because_it_is_multiple_choice() {
+        let form = compile(b"Ok Y/N", b"OK", MANY);
+        assert_eq!(form.fields[0].kind, b'Y');
+        assert!(!type_ok(&form.fields[0], b"YES"));
+
+        // The rest of the arm, reached by clearing the flag `tmpfld` set. `Y`
+        // is grouped with `?` in the C, and this is the whole of that grouping:
+        // no sign is stripped and no digit is looked for.
+        let mut typed = form.fields[0];
+        typed.flags = 0;
+        assert!(type_ok(&typed, b"YES"));
+        assert!(type_ok(&typed, b"-"));
+        typed.flags = flags::NOSPACES;
+        assert!(!type_ok(&typed, b"Y N"));
+    }
+
+    /// `FFFNSP` is the only other thing a `?` field checks.
+    #[test]
+    fn a_no_spaces_field_rejects_a_space_and_nothing_else_does() {
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        assert_eq!(spaced.fields[0].flags, flags::NOSPACES);
+        assert!(!type_ok(&spaced.fields[0], b"van Gogh"));
+        assert!(type_ok(&spaced.fields[0], b"vanGogh"));
+        // `strchr(bufptr,' ')` is the literal blank, not `isspace`.
+        assert!(type_ok(&spaced.fields[0], b"van\tGogh"));
+
+        let plain = compile(b"??????", b"NAME", MANY);
+        assert_eq!(plain.fields[0].flags, 0);
+        assert!(type_ok(&plain.fields[0], b"van Gogh"));
+    }
+
+    /// A `#` field is digits only, and an empty answer passes -- `alldgs("")`
+    /// is true, measured from the genuine host.
+    #[test]
+    fn a_hash_field_takes_digits_and_an_empty_answer() {
+        let form = compile(b"####", b"AGE", MANY);
+        assert!(type_ok(&form.fields[0], b"42"));
+        assert!(type_ok(&form.fields[0], b""));
+        assert!(!type_ok(&form.fields[0], b"-1"), "no sign on a # field");
+        assert!(!type_ok(&form.fields[0], b"4a"));
+        assert!(!type_ok(&form.fields[0], b"4 2"));
+        // Borland's `isdigit` indexes `_ctype` with a signed char, so the high
+        // half is the half worth asserting.
+        assert!(!type_ok(&form.fields[0], b"\xb2"), "superscript two is not 2");
+        assert!(!type_ok(&form.fields[0], b"4\xff"));
+    }
+
+    /// A `$` field takes one leading minus and then insists on at least one
+    /// digit -- `FSD.C:878-881`. This is the whole difference from `#`.
+    #[test]
+    fn a_dollar_field_takes_a_leading_minus_but_not_an_empty_answer() {
+        let form = compile(b"$$$$", b"BALANCE", MANY);
+        assert!(type_ok(&form.fields[0], b"-1"));
+        assert!(type_ok(&form.fields[0], b"1"));
+        assert!(!type_ok(&form.fields[0], b""), "unlike a # field");
+        assert!(!type_ok(&form.fields[0], b"-"), "a sign alone is not a number");
+        assert!(!type_ok(&form.fields[0], b"--1"), "one minus, not two");
+        assert!(!type_ok(&form.fields[0], b"1-"), "and only at the front");
+        assert!(!type_ok(&form.fields[0], b"-\xb2"));
+    }
+
+    /// Neither numeric arm reads a flag, so setting one changes nothing. The
+    /// C reads `FFFMCH` and `FFFNSP` in the `?`/`Y` arm and nowhere else.
+    #[test]
+    fn the_numeric_field_types_ignore_the_flags_the_text_ones_read() {
+        let hashes = compile(b"####", b"AGE(MULTICHOICE NOSPACES)", MANY);
+        assert_eq!(
+            hashes.fields[0].flags,
+            flags::MULTICHOICE | flags::NOSPACES,
+            "the options did compile"
+        );
+        assert!(type_ok(&hashes.fields[0], b"42"));
+
+        let dollars = compile(b"$$$$", b"AMT(MULTICHOICE NOSPACES)", MANY);
+        assert!(type_ok(&dollars.fields[0], b"-12"));
+    }
+
+    /// The `switch` has no `default` and `rc` starts at 1, and the arm is
+    /// reachable: a field the specification names and the template has no run
+    /// for never gets a `fldtyp`.
+    #[test]
+    fn a_field_the_template_had_no_room_for_is_consistent_with_anything() {
+        let form = compile(b"", b"A", MANY);
+        assert_eq!(form.in_template, 0);
+        assert_eq!(form.fields[0].kind, 0, "embscn never reached it");
+        assert!(type_ok(&form.fields[0], b"anything at all"));
+        assert!(type_ok(&form.fields[0], b""));
+        assert!(type_ok(&form.fields[0], b"-"));
+    }
+
+    /// `bufptr` is a C string, and `strchr` and `alldgs` both stop at its
+    /// terminator. Measured against the genuine host in `tests/fsd_statics.rs`,
+    /// which is the only reason this is the behaviour rather than the other
+    /// plausible one.
+    #[test]
+    fn an_embedded_nul_ends_the_answer() {
+        let hashes = compile(b"####", b"AGE", MANY);
+        assert!(type_ok(&hashes.fields[0], b"12\x00ab"));
+
+        let dollars = compile(b"$$$$", b"AMT", MANY);
+        assert!(type_ok(&dollars.fields[0], b"-1\x00a"));
+        assert!(!type_ok(&dollars.fields[0], b"\x009"), "an empty answer");
+
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        assert!(type_ok(&spaced.fields[0], b"ab\x00 c"));
+    }
+
+    /// `chkmin`'s `?` arm reads `MIN=` as a minimum **length**, but only when
+    /// it is all digits, at most two of them, and no wider than the field.
+    ///
+    /// The specification is `NAME(MIN=3)` and not `NAME (MIN=3)`: `fspscn` ends
+    /// a field name at white space, so a space before the `(` makes the option
+    /// list a second, nameless field and the first one carries no flags at all.
+    #[test]
+    fn a_text_minimum_that_looks_like_a_length_is_a_length() {
+        let spec = b"NAME(MIN=3)";
+        let form = compile(b"??????", spec, MANY);
+        let field = &form.fields[0];
+        assert_eq!(field.flags & flags::MINMAX, flags::MINMAX, "MIN= was read");
+
+        assert!(min_ok(spec, field, b"abc").is_ok());
+        assert_eq!(
+            min_ok(spec, field, b"ab").unwrap_err(),
+            "Enter at least 3 character(s)"
+        );
+    }
+
+    /// ...and otherwise **falls through** to the string comparison.
+    /// `FSD.C:911-912` is a `case '?'` that runs into `case '#'`, and these are
+    /// the two ways to reach it: three digits, and two digits wider than the
+    /// field.
+    #[test]
+    fn a_text_minimum_too_long_to_be_a_length_falls_through_to_a_value() {
+        let spec = b"CODE(MIN=100)";
+        let form = compile(b"????", spec, MANY);
+        let field = &form.fields[0];
+        // "099" sorts before "100", so this is refused on value, and the
+        // message is the value message rather than the length one.
+        assert_eq!(
+            min_ok(spec, field, b"099").unwrap_err(),
+            "Enter at least \"100\""
+        );
+        assert!(min_ok(spec, field, b"100").is_ok(), "equal is at least");
+        assert!(min_ok(spec, field, b"99").is_ok(), "text order, not numeric");
+
+        // Two digits, but 99 does not fit a two-wide field.
+        let spec = b"X(MIN=99)";
+        let form = compile(b"??", spec, MANY);
+        assert_eq!(
+            min_ok(spec, &form.fields[0], b"1").unwrap_err(),
+            "Enter at least \"99\""
+        );
+
+        // Three digits that would have fitted: the digit count alone stops it.
+        let spec = b"NAME(MIN=003)";
+        let form = compile(b"??????", spec, MANY);
+        assert!(min_ok(spec, &form.fields[0], b"ab").is_ok());
+    }
+
+    /// A `$` field compares numerically, which is the only place a number is
+    /// read as a number.
+    #[test]
+    fn a_dollar_minimum_compares_numerically_where_a_hash_compares_as_text() {
+        let dollars = b"AMT(MIN=9)";
+        let form = compile(b"$$$$", dollars, MANY);
+        assert!(min_ok(dollars, &form.fields[0], b"10").is_ok(), "10 >= 9");
+        assert!(min_ok(dollars, &form.fields[0], b"9").is_ok(), "9 >= 9");
+        assert_eq!(
+            min_ok(dollars, &form.fields[0], b"8").unwrap_err(),
+            "Enter at least 9"
+        );
+
+        let hashes = b"AGE(MIN=9)";
+        let form = compile(b"####", hashes, MANY);
+        assert_eq!(
+            min_ok(hashes, &form.fields[0], b"10").unwrap_err(),
+            "Enter at least \"9\"",
+            "as text, \"10\" sorts before \"9\""
+        );
+    }
+
+    /// `chkmax` has no fallthrough: `?` and `#` share one arm, so a `MAX=` is
+    /// never a maximum length.
+    #[test]
+    fn a_maximum_is_never_read_as_a_length() {
+        let spec = b"CODE(MAX=3)";
+        let form = compile(b"????", spec, MANY);
+        let field = &form.fields[0];
+        assert_eq!(
+            max_ok(spec, field, b"abcd").unwrap_err(),
+            "Enter no higher than \"3\"",
+            "four characters is not what MAX=3 is about"
+        );
+        assert!(max_ok(spec, field, b"2").is_ok());
+
+        let spec = b"AMT(MAX=9)";
+        let form = compile(b"$$$$", spec, MANY);
+        assert!(max_ok(spec, &form.fields[0], b"9").is_ok(), "9 <= 9");
+        assert_eq!(
+            max_ok(spec, &form.fields[0], b"10").unwrap_err(),
+            "Enter no higher than 9"
+        );
+    }
+
+    /// No `MIN=`/`MAX=` at all is a pass, and so is a field type the C's
+    /// `switch` does not name.
+    #[test]
+    fn a_field_with_no_minimum_passes_everything() {
+        let form = compile(b"??????", b"NAME", MANY);
+        assert_eq!(form.fields[0].flags, 0, "no options, no flags");
+        assert!(min_ok(b"NAME", &form.fields[0], b"").is_ok());
+        assert!(max_ok(b"NAME", &form.fields[0], b"zzzzzz").is_ok());
+
+        // A field the template had no run for keeps `fldtyp == 0`, and the C's
+        // `switch` has no `default`.
+        let spec = b"A(MIN=3)";
+        let form = compile(b"", spec, MANY);
+        assert_eq!(form.fields[0].kind, 0);
+        assert!(min_ok(spec, &form.fields[0], b"").is_ok());
+    }
+
+    /// An answer is a C string wherever these two look at it.
+    #[test]
+    fn an_embedded_nul_ends_the_answer_a_minimum_is_measured_against() {
+        let spec = b"NAME(MIN=3)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            min_ok(spec, &form.fields[0], b"ab\x00cd").unwrap_err(),
+            "Enter at least 3 character(s)",
+            "two characters long, not four"
+        );
+
+        let spec = b"NAME(MAX=M)";
+        let form = compile(b"??????", spec, MANY);
+        assert!(max_ok(spec, &form.fields[0], b"M\x00Z").is_ok());
+    }
+
+    /// `movfld()`, `FSD.C:675`: step past every field flagged "avoid".
+    #[test]
+    fn moving_skips_avoided_fields() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(form.in_template, 3, "three fields in the template");
+        form.fields[1].flags |= flags::AVOID;
+        assert_eq!(move_field(&form, 1, 1, Some(99), false), Some(2), "skipped B");
+        assert_eq!(move_field(&form, 1, -1, Some(99), false), Some(0), "skipped B downwards");
+        assert_eq!(move_field(&form, 0, 1, Some(99), false), Some(0), "already usable");
+    }
+
+    /// `vldfld()`, `FSD.C:662`: out of range is a refusal unless the session
+    /// wraps, and only an ANSI session with `udwrap` set wraps.
+    #[test]
+    fn only_a_wrapping_session_wraps_around_the_ends() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(move_field(&form, 3, 1, Some(99), true), Some(0), "to the top");
+        assert_eq!(move_field(&form, 3, 1, Some(99), false), Some(99), "the last resort");
+        assert_eq!(move_field(&form, -1, -1, Some(99), true), Some(2), "to the bottom");
+        assert_eq!(move_field(&form, -1, -1, Some(99), false), Some(99), "either way");
+        // The -1 the real call sites pass, which is what the `Option` is for.
+        assert_eq!(move_field(&form, 3, 1, None, false), None, "no there there");
+    }
+
+    /// Every field avoided means there is nowhere to go, and the answer is the
+    /// caller's last resort rather than a loop.
+    ///
+    /// This is the test the `fldi == fldn || fldi == flast` guard exists for.
+    /// A port that dropped it does not fail here, it hangs.
+    #[test]
+    fn a_form_of_avoided_fields_gives_up_instead_of_spinning() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        for f in form.fields.iter_mut() {
+            f.flags |= flags::AVOID;
+        }
+        assert_eq!(move_field(&form, 0, 1, Some(99), true), Some(99), "upwards");
+        assert_eq!(move_field(&form, 0, -1, Some(99), true), Some(99), "downwards");
+        assert_eq!(move_field(&form, 1, 1, Some(99), false), Some(99), "off the end");
+
+        // One field, avoided. Asked about *that* field, `fldi == fldn` is what
+        // ends the walk -- but asked about the one past it, `fldn` is 1 and the
+        // walk stands on 0, so nothing it ever reaches equals `fldn` and
+        // `flast` is the only guard left. Dropping `flast` does not fail the
+        // first of these; it hangs on the second.
+        let mut one = compile(b"??", b"A", MANY);
+        one.fields[0].flags |= flags::AVOID;
+        assert_eq!(move_field(&one, 0, 1, Some(7), true), Some(7), "fldn ends it");
+        assert_eq!(move_field(&one, 1, 1, Some(7), true), Some(7), "flast ends it");
+        assert_eq!(move_field(&one, -1, -1, Some(7), true), Some(7), "downwards");
+    }
+
+    /// `hopfld`'s zero step (`FSD.C:1363`): that field, or nothing.
+    ///
+    /// A step of 0 lands on `flast` on the first try, so the walk gives up
+    /// after one look rather than examining any neighbour.
+    #[test]
+    fn a_zero_step_considers_one_field_and_no_other() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(move_field(&form, 1, 0, None, true), Some(1), "it is usable");
+        form.fields[1].flags |= flags::AVOID;
+        assert_eq!(move_field(&form, 1, 0, None, true), None, "and B's neighbours");
+        assert_eq!(move_field(&form, 2, 0, None, true), Some(2), "are not looked at");
+    }
+
+    /// A template with no fields in it at all, where `numtpl-1` and the
+    /// refusal are the same number.
+    #[test]
+    fn an_empty_template_wraps_forwards_but_not_backwards() {
+        let form = compile(b"", b"A", MANY);
+        assert_eq!(form.in_template, 0, "the spec named it, the template did not");
+        assert_eq!(form.fields.len(), 1, "and it is still a field");
+
+        // Backwards: `numtpl-1` is -1, which is `vldfld`'s own "can't use".
+        assert_eq!(move_field(&form, -1, -1, Some(99), true), Some(99));
+        // Forwards: wrapping to 0 is a field number the template has no room
+        // for, and the C hands it back regardless.
+        assert_eq!(move_field(&form, 0, 1, Some(99), true), Some(0));
+        assert_eq!(move_field(&form, 0, 1, Some(99), false), Some(99), "or nowhere");
     }
 }
