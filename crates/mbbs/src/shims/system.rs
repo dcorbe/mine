@@ -717,16 +717,39 @@ pub struct Kick {
     pub dstrou: FarPtr,
 }
 
-/// A module that has been taken online.
+/// A module that has been taken online, or a host-native handler occupying a
+/// `state` slot the same way one would.
+///
+/// `MAJORBBS.C:2703`'s `(*(module[usrptr->state]->sttrou))()` does not care
+/// whether `module[n]` is a loaded NE module or `inifsd()` registering
+/// FSDBBS as one -- both are just an entry in the table. This enum is that
+/// indifference, made explicit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Registration {
-    /// The name from `descrp`, which is the key its records are kept under.
-    pub description: String,
+pub enum Registration {
+    /// A module that has been taken online.
+    Module {
+        /// The name from `descrp`, which is the key its records are kept
+        /// under.
+        description: String,
 
-    /// The module's own `struct module`, in its own memory. Every entry point
-    /// the host will ever call is read back through here rather than copied,
-    /// because the module may change them.
-    pub block: FarPtr,
+        /// The module's own `struct module`, in its own memory. Every entry
+        /// point the host will ever call is read back through here rather
+        /// than copied, because the module may change them.
+        block: FarPtr,
+    },
+
+    /// A handler implemented by this host rather than by module code.
+    /// `inifsd()` registering FSDBBS as an ordinary module is the reason
+    /// this variant exists; see [`Native`].
+    Native(Native),
+}
+
+/// A host-native handler occupying a `state` slot. One variant today; a
+/// second module (MajorMUD Plus) would add a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Native {
+    /// The full-screen data entry engine, `FSDBBS.C`'s `inifsd()` registers.
+    Fsd,
 }
 
 /// A client/server agent that has been taken online.
@@ -760,29 +783,54 @@ pub struct Agent {
     pub abort: Option<FarPtr>,
 }
 
-impl Registration {
-    /// Where one of the nine entry points is, or `None` if the module left it
+/// What [`Registration::dispatch`] found at a channel's state: a module's
+/// far pointer (which may be null, meaning the module supplies no handler
+/// for this vector), or a native handler to run directly.
+///
+/// Public rather than `pub(crate)`, matching the visibility [`Registration`]
+/// and its old `entry` method already had: a test outside this crate (an
+/// integration test under `tests/`) reads a registered module's entry points
+/// back the same way `Host::state_entry` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dispatch {
+    /// A module's far pointer for this entry, or `None` if it left the entry
     /// null.
+    Module(Option<FarPtr>),
+    /// A host-native handler, run directly rather than through a far call.
+    Native(Native),
+}
+
+impl Registration {
+    /// Where one of the nine entry points is, or which native handler runs
+    /// instead.
     ///
     /// `n` is its position in `struct module` after `descrp`: 0 is `lonrou`,
-    /// 1 `sttrou`, 2 `stsrou`, and so on to 8 for `finrou`.
+    /// 1 `sttrou`, 2 `stsrou`, and so on to 8 for `finrou`. Meaningless for a
+    /// [`Registration::Native`] -- it has no `struct module` to index -- so
+    /// it is not read.
     ///
-    /// Read every time. That is the whole reason the pointer is kept.
+    /// Read every time a [`Registration::Module`]'s pointer is wanted. That
+    /// is the whole reason the block address is kept instead of a copy.
     ///
     /// # Errors
     ///
-    /// If the block no longer names memory the module owns.
-    pub fn entry(&self, machine: &Machine, n: usize) -> Result<Option<FarPtr>, ShimError> {
-        let at = FarPtr {
-            offset: self.block.offset + MNMSIZ + (n as u16) * 4,
-            selector: self.block.selector,
-        };
-        let bytes = machine.resolve(at, 4)?;
-        let ptr = FarPtr {
-            offset: u16::from_le_bytes([bytes[0], bytes[1]]),
-            selector: u16::from_le_bytes([bytes[2], bytes[3]]),
-        };
-        Ok((ptr.selector != 0).then_some(ptr))
+    /// If a `Module`'s block no longer names memory the module owns.
+    pub fn dispatch(&self, machine: &Machine, n: usize) -> Result<Dispatch, ShimError> {
+        match self {
+            Self::Module { block, .. } => {
+                let at = FarPtr {
+                    offset: block.offset + MNMSIZ + (n as u16) * 4,
+                    selector: block.selector,
+                };
+                let bytes = machine.resolve(at, 4)?;
+                let ptr = FarPtr {
+                    offset: u16::from_le_bytes([bytes[0], bytes[1]]),
+                    selector: u16::from_le_bytes([bytes[2], bytes[3]]),
+                };
+                Ok(Dispatch::Module((ptr.selector != 0).then_some(ptr)))
+            }
+            Self::Native(native) => Ok(Dispatch::Native(*native)),
+        }
     }
 }
 
@@ -992,12 +1040,15 @@ mod tests {
             "the first module is module zero"
         );
         let registered = &f.host.modules()[0];
-        assert_eq!(registered.description, "MajorMUD");
+        let Registration::Module { description, .. } = registered else {
+            panic!("register_module always registers a Module, not {registered:?}");
+        };
+        assert_eq!(description, "MajorMUD");
 
         for (n, expect) in entries.iter().enumerate() {
             assert_eq!(
-                registered.entry(&f.machine, n).expect("readable"),
-                Some(*expect)
+                registered.dispatch(&f.machine, n).expect("readable"),
+                Dispatch::Module(Some(*expect))
             );
         }
     }
@@ -1012,8 +1063,8 @@ mod tests {
         f.invoke(register_module, &Fixture::far(block)).expect("ok");
 
         assert_eq!(
-            f.host.modules()[0].entry(&f.machine, 1).expect("readable"),
-            None,
+            f.host.modules()[0].dispatch(&f.machine, 1).expect("readable"),
+            Dispatch::Module(None),
             "a null entry point is no entry point"
         );
 
@@ -1028,8 +1079,8 @@ mod tests {
         f.machine.write(at, &sttrou.to_bytes()).expect("in bounds");
 
         assert_eq!(
-            f.host.modules()[0].entry(&f.machine, 1).expect("readable"),
-            Some(sttrou),
+            f.host.modules()[0].dispatch(&f.machine, 1).expect("readable"),
+            Dispatch::Module(Some(sttrou)),
             "read back, not remembered"
         );
     }

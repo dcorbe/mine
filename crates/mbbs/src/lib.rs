@@ -64,7 +64,7 @@ pub use globals::{GLOBALS, Global, Globals, NTERMS, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use keys::KeySet;
 pub use random::{RAND_MAX, Random, Runaway};
-pub use shims::system::{Agent, Kick, Registration};
+pub use shims::system::{Agent, Dispatch, Kick, Native, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
@@ -131,7 +131,7 @@ enum Vector {
 
 impl Vector {
     /// Its position in `struct module` after `descrp`, which is what
-    /// [`Registration::entry`] takes.
+    /// [`Registration::dispatch`] takes.
     ///
     /// `MAJORBBS.H:241-252` fixes the order: `descrp`, `lonrou`, `sttrou`,
     /// `stsrou`, `injrou`, `lofrou`, `huprou`, `mcurou`, `dlarou`, `finrou`.
@@ -606,7 +606,11 @@ fn caller(machine: &Machine, module: &Module) -> Option<String> {
 /// the module registered at init, and `POLSTS` reaches a callback it installed
 /// at runtime. There is no entry-point number for the second, which is why this
 /// is an enum and not the `usize` it used to be.
-enum Dispatch {
+///
+/// Named `PollTarget` rather than `Dispatch` to leave that name for
+/// [`shims::system::Dispatch`], which is what a channel's `state` itself
+/// resolves to -- a different question from the one this enum answers.
+enum PollTarget {
     Entry(usize),
     Poll,
 }
@@ -772,7 +776,8 @@ impl Host {
     }
 
     /// Every module that has registered, in the order they did.
-    /// Entry `n` of the module channel `chan`'s `state` names.
+    /// Entry `n` of the module channel `chan`'s `state` names -- or, if
+    /// `state` names a host-native registration, the native handler itself.
     ///
     /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`: a channel's
     /// `state` **is** an index into the module table, and `register_module`
@@ -798,7 +803,7 @@ impl Host {
         machine: &Machine,
         chan: Chan,
         n: usize,
-    ) -> io::Result<Result<Option<FarPtr>, ShimError>> {
+    ) -> io::Result<Result<Dispatch, ShimError>> {
         let state = match self.users.state(machine, chan) {
             Ok(state) => state,
             Err(e) => return Ok(Err(e)),
@@ -811,7 +816,37 @@ impl Host {
                  never given, or a registration this host owes has not happened"
             )));
         };
-        Ok(registered.entry(machine, n))
+        Ok(registered.dispatch(machine, n))
+    }
+
+    /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
+    /// dispatch: entry `n` of the FSD's own native slot, run directly
+    /// instead of through a far call.
+    ///
+    /// A stub for this task: it always answers "no far pointer to call",
+    /// the same shape [`Registration::dispatch`] gives a module that left
+    /// the entry point null. It exists so a `Native` state is seen to be
+    /// *reached* rather than silently folded into "no handler at all" --
+    /// this crate's refusal-over-fallback discipline applies to a state
+    /// with nothing wired up yet, not only to one with nothing registered.
+    /// Real per-entry behaviour lands starting with the FSD subsystem plan's
+    /// later tasks.
+    ///
+    /// # Errors
+    ///
+    /// Never, today. Kept fallible because the real dispatch this stands in
+    /// for will be.
+    fn fsd_dispatch(
+        &mut self,
+        _machine: &mut Machine,
+        chan: Chan,
+        n: usize,
+    ) -> Result<Option<FarPtr>, ShimError> {
+        self.note(format!(
+            "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
+             which has no handler wired up yet"
+        ));
+        Ok(None)
     }
 
     pub fn modules(&self) -> &[Registration] {
@@ -1339,7 +1374,7 @@ impl Host {
             return self.shim_stop(machine, "connect_state", e).map(Some);
         }
 
-        // `Registration::entry` borrows `self.modules()` immutably, and
+        // `Registration::dispatch` borrows `self.modules()` immutably, and
         // `self.run` needs `self` mutably right after -- so the pointer is
         // read out here and the borrow ends before `run` is ever reached.
         //
@@ -1354,7 +1389,14 @@ impl Host {
             let registered = self.modules().first().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
             })?;
-            registered.entry(machine, 0)
+            match registered.dispatch(machine, 0) {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                // A native registration has no `lonrou` -- `FSDBBS.C` supplies
+                // no module-shaped logon hook -- so this is the same "no call
+                // happened" as a module that left the pointer null.
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
         };
         let lonrou = match lonrou {
             Ok(lonrou) => lonrou,
@@ -1493,7 +1535,7 @@ impl Host {
             return self.shim_stop(machine, "point_curusr", e).map(Some);
         }
 
-        // `Registration::entry` borrows `self.modules()` immutably and
+        // `Registration::dispatch` borrows `self.modules()` immutably and
         // `self.run` needs `self` mutably right after, so the pointer is read
         // out here and the borrow ends before `run` is ever reached -- the same
         // discipline `Host::connect` follows.
@@ -1509,15 +1551,29 @@ impl Host {
         //   registered and is owed a loop the day a second one is. It is the
         //   first slot and not the channel's state deliberately: a hangup is
         //   news for every module, not just the one holding the channel.
+        //
+        // Neither vector has a native-handler shape: `FSDBBS.C` supplies no
+        // `lofrou` or `huprou`, so a `Dispatch::Native` answer here is the
+        // same "no call happened" as a module that left the pointer null --
+        // unlike `poll`'s `sttrou`/`stsrou` dispatch, which is the FSD's own
+        // reason to exist as a state at all.
         let rou = match vector {
-            Vector::Logoff => self.state_entry(machine, chan, vector.entry())?,
+            Vector::Logoff => match self.state_entry(machine, chan, vector.entry())? {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
             Vector::Hangup => {
                 let registered = self.modules().first().ok_or_else(|| {
                     io::Error::other(
                         "no module has registered, so there is nothing to disconnect from",
                     )
                 })?;
-                registered.entry(machine, vector.entry())
+                match registered.dispatch(machine, vector.entry()) {
+                    Ok(Dispatch::Module(rou)) => Ok(rou),
+                    Ok(Dispatch::Native(_)) => Ok(None),
+                    Err(e) => Err(e),
+                }
             }
         };
         let rou = match rou {
@@ -1745,7 +1801,7 @@ impl Host {
                 .expect("scan just found a channel with one");
 
             let dispatch = match status {
-                gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
+                gsbl::Gsbl::CRSTG => PollTarget::Entry(1),
                 // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
                 // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
                 // `ABOREQ` and `OUTMT`, and lets everything else fall to
@@ -1753,8 +1809,8 @@ impl Host {
                 // (`MAJORBBS.H:236`) is in "everything else", which is what
                 // makes `fsdnfy()` work at all -- it injects 240 at itself
                 // expecting `stsrou` to run.
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => Dispatch::Entry(2),
-                gsbl::Gsbl::POLSTS => Dispatch::Poll,
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => PollTarget::Entry(2),
+                gsbl::Gsbl::POLSTS => PollTarget::Poll,
                 other => {
                     self.note(format!(
                         "poll: channel {chan} raised status {other}, which nothing here dispatches"
@@ -1787,11 +1843,11 @@ impl Host {
                 // A polling routine is not an entry point and has no index. The
                 // arm diverges either way, so the `match` still yields the index
                 // the `Entry` arm carries.
-                Dispatch::Poll => match self.dopoll(machine, module, chan)? {
+                PollTarget::Poll => match self.dopoll(machine, module, chan)? {
                     Some(outcome) => return Ok(Some(outcome)),
                     None => continue,
                 },
-                Dispatch::Entry(index) => index,
+                PollTarget::Entry(index) => index,
             };
 
             if status == gsbl::Gsbl::CRSTG
@@ -1805,7 +1861,22 @@ impl Host {
             // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
             // is read out here and the borrow ends before `self.run` needs
             // `self` mutably.
+            //
+            // This is the one dispatch site a `Native` registration is
+            // genuinely for -- `inifsd()` registers the FSD so that a
+            // channel's `state` can name it exactly the way one names a
+            // module, and `sttrou`/`stsrou` are the entry points it exists to
+            // answer. `fsd_dispatch` carries that; every other call site in
+            // this file treats `Native` as a hook a module left null instead,
+            // because none of them are input dispatch.
             let entry = self.state_entry(machine, chan, entry_index)?;
+            let entry = match entry {
+                Ok(Dispatch::Module(entry)) => Ok(entry),
+                Ok(Dispatch::Native(Native::Fsd)) => {
+                    self.fsd_dispatch(machine, chan, entry_index)
+                }
+                Err(e) => Err(e),
+            };
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
@@ -2238,8 +2309,20 @@ impl Host {
 
     /// Take a module online, and give it its number.
     fn register(&mut self, description: String, block: FarPtr) -> u16 {
-        self.modules.push(Registration { description, block });
+        self.modules.push(Registration::Module { description, block });
         (self.modules.len() - 1) as u16
+    }
+
+    /// Give a host-native handler a `state` slot, the way [`Host::register`]
+    /// gives a module one. Returns the slot's index, for the same reason
+    /// `register_module` hands its caller a number back: whoever registered
+    /// it is the one who writes it into `user[chan].state`.
+    ///
+    /// [`Host::finish_init`] is this crate's `inifsd()` -- the FSD registers
+    /// its own native slot there, not here.
+    pub(crate) fn register_native(&mut self, native: Native) -> usize {
+        self.modules.push(Registration::Native(native));
+        self.modules.len() - 1
     }
 
     /// Load a module, binding its imports to this host.
@@ -2553,7 +2636,7 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing, users};
+    use crate::{Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Terms, gsbl, testing, users};
     use mbbs16::{FarPtr, Machine, Ret};
 
     #[test]
@@ -3191,6 +3274,71 @@ mod tests {
             f.machine.resolve(marker, 1).expect("the marker")[0],
             0xb1,
             "state 1 must reach the second module's sttrou, not the first's"
+        );
+    }
+
+    /// `inifsd()` registers FSDBBS as an ordinary module (`Host::finish_init`
+    /// will do the same, once it exists), so `state_entry` has to answer a
+    /// native registration exactly the way [`Registration::dispatch`] does --
+    /// no far pointer, but the *fact* that this state is host-native rather
+    /// than one nobody registered -- and a channel sitting in a *module's*
+    /// state must be completely unaffected by a native slot existing
+    /// elsewhere in the table.
+    ///
+    /// Mutate the `Dispatch::Native(Native::Fsd) => self.fsd_dispatch(...)`
+    /// arm in `poll` to fall through to `Dispatch::Module(None)` instead and
+    /// the `notes()` assertion below goes red: `poll`'s own "no entry
+    /// registered" note still fires either way (a native slot with nothing
+    /// wired up and a module that left the pointer null look the same from
+    /// there), so only `fsd_dispatch`'s own note tells the two apart.
+    #[test]
+    fn poll_dispatches_to_a_native_registration_without_a_far_call() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let sttrou = f.machine.code_ptr(0);
+        let stub = returns_stub(1);
+        f.machine.load_code(&stub).expect("the stub fits");
+        assert_eq!(register_named(&mut f, "MajorMUD", &[(1, sttrou)]), 0);
+
+        let native = f.host.register_native(Native::Fsd);
+
+        // `state_entry` itself, both ways: the native slot answers `Native`,
+        // and the module's own slot still answers `Module` with its far
+        // pointer -- unaffected by a second, native registration existing.
+        set_state(&mut f, console, native as u16);
+        assert_eq!(
+            f.host
+                .state_entry(&f.machine, console, 1)
+                .expect("readable")
+                .expect("no ShimError"),
+            Dispatch::Native(Native::Fsd),
+        );
+        set_state(&mut f, console, 0);
+        assert_eq!(
+            f.host
+                .state_entry(&f.machine, console, 1)
+                .expect("readable")
+                .expect("no ShimError"),
+            Dispatch::Module(Some(sttrou)),
+        );
+
+        // Now drive it through `poll`, with the channel in the native state:
+        // no far call happens -- `poll` returns cleanly rather than faulting
+        // on a bogus call -- and the native arm was genuinely reached.
+        set_state(&mut f, console, native as u16);
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+        assert_eq!(
+            outcome, None,
+            "a native slot with nothing wired up answers no far pointer, \
+             so no call happens"
+        );
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("fsd_dispatch")),
+            "the native arm must be reached, not folded into Dispatch::Module(None): {:?}",
+            f.host.notes()
         );
     }
 
