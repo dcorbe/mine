@@ -3772,6 +3772,39 @@ mod tests {
         );
     }
 
+    /// The same question as
+    /// `next_kick_is_the_soonest_of_several_and_not_merely_one_of_them`, asked
+    /// of the other place that answers it.
+    ///
+    /// `cycle` computes `next_kick` at two sites: the early return, when
+    /// nothing is queued, and the tail, when the pass bound is reached with
+    /// work still going. A fixture with nothing polling can only ever reach
+    /// the first. Review found the second by mutating it alone to `.max()` and
+    /// watching all 774 tests stay green -- the two sites are the same
+    /// arithmetic written twice, which is how call sites drift apart.
+    #[test]
+    fn the_bound_reports_the_soonest_kick_too() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        f.host.kicks.push(Kick { delay: 300, dstrou: rou });
+        f.host.kicks.push(Kick { delay: 7, dstrou: rou });
+        f.host.kicks.push(Kick { delay: 45, dstrou: rou });
+
+        // A polling channel keeps `pending()` true, so the loop runs out of
+        // passes instead of returning early -- which is the only way to reach
+        // the tail at all.
+        let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
+
+        assert_eq!(
+            cycles.ended,
+            Ended::Bound { next_kick: Some(7) },
+            "the soonest of the three, from the tail rather than the early return"
+        );
+    }
+
     /// A kick comes due across the calls a driver makes, not within one.
     ///
     /// The clock reads are conserved -- one per pass before, one per call now
