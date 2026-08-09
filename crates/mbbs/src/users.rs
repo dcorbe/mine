@@ -451,7 +451,7 @@ impl Users {
     /// `user[unum].state` -- which registered module this channel is in.
     ///
     /// The real host's whole dispatch is `(*(module[usrptr->state]->sttrou))()`
-    /// (`MAJORBBS.C:2796`), so this is the number that decides who gets a
+    /// (`MAJORBBS.C:2703`), so this is the number that decides who gets a
     /// keystroke. The module owns it: `register_module` hands back a number and
     /// the module writes it here itself, at 14 sites in `WCCMMUD.DLL`.
     ///
