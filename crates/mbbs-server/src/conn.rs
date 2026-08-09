@@ -379,6 +379,7 @@ mod tests {
             terms: mbbs::Terms::new(1),
             polls_per_wake: 1,
             passes: 1,
+            clock_reads: None,
         };
 
         let addr = super::serve(boot, default_keys(), "127.0.0.1:0")

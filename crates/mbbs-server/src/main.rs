@@ -220,6 +220,7 @@ async fn main() -> ExitCode {
         terms: config.terms,
         polls_per_wake: config.polls_per_wake,
         passes: config.passes,
+        clock_reads: None,
     };
 
     let addr = match conn::serve(boot, config.keys, &config.listen).await {

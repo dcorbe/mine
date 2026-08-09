@@ -11,10 +11,17 @@
 //! cannot keep up with its own output: the driver does not distinguish them,
 //! because a socket that will not drain is indistinguishable from one that
 //! is gone.
+//!
+//! [`Boot::clock_reads`], if set, is how `crates/mbbs-server/tests/sleep.rs`
+//! observes the real, shipped loop below rather than a copy of it: `Host`
+//! never leaves this thread, so without this the sleep meter would have had
+//! to reimplement the driver to measure it.
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mbbs::{Host, Terms, Wait};
@@ -37,6 +44,17 @@ pub struct Boot {
     pub polls_per_wake: usize,
     /// Passes made per [`Host::cycle`] call.
     pub passes: usize,
+    /// Where this thread reports its own [`Host::clock_reads`] after every
+    /// `cycle` call, for a caller outside the thread to sample.
+    ///
+    /// `Host` never leaves this thread -- it holds the `!Send` `Machine` by
+    /// reference throughout `run`'s whole life -- so this is the only way
+    /// anything outside can observe the counter that names how hard the
+    /// driver is spinning. `None` (the ordinary case) skips the write
+    /// entirely and costs nothing. `Ordering::Relaxed` because a reader is
+    /// polling this on its own schedule; nothing else in the program
+    /// synchronises against it.
+    pub clock_reads: Option<Arc<AtomicU64>>,
 }
 
 /// What one wake yielded.
@@ -131,6 +149,9 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
 
         // 4. Turn the world.
         let cycles = host.cycle(&mut machine, &module, boot.passes)?;
+        if let Some(meter) = &boot.clock_reads {
+            meter.store(host.clock_reads(), Ordering::Relaxed);
+        }
 
         // 5. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
