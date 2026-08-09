@@ -83,14 +83,45 @@ pub struct Channel {
     /// `btuchi(usrnum,fsdchi)`, which installs an interrupt-level character
     /// handler; this host has no interrupt level, so there is nothing to
     /// install and the handler's job -- take the byte, wake the module --
-    /// is what the flag does directly. The rest are terminal-driver knobs
-    /// (soft CR, LF-after-CR, pause character, XON/XOFF).
+    /// is what the flag does directly.
     ///
-    /// `echo` and `width` are still the module's to set, and it does not set
-    /// them symmetrically: `fsdcon` turns echo off with `btuech(usrnum,0)`
-    /// and `fsdcof` (`FSDBBS.C:104`) turns it back on with `echon()`, but
-    /// only `fsdcof` touches the width, restoring it with
-    /// `btutsw(usrnum,usaptr->scnwid)`. Nothing narrowed it on the way in.
+    /// Of the other seven, four are terminal-driver knobs -- `btulfd`
+    /// (LF after CR), `btuscr` (soft CR), `btupbc` (pause character) and
+    /// `btuxnf` (XON/XOFF) -- and three are not:
+    ///
+    /// * `btuech(usrnum,0)` turns echo off; this host's [`Channel::echo`]. The
+    ///   FSD draws its own fields, so a driver echoing keystrokes underneath
+    ///   it would write over the form.
+    /// * `btucli(usrnum)` throws away input that arrived **before** the FSD
+    ///   started, so type-ahead left at the previous prompt is not read as the
+    ///   form's first keystrokes. It is called on the way *in* only: `fsdcof`
+    ///   (`FSDBBS.C:104`) does not call it, so anything this host collected in
+    ///   `input` and nobody drained outlives the flag being cleared.
+    /// * `btuche(usrnum,1)` is the **other half of `btuchi`**, not a driver
+    ///   knob at all: it asks for the same handler to be called again, with
+    ///   `c == -1`, when the echo/quick-output buffer drains. That is why
+    ///   `fsdchi` (`FSDBBS.C:329`) opens with `if (c == -1) { fsdqoe(); }`,
+    ///   and `fsdqoe` (`FSD.C:1960`) is "Report that the quick output buffer
+    ///   has gone empty" -- the FSD defers cursor shuffling (`FSDSHN`) until
+    ///   its own output is truly out, and `fsdqoe` is what performs the
+    ///   deferred work. `fsdcof` turns it back off with `btuche(usrnum,0)`.
+    ///   **This host has no equivalent** -- [`Channel::oes`] (`btuoes`, which
+    ///   `fsdbkg` also uses) raises `OUTMT` on the same event but reaches the
+    ///   module through `stsrou` rather than through the character handler.
+    ///   Stage 3 owes the `fsdqoe` path one way or the other.
+    ///
+    /// `echo` and `width` are the module's to set, and it does not set them
+    /// from the same place. Echo is symmetric around the session: `fsdcon`
+    /// clears it, `fsdcof` restores it with `echon()`. The **width is set on
+    /// the way in too**, just not by `fsdcon`: `fsdbkg` (`FSDBBS.C:186`) does
+    /// `btutsw(usrnum,0)` -- wrapping off -- on the line before
+    /// `btulok(usrnum,1)`, and `fsdcof` restores it with
+    /// `btutsw(usrnum,usaptr->scnwid)`.
+    ///
+    /// Stage 3 has to do the same, and this is the concrete reason:
+    /// [`Channel::transmit`] word-wraps at `width`, so painting a full-screen
+    /// template while `width` still holds the account's `scnwid` would break
+    /// every row that reaches the margin and destroy the box drawing.
     pub raw: bool,
     /// `btutrg` -- the byte-count trigger. Zero is ASCII mode; non-zero is
     /// binary mode and the block size that raises status 4.
