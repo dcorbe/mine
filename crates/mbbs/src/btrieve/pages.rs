@@ -414,7 +414,7 @@ pub fn write_chain(
 
     // A position that is not a slot would put the pair inside a neighbouring
     // record -- the same reason `Layout::slot_of` refuses to round.
-    if layout.slot_of(position).is_none() {
+    let Some((_, slot)) = layout.slot_of(position) else {
         return Err(format!(
             "{}: {position} is not a record slot of a {}-byte page holding \
              {}-byte records",
@@ -422,8 +422,23 @@ pub fn write_chain(
             layout.page,
             layout.physical
         ));
-    }
-    if offset + 8 > usize::from(layout.physical) {
+    };
+
+    // Past `physical` is only safe when nothing else shares this page: for
+    // any slot but the page's last, those bytes are the next record's, so
+    // the bound stays at `physical`. The last slot has no neighbour to
+    // spill into -- only the page's own end, `page - HEADER`, offset by
+    // whatever precedes this slot -- and the real engine writes exactly
+    // there for a key descriptor like `WCCUSERS.VIR`'s (offset 2034 on a
+    // 2006-byte physical record, one record per 2048-byte page).
+    let limit = if slot + 1 == layout.per_page() {
+        usize::from(layout.page)
+            - usize::from(HEADER)
+            - slot as usize * usize::from(layout.physical)
+    } else {
+        usize::from(layout.physical)
+    };
+    if offset + 8 > limit {
         return Err(format!(
             "{}: a chain at offset {offset} does not fit a {}-byte physical slot",
             path.display(),
@@ -2183,6 +2198,60 @@ mod tests {
             "the refused write touched nothing -- it was already zero"
         );
         assert_eq!(long(&bytes[0x1a..0x1e]), 0, "the record count was not bumped either");
+    }
+
+    /// `write_chain`'s bound against a page holding exactly one record --
+    /// `WCCUSERS.VIR`'s own shape, measured in
+    /// `crates/btrieve-engine/tests/engine.rs`'s
+    /// `wccusers_vir_chain_offset_measurement`. Its key 2 names a chain
+    /// offset of 2034, past `physical` (2006) but inside the page's real
+    /// usable end (`page - HEADER` = 2042): nothing else shares this page,
+    /// so the real engine writes there and this host must accept it too.
+    #[test]
+    fn a_chain_fits_the_pages_usable_end_when_it_is_the_only_record_on_the_page() {
+        let dir = crate::testing::scratch("pages-write-chain-last-slot");
+        let path = dir.join("SCRATCH.DAT");
+        std::fs::write(&path, [0u8; 8]).expect("placeholder file");
+        let layout = Layout {
+            page: 2048,
+            physical: 2006,
+            pages: 1,
+        };
+        assert_eq!(layout.per_page(), 1, "one 2006-byte record fits a 2048-byte page");
+        let position = layout.position(0, 0);
+
+        write_chain(&path, layout, position, 2034, [7, 9]).expect(
+            "offset 2034 exceeds physical (2006) but fits this page's usable \
+             end (2042) -- WCCUSERS.VIR's own shape",
+        );
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            chain_pair(&bytes[position as usize..], 2034),
+            Some([7, 9]),
+            "the chain landed at the declared offset"
+        );
+    }
+
+    /// The bound above must not relax for a page that genuinely holds more
+    /// than one record: writing past `physical` there spills into the next
+    /// slot's own bytes, which is exactly the corruption `write_chain`
+    /// exists to refuse.
+    #[test]
+    fn a_chain_past_physical_is_still_refused_when_a_neighbour_shares_the_page() {
+        let dir = crate::testing::scratch("pages-write-chain-not-last-slot");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        assert_eq!(layout.per_page(), 2, "two 20-byte records fit a 58-byte usable page");
+        let position = layout.position(4, 0); // slot 0 of 2 -- not the last slot
+
+        let e = write_chain(&path, layout, position, 15, [7, 9])
+            .expect_err("offset 15 + 8 = 23 spills 3 bytes into slot 1");
+        assert!(e.contains("15") && e.contains("20"), "{e}");
     }
 
     /// The eight-times case: the file has no room and grows.
