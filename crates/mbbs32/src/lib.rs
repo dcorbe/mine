@@ -37,6 +37,8 @@
 //! `cargo test -p mbbs32 --release` are not the same check -- see the sibling
 //! crate's note for the measurement behind that.
 
+mod map;
 mod pe;
 
+pub use map::Mapping;
 pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section, Symbol};
