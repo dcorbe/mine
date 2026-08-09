@@ -163,6 +163,24 @@ impl Connection {
         }
     }
 
+    /// A non-ANSI terminal, otherwise the same size as [`Connection::ansi`].
+    ///
+    /// `_EDIT_CHARACTER_STATS`'s fork (`WCCMMUD_decompiled.c:1799-1805`) is an
+    /// `||` of three conditions -- `(ansifl & ANSON) == 0`, `scnfse < 23`,
+    /// `scnwid < 80` -- any one of which sends it down `fsdroom(7, spec, 0)`
+    /// (line mode) instead of `fsdroom(6, spec, 1)` (full-screen). Clearing
+    /// `ansi` alone is the minimal difference from [`Connection::ansi`] that
+    /// still takes that branch: it also matches what a real line-mode
+    /// connection *is* -- a terminal too dumb for ANSI, not an ANSI terminal
+    /// too small for it -- so `width`/`height` stay full-screen size rather
+    /// than being shrunk to manufacture the same outcome.
+    pub fn line_mode(userid: &str) -> Self {
+        Self {
+            ansi: false,
+            ..Self::ansi(userid)
+        }
+    }
+
     /// The keys this user holds.
     ///
     /// This is the seam the whole design turns on. A real board resolved keys
