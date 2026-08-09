@@ -1,9 +1,7 @@
 //! A [`PeImage`] mapped into memory: one [`Mapping`], sections copied into
-//! place.
+//! place, then rebased with [`Image::relocate`].
 //!
-//! Base relocations (Task 12) and import binding (Task 13) are not applied
-//! here -- this is the shape of the image once its bytes are in place, before
-//! either.
+//! Import binding (Task 13) is not applied here.
 //!
 //! **Section protections are parsed but not applied.** Every page of a
 //! [`Mapping`] is `PROT_READ | PROT_WRITE | PROT_EXEC`, regardless of a
@@ -16,7 +14,7 @@
 use std::io;
 
 use crate::map::Mapping;
-use crate::pe::PeImage;
+use crate::pe::{PeError, PeImage};
 
 /// A [`PeImage`], mapped: one [`Mapping`] of `size_of_image` bytes, with each
 /// section's raw bytes copied into place at its `rva`.
@@ -110,5 +108,64 @@ impl Image {
     /// The mapped image's contents.
     pub fn as_slice(&self) -> &[u8] {
         self.mapping.as_slice()
+    }
+
+    /// The address this image is actually mapped at.
+    ///
+    /// [`Mapping::new`] never asks the kernel for a specific address, so this
+    /// is almost never `image.image_base` -- which is exactly the property
+    /// [`Image::relocate`]'s tests depend on to prove the rebase arithmetic
+    /// rather than merely exercise a delta of zero.
+    pub fn base(&self) -> u32 {
+        // The cast cannot lose bits: `Mapping::new` only ever returns a base
+        // below 4 GiB (`MAP_32BIT`; see map.rs, and
+        // `base_is_non_null_below_4gib_and_page_aligned` in tests/map.rs),
+        // so `base as usize` already fits in 32 bits before this narrows it.
+        self.mapping.base() as usize as u32
+    }
+
+    /// Apply `image`'s base relocations against this mapping's actual load
+    /// address.
+    ///
+    /// `delta = self.base() - image.image_base`, and every relocation site is
+    /// `*(u32*)(base + rva) += delta`, wrapping. When `delta` is zero (the
+    /// image happened to land at its own `ImageBase`) this is a no-op: there
+    /// is nothing to fix up, and skipping the loop means a delta-zero load
+    /// can never be mistaken for one that actually exercised the rebase
+    /// arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// [`PeError::RelocsStripped`] if `delta != 0` and `image` was linked
+    /// without relocations (`image.rebasable()` is `false`, i.e.
+    /// `IMAGE_FILE_RELOCS_STRIPPED` is set). Such an image has no relocation
+    /// directory at all -- there is nothing to apply -- so loading it away
+    /// from `ImageBase` would otherwise silently leave every absolute address
+    /// it contains wrong, with zero fixups applied and nothing to report.
+    /// This is refused rather than mapped: no bytes are written when this
+    /// error is returned.
+    pub fn relocate(&mut self, image: &PeImage) -> Result<(), PeError> {
+        let delta = self.base().wrapping_sub(image.image_base);
+        if delta == 0 {
+            return Ok(());
+        }
+        if !image.rebasable() {
+            return Err(PeError::RelocsStripped);
+        }
+
+        let dst = self.mapping.as_mut_slice();
+        for reloc in &image.relocations {
+            let rva = reloc.rva as usize;
+            // In-bounds by construction: `PeImage::parse` refuses (as
+            // `PeError::UnmappedRva` / `PeError::RvaSpansSectionEnd`) any
+            // relocation whose 4-byte site is not entirely inside some
+            // section's raw data -- see `Relocation`'s doc comment in
+            // `pe.rs`. A `PeImage` this crate can construct at all therefore
+            // cannot describe a site outside `dst` (raw data is itself
+            // bounded to `size_of_image` by `SectionOutOfBounds`).
+            let word = u32::from_le_bytes(dst[rva..rva + 4].try_into().expect("4 bytes"));
+            dst[rva..rva + 4].copy_from_slice(&word.wrapping_add(delta).to_le_bytes());
+        }
+        Ok(())
     }
 }
