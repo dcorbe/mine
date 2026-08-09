@@ -109,6 +109,19 @@ pub mod scb {
     pub const HLPOFF: u16 = 40;
     /// `int allans` -- the answer string's current length.
     pub const ALLANS: u16 = 42;
+    /// `char flags` -- the entry session's own flags, `FSD.H:397-403`.
+    ///
+    /// The one piece of entry-session working storage named here, and named
+    /// because [`super::move_field`]'s `wrap` argument is where its `FSDANS`
+    /// (0x10) bit ends up: a caller with a live session reads it from this
+    /// offset. Everything else between `state` at 44 and `maxy` at 165 is
+    /// deliberately absent -- see the note above.
+    ///
+    /// 157 is not read off the header alone. `fsdent()` and `fsdlin()` are the
+    /// two routines whose first act is to set it (`FSD.C:828`, `:838`), and in
+    /// `MAJORBBS-mbbstd.EXE` they are `mov byte [es:bx+0x9d],0x10` at
+    /// `28:0x12e1` and `mov byte [es:bx+0x9d],0x0` at `28:0x132c`.
+    pub const FLAGS: u16 = 157;
 }
 
 /// Where each member of `struct fsdfld` sits. `FSD.H:247`.
@@ -487,10 +500,26 @@ pub mod flags {
     pub const MINMAX: u8 = 0x04;
     /// Does not accept spaces.
     pub const NOSPACES: u8 = 0x08;
+    /// `FFFCHG` -- the field has changed this session. `FSD.H:270`.
+    ///
+    /// Written by the entry session rather than by `fsdppc`, which is why
+    /// nothing in this module sets it: `fsdent()` and friends raise it when
+    /// `stfans` reports a change, and `fsdprc()`'s caller reads it back to find
+    /// out which answers to save.
+    pub const CHANGED: u8 = 0x10;
     /// No negative numbers allowed.
     pub const NONNEGATIVE: u8 = 0x20;
     /// Entry needs to be secret.
     pub const SECRET: u8 = 0x40;
+    /// `FFFAVD` -- avoid this field when moving or displaying. `FSD.H:273`.
+    ///
+    /// The one flag on this list that the **module** sets rather than the
+    /// specification: fourteen sites in `WCCMMUD.DLL` do
+    /// `or byte [flddat + 23*i + 12], 0x80` on its own character sheet, which
+    /// is how a field is shown but not typed into. [`move_field`] is what acts
+    /// on it, and `fsddsp` (`FSD.C:770`) blanks such a field rather than
+    /// displaying its answer.
+    pub const AVOID: u8 = 0x80;
 }
 
 /// A compiled form: what a data-entry session over one template will need.
@@ -1142,6 +1171,105 @@ pub fn max_ok(spec: &[u8], field: &Field, answer: &[u8]) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+/// `vldfld()` -- bring a proposed field number into range, or refuse.
+/// `FSD.C:662`.
+///
+/// `wrap` is the C's `udwrap && fsdscb->flags&FSDANS`, which is two pieces of
+/// state neither of them this routine's argument: `udwrap` is a file-scope
+/// `int` initialised to 1 (`FSD.C:36`) that the host exposes for a sysop to
+/// turn off, and `FSDANS` (0x10, `FSD.H:402`) is set by `fsdent()` and cleared
+/// by `fsdlin()`. Both terms matter and both are parameters here rather than
+/// globals, because a global would make this untestable and would put session
+/// state in a module that has none.
+///
+/// # The refusal and the last field are the same number in the C
+///
+/// `vldfld` says "no" by returning -1, and its wrapping arm computes
+/// `numtpl-1`. On a form with no fields in the template at all those are the
+/// same value, so a below-zero field number on such a form is refused **even
+/// with wrapping on** -- not because anything tests for it, but because the
+/// arithmetic collides with the sentinel. [`None`] here is that collision kept
+/// rather than tidied away.
+///
+/// The other end does not collide: `fldn >= numtpl` on an empty template wraps
+/// to field 0, which is a field the template has no room for and which
+/// [`move_field`] will then read the flags of. That is the original's
+/// behaviour and not an oversight of this port.
+fn valid_field(form: &Form, field: i32, wrap: bool) -> Option<usize> {
+    let last = form.in_template as i32;
+    if field < 0 {
+        // `numtpl-1`, and `-1` is the refusal. An empty template makes them one
+        // and the same, so this is not `wrap.then(...)` on its own.
+        wrap.then_some(last - 1).filter(|n| *n >= 0).map(|n| n as usize)
+    } else if field >= last {
+        wrap.then_some(0usize)
+    } else {
+        Some(field as usize)
+    }
+}
+
+/// `movfld()` -- the first usable field at or beyond `field`, stepping by
+/// `inc`. `FSD.C:675`.
+///
+/// "Usable" means not flagged [`flags::AVOID`]. `resort` is what comes back
+/// when there is nowhere to go: off the end of a form that does not wrap, or a
+/// walk that came back to where it started.
+///
+/// # `resort` is an `Option`, and the C is why
+///
+/// The original's `resort` is an `int`, and three of its six call sites pass
+/// **-1** as one (`FSD.C:1344`, `:1363`, `:1906`) and test the answer against
+/// -1 afterwards: "move there, and tell me if there is no there". The other
+/// three pass a real field number (`:829`, `:840`, `:1199`) and use it
+/// unconditionally. A `usize` cannot say the first thing and a bare `i32`
+/// makes every caller re-check the range before indexing, so the two are one
+/// [`Option`] here: [`None`] is the -1, and it comes back only when the caller
+/// put it in.
+///
+/// `inc` may be 0. `hopfld` (`FSD.C:1363`) passes it to mean "that field or
+/// nothing", and it works because a zero step lands on `flast` immediately.
+///
+/// # Why it terminates
+///
+/// Only because of the two comparisons at `FSD.C:689-690`. Stepping by ±1 with
+/// `wrap` on visits every field forever, so the loop is bounded by noticing
+/// that it has returned to the field it was asked about (`fldi == fldn`) or
+/// that the step did not move (`fldi == flast`). Drop either and a form whose
+/// fields are all avoided does not answer `resort`, it does not answer at all.
+///
+/// Note which numbers those are. `fldi == fldn` compares against the **raw
+/// argument**, which may be the -1 or the past-the-end value that was wrapped
+/// on the way in and therefore may match nothing; `fldi == flast` compares
+/// against the previous position, which is what catches a single-field form.
+///
+/// # Panics
+///
+/// If the walk reaches a field index `form.fields` does not have. That is
+/// reachable only through the `numtpl > fields.len()` inconsistency the C reads
+/// past the end of the array on, and a panic is the better of the two.
+pub fn move_field(
+    form: &Form,
+    field: i32,
+    inc: i32,
+    resort: Option<usize>,
+    wrap: bool,
+) -> Option<usize> {
+    let Some(mut at) = valid_field(form, field, wrap) else {
+        return resort;
+    };
+    let mut last = at;
+    while form.fields[at].flags & flags::AVOID != 0 {
+        match valid_field(form, at as i32 + inc, wrap) {
+            Some(next) if next as i32 != field && next != last => {
+                last = next;
+                at = next;
+            }
+            _ => return resort,
+        }
+    }
+    Some(at)
 }
 
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
@@ -2317,5 +2445,85 @@ mod tests {
         let spec = b"NAME(MAX=M)";
         let form = compile(b"??????", spec, MANY);
         assert!(max_ok(spec, &form.fields[0], b"M\x00Z").is_ok());
+    }
+
+    /// `movfld()`, `FSD.C:675`: step past every field flagged "avoid".
+    #[test]
+    fn moving_skips_avoided_fields() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(form.in_template, 3, "three fields in the template");
+        form.fields[1].flags |= flags::AVOID;
+        assert_eq!(move_field(&form, 1, 1, Some(99), false), Some(2), "skipped B");
+        assert_eq!(move_field(&form, 1, -1, Some(99), false), Some(0), "skipped B downwards");
+        assert_eq!(move_field(&form, 0, 1, Some(99), false), Some(0), "already usable");
+    }
+
+    /// `vldfld()`, `FSD.C:662`: out of range is a refusal unless the session
+    /// wraps, and only an ANSI session with `udwrap` set wraps.
+    #[test]
+    fn only_a_wrapping_session_wraps_around_the_ends() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(move_field(&form, 3, 1, Some(99), true), Some(0), "to the top");
+        assert_eq!(move_field(&form, 3, 1, Some(99), false), Some(99), "the last resort");
+        assert_eq!(move_field(&form, -1, -1, Some(99), true), Some(2), "to the bottom");
+        assert_eq!(move_field(&form, -1, -1, Some(99), false), Some(99), "either way");
+        // The -1 the real call sites pass, which is what the `Option` is for.
+        assert_eq!(move_field(&form, 3, 1, None, false), None, "no there there");
+    }
+
+    /// Every field avoided means there is nowhere to go, and the answer is the
+    /// caller's last resort rather than a loop.
+    ///
+    /// This is the test the `fldi == fldn || fldi == flast` guard exists for.
+    /// A port that dropped it does not fail here, it hangs.
+    #[test]
+    fn a_form_of_avoided_fields_gives_up_instead_of_spinning() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        for f in form.fields.iter_mut() {
+            f.flags |= flags::AVOID;
+        }
+        assert_eq!(move_field(&form, 0, 1, Some(99), true), Some(99), "upwards");
+        assert_eq!(move_field(&form, 0, -1, Some(99), true), Some(99), "downwards");
+        assert_eq!(move_field(&form, 1, 1, Some(99), false), Some(99), "off the end");
+
+        // One field, avoided. Asked about *that* field, `fldi == fldn` is what
+        // ends the walk -- but asked about the one past it, `fldn` is 1 and the
+        // walk stands on 0, so nothing it ever reaches equals `fldn` and
+        // `flast` is the only guard left. Dropping `flast` does not fail the
+        // first of these; it hangs on the second.
+        let mut one = compile(b"??", b"A", MANY);
+        one.fields[0].flags |= flags::AVOID;
+        assert_eq!(move_field(&one, 0, 1, Some(7), true), Some(7), "fldn ends it");
+        assert_eq!(move_field(&one, 1, 1, Some(7), true), Some(7), "flast ends it");
+        assert_eq!(move_field(&one, -1, -1, Some(7), true), Some(7), "downwards");
+    }
+
+    /// `hopfld`'s zero step (`FSD.C:1363`): that field, or nothing.
+    ///
+    /// A step of 0 lands on `flast` on the first try, so the walk gives up
+    /// after one look rather than examining any neighbour.
+    #[test]
+    fn a_zero_step_considers_one_field_and_no_other() {
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        assert_eq!(move_field(&form, 1, 0, None, true), Some(1), "it is usable");
+        form.fields[1].flags |= flags::AVOID;
+        assert_eq!(move_field(&form, 1, 0, None, true), None, "and B's neighbours");
+        assert_eq!(move_field(&form, 2, 0, None, true), Some(2), "are not looked at");
+    }
+
+    /// A template with no fields in it at all, where `numtpl-1` and the
+    /// refusal are the same number.
+    #[test]
+    fn an_empty_template_wraps_forwards_but_not_backwards() {
+        let form = compile(b"", b"A", MANY);
+        assert_eq!(form.in_template, 0, "the spec named it, the template did not");
+        assert_eq!(form.fields.len(), 1, "and it is still a field");
+
+        // Backwards: `numtpl-1` is -1, which is `vldfld`'s own "can't use".
+        assert_eq!(move_field(&form, -1, -1, Some(99), true), Some(99));
+        // Forwards: wrapping to 0 is a field number the template has no room
+        // for, and the C hands it back regardless.
+        assert_eq!(move_field(&form, 0, 1, Some(99), true), Some(0));
+        assert_eq!(move_field(&form, 0, 1, Some(99), false), Some(99), "or nowhere");
     }
 }
