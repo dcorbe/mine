@@ -1669,7 +1669,14 @@ impl Host {
 
             let dispatch = match status {
                 gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => Dispatch::Entry(2),
+                // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
+                // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
+                // `ABOREQ` and `OUTMT`, and lets everything else fall to
+                // `default: (*(module[usrptr->state]->stsrou))()`. `CYCLE`
+                // (`MAJORBBS.H:236`) is in "everything else", which is what
+                // makes `fsdnfy()` work at all -- it injects 240 at itself
+                // expecting `stsrou` to run.
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => Dispatch::Entry(2),
                 gsbl::Gsbl::POLSTS => Dispatch::Poll,
                 other => {
                     self.note(format!(
@@ -3070,6 +3077,49 @@ mod tests {
         assert!(
             text.contains("state 3") && text.contains("1 module(s)"),
             "the error names the state and the count, got: {text}"
+        );
+    }
+
+    /// `CYCLE` reaches `stsrou`, entry index 2.
+    ///
+    /// `susing()` (`MAJORBBS.C:2478`) is the status handler for a channel
+    /// inside a module. It names `POLSTS`, `SPXTRM`/`SPXWDG`, `RING`/`LOST2C`/
+    /// `LOST25`, `CRSTG`, `OBFCLR`, `ABOREQ` and `OUTMT` as cases; `CYCLE`
+    /// (`MAJORBBS.H:236`) is not among them, so it falls to
+    /// `default: (*(module[usrptr->state]->stsrou))()`. `dfsthn`
+    /// (`MAJORBBS.C:4488`), the `stsrou` the real host installs for a module
+    /// that supplies none, lists `case CYCLE:` among the statuses it ignores --
+    /// which only makes sense if `CYCLE` reaches `stsrou` in the first place.
+    #[test]
+    fn poll_dispatches_cycle_to_stsrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let marker = f.bytes(&[0x00], false);
+        let stsrou = f.machine.code_ptr(0);
+        let stub = marker_stub(marker, 0x2f);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
+        f.host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("stsrou was entered");
+
+        assert_eq!(
+            f.machine.resolve(marker, 1).expect("the marker")[0],
+            0x2f,
+            "CYCLE must reach stsrou"
+        );
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            gsbl::Gsbl::CYCLE as u16,
+            "stsrou reads `status` to find out why it was called"
         );
     }
 
