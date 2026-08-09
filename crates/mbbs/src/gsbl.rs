@@ -645,21 +645,15 @@ impl Channel {
     /// a carried word therefore always fits on the new line without itself
     /// re-triggering the wrap.
     ///
-    /// Finding 7 (not fixed) -- **invariant: do not drain `output` mid-line
-    /// while `width != 0`.** This recovers the trailing partial word by
-    /// popping it back off `output` itself, so whatever the current line has
-    /// written so far has to still be there. Nothing drains mid-line today --
-    /// [`Gsbl::drain_output`] always takes the whole buffer, and that only
-    /// ever happens after any wrap for the text so far has already run -- so
-    /// this is correct as the host is driven now. A transport that flushes to
-    /// a socket on its own schedule rather than only when the module finishes
-    /// a line would make this look-back scheduling-dependent, and the bytes
-    /// it emits would stop being deterministic. Every obvious fix trades one
-    /// bug for another: holding the pending word never sends a prompt lacking
-    /// a trailing CR (`[HP=100]:`), and draining only complete lines has the
-    /// same problem. Real GSBL gets away with this because a 2400-baud UART
-    /// never empties the buffer faster than the module fills it. Leave the
-    /// fix to whoever builds the transport.
+    /// Finding 7, **fixed**. This looks back into the `out` buffer its caller
+    /// owns, not into `self.output`, so a drain cannot move a line break.
+    /// [`Gsbl::drain_output`] is safe at any point, including mid-line, and a
+    /// transport may flush on whatever schedule it likes.
+    ///
+    /// It was not always so. While the look-back popped from `self.output`,
+    /// the bytes a channel emitted depended on when a socket task happened to
+    /// run. `transmit` building a private buffer and committing once is what
+    /// fixed it; see its own comment for why that shape was chosen.
     fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16) -> u16 {
         let mut word = Vec::new();
         while let Some(&back) = out.last() {

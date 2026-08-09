@@ -464,7 +464,8 @@ pub struct Host {
     noted: HashSet<String>,
 
     /// Every callback `rtkick` has been asked to run later, in the order it
-    /// was asked. **Nothing runs them.** See [`Host::kicks`].
+    /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
+    /// [`Host::prcrtk`]. See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick>,
 
     /// Poll dispatches left in this burst.
@@ -861,17 +862,17 @@ impl Host {
 
     /// Every callback the module asked `rtkick` to run later.
     ///
-    /// **This host never runs them**, and that is the one thing to know about
-    /// this list. `rtkick` is a one-shot timer measured in seconds; the real
-    /// host ran `prcrtk()` once per elapsed second from its main loop
-    /// (`MAJORBBS.C:476-480`) and this host has neither loop nor second.
+    /// [`Host::cycle`] runs them, once per elapsed second, the same way the
+    /// real host's main loop did: `rtkick` is a one-shot timer measured in
+    /// seconds, and `MAJORBBS.C:476-480` ran `prcrtk()` once per elapsed
+    /// second. `Host::cycle` tracks elapsed seconds against its own clock and
+    /// calls [`Host::prcrtk`] the same number of times, catching up in one
+    /// pass if more than a second has elapsed since the last call.
     ///
-    /// So this is a record of what a main loop would owe, not a queue that is
-    /// being served. MajorMUD registers two during initialisation -- a
-    /// one-second heartbeat into its own segment 6, and a second one-second
-    /// callback into segment 10, which is the last thing it does before it asks
-    /// for a random number -- and until something runs them, MajorMUD is a world
-    /// that has been built and never started.
+    /// So this list is not only a record: it is served, on the schedule above.
+    /// MajorMUD registers two during initialisation -- a one-second heartbeat
+    /// into its own segment 6, and a second one-second callback into segment
+    /// 10, which is the last thing it does before it asks for a random number.
     pub fn kicks(&self) -> &[Kick] {
         &self.kicks
     }

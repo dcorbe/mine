@@ -701,9 +701,10 @@ pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `GALMJD.C:1106` is that same call *inside* `mjdrtk` -- which is only
 /// necessary, and only correct, if a kick fires once.
 ///
-/// `delay` is kept as it was given rather than converted to a deadline. This
-/// host has no clock to measure one against, and inventing an epoch here would
-/// commit the future main loop to whichever one this file guessed.
+/// `delay` is kept as a countdown rather than converted to a deadline: it is
+/// live, decremented by one every elapsed second inside
+/// [`crate::Host::prcrtk`], which [`crate::Host::cycle`] calls on that
+/// schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kick {
     /// Seconds yet to go, counted down one per elapsed second by
