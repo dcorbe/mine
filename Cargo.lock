@@ -439,6 +439,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mbbs-server"
+version = "0.1.0"
+dependencies = [
+ "mbbs",
+ "mbbs16",
+ "mud-core",
+ "tokio",
+]
+
+[[package]]
 name = "mbbs16"
 version = "0.1.0"
 dependencies = [

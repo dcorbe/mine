@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mbbs",
     "crates/mbbs16",
+    "crates/mbbs-server",
     "crates/mud-core",
     "crates/mud-server",
     "crates/mud-oracle",

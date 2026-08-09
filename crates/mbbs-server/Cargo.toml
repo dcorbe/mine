@@ -1,0 +1,15 @@
+[package]
+name = "mbbs-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mbbs = { path = "../mbbs" }
+mbbs16 = { path = "../mbbs16" }
+mud-core = { path = "../mud-core" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+
+[lints]
+workspace = true
