@@ -1770,9 +1770,32 @@ mod tests {
         );
     }
 
-    /// Clearing `raw` puts the channel back exactly as it was.
+    /// Clearing `raw` puts line assembly back, and **keeps** what raw mode
+    /// collected that nobody drained.
+    ///
+    /// The keep is a decision, and `fsdcof` (`FSDBBS.C:104`) is what decides
+    /// it. `fsdcof` uninstalls the handler, restores echo, the LF and soft-CR
+    /// characters, the transmit rules and the width -- and does not touch the
+    /// input buffer. The FSD's one `btucli` is in `fsdcon` (`FSDBBS.C:91`), on
+    /// the way *in*, so type-ahead left at the previous prompt is not read as
+    /// the form's first keystrokes. Draining on the way out would be this host
+    /// calling a `btucli` the original does not, at a moment the original does
+    /// not have one.
+    ///
+    /// The original never has bytes to strand, because its handler consumed
+    /// each one at interrupt level as it arrived; this host batches, so the
+    /// leftovers are real and they are not free. `input` is not what line
+    /// assembly reads -- that is `line`, which is why the `hi` below is
+    /// unaffected -- but the strays are still counted by `btuibw` and still
+    /// handed to the next `btuica`. That is asserted in
+    /// `shims::gsbl::raw_bytes_are_what_btuica_takes_btuibw_counts_and_btucli_throws_away`,
+    /// where those routines are reachable.
+    ///
+    /// Reachable in the real FSD: `goback()` (`FSDBBS.C:223`) calls `fsdcof()`
+    /// and nothing else clears input. Stage 3 therefore owes the entry-side
+    /// `btucli` that `fsdcon` specifies; it does not owe an exit-side one.
     #[test]
-    fn leaving_raw_mode_restores_line_assembly() {
+    fn leaving_raw_mode_restores_line_assembly_and_keeps_what_was_not_drained() {
         let mut g = one();
         g.channel_mut(chan()).raw = true;
         g.push_input(chan(), b"xy");
@@ -1780,6 +1803,16 @@ mod tests {
 
         g.push_input(chan(), b"hi\r");
 
-        assert_eq!(g.take_line(chan()), Some(b"hi".to_vec()));
+        assert_eq!(
+            g.take_line(chan()),
+            Some(b"hi".to_vec()),
+            "line assembly is back, and the strays are not part of the line"
+        );
+        assert_eq!(
+            g.channel(chan()).input.iter().copied().collect::<Vec<u8>>(),
+            b"xy".to_vec(),
+            "what raw mode collected and nobody drained is still there: \
+             `fsdcof` clears no input, so neither does this"
+        );
     }
 }
