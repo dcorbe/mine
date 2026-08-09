@@ -171,7 +171,12 @@ pub enum Ended {
     /// Nothing can happen before then: `prcrtk` cannot fire anything until the
     /// next whole second, and no other source of work exists, because the
     /// 16-bit world only advances when this host dispatches into it.
-    Waiting { next_kick: u16 },
+    ///
+    /// `polls_cut` is whether the poll budget was exhausted. It is the meter
+    /// that calibrates [`Host::refill_polls`]: a driver that sees it set on
+    /// every wake is granting too few dispatches, and the module's amortised
+    /// work is falling behind.
+    Waiting { next_kick: u16, polls_cut: bool },
 
     /// `max` passes were made and there is still work queued. A driver calls
     /// straight back.
@@ -203,7 +208,7 @@ impl Ended {
     pub fn wait(&self) -> Wait {
         match self {
             Ended::Idle => Wait::Blocked,
-            Ended::Waiting { next_kick } => Wait::Until(*next_kick),
+            Ended::Waiting { next_kick, .. } => Wait::Until(*next_kick),
             Ended::Bound { .. } => Wait::Now,
             Ended::Stopped(_) => Wait::Stop,
         }
@@ -462,6 +467,13 @@ pub struct Host {
     /// was asked. **Nothing runs them.** See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick>,
 
+    /// Poll dispatches left in this burst.
+    ///
+    /// [`Host::dopoll`] spends one per call and stops re-arming at zero;
+    /// [`Host::refill_polls`] is the only thing that raises it. Zero at
+    /// construction: a host nobody is driving polls nothing.
+    pub(crate) polls_left: usize,
+
     /// Every form `fsdroom` has sized, in the order it was asked. See
     /// [`Host::forms`].
     ///
@@ -716,6 +728,7 @@ impl Host {
             notes: Vec::new(),
             noted: HashSet::new(),
             kicks: Vec::new(),
+            polls_left: 0,
             forms: Vec::new(),
             fsdscb: None,
             fsdtmp: None,
@@ -1570,7 +1583,21 @@ impl Host {
         self.inpolr = None;
         let outcome = outcome?;
 
-        if matches!(outcome, Outcome::Returned { .. }) {
+        // One dispatch, one token. Saturating because the budget may already
+        // be zero: when it runs out, up to `nterms` injections are still
+        // queued, and those are dispatched rather than dropped -- a status the
+        // host queued is one it owes the module.
+        self.polls_left = self.polls_left.saturating_sub(1);
+
+        // `MAJORBBS.C:3258` re-injects unconditionally, because the original
+        // owned the machine and had nothing else to do with the turn. The
+        // re-read of `polrou` below is its check and is kept exactly: a
+        // routine that zeroed its own `polrou` must not be re-armed.
+        //
+        // The budget is the addition. Without it this chain never breaks,
+        // `pending()` is permanently true, and `cycle` can never tell a driver
+        // it is safe to sleep.
+        if self.polls_left > 0 && matches!(outcome, Outcome::Returned { .. }) {
             match self.users.polrou(machine, chan) {
                 Ok(Some(_)) => {
                     self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
@@ -1778,6 +1805,51 @@ impl Host {
         }
     }
 
+    /// Grant `n` poll dispatches and arm every channel that polls.
+    ///
+    /// The analogue of `begin_polling`'s initial injection (`MAJORBBS.C:1183`).
+    /// [`Host::dopoll`] carries the chain from there, re-arming after each
+    /// call until the budget runs out; this is what starts it again.
+    ///
+    /// **It must arm, not merely count.** A budget that only gated the re-arm
+    /// would break the chain with nothing to restart it, and the channel would
+    /// be polled never again.
+    ///
+    /// A driver calls this once per wake. `n` has a floor -- enough dispatches
+    /// to drain a round of whatever the module amortises across its polling
+    /// routine -- and no ceiling worth worrying about: once a round is drained
+    /// the module's own pending-work counter is zero and every further poll
+    /// falls through. Overshooting buys no-ops. Undershooting is graceful, and
+    /// [`Ended::Waiting`]'s `polls_cut` is how a driver finds out.
+    ///
+    /// # Errors
+    ///
+    /// If a channel's `polrou` cannot be read out of the machine.
+    pub fn refill_polls(&mut self, machine: &Machine, n: usize) -> io::Result<()> {
+        self.polls_left = n;
+        if n == 0 {
+            return Ok(());
+        }
+        for chan in self.users.terms().all() {
+            // Already armed: either `dopoll` re-injected before the budget ran
+            // out, or the last burst hit `cycle`'s pass bound with statuses
+            // still queued. Injecting again would add a dispatch per wake.
+            if self.gsbl.polling_armed(chan) {
+                continue;
+            }
+            match self.users.polrou(machine, chan) {
+                Ok(Some(_)) => self.gsbl.inject(chan, gsbl::Gsbl::POLSTS),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "refill_polls: reading polrou for channel {chan}: {e:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Turn the main loop until something says stop.
     ///
     /// `MAJORBBS.C:417-480`, minus everything this host has already declined --
@@ -1884,7 +1956,10 @@ impl Host {
                     iterations,
                     dispatched,
                     ended: match next_kick {
-                        Some(next_kick) => Ended::Waiting { next_kick },
+                        Some(next_kick) => Ended::Waiting {
+                            next_kick,
+                            polls_cut: self.polls_left == 0,
+                        },
                         None => Ended::Idle,
                     },
                 });
@@ -3572,7 +3647,7 @@ mod tests {
             .users
             .set_polrou(&mut f.machine, console, Some(rou))
             .expect("channel 0");
-        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        f.host.refill_polls(&f.machine, 2).expect("armed");
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -3756,7 +3831,7 @@ mod tests {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
-        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        f.host.refill_polls(&f.machine, 1_000).expect("armed");
 
         let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
 
@@ -3788,7 +3863,7 @@ mod tests {
         let console = f.console();
         f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
-        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        f.host.refill_polls(&f.machine, 1_000).expect("armed");
         f.host.kicks.push(Kick { delay: 300, dstrou: rou });
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
@@ -3847,7 +3922,11 @@ mod tests {
 
         let cycles = f.host.cycle(&mut f.machine, &module, 10_000).expect("cycled");
 
-        assert_eq!(cycles.ended, Ended::Waiting { next_kick: 60 });
+        assert_eq!(
+            cycles.ended,
+            Ended::Waiting { next_kick: 60, polls_cut: true },
+            "no refill was ever granted, so the budget reads exhausted"
+        );
         assert_eq!(
             cycles.iterations, 1,
             "one pass to work out there is nothing to do -- not 10,000"
@@ -3878,9 +3957,95 @@ mod tests {
 
         assert_eq!(
             cycles.ended,
-            Ended::Waiting { next_kick: 7 },
+            Ended::Waiting { next_kick: 7, polls_cut: true },
             "the soonest of the three, not the last pushed and not the largest"
         );
+    }
+
+    /// The budget is what stops the poll pump, and the pump stops with the
+    /// queue empty -- which is what lets `cycle` report `Waiting` and the
+    /// driver sleep.
+    #[test]
+    fn the_poll_budget_bounds_dispatches_and_leaves_nothing_queued() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+
+        f.host.refill_polls(&f.machine, 5).expect("armed");
+        let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 5, "the budget, not the pass bound");
+        assert_eq!(
+            cycles.ended,
+            Ended::Idle,
+            "no kicks here, and the queue drained: there is nothing to wake for"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            None,
+            "the pump stopped with the queue empty, or the driver could never sleep"
+        );
+    }
+
+    /// The cold start. Once the budget is spent nothing re-arms the chain, so
+    /// a refill that only counted would poll this channel never again.
+    #[test]
+    fn a_refill_arms_the_chain_again_after_the_budget_ran_out() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+
+        f.host.refill_polls(&f.machine, 3).expect("armed");
+        let first = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        assert_eq!(first.dispatched, 3);
+
+        f.host.refill_polls(&f.machine, 3).expect("armed again");
+        let second = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        assert_eq!(second.dispatched, 3, "the second burst polls too");
+    }
+
+    /// A refill while the chain is still armed must not add a second status.
+    /// `cycle` hitting its pass bound leaves one queued, the driver refills on
+    /// every wake, and a queue that grows by one per wake is a leak no
+    /// single-burst test can see.
+    #[test]
+    fn a_refill_does_not_arm_a_channel_that_is_already_armed() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+
+        f.host.refill_polls(&f.machine, 100).expect("armed");
+        // One pass: dispatches one poll, and `dopoll` re-arms because budget
+        // remains. So a status is queued when the refill below runs.
+        let _ = f.host.cycle(&mut f.machine, &module, 1).expect("cycled");
+        f.host.refill_polls(&f.machine, 100).expect("refilled while armed");
+
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            None,
+            "one arming, not two"
+        );
+    }
+
+    /// The meter that calibrates the budget in production.
+    #[test]
+    fn polls_cut_says_the_budget_was_the_thing_that_stopped_it() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.kicks.push(Kick { delay: 60, dstrou: rou });
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+
+        f.host.refill_polls(&f.machine, 2).expect("armed");
+        let cut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        assert_eq!(cut.ended, Ended::Waiting { next_kick: 60, polls_cut: true });
+
+        // Nothing polling: the budget is untouched, so nothing was cut.
+        f.host.users.set_polrou(&mut f.machine, console, None).expect("channel 0");
+        f.host.refill_polls(&f.machine, 2).expect("nothing to arm");
+        let uncut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        assert_eq!(uncut.ended, Ended::Waiting { next_kick: 60, polls_cut: false });
     }
 
     /// The whole sleep policy, in one place, so that the socket driver and any
@@ -3889,8 +4054,14 @@ mod tests {
     fn ended_tells_a_driver_what_to_wait_on() {
         use crate::Wait;
         assert_eq!(Ended::Idle.wait(), Wait::Blocked);
-        assert_eq!(Ended::Waiting { next_kick: 1 }.wait(), Wait::Until(1));
-        assert_eq!(Ended::Waiting { next_kick: 60 }.wait(), Wait::Until(60));
+        assert_eq!(
+            Ended::Waiting { next_kick: 1, polls_cut: false }.wait(),
+            Wait::Until(1)
+        );
+        assert_eq!(
+            Ended::Waiting { next_kick: 60, polls_cut: true }.wait(),
+            Wait::Until(60)
+        );
         assert_eq!(Ended::Bound { next_kick: None }.wait(), Wait::Now);
         assert_eq!(Ended::Bound { next_kick: Some(3) }.wait(), Wait::Now);
 
