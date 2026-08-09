@@ -4,7 +4,7 @@
 //! file exercises exactly one path through each branch, and the error paths need
 //! an input built to reach them.
 
-use mbbs32::{PeError, PeImage};
+use mbbs32::{PeError, PeImage, Relocation};
 
 /// The smallest thing that parses: an MZ stub, a PE signature, a COFF header
 /// saying i386, a PE32 optional header, and no sections.
@@ -246,5 +246,127 @@ fn a_too_small_size_of_optional_header_is_refused() {
     assert_eq!(
         PeImage::parse(&v).unwrap_err(),
         PeError::BadOptionalHeaderSize { size: 0x20 }
+    );
+}
+
+/// `IMAGE_REL_BASED_HIGHLOW` (type 3) packed with `offset` the way
+/// `IMAGE_BASE_RELOCATION` entries store it: type in the top 4 bits, the
+/// 12-bit offset from the block's page in the low bits.
+fn highlow(offset: u16) -> u16 {
+    0x3000 | (offset & 0x0fff)
+}
+
+/// `IMAGE_REL_BASED_ABSOLUTE` (type 0): padding, dropped rather than applied.
+fn absolute(offset: u16) -> u16 {
+    offset & 0x0fff
+}
+
+/// Lays out one or more base-relocation blocks right after `with_one_section`'s
+/// CODE section raw data, and points the base-relocation data directory
+/// (index 5, at `opt + 96 + 5*8`) at them. Each block is `(page_rva, entries)`;
+/// entries are pre-packed by `highlow`/`absolute`.
+///
+/// The directory RVA is always the section's own RVA (0x1000): the block data
+/// is written starting at that section's raw offset, so the directory and the
+/// first block always share a file position, independent of what "page" each
+/// block's entries target.
+fn write_relocation_blocks(v: &mut [u8], blocks: &[(u32, &[u16])]) {
+    let sec = 0x98 + 0xe0;
+    let raw = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap()) as usize;
+    let mut at = raw;
+    for (page, entries) in blocks {
+        let size = 8 + entries.len() * 2;
+        v[at..at + 4].copy_from_slice(&page.to_le_bytes());
+        v[at + 4..at + 8].copy_from_slice(&(size as u32).to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            v[at + 8 + i * 2..at + 10 + i * 2].copy_from_slice(&e.to_le_bytes());
+        }
+        at += size;
+    }
+    let total = (at - raw) as u32;
+    let dir = 0x98 + 96 + 5 * 8;
+    v[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+    v[dir + 4..dir + 8].copy_from_slice(&total.to_le_bytes());
+}
+
+#[test]
+fn base_relocations_parse_and_padding_is_dropped() {
+    // One block covering page rva 0x1000: two HIGHLOW entries and one
+    // ABSOLUTE pad. Block header is 8 bytes, each entry 2.
+    let mut v = with_one_section();
+    write_relocation_blocks(
+        &mut v,
+        &[(0x1000, &[highlow(0x004), highlow(0x008), absolute(0)])],
+    );
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(
+        image.relocations,
+        vec![Relocation { rva: 0x1004 }, Relocation { rva: 0x1008 }],
+        "the ABSOLUTE entry is padding and must not survive parsing"
+    );
+}
+
+#[test]
+fn two_relocation_blocks_are_both_read_in_order() {
+    // A single block makes `at += size` invisible: a parser that only ever
+    // reads the first block, or that forgets to advance `at`, would still
+    // pass a one-block test. Two blocks at two different pages catch both:
+    // if the second block were skipped, the last two relocations here would
+    // be missing; if `at` were miscomputed, the second block's header would
+    // be read from the wrong offset and either error out or attribute its
+    // entries to the wrong page.
+    let mut v = with_one_section();
+    write_relocation_blocks(
+        &mut v,
+        &[
+            (0x1000, &[highlow(0x010)]),
+            (0x2000, &[highlow(0x004), highlow(0xffc)]),
+        ],
+    );
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(
+        image.relocations,
+        vec![
+            Relocation { rva: 0x1010 },
+            Relocation { rva: 0x2004 },
+            Relocation { rva: 0x2ffc },
+        ]
+    );
+}
+
+#[test]
+fn relocation_rva_is_page_plus_offset_not_page_or_offset() {
+    // A block's `page` field is not guaranteed 4KiB-aligned by anything this
+    // parser checks, and `page + offset` and `page | offset` only agree when
+    // it is. 0x1800 is deliberately unaligned, and the two entries land in
+    // two different 4KiB regions (0x1000..0x2000 and 0x2000..0x3000): a
+    // one-block, one-page test cannot distinguish `+` from `|`, because every
+    // page RVA in such a test is chosen aligned. This also exercises the
+    // block's last entry (offset 0xffe, right at the edge of the 12-bit
+    // range) to rule out an off-by-one that drops it.
+    let mut v = with_one_section();
+    write_relocation_blocks(&mut v, &[(0x1800, &[highlow(0x000), highlow(0xffe)])]);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(
+        image.relocations,
+        vec![Relocation { rva: 0x1800 }, Relocation { rva: 0x27fe }],
+        "page 0x1800 + offset 0xffe is 0x27fe; page 0x1800 | offset 0xffe would be 0x1ffe"
+    );
+}
+
+#[test]
+fn an_unsupported_relocation_type_is_an_error() {
+    // Type 3 (HIGHLOW) is the only type this image contains and the only one
+    // implemented; anything else must be reported rather than silently
+    // applied or silently dropped like ABSOLUTE padding is.
+    let mut v = with_one_section();
+    write_relocation_blocks(&mut v, &[(0x1000, &[0x1000 | 0x004])]); // type 1: HIGH
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnsupportedRelocation { kind: 1 }
     );
 }

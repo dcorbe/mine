@@ -55,6 +55,14 @@ pub enum PeError {
     /// header (out to `opt + 56`, i.e. the header must reach `opt + 0x60`) is
     /// rejected.
     BadOptionalHeaderSize { size: u16 },
+
+    /// A base-relocation entry's type is neither `IMAGE_REL_BASED_HIGHLOW`
+    /// (the only type this image contains) nor `IMAGE_REL_BASED_ABSOLUTE`
+    /// (padding, dropped rather than applied). Refusing it is the whole
+    /// reason this loader has a relocation model at all rather than an
+    /// assumption: an unknown type is a fixup this loader does not know how
+    /// to apply, and applying it wrong would corrupt the module silently.
+    UnsupportedRelocation { kind: u16 },
 }
 
 impl fmt::Display for PeError {
@@ -86,6 +94,9 @@ impl fmt::Display for PeError {
                 f,
                 "optional header size {size:#x} is too small to place the section table"
             ),
+            Self::UnsupportedRelocation { kind } => {
+                write!(f, "relocation type {kind} is not one this loader applies")
+            }
         }
     }
 }
@@ -162,6 +173,26 @@ const RELOCS_STRIPPED: u16 = 0x0001;
 /// one module this crate was measured against.
 const MIN_OPTIONAL_HEADER_SIZE: u16 = 0x60;
 
+/// Where the base-relocation directory sits among the optional header's data
+/// directories, which begin at `opt + 96`.
+const DIR_BASERELOC: usize = 5;
+
+/// `IMAGE_REL_BASED_HIGHLOW`: add the load delta to the 32-bit word at the
+/// site. The only type `wccmmud.dll` contains, and the only one implemented --
+/// see "Base relocations: one type, and padding" in the design note.
+const REL_HIGHLOW: u16 = 3;
+
+/// `IMAGE_REL_BASED_ABSOLUTE`: padding to a 4-byte block boundary. Defined by
+/// the format to mean nothing, and dropped at parse rather than at apply so it
+/// can never be counted as work.
+const REL_ABSOLUTE: u16 = 0;
+
+/// One site to rebase once the image is mapped: `*(u32*)(image + rva) += delta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relocation {
+    pub rva: u32,
+}
+
 /// A parsed PE32 image. Plain data: nothing here is mapped or allocated.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -172,6 +203,29 @@ pub struct PeImage {
     pub entry_point: u32,
     pub characteristics: u16,
     pub sections: Vec<Section>,
+    pub relocations: Vec<Relocation>,
+}
+
+/// The file offset an RVA's bytes live at, given a section table.
+///
+/// A free function rather than a method: base relocations are parsed inside
+/// `PeImage::parse`, before there is a `Self` to call a method on, and
+/// `PeImage::rva_to_file` is defined in terms of this so there is exactly one
+/// copy of the arithmetic. See `PeImage::rva_to_file` for why it is
+/// subtraction-then-compare rather than addition.
+///
+/// # Errors
+///
+/// If no section covers the RVA.
+fn rva_to_file_in(sections: &[Section], rva: u32) -> Result<usize, PeError> {
+    for s in sections {
+        if let Some(offset) = rva.checked_sub(s.rva)
+            && offset < s.raw_size
+        {
+            return Ok(s.raw_offset as usize + offset as usize);
+        }
+    }
+    Err(PeError::UnmappedRva { rva })
 }
 
 impl PeImage {
@@ -237,6 +291,61 @@ impl PeImage {
             });
         }
 
+        // Data directories start at opt+96 (after the 8 preceding header
+        // fields); each is an 8-byte {VirtualAddress, Size} pair. Base
+        // relocations are parsed here, during `parse`, before there is a
+        // `Self` to hang `rva_to_file` off of -- hence `rva_to_file_in`.
+        let dirs = opt + 96;
+        let reloc_rva = r.u32("basereloc rva", dirs + DIR_BASERELOC * 8)?;
+        let reloc_size = r.u32("basereloc size", dirs + DIR_BASERELOC * 8 + 4)?;
+        let mut relocations = Vec::new();
+        if reloc_rva != 0 && reloc_size != 0 {
+            let base = rva_to_file_in(&sections, reloc_rva)?;
+            let end =
+                base.checked_add(reloc_size as usize)
+                    .ok_or(PeError::Truncated {
+                        what: "basereloc directory",
+                        at: base,
+                        need: reloc_size as usize,
+                        len: file.len(),
+                    })?;
+            let mut at = base;
+            while at.checked_add(8).is_some_and(|next| next <= end) {
+                let page = r.u32("reloc block page", at)?;
+                let size = r.u32("reloc block size", at + 4)? as usize;
+                // A block size under 8 (the header alone) would not advance
+                // `at`, and the loop would spin on a malformed file rather
+                // than reject it.
+                if size < 8 {
+                    return Err(PeError::Truncated {
+                        what: "reloc block",
+                        at,
+                        need: 8,
+                        len: file.len(),
+                    });
+                }
+                for i in 0..(size - 8) / 2 {
+                    let entry = r.u16("reloc entry", at + 8 + i * 2)?;
+                    let kind = entry >> 12;
+                    if kind == REL_ABSOLUTE {
+                        continue;
+                    }
+                    if kind != REL_HIGHLOW {
+                        return Err(PeError::UnsupportedRelocation { kind });
+                    }
+                    relocations.push(Relocation {
+                        rva: page + u32::from(entry & 0x0fff),
+                    });
+                }
+                at = at.checked_add(size).ok_or(PeError::Truncated {
+                    what: "reloc block",
+                    at,
+                    need: size,
+                    len: file.len(),
+                })?;
+            }
+        }
+
         Ok(Self {
             image_base,
             size_of_image,
@@ -245,6 +354,7 @@ impl PeImage {
             entry_point,
             characteristics,
             sections,
+            relocations,
         })
     }
 
@@ -271,14 +381,7 @@ impl PeImage {
     ///
     /// If no section covers the RVA.
     pub fn rva_to_file(&self, rva: u32) -> Result<usize, PeError> {
-        for s in &self.sections {
-            if let Some(offset) = rva.checked_sub(s.rva)
-                && offset < s.raw_size
-            {
-                return Ok(s.raw_offset as usize + offset as usize);
-            }
-        }
-        Err(PeError::UnmappedRva { rva })
+        rva_to_file_in(&self.sections, rva)
     }
 }
 

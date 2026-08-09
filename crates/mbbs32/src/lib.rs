@@ -32,4 +32,4 @@
 
 mod pe;
 
-pub use pe::{PeError, PeImage, Section};
+pub use pe::{PeError, PeImage, Relocation, Section};
