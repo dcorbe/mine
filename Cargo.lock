@@ -461,6 +461,7 @@ dependencies = [
 name = "mbbs16"
 version = "0.1.0"
 dependencies = [
+ "btrieve-engine",
  "libc",
  "mbbs-ptr",
 ]

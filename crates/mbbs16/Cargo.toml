@@ -11,6 +11,7 @@ mbbs-ptr = { path = "../mbbs-ptr" }
 
 [dev-dependencies]
 libc = "0.2"
+btrieve-engine = { path = "../btrieve-engine" }
 
 [lints]
 workspace = true
