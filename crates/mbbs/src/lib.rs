@@ -3131,16 +3131,34 @@ mod tests {
     /// (btuoba(usrnum) == outbsz-1) goback(); else { actdet=0; fsdnfy(); }` --
     /// re-dispatch on every pass until the output buffer drains, with
     /// `actdet=0` so the host's idle detector does not count the loop as work.
-    /// This host has no interrupt level and no output ring to wait on, so it
-    /// must not inherit that: a status is an edge, consumed once.
+    ///
+    /// **This measures the consuming side, and only that.** The `stsrou` below
+    /// is a bare `retf` that re-arms nothing, so what is proved is that the
+    /// host takes one edge once and does not manufacture more from it: a status
+    /// is an edge, not a level. Worth pinning, and not the same fact as "this
+    /// host does not inherit the FSD's spin", which is what this test used to
+    /// claim.
+    ///
+    /// It says nothing about a module that *produces* edges, which is precisely
+    /// what `fsdsts` does through `fsdnfy()`. Measured rather than reasoned
+    /// about: queue 200 `CYCLE`s instead of one and `dispatched` comes back 50
+    /// with `iterations` at the bound. **There is no gate** -- `max` is the
+    /// only thing that ends it. A Stage 3 `fsdsts` that calls `fsdnfy()` on
+    /// every pass will run `cycle` to `max` every time, the way the original
+    /// does, but without the original's `btuoba(usrnum) == outbsz-1` to stop.
+    ///
+    /// Open question, deliberately not answered here: the concurrent
+    /// tokio-transport branch adds a `polls_left` budget to `Host` for this
+    /// exact shape on `POLSTS` -- a count armed with the polling and spent per
+    /// re-arm, so a self-re-arming chain ends on its own. `CYCLE` has no
+    /// equivalent. Whether it should share that budget, carry its own, or be
+    /// bounded by the FSD's own drain condition instead is for the two branches
+    /// to settle together; building a second budget here would prejudge it.
     ///
     /// Asserted on [`Cycles`] rather than on [`Ended`]: the `Ended` enum is
     /// being rewritten on the tokio transport branch, and
     /// `iterations`/`dispatched` say the thing that matters anyway -- how many
     /// times the module was entered, and whether the loop ran to its bound.
-    ///
-    /// Mutated by queueing 200 `CYCLE`s instead of one: `dispatched` becomes
-    /// 50 and `iterations` reaches the bound, and both assertions fire.
     #[test]
     fn one_injected_cycle_is_one_dispatch_and_the_loop_settles() {
         let mut f = Fixture::new();
