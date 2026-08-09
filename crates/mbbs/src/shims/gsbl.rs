@@ -402,6 +402,62 @@ mod tests {
         assert_eq!(f.invoke(btuibw, &[0]).expect("counted"), Ret::U16(0));
     }
 
+    /// Raw mode's bytes are ordinary input as far as these three are
+    /// concerned, which is the whole reason `Channel::raw` collects into
+    /// `input` rather than a buffer of its own.
+    ///
+    /// Here rather than in `crate::gsbl`'s tests, and the difference is not
+    /// cosmetic. The version this replaces lived there and asserted `btuica`
+    /// and `btucli` by calling `input.drain(..)` and `input.clear()` itself --
+    /// which measures `VecDeque`, not the shims, and would have survived any
+    /// mutation to either of them. The routines are reachable from here.
+    ///
+    /// The bytes are chosen so the answer would change if raw mode were not
+    /// in force: `\x1b` and `\n` are both dropped by the input translate
+    /// table, so a channel out of raw mode counts three of these five.
+    ///
+    /// The `btuibw` after the partial `btuica` is the second half of
+    /// `gsbl::tests::leaving_raw_mode_restores_line_assembly_and_keeps_what_was_not_drained`:
+    /// bytes raw mode collected and nobody drained keep being counted, which
+    /// is the price of `fsdcof` not clearing input and is asserted rather than
+    /// left to be discovered.
+    #[test]
+    fn raw_bytes_are_what_btuica_takes_btuibw_counts_and_btucli_throws_away() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).raw = true;
+        f.host.gsbl_mut().push_input(console, b"a\x1b[A\n");
+
+        assert_eq!(
+            f.invoke(btuibw, &[0]).expect("counted"),
+            Ret::U16(5),
+            "all five keystrokes are waiting, ESC and LF included"
+        );
+
+        let buf = f.buffer(16);
+        let ret = f
+            .invoke(btuica, &[0, buf.offset, buf.selector, 3])
+            .expect("copied");
+        assert_eq!(ret, Ret::U16(3));
+        assert_eq!(
+            f.machine.resolve(buf, 3).expect("in bounds"),
+            b"a\x1b[",
+            "in arrival order, uncooked"
+        );
+        assert_eq!(
+            f.invoke(btuibw, &[0]).expect("counted"),
+            Ret::U16(2),
+            "and what the FSD did not take is still waiting to be asked for"
+        );
+
+        f.invoke(btucli, &[0]).expect("cleared");
+        assert_eq!(
+            f.invoke(btuibw, &[0]).expect("counted"),
+            Ret::U16(0),
+            "btucli reaches raw bytes -- it is how fsdcon drops type-ahead"
+        );
+    }
+
     #[test]
     fn btuclo_throws_away_output_that_has_not_gone_out() {
         let mut f = Fixture::new();

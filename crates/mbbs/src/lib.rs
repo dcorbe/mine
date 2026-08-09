@@ -1669,7 +1669,14 @@ impl Host {
 
             let dispatch = match status {
                 gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT => Dispatch::Entry(2),
+                // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
+                // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
+                // `ABOREQ` and `OUTMT`, and lets everything else fall to
+                // `default: (*(module[usrptr->state]->stsrou))()`. `CYCLE`
+                // (`MAJORBBS.H:236`) is in "everything else", which is what
+                // makes `fsdnfy()` work at all -- it injects 240 at itself
+                // expecting `stsrou` to run.
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => Dispatch::Entry(2),
                 gsbl::Gsbl::POLSTS => Dispatch::Poll,
                 other => {
                     self.note(format!(
@@ -3070,6 +3077,172 @@ mod tests {
         assert!(
             text.contains("state 3") && text.contains("1 module(s)"),
             "the error names the state and the count, got: {text}"
+        );
+    }
+
+    /// `CYCLE` reaches `stsrou`, entry index 2.
+    ///
+    /// `susing()` (`MAJORBBS.C:2478`) is the status handler for a channel
+    /// inside a module. It names `POLSTS`, `SPXTRM`/`SPXWDG`, `RING`/`LOST2C`/
+    /// `LOST25`, `CRSTG`, `OBFCLR`, `ABOREQ` and `OUTMT` as cases; `CYCLE`
+    /// (`MAJORBBS.H:236`) is not among them, so it falls to
+    /// `default: (*(module[usrptr->state]->stsrou))()`. `dfsthn`
+    /// (`MAJORBBS.C:4488`), the `stsrou` the real host installs for a module
+    /// that supplies none, lists `case CYCLE:` among the statuses it ignores --
+    /// which only makes sense if `CYCLE` reaches `stsrou` in the first place.
+    #[test]
+    fn poll_dispatches_cycle_to_stsrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let marker = f.bytes(&[0x00], false);
+        let stsrou = f.machine.code_ptr(0);
+        let stub = marker_stub(marker, 0x2f);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
+        f.host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("stsrou was entered");
+
+        assert_eq!(
+            f.machine.resolve(marker, 1).expect("the marker")[0],
+            0x2f,
+            "CYCLE must reach stsrou"
+        );
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            gsbl::Gsbl::CYCLE as u16,
+            "stsrou reads `status` to find out why it was called"
+        );
+    }
+
+    /// A raw channel's keystrokes reach `stsrou`, with nothing in between.
+    ///
+    /// The two halves of the FSD's input path are tested apart: `crate::gsbl`
+    /// proves that a raw delivery queues a `CYCLE`, and
+    /// `poll_dispatches_cycle_to_stsrou` proves that an *injected* `CYCLE`
+    /// reaches entry point 2. Nothing joined them, so a wake-up that queued
+    /// some other status, or a `poll` that only dispatched what `btuinj` put
+    /// there, would have passed both.
+    ///
+    /// This is the whole of `fsdchi` (`FSDBBS.C:329`) as this host does it,
+    /// end to end and in one call: bytes arrive from the transport, the module
+    /// is entered at its status routine, and the keystrokes are still in
+    /// `input` for the `btuica` that routine will make -- `poll` delivers the
+    /// wake-up, not the bytes.
+    ///
+    /// The bytes are an arrow key, because that is what the flag exists for:
+    /// `\x1b[A` is three bytes of which the translate table would keep only
+    /// `[` and `A` outside raw mode, and a `CYCLE` would never be queued at all.
+    #[test]
+    fn raw_input_wakes_the_loop_and_poll_dispatches_it_to_stsrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let marker = f.bytes(&[0x00], false);
+        let stsrou = f.machine.code_ptr(0);
+        let stub = marker_stub(marker, 0x1b);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        f.host.gsbl_mut().channel_mut(console).raw = true;
+        f.host.gsbl_mut().push_input(console, b"\x1b[A");
+
+        f.host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("stsrou was entered");
+
+        assert_eq!(
+            f.machine.resolve(marker, 1).expect("the marker")[0],
+            0x1b,
+            "the keystrokes' own wake-up must reach stsrou, not just an injected one"
+        );
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            gsbl::Gsbl::CYCLE as u16,
+            "and stsrou must be told it was CYCLE that brought it here"
+        );
+        assert_eq!(
+            f.host
+                .gsbl()
+                .channel(console)
+                .input
+                .iter()
+                .copied()
+                .collect::<Vec<u8>>(),
+            b"\x1b[A".to_vec(),
+            "poll delivers the wake-up; the bytes are still there for btuica"
+        );
+    }
+
+    /// One injected `CYCLE` is one dispatch, and then the loop is done.
+    ///
+    /// The FSD's whole entry engine is driven by `fsdnfy()` (`FSDBBS.C:368`)
+    /// re-injecting `CYCLE` at the channel, and `fsdsts` (`FSDBBS.C:262`) is
+    /// the original documenting its own spin: in `case FINISHING`, `if
+    /// (btuoba(usrnum) == outbsz-1) goback(); else { actdet=0; fsdnfy(); }` --
+    /// re-dispatch on every pass until the output buffer drains, with
+    /// `actdet=0` so the host's idle detector does not count the loop as work.
+    ///
+    /// **This measures the consuming side, and only that.** The `stsrou` below
+    /// is a bare `retf` that re-arms nothing, so what is proved is that the
+    /// host takes one edge once and does not manufacture more from it: a status
+    /// is an edge, not a level. Worth pinning, and not the same fact as "this
+    /// host does not inherit the FSD's spin", which is what this test used to
+    /// claim.
+    ///
+    /// It says nothing about a module that *produces* edges, which is precisely
+    /// what `fsdsts` does through `fsdnfy()`. Measured rather than reasoned
+    /// about: queue 200 `CYCLE`s instead of one and `dispatched` comes back 50
+    /// with `iterations` at the bound. **There is no gate** -- `max` is the
+    /// only thing that ends it. A Stage 3 `fsdsts` that calls `fsdnfy()` on
+    /// every pass will run `cycle` to `max` every time, the way the original
+    /// does, but without the original's `btuoba(usrnum) == outbsz-1` to stop.
+    ///
+    /// Open question, deliberately not answered here: the concurrent
+    /// tokio-transport branch adds a `polls_left` budget to `Host` for this
+    /// exact shape on `POLSTS` -- a count armed with the polling and spent per
+    /// re-arm, so a self-re-arming chain ends on its own. `CYCLE` has no
+    /// equivalent. Whether it should share that budget, carry its own, or be
+    /// bounded by the FSD's own drain condition instead is for the two branches
+    /// to settle together; building a second budget here would prejudge it.
+    ///
+    /// Asserted on [`Cycles`] rather than on [`Ended`]: the `Ended` enum is
+    /// being rewritten on the tokio transport branch, and
+    /// `iterations`/`dispatched` say the thing that matters anyway -- how many
+    /// times the module was entered, and whether the loop ran to its bound.
+    #[test]
+    fn one_injected_cycle_is_one_dispatch_and_the_loop_settles() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        // A bare `retf`: a stsrou that does its work and does not ask to be
+        // called again.
+        let stsrou = f.machine.code_ptr(0);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&[0xcb]).expect("the stub fits");
+
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 1, "one CYCLE is one entry into stsrou");
+        assert!(
+            cycles.iterations < 50,
+            "the loop settled instead of running to its bound; it took {} passes",
+            cycles.iterations
         );
     }
 
