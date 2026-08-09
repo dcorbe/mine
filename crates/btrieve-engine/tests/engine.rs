@@ -13,15 +13,23 @@ use btrieve_engine::{Engine, Request, Response};
 
 /// Btrieve operation codes, `tools/btrieve-oracle/btrvprobe.c:42-51`.
 const B_OPEN: u16 = 0;
+const B_CLOSE: u16 = 1;
+const B_INSERT: u16 = 2;
 const B_GET_NEXT: u16 = 6;
 const B_GET_FIRST: u16 = 12;
 const B_STAT: u16 = 15;
 
+const MODE_NORMAL: i8 = 0;
 const MODE_READ_ONLY: i8 = -2;
 
 fn wccspels_path() -> Option<PathBuf> {
     // The crate lives two directories below the repository root.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/WCCSPELS.VIR");
+    path.exists().then_some(path)
+}
+
+fn wccusers_vir_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp/WCCUSERS.VIR");
     path.exists().then_some(path)
 }
 
@@ -156,4 +164,123 @@ fn the_engine_agrees_with_itself_on_wccspels() {
 
     assert_eq!(resp.status, 9, "the walk should end at end-of-file, not stall or error");
     assert_eq!(count, 1379, "the walk should visit every record WCCSPELS.VIR has");
+}
+
+/// Settles the question `docs/plans/2026-08-09-btrieve-duplicate-writes.md`
+/// left open: `WCCUSERS.VIR`'s key 2 (experience) descriptor names a chain
+/// offset of 2034 against a physical record length of 2006, which does not
+/// fit -- this host refuses to write a chain there. Does the *engine* care?
+///
+/// Inserts three records that collide on key 2 (all experience 0) and reads
+/// the raw bytes back. This is a measurement, not a correctness check: the
+/// answer decides what happens next, so nothing here asserts what that
+/// answer must be. See the doc above for what came out of it.
+#[test]
+fn wccusers_vir_chain_offset_measurement() {
+    let Some(src) = wccusers_vir_path() else {
+        eprintln!("skipped: tmp/WCCUSERS.VIR is not present in this checkout");
+        return;
+    };
+    if !wine_on_path() {
+        eprintln!("skipped: wine is not on PATH");
+        return;
+    }
+
+    let name = format!("{}WCCUSERS.VIR", std::process::id());
+    let dest = btrieve_work_dir().join(&name);
+    std::fs::copy(&src, &dest).expect("copying WCCUSERS.VIR into the wine work dir");
+
+    let mut engine = Engine::spawn().expect("spawning btrvprobe serve");
+
+    let mut keybuf = format!(r"C:\btrieve\{name}").into_bytes();
+    keybuf.push(0);
+    let open = engine
+        .call(Request {
+            op: B_OPEN,
+            posblk: [0u8; 128],
+            datalen: 0,
+            databuf: Vec::new(),
+            keylen: keybuf.len() as u8,
+            keynum: MODE_NORMAL,
+            keybuf,
+        })
+        .expect("B_OPEN call");
+    assert_eq!(open.status, 0, "opening WCCUSERS.VIR (normal mode) should succeed");
+
+    // Three records, each with a distinct 30-byte name at offset 0 (key 0 in
+    // this file, same as the .DAT's) and a distinct 11-byte value at offset
+    // 30 (key 1 in THIS file -- measured, not the 30-byte owner field the
+    // .DAT carries there); experience 0 at offset 60 collides on key 2,
+    // which is what names the disputed chain offset.
+    //
+    // The 41-byte concatenation of name and value, not the 30-byte name
+    // alone, is what gets searched for in the raw file afterward: the name
+    // alone also appears in key 0's own index page (30-byte key + 8-byte
+    // pointer entries -- measured on a first version of this test, which
+    // found index bytes 38 apart and reported them as the record). Name
+    // immediately followed by ITS OWN value is specific to the data record.
+    let markers: Vec<[u8; 41]> = (0..3)
+        .map(|i| {
+            let name = format!("{:0>30}", format!("CHAINPROBE{i}"));
+            let value = format!("{i:0>11}");
+            let mut marker = [0u8; 41];
+            marker[0..30].copy_from_slice(name.as_bytes());
+            marker[30..41].copy_from_slice(value.as_bytes());
+            marker
+        })
+        .collect();
+
+    let mut posblk = open.posblk;
+    for (i, marker) in markers.iter().enumerate() {
+        let mut record = vec![0u8; 1998];
+        record[0..41].copy_from_slice(marker);
+        // experience (4 bytes) at offset 60 stays zero -- the collision.
+
+        let resp = engine
+            .call(Request {
+                op: B_INSERT,
+                posblk,
+                datalen: record.len() as u32,
+                databuf: record,
+                keylen: 255,
+                keynum: 0,
+                keybuf: vec![0u8; 255],
+            })
+            .expect("B_INSERT call");
+        eprintln!(
+            "insert {i} name={:?}: status {}",
+            String::from_utf8_lossy(marker),
+            resp.status
+        );
+        posblk = resp.posblk;
+    }
+
+    // Btrieve buffers writes; the raw file on disk does not reflect them
+    // until the file is closed.
+    let close = engine
+        .call(Request {
+            op: B_CLOSE,
+            posblk,
+            datalen: 0,
+            databuf: Vec::new(),
+            keylen: 0,
+            keynum: 0,
+            keybuf: Vec::new(),
+        })
+        .expect("B_CLOSE call");
+    assert_eq!(close.status, 0, "closing WCCUSERS.VIR should succeed");
+
+    let raw = std::fs::read(&dest).expect("reading WCCUSERS.VIR back");
+    for (i, marker) in markers.iter().enumerate() {
+        let Some(slot) = raw.windows(marker.len()).position(|w| w == marker) else {
+            eprintln!("record {i}: not found in the file -- its insert did not land");
+            continue;
+        };
+        let at = |off: usize| raw.get(slot + off..slot + off + 8);
+        eprintln!(
+            "record {i} at file offset {slot}: bytes@reclen(1998)={:02x?} bytes@2034={:02x?}",
+            at(1998),
+            at(2034)
+        );
+    }
 }

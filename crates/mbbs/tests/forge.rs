@@ -467,26 +467,40 @@ fn insert_duplicate_users(block: &mut mbbs::btrieve::Block) -> Result<(), String
 /// **This host cannot write a chain into `WCCUSERS.VIR`**, and that is
 /// measured here rather than assumed: its key 2 (experience) descriptor names
 /// a chain offset of 2034, but the file's own physical record length is 2006
-/// bytes -- `2034 + 8 = 2042` does not fit. `pages::write_chain` refuses on
-/// exactly this check, and correctly so: writing the pair anyway would either
-/// fall off the end of the file's last record or spill into the page after it.
-/// `WCCUSERS.DAT` -- same 2048-byte page, same `1998` reclen, same `2006`
-/// physical, same three single-segment keys, also zero records -- reads `1998`
-/// there, which is `physical - 8`, the rule already measured against
-/// `DUPKEY30.DAT` (see `at::CHAIN`'s doc comment). So `.DAT` is the one
-/// actually inserted into, reindexed, and handed to the oracle.
+/// bytes -- `2034 + 8 = 2042` does not fit, and `pages::write_chain` refuses
+/// on exactly this check. `WCCUSERS.DAT` -- same 2048-byte page, same `1998`
+/// reclen, same `2006` physical, same three single-segment keys, also zero
+/// records -- reads `1998` there, which is `physical - 8`, the rule already
+/// measured against `DUPKEY30.DAT` (see `at::CHAIN`'s doc comment). So `.DAT`
+/// is the one actually inserted into, reindexed, and handed to the oracle.
 ///
-/// **What this does NOT establish is that the `.VIR` is a damaged file**, and
-/// it should not be read that way. Two measurements point the other way. Its
-/// key 1 is 11 bytes where the `.DAT`'s is 30, and that 11 is *internally
-/// coherent* -- entry size 19 is `11 + 8` and max entries 107 is
+/// **The refusal is over-strict, not a correct read of an unusable file --
+/// measured, not assumed, by `crates/btrieve-engine/tests/engine.rs`'s
+/// `wccusers_vir_chain_offset_measurement`** (Task 5 of
+/// `docs/plans/2026-08-09-btrieve-engine-in-the-loop.md`). Three records
+/// inserted into a fresh copy of the `.VIR` over the real engine, all
+/// colliding on key 2, all returned status 0, and the raw file afterward
+/// carries an 8-byte chain node at the *declared* offset 2034 in every
+/// physical slot -- not "does not fit", but fits exactly: `2034 + 8 = 2042`
+/// is `page (2048) - HEADER (6)`, the page's own usable end, and nothing else
+/// shares that page when it holds one record. So the claim this comment used
+/// to make -- that writing past `physical` here "would spill into the page
+/// after it" -- was wrong; the 36 bytes past `physical` belong to no other
+/// record. `docs/plans/2026-08-09-btrieve-duplicate-writes.md`, "What is
+/// still owed", has the fix `write_chain`'s bound needs: `page - HEADER`
+/// specifically when a page holds exactly one record, not `physical`
+/// unconditionally -- and not `page - HEADER` unconditionally either, which
+/// would allow real corruption whenever a page holds more than one.
+///
+/// Its key 1 is 11 bytes where the `.DAT`'s is 30, and that 11 is
+/// *internally coherent* -- entry size 19 is `11 + 8` and max entries 107 is
 /// `(2048 - 12) / 19`, both computed by the engine from 11 -- so the file was
-/// created that way on purpose. And genuine Btrieve opens it without
-/// complaint and reports `key 1 len=11`. The two files came from different
-/// builds; which one, and whether the engine would even consult `+0x12` on an
-/// insert rather than deriving the offset, is unmeasured. Nothing here depends
-/// on the answer: a running board writes characters to the `.DAT`, and the
-/// `.VIR` is the virgin template an install copies from.
+/// created that way on purpose, not damaged. Genuine Btrieve opens it
+/// without complaint and reports `key 1 len=11`, and now writes a real chain
+/// into it. The two files came from different builds; which one remains
+/// unmeasured, and nothing here depends on that answer: a running board
+/// writes characters to the `.DAT`, and the `.VIR` is the virgin template an
+/// install copies from.
 ///
 /// The refusal is asserted with its exact reason so that a change to
 /// `write_chain`'s bound, or to the file, cannot silently stop proving
