@@ -15,6 +15,22 @@
 //! | `update`  | rewrite one record in place, then close   | the same, plus `write_record` over an existing slot |
 //! | `grown`   | append records until the tree must deepen, then close | slot allocation, page appends, and a tree this host built from a shape the shipped file never had |
 //!
+//! Plus a fourth, `duplicates`, over a single file rather than every one of
+//! them: `WCCUSERS` ships with zero records, but is the one file whose keys
+//! include a duplicate-permitting one (key 2, MajorMUD's own experience
+//! field), and `HOLDS_RECORDS` below is a table of files that already hold
+//! records, which this one does not. `forge_a_duplicate_key_the_real_engine_can_read`
+//! inserts a populated corpus of characters -- colliding groups on key 2,
+//! distinct values on keys 0 and 1 -- so `pages::chain_pair`'s
+//! `[prev][next]` links get written and can be walked, not merely built and
+//! left unread. **The `.VIR` half of the pair turns out unusable**: its own
+//! key 2 descriptor names a chain offset past the end of its physical
+//! record, measured and asserted in that test, not assumed. `WCCUSERS.DAT`
+//! has the same shape without the defect and is what actually gets inserted
+//! into. See `docs/plans/2026-08-07-btrieve-interior-pages-design.md` and
+//! `tools/btrieve-oracle/fixtures/DUPKEY30.txt` for the shape this is
+//! measured against.
+//!
 //! The output is a directory of whole, openable Btrieve files -- not the bare
 //! index pages `tests/btrieve.rs` walks on a scratch file, which no engine can
 //! open. `tools/btrieve-oracle/sweep.sh <dir>` is what reads them.
@@ -324,4 +340,154 @@ fn forge_a_corpus_the_real_engine_can_read() {
             "unexpected refusal: {why}"
         );
     }
+}
+
+/// Group sizes for one "cycle" of [`insert_duplicate_users`]: five that
+/// collide (7, 5, 4, 3, 2 records apiece) and four singletons -- a value
+/// carried by exactly one record, the very first thing a real board's second
+/// character produces if nobody else already saved at that experience.
+const DUPLICATE_GROUP_SIZES: [u32; 9] = [7, 5, 4, 3, 2, 1, 1, 1, 1];
+
+/// How many times [`DUPLICATE_GROUP_SIZES`] repeats, each time with a fresh,
+/// non-overlapping base value so only the *intended* records collide.
+const DUPLICATE_REPEATS: u32 = 6;
+
+/// Insert a populated, duplicate-colliding corpus of characters into an empty
+/// `WCCUSERS`-shaped block, then reindex it.
+///
+/// Every newly rolled MajorMUD character has zero experience, so a real
+/// board's key 2 (experience) collides from the first save onward -- and
+/// nothing MajorMUD ships holds records at all, so nothing shipped can put
+/// that under the engine. This inserts them instead: distinct values on keys
+/// 0 and 1 (name, owner -- both forbid duplicates, so a collision there is a
+/// bug in this fixture, not a fact about the host) and colliding groups on
+/// key 2, sized by [`DUPLICATE_GROUP_SIZES`] x [`DUPLICATE_REPEATS`] --
+/// `9 * 6 = 54` distinct key-2 values, `(7+5+4+3+2+1+1+1+1) * 6 = 150`
+/// records total.
+///
+/// 150 also blows key 0's single-page capacity on purpose: its entries are
+/// `30 + 8 = 38` bytes (unique key, [`pages::Shape::entry_size`]), so
+/// `(2048 - 12) / 38 = 53` fit one page and 150 needs three -- key 0's tree
+/// is a real multi-level tree, not a single leaf, when the engine descends
+/// it.
+///
+/// # Errors
+///
+/// If the block does not already hold zero records and the three
+/// single-segment keys (30-byte name, some-width owner, 4-byte
+/// duplicate-permitting experience) this assumes, or if a record cannot be
+/// inserted or the block cannot be reindexed.
+fn insert_duplicate_users(block: &mut mbbs::btrieve::Block) -> Result<(), String> {
+    let count = block.records().map_err(|e| e.to_string())?.len();
+    if count != 0 {
+        return Err(format!(
+            "{count} records, not the 0 this variant assumes it is starting from"
+        ));
+    }
+
+    let keys = block.keys().to_vec();
+    let [key0, key1, key2] = keys.as_slice() else {
+        return Err(format!("{} keys, not the 3 this variant assumes", keys.len()));
+    };
+
+    let name_seg = match key0.segments.as_slice() {
+        [only] => *only,
+        other => return Err(format!("key 0 has {} segments, not 1", other.len())),
+    };
+    let owner_seg = match key1.segments.as_slice() {
+        [only] => *only,
+        other => return Err(format!("key 1 has {} segments, not 1", other.len())),
+    };
+    let exp_seg = match key2.segments.as_slice() {
+        [only] => *only,
+        other => return Err(format!("key 2 has {} segments, not 1", other.len())),
+    };
+    if !key2.duplicates {
+        return Err("key 2 does not permit duplicates".to_owned());
+    }
+
+    let reclen = usize::from(block.geometry().reclen);
+    if reclen != 1998 {
+        return Err(format!("reclen {reclen}, not the 1998 this variant assumes"));
+    }
+
+    let mut index = 0usize;
+    for repeat in 0..DUPLICATE_REPEATS {
+        let base = repeat * 100;
+        for (group, size) in DUPLICATE_GROUP_SIZES.iter().enumerate() {
+            let value = base + group as u32;
+            for _ in 0..*size {
+                let mut record = vec![0u8; reclen];
+
+                let name = format!("Forge{index:04}").into_bytes();
+                let name_at = usize::from(name_seg.offset);
+                record[name_at..name_at + name.len()].copy_from_slice(&name);
+
+                let owner = format!("Owner{index:04}").into_bytes();
+                let owner_at = usize::from(owner_seg.offset);
+                record[owner_at..owner_at + owner.len()].copy_from_slice(&owner);
+
+                let exp_at = usize::from(exp_seg.offset);
+                let exp_len = usize::from(exp_seg.length);
+                record[exp_at..exp_at + exp_len]
+                    .copy_from_slice(&value.to_le_bytes()[..exp_len]);
+
+                block.insert(&record).map_err(|e| e.to_string())?;
+                index += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "duplicates  inserted {index} records over {} distinct key-2 values \
+         ({} colliding groups, {} singletons, per cycle x {DUPLICATE_REPEATS} cycles)",
+        DUPLICATE_GROUP_SIZES.len() * DUPLICATE_REPEATS as usize,
+        DUPLICATE_GROUP_SIZES.iter().filter(|n| **n > 1).count(),
+        DUPLICATE_GROUP_SIZES.iter().filter(|n| **n == 1).count(),
+    );
+
+    block.reindex().map_err(|e| e.to_string())
+}
+
+/// The fourth variant: a duplicate-permitting key, populated and chained.
+///
+/// **`WCCUSERS.VIR` itself cannot be used for this**, and that is measured
+/// here rather than assumed: its key 2 (experience) descriptor names a chain
+/// offset of 2034, but the file's own physical record length is 2006 bytes --
+/// `2034 + 8 = 2042` does not fit. `pages::write_chain` refuses on exactly
+/// this check, and correctly so: writing the pair anyway would either fall
+/// off the end of the file's last record or spill into the page after it.
+/// `WCCUSERS.DAT` -- shipped alongside it, same 2048-byte page, same `1998`
+/// reclen, same `2006` physical, same three single-segment keys, also zero
+/// records -- has no such defect: its key 2 reads a chain offset of `1998`,
+/// which is `physical - 8`, the same rule this host already measured against
+/// `DUPKEY30.DAT` (see `at::CHAIN`'s doc comment). `WCCUSERS.VIR`'s *own*
+/// key 1 (owner) is also narrower here than `WCCUSERS.DAT`'s -- 11 bytes, not
+/// 30 -- another sign the two files' key descriptors have drifted apart, not
+/// that this host misread one of them.
+///
+/// So this checks both, in the direction the measurement points: `.VIR` is
+/// asserted to refuse, with the exact reason, so a future change to
+/// `write_chain`'s bound or to the shipped file silently stops proving
+/// anything here; `.DAT` is the one actually inserted into, reindexed, and
+/// handed to the oracle.
+#[test]
+#[ignore = "needs MajorMUD's data files in tmp/"]
+fn forge_a_duplicate_key_the_real_engine_can_read() {
+    let Some(data) = data() else { return };
+    let mut forge = Forge::new();
+
+    let refused = forge
+        .forge(&data, "WCCUSERS.VIR", "duplicates", insert_duplicate_users)
+        .expect_err("WCCUSERS.VIR's key 2 chain offset should not fit its physical slot");
+    eprintln!("duplicates  WCCUSERS.VIR refused, as expected: {refused}");
+    assert!(
+        refused.contains("a chain at offset 2034 does not fit a 2006-byte physical slot"),
+        "expected the physical-slot refusal, got: {refused}"
+    );
+
+    let path = forge
+        .forge(&data, "WCCUSERS.DAT", "duplicates", insert_duplicate_users)
+        .unwrap_or_else(|e| panic!("WCCUSERS.DAT duplicates: {e}"));
+    eprintln!("duplicates {}", path.display());
 }
