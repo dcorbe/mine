@@ -696,6 +696,84 @@ pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
     }
 }
 
+/// Splice one field's answer into the answer string. `stfans()`, `FSD.C:1036`.
+///
+/// Returns whether the answer differs from the one that was there. That is what
+/// the entry session counts as a change, and it is why the comparison happens
+/// **before** anything is written: after the splice the old answer is gone and
+/// the question can no longer be asked.
+///
+/// # Changing one answer's length moves every later one
+///
+/// The answers all live end to end in one string, so a longer answer pushes
+/// every later `ansoff` along and a shorter one pulls them back. The C walks
+/// backwards from `flddat[numfld-1]` to `fldptr` adding `anslen-m` to each
+/// (`FSD.C:1054-1058`), which is a `while (efptr != fldptr)` and therefore
+/// leaves the stored field itself alone -- its answer starts where it always
+/// did, only its length changed. Storing into the **last** field runs the loop
+/// zero times, and that is the boundary worth naming rather than a special
+/// case.
+///
+/// `allans` moves by the same delta, because the tail the C's first `movmem`
+/// shifts is `allans-nl-m` bytes -- the rest of the string, terminators
+/// included.
+///
+/// # The answer is a C string and the stored length is a byte
+///
+/// `anslen=strlen(bufptr)`, so an embedded NUL ends the answer: storing
+/// `"DA\0N"` stores `"DA"`, and storing `"DA\0N"` over an existing `"DA"`
+/// reports **no** change. `strcmp` decides the rest, so the comparison is
+/// case-sensitive.
+///
+/// `fldptr->anslen` is one byte (`FSD.H:262`) and the genuine host reads it
+/// back zero-extended -- `mov al,es:[bx+0x16] / mov ah,0` at `28:0x19bd`, so
+/// that build's `char` is unsigned. A 256-byte answer therefore stores a length
+/// of 0 while the offsets move by the full 256. Reproduced rather than
+/// corrected: the arithmetic is the C's, in the C's 16-bit `int`.
+///
+/// # Panics
+///
+/// If `field` is not one of `answers.offsets`, or if `allans` and the string's
+/// own length have come apart. The C has no such check -- `stfans` would walk
+/// `flddat` past `fldptr` and never find it, adding the delta to whatever
+/// follows the array until it faulted -- which is exactly why this one does.
+pub fn store(answers: &mut Answers, field: usize, answer: &[u8]) -> bool {
+    assert_eq!(
+        usize::from(answers.allans),
+        answers.text.len(),
+        "an answer string of {} bytes with allans={}: the two are the same \
+         number in the C, where `newans` is the buffer and `allans` its used \
+         length, and the splice arithmetic below is `allans-nl-m` in one place \
+         and the string's own tail in another",
+        answers.text.len(),
+        answers.allans
+    );
+    // `anslen=strlen(bufptr)`, once, and everything downstream is over that.
+    let answer = c_str(answer);
+    let (at, was) = answers.offsets[field];
+    let (at, was) = (usize::from(at), usize::from(was));
+
+    // `rc=(anslen != fldptr->anslen || strcmp(bufptr,fsdscb->newans+nl) != 0)`.
+    // The second half reads the old answer as a C string rather than as
+    // `anslen` bytes, and the two are the same only while the stored length and
+    // the string agree.
+    let changed = answer.len() != was || c_str(&answers.text[at..]) != answer;
+
+    // The two `movmem`s: shift the tail to make room (or close the gap), then
+    // copy the answer in. A splice is both.
+    answers.text.splice(at..at + was, answer.iter().copied());
+
+    // `fldptr->anslen=anslen`, a byte store from an `int`.
+    answers.offsets[field].1 = answer.len() as u8;
+    // `anslen-m` in a 16-bit `int`.
+    let delta = (answer.len() as i32 - was as i32) as i16;
+    for later in &mut answers.offsets[field + 1..] {
+        later.0 = later.0.wrapping_add_signed(delta);
+    }
+    answers.allans = answers.allans.wrapping_add_signed(delta);
+    changed
+}
+
 /// The synthetic option list a `Y/N` field gets. `foptkn()`, `FSD.C:135`.
 ///
 /// A `Y/N` field may not carry options of its own -- `tmpscn` calls that an
@@ -1719,6 +1797,100 @@ mod tests {
             a.allans,
             form.answer_max + 1
         );
+    }
+
+    /// `stfans()`, `FSD.C:1036`. A longer answer pushes every later answer
+    /// along, and `allans` grows by the same delta.
+    #[test]
+    fn storing_a_longer_answer_moves_every_later_offset() {
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let mut a = answers(&form, b"NAME RANK", b"\0");
+        assert_eq!(a.offsets, vec![(5u16, 0u8), (11, 0)]);
+
+        assert!(store(&mut a, 0, b"DAN"), "the answer changed");
+
+        assert_eq!(a.text, b"NAME=DAN\0RANK=\0\0");
+        assert_eq!(a.offsets, vec![(5, 3), (14, 0)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// Shorter works the same way in the other direction.
+    #[test]
+    fn storing_a_shorter_answer_pulls_every_later_offset_back() {
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let mut a = answers(&form, b"NAME RANK", b"NAME=DANIEL\0\0");
+        assert_eq!(a.offsets, vec![(5u16, 6u8), (17, 0)]);
+
+        assert!(store(&mut a, 0, b"DAN"));
+
+        assert_eq!(a.text, b"NAME=DAN\0RANK=\0\0");
+        assert_eq!(a.offsets, vec![(5, 3), (14, 0)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// The return value is "did it change", and it is the whole reason the
+    /// engine can count changes (`chgcnt`) without diffing the string itself.
+    #[test]
+    fn storing_the_same_answer_reports_no_change() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
+        assert!(!store(&mut a, 0, b"DAN"));
+        assert_eq!(a.text, b"NAME=DAN\0\0", "and nothing moved");
+    }
+
+    /// An answer of the same length and different content is still a change,
+    /// and it is the only shape that says so *only* through the `strcmp` half
+    /// of `FSD.C:1049`.
+    #[test]
+    fn a_same_length_answer_is_compared_byte_by_byte() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
+        assert!(store(&mut a, 0, b"dan"), "strcmp is case-sensitive");
+        assert_eq!(a.text, b"NAME=dan\0\0");
+    }
+
+    /// The backwards walk's boundary: `efptr` starts at the last field, so
+    /// storing into that field runs the loop zero times. `allans` still moves.
+    #[test]
+    fn storing_into_the_last_field_moves_nothing_after_it() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut a = answers(&form, b"A B C", b"\0");
+        assert_eq!(a.offsets, vec![(2u16, 0u8), (5, 0), (8, 0)]);
+
+        assert!(store(&mut a, 2, b"zz"));
+
+        assert_eq!(a.text, b"A=\0B=\0C=zz\0\0");
+        assert_eq!(a.offsets, vec![(2, 0), (5, 0), (8, 2)]);
+        assert_eq!(a.allans, a.text.len() as u16);
+    }
+
+    /// The fields *before* the stored one do not move either -- the walk stops
+    /// at `fldptr` rather than running to the front of the array.
+    #[test]
+    fn storing_into_a_middle_field_leaves_the_earlier_ones_alone() {
+        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut a = answers(&form, b"A B C", b"A=xx\0C=yy\0\0");
+        assert_eq!(a.offsets, vec![(2u16, 2u8), (7, 0), (10, 2)]);
+
+        assert!(store(&mut a, 1, b"q"));
+
+        assert_eq!(a.text, b"A=xx\0B=q\0C=yy\0\0");
+        assert_eq!(a.offsets, vec![(2, 2), (7, 1), (11, 2)]);
+    }
+
+    /// `anslen=strlen(bufptr)`: an embedded NUL ends the answer, so what is
+    /// stored is the prefix and an answer whose prefix is already there is not
+    /// a change.
+    #[test]
+    fn an_embedded_nul_ends_the_answer_being_stored() {
+        let form = compile(b"??????", b"NAME", MANY);
+        let mut a = answers(&form, b"NAME", b"NAME=DA\0\0");
+        assert!(!store(&mut a, 0, b"DA\0NIEL"), "strlen stops at the NUL");
+        assert_eq!(a.text, b"NAME=DA\0\0");
+
+        assert!(store(&mut a, 0, b"\0DA"), "an answer that begins with one");
+        assert_eq!(a.text, b"NAME=\0\0");
+        assert_eq!(a.offsets, vec![(5, 0)]);
     }
 
     #[test]
