@@ -23,11 +23,14 @@
 //! inserts a populated corpus of characters -- colliding groups on key 2,
 //! distinct values on keys 0 and 1 -- so `pages::chain_pair`'s
 //! `[prev][next]` links get written and can be walked, not merely built and
-//! left unread. **The `.VIR` half of the pair turns out unusable**: its own
-//! key 2 descriptor names a chain offset past the end of its physical
-//! record, measured and asserted in that test, not assumed. `WCCUSERS.DAT`
-//! has the same shape without the defect and is what actually gets inserted
-//! into. See `docs/plans/2026-08-07-btrieve-interior-pages-design.md` and
+//! left unread. **This host cannot write a chain into the `.VIR` half of the
+//! pair**: its own key 2 descriptor names a chain offset past the end of its
+//! physical record, measured and asserted in that test, not assumed -- so
+//! `WCCUSERS.DAT`, which reads `physical - 8` there, is what actually gets
+//! inserted into. That is a statement about what this host can write, not a
+//! verdict that the `.VIR` is damaged; the two files came from different
+//! builds and the engine opens both. See the test's own doc comment,
+//! `docs/plans/2026-08-07-btrieve-interior-pages-design.md` and
 //! `tools/btrieve-oracle/fixtures/DUPKEY30.txt` for the shape this is
 //! measured against.
 //!
@@ -461,26 +464,33 @@ fn insert_duplicate_users(block: &mut mbbs::btrieve::Block) -> Result<(), String
 
 /// The fourth variant: a duplicate-permitting key, populated and chained.
 ///
-/// **`WCCUSERS.VIR` itself cannot be used for this**, and that is measured
-/// here rather than assumed: its key 2 (experience) descriptor names a chain
-/// offset of 2034, but the file's own physical record length is 2006 bytes --
-/// `2034 + 8 = 2042` does not fit. `pages::write_chain` refuses on exactly
-/// this check, and correctly so: writing the pair anyway would either fall
-/// off the end of the file's last record or spill into the page after it.
-/// `WCCUSERS.DAT` -- shipped alongside it, same 2048-byte page, same `1998`
-/// reclen, same `2006` physical, same three single-segment keys, also zero
-/// records -- has no such defect: its key 2 reads a chain offset of `1998`,
-/// which is `physical - 8`, the same rule this host already measured against
-/// `DUPKEY30.DAT` (see `at::CHAIN`'s doc comment). `WCCUSERS.VIR`'s *own*
-/// key 1 (owner) is also narrower here than `WCCUSERS.DAT`'s -- 11 bytes, not
-/// 30 -- another sign the two files' key descriptors have drifted apart, not
-/// that this host misread one of them.
+/// **This host cannot write a chain into `WCCUSERS.VIR`**, and that is
+/// measured here rather than assumed: its key 2 (experience) descriptor names
+/// a chain offset of 2034, but the file's own physical record length is 2006
+/// bytes -- `2034 + 8 = 2042` does not fit. `pages::write_chain` refuses on
+/// exactly this check, and correctly so: writing the pair anyway would either
+/// fall off the end of the file's last record or spill into the page after it.
+/// `WCCUSERS.DAT` -- same 2048-byte page, same `1998` reclen, same `2006`
+/// physical, same three single-segment keys, also zero records -- reads `1998`
+/// there, which is `physical - 8`, the rule already measured against
+/// `DUPKEY30.DAT` (see `at::CHAIN`'s doc comment). So `.DAT` is the one
+/// actually inserted into, reindexed, and handed to the oracle.
 ///
-/// So this checks both, in the direction the measurement points: `.VIR` is
-/// asserted to refuse, with the exact reason, so a future change to
-/// `write_chain`'s bound or to the shipped file silently stops proving
-/// anything here; `.DAT` is the one actually inserted into, reindexed, and
-/// handed to the oracle.
+/// **What this does NOT establish is that the `.VIR` is a damaged file**, and
+/// it should not be read that way. Two measurements point the other way. Its
+/// key 1 is 11 bytes where the `.DAT`'s is 30, and that 11 is *internally
+/// coherent* -- entry size 19 is `11 + 8` and max entries 107 is
+/// `(2048 - 12) / 19`, both computed by the engine from 11 -- so the file was
+/// created that way on purpose. And genuine Btrieve opens it without
+/// complaint and reports `key 1 len=11`. The two files came from different
+/// builds; which one, and whether the engine would even consult `+0x12` on an
+/// insert rather than deriving the offset, is unmeasured. Nothing here depends
+/// on the answer: a running board writes characters to the `.DAT`, and the
+/// `.VIR` is the virgin template an install copies from.
+///
+/// The refusal is asserted with its exact reason so that a change to
+/// `write_chain`'s bound, or to the file, cannot silently stop proving
+/// anything -- not as a verdict on the file.
 #[test]
 #[ignore = "needs MajorMUD's data files in tmp/"]
 fn forge_a_duplicate_key_the_real_engine_can_read() {
