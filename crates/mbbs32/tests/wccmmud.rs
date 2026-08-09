@@ -152,3 +152,87 @@ fn the_export_table_is_as_measured() {
          _INIT__WCCMMUD, must be exported at the RVA measured from the file"
     );
 }
+
+/// `re/pefmt.py` reads the same import directory this crate does, written
+/// before this crate existed, so it is the independent second opinion --
+/// exactly what `crates/mbbs16/tests/wccmmud.rs`'s
+/// `the_import_histogram_agrees_with_nefmt` is for the 16-bit loader. Unlike
+/// that test, this one shells out for real rather than checking a
+/// hand-transcribed table: `pefmt.py` has no `__main__`, so the invocation
+/// below is a short driver script (mirroring `re/ne_imports.py`'s report over
+/// `nefmt.parse`) that imports it, parses the module, and prints one
+/// `library\tcount` line per imported library -- ordinals and names both
+/// counted, though this module has none of the former (see
+/// `the_import_histogram_is_as_measured`).
+#[test]
+fn the_import_table_agrees_with_pefmt_py() {
+    let Some(module) = module_path() else { return };
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/mbbs32 is two directories below the repo root");
+    let pefmt = root.join("re/pefmt.py");
+    if !pefmt.exists() {
+        eprintln!("skipped: re/pefmt.py is not present");
+        return;
+    }
+
+    const DRIVER: &str = "\
+import sys
+sys.path.insert(0, sys.argv[1])
+import pefmt
+from collections import Counter
+imports = pefmt.parse(sys.argv[2])
+per_library = Counter()
+for (library, _ordinal), count in imports.ordinals.items():
+    per_library[library] += count
+for (library, _name), count in imports.names.items():
+    per_library[library] += count
+for library in sorted(per_library):
+    print('%s\\t%d' % (library, per_library[library]))
+";
+
+    let output = match std::process::Command::new("python3")
+        .arg("-c")
+        .arg(DRIVER)
+        .arg(root.join("re"))
+        .arg(&module)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipped: python3 is not present");
+            return;
+        }
+        Err(e) => panic!("failed to run python3: {e}"),
+    };
+    assert!(
+        output.status.success(),
+        "re/pefmt.py failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut from_pefmt: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in String::from_utf8(output.stdout)
+        .expect("pefmt's driver prints UTF-8")
+        .lines()
+    {
+        let (library, count) = line.split_once('\t').expect("library\\tcount");
+        from_pefmt.insert(
+            library.to_string(),
+            count.parse().expect("a decimal count"),
+        );
+    }
+
+    let (_, image) = image().expect("module_path() already confirmed the file is present");
+    let mut from_rust: std::collections::BTreeMap<String, usize> = Default::default();
+    for i in &image.imports {
+        *from_rust.entry(i.library.clone()).or_default() += 1;
+    }
+
+    assert_eq!(
+        from_rust, from_pefmt,
+        "PeImage and re/pefmt.py must agree on the per-library import counts"
+    );
+}
