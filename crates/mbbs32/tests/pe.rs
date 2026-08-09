@@ -865,6 +865,41 @@ fn an_import_library_name_rva_outside_any_section_is_refused() {
 }
 
 #[test]
+fn an_iat_slot_outside_any_section_is_refused() {
+    // Unlike the ILT, nothing about walking the import table ever
+    // dereferences the IAT cursor -- it is only ever advanced and recorded
+    // into `Import::iat_rva`. A `FirstThunk` pointing anywhere a u32 can name
+    // would otherwise sail straight through into `Image::bind_imports`
+    // (Task 13), which indexes the mapping at exactly that rva.
+    let mut v = with_one_import_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let ilt_rva = 0x1000u32; // inside the one section: valid
+    let bogus_iat_rva = 0x9999_0000u32; // nowhere near this image's sections
+    let name_rva = 0x1000u32 + 0x20; // reuse in-bounds space for "X\0"
+
+    put_u32(&mut v, raw, 0x8000_0000 | 1); // one ordinal ILT entry
+    put_u32(&mut v, raw + 4, 0);
+    put_bytes(&mut v, raw + 0x20, b"X\0");
+
+    let desc = raw + 0x10;
+    put_u32(&mut v, desc, ilt_rva); // OriginalFirstThunk: a real, distinct ILT
+    put_u32(&mut v, desc + 4, 0);
+    put_u32(&mut v, desc + 8, 0);
+    put_u32(&mut v, desc + 12, name_rva);
+    put_u32(&mut v, desc + 16, bogus_iat_rva); // FirstThunk
+
+    set_import_directory(&mut v, 0x1000 + 0x10, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnmappedRva {
+            rva: bogus_iat_rva
+        }
+    );
+}
+
+#[test]
 fn a_library_name_with_no_nul_before_the_end_of_its_section_is_refused() {
     // Two sections: DESC holds the descriptor and its ILT with plenty of
     // room, NAME is exactly 4 bytes and none of them is zero -- no NUL is

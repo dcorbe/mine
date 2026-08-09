@@ -372,6 +372,14 @@ pub struct Import {
     /// walked in lockstep with the ILT -- never from the ILT's own address,
     /// even when `OriginalFirstThunk` was zero and the two walks share one
     /// array (see the fallback note on `PeImage::parse`).
+    ///
+    /// Guaranteed, by `PeImage::parse`, to have all 4 of its bytes inside
+    /// some section's raw data -- checked explicitly, because (unlike the
+    /// ILT cursor walked alongside it) nothing about reading this array ever
+    /// dereferences it, so nothing would otherwise catch a `FirstThunk` that
+    /// places it outside every section. `Image::bind_imports` (`image.rs`)
+    /// relies on exactly this invariant to index the mapping without a
+    /// second bounds check of its own -- mirroring `Relocation::rva`.
     pub iat_rva: u32,
 }
 
@@ -864,6 +872,29 @@ impl PeImage {
                         )?)
                     };
 
+                    // `iat_cursor` is never read through a bounds-checked
+                    // helper the way `ilt_cursor` is (`u32_at_rva`, every
+                    // iteration, above): when the ILT and IAT are separate
+                    // arrays -- the ordinary case, `ilt_rva != 0` -- nothing
+                    // in this walk ever dereferences the IAT at all, only
+                    // advances a cursor into it. So a crafted `FirstThunk`
+                    // could otherwise place `Import::iat_rva` anywhere a
+                    // `u32` can name, unbounded by any section, with only
+                    // `checked_add` below guarding against overflowing past
+                    // `u32::MAX` -- not against landing outside the image at
+                    // all. This is the same site Task 13's `Image::bind_imports`
+                    // (`image.rs`) indexes the mapping at, exactly as
+                    // `Relocation::rva` is for `Image::relocate`, so it gets
+                    // the same membership check.
+                    let (_, remaining) = rva_to_file_bounded_in(&sections, iat_cursor)?;
+                    if remaining < 4 {
+                        return Err(PeError::RvaSpansSectionEnd {
+                            what: "import address table slot",
+                            rva: iat_cursor,
+                            need: 4,
+                            remaining,
+                        });
+                    }
                     imports.push(Import {
                         library: library.clone(),
                         symbol,
