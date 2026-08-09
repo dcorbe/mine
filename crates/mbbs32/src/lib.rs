@@ -44,6 +44,7 @@
 //! `cargo test -p mbbs32 --release` are not the same check -- see the sibling
 //! crate's note for the measurement behind that.
 
+mod asm;
 mod image;
 mod map;
 mod pe;

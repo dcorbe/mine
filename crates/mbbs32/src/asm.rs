@@ -1,0 +1,476 @@
+//! The two pieces of assembly that cross between 64-bit and 32-bit compat-mode
+//! code.
+//!
+//! Same manoeuvre as `crates/mbbs16/src/asm.rs`, adapted for a flat 32-bit ABI
+//! rather than Borland's 16-bit huge model. Read that file first -- this one
+//! only documents where it differs, and every difference is a measurement, not
+//! a guess: `docs/plans/mbbs32/compat32.c` and `compat32_fault.c` are the two
+//! experiments, and `docs/plans/2026-08-08-mbbs32-design.md` ("The execution
+//! substrate") is where they are written up.
+//!
+//! Both routines are written as real assembly rather than hand-assembled byte
+//! arrays, and both address [`Ctx`] through `const` operands built from
+//! `offset_of!` rather than literal displacements -- the sibling crate's own
+//! doc comment explains why: a hand-worked-out offset is the mistake this
+//! project keeps making, and it is always silent.
+//!
+//! # What is different from `mbbs16::asm`, and why
+//!
+//! **No `ss16` field, and no segment switch at all.** `compat32_fault.c`
+//! measured `SS` unchanged across a fault in 32-bit compat mode -- 32-bit flat
+//! code runs on the host's own stack segment, so there is nothing to save or
+//! restore. `mbbs16`'s `R13` (which carries the host's `SS` across the
+//! excursion) has no counterpart here.
+//!
+//! **`FS` is the one segment register this crate still swaps**, because
+//! `wccmmud.dll`'s `DllMain` dereferences through it before it does anything
+//! else (see `tib.rs`). The *selector* load/restore shape is exactly
+//! `mbbs16`'s `DS` handling: the module's selector is loaded from [`Ctx::fs`]
+//! before the jump, the host's is carried across in a register the CPU cannot
+//! touch while compatibility mode is running (`%r12`, mirroring `mbbs16`'s use
+//! of the same register for `DS`), and restored by the trampoline on the way
+//! back.
+//!
+//! **That is not the whole story for `FS`, and `DS`'s shape is not enough on
+//! its own -- this was measured, not assumed, and the first version of this
+//! file got it wrong.** `DS`'s base is architecturally irrelevant once we are
+//! back in 64-bit long mode -- the CPU ignores it for addressing -- so
+//! round-tripping `mbbs16`'s selector is sufficient there. `FS` is different
+//! on this architecture: glibc's thread-local storage is addressed through
+//! `FS_BASE`, a hidden per-thread value the kernel sets once via
+//! `arch_prctl(ARCH_SET_FS)` while the selector itself stays `0` (null) for
+//! the whole life of the thread. Loading *any* selector into `FS` -- even
+//! reloading the null selector the host was already running under -- makes
+//! the CPU re-derive `FS_BASE` from the descriptor table (which means zero,
+//! for a null selector) rather than leaving the existing base alone. So a
+//! selector round-trip through `0 -> 0` still **zeroes** `FS_BASE`: measured
+//! on this box, one crossing with [`Ctx::fs`] left at its default was enough
+//! to break the very next `std::thread_local` access after `mbbs32_enter`
+//! returned. [`enter`] is the fix: it saves the calling thread's real
+//! `FS_BASE` with `arch_prctl(ARCH_GET_FS)` before touching `FS` at all, and
+//! restores it with `arch_prctl(ARCH_SET_FS)` after the raw crossing is over
+//! -- every time, not only when [`Ctx::fs`] is non-zero, because the selector
+//! reload that breaks `FS_BASE` happens unconditionally. A module with no TIB
+//! still carries `fs = 0`, which is a no-op for the *selector*; it is
+//! [`enter`]'s job, not the assembly's, to make it a no-op for `FS_BASE` too.
+//!
+//! **The far jump target is `0x23`, not an LDT selector**, and the way back is
+//! `0x33` (read at runtime by [`current_cs`], not hardcoded, for the same
+//! reason `mbbs16` does not hardcode it). Both are Linux's fixed GDT entries
+//! for 32-bit compatibility-mode code and 64-bit long-mode code respectively --
+//! see `compat32.c`'s header comment. Unlike the 16-bit case there is no
+//! `modify_ldt` call for the code segment itself: `__USER32_CS` already exists,
+//! for every process, for free.
+//!
+//! **Registers carry `u32`, not `u64`.** `mbbs16` widens 16-bit values into
+//! 64-bit `Ctx` fields and loads them with `movq` because compatibility mode
+//! only ever reads the low 16 bits and the rest is inert. 32-bit compat mode
+//! is the same story one tier up: a `movl` into a 32-bit register name
+//! zero-extends the upper 32 bits of its 64-bit home automatically, on this
+//! architecture, in either mode -- so `u32` fields loaded with `movl` are both
+//! sufficient and simpler than carrying dead high bits around in a `u64`.
+//!
+//! **The callee-saved set is `EBX`/`ESI`/`EDI`/`EBP`, plain 32-bit cdecl.**
+//! There is no Borland-runtime-helper quirk analogous to `mbbs16`'s `BX`/`CX`
+//! preservation on this side -- nothing in the design doc's survey of this
+//! module's imports calls for one -- so `EAX`, `ECX` and `EDX` are ordinary
+//! caller-saved scratch and this file never preserves them across a crossing.
+//!
+//! Everything else -- `R11` for the return address, `R15` for the host's
+//! `RSP`, the trampoline living below 4 GiB because a far jump's offset field
+//! is 32 bits either way, and `R14` carrying the `Ctx` pointer through a mode
+//! compatibility mode cannot even name -- is identical in shape to the 16-bit
+//! crate.
+
+use core::arch::global_asm;
+use core::mem::offset_of;
+
+/// Linux's fixed GDT selector for 32-bit compatibility-mode code. Present in
+/// every process; unlike the 16-bit case, entering 32-bit code costs no
+/// `modify_ldt` call at all.
+pub(crate) const USER32_CS: u16 = 0x23;
+
+/// State handed to [`enter`], and filled in by the trampoline on the way
+/// back out.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Ctx {
+    /// Far pointer to enter through, in the `m16:32` form `ljmpl` expects: a
+    /// 32-bit offset immediately followed by a 16-bit selector. These two must
+    /// stay adjacent and at the very front -- the jump reads them as one
+    /// operand, straight off `%r14`. This is the format the instruction needs
+    /// regardless of the target's own bitness: a far jump executed *from*
+    /// 64-bit long mode has no encoding for anything narrower.
+    pub target_offset: u32,
+    pub target_selector: u16,
+
+    /// The module's `FS` selector, loaded before the jump and restored to the
+    /// host's own on the way back. `0` -- the null selector -- when the
+    /// excursion has no Win32 TIB to offer; loading and restoring a null
+    /// selector is a harmless no-op. See `tib.rs`.
+    pub fs: u16,
+
+    /// Stack pointer to enter with, as a **linear address**, never a segment
+    /// offset. Unlike `mbbs16`'s `sp`, there is no segment base to add: 32-bit
+    /// compat mode runs on the host's own flat `SS`, so this is simply written
+    /// straight into `ESP`.
+    pub esp: u32,
+
+    /// Registers carrying a host call's return value back to the module.
+    /// `EAX` alone for most results, `EDX:EAX` for a 64-bit one.
+    pub eax: u32,
+    pub edx: u32,
+
+    /// The callee-saved quad in 32-bit cdecl, restored on entry so that a host
+    /// call is transparent to the module -- exactly the role `mbbs16::asm::Ctx`'s
+    /// `si`/`di`/`bp` play, one register wider and one register longer.
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+
+    /// `EAX`/`EDX` as the trampoline found them: a thunk index, or the
+    /// module's own return value, depending on how it got there.
+    pub out_eax: u32,
+    pub out_edx: u32,
+    /// The callee-saved quad as the module left it, to be handed back
+    /// unchanged on the next entry.
+    pub out_ebx: u32,
+    pub out_esi: u32,
+    pub out_edi: u32,
+    pub out_ebp: u32,
+    /// `ESP` at the same instant, still a linear address. The call frame --
+    /// whatever `cdecl` return address and arguments are on it -- is just
+    /// above.
+    pub out_esp: u32,
+}
+
+impl Ctx {
+    /// The one part of the layout `const` operands cannot express: `ljmpl
+    /// *(%r14)` reads a packed `m16:32` from the start of the struct, so the
+    /// far pointer's two halves must be adjacent and first.
+    pub const ASSERT_FAR_POINTER_FIRST: () = {
+        assert!(offset_of!(Ctx, target_offset) == 0);
+        assert!(offset_of!(Ctx, target_selector) == 4);
+    };
+}
+
+// Forces the assertion above to be checked at compile time regardless of
+// whether anything else in this crate references it yet -- there is no
+// `Machine` here for it to ride along with the way `mbbs16::Machine::new`
+// does.
+const _: () = Ctx::ASSERT_FAR_POINTER_FIRST;
+
+// The outbound half. Lives in the ordinary text segment and may sit anywhere
+// in the address space: the jump is the indirect `m16:32` form, so only its
+// *target* -- and the trampoline it names -- are confined to the low 4 GiB.
+//
+// R11, R14 and R15 carry state across the excursion, same as `mbbs16`. R12
+// joins them here to carry the host's FS selector, playing exactly the role it
+// plays for DS on the 16-bit side. Compatibility mode has no encoding that
+// names r8-r15, which is what makes any of this survive the crossing: nothing
+// on the other side can disturb them.
+//
+// RBP and RBX are pushed and popped too, and this is not optional decoration:
+// both are callee-saved under the SysV x86-64 ABI this function is called
+// under from Rust, and this function's own body *writes* EBP and EBX (loading
+// [`Ctx::ebp`]/[`Ctx::ebx`], the module's half of the callee-saved quad) on
+// every path, including the one where the far jump is never reached. A
+// function that assigns to a callee-saved register without saving and
+// restoring it is not "using it as scratch" -- it is corrupting whatever the
+// *caller* had there, silently, for exactly as long as it takes something in
+// the caller (here, or several frames up) to next read that register. This
+// was found the hard way: an earlier version of this file pushed only
+// R12/R14/R15, reasoning that RBP/RBX were not needed as scratch -- true, and
+// irrelevant, since they are clobbered regardless -- and a mutation aimed at
+// something else entirely (deleting the EBX load, two tests below) crashed
+// the whole test process instead of failing a single assertion, because by
+// then some caller several frames up already depended on RBX surviving the
+// call.
+global_asm!(
+    r#"
+.globl mbbs32_enter_raw
+.hidden mbbs32_enter_raw
+.p2align 4
+mbbs32_enter_raw:
+    pushq   %rbp
+    pushq   %rbx
+    pushq   %r12
+    pushq   %r14
+    pushq   %r15
+
+    movq    %rdi, %r14                  /* the Ctx */
+    leaq    1f(%rip), %r11              /* where the trampoline sends us back */
+    movq    %rsp, %r15                  /* the host's RSP, to restore */
+
+    movw    %fs, %r12w                  /* the host's FS, for the way back */
+    movzwl  {fs}(%r14), %ecx            /* the module's, or 0 if it has none */
+    movw    %cx, %fs
+
+    movl    {eax}(%r14), %eax           /* the call's return value, EAX or EDX:EAX */
+    movl    {edx}(%r14), %edx
+    movl    {ebx}(%r14), %ebx           /* the callee-saved quad, as the module */
+    movl    {esi}(%r14), %esi           /* had it before whatever call sent us  */
+    movl    {edi}(%r14), %edi           /* out to the host                     */
+    movl    {ebp}(%r14), %ebp
+    movl    {esp}(%r14), %esp           /* a linear address, not a segment offset */
+
+    ljmpl   *(%r14)                     /* into 32-bit compatibility mode */
+1:
+    popq    %r15
+    popq    %r14
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
+    retq
+"#,
+    fs = const offset_of!(Ctx, fs),
+    eax = const offset_of!(Ctx, eax),
+    edx = const offset_of!(Ctx, edx),
+    ebx = const offset_of!(Ctx, ebx),
+    esi = const offset_of!(Ctx, esi),
+    edi = const offset_of!(Ctx, edi),
+    ebp = const offset_of!(Ctx, ebp),
+    esp = const offset_of!(Ctx, esp),
+    options(att_syntax)
+);
+
+// The inbound half, and the only code here that must live below 4 GiB: a
+// 32-bit far jump can name a 32-bit offset and no more, so 32-bit code jumping
+// back out has to find this trampoline at an address that fits. It is
+// therefore copied into the module's low mapping at run time rather than
+// called where it sits, which is why it touches nothing but registers and
+// displacements off %r14 -- it has to run correctly from an address it was not
+// linked for.
+//
+// This code itself runs in 64-bit long mode: the far jump that reaches it
+// switches CS to the host's own 64-bit selector, which is exactly what makes
+// `movq %r15, %rsp` and `jmp *%r11` valid instructions again.
+global_asm!(
+    r#"
+.globl mbbs32_tramp_start, mbbs32_tramp_end
+.hidden mbbs32_tramp_start, mbbs32_tramp_end
+.p2align 4
+mbbs32_tramp_start:
+    movl    %eax, {out_eax}(%r14)       /* a thunk index, or a return value */
+    movl    %edx, {out_edx}(%r14)
+    movl    %ebx, {out_ebx}(%r14)       /* the callee-saved quad, to be handed */
+    movl    %esi, {out_esi}(%r14)       /* back unchanged when the module is   */
+    movl    %edi, {out_edi}(%r14)       /* resumed                             */
+    movl    %ebp, {out_ebp}(%r14)
+    movl    %esp, {out_esp}(%r14)       /* the call frame is just above */
+
+    movw    %r12w, %fs                  /* the host's FS back */
+
+    movq    %r15, %rsp
+    jmp     *%r11
+mbbs32_tramp_end:
+"#,
+    out_eax = const offset_of!(Ctx, out_eax),
+    out_edx = const offset_of!(Ctx, out_edx),
+    out_ebx = const offset_of!(Ctx, out_ebx),
+    out_esi = const offset_of!(Ctx, out_esi),
+    out_edi = const offset_of!(Ctx, out_edi),
+    out_ebp = const offset_of!(Ctx, out_ebp),
+    out_esp = const offset_of!(Ctx, out_esp),
+    options(att_syntax)
+);
+
+unsafe extern "C" {
+    /// The raw crossing. **Do not call this directly** -- see [`enter`],
+    /// which wraps it with the `FS_BASE` save/restore the module doc comment
+    /// explains. Not even `pub(crate)`, so nothing in this crate can reach it
+    /// by accident.
+    fn mbbs32_enter_raw(ctx: *mut Ctx);
+
+    static mbbs32_tramp_start: u8;
+    static mbbs32_tramp_end: u8;
+}
+
+/// `ARCH_GET_FS` / `ARCH_SET_FS` from `<asm/prctl.h>`, which `libc` does not
+/// re-export (only the `SYS_arch_prctl` syscall number itself does).
+const ARCH_SET_FS: i32 = 0x1002;
+const ARCH_GET_FS: i32 = 0x1003;
+
+/// The calling thread's current `FS_BASE` -- glibc's thread-local-storage
+/// pointer on this architecture, set once via `arch_prctl(ARCH_SET_FS)` when
+/// the thread was created and otherwise left alone by ordinary code.
+fn fs_base() -> u64 {
+    let mut base: u64 = 0;
+    // SAFETY: `&mut base` is a live, correctly sized place for the kernel to
+    // write into for the duration of the call; `ARCH_GET_FS` has no failure
+    // mode for a thread that exists to be asking.
+    unsafe {
+        libc::syscall(libc::SYS_arch_prctl, ARCH_GET_FS, &mut base as *mut u64);
+    }
+    base
+}
+
+/// Restore `FS_BASE` to a value [`fs_base`] previously read back on this same
+/// thread.
+fn set_fs_base(base: u64) {
+    // SAFETY: setting the calling thread's own FS_BASE back to a value it
+    // held before the crossing -- never a made-up address, never another
+    // thread's.
+    unsafe {
+        libc::syscall(libc::SYS_arch_prctl, ARCH_SET_FS, base as usize);
+    }
+}
+
+/// Enter 32-bit compatibility mode through `ctx`, returning when the
+/// trampoline is reached.
+///
+/// This is [`mbbs32_enter_raw`] plus the `FS_BASE` save/restore the module
+/// doc comment explains -- unconditionally, whether or not [`Ctx::fs`] is
+/// non-zero, because it is the act of loading *any* selector into `FS` that
+/// disturbs `FS_BASE`, not merely loading a real one.
+///
+/// # Safety
+///
+/// `ctx` must be a valid, exclusively-owned `Ctx` for the duration of the
+/// call: every field the assembly reads must already be set, and the code and
+/// stack the entry describes must be mapped, executable/writable as
+/// appropriate, and live until the trampoline (or a fault) returns control
+/// here.
+pub(crate) unsafe fn enter(ctx: *mut Ctx) {
+    let host_fs_base = fs_base();
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { mbbs32_enter_raw(ctx) };
+    set_fs_base(host_fs_base);
+}
+
+/// The trampoline's bytes, for copying into a mapping below 4 GiB.
+pub(crate) fn trampoline() -> &'static [u8] {
+    // SAFETY: both symbols bracket a contiguous run of instructions emitted by
+    // the assembler in one `global_asm!` block, so the range is valid and the
+    // end is never before the start.
+    unsafe {
+        let start = &raw const mbbs32_tramp_start;
+        let end = &raw const mbbs32_tramp_end;
+        let len = end.offset_from_unsigned(start);
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
+/// The selector of the 64-bit code segment we are running in.
+///
+/// Read rather than assumed, exactly as `mbbs16::current_cs` is: Linux's
+/// `__USER_CS` is 0x33, but the value has to be right for a far jump back to
+/// land, and reading it costs one instruction.
+pub(crate) fn current_cs() -> u16 {
+    let cs: u16;
+    // SAFETY: reading a segment register has no side effects.
+    unsafe {
+        std::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags))
+    };
+    cs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::Mapping;
+
+    /// Bytes for `ljmp $USER_CS, $target` (`ljmp ptr16:32`, opcode `0xea`),
+    /// the way back out of 32-bit code.
+    fn ljmp_back(target: u32) -> [u8; 7] {
+        let mut b = [0u8; 7];
+        b[0] = 0xea;
+        b[1..5].copy_from_slice(&target.to_le_bytes());
+        b[5..7].copy_from_slice(&current_cs().to_le_bytes());
+        b
+    }
+
+    /// A fresh low mapping with a copy of the trampoline at its base and
+    /// `build(tramp_addr)`'s bytes 16-byte-aligned right after it -- the same
+    /// layout `docs/plans/mbbs32/compat32.c` uses. Returns the mapping (which
+    /// must outlive the call to [`enter`]) and the code's address.
+    fn low_mapping_with(build: impl FnOnce(u32) -> Vec<u8>) -> (Mapping, u32) {
+        let mut mapping = Mapping::new(4096).expect("a low mapping");
+        let tramp_addr = mapping.base() as usize as u32;
+        let tramp = trampoline();
+        let tramp_len = tramp.len();
+        let code_off = tramp_len.div_ceil(16) * 16;
+
+        let code = build(tramp_addr);
+        assert!(
+            code_off + code.len() <= mapping.len(),
+            "test code does not fit the 4 KiB scratch mapping"
+        );
+
+        let dst = mapping.as_mut_slice();
+        dst[..tramp_len].copy_from_slice(tramp);
+        dst[code_off..code_off + code.len()].copy_from_slice(&code);
+
+        (mapping, tramp_addr + code_off as u32)
+    }
+
+    /// Assemble `mov eax, imm32 ; ljmp $USER_CS, $tramp` into a fresh low
+    /// mapping and enter it. This is `docs/plans/mbbs32/compat32.c` translated
+    /// to Rust: the minimal proof that 32-bit compatibility-mode code runs at
+    /// all, entered from 64-bit code with no LDT, and comes back with a value
+    /// in `EAX`.
+    #[test]
+    fn a_hand_assembled_mov_and_far_jump_arrives_in_eax() {
+        let (_mapping, code_addr) = low_mapping_with(|tramp_addr| {
+            let mut code = vec![0xb8u8]; // mov eax, imm32
+            code.extend_from_slice(&0xc0_ffeeu32.to_le_bytes());
+            code.extend_from_slice(&ljmp_back(tramp_addr));
+            code
+        });
+
+        let mut ctx = Ctx {
+            target_offset: code_addr,
+            target_selector: USER32_CS,
+            ..Default::default()
+        };
+        // SAFETY: `code_addr` points at the freshly written instructions
+        // above, which are mapped read/write/execute; `_mapping` is not
+        // dropped until after `enter` returns.
+        unsafe { enter(&mut ctx) };
+
+        assert_eq!(ctx.out_eax, 0xc0_ffee, "EAX did not carry the value back");
+    }
+
+    /// The registers 32-bit cdecl treats as callee-saved must arrive as
+    /// [`Ctx`] describes them, and come back as the module left them.
+    ///
+    /// Distinct, unlikely-to-collide sentinels per register, each incremented
+    /// by the module: a missing load would leave whatever the *host's* own
+    /// code last put in that register (zero, most likely, immediately after
+    /// `Ctx::default()`), which `+ 1` makes easy to tell apart from the
+    /// expected `sentinel + 1`.
+    #[test]
+    fn callee_saved_registers_survive_a_crossing() {
+        // INC r32, single-byte forms valid only outside 64-bit mode -- legal
+        // 32-bit compatibility-mode instructions, opcode 0x40 + register.
+        const INC_EBX: u8 = 0x43;
+        const INC_ESI: u8 = 0x46;
+        const INC_EDI: u8 = 0x47;
+        const INC_EBP: u8 = 0x45;
+
+        let (_mapping, code_addr) = low_mapping_with(|tramp_addr| {
+            let mut code = vec![INC_EBX, INC_ESI, INC_EDI, INC_EBP];
+            code.extend_from_slice(&ljmp_back(tramp_addr));
+            code
+        });
+
+        let mut ctx = Ctx {
+            target_offset: code_addr,
+            target_selector: USER32_CS,
+            ebx: 0x1000_0000,
+            esi: 0x2000_0000,
+            edi: 0x3000_0000,
+            ebp: 0x4000_0000,
+            esp: code_addr, // never dereferenced by this code; any valid value will do
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        unsafe { enter(&mut ctx) };
+
+        assert_eq!(ctx.out_ebx, 0x1000_0001, "EBX was not loaded, or not restored");
+        assert_eq!(ctx.out_esi, 0x2000_0001, "ESI was not loaded, or not restored");
+        assert_eq!(ctx.out_edi, 0x3000_0001, "EDI was not loaded, or not restored");
+        assert_eq!(ctx.out_ebp, 0x4000_0001, "EBP was not loaded, or not restored");
+    }
+}
