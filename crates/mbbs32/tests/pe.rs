@@ -284,30 +284,66 @@ fn absolute(offset: u16) -> u16 {
 
 /// Lays out one or more base-relocation blocks right after `with_one_section`'s
 /// CODE section raw data, and points the base-relocation data directory
-/// (index 5, at `opt + 96 + 5*8`) at them. Each block is `(page_rva, entries)`;
-/// entries are pre-packed by `highlow`/`absolute`.
+/// (index 5, at `opt + 96 + 5*8`) at a directory whose declared `size` is
+/// exactly the sum of the blocks written -- `dir_size` overrides that, for
+/// tests that need the directory to lie about how many bytes of blocks
+/// follow it. Each block is `(page_rva, entries)`; entries are pre-packed by
+/// `highlow`/`absolute`, and each block's own header always tells the truth
+/// about its size (`8 + 2*entries.len()`); a block that lies about *its own*
+/// size is written directly with `write_reloc_block_raw` instead.
 ///
 /// The directory RVA is always the section's own RVA (0x1000): the block data
 /// is written starting at that section's raw offset, so the directory and the
 /// first block always share a file position, independent of what "page" each
 /// block's entries target.
-fn write_relocation_blocks(v: &mut [u8], blocks: &[(u32, &[u16])]) {
+///
+/// This exists (as opposed to always computing `dir_size` from the blocks,
+/// which is what every test but the disagreement tests below wants) because a
+/// directory/block-sum mismatch is exactly the bug class this file's
+/// out-of-bounds and dangling-block-chain tests exist to catch. Do not remove
+/// this parameter to "simplify" the signature back to always-matching: no
+/// test built only on top of the always-agreeing helper can ever construct
+/// the disagreement.
+fn write_relocation_blocks_with_dir_size(v: &mut [u8], blocks: &[(u32, &[u16])], dir_size: u32) {
     let sec = 0x98 + 0xe0;
     let raw = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap()) as usize;
     let mut at = raw;
     for (page, entries) in blocks {
         let size = 8 + entries.len() * 2;
-        v[at..at + 4].copy_from_slice(&page.to_le_bytes());
-        v[at + 4..at + 8].copy_from_slice(&(size as u32).to_le_bytes());
-        for (i, e) in entries.iter().enumerate() {
-            v[at + 8 + i * 2..at + 10 + i * 2].copy_from_slice(&e.to_le_bytes());
-        }
+        write_reloc_block_raw(v, at, *page, size as u32, entries);
         at += size;
     }
-    let total = (at - raw) as u32;
     let dir = 0x98 + 96 + 5 * 8;
     v[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
-    v[dir + 4..dir + 8].copy_from_slice(&total.to_le_bytes());
+    v[dir + 4..dir + 8].copy_from_slice(&dir_size.to_le_bytes());
+}
+
+/// As `write_relocation_blocks_with_dir_size`, but the directory's declared
+/// size is always the exact sum of the blocks written -- the shape every
+/// test wants except the ones deliberately probing a disagreement between
+/// the two.
+fn write_relocation_blocks(v: &mut [u8], blocks: &[(u32, &[u16])]) {
+    let total: u32 = blocks.iter().map(|(_, e)| 8 + e.len() as u32 * 2).sum();
+    write_relocation_blocks_with_dir_size(v, blocks, total);
+}
+
+/// Writes one block's header (`page`, and a `size` that need not match
+/// `8 + 2*entries.len()`) plus whatever entries are given, at file offset
+/// `at`. Returns `at + size` -- not `at + `(bytes actually written), since a
+/// block's declared size is what the parser advances by, independent of how
+/// many entry bytes this helper happened to fill in.
+///
+/// A block that lies about its own size is exactly what
+/// `write_relocation_blocks`'s always-truthful blocks cannot express, and is
+/// the shape needed to test a size that overruns its directory or that isn't
+/// `8 + 2*n`.
+fn write_reloc_block_raw(v: &mut [u8], at: usize, page: u32, size: u32, entries: &[u16]) -> usize {
+    v[at..at + 4].copy_from_slice(&page.to_le_bytes());
+    v[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+    for (i, e) in entries.iter().enumerate() {
+        v[at + 8 + i * 2..at + 10 + i * 2].copy_from_slice(&e.to_le_bytes());
+    }
+    at + size as usize
 }
 
 #[test]
@@ -389,6 +425,81 @@ fn an_unsupported_relocation_type_is_an_error() {
     assert_eq!(
         PeImage::parse(&v).unwrap_err(),
         PeError::UnsupportedRelocation { kind: 1 }
+    );
+}
+
+#[test]
+fn a_reloc_block_larger_than_its_directory_is_refused() {
+    // A block declares size 0x100 (room for 0x7c entries) while the
+    // directory declares only 10 bytes: header plus one entry. Before the
+    // fix, the loop only checked that the next block *header* fit before the
+    // directory's end, never the block's own declared `size` -- so `at`
+    // advanced by the full 0x100 regardless, and a second, phantom entry
+    // planted just past the directory's declared end (offset 0xff, at file
+    // offset `raw + 10`) was walked and silently included in
+    // `image.relocations`. This is the case the standalone probe that found
+    // this defect built.
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    let raw = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap()) as usize;
+    write_reloc_block_raw(&mut v, raw, 0x1000, 0x100, &[highlow(0x004), highlow(0x0ff)]);
+    let dir = 0x98 + 96 + 5 * 8;
+    v[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+    v[dir + 4..dir + 8].copy_from_slice(&10u32.to_le_bytes());
+
+    assert!(
+        matches!(
+            PeImage::parse(&v).unwrap_err(),
+            PeError::RelocBlockOutOfBounds { need: 0x100, .. }
+        ),
+        "a block whose declared size runs past its directory's end must be refused, \
+         not walked past the directory boundary"
+    );
+}
+
+#[test]
+fn a_reloc_block_size_that_leaves_a_dangling_byte_is_refused() {
+    // Size 9: one byte past the 8-byte header, which is not `8 + 2*n` for any
+    // integer `n`. `(size - 8) / 2` floor-divides to 0 entries, so accepting
+    // this would silently drop the dangling byte while still advancing `at`
+    // by the full declared size -- shifting every later block's parse
+    // position by an attacker-chosen offset.
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    let raw = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap()) as usize;
+    write_reloc_block_raw(&mut v, raw, 0x1000, 9, &[]);
+    let dir = 0x98 + 96 + 5 * 8;
+    v[dir..dir + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+    v[dir + 4..dir + 8].copy_from_slice(&9u32.to_le_bytes());
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::MalformedRelocBlockSize { at: raw, size: 9 }
+    );
+}
+
+#[test]
+fn a_directory_declaring_more_bytes_than_its_blocks_sum_to_is_refused() {
+    // One well-formed block (10 bytes: header + one entry), but the
+    // directory declares 12 -- two bytes more than any block actually
+    // occupies. Whether to accept this (treat the shortfall as harmless
+    // padding) or reject it (require the walk to land exactly on the
+    // directory's declared end) is a real design choice: this loader takes
+    // the second, because accepting it means the 2 leftover bytes -- and
+    // whatever follows them in the file if the shortfall happens to be at
+    // least 8 bytes -- would otherwise be reinterpreted as the start of a
+    // fresh block, parsing bytes the directory never claimed as relocations
+    // that were never declared.
+    let mut v = with_one_section();
+    write_relocation_blocks_with_dir_size(&mut v, &[(0x1000, &[highlow(0x004)])], 12);
+
+    assert!(
+        matches!(
+            PeImage::parse(&v).unwrap_err(),
+            PeError::RelocBlockOutOfBounds { need: 8, .. }
+        ),
+        "a directory whose declared size exceeds its block chain's true length \
+         must be refused rather than have the shortfall read as a new block"
     );
 }
 

@@ -73,6 +73,37 @@ pub enum PeError {
         end: u64,
         limit: u64,
     },
+
+    /// A relocation block's header, or the entries its declared `size`
+    /// claims, would run past the base-relocation directory's own declared
+    /// end.
+    ///
+    /// This is deliberately not `Truncated`: that variant's `len` is the
+    /// file's length, and a block can overrun its *directory* while sitting
+    /// well inside the file -- a directory that claims 10 bytes but whose
+    /// only block declares `size = 0x100` parses every byte it touches out of
+    /// a file that is plenty long enough. `end` is the boundary that was
+    /// actually violated, mirroring why `SectionOutOfBounds` carries its own
+    /// `limit` rather than reusing `Truncated`.
+    ///
+    /// Also returned when the block chain does not land exactly on the
+    /// directory's end: a directory that overstates the chain's true length
+    /// would otherwise have its shortfall bytes reinterpreted as a fresh
+    /// block header, parsing whatever follows in the file as relocations
+    /// that were never declared.
+    RelocBlockOutOfBounds {
+        at: usize,
+        need: usize,
+        end: usize,
+    },
+
+    /// A relocation block's declared `size` is not `8 + 2*n` for an integer
+    /// `n`: after the 8-byte header, entries are 2 bytes each, so any other
+    /// size leaves a dangling byte inside the block. Accepting it would
+    /// floor-divide `(size - 8) / 2`, silently dropping that byte while still
+    /// advancing past the whole declared `size` -- shifting every later
+    /// block's parse position by an attacker-chosen offset.
+    MalformedRelocBlockSize { at: usize, size: usize },
 }
 
 impl fmt::Display for PeError {
@@ -115,6 +146,14 @@ impl fmt::Display for PeError {
             } => write!(
                 f,
                 "section {section:?} {what} ends at {end:#x}, past {limit:#x}"
+            ),
+            Self::RelocBlockOutOfBounds { at, need, end } => write!(
+                f,
+                "reloc block at {at:#x} needs {need} bytes, but its directory ends at {end:#x}"
+            ),
+            Self::MalformedRelocBlockSize { at, size } => write!(
+                f,
+                "reloc block at {at:#x} declares size {size}, which is not 8 + an even number of bytes"
             ),
         }
     }
@@ -356,7 +395,16 @@ impl PeImage {
                         len: file.len(),
                     })?;
             let mut at = base;
-            while at.checked_add(8).is_some_and(|next| next <= end) {
+            // The walk is required to land exactly on `end`, not merely stay
+            // under it: a directory that overstates the block chain's true
+            // length would otherwise have the shortfall bytes -- whatever
+            // happens to follow in the file -- reinterpreted as a fresh block
+            // header, so `at != end` with no room left for another header is
+            // an error rather than a quiet stop.
+            while at != end {
+                at.checked_add(8)
+                    .filter(|&next| next <= end)
+                    .ok_or(PeError::RelocBlockOutOfBounds { at, need: 8, end })?;
                 let page = r.u32("reloc block page", at)?;
                 let size = r.u32("reloc block size", at + 4)? as usize;
                 // A block size under 8 (the header alone) would not advance
@@ -370,6 +418,22 @@ impl PeImage {
                         len: file.len(),
                     });
                 }
+                // Entries are 2 bytes each after the 8-byte header; a size
+                // that isn't `8 + 2*n` leaves a dangling byte that floor
+                // division would silently drop while still advancing `at` by
+                // the whole declared `size`.
+                if !(size - 8).is_multiple_of(2) {
+                    return Err(PeError::MalformedRelocBlockSize { at, size });
+                }
+                // The block's own declared `size` must fit inside the
+                // directory too, not just its 8-byte header: this is the
+                // check whose absence let a block claim to be larger than
+                // its directory and have the bytes past the directory's
+                // declared end walked as relocation entries anyway.
+                let next = at
+                    .checked_add(size)
+                    .filter(|&next| next <= end)
+                    .ok_or(PeError::RelocBlockOutOfBounds { at, need: size, end })?;
                 for i in 0..(size - 8) / 2 {
                     let entry = r.u16("reloc entry", at + 8 + i * 2)?;
                     let kind = entry >> 12;
@@ -383,12 +447,7 @@ impl PeImage {
                         rva: page + u32::from(entry & 0x0fff),
                     });
                 }
-                at = at.checked_add(size).ok_or(PeError::Truncated {
-                    what: "reloc block",
-                    at,
-                    need: size,
-                    len: file.len(),
-                })?;
+                at = next;
             }
         }
 
