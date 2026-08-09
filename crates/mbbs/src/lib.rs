@@ -152,29 +152,62 @@ impl Vector {
 }
 
 /// Why [`Host::cycle`] stopped.
+///
+/// Descriptive: this is the host's state, not an instruction. [`Ended::wait`]
+/// turns it into one, in a single place, so that the socket driver and the
+/// tests cannot come to disagree about what a given state means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
     /// No status queued and no timer outstanding: nothing can happen until the
-    /// transport delivers something. A driver should block on the socket here,
-    /// not call `cycle` again.
+    /// transport delivers something. A driver blocks here.
     Idle,
 
-    /// `max` passes were made and there is still work. `polling` is whether any
-    /// channel has a polling routine installed -- the module genuinely running,
-    /// where spinning is legitimate. `next_kick` is the soonest countdown in
-    /// the kicktable.
+    /// No status queued, but a timer is outstanding. `next_kick` is the
+    /// soonest countdown in the kicktable, in whole seconds, and is never `0`
+    /// -- `rtkick` refuses a zero delay and `prcrtk` removes an entry the
+    /// moment it reaches zero.
     ///
-    /// A driver must not spin on `Bound { polling: false, next_kick: Some(_) }`
-    /// under a system clock: `prcrtk` cannot do anything before the next whole
-    /// second, so it should sleep to it. See
-    /// `docs/plans/2026-08-08-polling-design.md`.
-    Bound {
-        polling: bool,
-        next_kick: Option<u16>,
-    },
+    /// A driver sleeps up to that long and wakes early if input arrives.
+    /// Nothing can happen before then: `prcrtk` cannot fire anything until the
+    /// next whole second, and no other source of work exists, because the
+    /// 16-bit world only advances when this host dispatches into it.
+    Waiting { next_kick: u16 },
+
+    /// `max` passes were made and there is still work queued. A driver calls
+    /// straight back.
+    Bound { next_kick: Option<u16> },
 
     /// The module stopped, on the pass it stopped on.
     Stopped(Poison),
+}
+
+/// What a driver should do about an [`Ended`].
+///
+/// One function computes this, because a bare scalar answer derived at each
+/// call site is how call sites drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// Block until the transport delivers something.
+    Blocked,
+    /// Sleep at most this many whole seconds, waking early on input.
+    Until(u16),
+    /// Call `cycle` again now.
+    Now,
+    /// The module stopped. Shut the host down.
+    Stop,
+}
+
+impl Ended {
+    /// What a driver should do about this state.
+    #[must_use]
+    pub fn wait(&self) -> Wait {
+        match self {
+            Ended::Idle => Wait::Blocked,
+            Ended::Waiting { next_kick } => Wait::Until(*next_kick),
+            Ended::Bound { .. } => Wait::Now,
+            Ended::Stopped(_) => Wait::Stop,
+        }
+    }
 }
 
 /// What one [`Host::cycle`] run did.
@@ -1844,16 +1877,11 @@ impl Host {
             }
         }
 
-        let polling = self
-            .users
-            .terms()
-            .all()
-            .any(|chan| matches!(self.users.polrou(machine, chan), Ok(Some(_))));
         let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
         Ok(Cycles {
             iterations,
             dispatched,
-            ended: Ended::Bound { polling, next_kick },
+            ended: Ended::Bound { next_kick },
         })
     }
 
@@ -3710,7 +3738,7 @@ mod tests {
     }
 
     #[test]
-    fn a_polling_channel_ticks_until_the_bound_and_says_it_is_still_polling() {
+    fn a_polling_channel_ticks_until_the_bound() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
@@ -3720,10 +3748,7 @@ mod tests {
 
         assert_eq!(cycles.iterations, 20, "the bound is what stopped it");
         assert_eq!(cycles.dispatched, 20, "one tick a pass, self-sustaining");
-        assert_eq!(
-            cycles.ended,
-            Ended::Bound { polling: true, next_kick: None }
-        );
+        assert_eq!(cycles.ended, Ended::Bound { next_kick: None });
         // The status queue must not have grown while all that happened.
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
         assert_eq!(
@@ -3763,10 +3788,22 @@ mod tests {
 
         assert_eq!(
             cycles.ended,
-            Ended::Bound { polling: false, next_kick: Some(60) },
+            Ended::Bound { next_kick: Some(60) },
             "which is exactly what _UPDATE_POLLING_ROUTINE leaves behind"
         );
         assert_eq!(cycles.dispatched, 0);
+    }
+
+    /// The whole sleep policy, in one place, so that the socket driver and any
+    /// other driver cannot answer this question differently.
+    #[test]
+    fn ended_tells_a_driver_what_to_wait_on() {
+        use crate::Wait;
+        assert_eq!(Ended::Idle.wait(), Wait::Blocked);
+        assert_eq!(Ended::Waiting { next_kick: 1 }.wait(), Wait::Until(1));
+        assert_eq!(Ended::Waiting { next_kick: 60 }.wait(), Wait::Until(60));
+        assert_eq!(Ended::Bound { next_kick: None }.wait(), Wait::Now);
+        assert_eq!(Ended::Bound { next_kick: Some(3) }.wait(), Wait::Now);
     }
 
     /// `MAJORBBS.C:476` is `while (tcklst != ticker)`, which was safe only
