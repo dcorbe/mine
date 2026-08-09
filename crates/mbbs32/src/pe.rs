@@ -63,6 +63,16 @@ pub enum PeError {
     /// assumption: an unknown type is a fixup this loader does not know how
     /// to apply, and applying it wrong would corrupt the module silently.
     UnsupportedRelocation { kind: u16 },
+
+    /// A section describes bytes outside the file, or outside the image the
+    /// headers say to allocate. Either one would make the loader read or write
+    /// out of bounds when the image is mapped, so it is refused at parse.
+    SectionOutOfBounds {
+        section: String,
+        what: &'static str,
+        end: u64,
+        limit: u64,
+    },
 }
 
 impl fmt::Display for PeError {
@@ -97,6 +107,15 @@ impl fmt::Display for PeError {
             Self::UnsupportedRelocation { kind } => {
                 write!(f, "relocation type {kind} is not one this loader applies")
             }
+            Self::SectionOutOfBounds {
+                section,
+                what,
+                end,
+                limit,
+            } => write!(
+                f,
+                "section {section:?} {what} ends at {end:#x}, past {limit:#x}"
+            ),
         }
     }
 }
@@ -289,6 +308,33 @@ impl PeImage {
                 raw_offset: r.u32("section raw offset", at + 20)?,
                 characteristics: r.u32("section characteristics", at + 36)?,
             });
+
+            // Both bounds below are u64 arithmetic over attacker-controlled
+            // u32s specifically so the check itself cannot overflow: Part B
+            // (Task 10-13) copies `raw_size` bytes from `raw_offset` in the
+            // file to `rva` in a `size_of_image`-byte mapping, in `unsafe`
+            // code, so a section describing bytes outside either one must be
+            // refused here rather than trusted into an out-of-bounds read or
+            // write.
+            let s = sections.last().expect("just pushed");
+            let raw_end = u64::from(s.raw_offset) + u64::from(s.raw_size);
+            if raw_end > file.len() as u64 {
+                return Err(PeError::SectionOutOfBounds {
+                    section: s.name.clone(),
+                    what: "raw data",
+                    end: raw_end,
+                    limit: file.len() as u64,
+                });
+            }
+            let virtual_end = u64::from(s.rva) + u64::from(s.virtual_size);
+            if virtual_end > u64::from(size_of_image) {
+                return Err(PeError::SectionOutOfBounds {
+                    section: s.name.clone(),
+                    what: "virtual range",
+                    end: virtual_end,
+                    limit: u64::from(size_of_image),
+                });
+            }
         }
 
         // Data directories start at opt+96 (after the 8 preceding header

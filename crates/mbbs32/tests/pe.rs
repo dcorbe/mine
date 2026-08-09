@@ -391,3 +391,66 @@ fn an_unsupported_relocation_type_is_an_error() {
         PeError::UnsupportedRelocation { kind: 1 }
     );
 }
+
+/// Part B (Task 10-13) `mmap`s a `size_of_image`-byte region and, per
+/// section, `unsafe`ly copies `raw_size` bytes from `raw_offset` in the file
+/// to `rva` in that mapping. Nothing between the file and that copy checks
+/// either range against the buffer it actually indexes into, so a malformed
+/// section here is an out-of-bounds read or write once Part B exists rather
+/// than a parse-time error -- exactly the "malformed file is an error, not a
+/// half-built machine" contract this module states for itself. These tests
+/// are the parse-time refusal.
+#[test]
+fn a_sections_raw_data_past_the_end_of_the_file_is_refused() {
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    let raw_offset = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap());
+    let file_len = v.len() as u32;
+    // One byte more than fits between raw_offset and the end of the file.
+    let bad_raw_size = file_len - raw_offset + 1;
+    v[sec + 16..sec + 20].copy_from_slice(&bad_raw_size.to_le_bytes());
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::SectionOutOfBounds {
+            section: "CODE".to_string(),
+            what: "raw data",
+            end: u64::from(raw_offset) + u64::from(bad_raw_size),
+            limit: u64::from(file_len),
+        }
+    );
+}
+
+#[test]
+fn a_sections_virtual_range_past_size_of_image_is_refused() {
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    // rva is 0x1000; push virtual_size one byte past where it would fit
+    // inside SIZE_OF_IMAGE (0x0005_5000).
+    let bad_virtual_size = SIZE_OF_IMAGE - 0x1000 + 1;
+    v[sec + 8..sec + 12].copy_from_slice(&bad_virtual_size.to_le_bytes());
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::SectionOutOfBounds {
+            section: "CODE".to_string(),
+            what: "virtual range",
+            end: u64::from(0x1000u32) + u64::from(bad_virtual_size),
+            limit: u64::from(SIZE_OF_IMAGE),
+        }
+    );
+}
+
+#[test]
+fn a_pure_bss_section_with_zero_raw_size_still_parses() {
+    // SizeOfRawData 0 (nothing on disk, the section is entirely BSS) is
+    // legal and must not be rejected by the raw-data bounds check: with
+    // raw_size 0, raw_offset + raw_size is just raw_offset, which is well
+    // inside the file here.
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    v[sec + 16..sec + 20].copy_from_slice(&0u32.to_le_bytes());
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(image.sections[0].raw_size, 0);
+}
