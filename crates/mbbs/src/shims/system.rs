@@ -1026,6 +1026,12 @@ mod tests {
     #[test]
     fn register_module_keeps_the_pointer_and_hands_back_a_number() {
         let mut f = Fixture::new();
+        // `Fixture::new` runs `finish_init`, which registers the FSD's own
+        // native slot (`Host::fsd_state`) before any module can -- so "the
+        // first module is module zero" is no longer true; the number wanted
+        // is read back rather than assumed, the same way a real caller would
+        // only ever know it by what `register_module` hands back.
+        let want = f.host.modules().len() as u16;
         let entries: Vec<FarPtr> = (0..9)
             .map(|n| FarPtr {
                 offset: 0x100 + n * 0x10,
@@ -1036,10 +1042,10 @@ mod tests {
 
         assert_eq!(
             f.invoke(register_module, &Fixture::far(block)).expect("ok"),
-            Ret::U16(0),
-            "the first module is module zero"
+            Ret::U16(want),
+            "a module registers into the next free slot, past the FSD's own"
         );
-        let registered = &f.host.modules()[0];
+        let registered = &f.host.modules()[want as usize];
         let Registration::Module { description, .. } = registered else {
             panic!("register_module always registers a Module, not {registered:?}");
         };
@@ -1059,11 +1065,14 @@ mod tests {
         // (`MAJORBBS.C:1327`), and the module is free to rewrite it. A snapshot
         // would go stale and the host would call the wrong address.
         let mut f = Fixture::new();
+        let want = f.host.modules().len();
         let block = module_block(&mut f, "MajorMUD", &[]);
         f.invoke(register_module, &Fixture::far(block)).expect("ok");
 
         assert_eq!(
-            f.host.modules()[0].dispatch(&f.machine, 1).expect("readable"),
+            f.host.modules()[want]
+                .dispatch(&f.machine, 1)
+                .expect("readable"),
             Dispatch::Module(None),
             "a null entry point is no entry point"
         );
@@ -1079,7 +1088,9 @@ mod tests {
         f.machine.write(at, &sttrou.to_bytes()).expect("in bounds");
 
         assert_eq!(
-            f.host.modules()[0].dispatch(&f.machine, 1).expect("readable"),
+            f.host.modules()[want]
+                .dispatch(&f.machine, 1)
+                .expect("readable"),
             Dispatch::Module(Some(sttrou)),
             "read back, not remembered"
         );

@@ -527,6 +527,11 @@ pub struct Host {
     /// `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
     pub(crate) fsdtmp: Option<(FarPtr, u16, i16)>,
 
+    /// The FSD's own `state` slot, registered in [`Host::finish_init`] the
+    /// way `inifsd()` registers FSDBBS as a module. `None` before
+    /// `finish_init` has run.
+    pub(crate) fsd_state: Option<usize>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -753,6 +758,7 @@ impl Host {
             forms: Vec::new(),
             fsdscb: None,
             fsdtmp: None,
+            fsd_state: None,
             heap,
             users,
             asked: Vec::new(),
@@ -851,6 +857,29 @@ impl Host {
 
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// The first *module* registration, skipping any [`Registration::Native`]
+    /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
+    /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
+    /// and neither wants to mistake the FSD's native slot for it.
+    fn first_module(&self) -> Option<&Registration> {
+        self.modules
+            .iter()
+            .find(|r| matches!(r, Registration::Module { .. }))
+    }
+
+    /// The FSD's own `state` slot, the way `register_module`'s caller keeps
+    /// the number it returned.
+    ///
+    /// # Panics
+    ///
+    /// If called before [`Host::finish_init`] has registered it -- nothing
+    /// in this crate can reach a channel's `state` that early, so this is a
+    /// programming error rather than a condition callers should handle.
+    pub(crate) fn fsd_state(&self) -> usize {
+        self.fsd_state
+            .expect("finish_init registers the FSD before anything can reach it")
     }
 
     /// What time it is, and one step later than the last time anyone asked.
@@ -1378,22 +1407,26 @@ impl Host {
         // `self.run` needs `self` mutably right after -- so the pointer is
         // read out here and the borrow ends before `run` is ever reached.
         //
-        // `first()` and not the channel's state, on purpose. `cyclon` calls
-        // `if ((rouptr = module[i]->lonrou) != NULL)` over an `i`: a logon is
-        // announced to every registered module, not dispatched to one. This
-        // host makes the first iteration only, which is the whole loop while one
-        // module is registered. The day a second registers, this owes the rest
-        // of the loop -- and the hazard is ordering, not counting: a module that
-        // registered *after* the FSD would stop being `first()`.
+        // The first *module* registration, and not the channel's state, on
+        // purpose. `cyclon` calls `if ((rouptr = module[i]->lonrou) != NULL)`
+        // over an `i`: a logon is announced to every registered module, not
+        // dispatched to one. This host makes the first iteration only, which
+        // is the whole loop while one real module is registered -- and now
+        // that `Host::finish_init` registers the FSD's native slot ahead of
+        // any module, `first_module` (not `modules().first()`) is what keeps
+        // that "one module" reading correct: a `Native` registration has no
+        // `lonrou` to announce (`FSDBBS.C` supplies no module-shaped logon
+        // hook) and skipping past it is not the same thing as counting it as
+        // the sole module. A **second real module** is still owed the rest
+        // of `cyclon`'s loop; that debt is unaffected by this change.
         let lonrou = {
-            let registered = self.modules().first().ok_or_else(|| {
+            let registered = self.first_module().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
             })?;
             match registered.dispatch(machine, 0) {
                 Ok(Dispatch::Module(rou)) => Ok(rou),
-                // A native registration has no `lonrou` -- `FSDBBS.C` supplies
-                // no module-shaped logon hook -- so this is the same "no call
-                // happened" as a module that left the pointer null.
+                // `first_module` never answers `Native`, but the match stays
+                // exhaustive and the fallback stays correct if that changes.
                 Ok(Dispatch::Native(_)) => Ok(None),
                 Err(e) => Err(e),
             }
@@ -1547,10 +1580,13 @@ impl Host {
         //   the channel's state, like `sttrou`.
         // - `aschup` tests `(rouptr=module[i]->huprou) != NULL` -- an `i`, a
         //   loop over *every* registered module. This host makes the first
-        //   iteration and no more, which is exactly right while one module is
-        //   registered and is owed a loop the day a second one is. It is the
-        //   first slot and not the channel's state deliberately: a hangup is
-        //   news for every module, not just the one holding the channel.
+        //   iteration and no more, which is exactly right while one real
+        //   module is registered and is owed a loop the day a second one is.
+        //   It is the first *module* and not the channel's state
+        //   deliberately: a hangup is news for every module, not just the
+        //   one holding the channel -- `first_module`, not `modules().first()`,
+        //   because the FSD's native slot registers ahead of any module now
+        //   and has no `huprou` to be news to.
         //
         // Neither vector has a native-handler shape: `FSDBBS.C` supplies no
         // `lofrou` or `huprou`, so a `Dispatch::Native` answer here is the
@@ -1564,7 +1600,7 @@ impl Host {
                 Err(e) => Err(e),
             },
             Vector::Hangup => {
-                let registered = self.modules().first().ok_or_else(|| {
+                let registered = self.first_module().ok_or_else(|| {
                     io::Error::other(
                         "no module has registered, so there is nothing to disconnect from",
                     )
@@ -2139,6 +2175,11 @@ impl Host {
             self.rstchn(machine, chan)
                 .map_err(|e| io::Error::other(format!("rstchn({chan}): {e}")))?;
         }
+        // `inifsd()` registers FSDBBS as an ordinary module during startup;
+        // this is that registration. It must happen before `inited` is set,
+        // so nothing can reach a channel's `state` before the FSD's slot
+        // exists to be named.
+        self.fsd_state = Some(self.register_native(Native::Fsd));
         self.inited = true;
         Ok(())
     }
@@ -2636,7 +2677,10 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Terms, gsbl, testing, users};
+    use crate::{
+        Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Registration, Terms, gsbl, testing,
+        users,
+    };
     use mbbs16::{FarPtr, Machine, Ret};
 
     #[test]
@@ -2865,6 +2909,26 @@ mod tests {
     }
 
     #[test]
+    fn finish_init_registers_the_fsd_as_a_native_module() {
+        // `inifsd()` registers FSDBBS as an ordinary module during startup,
+        // the same startup sequence `finish_init` already runs `alcvda` and
+        // the `rstchn` loop for. The FSD's own `state` slot must exist by
+        // the time anything could reach it -- `Host::fsd_state()` is how the
+        // rest of the FSD subsystem finds that slot's number.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host = Host::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
+
+        host.finish_init(&mut machine).expect("finished starting up");
+
+        let n = host.fsd_state();
+        assert_eq!(
+            host.modules()[n],
+            Registration::Native(Native::Fsd),
+            "finish_init did not register the FSD's native slot"
+        );
+    }
+
+    #[test]
     fn a_reset_clears_the_channel_it_names_and_leaves_its_neighbours_alone() {
         // The two tests above share a shape, and three real defects fit through
         // it. Every assertion either of them makes is about the *target*
@@ -3025,27 +3089,35 @@ mod tests {
 
     /// A status is queued, but `poll` still needs somewhere to deliver it --
     /// and here, as in [`connect_with_no_module_registered_is_an_error_not_a_panic`],
-    /// there is a `Module` but nothing has registered.
+    /// there is a `Module` but nothing has registered for this channel's
+    /// state.
     #[test]
     fn poll_with_a_status_queued_but_no_module_registered_is_an_error_not_a_panic() {
         let mut f = Fixture::new();
         let console = f.console();
         let module = f.minimal_module();
+        // `Fixture::new` -> `finish_init` has already registered the FSD's
+        // own native slot at state 0 -- a real registration, just one with
+        // no `sttrou` shape -- so "nothing registered" can no longer be had
+        // by leaving state at its default. A state nothing names at all is
+        // what this test is actually after; see
+        // `poll_refuses_a_state_that_names_no_registered_module`.
+        set_state(&mut f, console, 99);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
             .host
             .poll(&mut f.machine, &module)
-            .expect_err("no module has registered");
+            .expect_err("state 99 names nothing");
         // R19: same reasoning as the `connect` test above -- `is_err()`
         // cannot distinguish this from a `ShimError` out of `point_curusr`,
         // `get_input` or the entry lookup, each a different failure.
         //
         // The wording is `state_entry`'s rather than a bare "no module has
-        // registered": a channel at state 0 with nothing registered and a
-        // channel at state 3 with one module registered are now different
-        // sentences, and conflating them is what this assertion exists to stop.
+        // registered": a channel at a state nothing names and a channel at
+        // state 3 with one module registered are now different sentences,
+        // and conflating them is what this assertion exists to stop.
         assert!(
-            err.to_string().contains("state 0") && err.to_string().contains("0 module(s)"),
+            err.to_string().contains("state 99") && err.to_string().contains("1 module(s)"),
             "expected the missing-registration message, got: {err}"
         );
     }
@@ -3059,9 +3131,10 @@ mod tests {
         let console = f.console();
         let module = f.minimal_module();
         f.host.gsbl_mut().push_input(console, b"look\r");
-        // No module registered, so this errors after `point_curusr` and the
-        // `status` write have already run -- which is exactly what is being
-        // checked.
+        // Whatever `poll` does with the dispatch itself -- error, or reach
+        // the FSD's native slot at the channel's default state -- happens
+        // after `point_curusr` and the `status` write, which is exactly what
+        // is being checked; the outcome of the dispatch is not.
         let _ = f.host.poll(&mut f.machine, &module);
         assert_eq!(
             f.host
@@ -3083,6 +3156,11 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let module = f.minimal_module();
+        // A state nothing names, so the CRSTG dispatch this test wants to
+        // reach still errors -- state 0 is the FSD's own slot now that
+        // `finish_init` registers it, and dispatching there would succeed
+        // with `Ok(None)` instead. See `poll_refuses_a_state_that_names_no_registered_module`.
+        set_state(&mut f, console, 99);
         f.host
             .gsbl_mut()
             .channel_mut(console)
@@ -3090,9 +3168,9 @@ mod tests {
             .push_back(crate::gsbl::Gsbl::OVRFLW);
         f.host.gsbl_mut().push_input(console, b"look\r");
 
-        // No module is registered, so `poll` errors -- but only once it
-        // reaches the CRSTG dispatch, which it does only if the `OVRFLW`
-        // ahead of it did not make `poll` stop and answer `Ok(None)`.
+        // No module is registered for this state, so `poll` errors -- but
+        // only once it reaches the CRSTG dispatch, which it does only if the
+        // `OVRFLW` ahead of it did not make `poll` stop and answer `Ok(None)`.
         let err = f
             .host
             .poll(&mut f.machine, &module)
@@ -3155,13 +3233,17 @@ mod tests {
     }
 
     /// Register a `struct module` whose entry points are these `(index,
-    /// vector)` pairs, and null everywhere else.
+    /// vector)` pairs, and null everywhere else. Returns the module number,
+    /// the same way [`register_named`] does -- since `Host::finish_init`
+    /// registers the FSD's own native slot first, this is no longer always
+    /// zero, and a caller that needs to put a channel in *this* module's
+    /// state has to use the number actually handed back.
     ///
     /// `index` is the position in `struct module` after `descrp` --
-    /// [`Registration::entry`]'s own numbering, which `MAJORBBS.H:241-252`
+    /// [`Registration::dispatch`]'s own numbering, which `MAJORBBS.H:241-252`
     /// fixes: 0 `lonrou`, 1 `sttrou`, 2 `stsrou`, 3 `injrou`, 4 `lofrou`,
     /// 5 `huprou`.
-    fn register_module_with(f: &mut Fixture, entries: &[(usize, FarPtr)]) {
+    fn register_module_with(f: &mut Fixture, entries: &[(usize, FarPtr)]) -> u16 {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         for (n, at) in entries {
@@ -3169,8 +3251,13 @@ mod tests {
             bytes[field..field + 4].copy_from_slice(&at.to_bytes());
         }
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+        let ret = f
+            .invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
+        match ret {
+            Ret::U16(n) => n,
+            other => panic!("register_module returns the module number, not {other:?}"),
+        }
     }
 
     /// 16-bit code that stores `mark` at `at` and returns, leaving `AX` alone.
@@ -3254,8 +3341,13 @@ mod tests {
         let second = f.machine.code_ptr(first_stub.len() as u16);
         let second_stub = marker_stub(marker, 0xb1);
 
-        assert_eq!(register_named(&mut f, "first", &[(1, first)]), 0);
-        assert_eq!(register_named(&mut f, "second", &[(1, second)]), 1);
+        // `Fixture::new` -> `finish_init` has already taken slot 0 for the
+        // FSD's own native registration, so "first" and "second" land one
+        // past where they would have before -- read back rather than
+        // assumed, same reasoning as `register_module_with`.
+        let first_state = register_named(&mut f, "first", &[(1, first)]);
+        let second_state = register_named(&mut f, "second", &[(1, second)]);
+        assert_eq!(second_state, first_state + 1, "registered back to back");
 
         // After the registrations: `Fixture::invoke` builds its trampoline in
         // this same scratch segment at offset zero.
@@ -3263,7 +3355,7 @@ mod tests {
         code.extend_from_slice(&second_stub);
         f.machine.load_code(&code).expect("both stubs fit");
 
-        set_state(&mut f, console, 1);
+        set_state(&mut f, console, second_state);
         f.host.gsbl_mut().push_input(console, b"look\r");
         f.host
             .poll(&mut f.machine, &module)
@@ -3300,14 +3392,22 @@ mod tests {
         let sttrou = f.machine.code_ptr(0);
         let stub = returns_stub(1);
         f.machine.load_code(&stub).expect("the stub fits");
-        assert_eq!(register_named(&mut f, "MajorMUD", &[(1, sttrou)]), 0);
-
-        let native = f.host.register_native(Native::Fsd);
+        // `Fixture::new` -> `finish_init` has already registered the FSD's
+        // own native slot (`Host::fsd_state`), so that is the native
+        // registration this test drives against -- a second one is not
+        // needed, and registering one would only add a slot nothing else
+        // points at.
+        let native = f.host.fsd_state() as u16;
+        let module_state = register_named(&mut f, "MajorMUD", &[(1, sttrou)]);
+        assert_ne!(
+            module_state, native,
+            "the module must not land in the FSD's own slot"
+        );
 
         // `state_entry` itself, both ways: the native slot answers `Native`,
         // and the module's own slot still answers `Module` with its far
         // pointer -- unaffected by a second, native registration existing.
-        set_state(&mut f, console, native as u16);
+        set_state(&mut f, console, native);
         assert_eq!(
             f.host
                 .state_entry(&f.machine, console, 1)
@@ -3315,7 +3415,7 @@ mod tests {
                 .expect("no ShimError"),
             Dispatch::Native(Native::Fsd),
         );
-        set_state(&mut f, console, 0);
+        set_state(&mut f, console, module_state);
         assert_eq!(
             f.host
                 .state_entry(&f.machine, console, 1)
@@ -3327,7 +3427,7 @@ mod tests {
         // Now drive it through `poll`, with the channel in the native state:
         // no far call happens -- `poll` returns cleanly rather than faulting
         // on a bogus call -- and the native arm was genuinely reached.
-        set_state(&mut f, console, native as u16);
+        set_state(&mut f, console, native);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
         assert_eq!(
@@ -3358,6 +3458,9 @@ mod tests {
         register_named(&mut f, "only", &[(1, sttrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // `Fixture::new` -> `finish_init` has already taken slot 0 for the
+        // FSD, so two slots are occupied (the FSD, then "only") and the
+        // count the error names has grown to match.
         set_state(&mut f, console, 3);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
@@ -3366,7 +3469,7 @@ mod tests {
             .expect_err("state 3 names nothing");
         let text = err.to_string();
         assert!(
-            text.contains("state 3") && text.contains("1 module(s)"),
+            text.contains("state 3") && text.contains("2 module(s)"),
             "the error names the state and the count, got: {text}"
         );
     }
@@ -3390,9 +3493,13 @@ mod tests {
         let marker = f.bytes(&[0x00], false);
         let stsrou = f.machine.code_ptr(0);
         let stub = marker_stub(marker, 0x2f);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // The channel's `state` defaults to zero, which is the FSD's own
+        // slot now that `finish_init` registers it first -- put the channel
+        // in the module's actual slot the way a real logon would have.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
         f.host
             .poll(&mut f.machine, &module)
@@ -3441,9 +3548,12 @@ mod tests {
         let marker = f.bytes(&[0x00], false);
         let stsrou = f.machine.code_ptr(0);
         let stub = marker_stub(marker, 0x1b);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // See `poll_dispatches_cycle_to_stsrou`'s identical comment: state
+        // zero is the FSD's own slot now, not "only"'s.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().channel_mut(console).raw = true;
         f.host.gsbl_mut().push_input(console, b"\x1b[A");
 
@@ -3523,9 +3633,12 @@ mod tests {
         // A bare `retf`: a stsrou that does its work and does not ask to be
         // called again.
         let stsrou = f.machine.code_ptr(0);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&[0xcb]).expect("the stub fits");
 
+        // State zero is the FSD's own slot now; see
+        // `poll_dispatches_cycle_to_stsrou`'s identical comment.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
         let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
 
@@ -3597,7 +3710,7 @@ mod tests {
             vectors.push((n, f.machine.code_ptr(code.len() as u16)));
             code.extend_from_slice(&stub);
         }
-        register_module_with(&mut f, &vectors);
+        let state = register_module_with(&mut f, &vectors);
         f.machine.load_code(&code).expect("the stubs fit");
 
         f.host
@@ -3607,6 +3720,14 @@ mod tests {
                 &Connection::ansi("rangerdan").with_keys(["PLAYKEY"]),
             )
             .expect("a user on the channel");
+        // A real logon would have put the channel in the module's own state;
+        // `connect_state` (deliberately, see its own doc comment) does not
+        // touch `state` at all, and it defaults to zero -- which, since
+        // `Host::finish_init` registers the FSD's native slot first, no
+        // longer names this module. `logoff`'s `lofrou` lookup is keyed on
+        // state (`state_entry`), so a test that wants it reached has to put
+        // the channel there itself, the same way the module would.
+        set_state(&mut f, console, state);
         (f, module, console)
     }
 
@@ -3767,20 +3888,30 @@ mod tests {
         );
     }
 
-    /// The one documented `Err` on either path. A host with nothing registered
-    /// has no `struct module` to read a vector out of, and answering `Ok(None)`
-    /// -- which is what "the module supplied no vector" means -- would say a
-    /// module had been asked and had nothing to offer.
+    /// The one documented `Err` on either path. A host with no *module*
+    /// registered has no `struct module` to read a vector out of, and
+    /// answering `Ok(None)` -- which is what "the module supplied no vector"
+    /// means -- would say a module had been asked and had nothing to offer.
     #[test]
     fn disconnecting_with_no_module_registered_is_an_error_not_a_silent_none() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let console = f.console();
 
+        // `hangup`'s `huprou` lookup is `first_module` -- the FSD's own
+        // native slot, which `finish_init` has already registered, does not
+        // count as a module -- so this stays an error with no setup needed.
         assert!(
             f.host.hangup(&mut f.machine, &module, console).is_err(),
             "hangup with no module registered"
         );
+
+        // `logoff`'s `lofrou` lookup is keyed on the channel's state
+        // instead, and state zero now names the FSD's own slot -- a real
+        // registration, just one with no `lofrou` shape, so it answers
+        // `Ok(None)` rather than erroring. A state nothing names at all is
+        // what "no module registered" means here now.
+        set_state(&mut f, console, 99);
         assert!(
             f.host.logoff(&mut f.machine, &module, console).is_err(),
             "logoff with no module registered"
@@ -3800,11 +3931,14 @@ mod tests {
         let huprou = f.machine.code_ptr(code.len() as u16);
         code.extend_from_slice(&marker_stub(mark, 5));
 
-        register_module_with(&mut f, &[(4, lofrou), (5, huprou)]);
+        let state = register_module_with(&mut f, &[(4, lofrou), (5, huprou)]);
         f.machine.load_code(&code).expect("both stubs fit");
         f.host
             .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("a user on the channel");
+        // `logoff`'s `lofrou` lookup is state-keyed; see `connected_with`'s
+        // identical comment for why this can no longer be left at zero.
+        set_state(&mut f, console, state);
 
         if hangup {
             f.host.hangup(&mut f.machine, &module, console)
