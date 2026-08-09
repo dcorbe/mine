@@ -244,6 +244,26 @@ mod tests {
     }
 
     #[test]
+    fn read_cstr_with_exactly_one_byte_left_and_no_terminator_is_unterminated() {
+        // Pins the boundary at `n > 0`, not `n > 1`: a mutation that changed
+        // the filter's threshold by one would still pass both of this file's
+        // other read_cstr tests (one starts with a wide-open tail, the other
+        // sits at zero-bytes-left, neither is *exactly* one byte inside the
+        // boundary) but must fail this one -- one non-zero byte available is
+        // enough to scan, and scanning it and finding no terminator is
+        // Unterminated, not OutOfBounds.
+        let file = minimal_with_one_section();
+        let mut image = load(&file);
+
+        let rva = SIZE_OF_IMAGE - 1;
+        image.write_at(rva, &[0xAA]).unwrap();
+
+        let ptr = Flat32Ptr(image.base() + rva);
+        let err = ptr.read_cstr(&image).unwrap_err();
+        assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
+    }
+
+    #[test]
     fn write_then_resolve_sees_the_write() {
         let file = minimal_with_one_section();
         let mut image = load(&file);
@@ -251,5 +271,21 @@ mod tests {
         let ptr = Flat32Ptr(image.base() + 0x1030);
         ptr.write(&mut image, &[1, 2, 3, 4]).unwrap();
         assert_eq!(ptr.resolve(&image, 4).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_past_the_image_is_refused() {
+        // write()'s delegation to Image::write_at is otherwise untested on
+        // its error path -- Image::write_at's own out-of-bounds case is
+        // covered directly (image.rs), which proves the primitive but not
+        // that Flat32Ptr::write forwards its failure rather than discarding
+        // it. A mutation that kept the write_at call but always returned
+        // Ok(()) passed the whole suite until this test existed.
+        let file = minimal_with_one_section();
+        let mut image = load(&file);
+
+        let ptr = Flat32Ptr(image.base() + SIZE_OF_IMAGE);
+        let err = ptr.write(&mut image, &[0]).unwrap_err();
+        assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
 }
