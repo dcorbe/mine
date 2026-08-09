@@ -155,6 +155,14 @@ pub(crate) struct Ctx {
     /// module's own return value, depending on how it got there.
     pub out_eax: u32,
     pub out_edx: u32,
+    /// `ECX` as the trampoline found it: the thunk-kind discriminant
+    /// (`crate::KIND_CALL`/`crate::KIND_RETURN`) a thunk placed there before
+    /// jumping. `ECX` is ordinary caller-saved scratch under 32-bit cdecl --
+    /// nothing a module returns through it -- so a thunk is free to load it,
+    /// and [`crate::Machine::run`] reads this field to tell "the module
+    /// called an import" from "the module returned" without disturbing
+    /// `EAX`/`EDX`, which for a return carry the module's actual result.
+    pub out_ecx: u32,
     /// The callee-saved quad as the module left it, to be handed back
     /// unchanged on the next entry.
     pub out_ebx: u32,
@@ -294,6 +302,7 @@ global_asm!(
 mbbs32_tramp_start:
     movl    %eax, {out_eax}(%r14)       /* a thunk index, or a return value */
     movl    %edx, {out_edx}(%r14)
+    movl    %ecx, {out_ecx}(%r14)       /* the thunk-kind discriminant a thunk set */
     movl    %ebx, {out_ebx}(%r14)       /* the callee-saved quad, to be handed */
     movl    %esi, {out_esi}(%r14)       /* back unchanged when the module is   */
     movl    %edi, {out_edi}(%r14)       /* resumed                             */
@@ -308,6 +317,7 @@ mbbs32_tramp_end:
 "#,
     out_eax = const offset_of!(Ctx, out_eax),
     out_edx = const offset_of!(Ctx, out_edx),
+    out_ecx = const offset_of!(Ctx, out_ecx),
     out_ebx = const offset_of!(Ctx, out_ebx),
     out_esi = const offset_of!(Ctx, out_esi),
     out_edi = const offset_of!(Ctx, out_edi),

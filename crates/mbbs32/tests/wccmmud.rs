@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mbbs32::{PeImage, Symbol};
+use mbbs32::{Exit, Image, Import32, Machine, PeImage, Symbol};
 
 fn module_path() -> Option<PathBuf> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -235,4 +235,74 @@ for library in sorted(per_library):
         from_rust, from_pefmt,
         "PeImage and re/pefmt.py must agree on the per-library import counts"
     );
+}
+
+/// **The falsifying test this whole increment exists for.** A loader with no
+/// execution proves nothing: "every relocation landed inside a section" and
+/// "every import resolved" are satisfied just as well by a plausibly-wrong
+/// image as by a correct one. Only running the module and watching it reach
+/// a real host symbol -- rather than a fault, or a return with no calls made
+/// at all -- tells the two apart.
+///
+/// Every import is bound to a thunk (`Import32::Routine`, never `Data`), so
+/// whichever symbol `DllMain` reaches first comes back as [`Exit::Call`]
+/// naming it, rather than silently succeeding through an address this crate
+/// invented. If it instead comes back [`Exit::Fault`], that is still a
+/// result: this test reports the linear `eip`, resolves it to a section and
+/// an offset, and fails loudly rather than papering over it.
+#[test]
+fn entering_dllmain_reaches_an_import_rather_than_a_fault() {
+    let Some((file, pe)) = image() else { return };
+
+    let mut mapped = Image::load(&file, &pe).expect("the module maps");
+    mapped.relocate(&pe).expect("the module relocates");
+
+    let resolver =
+        |_library: &str, _symbol: &Symbol| -> Option<Import32> { Some(Import32::Routine) };
+    let thunks = mapped.bind_imports(&pe, &resolver);
+
+    let mut machine = Machine::new().expect("a Machine");
+    mapped.patch_thunk_addresses(&pe, &thunks, |index| {
+        machine.thunk_addr(u16::try_from(index).expect("well under MAX_THUNKS"))
+    });
+
+    let entry = mapped.base() + pe.entry_point;
+    let hinst_dll = mapped.base();
+    // DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved).
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    let exit = machine
+        .call(entry, &[hinst_dll, DLL_PROCESS_ATTACH, 0])
+        .expect("a fault is recovered as Exit::Fault, never fatal to this test process");
+
+    match exit {
+        Exit::Call { index } => {
+            let site = &thunks[usize::from(index)];
+            eprintln!(
+                "DllMain's first host call: {}:{:?} (thunk {index} of {})",
+                site.library,
+                site.symbol,
+                thunks.len()
+            );
+        }
+        Exit::Fault { signo, eip } => {
+            let rva = eip.checked_sub(mapped.base());
+            let section = rva.and_then(|rva| {
+                pe.sections
+                    .iter()
+                    .find(|s| rva >= s.rva && rva < s.rva + s.virtual_size)
+                    .map(|s| (s.name.clone(), rva - s.rva))
+            });
+            panic!(
+                "DllMain faulted instead of reaching an import: signal {signo} at linear \
+                 eip {eip:#010x} (image base {:#010x}, rva {rva:?}, section {section:?})",
+                mapped.base(),
+            );
+        }
+        Exit::Returned { eax, edx } => {
+            panic!(
+                "DllMain returned ({eax:#x}, {edx:#x}) without calling any host import -- \
+                 unexpected for a module whose entry point does real startup work"
+            );
+        }
+    }
 }

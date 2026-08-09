@@ -243,6 +243,47 @@ impl Image {
 
         thunks
     }
+
+    /// After [`Image::bind_imports`], overwrite every IAT slot it gave a
+    /// thunk index with a real address instead: `thunk_addr(index)`.
+    ///
+    /// `thunks` must be exactly what the matching `bind_imports` call
+    /// returned. This does **not** call a resolver again -- a resolver may
+    /// have side effects (the doc comment on [`Image::bind_imports`] already
+    /// leans on that: an unresolved symbol gets a thunk rather than being
+    /// skipped precisely so a *future*, side-effecting resolver has a
+    /// diagnosable place to answer from), so asking it a second time for a
+    /// symbol it already answered would be wrong, not merely redundant.
+    /// Instead this rebuilds the `(library, symbol) -> index` map directly
+    /// from `thunks`'s own order -- which [`Image::bind_imports`]'s own doc
+    /// comment guarantees is "in that same index order" -- and walks
+    /// `image.imports` once more to find every site naming one of those
+    /// symbols. An import whose `(library, symbol)` is not a key in that map
+    /// was resolved to [`Import32::Data`] and is left exactly as
+    /// `bind_imports` already wrote it.
+    pub fn patch_thunk_addresses(
+        &mut self,
+        image: &PeImage,
+        thunks: &[ThunkSite],
+        thunk_addr: impl Fn(u32) -> u32,
+    ) {
+        let index_of: HashMap<(&str, &Symbol), u32> = thunks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ((t.library.as_str(), &t.symbol), i as u32))
+            .collect();
+
+        let dst = self.mapping.as_mut_slice();
+        for import in &image.imports {
+            let key = (import.library.as_str(), &import.symbol);
+            if let Some(&index) = index_of.get(&key) {
+                let rva = import.iat_rva as usize;
+                // In-bounds by construction: see the identical comment on
+                // `bind_imports`'s own write to this same slot above.
+                dst[rva..rva + 4].copy_from_slice(&thunk_addr(index).to_le_bytes());
+            }
+        }
+    }
 }
 
 /// How a host answers "what is `WGSERVER.EXE:_prfmsg`?".

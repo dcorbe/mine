@@ -200,6 +200,12 @@ const EMPTY_SEH_CHAIN: u32 = 0xffff_ffff;
 /// separate because nothing requires them to be adjacent, and a `DllMain`
 /// that walks past the end of one must not find the bytes of the other.
 pub(crate) struct Tib {
+    // Never read back through Rust: this mapping's bytes are read by the CPU
+    // through `FS:`-relative addressing during a crossing, which is invisible
+    // to the compiler's dead-code analysis. Held for ownership -- so the
+    // mapping stays live for as long as this `Tib` does, and so `Drop`
+    // unmaps it -- not for its contents.
+    #[allow(dead_code)]
     tib: Mapping,
     stack: Mapping,
     entry: u32,
