@@ -797,6 +797,68 @@ pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8
     if matches == 1 { found } else { None }
 }
 
+/// Is this answer consistent with the field's type? `chktyp()`, `FSD.C:861`.
+///
+/// One of the four checks a candidate answer has to pass, and the only one that
+/// looks at `fldtyp` at all -- `chkmin`, `chkmax` and `chkalt` are separate
+/// passes over the same buffer. So a `false` here is not "the answer is
+/// invalid", it is "the answer is not of this field's *shape*".
+///
+/// # A multiple-choice field says no to everything
+///
+/// `FFFMCH` makes the `?`/`Y` arm answer `false` whatever the answer is,
+/// including an empty one. That is deliberate and it is the normal case: the
+/// answer to a multiple-choice field is supposed to arrive from its `ALT=`
+/// list, which is [`ordinal`]'s job, and `chkalt` is what installs it. Every
+/// `Y/N` field is multiple-choice by construction -- `tmpfld` sets `FFFMCH` on
+/// the field the `/` makes -- so `type_ok` is `false` for every typed answer to
+/// every `Y/N` field on this host, `YES` included.
+///
+/// # The arms disagree about what they ignore
+///
+/// `FFFNSP` is read only by the `?`/`Y` arm, so a space in a `#` or `$` field
+/// is refused by the digit test rather than by `FFFNSP`, and setting `NOSPACES`
+/// on a numeric field changes nothing. `FFFMCH` is likewise read only there, so
+/// a multiple-choice `$` field accepts a typed number. Neither is an asymmetry
+/// worth tidying: the C reads each flag in exactly one arm.
+///
+/// # The answer is a C string
+///
+/// `bufptr` is one, and `strchr` and `alldgs` both stop at its terminator, so
+/// an embedded NUL ends the answer as far as this check is concerned rather
+/// than being a byte in it. Measured, not assumed: the genuine host's `chktyp`
+/// accepts `"12\0ab"` in a `#` field and accepts `"ab\0 c"` in a `NOSPACES`
+/// one.
+///
+/// # A field the template had no room for passes
+///
+/// The C's `switch` has no `default` and `rc` is initialised to 1, so a
+/// `fldtyp` that is none of `Y ? # $` is consistent with everything. That arm
+/// is reachable: `chkops` zeroes every field's `fldtyp` and only `embscn` fills
+/// it in, and `embscn` stops at `numtpl` -- so a field the specification names
+/// and the template has no run for keeps `fldtyp == 0` and answers `true` here.
+pub fn type_ok(field: &Field, answer: &[u8]) -> bool {
+    let answer = match answer.iter().position(|&c| c == 0) {
+        Some(nul) => &answer[..nul],
+        None => answer,
+    };
+    match field.kind {
+        b'Y' | b'?' => {
+            field.flags & flags::MULTICHOICE == 0
+                && (field.flags & flags::NOSPACES == 0 || !answer.contains(&b' '))
+        }
+        b'#' => crate::strings::all_digits(answer),
+        b'$' => {
+            // `cp=bufptr; if (*cp == '-') cp++;` -- one sign, and only at the
+            // front. `strlen(cp) > 0` is then what stops a lone `-`, and it is
+            // the whole of the difference between `$` and `#`.
+            let digits = answer.strip_prefix(b"-").unwrap_or(answer);
+            !digits.is_empty() && crate::strings::all_digits(digits)
+        }
+        _ => true,
+    }
+}
+
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
 ///
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
@@ -1625,5 +1687,126 @@ mod tests {
             + 1;
         assert_eq!(form.size(), Ok(expected as u16));
         assert_eq!(form.size(), Ok(59));
+    }
+
+    /// `chktyp()`, `FSD.C:861`. A multiple-choice field rejects *any* typed
+    /// answer -- the answer has to have come from the `ALT=` list, and getting
+    /// there is `chkalt`'s job, not this one's.
+    #[test]
+    fn a_multiple_choice_field_rejects_a_typed_answer_outright() {
+        let form = compile(b"??????", b"COLOUR(MULTICHOICE ALT=RED ALT=BLUE)", MANY);
+        assert_eq!(form.fields[0].flags & flags::MULTICHOICE, flags::MULTICHOICE);
+        assert!(!type_ok(&form.fields[0], b"RED"), "not even a listed one");
+        assert!(!type_ok(&form.fields[0], b""), "not even an empty one");
+    }
+
+    /// Every `Y/N` field is one, which is what makes the arm's `false` normal
+    /// rather than exceptional.
+    #[test]
+    fn a_yes_no_field_rejects_a_typed_answer_because_it_is_multiple_choice() {
+        let form = compile(b"Ok Y/N", b"OK", MANY);
+        assert_eq!(form.fields[0].kind, b'Y');
+        assert!(!type_ok(&form.fields[0], b"YES"));
+
+        // The rest of the arm, reached by clearing the flag `tmpfld` set. `Y`
+        // is grouped with `?` in the C, and this is the whole of that grouping:
+        // no sign is stripped and no digit is looked for.
+        let mut typed = form.fields[0];
+        typed.flags = 0;
+        assert!(type_ok(&typed, b"YES"));
+        assert!(type_ok(&typed, b"-"));
+        typed.flags = flags::NOSPACES;
+        assert!(!type_ok(&typed, b"Y N"));
+    }
+
+    /// `FFFNSP` is the only other thing a `?` field checks.
+    #[test]
+    fn a_no_spaces_field_rejects_a_space_and_nothing_else_does() {
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        assert_eq!(spaced.fields[0].flags, flags::NOSPACES);
+        assert!(!type_ok(&spaced.fields[0], b"van Gogh"));
+        assert!(type_ok(&spaced.fields[0], b"vanGogh"));
+        // `strchr(bufptr,' ')` is the literal blank, not `isspace`.
+        assert!(type_ok(&spaced.fields[0], b"van\tGogh"));
+
+        let plain = compile(b"??????", b"NAME", MANY);
+        assert_eq!(plain.fields[0].flags, 0);
+        assert!(type_ok(&plain.fields[0], b"van Gogh"));
+    }
+
+    /// A `#` field is digits only, and an empty answer passes -- `alldgs("")`
+    /// is true, measured from the genuine host.
+    #[test]
+    fn a_hash_field_takes_digits_and_an_empty_answer() {
+        let form = compile(b"####", b"AGE", MANY);
+        assert!(type_ok(&form.fields[0], b"42"));
+        assert!(type_ok(&form.fields[0], b""));
+        assert!(!type_ok(&form.fields[0], b"-1"), "no sign on a # field");
+        assert!(!type_ok(&form.fields[0], b"4a"));
+        assert!(!type_ok(&form.fields[0], b"4 2"));
+        // Borland's `isdigit` indexes `_ctype` with a signed char, so the high
+        // half is the half worth asserting.
+        assert!(!type_ok(&form.fields[0], b"\xb2"), "superscript two is not 2");
+        assert!(!type_ok(&form.fields[0], b"4\xff"));
+    }
+
+    /// A `$` field takes one leading minus and then insists on at least one
+    /// digit -- `FSD.C:878-881`. This is the whole difference from `#`.
+    #[test]
+    fn a_dollar_field_takes_a_leading_minus_but_not_an_empty_answer() {
+        let form = compile(b"$$$$", b"BALANCE", MANY);
+        assert!(type_ok(&form.fields[0], b"-1"));
+        assert!(type_ok(&form.fields[0], b"1"));
+        assert!(!type_ok(&form.fields[0], b""), "unlike a # field");
+        assert!(!type_ok(&form.fields[0], b"-"), "a sign alone is not a number");
+        assert!(!type_ok(&form.fields[0], b"--1"), "one minus, not two");
+        assert!(!type_ok(&form.fields[0], b"1-"), "and only at the front");
+        assert!(!type_ok(&form.fields[0], b"-\xb2"));
+    }
+
+    /// Neither numeric arm reads a flag, so setting one changes nothing. The
+    /// C reads `FFFMCH` and `FFFNSP` in the `?`/`Y` arm and nowhere else.
+    #[test]
+    fn the_numeric_field_types_ignore_the_flags_the_text_ones_read() {
+        let hashes = compile(b"####", b"AGE(MULTICHOICE NOSPACES)", MANY);
+        assert_eq!(
+            hashes.fields[0].flags,
+            flags::MULTICHOICE | flags::NOSPACES,
+            "the options did compile"
+        );
+        assert!(type_ok(&hashes.fields[0], b"42"));
+
+        let dollars = compile(b"$$$$", b"AMT(MULTICHOICE NOSPACES)", MANY);
+        assert!(type_ok(&dollars.fields[0], b"-12"));
+    }
+
+    /// The `switch` has no `default` and `rc` starts at 1, and the arm is
+    /// reachable: a field the specification names and the template has no run
+    /// for never gets a `fldtyp`.
+    #[test]
+    fn a_field_the_template_had_no_room_for_is_consistent_with_anything() {
+        let form = compile(b"", b"A", MANY);
+        assert_eq!(form.in_template, 0);
+        assert_eq!(form.fields[0].kind, 0, "embscn never reached it");
+        assert!(type_ok(&form.fields[0], b"anything at all"));
+        assert!(type_ok(&form.fields[0], b""));
+        assert!(type_ok(&form.fields[0], b"-"));
+    }
+
+    /// `bufptr` is a C string, and `strchr` and `alldgs` both stop at its
+    /// terminator. Measured against the genuine host in `tests/fsd_statics.rs`,
+    /// which is the only reason this is the behaviour rather than the other
+    /// plausible one.
+    #[test]
+    fn an_embedded_nul_ends_the_answer() {
+        let hashes = compile(b"####", b"AGE", MANY);
+        assert!(type_ok(&hashes.fields[0], b"12\x00ab"));
+
+        let dollars = compile(b"$$$$", b"AMT", MANY);
+        assert!(type_ok(&dollars.fields[0], b"-1\x00a"));
+        assert!(!type_ok(&dollars.fields[0], b"\x009"), "an empty answer");
+
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        assert!(type_ok(&spaced.fields[0], b"ab\x00 c"));
     }
 }
