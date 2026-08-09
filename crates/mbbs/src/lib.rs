@@ -3822,6 +3822,34 @@ mod tests {
         assert_eq!(cycles.dispatched, 0);
     }
 
+    /// `next_kick` is the SOONEST countdown, which is the whole of what makes
+    /// it safe to sleep on: a driver told the furthest one would sleep through
+    /// every timer before it.
+    ///
+    /// Every other test of `next_kick` in this crate has exactly one kick in
+    /// the table, where the soonest and the furthest are the same number.
+    /// Mutating `.min()` to `.max()` passed all 773 lib tests and all 17
+    /// real-module tests -- the gap predates this branch, and it is the shape
+    /// of the tests rather than any of them being wrong.
+    #[test]
+    fn next_kick_is_the_soonest_of_several_and_not_merely_one_of_them() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        // Pushed furthest-first, so a `next_kick` that took the last entry, or
+        // the first, or the largest is a different number from the answer.
+        f.host.kicks.push(Kick { delay: 300, dstrou: rou });
+        f.host.kicks.push(Kick { delay: 7, dstrou: rou });
+        f.host.kicks.push(Kick { delay: 45, dstrou: rou });
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+
+        assert_eq!(
+            cycles.ended,
+            Ended::Waiting { next_kick: 7 },
+            "the soonest of the three, not the last pushed and not the largest"
+        );
+    }
+
     /// The whole sleep policy, in one place, so that the socket driver and any
     /// other driver cannot answer this question differently.
     #[test]
