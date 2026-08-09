@@ -5,6 +5,7 @@ members = [
     "crates/mbbs-ptr",
     "crates/mbbs16",
     "crates/mbbs32",
+    "crates/btrieve-engine",
     "crates/mbbs-server",
     "crates/mud-core",
     "crates/mud-server",
