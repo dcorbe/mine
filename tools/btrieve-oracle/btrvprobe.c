@@ -34,6 +34,9 @@
  * The DLL is resolved at run time by name, so no import library is needed and
  * the engine can be swapped for a different build without relinking.
  */
+/* winsock2.h must come before windows.h: it defines _WINSOCKAPI_, which stops
+ * windows.h pulling in the old winsock.h behind it. */
+#include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -819,6 +822,269 @@ static void cmd_dump(const char *path, int keynum)
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
+/*
+ * serve: turn one TCP connection's framed requests into BTRCALLs, one at a
+ * time, for crates/btrieve-engine's Rust client. Wire format is
+ * docs/plans/2026-08-09-btrieve-engine-in-the-loop.md, Task 1:
+ *
+ *   Request   u32 frame_len | u16 op | [128] posblk | u32 datalen_in
+ *                           | u32 databuf_len | databuf
+ *                           | u8 keylen | i8 keynum | u32 keybuf_len | keybuf
+ *   Response  u32 frame_len | i16 status | [128] posblk | u32 datalen_out
+ *                           | u32 databuf_len | databuf
+ *                           | u32 keybuf_len | keybuf
+ *
+ * frame_len counts everything after itself. Every integer is little-endian,
+ * and so is this machine (x86 under Wine), so encoding is a plain memcpy --
+ * no htons/ntohs anywhere in this function.
+ *
+ * Stateless by design: posblk is 128 bytes of engine-private cursor state
+ * that a real Btrieve client owns and passes back in on the next call. Both
+ * directions carry it on the wire so the caller -- not this process -- holds
+ * cursor state, the way the genuine host does.
+ */
+#define OP_QUIT 0xFFFF
+/* Not a real Btrieve status (those are small non-negative numbers, see
+ * status_name() above): a distinct out-of-band value for "refused", so a
+ * caller can never mistake a protocol refusal for the engine's own answer. */
+#define SERVE_STATUS_REQUEST_TOO_LARGE (-1)
+
+static DWORD get_u32(const unsigned char *p)
+{
+    return (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24);
+}
+
+static void put_u32(unsigned char *p, DWORD v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static void put_u16(unsigned char *p, WORD v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+}
+
+/* Reads exactly `len` bytes. Returns 1 on success, 0 if the peer closed
+ * before any byte of this read arrived (a clean point to stop at). A close
+ * mid-read is not clean -- the other side wrote a frame_len it never
+ * finished -- so that exits loudly instead of returning a short frame. */
+static int recv_all(SOCKET s, void *buf, int len)
+{
+    char *p = (char *)buf;
+    int got = 0;
+    while (got < len) {
+        int n = recv(s, p + got, len - got, 0);
+        if (n == SOCKET_ERROR) {
+            fprintf(stderr, "FAIL: serve: recv failed: %d\n", WSAGetLastError());
+            exit(1);
+        }
+        if (n == 0) {
+            if (got == 0)
+                return 0;
+            fprintf(stderr, "FAIL: serve: connection closed mid-frame\n");
+            exit(1);
+        }
+        got += n;
+    }
+    return 1;
+}
+
+static void send_all(SOCKET s, const void *buf, int len)
+{
+    const char *p = (const char *)buf;
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, p + sent, len - sent, 0);
+        if (n == SOCKET_ERROR) {
+            fprintf(stderr, "FAIL: serve: send failed: %d\n", WSAGetLastError());
+            exit(1);
+        }
+        sent += n;
+    }
+}
+
+/* Handles one request already sitting in `body` (the frame_len prefix
+ * already stripped) and sends the reply. `databuf` scratch is the caller's,
+ * fixed at DATA_SIZE -- never a pointer to anything the wire sized for us,
+ * so a request cannot make the engine write past it on a read call. */
+static void serve_one(SOCKET client, const unsigned char *body, DWORD body_len,
+                      unsigned char *databuf)
+{
+    unsigned pos = 0;
+    WORD op;
+    char posblk[POSBLK_SIZE];
+    DWORD datalen_in, databuf_len_in, keybuf_len_in;
+    BYTE keylen;
+    char keynum;
+    unsigned char keybuf[KEY_SIZE];
+    unsigned char resp[2 + POSBLK_SIZE + 4 + 4 + DATA_SIZE + 4 + KEY_SIZE];
+    unsigned rpos;
+    DWORD dlen;
+    int st;
+
+    (void)body_len; /* the fixed layout below accounts for every byte read */
+
+    op = (WORD)(body[pos] | (body[pos + 1] << 8));
+    pos += 2;
+    memcpy(posblk, body + pos, POSBLK_SIZE);
+    pos += POSBLK_SIZE;
+    datalen_in = get_u32(body + pos);
+    pos += 4;
+    databuf_len_in = get_u32(body + pos);
+    pos += 4;
+
+    if (datalen_in > DATA_SIZE || databuf_len_in > DATA_SIZE) {
+        /* Refuse rather than silently truncate -- the ABI note at the top of
+         * this file measured what a truncated length does: every B_STAT
+         * comes back status 22 while the caller believes it asked for more. */
+        rpos = 0;
+        put_u16(resp + rpos, (WORD)SERVE_STATUS_REQUEST_TOO_LARGE);
+        rpos += 2;
+        memcpy(resp + rpos, posblk, POSBLK_SIZE);
+        rpos += POSBLK_SIZE;
+        put_u32(resp + rpos, 0);
+        rpos += 4;
+        put_u32(resp + rpos, 0);
+        rpos += 4;
+        put_u32(resp + rpos, 0);
+        rpos += 4;
+        {
+            unsigned char frame[4];
+            put_u32(frame, rpos);
+            send_all(client, frame, 4);
+            send_all(client, resp, rpos);
+        }
+        return;
+    }
+
+    memcpy(databuf, body + pos, databuf_len_in);
+    pos += databuf_len_in;
+    keylen = body[pos];
+    pos += 1;
+    keynum = (char)body[pos];
+    pos += 1;
+    keybuf_len_in = get_u32(body + pos);
+    pos += 4;
+    memset(keybuf, 0, sizeof keybuf);
+    memcpy(keybuf, body + pos, keybuf_len_in < sizeof keybuf ? keybuf_len_in : sizeof keybuf);
+    pos += keybuf_len_in;
+
+    dlen = datalen_in;
+    st = btrcall(op, posblk, databuf, &dlen, keybuf, keylen, keynum);
+
+    rpos = 0;
+    put_u16(resp + rpos, (WORD)(short)st);
+    rpos += 2;
+    memcpy(resp + rpos, posblk, POSBLK_SIZE);
+    rpos += POSBLK_SIZE;
+    put_u32(resp + rpos, dlen);
+    rpos += 4;
+    put_u32(resp + rpos, dlen);
+    rpos += 4;
+    memcpy(resp + rpos, databuf, dlen);
+    rpos += dlen;
+    put_u32(resp + rpos, keylen);
+    rpos += 4;
+    memcpy(resp + rpos, keybuf, keylen);
+    rpos += keylen;
+
+    {
+        unsigned char frame[4];
+        put_u32(frame, rpos);
+        send_all(client, frame, 4);
+        send_all(client, resp, rpos);
+    }
+}
+
+static void cmd_serve(const char *port_str)
+{
+    WSADATA wsa;
+    SOCKET listener, client;
+    struct sockaddr_in addr;
+    unsigned short port;
+    static unsigned char databuf[DATA_SIZE];
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "FAIL: WSAStartup failed\n");
+        exit(1);
+    }
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) {
+        fprintf(stderr, "FAIL: socket() failed: %d\n", WSAGetLastError());
+        exit(1);
+    }
+
+    port = (unsigned short)atoi(port_str);
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    /* Never 0.0.0.0: this exposes a database engine with no authentication
+     * of any kind. */
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(port);
+
+    if (bind(listener, (struct sockaddr *)&addr, sizeof addr) == SOCKET_ERROR) {
+        fprintf(stderr, "FAIL: bind() failed: %d\n", WSAGetLastError());
+        exit(1);
+    }
+    if (listen(listener, 1) == SOCKET_ERROR) {
+        fprintf(stderr, "FAIL: listen() failed: %d\n", WSAGetLastError());
+        exit(1);
+    }
+
+    /* The Rust side waits on this line rather than sleeping. Under Wine
+     * stdout is a pipe and therefore block-buffered, so the flush is not
+     * optional. */
+    printf("listening %u\n", port);
+    fflush(stdout);
+
+    client = accept(listener, NULL, NULL);
+    if (client == INVALID_SOCKET) {
+        fprintf(stderr, "FAIL: accept() failed: %d\n", WSAGetLastError());
+        exit(1);
+    }
+    closesocket(listener);
+
+    for (;;) {
+        unsigned char len_bytes[4];
+        DWORD frame_len;
+        unsigned char *body;
+
+        if (!recv_all(client, len_bytes, 4))
+            break; /* peer closed cleanly between frames */
+
+        frame_len = get_u32(len_bytes);
+        body = malloc(frame_len);
+        if (!body) {
+            fprintf(stderr, "FAIL: serve: out of memory for a %lu-byte frame\n",
+                    (unsigned long)frame_len);
+            exit(1);
+        }
+        if (!recv_all(client, body, (int)frame_len)) {
+            fprintf(stderr, "FAIL: serve: connection closed mid-frame\n");
+            exit(1);
+        }
+
+        if (frame_len >= 2 && (WORD)(body[0] | (body[1] << 8)) == OP_QUIT) {
+            free(body);
+            break;
+        }
+
+        serve_one(client, body, frame_len, databuf);
+        free(body);
+    }
+
+    closesocket(client);
+    WSACleanup();
+
+    /* main()'s own B_STOP-before-exit, below, covers this command too --
+     * every command shares that one call rather than each sending its own. */
+}
+
 int main(int argc, char **argv)
 {
     HMODULE dll;
@@ -827,7 +1093,7 @@ int main(int argc, char **argv)
 
     if (argc < 3) {
         fprintf(stderr,
-            "usage: btrvprobe <stat|walk|descend|keys|dump|create|insert> <file.VIR> [keynum|count]\n"
+            "usage: btrvprobe <stat|walk|descend|keys|dump|create|insert|serve> <file.VIR>|<port> [keynum|count]\n"
             "  stat     print the engine's own view of the file and its indexes\n"
             "  walk     GET_FIRST/GET_NEXT the whole file, check key order\n"
             "  descend  GET_EQUAL every key -- forces root-to-leaf traversal\n"
@@ -835,7 +1101,9 @@ int main(int argc, char **argv)
             "  dump     print every record's BYTES, in key order, as hex\n"
             "  create   create a 12-byte-record file with one duplicate,\n"
             "           descending, 4-byte key (WCCUSERS key 2, minus the rest)\n"
-            "  insert   insert <count> records; key values collide in groups of 3\n");
+            "  insert   insert <count> records; key values collide in groups of 3\n"
+            "  serve    <port>: turn one TCP connection's framed requests into\n"
+            "           BTRCALLs, for crates/btrieve-engine's Rust client\n");
         return 2;
     }
     cmd  = argv[1];
@@ -874,6 +1142,8 @@ int main(int argc, char **argv)
         }
         cmd_insert(path, keynum);   /* argv[3], already parsed as `keynum` above */
     }
+    else if (!strcmp(cmd, "serve"))
+        cmd_serve(path);   /* `path` holds the port number for this command */
     else {
         fprintf(stderr, "FAIL: unknown command %s\n", cmd);
         return 2;

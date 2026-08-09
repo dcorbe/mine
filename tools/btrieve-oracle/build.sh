@@ -23,7 +23,7 @@ WORK=$PREFIX/drive_c/btrieve
 # program has to cast it. The cast is the documented way to call the export.
 i686-w64-mingw32-gcc -O2 -Wall -Wextra -Wno-cast-function-type \
     -o "$REPO/tools/btrieve-oracle/btrvprobe.exe" \
-    "$REPO/tools/btrieve-oracle/btrvprobe.c"
+    "$REPO/tools/btrieve-oracle/btrvprobe.c" -lws2_32
 
 if [ ! -d "$PREFIX" ]; then
     # WINEARCH=win32 is rejected by wow64-mode Wine (11.x on this box), so the
