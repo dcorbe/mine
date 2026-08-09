@@ -25,27 +25,28 @@ const DEFAULT_TERMS: u16 = 2;
 
 /// Poll dispatches granted per driver wake -- `--polls-per-wake`'s default.
 ///
-/// The module advances exactly one monster per poll dispatch
-/// (`_SLOW_UPDATE_NEXT_MONSTER` and its fast/medium siblings, see
-/// `docs/plans/2026-08-08-tokio-transport-design.md`), off a global cursor
-/// every polling channel shares, gated on a pending-round counter that a
-/// background `rtkick` arms and a fully-drained sweep clears. So the floor
-/// for this number is "enough dispatches to sweep the live-monster table
-/// once per wake"; short of that floor a round survives to the next wake
-/// instead of draining -- `polls_cut` on `Ended::Waiting` is how a driver
-/// finds out that happened.
+/// **This number is the board's whole idle CPU cost, and very nearly its
+/// poll rate in hertz.** Measured with two players standing in the Realm:
+/// wakes are kick-driven at one a second, a polling channel spends the whole
+/// budget every wake, and the host thread's clock reads came back as
+/// `budget + 1` -- 33, 129 and 513 at budgets of 32, 128 and 512.
 ///
-/// This repository has not measured the table's real size against a live
-/// board -- that is Task 13's job, watching `polls_cut` on real traffic and
-/// raising this until it stops being set on every wake. 32 is a starting
-/// hypothesis, not a tuned number: generous for the handful of live
-/// monsters a `--terms 2` development board is likely to have nearby, and
-/// cheap to overshoot -- once a round drains, the module's own pending-round
-/// counter is zero and every further dispatch this wake falls through as one
-/// branch, not a monster update. Undershooting is graceful (a round survives
-/// to the next wake and monsters act slowly), so getting this starting value
-/// wrong by a factor of a few costs smoothness, not correctness.
-const DEFAULT_POLLS_PER_WAKE: usize = 32;
+/// It cannot be calibrated from inside the host. `Ended::Waiting`'s
+/// `polls_cut` is `true` at every budget (see its doc), because `dopoll`
+/// re-arms until the budget runs out and the chain has no way to say "done".
+/// Whether the number is big enough is a question about the module's own
+/// amortised work -- for MajorMUD, whether monsters act at the rate they
+/// should -- and answering it needs someone to play the game.
+///
+/// 512 is provisional, and chosen for the asymmetry rather than from a
+/// measurement of the game: MajorMUD's polling routine advances ONE monster
+/// per call, gated on every other call, so a budget of 32 buys about sixteen
+/// monster updates a second and a table of any size would starve. Overshoot
+/// is nearly free -- once a round drains, every further dispatch falls
+/// through one branch -- while undershoot makes the world visibly slow. 513
+/// clock reads a second is a rounding error of CPU; sixteen monster updates
+/// a second may not be a playable game.
+const DEFAULT_POLLS_PER_WAKE: usize = 512;
 
 /// Passes made per `Host::cycle` call -- `--passes`'s default.
 ///
@@ -56,11 +57,12 @@ const DEFAULT_POLLS_PER_WAKE: usize = 32;
 /// status, plus up to one already-queued-but-not-rearmed `POLSTS` per
 /// channel once the budget runs out (`Host::dopoll`'s budget comment), plus
 /// whatever `In` messages this wake drained (one status each). With the
-/// defaults above, `DEFAULT_POLLS_PER_WAKE` (32) plus `DEFAULT_TERMS` (2) is
-/// comfortably under 64, so 64 leaves slack for a burst of connects or input
+/// defaults above, `DEFAULT_POLLS_PER_WAKE` plus `DEFAULT_TERMS` must stay
+/// under it, so this is the poll budget plus room for a burst of
+/// connects and input rather than a number chosen on its own for a burst of connects or input
 /// on top of a full poll budget without ever being the thing that cuts a
 /// wake short.
-const DEFAULT_PASSES: usize = 64;
+const DEFAULT_PASSES: usize = 1024;
 
 const USAGE: &str = "\
 mbbs-server -- a tokio edge in front of one WCCMMUD.DLL host
@@ -75,8 +77,8 @@ OPTIONS:
     --module <path>           The module to load [default: re/WCCMMUD.DLL]
     --listen <addr>           Address to bind [default: 127.0.0.1:2323]
     --terms <n>                Fixed channel count, must be at least 1 [default: 2]
-    --polls-per-wake <n>       Poll dispatches granted per driver wake [default: 32]
-    --passes <n>                Passes made per Host::cycle call [default: 64]
+    --polls-per-wake <n>       Poll dispatches granted per driver wake [default: 512]
+    --passes <n>                Passes made per Host::cycle call [default: 1024]
     --keys <comma,separated>   Connection keys handed to a new player [default: DEMO,NORMAL,USER]
     --help                     Print this message and exit
 ";
@@ -241,7 +243,7 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseResult, parse_args};
+    use super::{DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, ParseResult, parse_args};
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -258,8 +260,8 @@ mod tests {
                 assert_eq!(c.module, std::path::PathBuf::from("re/WCCMMUD.DLL"));
                 assert_eq!(c.listen, "127.0.0.1:2323");
                 assert_eq!(c.terms.count(), 2);
-                assert_eq!(c.polls_per_wake, 32);
-                assert_eq!(c.passes, 64);
+                assert_eq!(c.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
+                assert_eq!(c.passes, DEFAULT_PASSES);
                 assert_eq!(c.keys, super::default_keys());
             }
         }
