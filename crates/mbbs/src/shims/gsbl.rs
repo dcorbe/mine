@@ -333,6 +333,53 @@ mod tests {
     }
 
     #[test]
+    fn btuxmt_writes_to_the_channel_it_was_given_and_not_the_current_one() {
+        // MajorMUD's entire cross-user output path. `_TELL_USER(chan)`
+        // (`re/exports/WCCMMUD_named.c:65778`) is handed a channel number,
+        // reads *that* player's filter bits out of `user[chan]`, and
+        // transmits. It never calls `curusr`, so the channel `btuxmt` is given
+        // is routinely not the channel the module is running as -- and every
+        // other test in this file, and the two-channel acceptance test in
+        // `tests/wccmmud.rs`, share a shape that hides the difference.
+        //
+        // Three channels, not two; the module runs as channel 2 and writes to
+        // channel 1. Under any two-channel arrangement a shim that transmitted
+        // to `usrnum`, and a shim that always transmitted to channel zero, are
+        // each indistinguishable from a correct one for some assignment of the
+        // two roles. Here every one of the three rings answers separately.
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        let two = terms.chan(2).expect("channel 2");
+
+        // The module is running as channel 2: `usrnum`, `usrptr`, `usaptr` and
+        // `vdaptr` all name it, exactly as `Host::poll` leaves them before a
+        // dispatch.
+        f.host
+            .point_curusr(&mut f.machine, two)
+            .expect("channel 2 is current");
+
+        let text = f.text("Kaimon just entered the Realm.");
+        f.invoke(btuxmt, &[1, text.offset, text.selector])
+            .expect("transmitted");
+
+        assert_eq!(
+            [
+                f.host.gsbl_mut().drain_output(zero),
+                f.host.gsbl_mut().drain_output(one),
+                f.host.gsbl_mut().drain_output(two),
+            ],
+            [
+                Vec::new(),
+                b"Kaimon just entered the Realm.".to_vec(),
+                Vec::new()
+            ],
+            "the argument names the ring -- not the current channel, and not zero"
+        );
+    }
+
+    #[test]
     fn btuxct_sends_the_byte_count_it_was_given_and_no_terminator() {
         // Binary: the length is an argument, not a NUL scan, so an embedded
         // zero is data.
