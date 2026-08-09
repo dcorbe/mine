@@ -3123,6 +3123,70 @@ mod tests {
         );
     }
 
+    /// A raw channel's keystrokes reach `stsrou`, with nothing in between.
+    ///
+    /// The two halves of the FSD's input path are tested apart: `crate::gsbl`
+    /// proves that a raw delivery queues a `CYCLE`, and
+    /// `poll_dispatches_cycle_to_stsrou` proves that an *injected* `CYCLE`
+    /// reaches entry point 2. Nothing joined them, so a wake-up that queued
+    /// some other status, or a `poll` that only dispatched what `btuinj` put
+    /// there, would have passed both.
+    ///
+    /// This is the whole of `fsdchi` (`FSDBBS.C:329`) as this host does it,
+    /// end to end and in one call: bytes arrive from the transport, the module
+    /// is entered at its status routine, and the keystrokes are still in
+    /// `input` for the `btuica` that routine will make -- `poll` delivers the
+    /// wake-up, not the bytes.
+    ///
+    /// The bytes are an arrow key, because that is what the flag exists for:
+    /// `\x1b[A` is three bytes of which the translate table would keep only
+    /// `[` and `A` outside raw mode, and a `CYCLE` would never be queued at all.
+    #[test]
+    fn raw_input_wakes_the_loop_and_poll_dispatches_it_to_stsrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let marker = f.bytes(&[0x00], false);
+        let stsrou = f.machine.code_ptr(0);
+        let stub = marker_stub(marker, 0x1b);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        f.host.gsbl_mut().channel_mut(console).raw = true;
+        f.host.gsbl_mut().push_input(console, b"\x1b[A");
+
+        f.host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("stsrou was entered");
+
+        assert_eq!(
+            f.machine.resolve(marker, 1).expect("the marker")[0],
+            0x1b,
+            "the keystrokes' own wake-up must reach stsrou, not just an injected one"
+        );
+        assert_eq!(
+            f.host
+                .globals()
+                .word(&f.machine, "status")
+                .expect("status is placed"),
+            gsbl::Gsbl::CYCLE as u16,
+            "and stsrou must be told it was CYCLE that brought it here"
+        );
+        assert_eq!(
+            f.host
+                .gsbl()
+                .channel(console)
+                .input
+                .iter()
+                .copied()
+                .collect::<Vec<u8>>(),
+            b"\x1b[A".to_vec(),
+            "poll delivers the wake-up; the bytes are still there for btuica"
+        );
+    }
+
     /// One injected `CYCLE` is one dispatch, and then the loop is done.
     ///
     /// The FSD's whole entry engine is driven by `fsdnfy()` (`FSDBBS.C:368`)
