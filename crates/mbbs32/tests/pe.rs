@@ -4,7 +4,7 @@
 //! file exercises exactly one path through each branch, and the error paths need
 //! an input built to reach them.
 
-use mbbs32::{PeError, PeImage, Relocation};
+use mbbs32::{Import, PeError, PeImage, Relocation, Symbol};
 
 /// The smallest thing that parses: an MZ stub, a PE signature, a COFF header
 /// saying i386, a PE32 optional header, and no sections.
@@ -564,4 +564,471 @@ fn a_pure_bss_section_with_zero_raw_size_still_parses() {
 
     let image = PeImage::parse(&v).unwrap();
     assert_eq!(image.sections[0].raw_size, 0);
+}
+
+// --- Imports (Task 5) -------------------------------------------------
+
+fn put_u32(v: &mut [u8], at: usize, val: u32) {
+    v[at..at + 4].copy_from_slice(&val.to_le_bytes());
+}
+
+fn put_u16(v: &mut [u8], at: usize, val: u16) {
+    v[at..at + 2].copy_from_slice(&val.to_le_bytes());
+}
+
+fn put_bytes(v: &mut [u8], at: usize, bytes: &[u8]) {
+    v[at..at + bytes.len()].copy_from_slice(bytes);
+}
+
+/// A section big enough to lay out a whole synthetic import directory by
+/// hand: descriptors, ILT/IAT arrays, hint/name pairs and library-name
+/// strings, all addressable within one section's RVA range
+/// (`0x1000..0x1400`). No BSS tail -- these tests are about the import walk
+/// itself, not the section-bounds tests already covered above.
+fn with_one_import_section() -> Vec<u8> {
+    let mut v = minimal();
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    v.resize(raw + 0x400 + 0x200, 0);
+    put_bytes(&mut v, sec, b"IMPORT\0\0");
+    put_u32(&mut v, sec + 8, 0x400); // VirtualSize
+    put_u32(&mut v, sec + 12, 0x1000); // VirtualAddress
+    put_u32(&mut v, sec + 16, 0x400); // SizeOfRawData
+    put_u32(&mut v, sec + 20, raw as u32); // PointerToRawData
+    put_u32(&mut v, sec + 36, 0x4000_0040);
+    v
+}
+
+/// Points data directory 1 (import) at `rva`/`size`. `size` is not required
+/// to be descriptor-count-accurate -- see the comment in `pe.rs` on why this
+/// parser never trusts it as one.
+fn set_import_directory(v: &mut [u8], rva: u32, size: u32) {
+    let dir = 0x98 + 96 + 8; // opt + 96 + DIR_IMPORT(1) * 8
+    put_u32(v, dir, rva);
+    put_u32(v, dir + 4, size);
+}
+
+#[test]
+fn imports_walk_two_libraries_by_name_and_ordinal_with_the_iat_kept_separate_from_the_ilt() {
+    // Layout, computed rather than hand-placed at magic offsets so nothing
+    // here can silently overlap:
+    //   desc0        LIBA.DLL: OriginalFirstThunk != FirstThunk (real ILT
+    //                and IAT, at different addresses)
+    //   desc1        LIBB.DLL: OriginalFirstThunk == 0 (older-linker
+    //                fallback -- ILT and IAT read the very same array)
+    //   desc2        the all-zero terminator
+    //   desc3        a well-formed-looking THIRD descriptor. If the walk
+    //                does not actually stop at desc2, this is parsed too,
+    //                and `imports.len() == 4` below catches it.
+    //   liba_ilt     LIBA's ILT: name entry, ordinal entry, 0 terminator
+    //   liba_iat     LIBA's IAT: a DIFFERENT address from liba_ilt, pre-filled
+    //                with a sentinel this loader must never read the value
+    //                of (only its address matters) and must never confuse
+    //                for the ILT's own address
+    //   libb_thunk   LIBB's single thunk array (the fallback case)
+    //   hint_funcone / hint_alpha / hint_beta   hint+name pairs
+    //   name_liba / name_libb                   library name strings
+    let mut v = with_one_import_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let desc0 = raw;
+    let desc1 = desc0 + 20;
+    let desc2 = desc1 + 20;
+    let desc3 = desc2 + 20;
+    let liba_ilt = desc3 + 20;
+    let liba_iat = liba_ilt + 12; // 3 x u32
+    let libb_thunk = liba_iat + 12;
+    let hint_funcone = libb_thunk + 12;
+    let hint_alpha = hint_funcone + 2 + 8; // 2-byte hint + "FuncOne\0"
+    let hint_beta = hint_alpha + 2 + 6; // "Alpha\0"
+    let name_liba = hint_beta + 2 + 5; // "Beta\0"
+    let name_libb = name_liba + 9; // "LIBA.DLL\0"
+
+    // desc0: LIBA.DLL, a real ILT distinct from its IAT.
+    put_u32(&mut v, desc0, to_rva(liba_ilt)); // OriginalFirstThunk
+    put_u32(&mut v, desc0 + 4, 0); // TimeDateStamp
+    put_u32(&mut v, desc0 + 8, 0); // ForwarderChain
+    put_u32(&mut v, desc0 + 12, to_rva(name_liba)); // Name
+    put_u32(&mut v, desc0 + 16, to_rva(liba_iat)); // FirstThunk
+
+    // desc1: LIBB.DLL, OriginalFirstThunk == 0 -- falls back to FirstThunk.
+    put_u32(&mut v, desc1, 0);
+    put_u32(&mut v, desc1 + 4, 0);
+    put_u32(&mut v, desc1 + 8, 0);
+    put_u32(&mut v, desc1 + 12, to_rva(name_libb));
+    put_u32(&mut v, desc1 + 16, to_rva(libb_thunk));
+
+    // desc2: the all-zero terminator.
+    put_u32(&mut v, desc2, 0);
+    put_u32(&mut v, desc2 + 4, 0);
+    put_u32(&mut v, desc2 + 8, 0);
+    put_u32(&mut v, desc2 + 12, 0);
+    put_u32(&mut v, desc2 + 16, 0);
+
+    // desc3: looks exactly like desc0. Must never be reached.
+    put_u32(&mut v, desc3, to_rva(liba_ilt));
+    put_u32(&mut v, desc3 + 4, 0);
+    put_u32(&mut v, desc3 + 8, 0);
+    put_u32(&mut v, desc3 + 12, to_rva(name_liba));
+    put_u32(&mut v, desc3 + 16, to_rva(liba_iat));
+
+    // LIBA's ILT: one by-name entry, one by-ordinal entry, 0 terminator.
+    put_u32(&mut v, liba_ilt, to_rva(hint_funcone));
+    put_u32(&mut v, liba_ilt + 4, 0x8000_0000 | 842);
+    put_u32(&mut v, liba_ilt + 8, 0);
+    // LIBA's IAT: a different array. Its contents are never read by this
+    // loader (a later task binds them); the sentinel is neither zero nor a
+    // plausible pointer, so misreading it would be obviously wrong if it
+    // were ever inspected.
+    put_u32(&mut v, liba_iat, 0xdead_beef);
+    put_u32(&mut v, liba_iat + 4, 0xdead_beef);
+    put_u32(&mut v, liba_iat + 8, 0xdead_beef);
+
+    // LIBB's single thunk array, read as both ILT and IAT.
+    put_u32(&mut v, libb_thunk, to_rva(hint_alpha));
+    put_u32(&mut v, libb_thunk + 4, to_rva(hint_beta));
+    put_u32(&mut v, libb_thunk + 8, 0);
+
+    put_u16(&mut v, hint_funcone, 0); // hint, never read
+    put_bytes(&mut v, hint_funcone + 2, b"FuncOne\0");
+    put_u16(&mut v, hint_alpha, 0);
+    put_bytes(&mut v, hint_alpha + 2, b"Alpha\0");
+    put_u16(&mut v, hint_beta, 0);
+    put_bytes(&mut v, hint_beta + 2, b"Beta\0");
+    put_bytes(&mut v, name_liba, b"LIBA.DLL\0");
+    put_bytes(&mut v, name_libb, b"LIBB.DLL\0");
+
+    // Deliberately not descriptor-count-accurate: 4 descriptors follow (80
+    // bytes), the directory claims 40. See the comment in `pe.rs` on why
+    // this parser never trusts the directory `Size` field as a bound.
+    set_import_directory(&mut v, to_rva(desc0), 40);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(
+        image.imports,
+        vec![
+            Import {
+                library: "LIBA.DLL".to_string(),
+                symbol: Symbol::Name("FuncOne".to_string()),
+                iat_rva: to_rva(liba_iat),
+            },
+            Import {
+                library: "LIBA.DLL".to_string(),
+                symbol: Symbol::Ordinal(842),
+                iat_rva: to_rva(liba_iat) + 4,
+            },
+            Import {
+                library: "LIBB.DLL".to_string(),
+                symbol: Symbol::Name("Alpha".to_string()),
+                iat_rva: to_rva(libb_thunk),
+            },
+            Import {
+                library: "LIBB.DLL".to_string(),
+                symbol: Symbol::Name("Beta".to_string()),
+                iat_rva: to_rva(libb_thunk) + 4,
+            },
+        ],
+        "4 imports across 2 libraries; the all-zero descriptor must stop the \
+         walk before the well-formed-looking phantom descriptor after it"
+    );
+}
+
+#[test]
+fn an_ordinal_import_is_not_read_as_a_name() {
+    // A single descriptor naming "X.DLL" with one by-ordinal thunk (842,
+    // i.e. IMPORT_BY_ORDINAL | 0x034a). This is the fixture the mandatory
+    // mutation targets: drop the `entry & IMPORT_BY_ORDINAL != 0` check and
+    // 0x8000_034a is read as a name RVA instead -- an address nowhere near
+    // any section in this fixture -- turning this `unwrap()` into a panic on
+    // `UnmappedRva` rather than a silently wrong `Symbol::Name`.
+    let mut v = with_one_import_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+
+    let ilt_rva = 0x1000u32; // the ILT array itself
+    let name_rva = 0x1000u32 + 8; // "X.DLL\0"
+    let desc_rva = 0x1000u32 + 0x10;
+
+    put_u32(&mut v, raw, 0x8000_0000 | 842); // ordinal 842
+    put_u32(&mut v, raw + 4, 0); // ILT terminator
+    put_bytes(&mut v, raw + 8, b"X.DLL\0");
+
+    let desc = raw + 0x10;
+    put_u32(&mut v, desc, ilt_rva);
+    put_u32(&mut v, desc + 4, 0);
+    put_u32(&mut v, desc + 8, 0);
+    put_u32(&mut v, desc + 12, name_rva);
+    put_u32(&mut v, desc + 16, ilt_rva); // FirstThunk -- contents never read
+    put_u32(&mut v, desc + 20, 0); // terminator descriptor
+    put_u32(&mut v, desc + 24, 0);
+    put_u32(&mut v, desc + 28, 0);
+    put_u32(&mut v, desc + 32, 0);
+    put_u32(&mut v, desc + 36, 0);
+
+    set_import_directory(&mut v, desc_rva, 20);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(
+        image.imports,
+        vec![Import {
+            library: "X.DLL".to_string(),
+            symbol: Symbol::Ordinal(842),
+            iat_rva: ilt_rva,
+        }]
+    );
+}
+
+#[test]
+fn an_import_library_name_rva_outside_any_section_is_refused() {
+    let mut v = with_one_import_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let ilt_rva = 0x1000u32;
+    let bogus_name_rva = 0x9999_0000u32; // nowhere near this image's sections
+
+    put_u32(&mut v, raw, 0x8000_0000 | 1); // one ordinal ILT entry
+    put_u32(&mut v, raw + 4, 0);
+
+    let desc = raw + 0x10;
+    put_u32(&mut v, desc, ilt_rva);
+    put_u32(&mut v, desc + 4, 0);
+    put_u32(&mut v, desc + 8, 0);
+    put_u32(&mut v, desc + 12, bogus_name_rva);
+    put_u32(&mut v, desc + 16, ilt_rva);
+
+    set_import_directory(&mut v, 0x1000 + 0x10, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnmappedRva { rva: bogus_name_rva }
+    );
+}
+
+#[test]
+fn a_library_name_with_no_nul_before_the_end_of_its_section_is_refused() {
+    // Two sections: DESC holds the descriptor and its ILT with plenty of
+    // room, NAME is exactly 4 bytes and none of them is zero -- no NUL is
+    // possible without reading past NAME's own raw data into whatever the
+    // file places after it.
+    let mut v = minimal();
+    v[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
+    let sec0 = 0x98 + 0xe0;
+    let sec1 = sec0 + 40;
+    let raw0 = sec1 + 40;
+    let raw1 = raw0 + 0x40;
+    v.resize(raw1 + 4 + 0x200, 0);
+
+    put_bytes(&mut v, sec0, b"DESC\0\0\0\0");
+    put_u32(&mut v, sec0 + 8, 0x40);
+    put_u32(&mut v, sec0 + 12, 0x1000);
+    put_u32(&mut v, sec0 + 16, 0x40);
+    put_u32(&mut v, sec0 + 20, raw0 as u32);
+    put_u32(&mut v, sec0 + 36, 0x4000_0040);
+
+    put_bytes(&mut v, sec1, b"NAME\0\0\0\0");
+    put_u32(&mut v, sec1 + 8, 4);
+    put_u32(&mut v, sec1 + 12, 0x1040); // right after DESC's virtual range
+    put_u32(&mut v, sec1 + 16, 4);
+    put_u32(&mut v, sec1 + 20, raw1 as u32);
+    put_u32(&mut v, sec1 + 36, 0x4000_0040);
+
+    let ilt_rva = 0x1000u32;
+    let name_rva = 0x1040u32;
+    put_u32(&mut v, raw0, 0x8000_0000 | 1); // ILT: one ordinal entry
+    put_u32(&mut v, raw0 + 4, 0);
+
+    let desc = raw0 + 0x10;
+    put_u32(&mut v, desc, ilt_rva);
+    put_u32(&mut v, desc + 4, 0);
+    put_u32(&mut v, desc + 8, 0);
+    put_u32(&mut v, desc + 12, name_rva);
+    put_u32(&mut v, desc + 16, ilt_rva);
+
+    put_bytes(&mut v, raw1, b"XYZW"); // NAME's 4 raw bytes: no NUL anywhere
+
+    set_import_directory(&mut v, 0x1000 + 0x10, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnterminatedString {
+            what: "import library name",
+            at: raw1,
+        }
+    );
+}
+
+#[test]
+fn a_symbol_name_rva_in_a_bss_tail_has_no_bytes_to_read() {
+    // VirtualSize (0x400) exceeds SizeOfRawData (shrunk to 0x40 here): the
+    // tail of the section is BSS and exists only once the image is mapped,
+    // nowhere in the file. An ILT entry naming an RVA there must be refused,
+    // not answered with whatever bytes happen to sit at that file offset.
+    let mut v = with_one_import_section();
+    let sec = 0x98 + 0xe0;
+    put_u32(&mut v, sec + 16, 0x40); // SizeOfRawData
+    let raw = sec + 40;
+
+    let ilt_rva = 0x1000u32;
+    let name_rva = 0x1000u32 + 8;
+    let bss_rva = 0x1000u32 + 0x40; // == SizeOfRawData: the first BSS byte
+
+    put_u32(&mut v, raw, bss_rva); // ILT entry: a name/hint rva into the BSS tail
+    put_u32(&mut v, raw + 4, 0);
+    put_bytes(&mut v, raw + 8, b"X.DLL\0");
+
+    let desc = raw + 0x10;
+    put_u32(&mut v, desc, ilt_rva);
+    put_u32(&mut v, desc + 4, 0);
+    put_u32(&mut v, desc + 8, 0);
+    put_u32(&mut v, desc + 12, name_rva);
+    put_u32(&mut v, desc + 16, ilt_rva);
+
+    set_import_directory(&mut v, 0x1000 + 0x10, 20);
+
+    // The hint/name pointer read is `bss_rva + 2` (the 2-byte hint is
+    // skipped before the name is resolved), so that -- not `bss_rva` itself
+    // -- is the RVA that fails to resolve.
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnmappedRva { rva: bss_rva + 2 }
+    );
+}
+
+#[test]
+fn an_ilt_that_never_terminates_before_its_section_ends_is_refused() {
+    // Two sections: DESC holds one descriptor and its library name with
+    // plenty of room; THUNK holds exactly two ILT entries and nothing else
+    // -- no room for a terminating zero anywhere in its raw data. The walk
+    // must be refused, not silently continue reading whatever the file
+    // places after THUNK.
+    let mut v = minimal();
+    v[0x86..0x88].copy_from_slice(&2u16.to_le_bytes());
+    let sec0 = 0x98 + 0xe0;
+    let sec1 = sec0 + 40;
+    let raw0 = sec1 + 40;
+    let raw1 = raw0 + 0x100;
+    v.resize(raw1 + 8 + 0x200, 0);
+
+    put_bytes(&mut v, sec0, b"DESC\0\0\0\0");
+    put_u32(&mut v, sec0 + 8, 0x100);
+    put_u32(&mut v, sec0 + 12, 0x1000);
+    put_u32(&mut v, sec0 + 16, 0x100);
+    put_u32(&mut v, sec0 + 20, raw0 as u32);
+    put_u32(&mut v, sec0 + 36, 0x4000_0040);
+
+    put_bytes(&mut v, sec1, b"THUNK\0\0\0");
+    put_u32(&mut v, sec1 + 8, 8);
+    put_u32(&mut v, sec1 + 12, 0x1100); // right after DESC's virtual range
+    put_u32(&mut v, sec1 + 16, 8); // exactly 2 u32 entries, no more
+    put_u32(&mut v, sec1 + 20, raw1 as u32);
+    put_u32(&mut v, sec1 + 36, 0x4000_0040);
+
+    let thunk_rva = 0x1100u32;
+    let name_rva = 0x1000u32 + 0x50;
+    put_bytes(&mut v, raw0 + 0x50, b"X.DLL\0");
+
+    // OriginalFirstThunk == FirstThunk == THUNK's rva: the walk reads THUNK
+    // for both.
+    put_u32(&mut v, raw0, thunk_rva);
+    put_u32(&mut v, raw0 + 4, 0);
+    put_u32(&mut v, raw0 + 8, 0);
+    put_u32(&mut v, raw0 + 12, name_rva);
+    put_u32(&mut v, raw0 + 16, thunk_rva);
+
+    // THUNK: two ordinal entries, neither zero -- no terminator anywhere in
+    // its 8 raw bytes.
+    put_u32(&mut v, raw1, 0x8000_0000 | 1);
+    put_u32(&mut v, raw1 + 4, 0x8000_0000 | 2);
+
+    set_import_directory(&mut v, 0x1000, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::UnmappedRva { rva: thunk_rva + 8 },
+        "the ILT walk must stop at THUNK's own end, not read past it"
+    );
+}
+
+#[test]
+fn an_import_descriptor_that_would_run_past_its_sections_end_is_refused() {
+    // The directory points 5 bytes from the section's end -- not enough for
+    // a 20-byte descriptor. This is `RvaSpansSectionEnd`, distinct from
+    // `UnmappedRva`: the rva itself is inside the section, there simply are
+    // not enough bytes left in it.
+    let mut v = with_one_import_section();
+    let rva = 0x1000u32 + 0x400 - 5;
+    set_import_directory(&mut v, rva, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::RvaSpansSectionEnd {
+            what: "import descriptor",
+            rva,
+            need: 20,
+            remaining: 5,
+        }
+    );
+}
+
+#[test]
+fn a_descriptor_table_that_never_terminates_before_its_section_ends_is_refused() {
+    // A shared, valid ILT array and library name at the start of the
+    // section, then ten identical nonzero descriptors tiled back-to-back
+    // with no all-zero terminator among them, ending 7 bytes short of an
+    // eleventh full descriptor. The walk can only be stopped here by
+    // refusing to read a descriptor past the section's own end -- there is
+    // no descriptor count anywhere in the format to bound it by instead.
+    let mut v = minimal();
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    const SHARED: usize = 16; // ILT (2 x u32) + "X.DLL\0" (6 bytes), padded
+    const N: usize = 10;
+    const RAW_SIZE: usize = SHARED + N * 20 + 7;
+    v.resize(raw + RAW_SIZE + 0x200, 0);
+    put_bytes(&mut v, sec, b"IMPORT\0\0");
+    put_u32(&mut v, sec + 8, RAW_SIZE as u32);
+    put_u32(&mut v, sec + 12, 0x1000);
+    put_u32(&mut v, sec + 16, RAW_SIZE as u32);
+    put_u32(&mut v, sec + 20, raw as u32);
+    put_u32(&mut v, sec + 36, 0x4000_0040);
+
+    let ilt_rva = 0x1000u32;
+    let name_rva = 0x1000u32 + 8;
+    put_u32(&mut v, raw, 0x8000_0000 | 7); // one ordinal entry
+    put_u32(&mut v, raw + 4, 0); // ILT terminator
+    put_bytes(&mut v, raw + 8, b"X.DLL\0");
+
+    for i in 0..N {
+        let d = raw + SHARED + i * 20;
+        put_u32(&mut v, d, ilt_rva);
+        put_u32(&mut v, d + 4, 0);
+        put_u32(&mut v, d + 8, 0);
+        put_u32(&mut v, d + 12, name_rva);
+        put_u32(&mut v, d + 16, ilt_rva);
+    }
+
+    set_import_directory(&mut v, 0x1000 + SHARED as u32, 20);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::RvaSpansSectionEnd {
+            what: "import descriptor",
+            rva: 0x1000 + (SHARED + N * 20) as u32,
+            need: 20,
+            remaining: 7,
+        }
+    );
+}
+
+#[test]
+fn no_imports_is_not_an_error() {
+    // The common case for a section table with nothing that references the
+    // import directory (rva 0 / size 0, `minimal()`'s and `with_one_section`'s
+    // default): the directory is simply absent, not malformed.
+    let image = PeImage::parse(&with_one_section()).unwrap();
+    assert_eq!(image.imports, Vec::new());
 }

@@ -104,6 +104,45 @@ pub enum PeError {
     /// advancing past the whole declared `size` -- shifting every later
     /// block's parse position by an attacker-chosen offset.
     MalformedRelocBlockSize { at: usize, size: usize },
+
+    /// A read through an RVA needs more contiguous bytes than remain in the
+    /// section that RVA falls inside.
+    ///
+    /// `rva_to_file` (and the bounded translation under it) only prove the
+    /// *first* byte of a read is inside a section; nothing about a single
+    /// starting offset stops a multi-byte read -- an import descriptor, a
+    /// thunk entry, a name -- from starting one byte before a section's raw
+    /// end and spilling into whatever the file happens to place next. This is
+    /// the same failure `UnmappedRva` refuses for a BSS tail, generalized to
+    /// reads wider than one byte: silently returning bytes from beyond the
+    /// section that RVA was declared to belong to.
+    RvaSpansSectionEnd {
+        what: &'static str,
+        rva: u32,
+        need: usize,
+        remaining: usize,
+    },
+
+    /// A NUL-terminated string had no NUL byte before the end of the section
+    /// its start RVA falls inside.
+    ///
+    /// The search is bounded to that section deliberately: scanning past it
+    /// would risk returning a "name" built from bytes the next section (or
+    /// inter-section padding) happens to contain, which were never part of
+    /// this string.
+    UnterminatedString { what: &'static str, at: usize },
+
+    /// Advancing an RVA by a fixed step (an import descriptor by 20 bytes, an
+    /// import lookup/address table cursor by 4) would overflow `u32`.
+    ///
+    /// Nothing in a well-formed file reaches this: every section's virtual
+    /// range is already checked to fit under `SizeOfImage`. But
+    /// `SizeOfImage` is itself an attacker-controlled field with no upper
+    /// bound enforced on it alone, so the overflow is reachable from a
+    /// crafted file, and `checked_add` is this parser's rule for every
+    /// file-supplied `u32` regardless of whether a real linker would ever
+    /// produce the input that exercises it.
+    RvaOverflow { what: &'static str, rva: u32 },
 }
 
 impl fmt::Display for PeError {
@@ -155,6 +194,22 @@ impl fmt::Display for PeError {
                 f,
                 "reloc block at {at:#x} declares size {size}, which is not 8 + an even number of bytes"
             ),
+            Self::RvaSpansSectionEnd {
+                what,
+                rva,
+                need,
+                remaining,
+            } => write!(
+                f,
+                "{what} at rva {rva:#x} needs {need} bytes, but only {remaining} remain in its section"
+            ),
+            Self::UnterminatedString { what, at } => write!(
+                f,
+                "{what} at file offset {at:#x} has no NUL before the end of its section"
+            ),
+            Self::RvaOverflow { what, rva } => {
+                write!(f, "{what}: advancing rva {rva:#x} would overflow u32")
+            }
         }
     }
 }
@@ -251,6 +306,43 @@ pub struct Relocation {
     pub rva: u32,
 }
 
+/// Where the import directory sits among the optional header's data
+/// directories, which begin at `opt + 96`.
+const DIR_IMPORT: usize = 1;
+
+/// The high bit of an import lookup/address table entry: when set, the low
+/// 16 bits are an ordinal, not an RVA to a hint/name pair.
+///
+/// `wccmmud.dll` imports all 210 of its symbols by name -- zero by ordinal --
+/// but the format allows either per entry, and other Worldgroup modules in
+/// the Task 9 corpus use it.
+const IMPORT_BY_ORDINAL: u32 = 0x8000_0000;
+
+/// How a module names something it wants from another DLL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Symbol {
+    /// The ordinary case here, and the only one `wccmmud.dll` uses.
+    Name(String),
+    /// Present in the format, and in other Worldgroup modules.
+    Ordinal(u16),
+}
+
+/// One symbol a module imports, and where its address must be written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    /// The DLL as the file spells it -- case is not normalised, because
+    /// `WGSERVER.EXE` and `cw3220mt.DLL` appear exactly like that in the same
+    /// file.
+    pub library: String,
+    pub symbol: Symbol,
+    /// RVA of the IAT slot this import's resolved address must be written
+    /// into. This is always read from the descriptor's `FirstThunk` array,
+    /// walked in lockstep with the ILT -- never from the ILT's own address,
+    /// even when `OriginalFirstThunk` was zero and the two walks share one
+    /// array (see the fallback note on `PeImage::parse`).
+    pub iat_rva: u32,
+}
+
 /// A parsed PE32 image. Plain data: nothing here is mapped or allocated.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -262,28 +354,115 @@ pub struct PeImage {
     pub characteristics: u16,
     pub sections: Vec<Section>,
     pub relocations: Vec<Relocation>,
+    pub imports: Vec<Import>,
+}
+
+/// The file offset an RVA's bytes live at, plus how many contiguous raw bytes
+/// of the *same section* follow it, given a section table.
+///
+/// A free function rather than a method: base relocations and imports are
+/// both parsed inside `PeImage::parse`, before there is a `Self` to call a
+/// method on. `rva_to_file_in` and `PeImage::rva_to_file` are both defined in
+/// terms of this so there is exactly one copy of the arithmetic. See
+/// `PeImage::rva_to_file` for why it is subtraction-then-compare rather than
+/// addition.
+///
+/// # Errors
+///
+/// If no section covers the RVA.
+fn rva_to_file_bounded_in(sections: &[Section], rva: u32) -> Result<(usize, usize), PeError> {
+    for s in sections {
+        if let Some(offset) = rva.checked_sub(s.rva)
+            && offset < s.raw_size
+        {
+            let remaining = (s.raw_size - offset) as usize;
+            return Ok((s.raw_offset as usize + offset as usize, remaining));
+        }
+    }
+    Err(PeError::UnmappedRva { rva })
 }
 
 /// The file offset an RVA's bytes live at, given a section table.
-///
-/// A free function rather than a method: base relocations are parsed inside
-/// `PeImage::parse`, before there is a `Self` to call a method on, and
-/// `PeImage::rva_to_file` is defined in terms of this so there is exactly one
-/// copy of the arithmetic. See `PeImage::rva_to_file` for why it is
-/// subtraction-then-compare rather than addition.
 ///
 /// # Errors
 ///
 /// If no section covers the RVA.
 fn rva_to_file_in(sections: &[Section], rva: u32) -> Result<usize, PeError> {
-    for s in sections {
-        if let Some(offset) = rva.checked_sub(s.rva)
-            && offset < s.raw_size
-        {
-            return Ok(s.raw_offset as usize + offset as usize);
-        }
+    rva_to_file_bounded_in(sections, rva).map(|(offset, _)| offset)
+}
+
+/// Reads `len` contiguous bytes starting at `rva`, refusing a read that would
+/// run past the end of the section `rva` falls inside -- see
+/// `PeError::RvaSpansSectionEnd`.
+///
+/// # Errors
+///
+/// If no section covers `rva`, if fewer than `len` bytes remain in that
+/// section, or if `len` bytes would run past the end of the file (which
+/// should not be reachable once the former two checks pass, since a
+/// section's raw range is validated against the file's length at parse time,
+/// but `Reader::slice` is the single place that fact is enforced).
+fn read_bytes_at_rva<'a>(
+    sections: &[Section],
+    r: &Reader<'a>,
+    what: &'static str,
+    rva: u32,
+    len: usize,
+) -> Result<&'a [u8], PeError> {
+    let (file_off, remaining) = rva_to_file_bounded_in(sections, rva)?;
+    if remaining < len {
+        return Err(PeError::RvaSpansSectionEnd {
+            what,
+            rva,
+            need: len,
+            remaining,
+        });
     }
-    Err(PeError::UnmappedRva { rva })
+    r.slice(what, file_off, len)
+}
+
+/// Reads a little-endian `u32` at `rva`, bounded to its own section.
+///
+/// # Errors
+///
+/// See `read_bytes_at_rva`.
+fn u32_at_rva(
+    sections: &[Section],
+    r: &Reader<'_>,
+    what: &'static str,
+    rva: u32,
+) -> Result<u32, PeError> {
+    let b = read_bytes_at_rva(sections, r, what, rva, 4)?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Reads a NUL-terminated string starting at `rva`, without the NUL.
+///
+/// The search for the terminator is bounded to the section `rva` falls
+/// inside -- see `PeError::UnterminatedString` for why reading further would
+/// be wrong even when the file has more bytes to offer.
+///
+/// Decoded byte-for-byte as Latin-1, not UTF-8, matching `Section::name`:
+/// these are 1990s toolchain outputs, and a non-ASCII byte is a name, not a
+/// decoding error.
+///
+/// # Errors
+///
+/// If no section covers `rva`, or if no NUL byte appears before the end of
+/// that section's raw data.
+fn read_cstr_at_rva(
+    sections: &[Section],
+    r: &Reader<'_>,
+    what: &'static str,
+    rva: u32,
+) -> Result<String, PeError> {
+    let (file_off, remaining) = rva_to_file_bounded_in(sections, rva)?;
+    let bytes = r.slice(what, file_off, remaining)?;
+    let end = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(PeError::UnterminatedString { what, at: file_off })?;
+    Ok(bytes[..end].iter().map(|&b| b as char).collect())
 }
 
 impl PeImage {
@@ -451,6 +630,104 @@ impl PeImage {
             }
         }
 
+        // Import directory: an array of 20-byte descriptors, terminated by
+        // one whose 20 bytes are all zero. Unlike the base-relocation
+        // directory, the descriptor array has no independent count or length
+        // to bound it by -- the `Size` field at `dirs + DIR_IMPORT*8 + 4`
+        // does not divide evenly by 20 even in the real module
+        // (4,308 / 20 = 215.4), so it describes the whole import section's
+        // rough extent, not an exact descriptor count, and is not trusted as
+        // one here. What *is* enforced is that no descriptor, and no thunk
+        // entry read while walking one, is ever read from beyond the end of
+        // the section its own RVA falls inside (`read_bytes_at_rva` /
+        // `u32_at_rva`): the walk can only be stopped by an all-zero
+        // descriptor or a zero ILT entry, or refused by running off a
+        // section, never by silently continuing into whatever bytes the file
+        // happens to place next.
+        let import_rva = r.u32("import directory rva", dirs + DIR_IMPORT * 8)?;
+        let import_size = r.u32("import directory size", dirs + DIR_IMPORT * 8 + 4)?;
+        let mut imports = Vec::new();
+        if import_rva != 0 && import_size != 0 {
+            let mut desc_rva = import_rva;
+            loop {
+                let desc = read_bytes_at_rva(&sections, &r, "import descriptor", desc_rva, 20)?;
+                let ilt_rva = u32::from_le_bytes(desc[0..4].try_into().expect("4 bytes"));
+                let time_date_stamp = u32::from_le_bytes(desc[4..8].try_into().expect("4 bytes"));
+                let forwarder_chain = u32::from_le_bytes(desc[8..12].try_into().expect("4 bytes"));
+                let name_rva = u32::from_le_bytes(desc[12..16].try_into().expect("4 bytes"));
+                let iat_rva = u32::from_le_bytes(desc[16..20].try_into().expect("4 bytes"));
+
+                // The terminator is the whole 20-byte descriptor being zero,
+                // not merely the fields this loader otherwise reads: a
+                // descriptor with, say, a nonzero TimeDateStamp but zero
+                // everything else is not the end of the array.
+                if ilt_rva == 0
+                    && time_date_stamp == 0
+                    && forwarder_chain == 0
+                    && name_rva == 0
+                    && iat_rva == 0
+                {
+                    break;
+                }
+
+                let library = read_cstr_at_rva(&sections, &r, "import library name", name_rva)?;
+
+                // Older linkers leave OriginalFirstThunk (the ILT) zero and
+                // populate only FirstThunk (the IAT); the walk below then
+                // reads the same array twice; see the doc comment on
+                // `Import::iat_rva` for why `iat_cursor` is still always
+                // taken from `iat_rva`, never from `thunk_rva`.
+                let thunk_rva = if ilt_rva != 0 { ilt_rva } else { iat_rva };
+
+                let mut ilt_cursor = thunk_rva;
+                let mut iat_cursor = iat_rva;
+                loop {
+                    let entry = u32_at_rva(&sections, &r, "import lookup table entry", ilt_cursor)?;
+                    if entry == 0 {
+                        break;
+                    }
+
+                    let symbol = if entry & IMPORT_BY_ORDINAL != 0 {
+                        Symbol::Ordinal((entry & 0xffff) as u16)
+                    } else {
+                        // The top bit is clear, so `entry` is itself the RVA
+                        // of a 2-byte hint followed by the NUL-terminated
+                        // name; the hint is not read, only skipped.
+                        let name_rva = entry.checked_add(2).ok_or(PeError::RvaOverflow {
+                            what: "import hint/name",
+                            rva: entry,
+                        })?;
+                        Symbol::Name(read_cstr_at_rva(
+                            &sections,
+                            &r,
+                            "import symbol name",
+                            name_rva,
+                        )?)
+                    };
+
+                    imports.push(Import {
+                        library: library.clone(),
+                        symbol,
+                        iat_rva: iat_cursor,
+                    });
+
+                    ilt_cursor = ilt_cursor.checked_add(4).ok_or(PeError::RvaOverflow {
+                        what: "import lookup table cursor",
+                        rva: ilt_cursor,
+                    })?;
+                    iat_cursor = iat_cursor.checked_add(4).ok_or(PeError::RvaOverflow {
+                        what: "import address table cursor",
+                        rva: iat_cursor,
+                    })?;
+                }
+
+                desc_rva = desc_rva.checked_add(20).ok_or(PeError::RvaOverflow {
+                    what: "import descriptor advance",
+                    rva: desc_rva,
+                })?;
+            }
+        }
+
         Ok(Self {
             image_base,
             size_of_image,
@@ -460,6 +737,7 @@ impl PeImage {
             characteristics,
             sections,
             relocations,
+            imports,
         })
     }
 
