@@ -38,6 +38,7 @@
 //! ```text
 //! cargo test -p mbbs --test forge -- --ignored --nocapture
 //! tools/btrieve-oracle/sweep.sh target/btrieve-corpus
+//! tools/btrieve-oracle/sweep.sh target/btrieve-corpus-duplicates
 //! ```
 
 use std::collections::HashSet;
@@ -78,8 +79,15 @@ fn data() -> Option<PathBuf> {
 
 /// Where the corpus lands. Under `target/` because it is build output: it is
 /// regenerated from `tmp/` every run and nothing should ever be edited in it.
-fn corpus() -> PathBuf {
-    let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/btrieve-corpus");
+/// **One root per test, and that is not tidiness.** Each corpus test wipes its
+/// whole root on the way in, so a previous run's files cannot be swept as this
+/// run's coverage. Tests in a binary run in parallel, so two of them sharing a
+/// root means that wipe can land between another test's `create_dir_all` and
+/// its `copy` -- which is not a flake that shows up as a wrong answer but as
+/// `No such file or directory` on the *destination*, and which happened on the
+/// first clean run after the duplicate variant was added.
+fn corpus(root: &str) -> PathBuf {
+    let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target").join(root);
     std::fs::create_dir_all(&at).expect("a corpus directory");
     at
 }
@@ -91,14 +99,19 @@ struct Forge {
     machine: Machine,
     heap: Heap,
     btrieve: Btrieve,
+    /// This forge's own corpus root, wiped on the way in. See [`corpus`].
+    root: PathBuf,
 }
 
 impl Forge {
-    fn new() -> Self {
+    fn new(root: &str) -> Self {
+        let root = corpus(root);
+        let _ = std::fs::remove_dir_all(&root);
         Self {
             machine: Machine::new().expect("a 16-bit machine"),
             heap: Heap::new(Config::default()),
             btrieve: Btrieve::default(),
+            root,
         }
     }
 
@@ -115,7 +128,7 @@ impl Forge {
         variant: &str,
         work: impl FnOnce(&mut mbbs::btrieve::Block) -> Result<(), String>,
     ) -> Result<PathBuf, String> {
-        let dir = corpus().join(variant);
+        let dir = self.root.join(variant);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(name);
         std::fs::copy(from.join(name), &path).map_err(|e| e.to_string())?;
@@ -198,10 +211,7 @@ fn next_key(segment: &mbbs::btrieve::keys::Segment, highest: u64, n: u64) -> Vec
 #[ignore = "needs MajorMUD's data files in tmp/"]
 fn forge_a_corpus_the_real_engine_can_read() {
     let Some(data) = data() else { return };
-    let root = corpus();
-    let _ = std::fs::remove_dir_all(&root);
-
-    let mut forge = Forge::new();
+    let mut forge = Forge::new("btrieve-corpus");
     let mut made = 0usize;
     let mut skipped: Vec<String> = Vec::new();
 
@@ -320,7 +330,7 @@ fn forge_a_corpus_the_real_engine_can_read() {
     for why in &skipped {
         eprintln!("skipped  {why}");
     }
-    eprintln!("{made} files forged into {}", root.display());
+    eprintln!("{made} files forged into {}", forge.root.display());
 
     // Eleven reindexes, and ten each of the two writing variants. The one file
     // that refuses both is WCCTEXT, the only variable-length file of the
@@ -475,7 +485,7 @@ fn insert_duplicate_users(block: &mut mbbs::btrieve::Block) -> Result<(), String
 #[ignore = "needs MajorMUD's data files in tmp/"]
 fn forge_a_duplicate_key_the_real_engine_can_read() {
     let Some(data) = data() else { return };
-    let mut forge = Forge::new();
+    let mut forge = Forge::new("btrieve-corpus-duplicates");
 
     let refused = forge
         .forge(&data, "WCCUSERS.VIR", "duplicates", insert_duplicate_users)
