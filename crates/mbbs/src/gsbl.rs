@@ -256,6 +256,7 @@ impl Gsbl {
     /// this at all, and that is where a channel that does not exist is refused.
     pub fn push_input(&mut self, chan: Chan, bytes: &[u8]) {
         let c = self.channel_mut(chan);
+        let before = c.input.len();
         for &byte in bytes {
             c.take(byte);
         }
@@ -268,7 +269,17 @@ impl Gsbl {
         //
         // Here rather than in `take` because `take` runs per byte and the
         // wake-up is per delivery.
-        if c.raw && !bytes.is_empty() && !c.status.contains(&Gsbl::CYCLE) {
+        //
+        // The condition is that a byte **landed**, not that one was offered.
+        // `take` accepts nothing while `locked`, and drops everything past
+        // `INPSIZ`; asking `!bytes.is_empty()` woke the module for both. The
+        // locked case is the FSD's ordinary traffic rather than a curiosity:
+        // `fsdbkg` (`FSDBBS.C:186`) does `btulok(usrnum,1)` -- "Turn off
+        // keyboard till all displayed" -- so the channel is locked *and* raw
+        // for the whole of every screen paint, and a wake-up per socket read
+        // through all of it is an entry into `stsrou` with an empty buffer
+        // every time.
+        if c.raw && c.input.len() > before && !c.status.contains(&Gsbl::CYCLE) {
             c.status.push_back(Gsbl::CYCLE);
         }
     }
@@ -1616,6 +1627,86 @@ mod tests {
             g.channel(chan()).status.iter().filter(|&&s| s == Gsbl::CYCLE).count(),
             1,
             "six bytes over two deliveries is one wake-up, not six and not two"
+        );
+    }
+
+    /// A locked channel accepts nothing, raw or not -- and is not woken for
+    /// what it did not accept.
+    ///
+    /// Two assertions because they catch two different edits, and both edits
+    /// used to be invisible:
+    ///
+    /// * `input` empty pins that the lockout step is **ahead** of the raw
+    ///   bypass. Move the `raw` block above the `locked` check in
+    ///   [`Channel::take`] -- inverting the order its own comment justifies --
+    ///   and the bytes land here.
+    /// * `status` empty pins that [`Gsbl::push_input`]'s wake-up asks whether
+    ///   a byte landed and not whether one was offered. Go back to
+    ///   `!bytes.is_empty()` and a `CYCLE` appears with nothing behind it.
+    ///
+    /// Neither is hypothetical. `fsdbkg` (`FSDBBS.C:186`) does
+    /// `btulok(usrnum,1)` -- "Turn off keyboard till all displayed" -- for the
+    /// whole of every full-screen paint, so a locked raw channel is the FSD's
+    /// normal condition, not an edge of it. A host that woke the module anyway
+    /// would enter `stsrou` once per socket read all the way through the paint,
+    /// every time with an empty buffer.
+    #[test]
+    fn a_locked_raw_channel_accepts_nothing_and_is_not_woken() {
+        let mut g = one();
+        let c = g.channel_mut(chan());
+        c.raw = true;
+        c.locked = true;
+
+        g.push_input(chan(), b"abc");
+
+        let c = g.channel(chan());
+        assert!(
+            c.input.is_empty(),
+            "input lockout is ahead of the raw bypass: a locked channel takes nothing"
+        );
+        assert!(
+            c.status.is_empty(),
+            "no byte landed, so there is nothing to wake the module for"
+        );
+    }
+
+    /// Raw mode stops at `INPSIZ`, and a delivery that lands nothing there
+    /// wakes nothing either.
+    ///
+    /// The buffer is filled in one delivery (which does wake the module once,
+    /// because bytes did land), the status queue is emptied the way a dispatch
+    /// would empty it, and then one more byte is offered to a full buffer. That
+    /// second delivery is the case the old guard got wrong.
+    ///
+    /// A raw channel really can fill: nothing drains `input` until `stsrou`
+    /// runs and calls `btuica`, and a paste or a key-repeat arrives in whatever
+    /// size the socket hands over.
+    #[test]
+    fn raw_mode_stops_at_inpsiz_and_a_full_buffer_is_not_woken() {
+        let mut g = one();
+        g.channel_mut(chan()).raw = true;
+
+        g.push_input(chan(), &vec![b'x'; INPSIZ + 16]);
+        assert_eq!(
+            g.channel(chan()).input.len(),
+            INPSIZ,
+            "the sixteen bytes past capacity are dropped, not stored"
+        );
+        assert_eq!(
+            g.channel(chan()).status.iter().filter(|&&s| s == Gsbl::CYCLE).count(),
+            1,
+            "bytes did land, so one wake-up is owed"
+        );
+
+        // What a dispatch would have done to the FIFO, without running one.
+        g.channel_mut(chan()).status.clear();
+        g.push_input(chan(), b"y");
+
+        let c = g.channel(chan());
+        assert_eq!(c.input.len(), INPSIZ, "a full buffer stays full");
+        assert!(
+            c.status.is_empty(),
+            "the byte was dropped, so the module has nothing to be woken for"
         );
     }
 
