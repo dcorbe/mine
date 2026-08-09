@@ -134,6 +134,32 @@ fn with_one_section() -> Vec<u8> {
     v
 }
 
+/// `with_one_section()`'s CODE section only covers virtual/raw rva
+/// `0x1000..0x1100` / `0x1000..0x1080`. Some relocation tests below
+/// deliberately target rvas past that -- a second 4 KiB page, or an offset
+/// near the 12-bit field's edge -- to prove `page + offset` arithmetic rather
+/// than `page | offset`. Task 12 made `PeImage::parse` check every
+/// relocation's `rva` against the section table (see `Relocation`'s doc
+/// comment in `pe.rs`), so those targets now need to actually be inside a
+/// section rather than merely being math the parser used to accept
+/// unchecked. This grows the one section's `VirtualSize`/`SizeOfRawData` to
+/// `end_rva - 0x1000` and grows the file to match, without touching
+/// `with_one_section()` itself -- other tests depend on its exact 0x100/0x80
+/// sizes.
+fn with_one_section_extended_to(end_rva: u32) -> Vec<u8> {
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    let raw_offset = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap());
+    let size = end_rva - 0x1000; // the section's own rva, per with_one_section()
+    v[sec + 8..sec + 12].copy_from_slice(&size.to_le_bytes()); // VirtualSize
+    v[sec + 16..sec + 20].copy_from_slice(&size.to_le_bytes()); // SizeOfRawData
+    let needed = raw_offset as usize + size as usize;
+    if v.len() < needed {
+        v.resize(needed, 0);
+    }
+    v
+}
+
 #[test]
 fn a_section_table_parses() {
     let image = PeImage::parse(&with_one_section()).unwrap();
@@ -373,7 +399,7 @@ fn two_relocation_blocks_are_both_read_in_order() {
     // be missing; if `at` were miscomputed, the second block's header would
     // be read from the wrong offset and either error out or attribute its
     // entries to the wrong page.
-    let mut v = with_one_section();
+    let mut v = with_one_section_extended_to(0x3000);
     write_relocation_blocks(
         &mut v,
         &[
@@ -403,7 +429,7 @@ fn relocation_rva_is_page_plus_offset_not_page_or_offset() {
     // page RVA in such a test is chosen aligned. This also exercises the
     // block's last entry (offset 0xffe, right at the edge of the 12-bit
     // range) to rule out an off-by-one that drops it.
-    let mut v = with_one_section();
+    let mut v = with_one_section_extended_to(0x3000);
     write_relocation_blocks(&mut v, &[(0x1800, &[highlow(0x000), highlow(0xffe)])]);
 
     let image = PeImage::parse(&v).unwrap();

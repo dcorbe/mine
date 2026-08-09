@@ -326,6 +326,13 @@ const REL_HIGHLOW: u16 = 3;
 const REL_ABSOLUTE: u16 = 0;
 
 /// One site to rebase once the image is mapped: `*(u32*)(image + rva) += delta`.
+///
+/// `rva` is guaranteed, by `PeImage::parse`, to have all 4 of its bytes
+/// inside some section's raw data -- the block header's `page` field is
+/// otherwise unbounded file input, so that membership is checked at parse
+/// time (`RvaSpansSectionEnd` / `UnmappedRva` on failure) rather than trusted.
+/// `Image::relocate` (`image.rs`) relies on exactly this invariant to index
+/// the mapping without a second bounds check of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relocation {
     pub rva: u32,
@@ -745,9 +752,38 @@ impl PeImage {
                     if kind != REL_HIGHLOW {
                         return Err(PeError::UnsupportedRelocation { kind });
                     }
-                    relocations.push(Relocation {
-                        rva: page + u32::from(entry & 0x0fff),
-                    });
+                    // `page` is the block header's `VirtualAddress`, read
+                    // straight from the file with no upper bound of its own,
+                    // so adding the entry's 12-bit page offset can overflow a
+                    // crafted file's `u32` even though no real linker output
+                    // gets near it.
+                    let rva = page.checked_add(u32::from(entry & 0x0fff)).ok_or(
+                        PeError::RvaOverflow {
+                            what: "relocation site",
+                            rva: page,
+                        },
+                    )?;
+                    // The block header's `page` places this fixup anywhere in
+                    // a 32-bit address space; nothing above has checked it
+                    // against the section table at all. Applying it unchecked
+                    // at map time would let a crafted file's relocation
+                    // directory write four bytes anywhere in the mapping (or,
+                    // for a `rva` past `size_of_image` entirely, out of
+                    // bounds of it) -- so this is the same bounded-membership
+                    // check every other RVA-indexed read in this parser goes
+                    // through, applied here to a site nothing yet reads or
+                    // writes, only records for `Image::relocate` to trust
+                    // later.
+                    let (_, remaining) = rva_to_file_bounded_in(&sections, rva)?;
+                    if remaining < 4 {
+                        return Err(PeError::RvaSpansSectionEnd {
+                            what: "relocation site",
+                            rva,
+                            need: 4,
+                            remaining,
+                        });
+                    }
+                    relocations.push(Relocation { rva });
                 }
                 at = next;
             }
