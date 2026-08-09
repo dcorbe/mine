@@ -142,3 +142,20 @@ pub(crate) fn ldt_index(selector: u16) -> Result<u16, FarPtrError> {
     }
     Ok(selector >> 3)
 }
+
+impl mbbs_ptr::ModulePtr for FarPtr {
+    type Memory = crate::Machine;
+    type Error = FarPtrError;
+
+    fn resolve<'m>(&self, memory: &'m Self::Memory, len: usize) -> Result<&'m [u8], Self::Error> {
+        memory.resolve(*self, len)
+    }
+
+    fn read_cstr<'m>(&self, memory: &'m Self::Memory) -> Result<&'m [u8], Self::Error> {
+        memory.read_cstr(*self)
+    }
+
+    fn write(&self, memory: &mut Self::Memory, bytes: &[u8]) -> Result<(), Self::Error> {
+        memory.write(*self, bytes)
+    }
+}
