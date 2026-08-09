@@ -3639,6 +3639,20 @@ mod tests {
         (f, module, rou)
     }
 
+    /// The same, at `count` channels.
+    ///
+    /// `polling_fixture` is one channel, which is what `Terms::new(NTERMS)`
+    /// means -- and at one channel "every channel" and "channel zero" are the
+    /// same set, so nothing built on it can tell a per-channel sweep from a
+    /// sweep that stops after the first.
+    fn polling_fixture_with(count: u16) -> (crate::testing::Fixture, mbbs16::Module, FarPtr) {
+        let mut f = crate::testing::Fixture::rooted_with_terms(testing::data(), Terms::new(count));
+        let module = f.minimal_module();
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+        let rou = f.machine.code_ptr(0);
+        (f, module, rou)
+    }
+
     #[test]
     fn a_polling_channel_is_serviced_and_re_arms_itself() {
         let (mut f, module, rou) = polling_fixture();
@@ -4026,6 +4040,68 @@ mod tests {
             None,
             "one arming, not two"
         );
+    }
+
+    /// A refill arms EVERY polling channel, not merely the first one it finds.
+    ///
+    /// Every other test of the budget uses `polling_fixture`, which is one
+    /// channel -- and at one channel a sweep over `terms().all()` and a sweep
+    /// that stops after the first are the same function. Mutating the loop to
+    /// `.take(1)` passed all 780 lib tests AND all 17 real-module tests,
+    /// including the two-player one, because there the module's own
+    /// `begin_polling` had already armed both channels and the refill's sweep
+    /// never had to do the work.
+    ///
+    /// This is the shape the multi-channel branch was built to make
+    /// falsifiable: `btuxmt` writing to the current channel instead of its
+    /// argument passed all sixteen real-module tests too.
+    #[test]
+    fn a_refill_arms_every_polling_channel_and_not_just_the_first() {
+        let (mut f, module, rou) = polling_fixture_with(3);
+        let terms = f.host.users().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+        let two = terms.chan(2).expect("channel 2");
+
+        // The middle channel deliberately does not poll, so that "armed every
+        // channel" and "armed every channel that polls" are also different
+        // answers here.
+        for chan in [zero, two] {
+            f.host
+                .users
+                .set_polrou(&mut f.machine, chan, Some(rou))
+                .expect("a polling channel");
+        }
+
+        f.host.refill_polls(&f.machine, 100).expect("armed");
+
+        assert!(f.host.gsbl().polling_armed(zero), "channel 0 polls, so it is armed");
+        assert!(
+            f.host.gsbl().polling_armed(two),
+            "channel 2 polls too, and a sweep that stopped at the first would miss it"
+        );
+        assert!(
+            !f.host.gsbl().polling_armed(one),
+            "channel 1 has no polling routine, so arming it would be a dispatch \
+             the module never asked for"
+        );
+
+        // And they are not merely queued: both armings become dispatches.
+        let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
+        assert_eq!(
+            cycles.dispatched, 101,
+            "the budget plus one, and the plus one is the point: when the \
+             budget reaches zero the OTHER channel still holds an injection, \
+             and `dopoll` dispatches it rather than dropping it -- a status \
+             the host queued is one it owes the module. So the overshoot is \
+             bounded by the number of armed channels, not by the budget"
+        );
+        assert_eq!(
+            f.host.gsbl_mut().next_status(zero),
+            None,
+            "and it stops with the queues empty, or the driver could never sleep"
+        );
+        assert_eq!(f.host.gsbl_mut().next_status(two), None);
     }
 
     /// The meter that calibrates the budget in production.
