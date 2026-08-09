@@ -1164,10 +1164,20 @@ impl Host {
     /// The original calls this from two places that look unrelated: startup
     /// (`:908-911`, over every channel, right after `alcvda`) and the tail of
     /// both disconnect paths. That is not a coincidence -- it is what makes "a
-    /// channel nobody has used" and "a channel just freed" the *same state by
-    /// construction*. [`Host::connect_state`] used to note that whether a
-    /// reused channel should clear its whole record was an open question; it is
-    /// not open, it is answered here, and the answer is "all of it".
+    /// channel nobody has used" and "a channel just freed" the same state.
+    /// [`Host::connect_state`] used to note that whether a reused channel
+    /// should clear its whole record was an open question; it is not open, it
+    /// is answered here.
+    ///
+    /// # What this does NOT clear, and where that is done instead
+    ///
+    /// The volatile data area. `dftrst` does not clear it either -- the
+    /// original zeroes it on the way *in*, at `MAJORBBS.C:4000`, the line
+    /// before `cyclon` calls a module's `lonrou`. [`Host::connect`] is where
+    /// that line lives here, so the guarantee is "a channel a module is handed
+    /// has a zeroed VDA", not "`rstchn` leaves nothing at all". An earlier
+    /// version of this comment claimed the latter and said "the answer is all
+    /// of it", which was false for 1,961 bytes per channel.
     ///
     /// At one channel none of this is observable, because no second user ever
     /// arrives to inherit the first one's bytes.
@@ -1245,6 +1255,25 @@ impl Host {
             // dx: 0 }` would claim a call this host never made.
             return Ok(None);
         };
+        // `MAJORBBS.C:4000` -- `setmem(vdaptr,vdasiz,0)`, the line before
+        // `cyclon` calls a module's `lonrou`. The volatile data area is the one
+        // per-channel block `rstchn` does *not* clear, because `dftrst` does not
+        // clear it either: the original zeroes it on the way *in* rather than on
+        // the way out, and this is that line.
+        //
+        // Found by a mutation that stayed green across all 786 tests -- pointing
+        // `vdaptr` at channel 0 for every dispatch. That is invisible today
+        // because MajorMUD leaves the area zero on the returning-player path,
+        // which is exactly the argument that made `btuxmt`'s channel argument
+        // unfalsifiable at one channel. This branch exists because that argument
+        // was wrong once already.
+        if let Some(vda) = self.users.vda(chan) {
+            let size = self.globals.word(machine, "vdasiz")?;
+            if let Err(e) = machine.write(vda, &vec![0u8; usize::from(size)]) {
+                return self.shim_stop(machine, "clearing the volatile data area", e.into()).map(Some);
+            }
+        }
+
         self.run(machine, module, lonrou, &[]).map(Some)
     }
 
@@ -1295,12 +1324,21 @@ impl Host {
     /// state for another pass. This host has no logoff state to stay in, so a
     /// `1` is refused with a named stop rather than discarded -- a silent
     /// discard would leave the module believing a multi-pass dialogue is in
-    /// progress. `-1`, the sweep's "abandon and return to the menu" (`:4087-4089`),
-    /// is refused on the same terms: it names the menuing system this host
-    /// does not have, and mapping it onto `0` would be a guess. MajorMUD's own
-    /// `_LJNGAME_LOFROU` (`re/exports/WCCMMUD_named.c:12628`) returns 0, which
-    /// is exactly why the refusal has to exist rather than be assumed
-    /// unreachable.
+    /// progress.
+    ///
+    /// **Only `1`.** `-1` -- the sweep's "abandon and return to the menu" at
+    /// `:4087-4089` -- is *not* refused, because that branch is inside the loop
+    /// this host never reaches. Against `:4100`'s `!= 1`, the values `0`, `-1`
+    /// and `42` are one answer: finished, go to the menu. "Go to the menu" for
+    /// a headless host collapses to "the logoff is over", which is exactly the
+    /// [`rstchn`](Self::rstchn) that follows. Refusing `-1` as well would be
+    /// this host inventing a distinction the original does not draw at the only
+    /// line it reaches. See
+    /// `a_lofrou_that_abandons_the_sweep_is_taken_at_its_word_like_any_non_one`.
+    ///
+    /// MajorMUD's own `_LJNGAME_LOFROU` (`re/exports/WCCMMUD_named.c:12628`)
+    /// returns 0, which is exactly why the refusal has to exist rather than be
+    /// assumed unreachable.
     ///
     /// Returns `None` if the module supplies no `lofrou`. As with
     /// [`Host::hangup`], the reset happens either way.
@@ -2362,6 +2400,53 @@ mod tests {
                     "writing the four user records reached channel {chan}'s {what}, \
                      so the tables are not four channels long"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_global_that_names_the_current_channel_follows_the_channel() {
+        // `point_curusr` writes four globals, and until this test three of them
+        // were pinned and one was not. Pointing `vdaptr` at channel 0's area for
+        // every dispatch passed **all 786 tests** -- 769 lib and all 17
+        // real-module, including the two-player run.
+        //
+        // The reason it hid is the reason this whole branch exists: every other
+        // `point_curusr` test uses a one-channel fixture, where `vda(console)`
+        // and `vda(chan 0)` are the same address and the assertion is satisfied
+        // by construction. `curusr_repoints_every_global_that_names_the_current_channel`
+        // in `shims/user.rs` is one of those, and it is not wrong -- it is just
+        // unable to see this.
+        //
+        // MajorMUD leaves the volatile data area zero on the returning-player
+        // path, so the defect is unobservable through the module *today*. That
+        // is precisely the argument that made `btuxmt`'s channel argument
+        // unfalsifiable at one channel, and it was wrong then.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host =
+            Host::new(&mut machine, testing::data(), Terms::new(2)).expect("host");
+        // A volatile data area only exists once a module has declared a size,
+        // and `Fixture` has no module -- so declare one the way `dclvda` would.
+        host.globals()
+            .write(&mut machine, "vdasiz", &64u16.to_le_bytes())
+            .expect("vdasiz");
+        host.finish_init(&mut machine).expect("finished starting up");
+
+        for chan in host.users().terms().all() {
+            host.point_curusr(&mut machine, chan).expect("point_curusr");
+            let g = host.globals();
+            assert_eq!(
+                g.word(&machine, "usrnum").expect("usrnum") as i16,
+                chan.number(),
+                "usrnum"
+            );
+            for (name, want) in [
+                ("usrptr", host.users().slot(chan)),
+                ("usaptr", host.users().account(chan)),
+                ("vdaptr", host.users().vda(chan).expect("an area per channel")),
+            ] {
+                let got = g.pointer(&machine, name).expect(name);
+                assert_eq!(got, want, "{name} does not follow channel {chan}");
             }
         }
     }
