@@ -541,6 +541,23 @@ impl Channel {
         // 3. Binary mode. None of the ASCII processing applies -- a CR in
         //    binary mode is a byte like any other.
         if self.trigger != 0 {
+            // The comment above says "nothing sets both", and this is where
+            // that stops being an assertion: the branch is reachable only with
+            // `raw` clear, because the `raw` branch returned. A build where the
+            // two have swapped places arrives here holding an FSD keystroke and
+            // says so, instead of quietly counting it toward an `INBLK` nobody
+            // asked for.
+            //
+            // Here rather than at the top of `take`, deliberately. An assert
+            // ahead of both branches fires identically whichever order they are
+            // in, which would make the ordering unobservable and leave
+            // `raw_mode_wins_over_the_byte_count_trigger` unable to tell a
+            // correct build from the mutation it exists to catch.
+            debug_assert!(
+                !self.raw,
+                "raw mode is handled ahead of binary mode: a raw keystroke \
+                 reached the byte-count trigger"
+            );
             if self.input.len() < INPSIZ {
                 self.input.push_back(byte);
             }
@@ -1738,6 +1755,45 @@ mod tests {
         assert!(
             c.status.is_empty(),
             "the byte was dropped, so the module has nothing to be woken for"
+        );
+    }
+
+    /// `raw` is handled ahead of the byte-count trigger.
+    ///
+    /// The third of the three orderings [`Channel::take`]'s comment claims and
+    /// nothing measured. `a_locked_raw_channel_accepts_nothing_and_is_not_woken`
+    /// pins `locked` before `raw`; this pins `raw` before `trigger`.
+    ///
+    /// Both flags set is a state the host does not produce -- `raw` is the
+    /// host's, `trigger` is the module's `btutrg` -- and the point of the test
+    /// is that the code has an answer for it anyway, in one specific direction.
+    /// Move the `raw` block after the `trigger` branch and this goes red twice
+    /// over: on the `debug_assert!` in that branch, and (in a release build,
+    /// where the assert is compiled out) on `INBLK`.
+    #[test]
+    fn raw_mode_wins_over_the_byte_count_trigger() {
+        let mut g = one();
+        let c = g.channel_mut(chan());
+        c.raw = true;
+        c.trigger = 2;
+
+        g.push_input(chan(), b"abcd");
+
+        let c = g.channel(chan());
+        assert_eq!(
+            c.input.iter().copied().collect::<Vec<u8>>(),
+            b"abcd".to_vec(),
+            "the bytes land either way -- it is everything else that differs"
+        );
+        assert!(
+            !c.status.contains(&Gsbl::INBLK),
+            "the trigger branch never ran, so no block status was raised"
+        );
+        assert_eq!(c.since_trigger, 0, "and nothing was counted toward the next one");
+        assert_eq!(
+            c.status.iter().copied().collect::<Vec<i16>>(),
+            vec![Gsbl::CYCLE],
+            "raw mode's own wake-up is the only status the delivery produced"
         );
     }
 
