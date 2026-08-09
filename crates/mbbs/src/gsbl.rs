@@ -70,6 +70,28 @@ pub struct Channel {
     pub echo: bool,
     /// `btulok` -- input lockout: arriving bytes are discarded.
     pub locked: bool,
+    /// `fsdcon` -- character-at-a-time mode: deliver bytes uncooked.
+    ///
+    /// While set, [`Channel::take`] appends to `input` and does nothing else:
+    /// no line assembly, no `maxinl`, no backspace cooking, no echo, no
+    /// `CRSTG`. The FSD's entry engine wants keystrokes, and a CR is one of
+    /// them rather than the end of anything.
+    ///
+    /// This is one flag where the original makes eight `btu*` calls
+    /// (`fsdcon`, `FSDBBS.C:91`): `btuche`, `btulfd`, `btuscr`, `btuchi`,
+    /// `btuech`, `btucli`, `btuxnf`, `btupbc`. The load-bearing one is
+    /// `btuchi(usrnum,fsdchi)`, which installs an interrupt-level character
+    /// handler; this host has no interrupt level, so there is nothing to
+    /// install and the handler's job -- take the byte, wake the module --
+    /// is what the flag does directly. The rest are terminal-driver knobs
+    /// (soft CR, LF-after-CR, pause character, XON/XOFF).
+    ///
+    /// `echo` and `width` are still the module's to set, and it does not set
+    /// them symmetrically: `fsdcon` turns echo off with `btuech(usrnum,0)`
+    /// and `fsdcof` (`FSDBBS.C:104`) turns it back on with `echon()`, but
+    /// only `fsdcof` touches the width, restoring it with
+    /// `btutsw(usrnum,usaptr->scnwid)`. Nothing narrowed it on the way in.
+    pub raw: bool,
     /// `btutrg` -- the byte-count trigger. Zero is ASCII mode; non-zero is
     /// binary mode and the block size that raises status 4.
     pub trigger: u16,
@@ -113,6 +135,7 @@ impl Default for Channel {
             maxinl: 0,
             echo: true,
             locked: false,
+            raw: false,
             trigger: 0,
             oes: false,
             xon: 0,
@@ -235,6 +258,18 @@ impl Gsbl {
         let c = self.channel_mut(chan);
         for &byte in bytes {
             c.take(byte);
+        }
+        // Raw mode queues no status of its own inside `take`, so nothing would
+        // ever wake the loop for these bytes. One `CYCLE` per delivery, and only
+        // if one is not already waiting: the handler drains `input` completely
+        // on the pass it runs, so a second status would dispatch into an empty
+        // buffer, and a pipelining client would otherwise grow the queue once
+        // per socket read.
+        //
+        // Here rather than in `take` because `take` runs per byte and the
+        // wake-up is per delivery.
+        if c.raw && !bytes.is_empty() && !c.status.contains(&Gsbl::CYCLE) {
+            c.status.push_back(Gsbl::CYCLE);
         }
     }
 
@@ -437,9 +472,27 @@ impl Channel {
     /// guide's, and it is why a backspace can be echoed while a byte past
     /// `maxinl` is not, and why DEL becomes a backspace before the backspace
     /// step ever sees it.
+    ///
+    /// [`Channel::raw`] short-circuits all of it, ahead of even the translate
+    /// table -- it stands in for the `btuchi` handler `fsdcon` installs, which
+    /// in the original runs at interrupt level and therefore before any of
+    /// these eleven steps too.
     fn take(&mut self, byte: u8) {
         // 2. Input lockout. The byte never happened.
         if self.locked {
+            return;
+        }
+
+        // Raw mode, before everything: a keystroke is a keystroke, and the FSD
+        // wants the CR and the backspace as bytes rather than as instructions.
+        // Before the translate table above all, which drops ESC -- the first
+        // byte of every arrow key, and the FSD steers on arrow keys. Ahead of
+        // the `trigger` branch because `raw` is the host's own doing and
+        // `trigger` is the module's; nothing sets both.
+        if self.raw {
+            if self.input.len() < INPSIZ {
+                self.input.push_back(byte);
+            }
             return;
         }
 
@@ -1474,5 +1527,108 @@ mod tests {
     #[test]
     fn cycle_is_the_number_the_module_injects() {
         assert_eq!(Gsbl::CYCLE, 240);
+    }
+
+    /// While `raw` is set, nothing is cooked: no line is assembled, no `CRSTG`
+    /// is queued, no echo is produced, and `maxinl` does not apply. The bytes
+    /// land in `input`, which is where `btuica` already looks for them.
+    ///
+    /// The byte sequence is chosen so that the *order* of the bypass is
+    /// measured and not just its presence. `a b \r c \x08` -- the obvious
+    /// sample -- passes through [`translate`] completely unchanged, so a
+    /// bypass placed after the translate table instead of before it delivers
+    /// exactly the same bytes and this test cannot see the difference. These
+    /// four can:
+    ///
+    /// * `\x1b` is dropped by the table. It is also the first byte of every
+    ///   arrow key, and the FSD's full-screen entry engine steers on arrow
+    ///   keys -- losing ESC is losing the feature this flag exists for.
+    /// * `\n` is dropped, so a client sending CR LF would deliver one byte.
+    /// * `\x00` is dropped, so a telnet client's CR NUL would deliver one.
+    /// * `\xff` is telnet IAC. The table strips the high bit, making it
+    ///   `\x7f`, which the table then rewrites to a **backspace** -- a byte
+    ///   that arrives as something else entirely rather than merely going
+    ///   missing.
+    #[test]
+    fn raw_mode_delivers_bytes_uncooked() {
+        let mut g = one();
+        g.channel_mut(chan()).raw = true;
+        g.channel_mut(chan()).maxinl = 2;
+
+        g.push_input(chan(), b"a\x1b[Ab\r\n\x00\xffc\x08");
+
+        let c = g.channel(chan());
+        assert_eq!(
+            c.input.iter().copied().collect::<Vec<u8>>(),
+            b"a\x1b[Ab\r\n\x00\xffc\x08".to_vec(),
+            "every byte arrives: ESC, LF, NUL, IAC, CR and backspace, \
+             none dropped and none rewritten by the translate table"
+        );
+        assert!(c.line.is_empty(), "no line is assembled");
+        assert!(c.ready.is_empty(), "no completed line is offered");
+        assert!(c.output.is_empty(), "raw mode does not echo");
+        assert!(
+            !c.status.contains(&Gsbl::CRSTG),
+            "a CR in raw mode is a byte, not a line terminator"
+        );
+    }
+
+    /// The bytes raw mode collects are reachable and clearable through the
+    /// shims that already own `input`, which is the whole reason `input` is the
+    /// destination rather than a buffer of raw mode's own.
+    ///
+    /// `btuica` (`shims/gsbl.rs`) drains `c.input` and `btucli` clears it, and
+    /// neither consults `trigger` first -- so neither has an opinion about how
+    /// the bytes got there. Asserted here on the fields rather than through the
+    /// shims because this module cannot call them; the shim tests own the
+    /// pointer handling.
+    #[test]
+    fn raw_bytes_land_where_btuica_and_btucli_already_look() {
+        let mut g = one();
+        g.channel_mut(chan()).raw = true;
+        g.push_input(chan(), b"abc");
+
+        // What `btuica` would take: the front of `input`, up to its maximum.
+        let taken: Vec<u8> = g.channel_mut(chan()).input.drain(..2).collect();
+        assert_eq!(taken, b"ab".to_vec(), "btuica's drain reaches raw bytes");
+
+        // What `btucli` would throw away: the rest of it.
+        g.channel_mut(chan()).input.clear();
+        assert!(
+            g.channel(chan()).input.is_empty(),
+            "btucli's clear reaches raw bytes"
+        );
+    }
+
+    /// A byte arriving in raw mode wakes the loop, because nothing else will.
+    /// One `CYCLE` per delivery and not per byte: the handler drains `input`
+    /// completely on the pass it runs, so a second status would dispatch into
+    /// an empty buffer.
+    #[test]
+    fn raw_mode_queues_one_cycle_per_delivery() {
+        let mut g = one();
+        g.channel_mut(chan()).raw = true;
+
+        g.push_input(chan(), b"abc");
+        g.push_input(chan(), b"def");
+
+        assert_eq!(
+            g.channel(chan()).status.iter().filter(|&&s| s == Gsbl::CYCLE).count(),
+            1,
+            "six bytes over two deliveries is one wake-up, not six and not two"
+        );
+    }
+
+    /// Clearing `raw` puts the channel back exactly as it was.
+    #[test]
+    fn leaving_raw_mode_restores_line_assembly() {
+        let mut g = one();
+        g.channel_mut(chan()).raw = true;
+        g.push_input(chan(), b"xy");
+        g.channel_mut(chan()).raw = false;
+
+        g.push_input(chan(), b"hi\r");
+
+        assert_eq!(g.take_line(chan()), Some(b"hi".to_vec()));
     }
 }
