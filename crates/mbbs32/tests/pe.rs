@@ -146,6 +146,27 @@ fn a_section_table_parses() {
 }
 
 #[test]
+fn every_section_field_comes_from_its_own_offset() {
+    // Mirrors `every_optional_header_field_comes_from_its_own_offset`:
+    // `with_one_section()` already plants five nonzero, pairwise-distinct
+    // values (rva 0x1000, virtual_size 0x100, raw_size 0x80, raw_offset
+    // ~0x1a0, characteristics 0x6000_0020), so a parser reading one field
+    // from another field's byte offset in the 40-byte section header --
+    // e.g. `characteristics` (at+36) from `rva`'s offset (at+12) -- lands on
+    // a value that belongs to the wrong field and is caught here. Nothing
+    // consumes `characteristics` yet, but Task 11 uses it to choose page
+    // protections, so it is about to become load-bearing.
+    let image = PeImage::parse(&with_one_section()).unwrap();
+    let s = &image.sections[0];
+    let sec = 0x98 + 0xe0; // opt + SizeOfOptionalHeader, same as with_one_section()
+    assert_eq!(s.rva, 0x1000, "rva, section+12");
+    assert_eq!(s.virtual_size, 0x100, "virtual size, section+8");
+    assert_eq!(s.raw_size, 0x80, "raw size, section+16");
+    assert_eq!(s.raw_offset, (sec + 40) as u32, "raw offset, section+20");
+    assert_eq!(s.characteristics, 0x6000_0020, "characteristics, section+36");
+}
+
+#[test]
 fn an_rva_resolves_to_a_file_offset_only_inside_a_section() {
     let image = PeImage::parse(&with_one_section()).unwrap();
     let base = image.sections[0].raw_offset;
