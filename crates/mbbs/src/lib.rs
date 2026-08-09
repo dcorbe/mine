@@ -3123,6 +3123,47 @@ mod tests {
         );
     }
 
+    /// One injected `CYCLE` is one dispatch, and then the loop is done.
+    ///
+    /// The FSD's whole entry engine is driven by `fsdnfy()` (`FSDBBS.C:368`)
+    /// re-injecting `CYCLE` at the channel, and `fsdsts` (`FSDBBS.C:262`) is
+    /// the original documenting its own spin: in `case FINISHING`, `if
+    /// (btuoba(usrnum) == outbsz-1) goback(); else { actdet=0; fsdnfy(); }` --
+    /// re-dispatch on every pass until the output buffer drains, with
+    /// `actdet=0` so the host's idle detector does not count the loop as work.
+    /// This host has no interrupt level and no output ring to wait on, so it
+    /// must not inherit that: a status is an edge, consumed once.
+    ///
+    /// Asserted on [`Cycles`] rather than on [`Ended`]: the `Ended` enum is
+    /// being rewritten on the tokio transport branch, and
+    /// `iterations`/`dispatched` say the thing that matters anyway -- how many
+    /// times the module was entered, and whether the loop ran to its bound.
+    ///
+    /// Mutated by queueing 200 `CYCLE`s instead of one: `dispatched` becomes
+    /// 50 and `iterations` reaches the bound, and both assertions fire.
+    #[test]
+    fn one_injected_cycle_is_one_dispatch_and_the_loop_settles() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        // A bare `retf`: a stsrou that does its work and does not ask to be
+        // called again.
+        let stsrou = f.machine.code_ptr(0);
+        register_named(&mut f, "only", &[(2, stsrou)]);
+        f.machine.load_code(&[0xcb]).expect("the stub fits");
+
+        f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+
+        assert_eq!(cycles.dispatched, 1, "one CYCLE is one entry into stsrou");
+        assert!(
+            cycles.iterations < 50,
+            "the loop settled instead of running to its bound; it took {} passes",
+            cycles.iterations
+        );
+    }
+
     /// 16-bit code that returns `ax` and does nothing else.
     fn returns_stub(ax: u16) -> Vec<u8> {
         let mut code = vec![0xb8]; // mov ax, <ax>
