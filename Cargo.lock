@@ -439,6 +439,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mbbs-ptr"
+version = "0.1.0"
+
+[[package]]
 name = "mbbs-server"
 version = "0.1.0"
 dependencies = [
@@ -454,6 +458,7 @@ name = "mbbs16"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "mbbs-ptr",
 ]
 
 [[package]]
@@ -461,6 +466,7 @@ name = "mbbs32"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "mbbs-ptr",
 ]
 
 [[package]]

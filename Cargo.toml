@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/mbbs",
+    "crates/mbbs-ptr",
     "crates/mbbs16",
     "crates/mbbs32",
     "crates/mbbs-server",
