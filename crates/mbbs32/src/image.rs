@@ -110,6 +110,55 @@ impl Image {
         self.mapping.as_slice()
     }
 
+    /// Read `len` bytes at linear-address-relative `rva`, bounds-checked
+    /// against this image's own mapped length.
+    ///
+    /// **Not** `PeImage::rva_to_file`: that answers a file-layout question and
+    /// refuses BSS addresses that are perfectly valid once mapped (zeroed by
+    /// the mapping itself, never present in the file). This checks only
+    /// against what is actually mapped.
+    ///
+    /// # Errors
+    ///
+    /// If `rva + len` runs past the end of the mapping.
+    pub fn read_at(&self, rva: u32, len: usize) -> io::Result<&[u8]> {
+        let start = rva as usize;
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rva + len overflows")
+        })?;
+        self.as_slice().get(start..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{len} bytes at rva {rva:#x} runs past the end of the image"),
+            )
+        })
+    }
+
+    /// Write `bytes` at linear-address-relative `rva`, bounds-checked the same
+    /// way as [`Image::read_at`].
+    ///
+    /// # Errors
+    ///
+    /// If `rva + bytes.len()` runs past the end of the mapping.
+    pub fn write_at(&mut self, rva: u32, bytes: &[u8]) -> io::Result<()> {
+        let start = rva as usize;
+        let end = start.checked_add(bytes.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rva + len overflows")
+        })?;
+        let len = bytes.len();
+        self.mapping
+            .as_mut_slice()
+            .get_mut(start..end)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{len} bytes at rva {rva:#x} runs past the end of the image"),
+                )
+            })?
+            .copy_from_slice(bytes);
+        Ok(())
+    }
+
     /// The address this image is actually mapped at.
     ///
     /// [`Mapping::new`] never asks the kernel for a specific address, so this
@@ -331,4 +380,113 @@ pub struct ThunkSite {
     /// index (see [`Image::bind_imports`]'s doc comment for why), so this is
     /// the only place that distinction survives.
     pub resolved: bool,
+}
+
+#[cfg(test)]
+mod read_write_tests {
+    use super::*;
+    use crate::pe::PeImage;
+
+    /// `size_of_image` this fixture's optional header plants -- large enough
+    /// that a one-section image maps comfortably inside it, with plenty of
+    /// room past the section for "past the mapped length" tests to land in.
+    const SIZE_OF_IMAGE: u32 = 0x0005_5000;
+
+    /// Offset (within the file buffer this returns) of the one section's raw
+    /// data. Mirrors `tests/pe.rs`'s `with_one_section()` layout exactly:
+    /// section table starts at `opt + SizeOfOptionalHeader` (`0x98 + 0xe0`),
+    /// one 40-byte section header, then raw data immediately after.
+    const RAW_OFFSET: usize = 0x98 + 0xe0 + 40;
+
+    /// The smallest file `PeImage::parse` accepts, plus one `CODE` section
+    /// covering rva `0x1000..0x1100` (raw `0x1000..0x1080`).
+    ///
+    /// `image.rs` had no `#[cfg(test)]` module of its own before this task,
+    /// so there is no existing helper in *this* crate's unit tests to reuse
+    /// directly -- `tests/pe.rs`'s `minimal()`/`with_one_section()` live in
+    /// the separate integration-test crate and are not visible from here.
+    /// This is that same byte layout, inlined, so these tests build a
+    /// `PeImage` + file buffer the same way every other test in this crate
+    /// family does rather than inventing a new fixture shape.
+    fn minimal_with_one_section() -> Vec<u8> {
+        let mut v = vec![0u8; 0x200];
+        v[0..2].copy_from_slice(b"MZ");
+        v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+        v[0x80..0x84].copy_from_slice(b"PE\0\0");
+        v[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes()); // machine = i386
+        v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+        v[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes()); // SizeOfOptionalHeader
+        v[0x96..0x98].copy_from_slice(&0x010eu16.to_le_bytes()); // characteristics
+        v[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32 magic
+
+        let opt = 0x98;
+        v[opt + 16..opt + 20].copy_from_slice(&0x0000_1111u32.to_le_bytes()); // entry point
+        v[opt + 28..opt + 32].copy_from_slice(&0x2222_0000u32.to_le_bytes()); // image base
+        v[opt + 32..opt + 36].copy_from_slice(&0x0000_3000u32.to_le_bytes()); // section alignment
+        v[opt + 36..opt + 40].copy_from_slice(&0x0000_0400u32.to_le_bytes()); // file alignment
+        v[opt + 56..opt + 60].copy_from_slice(&SIZE_OF_IMAGE.to_le_bytes());
+
+        let sec = opt + 0xe0;
+        v.resize(sec + 40 + 0x200, 0);
+        v[sec..sec + 8].copy_from_slice(b"CODE\0\0\0\0");
+        v[sec + 8..sec + 12].copy_from_slice(&0x100u32.to_le_bytes()); // VirtualSize
+        v[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+        v[sec + 16..sec + 20].copy_from_slice(&0x80u32.to_le_bytes()); // SizeOfRawData
+        v[sec + 20..sec + 24].copy_from_slice(&((sec + 40) as u32).to_le_bytes()); // PointerToRawData
+        v[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        v
+    }
+
+    /// Parse `file` and load it, panicking on failure -- every test here
+    /// starts from a fixture already proven to parse and load cleanly by
+    /// `tests/pe.rs`/`tests/map.rs`, so a failure here is a bug in the
+    /// fixture, not something under test.
+    fn load(file: &[u8]) -> Image {
+        let image = PeImage::parse(file).expect("fixture parses");
+        Image::load(file, &image).expect("fixture loads")
+    }
+
+    #[test]
+    fn read_at_returns_the_bytes_at_that_rva() {
+        // Arrange: a known byte pattern at some offset inside the CODE
+        // section's raw data, at file offset `RAW_OFFSET + 0x10` -- which
+        // `PeImage::load` copies to rva `0x1000 + 0x10`.
+        let mut file = minimal_with_one_section();
+        file[RAW_OFFSET + 0x10..RAW_OFFSET + 0x14].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let image = load(&file);
+
+        // Act + Assert: reading the matching rva returns the same bytes.
+        assert_eq!(image.read_at(0x1010, 4).unwrap(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn read_at_past_the_mapped_length_is_refused() {
+        let file = minimal_with_one_section();
+        let image = load(&file);
+
+        // Exactly at the end of the mapping: zero bytes available, one asked
+        // for.
+        assert!(image.read_at(SIZE_OF_IMAGE, 1).is_err());
+        // One byte inside the mapping, two asked for: the range would run
+        // one byte past the end.
+        assert!(image.read_at(SIZE_OF_IMAGE - 1, 2).is_err());
+    }
+
+    #[test]
+    fn write_at_is_visible_to_a_later_read_at() {
+        let file = minimal_with_one_section();
+        let mut image = load(&file);
+
+        image.write_at(0x1020, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(image.read_at(0x1020, 4).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_at_past_the_mapped_length_is_refused() {
+        let file = minimal_with_one_section();
+        let mut image = load(&file);
+
+        assert!(image.write_at(SIZE_OF_IMAGE, &[0]).is_err());
+        assert!(image.write_at(SIZE_OF_IMAGE - 1, &[0, 0]).is_err());
+    }
 }
