@@ -11,6 +11,8 @@
 const IAC: u8 = 255;
 const SB: u8 = 250;
 const SE: u8 = 240;
+const WILL: u8 = 251;
+const DONT: u8 = 254;
 
 /// Strips telnet IAC sequences from a byte stream fed in arbitrary chunks.
 #[derive(Default)]
@@ -49,13 +51,22 @@ impl Filter {
                     Some(len) => i += len,
                     None => break,
                 },
-                // Three-byte command (WILL/WONT/DO/DONT/...).
-                _ => {
+                // WILL/WONT/DO/DONT carry an option byte: three bytes.
+                WILL..=DONT => {
                     if self.held.len() < i + 3 {
                         break;
                     }
                     i += 3;
                 }
+                // Everything else in the command range -- NOP, Data Mark,
+                // BRK, IP, AO, AYT, EC, EL, GA, and a stray SE -- is TWO
+                // bytes, not three. RFC 854's command list.
+                //
+                // Treating them as three ate the byte after them, and the
+                // byte after them is a real one: a telnet client sends
+                // `IAC IP` when the user presses Ctrl-C, so the next
+                // character they typed silently vanished.
+                _ => i += 2,
             }
         }
 
@@ -135,6 +146,27 @@ mod tests {
         both_ways(b"\x08look\r\n\x1b[0m", b"\x08look\r\n\x1b[0m");
     }
 
+    /// Only WILL/WONT/DO/DONT (251-254) carry an option byte. Every other
+    /// telnet command is two bytes, and reading one as three eats the byte
+    /// after it -- which is a byte the user typed.
+    ///
+    /// `IAC IP` is what a telnet client sends on Ctrl-C, so this was not a
+    /// theoretical shape: the first character after an interrupt disappeared.
+    #[test]
+    fn a_two_byte_command_does_not_eat_the_byte_after_it() {
+        both_ways(b"\xff\xf4north\r", b"north\r"); // IAC IP
+        both_ways(b"\xff\xf9hi", b"hi"); // IAC GA
+        both_ways(b"\xff\xf1x", b"x"); // IAC NOP
+        both_ways(b"\xff\xf6?", b"?"); // IAC AYT
+    }
+
+    /// The three-byte ones still consume three.
+    #[test]
+    fn an_option_negotiation_still_consumes_its_option_byte() {
+        both_ways(b"\xff\xfb\x01ok", b"ok"); // IAC WILL ECHO
+        both_ways(b"\xff\xfe\x03ok", b"ok"); // IAC DONT SGA
+    }
+
     /// A sequence that has only half arrived is held, not emitted.
     #[test]
     fn a_partial_sequence_is_held_until_the_rest_arrives() {
@@ -144,3 +176,4 @@ mod tests {
         assert_eq!(f.feed(b"\x03b"), b"b");
     }
 }
+
