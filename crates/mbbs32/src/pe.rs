@@ -143,6 +143,22 @@ pub enum PeError {
     /// file-supplied `u32` regardless of whether a real linker would ever
     /// produce the input that exercises it.
     RvaOverflow { what: &'static str, rva: u32 },
+
+    /// A name's entry in `AddressOfNameOrdinals` indexes past the end of the
+    /// `AddressOfFunctions` array this same export directory declares
+    /// (`NumberOfFunctions`).
+    ///
+    /// This cannot be caught by a bounds-checked *read*: the two-byte
+    /// ordinal itself is read from perfectly valid, in-bounds memory. It is
+    /// a *data* inconsistency between two arrays this parser has already
+    /// finished reading, not a truncated read, so it gets checked
+    /// explicitly against `functions.len()` rather than being allowed to
+    /// index off the end of the `Vec` already built from it.
+    ExportOrdinalOutOfRange {
+        name: String,
+        ordinal: u16,
+        functions: u32,
+    },
 }
 
 impl fmt::Display for PeError {
@@ -210,6 +226,15 @@ impl fmt::Display for PeError {
             Self::RvaOverflow { what, rva } => {
                 write!(f, "{what}: advancing rva {rva:#x} would overflow u32")
             }
+            Self::ExportOrdinalOutOfRange {
+                name,
+                ordinal,
+                functions,
+            } => write!(
+                f,
+                "export {name:?} names function ordinal {ordinal}, but the export \
+                 directory declares only {functions} functions"
+            ),
         }
     }
 }
@@ -343,6 +368,46 @@ pub struct Import {
     pub iat_rva: u32,
 }
 
+/// Where the export directory sits among the optional header's data
+/// directories, which begin at `opt + 96`.
+const DIR_EXPORT: usize = 0;
+
+/// Where an export points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportAddress {
+    /// The ordinary case, and the only one `wccmmud.dll` contains: an RVA to
+    /// the function's own code.
+    Rva(u32),
+    /// The function's entry in `AddressOfFunctions` fell inside the export
+    /// directory's own `[VirtualAddress, VirtualAddress + Size)` range. That
+    /// is the format's signal that this "address" is not code at all, but
+    /// the RVA of a NUL-terminated `"DLL.Symbol"` string naming where the
+    /// real export lives. A loader that read it as code would jump into the
+    /// middle of a string; representing it as a distinct variant makes that
+    /// mistake a type error instead. Following the forwarder into the named
+    /// DLL is a Windows loader's job, not this crate's -- see the crate doc.
+    Forwarded(String),
+}
+
+/// One exported symbol: a name, and where it points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    pub address: ExportAddress,
+}
+
+impl Export {
+    /// `Some(target)` if this export forwards to another DLL's export under
+    /// `"DLL.Symbol"`, `None` if it is an ordinary code address.
+    #[must_use]
+    pub fn forwarder(&self) -> Option<&str> {
+        match &self.address {
+            ExportAddress::Forwarded(target) => Some(target.as_str()),
+            ExportAddress::Rva(_) => None,
+        }
+    }
+}
+
 /// A parsed PE32 image. Plain data: nothing here is mapped or allocated.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -355,6 +420,21 @@ pub struct PeImage {
     pub sections: Vec<Section>,
     pub relocations: Vec<Relocation>,
     pub imports: Vec<Import>,
+    pub exports: Vec<Export>,
+    /// The export directory's `Base` field (`+16`): the value that would be
+    /// added to a function's index in `AddressOfFunctions` to produce its
+    /// public exported ordinal number.
+    ///
+    /// Deliberately unused by `export_rva`: a name resolves to a function by
+    /// indexing `AddressOfFunctions` directly with
+    /// `AddressOfNameOrdinals[i]`, which the format already defines as a
+    /// plain 0-based array index, not a `Base`-relative ordinal. Subtracting
+    /// `Base` from it -- a classic mistake, since ordinals handed to
+    /// `GetProcAddress` *are* `Base`-relative -- indexes the wrong function
+    /// whenever `Base != 0`. This field is kept anyway, for whatever later
+    /// needs a module's true exported ordinal numbers. `None` when the image
+    /// has no export directory.
+    pub export_base: Option<u32>,
 }
 
 /// The file offset an RVA's bytes live at, plus how many contiguous raw bytes
@@ -434,6 +514,21 @@ fn u32_at_rva(
 ) -> Result<u32, PeError> {
     let b = read_bytes_at_rva(sections, r, what, rva, 4)?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Reads a little-endian `u16` at `rva`, bounded to its own section.
+///
+/// # Errors
+///
+/// See `read_bytes_at_rva`.
+fn u16_at_rva(
+    sections: &[Section],
+    r: &Reader<'_>,
+    what: &'static str,
+    rva: u32,
+) -> Result<u16, PeError> {
+    let b = read_bytes_at_rva(sections, r, what, rva, 2)?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 /// Reads a NUL-terminated string starting at `rva`, without the NUL.
@@ -728,6 +823,108 @@ impl PeImage {
             }
         }
 
+        // Export directory: unlike imports (a null-terminated walk with no
+        // length field at all) the export tables are true fixed-length
+        // arrays -- NumberOfFunctions and NumberOfNames are straight counts
+        // from the header. Neither is trusted by pre-allocating a `Vec` from
+        // it (an attacker-chosen NumberOfFunctions near u32::MAX would be a
+        // multi-gigabyte allocation before a single byte is read); every
+        // element is read one at a time through a bounds-checked RVA, so a
+        // header that overstates either count fails at the first read past
+        // the covering section's raw end.
+        //
+        // `+12 Name` (the RVA of the module's own name string) is
+        // deliberately never read: nothing in this crate's scope -- binding
+        // imports by name, finding an export's address by name -- needs the
+        // exporting module's own name string.
+        let export_dir_rva = r.u32("export directory rva", dirs + DIR_EXPORT * 8)?;
+        let export_dir_size = r.u32("export directory size", dirs + DIR_EXPORT * 8 + 4)?;
+        let mut exports = Vec::new();
+        let mut export_base = None;
+        if export_dir_rva != 0 && export_dir_size != 0 {
+            let field = |offset: u32, what: &'static str| -> Result<u32, PeError> {
+                let rva = export_dir_rva
+                    .checked_add(offset)
+                    .ok_or(PeError::RvaOverflow { what, rva: export_dir_rva })?;
+                u32_at_rva(&sections, &r, what, rva)
+            };
+            let base = field(16, "export base")?;
+            let number_of_functions = field(20, "export number of functions")?;
+            let number_of_names = field(24, "export number of names")?;
+            let addr_of_functions = field(28, "export address of functions")?;
+            let addr_of_names = field(32, "export address of names")?;
+            let addr_of_name_ordinals = field(36, "export address of name ordinals")?;
+            export_base = Some(base);
+
+            // The end of the export directory's own byte range: a function
+            // RVA landing inside [export_dir_rva, dir_end) is a forwarder
+            // string, not code. Computed once, outside the loop below, so
+            // an overflowing Size is refused up front rather than per entry.
+            let dir_end = export_dir_rva
+                .checked_add(export_dir_size)
+                .ok_or(PeError::RvaOverflow {
+                    what: "export directory range",
+                    rva: export_dir_rva,
+                })?;
+
+            let mut functions = Vec::new();
+            let mut cursor = addr_of_functions;
+            for _ in 0..number_of_functions {
+                let rva = u32_at_rva(&sections, &r, "export address table entry", cursor)?;
+                functions.push(rva);
+                cursor = cursor.checked_add(4).ok_or(PeError::RvaOverflow {
+                    what: "export address table cursor",
+                    rva: cursor,
+                })?;
+            }
+
+            let mut names_cursor = addr_of_names;
+            let mut ordinals_cursor = addr_of_name_ordinals;
+            for _ in 0..number_of_names {
+                let name_rva =
+                    u32_at_rva(&sections, &r, "export name pointer table entry", names_cursor)?;
+                let name = read_cstr_at_rva(&sections, &r, "export name", name_rva)?;
+                let ordinal =
+                    u16_at_rva(&sections, &r, "export name ordinal table entry", ordinals_cursor)?;
+
+                // `ordinal` is a plain 0-based index into `functions` -- see
+                // `PeImage::export_base` for why it is never combined with
+                // `Base`. It was read from a perfectly valid location, so an
+                // out-of-range value here is a data inconsistency between
+                // two arrays this loader has already finished reading, not
+                // a truncated read.
+                let func_rva = *functions.get(usize::from(ordinal)).ok_or(
+                    PeError::ExportOrdinalOutOfRange {
+                        name: name.clone(),
+                        ordinal,
+                        functions: number_of_functions,
+                    },
+                )?;
+
+                let address = if func_rva >= export_dir_rva && func_rva < dir_end {
+                    ExportAddress::Forwarded(read_cstr_at_rva(
+                        &sections,
+                        &r,
+                        "export forwarder string",
+                        func_rva,
+                    )?)
+                } else {
+                    ExportAddress::Rva(func_rva)
+                };
+
+                exports.push(Export { name, address });
+
+                names_cursor = names_cursor.checked_add(4).ok_or(PeError::RvaOverflow {
+                    what: "export name pointer table cursor",
+                    rva: names_cursor,
+                })?;
+                ordinals_cursor = ordinals_cursor.checked_add(2).ok_or(PeError::RvaOverflow {
+                    what: "export name ordinal table cursor",
+                    rva: ordinals_cursor,
+                })?;
+            }
+        }
+
         Ok(Self {
             image_base,
             size_of_image,
@@ -738,6 +935,8 @@ impl PeImage {
             sections,
             relocations,
             imports,
+            exports,
+            export_base,
         })
     }
 
@@ -765,6 +964,28 @@ impl PeImage {
     /// If no section covers the RVA.
     pub fn rva_to_file(&self, rva: u32) -> Result<usize, PeError> {
         rva_to_file_in(&self.sections, rva)
+    }
+
+    /// The RVA of the function a name exports, by linear search over
+    /// `exports`.
+    ///
+    /// `None` covers two different cases identically: no export has this
+    /// name, or the export does exist but is a forwarder rather than code --
+    /// there is no function RVA to hand back for one of those. Callers that
+    /// need to tell the two apart, or that want a forwarder's target
+    /// string, should search `exports` directly and match on
+    /// `ExportAddress::Forwarded`.
+    #[must_use]
+    pub fn export_rva(&self, name: &str) -> Option<u32> {
+        self.exports.iter().find_map(|e| {
+            if e.name != name {
+                return None;
+            }
+            match &e.address {
+                ExportAddress::Rva(rva) => Some(*rva),
+                ExportAddress::Forwarded(_) => None,
+            }
+        })
     }
 }
 

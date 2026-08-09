@@ -4,7 +4,7 @@
 //! file exercises exactly one path through each branch, and the error paths need
 //! an input built to reach them.
 
-use mbbs32::{Import, PeError, PeImage, Relocation, Symbol};
+use mbbs32::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Symbol};
 
 /// The smallest thing that parses: an MZ stub, a PE signature, a COFF header
 /// saying i386, a PE32 optional header, and no sections.
@@ -1031,4 +1031,296 @@ fn no_imports_is_not_an_error() {
     // default): the directory is simply absent, not malformed.
     let image = PeImage::parse(&with_one_section()).unwrap();
     assert_eq!(image.imports, Vec::new());
+}
+
+/// A section big enough to lay out a whole synthetic export directory by
+/// hand: the 40-byte `IMAGE_EXPORT_DIRECTORY` header, the functions/names/
+/// name-ordinals arrays, and name strings, all addressable within one
+/// section's RVA range (`0x1000..0x1400`).
+fn with_one_export_section() -> Vec<u8> {
+    let mut v = minimal();
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    v.resize(raw + 0x400 + 0x200, 0);
+    put_bytes(&mut v, sec, b"EXPORT\0\0");
+    put_u32(&mut v, sec + 8, 0x400); // VirtualSize
+    put_u32(&mut v, sec + 12, 0x1000); // VirtualAddress
+    put_u32(&mut v, sec + 16, 0x400); // SizeOfRawData
+    put_u32(&mut v, sec + 20, raw as u32); // PointerToRawData
+    put_u32(&mut v, sec + 36, 0x4000_0040);
+    v
+}
+
+/// Points data directory 0 (export) at `rva`/`size`.
+fn set_export_directory(v: &mut [u8], rva: u32, size: u32) {
+    let dir = 0x98 + 96; // opt + 96 + DIR_EXPORT(0) * 8
+    put_u32(v, dir, rva);
+    put_u32(v, dir + 4, size);
+}
+
+#[test]
+fn exports_resolve_through_the_name_ordinal_indirection_not_position_or_base() {
+    // Deliberately breaks all three symmetries a green suite here could
+    // otherwise hide behind:
+    //   - NumberOfFunctions (4) != NumberOfNames (3): function index 1
+    //     (0x2010) has no name at all, so a parser that conflates "how many
+    //     functions" with "how many names" reads one array with the other's
+    //     count.
+    //   - AddressOfNameOrdinals is [3, 0, 2], not the identity [0, 1, 2]: a
+    //     parser that resolves name i to function i (the loop's own
+    //     position) instead of to AddressOfNameOrdinals[i] gets Beta and
+    //     Alpha wrong (Gamma coincidentally lands right either way, at
+    //     index 2, which is exactly why the other two entries matter).
+    //   - Base is 5, not 1: nothing here subtracts it. If it were
+    //     mistakenly treated as ordinal-relative (`functions[ordinal -
+    //     base]`), every one of these ordinals (3, 0, 2) is smaller than
+    //     Base and the subtraction underflows -- loudly wrong rather than
+    //     coincidentally right, which a Base of 1 could not guarantee.
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let dir = raw;
+    let functions = dir + 40;
+    let names = functions + 4 * 4;
+    let ordinals = names + 3 * 4;
+    let name_alpha = ordinals + 3 * 2;
+    let name_beta = name_alpha + 6; // "Alpha\0"
+    let name_gamma = name_beta + 5; // "Beta\0"
+
+    put_u32(&mut v, dir + 16, 5); // Base
+    put_u32(&mut v, dir + 20, 4); // NumberOfFunctions
+    put_u32(&mut v, dir + 24, 3); // NumberOfNames
+    put_u32(&mut v, dir + 28, to_rva(functions)); // AddressOfFunctions
+    put_u32(&mut v, dir + 32, to_rva(names)); // AddressOfNames
+    put_u32(&mut v, dir + 36, to_rva(ordinals)); // AddressOfNameOrdinals
+
+    // Function 1 (0x2010) is exported by ordinal only -- no name below ever
+    // points at it.
+    put_u32(&mut v, functions, 0x2000);
+    put_u32(&mut v, functions + 4, 0x2010);
+    put_u32(&mut v, functions + 8, 0x2020);
+    put_u32(&mut v, functions + 12, 0x2030);
+
+    put_u32(&mut v, names, to_rva(name_alpha));
+    put_u32(&mut v, names + 4, to_rva(name_beta));
+    put_u32(&mut v, names + 8, to_rva(name_gamma));
+
+    put_u16(&mut v, ordinals, 3); // Alpha -> functions[3] == 0x2030
+    put_u16(&mut v, ordinals + 2, 0); // Beta  -> functions[0] == 0x2000
+    put_u16(&mut v, ordinals + 4, 2); // Gamma -> functions[2] == 0x2020
+
+    put_bytes(&mut v, name_alpha, b"Alpha\0");
+    put_bytes(&mut v, name_beta, b"Beta\0");
+    put_bytes(&mut v, name_gamma, b"Gamma\0");
+
+    // Nowhere near the export directory's own range (below), so none of
+    // these are forwarders.
+    set_export_directory(&mut v, to_rva(dir), 0x400);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(image.export_base, Some(5));
+    assert_eq!(
+        image.exports,
+        vec![
+            Export {
+                name: "Alpha".to_string(),
+                address: ExportAddress::Rva(0x2030),
+            },
+            Export {
+                name: "Beta".to_string(),
+                address: ExportAddress::Rva(0x2000),
+            },
+            Export {
+                name: "Gamma".to_string(),
+                address: ExportAddress::Rva(0x2020),
+            },
+        ],
+        "3 named exports; the unnamed function 0x2010 is not among them"
+    );
+    assert_eq!(image.export_rva("Alpha"), Some(0x2030));
+    assert_eq!(image.export_rva("Beta"), Some(0x2000));
+    assert_eq!(image.export_rva("Gamma"), Some(0x2020));
+    assert_eq!(image.export_rva("Missing"), None);
+}
+
+#[test]
+fn a_forwarder_is_not_mistaken_for_an_address() {
+    // A function RVA that falls inside the export directory's own
+    // [VirtualAddress, VirtualAddress + Size) range is not code: it is the
+    // RVA of a "DLL.Symbol" string. `wccmmud.dll` has none of these, so only
+    // a synthetic fixture can reach this arm.
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let dir = raw;
+    let functions = dir + 40;
+    let names = functions + 4;
+    let ordinals = names + 4;
+    let forward_str = ordinals + 2;
+    let name_str = forward_str + "OTHER.dll.RealFunc\0".len();
+
+    put_u32(&mut v, dir + 16, 1); // Base
+    put_u32(&mut v, dir + 20, 1); // NumberOfFunctions
+    put_u32(&mut v, dir + 24, 1); // NumberOfNames
+    put_u32(&mut v, dir + 28, to_rva(functions));
+    put_u32(&mut v, dir + 32, to_rva(names));
+    put_u32(&mut v, dir + 36, to_rva(ordinals));
+
+    // The function "address" points inside the directory's own range below.
+    put_u32(&mut v, functions, to_rva(forward_str));
+    put_u32(&mut v, names, to_rva(name_str));
+    put_u16(&mut v, ordinals, 0);
+
+    put_bytes(&mut v, forward_str, b"OTHER.dll.RealFunc\0");
+    put_bytes(&mut v, name_str, b"Exported\0");
+
+    set_export_directory(&mut v, to_rva(dir), 0x100);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(image.exports.len(), 1);
+    assert_eq!(image.exports[0].name, "Exported");
+    assert_eq!(
+        image.exports[0].forwarder(),
+        Some("OTHER.dll.RealFunc"),
+        "the function rva fell inside the export directory's own range"
+    );
+    assert_eq!(
+        image.export_rva("Exported"),
+        None,
+        "a forwarder has no function rva to hand back"
+    );
+}
+
+#[test]
+fn a_function_rva_exactly_at_the_export_directorys_end_is_not_a_forwarder() {
+    // The forwarder range is [VirtualAddress, VirtualAddress + Size) --
+    // half-open. A function rva equal to VirtualAddress + Size is one past
+    // the directory, not inside it, and must resolve as ordinary code.
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let dir = raw;
+    let functions = dir + 40;
+    let names = functions + 4;
+    let ordinals = names + 4;
+    let name_str = ordinals + 2;
+
+    let dir_rva = to_rva(dir);
+    let dir_size = (name_str - dir) as u32; // dir_end == to_rva(name_str)
+    let boundary = to_rva(name_str);
+
+    put_u32(&mut v, dir + 16, 1);
+    put_u32(&mut v, dir + 20, 1);
+    put_u32(&mut v, dir + 24, 1);
+    put_u32(&mut v, dir + 28, to_rva(functions));
+    put_u32(&mut v, dir + 32, to_rva(names));
+    put_u32(&mut v, dir + 36, to_rva(ordinals));
+
+    put_u32(&mut v, functions, boundary); // exactly dir_rva + dir_size
+    put_u32(&mut v, names, boundary);
+    put_u16(&mut v, ordinals, 0);
+
+    put_bytes(&mut v, name_str, b"X\0");
+
+    set_export_directory(&mut v, dir_rva, dir_size);
+
+    let image = PeImage::parse(&v).unwrap();
+    assert_eq!(image.exports[0].forwarder(), None);
+    assert_eq!(image.export_rva("X"), Some(boundary));
+}
+
+#[test]
+fn a_name_ordinal_indexing_past_the_functions_array_is_refused() {
+    // AddressOfNameOrdinals[0] is 5, but only one function (index 0) exists.
+    // The 2-byte read of the ordinal itself is perfectly in-bounds -- this
+    // is a data inconsistency between two already-parsed arrays, not a
+    // truncated read, so it needs its own check rather than an index panic
+    // on `functions[5]`.
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let dir = raw;
+    let functions = dir + 40;
+    let names = functions + 4;
+    let ordinals = names + 4;
+    let name_str = ordinals + 2;
+
+    put_u32(&mut v, dir + 16, 1);
+    put_u32(&mut v, dir + 20, 1); // NumberOfFunctions
+    put_u32(&mut v, dir + 24, 1); // NumberOfNames
+    put_u32(&mut v, dir + 28, to_rva(functions));
+    put_u32(&mut v, dir + 32, to_rva(names));
+    put_u32(&mut v, dir + 36, to_rva(ordinals));
+
+    put_u32(&mut v, functions, 0x2000);
+    put_u32(&mut v, names, to_rva(name_str));
+    put_u16(&mut v, ordinals, 5); // out of range: only index 0 exists
+
+    put_bytes(&mut v, name_str, b"Only\0");
+
+    set_export_directory(&mut v, to_rva(dir), 0x400);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::ExportOrdinalOutOfRange {
+            name: "Only".to_string(),
+            ordinal: 5,
+            functions: 1,
+        }
+    );
+}
+
+#[test]
+fn a_number_of_functions_claiming_more_entries_than_the_section_holds_is_refused() {
+    // AddressOfFunctions is placed so exactly two u32 entries fit before the
+    // section's raw data ends; NumberOfFunctions claims a third. The
+    // directory's own Size is not what stops this (the export tables have
+    // no length-bearing Size the way the base-relocation directory does) --
+    // only the bounds-checked read of the third entry does.
+    let mut v = with_one_export_section();
+    let sec = 0x98 + 0xe0;
+    let raw = sec + 40;
+    let dir = raw;
+
+    let functions_rva = 0x1000u32 + 0x400 - 6;
+    let functions_off = raw + 0x400 - 6;
+
+    put_u32(&mut v, dir + 16, 1); // Base
+    put_u32(&mut v, dir + 20, 2); // NumberOfFunctions: claims 2, only 1 fits
+    put_u32(&mut v, dir + 24, 0); // NumberOfNames
+    put_u32(&mut v, dir + 28, functions_rva);
+    put_u32(&mut v, dir + 32, 0);
+    put_u32(&mut v, dir + 36, 0);
+
+    put_u32(&mut v, functions_off, 0x2000); // the one entry that fits
+
+    set_export_directory(&mut v, 0x1000, 0x400);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::RvaSpansSectionEnd {
+            what: "export address table entry",
+            rva: functions_rva + 4,
+            need: 4,
+            remaining: 2,
+        }
+    );
+}
+
+#[test]
+fn no_exports_is_not_an_error() {
+    // The common case: rva 0 / size 0, `with_one_section()`'s default. The
+    // directory is simply absent, not malformed.
+    let image = PeImage::parse(&with_one_section()).unwrap();
+    assert_eq!(image.exports, Vec::new());
+    assert_eq!(image.export_base, None);
 }
