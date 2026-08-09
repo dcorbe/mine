@@ -711,7 +711,7 @@ impl Host {
     /// Every module that has registered, in the order they did.
     /// Entry `n` of the module channel `chan`'s `state` names.
     ///
-    /// `MAJORBBS.C:2796` is `(*(module[usrptr->state]->sttrou))()`: a channel's
+    /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`: a channel's
     /// `state` **is** an index into the module table, and `register_module`
     /// returning that index is the whole handshake. This host had dispatched to
     /// `modules().first()` instead, which is the same thing only while exactly
@@ -1716,7 +1716,7 @@ impl Host {
                 return self.shim_stop(machine, "get_input", e).map(Some);
             }
 
-            // `MAJORBBS.C:2796` keys both of these on the channel's own state:
+            // `MAJORBBS.C:2703` keys both of these on the channel's own state:
             // `sttrou` through `(*(module[usrptr->state]->sttrou))()` and
             // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
             // is read out here and the borrow ends before `self.run` needs
@@ -2997,7 +2997,7 @@ mod tests {
         f.machine.write(at, &state.to_le_bytes()).expect("in the segment");
     }
 
-    /// `MAJORBBS.C:2796` is `(*(module[usrptr->state]->sttrou))()`, and this is
+    /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`, and this is
     /// the test that says so.
     ///
     /// Two modules, both with a `sttrou`, each writing a different marker byte.
