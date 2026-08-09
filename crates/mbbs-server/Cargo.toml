@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 mbbs = { path = "../mbbs" }
 mbbs16 = { path = "../mbbs16" }
 mud-core = { path = "../mud-core" }

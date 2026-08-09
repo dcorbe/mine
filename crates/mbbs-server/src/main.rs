@@ -1,20 +1,9 @@
 //! The `mbbs-server` binary: parse arguments, boot the host thread, listen.
-//!
-//! Argument parsing is hand-rolled against `std::env::args` rather than
-//! pulling in a dependency for seven flags -- this workspace has none, and
-//! the plan does not call for one. Every rejection (an unknown flag, a
-//! missing required one, a number that does not parse) prints a clear
-//! message to stderr and exits non-zero rather than falling back to a
-//! default the operator did not ask for: silently defaulting a bad value
-//! would be exactly the undefined-behaviour-shaped surprise this codebase
-//! prefers a compile error or a clean refusal over. `--terms 0` gets the
-//! same treatment even though it is not a parse failure -- `Terms::new`
-//! panics on it, and a panic is a worse answer than a message and a
-//! non-zero exit.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::Parser;
 use mbbs::Terms;
 use mbbs_server::conn::{self, default_keys};
 use mbbs_server::host::Boot;
@@ -64,168 +53,94 @@ const DEFAULT_POLLS_PER_WAKE: usize = 512;
 /// wake short.
 const DEFAULT_PASSES: usize = 1024;
 
-const USAGE: &str = "\
-mbbs-server -- a tokio edge in front of one WCCMMUD.DLL host
-
-USAGE:
-    mbbs-server --root <dir> [OPTIONS]
-
-REQUIRED:
-    --root <dir>              The board directory (holds the module's own data files)
-
-OPTIONS:
-    --module <path>           The module to load [default: re/WCCMMUD.DLL]
-    --listen <addr>           Address to bind [default: 127.0.0.1:2323]
-    --terms <n>                Fixed channel count, must be at least 1 [default: 2]
-    --polls-per-wake <n>       Poll dispatches granted per driver wake [default: 512]
-    --passes <n>                Passes made per Host::cycle call [default: 1024]
-    --keys <comma,separated>   Connection keys handed to a new player [default: DEMO,NORMAL,USER]
-    --help                     Print this message and exit
-";
-
-/// A parsed command line, before `--terms` becomes a `Terms` (which can
-/// panic on a bad value, so that conversion happens under our own check, not
-/// inside the library).
-#[derive(Debug)]
-struct Config {
+// Every rejection (an unknown flag, a missing required one, a number that
+// does not parse) is a clear message to stderr and a non-zero exit, never a
+// fallback to a default the operator did not ask for -- that would be
+// exactly the undefined-behaviour-shaped surprise this codebase prefers a
+// compile error or a clean refusal over. `--terms 0` gets the same
+// treatment even though it is not a parse failure: `Terms::new` panics on
+// it, and a panic is a worse answer than a message and a non-zero exit, so
+// `parse_terms` range-checks before `main` ever calls `Terms::new`.
+#[derive(Parser, Debug)]
+#[command(name = "mbbs-server", about = "a tokio edge in front of one WCCMMUD.DLL host")]
+struct Cli {
+    /// The board directory (holds the module's own data files)
+    #[arg(long)]
     root: PathBuf,
+
+    /// The module to load
+    #[arg(long, default_value = DEFAULT_MODULE)]
     module: PathBuf,
+
+    /// Address to bind
+    #[arg(long, default_value = DEFAULT_LISTEN)]
     listen: String,
-    terms: Terms,
+
+    /// Fixed channel count, must be at least 1
+    #[arg(long, default_value_t = DEFAULT_TERMS, value_parser = parse_terms)]
+    terms: u16,
+
+    /// Poll dispatches granted per driver wake
+    #[arg(long, default_value_t = DEFAULT_POLLS_PER_WAKE)]
     polls_per_wake: usize,
+
+    /// Passes made per Host::cycle call
+    #[arg(long, default_value_t = DEFAULT_PASSES)]
     passes: usize,
+
+    /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
+    #[arg(long, value_delimiter = ',', value_parser = parse_key)]
     keys: Vec<String>,
 }
 
-/// What parsing the command line produced.
-#[derive(Debug)]
-enum ParseResult {
-    /// `--help` was given. Print [`USAGE`] and stop; nothing else parsed
-    /// matters once this is seen.
-    Help,
-    Config(Config),
-}
-
-/// Parse `argv[1..]`. Every failure is a `String` meant for a human, printed
-/// to stderr by the caller.
-fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<ParseResult, String> {
-    let mut root: Option<PathBuf> = None;
-    let mut module = PathBuf::from(DEFAULT_MODULE);
-    let mut listen = DEFAULT_LISTEN.to_string();
-    let mut terms_count: u16 = DEFAULT_TERMS;
-    let mut polls_per_wake = DEFAULT_POLLS_PER_WAKE;
-    let mut passes = DEFAULT_PASSES;
-    let mut keys = default_keys();
-
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--help" => return Ok(ParseResult::Help),
-            "--root" => root = Some(PathBuf::from(next_value(&mut iter, "--root")?)),
-            "--module" => module = PathBuf::from(next_value(&mut iter, "--module")?),
-            "--listen" => listen = next_value(&mut iter, "--listen")?,
-            "--terms" => {
-                terms_count = parse_number(&next_value(&mut iter, "--terms")?, "--terms")?;
-            }
-            "--polls-per-wake" => {
-                polls_per_wake =
-                    parse_number(&next_value(&mut iter, "--polls-per-wake")?, "--polls-per-wake")?;
-            }
-            "--passes" => {
-                passes = parse_number(&next_value(&mut iter, "--passes")?, "--passes")?;
-            }
-            "--keys" => keys = parse_keys(&next_value(&mut iter, "--keys")?)?,
-            other => return Err(format!("unknown argument '{other}' (see --help)")),
-        }
-    }
-
-    let root = root.ok_or_else(|| "--root is required (see --help)".to_string())?;
-
-    // `Terms::new` panics on 0 or on a count above `i16::MAX` -- a compile
-    // error would be better still, but a clean refusal here is the next best
-    // thing, and strictly better than letting a bad flag reach a panic.
-    if terms_count == 0 {
+/// Range-check `--terms` before it ever reaches `Terms::new`, which panics
+/// on 0 or on a count above `i16::MAX`.
+fn parse_terms(s: &str) -> Result<u16, String> {
+    let n: u16 = s.parse().map_err(|e| format!("'{s}' is not a valid number: {e}"))?;
+    if n == 0 {
         return Err(
-            "--terms must be at least 1 (a host with no channels cannot serve anyone)"
-                .to_string(),
+            "must be at least 1 (a host with no channels cannot serve anyone)".to_string(),
         );
     }
-    if terms_count > i16::MAX as u16 {
+    if n > i16::MAX as u16 {
         return Err(format!(
-            "--terms: {terms_count} is too large; the module addresses a channel as a 16-bit \
-             signed int, so the limit is {}",
+            "{n} is too large; the module addresses a channel as a 16-bit signed int, so the \
+             limit is {}",
             i16::MAX
         ));
     }
-    let terms = Terms::new(terms_count);
-
-    Ok(ParseResult::Config(Config {
-        root,
-        module,
-        listen,
-        terms,
-        polls_per_wake,
-        passes,
-        keys,
-    }))
+    Ok(n)
 }
 
-/// The value that must follow a flag, or a clear error naming the flag that
-/// was left dangling.
-fn next_value(iter: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    iter.next().ok_or_else(|| format!("{flag} requires a value"))
-}
-
-/// Parse a flag's value as a number, or explain which flag and value failed.
-fn parse_number<T>(value: &str, flag: &str) -> Result<T, String>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    value
-        .parse::<T>()
-        .map_err(|e| format!("{flag}: '{value}' is not a valid number: {e}"))
-}
-
-/// Split `--keys`' value on commas. An empty segment (a stray comma, or an
-/// empty flag value) is rejected rather than silently handing the new
-/// connection a blank key -- see the module doc on not defaulting a value
-/// the operator got wrong.
-fn parse_keys(value: &str) -> Result<Vec<String>, String> {
-    let keys: Vec<String> = value.split(',').map(str::to_string).collect();
-    if keys.iter().any(String::is_empty) {
-        return Err(format!(
-            "--keys: '{value}' contains an empty key (check for a stray or trailing comma)"
-        ));
+/// One `--keys` segment. An empty segment (a stray comma, or an empty flag
+/// value) is rejected rather than silently handing a new connection a blank
+/// key.
+fn parse_key(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err(
+            "must not contain an empty key (check for a stray or trailing comma)".to_string(),
+        );
     }
-    Ok(keys)
+    Ok(s.to_string())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = std::env::args().skip(1);
-    let config = match parse_args(args) {
-        Ok(ParseResult::Help) => {
-            print!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(ParseResult::Config(config)) => config,
-        Err(e) => {
-            eprintln!("mbbs-server: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let cli = Cli::parse();
+
+    let terms = Terms::new(cli.terms);
+    let keys = if cli.keys.is_empty() { default_keys() } else { cli.keys };
 
     let boot = Boot {
-        root: config.root,
-        module: config.module,
-        terms: config.terms,
-        polls_per_wake: config.polls_per_wake,
-        passes: config.passes,
+        root: cli.root,
+        module: cli.module,
+        terms,
+        polls_per_wake: cli.polls_per_wake,
+        passes: cli.passes,
         clock_reads: None,
     };
 
-    let addr = match conn::serve(boot, config.keys, &config.listen).await {
+    let addr = match conn::serve(boot, keys, &cli.listen).await {
         Ok(addr) => addr,
         Err(e) => {
             eprintln!("mbbs-server: failed to start: {e}");
@@ -243,28 +158,28 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, ParseResult, parse_args};
+    use clap::Parser;
 
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    use super::{Cli, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE};
+
+    fn args<'a>(v: &[&'a str]) -> Vec<&'a str> {
+        let mut a = vec!["mbbs-server"];
+        a.extend_from_slice(v);
+        a
     }
 
     /// The only required flag is `--root`; everything else takes the
     /// documented default.
     #[test]
     fn defaults_are_applied_when_only_root_is_given() {
-        match parse_args(args(&["--root", "tmp"])).expect("parses") {
-            ParseResult::Help => panic!("no --help was given"),
-            ParseResult::Config(c) => {
-                assert_eq!(c.root, std::path::PathBuf::from("tmp"));
-                assert_eq!(c.module, std::path::PathBuf::from("re/WCCMMUD.DLL"));
-                assert_eq!(c.listen, "127.0.0.1:2323");
-                assert_eq!(c.terms.count(), 2);
-                assert_eq!(c.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
-                assert_eq!(c.passes, DEFAULT_PASSES);
-                assert_eq!(c.keys, super::default_keys());
-            }
-        }
+        let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
+        assert_eq!(cli.root, std::path::PathBuf::from("tmp"));
+        assert_eq!(cli.module, std::path::PathBuf::from("re/WCCMMUD.DLL"));
+        assert_eq!(cli.listen, "127.0.0.1:2323");
+        assert_eq!(cli.terms, 2);
+        assert_eq!(cli.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
+        assert_eq!(cli.passes, DEFAULT_PASSES);
+        assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
     }
 
     /// `--help` short-circuits, even with other flags present -- a caller
@@ -272,40 +187,42 @@ mod tests {
     /// only passing out of habit.
     #[test]
     fn help_short_circuits() {
-        assert!(matches!(
-            parse_args(args(&["--help", "--terms", "not-a-number"])),
-            Ok(ParseResult::Help)
-        ));
+        let err = Cli::try_parse_from(args(&["--help", "--terms", "not-a-number"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
     /// No `--root` at all is a clear error, not a silent default.
     #[test]
     fn missing_root_is_an_error() {
-        let err = parse_args(args(&["--terms", "2"])).unwrap_err();
-        assert!(err.contains("--root"), "error should name the missing flag: {err}");
+        let err = Cli::try_parse_from(args(&["--terms", "2"])).unwrap_err();
+        assert!(err.to_string().contains("--root"), "error should name the missing flag: {err}");
     }
 
     /// A flag this binary does not know about is refused, not ignored.
     #[test]
     fn unknown_argument_is_an_error() {
-        let err = parse_args(args(&["--root", "tmp", "--bogus", "x"])).unwrap_err();
-        assert!(err.contains("--bogus"), "error should name the bad flag: {err}");
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--bogus", "x"])).unwrap_err();
+        assert!(err.to_string().contains("--bogus"), "error should name the bad flag: {err}");
     }
 
     /// A flag with nothing after it is refused, not silently left at its
     /// default.
     #[test]
     fn a_dangling_flag_is_an_error() {
-        let err = parse_args(args(&["--root", "tmp", "--terms"])).unwrap_err();
-        assert!(err.contains("--terms"), "error should name the flag missing its value: {err}");
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms"])).unwrap_err();
+        assert!(
+            err.to_string().contains("--terms"),
+            "error should name the flag missing its value: {err}"
+        );
     }
 
     /// `Terms::new(0)` panics; this must catch it first and report cleanly.
     #[test]
     fn terms_zero_is_rejected_before_it_reaches_terms_new() {
-        let err = parse_args(args(&["--root", "tmp", "--terms", "0"])).unwrap_err();
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "0"])).unwrap_err();
+        let msg = err.to_string().to_lowercase();
         assert!(
-            err.contains("--terms") && err.to_lowercase().contains("at least 1"),
+            msg.contains("--terms") && msg.contains("at least 1"),
             "error should explain why 0 is refused: {err}"
         );
     }
@@ -314,33 +231,32 @@ mod tests {
     /// is refused the same way `Terms::new` would panic on it.
     #[test]
     fn terms_above_i16_max_is_rejected() {
-        let err = parse_args(args(&["--root", "tmp", "--terms", "40000"])).unwrap_err();
-        assert!(err.contains("--terms"), "error should name the flag: {err}");
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "40000"])).unwrap_err();
+        assert!(err.to_string().contains("--terms"), "error should name the flag: {err}");
     }
 
     /// A value that does not parse as the expected number names both the
     /// flag and the bad value, not just "invalid input".
     #[test]
     fn an_unparseable_number_is_a_clear_error() {
-        let err = parse_args(args(&["--root", "tmp", "--terms", "banana"])).unwrap_err();
-        assert!(err.contains("--terms"), "error should name the flag: {err}");
-        assert!(err.contains("banana"), "error should echo the bad value: {err}");
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--terms", "banana"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--terms"), "error should name the flag: {msg}");
+        assert!(msg.contains("banana"), "error should echo the bad value: {msg}");
     }
 
     /// `--keys` splits on commas.
     #[test]
     fn keys_split_on_commas() {
-        match parse_args(args(&["--root", "tmp", "--keys", "A,B,C"])).expect("parses") {
-            ParseResult::Config(c) => assert_eq!(c.keys, vec!["A", "B", "C"]),
-            ParseResult::Help => panic!("no --help was given"),
-        }
+        let cli = Cli::try_parse_from(args(&["--root", "tmp", "--keys", "A,B,C"])).expect("parses");
+        assert_eq!(cli.keys, vec!["A", "B", "C"]);
     }
 
     /// A stray comma produces an empty key, which is refused rather than
     /// silently handed to a new connection.
     #[test]
     fn an_empty_key_segment_is_rejected() {
-        let err = parse_args(args(&["--root", "tmp", "--keys", "A,,C"])).unwrap_err();
-        assert!(err.contains("--keys"), "error should name the flag: {err}");
+        let err = Cli::try_parse_from(args(&["--root", "tmp", "--keys", "A,,C"])).unwrap_err();
+        assert!(err.to_string().contains("--keys"), "error should name the flag: {err}");
     }
 }

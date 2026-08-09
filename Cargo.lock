@@ -442,6 +442,7 @@ dependencies = [
 name = "mbbs-server"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "mbbs",
  "mbbs16",
  "mud-core",
