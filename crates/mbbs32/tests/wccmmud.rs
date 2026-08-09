@@ -283,6 +283,24 @@ fn entering_dllmain_reaches_an_import_rather_than_a_fault() {
                 site.symbol,
                 thunks.len()
             );
+
+            // Printing it is not asserting it. This measurement is the whole
+            // point of the increment -- it is what the host port needs and
+            // what no amount of static parsing produces -- so it is pinned
+            // here rather than left to a line of stderr nobody reads.
+            //
+            // It is also stable under the obvious next change. Servicing
+            // `GetModuleHandleA` instead of stopping at it would let `DllMain`
+            // continue to a *second* symbol; the first would still be this
+            // one. A different answer here means the entry path changed --
+            // relocation, binding, the TIB, or the module -- and that is
+            // exactly the regression worth catching.
+            assert_eq!(site.library, "KERNEL32.dll");
+            assert_eq!(
+                site.symbol,
+                Symbol::Name("GetModuleHandleA".to_owned()),
+                "DllMain's first host call"
+            );
         }
         Exit::Fault { signo, eip } => {
             let rva = eip.checked_sub(mapped.base());
