@@ -31,7 +31,7 @@
 //! At `ascn=0` every one of those branches is skipped and the whole of
 //! `fsdppc` is a pure function of two byte strings, which is what this is.
 //!
-//! # Two overflows of the original are not reproduced
+//! # Overflows of the original are not reproduced
 //!
 //! `tmpfld()` takes its `width` as a `char` and `xwidth` is a `char`, so in the
 //! original a field run longer than 127 characters wraps *before* being clamped
@@ -39,6 +39,11 @@
 //! is then added to `maxans` as a subtraction. This clamps instead. No template
 //! in evidence comes near it: the longest run in either of MajorMUD's is 61,
 //! and a field wider than a screen is not a thing a form can mean.
+//!
+//! The third is `stranslen`'s `int`, which [`put_answer`] refuses rather than
+//! wraps. That one has been watched happen -- `tests/fsd_oracle.rs` calls the
+//! genuine `_FSDPAN` on either side of the boundary and the far side really
+//! does write the new value over the tail it should have moved.
 
 use std::fmt;
 
@@ -664,6 +669,147 @@ fn value_at(answers: &[u8], at: usize) -> &[u8] {
         .position(|&c| c == 0)
         .map_or(answers.len(), |n| at + n);
     &answers[at..end]
+}
+
+/// The length of an answer string, its final double NUL included.
+/// `stranslen()`, `FSD.C:2061`.
+///
+/// Entries are walked, not bytes: each one costs `strlen+1`, and the empty
+/// entry that ends the string costs the 1 added at the end. So `b"A=1\0\0"`
+/// measures 5 and the empty answer string -- `fsdans`'s own `""`, `FSD.H:475`
+/// -- measures 1.
+///
+/// **A zero-length entry *is* the terminator**, wherever it appears. The C's
+/// loop condition is `*anstg != '\0'` and nothing else, so `b"\0A=1\0\0"`
+/// measures 1 and everything after that first NUL is unreachable. Measured: the
+/// genuine host's `_STRANSLEN` answers 1. The same fact read the other way is
+/// that a trailing byte does not have to be there -- `b"\0\0"` also measures 1,
+/// so the "double NUL" of the comment is the *entry's* terminator followed by
+/// the *string's*, not a pair this has to find.
+///
+/// **The C returns an `int`.** `stranslen` accumulates into `si` and returns
+/// `si+1` (`28:0x36a2`), so an answer string of 32768 bytes or more comes back
+/// negative -- and `fsdpan` tests that result with a signed `jng`. This returns
+/// the true length; [`put_answer`] is where the difference has to be dealt
+/// with, and says what it does about it.
+///
+/// # Panics
+///
+/// If the string does not terminate inside the slice. The C reads on until it
+/// finds a NUL somewhere in the segment, so there is no length here that would
+/// be the right answer, and a made-up one is worse than a stop.
+pub fn answer_len(answers: &[u8]) -> usize {
+    let mut at = 0usize;
+    loop {
+        let end = answers[at..]
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "an answer string ends with an empty entry, and from \
+                     offset {at} these {} bytes hold no NUL at all: {:02x?}",
+                    answers.len() - at,
+                    &answers[at..]
+                )
+            });
+        if end == 0 {
+            return at + 1;
+        }
+        at += end + 1;
+    }
+}
+
+/// Put a value into an answer string, replacing whatever was there.
+/// `fsdpan()`, `FSD.C:2092`.
+///
+/// Two branches, and `fsdxan` picks between them. A name already in the string
+/// has its value replaced where it stands, every later entry sliding along by
+/// the difference in length; a name that is not there gets a whole
+/// `NAME=value` entry appended at the end, over the terminator, with a fresh
+/// terminator after it.
+///
+/// The name is written **as given** in that second case. Matching folds case
+/// and writing does not, so `put_answer(a, b"eye_col", b"Violet")` on a string
+/// with no such name leaves a lower-case entry that the next lookup still
+/// finds. `sameto` is where the fold happens (`FSD.C:2085`): the genuine host's
+/// is at `104:0` and folds each pair of bytes through `tolower` (`1:0x2a38`),
+/// which is a `ctype` table lookup whose upper-case set is exactly `A`-`Z`. So
+/// [`extract`]'s `eq_ignore_ascii_case` is the same function, and `A[C` does
+/// not match `A{C` however tempting the 0x20 between them looks.
+///
+/// # The C is a buffer and this is a `Vec`
+///
+/// `FSD.C:2094` says the answer string "must have room for the new value" and
+/// leaves the room to the caller. Growing a `Vec` is this port's answer to that
+/// requirement, and the price is the assertion below: the `Vec` has to *be* the
+/// answer string. The C's `movmem` moves `stranslen(vp+nold+1)` bytes, which
+/// stops at the string's own terminator, where a splice moves everything to the
+/// end of the `Vec` -- and those are the same bytes only when nothing follows
+/// the terminator.
+///
+/// # `name` and `value` are C strings
+///
+/// `strlen`, `strcpy` and `sprintf`'s `%s` all stop at the first NUL, so
+/// `put_answer(a, b"A", b"xy\0zw")` stores `xy`, and a `name` with a NUL in it
+/// is the part before it. Measured against the genuine host rather than
+/// assumed, as in [`store`].
+///
+/// # Panics
+///
+/// If `answers` is not a well-formed answer string, or if the part of it that
+/// follows the entry being replaced is longer than an `int` can count. The
+/// second is the C's own limit and not this port's: `nstr=stranslen(vp+nold+1)`
+/// is an `int` and `if (nstr > 0 ...)` is a **signed** test -- `or dx,dx / jng`
+/// at `28:0x37b6` -- so past 32767 the genuine host stops moving the tail and
+/// `strcpy` writes the new value over whatever happened to follow it. That is a
+/// corruption rather than a behaviour, so it is refused here the way the module
+/// doc's two `tmpfld` overflows are. `tests/fsd_oracle.rs` holds the
+/// measurement that says the host really does it.
+pub fn put_answer(answers: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    assert_eq!(
+        answer_len(answers),
+        answers.len(),
+        "a {}-byte buffer holding a {}-byte answer string: the C splices with \
+         `movmem(vp+nold+1,vp+nnew+1,stranslen(vp+nold+1))`, which moves the \
+         string and stops, and a splice here moves the whole `Vec`. The two \
+         are the same edit only while nothing follows the terminator",
+        answers.len(),
+        answer_len(answers)
+    );
+    // `n=strlen(name)` in `fsdxan`, `nnew=strlen(value)` in `fsdpan`.
+    let name = c_str(name);
+    let value = c_str(value);
+
+    match extract(answers, name) {
+        // `nold=strlen(vp)`; the tail from `vp+nold+1` to the terminator slides
+        // by `nnew-nold`, and `strcpy(vp,value)` puts the value in. One splice
+        // is both `movmem`s.
+        Some(at) => {
+            let old = value_at(answers, at).len();
+            let tail = answer_len(&answers[at + old + 1..]);
+            assert!(
+                tail <= i16::MAX as usize,
+                "{tail} bytes follow the {:?} entry, and `nstr` is an `int` the \
+                 genuine host tests with `jng`: past {} it stops moving the \
+                 tail and writes the new value over the head of it instead",
+                String::from_utf8_lossy(name),
+                i16::MAX
+            );
+            answers.splice(at..at + old, value.iter().copied());
+        }
+        // `sprintf(xannam,"%s=%s%c",name,value,'\0')`, where `xannam` is the
+        // string's final NUL: the entry lands on top of it, and the `%c` is the
+        // terminator that ends the string again. `sprintf`'s own NUL is the
+        // entry's.
+        None => {
+            answers.truncate(answers.len() - 1);
+            answers.extend_from_slice(name);
+            answers.push(b'=');
+            answers.extend_from_slice(value);
+            answers.push(0);
+            answers.push(0);
+        }
+    }
 }
 
 /// An answer string, installed over a form. What `fsdans()` leaves behind.
@@ -2019,6 +2165,157 @@ mod tests {
         assert!(store(&mut a, 0, b"\0DA"), "an answer that begins with one");
         assert_eq!(a.text, b"NAME=\0\0");
         assert_eq!(a.offsets, vec![(5, 0)]);
+    }
+
+    /// `stranslen` walks entries, so its answer is a count of entries and
+    /// their terminators plus the string's own.
+    #[test]
+    fn an_answer_strings_length_counts_every_terminator() {
+        assert_eq!(answer_len(b"\0"), 1, "the empty answer string, fsdans's \"\"");
+        assert_eq!(answer_len(b"A=1\0\0"), 5, "one entry");
+        assert_eq!(answer_len(b"A=1\0B=22\0C=\0\0"), 13, "three");
+        assert_eq!(answer_len(b"NOEQUALS\0\0"), 10, "an entry need not have '='");
+    }
+
+    /// The loop condition is `*anstg != '\0'` and nothing else, so the first
+    /// empty entry ends the string wherever it is -- and a byte after the
+    /// terminator is not part of it.
+    #[test]
+    fn a_zero_length_entry_is_the_terminator() {
+        assert_eq!(answer_len(b"\0A=1\0\0"), 1, "unreachable entries are not counted");
+        assert_eq!(answer_len(b"\0\0"), 1, "and neither is a spare NUL");
+        assert_eq!(answer_len(b"A=1\0\0B=2\0\0"), 5);
+    }
+
+    /// The C reads on past the slice; there is no length here that would be
+    /// right, so this stops instead of inventing one.
+    #[test]
+    #[should_panic(expected = "hold no NUL at all")]
+    fn an_answer_string_that_does_not_terminate_is_a_panic() {
+        answer_len(b"A=1");
+    }
+
+    #[test]
+    #[should_panic(expected = "hold no NUL at all")]
+    fn an_answer_string_missing_only_its_terminator_is_a_panic() {
+        answer_len(b"A=1\0");
+    }
+
+    /// The replace branch: the value goes in where it stood and everything
+    /// after it slides, in both directions.
+    #[test]
+    fn putting_a_value_over_one_that_is_there_moves_the_rest() {
+        let mut a = b"A=1234\0B=22\0C=3\0\0".to_vec();
+        put_answer(&mut a, b"A", b"9");
+        assert_eq!(a, b"A=9\0B=22\0C=3\0\0", "shorter");
+
+        put_answer(&mut a, b"B", b"abcde");
+        assert_eq!(a, b"A=9\0B=abcde\0C=3\0\0", "longer");
+
+        put_answer(&mut a, b"C", b"7");
+        assert_eq!(a, b"A=9\0B=abcde\0C=7\0\0", "the last one, same length");
+
+        put_answer(&mut a, b"B", b"");
+        assert_eq!(a, b"A=9\0B=\0C=7\0\0", "emptied");
+    }
+
+    /// The append branch: `sprintf` writes over the terminator and puts a new
+    /// one after the entry, so the string grows by `strlen(name)+strlen(value)+2`.
+    #[test]
+    fn putting_a_value_no_name_carries_appends_an_entry() {
+        let mut a = b"\0".to_vec();
+        put_answer(&mut a, b"A", b"1");
+        assert_eq!(a, b"A=1\0\0", "onto the empty answer string");
+
+        put_answer(&mut a, b"B", b"");
+        assert_eq!(a, b"A=1\0B=\0\0", "an empty value is still an entry");
+
+        put_answer(&mut a, b"eye_col", b"Violet");
+        assert_eq!(a, b"A=1\0B=\0eye_col=Violet\0\0", "the name as it was given");
+        put_answer(&mut a, b"EYE_COL", b"Green");
+        assert_eq!(
+            a, b"A=1\0B=\0eye_col=Green\0\0",
+            "and found again whichever way it is spelled, `sameto` folding case"
+        );
+    }
+
+    /// `xannam[n] == '='` is the second half of the match, and it is what stops
+    /// a name from matching an entry it is merely a prefix of.
+    #[test]
+    fn a_name_that_is_a_prefix_of_another_matches_neither() {
+        let mut a = b"NAMEX=1\0NAME=2\0\0".to_vec();
+        put_answer(&mut a, b"NAME", b"9");
+        assert_eq!(a, b"NAMEX=1\0NAME=9\0\0");
+
+        let mut a = b"NAMEX=1\0\0".to_vec();
+        put_answer(&mut a, b"NAME", b"9");
+        assert_eq!(a, b"NAMEX=1\0NAME=9\0\0", "so the name is not there at all");
+    }
+
+    /// `fsdxan` returns on its first hit, which is the same rule `fsdans`
+    /// follows: of a duplicate name the earlier answer prevails.
+    #[test]
+    fn putting_a_value_replaces_the_first_of_two_entries_of_a_name() {
+        let mut a = b"CLASS=Warrior\0CLASS=Thief\0\0".to_vec();
+        put_answer(&mut a, b"CLASS", b"Mage");
+        assert_eq!(a, b"CLASS=Mage\0CLASS=Thief\0\0");
+    }
+
+    /// `strlen`, `strcpy` and `%s` all stop at the first NUL.
+    #[test]
+    fn an_embedded_nul_ends_the_name_and_the_value_being_put() {
+        let mut a = b"A=1\0B=2\0\0".to_vec();
+        put_answer(&mut a, b"A", b"xy\0zw");
+        assert_eq!(a, b"A=xy\0B=2\0\0", "the value is what precedes the NUL");
+
+        let mut a = b"AB=1\0\0".to_vec();
+        put_answer(&mut a, b"A\0B", b"9");
+        assert_eq!(a, b"AB=1\0A=9\0\0", "and the name is `A`, which is not `AB`");
+    }
+
+    /// Past 32767 bytes of tail the genuine host stops moving it and splices
+    /// over it instead, because `nstr` is an `int` and the guard is signed.
+    /// That is a corruption rather than a behaviour: this refuses. The
+    /// measurement that says the host really does it is in
+    /// `tests/fsd_oracle.rs`, which is where the number comes from.
+    #[test]
+    #[should_panic(expected = "stops moving the tail")]
+    fn a_tail_no_int_can_count_is_refused() {
+        let mut a = with_tail(i16::MAX as usize + 1);
+        put_answer(&mut a, b"A", b"22");
+    }
+
+    /// One byte less is inside what an `int` can count, and then the two agree.
+    #[test]
+    fn a_tail_an_int_can_still_count_is_spliced() {
+        let mut a = with_tail(i16::MAX as usize);
+        let tail = a[4..].to_vec();
+
+        put_answer(&mut a, b"A", b"22");
+
+        assert_eq!(&a[..5], b"A=22\0");
+        assert_eq!(&a[5..], &tail[..], "the whole of it moved up one byte");
+    }
+
+    /// `A=1` and then one entry big enough that `stranslen` of everything after
+    /// the first is exactly `tail`.
+    fn with_tail(tail: usize) -> Vec<u8> {
+        let mut a = b"A=1\0".to_vec();
+        a.extend_from_slice(b"B=");
+        a.resize(4 + tail - 2, b'x');
+        a.push(0);
+        a.push(0);
+        assert_eq!(answer_len(&a[4..]), tail, "the tail this was built for");
+        a
+    }
+
+    /// A `Vec` that is not exactly the answer string would splice bytes the C's
+    /// `movmem` never touches, so it is refused rather than guessed at.
+    #[test]
+    #[should_panic(expected = "the same edit only while nothing follows")]
+    fn putting_a_value_into_a_buffer_that_is_not_an_answer_string_is_a_panic() {
+        let mut a = b"A=1\0\0spare room".to_vec();
+        put_answer(&mut a, b"A", b"9");
     }
 
     #[test]
