@@ -631,13 +631,13 @@ impl PeImage {
                 characteristics: r.u32("section characteristics", at + 36)?,
             });
 
-            // Both bounds below are u64 arithmetic over attacker-controlled
-            // u32s specifically so the check itself cannot overflow: Part B
-            // (Task 10-13) copies `raw_size` bytes from `raw_offset` in the
-            // file to `rva` in a `size_of_image`-byte mapping, in `unsafe`
-            // code, so a section describing bytes outside either one must be
-            // refused here rather than trusted into an out-of-bounds read or
-            // write.
+            // All three bounds below are u64 arithmetic over
+            // attacker-controlled u32s specifically so the check itself
+            // cannot overflow: Part B (Task 10-13) copies `raw_size` bytes
+            // from `raw_offset` in the file to `rva` in a
+            // `size_of_image`-byte mapping, so a section describing bytes
+            // outside any of the three must be refused here rather than
+            // trusted into an out-of-bounds read or write.
             let s = sections.last().expect("just pushed");
             let raw_end = u64::from(s.raw_offset) + u64::from(s.raw_size);
             if raw_end > file.len() as u64 {
@@ -654,6 +654,25 @@ impl PeImage {
                     section: s.name.clone(),
                     what: "virtual range",
                     end: virtual_end,
+                    limit: u64::from(size_of_image),
+                });
+            }
+            // Nothing above bounds `raw_size` against `virtual_size` (the
+            // format does not forbid `SizeOfRawData > VirtualSize`, and
+            // neither of the two checks above catches it: a small
+            // `virtual_size` at a high `rva` can pass "virtual range" while a
+            // much larger `raw_size` at that same `rva` still passes "raw
+            // data" against the file). Task 11 (`image.rs`) copies exactly
+            // `raw_size` bytes to `rva` in a `size_of_image`-byte mapping, so
+            // that write is the thing this check exists to keep in-bounds —
+            // check it directly rather than through `virtual_size` as a
+            // proxy.
+            let raw_into_image_end = u64::from(s.rva) + u64::from(s.raw_size);
+            if raw_into_image_end > u64::from(size_of_image) {
+                return Err(PeError::SectionOutOfBounds {
+                    section: s.name.clone(),
+                    what: "raw data mapped into the image",
+                    end: raw_into_image_end,
                     limit: u64::from(size_of_image),
                 });
             }

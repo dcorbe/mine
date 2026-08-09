@@ -553,6 +553,37 @@ fn a_sections_virtual_range_past_size_of_image_is_refused() {
 }
 
 #[test]
+fn a_sections_raw_size_that_would_overrun_the_image_once_mapped_is_refused() {
+    // Small virtual_size, so the "virtual range" check above passes; but
+    // raw_size is deliberately large enough that rva + raw_size still runs
+    // past size_of_image -- the range Task 11's copy actually writes into.
+    // Neither the "raw data" check (raw_offset + raw_size <= file.len()) nor
+    // the "virtual range" check (rva + virtual_size <= size_of_image) catches
+    // this on its own: raw_size and virtual_size are independent fields, and
+    // before this check was added, nothing related them to each other.
+    let mut v = with_one_section();
+    let sec = 0x98 + 0xe0;
+    v[sec + 8..sec + 12].copy_from_slice(&0x10u32.to_le_bytes()); // virtual_size: tiny
+    let raw_offset = u32::from_le_bytes(v[sec + 20..sec + 24].try_into().unwrap());
+    // rva is 0x1000; one byte more than fits between rva and SIZE_OF_IMAGE.
+    let bad_raw_size = SIZE_OF_IMAGE - 0x1000 + 1;
+    v[sec + 16..sec + 20].copy_from_slice(&bad_raw_size.to_le_bytes());
+    // Long enough that the "raw data vs. file length" check passes, so
+    // parsing reaches the new check rather than the old one.
+    v.resize((raw_offset + bad_raw_size) as usize + 0x10, 0);
+
+    assert_eq!(
+        PeImage::parse(&v).unwrap_err(),
+        PeError::SectionOutOfBounds {
+            section: "CODE".to_string(),
+            what: "raw data mapped into the image",
+            end: u64::from(0x1000u32) + u64::from(bad_raw_size),
+            limit: u64::from(SIZE_OF_IMAGE),
+        }
+    );
+}
+
+#[test]
 fn a_pure_bss_section_with_zero_raw_size_still_parses() {
     // SizeOfRawData 0 (nothing on disk, the section is entirely BSS) is
     // legal and must not be rejected by the raw-data bounds check: with
