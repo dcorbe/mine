@@ -3719,7 +3719,13 @@ mod tests {
             .users
             .set_polrou(&mut f.machine, console, Some(rou))
             .expect("channel 0");
-        f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
+        // A budget, and it is what makes this test a test at all. `dopoll`'s
+        // re-arm is gated `polls_left > 0 && ..`, so at the default budget of
+        // zero the whole branch is skipped and the fresh read of `polrou`
+        // inside it never runs. Deleting that read outright then passed all
+        // 781 lib tests and all 17 real-module tests -- the budget silently
+        // defanged the one test that protects it.
+        f.host.refill_polls(&f.machine, 4).expect("armed");
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -4102,6 +4108,28 @@ mod tests {
             "and it stops with the queues empty, or the driver could never sleep"
         );
         assert_eq!(f.host.gsbl_mut().next_status(two), None);
+    }
+
+    /// A refill of nothing arms nothing.
+    ///
+    /// The `n == 0` early return is not an optimisation: dispatch itself is
+    /// never budget-gated, only the re-arm is, so arming a channel here would
+    /// buy exactly one unbudgeted poll per channel per wake. Deleting the
+    /// guard passed the whole suite, so nothing said this out loud.
+    #[test]
+    fn a_refill_of_zero_arms_nothing_and_dispatches_nothing() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+
+        f.host.refill_polls(&f.machine, 0).expect("granted nothing");
+
+        assert!(
+            !f.host.gsbl().polling_armed(console),
+            "a budget of zero arms nothing, or it buys a poll it did not grant"
+        );
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        assert_eq!(cycles.dispatched, 0);
     }
 
     /// The meter that calibrates the budget in production.
