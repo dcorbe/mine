@@ -39,6 +39,49 @@ pub struct Boot {
     pub passes: usize,
 }
 
+/// What one wake yielded.
+enum Woke {
+    /// A message arrived.
+    Message(In),
+    /// Nothing arrived, which is expected: a kick came due, or there was
+    /// simply nothing to do yet.
+    Nothing,
+    /// Every `Sender<In>` is gone. The listener and every connection task
+    /// have dropped theirs, so nobody can ever send again.
+    Gone,
+}
+
+/// Block, sleep, or peek, according to what the last `cycle` asked for.
+///
+/// Separated from [`run`] so that it can be tested at all: `run` needs a
+/// booted `Machine`, and this needs only a channel.
+///
+/// **`Gone` is the case worth having a name.** Once every sender is dropped,
+/// `recv` stops blocking and returns an error immediately, every time. A
+/// driver that treated that as "nothing arrived" -- which is what a bare
+/// `.ok()` does -- would spin at full speed forever under `Wait::Blocked`,
+/// which is precisely the busy-wait this crate exists to remove, arriving by
+/// the back door at shutdown.
+fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
+    match wait {
+        Wait::Blocked => match rx.recv() {
+            Ok(msg) => Woke::Message(msg),
+            Err(_) => Woke::Gone,
+        },
+        Wait::Until(secs) => match rx.recv_timeout(Duration::from_secs(secs.into())) {
+            Ok(msg) => Woke::Message(msg),
+            Err(RecvTimeoutError::Timeout) => Woke::Nothing,
+            Err(RecvTimeoutError::Disconnected) => Woke::Gone,
+        },
+        Wait::Now => match rx.try_recv() {
+            Ok(msg) => Woke::Message(msg),
+            Err(TryRecvError::Empty) => Woke::Nothing,
+            Err(TryRecvError::Disconnected) => Woke::Gone,
+        },
+        Wait::Stop => Woke::Gone,
+    }
+}
+
 /// Build the machine, boot the module, and drive it until [`Wait::Stop`].
 ///
 /// This is the whole life of the host thread. It never awaits and holds
@@ -68,29 +111,10 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
 
     loop {
         // 1. Sleep according to what the previous cycle told us to do.
-        //
-        // `RecvTimeoutError::Timeout` and `TryRecvError::Empty` both mean
-        // "nothing arrived, which is expected" -- a kick fired, or there was
-        // simply nothing to do yet. `Disconnected` means every `Sender<In>`
-        // is gone, which can only happen once the process is shutting down:
-        // there is nobody left who could ever send `In::Connect`, so the
-        // thread ends instead of spinning on a `recv` that no longer blocks.
-        let first = match wait {
-            Wait::Blocked => match rx.recv() {
-                Ok(msg) => Some(msg),
-                Err(_) => return Ok(()),
-            },
-            Wait::Until(secs) => match rx.recv_timeout(Duration::from_secs(secs.into())) {
-                Ok(msg) => Some(msg),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
-            },
-            Wait::Now => match rx.try_recv() {
-                Ok(msg) => Some(msg),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => return Ok(()),
-            },
-            Wait::Stop => return Ok(()),
+        let first = match wake(wait, &rx) {
+            Woke::Message(msg) => Some(msg),
+            Woke::Nothing => None,
+            Woke::Gone => return Ok(()),
         };
 
         // 2. Drain every message available, not just the one that woke us --
@@ -214,6 +238,43 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::pool::Pool;
+
+    use super::{Woke, wake};
+    use crate::msg::In;
+    use mbbs::Wait;
+
+
+    /// A driver whose senders are all gone must stop, not spin.
+    ///
+    /// This is the one part of the loop that can be tested without a booted
+    /// `Machine`, and it is worth having: the plan this was built from wrote
+    /// the wait step as a bare `.ok()` on each recv, which turns a dropped
+    /// sender into "nothing arrived" and spins at full speed forever under
+    /// `Wait::Blocked`. That is the busy-wait this whole crate exists to
+    /// remove, reached by the back door at shutdown -- and no socket test
+    /// finds it, because a socket test never drops its senders.
+    #[test]
+    fn every_wait_stops_once_the_senders_are_gone() {
+        for wait in [Wait::Blocked, Wait::Until(60), Wait::Now, Wait::Stop] {
+            let (tx, rx) = std::sync::mpsc::channel::<In>();
+            drop(tx);
+            assert!(
+                matches!(wake(wait, &rx), Woke::Gone),
+                "{wait:?} must report Gone, not spin"
+            );
+        }
+    }
+
+    /// The two "nothing arrived" answers, which must NOT be `Gone` -- a
+    /// driver that shut down on an idle tick would end the board the first
+    /// second nobody typed.
+    #[test]
+    fn an_idle_wake_is_nothing_rather_than_gone() {
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        assert!(matches!(wake(Wait::Now, &rx), Woke::Nothing));
+        assert!(matches!(wake(Wait::Until(1), &rx), Woke::Nothing));
+        drop(tx);
+    }
 
     /// `apply`'s `Connect` arm, stripped of the `Host`/`Module` it would
     /// otherwise need: a pool with nothing free must answer the reply
