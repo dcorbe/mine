@@ -48,6 +48,7 @@ mod asm;
 mod image;
 mod map;
 mod pe;
+mod tib;
 
 pub use image::{Image, Import32, ImportResolver, ThunkSite};
 pub use map::Mapping;
