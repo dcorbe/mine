@@ -172,10 +172,26 @@ pub enum Ended {
     /// next whole second, and no other source of work exists, because the
     /// 16-bit world only advances when this host dispatches into it.
     ///
-    /// `polls_cut` is whether the poll budget was exhausted. It is the meter
-    /// that calibrates [`Host::refill_polls`]: a driver that sees it set on
-    /// every wake is granting too few dispatches, and the module's amortised
-    /// work is falling behind.
+    /// `polls_cut` is whether the poll budget was exhausted -- **and that is
+    /// all it is.** It is NOT a signal that the budget is too small, though
+    /// this doc claimed exactly that until it was measured.
+    ///
+    /// Measured against MajorMUD with two players in the Realm, at budgets of
+    /// 32, 128 and 512: `polls_cut` was `true` at every one, and the pass
+    /// count came back as `budget + 1` each time. That is structural, not a
+    /// property of the budget being low. [`Host::dopoll`] re-arms after every
+    /// dispatch for as long as budget remains, so a polling channel consumes
+    /// whatever it is given; the chain has no way to say "done". The module's
+    /// routine simply falls through once its own pending-round counter is
+    /// zero, and falling through still costs a dispatch.
+    ///
+    /// So a driver cannot calibrate from this. Whether the budget is high
+    /// enough is a question about the *module's* amortised work -- for
+    /// MajorMUD, whether monsters are acting at the rate they should -- and
+    /// the host has no way to see it. What `polls_cut` is good for is the
+    /// other direction: `false` means the module ran out of work before the
+    /// budget ran out, which is the only cheap evidence that the budget is
+    /// more than enough.
     Waiting { next_kick: u16, polls_cut: bool },
 
     /// `max` passes were made and there is still work queued. A driver calls
@@ -1820,8 +1836,17 @@ impl Host {
     /// to drain a round of whatever the module amortises across its polling
     /// routine -- and no ceiling worth worrying about: once a round is drained
     /// the module's own pending-work counter is zero and every further poll
-    /// falls through. Overshooting buys no-ops. Undershooting is graceful, and
-    /// [`Ended::Waiting`]'s `polls_cut` is how a driver finds out.
+    /// falls through. Overshooting buys no-ops. Undershooting is graceful.
+    ///
+    /// **`n` is the driver's whole sleep policy, so pick it knowingly.** The
+    /// chain re-arms until the budget runs out, so a polling channel spends
+    /// exactly what it is given: measured against MajorMUD, one wake per
+    /// second consumed all of 32, 128 and 512, and the host thread's pass
+    /// count came back as `n + 1` each time. `n` is therefore very nearly
+    /// "poll dispatches per second" on a board whose wakes are kick-driven,
+    /// and it is also, to within one, the host thread's idle CPU cost.
+    /// [`Ended::Waiting`]'s `polls_cut` does NOT tell a driver whether `n` was
+    /// large enough -- see its own doc for why not.
     ///
     /// # Errors
     ///
