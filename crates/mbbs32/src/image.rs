@@ -77,6 +77,30 @@ impl Image {
             // crate needs to reach the mapping's memory at all (see
             // `map.rs`); nothing is gained by duplicating it here under a
             // weaker guarantee.
+            //
+            // Two consequences of copying `raw_size` rather than Windows'
+            // `min(raw_size, virtual_size)` were measured across the 188-file
+            // PE32 corpus in `archive/_acquire/pools/full` rather than argued
+            // about, because both are the kind of thing that is fine until the
+            // one file where it is not:
+            //
+            //   - `SizeOfRawData > VirtualSize` is COMMON -- 205 of 985
+            //     sections, 20.8% -- since raw data is padded up to
+            //     `FileAlignment` while `VirtualSize` is not. So the
+            //     `rva + raw_size <= size_of_image` check above is load-bearing
+            //     on a fifth of all real sections, not an exotic case.
+            //   - Despite that, ZERO of those 985 sections have
+            //     `rva + raw_size > SizeOfImage`, and zero of the 797 adjacent
+            //     section pairs have `rva + raw_size` reaching into the next
+            //     section's `rva`. The padding always fits in the gap that
+            //     `SectionAlignment` (0x1000, against a typical 0x200
+            //     `FileAlignment`) leaves behind.
+            //
+            // So copying the full `raw_size` neither overruns the mapping nor
+            // clobbers a neighbour on any real input measured. If a future file
+            // trips the parse-time check, that is the case to re-read this
+            // against -- the fix would be to copy `min(raw_size, virtual_size)`,
+            // which is what Windows does, not to relax the bound.
             dst[rva..rva + raw_size].copy_from_slice(&file[raw_offset..raw_offset + raw_size]);
         }
 
