@@ -181,6 +181,14 @@ impl Records {
     /// So this counts the pairs where it *could* matter, and the host reports
     /// the number rather than letting the difference be silent. On a board
     /// nobody has played on, every one of them is zero.
+    ///
+    /// **For a file this host itself indexed the difference is gone**, and
+    /// this still counts: [`Block::reindex`](super::Block::reindex) writes the
+    /// duplicate chain in exactly this order, so the file's own index agrees
+    /// with the order here by construction. What remains is a count of the
+    /// records whose place in a *Btrieve-written* file could have come from an
+    /// insertion sequence this host cannot see -- which is what it always
+    /// measured, and is now the narrower thing it says.
     pub fn ties(&self) -> &[usize] {
         &self.ties
     }

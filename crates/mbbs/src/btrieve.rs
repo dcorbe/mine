@@ -826,12 +826,67 @@ impl Block {
                     key.number
                 ))
             })?;
-            let entries: Vec<(Vec<u8>, u32)> = (0..len)
-                .map(|n| {
-                    let record = records.ordered(key.number, n).expect("in range");
-                    (key.extract(&record.bytes), record.position)
-                })
-                .collect();
+            // One entry per distinct key value, and for a key that permits
+            // duplicates that is fewer than `len`. Grouped with `key.compare`
+            // -- the same comparator `Records::reindex` sorted by, so the
+            // group boundaries cannot disagree with the order they fall in --
+            // rather than by comparing the extracted key bytes, which would
+            // split a group whenever a key folds two spellings of a value onto
+            // one (an alternate collating sequence, or a case-insensitive
+            // name). Btrieve's own index holds one entry per *value*, and two
+            // entries a binary search cannot tell apart is a tree that reads
+            // back in a plausible wrong order.
+            let mut entries: Vec<pages::Entry> = Vec::new();
+            let mut groups: Vec<Vec<u32>> = Vec::new();
+            for n in 0..len {
+                let record = records.ordered(key.number, n).expect("in range");
+                let joins = n > 0
+                    && key.compare(
+                        &records.ordered(key.number, n - 1).expect("in range").bytes,
+                        &record.bytes,
+                    ) == std::cmp::Ordering::Equal;
+                if joins && key.duplicates {
+                    let last = entries.last_mut().expect("a group to join");
+                    last.tail = record.position;
+                    groups.last_mut().expect("a group to join").push(record.position);
+                } else {
+                    entries.push(pages::Entry::unique(
+                        key.extract(&record.bytes),
+                        record.position,
+                    ));
+                    groups.push(vec![record.position]);
+                }
+            }
+
+            // The chain that joins each group, written into the records
+            // themselves. Every record of a duplicate-permitting key carries
+            // one, including a value only one record holds: its pair is
+            // `[NOWHERE, NOWHERE]`, and leaving it as the zeros
+            // `write_record` pads a fresh slot with would name page 0 -- the
+            // file control record -- as the next record in the chain.
+            if key.duplicates {
+                let offset = usize::from(key.chain.ok_or_else(|| {
+                    fail(format!(
+                        "key {}: permits duplicates and its definition names no \
+                         chain offset, so there is nowhere to write one",
+                        key.number
+                    ))
+                })?);
+                for group in &groups {
+                    for (at, position) in group.iter().enumerate() {
+                        let chain = [
+                            if at == 0 { pages::NOWHERE } else { group[at - 1] },
+                            if at + 1 == group.len() {
+                                pages::NOWHERE
+                            } else {
+                                group[at + 1]
+                            },
+                        ];
+                        pages::write_chain(&self.path, layout, *position, offset, chain)
+                            .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+                    }
+                }
+            }
 
             // `key.definition`, not `key.number`: a multi-segment key's root
             // and record count live at its *first* definition, and the two
@@ -1870,6 +1925,65 @@ mod tests {
         }
     }
 
+    /// `seed_indexed`'s file, with its one key permitting duplicates.
+    ///
+    /// Eight more bytes of physical record than logical -- the `[prev][next]`
+    /// pair -- which is the delta every one of MajorMUD's own duplicate-key
+    /// files carries (`WCCUSERS` 1998 -> 2006, `WCCBANKS` 72 -> 80). The chain
+    /// offset is `reclen`: it is measured from the physical slot, and in a
+    /// version 5 file the slot and the record start at the same byte. See
+    /// [`pages::chain_pair`].
+    fn seed_duplicated(dir: &Path) -> PathBuf {
+        let (page, physical, pages) = (512usize, 24usize, 5usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[0x08..0x0a].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[0x14..0x16].copy_from_slice(&1u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&16u16.to_le_bytes());
+        bytes[0x18..0x1a].copy_from_slice(&(physical as u16).to_le_bytes());
+        bytes[0x1e..0x20].copy_from_slice(&4u16.to_le_bytes());
+        bytes[0x26..0x2a].copy_from_slice(&pages::to_long(pages as u32));
+        for number in 1..pages {
+            let header = pages::Header {
+                number: number as u32,
+                data: number == 4,
+                stamp: 0,
+            };
+            bytes[number * page..number * page + 6].copy_from_slice(&header.encode());
+        }
+        bytes[0x110..0x114].copy_from_slice(&pages::to_long(1));
+        let path = dir.join("DUPLICATE.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    /// A `Block` over [`seed_duplicated`]'s file.
+    fn block_duplicated(path: PathBuf) -> Block {
+        let mut block = block_indexed(path);
+        block.name = "DUPLICATE.DAT".to_owned();
+        block.geometry.physical = 24;
+        block.keys[0].duplicates = true;
+        block.keys[0].chain = Some(16);
+        block
+    }
+
+    /// A record of [`seed_duplicated`]'s shape: `value` is its key, `tag` is
+    /// what tells two records sharing a value apart.
+    ///
+    /// `tag` sits at offset 4 rather than anywhere earlier because a record
+    /// whose bytes past the first four are all zero reads back as a free slot
+    /// -- `records::looks_empty` -- so a record of key 0 needs something in it
+    /// that is not the key -- so callers pass a `tag` of 1 or more. Key 0 is
+    /// exactly the case this file exists to exercise: every new MajorMUD
+    /// character has zero experience, and `WCCUSERS` key 2 is experience. A
+    /// real character record is never all zero either; it carries a name.
+    fn duplicated_record(value: u16, tag: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16];
+        bytes[..2].copy_from_slice(&value.to_le_bytes());
+        bytes[4..6].copy_from_slice(&tag.to_le_bytes());
+        bytes
+    }
+
     /// A `Block` over `seed_indexed`'s file holding `n` records, inserted out
     /// of key order.
     ///
@@ -1922,11 +2036,111 @@ mod tests {
         assert!(walk.pages.len() > 1, "400 records do not fit one page");
 
         let records = block.records.as_ref().expect("loaded");
-        for (n, (value, position)) in walk.entries.iter().enumerate() {
+        for (n, entry) in walk.entries.iter().enumerate() {
             let record = records.ordered(key.number, n).expect("in range");
-            assert_eq!(*position, record.position, "entry {n} names the wrong record");
-            assert_eq!(*value, key.extract(&record.bytes), "entry {n} holds the wrong key");
+            assert_eq!(entry.head, record.position, "entry {n} names the wrong record");
+            assert_eq!(entry.key, key.extract(&record.bytes), "entry {n} holds the wrong key");
         }
+    }
+
+    /// **Stage D2.** A duplicate-permitting key with records in it: one index
+    /// entry per distinct value, and a chain through the records that share
+    /// one.
+    ///
+    /// Twelve records over four values, inserted round-robin so that no
+    /// group's records are neighbours on the page -- a chain that merely
+    /// stepped to the next slot would pass on a file seeded value by value,
+    /// and would be wrong here.
+    ///
+    /// Every claim is checked against the **file**, not against the model that
+    /// wrote it: the tree is walked back off disk, and each chain link is read
+    /// with [`pages::chain_pair`] out of the bytes on the page.
+    #[test]
+    fn reindex_writes_one_entry_per_value_and_chains_the_records_sharing_it() {
+        const VALUES: u16 = 4;
+        const PER_VALUE: u16 = 3;
+
+        let dir = crate::testing::scratch("block-reindex-duplicates");
+        let mut block = block_duplicated(seed_duplicated(&dir));
+        for tag in 0..VALUES * PER_VALUE {
+            block
+                .insert(&duplicated_record(tag % VALUES, tag + 1))
+                .expect("insert");
+        }
+        block.reindex().expect("reindexes a duplicate key");
+
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let key = &block.keys[0];
+
+        // What the model says each group is: the positions carrying each
+        // value, in the order the key orders them.
+        let records = block.records.as_ref().expect("loaded");
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new(); VALUES as usize];
+        for n in 0..records.len() {
+            let record = records.ordered(0, n).expect("in range");
+            let value = u16::from_le_bytes([record.bytes[0], record.bytes[1]]);
+            groups[usize::from(value)].push(record.position);
+        }
+        for group in &groups {
+            assert_eq!(group.len(), usize::from(PER_VALUE), "three records a value");
+        }
+
+        // One entry per value, naming the ends of that value's group.
+        let walk = pages::walk(&block.path, layout, 1, key.shape()).expect("walks");
+        assert_eq!(
+            walk.entries.len(),
+            usize::from(VALUES),
+            "one entry per distinct value, not one per record"
+        );
+        for (value, entry) in walk.entries.iter().enumerate() {
+            let group = &groups[value];
+            assert_eq!(entry.key, (value as u16).to_le_bytes().to_vec(), "entry {value}");
+            assert_eq!(entry.head, group[0], "value {value}'s head");
+            assert_eq!(entry.tail, group[PER_VALUE as usize - 1], "value {value}'s tail");
+        }
+
+        // And the chain that joins them, read back off the pages.
+        let file = std::fs::read(&block.path).expect("readable");
+        let offset = usize::from(key.chain.expect("a duplicate key has a chain offset"));
+        for group in &groups {
+            for (at, position) in group.iter().enumerate() {
+                let slot = *position as usize;
+                let bytes = &file[slot..slot + usize::from(layout.physical)];
+                assert_eq!(
+                    pages::chain_pair(bytes, offset),
+                    Some([
+                        if at == 0 { pages::NOWHERE } else { group[at - 1] },
+                        if at + 1 == group.len() {
+                            pages::NOWHERE
+                        } else {
+                            group[at + 1]
+                        },
+                    ]),
+                    "the record at {position}, {} of its group",
+                    at + 1
+                );
+            }
+        }
+
+        // The per-key count in the file control record is the number of
+        // entries, not the number of records -- measured on `DUPKEY30.DAT`,
+        // whose file control record reads 10 for a file of 30 records.
+        let fcr = std::fs::read(&block.path).expect("readable");
+        let at = pages::fcr::KEYS + pages::fcr::KEY_RECORDS;
+        assert_eq!(
+            pages::long(&fcr[at..at + 4]),
+            u32::from(VALUES),
+            "the key's record count is its distinct values"
+        );
+
+        // And it is still a no-op the second time, chains included.
+        let once = std::fs::read(&block.path).expect("readable");
+        block.reindex().expect("second");
+        assert_eq!(once, std::fs::read(&block.path).expect("readable"));
     }
 
     /// Rebuilding a file this host already indexed changes nothing.

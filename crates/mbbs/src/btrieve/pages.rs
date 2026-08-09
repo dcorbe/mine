@@ -385,6 +385,66 @@ pub fn write_record(
         .map_err(|e| fail("writing the file control record", e))
 }
 
+/// Write one duplicate chain's `[prev][next]` pair into a record on disk.
+///
+/// Eight bytes at `position + offset`, and nothing else: no record count, no
+/// free list, no page header. That is the whole difference from
+/// [`write_record`], and the reason this is a separate function rather than an
+/// argument to that one -- a chain write changes no field the file control
+/// record holds, so re-reading and rewriting a whole page of it per record
+/// would be both slow and an opportunity to write a stale count back.
+///
+/// `offset` is [`Key::chain`](super::keys::Key::chain): measured from the start
+/// of the physical slot, not from the logical record. `chain` is
+/// `[prev, next]`, each a record position or [`NOWHERE`] at that end of the
+/// chain.
+///
+/// # Errors
+///
+/// If `position` is not a slot boundary of this layout, if the pair would not
+/// fit inside the slot, or if the file cannot be opened, sought or written.
+pub fn write_chain(
+    path: &std::path::Path,
+    layout: Layout,
+    position: u32,
+    offset: usize,
+    chain: [u32; 2],
+) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    // A position that is not a slot would put the pair inside a neighbouring
+    // record -- the same reason `Layout::slot_of` refuses to round.
+    if layout.slot_of(position).is_none() {
+        return Err(format!(
+            "{}: {position} is not a record slot of a {}-byte page holding \
+             {}-byte records",
+            path.display(),
+            layout.page,
+            layout.physical
+        ));
+    }
+    if offset + 8 > usize::from(layout.physical) {
+        return Err(format!(
+            "{}: a chain at offset {offset} does not fit a {}-byte physical slot",
+            path.display(),
+            layout.physical
+        ));
+    }
+
+    let mut bytes = [0u8; 8];
+    bytes[..4].copy_from_slice(&to_long(chain[0]));
+    bytes[4..].copy_from_slice(&to_long(chain[1]));
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(u64::from(position) + offset as u64))
+        .and_then(|_| file.write_all(&bytes))
+        .and_then(|_| file.flush())
+        .map_err(|e| format!("{}: writing a duplicate chain: {e}", path.display()))
+}
+
 /// The free list's head, or `None` if it is empty.
 ///
 /// Reads only the four bytes at [`fcr::FREE`]. `Block::insert` calls this
@@ -531,11 +591,13 @@ impl Shape {
     }
 }
 
-/// The refusal every populated duplicate-key index **write** path shares.
+/// How a duplicate-permitting key's index differs from a unique one's.
 ///
-/// **Reading** a populated duplicate-key page is [`decode_index_page`]'s job
-/// now, and it no longer calls this. This is what [`build_index`] still says,
-/// because writing one is a different, harder problem it does not yet solve.
+/// Kept as documentation rather than deleted with the refusal it used to carry
+/// -- Stage D2 of `docs/plans/2026-08-08-fsd-subsystem-design.md` says this
+/// comment "gets rewritten, not deleted" -- because the two consequences below
+/// are what [`build_index`] and [`Block::reindex`](super::Block::reindex) are
+/// now built around rather than reasons to stop.
 ///
 /// A duplicate-permitting key's index entry is four bytes wider, and those four
 /// bytes are **not** slack at the end of the entry. The engine lays a *linked
@@ -560,38 +622,35 @@ impl Shape {
 /// group of three and a `tail` that is measurably the last. See
 /// `docs/plans/2026-08-08-fsd-subsystem-design.md`, Stage D1.
 ///
-/// **Two consequences make this a feature rather than an offset fix, which is
-/// why *building* one is refused here instead of implemented:**
+/// **Two consequences make this a feature rather than an offset fix, and they
+/// are what the two halves of writing one are:**
 ///
 /// 1. A linked-duplicates index holds **one entry per distinct key value**, not
-///    one per record. The invariant [`build_index`] and [`push_node`] are
-///    written against -- that a tree's entry count equals the file's record
-///    count -- does not hold for one, and neither function groups records by
-///    value before laying out entries.
-/// 2. The chain itself lives **inside the records**, as a `[prev][next]` pair of
-///    record addresses at the offset the key descriptor stores at `+0x12`
-///    ([`super::keys::Key::chain`]), which is why such a file's physical
-///    record is longer than its logical one by the width of that pair (eight
-///    bytes: `WCCUSERS` 1998 -> 2006, `DUPKEY30.DAT` 12 -> 22, the last four
-///    of those ten also going to a two-byte gap `Key::chain` itself measures
-///    and this host does not yet explain). Writing the index therefore means
-///    writing the chain into the records too, which [`build_index`] cannot
-///    do and should not.
+///    one per record. The invariant [`build_index`] and [`push_node`] used to
+///    be written against -- that a tree's entry count equals the file's record
+///    count -- does not hold for one. So [`build_index`] takes [`Entry`]
+///    values rather than records, and
+///    [`Block::reindex`](super::Block::reindex) collapses each group into one
+///    before calling it, using the same comparator that put the records in
+///    order so the two cannot disagree about what "the same value" means.
+/// 2. The chain itself lives **inside the records**, as a `[prev][next]` pair
+///    of record positions at the offset the key descriptor stores at `+0x12`
+///    ([`super::keys::Key::chain`]), measured from the physical slot. That is
+///    why such a file's physical record is longer than its logical one by the
+///    width of the pair -- `WCCUSERS` 1998 -> 2006, `WCCBANKS` 72 -> 80, all
+///    eight. (`DUPKEY30.DAT`'s 12 -> 22 is that eight plus two more, which are
+///    the version 6 per-slot in-use marker every page in that file carries
+///    whether or not its key permits duplicates, and not part of the chain;
+///    see [`chain_pair`].) Writing the index therefore means writing the chain
+///    into the records too, which [`build_index`] does not do and should not:
+///    `Block::reindex` owns it, because only it knows where the records are.
 ///
-/// So building still refuses rather than guesses. A wrong guess writes an
-/// index Btrieve reads as a plausible wrong order, which is the failure this
-/// whole module is built to avoid -- see the note on [`Kind`](super::keys::Kind).
-/// Refusing costs a loud error at the first character written to `WCCUSERS`;
-/// guessing costs a character file that reads back subtly shuffled.
-fn unplaced_duplicate_bytes(shape: Shape) -> String {
-    format!(
-        "a duplicate-permitting key of {} bytes has {}-byte index entries \
-         holding a chain this host does not yet write; refusing rather than \
-         writing an index Btrieve would read in the wrong order",
-        shape.length,
-        shape.entry_size()
-    )
-}
+/// The failure being avoided has not changed, only the way of avoiding it: a
+/// wrong guess writes an index Btrieve reads as a plausible wrong order, which
+/// is what this module exists to prevent -- see the note on
+/// [`Kind`](super::keys::Kind). What used to be a refusal is now measured
+/// against the engine itself, which is a better answer than either refusing or
+/// guessing.
 
 /// One index page, decoded.
 ///
@@ -808,18 +867,14 @@ const MAX_DEPTH: usize = 32;
 pub struct Walk {
     /// Every entry in the tree, in key order.
     ///
-    /// For a **unique** key this is `(key bytes, record position)` one row
-    /// per record. **For a key that permits duplicates it is one row per
-    /// distinct key value**, not one per record -- the restated invariant
-    /// `docs/plans/2026-08-08-fsd-subsystem-design.md`'s Stage D1 calls "the
-    /// actual refactor" -- and the position is the chain's **head**, the
-    /// first record ever inserted with that value. The rest of the group
-    /// (the tail and anything between) is not here; [`decode_index_page`]
-    /// keeps the tail alongside [`IndexPage::entries`] as
-    /// [`IndexPage::tails`], which this function does not thread through
-    /// because [`Block::reindex`](super::Block::reindex) -- its only caller
-    /// today -- only ever consults [`Self::pages`].
-    pub entries: Vec<(Vec<u8>, u32)>,
+    /// **One row per distinct key value**, which for a unique key is one row
+    /// per record and for a duplicate-permitting key is not -- the restated
+    /// invariant `docs/plans/2026-08-08-fsd-subsystem-design.md`'s Stage D1
+    /// calls "the actual refactor". [`Entry::head`] and [`Entry::tail`] are
+    /// the ends of the group's chain, and are the same record when the value
+    /// is unique to it; the records between them are reachable only through
+    /// the chain itself ([`chain_pair`]), which a tree walk does not follow.
+    pub entries: Vec<Entry>,
     /// The page numbers the tree occupies, **root first**.
     ///
     /// `Block::reindex` rebuilds into exactly these numbers, which is what
@@ -902,8 +957,14 @@ pub fn walk(
             stack.pop();
             continue;
         }
-        let (key, position, child) = &frame.page.entries[frame.at];
-        out.entries.push((key.clone(), *position));
+        let (key, head, child) = &frame.page.entries[frame.at];
+        out.entries.push(Entry {
+            key: key.clone(),
+            head: *head,
+            // A unique key's entry has no tail field, and its one record is
+            // both ends of a chain of one.
+            tail: frame.page.tails.get(frame.at).copied().unwrap_or(*head),
+        });
         frame.at += 1;
         if !frame.page.leaf() {
             next = Some(if frame.at == frame.page.entries.len() {
@@ -915,11 +976,43 @@ pub fn walk(
     }
 }
 
+/// One index entry: a key value, and the record or records that carry it.
+///
+/// **One entry is one key value, not one record.** For a key that forbids
+/// duplicates those are the same thing and [`Self::head`] and [`Self::tail`]
+/// are both simply the record. For one that permits them, an entry stands for
+/// every record sharing the value, and the two ends of that group's chain are
+/// what the page stores -- see [`chain_pair`] for the links between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// The key value, [`Shape::length`] bytes.
+    pub key: Vec<u8>,
+    /// The first record carrying it.
+    pub head: u32,
+    /// The last record carrying it, equal to [`Self::head`] when only one
+    /// does. **Written to the page only when the key permits duplicates**; a
+    /// unique key's entry has no slot for it, which is the four bytes
+    /// [`Shape::entry_size`] differs by.
+    pub tail: u32,
+}
+
+impl Entry {
+    /// The entry for a record whose key value no other record shares.
+    #[must_use]
+    pub fn unique(key: Vec<u8>, position: u32) -> Self {
+        Self {
+            key,
+            head: position,
+            tail: position,
+        }
+    }
+}
+
 /// One node of a tree under construction.
 #[derive(Debug)]
 pub struct Node {
-    /// `(key bytes, record position)`, in key order.
-    pub entries: Vec<(Vec<u8>, u32)>,
+    /// The node's entries, in key order.
+    pub entries: Vec<Entry>,
     /// Indices into [`Built::nodes`]. Empty for a leaf; otherwise one more than
     /// `entries.len()`.
     pub children: Vec<usize>,
@@ -952,20 +1045,21 @@ pub struct Built {
     pub shape: Shape,
 }
 
-/// Build a key's whole tree from records already in that key's order.
+/// Build a key's whole tree from entries already in that key's order.
 ///
-/// `entries` is `(key bytes, record position)` pairs, already sorted —
-/// [`Records`](super::Records) has done that, and this does not re-sort them.
+/// `entries` is already sorted — [`Records`](super::Records) has done that, and
+/// this does not re-sort them. **One entry per key value**, which for a
+/// duplicate-permitting key is fewer than the file has records:
+/// [`Block::reindex`](super::Block::reindex) collapses each group of records
+/// sharing a value into a single [`Entry`] before calling this, and writes the
+/// chain that joins them into the records themselves.
 ///
 /// Bottom-up and evenly filled: a level too big for one page splits into the
 /// fewest nodes that will hold it, with the entries that fall between them
-/// promoted to the level above. **A promoted entry is a real record**, which is
-/// what the format does and why the total entry count across every node equals
-/// the record count -- **for a unique key**. `entries` here is still one row
-/// per record even for a duplicate-permitting key
-/// ([`Block::reindex`](super::Block::reindex)'s own caller builds it that
-/// way), which is exactly why this refuses rather than building a tree for
-/// one: see [`unplaced_duplicate_bytes`].
+/// promoted to the level above. **A promoted entry is a real entry**, indexing
+/// its records exactly as it would in a leaf, which is what the format does and
+/// why the total entry count across every node equals the number of distinct
+/// key values.
 ///
 /// The fill factor is this host's to choose — see
 /// `docs/plans/2026-08-07-btrieve-interior-pages-design.md`, "The fidelity
@@ -975,18 +1069,7 @@ pub struct Built {
 /// # Errors
 ///
 /// If no entry fits a page.
-pub fn build_index(
-    layout: Layout,
-    entries: &[(Vec<u8>, u32)],
-    shape: Shape,
-) -> Result<Built, String> {
-    // An empty index is laid out the same whether the key permits duplicates or
-    // not -- there are no entries to place the four unknown bytes in. That is
-    // not a technicality: all four shipped duplicate-key files hold zero
-    // records, so this is the case that has to keep working.
-    if shape.duplicates && !entries.is_empty() {
-        return Err(unplaced_duplicate_bytes(shape));
-    }
+pub fn build_index(layout: Layout, entries: &[Entry], shape: Shape) -> Result<Built, String> {
     let width = shape.entry_size();
     let cap = shape.capacity(layout.page);
     if cap == 0 {
@@ -998,7 +1081,7 @@ pub fn build_index(
     }
 
     let mut nodes: Vec<Node> = Vec::new();
-    let mut items: Vec<(Vec<u8>, u32)> = entries.to_vec();
+    let mut items: Vec<Entry> = entries.to_vec();
     let mut children: Vec<usize> = Vec::new();
 
     let root = loop {
@@ -1013,13 +1096,13 @@ pub fn build_index(
         let base = held / count;
         let extra = held % count;
 
-        let mut promoted: Vec<(Vec<u8>, u32)> = Vec::with_capacity(count - 1);
+        let mut promoted: Vec<Entry> = Vec::with_capacity(count - 1);
         let mut level: Vec<usize> = Vec::with_capacity(count);
         let mut taken = 0usize;
         let mut consumed = 0usize;
         for n in 0..count {
             let size = base + usize::from(n < extra);
-            let mine: Vec<(Vec<u8>, u32)> = items[taken..taken + size].to_vec();
+            let mine: Vec<Entry> = items[taken..taken + size].to_vec();
             taken += size;
             let theirs = if children.is_empty() {
                 Vec::new()
@@ -1051,7 +1134,7 @@ fn push_node(
     nodes: &mut Vec<Node>,
     layout: Layout,
     shape: Shape,
-    entries: Vec<(Vec<u8>, u32)>,
+    entries: Vec<Entry>,
     children: Vec<usize>,
 ) -> usize {
     let mut image = vec![0u8; usize::from(layout.page)];
@@ -1073,10 +1156,19 @@ fn push_node(
     image[12..16].copy_from_slice(&to_long(NOWHERE));
 
     let mut at = INDEX_HEADER;
-    for (n, (key, position)) in entries.iter().enumerate() {
-        image[at..at + key.len()].copy_from_slice(key);
-        let tail = at + key.len();
-        image[tail..tail + 4].copy_from_slice(&to_long(*position));
+    for (n, entry) in entries.iter().enumerate() {
+        image[at..at + entry.key.len()].copy_from_slice(&entry.key);
+        let mut field = at + entry.key.len();
+        image[field..field + 4].copy_from_slice(&to_long(entry.head));
+        // The chain's other end, for a key that permits duplicates: the four
+        // bytes `Shape::entry_size` is wider by, between the head and the
+        // child. A unique key has no slot here at all -- writing one would
+        // push its child four bytes late and every entry after it with it.
+        if shape.duplicates {
+            field += 4;
+            image[field..field + 4].copy_from_slice(&to_long(entry.tail));
+        }
+        let tail = field;
         // The last entry's child slot is a placeholder -- a node with `n` keys
         // has `n+1` children and the last of them lives in the header at offset
         // 8, so this slot is never a pointer. Every other slot is left empty
@@ -1168,7 +1260,13 @@ pub fn number_pages(built: &Built, numbers: &[u32]) -> Result<Vec<(u32, Vec<u8>)
             image[8..12].copy_from_slice(&to_long(placed[node.children[node.entries.len()]]));
             image[12..16].copy_from_slice(&to_long(placed[node.children[0]]));
             for n in 0..node.entries.len().saturating_sub(1) {
-                let tail = INDEX_HEADER + n * width + built.shape.length + 4;
+                // The child is the entry's **last** four bytes, whatever the
+                // entry holds before them. Spelling that as `length + 4` was
+                // right only for a unique key, and put an interior node's
+                // children in a duplicate key's `tail` fields -- unreachable
+                // while `build_index` refused the shape, and wrong the moment
+                // it stopped.
+                let tail = INDEX_HEADER + n * width + (width - 4);
                 image[tail..tail + 4].copy_from_slice(&to_long(placed[node.children[n + 1]]));
             }
         }
@@ -1310,30 +1408,67 @@ mod tests {
         (2048, 11, false, 19, 107), // WCCUSERS.VIR key 1
     ];
 
-    /// **Building** a duplicate key with records in it is refused, and an
-    /// empty one is not. Reading is a different story -- see
-    /// [`a_duplicate_leafs_head_and_tail_are_the_first_and_last_inserted_record`]
-    /// below, which reads a page exactly this shape and does not error.
+    /// A built duplicate leaf lays its entries out the way the real engine's
+    /// does, and decodes back to what went in.
     ///
-    /// Both halves of the *build* side matter. All four shipped duplicate-key
-    /// files hold zero records, so `Block::reindex` runs over them on every
-    /// close and must keep working -- a blanket refusal would regress
-    /// `WCCUSERS`, `WCCGANGS`, `WCCITOWN` and `WCCBANKS` from "rebuilds an
-    /// empty tree" to "cannot be closed". The refusal has to arrive exactly
-    /// when the first record does.
+    /// The bytes are checked against the layout `decode_index_page` reads and
+    /// against the engine's own `DUPKEY30.DAT` leaf next to it -- head where a
+    /// unique key's record pointer goes, tail in the four bytes
+    /// [`Shape::entry_size`] adds, child last -- rather than only round-
+    /// tripped through this module's own decoder, which would agree with a
+    /// builder that put the tail and the child the wrong way round.
+    ///
+    /// An empty duplicate index still builds, and that is not a technicality:
+    /// all four shipped duplicate-key files hold zero records, so
+    /// `Block::reindex` runs over them on every close.
     #[test]
-    fn a_duplicate_key_is_refused_only_once_it_has_something_to_index() {
+    fn a_built_duplicate_leaf_holds_a_head_a_tail_and_a_child_in_that_order() {
         let layout = index_layout();
         let duplicate = Shape {
             length: 2,
             duplicates: true,
         };
 
-        build_index(layout, &[], duplicate).expect("an empty duplicate index is still empty");
+        let empty = build_index(layout, &[], duplicate).expect("an empty duplicate index");
+        assert_eq!(empty.nodes.len(), 1, "one empty leaf, as a virgin file has");
 
-        let e = build_index(layout, &[(vec![1u8, 0], 100)], duplicate)
-            .expect_err("one record is enough to need the chain");
-        assert!(e.contains("chain"), "{e}");
+        let entries = vec![
+            Entry {
+                key: vec![1u8, 0],
+                head: 100,
+                tail: 300,
+            },
+            Entry {
+                key: vec![2u8, 0],
+                head: 200,
+                tail: 200,
+            },
+        ];
+        let built = build_index(layout, &entries, duplicate).expect("two values fit one leaf");
+        assert_eq!(built.nodes.len(), 1);
+
+        let image = &built.nodes[built.root].image;
+        assert_eq!(
+            &image[INDEX_HEADER..INDEX_HEADER + 14],
+            [
+                &[1u8, 0][..],       // the key
+                &to_long(100)[..],   // its chain's head
+                &to_long(300)[..],   // its chain's tail
+                &to_long(NOWHERE)[..], // no child: this is a leaf
+            ]
+            .concat()
+            .as_slice(),
+            "a duplicate entry is [key][head][tail][child]"
+        );
+
+        let decoded = decode_index_page(image, duplicate).expect("decodes");
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.entries[0].1, 100, "head");
+        assert_eq!(decoded.tails, vec![300, 200], "both tails");
+        assert_eq!(
+            decoded.entries[1].2, 0,
+            "the last entry's child is the zero placeholder, not the tail"
+        );
     }
 
     /// **Reading** the same shape `build_index` above refuses to *write*: a
@@ -1362,6 +1497,17 @@ mod tests {
         let decoded = decode_index_page(&page, duplicate).expect("a populated duplicate leaf");
         assert_eq!(decoded.entries, vec![(vec![1, 0], 100, 0)], "head, as the record pointer");
         assert_eq!(decoded.tails, vec![200], "tail, in the field a unique entry does not have");
+    }
+
+    /// `(key bytes, position)` rows as entries of a key no two records share.
+    ///
+    /// Most of these tests build a unique key, where an entry and a record are
+    /// the same thing; this keeps them reading as the rows they are rather
+    /// than as `Entry::unique` repeated.
+    fn rows(of: &[(Vec<u8>, u32)]) -> Vec<Entry> {
+        of.iter()
+            .map(|(key, at)| Entry::unique(key.clone(), *at))
+            .collect()
     }
 
     /// `tools/btrieve-oracle/fixtures/DUPKEY30.DAT` -- built by the genuine
@@ -1594,7 +1740,7 @@ mod tests {
         let values: Vec<u32> = walked
             .entries
             .iter()
-            .map(|(key, _)| u32::from_le_bytes(key.clone().try_into().expect("4-byte key")))
+            .map(|e| u32::from_le_bytes(e.key.clone().try_into().expect("4-byte key")))
             .collect();
         assert_eq!(values, (0..10).rev().collect::<Vec<_>>(), "descending, 9 down to 0");
     }
@@ -1669,14 +1815,16 @@ mod tests {
         let walked = walk(&path, layout, 1, shape).expect("walks a duplicate tree");
         assert_eq!(
             walked.entries,
-            vec![
-                (vec![10, 0], 1000),
-                (vec![15, 0], 1500),
-                (vec![20, 0], 3000),
-                (vec![25, 0], 2500),
-                (vec![30, 0], 3500),
-            ],
-            "the root's own entry -- head 3000 -- sorts between its two children"
+            [
+                (vec![10u8, 0], 1000u32, 1005u32),
+                (vec![15, 0], 1500, 1505),
+                (vec![20, 0], 3000, 3050),
+                (vec![25, 0], 2500, 2505),
+                (vec![30, 0], 3500, 3505),
+            ]
+            .map(|(key, head, tail)| Entry { key, head, tail }),
+            "the root's own entry -- head 3000 -- sorts between its two \
+             children, and every entry carries its own chain's far end"
         );
         assert_eq!(walked.pages, vec![1, 2, 3]);
     }
@@ -2183,7 +2331,7 @@ mod tests {
         let layout = index_layout();
         let entries = vec![(vec![1u8, 0], 100u32), (vec![2u8, 0], 200u32)];
 
-        let built = build_index(layout, &entries, unique(2)).expect("two entries fit easily");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("two entries fit easily");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
 
@@ -2240,7 +2388,7 @@ mod tests {
         entries.push((0x000du16.to_le_bytes().to_vec(), 0x0000_0a06));
         assert_eq!(entries.len(), 13);
 
-        let built = build_index(layout, &entries, unique(2)).expect("13 entries fit one leaf");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("13 entries fit one leaf");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
 
@@ -2300,7 +2448,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (0..6u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
-        let built = build_index(layout, &entries, unique(2)).expect("what index_pages refused");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("what index_pages refused");
 
         assert_eq!(built.nodes.len(), 3, "two leaves and a root");
         assert_eq!(
@@ -2328,7 +2476,7 @@ mod tests {
             (0..5u32).map(|n| (n.to_le_bytes()[..2].to_vec(), n)).collect();
 
         let built =
-            build_index(layout, &entries, unique(2)).expect("five entries need exactly 62");
+            build_index(layout, &rows(&entries), unique(2)).expect("five entries need exactly 62");
         assert_eq!(built.nodes.len(), 1, "these entries fit one page");
         let page = &built.nodes[built.root].image;
         assert_eq!(page.len(), usize::from(layout.page));
@@ -2629,13 +2777,13 @@ mod tests {
         let walk = walk(&path, layout, 1, unique(2)).expect("walks");
         assert_eq!(
             walk.entries,
-            vec![
+            rows(&[
                 (vec![10, 0], 1000),
                 (vec![15, 0], 1500),
                 (vec![20, 0], 3000),
                 (vec![25, 0], 2500),
                 (vec![30, 0], 3000),
-            ],
+            ]),
             "the root's own entry sorts between its two children"
         );
         assert_eq!(walk.pages, vec![1, 2, 3], "root first, then in walk order");
@@ -2697,7 +2845,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=4).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, unique(2)).expect("four entries fit");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("four entries fit");
         assert_eq!(built.nodes.len(), 1, "one page, so one node");
         assert_eq!(built.root, 0, "the root is the only node");
 
@@ -2720,6 +2868,70 @@ mod tests {
         assert_eq!(built.nodes[0].image, expected, "the one-page case must not have moved");
     }
 
+    /// A duplicate key's tree, built across more than one page, and walked
+    /// back entry for entry -- **tails included**.
+    ///
+    /// The one-leaf case above cannot see where an interior node puts its
+    /// children, because a one-leaf tree has none. A duplicate entry is
+    /// `[key][head][tail][child]`, so the child is twelve bytes past the key
+    /// rather than four, and [`number_pages`] spelled that offset as
+    /// `length + 4` -- which for this shape writes each child page into the
+    /// entry's `tail` and leaves the real child slot empty. Nothing could
+    /// reach it while `build_index` refused the shape.
+    ///
+    /// Round-tripped through a real file rather than through
+    /// [`decode_index_page`] alone: [`walk`] descends children the way the
+    /// engine does, so a tree whose children landed in the wrong field does
+    /// not walk at all.
+    #[test]
+    fn a_duplicate_tree_across_pages_walks_back_with_every_head_and_tail() {
+        let shape = Shape {
+            length: 2,
+            duplicates: true,
+        };
+        // (64 - 12) / (2 + 12) = 3 entries per page.
+        assert_eq!(shape.capacity(64), 3);
+        let layout = Layout {
+            page: 64,
+            physical: 16,
+            pages: 16,
+        };
+
+        // Eleven values, each carried by two records a hundred apart, which
+        // makes every head and tail distinct and distinguishable from the key.
+        let entries: Vec<Entry> = (1u16..=11)
+            .map(|k| Entry {
+                key: k.to_le_bytes().to_vec(),
+                head: u32::from(k) * 1000,
+                tail: u32::from(k) * 1000 + 100,
+            })
+            .collect();
+
+        let built = build_index(layout, &entries, shape).expect("eleven values, several pages");
+        assert!(built.nodes.len() > 1, "eleven entries do not fit a page of three");
+
+        let dir = crate::testing::scratch("pages-duplicate-tree-round-trip");
+        let path = dir.join("DUPTREE.DAT");
+        let numbers: Vec<u32> = (1..=built.nodes.len() as u32).collect();
+        let mut file = vec![0u8; usize::from(layout.page) * (built.nodes.len() + 1)];
+        for (number, image) in number_pages(&built, &numbers).expect("numbered") {
+            let at = number as usize * usize::from(layout.page);
+            file[at..at + usize::from(layout.page)].copy_from_slice(&image);
+        }
+        std::fs::write(&path, &file).expect("writes");
+
+        let layout = Layout {
+            pages: (built.nodes.len() + 1) as u32,
+            ..layout
+        };
+        let walked = walk(&path, layout, 1, shape).expect("walks the tree it just wrote");
+        assert_eq!(
+            walked.entries, entries,
+            "every value, in order, with both ends of its chain"
+        );
+        assert_eq!(walked.pages.len(), built.nodes.len(), "every node reached once");
+    }
+
     /// Two levels, and the shape is the one the format uses.
     ///
     /// Nine entries into pages holding four. The split needs
@@ -2733,13 +2945,13 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, unique(2)).expect("nine entries, three pages");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("nine entries, three pages");
         assert_eq!(built.nodes.len(), 3, "two leaves and a root");
 
         let root = &built.nodes[built.root];
         assert_eq!(root.entries.len(), 1, "one separator between two leaves");
         assert_eq!(root.children.len(), 2);
-        assert_eq!(root.entries[0].0, 5u16.to_le_bytes().to_vec(), "the middle key");
+        assert_eq!(root.entries[0].key, 5u16.to_le_bytes().to_vec(), "the middle key");
 
         let left = &built.nodes[root.children[0]];
         let right = &built.nodes[root.children[1]];
@@ -2770,7 +2982,7 @@ mod tests {
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=200).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
 
-        let built = build_index(layout, &entries, unique(2)).expect("200 entries");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("200 entries");
         let mut depth = 0usize;
         let mut at = built.root;
         while !built.nodes[at].children.is_empty() {
@@ -2797,7 +3009,7 @@ mod tests {
     #[test]
     fn a_key_too_wide_for_a_page_is_refused() {
         let layout = Layout { page: 32, physical: 16, pages: 4 };
-        let e = build_index(layout, &[(vec![0u8; 40], 1)], unique(40))
+        let e = build_index(layout, &rows(&[(vec![0u8; 40], 1)]), unique(40))
             .expect_err("40 + 8 > 32 - 12");
         assert!(e.contains("does not fit"), "{e}");
     }
@@ -2814,7 +3026,7 @@ mod tests {
         let layout = Layout { page: 64, physical: 16, pages: 16 };
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
-        let built = build_index(layout, &entries, unique(2)).expect("three nodes");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("three nodes");
 
         let placed = number_pages(&built, &[7, 3, 5]).expect("three numbers for three nodes");
         assert_eq!(placed[0].0, 7, "the root takes the first number given");
@@ -2843,7 +3055,7 @@ mod tests {
         let layout = Layout { page: 64, physical: 16, pages: 16 };
         let entries: Vec<(Vec<u8>, u32)> =
             (1u16..=9).map(|k| (k.to_le_bytes().to_vec(), u32::from(k) * 100)).collect();
-        let built = build_index(layout, &entries, unique(2)).expect("three nodes");
+        let built = build_index(layout, &rows(&entries), unique(2)).expect("three nodes");
 
         let e = number_pages(&built, &[7, 3]).expect_err("three nodes, two pages");
         assert!(e.contains('3') && e.contains('2'), "{e}");
