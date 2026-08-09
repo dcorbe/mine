@@ -11,3 +11,5 @@
 //! See `docs/plans/2026-08-08-tokio-transport-design.md`.
 
 pub mod iac;
+pub mod msg;
+pub mod pool;
