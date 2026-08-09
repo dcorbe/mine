@@ -58,7 +58,20 @@ impl ModulePtr for Flat32Ptr {
 
     fn read_cstr<'m>(&self, memory: &'m Image) -> Result<&'m [u8], Flat32PtrError> {
         let rva = self.0.wrapping_sub(memory.base());
-        let avail = memory.as_slice().len().saturating_sub(rva as usize);
+
+        // A pointer with zero bytes left before the image ends is refused as
+        // OutOfBounds, not treated as an empty Unterminated string -- the
+        // same distinction `FarPtr::read_cstr` (mbbs16/src/lib.rs) draws via
+        // its own `filter(|n| *n > 0)`. Kept explicit here rather than
+        // saturating to zero and letting the terminator scan fail on an
+        // empty slice, so the two ModulePtr impls agree at this boundary.
+        let avail = memory
+            .as_slice()
+            .len()
+            .checked_sub(rva as usize)
+            .filter(|n| *n > 0)
+            .ok_or(Flat32PtrError::OutOfBounds { addr: self.0, len: 1 })?;
+
         let tail = memory
             .read_at(rva, avail)
             .map_err(|_| Flat32PtrError::OutOfBounds { addr: self.0, len: 1 })?;
@@ -215,6 +228,19 @@ mod tests {
         let ptr = Flat32Ptr(image.base() + rva);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
+    }
+
+    #[test]
+    fn read_cstr_with_nothing_left_before_the_images_end_is_out_of_bounds_not_unterminated() {
+        // A pointer sitting exactly at the image's end has zero bytes to
+        // scan -- that is a distinct failure from "scanned some bytes, found
+        // no terminator," and FarPtr::read_cstr draws the same distinction.
+        let file = minimal_with_one_section();
+        let image = load(&file);
+
+        let ptr = Flat32Ptr(image.base() + SIZE_OF_IMAGE);
+        let err = ptr.read_cstr(&image).unwrap_err();
+        assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
 
     #[test]
