@@ -6,10 +6,11 @@
 //! kernel state, so these tests check real kernel state back, not merely that
 //! a `Result` came back `Ok`.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use mbbs32::{Image, Mapping, PeError, PeImage};
+use mbbs32::{Image, Import32, Mapping, PeError, PeImage, Symbol, ThunkSite};
 
 #[test]
 fn base_is_non_null_below_4gib_and_page_aligned() {
@@ -297,4 +298,249 @@ fn relocation_changes_exactly_the_sites_the_directory_names() {
         13_920,
         "wccmmud.dll's measured relocation count"
     );
+}
+
+/// A loadable image with one import: `LIB.DLL:Widget`, named at **two**
+/// distinct IAT sites (`iat0`, `iat1`) via two ILT entries that both point at
+/// the same hint/name pair. `wccmmud.dll` itself has zero duplicate
+/// `(library, symbol)` pairs among its 210 imports (verified separately, by
+/// inspection of `image.imports` grouped by `(library, symbol)`) so this is
+/// the only way to reach the once-per-symbol bug this task exists to make
+/// impossible.
+///
+/// Returns the file bytes, the parsed image, and the two IAT rvas in ILT
+/// order, so a test can read back exactly what landed at each without
+/// re-deriving the layout.
+fn duplicate_symbol_fixture() -> (Vec<u8>, PeImage, [u32; 2]) {
+    let mut v = vec![0u8; 0x200];
+    v[0..2].copy_from_slice(b"MZ");
+    v[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes()); // e_lfanew
+    v[0x80..0x84].copy_from_slice(b"PE\0\0");
+    v[0x84..0x86].copy_from_slice(&0x014cu16.to_le_bytes()); // machine = i386
+    v[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // 1 section
+    v[0x94..0x96].copy_from_slice(&0xe0u16.to_le_bytes()); // SizeOfOptionalHeader
+    v[0x96..0x98].copy_from_slice(&0u16.to_le_bytes()); // characteristics
+    v[0x98..0x9a].copy_from_slice(&0x010bu16.to_le_bytes()); // PE32 magic
+
+    let opt = 0x98;
+    v[opt + 16..opt + 20].copy_from_slice(&0x1000u32.to_le_bytes()); // entry point
+    v[opt + 28..opt + 32].copy_from_slice(&0x4000_0000u32.to_le_bytes()); // image base
+    v[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // section alignment
+    v[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // file alignment
+    v[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes()); // size of image
+
+    let sec = opt + 0xe0;
+    let raw = sec + 40;
+    v.resize(raw + 0x400 + 0x200, 0);
+    v[sec..sec + 8].copy_from_slice(b"TEST\0\0\0\0");
+    v[sec + 8..sec + 12].copy_from_slice(&0x400u32.to_le_bytes()); // VirtualSize
+    v[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+    v[sec + 16..sec + 20].copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfRawData
+    v[sec + 20..sec + 24].copy_from_slice(&(raw as u32).to_le_bytes()); // PointerToRawData
+    v[sec + 36..sec + 40].copy_from_slice(&0x4000_0040u32.to_le_bytes());
+
+    let to_rva = |file_off: usize| 0x1000u32 + (file_off - raw) as u32;
+
+    let desc = raw;
+    let desc_term = desc + 20;
+    let ilt = desc_term + 20;
+    let iat = ilt + 12; // 2 entries + 0 terminator
+    let hint = iat + 8; // 2 entries, no terminator needed (ILT's does the job)
+    let name = hint + 2 + 7; // 2-byte hint + "Widget\0"
+
+    v[desc..desc + 4].copy_from_slice(&to_rva(ilt).to_le_bytes()); // OriginalFirstThunk
+    v[desc + 4..desc + 8].copy_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+    v[desc + 8..desc + 12].copy_from_slice(&0u32.to_le_bytes()); // ForwarderChain
+    v[desc + 12..desc + 16].copy_from_slice(&to_rva(name).to_le_bytes()); // Name
+    v[desc + 16..desc + 20].copy_from_slice(&to_rva(iat).to_le_bytes()); // FirstThunk
+    // desc_term is already all-zero from the vec's initial fill.
+
+    v[ilt..ilt + 4].copy_from_slice(&to_rva(hint).to_le_bytes());
+    v[ilt + 4..ilt + 8].copy_from_slice(&to_rva(hint).to_le_bytes());
+    v[ilt + 8..ilt + 12].copy_from_slice(&0u32.to_le_bytes());
+    // iat's 8 bytes are already zero -- their contents are never read while
+    // parsing (see `Import::iat_rva`'s doc comment in pe.rs); only the two
+    // rvas `iat` and `iat + 4` matter, and those come from the ILT walk.
+
+    v[hint..hint + 2].copy_from_slice(&0u16.to_le_bytes()); // hint, never read
+    v[hint + 2..hint + 9].copy_from_slice(b"Widget\0");
+    v[name..name + 8].copy_from_slice(b"LIB.DLL\0");
+
+    let dir = opt + 96 + 8; // opt + 96 + DIR_IMPORT(1) * 8
+    v[dir..dir + 4].copy_from_slice(&to_rva(desc).to_le_bytes());
+    v[dir + 4..dir + 8].copy_from_slice(&40u32.to_le_bytes());
+
+    let image = PeImage::parse(&v).expect("duplicate_symbol_fixture parses");
+    assert_eq!(
+        image.imports.len(),
+        2,
+        "the fixture must produce exactly two import sites sharing one symbol"
+    );
+    assert_eq!(image.imports[0].library, "LIB.DLL");
+    assert_eq!(image.imports[1].library, "LIB.DLL");
+    assert_eq!(
+        image.imports[0].symbol,
+        Symbol::Name("Widget".to_string())
+    );
+    assert_eq!(image.imports[0].symbol, image.imports[1].symbol);
+    assert_ne!(
+        image.imports[0].iat_rva, image.imports[1].iat_rva,
+        "the two sites must be genuinely distinct IAT slots"
+    );
+
+    let iats = [image.imports[0].iat_rva, image.imports[1].iat_rva];
+    (v, image, iats)
+}
+
+#[test]
+fn resolving_once_per_symbol_writes_the_same_answer_to_every_site_naming_it() {
+    // A resolver that hands out a fresh, distinguishable address on every
+    // call. If `bind_imports` asked it once per *site* rather than once per
+    // distinct `(library, symbol)`, the two IAT slots below would receive two
+    // different addresses -- exactly the bug the sibling 16-bit loader hit
+    // for real (`usrnum`, resolved once per site, scattered across every one
+    // of its 1,285 sites).
+    let (file, image, [iat0, iat1]) = duplicate_symbol_fixture();
+    let mut mapped = Image::load(&file, &image).expect("fixture maps");
+
+    let calls = Cell::new(0u32);
+    let resolver = |_library: &str, _symbol: &Symbol| {
+        calls.set(calls.get() + 1);
+        Some(Import32::Data(0xcafe_0000 + calls.get()))
+    };
+    let thunks = mapped.bind_imports(&image, &resolver);
+
+    assert_eq!(
+        calls.get(),
+        1,
+        "the resolver must be asked exactly once for the one distinct symbol \
+         this fixture names, not once per site"
+    );
+    assert!(
+        thunks.is_empty(),
+        "Import32::Data resolves directly; nothing here needs a thunk index"
+    );
+
+    let read = |rva: u32| {
+        let rva = rva as usize;
+        u32::from_le_bytes(mapped.as_slice()[rva..rva + 4].try_into().unwrap())
+    };
+    assert_eq!(
+        read(iat0),
+        read(iat1),
+        "both sites name the same symbol and must receive the same answer"
+    );
+    assert_eq!(read(iat0), 0xcafe_0001, "the one answer the resolver gave");
+}
+
+#[test]
+fn every_thunk_bound_site_names_a_distinct_symbol() {
+    // The 210-import assertion against the real module lives here rather
+    // than as a bare count: it also verifies `bind_imports`'s two other
+    // guarantees against real data -- every one of the 210 IAT slots was
+    // actually written with the value its own resolution produced, and the
+    // returned thunk list has no duplicate `(library, symbol)` entries.
+    let Some((file, image, _)) = loaded() else {
+        return;
+    };
+    let mut mapped = Image::load(&file, &image).expect("the fixture maps");
+
+    // wccmmud.dll's 210 imports split 149 + 17 + 1 = 167 from WGSERVER.EXE /
+    // GALGSBL.dll / GALME.dll (the host libraries this project's own design
+    // doc identifies as ones it intends to implement) and 40 + 3 = 43 from
+    // cw3220mt.DLL / KERNEL32.dll (third-party runtime/OS libraries, out of
+    // scope here). This resolver encodes exactly that split -- Routine for
+    // the 167, unimplemented (None) for the other 43 -- rather than
+    // resolving anything for real: nothing in this crate has a host to ask
+    // yet.
+    let resolver = |library: &str, _symbol: &Symbol| -> Option<Import32> {
+        match library {
+            "WGSERVER.EXE" | "GALGSBL.dll" | "GALME.dll" => Some(Import32::Routine),
+            _ => None,
+        }
+    };
+    let thunks = mapped.bind_imports(&image, &resolver);
+
+    // Every distinct (library, symbol) pair gets exactly one thunk site --
+    // no duplicates, whether resolved or not.
+    let mut seen = std::collections::HashSet::new();
+    for t in &thunks {
+        assert!(
+            seen.insert((t.library.clone(), t.symbol.clone())),
+            "duplicate thunk site for {}:{:?} -- bind_imports must assign \
+             each distinct symbol exactly one thunk index",
+            t.library,
+            t.symbol
+        );
+    }
+
+    // Data never appears in this test's resolver, so every distinct symbol
+    // becomes a thunk: 210 imports, zero duplicate (library, symbol) pairs
+    // (checked below), so 210 distinct thunk sites.
+    assert_eq!(image.imports.len(), 210, "wccmmud.dll's measured import count");
+    assert_eq!(
+        thunks.len(),
+        210,
+        "zero Data answers and zero duplicate (library, symbol) pairs means \
+         every import becomes its own thunk site"
+    );
+    assert_eq!(
+        thunks.iter().filter(|t| t.resolved).count(),
+        167,
+        "the WGSERVER.EXE + GALGSBL.dll + GALME.dll count this test's \
+         resolver answers Routine for"
+    );
+
+    // And the thing this task is actually for: every one of the 210 IAT
+    // slots holds the thunk index this test can independently recompute by
+    // re-walking image.imports the same way bind_imports itself must have.
+    let mut index_by_symbol: std::collections::HashMap<(&str, &Symbol), u32> =
+        std::collections::HashMap::new();
+    let mut next_index = 0u32;
+    for import in &image.imports {
+        let key = (import.library.as_str(), &import.symbol);
+        let index = *index_by_symbol.entry(key).or_insert_with(|| {
+            let i = next_index;
+            next_index += 1;
+            i
+        });
+        let rva = import.iat_rva as usize;
+        let written =
+            u32::from_le_bytes(mapped.as_slice()[rva..rva + 4].try_into().unwrap());
+        assert_eq!(
+            written, index,
+            "iat_rva {:#x} for {}:{:?} must hold its symbol's thunk index",
+            import.iat_rva, import.library, import.symbol
+        );
+    }
+}
+
+#[test]
+fn thunk_sites_report_which_symbols_the_host_did_not_implement() {
+    let (file, image, [iat0, iat1]) = duplicate_symbol_fixture();
+    let mut mapped = Image::load(&file, &image).expect("fixture maps");
+
+    // The host has no answer at all for this fixture's one symbol -- unlike
+    // the two tests above, which either resolve to Data or to a known
+    // Routine.
+    let resolver = |_library: &str, _symbol: &Symbol| -> Option<Import32> { None };
+    let thunks = mapped.bind_imports(&image, &resolver);
+
+    assert_eq!(
+        thunks,
+        vec![ThunkSite {
+            library: "LIB.DLL".to_string(),
+            symbol: Symbol::Name("Widget".to_string()),
+            resolved: false,
+        }],
+        "an unresolved symbol still gets exactly one thunk site, named, so \
+         calling it later is diagnosable rather than a jump into nothing"
+    );
+
+    let read = |rva: u32| {
+        let rva = rva as usize;
+        u32::from_le_bytes(mapped.as_slice()[rva..rva + 4].try_into().unwrap())
+    };
+    assert_eq!(read(iat0), 0, "the fixture's one symbol is thunk index 0");
+    assert_eq!(read(iat0), read(iat1));
 }

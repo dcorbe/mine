@@ -1,7 +1,6 @@
 //! A [`PeImage`] mapped into memory: one [`Mapping`], sections copied into
-//! place, then rebased with [`Image::relocate`].
-//!
-//! Import binding (Task 13) is not applied here.
+//! place, rebased with [`Image::relocate`], imports bound with
+//! [`Image::bind_imports`].
 //!
 //! **Section protections are parsed but not applied.** Every page of a
 //! [`Mapping`] is `PROT_READ | PROT_WRITE | PROT_EXEC`, regardless of a
@@ -11,10 +10,11 @@
 //! *aligned* extent, which is a distinct piece of machinery from copying
 //! bytes, and nothing through this task exercises it.
 
+use std::collections::HashMap;
 use std::io;
 
 use crate::map::Mapping;
-use crate::pe::{PeError, PeImage};
+use crate::pe::{PeError, PeImage, Symbol};
 
 /// A [`PeImage`], mapped: one [`Mapping`] of `size_of_image` bytes, with each
 /// section's raw bytes copied into place at its `rva`.
@@ -168,4 +168,126 @@ impl Image {
         }
         Ok(())
     }
+
+    /// Bind every import: for each *distinct* `(library, symbol)` pair among
+    /// `image.imports`, ask `resolver` once, and write the answer into every
+    /// IAT slot naming that pair.
+    ///
+    /// **Once per symbol, not once per site, and this is not an
+    /// optimisation.** `wccmmud.dll` names some symbols at only one site, but
+    /// nothing about the format stops a module from naming the same host
+    /// global at hundreds -- the sibling 16-bit loader's own module does
+    /// exactly that (`usrnum`, 1,285 sites). A resolver that allocates
+    /// storage for a global on first sight, asked once per site, would
+    /// scatter that one global across every site that names it, and the
+    /// module would read whichever fixup happened to run last. Caching the
+    /// answer by `(library, symbol)` here, in the loader, makes that bug
+    /// impossible regardless of how a resolver is implemented.
+    ///
+    /// [`Import32::Data`] writes its address directly. Anything else --
+    /// [`Import32::Routine`], or `resolver.resolve` returning `None` for a
+    /// symbol the host does not implement -- gets a dense thunk index instead
+    /// (0, 1, 2, ... in first-encounter order across the whole import table),
+    /// written into the IAT slot in place of a real address. No code lives at
+    /// that index yet: nothing through this task builds thunks (that is a
+    /// later increment; see `docs/plans/2026-08-08-mbbs32-implementation.md`,
+    /// Task 16). What this task fixes, permanently, is *which* index every
+    /// site sharing a symbol gets -- one, the same one, never reassigned.
+    ///
+    /// An unresolved symbol is given an index rather than skipped so that
+    /// calling it later is a diagnosable event (which thunk index; look it up
+    /// in the returned list) rather than a call through whatever happened to
+    /// already be in that IAT slot's freshly-mapped, zeroed memory.
+    ///
+    /// Returns every distinct symbol that was given an index, in that same
+    /// index order, so a later task can tell one thunk from the next without
+    /// re-walking `image.imports` itself.
+    pub fn bind_imports(
+        &mut self,
+        image: &PeImage,
+        resolver: &dyn ImportResolver,
+    ) -> Vec<ThunkSite> {
+        let mut cache: HashMap<(&str, &Symbol), u32> = HashMap::new();
+        let mut thunks: Vec<ThunkSite> = Vec::new();
+
+        let dst = self.mapping.as_mut_slice();
+        for import in &image.imports {
+            let key = (import.library.as_str(), &import.symbol);
+            let value = *cache.entry(key).or_insert_with(|| {
+                let answer = resolver.resolve(&import.library, &import.symbol);
+                match answer {
+                    Some(Import32::Data(addr)) => addr,
+                    other => {
+                        // `other` is `Some(Import32::Routine)` or `None`;
+                        // both get a thunk, see the doc comment above.
+                        let index = thunks.len();
+                        thunks.push(ThunkSite {
+                            library: import.library.clone(),
+                            symbol: import.symbol.clone(),
+                            resolved: matches!(other, Some(Import32::Routine)),
+                        });
+                        index as u32
+                    }
+                }
+            });
+
+            let rva = import.iat_rva as usize;
+            // In-bounds by construction: `PeImage::parse` refuses (as
+            // `PeError::UnmappedRva` / `PeError::RvaSpansSectionEnd`) any
+            // import whose IAT slot is not entirely inside some section's raw
+            // data -- see `Import::iat_rva`'s doc comment in `pe.rs`. A
+            // `PeImage` this crate can construct at all therefore cannot
+            // describe a slot outside `dst`.
+            dst[rva..rva + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
+        thunks
+    }
+}
+
+/// How a host answers "what is `WGSERVER.EXE:_prfmsg`?".
+///
+/// Two arms, not the sibling 16-bit loader's three: a flat 32-bit ABI has no
+/// segment:offset far pointers to carry, and nothing measured in
+/// `wccmmud.dll`'s 210 imports needs [`Import`](crate::Import)-by-constant
+/// (the 16-bit loader's `Absolute` arm, for `DOSCALLS.135`'s shift count) --
+/// a fixup here writes a whole address-sized slot, never patches an
+/// instruction's immediate field.
+pub trait ImportResolver {
+    /// `None` for a symbol the host does not implement. The loader still
+    /// gives it a thunk, so that calling it is a diagnosable event rather
+    /// than a jump into nothing.
+    fn resolve(&self, library: &str, symbol: &Symbol) -> Option<Import32>;
+}
+
+impl<F: Fn(&str, &Symbol) -> Option<Import32>> ImportResolver for F {
+    fn resolve(&self, library: &str, symbol: &Symbol) -> Option<Import32> {
+        self(library, symbol)
+    }
+}
+
+/// What a host answers `ImportResolver::resolve` with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Import32 {
+    /// A host routine. Gets a thunk; calling it comes back as `Exit::Call`
+    /// (a later increment -- see `Image::bind_imports`'s doc comment).
+    Routine,
+    /// A host global the module addresses directly. This address goes
+    /// straight into the IAT slot, and the host is never told it was read.
+    Data(u32),
+}
+
+/// One symbol [`Image::bind_imports`] gave a thunk index rather than a real
+/// address -- every site in `image.imports` naming this exact
+/// `(library, symbol)` pair got the same index, in the order these appear in
+/// the `Vec` [`Image::bind_imports`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThunkSite {
+    pub library: String,
+    pub symbol: Symbol,
+    /// `false` when `ImportResolver::resolve` answered `None` -- the host
+    /// does not implement this symbol at all. The site still gets a thunk
+    /// index (see [`Image::bind_imports`]'s doc comment for why), so this is
+    /// the only place that distinction survives.
+    pub resolved: bool,
 }

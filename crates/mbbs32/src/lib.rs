@@ -48,6 +48,6 @@ mod image;
 mod map;
 mod pe;
 
-pub use image::Image;
+pub use image::{Image, Import32, ImportResolver, ThunkSite};
 pub use map::Mapping;
 pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section, Symbol};
