@@ -1786,10 +1786,14 @@ impl Host {
     /// catch the tick counter up to the clock, running [`Host::prcrtk`] once per
     /// elapsed second.
     ///
-    /// **`max` bounds passes, not dispatches.** The real loop keeps spinning
-    /// when `btuscn()` finds nothing, and that spin is not waste -- it is what
-    /// lets timers come due. A bound on dispatches would make a module that
-    /// stopped polling to wait on a timer return zero work forever.
+    /// **`max` bounds passes, not dispatches.** A bound on dispatches would
+    /// make a module that stopped polling to wait on a timer return zero work
+    /// forever.
+    ///
+    /// It returns as soon as nothing is queued, rather than spinning until a
+    /// timer comes due. The caller advances time by sleeping and calling back;
+    /// [`Ended::wait`] says how long. The old loop turned here because the
+    /// original's did, and the original's did because it owned the machine.
     ///
     /// This never sleeps. One thread owns the `Machine`, so a sleep here would
     /// be a sleep the socket cannot interrupt; the caller owns all blocking and
@@ -1868,11 +1872,21 @@ impl Host {
                 ));
             }
 
-            if !self.gsbl().pending() && self.kicks.is_empty() {
+            // Nothing queued. Whether a timer is outstanding decides which
+            // kind of nothing this is, but either way the loop has no reason
+            // to turn again: `prcrtk` cannot fire before the next whole
+            // second, and no other source of work exists -- the 16-bit world
+            // only advances when this host dispatches into it. Spinning here
+            // was the whole of the old busy-wait.
+            if !self.gsbl().pending() {
+                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
                 return Ok(Cycles {
                     iterations,
                     dispatched,
-                    ended: Ended::Idle,
+                    ended: match next_kick {
+                        Some(next_kick) => Ended::Waiting { next_kick },
+                        None => Ended::Idle,
+                    },
                 });
             }
         }
@@ -3758,38 +3772,52 @@ mod tests {
         );
     }
 
-    /// A kick cannot come due under a pin, so a stepping clock is what makes
-    /// this reachable at all.
+    /// A kick comes due across the calls a driver makes, not within one.
+    ///
+    /// The clock reads are conserved -- one per pass before, one per call now
+    /// -- so the count that used to be `iterations` is now the number of
+    /// calls. If this number changes, the clock is being read a different
+    /// number of times, which is a real change and not a test to adjust.
     #[test]
-    fn a_kick_comes_due_on_its_own_once_the_clock_moves() {
+    fn a_kick_comes_due_across_the_calls_a_driver_makes() {
         let (mut f, module, rou) = polling_fixture();
         f.host.set_clock(Clock::stepped(1_135_952_405, 500));
         f.host.kicks.push(Kick { delay: 2, dstrou: rou });
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+        let mut dispatched = 0;
+        let mut calls = 0;
+        while dispatched == 0 {
+            calls += 1;
+            assert!(calls < 20, "the kick never came due");
+            let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
+            assert_eq!(
+                cycles.iterations, 1,
+                "nothing is ever pending here, so every call returns on its first pass"
+            );
+            dispatched += cycles.dispatched;
+        }
 
-        assert_eq!(cycles.dispatched, 1, "the kick fired, once");
+        assert_eq!(dispatched, 1, "the kick fired, once");
+        assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
+        let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
-        assert_eq!(
-            cycles.iterations, 4,
-            "two reads to the second, two seconds to the kick"
-        );
     }
 
+    /// The anti-spin test. Nothing is pending and a kick is outstanding, so
+    /// there is nothing to do until the clock moves -- and under a pinned
+    /// clock it cannot. The old loop burned every one of its passes here.
     #[test]
-    fn nothing_polling_and_a_timer_pending_is_what_the_transport_must_sleep_on() {
+    fn nothing_pending_returns_at_once_instead_of_spinning_to_the_bound() {
         let (mut f, module, rou) = polling_fixture();
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
-        // A pinned clock: no second can elapse, so the kick can never come due
-        // and the loop can only run out of passes.
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        let cycles = f.host.cycle(&mut f.machine, &module, 5).expect("cycled");
+        let cycles = f.host.cycle(&mut f.machine, &module, 10_000).expect("cycled");
 
+        assert_eq!(cycles.ended, Ended::Waiting { next_kick: 60 });
         assert_eq!(
-            cycles.ended,
-            Ended::Bound { next_kick: Some(60) },
-            "which is exactly what _UPDATE_POLLING_ROUTINE leaves behind"
+            cycles.iterations, 1,
+            "one pass to work out there is nothing to do -- not 10,000"
         );
         assert_eq!(cycles.dispatched, 0);
     }
