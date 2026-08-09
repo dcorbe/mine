@@ -705,33 +705,64 @@ pub fn answers(form: &Form, spec: &[u8], old: &[u8]) -> Answers {
 /// fires for every caller after `fsdppc` and for none before.
 const YES_NO: &[u8] = b"(ALT=NO ALT=YES)";
 
-/// Every `ALT=` value of one field, in the order the specification lists them.
+/// The option list `foptkn()` searches for one field, and where it starts.
+///
+/// The whole of `foptkn()` (`FSD.C:127`) bar its final `nxttkn` call, including
+/// the substitution the `fldtyp == 'Y'` branch makes: a `Y/N` field's options
+/// come from [`YES_NO`] and not from the specification, so `MIN=` and `MAX=`
+/// are unfindable on one however its name was written. That is not a corner --
+/// `chkops` sets `FFFMMX` from the *specification*, before `embscn` has made
+/// the field a `Y`, so a `Y/N` field really can arrive at [`min_ok`] with the
+/// flag set and no minimum to be found.
+///
+/// `None` when the field has no option list at all. The offset is into the
+/// returned list, which is [`YES_NO`] rather than `spec` for a `Y/N` field.
+fn option_list_of<'a>(spec: &'a [u8], field: &Field) -> Option<(&'a [u8], usize)> {
+    if field.kind == b'Y' {
+        Some((YES_NO, 1))
+    } else {
+        option_list(spec, field).map(|at| (spec, at))
+    }
+}
+
+/// One option's value: from `start` to its terminator. `endtkn(tp,0)`,
+/// `FSD.C:148`.
 ///
 /// A value ends at white space, `)` or the terminator, and never runs past
-/// [`ANSLEN`] characters -- `endtkn()`, `FSD.C:148`.
+/// [`ANSLEN`] characters. The clamp is the *default* as well as the bound on
+/// the search -- `endtkn` returns `token+ANSLEN` when it ran out of characters
+/// before it ran out of value -- so falling through to the end of the list
+/// instead would hand back a value as long as the rest of the specification.
+fn token_value(list: &[u8], start: usize) -> &[u8] {
+    let end = list[start..]
+        .iter()
+        .take(usize::from(ANSLEN))
+        .position(|&c| c == 0 || c == b')' || is_space(c))
+        .map_or((start + usize::from(ANSLEN)).min(list.len()), |n| start + n);
+    &list[start..end]
+}
+
+/// `foptkn()` then `endtkn(tp,0)`: what one option of one field is set to.
+///
+/// `None` when the field has no options, or has options but not this one --
+/// the two cases the C spells `foptkn(...) == NULL`, which is what both
+/// [`min_ok`] and [`max_ok`] test.
+fn option_value<'a>(spec: &'a [u8], field: &Field, token: &[u8], word: bool) -> Option<&'a [u8]> {
+    let (list, at) = option_list_of(spec, field)?;
+    let start = next_token(list, at, token, word)?;
+    Some(token_value(list, start))
+}
+
+/// Every `ALT=` value of one field, in the order the specification lists them.
 fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
-    let (list, mut at) = if field.kind == b'Y' {
-        (YES_NO, 1usize)
-    } else {
-        match option_list(spec, field) {
-            Some(at) => (spec, at),
-            None => return Vec::new(),
-        }
+    let Some((list, mut at)) = option_list_of(spec, field) else {
+        return Vec::new();
     };
 
     let mut out = Vec::new();
     while let Some(start) = next_token(list, at, b"ALT=", false) {
-        // `endtkn()` stops at `i < ANSLEN` and returns `token+ANSLEN` when it
-        // ran out of characters before it ran out of value, so the clamp is the
-        // *default* as well as the bound on the search. Falling through to the
-        // end of the list instead would hand back an alternate as long as the
-        // rest of the specification.
-        let end = list[start..]
-            .iter()
-            .take(usize::from(ANSLEN))
-            .position(|&c| c == 0 || c == b')' || is_space(c))
-            .map_or((start + usize::from(ANSLEN)).min(list.len()), |n| start + n);
-        out.push(&list[start..end]);
+        let value = token_value(list, start);
+        out.push(value);
         // `nxttkn(ep, ...)` resumes exactly at the value's terminator, and its
         // own loop guard stops it on `)`. Stepping even one byte past that --
         // which an empty `ALT=` right before the `)` would do -- carries the
@@ -740,7 +771,7 @@ fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
         //
         // No progress guard is needed: `next_token` returns the offset one past
         // the token it matched, so `start` is at least `at + 4` every time round.
-        at = end;
+        at = start + value.len();
     }
     out
 }
@@ -838,10 +869,7 @@ pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8
 /// it in, and `embscn` stops at `numtpl` -- so a field the specification names
 /// and the template has no run for keeps `fldtyp == 0` and answers `true` here.
 pub fn type_ok(field: &Field, answer: &[u8]) -> bool {
-    let answer = match answer.iter().position(|&c| c == 0) {
-        Some(nul) => &answer[..nul],
-        None => answer,
-    };
+    let answer = c_str(answer);
     match field.kind {
         b'Y' | b'?' => {
             field.flags & flags::MULTICHOICE == 0
@@ -856,6 +884,185 @@ pub fn type_ok(field: &Field, answer: &[u8]) -> bool {
             !digits.is_empty() && crate::strings::all_digits(digits)
         }
         _ => true,
+    }
+}
+
+/// A candidate answer as the C sees it: up to its first NUL.
+///
+/// `bufptr` is a `char *` and every routine that reads it -- `strchr`,
+/// `alldgs`, `strlen`, `strcmpi`, `sscanf` -- stops at the terminator. A Rust
+/// slice does not, so the truncation has to be written down. Measured rather
+/// than assumed: the genuine host's `chktyp` accepts `"12\0ab"` in a `#` field,
+/// and its `chkmin` reads `"ab\0cd"` as two characters long.
+fn c_str(s: &[u8]) -> &[u8] {
+    match s.iter().position(|&c| c == 0) {
+        Some(nul) => &s[..nul],
+        None => s,
+    }
+}
+
+/// `sscanf(s,"%ld",&n)`, as far as [`min_ok`] and [`max_ok`] need it.
+///
+/// A C `long` here is 32 bits, so this one is too. Two of `sscanf`'s edges are
+/// deliberately not reproduced, because both are undefined behaviour rather
+/// than behaviour:
+///
+/// * **Nothing to convert.** C leaves the target untouched, so the original
+///   compares against whatever the stack held. This answers zero.
+/// * **Overflow.** This saturates. A `MIN=` beyond a 32-bit `long` is outside
+///   what either side can be said to mean.
+fn as_long(s: &[u8]) -> i32 {
+    let mut at = 0usize;
+    while at < s.len() && is_space(s[at]) {
+        at += 1;
+    }
+    let negative = s.get(at) == Some(&b'-');
+    if negative || s.get(at) == Some(&b'+') {
+        at += 1;
+    }
+    let magnitude = s[at..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .fold(0i32, |n, &c| {
+            n.saturating_mul(10).saturating_add(i32::from(c - b'0'))
+        });
+    if negative { -magnitude } else { magnitude }
+}
+
+/// `MIN=` read as a minimum **length**, or `None` if it cannot be one.
+///
+/// `FSD.C:903-905`: all digits, at most two of them, and no greater than the
+/// field's width. Each of the three is load-bearing and the third is the one
+/// that surprises -- `MIN=99` on a two-wide field is a *value*, not a length.
+///
+/// The result fits a `u8` because two digits cannot exceed 99.
+fn as_length(min: &[u8], width: u8) -> Option<u8> {
+    if !crate::strings::all_digits(min) || min.len() > 2 {
+        return None;
+    }
+    // `atoi(tp)` over at most two digits. An empty `MIN=` reaches here -- both
+    // `alldgs("")` and `atoi("")` are happy with it -- and asks for a minimum
+    // length of zero, which every answer meets.
+    let ml = min.iter().fold(0u8, |n, &c| n * 10 + (c - b'0'));
+    (ml <= width).then_some(ml)
+}
+
+/// Is the answer at or above the field's `MIN=`? `chkmin()`, `FSD.C:887`.
+///
+/// # The `?` arm falls through, and that is the whole of this routine
+///
+/// A `?` field's `MIN=` is a minimum **length** when [`as_length`] can read it
+/// as one, and a minimum **value** otherwise: `FSD.C:911-912` is a `case '?'`
+/// that runs off the end of its block into `case '#'`, deliberately and
+/// unmarked. A port that made the `?` arm complete in itself is right on every
+/// input anyone would think to try and wrong on `MIN=100` for a four-wide
+/// field, where the C compares `"100"` against the answer as text.
+///
+/// # Only `$` is arithmetic
+///
+/// `?` and `#` go through `strcmpi`, which compares *strings*: for a `#` field
+/// `"9"` is greater than `"10"`, and a `MIN=9` therefore refuses `10`. Only a
+/// `$` field reaches `sscanf("%ld")`. That is not a bug being preserved for its
+/// own sake -- it is what makes `MIN=` usable on an alphabetic field at all.
+///
+/// # `Err` carries the message, because the message is the behaviour
+///
+/// The C writes it into `chkemg` (`FSD.C:29`) and the entry engine displays it,
+/// so the wording, the quoting and the truncation are all observable. The
+/// truncation is `%0.*s` with a precision of `MAXHLP-17`, and the genuine
+/// host's `sprintf` overruns `chkemg` by exactly the terminating NUL when it
+/// bites -- 15 characters of prose, two quotes and 63 of value is 80, and
+/// `chkemg` is 80 bytes. Not reproduced: a `String` has no such edge.
+///
+/// # A `Y/N` field has no minimum whatever its flags say
+///
+/// `foptkn` substitutes `(ALT=NO ALT=YES)` for a `Y` field's option list, so
+/// the `MIN=` its specification carried is unfindable. See [`option_list_of`].
+pub fn min_ok(spec: &[u8], field: &Field, answer: &[u8]) -> Result<(), String> {
+    if field.flags & flags::MINMAX == 0 {
+        return Ok(());
+    }
+    let Some(min) = option_value(spec, field, b"MIN=", false) else {
+        return Ok(());
+    };
+    let answer = c_str(answer);
+
+    if field.kind == b'?'
+        && let Some(ml) = as_length(min, field.width)
+    {
+        return if answer.len() >= usize::from(ml) {
+            Ok(())
+        } else {
+            Err(format!("Enter at least {ml} character(s)"))
+        };
+    }
+
+    match field.kind {
+        // The fallthrough: `?` arrives here when its `MIN=` was not a length.
+        b'?' | b'#' => {
+            if crate::strings::strcmpi(min, answer).is_le() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Enter at least \"{}\"",
+                    String::from_utf8_lossy(&min[..min.len().min(usize::from(MAXHLP) - 17)])
+                ))
+            }
+        }
+        b'$' => {
+            let (want, got) = (as_long(min), as_long(answer));
+            if want <= got {
+                Ok(())
+            } else {
+                Err(format!("Enter at least {want}"))
+            }
+        }
+        // `Y`, and a field the template had no run for. The C's `switch` has no
+        // `default` and `rc` starts at 1, so neither has a minimum.
+        _ => Ok(()),
+    }
+}
+
+/// Is the answer at or below the field's `MAX=`? `chkmax()`, `FSD.C:931`.
+///
+/// Everything [`min_ok`] says about `strcmpi` versus `sscanf`, about `Err`
+/// carrying the message, and about `Y/N`, holds here too. The one difference is
+/// the one worth naming: **there is no fallthrough**. `case '?'` and `case '#'`
+/// share a single arm outright (`FSD.C:944-945`), so a `MAX=` is never read as
+/// a maximum length and `MAX=3` on a `?` field refuses every answer that sorts
+/// after `"3"` however short it is.
+///
+/// Its message truncates at `MAXHLP-23` rather than `MAXHLP-17`, the prose
+/// being six characters longer.
+pub fn max_ok(spec: &[u8], field: &Field, answer: &[u8]) -> Result<(), String> {
+    if field.flags & flags::MINMAX == 0 {
+        return Ok(());
+    }
+    let Some(max) = option_value(spec, field, b"MAX=", false) else {
+        return Ok(());
+    };
+    let answer = c_str(answer);
+
+    match field.kind {
+        b'?' | b'#' => {
+            if crate::strings::strcmpi(max, answer).is_ge() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Enter no higher than \"{}\"",
+                    String::from_utf8_lossy(&max[..max.len().min(usize::from(MAXHLP) - 23)])
+                ))
+            }
+        }
+        b'$' => {
+            let (want, got) = (as_long(max), as_long(answer));
+            if got <= want {
+                Ok(())
+            } else {
+                Err(format!("Enter no higher than {want}"))
+            }
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1808,5 +2015,135 @@ mod tests {
 
         let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
         assert!(type_ok(&spaced.fields[0], b"ab\x00 c"));
+    }
+
+    /// `chkmin`'s `?` arm reads `MIN=` as a minimum **length**, but only when
+    /// it is all digits, at most two of them, and no wider than the field.
+    ///
+    /// The specification is `NAME(MIN=3)` and not `NAME (MIN=3)`: `fspscn` ends
+    /// a field name at white space, so a space before the `(` makes the option
+    /// list a second, nameless field and the first one carries no flags at all.
+    #[test]
+    fn a_text_minimum_that_looks_like_a_length_is_a_length() {
+        let spec = b"NAME(MIN=3)";
+        let form = compile(b"??????", spec, MANY);
+        let field = &form.fields[0];
+        assert_eq!(field.flags & flags::MINMAX, flags::MINMAX, "MIN= was read");
+
+        assert!(min_ok(spec, field, b"abc").is_ok());
+        assert_eq!(
+            min_ok(spec, field, b"ab").unwrap_err(),
+            "Enter at least 3 character(s)"
+        );
+    }
+
+    /// ...and otherwise **falls through** to the string comparison.
+    /// `FSD.C:911-912` is a `case '?'` that runs into `case '#'`, and these are
+    /// the two ways to reach it: three digits, and two digits wider than the
+    /// field.
+    #[test]
+    fn a_text_minimum_too_long_to_be_a_length_falls_through_to_a_value() {
+        let spec = b"CODE(MIN=100)";
+        let form = compile(b"????", spec, MANY);
+        let field = &form.fields[0];
+        // "099" sorts before "100", so this is refused on value, and the
+        // message is the value message rather than the length one.
+        assert_eq!(
+            min_ok(spec, field, b"099").unwrap_err(),
+            "Enter at least \"100\""
+        );
+        assert!(min_ok(spec, field, b"100").is_ok(), "equal is at least");
+        assert!(min_ok(spec, field, b"99").is_ok(), "text order, not numeric");
+
+        // Two digits, but 99 does not fit a two-wide field.
+        let spec = b"X(MIN=99)";
+        let form = compile(b"??", spec, MANY);
+        assert_eq!(
+            min_ok(spec, &form.fields[0], b"1").unwrap_err(),
+            "Enter at least \"99\""
+        );
+
+        // Three digits that would have fitted: the digit count alone stops it.
+        let spec = b"NAME(MIN=003)";
+        let form = compile(b"??????", spec, MANY);
+        assert!(min_ok(spec, &form.fields[0], b"ab").is_ok());
+    }
+
+    /// A `$` field compares numerically, which is the only place a number is
+    /// read as a number.
+    #[test]
+    fn a_dollar_minimum_compares_numerically_where_a_hash_compares_as_text() {
+        let dollars = b"AMT(MIN=9)";
+        let form = compile(b"$$$$", dollars, MANY);
+        assert!(min_ok(dollars, &form.fields[0], b"10").is_ok(), "10 >= 9");
+        assert!(min_ok(dollars, &form.fields[0], b"9").is_ok(), "9 >= 9");
+        assert_eq!(
+            min_ok(dollars, &form.fields[0], b"8").unwrap_err(),
+            "Enter at least 9"
+        );
+
+        let hashes = b"AGE(MIN=9)";
+        let form = compile(b"####", hashes, MANY);
+        assert_eq!(
+            min_ok(hashes, &form.fields[0], b"10").unwrap_err(),
+            "Enter at least \"9\"",
+            "as text, \"10\" sorts before \"9\""
+        );
+    }
+
+    /// `chkmax` has no fallthrough: `?` and `#` share one arm, so a `MAX=` is
+    /// never a maximum length.
+    #[test]
+    fn a_maximum_is_never_read_as_a_length() {
+        let spec = b"CODE(MAX=3)";
+        let form = compile(b"????", spec, MANY);
+        let field = &form.fields[0];
+        assert_eq!(
+            max_ok(spec, field, b"abcd").unwrap_err(),
+            "Enter no higher than \"3\"",
+            "four characters is not what MAX=3 is about"
+        );
+        assert!(max_ok(spec, field, b"2").is_ok());
+
+        let spec = b"AMT(MAX=9)";
+        let form = compile(b"$$$$", spec, MANY);
+        assert!(max_ok(spec, &form.fields[0], b"9").is_ok(), "9 <= 9");
+        assert_eq!(
+            max_ok(spec, &form.fields[0], b"10").unwrap_err(),
+            "Enter no higher than 9"
+        );
+    }
+
+    /// No `MIN=`/`MAX=` at all is a pass, and so is a field type the C's
+    /// `switch` does not name.
+    #[test]
+    fn a_field_with_no_minimum_passes_everything() {
+        let form = compile(b"??????", b"NAME", MANY);
+        assert_eq!(form.fields[0].flags, 0, "no options, no flags");
+        assert!(min_ok(b"NAME", &form.fields[0], b"").is_ok());
+        assert!(max_ok(b"NAME", &form.fields[0], b"zzzzzz").is_ok());
+
+        // A field the template had no run for keeps `fldtyp == 0`, and the C's
+        // `switch` has no `default`.
+        let spec = b"A(MIN=3)";
+        let form = compile(b"", spec, MANY);
+        assert_eq!(form.fields[0].kind, 0);
+        assert!(min_ok(spec, &form.fields[0], b"").is_ok());
+    }
+
+    /// An answer is a C string wherever these two look at it.
+    #[test]
+    fn an_embedded_nul_ends_the_answer_a_minimum_is_measured_against() {
+        let spec = b"NAME(MIN=3)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            min_ok(spec, &form.fields[0], b"ab\x00cd").unwrap_err(),
+            "Enter at least 3 character(s)",
+            "two characters long, not four"
+        );
+
+        let spec = b"NAME(MAX=M)";
+        let form = compile(b"??????", spec, MANY);
+        assert!(max_ok(spec, &form.fields[0], b"M\x00Z").is_ok());
     }
 }
