@@ -37,6 +37,20 @@ pub const SEGMAX: usize = 24;
 mod at {
     /// Attribute flags.
     pub const ATTRIBUTES: usize = 0x08;
+    /// Where a duplicate-permitting key's in-record `[prev][next]` chain pair
+    /// lives, as a byte offset into the record's **physical** slot.
+    ///
+    /// Measured against two files the real engine wrote: `WCCUSERS.DAT` key 2
+    /// reads 1998 here, its own `reclen` exactly, with no records to say
+    /// whether that is `reclen` or `physical - 8` (`physical` is `reclen + 8`
+    /// there, so the two coincide). `DUPKEY30.DAT` -- the first file measured
+    /// with actual duplicate records in it -- reads 14, which is **not**
+    /// `reclen` (12) but is exactly `physical - 8` (`physical` is 22: 12 of
+    /// record, 2 unaccounted for, 8 of chain). `physical - 8` is therefore the
+    /// general rule; `reclen` only looked right because `WCCUSERS` happens to
+    /// have no gap between its record and its chain. See
+    /// `docs/plans/2026-08-08-fsd-subsystem-design.md`.
+    pub const CHAIN: usize = 0x12;
     /// Offset of this segment within the record.
     pub const OFFSET: usize = 0x14;
     /// Length of this segment, in bytes.
@@ -238,6 +252,11 @@ pub struct Key {
     pub segments: Vec<Segment>,
     /// Whether two records may carry the same value.
     pub duplicates: bool,
+    /// Where the in-record `[prev][next]` duplicate-chain pair lives, as a
+    /// byte offset into a record's **physical** slot -- `None` when
+    /// [`Self::duplicates`] is false, since a unique key has no chain to
+    /// offset. See [`at::CHAIN`].
+    pub chain: Option<u16>,
 }
 
 impl Key {
@@ -413,11 +432,19 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
         // `ANOSEG` says another segment of *this* key follows. Without it, the
         // key is complete.
         if attributes & flag::ANOSEG == 0 {
+            let duplicates = attributes & flag::DUPLICATES != 0;
             keys.push(Key {
                 number: keys.len() as u16,
                 definition: start_definition as u16,
                 segments: std::mem::take(&mut segments),
-                duplicates: attributes & flag::DUPLICATES != 0,
+                duplicates,
+                // Read from *this* definition -- the key's last one, which is
+                // also its first and only one for every duplicate-permitting
+                // key MajorMUD ships (none of the four is segmented). A
+                // segmented duplicate key would need this read at
+                // `start_definition` instead, same as `Self::definition`; none
+                // exists to measure that against.
+                chain: duplicates.then(|| word(at::CHAIN)),
             });
         }
     }
@@ -441,6 +468,15 @@ mod tests {
         out[at::OFFSET..at::OFFSET + 2].copy_from_slice(&offset.to_le_bytes());
         out[at::LENGTH..at::LENGTH + 2].copy_from_slice(&length.to_le_bytes());
         out[at::EXTENDED] = extended;
+        out
+    }
+
+    /// A key definition like [`definition`], with a chain offset at
+    /// [`at::CHAIN`] -- what a duplicate-permitting key's descriptor carries
+    /// and a unique one leaves zero.
+    fn definition_with_chain(attributes: u16, offset: u16, length: u16, extended: u8, chain: u16) -> Vec<u8> {
+        let mut out = definition(attributes, offset, length, extended);
+        out[at::CHAIN..at::CHAIN + 2].copy_from_slice(&chain.to_le_bytes());
         out
     }
 
@@ -476,6 +512,33 @@ mod tests {
         assert_eq!(keys[2].segments[0].kind, Kind::Unsigned);
         assert!(keys[2].duplicates);
         assert!(!keys[0].duplicates);
+    }
+
+    /// The in-record chain offset, measured against `DUPKEY30.DAT`'s own key
+    /// descriptor: a 4-byte descending duplicate key over a 12-byte record
+    /// reads 14 at [`at::CHAIN`] -- `physical - 8` (22 - 8), **not** `reclen`
+    /// (12), which is what a first reading of `WCCUSERS.DAT` (a file with no
+    /// duplicate records to disprove it) suggested. A key that forbids
+    /// duplicates has nothing to read there at all.
+    #[test]
+    fn a_duplicate_keys_chain_offset_is_read_from_its_own_definition() {
+        let keys = parse(
+            "DUPKEY30.DAT",
+            &fcr(&[definition_with_chain(
+                flag::EXTENDED | flag::DUPLICATES,
+                0,
+                4,
+                0x0e,
+                14,
+            )]),
+            1,
+        )
+        .expect("parses");
+        assert_eq!(keys[0].chain, Some(14));
+
+        let unique = parse("WCCRACE.DAT", &fcr(&[definition(flag::EXTENDED, 0, 2, 0x0e)]), 1)
+            .expect("parses");
+        assert_eq!(unique[0].chain, None, "a unique key has no chain to offset");
     }
 
     #[test]
@@ -568,6 +631,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            chain: None,
         }
     }
 
@@ -643,6 +707,7 @@ mod tests {
                 },
             ],
             duplicates: true,
+            chain: Some(6),
         };
         assert_eq!(key.length(), 6);
         assert_eq!(key.extract(b"abc\0\x02\x00"), b"abc\0\x02\x00");
@@ -677,6 +742,7 @@ mod tests {
                 },
             ],
             duplicates: true,
+            chain: Some(6),
         };
 
         let mut record = vec![0u8; 32];

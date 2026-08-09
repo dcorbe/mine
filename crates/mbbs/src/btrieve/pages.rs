@@ -452,9 +452,12 @@ pub const INDEX_HEADER: usize = 16;
 /// Bytes of one index entry past its key: a record pointer, then a child page.
 ///
 /// The record pointer names a live record — **an interior entry indexes a
-/// record just as a leaf entry does**, which is why a traversal of the whole
-/// tree visits every record exactly once, and why the eleven shipped files that
-/// hold records yield exactly as many index entries as they have records.
+/// record just as a leaf entry does**, which is why a traversal of a
+/// **unique** key's whole tree visits every record exactly once, and why the
+/// eleven shipped files that hold records yield exactly as many index entries
+/// as they have records. **Not so for a duplicate-permitting key**: its entry
+/// count is the number of distinct values, and the record pointer is the
+/// *first* of possibly several -- see [`IndexPage::tails`] for the rest.
 ///
 /// The child page holds keys **greater** than this entry's, and is [`NOWHERE`]
 /// on a leaf. The **last** entry of any page carries zero there instead: a node
@@ -528,7 +531,11 @@ impl Shape {
     }
 }
 
-/// The refusal every populated duplicate-key index path shares.
+/// The refusal every populated duplicate-key index **write** path shares.
+///
+/// **Reading** a populated duplicate-key page is [`decode_index_page`]'s job
+/// now, and it no longer calls this. This is what [`build_index`] still says,
+/// because writing one is a different, harder problem it does not yet solve.
 ///
 /// A duplicate-permitting key's index entry is four bytes wider, and those four
 /// bytes are **not** slack at the end of the entry. The engine lays a *linked
@@ -541,33 +548,45 @@ impl Shape {
 /// where the last slot -- the one a unique key uses as its record pointer -- is
 /// the *last* record carrying this key value, and the inserted slot is the
 /// *first*. For a unique key the two collapse onto one field, which is why the
-/// engine's own walkers need no special case and why this host's decoder has
-/// been reading dup entries as though they were unique ones without noticing.
+/// engine's own walkers need no special case and why this host's decoder used
+/// to read dup entries as though they were unique ones without noticing.
 /// Decompiled at `re/btrieve_ghidra/exports/W32MKDE_decompiled.c`: the entry is
 /// built at :16457-16462, strided at :11788-11800, and the two ends are picked
-/// apart by Get-First and Get-Last at :11895-11903.
+/// apart by Get-First and Get-Last at :11895-11903. Confirmed against a file
+/// the real engine actually populated,
+/// `tools/btrieve-oracle/fixtures/DUPKEY30.DAT`: its one populated leaf decodes
+/// to exactly 10 entries -- one per distinct value, not one per its 30 records
+/// -- each with a `head` that is measurably the first-inserted record of its
+/// group of three and a `tail` that is measurably the last. See
+/// `docs/plans/2026-08-08-fsd-subsystem-design.md`, Stage D1.
 ///
 /// **Two consequences make this a feature rather than an offset fix, which is
-/// why it is refused here instead of implemented:**
+/// why *building* one is refused here instead of implemented:**
 ///
 /// 1. A linked-duplicates index holds **one entry per distinct key value**, not
-///    one per record. The invariant the rest of this module is built on -- that
-///    a tree's entry count equals the file's record count -- does not hold.
+///    one per record. The invariant [`build_index`] and [`push_node`] are
+///    written against -- that a tree's entry count equals the file's record
+///    count -- does not hold for one, and neither function groups records by
+///    value before laying out entries.
 /// 2. The chain itself lives **inside the records**, as a `[prev][next]` pair of
-///    record addresses at the offset the key descriptor stores at `+0x12`,
-///    which is why such a file's physical record is eight bytes longer than its
-///    logical one (`WCCUSERS` 1998 -> 2006). Building the index therefore means
-///    writing the records too, which [`build_index`] cannot do and should not.
+///    record addresses at the offset the key descriptor stores at `+0x12`
+///    ([`super::keys::Key::chain`]), which is why such a file's physical
+///    record is longer than its logical one by the width of that pair (eight
+///    bytes: `WCCUSERS` 1998 -> 2006, `DUPKEY30.DAT` 12 -> 22, the last four
+///    of those ten also going to a two-byte gap `Key::chain` itself measures
+///    and this host does not yet explain). Writing the index therefore means
+///    writing the chain into the records too, which [`build_index`] cannot
+///    do and should not.
 ///
-/// So this refuses rather than guesses. A wrong guess writes an index Btrieve
-/// reads as a plausible wrong order, which is the failure this whole module is
-/// built to avoid -- see the note on [`Kind`](super::keys::Kind). Refusing costs
-/// a loud error at the first character written to `WCCUSERS`; guessing costs a
-/// character file that reads back subtly shuffled.
+/// So building still refuses rather than guesses. A wrong guess writes an
+/// index Btrieve reads as a plausible wrong order, which is the failure this
+/// whole module is built to avoid -- see the note on [`Kind`](super::keys::Kind).
+/// Refusing costs a loud error at the first character written to `WCCUSERS`;
+/// guessing costs a character file that reads back subtly shuffled.
 fn unplaced_duplicate_bytes(shape: Shape) -> String {
     format!(
         "a duplicate-permitting key of {} bytes has {}-byte index entries \
-         holding a chain this host does not maintain; refusing rather than \
+         holding a chain this host does not yet write; refusing rather than \
          writing an index Btrieve would read in the wrong order",
         shape.length,
         shape.entry_size()
@@ -598,9 +617,35 @@ pub struct IndexPage {
     ///
     /// The child is [`NOWHERE`] on a leaf, and zero on the last entry of any
     /// page. **The key is a real record's key** — an interior entry names a
-    /// record just as a leaf entry does, which is why a traversal visits every
-    /// record exactly once.
+    /// record just as a leaf entry does, which is why a traversal of a
+    /// **unique** key's tree visits every record exactly once.
+    ///
+    /// For a key that permits duplicates, `entries` holds one row per
+    /// **distinct key value**, not one per record — see [`Self::tails`] — and
+    /// `entries[n].1` is the **head** of that value's chain (the first record
+    /// this value was ever inserted for), not "the" record the way it is for
+    /// a unique key.
     pub entries: Vec<(Vec<u8>, u32, u32)>,
+
+    /// The **tail** of each entry's duplicate chain — the last record
+    /// inserted with that entry's key value — parallel to [`Self::entries`]
+    /// and the same length as it whenever the key permits duplicates, empty
+    /// otherwise.
+    ///
+    /// A duplicate-permitting key's index entry is four bytes wider than a
+    /// unique one ([`Shape::entry_size`]), and this is where the extra four
+    /// bytes go: `[child page][key bytes][head of chain][tail of chain]`,
+    /// confirmed against `tools/btrieve-oracle/fixtures/DUPKEY30.DAT` --
+    /// built by the genuine engine with 30 records colliding in groups of
+    /// three over 10 distinct values. That file's root page decodes to
+    /// exactly 10 entries, each carrying a `tails[n]` that is measurably the
+    /// **last-inserted** record of the group and an `entries[n].1` that is
+    /// measurably the **first-inserted** one — see
+    /// `a_duplicate_leafs_head_and_tail_are_the_first_and_last_inserted_record`
+    /// in this module's tests, which cross-checks both against the in-record
+    /// `[prev][next]` chain ([`chain_pair`]) rather than trusting the index
+    /// page alone.
+    pub tails: Vec<u32>,
 }
 
 impl IndexPage {
@@ -640,21 +685,19 @@ pub fn decode_index_page(page: &[u8], shape: Shape) -> Result<IndexPage, String>
     }
     let header = Header::decode(&page[..usize::from(HEADER)]);
     let count = usize::from(u16::from_le_bytes([page[6], page[7]]));
-    if shape.duplicates && count != 0 {
-        return Err(unplaced_duplicate_bytes(shape));
-    }
     let key_length = shape.length;
     let width = shape.entry_size();
     // The **last** entry may be four bytes short. Its child field is a
     // placeholder nothing reads (see `INDEX_ENTRY_TAIL`), and when a leaf fills
     // a page exactly Btrieve does not write it -- `WCCSPELS.VIR` page 1 is the
     // one page in all eleven shipped files that does, and it is four bytes
-    // shy of the full width. So only `key + position` is required of the last
-    // entry.
+    // shy of the full width. So only `key + position` -- or, for a duplicate
+    // key, `key + head + tail` -- is required of the last entry: `width - 4`
+    // either way, since `width` already carries the duplicates term.
     let used = if count == 0 {
         INDEX_HEADER
     } else {
-        INDEX_HEADER + (count - 1) * width + key_length + 4
+        INDEX_HEADER + (count - 1) * width + (width - 4)
     };
     if used > page.len() {
         return Err(format!(
@@ -665,19 +708,31 @@ pub fn decode_index_page(page: &[u8], shape: Shape) -> Result<IndexPage, String>
     }
 
     let mut entries = Vec::with_capacity(count);
+    let mut tails = Vec::with_capacity(if shape.duplicates { count } else { 0 });
     for n in 0..count {
         let at = INDEX_HEADER + n * width;
         let key = page[at..at + key_length].to_vec();
-        let tail = at + key_length;
+        let head_at = at + key_length;
+        let head = long(&page[head_at..head_at + 4]);
+        // A duplicate entry carries a second four-byte field -- the chain's
+        // tail -- between the head and the child; a unique entry does not.
+        // Either way the child sits in the entry's last four bytes.
+        let child_at = if shape.duplicates {
+            let tail_at = head_at + 4;
+            tails.push(long(&page[tail_at..tail_at + 4]));
+            tail_at + 4
+        } else {
+            head_at + 4
+        };
         // Zero rather than a read when the child field was never written: that
         // is the value the last entry's slot carries when it *is* written, so
         // the two spellings of "no child here" decode alike.
-        let child = if tail + 8 <= page.len() {
-            long(&page[tail + 4..tail + 8])
+        let child = if child_at + 4 <= page.len() {
+            long(&page[child_at..child_at + 4])
         } else {
             0
         };
-        entries.push((key, long(&page[tail..tail + 4]), child));
+        entries.push((key, head, child));
     }
 
     Ok(IndexPage {
@@ -686,7 +741,52 @@ pub fn decode_index_page(page: &[u8], shape: Shape) -> Result<IndexPage, String>
         rightmost: long(&page[8..12]),
         leftmost: long(&page[12..16]),
         entries,
+        tails,
     })
+}
+
+/// The `[prev][next]` pair inside one physical record of a
+/// duplicate-permitting key, at the offset the key's own descriptor names.
+///
+/// `physical` is the record's **whole physical slot**, not just its logical
+/// `reclen` bytes -- the pair lives past the logical record, at `offset`
+/// (the key descriptor's own `+0x12`; see
+/// [`Key::chain`](super::keys::Key::chain)). Each half is returned as
+/// `(value, tag)`: the low and high sixteen bits of the four raw bytes, in
+/// that order.
+///
+/// **This is `(value, tag)` and not a [`long`]**, unlike every other pointer
+/// in this format, and that asymmetry is measured rather than assumed. On
+/// `DUPKEY30.DAT` -- built by the genuine engine, 30 records colliding in
+/// groups of three -- a middle record's `prev.0` equals the *previous*
+/// record's own `next.0` exactly, and a chain's first record's `next.0`
+/// equals the value [`decode_index_page`] reads as that value's `head`, with
+/// the *last* record's `next.0` reading as a null marker instead. So `value`
+/// is a real, self-consistent link between records; `tag` is `0` on every
+/// measured `prev` half and `1` on every measured `next` half except the
+/// chain's own last link, which is not enough samples to say what it means.
+///
+/// **`value` is not a [`Layout::position`]**, and this does not claim it is.
+/// `DUPKEY30.DAT`'s own data pages and its chain disagree by a constant that
+/// does not match any `Layout` this host can construct from the file's own
+/// header -- consistent with the "the Microkernel caches pages by path"
+/// hazard `tools/btrieve-oracle/btrvprobe.c`'s header comment already warns
+/// about for this exact fixture. Resolving `value` to a live record is left
+/// to whichever stage first needs to (D2, writing one, does not: it builds
+/// fresh chains rather than reading old ones). Reading is what this measures;
+/// see `a_records_own_chain_agrees_with_its_neighbours_and_with_the_index` in
+/// this module's tests for the cross-check.
+///
+/// `None` if `offset + 8` runs past the end of `physical`.
+pub fn chain_pair(physical: &[u8], offset: usize) -> Option<[(u16, u16); 2]> {
+    let half = |at: usize| -> Option<(u16, u16)> {
+        let bytes = physical.get(at..at + 4)?;
+        Some((
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+        ))
+    };
+    Some([half(offset)?, half(offset + 4)?])
 }
 
 /// The most levels a tree may have before a walk gives up.
@@ -700,7 +800,19 @@ const MAX_DEPTH: usize = 32;
 /// What walking a key's tree found.
 #[derive(Debug)]
 pub struct Walk {
-    /// Every `(key bytes, record position)` in the tree, in key order.
+    /// Every entry in the tree, in key order.
+    ///
+    /// For a **unique** key this is `(key bytes, record position)` one row
+    /// per record. **For a key that permits duplicates it is one row per
+    /// distinct key value**, not one per record -- the restated invariant
+    /// `docs/plans/2026-08-08-fsd-subsystem-design.md`'s Stage D1 calls "the
+    /// actual refactor" -- and the position is the chain's **head**, the
+    /// first record ever inserted with that value. The rest of the group
+    /// (the tail and anything between) is not here; [`decode_index_page`]
+    /// keeps the tail alongside [`IndexPage::entries`] as
+    /// [`IndexPage::tails`], which this function does not thread through
+    /// because [`Block::reindex`](super::Block::reindex) -- its only caller
+    /// today -- only ever consults [`Self::pages`].
     pub entries: Vec<(Vec<u8>, u32)>,
     /// The page numbers the tree occupies, **root first**.
     ///
@@ -843,7 +955,11 @@ pub struct Built {
 /// fewest nodes that will hold it, with the entries that fall between them
 /// promoted to the level above. **A promoted entry is a real record**, which is
 /// what the format does and why the total entry count across every node equals
-/// the record count.
+/// the record count -- **for a unique key**. `entries` here is still one row
+/// per record even for a duplicate-permitting key
+/// ([`Block::reindex`](super::Block::reindex)'s own caller builds it that
+/// way), which is exactly why this refuses rather than building a tree for
+/// one: see [`unplaced_duplicate_bytes`].
 ///
 /// The fill factor is this host's to choose — see
 /// `docs/plans/2026-08-07-btrieve-interior-pages-design.md`, "The fidelity
@@ -1188,13 +1304,17 @@ mod tests {
         (2048, 11, false, 19, 107), // WCCUSERS.VIR key 1
     ];
 
-    /// A duplicate key with records in it is refused, and an empty one is not.
+    /// **Building** a duplicate key with records in it is refused, and an
+    /// empty one is not. Reading is a different story -- see
+    /// [`a_duplicate_leafs_head_and_tail_are_the_first_and_last_inserted_record`]
+    /// below, which reads a page exactly this shape and does not error.
     ///
-    /// Both halves matter. All four shipped duplicate-key files hold zero
-    /// records, so `Block::reindex` runs over them on every close and must keep
-    /// working -- a blanket refusal would regress `WCCUSERS`, `WCCGANGS`,
-    /// `WCCITOWN` and `WCCBANKS` from "rebuilds an empty tree" to "cannot be
-    /// closed". The refusal has to arrive exactly when the first record does.
+    /// Both halves of the *build* side matter. All four shipped duplicate-key
+    /// files hold zero records, so `Block::reindex` runs over them on every
+    /// close and must keep working -- a blanket refusal would regress
+    /// `WCCUSERS`, `WCCGANGS`, `WCCITOWN` and `WCCBANKS` from "rebuilds an
+    /// empty tree" to "cannot be closed". The refusal has to arrive exactly
+    /// when the first record does.
     #[test]
     fn a_duplicate_key_is_refused_only_once_it_has_something_to_index() {
         let layout = index_layout();
@@ -1208,13 +1328,302 @@ mod tests {
         let e = build_index(layout, &[(vec![1u8, 0], 100)], duplicate)
             .expect_err("one record is enough to need the chain");
         assert!(e.contains("chain"), "{e}");
+    }
 
-        // And the reader refuses the same page rather than reading the chain's
-        // tail as a child page number, which is what it used to do.
+    /// **Reading** the same shape `build_index` above refuses to *write*: a
+    /// duplicate-permitting key's populated leaf decodes rather than errors,
+    /// with the extra four bytes read as a chain tail rather than mistaken for
+    /// a child page.
+    ///
+    /// One entry, hand-built rather than drawn from a real file (the
+    /// DUPKEY30-shaped tests below cover that): key `[1, 0]`, head 100, tail
+    /// 200, and -- because it is also the page's last entry -- a zero
+    /// placeholder where a child page would go.
+    #[test]
+    fn a_populated_duplicate_leaf_decodes_its_head_and_tail_rather_than_erroring() {
+        let layout = index_layout();
+        let duplicate = Shape {
+            length: 2,
+            duplicates: true,
+        };
         let mut page = vec![0u8; usize::from(layout.page)];
         page[6..8].copy_from_slice(&1u16.to_le_bytes());
-        let e = decode_index_page(&page, duplicate).expect_err("a populated duplicate page");
-        assert!(e.contains("chain"), "{e}");
+        page[16..18].copy_from_slice(&[1, 0]); // key
+        page[18..22].copy_from_slice(&to_long(100)); // head
+        page[22..26].copy_from_slice(&to_long(200)); // tail
+        page[26..30].copy_from_slice(&to_long(0)); // the last entry's placeholder child
+
+        let decoded = decode_index_page(&page, duplicate).expect("a populated duplicate leaf");
+        assert_eq!(decoded.entries, vec![(vec![1, 0], 100, 0)], "head, as the record pointer");
+        assert_eq!(decoded.tails, vec![200], "tail, in the field a unique entry does not have");
+    }
+
+    /// `tools/btrieve-oracle/fixtures/DUPKEY30.DAT` -- built by the genuine
+    /// Pervasive Btrieve 6.15 engine, not this crate: 12-byte records, one
+    /// 4-byte descending duplicate-permitting key, 30 records whose values
+    /// collide in groups of three. Committed to the repository (unlike
+    /// `tmp/`), so this reads it directly rather than skipping when it is
+    /// absent. See `tools/btrieve-oracle/fixtures/DUPKEY30.txt`.
+    fn dupkey30() -> Vec<u8> {
+        std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT"),
+        )
+        .expect("DUPKEY30.DAT is committed to the repository")
+    }
+
+    /// The real engine's own duplicate-key leaf, decoded: 10 entries for 30
+    /// records -- one per distinct value, not one per record -- each with the
+    /// head and tail measured straight off the index page's bytes.
+    ///
+    /// Page 9 (`9 * 512` into the file) is this key's whole tree: a single
+    /// leaf, both child slots `NOWHERE`, ten entries in descending order, the
+    /// last one carrying the zero placeholder every format's last entry does
+    /// instead of a child page -- the same convention a unique key's leaf
+    /// uses, confirming the duplicates term does not disturb it.
+    #[test]
+    fn a_duplicate_leafs_head_and_tail_are_the_first_and_last_inserted_record() {
+        let file = dupkey30();
+        let page = &file[9 * 512..10 * 512];
+        let shape = Shape {
+            length: 4,
+            duplicates: true,
+        };
+
+        let decoded = decode_index_page(page, shape).expect("the real engine's own leaf");
+        assert!(decoded.leaf(), "one page holds all ten entries");
+        assert_eq!(decoded.entries.len(), 10, "one entry per distinct value, not per record");
+        assert_eq!(decoded.tails.len(), 10);
+        assert_eq!(decoded.leftmost, NOWHERE);
+        assert_eq!(decoded.rightmost, NOWHERE);
+
+        // Descending: key 9 first, key 0 last. `(value, head, tail)`, read
+        // independently off the page's raw bytes.
+        let expected: [(u32, u32, u32); 10] = [
+            (9, 2654, 2698),
+            (8, 2588, 2632),
+            (7, 1492, 2566),
+            (6, 1426, 1470),
+            (5, 1360, 1404),
+            (4, 1294, 1338),
+            (3, 1228, 1272),
+            (2, 1162, 1206),
+            (1, 1096, 1140),
+            (0, 1030, 1074),
+        ];
+        for (n, (value, head, tail)) in expected.into_iter().enumerate() {
+            assert_eq!(decoded.entries[n].0, value.to_le_bytes().to_vec(), "entry {n}'s key");
+            assert_eq!(decoded.entries[n].1, head, "entry {n} (value {value})'s head");
+            assert_eq!(decoded.tails[n], tail, "entry {n} (value {value})'s tail");
+        }
+        for n in 0..9 {
+            assert_eq!(decoded.entries[n].2, NOWHERE, "entry {n}'s child -- a leaf has none");
+        }
+        assert_eq!(decoded.entries[9].2, 0, "the last entry's placeholder, not NOWHERE");
+    }
+
+    /// The in-record `[prev][next]` chain, read at the offset
+    /// `a_duplicate_keys_chain_offset_is_read_from_its_own_definition`
+    /// (`keys.rs`) measured on this same file: 14, confirmed above to be
+    /// `physical - 8` and **not** `reclen`.
+    ///
+    /// Three physical slots for key value 9 -- the whole group, 22 bytes
+    /// each, bytes measured directly off `DUPKEY30.DAT` -- read as a doubly
+    /// linked list in **insertion order**, not file-position order: the
+    /// group's first-inserted record's own address (recovered from its
+    /// neighbour, since nothing points *to* a chain's own start except the
+    /// index) equals the index leaf's `head` for value 9 above (2654), and
+    /// the last-inserted record's own address equals that entry's `tail`
+    /// (2698). This is the confirmation the design doc asks for: **the chain
+    /// is walked head-to-tail in the order the engine inserted it, not the
+    /// order the records sit on disk** -- value 9's group inserted in the
+    /// order field-2 27, 28, 29, all landing at ascending file positions in
+    /// this fixture, but nothing in the chain bytes depends on that; a second
+    /// group below crosses a data-page boundary and still agrees.
+    #[test]
+    fn a_records_own_chain_agrees_with_its_neighbours_and_with_the_index() {
+        const CHAIN_OFFSET: usize = 14;
+
+        // Value 9: all three records physically on the same data page.
+        let first = hex("090000001b00000000000000ffffffff0000740a0100");
+        let middle = hex("090000001c0000000000000000005e0a00008a0a0100");
+        let last = hex("090000001d000000000000000000740affffffff0000");
+
+        assert_eq!(
+            chain_pair(&first, CHAIN_OFFSET),
+            Some([(0xffff, 0), (2676, 1)]),
+            "the first-inserted record has no prev"
+        );
+        assert_eq!(chain_pair(&middle, CHAIN_OFFSET), Some([(2654, 0), (2698, 1)]));
+        assert_eq!(
+            chain_pair(&last, CHAIN_OFFSET),
+            Some([(2676, 0xffff), (0xffff, 0)]),
+            "the last-inserted record has no next"
+        );
+
+        // The middle record's own address does not appear in the index (only
+        // head and tail are kept there), but the chain is internally
+        // consistent about it: the first record's `next` and the last
+        // record's `prev` both name it, and they agree with each other.
+        assert_eq!(chain_pair(&first, CHAIN_OFFSET).unwrap()[1].0, 2676);
+        assert_eq!(chain_pair(&last, CHAIN_OFFSET).unwrap()[0].0, 2676);
+
+        // And the ends DO appear in the index, from the previous test:
+        // middle.prev is the first record's own address, which is entry
+        // value 9's `head` (2654); middle.next is the last record's own
+        // address, entry value 9's `tail` (2698).
+        assert_eq!(chain_pair(&middle, CHAIN_OFFSET).unwrap()[0].0, 2654, "== index head");
+        assert_eq!(chain_pair(&middle, CHAIN_OFFSET).unwrap()[1].0, 2698, "== index tail");
+
+        // Value 7: the same shape, but the first two records physically sit
+        // on page 10 (file positions 5590, 5612) and the third was written
+        // onto page 8 (position 4104) -- a genuine page-crossing chain, not a
+        // hand-picked easy case. The chain still agrees with itself and with
+        // the index's head (1492) and tail (2566) for value 7, exactly as
+        // the same-page group above does.
+        let first7 = hex("070000001500000000000000ffffffff0000ea050100");
+        let middle7 = hex("0700000016000000000000000000d4050000060a0000");
+        let last7 = hex("0700000017000000000000000000ea05ffffffff0100");
+
+        assert_eq!(chain_pair(&middle7, CHAIN_OFFSET).unwrap()[0].0, 1492, "== index head for 7");
+        assert_eq!(chain_pair(&middle7, CHAIN_OFFSET).unwrap()[1].0, 2566, "== index tail for 7");
+        assert_eq!(chain_pair(&first7, CHAIN_OFFSET).unwrap()[1].0, 1514, "first7.next == middle7's own address");
+        assert_eq!(chain_pair(&last7, CHAIN_OFFSET).unwrap()[0].0, 1514, "last7.prev == middle7's own address");
+
+        // `None` past the end of a short buffer -- the guard that stops this
+        // from panicking on a record whose declared physical length turns
+        // out to be too short to hold the chain a duplicate key's descriptor
+        // promises.
+        assert_eq!(chain_pair(&first[..20], CHAIN_OFFSET), None);
+    }
+
+    /// Bytes from a hex string, for the two tests above -- shorter to read
+    /// than a byte-array literal at 22 bytes a line.
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    /// The count invariant, restated, exercised through the actual production
+    /// entry point rather than `decode_index_page` alone: [`walk`] over
+    /// `DUPKEY30.DAT`'s real root returns **10** entries for a file of **30**
+    /// records, because it is one entry per distinct value. Before this
+    /// stage, [`walk`] could not even reach this page -- `decode_index_page`
+    /// refused any populated duplicate page outright.
+    #[test]
+    fn walking_the_real_engines_duplicate_tree_yields_ten_entries_not_thirty() {
+        let file = dupkey30();
+        let dir = crate::testing::scratch("pages-walk-dupkey30");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::write(&path, &file).expect("copy the fixture into scratch");
+
+        let layout = Layout {
+            page: 512,
+            physical: 22,
+            pages: (file.len() / 512) as u32,
+        };
+        let shape = Shape {
+            length: 4,
+            duplicates: true,
+        };
+
+        let walked = walk(&path, layout, 9, shape).expect("the real engine's own tree");
+        assert_eq!(walked.pages, vec![9], "one leaf, and it owns itself");
+        assert_eq!(
+            walked.entries.len(),
+            10,
+            "ten distinct values, not the file's thirty records"
+        );
+        let values: Vec<u32> = walked
+            .entries
+            .iter()
+            .map(|(key, _)| u32::from_le_bytes(key.clone().try_into().expect("4-byte key")))
+            .collect();
+        assert_eq!(values, (0..10).rev().collect::<Vec<_>>(), "descending, 9 down to 0");
+    }
+
+    /// Interior duplicate entries, and a chain that spans two leaves.
+    ///
+    /// `DUPKEY30.DAT` is one shape every test above shares and this one does
+    /// not: ten distinct values fit a single leaf, so every child slot in it
+    /// is either `NOWHERE` or the zero placeholder -- never a **real** child
+    /// page sitting right next to a `[head][tail]` pair, which is what an
+    /// interior node of a bigger duplicate-keyed file (`WCCUSERS` at scale)
+    /// would actually hold. Built by hand, the way
+    /// `a_walk_returns_the_tree_in_key_order` is, rather than through
+    /// `build_index` -- which still refuses this shape outright -- so a
+    /// walker and a builder that happened to agree with each other could not
+    /// both be wrong here in the same way.
+    ///
+    /// Root: one duplicate entry (key 20, head 3000, tail 3050), a real
+    /// leftmost child (page 2) and rightmost child (page 3). Two leaves of
+    /// two duplicate entries each.
+    #[test]
+    fn a_walk_over_a_multi_page_duplicate_tree_visits_every_entry_once_in_order() {
+        let dir = crate::testing::scratch("pages-walk-duplicate-two-levels");
+        let path = dir.join("DUPTREE.DAT");
+        let layout = Layout {
+            page: 512,
+            physical: 16,
+            pages: 4,
+        };
+        let shape = Shape {
+            length: 2,
+            duplicates: true,
+        };
+        let width = shape.entry_size();
+        assert_eq!(width, 14, "a 2-byte duplicate key's entry width");
+
+        let mut file = vec![0u8; 512 * 4];
+
+        // Root, page 1: one entry (key 20, head 3000, tail 3050), leftmost
+        // child 2, rightmost child 3.
+        let root = 512;
+        file[root..root + 6].copy_from_slice(&[0, 0, 1, 0, 0, 0]);
+        file[root + 6..root + 8].copy_from_slice(&1u16.to_le_bytes());
+        file[root + 8..root + 12].copy_from_slice(&to_long(3));
+        file[root + 12..root + 16].copy_from_slice(&to_long(2));
+        file[root + 16..root + 18].copy_from_slice(&20u16.to_le_bytes());
+        file[root + 18..root + 22].copy_from_slice(&to_long(3000));
+        file[root + 22..root + 26].copy_from_slice(&to_long(3050));
+        file[root + 26..root + 30].copy_from_slice(&to_long(0)); // last entry, placeholder
+
+        // Leaves, pages 2 and 3: two duplicate entries each.
+        let leaves = [
+            (2u32, [(10u16, 1000u32, 1005u32), (15, 1500, 1505)]),
+            (3u32, [(25, 2500, 2505), (30, 3500, 3505)]),
+        ];
+        for (number, entries) in leaves {
+            let at = 512 * number as usize;
+            file[at..at + 6].copy_from_slice(&[0, 0, number as u8, 0, 0, 0]);
+            file[at + 6..at + 8].copy_from_slice(&2u16.to_le_bytes());
+            file[at + 8..at + 16].copy_from_slice(&[0xff; 8]); // a leaf: no children
+            for (n, (key, head, tail)) in entries.iter().enumerate() {
+                let e = at + 16 + n * width;
+                file[e..e + 2].copy_from_slice(&key.to_le_bytes());
+                file[e + 2..e + 6].copy_from_slice(&to_long(*head));
+                file[e + 6..e + 10].copy_from_slice(&to_long(*tail));
+                let child = if n + 1 == entries.len() { 0 } else { NOWHERE };
+                file[e + 10..e + 14].copy_from_slice(&to_long(child));
+            }
+        }
+        std::fs::write(&path, &file).expect("writes");
+
+        let walked = walk(&path, layout, 1, shape).expect("walks a duplicate tree");
+        assert_eq!(
+            walked.entries,
+            vec![
+                (vec![10, 0], 1000),
+                (vec![15, 0], 1500),
+                (vec![20, 0], 3000),
+                (vec![25, 0], 2500),
+                (vec![30, 0], 3500),
+            ],
+            "the root's own entry -- head 3000 -- sorts between its two children"
+        );
+        assert_eq!(walked.pages, vec![1, 2, 3]);
     }
 
     /// An index entry is as wide as Btrieve says it is, duplicates included.
@@ -2011,6 +2420,36 @@ mod tests {
         assert!(decoded.entries.is_empty());
     }
 
+    /// The same virgin shape, but for a duplicate-permitting key: an empty
+    /// leaf decodes the same regardless of `Shape::duplicates`, because there
+    /// are no entries to put the four extra bytes in. This is the read-side
+    /// half of what `a_duplicate_key_is_refused_only_once_it_has_something_to_index`
+    /// pins for `build_index` -- all four shipped duplicate-key files are
+    /// exactly this page, so a decoder that could not read it would have
+    /// broken `Block::reindex` for `WCCUSERS`, `WCCGANGS`, `WCCITOWN` and
+    /// `WCCBANKS` the moment this stage's duplicate handling landed, not just
+    /// once one of them gained a record.
+    #[test]
+    fn an_empty_duplicate_leaf_decodes_with_no_tails_at_all() {
+        let mut page = vec![0u8; 2048];
+        page[..16].copy_from_slice(&[
+            0x00, 0x00, 0x01, 0x00, // page 1
+            0x00, 0x00, //             no stamp
+            0x00, 0x00, //             no entries
+            0xff, 0xff, 0xff, 0xff, // no rightmost child
+            0x00, 0x00, 0x00, 0x00, // no leftmost child -- as zero, not NOWHERE
+        ]);
+        let duplicate = Shape {
+            length: 4,
+            duplicates: true,
+        };
+
+        let decoded = decode_index_page(&page, duplicate).expect("an empty duplicate leaf");
+        assert!(decoded.leaf());
+        assert!(decoded.entries.is_empty());
+        assert!(decoded.tails.is_empty(), "nothing to carry a tail for");
+    }
+
     /// A count that runs off the end of the page is a refusal, not a panic.
     /// This is the guard that stops a corrupt or misidentified page from
     /// indexing out of bounds during a walk.
@@ -2020,6 +2459,31 @@ mod tests {
         page[6..8].copy_from_slice(&500u16.to_le_bytes());
         let e = decode_index_page(&page, unique(2)).expect_err("500 entries do not fit 512 bytes");
         assert!(e.contains("500"), "{e}");
+    }
+
+    /// The same guard, sized for a **duplicate** key's wider entry: this is
+    /// the boundary a formula that forgot the tail field would get past.
+    ///
+    /// One duplicate entry of a 2-byte key needs `INDEX_HEADER + (width - 4)`
+    /// = `16 + 10` = 26 bytes -- the last entry may omit its child, but not
+    /// its tail. A page of 24 bytes is short by exactly the tail field's
+    /// contribution a formula copied from the unique case (`key_length + 4`
+    /// = 6, needing only 22) would not have noticed. Refused here means the
+    /// reader stops before it would have sliced `page[22..26]` on a
+    /// 24-byte buffer and panicked instead.
+    #[test]
+    fn a_duplicate_entrys_missing_tail_is_refused_not_read_past_the_page() {
+        let duplicate = Shape {
+            length: 2,
+            duplicates: true,
+        };
+        assert_eq!(duplicate.entry_size(), 14);
+
+        let mut page = vec![0u8; 24];
+        page[6..8].copy_from_slice(&1u16.to_le_bytes());
+        let e = decode_index_page(&page, duplicate)
+            .expect_err("26 bytes needed for one duplicate entry's key, head and tail; 24 given");
+        assert!(e.contains("26") && e.contains("24"), "{e}");
     }
 
     /// **A leaf that fills its page exactly is four bytes short, and legal.**

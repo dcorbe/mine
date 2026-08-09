@@ -1476,6 +1476,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            chain: None,
         }];
         Block {
             name: "SCRATCH.DAT".to_owned(),
@@ -1852,6 +1853,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            chain: None,
         }];
         Block {
             name: "INDEXED.DAT".to_owned(),
@@ -2173,12 +2175,14 @@ mod tests {
                 definition: 0,
                 segments: vec![segment(0), segment(2)],
                 duplicates: false,
+                chain: None,
             },
             Key {
                 number: 1,
                 definition: 2,
                 segments: vec![segment(4)],
                 duplicates: false,
+                chain: None,
             },
         ];
         Block {
