@@ -709,6 +709,48 @@ impl Host {
     }
 
     /// Every module that has registered, in the order they did.
+    /// Entry `n` of the module channel `chan`'s `state` names.
+    ///
+    /// `MAJORBBS.C:2796` is `(*(module[usrptr->state]->sttrou))()`: a channel's
+    /// `state` **is** an index into the module table, and `register_module`
+    /// returning that index is the whole handshake. This host had dispatched to
+    /// `modules().first()` instead, which is the same thing only while exactly
+    /// one module is registered -- and `inifsd()` registers FSDBBS as an
+    /// ordinary module, so the FSD is a second one.
+    ///
+    /// A `state` naming a slot nobody registered stops with a reason. Falling
+    /// back to module 0 would send another module's keystrokes to MajorMUD and
+    /// look, from the outside, like a module that ignored its input.
+    ///
+    /// The two layers of `Result` are not decoration: the outer is "this host
+    /// cannot go on", the inner is a [`ShimError`] the caller turns into
+    /// [`Outcome::Stopped`] through [`Host::shim_stop`], and only the caller
+    /// knows which of its own step names to attach.
+    ///
+    /// # Errors
+    ///
+    /// If `state` names no registered module.
+    fn state_entry(
+        &self,
+        machine: &Machine,
+        chan: Chan,
+        n: usize,
+    ) -> io::Result<Result<Option<FarPtr>, ShimError>> {
+        let state = match self.users.state(machine, chan) {
+            Ok(state) => state,
+            Err(e) => return Ok(Err(e)),
+        };
+        let Some(registered) = self.modules().get(usize::from(state)) else {
+            let count = self.modules().len();
+            return Err(io::Error::other(format!(
+                "channel {chan} is in state {state} and {count} module(s) are registered, \
+                 so there is no module to enter: either a module wrote a state it was \
+                 never given, or a registration this host owes has not happened"
+            )));
+        };
+        Ok(registered.entry(machine, n))
+    }
+
     pub fn modules(&self) -> &[Registration] {
         &self.modules
     }
@@ -1237,6 +1279,14 @@ impl Host {
         // `Registration::entry` borrows `self.modules()` immutably, and
         // `self.run` needs `self` mutably right after -- so the pointer is
         // read out here and the borrow ends before `run` is ever reached.
+        //
+        // `first()` and not the channel's state, on purpose. `cyclon` calls
+        // `if ((rouptr = module[i]->lonrou) != NULL)` over an `i`: a logon is
+        // announced to every registered module, not dispatched to one. This
+        // host makes the first iteration only, which is the whole loop while one
+        // module is registered. The day a second registers, this owes the rest
+        // of the loop -- and the hazard is ordering, not counting: a module that
+        // registered *after* the FSD would stop being `first()`.
         let lonrou = {
             let registered = self.modules().first().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
@@ -1384,11 +1434,28 @@ impl Host {
         // `self.run` needs `self` mutably right after, so the pointer is read
         // out here and the borrow ends before `run` is ever reached -- the same
         // discipline `Host::connect` follows.
-        let rou = {
-            let registered = self.modules().first().ok_or_else(|| {
-                io::Error::other("no module has registered, so there is nothing to disconnect from")
-            })?;
-            registered.entry(machine, vector.entry())
+        //
+        // The two vectors are not reached the same way, and this is the one
+        // place that difference is visible:
+        //
+        // - `bgnlof` tests `module[usrptr->state]->lofrou == NULL` -- keyed on
+        //   the channel's state, like `sttrou`.
+        // - `aschup` tests `(rouptr=module[i]->huprou) != NULL` -- an `i`, a
+        //   loop over *every* registered module. This host makes the first
+        //   iteration and no more, which is exactly right while one module is
+        //   registered and is owed a loop the day a second one is. It is the
+        //   first slot and not the channel's state deliberately: a hangup is
+        //   news for every module, not just the one holding the channel.
+        let rou = match vector {
+            Vector::Logoff => self.state_entry(machine, chan, vector.entry())?,
+            Vector::Hangup => {
+                let registered = self.modules().first().ok_or_else(|| {
+                    io::Error::other(
+                        "no module has registered, so there is nothing to disconnect from",
+                    )
+                })?;
+                registered.entry(machine, vector.entry())
+            }
         };
         let rou = match rou {
             Ok(rou) => rou,
@@ -1649,15 +1716,12 @@ impl Host {
                 return self.shim_stop(machine, "get_input", e).map(Some);
             }
 
-            // Same borrow trap as `connect`: read the entry pointer out of
-            // `self.modules()` and let that borrow end before `self.run` needs
+            // `MAJORBBS.C:2796` keys both of these on the channel's own state:
+            // `sttrou` through `(*(module[usrptr->state]->sttrou))()` and
+            // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
+            // is read out here and the borrow ends before `self.run` needs
             // `self` mutably.
-            let entry = {
-                let registered = self.modules().first().ok_or_else(|| {
-                    io::Error::other("no module has registered, so there is nothing to enter")
-                })?;
-                registered.entry(machine, entry_index)
-            };
+            let entry = self.state_entry(machine, chan, entry_index)?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
@@ -2340,7 +2404,7 @@ mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing, users};
-    use mbbs16::{FarPtr, Machine};
+    use mbbs16::{FarPtr, Machine, Ret};
 
     #[test]
     fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {
@@ -2742,8 +2806,13 @@ mod tests {
         // R19: same reasoning as the `connect` test above -- `is_err()`
         // cannot distinguish this from a `ShimError` out of `point_curusr`,
         // `get_input` or the entry lookup, each a different failure.
+        //
+        // The wording is `state_entry`'s rather than a bare "no module has
+        // registered": a channel at state 0 with nothing registered and a
+        // channel at state 3 with one module registered are now different
+        // sentences, and conflating them is what this assertion exists to stop.
         assert!(
-            err.to_string().contains("no module has registered"),
+            err.to_string().contains("state 0") && err.to_string().contains("0 module(s)"),
             "expected the missing-registration message, got: {err}"
         );
     }
@@ -2796,7 +2865,7 @@ mod tests {
             .poll(&mut f.machine, &module)
             .expect_err("the CRSTG behind the OVRFLW is still there to dispatch");
         assert!(
-            err.to_string().contains("no module has registered"),
+            err.to_string().contains("no module to enter"),
             "expected to reach the CRSTG dispatch past the OVRFLW: {err}"
         );
     }
@@ -2888,6 +2957,120 @@ mod tests {
         code.push(mark);
         code.push(0xcb); // retf
         code
+    }
+
+    /// Register a module under `name` with the entry points `entries` names.
+    ///
+    /// [`register_module_with`] exists for the one-module case and calls its
+    /// module `MajorMUD`; the state-dispatch tests need two that can be told
+    /// apart in a failure message.
+    fn register_named(f: &mut Fixture, name: &str, entries: &[(usize, FarPtr)]) -> u16 {
+        let mut bytes = name.as_bytes().to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        for (n, at) in entries {
+            let field = 25 + n * 4;
+            bytes[field..field + 4].copy_from_slice(&at.to_bytes());
+        }
+        let block = f.bytes(&bytes, false);
+        let ret = f
+            .invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+        match ret {
+            Ret::U16(n) => n,
+            other => panic!("register_module returns the module number, not {other:?}"),
+        }
+    }
+
+    /// Write `state` into `user[chan].state`, the way the module does.
+    ///
+    /// Through [`Users::slot`] and `user::STATE` rather than a setter, because
+    /// production code never assigns a state -- `register_module` hands the
+    /// number back and the module stores it itself, at 14 sites in
+    /// `WCCMMUD.DLL`. A test that wrote it any other way would be agreeing with
+    /// [`Users::state`] about an offset instead of checking it.
+    fn set_state(f: &mut Fixture, chan: crate::Chan, state: u16) {
+        let slot = f.host.users().slot(chan);
+        let at = FarPtr {
+            offset: slot.offset + users::user::STATE,
+            selector: slot.selector,
+        };
+        f.machine.write(at, &state.to_le_bytes()).expect("in the segment");
+    }
+
+    /// `MAJORBBS.C:2796` is `(*(module[usrptr->state]->sttrou))()`, and this is
+    /// the test that says so.
+    ///
+    /// Two modules, both with a `sttrou`, each writing a different marker byte.
+    /// The channel is put in state 1 and the input is delivered to the *second*
+    /// module.
+    ///
+    /// **One module is not enough to test this.** Every other test in this file
+    /// has exactly one registered module and every channel at state 0, where
+    /// `modules()[state]` and `modules().first()` are the same pointer -- so the
+    /// bug this fixes is invisible to all of them. Mutate `state_entry` back to
+    /// `.first()` and this must go red; nothing else will.
+    #[test]
+    fn poll_dispatches_to_the_module_the_channels_state_names() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let marker = f.bytes(&[0x00], false);
+        let first = f.machine.code_ptr(0);
+        let first_stub = marker_stub(marker, 0xa0);
+        let second = f.machine.code_ptr(first_stub.len() as u16);
+        let second_stub = marker_stub(marker, 0xb1);
+
+        assert_eq!(register_named(&mut f, "first", &[(1, first)]), 0);
+        assert_eq!(register_named(&mut f, "second", &[(1, second)]), 1);
+
+        // After the registrations: `Fixture::invoke` builds its trampoline in
+        // this same scratch segment at offset zero.
+        let mut code = first_stub;
+        code.extend_from_slice(&second_stub);
+        f.machine.load_code(&code).expect("both stubs fit");
+
+        set_state(&mut f, console, 1);
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        f.host
+            .poll(&mut f.machine, &module)
+            .expect("polled")
+            .expect("the module was entered");
+
+        assert_eq!(
+            f.machine.resolve(marker, 1).expect("the marker")[0],
+            0xb1,
+            "state 1 must reach the second module's sttrou, not the first's"
+        );
+    }
+
+    /// A `state` naming a slot nobody registered stops with a reason.
+    ///
+    /// Falling back to module 0 would deliver another module's keystrokes to
+    /// MajorMUD, which from outside looks like a module that ignored its input
+    /// -- the least diagnosable failure this host could choose.
+    #[test]
+    fn poll_refuses_a_state_that_names_no_registered_module() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let stub = returns_stub(1);
+        let sttrou = f.machine.code_ptr(0);
+        register_named(&mut f, "only", &[(1, sttrou)]);
+        f.machine.load_code(&stub).expect("the stub fits");
+
+        set_state(&mut f, console, 3);
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        let err = f
+            .host
+            .poll(&mut f.machine, &module)
+            .expect_err("state 3 names nothing");
+        let text = err.to_string();
+        assert!(
+            text.contains("state 3") && text.contains("1 module(s)"),
+            "the error names the state and the count, got: {text}"
+        );
     }
 
     /// 16-bit code that returns `ax` and does nothing else.

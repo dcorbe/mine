@@ -448,6 +448,34 @@ impl Users {
         Ok(())
     }
 
+    /// `user[unum].state` -- which registered module this channel is in.
+    ///
+    /// The real host's whole dispatch is `(*(module[usrptr->state]->sttrou))()`
+    /// (`MAJORBBS.C:2796`), so this is the number that decides who gets a
+    /// keystroke. The module owns it: `register_module` hands back a number and
+    /// the module writes it here itself, at 14 sites in `WCCMMUD.DLL`.
+    ///
+    /// Read every time, never remembered, for the reason
+    /// [`polrou`](Self::polrou) is: module code changes it between dispatches,
+    /// and that is the point of it.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment.
+    pub fn state(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
+        let bytes = machine.resolve(self.state_at(unum), 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// `&user[unum].state`.
+    fn state_at(&self, unum: Chan) -> FarPtr {
+        let slot = self.slot(unum);
+        FarPtr {
+            offset: slot.offset + user::STATE,
+            selector: slot.selector,
+        }
+    }
+
     /// `&user[unum].polrou`.
     fn polrou_at(&self, unum: Chan) -> FarPtr {
         let slot = self.slot(unum);
