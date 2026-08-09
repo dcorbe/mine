@@ -748,44 +748,50 @@ pub fn decode_index_page(page: &[u8], shape: Shape) -> Result<IndexPage, String>
 /// The `[prev][next]` pair inside one physical record of a
 /// duplicate-permitting key, at the offset the key's own descriptor names.
 ///
-/// `physical` is the record's **whole physical slot**, not just its logical
-/// `reclen` bytes -- the pair lives past the logical record, at `offset`
-/// (the key descriptor's own `+0x12`; see
-/// [`Key::chain`](super::keys::Key::chain)). Each half is returned as
-/// `(value, tag)`: the low and high sixteen bits of the four raw bytes, in
-/// that order.
+/// `slot` is the record's **whole physical slot**, from its first byte, not
+/// just its logical `reclen` bytes and not the logical record's own start --
+/// `offset` is measured from the slot ([`Key::chain`](super::keys::Key::chain),
+/// the descriptor's `+0x12`), and in a version 6 file the two are two bytes
+/// apart. Both halves are ordinary [`long`]s: a record position, or
+/// [`NOWHERE`] at the end of the chain.
 ///
-/// **This is `(value, tag)` and not a [`long`]**, unlike every other pointer
-/// in this format, and that asymmetry is measured rather than assumed. On
-/// `DUPKEY30.DAT` -- built by the genuine engine, 30 records colliding in
-/// groups of three -- a middle record's `prev.0` equals the *previous*
-/// record's own `next.0` exactly, and a chain's first record's `next.0`
-/// equals the value [`decode_index_page`] reads as that value's `head`, with
-/// the *last* record's `next.0` reading as a null marker instead. So `value`
-/// is a real, self-consistent link between records; `tag` is `0` on every
-/// measured `prev` half and `1` on every measured `next` half except the
-/// chain's own last link, which is not enough samples to say what it means.
+/// **Both are [`Layout::position`]s**, in the same encoding a unique key's
+/// index entry uses for its record pointer -- there is no second pointer
+/// format in this file layout. Every one of `DUPKEY30.DAT`'s 30 records agrees:
+/// `prev` is `NOWHERE` on the first record of a group and otherwise the
+/// previous record's own position, `next` is `NOWHERE` on the last and
+/// otherwise the following record's, and the two ends are exactly the `head`
+/// and `tail` [`decode_index_page`] reads out of that value's index entry.
+/// Asserted over the whole file rather than over a hand-picked group in
+/// `a_records_own_chain_agrees_with_its_neighbours_and_with_the_index`.
 ///
-/// **`value` is not a [`Layout::position`]**, and this does not claim it is.
-/// `DUPKEY30.DAT`'s own data pages and its chain disagree by a constant that
-/// does not match any `Layout` this host can construct from the file's own
-/// header -- consistent with the "the Microkernel caches pages by path"
-/// hazard `tools/btrieve-oracle/btrvprobe.c`'s header comment already warns
-/// about for this exact fixture. Resolving `value` to a live record is left
-/// to whichever stage first needs to (D2, writing one, does not: it builds
-/// fresh chains rather than reading old ones). Reading is what this measures;
-/// see `a_records_own_chain_agrees_with_its_neighbours_and_with_the_index` in
-/// this module's tests for the cross-check.
+/// **The position is against the file's *logical* page numbering**, which is
+/// only worth saying because `DUPKEY30.DAT` is a **version 6** file and so
+/// distinguishes it from the physical one: physical pages 0 and 1 are two
+/// shadowed copies of the file control record, 2 and 3 are page allocation
+/// tables, and every remaining page carries the logical page it currently
+/// holds in the second word of its own header -- physical page 10 says
+/// logical 2, physical 8 says logical 5. Feed those logical numbers to
+/// `Layout::position` and the chain resolves exactly. **Every file MajorMUD
+/// ships is version 5**, where the two numberings are the same thing and this
+/// distinction disappears; it is recorded here only so that the next reading
+/// of this fixture does not rediscover the offset as an unexplained constant.
 ///
-/// `None` if `offset + 8` runs past the end of `physical`.
-pub fn chain_pair(physical: &[u8], offset: usize) -> Option<[(u16, u16); 2]> {
-    let half = |at: usize| -> Option<(u16, u16)> {
-        let bytes = physical.get(at..at + 4)?;
-        Some((
-            u16::from_le_bytes([bytes[0], bytes[1]]),
-            u16::from_le_bytes([bytes[2], bytes[3]]),
-        ))
-    };
+/// An earlier reading of this function did exactly that. It returned each half
+/// as `(value, tag)` and reported that the values were *not* positions,
+/// because it was handed a window starting at the logical record rather than
+/// at the slot -- two bytes late, which splits a word-swapped [`long`] down
+/// the middle. In a file this small every position's high word is zero, so the
+/// misaligned low half still read as the right number and every internal
+/// cross-check passed; the "tag" was the *following* slot's two-byte
+/// in-use marker, which is why it read 1 everywhere except at the end of a
+/// page. All six of that test's sample records were shifted the same way, so
+/// no comparison *between* them could see it -- which is why the test below
+/// derives its records from the fixture instead of quoting them.
+///
+/// `None` if `offset + 8` runs past the end of `slot`.
+pub fn chain_pair(slot: &[u8], offset: usize) -> Option<[u32; 2]> {
+    let half = |at: usize| -> Option<u32> { slot.get(at..at + 4).map(long) };
     Some([half(offset)?, half(offset + 4)?])
 }
 
@@ -1422,88 +1428,137 @@ mod tests {
         assert_eq!(decoded.entries[9].2, 0, "the last entry's placeholder, not NOWHERE");
     }
 
-    /// The in-record `[prev][next]` chain, read at the offset
-    /// `a_duplicate_keys_chain_offset_is_read_from_its_own_definition`
-    /// (`keys.rs`) measured on this same file: 14, confirmed above to be
-    /// `physical - 8` and **not** `reclen`.
+    /// Where `DUPKEY30.DAT` keeps each of its 30 records, and what position
+    /// the engine calls it by.
     ///
-    /// Three physical slots for key value 9 -- the whole group, 22 bytes
-    /// each, bytes measured directly off `DUPKEY30.DAT` -- read as a doubly
-    /// linked list in **insertion order**, not file-position order: the
-    /// group's first-inserted record's own address (recovered from its
-    /// neighbour, since nothing points *to* a chain's own start except the
-    /// index) equals the index leaf's `head` for value 9 above (2654), and
-    /// the last-inserted record's own address equals that entry's `tail`
-    /// (2698). This is the confirmation the design doc asks for: **the chain
-    /// is walked head-to-tail in the order the engine inserted it, not the
-    /// order the records sit on disk** -- value 9's group inserted in the
-    /// order field-2 27, 28, 29, all landing at ascending file positions in
-    /// this fixture, but nothing in the chain bytes depends on that; a second
-    /// group below crosses a data-page boundary and still agrees.
+    /// Returns `(slot offset in the file, the record's position)` indexed by
+    /// **insertion order** -- which this fixture makes recoverable, because
+    /// its second field is the insertion index and its key is that index over
+    /// three (see `tools/btrieve-oracle/fixtures/DUPKEY30.txt`).
+    ///
+    /// The position is [`Layout::position`] against the page's **logical**
+    /// number, read out of the page's own header rather than assumed from
+    /// where the page sits: this is a version 6 file and the two differ. See
+    /// [`chain_pair`]. A version 6 slot also opens with two bytes of in-use
+    /// marker before the logical record, which is why the slot starts two
+    /// bytes before the record content this searches for -- and why
+    /// [`Key::chain`](super::super::btrieve::keys::Key::chain) reads 14 here
+    /// on a file whose `reclen` is 12.
+    fn dupkey30_records(file: &[u8]) -> Vec<(usize, u32)> {
+        const PAGE: usize = 512;
+        const PHYSICAL: usize = 22;
+        const DATA_PAGE: u16 = 0x4400;
+
+        let layout = Layout {
+            page: PAGE as u16,
+            physical: PHYSICAL as u16,
+            pages: (file.len() / PAGE) as u32,
+        };
+
+        // Every slot in the file, by where it starts, with the position the
+        // engine would name it by.
+        let mut slots: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        for physical in 0..file.len() / PAGE {
+            let base = physical * PAGE;
+            let flags = u16::from_le_bytes([file[base], file[base + 1]]);
+            let logical = u32::from(u16::from_le_bytes([file[base + 2], file[base + 3]]));
+            if flags != DATA_PAGE {
+                continue;
+            }
+            for slot in 0..layout.per_page() {
+                let at = base + usize::from(HEADER) + PHYSICAL * slot as usize;
+                slots.insert(at, layout.position(logical, slot));
+            }
+        }
+
+        (0..30)
+            .map(|n: u32| {
+                // Key value, insertion index, and the record's third field.
+                let mut content = Vec::new();
+                content.extend_from_slice(&(n / 3).to_le_bytes());
+                content.extend_from_slice(&n.to_le_bytes());
+                content.extend_from_slice(&0u32.to_le_bytes());
+                let found: Vec<usize> = slots
+                    .keys()
+                    .copied()
+                    .filter(|slot| file[slot + 2..slot + 14] == content[..])
+                    .collect();
+                assert_eq!(found.len(), 1, "record {n} sits in exactly one slot");
+                let slot = found[0];
+                (slot, slots[&slot])
+            })
+            .collect()
+    }
+
+    /// The in-record `[prev][next]` chain, over **every record in the file**.
+    ///
+    /// Read at the offset `DUPKEY30.DAT`'s own key descriptor names --
+    /// `a_duplicate_keys_chain_offset_is_read_from_its_own_definition` in
+    /// `keys.rs` measures it as 14, which is `physical - 8` -- and decoded as
+    /// two ordinary [`long`]s, which is what they are: positions, in the one
+    /// pointer encoding this format has.
+    ///
+    /// **The chain is in insertion order, and the index's `head` and `tail`
+    /// are its two ends.** That is the claim, and it is checked here against
+    /// all 30 records and all 10 groups rather than against a hand-picked
+    /// one: for each group, `prev` is [`NOWHERE`] at the head and otherwise
+    /// the previous record's position, `next` is `NOWHERE` at the tail and
+    /// otherwise the following record's. Group 7 crosses a data-page boundary
+    /// -- its third record was written onto a different page than its first
+    /// two -- so the walk is not merely following adjacent slots.
+    ///
+    /// Deriving the records from the fixture rather than quoting their bytes
+    /// is deliberate. The version of this test that quoted six of them read
+    /// each one two bytes late, and could not see it, because *all six* were
+    /// shifted the same way and every assertion compared one against another.
     #[test]
     fn a_records_own_chain_agrees_with_its_neighbours_and_with_the_index() {
         const CHAIN_OFFSET: usize = 14;
 
-        // Value 9: all three records physically on the same data page.
-        let first = hex("090000001b00000000000000ffffffff0000740a0100");
-        let middle = hex("090000001c0000000000000000005e0a00008a0a0100");
-        let last = hex("090000001d000000000000000000740affffffff0000");
+        let file = dupkey30();
+        let records = dupkey30_records(&file);
 
-        assert_eq!(
-            chain_pair(&first, CHAIN_OFFSET),
-            Some([(0xffff, 0), (2676, 1)]),
-            "the first-inserted record has no prev"
-        );
-        assert_eq!(chain_pair(&middle, CHAIN_OFFSET), Some([(2654, 0), (2698, 1)]));
-        assert_eq!(
-            chain_pair(&last, CHAIN_OFFSET),
-            Some([(2676, 0xffff), (0xffff, 0)]),
-            "the last-inserted record has no next"
-        );
+        for (n, (slot, _)) in records.iter().enumerate() {
+            let bytes = &file[*slot..*slot + 22];
+            let group = n / 3;
+            let within = n % 3;
+            let expected = [
+                if within == 0 { NOWHERE } else { records[n - 1].1 },
+                if within == 2 { NOWHERE } else { records[n + 1].1 },
+            ];
+            assert_eq!(
+                chain_pair(bytes, CHAIN_OFFSET),
+                Some(expected),
+                "record {n} (value {group}, {} of its group)",
+                within + 1
+            );
+        }
 
-        // The middle record's own address does not appear in the index (only
-        // head and tail are kept there), but the chain is internally
-        // consistent about it: the first record's `next` and the last
-        // record's `prev` both name it, and they agree with each other.
-        assert_eq!(chain_pair(&first, CHAIN_OFFSET).unwrap()[1].0, 2676);
-        assert_eq!(chain_pair(&last, CHAIN_OFFSET).unwrap()[0].0, 2676);
-
-        // And the ends DO appear in the index, from the previous test:
-        // middle.prev is the first record's own address, which is entry
-        // value 9's `head` (2654); middle.next is the last record's own
-        // address, entry value 9's `tail` (2698).
-        assert_eq!(chain_pair(&middle, CHAIN_OFFSET).unwrap()[0].0, 2654, "== index head");
-        assert_eq!(chain_pair(&middle, CHAIN_OFFSET).unwrap()[1].0, 2698, "== index tail");
-
-        // Value 7: the same shape, but the first two records physically sit
-        // on page 10 (file positions 5590, 5612) and the third was written
-        // onto page 8 (position 4104) -- a genuine page-crossing chain, not a
-        // hand-picked easy case. The chain still agrees with itself and with
-        // the index's head (1492) and tail (2566) for value 7, exactly as
-        // the same-page group above does.
-        let first7 = hex("070000001500000000000000ffffffff0000ea050100");
-        let middle7 = hex("0700000016000000000000000000d4050000060a0000");
-        let last7 = hex("0700000017000000000000000000ea05ffffffff0100");
-
-        assert_eq!(chain_pair(&middle7, CHAIN_OFFSET).unwrap()[0].0, 1492, "== index head for 7");
-        assert_eq!(chain_pair(&middle7, CHAIN_OFFSET).unwrap()[1].0, 2566, "== index tail for 7");
-        assert_eq!(chain_pair(&first7, CHAIN_OFFSET).unwrap()[1].0, 1514, "first7.next == middle7's own address");
-        assert_eq!(chain_pair(&last7, CHAIN_OFFSET).unwrap()[0].0, 1514, "last7.prev == middle7's own address");
+        // And the index's ends are the chain's ends. Read off the same leaf
+        // `a_duplicate_leafs_head_and_tail_are_the_first_and_last_inserted_record`
+        // decodes, so the two halves of the format are checked against each
+        // other rather than each against its own reading.
+        let leaf = decode_index_page(
+            &file[9 * 512..10 * 512],
+            Shape {
+                length: 4,
+                duplicates: true,
+            },
+        )
+        .expect("the real engine's own leaf");
+        for (at, (key, head, _)) in leaf.entries.iter().enumerate() {
+            let value = u32::from_le_bytes(key.clone().try_into().expect("4-byte key"));
+            let group = value as usize;
+            assert_eq!(*head, records[group * 3].1, "value {value}'s head");
+            assert_eq!(leaf.tails[at], records[group * 3 + 2].1, "value {value}'s tail");
+        }
 
         // `None` past the end of a short buffer -- the guard that stops this
         // from panicking on a record whose declared physical length turns
         // out to be too short to hold the chain a duplicate key's descriptor
         // promises.
-        assert_eq!(chain_pair(&first[..20], CHAIN_OFFSET), None);
-    }
-
-    /// Bytes from a hex string, for the two tests above -- shorter to read
-    /// than a byte-array literal at 22 bytes a line.
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
-            .collect()
+        let short = &file[records[0].0..records[0].0 + 20];
+        assert_eq!(chain_pair(short, CHAIN_OFFSET), None);
     }
 
     /// The count invariant, restated, exercised through the actual production
