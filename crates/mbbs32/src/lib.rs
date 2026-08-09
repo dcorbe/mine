@@ -31,14 +31,23 @@
 //! It is not a host. Imports bind to thunks that report which symbol was wanted;
 //! nothing services them.
 //!
+//! [`Image::load`] maps a [`PeImage`] and copies its sections into place, but
+//! leaves every page `PROT_READ | PROT_WRITE | PROT_EXEC` -- section
+//! characteristics are parsed (`Section::characteristics`) but not yet turned
+//! into per-page protections. `CODE` being writable and `.reloc` being
+//! present at runtime at all are both looser than the real module needs;
+//! tightening that is later work, not a gap this crate is unaware of.
+//!
 //! # Testing
 //!
 //! **Run the tests in both profiles.** `cargo test -p mbbs32` and
 //! `cargo test -p mbbs32 --release` are not the same check -- see the sibling
 //! crate's note for the measurement behind that.
 
+mod image;
 mod map;
 mod pe;
 
+pub use image::Image;
 pub use map::Mapping;
 pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section, Symbol};

@@ -6,7 +6,9 @@
 //! kernel state, so these tests check real kernel state back, not merely that
 //! a `Result` came back `Ok`.
 
-use mbbs32::Mapping;
+use std::path::{Path, PathBuf};
+
+use mbbs32::{Image, Mapping, PeImage};
 
 #[test]
 fn base_is_non_null_below_4gib_and_page_aligned() {
@@ -56,5 +58,92 @@ fn drop_actually_unmaps() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ENOMEM),
         "ENOMEM is msync's documented answer for an unmapped range"
+    );
+}
+
+/// The real 32-bit MajorMUD module, the same fixture
+/// `tests/wccmmud.rs` uses -- see that file for the measured layout these
+/// tests depend on. Skips loudly rather than failing when the fixture is
+/// absent, matching `crates/mbbs16/tests/wccmmud.rs`.
+fn module_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("re/wg_nt_ref/WCCNT8PJ/out/wccmmud.dll"))?;
+    if path.exists() {
+        Some(path)
+    } else {
+        eprintln!("skipped: re/wg_nt_ref/WCCNT8PJ/out/wccmmud.dll is not present");
+        None
+    }
+}
+
+fn loaded() -> Option<(Vec<u8>, PeImage, Image)> {
+    let file = std::fs::read(module_path()?).expect("the fixture is readable");
+    let image = PeImage::parse(&file).expect("the fixture parses");
+    let mapped = Image::load(&file, &image).expect("the fixture maps");
+    Some((file, image, mapped))
+}
+
+#[test]
+fn every_sections_raw_bytes_land_at_its_rva() {
+    let Some((file, image, mapped)) = loaded() else {
+        return;
+    };
+    for section in &image.sections {
+        let rva = section.rva as usize;
+        let raw_offset = section.raw_offset as usize;
+        let raw_size = section.raw_size as usize;
+        assert_eq!(
+            &mapped.as_slice()[rva..rva + raw_size],
+            &file[raw_offset..raw_offset + raw_size],
+            "section {:?} did not land at its rva",
+            section.name
+        );
+    }
+}
+
+#[test]
+fn the_bss_tail_arrives_zeroed_and_is_not_the_next_sections_bytes() {
+    let Some((file, image, mapped)) = loaded() else {
+        return;
+    };
+
+    let data = image
+        .sections
+        .iter()
+        .find(|s| s.name == "DATA")
+        .expect("the module has a DATA section");
+    let idata = image
+        .sections
+        .iter()
+        .find(|s| s.name == ".idata")
+        .expect("the module has an .idata section");
+
+    let tail_start = (data.rva + data.raw_size) as usize;
+    let tail_end = (data.rva + data.virtual_size) as usize;
+    assert_eq!(
+        tail_end - tail_start,
+        0xc400,
+        "DATA's measured BSS tail size"
+    );
+
+    let tail = &mapped.as_slice()[tail_start..tail_end];
+    assert!(
+        tail.iter().all(|&b| b == 0),
+        "DATA's BSS tail must arrive zeroed, not carry whatever the file \
+         happens to hold past DATA's own raw data"
+    );
+
+    // The other half of the same assertion: not merely "zero", but
+    // specifically *not* .idata's raw bytes, which is what a `virtual_size`
+    // copy would put there -- DATA's raw data on disk ends at exactly the
+    // file offset .idata's raw data begins.
+    let idata_raw_start = idata.raw_offset as usize;
+    let idata_raw_len = (idata.raw_size as usize).min(tail.len());
+    assert_ne!(
+        &tail[..idata_raw_len],
+        &file[idata_raw_start..idata_raw_start + idata_raw_len],
+        ".idata's raw bytes must not have landed in DATA's BSS tail"
     );
 }
