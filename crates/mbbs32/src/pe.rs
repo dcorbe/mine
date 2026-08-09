@@ -41,6 +41,20 @@ pub enum PeError {
 
     /// The image says its relocations were stripped, so it cannot be rebased.
     RelocsStripped,
+
+    /// `SizeOfOptionalHeader` is smaller than this parser trusts to place the
+    /// section table.
+    ///
+    /// The section table sits at `opt + SizeOfOptionalHeader`. A value that
+    /// is too small points that address back into the optional header's own
+    /// data directories -- which still bounds-checks cleanly, so parsing
+    /// would otherwise succeed with a `PeImage` whose sections describe the
+    /// wrong bytes rather than failing. This is a floor, not the real
+    /// module's exact `0xe0`: legitimate toolchains vary this field, and only
+    /// a value that cannot even cover the fields already read from the
+    /// header (out to `opt + 56`, i.e. the header must reach `opt + 0x60`) is
+    /// rejected.
+    BadOptionalHeaderSize { size: u16 },
 }
 
 impl fmt::Display for PeError {
@@ -68,6 +82,10 @@ impl fmt::Display for PeError {
             Self::RelocsStripped => {
                 write!(f, "the image has no relocations and cannot be rebased")
             }
+            Self::BadOptionalHeaderSize { size } => write!(
+                f,
+                "optional header size {size:#x} is too small to place the section table"
+            ),
         }
     }
 }
@@ -129,6 +147,21 @@ const PE32_MAGIC: u16 = 0x010b;
 /// `IMAGE_FILE_RELOCS_STRIPPED` in the COFF characteristics word.
 const RELOCS_STRIPPED: u16 = 0x0001;
 
+/// The smallest `SizeOfOptionalHeader` this parser trusts.
+///
+/// Every optional-header field this parser reads -- through `SizeOfImage` at
+/// `opt + 56` -- fits inside the first `0x60` bytes, which not coincidentally
+/// is also where the real header's data directories begin (see `DIR_*`
+/// below). A file reporting less than this cannot even cover the fields
+/// already read out of it, which means the section table -- located at
+/// `opt + SizeOfOptionalHeader` -- would be read from inside the optional
+/// header rather than after it. This is a floor, not equality against the
+/// real module's `0xe0`: legitimate toolchains vary this field, and the goal
+/// is to catch a value that makes the section table land somewhere
+/// impossible, not to reject every file that isn't a bit-for-bit match of the
+/// one module this crate was measured against.
+const MIN_OPTIONAL_HEADER_SIZE: u16 = 0x60;
+
 /// A parsed PE32 image. Plain data: nothing here is mapped or allocated.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -169,6 +202,9 @@ impl PeImage {
         }
         let nsections = r.u16("section count", pe + 6)?;
         let optional_size = r.u16("optional header size", pe + 20)?;
+        if optional_size < MIN_OPTIONAL_HEADER_SIZE {
+            return Err(PeError::BadOptionalHeaderSize { size: optional_size });
+        }
         let characteristics = r.u16("characteristics", pe + 22)?;
 
         let opt = pe + 24;
@@ -183,7 +219,24 @@ impl PeImage {
         let file_alignment = r.u32("file alignment", opt + 36)?;
         let size_of_image = r.u32("size of image", opt + 56)?;
 
-        let _ = (nsections, optional_size);
+        let table = opt + usize::from(optional_size);
+        let mut sections = Vec::with_capacity(usize::from(nsections));
+        for i in 0..usize::from(nsections) {
+            let at = table + i * 40;
+            let raw = r.slice("section name", at, 8)?;
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            sections.push(Section {
+                // Latin-1, not UTF-8: these are 1990s toolchain output and a
+                // non-ASCII byte is a name, not a decoding error.
+                name: raw[..end].iter().map(|&b| b as char).collect(),
+                rva: r.u32("section rva", at + 12)?,
+                virtual_size: r.u32("section virtual size", at + 8)?,
+                raw_size: r.u32("section raw size", at + 16)?,
+                raw_offset: r.u32("section raw offset", at + 20)?,
+                characteristics: r.u32("section characteristics", at + 36)?,
+            });
+        }
+
         Ok(Self {
             image_base,
             size_of_image,
@@ -191,13 +244,41 @@ impl PeImage {
             file_alignment,
             entry_point,
             characteristics,
-            sections: Vec::new(),
+            sections,
         })
     }
 
     /// Whether the image can be loaded anywhere, or only at `image_base`.
     pub fn rebasable(&self) -> bool {
         self.characteristics & RELOCS_STRIPPED == 0
+    }
+
+    /// The file offset an RVA's bytes live at.
+    ///
+    /// Only defined where the section has file bytes: an RVA inside a
+    /// section's BSS tail -- past `SizeOfRawData` but within `VirtualSize` --
+    /// exists once the image is mapped and nowhere in the file. Answering
+    /// with a plausible offset there would silently read the *next*
+    /// section's bytes.
+    ///
+    /// The arithmetic here is deliberately subtraction-then-compare rather
+    /// than `s.rva + s.raw_size`: both are attacker-controlled `u32`s read
+    /// straight from the file, and a sum close to `u32::MAX` would overflow
+    /// and panic in a debug build -- exactly the kind of malformed-file panic
+    /// this parser exists to never produce.
+    ///
+    /// # Errors
+    ///
+    /// If no section covers the RVA.
+    pub fn rva_to_file(&self, rva: u32) -> Result<usize, PeError> {
+        for s in &self.sections {
+            if let Some(offset) = rva.checked_sub(s.rva)
+                && offset < s.raw_size
+            {
+                return Ok(s.raw_offset as usize + offset as usize);
+            }
+        }
+        Err(PeError::UnmappedRva { rva })
     }
 }
 
