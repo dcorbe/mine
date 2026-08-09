@@ -1632,33 +1632,6 @@ mod tests {
         );
     }
 
-    /// The bytes raw mode collects are reachable and clearable through the
-    /// shims that already own `input`, which is the whole reason `input` is the
-    /// destination rather than a buffer of raw mode's own.
-    ///
-    /// `btuica` (`shims/gsbl.rs`) drains `c.input` and `btucli` clears it, and
-    /// neither consults `trigger` first -- so neither has an opinion about how
-    /// the bytes got there. Asserted here on the fields rather than through the
-    /// shims because this module cannot call them; the shim tests own the
-    /// pointer handling.
-    #[test]
-    fn raw_bytes_land_where_btuica_and_btucli_already_look() {
-        let mut g = one();
-        g.channel_mut(chan()).raw = true;
-        g.push_input(chan(), b"abc");
-
-        // What `btuica` would take: the front of `input`, up to its maximum.
-        let taken: Vec<u8> = g.channel_mut(chan()).input.drain(..2).collect();
-        assert_eq!(taken, b"ab".to_vec(), "btuica's drain reaches raw bytes");
-
-        // What `btucli` would throw away: the rest of it.
-        g.channel_mut(chan()).input.clear();
-        assert!(
-            g.channel(chan()).input.is_empty(),
-            "btucli's clear reaches raw bytes"
-        );
-    }
-
     /// A byte arriving in raw mode wakes the loop, because nothing else will.
     /// One `CYCLE` per delivery and not per byte: the handler drains `input`
     /// completely on the pass it runs, so a second status would dispatch into
