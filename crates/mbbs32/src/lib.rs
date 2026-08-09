@@ -11,9 +11,15 @@
 //! # Two things this is not
 //!
 //! It is not a Windows loader. No TLS callbacks, no SEH, no resources, no
-//! delay-imports, no forwarded exports -- the module measured here needs none of
-//! them, and a loader that implements what its input does not contain is
-//! untested code pretending to be a feature.
+//! delay-imports -- the module measured here needs none of them, and a loader
+//! that implements what its input does not contain is untested code pretending
+//! to be a feature.
+//!
+//! Forwarded exports are the one thing here that is *detected but not
+//! serviced*: a forwarder's "address" is a `"DLL.Symbol"` string rather than
+//! code, so mistaking one for an RVA hands back a pointer into text. The
+//! measured module forwards nothing, and following a forwarder into another DLL
+//! is a Windows loader's job, not this one's.
 //!
 //! It is not a host. Imports bind to thunks that report which symbol was wanted;
 //! nothing services them.
