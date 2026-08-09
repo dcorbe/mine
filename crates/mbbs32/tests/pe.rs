@@ -1072,11 +1072,15 @@ fn exports_resolve_through_the_name_ordinal_indirection_not_position_or_base() {
     //     position) instead of to AddressOfNameOrdinals[i] gets Beta and
     //     Alpha wrong (Gamma coincidentally lands right either way, at
     //     index 2, which is exactly why the other two entries matter).
-    //   - Base is 5, not 1: nothing here subtracts it. If it were
-    //     mistakenly treated as ordinal-relative (`functions[ordinal -
-    //     base]`), every one of these ordinals (3, 0, 2) is smaller than
-    //     Base and the subtraction underflows -- loudly wrong rather than
-    //     coincidentally right, which a Base of 1 could not guarantee.
+    //   - Base is 5, not 0: nothing here combines it with an ordinal. The
+    //     property that matters is `Base != 0` together with a non-identity
+    //     ordinal array -- if the resolution were mistakenly
+    //     `functions[ordinal - base]` or `functions[ordinal + base]`, every
+    //     one of these ordinals (3, 0, 2) would be pushed out of bounds or
+    //     onto the wrong entry, for any nonzero Base. `Base = 1` would catch
+    //     the same bug just as reliably; 5 is used only so a mistaken
+    //     subtraction underflows uniformly instead of underflowing for some
+    //     ordinals and merely misindexing for others.
     let mut v = with_one_export_section();
     let sec = 0x98 + 0xe0;
     let raw = sec + 40;
