@@ -121,6 +121,19 @@ static unsigned fs_indexes(const FileSpec *fs)
  */
 #define KFLG_SEGMENTED 0x0010
 
+/* Key flag bit 6: this key is ordered from the largest value down. `cmd_walk`
+ * flags a step that goes the wrong way as an ORDER REGRESSION, and without
+ * this it flagged every step of a descending key -- so it could not validate
+ * one at all, and reported WALK MISMATCH on a walk that was exactly right.
+ * `WCCUSERS` key 2 is MajorMUD's experience field, descending and permitting
+ * duplicates, which is the key this program most needs to be able to check.
+ *
+ * The count it produced was itself evidence of what it was measuring: a forged
+ * file of 150 records over 54 distinct values reported 53 regressions -- one
+ * per strictly-decreasing step, none for the steps within a duplicate group,
+ * because equal keys compare equal in either direction. */
+#define KFLG_DESCENDING 0x0040
+
 /* Where key `keynum` starts in the spec array, and how long it is in total.
  * Returns 0 if the file has no such key. */
 static int key_extent(const KeySpec *specs, unsigned specs_len, unsigned keys,
@@ -482,7 +495,7 @@ static void cmd_walk(const char *path, int keynum)
     unsigned long count = 0, regressions = 0;
     unsigned klen, first, length = 0, segments = 0;
     enum collation coll;
-    int st, have_prev = 0;
+    int st, have_prev = 0, descending = 0;
 
     st = open_file(posblk, path, MODE_READ_ONLY);
     if (st != ST_OK)
@@ -500,6 +513,7 @@ static void cmd_walk(const char *path, int keynum)
          * how to order a single one, and reports "not checked" rather than
          * manufacturing violations out of a whole-blob compare. */
         coll = segments == 1 ? collation_of(keys[first].ext_type, klen) : COLL_UNKNOWN;
+        descending = (keys[first].flags & KFLG_DESCENDING) != 0;
     }
 
     dlen = DATA_SIZE;
@@ -509,7 +523,9 @@ static void cmd_walk(const char *path, int keynum)
 
     while (st == ST_OK) {
         count++;
-        if (have_prev && klen && key_cmp(prev, keybuf, klen, coll) > 0) {
+        if (have_prev && klen
+            && (descending ? key_cmp(prev, keybuf, klen, coll) < 0
+                           : key_cmp(prev, keybuf, klen, coll) > 0)) {
             regressions++;
             if (regressions <= 5) {
                 printf("  ORDER REGRESSION at record %lu: ", count);
@@ -541,8 +557,9 @@ static void cmd_walk(const char *path, int keynum)
         print_key(prev, klen);
         printf("\n");
     }
-    printf("key         %d (len %u, %u segment(s), type %u, %s)\n", keynum, klen,
-           segments, keys[first].ext_type, collation_name(coll));
+    printf("key         %d (len %u, %u segment(s), type %u, %s%s)\n", keynum, klen,
+           segments, keys[first].ext_type, collation_name(coll),
+           descending ? ", descending" : "");
     printf("walked      %lu\n", count);
     printf("stat says   %lu\n", (unsigned long)fs.records);
     printf("regressions %lu%s\n", regressions,
