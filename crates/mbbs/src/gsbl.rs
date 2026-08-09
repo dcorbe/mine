@@ -192,6 +192,18 @@ impl Gsbl {
     /// page 155, status 3).
     pub const CRSTG: i16 = 3;
 
+    /// `CYCLE` -- the "cycle-thru-other-users" pseudo-status, `MAJORBBS.H:236`.
+    ///
+    /// What a module injects at itself to be called back on the next pass.
+    /// `fsdnfy()` (`FSDBBS.C:368`) is its whole body:
+    ///
+    ///
+    /// It reaches `stsrou`, not `sttrou`: `susing()` (`MAJORBBS.C:2478`) names
+    /// `POLSTS`, the hangup statuses, `CRSTG`, `OBFCLR`, `ABOREQ` and `OUTMT`
+    /// as cases and lets everything else fall to
+    /// `default: (*(module[usrptr->state]->stsrou))()`.
+    pub const CYCLE: i16 = 240;
+
     /// `INBLK` -- byte-count-triggered input data is available (status 4).
     pub const INBLK: i16 = 4;
 
@@ -1454,5 +1466,13 @@ mod tests {
             Some(0),
             "three tests did not consume channel 0's turn"
         );
+    }
+
+    /// `MAJORBBS.H:236`. The value matters because a module injects it by
+    /// number through `btuinj`, and `fsdnfy()` (`FSDBBS.C:368`) is nothing but
+    /// `btuinj(usrnum, CYCLE)`.
+    #[test]
+    fn cycle_is_the_number_the_module_injects() {
+        assert_eq!(Gsbl::CYCLE, 240);
     }
 }
