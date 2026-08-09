@@ -9,5 +9,8 @@ publish.workspace = true
 libc = "0.2"
 mbbs16 = { path = "../mbbs16" }
 
+[dev-dependencies]
+btrieve-engine = { path = "../btrieve-engine" }
+
 [lints]
 workspace = true

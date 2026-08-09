@@ -175,12 +175,23 @@ impl Records {
     /// record inserted into a slot freed by a deletion has a low position and a
     /// late insertion.
     ///
-    /// It cannot be measured because all four keys in MajorMUD's files that
-    /// permit duplicates -- `WCCUSERS` key 2, `WCCGANGS` key 1, `WCCBANKS`
-    /// key 0, `WCCITOWN` key 1 -- are in files that hold no records at all.
-    /// So this counts the pairs where it *could* matter, and the host reports
-    /// the number rather than letting the difference be silent. On a board
-    /// nobody has played on, every one of them is zero.
+    /// It cannot be measured **against MajorMUD's own shipped data**, because
+    /// all four keys in MajorMUD's files that permit duplicates -- `WCCUSERS`
+    /// key 2, `WCCGANGS` key 1, `WCCBANKS` key 0, `WCCITOWN` key 1 -- are in
+    /// files that hold no records at all. So this counts the pairs where it
+    /// *could* matter, and the host reports the number rather than letting
+    /// the difference be silent. On a board nobody has played on, every one
+    /// of them is zero.
+    ///
+    /// **The assumption itself has since been measured, against a file that
+    /// isn't MajorMUD's.**
+    /// `crates/mbbs/tests/engine_diff.rs`'s `duplicate_insertion_order_the_real_engine_uses`
+    /// (`docs/plans/2026-08-09-btrieve-engine-in-the-loop.md`, Task 8) inserts
+    /// five colliding records through the genuine Btrieve engine and reads
+    /// its chain-walk order back: it is insertion order, agreeing with what
+    /// this module assumes. One collision group of five is not every shape a
+    /// duplicate chain can take, but it is the first time this ever had an
+    /// engine-measured answer rather than an assumption stated as one.
     ///
     /// **For a file this host itself indexed the difference is gone**, and
     /// this still counts: [`Block::reindex`](super::Block::reindex) writes the
