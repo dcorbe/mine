@@ -3804,6 +3804,16 @@ mod tests {
         assert_eq!(Ended::Waiting { next_kick: 60 }.wait(), Wait::Until(60));
         assert_eq!(Ended::Bound { next_kick: None }.wait(), Wait::Now);
         assert_eq!(Ended::Bound { next_kick: Some(3) }.wait(), Wait::Now);
+
+        // The arm a driver reaches once and never returns from. Left out of
+        // the first draft of this test, and review found it by mutating
+        // `Wait::Stop` to `Wait::Blocked` and watching all 773 tests stay
+        // green -- a driver that blocked forever on a stopped module instead
+        // of shutting down, with nothing to say so.
+        assert_eq!(
+            Ended::Stopped(mbbs16::Poison::Timeout { cs: 0, ip: 0 }).wait(),
+            Wait::Stop
+        );
     }
 
     /// `MAJORBBS.C:476` is `while (tcklst != ticker)`, which was safe only
