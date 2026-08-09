@@ -420,6 +420,15 @@ pub struct PeImage {
     pub sections: Vec<Section>,
     pub relocations: Vec<Relocation>,
     pub imports: Vec<Import>,
+    /// Every *named* export. Functions exported by ordinal only
+    /// (`NumberOfFunctions > NumberOfNames`) are silently absent -- there is
+    /// no name to key them by, and nothing through Task 17 needs one. This
+    /// is not hypothetical: measured against the two host binaries in this
+    /// repo, `WGSERVER.EXE` has 1615 functions but only 1393 names (222
+    /// ordinal-only), and `GALGSBL.DLL` has 109 functions but only 89 names
+    /// (20 ordinal-only). `export_rva` returning `None` for such a symbol is
+    /// indistinguishable from the symbol not existing at all. See the crate
+    /// doc's "Two things this is not" for the scope decision.
     pub exports: Vec<Export>,
     /// The export directory's `Base` field (`+16`): the value that would be
     /// added to a function's index in `AddressOfFunctions` to produce its

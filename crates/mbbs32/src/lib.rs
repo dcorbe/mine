@@ -21,6 +21,13 @@
 //! measured module forwards nothing, and following a forwarder into another DLL
 //! is a Windows loader's job, not this one's.
 //!
+//! Exports with no name (`NumberOfFunctions > NumberOfNames`) are not
+//! surfaced by [`PeImage::exports`] at all -- not hypothetical:
+//! `WGSERVER.EXE` has 222 such ordinal-only exports out of 1615 functions,
+//! and `GALGSBL.DLL` has 20 out of 109. Nothing through Task 17 parses those
+//! files, so it is inert today, but `export_rva` returning `None` for one is
+//! indistinguishable from the symbol not existing.
+//!
 //! It is not a host. Imports bind to thunks that report which symbol was wanted;
 //! nothing services them.
 //!
