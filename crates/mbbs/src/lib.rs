@@ -537,6 +537,20 @@ pub struct Host {
     /// `finish_init` has run.
     pub(crate) fsd_state: Option<usize>,
 
+    /// Per-channel state an entry session needs that no module can see, so
+    /// it lives only here rather than round-tripping through `Machine` the
+    /// way [`Scb`](fsd::Scb) does.
+    ///
+    /// `FSDBBS.C`'s own home for these is `struct fsdbbs` (`fsdusr`):
+    /// `whndun` there is a far pointer into the module the host must call
+    /// back, and the save/quit flag is `fsdusr->flags & FBSAVE`, read by
+    /// `goback()` after the session's own buffer may already be gone. Both
+    /// are genuinely invisible to the module -- unlike `Scb`'s bytes, which
+    /// the module dereferences directly -- so they are Rust-side. Indexed by
+    /// [`Chan::index`], for the reason [`Host::fsdscb`] is: one session per
+    /// channel, not one shared by all of them.
+    pub(crate) fsd_sessions: Vec<Option<FsdSession>>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -623,6 +637,21 @@ fn caller(machine: &Machine, module: &Module) -> Option<String> {
 enum PollTarget {
     Entry(usize),
     Poll,
+}
+
+/// The two things about an FSD session no module can see. See
+/// [`Host::fsd_sessions`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FsdSession {
+    /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
+    /// module passed `NULL` -- `goback()`'s own `else` branch
+    /// (`FSDBBS.C:236`) is what a `None` here means to it.
+    pub whndun: Option<FarPtr>,
+
+    /// Whether the session is exiting to save (`FSDSAV`) or to quit
+    /// (`FSDQIT`). `fsdusr->flags & FBSAVE`, read by `goback()` after
+    /// `xitfsd` decided.
+    pub save: bool,
 }
 
 impl Host {
@@ -764,6 +793,7 @@ impl Host {
             fsdscb: vec![None; usize::from(terms.count())],
             fsdtmp: vec![None; usize::from(terms.count())],
             fsd_state: None,
+            fsd_sessions: vec![None; usize::from(terms.count())],
             heap,
             users,
             asked: Vec::new(),

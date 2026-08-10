@@ -98,6 +98,11 @@ pub mod scb {
     pub const MBPUNC: u16 = 8;
     /// `char *newans` -- the answer string this session is building.
     pub const NEWANS: u16 = 12;
+    /// `int (*fldvfy)(int fldno, char *answer)` -- the field verify routine,
+    /// or NULL. A far function pointer, four bytes, the same as the data
+    /// pointers ahead of it -- confirmed by [`CRSATR`] landing at 20, which
+    /// only holds if this is 16 through 19.
+    pub const FLDVFY: u16 = 16;
     /// `char crsatr` -- the attribute of the field the cursor is on.
     pub const CRSATR: u16 = 20;
     /// `int numfld` -- how many fields the specification names.
@@ -127,6 +132,75 @@ pub mod scb {
     /// `MAJORBBS-mbbstd.EXE` they are `mov byte [es:bx+0x9d],0x10` at
     /// `28:0x12e1` and `mov byte [es:bx+0x9d],0x0` at `28:0x132c`.
     pub const FLAGS: u16 = 157;
+
+    /// `char state` -- the entry engine's own state code, see [`state`].
+    /// `fsdlin()` sets it last (`FSD.C:847`), which is how [`FLAGS`]'s own
+    /// doc comment above pins offset 157 -- 44 is the running total that
+    /// gets there one member earlier, cross-checked against
+    /// `the_session_control_block_is_the_size_the_header_declares`'s own
+    /// tally.
+    pub const STATE: u16 = 44;
+
+    /// `char ansbuf[ANSLEN+1]` -- the answer being typed, as a NUL-terminated
+    /// C string. 81 bytes (`ANSLEN`, 80, plus the terminator), `FSD.H:307`.
+    pub const ANSBUF: u16 = 45;
+
+    /// `char crsfld` -- `fsdinc()`'s idea of the current cursor field.
+    /// `FSD.H:314`.
+    pub const CRSFLD: u16 = 151;
+
+    /// `int xitkey` -- the keystroke that initiated exit of the field.
+    /// `FSD.H:319`.
+    pub const XITKEY: u16 = 162;
+
+    /// `char chgcnt` -- count of changes during the session. `FSD.H:320`.
+    pub const CHGCNT: u16 = 164;
+}
+
+/// FSD entry-engine state codes, `FSD.H:326-334`. `fsdscb->state` drives
+/// `fsdinc()`'s outer switch (Task 6-9's scope); named here rather than as
+/// magic numbers, because [`fsdlin`] already writes one of them.
+pub mod state {
+    /// Beginning, ANSI point mode. Stage 5 -- `fsdent`, not built by this
+    /// host.
+    pub const FSDAPT: u8 = 0;
+    /// Entering stuff, ANSI mode. Stage 5.
+    pub const FSDAEN: u8 = 1;
+    /// Non-ANSI point mode -- what [`fsdlin`] leaves a fresh session in
+    /// (`FSD.C:847`).
+    pub const FSDNPT: u8 = 2;
+    /// Non-ANSI entry mode: a field is being typed into.
+    pub const FSDNEN: u8 = 3;
+    /// Entry ready, buffering new keystrokes for `fsdprc`.
+    pub const FSDBUF: u8 = 4;
+    /// Entry processed, but still buffering keystrokes.
+    pub const FSDSTB: u8 = 5;
+    /// Need to wipe out the help message. ANSI only.
+    pub const FSDKHP: u8 = 6;
+    /// Exit the session, saving the answers.
+    pub const FSDSAV: u8 = 7;
+    /// Exit the session, discarding the answers.
+    pub const FSDQIT: u8 = 8;
+}
+
+/// `fsdscb->flags`, `FSD.H:397-403`. The entry engine's own session flags --
+/// distinct from a *field*'s `FFF*` flags in [`flags`], which live on each
+/// [`Field`] instead.
+pub mod entry_flags {
+    /// Major `fsdinc()`-induced output has taken place and we're not yet
+    /// sure it all went out.
+    pub const FSDQOT: u8 = 0x01;
+    /// Cursor shuffle NOT sent, need to shuffle cursor.
+    pub const FSDSHN: u8 = 0x02;
+    /// Alternate value entry has begun.
+    pub const FSDANT: u8 = 0x04;
+    /// Alternate value entered.
+    pub const FSDALT: u8 = 0x08;
+    /// ANSI supported this session? [`move_field`]'s `wrap` argument is
+    /// `udwrap && fsdscb->flags&FSDANS` -- see its own doc comment.
+    pub const FSDANS: u8 = 0x10;
+    /// Ignore answer, just move cursor.
+    pub const FSDIGA: u8 = 0x20;
 }
 
 /// Where each member of `struct fsdfld` sits. `FSD.H:247`.
@@ -492,6 +566,94 @@ impl Scb {
     /// Set [`Scb::allans`].
     pub fn set_allans(&mut self, value: u16) {
         self.set_word(scb::ALLANS, value);
+    }
+
+    /// `fldvfy`: the field verify routine the module gave `fsdego`, or
+    /// [`FarPtr::NULL`] if it passed none.
+    pub fn fldvfy(&self) -> FarPtr {
+        self.ptr(scb::FLDVFY)
+    }
+    /// Set [`Scb::fldvfy`].
+    pub fn set_fldvfy(&mut self, value: FarPtr) {
+        self.set_ptr(scb::FLDVFY, value);
+    }
+
+    /// `state`: the entry engine's own state code. See [`state`].
+    pub fn state(&self) -> u8 {
+        self.byte(scb::STATE)
+    }
+    /// Set [`Scb::state`].
+    pub fn set_state(&mut self, value: u8) {
+        self.set_byte(scb::STATE, value);
+    }
+
+    /// `ansbuf`: the answer currently being typed, up to its NUL terminator.
+    /// `strcpy(fsdscb->ansbuf, ...)` is how the original writes it, so the
+    /// bytes after the terminator -- if any survive from an earlier,
+    /// shorter answer -- are not part of the string and are not returned.
+    pub fn ansbuf(&self) -> &[u8] {
+        let at = usize::from(scb::ANSBUF);
+        let len = usize::from(ANSLEN) + 1;
+        let raw = &self.bytes[at..at + len];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        &raw[..end]
+    }
+    /// Set [`Scb::ansbuf`], NUL-terminated, the way `strcpy` leaves it.
+    ///
+    /// # Panics
+    ///
+    /// If `value` does not fit in `ANSLEN+1` bytes with its terminator. The
+    /// original's `strcpy` has no such check -- every real caller's answer
+    /// is already bounded by `fldptr->width <= ANSLEN`, so this is `fsdroom`'s
+    /// refusal-over-corruption discipline applied to a member `fsdroom`
+    /// itself never touches.
+    pub fn set_ansbuf(&mut self, value: &[u8]) {
+        let cap = usize::from(ANSLEN) + 1;
+        assert!(
+            value.len() < cap,
+            "ansbuf is ANSLEN+1 ({cap}) bytes and a {}-byte answer plus its \
+             terminator does not fit",
+            value.len()
+        );
+        let at = usize::from(scb::ANSBUF);
+        self.bytes[at..at + value.len()].copy_from_slice(value);
+        self.bytes[at + value.len()] = 0;
+    }
+
+    /// `crsfld`: `fsdinc()`'s idea of the current cursor field.
+    pub fn crsfld(&self) -> u8 {
+        self.byte(scb::CRSFLD)
+    }
+    /// Set [`Scb::crsfld`].
+    pub fn set_crsfld(&mut self, value: u8) {
+        self.set_byte(scb::CRSFLD, value);
+    }
+
+    /// `flags`: the entry session's own flags. See [`entry_flags`].
+    pub fn flags(&self) -> u8 {
+        self.byte(scb::FLAGS)
+    }
+    /// Set [`Scb::flags`].
+    pub fn set_flags(&mut self, value: u8) {
+        self.set_byte(scb::FLAGS, value);
+    }
+
+    /// `xitkey`: the keystroke that initiated exit of the field.
+    pub fn xitkey(&self) -> u16 {
+        self.word(scb::XITKEY)
+    }
+    /// Set [`Scb::xitkey`].
+    pub fn set_xitkey(&mut self, value: u16) {
+        self.set_word(scb::XITKEY, value);
+    }
+
+    /// `chgcnt`: count of changes during the session.
+    pub fn chgcnt(&self) -> u8 {
+        self.byte(scb::CHGCNT)
+    }
+    /// Set [`Scb::chgcnt`].
+    pub fn set_chgcnt(&mut self, value: u8) {
+        self.set_byte(scb::CHGCNT, value);
     }
 }
 
@@ -2394,6 +2556,22 @@ mod tests {
         assert_eq!(scb::NUMFLD, 21);
         assert_eq!(scb::HLPOFF, 40);
         assert_eq!(scb::ALLANS, 42);
+        assert_eq!(scb::FLDVFY, 16, "the four pointers ahead of crsatr");
+        assert_eq!(scb::STATE, 44, "the byte right after allans");
+        assert_eq!(scb::ANSBUF, 45, "state's own one byte later");
+        assert_eq!(
+            scb::CRSFLD,
+            151,
+            "45 (ansbuf) + 81 + 1 (anslen) + 1 (ansptr) + 20 (typahd) + 1 \
+             (ahdptr) + 1 (hdlahd) + 1 (entfld)"
+        );
+        assert_eq!(
+            scb::FLAGS,
+            157,
+            "crsfld(151) + 1 (crsfld itself) + 1 (shffld) + 4 (ftmptr)"
+        );
+        assert_eq!(scb::XITKEY, 162, "flags(157) + 1 + 4 (altptr)");
+        assert_eq!(scb::CHGCNT, 164, "xitkey(162) + 2");
     }
 
     #[test]
@@ -2405,6 +2583,94 @@ mod tests {
         // nothing would say so.
         assert_eq!(scb::FLDDAT, 4);
         assert_eq!(scb::NEWANS, 12);
+    }
+
+    /// A fresh, zeroed control block, the way `alczer` leaves one.
+    fn zeroed_scb() -> Scb {
+        Scb::from_bytes(&[0u8; FSDSCB as usize]).expect("exactly FSDSCB bytes")
+    }
+
+    #[test]
+    fn scb_fldvfy_reads_and_writes_only_its_own_offset() {
+        let mut scb = zeroed_scb();
+        let rou = FarPtr {
+            offset: 0x1234,
+            selector: 0x5678,
+        };
+        scb.set_fldvfy(rou);
+        assert_eq!(scb.fldvfy(), rou);
+        // Isolated: the neighbour on either side is untouched.
+        assert_eq!(scb.crsatr(), 0, "crsatr, right after fldvfy");
+        assert_eq!(scb.newans(), FarPtr::NULL, "newans, right before fldvfy");
+    }
+
+    #[test]
+    fn scb_state_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDNPT);
+        assert_eq!(scb.state(), state::FSDNPT);
+        assert_eq!(scb.allans(), 0, "allans, right before state");
+        assert_eq!(scb.ansbuf(), b"", "ansbuf, right after state, still empty");
+    }
+
+    #[test]
+    fn scb_ansbuf_round_trips_a_c_string_and_leaves_its_neighbours_alone() {
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDNPT);
+        scb.set_crsfld(3);
+
+        scb.set_ansbuf(b"Kaimon");
+        assert_eq!(scb.ansbuf(), b"Kaimon");
+
+        // Bytes past the terminator are not part of the string, even if a
+        // previous, longer answer left them non-zero.
+        scb.set_ansbuf(b"Verylongname");
+        scb.set_ansbuf(b"Hi");
+        assert_eq!(scb.ansbuf(), b"Hi");
+
+        // Neither neighbour moved.
+        assert_eq!(scb.state(), state::FSDNPT);
+        assert_eq!(scb.crsfld(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn scb_ansbuf_refuses_an_answer_that_does_not_fit() {
+        let mut scb = zeroed_scb();
+        scb.set_ansbuf(&[b'x'; 81]);
+    }
+
+    #[test]
+    fn scb_crsfld_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(9);
+        assert_eq!(scb.crsfld(), 9);
+        assert_eq!(scb.flags(), 0, "flags, a handful of bytes after crsfld");
+    }
+
+    #[test]
+    fn scb_flags_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS | entry_flags::FSDANT);
+        assert_eq!(scb.flags(), entry_flags::FSDANS | entry_flags::FSDANT);
+        assert_eq!(scb.crsfld(), 0, "crsfld, right before flags");
+        assert_eq!(scb.xitkey(), 0, "xitkey, right after flags");
+    }
+
+    #[test]
+    fn scb_xitkey_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_xitkey(0x1b);
+        assert_eq!(scb.xitkey(), 0x1b);
+        assert_eq!(scb.chgcnt(), 0, "chgcnt, right after xitkey");
+    }
+
+    #[test]
+    fn scb_chgcnt_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_chgcnt(5);
+        assert_eq!(scb.chgcnt(), 5);
+        assert_eq!(scb.xitkey(), 0, "xitkey, right before chgcnt");
     }
 
     #[test]
