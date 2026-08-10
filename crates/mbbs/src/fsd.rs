@@ -2781,6 +2781,112 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
     out
 }
 
+/// The SGR foreground parameter for each of the eight IBM PC colour codes.
+/// Index is the attribute's low three bits; `None` means the parameter is
+/// omitted entirely.
+///
+/// The mapping is a **bit reversal**, which is the whole reason this is a
+/// table rather than an addition: IBM packs the low nibble blue-green-red
+/// (bit 0 is blue) and ANSI packs it red-green-blue (30 + 1 is red). So IBM 1,
+/// blue, is ANSI 34, and IBM 4, red, is ANSI 31. Measured, not derived -- see
+/// [`ibm2ans`].
+const SGR_FOREGROUND: [Option<u8>; 8] = [
+    None,     // 0: black -- omitted, not `30`
+    Some(34), // 1: blue
+    Some(32), // 2: green
+    Some(36), // 3: cyan
+    Some(31), // 4: red
+    Some(35), // 5: magenta
+    Some(33), // 6: brown/yellow
+    Some(37), // 7: light grey
+];
+
+/// The SGR background parameter for each IBM PC colour code, indexed by bits
+/// 4-6 of the attribute. `None` means omitted -- see [`SGR_FOREGROUND`] for
+/// the reversal, and [`ibm2ans`] for why code 7 is the omitted one here where
+/// code 0 is the omitted one there.
+const SGR_BACKGROUND: [Option<u8>; 8] = [
+    Some(40), // 0: black
+    Some(44), // 1: blue
+    Some(42), // 2: green
+    Some(46), // 3: cyan
+    Some(41), // 4: red
+    Some(45), // 5: magenta
+    Some(43), // 6: brown/yellow
+    None,     // 7: light grey -- omitted, not `47`
+];
+
+/// `ibm2ans()`: an IBM PC attribute byte as the SGR escape sequence that
+/// reproduces it. `GCOMM.H:352`.
+///
+/// # Measured, not invented
+///
+/// There is no C source for this in the archive, but the genuine host exports
+/// it (ordinal 343, segment 72 offset 0) and `tests/fsd_oracle.rs` calls it
+/// across **all 256 attribute values** and asserts this function reproduces
+/// every one. The input domain is 256 values wide and every one of them has
+/// been observed, so this is not a model of `ibm2ans` -- it is `ibm2ans`.
+///
+/// Guessing an SGR encoding that looks right is exactly the failure mode the
+/// `getasc`/`getmsg` mix-up already demonstrated on this subsystem, and the
+/// measurement caught two things a sensible guess would have got wrong:
+/// foreground black is *omitted* rather than sent as `30`, and background
+/// light-grey is omitted rather than sent as `47`.
+///
+/// # The `7` at attribute `0x70`
+///
+/// `0x70` -- black on light grey, the attribute `fsdego` hardcodes for the
+/// cursor field (`FSDBBS.C:180`) -- is the one value where every other
+/// parameter is omitted, and there the host emits `ESC[0;7m`: reverse video,
+/// which is the only way to say "black on light grey" once `47` is off the
+/// table.
+///
+/// Two rules reproduce this equally well: "emit `7` when nothing else was
+/// emitted", and "special-case `0x70`". They cannot be told apart, because
+/// `0x70` is the *only* attribute whose parameter list is otherwise empty --
+/// blink, bright or any non-black foreground all suppress it. This takes the
+/// first form because it is the less arbitrary of the two; the distinction is
+/// unobservable across the entire input domain, so nothing rests on it.
+///
+/// Note the consequence, which is the host's and not this port's: `0xF0`
+/// (blinking black on light grey) comes back as `ESC[0;5m` -- blinking light
+/// grey on black, the wrong way round -- because the `5` suppresses the `7`.
+#[must_use]
+pub fn ibm2ans(attr: u8) -> Vec<u8> {
+    let mut params: Vec<u8> = Vec::new();
+
+    if attr & 0x80 != 0 {
+        params.push(5); // blink
+    }
+    if attr & 0x08 != 0 {
+        params.push(1); // bright/bold
+    }
+    if let Some(fg) = SGR_FOREGROUND[usize::from(attr & 0x07)] {
+        params.push(fg);
+    }
+    if let Some(bg) = SGR_BACKGROUND[usize::from((attr >> 4) & 0x07)] {
+        params.push(bg);
+    }
+
+    if params.is_empty() {
+        params.push(7); // reverse video -- see this function's own doc comment
+    }
+
+    let mut out = b"\x1b[0".to_vec();
+    for p in params {
+        out.push(b';');
+        out.extend_from_slice(p.to_string().as_bytes());
+    }
+    out.push(b'm');
+    out
+}
+
+/// Swap an ANSI colour code's red and blue bits to get the IBM PC one, or
+/// back -- the operation is its own inverse. See [`SGR_FOREGROUND`].
+fn reverse_colour_bits(code: u8) -> u8 {
+    (code & 0b010) | ((code & 0b001) << 2) | ((code & 0b100) >> 2)
+}
+
 /// Something in a template that [`Terminal`] does not model.
 ///
 /// The tracker refuses rather than ignores, on purpose. Silently skipping an
@@ -3006,19 +3112,61 @@ impl Terminal {
             b'm' => {
                 // SGR. Every escape in MajorMUD's template is one of these
                 // (171 of them, all `m`), so consuming the sequence without
-                // counting its bytes as glyphs is already the whole of what
-                // the *position* needs -- and position is what Task 4 checks
-                // field by field against the oracle.
+                // counting its bytes as glyphs is what the *position* needs.
                 //
-                // The *attribute* is Task 3's: which SGR parameters map to
-                // which bits of an IBM PC attribute byte is a screen-library
-                // detail, and `ibm2ans` (exported at ordinal 343) is the
-                // measurement rather than something to derive from first
-                // principles. Until then `attr` stays where `setatr(0x07)`
-                // put it. Deliberately not a `todo!()`: the position this
-                // function exists to track is correct now, and panicking
-                // would make it unusable for the task that validates it.
-                let _ = params;
+                // The *attribute* runs [`ibm2ans`]'s colour tables backwards.
+                // Note what that measurement does and does not settle: it is
+                // an attribute-to-SGR function, so it fixes which SGR
+                // parameter means which IBM colour beyond argument, but it
+                // says nothing about how the screen library's ANSI *input*
+                // parser accumulates them -- and the template's sequences are
+                // not in `ibm2ans`'s canonical output form anyway (`ESC[37m`
+                // and `ESC[1;30m` both occur, neither with a leading `0`).
+                //
+                // The accumulate-until-reset reading below is the standard
+                // one, and it is checked rather than assumed: Task 4 compares
+                // every field's `attr` against the genuine host's
+                // `curatr.attrib` after printing the real template, which is
+                // a direct measurement of this parser on the only input that
+                // matters.
+                for param in params.split(|&b| b == b';') {
+                    // `ESC[m` and an empty parameter both mean 0.
+                    let n: u16 = if param.is_empty() {
+                        0
+                    } else {
+                        let mut n: u16 = 0;
+                        for &d in param {
+                            n = n.saturating_mul(10).saturating_add(u16::from(d - b'0'));
+                        }
+                        n
+                    };
+                    match n {
+                        // Back to `setatr`'s own starting attribute.
+                        0 => self.attr = 0x07,
+                        1 => self.attr |= 0x08,
+                        5 => self.attr |= 0x80,
+                        7 => self.attr = (self.attr & 0x88) | 0x70,
+                        30..=37 => {
+                            let code = u8::try_from(n - 30).expect("in range");
+                            self.attr = (self.attr & 0xf8) | reverse_colour_bits(code);
+                        }
+                        40..=47 => {
+                            let code = u8::try_from(n - 40).expect("in range");
+                            self.attr = (self.attr & 0x8f) | (reverse_colour_bits(code) << 4);
+                        }
+                        // Anything else -- `ESC[2m` (dim), `ESC[7m`'s
+                        // counterpart `ESC[27m`, the 256-colour forms -- is
+                        // not in MajorMUD's template and is not modelled.
+                        // Refusing keeps this honest the way the rest of the
+                        // tracker is; see [`TerminalError`].
+                        _ => {
+                            let mut seq = vec![0x1b, b'['];
+                            seq.extend_from_slice(params);
+                            seq.push(final_byte);
+                            return Err(TerminalError::UnsupportedEscape(seq));
+                        }
+                    }
+                }
                 Ok(())
             }
             _ => {
@@ -6649,15 +6797,63 @@ mod tests {
     }
 
     #[test]
-    fn sgr_leaves_the_attribute_alone_until_task_3_measures_ibm2ans() {
-        // Stated as a test rather than only as a comment, so that whoever
-        // completes `finish_csi` finds this failing and updates it on
-        // purpose. Position is already right; attribute is not yet.
-        let t = track(b"\x1b[1;30m");
+    fn sgr_accumulates_into_an_ibm_attribute_byte() {
+        // Every SGR form MajorMUD's own template uses, worked through. The
+        // colour codes come from `ibm2ans`, measured against the genuine host
+        // across all 256 attributes; how the parser *accumulates* them is
+        // checked end to end in Task 4, against curatr.attrib on the real
+        // template.
+        assert_eq!(track(b"\x1b[0m").attr(), 0x07, "reset is setatr's default");
+        assert_eq!(track(b"\x1b[1m").attr(), 0x0f, "bright ORs in bit 3");
         assert_eq!(
-            t.attr(),
-            0x07,
-            "still setatr(0x07) -- Task 3 replaces this assertion"
+            track(b"\x1b[1;30m").attr(),
+            0x08,
+            "bright black -- dark grey, which is what the rules are drawn in"
+        );
+        assert_eq!(track(b"\x1b[37m").attr(), 0x07);
+        assert_eq!(track(b"\x1b[0;35m").attr(), 0x05, "magenta");
+        assert_eq!(track(b"\x1b[1;37m").attr(), 0x0f);
+        assert_eq!(track(b"\x1b[0;31m").attr(), 0x04, "ANSI 31 red is IBM 4");
+        assert_eq!(track(b"\x1b[36m").attr(), 0x03, "ANSI 36 cyan is IBM 3");
+
+        // A reset really resets, rather than only clearing the colour.
+        assert_eq!(track(b"\x1b[1;31m\x1b[0m").attr(), 0x07);
+        // ...and a colour change on its own leaves brightness alone.
+        assert_eq!(track(b"\x1b[1;31m\x1b[36m").attr(), 0x0b);
+    }
+
+    #[test]
+    fn the_colour_bit_reversal_runs_both_ways() {
+        // `ibm2ans` is attribute-to-SGR and the tracker is SGR-to-attribute,
+        // so the two share one table read in opposite directions. Where the
+        // host's encoding is lossless, they round-trip -- and where it is
+        // not, the loss is the host's, so pin it rather than paper over it.
+        for attr in 0u8..=255 {
+            let fg = attr & 0x07;
+            let bg = (attr >> 4) & 0x07;
+            let round = track(&ibm2ans(attr)).attr();
+            if fg != 0 && bg != 7 {
+                assert_eq!(round, attr, "ibm2ans({attr:#04x}) round-trips");
+            }
+        }
+
+        // Foreground black is omitted from the SGR entirely, so nothing in
+        // the output says "black" and a reset's light grey stands.
+        assert_eq!(track(&ibm2ans(0x00)).attr(), 0x07);
+        // Background light grey survives only at 0x70, via the reverse-video
+        // fallback; with a foreground parameter present it is simply gone.
+        assert_eq!(track(&ibm2ans(0x70)).attr(), 0x70, "the cursor attribute");
+        assert_eq!(track(&ibm2ans(0x71)).attr(), 0x01, "and here it is lost");
+    }
+
+    #[test]
+    fn an_unmodelled_sgr_parameter_is_refused() {
+        // The tracker refuses what it does not model, and SGR is no
+        // exception: `ESC[2m` is real ANSI this port has not measured.
+        let mut t = Terminal::new();
+        assert_eq!(
+            t.write(b"\x1b[2m"),
+            Err(TerminalError::UnsupportedEscape(b"\x1b[2m".to_vec()))
         );
     }
 
