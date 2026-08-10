@@ -2576,18 +2576,35 @@ pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
 /// literal control characters those expressions evaluate to and are
 /// reachable the same way.
 ///
-/// # `'L'-64` (`fsdqdp()`) is refused, not silently dropped
+/// # `'L'-64` (`fsdqdp()`) is a no-op, not refused
 ///
 /// `fsdqdp()` (`FSDBBS.C:407-411`) sets a host-side redisplay flag
 /// (`fsdusr->flags|=FBRDSP`) and re-arms `CYCLE` via `fsdnfy()` so a later
 /// poll pass redraws the whole screen -- machinery this crate's `Host` does
 /// not have (no `FBRDSP` equivalent, no `fsdnfy` port), and it is not
 /// ANSI-specific, so it falls under neither Tasks 6-8's ports nor this
-/// plan's Stage 5 deferral list. Silently doing nothing on Ctrl-L would
-/// look identical to a correct implementation in every test that never
-/// presses it, so this refuses loudly instead, the same
-/// refusal-over-fallback discipline [`bgnter`]/[`xitfld`] already apply to
-/// their own out-of-scope ANSI branches.
+/// plan's Stage 5 deferral list. In the original, Ctrl-L was a completely
+/// benign redraw request; not honoring it here should be equally benign,
+/// so this drops it on the floor: no output, no state change.
+///
+/// This is deliberately *not* the same call as [`bgnter`]/[`xitfld`]'s own
+/// `assert!(flags & FSDANS == 0)` guards. Those fire on a state this crate's
+/// own invariants make unreachable -- nothing anywhere in this port ever
+/// sets `FSDANS`, so tripping that assert means a caller broke the
+/// contract, and a loud panic is the right way to find that caller during
+/// development. Ctrl-L is the opposite: it is an ordinary byte a real user
+/// sends by pressing Ctrl-L during, say, character creation, in exactly the
+/// reachable state (`FSDNEN`) this function is built to handle. There is no
+/// broken caller to catch here, only unimplemented redraw machinery. And
+/// per this crate's own architecture, Machine+Host for *every* connected
+/// channel run on one dedicated thread with no `catch_unwind` in the poll
+/// path -- so panicking here would not fail one session, it would take the
+/// entire board down, disconnecting every other connected user over a
+/// keystroke that used to be harmless. Silently doing nothing on Ctrl-L
+/// would look identical to a correct implementation in every test that
+/// never presses it, which is exactly why the test suite covers it
+/// directly (`fsdinc_ctrl_l_is_a_no_op_not_a_crash`) rather than relying on
+/// a panic to flag the gap.
 ///
 /// # `fsdnfy()` and `ahdptr=0`, inside `xitfld`'s own original body
 ///
@@ -2645,7 +2662,7 @@ pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
 /// `FSDAPT`/`FSDAEN` (ANSI) are Stage 5, and `FSDBUF`/`FSDSTB` (typeahead
 /// accumulation between an `fsdinc` call and `fsdprc` catching up) are
 /// dropped per the design doc's "Dropped" list, neither built by this
-/// crate. Or if `byte` is Ctrl-L -- see above.
+/// crate. Ctrl-L does *not* panic -- see above.
 pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
     assert!(
         matches!(scb.state(), state::FSDNPT | state::FSDNEN),
@@ -2706,9 +2723,9 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
             }
         }
         0x0c => {
-            // 'L'-64: fsdqdp() -- refused, see this function's own doc
-            // comment.
-            panic!("fsdinc: Ctrl-L (fsdqdp, full-screen redisplay) is not built");
+            // 'L'-64: fsdqdp() -- silently no-op, see this function's own
+            // doc comment. Not a panic: this byte is ordinary live user
+            // input, not a caller-contract violation.
         }
         0x08 | 0x7f => {
             // '\b', literal DEL (0x7F). The special-code `DEL` (83*256) is
@@ -5030,14 +5047,36 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "fsdqdp")]
-    fn fsdinc_refuses_ctrl_l_the_redisplay_request_it_does_not_build() {
-        let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+    fn fsdinc_ctrl_l_is_a_no_op_not_a_crash() {
+        // Ctrl-L (fsdqdp, full-screen redisplay) is an ordinary keystroke a
+        // live user can send mid-field -- not a caller-contract violation
+        // like the FSDANS asserts in bgnter/xitfld. This host has no
+        // FBRDSP/fsdnfy machinery to honor the redisplay request, but
+        // refusing to honor it is not a reason to crash the single shared
+        // board thread: every other connected channel would go down with
+        // it. So it must no-op cleanly: no output, no state change,
+        // typing resumes normally afterward.
+        let spec = b"NAME";
+        let form = compile(b"????????", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_state(state::FSDNEN);
-        fsdinc(&form, spec, &mut scb, 0x0c);
+        scb.set_state(state::FSDNPT);
+
+        for &c in b"Kai" {
+            fsdinc(&form, spec, &mut scb, c);
+        }
+        assert_eq!(scb.ansbuf(), b"Kai");
+        assert_eq!(scb.state(), state::FSDNEN);
+
+        let before = scb.clone();
+        let out = fsdinc(&form, spec, &mut scb, 0x0c);
+        assert!(out.is_empty(), "Ctrl-L produces no output");
+        assert_eq!(scb, before, "Ctrl-L leaves the whole session control block untouched");
+
+        // Typing still works afterward -- the no-op didn't wedge anything.
+        let out = fsdinc(&form, spec, &mut scb, b'm');
+        assert_eq!(out, b"m");
+        assert_eq!(scb.ansbuf(), b"Kaim");
     }
 
     #[test]
