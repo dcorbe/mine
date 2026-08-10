@@ -63,6 +63,12 @@ const MAXHLP: u16 = 80;
 /// Maximum size of the embedded-punctuation array. `FSDBBS.H:208`.
 pub const MBPMAX: u16 = 200;
 
+/// Rows on an ANSI screen. `FSD.H:244`.
+pub const ANSILN: u16 = 25;
+
+/// Columns on an ANSI screen. `FSD.H:245`.
+pub const ANSIWD: u16 = 80;
+
 /// `sizeof(struct fsdfld)`.
 ///
 /// **A constant, not `size_of::<Field>()`.** The number is part of the answer
@@ -2773,6 +2779,256 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
         _ => {}
     }
     out
+}
+
+/// Something in a template that [`Terminal`] does not model.
+///
+/// The tracker refuses rather than ignores, on purpose. Silently skipping an
+/// unrecognised escape sequence would leave the cursor at coordinates that
+/// look entirely plausible and are wrong by however wide that sequence's
+/// visible effect was -- and the symptom, a field lit in the wrong place, is
+/// indistinguishable from a dozen other causes. An error names the byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalError {
+    /// A control byte whose effect on the cursor this tracker has not
+    /// measured. See [`Terminal::write`] for which bytes are *not* in this
+    /// set despite looking like control codes.
+    UnsupportedControl(u8),
+
+    /// A well-formed `ESC [ ... <final>` sequence whose final byte is not one
+    /// this tracker models. Carries the whole sequence.
+    UnsupportedEscape(Vec<u8>),
+
+    /// An `ESC` followed by something other than `[`. `tmpscn` prints only
+    /// what the module put in its template, and nothing in evidence emits a
+    /// two-byte escape, so this is a template this tracker declines to guess
+    /// at rather than a sequence it merely has not implemented.
+    UnsupportedEscapeIntroducer(u8),
+}
+
+impl fmt::Display for TerminalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedControl(b) => {
+                write!(f, "control byte {b:#04x} has no modelled cursor effect")
+            }
+            Self::UnsupportedEscape(seq) => write!(
+                f,
+                "escape sequence {:?} has no modelled cursor effect",
+                String::from_utf8_lossy(seq)
+            ),
+            Self::UnsupportedEscapeIntroducer(b) => {
+                write!(f, "ESC followed by {b:#04x}, which is not '['")
+            }
+        }
+    }
+}
+
+/// Where printing a template would leave the cursor. The tracker
+/// `fsdppc(ascn=1)` needs and this host has no screen library to provide.
+///
+/// # What the original does instead
+///
+/// `tmpscn` opens an off-screen window over the host's screen library --
+/// `setwin(fsdbuf,0,0,ANSIWD-1,ANSILN-1,0)`, `cursiz(NOCURS)`, `locate(0,0)`,
+/// `setatr(0x07)`, `ansion(1)` (`FSD.C:311-317`) -- `printf`s the template
+/// into it in chunks, and reads `curcurx()`/`curcury()`/`curatr.attrib` back
+/// at each field boundary (`FSD.C:271-283`). Those five routines are exported
+/// by the genuine host and callable as an oracle, but reimplementing a screen
+/// library to get three numbers out of it would be absurd. This tracks the
+/// three numbers.
+///
+/// It is **not** a screen buffer. No glyph is ever stored and none can be read
+/// back; the only outputs are a position and an attribute.
+///
+/// # The window's geometry is not incidental
+///
+/// The final `0` of that `setwin` call is the no-scroll flag, so `y` saturates
+/// at the bottom row instead of the window shifting up under it. The window is
+/// the full 80x25, so `x` wraps at column 80. MajorMUD's own template has 23
+/// lines and a longest visible line of 78 columns, so **the fixture exercises
+/// neither path** -- both are covered by synthetic tests below, and neither is
+/// checkable against the oracle.
+///
+/// # Starting state
+///
+/// `locate(0,0)` and `setatr(0x07)` -- origin, and the ordinary
+/// light-grey-on-black attribute. `0x07` is also what `tmpfld` writes into
+/// every field's `attr` off the ANSI path (`FSD.C:285-286`), which is why the
+/// non-ANSI compile and an all-default ANSI compile agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Terminal {
+    x: u16,
+    y: u16,
+    attr: u8,
+    parse: Parse,
+}
+
+/// [`Terminal`]'s escape-sequence parse state, kept across [`Terminal::write`]
+/// calls because `tmpscn` hands the template over in chunks split at field
+/// runs (`FSD.C:343-347`) and nothing guarantees a chunk boundary misses a
+/// sequence. In MajorMUD's own template none does -- every escape in it is a
+/// complete SGR run of digits and semicolons, and a field run is `?`/`$`/`#`
+/// -- but that is a property of one template, not of templates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Parse {
+    /// Ordinary text.
+    Ground,
+    /// An `ESC` has arrived; waiting for `[`.
+    Escape,
+    /// Inside `ESC [`; accumulating parameter bytes until a final byte.
+    Csi(Vec<u8>),
+}
+
+impl Default for Terminal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Terminal {
+    /// A tracker positioned as `tmpscn`'s preamble leaves the window.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            attr: 0x07,
+            parse: Parse::Ground,
+        }
+    }
+
+    /// `curcurx()`: the current column, 0-based.
+    #[must_use]
+    pub fn x(&self) -> u16 {
+        self.x
+    }
+
+    /// `curcury()`: the current row, 0-based.
+    #[must_use]
+    pub fn y(&self) -> u16 {
+        self.y
+    }
+
+    /// `curatr.attrib`: the current IBM PC attribute byte.
+    #[must_use]
+    pub fn attr(&self) -> u8 {
+        self.attr
+    }
+
+    /// Print bytes into the window, moving the cursor as the screen library
+    /// would.
+    ///
+    /// # What counts as a glyph
+    ///
+    /// Everything except `\r`, `\n` and a well-formed escape sequence --
+    /// including bytes below 0x20 and bytes above 0x7F, which on an IBM PC
+    /// screen are ordinary CP437 characters rather than control codes. This is
+    /// not a guess: MajorMUD's own template draws its rules with `0xC4` and
+    /// friends, and puts a literal `0x11` (CP437 `◄`) at the left end of three
+    /// of them. A tracker that treated `0x11` as a control code would lose a
+    /// column on every one of those rows.
+    ///
+    /// # What is refused
+    ///
+    /// `\t`, `\b`, `\a` and `\f` -- the control bytes a screen library
+    /// plausibly *does* interpret, and whose exact effect (tab stops, in
+    /// particular) this port has not measured. No template in evidence
+    /// contains one. Refusing an unmeasured tab is better than picking eight
+    /// columns and being quietly wrong on a template that has one.
+    ///
+    /// # `\r` and `\n` are not symmetric
+    ///
+    /// `\r` sets `x` to 0 and leaves `y` alone; `\n` advances `y` and leaves
+    /// `x` alone. That asymmetry is the entire reason `fsdroom` must feed the
+    /// ASCII-expanded template (`getasc`, `FSDBBS.C:137`) rather than the
+    /// compact one: the compact form has 22 `\r` and no `\n` at all, so every
+    /// field in it lands on row 0.
+    ///
+    /// # Errors
+    ///
+    /// [`TerminalError`], naming the byte or sequence, for anything above.
+    /// Nothing is partially applied on error beyond the bytes already
+    /// consumed before it.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<(), TerminalError> {
+        for &b in bytes {
+            match std::mem::replace(&mut self.parse, Parse::Ground) {
+                Parse::Ground => match b {
+                    0x1b => self.parse = Parse::Escape,
+                    b'\r' => self.x = 0,
+                    b'\n' => self.newline(),
+                    0x07 | 0x08 | b'\t' | 0x0c => {
+                        return Err(TerminalError::UnsupportedControl(b));
+                    }
+                    _ => self.glyph(),
+                },
+                Parse::Escape => {
+                    if b == b'[' {
+                        self.parse = Parse::Csi(Vec::new());
+                    } else {
+                        return Err(TerminalError::UnsupportedEscapeIntroducer(b));
+                    }
+                }
+                Parse::Csi(mut params) => {
+                    if b.is_ascii_digit() || b == b';' {
+                        params.push(b);
+                        self.parse = Parse::Csi(params);
+                    } else {
+                        self.finish_csi(&params, b)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One glyph: advance, wrapping at the right edge of the window.
+    fn glyph(&mut self) {
+        self.x += 1;
+        if self.x >= ANSIWD {
+            self.x = 0;
+            self.newline();
+        }
+    }
+
+    /// Down one row, or stay put at the bottom. `setwin`'s last argument is
+    /// the no-scroll flag (`FSD.C:313`), so the window never shifts and
+    /// anything printed past the last row is simply lost.
+    fn newline(&mut self) {
+        if self.y + 1 < ANSILN {
+            self.y += 1;
+        }
+    }
+
+    /// A complete `ESC [ <params> <final>`.
+    fn finish_csi(&mut self, params: &[u8], final_byte: u8) -> Result<(), TerminalError> {
+        match final_byte {
+            b'm' => {
+                // SGR. Every escape in MajorMUD's template is one of these
+                // (171 of them, all `m`), so consuming the sequence without
+                // counting its bytes as glyphs is already the whole of what
+                // the *position* needs -- and position is what Task 4 checks
+                // field by field against the oracle.
+                //
+                // The *attribute* is Task 3's: which SGR parameters map to
+                // which bits of an IBM PC attribute byte is a screen-library
+                // detail, and `ibm2ans` (exported at ordinal 343) is the
+                // measurement rather than something to derive from first
+                // principles. Until then `attr` stays where `setatr(0x07)`
+                // put it. Deliberately not a `todo!()`: the position this
+                // function exists to track is correct now, and panicking
+                // would make it unusable for the task that validates it.
+                let _ = params;
+                Ok(())
+            }
+            _ => {
+                let mut seq = vec![0x1b, b'['];
+                seq.extend_from_slice(params);
+                seq.push(final_byte);
+                Err(TerminalError::UnsupportedEscape(seq))
+            }
+        }
+    }
 }
 
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
@@ -6281,5 +6537,214 @@ mod tests {
         // for, and the C hands it back regardless.
         assert_eq!(move_field(&form, 0, 1, Some(99), true), Some(0));
         assert_eq!(move_field(&form, 0, 1, Some(99), false), Some(99), "or nowhere");
+    }
+
+    // --- Task 2: Terminal, the cursor tracker ---------------------------
+
+    /// Write and unwrap -- the tracker refuses a lot, and a test that means
+    /// to exercise the accepting path should say so by panicking loudly.
+    fn track(bytes: &[u8]) -> Terminal {
+        let mut t = Terminal::new();
+        t.write(bytes).expect("modelled");
+        t
+    }
+
+    #[test]
+    fn terminal_starts_where_tmpscns_preamble_leaves_the_window() {
+        // `locate(0,0)` and `setatr(0x07)`, FSD.C:315-316.
+        let t = Terminal::new();
+        assert_eq!((t.x(), t.y()), (0, 0));
+        assert_eq!(t.attr(), 0x07);
+    }
+
+    #[test]
+    fn carriage_return_and_line_feed_are_not_symmetric() {
+        // The asymmetry decision 6 of the Stage 5 plan turns on, and the
+        // single most consequential behaviour in this type: `\r` moves the
+        // column only, `\n` moves the row only.
+        let t = track(b"Kaimon\r");
+        assert_eq!((t.x(), t.y()), (0, 0), "\\r returns to column 0, same row");
+
+        let t = track(b"Kaimon\n");
+        assert_eq!((t.x(), t.y()), (6, 1), "\\n drops a row, same column");
+
+        let t = track(b"Kaimon\r\n");
+        assert_eq!((t.x(), t.y()), (0, 1), "together, an ordinary newline");
+    }
+
+    #[test]
+    fn a_template_of_bare_carriage_returns_puts_everything_on_row_zero() {
+        // Why `getasc` is load-bearing, stated as an executable fact. The
+        // compact template form (`getmsg`) has 22 `\r` and no `\n` at all;
+        // fed to the tracker it never leaves row 0, which is exactly the
+        // "columns right, rows uniformly wrong" failure the design doc
+        // describes. Task 4 checks the real fixture against the oracle; this
+        // pins the mechanism.
+        let compact = track(b"one\rtwo\rthree\r");
+        assert_eq!(compact.y(), 0, "every row of the form lands on row 0");
+
+        let expanded = track(b"one\r\ntwo\r\nthree\r\n");
+        assert_eq!(expanded.y(), 3, "the ASCII-expanded form advances properly");
+    }
+
+    #[test]
+    fn glyphs_wrap_at_the_eightieth_column() {
+        // Untestable against the oracle: MajorMUD's own template has a
+        // longest visible line of 78 columns and so never wraps. Synthetic,
+        // per the plan.
+        let t = track(&[b'x'; 79]);
+        assert_eq!((t.x(), t.y()), (79, 0), "the last column of row 0");
+
+        let t = track(&[b'x'; 80]);
+        assert_eq!((t.x(), t.y()), (0, 1), "the eightieth glyph wraps");
+
+        let t = track(&[b'x'; 81]);
+        assert_eq!((t.x(), t.y()), (1, 1));
+    }
+
+    #[test]
+    fn the_window_does_not_scroll() {
+        // `setwin`'s trailing 0 (FSD.C:313) is the no-scroll flag. Content
+        // past the bottom row is dropped where it falls; `y` saturates.
+        let mut t = Terminal::new();
+        t.write(&b"\n".repeat(24)).expect("modelled");
+        assert_eq!(t.y(), ANSILN - 1, "the last row of the window");
+
+        t.write(&b"\n".repeat(10)).expect("modelled");
+        assert_eq!(t.y(), ANSILN - 1, "and it stays there");
+
+        // Wrapping into the bottom row saturates the same way, rather than
+        // taking the `y += 1` path unguarded.
+        let mut t = Terminal::new();
+        t.write(&b"\n".repeat(24)).expect("modelled");
+        t.write(&[b'x'; 80]).expect("modelled");
+        assert_eq!((t.x(), t.y()), (0, ANSILN - 1));
+    }
+
+    #[test]
+    fn sgr_sequences_are_consumed_without_costing_a_column() {
+        // The whole point of parsing escapes at all. `ESC[1;30m` is eight
+        // bytes and zero columns; counting them as glyphs would put every
+        // field after the first one eight columns to the right.
+        let t = track(b"\x1b[1;30mAB");
+        assert_eq!(t.x(), 2, "two glyphs, however many escape bytes preceded them");
+
+        // Every SGR form that actually occurs in MajorMUD's template.
+        for seq in [
+            &b"\x1b[0m"[..],
+            b"\x1b[1m",
+            b"\x1b[37m",
+            b"\x1b[1;30m",
+            b"\x1b[0;35m",
+            b"\x1b[1;37m",
+        ] {
+            let t = track(seq);
+            assert_eq!(
+                (t.x(), t.y()),
+                (0, 0),
+                "{:?} must move the cursor not at all",
+                String::from_utf8_lossy(seq)
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_leaves_the_attribute_alone_until_task_3_measures_ibm2ans() {
+        // Stated as a test rather than only as a comment, so that whoever
+        // completes `finish_csi` finds this failing and updates it on
+        // purpose. Position is already right; attribute is not yet.
+        let t = track(b"\x1b[1;30m");
+        assert_eq!(
+            t.attr(),
+            0x07,
+            "still setatr(0x07) -- Task 3 replaces this assertion"
+        );
+    }
+
+    #[test]
+    fn control_bytes_that_are_cp437_glyphs_advance_the_cursor() {
+        // Measured from the fixture, not assumed: MajorMUD's template puts a
+        // literal 0x11 -- CP437 `◄` -- at the left end of three of its rules,
+        // and draws the rules themselves with 0xC4. Treat either as a
+        // control code and those rows come out a column short.
+        let t = track(&[0x11, 0xc4, 0xc4, 0xb4]);
+        assert_eq!(t.x(), 4, "all four are glyphs");
+
+        let t = track(&[0x00, 0x01, 0x1f, 0x7f, 0xff]);
+        assert_eq!(t.x(), 5, "and so is everything else outside \\r, \\n and ESC");
+    }
+
+    #[test]
+    fn unmeasured_control_bytes_are_refused_rather_than_guessed() {
+        // A tab is the one that would really hurt -- picking eight columns
+        // and being wrong is indistinguishable from a tracker bug. No
+        // template in evidence has one.
+        for b in [0x07u8, 0x08, b'\t', 0x0c] {
+            let mut t = Terminal::new();
+            assert_eq!(
+                t.write(&[b'A', b]),
+                Err(TerminalError::UnsupportedControl(b)),
+                "{b:#04x} must be named, not ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmodelled_escape_sequence_is_refused_with_its_bytes() {
+        let mut t = Terminal::new();
+        assert_eq!(
+            t.write(b"\x1b[2J"),
+            Err(TerminalError::UnsupportedEscape(b"\x1b[2J".to_vec())),
+            "clear-screen has a real cursor effect this tracker does not model"
+        );
+
+        let mut t = Terminal::new();
+        assert_eq!(
+            t.write(b"\x1b[10;20f"),
+            Err(TerminalError::UnsupportedEscape(b"\x1b[10;20f".to_vec())),
+            "and so does an absolute goto"
+        );
+
+        let mut t = Terminal::new();
+        assert_eq!(
+            t.write(b"\x1bZ"),
+            Err(TerminalError::UnsupportedEscapeIntroducer(b'Z'))
+        );
+    }
+
+    #[test]
+    fn an_escape_sequence_may_be_split_across_writes() {
+        // `tmpscn` hands the template over in chunks split at field runs, so
+        // the parse state has to survive a chunk boundary. It happens not to
+        // matter for MajorMUD's template -- a field run is `?`/`$`/`#` and an
+        // SGR body is digits and semicolons, so no split can land inside one
+        // -- which is a property of that template rather than of the format.
+        let mut t = Terminal::new();
+        t.write(b"AB\x1b").expect("modelled");
+        t.write(b"[1;3").expect("modelled");
+        t.write(b"0mCD").expect("modelled");
+        assert_eq!(t.x(), 4, "four glyphs, and the escape cost nothing");
+    }
+
+    #[test]
+    fn majormuds_own_template_is_fully_modelled() {
+        // The strongest thing this task can assert without the oracle: every
+        // byte of the real character sheet is something the tracker
+        // understands. If MajorMUD used a cursor-goto or a tab anywhere in
+        // it, this is where that would surface -- as a named error rather
+        // than as a wrong coordinate in Task 4.
+        let Ok(template) = std::fs::read("../../tmp/fsd-template-6-ascii.bin") else {
+            // The fixture is a gitignored build input (see the repo's
+            // worktree-fixture rules); skip rather than fail where it is
+            // absent.
+            return;
+        };
+        let mut t = Terminal::new();
+        assert_eq!(t.write(&template), Ok(()), "every byte is modelled");
+        assert_eq!(
+            t.y(),
+            22,
+            "23 rows of template leave the cursor on the last one"
+        );
     }
 }
