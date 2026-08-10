@@ -672,6 +672,43 @@ pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
+/// `fsdcon()`, `FSDBBS.C:91-101`. Turn on the channel settings an FSD session
+/// needs: raw input (Stage 2's [`crate::gsbl::Channel::raw`], so `push_input`
+/// stops assembling lines and delivers keystrokes one at a time) and no echo
+/// (the entry engine echoes its own bytes explicitly, byte by byte, once
+/// Task 7 lands).
+///
+/// Of the original's eight `btu*` calls, `crate::gsbl::Channel::raw`'s own
+/// doc comment already accounts for all eight: `btuche`/`btuchi` become
+/// `raw`, `btuech` becomes `echo`, `btucli`/`btuche(1)`'s echo-drain half
+/// have no state to touch here, and `btulfd`/`btuscr`/`btupbc`/`btuxnf` are
+/// terminal-driver knobs this host does not model individually. **Width is
+/// not one of the eight** -- `fsdcon` itself never calls `btutsw`. The
+/// `btutsw(usrnum,0)` that zeroes wrap width belongs to `fsdbkg`
+/// (`FSDBBS.C:186`, "display background for full-screen entry mode"), a
+/// *module-callable* routine a caller invokes before `fsdego` for full-screen
+/// (`amode == 1`, ANSI, Stage 5) sessions -- `fsdlin` (line mode, what this
+/// host builds) never calls it, and neither `fsdego` nor `fsdcon` do either.
+/// Line mode leaves width exactly as the connection set it.
+fn fsdcon(host: &mut Host, chan: Chan) {
+    let ch = host.gsbl_mut().channel_mut(chan);
+    ch.raw = true;
+    ch.echo = false;
+}
+
+/// `fsdcof()`, `FSDBBS.C:103-113`. Undo [`fsdcon`]: restore cooked input and
+/// echo, and -- unconditionally, regardless of `amode` -- the screen width
+/// from the account record (`usaptr->scnwid`, `btutsw(usrnum,usaptr->scnwid)`
+/// at `FSDBBS.C:112`). In line mode this is a no-op against what `fsdcon` did
+/// (which never touched width, see its doc comment), but it is still exactly
+/// what the original always does on the way out, so this host does too.
+fn fsdcof(host: &mut Host, chan: Chan, scnwid: u16) {
+    let ch = host.gsbl_mut().channel_mut(chan);
+    ch.raw = false;
+    ch.echo = true;
+    ch.width = scnwid;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,5 +1641,63 @@ mod tests {
             .expect_err("refused");
         assert!(format!("{e}").contains("too long"), "{e}");
         assert!(f.host.forms().is_empty());
+    }
+
+    #[test]
+    fn fsdcon_sets_raw_and_clears_echo_but_leaves_width_alone() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        {
+            let ch = f.host.gsbl_mut().channel_mut(chan);
+            ch.echo = true;
+            ch.width = 80;
+            ch.raw = false;
+        }
+
+        fsdcon(&mut f.host, chan);
+
+        let ch = f.host.gsbl_mut().channel_mut(chan);
+        assert!(ch.raw, "fsdcon must turn raw input on");
+        assert!(!ch.echo, "fsdcon must turn echo off");
+        assert_eq!(
+            ch.width, 80,
+            "fsdcon never calls btutsw (FSDBBS.C:91-101) -- width zeroing is \
+             fsdbkg's job, and fsdbkg is not part of line mode"
+        );
+    }
+
+    #[test]
+    fn fsdcof_restores_what_fsdcon_changed() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        {
+            let ch = f.host.gsbl_mut().channel_mut(chan);
+            ch.echo = true;
+            ch.width = 80;
+            ch.raw = false;
+        }
+
+        fsdcon(&mut f.host, chan);
+        fsdcof(&mut f.host, chan, 80);
+
+        let ch = f.host.gsbl_mut().channel_mut(chan);
+        assert!(!ch.raw, "fsdcof must turn raw input back off");
+        assert!(ch.echo, "fsdcof must turn echo back on");
+        assert_eq!(ch.width, 80, "fsdcof restores width from usaptr->scnwid");
+    }
+
+    #[test]
+    fn fsdcof_sets_width_from_its_argument_not_whatever_fsdcon_left_behind() {
+        // FSDBBS.C:112 always writes usaptr->scnwid on the way out, even
+        // though fsdcon on the way in never touched width in line mode --
+        // this proves fsdcof's width write is unconditional, not "restore
+        // if changed".
+        let mut f = Fixture::new();
+        let chan = f.console();
+        f.host.gsbl_mut().channel_mut(chan).width = 0;
+
+        fsdcof(&mut f.host, chan, 132);
+
+        assert_eq!(f.host.gsbl_mut().channel_mut(chan).width, 132);
     }
 }
