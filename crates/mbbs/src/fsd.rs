@@ -2097,26 +2097,208 @@ pub enum Hdlprt {
     Handled,
 }
 
-/// The part of `hdlalt()`, `FSD.C:1427-1484`, that is safe to run without
-/// the rest of the routine: its own first line, `if (!(fldptr->flags&FFFALT))
-/// return(0);`. A field with no `ALT=` values at all cannot match one,
-/// whatever the rest of `hdlalt` would have done, so this much is ported
-/// faithfully and the remainder -- Task 7 -- is refused loudly rather than
-/// silently approximated for a field that really does carry `ALT=` values.
+/// `bstalt()`, `FSD.C:1558-1569`. Can an ordinary backspace "bust through" a
+/// committed alternate value? Task 8's `hdlcbs` is the only intended caller
+/// -- ported here, ahead of Task 8, because this is the task that starts
+/// setting [`Scb::altptr`] in the first place, and a routine that reads a
+/// member nothing else writes yet would be untestable.
 ///
-/// # Panics
-///
-/// If `field.flags & ALTERNATES != 0`. This is the seam Task 6's own plan
-/// asks to leave visible rather than silently wrong.
-fn hdlalt(field: &Field, _c: u8) -> Hdlprt {
-    if field.flags & flags::ALTERNATES == 0 {
-        return Hdlprt::Ignore;
+/// `true` means backspace may proceed: either nothing is committed
+/// (`altptr` is `None`), or the field is a plain `?` field that is not
+/// itself [`flags::MULTICHOICE`] -- an ALT= list offered as a shortcut
+/// alongside ordinary typing, where starting over is safe -- in which case
+/// [`Scb::altptr`] is cleared as a side effect (`fsdscb->altptr=NULL;`,
+/// `FSD.C:1566`). `false` means a MULTICHOICE field's own committed choice,
+/// or a `#`/`$` field's, is not undone by a bare backspace; `altptr` is left
+/// alone.
+pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
+    if scb.altptr().is_some() {
+        if field.flags & flags::MULTICHOICE != 0 || field.kind != b'?' {
+            return false;
+        }
+        scb.set_altptr(None);
     }
-    unimplemented!(
-        "hdlalt: ALT= entry (Task 7) is not ported yet, and field {:?} has \
-         ALTERNATES set",
-        field
-    )
+    true
+}
+
+/// Every alternate whose value case-insensitively *starts with* `answer`,
+/// first-in-list first. `ck4alt(0)`'s own search (`foptkn(bufptr,0)` over
+/// `"ALT="+answer`), used by [`hdlalt`]'s space-cycling branch to seed a
+/// cycle from whatever has already been typed, when nothing is selected yet.
+///
+/// `None` if `answer` is empty -- `ck4alt`'s own `anslen==0` guard,
+/// `FSD.C:723-725`: an empty answer would match every alternate via `sameto`
+/// and "everything" is not a seed.
+fn first_alternate_starting_with(spec: &[u8], field: &Field, answer: &[u8]) -> Option<u16> {
+    if answer.is_empty() {
+        return None;
+    }
+    alternates(spec, field)
+        .into_iter()
+        .position(|alt| alt.len() >= answer.len() && alt[..answer.len()].eq_ignore_ascii_case(answer))
+        .map(|i| i as u16)
+}
+
+/// The alternate whose value case-insensitively *equals* `answer` exactly,
+/// if there is one. `ck4alt(1)`'s own search (`tokend=1`, an exact-boundary
+/// match rather than [`first_alternate_starting_with`]'s prefix one),
+/// `FSD.C:715-729`. Used by [`defntr`] to seed [`Scb::altptr`] from a
+/// field's pre-existing answer when a session starts on an already-answered
+/// field.
+fn exact_alternate(spec: &[u8], field: &Field, answer: &[u8]) -> Option<u16> {
+    if answer.is_empty() {
+        return None;
+    }
+    alternates(spec, field)
+        .into_iter()
+        .position(|alt| alt.eq_ignore_ascii_case(answer))
+        .map(|i| i as u16)
+}
+
+/// The alternate right after `at`, in [`alternates`]'s own listing order, or
+/// `None` if `at` was the last one. `nxttkn(altptr,"ALT=",0)`, `FSD.C:1437`
+/// -- a second scan of the specification text starting just past the
+/// current match, stopping at the option list's own `)`. Since
+/// [`alternates`] already enumerates every entry that scan could find, "the
+/// next index, if the list reaches that far" is the same answer.
+fn next_alternate(spec: &[u8], field: &Field, at: u16) -> Option<u16> {
+    let next = at + 1;
+    (usize::from(next) < alternates(spec, field).len()).then_some(next)
+}
+
+/// `altntr()`, `FSD.C:1409-1425`. Commit `spelling` -- the alternate at
+/// ordinal `at` -- as the field's answer: record `at` in [`Scb::altptr`],
+/// erase whatever was showing ([`bgnter`]), overwrite `ansbuf` with the
+/// canonical spelling and redisplay it ([`shoabf`]), clear `FSDANT`, and set
+/// `FSDQOT`.
+///
+/// # `bgnter` runs before `ansbuf` is overwritten, not after
+///
+/// The original's own order is `strcpy(fsdscb->ansbuf,bufptr); bgnter();` --
+/// ansbuf already holds the *new* value by the time `bgnter()` (and the
+/// `unentr()` inside it) runs. That is not a bug there: `unentr()` erases
+/// based on `fsdscb->anslen`, a separately-tracked field that still holds
+/// the *old* length at that point (its own update, `anslen=strlen(ansbuf)`,
+/// happens inside `bgnter()` itself, one line after `unentr()` already used
+/// the old value). This port has no such separate field -- `entprp`'s own
+/// doc comment names `scb.ansbuf().len()` as the standing substitution for
+/// `anslen` -- so it has to get the same answer a different way: by calling
+/// [`bgnter`] (whose [`unentr`] erases what's *currently* in `ansbuf`)
+/// before overwriting it, rather than after. `hdlprt`'s own two reset
+/// branches hit the identical trap; see either of their doc comments for a
+/// second instance of the same fix.
+///
+/// # Only the non-ANSI half runs
+///
+/// The original's `if (fsdscb->flags&FSDANS) { shoabf(-1); ansmov(...); }`
+/// branch is unreachable here for the same reason [`bgnter`]'s own ANSI
+/// branch is: [`bgnter`] (called first) already asserts `FSDANS` is unset,
+/// so by the time this function would test it, the answer is already known.
+/// Calling [`shoabf`] with `justfy=0` unconditionally is that assertion's
+/// consequence made explicit rather than a second, redundant check.
+fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
+    scb.set_altptr(Some(at));
+    let mut out = bgnter(form, scb);
+    scb.set_ansbuf(spelling);
+    out.extend(shoabf(form, scb, 0));
+    scb.set_flags((scb.flags() & !entry_flags::FSDANT) | entry_flags::FSDQOT);
+    out
+}
+
+/// `hdlalt(c)`, `FSD.C:1427-1484`. Handle one character typed into a field
+/// that carries an `ALT=` list.
+///
+/// # The two branches
+///
+/// A space, on a [`flags::MULTICHOICE`] field, with `FSDQOT` not already set
+/// (i.e. nothing from a previous commit is still pending display): cycles to
+/// the next alternate after whichever is currently selected -- or, if none
+/// is, the first alternate that matches whatever has already been typed --
+/// or, failing that, the very first alternate in the list. If cycling would
+/// land back where it started (a one-alternate list, most commonly),
+/// nothing happens ([`Hdlprt::Ignore`]). Otherwise the landed-on alternate
+/// is committed via [`altntr`] and the character is [`Hdlprt::Handled`].
+///
+/// Any other character: builds a candidate out of whatever has already been
+/// typed this attempt (`ansbuf`, but only if `FSDANT` says an ambiguous
+/// match is already underway -- otherwise a fresh one-character candidate,
+/// matching [`hdlprt`]'s own already-established substitution for `bufptr`)
+/// plus `c`, then asks [`matching_alternates`]:
+/// - no matches: [`Hdlprt::Ignore`], the character is rejected outright.
+/// - exactly one: committed via [`altntr`], [`Hdlprt::Handled`].
+/// - more than one: [`Hdlprt::Enter`] -- the caller's own [`addprt`] appends
+///   it -- and, the *first* time this field becomes ambiguous, `FSDANT` is
+///   set and (if anything was already showing) the field is blanked and
+///   redrawn via [`bgnter`].
+///
+/// A space that is neither (not MULTICHOICE, or `FSDQOT` already set) falls
+/// through both branches to [`Hdlprt::Ignore`], matching the original's own
+/// fall-through to its final `return(0);`.
+pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
+    let field = form.fields[usize::from(scb.crsfld())];
+    if field.flags & flags::ALTERNATES == 0 {
+        return (Hdlprt::Ignore, Vec::new());
+    }
+
+    if c == b' ' && field.flags & flags::MULTICHOICE != 0 && scb.flags() & entry_flags::FSDQOT == 0 {
+        let old = scb.altptr();
+        let mut candidate = old.and_then(|at| next_alternate(spec, &field, at));
+        if candidate.is_none() && !scb.ansbuf().is_empty() {
+            candidate = first_alternate_starting_with(spec, &field, scb.ansbuf());
+        }
+        if candidate.is_none() && !alternates(spec, &field).is_empty() {
+            candidate = Some(0);
+        }
+        match candidate {
+            None => (Hdlprt::Ignore, Vec::new()),
+            Some(at) if Some(at) == old => (Hdlprt::Ignore, Vec::new()),
+            Some(at) => {
+                let spelling = alternates(spec, &field)[usize::from(at)].to_vec();
+                (Hdlprt::Handled, altntr(form, scb, at, &spelling))
+            }
+        }
+    } else if c != b' ' {
+        let mut candidate = Vec::new();
+        if scb.flags() & entry_flags::FSDANT != 0 {
+            candidate.extend_from_slice(scb.ansbuf());
+        }
+        candidate.push(c);
+
+        let mut matches = matching_alternates(spec, &field, &candidate);
+        match matches.len() {
+            0 => (Hdlprt::Ignore, Vec::new()),
+            1 => {
+                let (at, spelling) = matches.pop().unwrap();
+                (Hdlprt::Handled, altntr(form, scb, at, &spelling))
+            }
+            _ => {
+                let mut out = Vec::new();
+                if scb.flags() & entry_flags::FSDANT == 0 {
+                    scb.set_flags(scb.flags() | entry_flags::FSDANT);
+                    scb.set_altptr(None);
+                    if !scb.ansbuf().is_empty() {
+                        // `bgnter()` (via `unentr()`) has to run *before*
+                        // `ansbuf` is blanked on an unpunctuated field: this
+                        // port's `unentr` reads its erase count off
+                        // `scb.ansbuf().len()`, the standing substitution
+                        // for the original's separately-tracked `anslen`
+                        // (see `entprp`'s own doc comment) -- and that
+                        // substitution only holds if the blank hasn't
+                        // already happened. The original gets away with
+                        // blanking first because `anslen` is a real,
+                        // independent field that still holds the old count
+                        // at the moment `unentr()` reads it; this port has
+                        // no such field to lag behind the string.
+                        out.extend(bgnter(form, scb));
+                        scb.set_ansbuf(b"");
+                    }
+                }
+                (Hdlprt::Enter, out)
+            }
+        }
+    } else {
+        (Hdlprt::Ignore, Vec::new())
+    }
 }
 
 /// `hdlprt(c)`, `FSD.C:1486-1518`. Decide what a printable character means
@@ -2134,22 +2316,40 @@ fn hdlalt(field: &Field, _c: u8) -> Hdlprt {
 /// entry is already underway and there is something typed to lose
 /// (`!FSDANT || ansbuf is empty`) -- otherwise it falls through to
 /// [`hdlalt`] the same as an unrecognised character on any other field
-/// would. Accepting a digit while `FSDANT` was set blanks `ansbuf` and
-/// re-runs [`bgnter`] first, which is why this returns output bytes: it is
-/// the one branch of `hdlprt` with a side effect beyond its own verdict.
+/// would. Accepting a digit resets any alternate-matching in progress --
+/// blanks `ansbuf`, re-runs [`bgnter`], clears `FSDANT` and nulls `altptr`
+/// -- which is why this returns output bytes: it is the one branch of
+/// `hdlprt` with a side effect beyond its own verdict.
 ///
-/// `altptr != NULL` -- the other half of the original's "was there an
-/// alternate in progress" test -- is not checked: [`defntr`]'s doc comment
-/// explains why `altptr` is not modeled, and until Task 7's `hdlalt` starts
-/// setting it, nothing in this crate's reachable state ever makes it
-/// non-NULL, so `FSDANT` alone already covers every case this port can
-/// produce.
-pub fn hdlprt(form: &Form, scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
+/// # Why the reset checks `altptr`, not just `FSDANT`
+///
+/// The original's guard is `fsdscb->flags&FSDANT || fsdscb->altptr != NULL`
+/// (`FSD.C:1508`) -- both halves, not one. Task 6 ported only the `FSDANT`
+/// half, on the reasoning that nothing before Task 7 ever made `altptr`
+/// non-`NULL`, so the two conditions could not yet come apart. Task 7 is
+/// exactly what breaks that: [`hdlalt`]'s typed-character branch clears
+/// `FSDANT` in the very same call that [`altntr`] sets `altptr` (a
+/// completed, unambiguous match), so a `#`/`$` field that also carries an
+/// `ALT=` list (legal per `FSD.H`, even though it is not
+/// [`flags::MULTICHOICE`]) can be typed into: `AGE(ALT=UNKNOWN)`, type
+/// "UNKNOWN" to commit it (`altptr=Some(0)`, `FSDANT` cleared by that same
+/// commit), then type a digit -- `FSDANT` alone now reads `false` and the
+/// stale "UNKNOWN" would neither be erased on screen nor cleared from
+/// `ansbuf`, so `addprt` would append the digit onto the end of it
+/// (`"UNKNOWN5"`) instead of starting fresh. Checking `scb.altptr().is_some()`
+/// alongside `FSDANT` closes that gap and matches the original exactly.
+/// (MajorMUD's own three `ALT=` fields -- `HAIR_COL`, `EYE_COL`, the
+/// terminal `SAVE` field -- are all `?`/[`flags::MULTICHOICE`], which never
+/// reaches this arm at all, so this fix is not observable through this
+/// crate's acceptance test; it is real regardless, reachable through this
+/// port's own `hdlalt`/`hdlprt` on any `#`/`$` ALT= field a specification
+/// could name.)
+pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
     let field = form.fields[usize::from(scb.crsfld())];
     match field.kind {
         b'Y' | b'?' => {
             if field.flags & flags::MULTICHOICE != 0 {
-                (hdlalt(&field, c), Vec::new())
+                hdlalt(form, spec, scb, c)
             } else {
                 (Hdlprt::Enter, Vec::new())
             }
@@ -2164,14 +2364,19 @@ pub fn hdlprt(form: &Form, scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
 
             if (!fsdant || empty) && (c.is_ascii_digit() || is_minus) {
                 let mut out = Vec::new();
-                if fsdant {
-                    scb.set_ansbuf(b"");
+                if fsdant || scb.altptr().is_some() {
+                    // `bgnter()` before the blank, not after -- see
+                    // `hdlalt`'s own identical reset for why this port's
+                    // `unentr` needs `ansbuf` still holding its old value
+                    // when it computes how much to erase.
                     out.extend(bgnter(form, scb));
+                    scb.set_ansbuf(b"");
                     scb.set_flags(scb.flags() & !entry_flags::FSDANT);
+                    scb.set_altptr(None);
                 }
                 (Hdlprt::Enter, out)
             } else {
-                (hdlalt(&field, c), Vec::new())
+                hdlalt(form, spec, scb, c)
             }
         }
         _ => (Hdlprt::Enter, Vec::new()),
@@ -3629,83 +3834,122 @@ mod tests {
 
     #[test]
     fn hdlprt_enters_any_character_on_a_plain_text_field() {
-        let form = compile(b"??", b"NAME", MANY);
+        let spec = b"NAME";
+        let form = compile(b"??", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'!');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'!');
         assert_eq!(verdict, Hdlprt::Enter);
         assert_eq!(out, b"");
     }
 
     #[test]
     fn hdlprt_ignores_a_multichoice_field_with_no_alternates() {
-        // Exercises hdlalt's own first line -- safe without the rest of
-        // Task 7 -- against a field that really is MULTICHOICE but has no
-        // ALT= list to match against.
-        let form = compile(b"??", b"F(MULTICHOICE)", MANY);
+        // Exercises hdlalt's own first line against a field that really is
+        // MULTICHOICE but has no ALT= list to match against.
+        let spec = b"F(MULTICHOICE)";
+        let form = compile(b"??", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert_eq!(form.fields[0].flags, flags::MULTICHOICE);
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'x');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'x');
         assert_eq!(verdict, Hdlprt::Ignore);
         assert_eq!(out, b"");
     }
 
     #[test]
-    #[should_panic(expected = "hdlalt")]
-    fn hdlprt_refuses_a_field_with_alternates_rather_than_guess() {
+    fn hdlprt_starts_an_ambiguous_alternate_match_and_sets_fsdant() {
+        // "b" matches both Black and Brown -- ambiguous, so the character is
+        // still entered (the caller's own addprt appends it) but FSDANT
+        // gets set to mark that a match is now in progress.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
         let form = compile(b"??????", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
-        hdlprt(&form, &mut scb, b'b');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'b');
+
+        assert_eq!(verdict, Hdlprt::Enter);
+        assert_eq!(out, b"", "nothing was showing yet, so no erase/redraw");
+        assert_eq!(scb.flags(), entry_flags::FSDANT);
+        assert_eq!(scb.altptr(), None);
     }
 
     #[test]
     fn hdlprt_enters_a_digit_on_a_numeric_field() {
-        let form = compile(b"###", b"AGE", MANY);
+        let spec = b"AGE";
+        let form = compile(b"###", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'5');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'5');
         assert_eq!(verdict, Hdlprt::Enter);
         assert_eq!(out, b"");
     }
 
     #[test]
     fn hdlprt_ignores_a_non_digit_on_a_numeric_field_with_no_alternates() {
-        let form = compile(b"###", b"AGE", MANY);
+        let spec = b"AGE";
+        let form = compile(b"###", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'x');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'x');
         assert_eq!(verdict, Hdlprt::Ignore);
         assert_eq!(out, b"");
     }
 
     #[test]
     fn hdlprt_enters_a_leading_minus_on_a_signed_dollar_field() {
-        let form = compile(b"$$$", b"BAL", MANY);
+        let spec = b"BAL";
+        let form = compile(b"$$$", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert_eq!(scb.ansbuf(), b"", "nothing typed yet");
 
-        let (verdict, _) = hdlprt(&form, &mut scb, b'-');
+        let (verdict, _) = hdlprt(&form, spec, &mut scb, b'-');
         assert_eq!(verdict, Hdlprt::Enter);
     }
 
     #[test]
     fn hdlprt_refuses_a_minus_on_a_nonnegative_dollar_field() {
-        let form = compile(b"$$$", b"BAL(MIN=0)", MANY);
+        let spec = b"BAL(MIN=0)";
+        let form = compile(b"$$$", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert!(form.fields[0].flags & flags::NONNEGATIVE != 0);
 
-        let (verdict, _) = hdlprt(&form, &mut scb, b'-');
-        assert_eq!(verdict, Hdlprt::Ignore, "no ALT= list either, so hdlalt's stub is safe");
+        let (verdict, _) = hdlprt(&form, spec, &mut scb, b'-');
+        assert_eq!(verdict, Hdlprt::Ignore, "no ALT= list either, so hdlalt refuses too");
+    }
+
+    #[test]
+    fn hdlprt_resets_a_committed_alternate_on_a_numeric_field_when_a_digit_follows() {
+        // A `#`/`$` field carrying its own ALT= list (legal, and not
+        // MULTICHOICE) whose alternate has already been committed --
+        // altptr set, FSDANT cleared, exactly the state altntr leaves
+        // behind. This is the state hdlprt's own reset guard has to catch
+        // by testing altptr, not just FSDANT: see hdlprt's own doc comment.
+        let spec = b"AGE(ALT=UNK)";
+        let form = compile(b"###", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"UNK");
+        scb.set_altptr(Some(0));
+        assert_eq!(scb.flags(), 0, "FSDANT already clear, as altntr leaves it");
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'5');
+
+        assert_eq!(verdict, Hdlprt::Enter);
+        assert_eq!(
+            out,
+            b"\x08 \x08\x08 \x08\x08 \x08",
+            "the stale \"UNK\" is erased, not left on screen"
+        );
+        assert_eq!(scb.altptr(), None, "the committed alternate is discarded");
+        assert_eq!(scb.ansbuf(), b"", "ready for the caller's own addprt to append the digit");
     }
 
     #[test]
@@ -3720,7 +3964,8 @@ mod tests {
         // after an aborted partial match against a punctuated field's
         // alternates.
         let template = b"Code: ###-###";
-        let form = compile(template, b"CODE", MANY);
+        let spec = b"CODE";
+        let form = compile(template, spec, MANY);
         let mbpoff = form.fields[0].punctuation_at.expect("this field joins");
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -3728,7 +3973,7 @@ mod tests {
         scb.set_flags(entry_flags::FSDANT);
         assert_eq!(scb.ansbuf(), b"", "the guard's other half: nothing typed");
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'3');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'3');
 
         assert_eq!(verdict, Hdlprt::Enter);
         assert_eq!(
@@ -3746,17 +3991,236 @@ mod tests {
         // The C's outer guard again, from the other side: FSDANT set AND
         // ansbuf non-empty means the digit-accept branch never runs at
         // all, whatever the character is -- it always falls to hdlalt.
-        let form = compile(b"###", b"AGE", MANY);
+        let spec = b"AGE";
+        let form = compile(b"###", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"1");
         scb.set_flags(entry_flags::FSDANT);
 
-        let (verdict, out) = hdlprt(&form, &mut scb, b'3');
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'3');
 
-        assert_eq!(verdict, Hdlprt::Ignore, "AGE has no ALT= list, so hdlalt's stub is safe");
+        assert_eq!(verdict, Hdlprt::Ignore, "AGE has no ALT= list, so hdlalt refuses too");
         assert_eq!(out, b"");
         assert_eq!(scb.ansbuf(), b"1", "hdlprt's own branch never ran");
+    }
+
+    #[test]
+    fn hdlalt_types_a_full_alternate_value_and_commits_when_unambiguous() {
+        // The seam Task 7 exists for: a whole field's worth of typing, not
+        // one call in isolation -- "b" is ambiguous (Black, Brown both
+        // match), "bl" is not. Drives hdlprt+addprt together the way
+        // fsdinc's own dispatcher (Task 9) will, since Hdlprt::Enter's own
+        // contract is "the caller appends it".
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'B');
+        assert_eq!(verdict, Hdlprt::Enter, "ambiguous: Black and Brown both start with B");
+        assert_eq!(out, b"", "nothing was showing yet to erase");
+        addprt(&form, &mut scb, b'B');
+        assert_eq!(scb.ansbuf(), b"B");
+        assert_eq!(scb.flags(), entry_flags::FSDANT, "now tracking an ambiguous match");
+        assert_eq!(scb.altptr(), None);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'l');
+        assert_eq!(verdict, Hdlprt::Handled, "\"Bl\" matches only Black");
+        assert_eq!(scb.ansbuf(), b"Black", "the canonical spelling, not \"Bl\"");
+        assert_eq!(scb.altptr(), Some(0));
+        assert_eq!(scb.flags(), entry_flags::FSDQOT, "FSDANT cleared, FSDQOT set");
+        assert_eq!(
+            out,
+            b"\x08 \x08Black",
+            "bgnter erases the one \"B\" that was showing, then shoabf shows \
+             \"Black\" in full"
+        );
+    }
+
+    #[test]
+    fn hdlalt_rejects_a_character_that_matches_no_alternate_at_all() {
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'Z');
+
+        assert_eq!(verdict, Hdlprt::Ignore, "no alternate starts with Z");
+        assert_eq!(out, b"");
+        assert_eq!(scb.ansbuf(), b"", "rejected outright, nothing to append");
+        assert_eq!(scb.flags(), 0, "FSDANT never set for an outright rejection");
+    }
+
+    #[test]
+    fn hdlalt_rejects_a_typo_partway_through_an_otherwise_good_match() {
+        // "Bl" narrows to Black alone; a further character that Black
+        // itself does not continue with is rejected, not accepted as a new
+        // ambiguous start -- matching chkalt(0)'s own "0 matches" case,
+        // which is unconditional once FSDANT is already set (the typed
+        // candidate is always ansbuf+c while FSDANT holds).
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Bl");
+        scb.set_flags(entry_flags::FSDANT);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b'x');
+
+        assert_eq!(verdict, Hdlprt::Ignore, "\"Blx\" matches nothing");
+        assert_eq!(out, b"");
+        assert_eq!(scb.ansbuf(), b"Bl", "the typo is not appended");
+        assert_eq!(scb.flags(), entry_flags::FSDANT, "still mid-match, unchanged");
+    }
+
+    #[test]
+    fn hdlalt_space_cycles_to_the_first_alternate_from_a_fresh_field() {
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b' ');
+
+        assert_eq!(verdict, Hdlprt::Handled);
+        assert_eq!(scb.ansbuf(), b"Black", "the first alternate in the list");
+        assert_eq!(scb.altptr(), Some(0));
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn hdlalt_space_cycles_forward_through_the_list_and_wraps_to_ignore() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (v1, _) = hdlprt(&form, spec, &mut scb, b' ');
+        assert_eq!(v1, Hdlprt::Handled);
+        assert_eq!(scb.ansbuf(), b"Black");
+
+        // FSDQOT is now set (altntr's own last act), so a second space in
+        // the same "hasn't been flushed yet" window does nothing -- exactly
+        // the gate the real host clears between keystrokes in fsdinc's own
+        // dispatcher (Task 9, not built here). Clear it by hand to drive
+        // the cycle a second time, the way that dispatcher eventually will.
+        scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+        let (v2, _) = hdlprt(&form, spec, &mut scb, b' ');
+        assert_eq!(v2, Hdlprt::Handled);
+        assert_eq!(scb.ansbuf(), b"Brown", "cycled to the next alternate");
+
+        // A third space would cycle back to Black, i.e. nowhere new: with
+        // only two alternates and already on the last, there is no "next".
+        scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+        let (v3, out3) = hdlprt(&form, spec, &mut scb, b' ');
+        assert_eq!(v3, Hdlprt::Ignore, "no next alternate after the last one");
+        assert_eq!(out3, b"");
+        assert_eq!(scb.ansbuf(), b"Brown", "unchanged");
+    }
+
+    #[test]
+    fn hdlalt_space_does_nothing_on_a_field_that_is_not_multichoice() {
+        // ALTERNATES without MULTICHOICE -- a numeric field with an ALT=
+        // shortcut alongside ordinary digit entry -- never takes the
+        // space-cycling branch. A `?`/`Y` field can't even reach `hdlalt`
+        // with a space unless it is MULTICHOICE (hdlprt's own `?`/`Y` arm
+        // short-circuits to Enter otherwise), so this needs a `#`/`$` field,
+        // whose arm falls through to `hdlalt` for any character that is not
+        // a digit -- a space included.
+        let spec = b"C(ALT=Black ALT=Brown)";
+        let form = compile(b"######", spec, MANY);
+        assert_eq!(form.fields[0].kind, b'#');
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b' ');
+
+        assert_eq!(verdict, Hdlprt::Ignore);
+        assert_eq!(out, b"");
+        assert_eq!(scb.altptr(), None);
+    }
+
+    #[test]
+    fn bstalt_with_no_committed_alternate_always_allows_backspace() {
+        let field = Field {
+            width: 5,
+            xwidth: 5,
+            attr: 0,
+            flags: flags::MULTICHOICE,
+            kind: b'?',
+            spec_at: 0,
+            template_at: 0,
+            punctuation_at: None,
+        };
+        let mut scb = zeroed_scb();
+        assert_eq!(scb.altptr(), None);
+
+        assert!(bstalt(&field, &mut scb));
+        assert_eq!(scb.altptr(), None, "nothing to clear");
+    }
+
+    #[test]
+    fn bstalt_refuses_to_bust_a_multichoice_fields_committed_choice() {
+        let field = Field {
+            width: 5,
+            xwidth: 5,
+            attr: 0,
+            flags: flags::MULTICHOICE,
+            kind: b'?',
+            spec_at: 0,
+            template_at: 0,
+            punctuation_at: None,
+        };
+        let mut scb = zeroed_scb();
+        scb.set_altptr(Some(1));
+
+        assert!(!bstalt(&field, &mut scb));
+        assert_eq!(scb.altptr(), Some(1), "not busted through");
+    }
+
+    #[test]
+    fn bstalt_refuses_to_bust_a_numeric_fields_committed_choice() {
+        // `fldptr->fldtyp != '?'` -- a `#`/`$` field with an ALT= list of its
+        // own (not MULTICHOICE) still refuses, because busting through would
+        // leave a numeric field's own digit-entry state inconsistent.
+        let field = Field {
+            width: 5,
+            xwidth: 5,
+            attr: 0,
+            flags: flags::ALTERNATES,
+            kind: b'#',
+            spec_at: 0,
+            template_at: 0,
+            punctuation_at: None,
+        };
+        let mut scb = zeroed_scb();
+        scb.set_altptr(Some(0));
+
+        assert!(!bstalt(&field, &mut scb));
+        assert_eq!(scb.altptr(), Some(0));
+    }
+
+    #[test]
+    fn bstalt_busts_through_a_plain_text_fields_committed_choice() {
+        // Not MULTICHOICE, and fldtyp == '?': the one combination that is
+        // allowed to start over.
+        let field = Field {
+            width: 5,
+            xwidth: 5,
+            attr: 0,
+            flags: flags::ALTERNATES,
+            kind: b'?',
+            spec_at: 0,
+            template_at: 0,
+            punctuation_at: None,
+        };
+        let mut scb = zeroed_scb();
+        scb.set_altptr(Some(2));
+
+        assert!(bstalt(&field, &mut scb));
+        assert_eq!(scb.altptr(), None, "starting over");
     }
 
     #[test]
