@@ -669,18 +669,130 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// current when one was.
 pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let chan = host.current_channel(machine)?;
-    let Some((block, number, _)) = host.fsdtmp[chan.index()] else {
+    let Some((block, number, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdrft: no template has been compiled; FSDBBS.C:419 refreshes the one fsdroom \
              recorded, and fsdroom has not run"
                 .into(),
         ));
     };
-    let at = host
-        .messages
-        .text(block, number)
-        .map_err(ShimError::Failed)?;
-    Ok(Ret::Far(at))
+    ascii_template(machine, host, block, number, amode).map(Ret::Far)
+}
+
+/// The template as a pointer the module can hold, in whichever form this
+/// `amode` compiled against. Backs [`fsdrft`].
+///
+/// At `amode == -1` that is the message text where it already sits, and this
+/// hands back the pointer `getmsg` would have. Otherwise it is
+/// [`getasc`](crate::msg::getasc)'s expansion, which exists nowhere in memory
+/// until something writes it -- so this allocates a segment, writes it, and
+/// caches it in [`Host::fsd_ascii`].
+///
+/// # Why it cannot simply return the message text
+///
+/// `fsdbkg(fsdrft())` (`FSDBBS.C:87`) walks the returned string using every
+/// field's `tmpoff`, and those were measured against the expanded form. Hand
+/// back the compact one and every field's supporting text is read off the
+/// wrong bytes: the two disagree from the first line break onward. The genuine
+/// host has the same problem and solves it the same way -- `getasc` writes
+/// into a buffer of the host's and returns a pointer to that.
+fn ascii_template(
+    machine: &mut Machine,
+    host: &mut Host,
+    block: FarPtr,
+    number: u16,
+    amode: i16,
+) -> Result<FarPtr, ShimError> {
+    let at = host.messages.text(block, number).map_err(ShimError::Failed)?;
+    if amode == -1 {
+        return Ok(at);
+    }
+    if let Some(cached) = host.fsd_ascii.get(&(block, number)) {
+        return Ok(*cached);
+    }
+
+    let compact = machine.read_cstr(at)?.to_vec();
+    let mut expanded = crate::msg::getasc(&compact);
+    expanded.push(0);
+    let selector = machine.alloc_segment(expanded.len()).map_err(|e| {
+        ShimError::Failed(format!(
+            "fsdrft: no room for the ASCII form of message {number}: {e}"
+        ))
+    })?;
+    let buffer = FarPtr {
+        offset: 0,
+        selector,
+    };
+    machine.write(buffer, &expanded)?;
+    host.fsd_ascii.insert((block, number), buffer);
+    Ok(buffer)
+}
+
+/// `void fsdbkg(char *templt)` -- paint the full-screen background.
+/// `FSDBBS.C:185-194`.
+///
+///
+/// Module-callable, and the module does call it: `fsdbkg(fsdrft())`
+/// (`FSDBBS.C:87`), before `fsdego`. Nothing inside the FSD calls it --
+/// `fsdlin` does not and neither does `fsdego`, which is why line mode never
+/// runs any of this.
+///
+/// # `btutsw(usrnum,0)` is the load-bearing line
+///
+/// [`Channel::transmit`](crate::gsbl::Channel::transmit) counts every byte
+/// that is not `\r`/`\n` toward the wrap column, with no idea that ANSI
+/// escapes exist. A cursor-goto sent at a nonzero width can be split in the
+/// middle, which corrupts the screen in a way that looks exactly like a
+/// cursor-tracker bug and is not one. Zeroing the width here is what stops
+/// that, and it is why this lands before anything lights a field. [`fsdcof`]
+/// restores the account's own width on the way out (`FSDBBS.C:112`).
+///
+/// `btulok(usrnum,1)` locks the keyboard until the screen has drained, and
+/// `btuoes(usrnum,1)` asks to be told when it has. The lock is the busy-wait
+/// the design doc replaced with an edge; the `btuoes` arming is what Task 11
+/// turns into that edge, so both are set as real channel state here rather
+/// than dropped, even though nothing reads `oes` yet.
+///
+/// # Errors
+///
+/// If no channel is current, if no form has been sized for it, or if the
+/// template pointer it was handed is not addressable.
+pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let chan = host.current_channel(machine)?;
+    let templt = machine.arg_far(0);
+    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        return Err(ShimError::Failed(
+            "fsdbkg: no template has been compiled for this channel; FSDBBS.H:245 has \
+             fsdroom() first"
+                .into(),
+        ));
+    };
+    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        return Err(ShimError::Failed(format!(
+            "fsdbkg: channel {chan} recorded message {msgno} (amode {amode}) but no such \
+             form is cached"
+        )));
+    };
+
+    let (block, _) = prepared(machine, host, "fsdbkg")?;
+    let form = live_form(machine, &block, &form)?;
+    let answers = read_answers(machine, &block)?;
+    let template = machine.read_cstr(templt)?.to_vec();
+
+    // `prf("\x1B[0m\x1B[2J\x1B[0m")` -- reset, clear screen, reset again.
+    crate::shims::text::append(machine, host, b"\x1b[0m\x1b[2J\x1b[0m")?;
+
+    {
+        let ch = host.gsbl_mut().channel_mut(chan);
+        ch.width = 0;
+        ch.locked = true;
+        ch.oes = true;
+    }
+
+    let drawn = fsd::fsddsp(&form, &answers, &template);
+    crate::shims::text::append(machine, host, &drawn)?;
+
+    Ok(Ret::Void)
 }
 
 /// `int vfyadn(int fldno, char *answer)` -- `FSD.C:2007-2053`. See
@@ -2145,6 +2257,20 @@ mod tests {
         assert!(matches!(e, ShimError::BadPointer(_)), "{e}");
     }
 
+    /// What `fsdrft` hands back, as bytes.
+    ///
+    /// These used to compare the returned *pointer* against the message
+    /// text's. They compare content now, because since Task 6 the pointer is
+    /// deliberately not that one: at any `amode` but -1 the module must get
+    /// `getasc`'s expansion, which lives in a buffer of the host's
+    /// (`FSDBBS.C:137`, and see [`ascii_template`]).
+    fn fsdrft_text(f: &mut Fixture) -> Vec<u8> {
+        let Ok(Ret::Far(at)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        f.machine.read_cstr(at).expect("addressable").to_vec()
+    }
+
     #[test]
     fn fsdrft_returns_the_template_fsdroom_compiled() {
         let mut f = Fixture::new();
@@ -2154,7 +2280,8 @@ mod tests {
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
-        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+        let expected = f.machine.read_cstr(expected).expect("text").to_vec();
+        assert_eq!(fsdrft_text(&mut f), crate::msg::getasc(&expected));
     }
 
     #[test]
@@ -2182,12 +2309,14 @@ mod tests {
             .messages()
             .text(form, 0)
             .expect("message 0 of the form's own file");
-        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+        let expected = f.machine.read_cstr(expected).expect("text").to_vec();
+        let current = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
+        let current = f.machine.read_cstr(current).expect("text").to_vec();
         assert_ne!(
-            expected,
-            crate::shims::msg::message(&f.machine, &f.host, 0).expect("message"),
+            expected, current,
             "and the current file's message 0 is a different string"
         );
+        assert_eq!(fsdrft_text(&mut f), crate::msg::getasc(&expected));
     }
 
     #[test]
@@ -2201,7 +2330,8 @@ mod tests {
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 1).expect("message");
-        assert!(matches!(f.invoke(fsdrft, &[]), Ok(Ret::Far(at)) if at == expected));
+        let expected = f.machine.read_cstr(expected).expect("text").to_vec();
+        assert_eq!(fsdrft_text(&mut f), crate::msg::getasc(&expected));
     }
 
     #[test]
@@ -3536,5 +3666,132 @@ mod tests {
         let chan = f.console();
         let e = fsd_cycle(&mut f.machine, &mut f.host, &module, chan).expect_err("refused");
         assert!(format!("{e}").contains("no session control block"), "{e}");
+    }
+
+    // --- Task 6: fsdbkg ---------------------------------------------------
+
+    #[test]
+    fn fsdbkg_clears_the_screen_and_draws_the_form() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0");
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        assert!(matches!(
+            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
+            Ok(Ret::Void)
+        ));
+
+        let drawn = f.read(f.host.globals().prf_buffer());
+        assert!(
+            drawn.starts_with("\x1b[0m\x1b[2J\x1b[0m"),
+            "reset, clear, reset -- byte for byte, first: {:?}",
+            &drawn[..drawn.len().min(20)]
+        );
+        assert!(
+            drawn.contains("Kai") && drawn.contains("Cpl"),
+            "and then every filled-in field: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn fsdbkg_zeroes_the_wrap_width_so_escapes_survive_transmit() {
+        // Decision 5 of the Stage 5 plan, and the reason this task precedes
+        // anything that lights a field. `Channel::transmit` counts every byte
+        // that is not \r or \n toward the wrap column and knows nothing about
+        // escape sequences, so a cursor-goto sent at a nonzero width can be
+        // split down the middle -- which corrupts the screen in a way that
+        // looks exactly like a cursor-tracker bug.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=Kai\0\0");
+        let chan = f.console();
+
+        // A narrow width, and a goto placed where the wrap would land inside
+        // it. Establish first that the hazard is real -- otherwise the second
+        // half of this test proves nothing.
+        f.host.gsbl_mut().channel_mut(chan).width = 10;
+        f.host.gsbl_mut().transmit(chan, b"12345678\x1b[12;34f");
+        let mangled = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            !mangled.contains("\x1b[12;34f"),
+            "with a wrap width set, the goto must come out broken -- if it \
+             does not, this test cannot discriminate: {mangled:?}"
+        );
+
+        // Now the real thing: fsdbkg's btutsw(usrnum,0).
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        assert!(matches!(
+            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
+            Ok(Ret::Void)
+        ));
+        assert_eq!(
+            f.host.gsbl_mut().channel_mut(chan).width,
+            0,
+            "btutsw(usrnum,0)"
+        );
+
+        f.host.gsbl_mut().transmit(chan, b"12345678\x1b[12;34f");
+        let intact = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            intact.contains("\x1b[12;34f"),
+            "after fsdbkg the goto goes out whole: {intact:?}"
+        );
+    }
+
+    #[test]
+    fn fsdbkg_locks_the_keyboard_and_arms_the_output_empty_signal() {
+        // btulok(usrnum,1) and btuoes(usrnum,1). Nothing reads `oes` until
+        // Task 11 turns it into the output-drained edge; it is set as real
+        // channel state now rather than dropped, so that task has something
+        // to consume instead of having to add it retroactively.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+        assert!(!f.host.gsbl_mut().channel_mut(chan).locked);
+        assert!(!f.host.gsbl_mut().channel_mut(chan).oes);
+
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        f.invoke(fsdbkg, &[templt.offset, templt.selector]).expect("painted");
+
+        assert!(f.host.gsbl_mut().channel_mut(chan).locked, "btulok");
+        assert!(f.host.gsbl_mut().channel_mut(chan).oes, "btuoes");
+    }
+
+    #[test]
+    fn fsdrft_hands_back_the_form_the_field_offsets_were_measured_against() {
+        // `fsdbkg(fsdrft())` walks the returned string by tmpoff, so the
+        // pointer has to address the ASCII-expanded template (FSDBBS.C:137),
+        // not the compact message text. They diverge from the first line
+        // break onward, and the symptom of getting it wrong is supporting
+        // text drawn from the wrong bytes rather than any kind of error.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        let returned = f.machine.read_cstr(templt).expect("addressable").to_vec();
+
+        let raw = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
+        let raw = f.machine.read_cstr(raw).expect("text").to_vec();
+        assert_eq!(
+            returned,
+            crate::msg::getasc(&raw),
+            "fsdrft returns getasc's expansion"
+        );
+
+        // And it is stable: the module holds this pointer across calls, so a
+        // second fsdrft must not hand out a different buffer.
+        let Ok(Ret::Far(again)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        assert_eq!(templt, again, "the expansion is cached, not rebuilt");
     }
 }

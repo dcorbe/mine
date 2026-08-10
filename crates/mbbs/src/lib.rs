@@ -566,6 +566,22 @@ pub struct Host {
     /// whole reason line mode is decoded too.
     pub(crate) fsd_ain: Vec<fsd::ain::Ainscb>,
 
+    /// `getasc(tmpmsg)`'s output, materialised in module memory, keyed by the
+    /// `(message block, message number)` it came from.
+    ///
+    /// `fsdrft` hands the module a `char *`, and the module passes it straight
+    /// back in as `fsdbkg(fsdrft())` (`FSDBBS.C:87`). That pointer has to
+    /// address the *same* string the form's field offsets were measured
+    /// against -- the ASCII-expanded one (`FSDBBS.C:137`) -- so it cannot
+    /// simply be the message text where it already sits. The genuine host has
+    /// the same problem and solves it the same way: `getasc` writes into a
+    /// buffer of the host's and returns a pointer to that.
+    ///
+    /// Cached rather than rebuilt because message text does not change once
+    /// read, and because a fresh segment per `fsdrft` call would leak one per
+    /// redisplay.
+    pub(crate) fsd_ascii: std::collections::HashMap<(FarPtr, u16), FarPtr>,
+
     /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
     /// hands `fldvfy`: the module reads `char *answer` out of it, and
     /// `VFYOK`'s own contract (`FSD.H` Note 2) lets it rewrite the bytes
@@ -828,6 +844,7 @@ impl Host {
             fsd_state: None,
             fsd_sessions: vec![None; usize::from(terms.count())],
             fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
+            fsd_ascii: std::collections::HashMap::new(),
             fsd_scratch: None,
             heap,
             users,

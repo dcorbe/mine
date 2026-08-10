@@ -218,6 +218,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "fsdord", fsd::fsdord, Cleans::Caller),
     (MAJORBBS, "fsdxan", fsd::fsdxan, Cleans::Caller),
     (MAJORBBS, "fsdrft", fsd::fsdrft, Cleans::Caller),
+    (MAJORBBS, "fsdbkg", fsd::fsdbkg, Cleans::Caller),
     (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
     (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
     (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
@@ -383,12 +384,13 @@ mod tests {
     }
 
     #[test]
-    fn fsdbkg_needs_a_screen_this_host_does_not_have_and_is_not_implemented() {
-        // `fsdbkg` clears an ANSI screen and runs `fsddsp`, a display engine
-        // -- full-screen entry, Stage 5. There is no screen to draw one on,
-        // so it stops the module and names itself, which is the answer --
-        // see the `shims::fsd` module documentation.
-        assert!(matches!(entry(MAJORBBS, "fsdbkg"), Entry::Unimplemented));
+    fn fsdbkg_is_wired() {
+        // It used to be `Entry::Unimplemented`, on the grounds that clearing
+        // an ANSI screen and running a display engine needed a screen this
+        // host did not have. Stage 5's Task 6 built one: `fsd::fsddsp` draws
+        // the form and `fsdbkg` sends it, with the wrap width zeroed first so
+        // the escapes survive `Channel::transmit`.
+        assert!(matches!(entry(MAJORBBS, "fsdbkg"), Entry::Routine { .. }));
     }
 
     #[test]
