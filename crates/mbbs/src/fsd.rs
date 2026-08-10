@@ -2555,6 +2555,185 @@ pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
     scb.set_state(state::FSDBUF);
 }
 
+/// `fsdinc(c)`'s `FSDNPT`/`FSDNEN` cases -- the non-ANSI (line-mode)
+/// keystroke dispatch. `FSD.C:1877-1888` (`FSDNPT`) and `:1889-1940`
+/// (`FSDNEN`), re-derived directly from the file rather than trusted from
+/// this plan's own transcription, per this repo's house rule.
+///
+/// # Why `byte: u8`, and what that already refuses for free
+///
+/// The original's `c` is an `int`. Values `0..255` are real keystrokes;
+/// values that are exact multiples of 256 (`CRSRUP`, `CRSRDN`, `BAKTAB`,
+/// `CRSRLF`, `CRSRRT`, `HOME`, `END`, `DEL`, `CTRLHOME`, `CTRLEND`,
+/// `CTRLPGUP`, `CTRLPGDN` -- `GCOMM.H:169-185`) are two-byte special codes
+/// `getchc()` assembles out of a BIOS scan code when it recognizes a cursor
+/// key. This host's line-mode input never scans for those -- that is
+/// exactly the ANSI cursor-key handling Stage 5 would add -- so a `u8`
+/// parameter excludes every one of them at the type level, with no runtime
+/// guard needed: there is no `u8` value equal to `72*256`. `TAB` (9) and
+/// `ESC` (27, `GCOMM.H:180-181`) are ordinary bytes and stay reachable;
+/// `'U'-64`, `'L'-64`, `'O'-64`, `'G'-64` (0x15, 0x0c, 0x0f, 0x07) are the
+/// literal control characters those expressions evaluate to and are
+/// reachable the same way.
+///
+/// # `'L'-64` (`fsdqdp()`) is refused, not silently dropped
+///
+/// `fsdqdp()` (`FSDBBS.C:407-411`) sets a host-side redisplay flag
+/// (`fsdusr->flags|=FBRDSP`) and re-arms `CYCLE` via `fsdnfy()` so a later
+/// poll pass redraws the whole screen -- machinery this crate's `Host` does
+/// not have (no `FBRDSP` equivalent, no `fsdnfy` port), and it is not
+/// ANSI-specific, so it falls under neither Tasks 6-8's ports nor this
+/// plan's Stage 5 deferral list. Silently doing nothing on Ctrl-L would
+/// look identical to a correct implementation in every test that never
+/// presses it, so this refuses loudly instead, the same
+/// refusal-over-fallback discipline [`bgnter`]/[`xitfld`] already apply to
+/// their own out-of-scope ANSI branches.
+///
+/// # `fsdnfy()` and `ahdptr=0`, inside `xitfld`'s own original body
+///
+/// Not called here either, for the reason [`xitfld`]'s own doc comment
+/// gives: both are `Machine`/`Host` territory a pure `&Form`/`&mut Scb`
+/// function cannot reach. Whatever eventually wraps this `fsdinc` in
+/// `Machine` I/O is where they belong; this function stays pure like every
+/// function it calls.
+///
+/// # The subtlety `FSDNPT`'s missing `break` preserves
+///
+/// The original's `case FSDNPT:` body only runs -- and only sets
+/// `state=FSDNEN` -- when `c` is a genuine printable byte (`'!' <= c`); for
+/// every byte below that (backspace, `\r`, Ctrl-U, ESC, ...) control falls
+/// straight through the missing `break` into `case FSDNEN:`'s own
+/// `switch(c)`, with `fsdscb->state` **untouched**. That is not cosmetic:
+/// the `'U'-64` branch below reads `fsdscb->state` mid-switch to decide
+/// whether to erase what is on screen before backing out of the field, and
+/// the answer differs depending on whether this call arrived via a direct
+/// `FSDNEN` dispatch (state already `FSDNEN`, something was mid-typed,
+/// erase it) or via `FSDNPT`'s fallthrough (state still `FSDNPT`, nothing
+/// has been typed into this field this session, nothing to erase). This
+/// port reproduces the fallthrough by testing `scb.state()` once, up
+/// front, only to decide whether the point-mode arm's own body should run
+/// at all -- it never writes `FSDNEN` back for a byte that took the
+/// fallthrough path, so the read further down still sees the truth.
+///
+/// # The "double `bgnter`" `FSDNPT`'s own body produces, and why it is not a bug
+///
+/// `case FSDNPT`'s body runs `ansbuf[0]='\0'; bgnter(); addprt(c);`
+/// unconditionally whenever `hdlprt(c)==1`, with no regard for whether
+/// [`hdlprt`] already performed its own reset-and-erase internally -- its
+/// `#`/`$` branch does, exactly when a digit follows an aborted or
+/// committed `ALT=` match (see [`hdlprt`]'s own doc comment). A field can
+/// reach `FSDNPT` with a non-empty, `ALT=`-matching answer already seeded
+/// by [`defntr`] (returning to an already-answered numeric field, say), so
+/// both erasures really can fire back to back on the very same keystroke.
+/// That is what `FSD.C:1881-1885` says to do, and this port does it too.
+///
+/// # `bgnter` before the blank, not after
+///
+/// The C's own statement order is `ansbuf[0]='\0'; bgnter();` -- blank
+/// first. This port runs [`bgnter`] first and blanks second, the same
+/// reordering [`altntr`]'s own doc comment already explains and
+/// [`hdlprt`]'s two reset branches already apply: [`unentr`] (called
+/// inside `bgnter`) measures how much to erase off `scb.ansbuf().len()`,
+/// this port's standing substitution for the C's separately-tracked
+/// `anslen` -- and that substitution only gives the right answer while
+/// `ansbuf` still holds what was actually on screen, i.e. before the blank
+/// the C's own `anslen` would not see either.
+///
+/// # Panics
+///
+/// If `scb.state()` is not [`state::FSDNPT`] or [`state::FSDNEN`] --
+/// `FSDAPT`/`FSDAEN` (ANSI) are Stage 5, and `FSDBUF`/`FSDSTB` (typeahead
+/// accumulation between an `fsdinc` call and `fsdprc` catching up) are
+/// dropped per the design doc's "Dropped" list, neither built by this
+/// crate. Or if `byte` is Ctrl-L -- see above.
+pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
+    assert!(
+        matches!(scb.state(), state::FSDNPT | state::FSDNEN),
+        "fsdinc: state {} is neither FSDNPT nor FSDNEN -- FSDAPT/FSDAEN \
+         (ANSI) are Stage 5 and FSDBUF/FSDSTB (typeahead accumulation) are \
+         not this function's cases",
+        scb.state()
+    );
+
+    let mut out = Vec::new();
+
+    // Falls through to FSDNEN's own switch below, with `state` left at
+    // FSDNPT, when this is false -- see this function's own doc comment.
+    if scb.state() == state::FSDNPT && byte >= b'!' {
+        scb.set_state(state::FSDNEN);
+        // `fsdscb->ansptr=0` / the matching `...=fsdscb->anslen` that
+        // bracket this whole arm in the original are not modeled -- see
+        // `addprt`'s own doc comment for ansptr's standing substitution.
+        let (verdict, prt_out) = hdlprt(form, spec, scb, byte);
+        out.extend(prt_out);
+        if verdict == Hdlprt::Enter {
+            out.extend(bgnter(form, scb));
+            scb.set_ansbuf(b"");
+            out.extend(addprt(form, scb, byte));
+        }
+        return out;
+    }
+
+    match byte {
+        b'\r' | b'\t' => {
+            // CRSRDN is a special code, already excluded by `byte: u8`.
+            scb.set_xitkey(u16::from(byte));
+            if usize::from(scb.crsfld()) + 1 < form.in_template {
+                xitfld(form, scb, 1);
+            } else {
+                // The last field: stay put but still commit it, then step
+                // crsfld one past the end by hand (not through move_field)
+                // -- the out-of-range sentinel fsdprc's own FSDBUF arm
+                // (Task 10, not built here) reads to know the form is
+                // complete.
+                xitfld(form, scb, 0);
+                scb.set_crsfld(scb.crsfld() + 1);
+            }
+        }
+        0x15 => {
+            // 'U'-64: CRSRUP/BAKTAB's ASCII alias, move to the previous
+            // field. `movfld` is called first only to test whether one
+            // exists -- it has no side effect of its own, matching how the
+            // C uses its return value purely as an is-there-a-target check
+            // before anything else runs.
+            if move_field(form, i32::from(scb.crsfld()) - 1, -1, None, false).is_some() {
+                if scb.state() == state::FSDNEN {
+                    out.extend(unentr(form, scb));
+                }
+                scb.set_xitkey(u16::from(byte));
+                xitfld(form, scb, -1);
+                scb.set_flags(scb.flags() | entry_flags::FSDIGA);
+            }
+        }
+        0x0c => {
+            // 'L'-64: fsdqdp() -- refused, see this function's own doc
+            // comment.
+            panic!("fsdinc: Ctrl-L (fsdqdp, full-screen redisplay) is not built");
+        }
+        0x08 | 0x7f => {
+            // '\b', literal DEL (0x7F). The special-code `DEL` (83*256) is
+            // already excluded by `byte: u8`.
+            scb.set_state(state::FSDNEN);
+            out.extend(hdlcbs(form, scb));
+        }
+        0x0f | 0x07 | 0x1b => {
+            // 'O'-64, 'G'-64, ESC: abandon the field.
+            scb.set_xitkey(u16::from(byte));
+            xitfld(form, scb, 0);
+        }
+        _ if byte >= b' ' => {
+            scb.set_state(state::FSDNEN);
+            let (verdict, prt_out) = hdlprt(form, spec, scb, byte);
+            out.extend(prt_out);
+            if verdict == Hdlprt::Enter {
+                out.extend(addprt(form, scb, byte));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
 ///
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
@@ -4651,6 +4830,214 @@ mod tests {
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
         xitfld(&form, &mut scb, 1);
+    }
+
+    #[test]
+    fn fsdinc_types_a_whole_field_then_exits_on_enter() {
+        // A whole field's worth of typing, byte by byte, through fsdinc
+        // itself -- not one call per test. Three fields so the middle one
+        // (crsfld=1) isn't the boundary case a last-field Enter is.
+        let spec = b"A NAME B";
+        let form = compile(b"?? ????????? ??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1);
+        scb.set_state(state::FSDNPT); // what fsdlin() itself leaves a session in
+
+        let mut out = Vec::new();
+        for &c in b"Kaimon" {
+            out.extend(fsdinc(&form, spec, &mut scb, c));
+        }
+        assert_eq!(out, b"Kaimon", "each character echoed as it was typed");
+        assert_eq!(scb.ansbuf(), b"Kaimon");
+        assert_eq!(scb.state(), state::FSDNEN, "still entering until Enter");
+
+        fsdinc(&form, spec, &mut scb, b'\r');
+
+        assert_eq!(scb.state(), state::FSDBUF, "xitfld committed the field");
+        assert_eq!(scb.crsfld(), 2, "the cursor genuinely moved to the next field");
+        assert_eq!(scb.entfld(), 1, "entfld records which field was just exited");
+    }
+
+    #[test]
+    fn fsdinc_handles_a_typo_correction_mid_field() {
+        // "Kaimoon" + backspace + backspace + "n" + Enter -> "Kaimon". The
+        // same fixture hdlcbs_and_addprt_together_correct_a_typo_across_a_
+        // sequence_of_keystrokes already proves at the addprt/hdlcbs level;
+        // driven here through fsdinc's own byte dispatch instead, which is
+        // the interaction a single-function test can't catch (state has to
+        // survive FSDNPT->FSDNEN and every backspace correctly, not just
+        // the answer buffer).
+        let spec = b"NAME";
+        let form = compile(b"????????", spec, MANY); // width 8
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDNPT);
+
+        for &c in b"Kaimoon" {
+            fsdinc(&form, spec, &mut scb, c);
+        }
+        assert_eq!(scb.ansbuf(), b"Kaimoon");
+        assert_eq!(scb.state(), state::FSDNEN);
+
+        let bs1 = fsdinc(&form, spec, &mut scb, 0x08);
+        let bs2 = fsdinc(&form, spec, &mut scb, 0x08);
+        assert_eq!(bs1, b"\x08 \x08");
+        assert_eq!(bs2, b"\x08 \x08");
+        assert_eq!(scb.ansbuf(), b"Kaimo", "both trailing o's backspaced off");
+        assert_eq!(scb.state(), state::FSDNEN, "backspace re-asserts FSDNEN");
+
+        let out = fsdinc(&form, spec, &mut scb, b'n');
+        assert_eq!(out, b"n");
+        assert_eq!(scb.ansbuf(), b"Kaimon");
+
+        fsdinc(&form, spec, &mut scb, b'\r');
+        assert_eq!(scb.state(), state::FSDBUF);
+        assert_eq!(scb.ansbuf(), b"Kaimon", "the committed answer");
+    }
+
+    #[test]
+    fn fsdinc_cycles_an_alt_field_with_space_and_commits_it_with_enter() {
+        // MajorMUD's real HAIR_COL/EYE_COL/terminal SAVE fields are all
+        // MULTICHOICE ALT= fields cycled with space -- this is the seam
+        // Task 7 built and Task 9 has to actually dispatch to.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDNPT);
+
+        // The first space arrives via FSDNPT's own fallthrough (' ' < '!'),
+        // reaching FSDNEN's default arm with state still FSDNPT at the
+        // moment hdlprt/hdlalt run -- and commits the first alternate.
+        let out1 = fsdinc(&form, spec, &mut scb, b' ');
+        assert_eq!(scb.ansbuf(), b"Black");
+        assert_eq!(scb.state(), state::FSDNEN, "the default arm sets it even via fallthrough");
+        assert!(!out1.is_empty());
+
+        // FSDQOT (set by altntr's own commit) gates repeat spaces until
+        // fsdqoe() -- the genuine output-drain callback, Machine-level and
+        // out of this task's scope -- clears it. Driven by hand here, the
+        // same workaround hdlalt_space_cycles_forward_through_the_list_
+        // and_wraps_to_the_first_alternate already uses for the identical
+        // reason.
+        scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+        fsdinc(&form, spec, &mut scb, b' ');
+        assert_eq!(scb.ansbuf(), b"Brown", "cycled to the next alternate");
+
+        scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+        fsdinc(&form, spec, &mut scb, b' ');
+        assert_eq!(scb.ansbuf(), b"Red", "cycled to the last alternate");
+
+        fsdinc(&form, spec, &mut scb, b'\r');
+        assert_eq!(scb.state(), state::FSDBUF, "Enter committed the field");
+        assert_eq!(scb.ansbuf(), b"Red", "the last-cycled alternate is what got saved");
+        assert_eq!(
+            scb.crsfld(), 1,
+            "the single-field form's last field: xitfld(0) leaves crsfld at 0, \
+             then fsdinc steps it one past the end by hand as the \
+             form-is-complete sentinel -- not xitfld(1)'s own move_field, \
+             which would find no field 1 and leave crsfld unmoved at 0"
+        );
+    }
+
+    #[test]
+    fn fsdinc_backing_out_with_ctrl_u_only_erases_a_field_that_was_actually_typed_into() {
+        // The subtlety FSDNPT's own missing `break` preserves: `'U'-64`'s
+        // branch reads `fsdscb->state` to decide whether to unentr() before
+        // backing out, and that read has to see FSDNPT (not FSDNEN) when
+        // Ctrl-U itself is what triggered the fallthrough -- FSDNPT's own
+        // body only ever runs for `c >= '!'`, and Ctrl-U (0x15) never is.
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+
+        // Scenario 1: field B (crsfld=1) has never been typed into this
+        // session -- state is still FSDNPT when Ctrl-U arrives, even though
+        // ansbuf is non-empty (defntr() seeded it from an existing answer,
+        // and shoabf() already painted it on screen before this fsdinc call
+        // ever ran). A pre-seeded, non-empty ansbuf is deliberate: with an
+        // empty one, an erroneous unentr() call and a correctly-skipped one
+        // produce the same (empty) output, so that version of this test
+        // could not tell "state was read as FSDNEN when it should have
+        // stayed FSDNPT" apart from "state was read correctly" -- exactly
+        // the sequence-only bug a naive always-set-FSDNEN implementation
+        // would pass unnoticed.
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1);
+        scb.set_state(state::FSDNPT);
+        scb.set_ansbuf(b"Al");
+
+        let out = fsdinc(&form, spec, &mut scb, 0x15);
+
+        assert_eq!(
+            out, b"",
+            "state is still FSDNPT (never entered), so unentr must not fire \
+             even though ansbuf holds defntr's pre-seeded \"Al\""
+        );
+        assert_eq!(scb.crsfld(), 0, "moved back to field A");
+        assert_eq!(scb.entfld(), 1);
+        assert_eq!(scb.state(), state::FSDBUF);
+        assert_eq!(scb.flags() & entry_flags::FSDIGA, entry_flags::FSDIGA);
+
+        // Scenario 2: field B was typed into first (FSDNPT -> FSDNEN via a
+        // real character), so backing out with Ctrl-U now has something on
+        // screen to erase.
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1);
+        scb.set_state(state::FSDNPT);
+        fsdinc(&form, spec, &mut scb, b'x');
+        assert_eq!(scb.state(), state::FSDNEN, "typing moved it out of FSDNPT");
+
+        let out = fsdinc(&form, spec, &mut scb, 0x15);
+
+        assert_eq!(out, b"\x08 \x08", "the one typed character is erased before backing out");
+        assert_eq!(scb.crsfld(), 0);
+    }
+
+    #[test]
+    fn fsdinc_erases_a_pre_seeded_default_before_typing_a_fresh_first_character() {
+        // A field defntr() seeded with an existing answer (returning to an
+        // already-answered field): the very first fresh character must
+        // erase the OLD value's on-screen characters before echoing the
+        // new one. This only comes out right if bgnter() -- whose unentr()
+        // reads this port's ansbuf-is-anslen substitution -- runs BEFORE
+        // ansbuf is blanked, not after; see altntr's/hdlprt's own doc
+        // comments for the same reordering and why the plain C statement
+        // order (`ansbuf[0]='\0'; bgnter();`) does not port literally.
+        let spec = b"NAME";
+        let form = compile(b"????????", spec, MANY); // width 8
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDNPT);
+        scb.set_ansbuf(b"Al"); // defntr()'s seed; shoabf() already showed it
+
+        let out = fsdinc(&form, spec, &mut scb, b'K');
+
+        assert_eq!(
+            out,
+            b"\x08 \x08\x08 \x08K",
+            "unentr erases the two characters of the OLD default (\"Al\"), then K is echoed"
+        );
+        assert_eq!(scb.ansbuf(), b"K", "the old default is gone, not \"AlK\"");
+    }
+
+    #[test]
+    #[should_panic(expected = "FSDNPT")]
+    fn fsdinc_refuses_a_state_outside_fsdnpt_fsdnen() {
+        let form = compile(b"?? ??", b"A B", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDAPT);
+        fsdinc(&form, b"A B", &mut scb, b'x');
+    }
+
+    #[test]
+    #[should_panic(expected = "fsdqdp")]
+    fn fsdinc_refuses_ctrl_l_the_redisplay_request_it_does_not_build() {
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDNEN);
+        fsdinc(&form, spec, &mut scb, 0x0c);
     }
 
     #[test]
