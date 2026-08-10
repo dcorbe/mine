@@ -1907,8 +1907,53 @@ fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec
 /// Task 6 ever reads `ftmptr`, the way [`defntr`]'s own doc comment explains
 /// `altptr`'s identical gap.
 pub fn shoabf(form: &Form, scb: &Scb, justfy: i16) -> Vec<u8> {
+    shoabf_fmtend(form, scb, justfy).0
+}
+
+/// [`shoabf`], keeping `dspans`'s `fmtend` as well as its bytes.
+///
+/// `fmtend` is where the formatted answer stopped inside the field -- the
+/// offset `altntr` subtracts from `xwidth` to work out how far left to walk
+/// the cursor afterwards (`FSD.C:1421`). Only the ANSI path needs it, which is
+/// why [`shoabf`] itself still throws it away.
+fn shoabf_fmtend(form: &Form, scb: &Scb, justfy: i16) -> (Vec<u8>, i16) {
     let field = &form.fields[usize::from(scb.crsfld())];
-    dspans(field, &form.punctuation, scb.ansbuf(), justfy).0
+    dspans(field, &form.punctuation, scb.ansbuf(), justfy)
+}
+
+/// `ansmov()`, `FSD.C:1271-1285`: an ANSI relative cursor move.
+///
+/// `cmd` is `A` up, `B` down, `C` right, `D` left.
+///
+/// # It drops out-of-range moves rather than clamping them
+///
+/// `if (val > 0 && val < 100)` guards the whole body, so a count of 0, a
+/// negative one, or anything from 100 up emits **nothing at all**. That is not
+/// a bug being reproduced for its own sake: `altntr` computes its count as
+/// `xwidth - fmtend`, which is zero whenever the answer fills the field, and
+/// the silent drop is what makes that case correct rather than a stray move.
+///
+/// # And it omits the parameter entirely when the count is 1
+///
+/// `ESC[C`, not `ESC[1C` (`FSD.C:1277`). ANSI treats a missing parameter as 1,
+/// so the two are equivalent to a terminal -- but they are different bytes,
+/// and `fsdinc`'s FSDAEN arm hand-writes the literal `"\x1B[C"` in one place
+/// while calling `ansmov` in another. Matching the byte stream means matching
+/// this.
+#[must_use]
+pub fn ansmov(val: i16, cmd: u8) -> Vec<u8> {
+    if val <= 0 || val >= 100 {
+        return Vec::new();
+    }
+    let mut out = b"\x1b[".to_vec();
+    if val > 1 {
+        if val > 9 {
+            out.push(u8::try_from(val / 10).expect("< 10") + b'0');
+        }
+        out.push(u8::try_from(val % 10).expect("< 10") + b'0');
+    }
+    out.push(cmd);
+    out
 }
 
 /// `spaces()`, `FSD.C:532-545`: `n` blanks, with `n` clamped to `0..=ANSLEN+1`.
@@ -2276,11 +2321,34 @@ pub fn unentr(form: &Form, scb: &Scb) -> Vec<u8> {
 ///
 /// If `scb.flags() & FSDANS != 0` -- see above.
 pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
-    assert!(
-        scb.flags() & entry_flags::FSDANS == 0,
-        "bgnter: ANSI mode (FSDANS) is not ported -- Stage 5"
-    );
-    let mut out = unentr(form, scb);
+    let field = &form.fields[usize::from(scb.crsfld())];
+    let mut out = if scb.flags() & entry_flags::FSDANS == 0 {
+        unentr(form, scb)
+    } else {
+        // `FSD.C:1384-1400`. Go to the field, set the cursor attribute, blank
+        // it, and **go to it again**.
+        //
+        // That second goto is not redundant: blanking left the cursor at the
+        // field's end, and typing has to begin at its start. The same
+        // paint-then-re-home idiom recurs in `fsdent`, `hopfld` and the
+        // insert/delete branches -- it is the shape of the thing, not a
+        // slip to optimise away.
+        let mut out = field.ansgto.clone();
+        out.extend(ibm2ans(scb.crsatr()));
+        match field.punctuation_at {
+            // `fsdous(fsdscb->mbpunc+fldptr->mbpoff)`: the field's embedded
+            // punctuation template, up to its NUL -- so `###-####` blanks as
+            // `   -    ` and keeps its own dash on screen.
+            Some(at) => {
+                let tp = &form.punctuation[usize::from(at)..];
+                let end = tp.iter().position(|&b| b == 0).unwrap_or(tp.len());
+                out.extend_from_slice(&tp[..end]);
+            }
+            None => out.extend(spaces(i16::from(field.width))),
+        }
+        out.extend_from_slice(&field.ansgto);
+        out
+    };
     out.extend(skppnc(form, scb));
     out
 }
@@ -2517,7 +2585,17 @@ fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
     scb.set_altptr(Some(at));
     let mut out = bgnter(form, scb);
     scb.set_ansbuf(spelling);
-    out.extend(shoabf(form, scb, 0));
+    if scb.flags() & entry_flags::FSDANS == 0 {
+        out.extend(shoabf(form, scb, 0));
+    } else {
+        // `FSD.C:1419-1422`: draw the alternate left-justified, then walk the
+        // cursor back over the padding `dspans` just emitted, so typing
+        // continues where the text ends rather than at the field's edge.
+        let (drawn, fmtend) = shoabf_fmtend(form, scb, -1);
+        out.extend(drawn);
+        let field = &form.fields[usize::from(scb.crsfld())];
+        out.extend(ansmov(i16::from(field.xwidth) - fmtend, b'D'));
+    }
     scb.set_flags((scb.flags() & !entry_flags::FSDANT) | entry_flags::FSDQOT);
     out
 }
@@ -2768,20 +2846,25 @@ pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
 ///   territory, wired up by Task 9's `fsdinc` dispatcher) -- not a thing a
 ///   pure `&Form`/`&mut Scb` function can do at all.
 ///
-/// # Panics
+/// # Returns
 ///
-/// If `scb.flags() & FSDANS != 0` -- see above.
-pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
-    assert!(
-        scb.flags() & entry_flags::FSDANS == 0,
-        "xitfld: ANSI mode (FSDANS) is not ported -- Stage 5's cursor-goto \
-         echo (`fsdous(fldptr->ansgto)`) is dead code without it"
-    );
+/// The cursor-goto for the field it moved to, on the ANSI path, and nothing
+/// at all off it.
+pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) -> Vec<u8> {
+    let mut out = Vec::new();
     scb.set_entfld(scb.crsfld());
     if let Some(fldn) = move_field(form, i32::from(scb.crsfld()) + finc, finc, None, false) {
         scb.set_crsfld(fldn as u8);
+        // `FSD.C:1345-1347`. Live since Stage 5: the cursor follows the field
+        // it just moved to. Off the ANSI path every `ansgto` is empty anyway,
+        // so the flag test is what says *why* nothing is emitted rather than
+        // the emptiness saying it by accident.
+        if scb.flags() & entry_flags::FSDANS != 0 {
+            out.extend_from_slice(&form.fields[usize::from(scb.crsfld())].ansgto);
+        }
     }
     scb.set_state(state::FSDBUF);
+    out
 }
 
 /// `fsdinc(c)`'s `FSDNPT`/`FSDNEN` cases -- the non-ANSI (line-mode)
@@ -2938,14 +3021,14 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
         ain::CRSRDN | 0x0d | 0x09 => {
             scb.set_xitkey(key as u16);
             if usize::from(scb.crsfld()) + 1 < form.in_template {
-                xitfld(form, scb, 1);
+                out.extend(xitfld(form, scb, 1));
             } else {
                 // The last field: stay put but still commit it, then step
                 // crsfld one past the end by hand (not through move_field)
                 // -- the out-of-range sentinel fsdprc's own FSDBUF arm
                 // (Task 10, not built here) reads to know the form is
                 // complete.
-                xitfld(form, scb, 0);
+                out.extend(xitfld(form, scb, 0));
                 scb.set_crsfld(scb.crsfld() + 1);
             }
         }
@@ -2960,7 +3043,7 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
                     out.extend(unentr(form, scb));
                 }
                 scb.set_xitkey(key as u16);
-                xitfld(form, scb, -1);
+                out.extend(xitfld(form, scb, -1));
                 scb.set_flags(scb.flags() | entry_flags::FSDIGA);
             }
         }
@@ -2983,7 +3066,7 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
             // now takes `ESC ESC` from the wire, which is the original's
             // behaviour -- see [`ain`]'s module docs.
             scb.set_xitkey(key as u16);
-            xitfld(form, scb, 0);
+            out.extend(xitfld(form, scb, 0));
         }
         // `' ' <= c && c < 256` (`FSD.C:1925`). Same upper bound, same
         // reason, as the FSDNPT guard above.
@@ -5404,12 +5487,71 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FSDANS")]
-    fn bgnter_refuses_the_ansi_branch_it_does_not_port() {
-        let form = compile(b"??", b"A", MANY, Ascn::Line);
+    fn bgnter_blanks_an_ansi_field_and_re_homes_the_cursor() {
+        // The assertion this replaces refused FSDANS outright. `FSD.C:1384-1400`
+        // is what it refused: goto, cursor attribute, blank, **goto again**.
+        // That second goto is the part worth a test of its own -- blanking
+        // left the cursor at the field's end, and typing has to start at its
+        // beginning, so dropping it would put every keystroke one field-width
+        // to the right.
+        let form = compile(b"a ?????", b"A", MANY, Ascn::Ansi);
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
-        bgnter(&form, &mut scb);
+        scb.set_crsatr(0x70);
+        scb.set_crsfld(0);
+
+        let out = bgnter(&form, &mut scb);
+        let gto = &form.fields[0].ansgto;
+        assert!(!gto.is_empty(), "an ANSI form has a goto");
+
+        let mut expected = gto.clone();
+        expected.extend(ibm2ans(0x70));
+        expected.extend(b"     "); // width 5
+        expected.extend_from_slice(gto);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&expected)
+        );
+        assert!(
+            out.ends_with(gto),
+            "and it ends back at the field's start, not its end"
+        );
+    }
+
+    #[test]
+    fn bgnter_blanks_an_ansi_field_with_its_own_punctuation_template() {
+        // `fsdous(fsdscb->mbpunc+fldptr->mbpoff)` (FSD.C:1390) rather than
+        // `spaces(width)`: a field with embedded punctuation keeps its
+        // separators on screen while its answer positions go blank.
+        let form = compile(b"###-####", b"PHONE", MANY, Ascn::Ansi);
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        assert!(
+            form.fields[0].punctuation_at.is_some(),
+            "the run joined across the dash"
+        );
+
+        let out = bgnter(&form, &mut scb);
+        let drawn = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            drawn.contains("   -    "),
+            "the dash survives the blanking: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn bgnter_off_the_ansi_path_is_unchanged() {
+        // The `else` arm is still `unentr()`, still taken, and line mode must
+        // not start emitting cursor movement it never emitted before.
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        let out = bgnter(&form, &mut scb);
+        assert!(
+            !out.contains(&0x1b),
+            "no escape may appear off the ANSI path: {out:?}"
+        );
     }
 
     #[test]
@@ -6076,12 +6218,106 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FSDANS")]
-    fn xitfld_refuses_the_ansi_branch_it_does_not_port() {
-        let form = compile(b"?? ??", b"A B", MANY, Ascn::Line);
+    fn xitfld_sends_the_cursor_after_the_field_it_moved_to() {
+        // `FSD.C:1345-1347`, live since Stage 5. The assertion this replaces
+        // refused FSDANS because there was nothing faithful to send.
+        let form = compile(b"?? ??", b"A B", MANY, Ascn::Ansi);
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
-        xitfld(&form, &mut scb, 1);
+        scb.set_crsfld(0);
+
+        let out = xitfld(&form, &mut scb, 1);
+        assert_eq!(scb.crsfld(), 1);
+        assert_eq!(
+            out, form.fields[1].ansgto,
+            "the goto is the one for the field it arrived at, not the one it left"
+        );
+        assert_eq!(scb.state(), state::FSDBUF);
+        assert_eq!(scb.entfld(), 0, "entfld records the field just exited");
+    }
+
+    #[test]
+    fn xitfld_off_the_ansi_path_emits_nothing() {
+        let form = compile(b"?? ??", b"A B", MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        assert_eq!(xitfld(&form, &mut scb, 1), b"");
+        assert_eq!(scb.crsfld(), 1, "but it still moves");
+    }
+
+    #[test]
+    fn xitfld_that_cannot_move_sends_no_goto() {
+        // `movfld` returning -1 skips the whole `if` body, cursor-goto
+        // included -- so a session that cannot advance must not emit a stale
+        // goto for the field it is still sitting on.
+        let form = compile(b"??", b"A", MANY, Ascn::Ansi);
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        assert_eq!(
+            xitfld(&form, &mut scb, 1),
+            b"",
+            "there is no next field to go to"
+        );
+        assert_eq!(scb.crsfld(), 0, "and the cursor stayed put");
+    }
+
+    #[test]
+    fn ansmov_drops_out_of_range_counts_instead_of_clamping() {
+        // `if (val > 0 && val < 100)` guards the whole body (FSD.C:1275).
+        // altntr computes its count as xwidth-fmtend, which is 0 whenever the
+        // answer fills the field -- so the silent drop is what makes that
+        // case right rather than a stray cursor move.
+        assert_eq!(ansmov(0, b'D'), b"", "zero emits nothing");
+        assert_eq!(ansmov(-5, b'D'), b"", "and so does a negative");
+        assert_eq!(ansmov(100, b'D'), b"", "and so does 100");
+        assert_eq!(ansmov(i16::MAX, b'C'), b"");
+    }
+
+    #[test]
+    fn ansmov_omits_the_parameter_when_the_count_is_one() {
+        // ESC[C, not ESC[1C (FSD.C:1277). Equivalent to a terminal, different
+        // bytes on the wire -- and fsdinc's FSDAEN arm hand-writes the
+        // literal in one place while calling ansmov in another, so the byte
+        // streams have to agree.
+        assert_eq!(ansmov(1, b'C'), b"\x1b[C");
+        assert_eq!(ansmov(2, b'C'), b"\x1b[2C");
+        assert_eq!(ansmov(9, b'D'), b"\x1b[9D");
+        assert_eq!(ansmov(10, b'A'), b"\x1b[10A");
+        assert_eq!(ansmov(99, b'B'), b"\x1b[99B");
+    }
+
+    #[test]
+    fn altntr_walks_the_cursor_back_over_the_padding_it_just_drew() {
+        // `FSD.C:1419-1422`: shoabf(-1) draws the alternate left-justified
+        // and pads to the field's width; ansmov(xwidth-fmtend,'D') puts the
+        // cursor back where the text ended. Without it, typing would continue
+        // at the field's right edge.
+        let spec = b"OK(ALT=YES ALT=NO MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY, Ascn::Ansi);
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+
+        let out = altntr(&form, &mut scb, 0, b"YES");
+        let drawn = String::from_utf8_lossy(&out).into_owned();
+        assert!(drawn.contains("YES"), "{drawn:?}");
+        assert!(
+            drawn.ends_with("\u{1b}[3D"),
+            "three columns of padding walked back: {drawn:?}"
+        );
+        assert_eq!(scb.flags() & entry_flags::FSDQOT, entry_flags::FSDQOT);
+    }
+
+    #[test]
+    fn altntr_off_the_ansi_path_draws_the_minimum_and_moves_nothing() {
+        let spec = b"OK(ALT=YES ALT=NO MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let out = altntr(&form, &mut scb, 0, b"YES");
+        assert_eq!(out, b"YES", "justfy 0: no padding, and so nothing to undo");
     }
 
     #[test]
