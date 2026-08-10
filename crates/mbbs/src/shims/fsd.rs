@@ -47,7 +47,7 @@
 //! `btuchi`'s whole family collapses to here -- see [`fsdcon`]'s own doc
 //! comment.
 
-use mbbs16::{Exit, FarPtr, Machine, Ret};
+use mbbs16::{FarPtr, Machine, Module, Ret};
 
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
@@ -678,6 +678,43 @@ pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
+/// `int vfyadn(int fldno, char *answer)` -- `FSD.C:2007-2053`. See
+/// [`fsd::vfyadn`]'s own doc comment for what it does and why it is in
+/// scope: MajorMUD's own `_ljnvfy` (the `fldvfy` [`fsdego`] is handed)
+/// falls through to this on every field, so `machine.call(fldvfy, ..)`
+/// cannot return at all until this ordinal is serviced like any other
+/// import.
+///
+/// Not called from this crate's own dispatch -- `fsdscb->fldvfy` calling it
+/// is `WCCMMUD.DLL`'s doing, reached only from inside
+/// [`fsdprc`]'s `machine.call(fldvfy, ..)`. Registered under `"vfyadn"` in
+/// `shims/mod.rs`'s `ROUTINES` table the same way `fsdroom`/`fsdapr`/etc.
+/// are, so it is this file's convention to keep it here beside them.
+///
+/// # Errors
+///
+/// If no session has been prepared, or `fldno` is not a field of it.
+pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let fldno = machine.arg_u16(0);
+    let answer = machine.read_cstr(machine.arg_far(1))?.to_vec();
+
+    let (mut block, at) = prepared(machine, host, "vfyadn")?;
+    let record = field_record(machine, &block, fldno, "vfyadn")?;
+    let field = u8::try_from(fldno).map_err(|_| {
+        ShimError::Failed(format!("vfyadn: field {fldno} does not fit fsdscb->entfld's byte"))
+    })?;
+    let ansoff = answer_offset(&record);
+    let current = machine
+        .read_cstr(offset(block.newans(), usize::from(ansoff))?)?
+        .to_vec();
+
+    let numtpl = block.numtpl();
+    let vc = fsd::vfyadn(&mut block, field, numtpl, &answer, &current);
+    machine.write(at, block.as_bytes())?;
+
+    Ok(Ret::U16(vc as u16))
+}
+
 /// `fsdcon()`, `FSDBBS.C:91-101`. Turn on the channel settings an FSD session
 /// needs: raw input (Stage 2's [`crate::gsbl::Channel::raw`], so `push_input`
 /// stops assembling lines and delivers keystrokes one at a time) and no echo
@@ -914,20 +951,32 @@ fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, Shi
 /// exactly the trap `polrou` already documents (`lib.rs:1128`, cited by
 /// the design doc's "The two callbacks into module code").
 ///
-/// `machine.call` is used directly here, matching the design doc's own
-/// description of this call site ("`machine.call` is already legal") and
-/// this plan's own sketch for `goback`/`whndun` -- not the full
-/// `Host::run` service loop `dopoll`/`polrou` use. A callback that itself
-/// calls a further host routine is therefore not serviced; see "Errors".
+/// **Correction, found driving this against the real `WCCMMUD.DLL`
+/// (Task 12):** an earlier version of this doc comment said `machine.call`
+/// was used directly here, "not the full `Host::run` service loop", and
+/// that "a callback that itself calls a further host routine is therefore
+/// not serviced". That was true of the code and false about what MajorMUD
+/// needs: measured against the real module, `fldvfy` (`_ljnvfy`,
+/// `re/exports/WCCMMUD_decompiled.c:11227`) calls a further host routine
+/// (`vfyadn`, now [`crate::shims::fsd::vfyadn`]) on every field, so a
+/// `machine.call` that could not service a nested call could not process a
+/// single field against the real module. This now goes through
+/// [`Host::run`], the same servicing loop `dopoll`/`polrou` use, so nested
+/// calls resolve like any other import.
 ///
 /// # Errors
 ///
-/// If no session has been prepared; if `fldvfy` does anything other than
-/// return a value directly -- in particular, the real `_ljnvfy`/`vfyadn`
-/// chain MajorMUD uses (`fsd::fsdprc`'s own doc comment traces it) always
-/// calls the still-unbuilt `vfyadn`, so this refuses rather than mis-
-/// handling a call this crate cannot yet service.
-pub(crate) fn fsdprc(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<Ret, ShimError> {
+/// If no session has been prepared, or if `fldvfy` stops the machine (an
+/// unimplemented import, a fault, or a timeout, anywhere in the call tree
+/// `Host::run` services) -- the machine is already poisoned with the real
+/// reason by the time that happens (`Machine::poison`'s "the first reason
+/// wins"), so this only has to name the fact, not invent a better one.
+pub(crate) fn fsdprc(
+    machine: &mut Machine,
+    host: &mut Host,
+    module: &Module,
+    chan: Chan,
+) -> Result<Ret, ShimError> {
     let (block, at) = prepared(machine, host, "fsdprc")?;
     let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
@@ -964,15 +1013,14 @@ pub(crate) fn fsdprc(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
         // The borrow on `block` ends here: everything after this point
         // re-reads fresh from `Machine`, per the callback discipline
         // above.
-        let exit = machine
-            .call(fldvfy, &[u16::from(entfld), scratch.offset, scratch.selector])
+        let outcome = host
+            .run(machine, module, fldvfy, &[u16::from(entfld), scratch.offset, scratch.selector])
             .map_err(|e| ShimError::Failed(format!("fsdprc: fldvfy call failed: {e}")))?;
-        match exit {
-            Exit::Returned { ax, .. } => ax as i16,
-            other => {
+        match outcome {
+            crate::Outcome::Returned { ax, .. } => ax as i16,
+            crate::Outcome::Stopped(poison) => {
                 return Err(ShimError::Failed(format!(
-                    "fsdprc: fldvfy at {fldvfy} did not return directly ({other:?}) -- a \
-                     nested host call from inside it is not serviced here"
+                    "fsdprc: fldvfy at {fldvfy} stopped the machine: {poison}"
                 )));
             }
         }
@@ -1047,7 +1095,7 @@ pub(crate) fn fsdprc(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
     // edge) forbids keeping. Ending the session on this same pass is
     // therefore not a shortcut; it is what dropping `FINISHING` requires.
     if matches!(block.state(), fsd::state::FSDSAV | fsd::state::FSDQIT) {
-        return goback(machine, host, chan);
+        return goback(machine, host, module, chan);
     }
 
     Ok(Ret::Void)
@@ -1135,15 +1183,17 @@ fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, Shi
 /// code". Because the teardown (`fsdcof`, the session's own removal) all
 /// happens before the call rather than after, a `whndun` that dies leaves
 /// nothing half-done: the channel is already back to cooked input and the
-/// session is already gone, whether `whndun` returns, faults, or times out.
-/// `machine.call`'s own book-keeping poisons the machine on a fault or a
-/// timeout (`mbbs16::lib.rs:1111`) independently of this function's `Result`,
-/// which is what lets `Outcome::Stopped` reach a caller that services this
-/// the way [`crate::Host::run`] would -- this function itself has no
-/// `Machine`-servicing loop to run one through (matching `fsdprc`'s own
-/// `fldvfy` call, see its doc comment's "Errors" section): a `whndun` that
-/// makes a *further* host call, rather than dying outright, is refused the
-/// same way a nested `fldvfy` call already is.
+/// session is already gone, whether `whndun` returns, faults, times out, or
+/// asks for an import this crate has not built.
+///
+/// **Correction, found the same way `fsdprc`'s own doc comment was
+/// (Task 12):** `whndun` -- in practice, MajorMUD's `_LJNDUN`, the routine
+/// that actually saves the finished character -- calls plenty of further
+/// host routines of its own (Btrieve, `prf`, polling registration). Those
+/// go through [`Host::run`] now, the same servicing loop `dopoll`/`polrou`
+/// use, rather than the bare `machine.call` an earlier version of this
+/// function used (and could not get past a single field's `fldvfy` with,
+/// let alone `whndun`).
 ///
 /// # The gap this does not close: a hard disconnect mid-session
 ///
@@ -1164,9 +1214,15 @@ fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, Shi
 ///
 /// # Errors
 ///
-/// If the channel has no session to close, or `whndun` does anything other
-/// than return directly.
-pub(crate) fn goback(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<Ret, ShimError> {
+/// If the channel has no session to close, or `whndun` stops the machine
+/// anywhere in the call tree `Host::run` services -- see `fsdprc`'s own
+/// doc comment on why the machine is already correctly poisoned by then.
+pub(crate) fn goback(
+    machine: &mut Machine,
+    host: &mut Host,
+    module: &Module,
+    chan: Chan,
+) -> Result<Ret, ShimError> {
     let session = host.fsd_sessions[chan.index()].take().ok_or_else(|| {
         ShimError::Failed(format!("goback: channel {chan} has no session to close"))
     })?;
@@ -1190,15 +1246,14 @@ pub(crate) fn goback(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
 
     match session.whndun {
         Some(whndun) => {
-            let exit = machine
-                .call(whndun, &[u16::from(session.save)])
+            let outcome = host
+                .run(machine, module, whndun, &[u16::from(session.save)])
                 .map_err(|e| ShimError::Failed(format!("goback: whndun call failed: {e}")))?;
-            match exit {
-                Exit::Returned { .. } => {}
-                other => {
+            match outcome {
+                crate::Outcome::Returned { .. } => {}
+                crate::Outcome::Stopped(poison) => {
                     return Err(ShimError::Failed(format!(
-                        "goback: whndun at {whndun} did not return directly ({other:?}) -- a \
-                         nested host call from inside it is not serviced here"
+                        "goback: whndun at {whndun} stopped the machine: {poison}"
                     )));
                 }
             }
@@ -1261,6 +1316,7 @@ pub(crate) fn goback(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
 pub(crate) fn fsd_cycle(
     machine: &mut Machine,
     host: &mut Host,
+    module: &Module,
     chan: Chan,
 ) -> Result<(), ShimError> {
     let at = host.fsdscb[chan.index()].ok_or_else(|| {
@@ -1278,11 +1334,7 @@ pub(crate) fn fsd_cycle(
 
     let mut pending: Vec<u8> = Vec::new();
 
-    loop {
-        let Some(byte) = host.gsbl_mut().channel_mut(chan).input.pop_front() else {
-            break;
-        };
-
+    while let Some(byte) = host.gsbl_mut().channel_mut(chan).input.pop_front() {
         let mut block = read_block(machine, at)?;
         let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
             return Err(ShimError::Failed(format!(
@@ -1314,7 +1366,7 @@ pub(crate) fn fsd_cycle(
             crate::shims::text::clrprf(machine, host)?;
             crate::shims::text::append(machine, host, b"")?;
 
-            fsdprc(machine, host, chan)?;
+            fsdprc(machine, host, module, chan)?;
 
             if host.fsd_sessions[chan.index()].is_none() {
                 // `goback` already ran (from inside `fsdprc`), flushed its
@@ -2536,9 +2588,11 @@ mod tests {
         ptr
     }
 
-    /// A synthetic `fldvfy` that immediately far-calls thunk 0 -- a
-    /// nested host call `fsdprc` does not service, see its own doc
-    /// comment.
+    /// A synthetic `fldvfy` that immediately far-calls thunk 0 -- an
+    /// import `f.minimal_module()` never registered, so [`Host::run`]
+    /// services the call (unlike the old bare `machine.call` this replaced)
+    /// but still stops the machine, naming the unimplemented import rather
+    /// than refusing to look at it at all.
     fn stub_calling_a_thunk(f: &mut Fixture, code_offset: u16) -> FarPtr {
         let mut code = vec![0x9au8]; // far call
         code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
@@ -2551,6 +2605,7 @@ mod tests {
     #[test]
     fn fsdprc_accepts_via_fldvfy_stores_the_rewritten_answer_and_advances() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let (buffer, _) = session(&mut f, "A B", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2571,7 +2626,7 @@ mod tests {
         set_buffered(&mut f, 0, 1, b'\r', b"hello");
         let _ = buffer; // silence unused warning if the field is trivial
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
@@ -2603,6 +2658,7 @@ mod tests {
     #[test]
     fn fsdprc_rejects_via_fldvfy_and_does_not_advance() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2617,7 +2673,7 @@ mod tests {
         f.machine.write(scb_at, scb.as_bytes()).expect("written");
         set_buffered(&mut f, 0, 0, b'\r', b"nope");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
@@ -2636,6 +2692,7 @@ mod tests {
         // and would wrongly redisplay the field instead of ending the
         // session.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         // Task 11: `fsdprc` now reaches `goback` itself as soon as it sees
@@ -2669,7 +2726,7 @@ mod tests {
         // unmoved, then fsdinc stepped it one past the end by hand.
         set_buffered(&mut f, 0, 1, b'\r', b"done");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         assert_eq!(
             block(&f).state(),
@@ -2696,6 +2753,7 @@ mod tests {
         // reading `Host::fsd_sessions` back afterward: `goback` consumes
         // the session as part of the same call, so nothing is left to read.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2729,7 +2787,7 @@ mod tests {
         f.machine.write(scb_at, scb.as_bytes()).expect("written");
         set_buffered(&mut f, 0, 1, b'\r', b"done");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         assert!(
             f.host.fsd_sessions[chan.index()].is_none(),
@@ -2753,6 +2811,7 @@ mod tests {
         // sibling test above for why this reads `whndun`'s own argument
         // rather than `Host::fsd_sessions` after the call.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2784,7 +2843,7 @@ mod tests {
         f.machine.write(scb_at, scb.as_bytes()).expect("written");
         set_buffered(&mut f, 0, 1, b'\r', b"done");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         assert!(f.host.fsd_sessions[chan.index()].is_none(), "goback consumed the session");
         let recorded = f.machine.resolve(marker, 2).expect("in range");
@@ -2804,6 +2863,7 @@ mod tests {
         // callback genuinely did not run: if it had, the reject would
         // show up as an empty answer and no field advance.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A B", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2819,7 +2879,7 @@ mod tests {
         f.machine.write(scb_at, scb.as_bytes()).expect("written");
         set_buffered(&mut f, 1, 0, u8::try_from(0x15).unwrap(), b"Al");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         assert_eq!(
             block(&f).flags() & fsd::entry_flags::FSDIGA,
@@ -2835,8 +2895,14 @@ mod tests {
     }
 
     #[test]
-    fn fsdprc_refuses_a_callback_that_makes_a_further_host_call() {
+    fn fsdprc_stops_the_module_when_a_nested_call_is_unimplemented() {
+        // A nested call *is* serviced now (`Host::run`, not a bare
+        // `machine.call` -- see this function's own doc comment on the
+        // Task 12 correction), so this no longer refuses the call outright;
+        // it runs it, and the call itself stops the machine because
+        // thunk 0 names no import `f.minimal_module()` ever registered.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         let scb_at = f
@@ -2851,19 +2917,24 @@ mod tests {
         f.machine.write(scb_at, scb.as_bytes()).expect("written");
         set_buffered(&mut f, 0, 0, b'\r', b"x");
 
-        let e = crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect_err("refused");
-        assert!(format!("{e}").contains("did not return directly"), "{e}");
+        let e = crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect_err("refused");
+        assert!(format!("{e}").contains("stopped the machine"), "{e}");
+        assert!(
+            f.machine.poisoned().is_some(),
+            "the machine is poisoned with the real reason, not merely this call's own Result"
+        );
     }
 
     #[test]
     fn fsdprc_with_no_fldvfy_validates_locally() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A(MIN=1 MAX=5)", b"\0");
         let chan = f.console();
         // fldvfy left NULL -- fsdroom/fsdapr never set one.
         set_buffered(&mut f, 0, 1, b'\r', b"3");
 
-        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
         let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
@@ -2874,10 +2945,11 @@ mod tests {
     #[test]
     fn fsdprc_before_any_session_stops_the_module() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         current(&mut f);
         let chan = f.console();
         let e =
-            crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect_err("refused");
+            crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
@@ -2930,6 +3002,7 @@ mod tests {
     #[test]
     fn goback_calls_whndun_with_the_save_flag_and_restores_the_channel() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
@@ -2945,7 +3018,7 @@ mod tests {
         });
 
         assert!(matches!(
-            goback(&mut f.machine, &mut f.host, chan),
+            goback(&mut f.machine, &mut f.host, &module, chan),
             Ok(Ret::Void)
         ));
 
@@ -2971,6 +3044,7 @@ mod tests {
         // 0, say) would not pass this test by accident the way seeding 0
         // and expecting 0 could.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
@@ -2984,7 +3058,7 @@ mod tests {
         });
 
         assert!(matches!(
-            goback(&mut f.machine, &mut f.host, chan),
+            goback(&mut f.machine, &mut f.host, &module, chan),
             Ok(Ret::Void)
         ));
 
@@ -2998,6 +3072,7 @@ mod tests {
         // pass `whndun == NULL` (its own contract), and the original
         // answers that with `btuinj(usrnum,CRSTG)`.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
@@ -3007,7 +3082,7 @@ mod tests {
         });
 
         assert!(matches!(
-            goback(&mut f.machine, &mut f.host, chan),
+            goback(&mut f.machine, &mut f.host, &module, chan),
             Ok(Ret::Void)
         ));
 
@@ -3024,6 +3099,7 @@ mod tests {
         // cleanly -- no half-torn-down session, per the design doc's "The
         // two callbacks into module code".
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
@@ -3034,8 +3110,8 @@ mod tests {
             save: false,
         });
 
-        let e = goback(&mut f.machine, &mut f.host, chan).expect_err("whndun faulted");
-        assert!(format!("{e}").contains("did not return directly"), "{e}");
+        let e = goback(&mut f.machine, &mut f.host, &module, chan).expect_err("whndun faulted");
+        assert!(format!("{e}").contains("stopped the machine"), "{e}");
 
         // The teardown already happened, unconditionally, before the call
         // -- so there is nothing left half-done: the channel is back to
@@ -3061,9 +3137,10 @@ mod tests {
     #[test]
     fn goback_with_no_session_stops_the_module() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         current(&mut f);
         let chan = f.console();
-        let e = goback(&mut f.machine, &mut f.host, chan).expect_err("refused");
+        let e = goback(&mut f.machine, &mut f.host, &module, chan).expect_err("refused");
         assert!(format!("{e}").contains("no session"), "{e}");
     }
 
@@ -3076,6 +3153,7 @@ mod tests {
         // proves the callback genuinely reaches module code, the way the
         // design doc's own testing section asks for.
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "A", b"\0");
         let chan = f.console();
         entered(&mut f, chan);
@@ -3106,7 +3184,7 @@ mod tests {
         set_buffered(&mut f, 0, 1, b'\r', b"done");
 
         assert!(matches!(
-            crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan),
+            crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan),
             Ok(Ret::Void)
         ));
 
@@ -3140,6 +3218,7 @@ mod tests {
     #[test]
     fn fsd_cycle_drains_a_whole_field_and_advances_without_ending_the_session() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "NAME RANK", b"\0");
         let chan = f.console();
 
@@ -3155,7 +3234,7 @@ mod tests {
 
         queue(&mut f, chan, b"Kaimon\r");
         assert!(matches!(
-            fsd_cycle(&mut f.machine, &mut f.host, chan),
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
             Ok(())
         ));
 
@@ -3191,6 +3270,7 @@ mod tests {
     #[test]
     fn fsd_cycle_ends_the_session_and_calls_whndun_on_ctrl_g() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
 
@@ -3212,7 +3292,7 @@ mod tests {
         // 0x07: Ctrl-G, "save and exit" -- FSD.C:1877-1940's own xitkey.
         queue(&mut f, chan, b"Kaimon\x07");
         assert!(matches!(
-            fsd_cycle(&mut f.machine, &mut f.host, chan),
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
             Ok(())
         ));
 
@@ -3240,9 +3320,10 @@ mod tests {
     #[test]
     fn fsd_cycle_refuses_a_channel_with_no_session() {
         let mut f = Fixture::new();
+        let module = f.minimal_module();
         current(&mut f);
         let chan = f.console();
-        let e = fsd_cycle(&mut f.machine, &mut f.host, chan).expect_err("refused");
+        let e = fsd_cycle(&mut f.machine, &mut f.host, &module, chan).expect_err("refused");
         assert!(format!("{e}").contains("no session control block"), "{e}");
     }
 }

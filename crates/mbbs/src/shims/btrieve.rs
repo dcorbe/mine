@@ -966,14 +966,45 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         (24, Cursor::Physical { at }) => at + 1,
         (35, Cursor::Physical { at }) if at > 0 => at - 1,
         (35, Cursor::Physical { .. }) => return Ok(Ret::U16(0)),
-        // Stepping from a keyed position, or from no position at all. Btrieve
-        // keeps one cursor per file and a step reads it as a physical one, so
-        // this is a module bug rather than something to answer: the honest
-        // reading of "next" here does not exist.
-        (24 | 35, cursor) => {
+        // Stepping from a keyed position. **Correction, found driving
+        // character creation's real duplicate-name check against
+        // `WCCMMUD.DLL` (Task 12):** an earlier version of this arm treated
+        // this as a module bug and refused outright. Real Btrieve keeps
+        // exactly one cursor per open file, in *physical* terms, regardless
+        // of whether a keyed query or a step last moved it there -- a
+        // `qrybtv`/`gabbtvl` positions the file physically same as a step
+        // does, it just also remembers which key ordinal that physical slot
+        // was found at. So a step-family call (`stpbtvl`, "no key at all",
+        // this function's own doc comment) after a keyed one is not a module
+        // bug at all; it is the ordinary way a real board reads a few
+        // records by key and then walks the rest of the file by position.
+        // The translation is the one `obtbtvl`'s own `here` resolution
+        // already trusts for the opposite direction (an `Ordered` cursor
+        // read in a *different* key's order, above) -- the record a key
+        // ordinal names has a physical position like any other, found the
+        // same way.
+        (24 | 35, Cursor::Ordered { key, at }) => {
+            let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+            let physical = records
+                .ordered(key, at)
+                .and_then(|record| records.find_physical(record.position))
+                .ok_or_else(|| {
+                    ShimError::Failed(format!(
+                        "stpbtvl({opt}) on {}: the ordered cursor (key {key}, {at}) does \
+                         not resolve to a physical record -- the file changed under it",
+                        file.name()
+                    ))
+                })?;
+            match opt {
+                24 => physical + 1,
+                _ if physical > 0 => physical - 1,
+                _ => return Ok(Ret::U16(0)),
+            }
+        }
+        (24 | 35, Cursor::Nowhere) => {
             return Err(ShimError::Failed(format!(
-                "stpbtvl({opt}) on {}, which is positioned {cursor:?} -- \
-                 a step continues a step, and nothing has stepped yet",
+                "stpbtvl({opt}) on {}, which is positioned Nowhere -- nothing has \
+                 positioned it yet, by a key or by a step",
                 file.name()
             )));
         }

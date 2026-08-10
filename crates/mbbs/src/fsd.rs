@@ -3065,6 +3065,89 @@ pub mod verify {
     pub const VFYDEF: i16 = -4;
 }
 
+/// `int vfyadn(int fldno, char *answer)` -- `FSD.C:2007-2053`, the
+/// factory-issue field-verify routine "for ask-done-at-end scheme". Despite
+/// the design doc's "Dropped" list naming this out of scope, driving
+/// character creation against the real `WCCMMUD.DLL` (Task 12) found that
+/// every one of MajorMUD's own `_LJNVFY` cases (`re/exports/
+/// WCCMMUD_decompiled.c:11227`) falls through to this on a successful
+/// answer -- and unconditionally for the terminal
+/// `SAVE(ALT=SAVE ALT=EDIT ALT=QUIT MULTICHOICE)` field, which is the one
+/// place in the whole session that ever sets `state` to
+/// [`state::FSDSAV`]/[`state::FSDQIT`] directly, per `FSD.H`'s Note 2. A
+/// field-verify callback this crate could not service was not a difference
+/// in behaviour worth reproducing; it was a wall, so this is in scope after
+/// all. See [`crate::shims::fsd::vfyadn`] for the `Machine`-facing wrapper.
+///
+/// `current` is the answer already on record for `entfld` -- `fsdscb->
+/// newans+fldptr->ansoff` -- needed only for the non-terminal-field "are
+/// you sure" comparison below.
+///
+/// # ANSI-only branches, unreachable through this host's `fsdinc`
+///
+/// `CRSRDN`/`CRSRUP`/`BAKTAB` are the special two-byte cursor codes
+/// `AIN.C`'s `ainchr` produces for arrow keys; this host's ASCII-only
+/// `fsdinc` never sets `xitkey` to one of them (Stage 5). `TAB`
+/// (`\t`, 9), `'U'-64` (0x15), `'G'-64` (0x07), `'O'-64` (0x0f) and `ESC`
+/// (0x1b) are ordinary bytes `fsdinc` does set `xitkey` to, and are
+/// reachable.
+///
+/// # `xitfsd`'s own `"\r\n"` is not reproduced
+///
+/// The real `vfyadn` calls `xitfsd`, which -- like every call to it --
+/// writes `"\r\n"` via `fsdous` before changing `state`. But `xitfsd` here
+/// only ever fires from the branches that also change `state` to
+/// `FSDSAV`/`FSDQIT`, and *that* is exactly the case `goback`'s own
+/// unconditional `clrprf()` discards before anything reaches the channel
+/// (`FSDBBS.C:224`, and see `shims::fsd::goback`'s own doc comment). So the
+/// `"\r\n"` is written here as what it actually is once traced all the way
+/// through -- a state change with no observable output -- rather than
+/// composed and then thrown away one call further up.
+///
+/// # `fsdemg` is not modelled
+///
+/// The "Are you sure? Enter QUIT or ^O to quit now." message the
+/// non-terminal-field branch writes is display-only text this host has
+/// nowhere to keep (`announce`'s own doc comment already treats `fsdemg`
+/// this way); [`verify::VFYCHK`] is returned regardless of whether a real
+/// session would have had a message to go with it.
+pub fn vfyadn(scb: &mut Scb, entfld: u8, numtpl: u16, answer: &[u8], current: &[u8]) -> i16 {
+    const TAB: u16 = 9;
+    const ESC: u16 = 0x1b;
+
+    if u16::from(entfld) + 1 == numtpl {
+        match scb.xitkey() {
+            // `!(fsdscb->flags&FSDANS) || !udwrap` is always true in line
+            // mode (`FSDANS` is never set here), so `TAB`/`CRSRDN` always
+            // `break` out of this switch rather than falling into the
+            // `return(VFYDEF)` cases below -- exactly like an ordinary
+            // Enter.
+            TAB => {}
+            0x15 | 0x07 | 0x0f | ESC => return verify::VFYDEF,
+            _ => {}
+        }
+        match answer.first().map(u8::to_ascii_uppercase) {
+            Some(b'S' | b'Y' | b'D') => {
+                scb.set_state(state::FSDSAV);
+                return verify::VFYOK;
+            }
+            Some(b'Q' | b'X' | b'A') => {
+                scb.set_state(state::FSDQIT);
+                return verify::VFYOK;
+            }
+            Some(b'E' | b'N') => {
+                scb.set_crsfld(0);
+                return verify::VFYDEF;
+            }
+            _ => {}
+        }
+    } else if matches!(scb.xitkey(), 0x0f | ESC) && (scb.chgcnt() > 0 || answer != current) {
+        scb.set_crsfld((numtpl - 1) as u8);
+        scb.set_xitkey(0);
+    }
+    verify::VFYCHK
+}
+
 /// The candidate answer `fsdprc`'s `FSDBUF` arm hands to `fldvfy` and to
 /// its own local checks: `scb.ansbuf()`, trailing whitespace stripped
 /// (`depad`), and -- for a `#` or `$` field -- leading spaces stripped too

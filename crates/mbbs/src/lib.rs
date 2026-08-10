@@ -907,6 +907,7 @@ impl Host {
     fn fsd_dispatch(
         &mut self,
         machine: &mut Machine,
+        module: &Module,
         chan: Chan,
         n: usize,
     ) -> Result<Option<FarPtr>, ShimError> {
@@ -918,7 +919,7 @@ impl Host {
             return Ok(None);
         }
 
-        shims::fsd::fsd_cycle(machine, self, chan)?;
+        shims::fsd::fsd_cycle(machine, self, module, chan)?;
         Ok(None)
     }
 
@@ -2004,7 +2005,7 @@ impl Host {
             let entry = match entry {
                 Ok(Dispatch::Module(entry)) => Ok(entry),
                 Ok(Dispatch::Native(Native::Fsd)) => {
-                    self.fsd_dispatch(machine, chan, entry_index)
+                    self.fsd_dispatch(machine, module, chan, entry_index)
                 }
                 Err(e) => Err(e),
             };
