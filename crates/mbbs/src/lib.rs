@@ -3537,6 +3537,79 @@ mod tests {
         );
     }
 
+    /// The design doc's own standing rule, restated as a test:
+    /// `docs/plans/2026-08-08-fsd-subsystem-design.md`, "The standing
+    /// rule" --
+    ///
+    /// ```text
+    /// channel in an FSD session, mid-field, no input delivered
+    ///   -> cycle(max) returns Ended::Idle, not Bound
+    /// ```
+    ///
+    /// A channel mid-FSD-session with nothing left in `channel.input` must
+    /// leave `cycle` idle, not spend its whole pass budget getting nowhere.
+    ///
+    /// Mutate by re-arming `CYCLE` unconditionally at the end of
+    /// `shims::fsd::fsd_cycle` (e.g. an unconditional
+    /// `host.gsbl_mut().inject(chan, gsbl::Gsbl::CYCLE);` right before its
+    /// final `Ok(())`) and this test goes red -- the design doc warns
+    /// explicitly that this assertion "passes trivially against a spinning
+    /// implementation until the implementation is made to spin on
+    /// purpose", so that mutation is not optional colour here, it is what
+    /// makes this test mean anything. Measured directly: with that
+    /// mutation in place, `cycles.ended` comes back `Bound { next_kick:
+    /// None }` after five iterations instead of `Idle` after one.
+    #[test]
+    fn a_channel_mid_field_with_no_input_goes_idle_not_bound() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let chan = f.console();
+        f.host
+            .point_curusr(&mut f.machine, chan)
+            .expect("channel 0 is current");
+
+        let name = f.text("FSDFORM.MSG");
+        let opened = f
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .expect("opened");
+        assert!(matches!(opened, Ret::Far(_)));
+
+        let spec = f.text("NAME RANK");
+        let Ok(Ret::U16(size)) =
+            f.invoke(crate::shims::fsd::fsdroom, &[0, spec.offset, spec.selector, 0])
+        else {
+            panic!("fsdroom refused")
+        };
+        let buffer = f.buffer(size);
+        let defaults = f.bytes(b"\0", false);
+        f.invoke(
+            crate::shims::fsd::fsdapr,
+            &[
+                buffer.offset,
+                buffer.selector,
+                size,
+                defaults.offset,
+                defaults.selector,
+            ],
+        )
+        .expect("prepared");
+        f.invoke(crate::shims::fsd::fsdego, &[0, 0, 0, 0])
+            .expect("handed the channel to the FSD");
+
+        // Enough to fill part of a field, deliberately with no `\r` --
+        // real, pending work (an unfinished keystroke) that fsd_cycle must
+        // drain, but nothing left in `channel.input` once it has.
+        f.host.gsbl_mut().push_input(chan, b"Kai");
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 5).expect("cycled");
+        assert_eq!(
+            cycles.ended,
+            Ended::Idle,
+            "a channel mid-field with no input left must go Idle, not spin to the bound: {cycles:?}"
+        );
+        assert_eq!(cycles.iterations, 1, "the one queued CYCLE is drained on the first pass");
+    }
+
     /// A `state` naming a slot nobody registered stops with a reason.
     ///
     /// Falling back to module 0 would deliver another module's keystrokes to
