@@ -10,8 +10,9 @@
 //!   host leaves it in `prfbuf` for [`fsdapr`] to copy out (`FSDBBS.C:131`, and
 //!   `FSDBBS.H:109` warns that those bytes must survive in between); this host
 //!   does not, so an intervening `prf` cannot corrupt a form here.
-//! - **`struct fsdscb`** is in a segment of the host's, and the `fsdscb` global
-//!   points at it. Not host-side: the module dereferences that global at 55
+//! - **`struct fsdscb`** is in a segment of the host's -- one per channel, in
+//!   [`Host::fsdscb`] -- and the `fsdscb` global points at whichever channel's
+//!   is current. Not host-side: the module dereferences that global at 55
 //!   sites and *writes* through it -- fourteen `flddat[i].flags |= FFFAVD` from
 //!   `seg 3:0x4344` on, marking the fields a player may see but not type into,
 //!   and reading them back at `seg 3:0x374a` to choose a branch.
@@ -42,37 +43,47 @@
 
 use mbbs16::{FarPtr, Machine, Ret};
 
-use crate::Host;
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::{NO, ShimError};
+use crate::{Chan, Host};
 
 /// This channel's session control block, allocating it on first use.
 ///
 /// `inifsdscb()`, `FSDBBS.C:64`. The real one is
 /// `alczer(nterms*sizeof(struct fsdbbs))` out of the *host's* heap; this is a
-/// segment of its own, so that a module writing past what it was given cannot
-/// reach the globals, and so that the module's heap accounting does not report
-/// a host allocation as one of the module's.
+/// segment of its own, one per channel rather than one shared by all of
+/// them, so that a module writing past what it was given cannot reach the
+/// globals, and so that the module's heap accounting does not report a host
+/// allocation as one of the module's.
 ///
 /// Only the `struct fsdscb` prefix of `struct fsdbbs` is modelled. The rest --
 /// the `ainscb`, `curmbk`, `tmpmsg`, `amode`, `flags` and `whndun` members --
 /// belongs to the entry session and to `fsdusr`, which no module imports.
-fn control_block(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimError> {
-    if let Some(at) = host.fsdscb {
-        return Ok(at);
-    }
-    let selector = machine
-        .alloc_segment(usize::from(fsd::FSDSCB))
-        .map_err(|e| ShimError::Failed(format!("fsdroom: no room for a session block: {e}")))?;
-    let at = FarPtr {
-        offset: 0,
-        selector,
+///
+/// The module-visible `fsdscb` global is written on **every** call, not just
+/// the one that allocates -- `setfsd(chan)`, `FSDBBS.C:58-61`, repoints it
+/// unconditionally, and a host that only wrote it on first allocation would
+/// leave the global pointing at whichever channel allocated last after a
+/// second channel's `fsdroom` reused its own, already-allocated block.
+fn control_block(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<FarPtr, ShimError> {
+    let at = match host.fsdscb[chan.index()] {
+        Some(at) => at,
+        None => {
+            let selector = machine.alloc_segment(usize::from(fsd::FSDSCB)).map_err(|e| {
+                ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
+            })?;
+            let at = FarPtr {
+                offset: 0,
+                selector,
+            };
+            host.fsdscb[chan.index()] = Some(at);
+            at
+        }
     };
     host.globals()
         .write(machine, "fsdscb", &at.to_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.fsdscb = Some(at);
     Ok(at)
 }
 
@@ -214,28 +225,55 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     // here: the real host leaves them pointing into `prfbuf` (`FSDBBS.C:131`)
     // for `fsdapr` to copy out of, and this host keeps the parse in
     // `Host::forms` instead -- see the module documentation above.
-    let at = control_block(machine, host)?;
-    let mut block = read_block(machine, at)?;
-    block.set_fldspc(machine.arg_far(1));
-    block.set_numfld(form.fields.len() as u16);
-    block.set_numtpl(form.in_template as u16);
-    block.set_mbleng(form.punctuation.len() as u16);
-    block.set_maxans(form.answer_max);
-    block.set_hlplen(form.help_len);
-    block.set_hlpoff(form.help_at);
-    machine.write(at, block.as_bytes())?;
+    //
+    // `Host::forms` is keyed by `(message number, amode)`, not by channel --
+    // see its doc comment -- so the cache is filled in regardless of whether
+    // anyone is current right now.
+    host.forms.insert((number, amode), form.clone());
 
-    // `fsdusr->{curmbk,tmpmsg,amode}`, `FSDBBS.C:134`, for `fsdrft` to come
-    // back to. The block is read now rather than at `fsdrft` time because the
-    // module will have `rstmbk`'d by then -- it does so four instructions after
-    // this call, at `seg 3:0x3f86`.
-    let block = host
-        .globals()
-        .pointer(machine, "curmbk")
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.fsdtmp = Some((block, number, amode));
+    // `setfsd(usrnum)`, `FSDBBS.C:129`. Every *real* session's `fsdroom` runs
+    // with a channel current -- `fsdapr`'s own doc comment traces MajorMUD's
+    // one call site to after `point_curusr`, and `WCCTEXT.MSG`'s two-form
+    // priming has already happened by then. That priming is the one measured
+    // exception: `_INIT__WCCMMUD` calls `fsdroom` for message 6 and message 7
+    // at calls 7326 and 7328, before any channel has connected at all.
+    // `usrnum` is `-1` there -- confirmed by instrumenting this shim against
+    // `re/WCCMMUD.DLL` across all 18 of this crate's module-level acceptance
+    // tests: 34 `fsdroom` calls, all of them `-1`.
+    //
+    // The original's `setfsd(-1)` computes `fsdtbl+(unsigned)(-1)`, a garbage
+    // `fsdscb` one struct short of the array, and writes through it anyway --
+    // and gets away with it only because nothing downstream ever reads that
+    // write back before a real channel's own `fsdroom` overwrites it
+    // properly. This host has no adjacent segment to alias into by accident
+    // and nothing sane to invent one from, so a priming call with no channel
+    // current sizes and caches the form -- which is all `dclvda`, the very
+    // next thing MajorMUD does with the answer, ever needed -- and leaves the
+    // per-channel control block alone rather than corrupt a channel that is
+    // not this one.
+    if let Ok(chan) = host.current_channel(machine) {
+        let at = control_block(machine, host, chan)?;
+        let mut scb = read_block(machine, at)?;
+        scb.set_fldspc(machine.arg_far(1));
+        scb.set_numfld(form.fields.len() as u16);
+        scb.set_numtpl(form.in_template as u16);
+        scb.set_mbleng(form.punctuation.len() as u16);
+        scb.set_maxans(form.answer_max);
+        scb.set_hlplen(form.help_len);
+        scb.set_hlpoff(form.help_at);
+        machine.write(at, scb.as_bytes())?;
 
-    host.forms.push(form);
+        // `fsdusr->{curmbk,tmpmsg,amode}`, `FSDBBS.C:134`, for `fsdrft` to
+        // come back to. The block is read now rather than at `fsdrft` time
+        // because the module will have `rstmbk`'d by then -- it does so four
+        // instructions after this call, at `seg 3:0x3f86`.
+        let curmbk = host
+            .globals()
+            .pointer(machine, "curmbk")
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        host.fsdtmp[chan.index()] = Some((curmbk, number, amode));
+    }
+
     Ok(Ret::U16(size))
 }
 
@@ -273,11 +311,24 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let length = machine.arg_u16(2);
     let defaults = machine.arg_far(3);
 
-    let Some(form) = host.forms.last().cloned() else {
+    let chan = host.current_channel(machine)?;
+    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdapr: no form has been sized, and FSDBBS.H:245 has this called after fsdroom()"
                 .into(),
         ));
+    };
+    // Invariant: `fsdroom` always inserts into `Host::forms` before it
+    // records this channel's `fsdtmp` entry, and nothing ever removes a
+    // `Host::forms` entry -- so if `fsdtmp` names a `(msgno, amode)`, that key
+    // is in the map. Refused rather than assumed, because a Rust-side
+    // invariant across two fields is exactly the kind of thing a future edit
+    // could quietly break.
+    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        return Err(ShimError::Failed(format!(
+            "fsdapr: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
+             is cached -- fsdroom and fsdtmp have gone out of sync"
+        )));
     };
     let needed = form
         .size()
@@ -290,8 +341,7 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     }
 
-    let at = host
-        .fsdscb
+    let at = host.fsdscb[chan.index()]
         .ok_or_else(|| ShimError::Failed("fsdapr: no session control block".into()))?;
     let mut block = read_block(machine, at)?;
     let spec = machine.read_cstr(block.fldspc())?.to_vec();
@@ -332,7 +382,8 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `newans`, which is the same test the real host's own `fsdchi` makes at
 /// `FSDBBS.C:340` before touching anything.
 fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarPtr), ShimError> {
-    let at = host.fsdscb.ok_or_else(|| {
+    let chan = host.current_channel(machine)?;
+    let at = host.fsdscb[chan.index()].ok_or_else(|| {
         ShimError::Failed(format!(
             "{who}: no form has been sized, so there is no session; FSDBBS.H:245 has \
              fsdroom() first"
@@ -569,7 +620,9 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// point of that pair is that the answer comes from *that* message file
 /// whatever is current now. `Messages::text` takes the block explicitly, so
 /// this asks the recorded block directly; the round trip through `curmbk`
-/// arrives at the same pointer.
+/// arrives at the same pointer. Recorded per channel, in [`Host::fsdtmp`],
+/// because `fsdusr` -- and so which block a `fsdroom` recorded -- is itself
+/// per channel.
 ///
 /// `getasc` versus `getmsg` is not modelled, for the reason the `fsdroom` plan
 /// gave: the difference is line terminators, both are white space to the
@@ -594,8 +647,8 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// If no form has been sized, or the template is not in the file that was
 /// current when one was.
 pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let _ = machine;
-    let Some((block, number, _)) = host.fsdtmp else {
+    let chan = host.current_channel(machine)?;
+    let Some((block, number, _)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdrft: no template has been compiled; FSDBBS.C:419 refreshes the one fsdroom \
              recorded, and fsdroom has not run"
@@ -615,8 +668,26 @@ mod tests {
     use crate::testing::Fixture;
     use mbbs16::FarPtr;
 
+    /// Point `usrnum` at the fixture's own console.
+    ///
+    /// Every FSD shim now asks [`Host::current_channel`] which channel it is
+    /// serving, the way the real module's own `usrnum` reads do -- so a test
+    /// that never made one current, the way none of these had to before this
+    /// channel key landed, would fail on that question before it reached
+    /// whatever the test actually means to exercise. `Fixture::new` builds a
+    /// single-channel host and deliberately leaves `usrnum` at `-1`
+    /// (`MAJORBBS.C:882`, see `globals.rs`'s own test of that fact) until
+    /// something points it somewhere, which is what this does.
+    fn current(f: &mut Fixture) {
+        let chan = f.console();
+        f.host
+            .point_curusr(&mut f.machine, chan)
+            .expect("channel 0 is current");
+    }
+
     /// Open `SAMPLE.MSG`, which `Fixture` roots on, and make it current.
     fn open(f: &mut Fixture) -> FarPtr {
+        current(f);
         let name = f.text("SAMPLE.MSG");
         let block = f
             .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
@@ -646,9 +717,8 @@ mod tests {
         let args = [0, spec.offset, spec.selector, 0];
         assert!(matches!(f.invoke(fsdroom, &args), Ok(Ret::U16(n)) if n == expected));
 
-        let [form] = f.host.forms() else {
-            panic!("expected one form, got {:?}", f.host.forms())
-        };
+        assert_eq!(f.host.forms().len(), 1, "{:?}", f.host.forms());
+        let form = f.host.forms().get(&(0, 0)).expect("message 0, amode 0");
         assert_eq!(form.fields.len(), 2);
     }
 
@@ -660,6 +730,7 @@ mod tests {
     /// what this file is: four thirty-character `?` runs as message 0, and a
     /// `###-####` as message 1.
     fn open_form(f: &mut Fixture) -> FarPtr {
+        current(f);
         let name = f.text("FSDFORM.MSG");
         let block = f
             .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
@@ -725,7 +796,11 @@ mod tests {
             buffer.offset + scb.mbleng() + scb.numfld() * crate::fsd::FSDFLD
         );
         assert_eq!(scb.crsatr(), 0x70, "FSDBBS.C:180");
-        assert_eq!(scb.numfld(), f.host.forms()[0].fields.len() as u16);
+        assert_eq!(
+            scb.numfld(),
+            f.host.forms()[&(0, 0)].fields.len() as u16,
+            "message 0, amode 0"
+        );
         assert_eq!(scb.allans(), b"ONE=\0TWO=\0\0".len() as u16);
     }
 
@@ -830,6 +905,7 @@ mod tests {
         // an uninitialised control block; there is nothing here to read and
         // nothing plausible to invent.
         let mut f = Fixture::new();
+        current(&mut f);
         let buffer = f.buffer(64);
         let defaults = f.bytes(b"\0", false);
         let e = f
@@ -991,6 +1067,7 @@ mod tests {
     #[test]
     fn fsdnan_before_a_session_stops_the_module() {
         let mut f = Fixture::new();
+        current(&mut f);
         let e = f.invoke(fsdnan, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
 
@@ -1139,7 +1216,7 @@ mod tests {
 
         assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
         assert!(
-            f.host.forms()[0].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
+            f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
             "the host's own copy still says otherwise, which is the point"
         );
     }
@@ -1325,6 +1402,7 @@ mod tests {
     #[test]
     fn fsdrft_before_any_fsdroom_stops_the_module() {
         let mut f = Fixture::new();
+        current(&mut f);
         let e = f.invoke(fsdrft, &[]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
@@ -1364,8 +1442,11 @@ mod tests {
             spec,
             "the module's own copy of the spec, not a host one"
         );
-        assert_eq!(block.maxans(), f.host.forms()[0].answer_max);
-        assert_eq!(block.mbleng(), f.host.forms()[0].punctuation.len() as u16);
+        assert_eq!(block.maxans(), f.host.forms()[&(0, 0)].answer_max);
+        assert_eq!(
+            block.mbleng(),
+            f.host.forms()[&(0, 0)].punctuation.len() as u16
+        );
     }
 
     #[test]
@@ -1390,6 +1471,86 @@ mod tests {
             .pointer(&f.machine, "fsdscb")
             .expect("placed");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn two_channels_sizing_different_forms_do_not_share_a_session() {
+        // The shape that catches a flat `Host::forms`/`fsdscb`/`fsdtmp`: size
+        // and prepare a session for channel A, then a *different* one for
+        // channel B, before anything reads either back. A test that only
+        // ever looked at one channel could not tell "keyed by channel" from
+        // "still flat" -- `a_second_form_reuses_the_one_control_block` above
+        // is exactly that kind of test, and it stays green under either
+        // implementation. This one does not: reverting `forms`/`fsdscb`/
+        // `fsdtmp` to their old flat shape makes it fail while every other
+        // FSD test in this file keeps passing, which is the whole point.
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let a = f.host.users().terms().chan(0).expect("channel 0");
+        let b = f.host.users().terms().chan(1).expect("channel 1");
+
+        // Channel A sizes and prepares message 0 of FSDFORM.MSG ("NAME"),
+        // with "Alice" as its answer.
+        f.host
+            .point_curusr(&mut f.machine, a)
+            .expect("channel 0 is current");
+        let _ = open_form(&mut f);
+        let spec_a = f.text("NAME");
+        let Ok(Ret::U16(size_a)) = f.invoke(fsdroom, &[0, spec_a.offset, spec_a.selector, 0])
+        else {
+            panic!("fsdroom (channel A) refused");
+        };
+        let buffer_a = f.buffer(size_a);
+        let defaults_a = f.bytes(b"NAME=Alice\0\0", false);
+        f.invoke(
+            fsdapr,
+            &[
+                buffer_a.offset,
+                buffer_a.selector,
+                size_a,
+                defaults_a.offset,
+                defaults_a.selector,
+            ],
+        )
+        .expect("fsdapr (channel A) prepared");
+
+        // Channel B sizes and prepares a *different* form -- message 1
+        // ("PHONE") -- before channel A's session is ever read back.
+        f.host
+            .point_curusr(&mut f.machine, b)
+            .expect("channel 1 is current");
+        let spec_b = f.text("PHONE");
+        let Ok(Ret::U16(size_b)) = f.invoke(fsdroom, &[1, spec_b.offset, spec_b.selector, 0])
+        else {
+            panic!("fsdroom (channel B) refused");
+        };
+        let buffer_b = f.buffer(size_b);
+        let defaults_b = f.bytes(b"PHONE=5551234\0\0", false);
+        f.invoke(
+            fsdapr,
+            &[
+                buffer_b.offset,
+                buffer_b.selector,
+                size_b,
+                defaults_b.offset,
+                defaults_b.selector,
+            ],
+        )
+        .expect("fsdapr (channel B) prepared");
+
+        // Back to channel A: `fsdnan(0)` must still resolve against *A's*
+        // control block and answer string, not whatever channel B's fsdroom/
+        // fsdapr left behind.
+        f.host
+            .point_curusr(&mut f.machine, a)
+            .expect("channel 0 is current again");
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan (channel A) refused");
+        };
+        assert_eq!(
+            f.read(at),
+            "Alice",
+            "channel A's own answer, not channel B's PHONE session"
+        );
     }
 
     #[test]

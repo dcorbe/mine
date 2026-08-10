@@ -491,41 +491,46 @@ pub struct Host {
     /// construction: a host nobody is driving polls nothing.
     pub(crate) polls_left: usize,
 
-    /// Every form `fsdroom` has sized, in the order it was asked. See
-    /// [`Host::forms`].
+    /// Every form `fsdroom` has sized, keyed by the `(message number, amode)`
+    /// it was compiled from. See [`Host::forms`].
     ///
-    /// **Flat, and owed a channel key.** See [`Host::fsdscb`](Host#structfield.fsdscb).
-    pub(crate) forms: Vec<Form>,
+    /// **Channel-keyed as of the commit that added this doc comment.** Used
+    /// to be a flat `Vec<Form>` -- see [`Host::fsdscb`](Host#structfield.fsdscb)'s
+    /// history for why that was a debt -- but the compiled form itself is not
+    /// per-channel state at all: two channels filling out the *same* form
+    /// (the same message number and amode) share one compilation, the way the
+    /// real host's `fsdroom` would have parsed the same template twice and
+    /// gotten the same answer both times. What is per-channel is which form a
+    /// given channel is using, which [`Host::fsdtmp`] records.
+    pub(crate) forms: std::collections::HashMap<(u16, i16), Form>,
 
-    /// Where `struct fsdscb` lives, once `fsdroom` has needed one.
+    /// Where each channel's `struct fsdscb` lives, once its `fsdroom` has
+    /// needed one. Indexed by [`Chan::index`].
     ///
     /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them, and the real
-    /// `setfsd(chan)` exists precisely to select among them. `None` until the
-    /// first `fsdroom`, because the module *tests* the `fsdscb` global for
-    /// null -- `seg 3:0x430f` -- and takes another path when it is.
+    /// `setfsd(chan)` exists precisely to select among them -- which this
+    /// mirrors: one segment per channel rather than one segment shared by
+    /// all of them. `None` until that channel's first `fsdroom`, because the
+    /// module *tests* the `fsdscb` global for null -- `seg 3:0x430f` -- and
+    /// takes another path when it is.
     ///
-    /// # This is one control block and it should be `nterms` of them
+    /// # The debt this repays
     ///
-    /// This field and [`forms`](Host#structfield.forms) above are both flat.
-    /// That was a *fact* while `Host::new` fixed the count at one; since the
-    /// count became a caller's input it is a **debt**, and the capability to
-    /// trip it shipped with that change. Two channels in the full-screen data
-    /// entry subsystem at once would share one control block and interleave
-    /// their answers into a single `newans`.
-    ///
-    /// Not fixed here because the FSD is out of scope for the multi-channel
-    /// work -- a *returning* player reaches the realm without touching a single
-    /// `fsd*` routine, which is why raising the count did not have to wait for
-    /// it -- so nothing in this crate can currently reach the hazard. It is
-    /// recorded rather than repaired, and keying both by [`Chan`] belongs with
-    /// whoever builds the form engine.
-    pub(crate) fsdscb: Option<FarPtr>,
+    /// This used to be a single `Option<FarPtr>`, on the reasoning that the
+    /// FSD was out of scope for the multi-channel work and nothing could
+    /// reach the hazard. That reasoning held until [`Host::fsd_state`]
+    /// existed to dispatch a channel into an FSD session at all -- from that
+    /// point on, two channels entering data at once would have shared one
+    /// control block and interleaved their answers into a single `newans`.
+    /// Keyed by channel now, so that cannot happen by construction.
+    pub(crate) fsdscb: Vec<Option<FarPtr>>,
 
-    /// Which message block `fsdroom` last read a template out of, which
-    /// template, and in which mode. `fsdusr->{curmbk,tmpmsg,amode}`,
-    /// `FSDBBS.C:134`, and Rust-side rather than in module memory because
-    /// `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
-    pub(crate) fsdtmp: Option<(FarPtr, u16, i16)>,
+    /// Each channel's `fsdusr->{curmbk,tmpmsg,amode}` -- which message block
+    /// `fsdroom` last read a template out of, which template, and in which
+    /// mode. `FSDBBS.C:134`, and Rust-side rather than in module memory
+    /// because `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
+    /// Indexed by [`Chan::index`], for the same reason [`Host::fsdscb`] is.
+    pub(crate) fsdtmp: Vec<Option<(FarPtr, u16, i16)>>,
 
     /// The FSD's own `state` slot, registered in [`Host::finish_init`] the
     /// way `inifsd()` registers FSDBBS as a module. `None` before
@@ -755,9 +760,9 @@ impl Host {
             noted: HashSet::new(),
             kicks: Vec::new(),
             polls_left: 0,
-            forms: Vec::new(),
-            fsdscb: None,
-            fsdtmp: None,
+            forms: HashMap::new(),
+            fsdscb: vec![None; usize::from(terms.count())],
+            fsdtmp: vec![None; usize::from(terms.count())],
             fsd_state: None,
             heap,
             users,
@@ -957,17 +962,14 @@ impl Host {
         &self.kicks
     }
 
-    /// Every form the module asked `fsdroom` to size.
+    /// Every form the module asked `fsdroom` to size, keyed by the
+    /// `(message number, amode)` it was compiled from.
     ///
-    /// A record rather than a session. The real host keeps one control block
-    /// per channel and overwrites it on each call; this keeps them all, because
-    /// what a caller can usefully ask this host is "what did initialisation
-    /// size?" and not "what is channel 0 in the middle of?".
-    ///
-    /// **Nothing fills one in.** A form is a screen and a user, and this host
-    /// has neither -- so these are the shapes of the two screens MajorMUD would
-    /// have put a new player through, measured and then set down.
-    pub fn forms(&self) -> &[Form] {
+    /// A cache, not a session: what a caller can usefully ask this host is
+    /// "what forms exist" and not "what is channel 0 in the middle of" --
+    /// see [`Host::fsdtmp`] and [`Host::fsdscb`] for the per-channel half of
+    /// that question.
+    pub fn forms(&self) -> &std::collections::HashMap<(u16, i16), Form> {
         &self.forms
     }
 
@@ -1179,6 +1181,37 @@ impl Host {
             .write(machine, "vdaptr", &vda.to_bytes())
             .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
         Ok(())
+    }
+
+    /// The channel [`Host::point_curusr`] last made current, read back the
+    /// way the module itself would: out of the `usrnum` global.
+    ///
+    /// Every FSD shim needs to know which channel it is serving, and none of
+    /// them are handed a [`Chan`] argument -- the module's own call
+    /// signatures have no room for one (`fsdroom(msgno, fldspc, amode)`, four
+    /// words, matches `FSDBBS.H:60-67` and `GALP&Q.C:1273`). This is how they
+    /// ask.
+    ///
+    /// # Errors
+    ///
+    /// If `usrnum` does not name a channel of this host -- in particular, if
+    /// nobody is current at all. `MAJORBBS.C:882` sets `usrnum=-1` before any
+    /// module's init runs, and that value survives until the first
+    /// [`Host::point_curusr`], which is exactly the state a module's own
+    /// initialisation runs in. Most callers of this may propagate the error;
+    /// [`crate::shims::fsd::fsdroom`] is the one exception, because it is the
+    /// one FSD routine measured calling in from there.
+    pub(crate) fn current_channel(&self, machine: &Machine) -> Result<Chan, ShimError> {
+        let uno = self
+            .globals()
+            .word(machine, "usrnum")
+            .map_err(|e| ShimError::Failed(format!("current_channel: {e}")))?;
+        self.users.terms().chan(uno as i16).ok_or_else(|| {
+            ShimError::Failed(format!(
+                "current_channel: usrnum is {}, which names no channel",
+                uno as i16
+            ))
+        })
     }
 
     /// Plant a connecting user's account record and channel state, and make
