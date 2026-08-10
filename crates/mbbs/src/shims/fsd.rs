@@ -1535,8 +1535,13 @@ pub(crate) fn fsd_cycle(
         };
         let form = live_form(machine, &block, &form)?;
         let spec = machine.read_cstr(block.fldspc())?.to_vec();
+        // `fsdinc`'s `FSDAPT` arm needs the installed answer string --
+        // `hopfld`'s repaint and the Ctrl-F/DEL per-field-width guards read
+        // a field's *stored* answer, not the in-session `ansbuf` -- the same
+        // `read_answers` this shim's `fsdego` already builds for `fsdent`.
+        let answers = read_answers(machine, &block)?;
 
-        pending.extend(fsd::fsdinc(&form, &spec, &mut block, key));
+        pending.extend(fsd::fsdinc(&form, &spec, &answers, &mut block, key));
         machine.write(at, block.as_bytes())?;
 
         if block.state() == fsd::state::FSDBUF {

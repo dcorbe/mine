@@ -103,6 +103,33 @@ pub const BAKTAB: i16 = 15 * 256;
 /// for why this exists despite being unreachable through [`Ainscb::ainchr`].
 pub const DEL: i16 = 83 * 256;
 
+/// Ctrl-Home, `GCOMM.H:183` (`119*256`). See [`BAKTAB`] for why this exists
+/// despite [`Ainscb::ainchr`] having no arm that produces it -- `fsdinc`'s
+/// `FSDAPT` case (`FSD.C:1663`) names it directly.
+pub const CTRLHOME: i16 = 119 * 256;
+
+/// Ctrl-End, `GCOMM.H:182` (`117*256`). See [`CTRLHOME`].
+pub const CTRLEND: i16 = 117 * 256;
+
+/// Ctrl-PgDn, `GCOMM.H:185` (`118*256`). See [`CTRLHOME`].
+pub const CTRLPGDN: i16 = 118 * 256;
+
+/// Ctrl-PgUp, `GCOMM.H:184` (`132*256` = 33792). See [`CTRLHOME`] for why
+/// this exists at all.
+///
+/// # It overflows a signed 16-bit `int`, on purpose
+///
+/// `132*256` is 33792, past `i16::MAX` (32767) -- the module docs already
+/// flag this as the second of the two places this crate's `i16` choice for a
+/// keystroke shows its C ancestry (`char c` sign-extending is the first).
+/// Two's-complement wraparound turns 33792 into -31744, which is exactly
+/// what Borland's own 16-bit `int` would have held and exactly what
+/// `fsdinc`'s `case CTRLPGUP:` label compares against on the real host --
+/// so this is written as the wrapped value directly rather than as
+/// `132 * 256`, which does not compile (`i16` overflow is a hard error in a
+/// const, even though the real machine's arithmetic wrapped silently).
+pub const CTRLPGUP: i16 = -31744;
+
 /// The `ESC O <letter>` function-key table, `AIN.C:88-116`.
 ///
 /// Transcribed rather than computed, because it is **not** alphabetical:
@@ -423,5 +450,20 @@ mod tests {
             assert!(code > 0, "{code} did not overflow into negative");
         }
         assert_eq!(CRSRDN, 20480, "the largest code ainchr can produce");
+    }
+
+    #[test]
+    fn the_ctrl_navigation_keys_have_the_right_scancodes_including_the_overflowed_one() {
+        // Transcribed straight from GCOMM.H:182-185, not derived: getting any
+        // one of these wrong is invisible until fsdinc's FSDAPT arm compares
+        // a real keystroke against the wrong constant and silently no-ops.
+        assert_eq!(CTRLEND, 117 * 256);
+        assert_eq!(CTRLHOME, 119 * 256);
+        assert_eq!(CTRLPGDN, 118 * 256);
+        // CTRLPGUP alone overflows i16 -- 132*256 = 33792, and two's
+        // complement wraparound is what a real Borland `int` would have
+        // done. Checked against the wide computation rather than trusted as
+        // a bare literal, so a future edit that "fixes" the sign is caught.
+        assert_eq!(i32::from(CTRLPGUP), 132 * 256 - 65536);
     }
 }
