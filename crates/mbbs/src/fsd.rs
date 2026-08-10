@@ -149,6 +149,15 @@ pub mod scb {
     /// `FSD.H:314`.
     pub const CRSFLD: u16 = 151;
 
+    /// `char *ftmptr` -- pointer into the current field's embedded-
+    /// punctuation template, `FSD.H:316`. Computed from `CRSFLD` (151, 1
+    /// byte) + `SHFFLD` (1 byte, not otherwise modeled) landing at 153,
+    /// with `FLAGS` at 157 (`FSD.H:275`'s running total, cross-checked
+    /// against the header's own member order) confirming the 4 bytes a
+    /// real far pointer needs fit exactly in between. See
+    /// [`Scb::ftmptr`] for why this port keeps only 2 of those 4 bytes.
+    pub const FTMPTR: u16 = 153;
+
     /// `int xitkey` -- the keystroke that initiated exit of the field.
     /// `FSD.H:319`.
     pub const XITKEY: u16 = 162;
@@ -627,6 +636,34 @@ impl Scb {
     /// Set [`Scb::crsfld`].
     pub fn set_crsfld(&mut self, value: u8) {
         self.set_byte(scb::CRSFLD, value);
+    }
+
+    /// `ftmptr`: how far [`skppnc`]/[`addprt`]/[`unentr`] have echoed into
+    /// the current field's embedded-punctuation template.
+    ///
+    /// The real member (`FSD.H:316`) is a 4-byte far pointer,
+    /// `mbpunc + position`. This stores only `position` -- an offset into
+    /// [`Form::punctuation`] -- the same substitution
+    /// [`Field::punctuation_at`] already makes for `fldptr->mbpoff`, and
+    /// for the same reason: every reader of this port's `ftmptr` already
+    /// has `form.punctuation` in hand and none of them resolve a `mbpunc`
+    /// base through `Machine` (Task 6 is pure `fsd.rs`, no shim). The other
+    /// two bytes the real pointer would occupy are left in the
+    /// "deliberately absent" bucket like every other untouched byte in
+    /// this struct -- nothing reads them back.
+    ///
+    /// `0` is the value an `alczer`'d block starts with, same as the real
+    /// pointer's `NULL`. [`unentr`]'s own doc comment explains why that
+    /// collision -- `ftmptr==0` meaning either "never positioned" or
+    /// "positioned at the very start of a field whose own `mbpoff` happens
+    /// to be 0" -- never has to be told apart: both mean "nothing to
+    /// erase yet", and the clamp there produces that answer either way.
+    pub fn ftmptr(&self) -> u16 {
+        self.word(scb::FTMPTR)
+    }
+    /// Set [`Scb::ftmptr`].
+    pub fn set_ftmptr(&mut self, value: u16) {
+        self.set_word(scb::FTMPTR, value);
     }
 
     /// `flags`: the entry session's own flags. See [`entry_flags`].
@@ -1780,6 +1817,292 @@ pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers:
     scb.set_state(state::FSDNPT);
     scb.set_chgcnt(0);
     out
+}
+
+/// `entprp()`, `FSD.C:776-784`.
+///
+/// **Not** `FSD.C:1776-1784` -- the file has exactly one `entprp`, and this
+/// plan's own citation for it was wrong; re-derived from the source rather
+/// than trusted, per this repo's house rule about citing the file and not a
+/// prior summary of it.
+///
+/// Prepare for entry mode: blank `ansbuf` and clear `FSDANT`.
+///
+/// `anslen`, `ansptr` and `altptr` are not modeled. The first two are this
+/// module's standing substitution -- [`bgnter`] and [`fsdlin`] both derive
+/// them from `ansbuf`'s own length rather than storing them separately, and
+/// blanking `ansbuf` here has the same effect `anslen=ansptr=0` would.
+/// `altptr` is [`defntr`]'s own gap, for the same reason: Task 7's
+/// `hdlalt`/`altntr` are what set it, and nothing before them reads it.
+pub fn entprp(scb: &mut Scb) {
+    scb.set_ansbuf(b"");
+    scb.set_flags(scb.flags() & !entry_flags::FSDANT);
+}
+
+/// `skppnc()`, `FSD.C:1287-1299`. Position [`Scb::ftmptr`] at the start of
+/// the current field's embedded-punctuation template, echoing every literal
+/// character up to (not including) the first blank slot or the template's
+/// own terminator.
+///
+/// # Provably dead code against this engine's own [`compile`]
+///
+/// Every field this engine (real or ported) produces has its punctuation
+/// template start with a blank, never a literal: `embscn`/[`punctuation`]
+/// both build the template starting at `fldptr->tmpoff`/`field.template_at`,
+/// which is always the position of the field's *own* leading `#`/`?`/`Y`
+/// character -- the very thing every entry of `tmpspc[]` compares against
+/// to decide "blank or literal" in the first place, so position 0 is always
+/// "matches its own kind" and therefore always a space. `skppnc`'s echo loop
+/// can only ever run zero times against a `Form` this crate's own
+/// `compile()` built. It is ported anyway, faithfully, because that is what
+/// `FSD.C` does and because the loop is not dead against a `Form` built by
+/// hand -- which is exactly how this file's own tests exercise it.
+pub fn skppnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    let mut out = Vec::new();
+    if let Some(mbpoff) = field.punctuation_at {
+        let mut at = usize::from(mbpoff);
+        while form.punctuation[at] != b' ' && form.punctuation[at] != 0 {
+            out.push(form.punctuation[at]);
+            at += 1;
+        }
+        scb.set_ftmptr(at as u16);
+    }
+    out
+}
+
+/// `unentr()`, `FSD.C:699-713`. Undo the on-screen display of a field's
+/// previous answer in ASCII mode: one destructive backspace (`"\b \b"`) per
+/// character currently showing.
+///
+/// # Pulled forward from Task 8
+///
+/// `unentr` is named in Task 8's scope (`hdlcbs`/`unentr`/`xitfld`), not
+/// Task 6's. It is ported here anyway, in full rather than stubbed, because
+/// [`bgnter`]'s else-branch calls it directly and unconditionally in line
+/// mode -- a stub would make every `bgnter` test either untestable or
+/// trivially true. `unentr` itself is eight lines of C over state Task 6
+/// already models (`ftmptr`, `ansbuf`, `punctuation_at`), so porting it
+/// costs nothing `hdlcbs`/`xitfld` would need. Those two are **not** ported
+/// here and remain Task 8's.
+///
+/// # How many characters are "currently showing"
+///
+/// With no embedded punctuation, it is simply `anslen` -- this port's
+/// `scb.ansbuf().len()`. With punctuation, the original computes
+/// `ftmptr - (mbpunc+mbpoff)`, a pointer difference; this port's `ftmptr`
+/// is already an offset into the same array `mbpoff` indexes, so the
+/// subtraction is direct.
+///
+/// # The subtraction can go negative, and that is not a bug
+///
+/// The very first time a field is ever entered, nothing has called
+/// [`skppnc`] for it yet, so `ftmptr` is still its `alczer`'d zero. In the
+/// original, `ftmptr` is a real pointer and `0` is `NULL` -- always less
+/// than the real heap address `mbpunc+mbpoff` -- so the pointer-difference
+/// `n` comes out strongly negative, and `while (n-- > 0)` never runs: the
+/// C's own signed arithmetic already produces "erase nothing" for a field
+/// that has never been shown. This port's `ftmptr` is an offset rather than
+/// an address, so `0` does not sit below every real `mbpoff` the way `NULL`
+/// sits below every real heap address -- the subtraction is done as `i32`
+/// and clamped at zero to reproduce the same "erase nothing" outcome by
+/// construction rather than by coincidence of address space.
+pub fn unentr(form: &Form, scb: &Scb) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    let n = if let Some(mbpoff) = field.punctuation_at {
+        (i32::from(scb.ftmptr()) - i32::from(mbpoff)).max(0) as usize
+    } else {
+        scb.ansbuf().len()
+    };
+    let mut out = Vec::new();
+    for _ in 0..n {
+        out.extend_from_slice(b"\x08 \x08");
+    }
+    out
+}
+
+/// `bgnter()`, `FSD.C:1383-1407`. Begin entry/edit of the field at
+/// `scb.crsfld()`: undo whatever was previously shown for it, then position
+/// [`Scb::ftmptr`] at the field's own punctuation start via [`skppnc`].
+///
+/// # Only the ASCII (else) branch is ported
+///
+/// The original's `if (fsdscb->flags&FSDANS)` branch is ANSI cursor-goto
+/// output (`ibm2ans`, `spaces`) -- Stage 5, not built by this host. It is
+/// unreachable through every line-mode path this crate builds: [`fsdlin`]
+/// zeroes `flags` outright, and nothing this crate ports before Stage 5
+/// ever sets `FSDANS`. Rather than silently take the else-branch
+/// regardless of what `scb.flags()` says, this checks and refuses loudly if
+/// the flag is somehow set, matching this crate's refusal-over-fallback
+/// discipline for a seam that is not yet built.
+///
+/// `fsdscb->ansptr=fsdscb->anslen=strlen(fsdscb->ansbuf)`, between the
+/// `if`/`else` and the `skppnc()` call in the original, is not reproduced:
+/// both are the scb-level fields this module derives from `ansbuf` itself
+/// rather than storing (see [`entprp`]'s doc comment).
+///
+/// # Panics
+///
+/// If `scb.flags() & FSDANS != 0` -- see above.
+pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
+    assert!(
+        scb.flags() & entry_flags::FSDANS == 0,
+        "bgnter: ANSI mode (FSDANS) is not ported -- Stage 5"
+    );
+    let mut out = unentr(form, scb);
+    out.extend(skppnc(form, scb));
+    out
+}
+
+/// Try to add a printable character to the end of the current field's entry
+/// buffer. `addprt()`, `FSD.C:1520-1538`.
+///
+/// Refuses silently (no output, `ansbuf` unchanged) when the field is
+/// already at `width` or the character is a space on a [`flags::NOSPACES`]
+/// field -- the original's whole body is one `if`, and there is no `else`.
+///
+/// # Where "the cursor position" comes from
+///
+/// The original indexes `ansbuf[fsdscb->ansptr++]`. This port has no
+/// separate `ansptr` (see [`entprp`]'s doc comment): every caller of
+/// `addprt` in this crate's scope only ever appends at the end of the field
+/// currently being typed, so `scb.ansbuf().len()` is `ansptr`, and the
+/// append below both plays `ansptr`'s role and re-terminates the string the
+/// way `ansbuf[anslen=n]='\0'` does.
+pub fn addprt(form: &Form, scb: &mut Scb, c: u8) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    let mut out = Vec::new();
+    let ansptr = scb.ansbuf().len();
+    if usize::from(field.width) > ansptr && (field.flags & flags::NOSPACES == 0 || c != b' ') {
+        let mut answer = scb.ansbuf().to_vec();
+        answer.push(c);
+        scb.set_ansbuf(&answer);
+
+        out.push(if field.flags & flags::SECRET != 0 {
+            SECCHR
+        } else {
+            c
+        });
+
+        // `while ((c=*++fsdscb->ftmptr) != ' ' && c != '\0') fsdouc(c);` --
+        // pre-increment, so this always steps at least one byte past
+        // wherever `skppnc`/the previous `addprt` left `ftmptr`, then
+        // echoes every literal character up to the next blank slot or
+        // terminator. Unlike `skppnc`'s own leading-punctuation loop, this
+        // one is very much reachable: typing the last digit before a
+        // literal separator (`"###-####"`'s dash) is exactly the case that
+        // exercises it.
+        if field.punctuation_at.is_some() {
+            let mut at = usize::from(scb.ftmptr()) + 1;
+            while form.punctuation[at] != b' ' && form.punctuation[at] != 0 {
+                out.push(form.punctuation[at]);
+                at += 1;
+            }
+            scb.set_ftmptr(at as u16);
+        }
+    }
+    out
+}
+
+/// What [`hdlprt`] decided about one printable character, mirroring the
+/// original's `int` return: `0`/`1`/`-1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hdlprt {
+    /// `0`: the field says no to this character outright -- it is neither
+    /// entered nor handled.
+    Ignore,
+    /// `1`: the caller should append it, with [`addprt`] (or, on the very
+    /// first character of a fresh field, `fsdinc`'s own `bgnter()` +
+    /// [`addprt`] sequence -- Task 9's wiring, not built here).
+    Enter,
+    /// `-1`: already handled -- an `ALT=` match completed and `altntr()`
+    /// echoed it itself, so the caller does nothing further. Never
+    /// produced by this port: only Task 7's `hdlalt`/`altntr` produce it,
+    /// and [`hdlprt`] refuses loudly rather than guess at their behaviour.
+    /// Named here so [`Hdlprt`] states the whole contract `hdlprt()`
+    /// promises its caller, not just the part this task builds.
+    Handled,
+}
+
+/// The part of `hdlalt()`, `FSD.C:1427-1484`, that is safe to run without
+/// the rest of the routine: its own first line, `if (!(fldptr->flags&FFFALT))
+/// return(0);`. A field with no `ALT=` values at all cannot match one,
+/// whatever the rest of `hdlalt` would have done, so this much is ported
+/// faithfully and the remainder -- Task 7 -- is refused loudly rather than
+/// silently approximated for a field that really does carry `ALT=` values.
+///
+/// # Panics
+///
+/// If `field.flags & ALTERNATES != 0`. This is the seam Task 6's own plan
+/// asks to leave visible rather than silently wrong.
+fn hdlalt(field: &Field, _c: u8) -> Hdlprt {
+    if field.flags & flags::ALTERNATES == 0 {
+        return Hdlprt::Ignore;
+    }
+    unimplemented!(
+        "hdlalt: ALT= entry (Task 7) is not ported yet, and field {:?} has \
+         ALTERNATES set",
+        field
+    )
+}
+
+/// `hdlprt(c)`, `FSD.C:1486-1518`. Decide what a printable character means
+/// for the field at `scb.crsfld()`.
+///
+/// # The two field-type arms
+///
+/// A `Y`/`?` field with [`flags::MULTICHOICE`] set routes to [`hdlalt`]
+/// unconditionally; without it, every character is accepted (`return(1)`
+/// regardless of what `c` is -- [`addprt`] is where width and
+/// [`flags::NOSPACES`] actually get enforced).
+///
+/// A `#`/`$` field accepts a digit (or, on a non-[`flags::NONNEGATIVE`] `$`
+/// field with nothing typed yet, a leading `-`) *unless* alternate-value
+/// entry is already underway and there is something typed to lose
+/// (`!FSDANT || ansbuf is empty`) -- otherwise it falls through to
+/// [`hdlalt`] the same as an unrecognised character on any other field
+/// would. Accepting a digit while `FSDANT` was set blanks `ansbuf` and
+/// re-runs [`bgnter`] first, which is why this returns output bytes: it is
+/// the one branch of `hdlprt` with a side effect beyond its own verdict.
+///
+/// `altptr != NULL` -- the other half of the original's "was there an
+/// alternate in progress" test -- is not checked: [`defntr`]'s doc comment
+/// explains why `altptr` is not modeled, and until Task 7's `hdlalt` starts
+/// setting it, nothing in this crate's reachable state ever makes it
+/// non-NULL, so `FSDANT` alone already covers every case this port can
+/// produce.
+pub fn hdlprt(form: &Form, scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
+    let field = form.fields[usize::from(scb.crsfld())];
+    match field.kind {
+        b'Y' | b'?' => {
+            if field.flags & flags::MULTICHOICE != 0 {
+                (hdlalt(&field, c), Vec::new())
+            } else {
+                (Hdlprt::Enter, Vec::new())
+            }
+        }
+        b'#' | b'$' => {
+            let fsdant = scb.flags() & entry_flags::FSDANT != 0;
+            let empty = scb.ansbuf().is_empty();
+            let is_minus = c == b'-'
+                && field.kind == b'$'
+                && empty // `fsdscb->ansptr == 0`, this port's ansbuf-is-empty
+                && field.flags & flags::NONNEGATIVE == 0;
+
+            if (!fsdant || empty) && (c.is_ascii_digit() || is_minus) {
+                let mut out = Vec::new();
+                if fsdant {
+                    scb.set_ansbuf(b"");
+                    out.extend(bgnter(form, scb));
+                    scb.set_flags(scb.flags() & !entry_flags::FSDANT);
+                }
+                (Hdlprt::Enter, out)
+            } else {
+                (hdlalt(&field, c), Vec::new())
+            }
+        }
+        _ => (Hdlprt::Enter, Vec::new()),
+    }
 }
 
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
@@ -3037,6 +3360,306 @@ mod tests {
 
         assert_eq!(scb.crsfld(), 1, "field 0 was avoided, so field 1 is current");
         assert_eq!(out, b" B: 2");
+    }
+
+    #[test]
+    fn scb_ftmptr_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_ftmptr(42);
+        assert_eq!(scb.ftmptr(), 42);
+        assert_eq!(scb.crsfld(), 0, "crsfld, right before ftmptr");
+        assert_eq!(scb.flags(), 0, "flags, right after ftmptr");
+    }
+
+    #[test]
+    fn entprp_blanks_ansbuf_and_clears_fsdant_only() {
+        let mut scb = zeroed_scb();
+        scb.set_ansbuf(b"stale");
+        scb.set_flags(entry_flags::FSDANT | entry_flags::FSDANS);
+
+        entprp(&mut scb);
+
+        assert_eq!(scb.ansbuf(), b"");
+        assert_eq!(
+            scb.flags(),
+            entry_flags::FSDANS,
+            "FSDANT cleared, FSDANS (unrelated) left alone"
+        );
+    }
+
+    #[test]
+    fn skppnc_positions_ftmptr_but_echoes_nothing_on_a_form_this_engine_compiled() {
+        // The "provably dead" case: `compile()` never puts anything but a
+        // blank in position 0 of a field's own punctuation template. Proven
+        // directly rather than merely asserted in the doc comment.
+        let template = b"Phone: ###-####";
+        let form = compile(template, b"PHONE", MANY);
+        let mbpoff = form.fields[0].punctuation_at.expect("this field joins");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(skppnc(&form, &mut scb), b"", "position 0 is always blank");
+        assert_eq!(scb.ftmptr(), mbpoff, "positioned at the field's own start");
+    }
+
+    #[test]
+    fn skppnc_echoes_a_literal_prefix_on_a_hand_built_form() {
+        // `compile()` cannot produce this shape -- see the doc comment on
+        // `skppnc` -- but the function does not know that, and a hand-built
+        // `Form` exercises the loop `compile()`'s own output never can.
+        let mut form = compile(b"??", b"A", MANY);
+        form.fields[0].punctuation_at = Some(0);
+        form.punctuation = b"(-) \0".to_vec();
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(skppnc(&form, &mut scb), b"(-)", "up to the first blank");
+        assert_eq!(scb.ftmptr(), 3, "left pointing AT the blank, not past it");
+    }
+
+    #[test]
+    fn unentr_on_a_never_shown_field_erases_nothing() {
+        // The first-ever `bgnter()` for a field: `ftmptr` is still its
+        // zeroed default, and the C's own pointer arithmetic (NULL is
+        // always "less than" a real heap address) already means "erase
+        // nothing" here -- this port's clamp reproduces that by
+        // construction. `mbpoff` deliberately nonzero, so a naive
+        // `ftmptr - mbpoff` without the clamp would underflow.
+        let mut form = compile(b"??", b"A", MANY);
+        form.fields[0].punctuation_at = Some(5);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        assert_eq!(scb.ftmptr(), 0, "never positioned");
+
+        assert_eq!(unentr(&form, &scb), b"");
+    }
+
+    #[test]
+    fn unentr_backspaces_once_per_character_shown() {
+        let mut form = compile(b"??", b"A", MANY);
+        form.fields[0].punctuation_at = Some(5);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ftmptr(9); // 4 characters in from mbpoff=5
+
+        assert_eq!(unentr(&form, &scb), b"\x08 \x08\x08 \x08\x08 \x08\x08 \x08");
+    }
+
+    #[test]
+    fn unentr_with_no_punctuation_erases_the_whole_answer() {
+        let form = compile(b"??", b"A", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Al");
+
+        assert_eq!(unentr(&form, &scb), b"\x08 \x08\x08 \x08");
+    }
+
+    #[test]
+    fn bgnter_erases_the_old_answer_then_positions_for_the_new_one() {
+        let spec = b"NAME";
+        let form = compile(b"??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Al"); // what was showing before this bgnter() call
+
+        let out = bgnter(&form, &mut scb);
+
+        assert_eq!(out, b"\x08 \x08\x08 \x08", "unentr's erasure; skppnc echoes nothing (no punctuation)");
+    }
+
+    #[test]
+    #[should_panic(expected = "FSDANS")]
+    fn bgnter_refuses_the_ansi_branch_it_does_not_port() {
+        let form = compile(b"??", b"A", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        bgnter(&form, &mut scb);
+    }
+
+    #[test]
+    fn addprt_refuses_a_character_past_the_fields_width() {
+        let form = compile(b"??", b"A", MANY); // width 2
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Al");
+
+        assert_eq!(addprt(&form, &mut scb, b'x'), b"", "already at width");
+        assert_eq!(scb.ansbuf(), b"Al", "unchanged");
+    }
+
+    #[test]
+    fn addprt_refuses_a_space_on_a_nospaces_field() {
+        let form = compile(b"????", b"A(NOSPACES)", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(addprt(&form, &mut scb, b' '), b"");
+        assert_eq!(scb.ansbuf(), b"");
+    }
+
+    #[test]
+    fn addprt_masks_a_secret_fields_echo_but_not_its_storage() {
+        let form = compile(b"????", b"PASS(SECRET)", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(addprt(&form, &mut scb, b'x'), b"*");
+        assert_eq!(scb.ansbuf(), b"x", "the real character is what's stored");
+    }
+
+    #[test]
+    fn addprt_types_a_phone_number_and_skips_the_dash_after_the_third_digit() {
+        // "Phone: ###-####": three addprt() calls type the digits before
+        // the dash; the third one's own echo carries the dash along with
+        // it, exactly as `shoabf`'s own test of this same fixture shows
+        // the finished display doing ("555-", not "555").
+        let template = b"Phone: ###-####";
+        let form = compile(template, b"PHONE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        skppnc(&form, &mut scb); // bgnter's own precondition: ftmptr positioned
+
+        assert_eq!(addprt(&form, &mut scb, b'5'), b"5");
+        assert_eq!(addprt(&form, &mut scb, b'5'), b"5");
+        assert_eq!(
+            addprt(&form, &mut scb, b'5'),
+            b"5-",
+            "the third digit's own call carries the literal dash with it"
+        );
+        assert_eq!(scb.ansbuf(), b"555");
+    }
+
+    #[test]
+    fn hdlprt_enters_any_character_on_a_plain_text_field() {
+        let form = compile(b"??", b"NAME", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'!');
+        assert_eq!(verdict, Hdlprt::Enter);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn hdlprt_ignores_a_multichoice_field_with_no_alternates() {
+        // Exercises hdlalt's own first line -- safe without the rest of
+        // Task 7 -- against a field that really is MULTICHOICE but has no
+        // ALT= list to match against.
+        let form = compile(b"??", b"F(MULTICHOICE)", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        assert_eq!(form.fields[0].flags, flags::MULTICHOICE);
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'x');
+        assert_eq!(verdict, Hdlprt::Ignore);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "hdlalt")]
+    fn hdlprt_refuses_a_field_with_alternates_rather_than_guess() {
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        hdlprt(&form, &mut scb, b'b');
+    }
+
+    #[test]
+    fn hdlprt_enters_a_digit_on_a_numeric_field() {
+        let form = compile(b"###", b"AGE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'5');
+        assert_eq!(verdict, Hdlprt::Enter);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn hdlprt_ignores_a_non_digit_on_a_numeric_field_with_no_alternates() {
+        let form = compile(b"###", b"AGE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'x');
+        assert_eq!(verdict, Hdlprt::Ignore);
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn hdlprt_enters_a_leading_minus_on_a_signed_dollar_field() {
+        let form = compile(b"$$$", b"BAL", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        assert_eq!(scb.ansbuf(), b"", "nothing typed yet");
+
+        let (verdict, _) = hdlprt(&form, &mut scb, b'-');
+        assert_eq!(verdict, Hdlprt::Enter);
+    }
+
+    #[test]
+    fn hdlprt_refuses_a_minus_on_a_nonnegative_dollar_field() {
+        let form = compile(b"$$$", b"BAL(MIN=0)", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        assert!(form.fields[0].flags & flags::NONNEGATIVE != 0);
+
+        let (verdict, _) = hdlprt(&form, &mut scb, b'-');
+        assert_eq!(verdict, Hdlprt::Ignore, "no ALT= list either, so hdlalt's stub is safe");
+    }
+
+    #[test]
+    fn hdlprt_reruns_bgnter_and_clears_fsdant_when_a_digit_follows_an_aborted_alternate() {
+        // The C's own outer guard, `!FSDANT || anslen==0`, means the
+        // reset-and-restart sub-branch is reachable only once `ansbuf` is
+        // ALREADY empty -- a non-empty `ansbuf` alongside `FSDANT` routes
+        // to `hdlalt` instead (below). So the only way to observe the
+        // restart's own erasure is through `ftmptr`, which -- on a
+        // punctuated field -- `unentr` reads independently of `ansbuf`'s
+        // length: exactly the state Task 7's `hdlalt` would leave behind
+        // after an aborted partial match against a punctuated field's
+        // alternates.
+        let template = b"Code: ###-###";
+        let form = compile(template, b"CODE", MANY);
+        let mbpoff = form.fields[0].punctuation_at.expect("this field joins");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ftmptr(mbpoff + 4); // as if echoing had advanced this far
+        scb.set_flags(entry_flags::FSDANT);
+        assert_eq!(scb.ansbuf(), b"", "the guard's other half: nothing typed");
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'3');
+
+        assert_eq!(verdict, Hdlprt::Enter);
+        assert_eq!(
+            out,
+            b"\x08 \x08\x08 \x08\x08 \x08\x08 \x08",
+            "unentr erased the 4 characters ftmptr had advanced past; skppnc's \
+             own re-echo is empty, per skppnc's own \"provably dead\" doc comment"
+        );
+        assert_eq!(scb.ftmptr(), mbpoff, "skppnc repositioned it to the field's own start");
+        assert_eq!(scb.flags(), 0, "FSDANT cleared");
+    }
+
+    #[test]
+    fn hdlprt_falls_through_to_hdlalt_when_fsdant_is_set_and_something_is_typed() {
+        // The C's outer guard again, from the other side: FSDANT set AND
+        // ansbuf non-empty means the digit-accept branch never runs at
+        // all, whatever the character is -- it always falls to hdlalt.
+        let form = compile(b"###", b"AGE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"1");
+        scb.set_flags(entry_flags::FSDANT);
+
+        let (verdict, out) = hdlprt(&form, &mut scb, b'3');
+
+        assert_eq!(verdict, Hdlprt::Ignore, "AGE has no ALT= list, so hdlalt's stub is safe");
+        assert_eq!(out, b"");
+        assert_eq!(scb.ansbuf(), b"1", "hdlprt's own branch never ran");
     }
 
     #[test]
