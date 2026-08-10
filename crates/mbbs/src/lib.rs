@@ -3550,16 +3550,51 @@ mod tests {
     /// A channel mid-FSD-session with nothing left in `channel.input` must
     /// leave `cycle` idle, not spend its whole pass budget getting nowhere.
     ///
-    /// Mutate by re-arming `CYCLE` unconditionally at the end of
-    /// `shims::fsd::fsd_cycle` (e.g. an unconditional
-    /// `host.gsbl_mut().inject(chan, gsbl::Gsbl::CYCLE);` right before its
-    /// final `Ok(())`) and this test goes red -- the design doc warns
-    /// explicitly that this assertion "passes trivially against a spinning
-    /// implementation until the implementation is made to spin on
-    /// purpose", so that mutation is not optional colour here, it is what
-    /// makes this test mean anything. Measured directly: with that
-    /// mutation in place, `cycles.ended` comes back `Bound { next_kick:
-    /// None }` after five iterations instead of `Idle` after one.
+    /// Measured, not assumed -- three mutations of `shims::fsd::fsd_cycle`
+    /// were actually run, because the design doc warns that this assertion
+    /// "passes trivially against a spinning implementation until the
+    /// implementation is made to spin on purpose":
+    ///
+    /// 1. Re-arm `CYCLE` unconditionally, every pass (an unconditional
+    ///    `host.gsbl_mut().inject(chan, gsbl::Gsbl::CYCLE);` right before
+    ///    `fsd_cycle`'s final `Ok(())`). This does **not** come back
+    ///    `Bound { next_kick: None }` after five iterations -- `Host::poll`'s
+    ///    own pre-existing runaway guard (`SPINS = 1024`, `lib.rs` ~1943-1953,
+    ///    predates this task entirely) fires first, from *inside* the single
+    ///    `poll()` call this test's first `cycle()` iteration makes, and
+    ///    `cycled` comes back `Err("poll went round 1024 times without
+    ///    dispatching to the module: a status is being read but not
+    ///    consumed")` -- the `assert_eq!` below is never reached.
+    /// 2. Re-arm `CYCLE` a *bounded* number of times instead (measured at 1,
+    ///    10, and 1020 re-arms, all well under 1024): every one of them still
+    ///    converges to `Cycles { iterations: 1, dispatched: 0, ended: Idle }`
+    ///    -- the right answer, just reached by wasting extra spins inside
+    ///    that same `poll()` call. This is not a fluke of the numbers tried:
+    ///    `fsd_dispatch` always answers "no far pointer" for the FSD's native
+    ///    slot (see its own doc, above `Host::fsd_dispatch`), so `poll`'s
+    ///    inner loop `continue`s on every dispatch to this channel and cannot
+    ///    return until `Gsbl::pending()` is already false -- so
+    ///    `Host::cycle`'s outer loop can only ever see `iterations == 1`
+    ///    here. **`Ended::Bound` is not reachable at all** from a bounded
+    ///    `CYCLE`-re-arm bug confined to this one channel: it either resolves
+    ///    correctly (Idle) or trips the unrelated SPINS guard: there is no
+    ///    bounded mutation in between that lands on `Bound`.
+    /// 3. What *does* trip the `assert_eq!` below on its own terms, nowhere
+    ///    near `poll`'s spin counter: leaving a stale [`shims::system::Kick`]
+    ///    registered in `host.kicks` instead of consuming or clearing it (one
+    ///    unconditional push, right before `fsd_cycle`'s final `Ok(())`).
+    ///    `Host::cycle` only reports `Ended::Idle` off an *empty*
+    ///    `self.kicks`; with one left behind it reports
+    ///    `Ended::Waiting { next_kick: 3, polls_cut: true }` on the very
+    ///    first iteration instead, which the assertion below catches
+    ///    cleanly: `Cycles { iterations: 1, dispatched: 0, ended: Waiting {
+    ///    next_kick: 3, polls_cut: true } }`.
+    ///
+    /// So this test's own assertion cannot discriminate the specific
+    /// "spins on CYCLE" shape the design doc's prose describes -- that shape
+    /// is caught by `poll`'s pre-existing SPINS guard instead, one layer
+    /// down -- but it does have real, measured discriminating power against
+    /// a channel-scoped regression of comparable severity (mutation 3).
     #[test]
     fn a_channel_mid_field_with_no_input_goes_idle_not_bound() {
         let mut f = Fixture::new();
