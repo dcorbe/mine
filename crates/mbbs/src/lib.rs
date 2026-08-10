@@ -883,29 +883,42 @@ impl Host {
     /// dispatch: entry `n` of the FSD's own native slot, run directly
     /// instead of through a far call.
     ///
-    /// A stub for this task: it always answers "no far pointer to call",
-    /// the same shape [`Registration::dispatch`] gives a module that left
-    /// the entry point null. It exists so a `Native` state is seen to be
-    /// *reached* rather than silently folded into "no handler at all" --
-    /// this crate's refusal-over-fallback discipline applies to a state
-    /// with nothing wired up yet, not only to one with nothing registered.
-    /// Real per-entry behaviour lands starting with the FSD subsystem plan's
-    /// later tasks.
+    /// Entry 2 is `stsrou`, the only one `FSDBBS.C`'s own `fsdmod` ever gave
+    /// a body -- `fsdsts`, folded here into
+    /// [`shims::fsd::fsd_cycle`]. Entry 1 (`sttrou`, reached on `CRSTG`)
+    /// is never real: raw mode means `CRSTG` cannot fire while a session is
+    /// under way (the design doc's "Input" section), so a `CRSTG` reaching
+    /// this slot at all means the channel is in the FSD's `state` without a
+    /// live session -- the same shape as a module that left the entry point
+    /// null, noted rather than refused so [`Host::poll`]'s own "no entry
+    /// registered" fallback handles it exactly as it would a module's own
+    /// null pointer.
+    ///
+    /// Always answers "no far pointer to call": the FSD's own work, when
+    /// there is any, happens right here rather than through a far call --
+    /// that is the whole point of a *native* registration.
     ///
     /// # Errors
     ///
-    /// Never, today. Kept fallible because the real dispatch this stands in
-    /// for will be.
+    /// If [`shims::fsd::fsd_cycle`] does -- in particular, if this channel's
+    /// state names the FSD's own slot but `fsdego` never ran for it, which
+    /// is a bug in whatever set that state rather than a condition to
+    /// silently ignore.
     fn fsd_dispatch(
         &mut self,
-        _machine: &mut Machine,
+        machine: &mut Machine,
         chan: Chan,
         n: usize,
     ) -> Result<Option<FarPtr>, ShimError> {
-        self.note(format!(
-            "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
-             which has no handler wired up yet"
-        ));
+        if n != 2 {
+            self.note(format!(
+                "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
+                 which has no handler wired up yet"
+            ));
+            return Ok(None);
+        }
+
+        shims::fsd::fsd_cycle(machine, self, chan)?;
         Ok(None)
     }
 

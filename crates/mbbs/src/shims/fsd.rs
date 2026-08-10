@@ -1215,6 +1215,128 @@ pub(crate) fn goback(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
     Ok(Ret::Void)
 }
 
+/// The FSD's own `CYCLE` dispatch -- `fsdsts()`'s `ENTERING` case
+/// (`FSDBBS.C:275-286`), folded together with the interrupt-level echo
+/// `fsdchi`/`fsdinc` (`FSDBBS.C:329-361`) would otherwise already have
+/// produced by the time any `CYCLE` reached it. There is no interrupt level
+/// here, so both run in the same pass: raw-mode [`crate::gsbl::Gsbl::push_input`]
+/// queues exactly one `CYCLE` for however many bytes arrived together (its
+/// own doc comment), and this drains every one of them -- the design doc's
+/// "the handler drains `channel.input` completely on every pass".
+///
+/// Each byte goes through [`fsd::fsdinc`]; its echo is queued in `pending`
+/// rather than sent immediately, but flushed to the channel as its own
+/// segment the instant a byte lands a field on [`fsd::state::FSDBUF`] --
+/// matching the timing the original's interrupt-level `fsdchi` already had,
+/// since by the time a real `fsdsts` ever ran, every prior keystroke's echo
+/// was already on the wire. At that point [`fsdprc`] runs immediately --
+/// `fsdsts`'s own `clrprf(); prf("");` preamble first (`FSDBBS.C:279-280`),
+/// so its composed output starts from an empty print buffer regardless of
+/// what was just flushed -- and if that ends the session ([`goback`],
+/// called from inside `fsdprc` per Task 11), the rest of this pass's queued
+/// bytes are left undrained: the channel is no longer in an FSD session for
+/// them to mean anything to.
+///
+/// # No `fsdnfy()` of its own
+///
+/// The original's `fsdchi` calls `fsdnfy()` itself once a field commits, to
+/// wake `fsdsts` on a later pass. This function has no later pass to wake:
+/// `fsdprc` runs inline, in the same call, which is what dropping `FSDSTB`
+/// (the design doc's own "Dropped" list) requires -- see `fsdprc`'s own doc
+/// comment, "No `FSDSTB` catch-up". So nothing here ever queues `CYCLE`
+/// again on its own account; per the design doc's standing rule ("every
+/// place the original polls, this host makes an edge"), a channel with
+/// nothing left in `channel.input` leaves this function having queued no
+/// further work, and [`crate::Host::cycle`] is free to go `Idle`.
+///
+/// # Errors
+///
+/// If this channel has no session control block or no
+/// [`crate::Host::fsd_sessions`] entry -- reaching the FSD's own `CYCLE`
+/// dispatch with neither means `fsdego` never ran for this channel, which is
+/// a bug in whatever put it in [`crate::Host::fsd_state`] rather than a
+/// condition to paper over -- or if anything [`fsd::fsdinc`]/[`fsdprc`]
+/// themselves need turns out missing (the same errors `fsdprc` and its
+/// neighbours already raise).
+pub(crate) fn fsd_cycle(
+    machine: &mut Machine,
+    host: &mut Host,
+    chan: Chan,
+) -> Result<(), ShimError> {
+    let at = host.fsdscb[chan.index()].ok_or_else(|| {
+        ShimError::Failed(format!(
+            "fsd_cycle: channel {chan} is in the FSD's own state but has no session control \
+             block -- fsdego never ran for it"
+        ))
+    })?;
+    if host.fsd_sessions[chan.index()].is_none() {
+        return Err(ShimError::Failed(format!(
+            "fsd_cycle: channel {chan} is in the FSD's own state but Host::fsd_sessions has \
+             nothing recorded for it -- fsdego never ran, or the session already ended"
+        )));
+    }
+
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        let Some(byte) = host.gsbl_mut().channel_mut(chan).input.pop_front() else {
+            break;
+        };
+
+        let mut block = read_block(machine, at)?;
+        let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+            return Err(ShimError::Failed(format!(
+                "fsd_cycle: channel {chan} recorded no template -- fsdego's own invariant has \
+                 come apart"
+            )));
+        };
+        let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+            return Err(ShimError::Failed(format!(
+                "fsd_cycle: channel {chan} recorded message {msgno} (amode {amode}) but no \
+                 such form is cached"
+            )));
+        };
+        let form = live_form(machine, &block, &form)?;
+        let spec = machine.read_cstr(block.fldspc())?.to_vec();
+
+        pending.extend(fsd::fsdinc(&form, &spec, &mut block, byte));
+        machine.write(at, block.as_bytes())?;
+
+        if block.state() == fsd::state::FSDBUF {
+            if !pending.is_empty() {
+                host.gsbl_mut().transmit(chan, &pending);
+                pending.clear();
+            }
+
+            // `clrprf(); prf("");` -- FSDBBS.C:279-280, immediately before
+            // fsdprc(), so its own composed output starts from an empty
+            // print buffer regardless of anything already flushed above.
+            crate::shims::text::clrprf(machine, host)?;
+            crate::shims::text::append(machine, host, b"")?;
+
+            fsdprc(machine, host, chan)?;
+
+            if host.fsd_sessions[chan.index()].is_none() {
+                // `goback` already ran (from inside `fsdprc`), flushed its
+                // own output and torn the session down. Nothing left in
+                // `channel.input` is this channel's to read any more.
+                return Ok(());
+            }
+
+            // The session is still open: `fsdprc`'s own output (a
+            // reprompt, or a rejection message) is sitting in `prfbuf`,
+            // unflushed -- no module code runs to `tell_user` it for us.
+            outprf(machine, host, chan)?;
+        }
+    }
+
+    if !pending.is_empty() {
+        host.gsbl_mut().transmit(chan, &pending);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2999,5 +3121,128 @@ mod tests {
             1,
             "whndun ran, with the save flag fsdprc's own state propagation set"
         );
+    }
+
+    // --- Task 12: fsd_cycle, the FSD's own CYCLE dispatch ----------------
+
+    /// Push straight into `channel.input`, the way raw-mode
+    /// [`crate::gsbl::Gsbl::push_input`] would have -- a `fsd_cycle` test
+    /// wants full control over exactly which bytes are queued for one pass,
+    /// not `push_input`'s own line-cooking or its `CYCLE` bookkeeping.
+    fn queue(f: &mut Fixture, chan: Chan, bytes: &[u8]) {
+        f.host
+            .gsbl_mut()
+            .channel_mut(chan)
+            .input
+            .extend(bytes.iter().copied());
+    }
+
+    #[test]
+    fn fsd_cycle_drains_a_whole_field_and_advances_without_ending_the_session() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"\0");
+        let chan = f.console();
+
+        assert!(matches!(
+            f.invoke(fsdego, &[0, 0, 0, 0]),
+            Ok(Ret::Void)
+        ));
+        // `fsdego` prompted field 0 into the print buffer; that is not this
+        // test's concern, and `fsd_cycle` starts every pass with its own
+        // `clrprf` only once a field commits -- so drop it here rather than
+        // let it leak into the assertions below.
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        queue(&mut f, chan, b"Kaimon\r");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, chan),
+            Ok(())
+        ));
+
+        assert!(
+            f.host.gsbl_mut().channel_mut(chan).input.is_empty(),
+            "every queued byte must be drained in one pass"
+        );
+        assert_eq!(
+            block(&f).crsfld(),
+            1,
+            "Enter on a non-final field commits it and moves the cursor to the next one"
+        );
+        assert!(
+            f.host.fsd_sessions[chan.index()].is_some(),
+            "the session is not over -- there is still a field left"
+        );
+        assert!(
+            !f.host
+                .gsbl_mut()
+                .channel_mut(chan)
+                .status
+                .contains(&crate::gsbl::Gsbl::CYCLE),
+            "fsd_cycle must not re-arm CYCLE on its own account"
+        );
+
+        let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            sent.contains("Kaimon"),
+            "the typed field must have been echoed to the channel: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn fsd_cycle_ends_the_session_and_calls_whndun_on_ctrl_g() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+
+        let marker = f.buffer(2);
+        f.machine
+            .write(marker, &[0xff, 0xff])
+            .expect("seeded with a value session.save as u16 can never be");
+        let whndun = stub_recording_save(&mut f, 0x100, marker);
+
+        assert!(matches!(
+            f.invoke(
+                fsdego,
+                &[0, 0, whndun.offset, whndun.selector],
+            ),
+            Ok(Ret::Void)
+        ));
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        // 0x07: Ctrl-G, "save and exit" -- FSD.C:1877-1940's own xitkey.
+        queue(&mut f, chan, b"Kaimon\x07");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, chan),
+            Ok(())
+        ));
+
+        assert!(
+            f.host.gsbl_mut().channel_mut(chan).input.is_empty(),
+            "every queued byte must be drained, even the one that ended the session"
+        );
+        assert!(
+            f.host.fsd_sessions[chan.index()].is_none(),
+            "fsdprc must reach goback itself when the last field is saved"
+        );
+        assert!(
+            !f.host.gsbl_mut().channel_mut(chan).raw,
+            "goback's fsdcof restored cooked input"
+        );
+
+        let recorded = f.machine.resolve(marker, 2).expect("in range");
+        assert_eq!(
+            u16::from_le_bytes([recorded[0], recorded[1]]),
+            1,
+            "whndun ran, with save=true"
+        );
+    }
+
+    #[test]
+    fn fsd_cycle_refuses_a_channel_with_no_session() {
+        let mut f = Fixture::new();
+        current(&mut f);
+        let chan = f.console();
+        let e = fsd_cycle(&mut f.machine, &mut f.host, chan).expect_err("refused");
+        assert!(format!("{e}").contains("no session control block"), "{e}");
     }
 }
