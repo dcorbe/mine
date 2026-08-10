@@ -186,6 +186,25 @@ pub mod scb {
     /// `FSD.H:314`.
     pub const CRSFLD: u16 = 151;
 
+    /// `char ansptr` -- where the cursor sits inside the answer buffer.
+    /// `FSD.H:311`.
+    ///
+    /// # Why this is a real member now and was not before
+    ///
+    /// Stage 4 substituted `scb.ansbuf().len()` for it, on the grounds that
+    /// "every caller of `addprt` only ever appends at the end of the field
+    /// currently being typed". That is true of line mode and false of ANSI:
+    /// `FSD.C:1525-1530` writes `ansbuf[ansptr++]` and extends `anslen`
+    /// **only when `ansptr` passes it**, so typing into the middle of a field
+    /// overwrites rather than appends and the two numbers diverge. Cursor
+    /// keys, `HOME`, `END` and the insert/delete branches all move one
+    /// without the other.
+    ///
+    /// `anslen` keeps the substitution: `ansbuf` in this port *is* the
+    /// string, so its length is `anslen` by construction. Only the cursor
+    /// needed rescuing.
+    pub const ANSPTR: u16 = 127;
+
     /// `char shffld` -- the field whose highlight the deferred cursor shuffle
     /// still owes a repaint. `FSD.H:317`.
     ///
@@ -731,6 +750,19 @@ impl Scb {
     /// Set [`Scb::crsfld`].
     pub fn set_crsfld(&mut self, value: u8) {
         self.set_byte(scb::CRSFLD, value);
+    }
+
+    /// `ansptr`: where the cursor sits inside `ansbuf`. See [`scb::ANSPTR`]
+    /// for why this is a stored member rather than `ansbuf().len()`.
+    ///
+    /// Never greater than `ansbuf().len()`: the C only ever advances it past
+    /// the end by writing a byte there in the same statement.
+    pub fn ansptr(&self) -> u8 {
+        self.byte(scb::ANSPTR)
+    }
+    /// Set [`Scb::ansptr`].
+    pub fn set_ansptr(&mut self, value: u8) {
+        self.set_byte(scb::ANSPTR, value);
     }
 
     /// `shffld`: the field the deferred cursor shuffle still owes a repaint.
@@ -2181,6 +2213,10 @@ pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers:
 
     let mut out = pmtfld(form, template, scb);
     defntr(form, spec, scb, answers);
+    // `fsdscb->ansptr=fsdscb->anslen` (FSD.C:840): `defntr` seeds `ansbuf`
+    // and sets `anslen`, but leaves the cursor where it was, so every caller
+    // places it. Line mode puts it at the end -- entry appends.
+    scb.set_ansptr(u8::try_from(scb.ansbuf().len()).unwrap_or(u8::MAX));
     out.extend(shoabf(form, scb, 0));
 
     scb.set_state(state::FSDNPT);
@@ -2237,6 +2273,9 @@ pub fn fsdent(form: &Form, answers: &Answers, scb: &mut Scb, inifld: i32) -> Vec
 /// Prepare for entry mode: blank `ansbuf`, clear `FSDANT`, and null
 /// `altptr`.
 ///
+/// `anslen` is not modeled -- see [`scb::ANSPTR`] for why `ansptr` is, and
+/// why `anslen` still is not. What follows is that substitution's own note:
+///
 /// `anslen` and `ansptr` are not modeled. Both are this module's standing
 /// substitution -- [`bgnter`] and [`fsdlin`] both derive them from
 /// `ansbuf`'s own length rather than storing them separately, and blanking
@@ -2250,6 +2289,10 @@ pub fn fsdent(form: &Form, answers: &Answers, scb: &mut Scb, inifld: i32) -> Vec
 /// this port ports has a chance to reset it.
 pub fn entprp(scb: &mut Scb) {
     scb.set_ansbuf(b"");
+    // `fsdscb->ansptr=0`, FSD.C:781. `anslen=0` on the line above it is what
+    // blanking `ansbuf` already says; the cursor is its own member -- see
+    // [`scb::ANSPTR`].
+    scb.set_ansptr(0);
     scb.set_flags(scb.flags() & !entry_flags::FSDANT);
     scb.set_altptr(None);
 }
@@ -2388,6 +2431,11 @@ pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
         out.extend_from_slice(&field.ansgto);
         out
     };
+    // `fsdscb->ansptr=fsdscb->anslen=strlen(fsdscb->ansbuf)`, FSD.C:1403 --
+    // between the if/else and the skppnc() below it. The cursor lands at the
+    // end of whatever the buffer already holds, which is where entry
+    // continues from.
+    scb.set_ansptr(u8::try_from(scb.ansbuf().len()).unwrap_or(u8::MAX));
     out.extend(skppnc(form, scb));
     out
 }
@@ -2399,22 +2447,28 @@ pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// already at `width` or the character is a space on a [`flags::NOSPACES`]
 /// field -- the original's whole body is one `if`, and there is no `else`.
 ///
-/// # Where "the cursor position" comes from
+/// # It writes *at* the cursor, and only grows the answer when it has to
 ///
-/// The original indexes `ansbuf[fsdscb->ansptr++]`. This port has no
-/// separate `ansptr` (see [`entprp`]'s doc comment): every caller of
-/// `addprt` in this crate's scope only ever appends at the end of the field
-/// currently being typed, so `scb.ansbuf().len()` is `ansptr`, and the
-/// append below both plays `ansptr`'s role and re-terminates the string the
-/// way `ansbuf[anslen=n]='\0'` does.
+///
+/// So a character typed into the middle of a field **overwrites** the one
+/// already there and leaves the answer the same length; only a character
+/// typed at the end extends it. In line mode the cursor is always at the end
+/// and the two are the same thing, which is why Stage 4 could substitute
+/// `ansbuf().len()` for `ansptr` and why ANSI mode cannot -- see
+/// [`scb::ANSPTR`].
 pub fn addprt(form: &Form, scb: &mut Scb, c: u8) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
-    let ansptr = scb.ansbuf().len();
+    let ansptr = usize::from(scb.ansptr());
     if usize::from(field.width) > ansptr && (field.flags & flags::NOSPACES == 0 || c != b' ') {
         let mut answer = scb.ansbuf().to_vec();
-        answer.push(c);
+        if ansptr < answer.len() {
+            answer[ansptr] = c;
+        } else {
+            answer.push(c);
+        }
         scb.set_ansbuf(&answer);
+        scb.set_ansptr(u8::try_from(ansptr + 1).unwrap_or(u8::MAX));
 
         out.push(if field.flags & flags::SECRET != 0 {
             SECCHR
@@ -2517,17 +2571,19 @@ pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
 /// always finds one -- at the very latest, the current field's own leading
 /// slot.
 ///
-/// `fsdscb->ansptr--; fsdscb->anslen--; ...ansbuf[anslen]='\0';` -- three
-/// statements that all say the same thing this port's `ansbuf`-is-the-
-/// source-of-truth substitution already says once: drop the answer's last
-/// byte and re-terminate. [`Scb::set_ansbuf`] does both.
+/// `fsdscb->ansptr--; fsdscb->anslen--; ...ansbuf[anslen]='\0';`. This is the
+/// *destructive* backspace of ASCII mode, which only ever runs with the
+/// cursor at the end of the answer, so dropping the last byte and stepping
+/// `ansptr` back are the same movement. (ANSI mode's backspace is `hdlnbs`
+/// plus `dprest`, which can act mid-field; it is not this function.)
 pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
-    if !scb.ansbuf().is_empty() && bstalt(field, scb) {
+    if scb.ansptr() > 0 && bstalt(field, scb) {
         let mut answer = scb.ansbuf().to_vec();
         answer.pop();
         scb.set_ansbuf(&answer);
+        scb.set_ansptr(scb.ansptr() - 1);
 
         if field.punctuation_at.is_some() {
             let mut at = usize::from(scb.ftmptr());
@@ -2815,7 +2871,7 @@ pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
         }
         b'#' | b'$' => {
             let fsdant = scb.flags() & entry_flags::FSDANT != 0;
-            let empty = scb.ansbuf().is_empty();
+            let empty = scb.ansptr() == 0;
             let is_minus = c == b'-'
                 && field.kind == b'$'
                 && empty // `fsdscb->ansptr == 0`, this port's ansbuf-is-empty
@@ -3035,10 +3091,10 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
     // parameter widened past `u8` -- before that the type enforced it.
     if scb.state() == state::FSDNPT && (i16::from(b'!')..256).contains(&key) {
         scb.set_state(state::FSDNEN);
-        // `fsdscb->ansptr=0` / the matching `...=fsdscb->anslen` that
-        // bracket this whole arm in the original are not modeled -- see
-        // `addprt`'s own doc comment for ansptr's standing substitution.
-        //
+        // `fsdscb->ansptr=0` (FSD.C:1880, "allows - entry") and the matching
+        // `fsdscb->ansptr=fsdscb->anslen` that closes the arm (`:1886`).
+        // Both are real now -- see [`scb::ANSPTR`].
+        scb.set_ansptr(0);
         // The cast is lossless under the bound just tested.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let byte = key as u8;
@@ -3047,8 +3103,10 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
         if verdict == Hdlprt::Enter {
             out.extend(bgnter(form, scb));
             scb.set_ansbuf(b"");
+            scb.set_ansptr(0);
             out.extend(addprt(form, scb, byte));
         }
+        scb.set_ansptr(u8::try_from(scb.ansbuf().len()).unwrap_or(u8::MAX));
         return out;
     }
 
@@ -5116,6 +5174,21 @@ mod tests {
         Scb::from_bytes(&[0u8; FSDSCB as usize]).expect("exactly FSDSCB bytes")
     }
 
+    /// Seed a field's entry buffer *and* the cursor that goes with it.
+    ///
+    /// `ansbuf` and [`Scb::ansptr`] are separate members, and a session can
+    /// never reach a state where the buffer holds text while the cursor is
+    /// still at 0: every production path that fills the buffer places the
+    /// cursor in the same breath (`bgnter`, `addprt`, `fsdlin`, `entprp`). A
+    /// test that set only the buffer would be asserting against a state the
+    /// engine cannot be in -- and before `ansptr` became a real member, it
+    /// silently was that state. This is how a test says "the player has
+    /// typed this much".
+    fn typed(scb: &mut Scb, text: &[u8]) {
+        scb.set_ansbuf(text);
+        scb.set_ansptr(u8::try_from(text.len()).expect("a field is at most ANSLEN wide"));
+    }
+
     #[test]
     fn scb_fldvfy_reads_and_writes_only_its_own_offset() {
         let mut scb = zeroed_scb();
@@ -5145,13 +5218,13 @@ mod tests {
         scb.set_state(state::FSDNPT);
         scb.set_crsfld(3);
 
-        scb.set_ansbuf(b"Kaimon");
+        typed(&mut scb, b"Kaimon");
         assert_eq!(scb.ansbuf(), b"Kaimon");
 
         // Bytes past the terminator are not part of the string, even if a
         // previous, longer answer left them non-zero.
-        scb.set_ansbuf(b"Verylongname");
-        scb.set_ansbuf(b"Hi");
+        typed(&mut scb, b"Verylongname");
+        typed(&mut scb, b"Hi");
         assert_eq!(scb.ansbuf(), b"Hi");
 
         // Neither neighbour moved.
@@ -5163,7 +5236,7 @@ mod tests {
     #[should_panic(expected = "does not fit")]
     fn scb_ansbuf_refuses_an_answer_that_does_not_fit() {
         let mut scb = zeroed_scb();
-        scb.set_ansbuf(&[b'x'; 81]);
+        typed(&mut scb, &[b'x'; 81]);
     }
 
     #[test]
@@ -5298,7 +5371,7 @@ mod tests {
         let form = compile(b"????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Kaimon");
+        typed(&mut scb, b"Kaimon");
 
         // justfy=0 with no embedded punctuation: dspans's first branch,
         // `secreted(answer)` and nothing else -- no padding out to width.
@@ -5311,7 +5384,7 @@ mod tests {
         let form = compile(b"????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"xy");
+        typed(&mut scb, b"xy");
 
         assert_eq!(shoabf(&form, &scb, 0), b"**");
     }
@@ -5336,7 +5409,7 @@ mod tests {
         let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"555");
+        typed(&mut scb, b"555");
 
         assert_eq!(shoabf(&form, &scb, 0), b"555-");
     }
@@ -5351,7 +5424,7 @@ mod tests {
         let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"");
+        typed(&mut scb, b"");
 
         assert_eq!(shoabf(&form, &scb, 0), b"");
     }
@@ -5429,7 +5502,7 @@ mod tests {
         // a fresh field's entry is exactly the cross-field leak Task 7's own
         // `hdlalt` would otherwise be able to observe.
         let mut scb = zeroed_scb();
-        scb.set_ansbuf(b"stale");
+        typed(&mut scb, b"stale");
         scb.set_flags(entry_flags::FSDANT | entry_flags::FSDANS);
         scb.set_altptr(Some(2));
 
@@ -5507,7 +5580,7 @@ mod tests {
         let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Al");
+        typed(&mut scb, b"Al");
 
         assert_eq!(unentr(&form, &scb), b"\x08 \x08\x08 \x08");
     }
@@ -5598,7 +5671,7 @@ mod tests {
         let form = compile(b"??", b"A", MANY, Ascn::Line); // width 2
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Al");
+        typed(&mut scb, b"Al");
 
         assert_eq!(addprt(&form, &mut scb, b'x'), b"", "already at width");
         assert_eq!(scb.ansbuf(), b"Al", "unchanged");
@@ -5750,7 +5823,7 @@ mod tests {
         let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"UNK");
+        typed(&mut scb, b"UNK");
         scb.set_altptr(Some(0));
         assert_eq!(scb.flags(), 0, "FSDANT already clear, as altntr leaves it");
 
@@ -5809,7 +5882,7 @@ mod tests {
         let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"1");
+        typed(&mut scb, b"1");
         scb.set_flags(entry_flags::FSDANT);
 
         let (verdict, out) = hdlprt(&form, spec, &mut scb, b'3');
@@ -5878,7 +5951,7 @@ mod tests {
         let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Bl");
+        typed(&mut scb, b"Bl");
         scb.set_flags(entry_flags::FSDANT);
 
         let (verdict, out) = hdlprt(&form, spec, &mut scb, b'x');
@@ -5960,7 +6033,7 @@ mod tests {
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_altptr(Some(2));
-        scb.set_ansbuf(b"Red");
+        typed(&mut scb, b"Red");
 
         let (verdict, out) = hdlprt(&form, spec, &mut scb, b' ');
 
@@ -6092,7 +6165,7 @@ mod tests {
         let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Al");
+        typed(&mut scb, b"Al");
 
         assert_eq!(hdlcbs(&form, &mut scb), b"\x08 \x08");
         assert_eq!(scb.ansbuf(), b"A");
@@ -6135,7 +6208,7 @@ mod tests {
         let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Black");
+        typed(&mut scb, b"Black");
         scb.set_altptr(Some(0));
 
         assert_eq!(hdlcbs(&form, &mut scb), b"", "bstalt refuses -- the committed choice stands");
@@ -6153,7 +6226,7 @@ mod tests {
         assert_eq!(form.fields[0].flags, flags::ALTERNATES);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Black");
+        typed(&mut scb, b"Black");
         scb.set_altptr(Some(0));
 
         let out = hdlcbs(&form, &mut scb);
@@ -6200,7 +6273,7 @@ mod tests {
         let form = compile(b"?? ?? ??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
-        scb.set_ansbuf(b"Hi");
+        typed(&mut scb, b"Hi");
 
         xitfld(&form, &mut scb, 1);
 
@@ -6491,7 +6564,7 @@ mod tests {
         let mut scb = zeroed_scb();
         scb.set_crsfld(1);
         scb.set_state(state::FSDNPT);
-        scb.set_ansbuf(b"Al");
+        typed(&mut scb, b"Al");
 
         let out = fsdinc(&form, spec, &mut scb, 0x15);
 
@@ -6750,7 +6823,7 @@ mod tests {
         // A single-field form: xitfld's own movfld found nowhere to go, so
         // crsfld stayed at 0 -- the same field as entfld.
         let mut scb = buffered_scb(0, 0, b'\r');
-        scb.set_ansbuf(b"3");
+        typed(&mut scb, b"3");
 
         let (out, changed) = fsdprc(
             &form,
@@ -6784,7 +6857,7 @@ mod tests {
         let form = compile(b"##", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 0, b'\r');
-        scb.set_ansbuf(b"xx");
+        typed(&mut scb, b"xx");
 
         let (out, changed) = fsdprc(
             &form,
@@ -7673,7 +7746,7 @@ mod tests {
         let spec = b"NAME";
         let (form, answers) = ansi_form(b"??????\r\n", spec, b"NAME=Kai\0\0");
         let mut scb = zeroed_scb();
-        scb.set_ansbuf(b"Zzz");
+        typed(&mut scb, b"Zzz");
 
         let stored = shofld(&form, &answers, 0, 0x07, 1);
         assert!(
@@ -7788,5 +7861,133 @@ mod tests {
         });
         assert!(bad.is_err(), "justfy=2 must not silently pick a layout");
         let _ = answers;
+    }
+
+    // --- ansptr: the cursor, once it stopped being ansbuf's length --------
+
+    #[test]
+    fn addprt_overwrites_at_the_cursor_rather_than_appending() {
+        // `fsdscb->ansbuf[fsdscb->ansptr++]=c` (FSD.C:1527). Line mode can
+        // never reach this -- its cursor is always at the end -- which is
+        // exactly why the Stage 4 substitution survived so long and why this
+        // test has to construct the state directly.
+        let form = compile(b"?????", b"A", MANY, Ascn::Line); // width 5
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        typed(&mut scb, b"ABCD");
+        scb.set_ansptr(1);
+
+        let out = addprt(&form, &mut scb, b'x');
+        assert_eq!(scb.ansbuf(), b"AxCD", "the D is not disturbed and nothing grew");
+        assert_eq!(scb.ansptr(), 2, "and the cursor stepped one right");
+        assert_eq!(out, b"x", "the echo is the character itself");
+    }
+
+    #[test]
+    fn addprt_extends_the_answer_only_at_its_end() {
+        // `if ((n=fsdscb->ansptr) > fsdscb->anslen)` (FSD.C:1528): the
+        // answer grows only when the cursor was already past its end.
+        let form = compile(b"?????", b"A", MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        typed(&mut scb, b"AB");
+
+        addprt(&form, &mut scb, b'C');
+        assert_eq!(scb.ansbuf(), b"ABC");
+        assert_eq!(scb.ansptr(), 3);
+    }
+
+    #[test]
+    fn addprts_width_check_is_against_the_cursor_not_the_length() {
+        // `fsdscb->ansptr < fldptr->width` (FSD.C:1525). A full field whose
+        // cursor is not at the end still accepts a keystroke -- it overwrites.
+        // Under the old `ansbuf().len()` substitution this refused, which
+        // would have made a full field un-editable in ANSI mode: every
+        // correction to a name that already filled its box would be silently
+        // dropped.
+        let form = compile(b"????", b"A", MANY, Ascn::Line); // width 4
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        typed(&mut scb, b"ABCD"); // full
+        scb.set_ansptr(1);
+
+        assert_eq!(addprt(&form, &mut scb, b'x'), b"x", "accepted");
+        assert_eq!(scb.ansbuf(), b"AxCD");
+
+        // ...and at the end it really is refused.
+        scb.set_ansptr(4);
+        assert_eq!(addprt(&form, &mut scb, b'y'), b"", "now the field is full");
+        assert_eq!(scb.ansbuf(), b"AxCD");
+    }
+
+    #[test]
+    fn entprp_puts_the_cursor_back_to_the_start() {
+        let mut scb = zeroed_scb();
+        typed(&mut scb, b"stale");
+        entprp(&mut scb);
+        assert_eq!(scb.ansbuf(), b"");
+        assert_eq!(scb.ansptr(), 0, "`fsdscb->ansptr=0`, FSD.C:781");
+    }
+
+    #[test]
+    fn bgnter_leaves_the_cursor_at_the_end_of_what_it_found() {
+        // `fsdscb->ansptr=fsdscb->anslen=strlen(fsdscb->ansbuf)`, FSD.C:1403.
+        // Entry continues from the end of the seeded default, not its start.
+        let form = compile(b"?????", b"A", MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Kai"); // deliberately *not* `typed`: bgnter sets it
+        scb.set_ansptr(0);
+
+        bgnter(&form, &mut scb);
+        assert_eq!(scb.ansptr(), 3);
+    }
+
+    #[test]
+    fn hdlcbs_tests_the_cursor_rather_than_the_buffer() {
+        // `if (fsdscb->ansptr > 0 && bstalt())` (FSD.C:1574). A buffer with
+        // text but a cursor at 0 is a state line mode cannot produce, and
+        // the destructive backspace must not fire there.
+        let form = compile(b"?????", b"A", MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(0);
+        assert_eq!(hdlcbs(&form, &mut scb), b"", "nothing to back over");
+        assert_eq!(scb.ansbuf(), b"Kai", "and nothing was eaten");
+
+        // With the cursor where line mode always puts it, it does fire.
+        typed(&mut scb, b"Kai");
+        assert_eq!(hdlcbs(&form, &mut scb), b"\x08 \x08");
+        assert_eq!(scb.ansbuf(), b"Ka");
+        assert_eq!(scb.ansptr(), 2, "and the cursor came back with it");
+    }
+
+    #[test]
+    fn line_mode_keeps_the_cursor_and_the_length_in_step() {
+        // The invariant the Stage 4 substitution relied on, now asserted
+        // rather than assumed: drive a whole field through `fsdinc` and check
+        // after every keystroke that ansptr still equals ansbuf's length. If
+        // this ever fails, the substitution's remaining users are wrong too.
+        let spec = b"NAME";
+        let form = compile(b"????????", spec, MANY, Ascn::Line);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDNPT);
+
+        for &c in b"Kaimon" {
+            fsdinc(&form, spec, &mut scb, i16::from(c));
+            assert_eq!(
+                usize::from(scb.ansptr()),
+                scb.ansbuf().len(),
+                "after {:?}",
+                c as char
+            );
+        }
+        for _ in 0..3 {
+            fsdinc(&form, spec, &mut scb, 0x08);
+            assert_eq!(usize::from(scb.ansptr()), scb.ansbuf().len(), "after a backspace");
+        }
+        assert_eq!(scb.ansbuf(), b"Kai");
     }
 }
