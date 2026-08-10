@@ -1016,6 +1016,22 @@ pub(crate) fn fsdprc(machine: &mut Machine, host: &mut Host, chan: Chan) -> Resu
     block.set_allans(answers.allans);
     machine.write(at, block.as_bytes())?;
 
+    // Propagate the outcome into `Host::fsd_sessions`, right while
+    // `block.state()` is known-fresh (re-read from `Machine` above, per
+    // the callback discipline). `goback()` (Task 11) needs `save` after
+    // the session buffer this `state` came from may already be gone --
+    // see [`crate::FsdSession::save`]'s own doc comment -- so this is the
+    // one place that state is both current and about to stop being
+    // readable, and the only place it is copied out to the Rust-side flag
+    // that survives past it.
+    if let Some(session) = host.fsd_sessions[chan.index()].as_mut() {
+        match block.state() {
+            fsd::state::FSDSAV => session.save = true,
+            fsd::state::FSDQIT => session.save = false,
+            _ => {}
+        }
+    }
+
     crate::shims::text::append(machine, host, &output)?;
 
     Ok(Ret::Void)
@@ -2353,6 +2369,106 @@ mod tests {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "done", "VFYOK still stored the answer");
+    }
+
+    #[test]
+    fn fsdprc_landing_on_fsdsav_sets_the_session_s_save_flag() {
+        // Task 10 review gap: `scb.state()` landing on FSDSAV is not, by
+        // itself, enough for `goback()` (Task 11) to know a session ended
+        // in save -- by the time it runs, the session buffer FSDSAV was
+        // read from may already be gone (design doc: `FsdSession.save`
+        // exists precisely so the flag survives that). `fsdprc` must
+        // propagate the outcome into `Host::fsd_sessions[chan].save`
+        // itself, right here, while `block.state()` is still fresh.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        // A session normally starts life through `fsdego`, which is what
+        // populates `Host::fsd_sessions` in the first place; recreated by
+        // hand here so this test can drive `fsdprc` directly the way its
+        // neighbours already do, without `fsdego`'s own `fsdlin` call
+        // moving `state` off `FSDBUF` before `set_buffered` gets to it.
+        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            whndun: None,
+            save: false,
+        });
+
+        let fldvfy = stub_setting_state(
+            &mut f,
+            0x100,
+            scb_at,
+            fsd::state::FSDSAV,
+            crate::fsd::verify::VFYOK,
+        );
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        set_buffered(&mut f, 0, 1, b'\r', b"done");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        assert_eq!(block(&f).state(), fsd::state::FSDSAV);
+        assert!(
+            f.host.fsd_sessions[chan.index()]
+                .as_ref()
+                .expect("session still recorded")
+                .save,
+            "FSDSAV must reach Host::fsd_sessions, not just module memory"
+        );
+    }
+
+    #[test]
+    fn fsdprc_landing_on_fsdqit_clears_the_session_s_save_flag() {
+        // The other half of the same propagation, asserted explicitly
+        // (rather than trusting `FsdSession::save`'s `false` default) so a
+        // regression that stops updating the flag on *every* exit --
+        // FSDSAV included -- would not be masked by FSDQIT's own outcome
+        // already matching the untouched default.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        // Seeded `true` so a `fsdprc` that never writes `save` at all
+        // would leave this test's assertion failing rather than
+        // vacuously true.
+        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            whndun: None,
+            save: true,
+        });
+
+        let fldvfy = stub_setting_state(
+            &mut f,
+            0x100,
+            scb_at,
+            fsd::state::FSDQIT,
+            crate::fsd::verify::VFYOK,
+        );
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        set_buffered(&mut f, 0, 1, b'\r', b"done");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        assert_eq!(block(&f).state(), fsd::state::FSDQIT);
+        assert!(
+            !f.host.fsd_sessions[chan.index()]
+                .as_ref()
+                .expect("session still recorded")
+                .save,
+            "FSDQIT must clear the flag, not just leave FSDSAV's earlier true in place"
+        );
     }
 
     #[test]

@@ -3255,7 +3255,7 @@ fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
 /// `FSDSAV`/`FSDQIT` directly (`FSD.H`'s Note 2) -- which is exactly what
 /// `sover`, read *after* the callback, catches. Confirmed against the
 /// decompiled `_ljnvfy`/`vfyadn` call chain
-/// (`re/wg_nt_ghidra/exports/WCCMMUD_decompiled.c:1222`), not assumed:
+/// (`re/exports/WCCMMUD_decompiled.c:11227`, `_LJNVFY`), not assumed:
 /// every one of `_ljnvfy`'s cases falls through to `vfyadn`, the host's
 /// own factory verify routine (imported, ordinal `0xba`) -- not built by
 /// this crate (design doc, "Dropped"). A synthetic `fldvfy` stub that sets
