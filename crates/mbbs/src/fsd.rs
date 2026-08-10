@@ -49,6 +49,8 @@ use std::fmt;
 
 use mbbs16::FarPtr;
 
+pub mod ain;
+
 /// Maximum length of any one answer. `FSD.H:238`.
 pub(crate) const ANSLEN: u16 = 80;
 
@@ -2663,7 +2665,7 @@ pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
 /// accumulation between an `fsdinc` call and `fsdprc` catching up) are
 /// dropped per the design doc's "Dropped" list, neither built by this
 /// crate. Ctrl-L does *not* panic -- see above.
-pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
+pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
     assert!(
         matches!(scb.state(), state::FSDNPT | state::FSDNEN),
         "fsdinc: state {} is neither FSDNPT nor FSDNEN -- FSDAPT/FSDAEN \
@@ -2676,11 +2678,21 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
 
     // Falls through to FSDNEN's own switch below, with `state` left at
     // FSDNPT, when this is false -- see this function's own doc comment.
-    if scb.state() == state::FSDNPT && byte >= b'!' {
+    //
+    // `c < 256` is the C's own upper bound (`FSD.C:1878`) and it is what
+    // keeps a special key out of this arm: `CRSRDN` is 20480, comfortably
+    // `>= '!'`, and without the bound an arrow key would be typed into the
+    // field as though it were text. It only became reachable when the
+    // parameter widened past `u8` -- before that the type enforced it.
+    if scb.state() == state::FSDNPT && (i16::from(b'!')..256).contains(&key) {
         scb.set_state(state::FSDNEN);
         // `fsdscb->ansptr=0` / the matching `...=fsdscb->anslen` that
         // bracket this whole arm in the original are not modeled -- see
         // `addprt`'s own doc comment for ansptr's standing substitution.
+        //
+        // The cast is lossless under the bound just tested.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let byte = key as u8;
         let (verdict, prt_out) = hdlprt(form, spec, scb, byte);
         out.extend(prt_out);
         if verdict == Hdlprt::Enter {
@@ -2691,10 +2703,13 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
         return out;
     }
 
-    match byte {
-        b'\r' | b'\t' => {
-            // CRSRDN is a special code, already excluded by `byte: u8`.
-            scb.set_xitkey(u16::from(byte));
+    match key {
+        // `CRSRDN` shares this arm with `\r` and TAB (`FSD.C:1890-1892`).
+        // Reachable since the keystroke widened: the decoder turns `ESC [ B`
+        // into it, and a line-mode session is decoded exactly as hard as a
+        // full-screen one -- see [`ain`]'s own module docs.
+        ain::CRSRDN | 0x0d | 0x09 => {
+            scb.set_xitkey(key as u16);
             if usize::from(scb.crsfld()) + 1 < form.in_template {
                 xitfld(form, scb, 1);
             } else {
@@ -2707,17 +2722,17 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
                 scb.set_crsfld(scb.crsfld() + 1);
             }
         }
-        0x15 => {
-            // 'U'-64: CRSRUP/BAKTAB's ASCII alias, move to the previous
-            // field. `movfld` is called first only to test whether one
-            // exists -- it has no side effect of its own, matching how the
-            // C uses its return value purely as an is-there-a-target check
-            // before anything else runs.
+        // CRSRUP, BAKTAB, and their ASCII alias 'U'-64: move to the previous
+        // field. `movfld` is called first only to test whether one exists --
+        // it has no side effect of its own, matching how the C uses its
+        // return value purely as an is-there-a-target check before anything
+        // else runs.
+        ain::CRSRUP | ain::BAKTAB | 0x15 => {
             if move_field(form, i32::from(scb.crsfld()) - 1, -1, None, false).is_some() {
                 if scb.state() == state::FSDNEN {
                     out.extend(unentr(form, scb));
                 }
-                scb.set_xitkey(u16::from(byte));
+                scb.set_xitkey(key as u16);
                 xitfld(form, scb, -1);
                 scb.set_flags(scb.flags() | entry_flags::FSDIGA);
             }
@@ -2727,19 +2742,28 @@ pub fn fsdinc(form: &Form, spec: &[u8], scb: &mut Scb, byte: u8) -> Vec<u8> {
             // doc comment. Not a panic: this byte is ordinary live user
             // input, not a caller-contract violation.
         }
-        0x08 | 0x7f => {
-            // '\b', literal DEL (0x7F). The special-code `DEL` (83*256) is
-            // already excluded by `byte: u8`.
+        // '\b', literal DEL (0x7F), and the special-code `DEL` (83*256),
+        // which the C groups with them (`FSD.C:1918-1920`). No terminal
+        // sequence this crate decodes produces the special code -- `ainchr`
+        // has no arm for `ESC [ 3 ~` and discards it (see [`ain`]) -- but
+        // the C accepts it and so does this.
+        0x08 | 0x7f | ain::DEL => {
             scb.set_state(state::FSDNEN);
             out.extend(hdlcbs(form, scb));
         }
         0x0f | 0x07 | 0x1b => {
-            // 'O'-64, 'G'-64, ESC: abandon the field.
-            scb.set_xitkey(u16::from(byte));
+            // 'O'-64, 'G'-64, ESC: abandon the field. Reaching the bare ESC
+            // now takes `ESC ESC` from the wire, which is the original's
+            // behaviour -- see [`ain`]'s module docs.
+            scb.set_xitkey(key as u16);
             xitfld(form, scb, 0);
         }
-        _ if byte >= b' ' => {
+        // `' ' <= c && c < 256` (`FSD.C:1925`). Same upper bound, same
+        // reason, as the FSDNPT guard above.
+        _ if (i16::from(b' ')..256).contains(&key) => {
             scb.set_state(state::FSDNEN);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let byte = key as u8;
             let (verdict, prt_out) = hdlprt(form, spec, scb, byte);
             out.extend(prt_out);
             if verdict == Hdlprt::Enter {
@@ -5280,13 +5304,13 @@ mod tests {
 
         let mut out = Vec::new();
         for &c in b"Kaimon" {
-            out.extend(fsdinc(&form, spec, &mut scb, c));
+            out.extend(fsdinc(&form, spec, &mut scb, c.into()));
         }
         assert_eq!(out, b"Kaimon", "each character echoed as it was typed");
         assert_eq!(scb.ansbuf(), b"Kaimon");
         assert_eq!(scb.state(), state::FSDNEN, "still entering until Enter");
 
-        fsdinc(&form, spec, &mut scb, b'\r');
+        fsdinc(&form, spec, &mut scb, b'\r'.into());
 
         assert_eq!(scb.state(), state::FSDBUF, "xitfld committed the field");
         assert_eq!(scb.crsfld(), 2, "the cursor genuinely moved to the next field");
@@ -5309,7 +5333,7 @@ mod tests {
         scb.set_state(state::FSDNPT);
 
         for &c in b"Kaimoon" {
-            fsdinc(&form, spec, &mut scb, c);
+            fsdinc(&form, spec, &mut scb, c.into());
         }
         assert_eq!(scb.ansbuf(), b"Kaimoon");
         assert_eq!(scb.state(), state::FSDNEN);
@@ -5321,11 +5345,11 @@ mod tests {
         assert_eq!(scb.ansbuf(), b"Kaimo", "both trailing o's backspaced off");
         assert_eq!(scb.state(), state::FSDNEN, "backspace re-asserts FSDNEN");
 
-        let out = fsdinc(&form, spec, &mut scb, b'n');
+        let out = fsdinc(&form, spec, &mut scb, b'n'.into());
         assert_eq!(out, b"n");
         assert_eq!(scb.ansbuf(), b"Kaimon");
 
-        fsdinc(&form, spec, &mut scb, b'\r');
+        fsdinc(&form, spec, &mut scb, b'\r'.into());
         assert_eq!(scb.state(), state::FSDBUF);
         assert_eq!(scb.ansbuf(), b"Kaimon", "the committed answer");
     }
@@ -5344,7 +5368,7 @@ mod tests {
         // The first space arrives via FSDNPT's own fallthrough (' ' < '!'),
         // reaching FSDNEN's default arm with state still FSDNPT at the
         // moment hdlprt/hdlalt run -- and commits the first alternate.
-        let out1 = fsdinc(&form, spec, &mut scb, b' ');
+        let out1 = fsdinc(&form, spec, &mut scb, b' '.into());
         assert_eq!(scb.ansbuf(), b"Black");
         assert_eq!(scb.state(), state::FSDNEN, "the default arm sets it even via fallthrough");
         assert!(!out1.is_empty());
@@ -5356,14 +5380,14 @@ mod tests {
         // and_wraps_to_the_first_alternate already uses for the identical
         // reason.
         scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
-        fsdinc(&form, spec, &mut scb, b' ');
+        fsdinc(&form, spec, &mut scb, b' '.into());
         assert_eq!(scb.ansbuf(), b"Brown", "cycled to the next alternate");
 
         scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
-        fsdinc(&form, spec, &mut scb, b' ');
+        fsdinc(&form, spec, &mut scb, b' '.into());
         assert_eq!(scb.ansbuf(), b"Red", "cycled to the last alternate");
 
-        fsdinc(&form, spec, &mut scb, b'\r');
+        fsdinc(&form, spec, &mut scb, b'\r'.into());
         assert_eq!(scb.state(), state::FSDBUF, "Enter committed the field");
         assert_eq!(scb.ansbuf(), b"Red", "the last-cycled alternate is what got saved");
         assert_eq!(
@@ -5419,7 +5443,7 @@ mod tests {
         let mut scb = zeroed_scb();
         scb.set_crsfld(1);
         scb.set_state(state::FSDNPT);
-        fsdinc(&form, spec, &mut scb, b'x');
+        fsdinc(&form, spec, &mut scb, b'x'.into());
         assert_eq!(scb.state(), state::FSDNEN, "typing moved it out of FSDNPT");
 
         let out = fsdinc(&form, spec, &mut scb, 0x15);
@@ -5445,7 +5469,7 @@ mod tests {
         scb.set_state(state::FSDNPT);
         scb.set_ansbuf(b"Al"); // defntr()'s seed; shoabf() already showed it
 
-        let out = fsdinc(&form, spec, &mut scb, b'K');
+        let out = fsdinc(&form, spec, &mut scb, b'K'.into());
 
         assert_eq!(
             out,
@@ -5461,7 +5485,7 @@ mod tests {
         let form = compile(b"?? ??", b"A B", MANY);
         let mut scb = zeroed_scb();
         scb.set_state(state::FSDAPT);
-        fsdinc(&form, b"A B", &mut scb, b'x');
+        fsdinc(&form, b"A B", &mut scb, b'x'.into());
     }
 
     #[test]
@@ -5481,7 +5505,7 @@ mod tests {
         scb.set_state(state::FSDNPT);
 
         for &c in b"Kai" {
-            fsdinc(&form, spec, &mut scb, c);
+            fsdinc(&form, spec, &mut scb, c.into());
         }
         assert_eq!(scb.ansbuf(), b"Kai");
         assert_eq!(scb.state(), state::FSDNEN);
@@ -5492,7 +5516,7 @@ mod tests {
         assert_eq!(scb, before, "Ctrl-L leaves the whole session control block untouched");
 
         // Typing still works afterward -- the no-op didn't wedge anything.
-        let out = fsdinc(&form, spec, &mut scb, b'm');
+        let out = fsdinc(&form, spec, &mut scb, b'm'.into());
         assert_eq!(out, b"m");
         assert_eq!(scb.ansbuf(), b"Kaim");
     }

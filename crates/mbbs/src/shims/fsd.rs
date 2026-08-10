@@ -758,6 +758,21 @@ fn fsdcof(host: &mut Host, chan: Chan, scnwid: u16) {
 /// this found nothing already modeling it.
 const ENTERING: u16 = 1;
 
+/// `eurmsk`, the high-bit mask `fsdchi` applies to every ordinary byte.
+/// `MAJORBBS.C:311`: `char eurmsk=0x7F;` -- "0x7F if U.S.A. only, 0xFF if
+/// European."
+///
+/// # Why a constant and not a global
+///
+/// The genuine host promotes it to `0xFF` at `MAJORBBS.C:673`, off a
+/// configuration option, and exports it for modules to read (ordinal 194).
+/// `WCCMMUD.DLL` imports no such symbol, and this host has no European
+/// configuration to switch on, so a constant is the whole of the behaviour
+/// rather than a stub of it. It is not a no-op either way: at `0x7F` this
+/// strips the high bit off every inbound byte, which is why a CP437
+/// character typed into a field arrives as its low seven bits.
+const EURMSK: i16 = 0x7F;
+
 /// The [`fsd::Form`] `fsdlin` should walk for this channel's session: the
 /// compiled [`Host::forms`] entry, with every field's `flags` refreshed from
 /// the module's own `flddat[]` rather than trusted from the cache.
@@ -875,6 +890,11 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         whndun: (whndun != FarPtr::NULL).then_some(whndun),
         save: false,
     });
+
+    // `ainscb=&fsdusr->ainscb; ainbeg();` -- FSDBBS.C:217-218, *outside* the
+    // amode branch above and immediately before fsdcon(). Line mode gets a
+    // decoder too; see `fsd::ain`'s module docs for what that changes.
+    host.fsd_ain[chan.index()].ainbeg();
 
     fsdcon(host, chan);
     crate::shims::text::append(machine, host, &output)?;
@@ -1335,6 +1355,25 @@ pub(crate) fn fsd_cycle(
     let mut pending: Vec<u8> = Vec::new();
 
     while let Some(byte) = host.gsbl_mut().channel_mut(chan).input.pop_front() {
+        // `if ((c=ainchr(c)) != 0) { if (c < 256) c&=eurmsk; fsdinc(c); }`
+        // -- FSDBBS.C:349-356. Three things about this are load-bearing:
+        //
+        // * There is no `amode` test. Every byte of every session, line mode
+        //   included, is decoded (see `fsd::ain`).
+        // * A zero return means "consumed" -- a byte part-way through an
+        //   escape sequence -- and `fsdinc` is not called at all. `continue`
+        //   rather than falling through with a 0, which `fsdinc` would treat
+        //   as an ordinary control byte.
+        // * The `eurmsk` mask belongs *here*, not inside the decoder, and is
+        //   guarded by `c < 256` so it cannot touch a special key: `eurmsk`
+        //   is 0x7F on a U.S. board (`MAJORBBS.C:311`) and `CRSRUP & 0x7F`
+        //   would be 0.
+        let key = host.fsd_ain[chan.index()].ainchr(byte);
+        if key == 0 {
+            continue;
+        }
+        let key = if key < 256 { key & EURMSK } else { key };
+
         let mut block = read_block(machine, at)?;
         let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
             return Err(ShimError::Failed(format!(
@@ -1351,7 +1390,7 @@ pub(crate) fn fsd_cycle(
         let form = live_form(machine, &block, &form)?;
         let spec = machine.read_cstr(block.fldspc())?.to_vec();
 
-        pending.extend(fsd::fsdinc(&form, &spec, &mut block, byte));
+        pending.extend(fsd::fsdinc(&form, &spec, &mut block, key));
         machine.write(at, block.as_bytes())?;
 
         if block.state() == fsd::state::FSDBUF {
@@ -3315,6 +3354,139 @@ mod tests {
             1,
             "whndun ran, with save=true"
         );
+    }
+
+    #[test]
+    fn fsd_cycle_needs_two_escapes_to_quit_a_line_mode_session() {
+        // The landed line-mode divergence `fsd::ain` corrects, pinned where
+        // it is actually observable. `fsdchi` routes every byte through
+        // `ainchr` with no `amode` test (FSDBBS.C:349-356), so a bare ESC is
+        // swallowed into WT4BKT and never reaches `fsdinc`. Before the
+        // decoder was wired in, one ESC quit the session on the spot.
+        //
+        // Both halves matter: a test that only pressed ESC ESC would pass
+        // just as well against the old, undecoded code.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        queue(&mut f, chan, b"Kaimon\x1b");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+        assert!(
+            f.host.fsd_sessions[chan.index()].is_some(),
+            "one ESC is swallowed by the decoder -- the session must still be open"
+        );
+        assert_eq!(
+            block(&f).ansbuf(),
+            b"Kaimon",
+            "and the field is untouched: the ESC was consumed, not typed"
+        );
+
+        // The second ESC lands on WT4BKT's default arm (AIN.C:54-57), which
+        // hands back the offending character -- so *now* fsdinc sees a 27.
+        queue(&mut f, chan, b"\x1b");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+        assert!(
+            f.host.fsd_sessions[chan.index()].is_none(),
+            "the second ESC reaches fsdinc and abandons the session"
+        );
+    }
+
+    #[test]
+    fn fsd_cycle_decodes_an_arrow_key_into_a_line_mode_field_move() {
+        // The other half of the widening: `ESC [ B` is CRSRDN (20480), which
+        // the C's line-mode switch groups with '\r' and TAB
+        // (FSD.C:1890-1892). Three bytes in, one field advance out -- and
+        // none of the three is echoed as text, which is what would happen if
+        // the decoder were absent and `[`/`B` fell through to the printable
+        // arm.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session(&mut f, "NAME RANK", b"\0");
+        let chan = f.console();
+
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        queue(&mut f, chan, b"Kaimon\x1b[B");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+
+        assert_eq!(
+            block(&f).crsfld(),
+            1,
+            "CRSRDN commits the field and advances, exactly as Enter does"
+        );
+        assert!(
+            f.host.fsd_sessions[chan.index()].is_some(),
+            "there is still a field left -- the session is not over"
+        );
+
+        let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            !sent.contains('['),
+            "no byte of the escape sequence may be echoed as text: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn fsd_cycle_ignores_a_sideways_arrow_in_line_mode_rather_than_typing_it() {
+        // What keeps `fsdinc`'s two `c < 256` bounds (FSD.C:1878, :1925)
+        // honest. CRSRRT is 19712; drop either bound and it satisfies
+        // `'!' <= c` / `' ' <= c`, gets truncated to a byte -- 19712 & 0xFF
+        // is 0x00 -- and a NUL is typed into the field. Line mode has no
+        // horizontal cursor, so the correct behaviour is that nothing at all
+        // happens, twice: once from FSDNPT and once from FSDNEN, because the
+        // two bounds are in different arms and one test hitting only the
+        // first would leave the second unguarded.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session(&mut f, "NAME RANK", b"\0");
+        let chan = f.console();
+
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        // From FSDNPT -- the state `fsdlin` leaves a fresh session in.
+        assert_eq!(block(&f).state(), fsd::state::FSDNPT);
+        queue(&mut f, chan, b"\x1b[C");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+        assert_eq!(
+            block(&f).state(),
+            fsd::state::FSDNPT,
+            "an arrow key must not begin an entry the way a printable byte does"
+        );
+        assert_eq!(block(&f).ansbuf(), b"", "and must not be typed into it");
+
+        // And again from FSDNEN, once something really has been typed.
+        queue(&mut f, chan, b"Kai\x1b[C");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+        assert_eq!(block(&f).state(), fsd::state::FSDNEN);
+        assert_eq!(
+            block(&f).ansbuf(),
+            b"Kai",
+            "the arrow appended nothing -- not even the NUL a truncated \
+             CRSRRT would have appended"
+        );
+        assert_eq!(block(&f).crsfld(), 0, "and it moved no field either");
     }
 
     #[test]

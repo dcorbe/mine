@@ -551,6 +551,21 @@ pub struct Host {
     /// channel, not one shared by all of them.
     pub(crate) fsd_sessions: Vec<Option<FsdSession>>,
 
+    /// Per-channel ANSI keystroke-decoder state, one byte apiece.
+    ///
+    /// The original hangs this off `struct fsdbbs` as `fsdusr->ainscb` and
+    /// reaches it through a global pointer that `fsdchi` swaps in and back
+    /// out around each call (`FSDBBS.C:344-355`). It is invisible to the
+    /// module either way -- a half-finished `ESC [` is not something a form
+    /// can ask about -- so it lives here rather than in [`Scb`](fsd::Scb).
+    ///
+    /// Sized for every channel and never `Option`: a decoder with no session
+    /// in progress is just one sitting in `WT4ESC`, which is exactly what
+    /// [`Ainscb::default`](fsd::ain::Ainscb::default) is. `fsdego` calls
+    /// `ainbeg` on it for **both** modes (`FSDBBS.C:217-218`), which is the
+    /// whole reason line mode is decoded too.
+    pub(crate) fsd_ain: Vec<fsd::ain::Ainscb>,
+
     /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
     /// hands `fldvfy`: the module reads `char *answer` out of it, and
     /// `VFYOK`'s own contract (`FSD.H` Note 2) lets it rewrite the bytes
@@ -812,6 +827,7 @@ impl Host {
             fsdtmp: vec![None; usize::from(terms.count())],
             fsd_state: None,
             fsd_sessions: vec![None; usize::from(terms.count())],
+            fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
             fsd_scratch: None,
             heap,
             users,
