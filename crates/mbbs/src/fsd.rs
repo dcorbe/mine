@@ -1580,6 +1580,208 @@ pub fn move_field(
     Some(at)
 }
 
+/// The character `dspans()` echoes for a `SECRET` field's answer, in place of
+/// the answer itself. `char secchr='*'`, `FSD.C:37`.
+///
+/// The real host's `inifsd()` (`FSDBBS.C:82`) can override this from a
+/// message (`SECCHR`, `BBSFSD.MCV`) -- not modeled, because `inifsd()`
+/// itself is not ported: this crate registers the FSD's `state` slot
+/// directly in [`crate::Host::finish_init`] rather than by walking
+/// `inifsd()`'s own body, and MajorMUD's character sheet has no `SECRET`
+/// field to expose the difference. Fixed at the compiled-in default rather
+/// than silently assumed to be `'*'` for other reasons.
+const SECCHR: u8 = b'*';
+
+/// `dspans()`, `FSD.C:556-630`, wrapped by [`shoabf`]. Format `answer` for
+/// display against one field's width and (if it has one) embedded
+/// punctuation, and return the bytes it would have sent to the channel,
+/// paired with `fmtend` -- the offset, within the field's `xwidth`, of the
+/// first byte the answer did not reach.
+///
+/// `justfy`: `0` = show the minimum of the field (stop as soon as the answer
+/// given so far has been shown, no trailing padding), `1` = justify --
+/// right for embedded punctuation, and per [`Field::kind`] otherwise -- `-1`
+/// = left-justify unconditionally. [`fsdlin`] only ever asks for `0`; `1`
+/// and `-1` exist for `shofld`/`cursat` (ANSI, Stage 5), not yet ported.
+///
+/// `fmtbeg`, the C's other file-scope output, is not returned: nothing this
+/// crate ports yet reads it (`shofld`, Stage 5, is the one caller).
+///
+/// # Panics
+///
+/// If `field`'s `xwidth` describes more embedded-punctuation bytes than
+/// `punctuation` has from `field.punctuation_at` on. Unreachable through
+/// [`fsdlin`], because both come from the same compiled [`Form`]; reachable
+/// only if a caller hands `dspans` a field and a punctuation array that did
+/// not come from one `compile()` call together.
+fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec<u8>, i16) {
+    let answer = c_str(answer);
+    let anslen = answer.len() as i16;
+    let npad = (i16::from(field.width) - anslen).max(0);
+    let n = field.xwidth;
+    let secret = field.flags & flags::SECRET != 0;
+
+    let secreted = |answer: &[u8], out: &mut Vec<u8>| {
+        if secret {
+            out.extend(std::iter::repeat_n(SECCHR, answer.len()));
+        } else {
+            out.extend_from_slice(answer);
+        }
+    };
+
+    if let Some(mbpoff) = field.punctuation_at {
+        let tp = &punctuation[usize::from(mbpoff)..];
+        let mut out = Vec::new();
+        let mut fmtend: i16 = -1;
+        let mut j = 0usize;
+        for (i, &c) in tp.iter().take(usize::from(n)).enumerate() {
+            if c == b' ' {
+                if j >= answer.len() {
+                    if fmtend == -1 {
+                        fmtend = i as i16;
+                    }
+                    if justfy == 0 {
+                        break;
+                    }
+                    out.push(b' ');
+                } else {
+                    secreted(&answer[j..j + 1], &mut out);
+                }
+                j += 1;
+            } else {
+                out.push(c);
+            }
+        }
+        if fmtend == -1 {
+            fmtend = i16::from(n);
+        }
+        (out, fmtend)
+    } else {
+        let mut out = Vec::new();
+        let fmtend;
+        if justfy == 0 || npad == 0 {
+            secreted(answer, &mut out);
+            fmtend = anslen;
+        } else if field.kind == b'$' && justfy != -1 {
+            out.extend(std::iter::repeat_n(b' ', npad as usize));
+            secreted(answer, &mut out);
+            fmtend = i16::from(n);
+        } else {
+            secreted(answer, &mut out);
+            fmtend = anslen;
+            out.extend(std::iter::repeat_n(b' ', npad as usize));
+        }
+        (out, fmtend)
+    }
+}
+
+/// `shoabf()`, `FSD.C:652-660`. [`dspans`] over `scb.ansbuf()` -- the buffer
+/// [`defntr`] just seeded -- for the field at `scb.crsfld()`.
+///
+/// The original's second half -- `if (fldptr->mbpoff >= 0) fsdscb->ftmptr =
+/// fsdscb->mbpunc+fldptr->mbpoff+fmtend;` -- sets the entry session's
+/// embedded-punctuation cursor. Not modeled: nothing this crate ports before
+/// Task 6 ever reads `ftmptr`, the way [`defntr`]'s own doc comment explains
+/// `altptr`'s identical gap.
+pub fn shoabf(form: &Form, scb: &Scb, justfy: i16) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    dspans(field, &form.punctuation, scb.ansbuf(), justfy).0
+}
+
+/// `pmtfld()`, `FSD.C:795-813`. The non-ANSI prompt for the field at
+/// `scb.crsfld()`: the template text between the end of the previous
+/// field's run and the start of this one -- or, for the very first field,
+/// a leading `"\r\n"` and the template's own text up to that field's start.
+///
+/// `fldptr > fsdscb->flddat` in the original is a pointer comparison; since
+/// `fldptr == flddat + crsfld`, it is true exactly when `crsfld > 0`, which
+/// is the test this uses.
+pub fn pmtfld(form: &Form, template: &[u8], scb: &Scb) -> Vec<u8> {
+    let crsfld = usize::from(scb.crsfld());
+    let field = &form.fields[crsfld];
+    let mut out = Vec::new();
+    let ti = if crsfld > 0 {
+        let prev = &form.fields[crsfld - 1];
+        usize::from(prev.template_at) + usize::from(prev.xwidth)
+    } else {
+        out.extend_from_slice(b"\r\n");
+        0
+    };
+    let tn = usize::from(field.template_at);
+    out.extend_from_slice(&template[ti..tn]);
+    out
+}
+
+/// `defntr()`, `FSD.C:786-793`. Seed `ansbuf` from the field at
+/// `scb.crsfld()`'s current answer, verbatim, and clear `FSDANT`.
+///
+/// # `ck4alt(1)` is read, and not reproduced
+///
+/// The original's third line, `fsdscb->altptr=ck4alt(1);`, is not a
+/// normalization -- it does not touch `ansbuf` or `answers` at all.
+/// `ck4alt` (`FSD.C:716-729`) only *looks up* whether the answer already
+/// matches one of the field's `ALT=` values and, if so, hands back a
+/// pointer into that alternate's own text; the result feeds `altptr`,
+/// cursor-tracking state `hdlalt`/`altntr` (Task 6/7, not yet ported)
+/// consume while the player is mid-edit of an `ALT=` field. The routine
+/// that *rewrites* an answer to its canonical `ALT=` spelling is
+/// `fsdord()`, already ported as [`ordinal`], and it acts on `newans`
+/// directly -- so by the time `defntr` runs, `answers` already carries
+/// whatever spelling the module's own `fsdord` calls left there, and this
+/// copies it as-is. `altptr` itself is not modeled, for the reason
+/// [`shoabf`]'s own doc comment gives for `ftmptr`.
+///
+/// The scb-level `anslen` (distinct from a *field's* `anslen` byte -- see
+/// [`Field`]'s own doc comment) is likewise not modeled: nothing this crate
+/// ports before Task 6 reads it.
+///
+/// # Finding "the field's current answer"
+///
+/// The original reads `fsdscb->newans+fldptr->ansoff`, an offset computed
+/// once by `fsdans()`/`fsdord()` and stored in the field's own record. This
+/// port has no access to per-field storage outside `answers` itself, so it
+/// finds the same bytes the way [`answers`] built them in the first place:
+/// by the field's name. The two are the same value for the same reason
+/// [`fsdnan`](crate::shims::fsd::fsdnan)'s own doc comment gives for reading
+/// `flddat` fresh rather than trusting a host-side copy -- `fsdord` never
+/// changes a `NAME=`, only what follows it, so a name lookup finds
+/// whatever `fsdord` most recently put there.
+pub fn defntr(form: &Form, spec: &[u8], scb: &mut Scb, answers: &[u8]) {
+    let crsfld = usize::from(scb.crsfld());
+    let field = &form.fields[crsfld];
+    let name = name_of(spec, field);
+    let value = extract(answers, name).map_or(&[][..], |at| value_at(answers, at));
+    scb.set_ansbuf(value);
+    scb.set_flags(scb.flags() & !entry_flags::FSDANT);
+}
+
+/// `fsdlin()`, `FSD.C:836-848`. Begin data entry for a non-ANSI (line-mode)
+/// session: unconditional, no branches at all in the original, so this
+/// calls [`pmtfld`], [`defntr`] and [`shoabf`] in that fixed order every
+/// time. Returns the bytes the original would have sent with `fsdous`.
+///
+/// `fsdscb->ansptr=fsdscb->anslen`, between `defntr()` and `shoabf(0)` in
+/// the original, is not reproduced -- both are the scb-level fields
+/// [`defntr`]'s own doc comment already declines to model.
+pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers: &[u8]) -> Vec<u8> {
+    scb.set_flags(0);
+    // `movfld(0,1,0)`: a real field number as the last-resort, not the `-1`
+    // sentinel -- see `move_field`'s own doc comment for which of its six
+    // call sites do which. `wrap` is `udwrap && fsdscb->flags&FSDANS`
+    // (`valid_field`'s doc comment); `flags` was just zeroed above, so
+    // `FSDANS` is unset and `wrap` is `false` regardless of `udwrap`.
+    let crsfld = move_field(form, 0, 1, Some(0), false).unwrap_or(0);
+    scb.set_crsfld(crsfld as u8);
+
+    let mut out = pmtfld(form, template, scb);
+    defntr(form, spec, scb, answers);
+    out.extend(shoabf(form, scb, 0));
+
+    scb.set_state(state::FSDNPT);
+    scb.set_chgcnt(0);
+    out
+}
+
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
 ///
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
@@ -2671,6 +2873,170 @@ mod tests {
         scb.set_chgcnt(5);
         assert_eq!(scb.chgcnt(), 5);
         assert_eq!(scb.xitkey(), 0, "xitkey, right before chgcnt");
+    }
+
+    #[test]
+    fn pmtfld_prints_the_leading_template_text_for_the_first_field() {
+        // "Name: " is six characters of literal text before the field's own
+        // `??` run starts.
+        let template = b"Name: ??\r\n";
+        let form = compile(template, b"NAME", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(pmtfld(&form, template, &scb), b"\r\nName: ");
+    }
+
+    #[test]
+    fn pmtfld_on_a_later_field_starts_after_the_previous_fields_template_run() {
+        // FSD.C:795-813's `ti` computation: crsfld > 0, so `ti` comes from
+        // the PREVIOUS field's `tmpoff+xwidth`, not the template's start --
+        // and no leading "\r\n" this time.
+        let template = b"A: ?? B: ??";
+        let form = compile(template, b"A B", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1);
+
+        assert_eq!(pmtfld(&form, template, &scb), b" B: ");
+    }
+
+    #[test]
+    fn defntr_seeds_ansbuf_from_the_fields_current_answer_verbatim() {
+        // Not normalized to the ALT= value's canonical spelling -- that is
+        // fsdord's job (already ported as `ordinal`), which rewrites
+        // `answers` itself before defntr ever runs. `ck4alt(1)`'s own
+        // effect (feeding `altptr`) is not observable here; see defntr's
+        // own doc comment for why.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_flags(entry_flags::FSDANT | entry_flags::FSDANS);
+
+        defntr(&form, spec, &mut scb, b"C=br\0\0");
+
+        assert_eq!(scb.ansbuf(), b"br", "verbatim, not \"Brown\"");
+        assert_eq!(
+            scb.flags(),
+            entry_flags::FSDANS,
+            "FSDANT cleared, FSDANS (unrelated) left alone"
+        );
+    }
+
+    #[test]
+    fn defntr_blanks_ansbuf_when_the_field_has_no_answer_yet() {
+        let spec = b"NAME";
+        let form = compile(b"??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        defntr(&form, spec, &mut scb, b"NAME=\0\0");
+
+        assert_eq!(scb.ansbuf(), b"");
+    }
+
+    #[test]
+    fn shoabf_echoes_the_answer_buffer_for_the_current_field() {
+        let spec = b"NAME";
+        let form = compile(b"????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Kaimon");
+
+        // justfy=0 with no embedded punctuation: dspans's first branch,
+        // `secreted(answer)` and nothing else -- no padding out to width.
+        assert_eq!(shoabf(&form, &scb, 0), b"Kaimon");
+    }
+
+    #[test]
+    fn shoabf_masks_a_secret_fields_answer() {
+        let spec = b"PASS(SECRET)";
+        let form = compile(b"????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"xy");
+
+        assert_eq!(shoabf(&form, &scb, 0), b"**");
+    }
+
+    #[test]
+    fn shoabf_stops_at_the_answer_but_a_literal_character_right_after_it_still_shows() {
+        // "Phone: ###-####" -- the one field joins across the "-", so it has
+        // embedded punctuation: "   -    " is its own template, three blanks
+        // (one per digit of "###"), the literal "-", then four more blanks.
+        //
+        // justfy=0 breaks out of dspans's loop the moment it reaches a BLANK
+        // slot the answer does not reach -- but FSD.C:583's `else { *bp++=
+        // *tp; }` arm, which handles a literal character, has no such break
+        // at all. With answer "555" the loop consumes the three leading
+        // blanks, then reaches the literal "-" *before* the next blank
+        // (where it would stop), and echoes it unconditionally. So the
+        // output is "555-", not "555" -- the dash survives, the trailing
+        // "####" blanks do not. Measured against the C line by line, not
+        // assumed: an earlier version of this test asserted "555" and was
+        // wrong.
+        let template = b"Phone: ###-####";
+        let form = compile(template, b"PHONE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"555");
+
+        assert_eq!(shoabf(&form, &scb, 0), b"555-");
+    }
+
+    #[test]
+    fn shoabf_stops_before_any_blank_the_answer_does_not_reach() {
+        // The companion to the test above: with NO answer at all, the very
+        // first slot (i=0, a blank) already has `j(0) >= anslen(0)`, so the
+        // loop breaks before emitting anything -- not even the leading
+        // blanks let alone the dash.
+        let template = b"Phone: ###-####";
+        let form = compile(template, b"PHONE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"");
+
+        assert_eq!(shoabf(&form, &scb, 0), b"");
+    }
+
+    #[test]
+    fn fsdlin_calls_pmtfld_defntr_and_shoabf_in_that_fixed_order_and_sets_fsdnpt() {
+        let template = b"Name: ??\r\n";
+        let spec = b"NAME";
+        let form = compile(template, spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_state(0xff); // anything but FSDNPT, so the assertion below is real
+        scb.set_flags(entry_flags::FSDANT);
+        scb.set_chgcnt(9);
+
+        let out = fsdlin(&form, spec, template, &mut scb, b"NAME=Kaimon\0\0");
+
+        // pmtfld's text, then shoabf's echo of the default answer -- in that
+        // order, with nothing in between (defntr produces no output at all).
+        assert_eq!(out, b"\r\nName: Kaimon");
+        assert_eq!(scb.state(), state::FSDNPT);
+        assert_eq!(scb.chgcnt(), 0);
+        assert_eq!(scb.crsfld(), 0);
+        assert_eq!(scb.ansbuf(), b"Kaimon", "defntr ran, seeding ansbuf");
+    }
+
+    #[test]
+    fn fsdlin_skips_an_avoided_first_field_by_way_of_move_field() {
+        // `movfld(0,1,0)` walks forward over FFFAVD fields -- this is the
+        // seam that matters when a caller (fsdego, in the shim) has to
+        // supply flags as the module left them, not as fsdroom compiled
+        // them: proven here by simply marking field 0 avoided directly in
+        // the Form this pure function is handed.
+        let template = b"A: ?? B: ??";
+        let spec = b"A B";
+        let mut form = compile(template, spec, MANY);
+        form.fields[0].flags |= flags::AVOID;
+
+        let mut scb = zeroed_scb();
+        let out = fsdlin(&form, spec, template, &mut scb, b"A=1\0B=2\0\0");
+
+        assert_eq!(scb.crsfld(), 1, "field 0 was avoided, so field 1 is current");
+        assert_eq!(out, b" B: 2");
     }
 
     #[test]
