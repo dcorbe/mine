@@ -1,7 +1,7 @@
 //! Full-Screen Data Entry: the form, the session, and the screen there is not.
 //!
 //! FSD is the subsystem behind MajorMUD's character-creation screens. Eight of
-//! its routines are imported by `WCCMMUD.DLL`; six are here.
+//! its routines are imported by `WCCMMUD.DLL`; seven are here.
 //!
 //! # The three pieces of state, and where each one lives
 //!
@@ -24,22 +24,28 @@
 //!
 //! `fsdbkg` (`FSDBBS.C:185`) writes an ANSI clear-screen, then calls `btutsw`,
 //! `btulok` and `btuoes` against a channel and `fsddsp` to draw every field of
-//! the form. `fsdego` (`FSDBBS.C:196`) starts an entry session: it sets
-//! `usrptr->state` and `->substt`, installs `fsdchi` as the channel's
-//! character-input handler through `btuchi`, and arranges for the module's own
-//! `fldvfy` and `whndun` -- two far pointers into module code, pushed at
-//! `seg 3:0x4463` -- to be called back as keystrokes arrive.
+//! the form. It is a full-screen (ANSI, `amode == 1`) display routine with no
+//! screen to draw on, so it stops the module and names itself -- the right
+//! answer, and one that needs no code.
 //!
-//! Neither is a display routine that could be stubbed into silence. They need a
-//! connected user, a terminal, and a way for the host to re-enter module code,
-//! and this host has none of the three: `Machine::call` is the top-level entry
-//! and a shim already holds `&mut Machine`, so there is no re-entrant
-//! host-to-module call in this design at all. Both are therefore left out of
-//! `ROUTINES`, which stops the module and names the routine and the address it
-//! was called from -- the right answer, and one that needs no code.
+//! [`fsdego`] (`FSDBBS.C:196`) started out beside it for the same reason: it
+//! arranges for the module's own `fldvfy` and `whndun` -- two far pointers
+//! into module code, pushed at `seg 3:0x4463` -- to be called back later, and
+//! this host has no re-entrant host-to-module call at all (`Machine::call` is
+//! the top-level entry, and a shim already holds `&mut Machine`). What moved
+//! it into `ROUTINES`: storing a `FarPtr` and returning is not a call, so
+//! `fsdego` itself never needs one -- the callbacks it stores fire later,
+//! from a channel's own dispatch (`Host::poll`, once the FSD's `state` is
+//! current), which is a fresh top-level entry the same way `dopoll`/`polrou`
+//! already are. `amode == 1` (`fsdent`, the full-screen counterpart `fsdego`
+//! would otherwise dispatch to) is still refused, for the same reason
+//! `fsdroom`'s own `amode == 1` is one step earlier.
 //!
-//! `fsdroom`'s `amode == 1`, the full-screen entry mode both of them serve, is
-//! refused for the same reason one step earlier.
+//! `installs fsdchi as the channel's character-input handler through
+//! btuchi` in the original has no equivalent shim at all: `crate::gsbl`'s
+//! `raw` mode (which [`fsdego`] turns on through `fsdcon`) is what
+//! `btuchi`'s whole family collapses to here -- see [`fsdcon`]'s own doc
+//! comment.
 
 use mbbs16::{FarPtr, Machine, Ret};
 
@@ -707,6 +713,136 @@ fn fsdcof(host: &mut Host, chan: Chan, scnwid: u16) {
     ch.raw = false;
     ch.echo = true;
     ch.width = scnwid;
+}
+
+/// `usrptr->substt` while an entry session is under way. `FSDBBS.C:54`:
+/// `#define ENTERING 1`. Not in `MAJORBBS.H` -- FSDBBS defines its own
+/// substate codes, and `grep -rn "ENTERING" crates/mbbs/src/` before adding
+/// this found nothing already modeling it.
+const ENTERING: u16 = 1;
+
+/// The [`fsd::Form`] `fsdlin` should walk for this channel's session: the
+/// compiled [`Host::forms`] entry, with every field's `flags` refreshed from
+/// the module's own `flddat[]` rather than trusted from the cache.
+///
+/// `_EDIT_CHARACTER_STATS` sets `FFFAVD` on fourteen fields (`seg 3:0x4344`
+/// on, per [`fsdroom`]'s own doc comment) *before* calling `fsdego`, and
+/// `movfld(0,1,0)` -- the first thing [`fsd::fsdlin`] does -- has to skip
+/// them. A `Form` still carrying `fsdroom`-time flags would let the cursor
+/// land on a field the player was never meant to type into. Same reasoning
+/// [`fsdord`]'s own doc comment gives for reading `flddat` fresh rather than
+/// [`Host::forms`]'s copy; no other field of [`fsd::Field`] is module-mutable
+/// (fourteen `or byte [...+12],0x80` sites are the only writes into
+/// `flddat[]` anywhere in this crate's own measurements), so `flags` is the
+/// only one refreshed.
+fn live_form(
+    machine: &Machine,
+    block: &fsd::Scb,
+    form: &fsd::Form,
+) -> Result<fsd::Form, ShimError> {
+    let mut form = form.clone();
+    for (i, field) in form.fields.iter_mut().enumerate() {
+        let record = field_record(machine, block, i as u16, "fsdego")?;
+        field.flags = record[fsd::fld::FLAGS];
+    }
+    Ok(form)
+}
+
+/// `void fsdego(int (*fldvfy)(int,char*), void (*whndun)(int))` -- hand the
+/// channel to the FSD. `FSDBBS.C:196-220`.
+///
+/// Stores `fldvfy` in the session control block, runs [`fsd::fsdlin`] (line
+/// mode -- everything this host builds today; full-screen/`fsdent` is Stage
+/// 5 and refused below), sets `state`/`substt` so [`Host::poll`]'s dispatch
+/// finds the FSD next time, records `whndun` where only this host can see
+/// it, and finally turns on raw mode with [`fsdcon`] -- in that order,
+/// matching the original exactly, so that the prompt this call composes is
+/// still being built under the channel's *ordinary* settings.
+///
+/// # Output
+///
+/// `fsdlin`'s return value is appended to the print buffer through
+/// [`crate::shims::text::append`] -- the same "leave it in `prfbuf` for the
+/// caller to flush" contract [`fsdapr`]'s own doc comment already states for
+/// its twelve `prf` calls. It is not written to the channel directly: the
+/// real host's own comment on `fsdego` says "(expects caller to
+/// outprf(usrnum))", and `WCCMMUD_decompiled.c:1910-1911` shows the actual
+/// caller doing exactly that --
+/// `fsdego(ljnvfy,ljndun); tell_user(usrnum);` -- immediately afterward,
+/// through the same `_TELL_USER`/`btuxmt` path every other `prf` in this
+/// module already uses (`shims/gsbl.rs`'s `btuxmt` doc comment). So the
+/// prompt reaches the channel the first time the module calls `tell_user`
+/// after this returns, not before.
+///
+/// # `amode == 1` is refused, defensively
+///
+/// [`fsdroom`] already refuses to size a full-screen (`amode == 1`) form at
+/// all -- the module never reaches `fsdapr`, let alone `fsdego`, over one --
+/// so in this host's own call sequence this branch is dead code reachable
+/// only from a forged `Host::fsdtmp` entry. Checked anyway, and checked
+/// *before* anything below is allowed to mutate `block`/`state`/`substt`/
+/// [`Host::fsd_sessions`]: one refusing gate is what `fsdroom` itself is,
+/// and a second, independent one here is this crate's defense-in-depth
+/// discipline rather than trusting that gate alone.
+///
+/// # Errors
+///
+/// If no session has been prepared (`fsdroom`/`fsdapr` first), or the
+/// recorded `amode` is `1`.
+pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let fldvfy = machine.arg_far(0);
+    let whndun = machine.arg_far(2);
+    let chan = host.current_channel(machine)?;
+
+    let (mut block, at) = prepared(machine, host, "fsdego")?;
+    let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        return Err(ShimError::Failed(
+            "fsdego: no template on record for this channel; FSDBBS.H:245 has fsdroom() first"
+                .into(),
+        ));
+    };
+    if amode == 1 {
+        return Err(ShimError::Failed(
+            "fsdego(amode=1): a full-screen entry session (fsdent, FSD.C:816) is not \
+             implemented -- Stage 5. fsdroom already refuses this amode; reaching fsdego with \
+             it recorded means Host::fsdtmp and reality have come apart"
+                .into(),
+        ));
+    }
+    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        return Err(ShimError::Failed(format!(
+            "fsdego: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
+             is cached -- fsdroom and fsdtmp have gone out of sync"
+        )));
+    };
+
+    let form = live_form(machine, &block, &form)?;
+    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let template_at = host.messages.text(mbk, msgno).map_err(ShimError::Failed)?;
+    let template = machine.read_cstr(template_at)?.to_vec();
+    let answers = answer_string(machine, block.newans())?;
+
+    block.set_fldvfy(fldvfy);
+    let output = fsd::fsdlin(&form, &spec, &template, &mut block, &answers);
+    machine.write(at, block.as_bytes())?;
+
+    host
+        .users
+        .set_state(machine, chan, host.fsd_state() as u16)
+        .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
+    host
+        .users
+        .set_substt(machine, chan, ENTERING)
+        .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
+    host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+        whndun: (whndun != FarPtr::NULL).then_some(whndun),
+        save: false,
+    });
+
+    fsdcon(host, chan);
+    crate::shims::text::append(machine, host, &output)?;
+
+    Ok(Ret::Void)
 }
 
 #[cfg(test)]
@@ -1709,5 +1845,105 @@ mod tests {
         fsdcof(&mut f.host, chan, 132);
 
         assert_eq!(f.host.gsbl_mut().channel_mut(chan).width, 132);
+    }
+
+    #[test]
+    fn fsdego_hands_the_channel_to_the_fsd_and_prompts_the_first_field() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=Kaimon\0\0");
+        let chan = f.console();
+
+        // The expected prompt, computed independently: the same template
+        // and form fsdroom compiled, walked through the pure `fsd::fsdlin`
+        // this shim wraps -- not a literal copied from FSDFORM.MSG, which
+        // this test does not otherwise depend on the exact wording of.
+        let template = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
+        let template = f.machine.read_cstr(template).expect("text").to_vec();
+        let form = f.host.forms()[&(0, 0)].clone();
+        let mut expected_scb = fsd::Scb::from_bytes(&[0u8; fsd::FSDSCB as usize]).expect("zeroed");
+        let expected = fsd::fsdlin(&form, b"NAME", &template, &mut expected_scb, b"NAME=Kaimon\0\0");
+
+        let fldvfy = FarPtr {
+            offset: 0x1000,
+            selector: 0x2000,
+        };
+        let whndun = FarPtr {
+            offset: 0x3000,
+            selector: 0x4000,
+        };
+
+        assert!(
+            !f.host.gsbl_mut().channel_mut(chan).raw,
+            "not raw before fsdego"
+        );
+        assert_eq!(f.host.users().state(&f.machine, chan).expect("read"), 0);
+
+        assert!(matches!(
+            f.invoke(
+                fsdego,
+                &[fldvfy.offset, fldvfy.selector, whndun.offset, whndun.selector],
+            ),
+            Ok(Ret::Void)
+        ));
+
+        assert_eq!(
+            f.host.users().state(&f.machine, chan).expect("read"),
+            f.host.fsd_state() as u16,
+            "usrptr->state = fsdstt"
+        );
+        assert_eq!(
+            f.host.users().substt(&f.machine, chan).expect("read"),
+            ENTERING,
+            "usrptr->substt = ENTERING"
+        );
+        assert!(f.host.gsbl_mut().channel_mut(chan).raw, "fsdcon ran");
+
+        assert_eq!(
+            f.read(f.host.globals().prf_buffer()),
+            String::from_utf8_lossy(&expected),
+            "fsdlin's output, appended to the print buffer the way fsdapr's \
+             twelve prf calls already are"
+        );
+
+        match &f.host.fsd_sessions[chan.index()] {
+            Some(session) => {
+                assert_eq!(session.whndun, Some(whndun));
+                assert!(!session.save, "not exiting yet");
+            }
+            None => panic!("fsdego did not record a session"),
+        }
+    }
+
+    #[test]
+    fn fsdego_before_any_session_stops_the_module() {
+        let mut f = Fixture::new();
+        current(&mut f);
+        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
+    }
+
+    #[test]
+    fn fsdego_refuses_a_forged_amode_1_recording_defensively() {
+        // `fsdroom` already refuses `amode == 1` outright (line 175 of this
+        // file), so the module's own call sequence can never reach fsdego
+        // with a full-screen session recorded -- this can only be reached
+        // by a `Host::fsdtmp` that has come apart from reality, forged here
+        // the way `a_field_count_the_module_forged_cannot_index_out_of_the_
+        // segment` forges `numfld`. fsdego refuses independently rather
+        // than trusting fsdroom's gate alone.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+        let (mbk, msgno, _) = f.host.fsdtmp[chan.index()].expect("recorded by session()");
+        f.host.fsdtmp[chan.index()] = Some((mbk, msgno, 1));
+
+        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
+        assert!(format!("{e}").contains("amode=1"), "{e}");
+
+        // And refusing did not half-mutate anything on the way there.
+        assert_eq!(f.host.users().state(&f.machine, chan).expect("read"), 0);
+        assert_eq!(f.host.users().substt(&f.machine, chan).expect("read"), 0);
+        assert!(f.host.fsd_sessions[chan.index()].is_none());
+        assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcon did not run");
     }
 }

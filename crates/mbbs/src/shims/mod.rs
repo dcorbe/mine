@@ -218,6 +218,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "fsdord", fsd::fsdord, Cleans::Caller),
     (MAJORBBS, "fsdxan", fsd::fsdxan, Cleans::Caller),
     (MAJORBBS, "fsdrft", fsd::fsdrft, Cleans::Caller),
+    (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
     (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
     (
         MAJORBBS,
@@ -381,15 +382,26 @@ mod tests {
     }
 
     #[test]
-    fn the_two_fsd_routines_that_need_a_screen_are_not_implemented() {
-        // `fsdbkg` clears an ANSI screen and runs `fsddsp`, a display engine;
-        // `fsdego` puts a user into an entry session and arranges for the
-        // module's own callbacks to run on keystrokes. There is no channel, no
-        // screen, and no re-entrant call back into module code. Both stop the
-        // module and name themselves, which is the answer -- see the `shims::fsd`
-        // module documentation.
+    fn fsdbkg_needs_a_screen_this_host_does_not_have_and_is_not_implemented() {
+        // `fsdbkg` clears an ANSI screen and runs `fsddsp`, a display engine
+        // -- full-screen entry, Stage 5. There is no screen to draw one on,
+        // so it stops the module and names itself, which is the answer --
+        // see the `shims::fsd` module documentation.
         assert!(matches!(entry(MAJORBBS, "fsdbkg"), Entry::Unimplemented));
-        assert!(matches!(entry(MAJORBBS, "fsdego"), Entry::Unimplemented));
+    }
+
+    #[test]
+    fn fsdego_is_wired_to_ordinal_241() {
+        // `fsdego` puts a channel into an entry session (Task 5,
+        // docs/plans/2026-08-09-fsd-stage4-line-mode.md) -- no longer the
+        // routine `shims::fsd`'s own module documentation once named
+        // alongside `fsdbkg` as needing a re-entrant call this host cannot
+        // make. It refuses on its own terms now (amode==1, no session
+        // prepared), rather than unconditionally.
+        assert!(matches!(
+            entry(MAJORBBS, "fsdego"),
+            Entry::Routine(_, Cleans::Caller)
+        ));
     }
 
     #[test]
