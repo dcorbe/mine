@@ -3050,6 +3050,341 @@ fn punctuation(form: &mut Form, template: &[u8]) {
     form.punctuation = out;
 }
 
+/// `fldvfy()`'s return codes, `FSD.H:390-393`. Also what `fsdscb->fldvfy ==
+/// NULL`/`FSDIGA` resolve to before a callback is even considered --
+/// [`shims::fsd::fsdprc`](crate::shims::fsd::fsdprc)'s own doc comment
+/// names which.
+pub mod verify {
+    /// Accept this field entry outright -- don't check `MIN=`/`MAX=`/`ALT=`.
+    pub const VFYOK: i16 = -1;
+    /// Check the field's type, `MIN=`, `MAX=` and `ALT=` before accepting.
+    pub const VFYCHK: i16 = -2;
+    /// Reject the entry: revert to the old answer and re-enter this field.
+    pub const VFYREJ: i16 = -3;
+    /// Revert to the old answer and move on to the next field.
+    pub const VFYDEF: i16 = -4;
+}
+
+/// The candidate answer `fsdprc`'s `FSDBUF` arm hands to `fldvfy` and to
+/// its own local checks: `scb.ansbuf()`, trailing whitespace stripped
+/// (`depad`), and -- for a `#` or `$` field -- leading spaces stripped too
+/// (`skpwht`). `FSD.C:1128-1133`.
+pub fn candidate_answer(field: &Field, ansbuf: &[u8]) -> Vec<u8> {
+    let (kept, _) = crate::strings::depad(ansbuf);
+    let mut buf = ansbuf[..kept].to_vec();
+    if field.kind == b'#' || field.kind == b'$' {
+        let skip = crate::strings::skpwht(&buf);
+        buf.drain(..skip);
+    }
+    buf
+}
+
+/// Every alternate `chkalt`'s own "Choices:" report would list --
+/// `sameto(bufptr,tp)`, `FSD.C:978`, with **no** further
+/// `bc==toupper(*tp)` test. A strictly larger set than
+/// [`matching_alternates`]'s own on an empty answer: `sameto("",tp)` is
+/// true of every alternate there, while `matching_alternates` narrows to a
+/// truly blank one (see its own doc comment).
+fn prefixed_alternates<'a>(spec: &'a [u8], field: &Field, answer: &[u8]) -> Vec<&'a [u8]> {
+    let wanted = crate::strings::rmvwht(answer);
+    alternates(spec, field)
+        .into_iter()
+        .filter(|alt| {
+            alt.len() >= wanted.len() && alt[..wanted.len()].eq_ignore_ascii_case(&wanted)
+        })
+        .collect()
+}
+
+/// The "Choices: ..." report `chkalt(1)` builds in `chkemg` when a
+/// `FFFMCH` field's answer does not resolve to exactly one alternate.
+/// `FSD.C:966-1000`'s `rpt` branch. `femax` is fixed at [`MAXHLP`] --
+/// `fsdscb->flags&FSDANS ? fsdscb->hlplen : MAXHLP` always takes the
+/// second arm, since `FSDANS` is never set in line mode.
+fn choices_message(spec: &[u8], field: &Field, answer: &[u8]) -> Vec<u8> {
+    let femax = usize::from(MAXHLP);
+    let mut out = b"Choices:  ".to_vec();
+    let mut felen = out.len();
+    for alt in prefixed_alternates(spec, field, answer) {
+        felen += alt.len() + 2;
+        if felen <= femax - 3 {
+            out.extend_from_slice(alt);
+            out.extend_from_slice(b"  ");
+        } else {
+            out.extend_from_slice(b"...");
+            break;
+        }
+    }
+    out
+}
+
+/// `chktyp() && chkmin() && chkmax() || chkalt(1) == 1`, `FSD.C:1153`,
+/// evaluated with the same short-circuiting: `chkmin`/`chkmax` run only
+/// when `chktyp` already passed, and the `ALT=` match ([`ordinal`], which
+/// is `chkalt(1)`'s own ordinal-and-rewrite half) runs only when that
+/// whole chain came up short.
+///
+/// `Ok(answer)` on acceptance -- `answer` is `bufptr` unchanged unless
+/// exactly one `ALT=` value matched, in which case it is that alternate's
+/// own canonical spelling (`chkalt`'s `strcpy(bufptr,anstmp)`,
+/// `FSD.C:995`). `Err(message)` is empty when nothing has anything to say
+/// (`chktyp` alone failed on a non-`FFFMCH` field, or `chkmin`/`chkmax`
+/// failed with no matching alternate to fall back on), and otherwise
+/// `chkmin`'s, `chkmax`'s, or [`choices_message`]'s own text -- the
+/// "Choices:" report only ever builds for a `FFFMCH` field
+/// (`FSD.C:995-999`), which is exactly when `chktyp` alone already failed
+/// (every multiple-choice field's `chktyp` is unconditionally `false`, see
+/// [`type_ok`]'s own doc comment).
+fn verify_locally(spec: &[u8], field: &Field, answer: &[u8]) -> Result<Vec<u8>, Vec<u8>> {
+    if type_ok(field, answer) {
+        if let Err(message) = min_ok(spec, field, answer) {
+            return ordinal(spec, field, answer)
+                .map(|(_, canonical)| canonical)
+                .ok_or_else(|| message.into_bytes());
+        }
+        if let Err(message) = max_ok(spec, field, answer) {
+            return ordinal(spec, field, answer)
+                .map(|(_, canonical)| canonical)
+                .ok_or_else(|| message.into_bytes());
+        }
+        return Ok(answer.to_vec());
+    }
+    match ordinal(spec, field, answer) {
+        Some((_, canonical)) => Ok(canonical),
+        None if field.flags & flags::MULTICHOICE != 0 => {
+            Err(choices_message(spec, field, answer))
+        }
+        None => Err(Vec::new()),
+    }
+}
+
+/// Whether [`alarm`] may beep at all -- `almmmx`, `FSDBBS.C:76`:
+/// `almmmx=ynopt(ALMMMX);` at `inifsd()`, which this crate does not port.
+/// A compiled-in default rather than a modeled sysop option, the same
+/// resolution [`SECCHR`]'s own doc comment already gives for the identical
+/// gap.
+const ALMMMX: bool = true;
+
+/// `alarm()`, `FSD.C:1063-1070`. A BEL byte, if `beep` and the sysop
+/// allows it.
+fn alarm(beep: bool) -> Vec<u8> {
+    if ALMMMX && beep { vec![0x07] } else { Vec::new() }
+}
+
+/// `announce()`, `FSD.C:1072-1096`, else-branch only -- the `FSDANS`
+/// (ANSI help-area) branch is Stage 5, out of scope, and unreachable from
+/// this port's own line-mode path the same way every other `FSDANS` branch
+/// already is ([`bgnter`]/[`xitfld`]'s own guards). A blank line, the
+/// message, [`alarm`], another line break.
+fn announce(message: &[u8], beep: bool) -> Vec<u8> {
+    let mut out = b"\r\n\r\n".to_vec();
+    out.extend_from_slice(message);
+    out.extend(alarm(beep));
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// `xitfsd()`, `FSD.C:1098-1107`. End the session: a line break (the
+/// `FSDANS` guard is always false in line mode, the same fact
+/// [`announce`]'s own doc comment already states) and the exit state --
+/// [`state::FSDSAV`] or [`state::FSDQIT`]. `fsdnfy()` is not reproduced:
+/// `Machine`/`Host` territory no pure function can reach, the same gap
+/// [`xitfld`]'s own doc comment already names for its own dropped
+/// `fsdnfy()` call.
+fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
+    scb.set_state(exit_state);
+    b"\r\n".to_vec()
+}
+
+/// `fsdprc()`'s `FSDBUF` arm, `FSD.C:1124-1233`. Validate the answer just
+/// committed to `scb.entfld()`, then either accept it ([`store`]) and
+/// advance, reject it and reprompt the same field, or end the session
+/// ([`xitfsd`], or the module's own `fldvfy` setting `scb.state()`
+/// directly per `FSD.H`'s Note 2).
+///
+/// `vc` is the field-verify result already resolved by the caller:
+/// [`verify::VFYOK`]/[`verify::VFYCHK`]/[`verify::VFYREJ`]/[`verify::VFYDEF`],
+/// or whatever `fsdscb->fldvfy` returned. `FSD.H` promises only those four;
+/// anything else falls through the C's own `switch(vc)` with no matching
+/// `case` and does nothing, reproduced here as the identical silent no-op
+/// rather than a refusal. `bufptr` is [`candidate_answer`]'s result,
+/// **already possibly rewritten by the callback** -- `VFYOK`'s own
+/// contract lets a module "change the answer string IN PLACE" (`FSD.H`
+/// Note 2) -- so the caller must hand this function whatever `bufptr`
+/// reads *after* any `fldvfy` call, never the pre-call copy. The same is
+/// true of `scb` itself: `sover` (`FSD.C:1144`) is `scb.state() !=
+/// FSDBUF` read at this function's own entry, which only means what the C
+/// means if the caller already re-read `scb` from `Machine` after the
+/// callback -- the discipline the design doc's "The two callbacks into
+/// module code" section states for `fldvfy` by name, and the same trap
+/// `polrou` already documents (`lib.rs:1128`).
+///
+/// Returns the output bytes to send, and whether the field's answer
+/// changed (`FFFCHG`, `fldptr->flags|=FFFCHG` in the original) -- the
+/// caller's to write into `flddat[scb.entfld()].flags` in module memory,
+/// since this function has no `Machine` to reach it with itself.
+///
+/// # No `FSDSTB` catch-up
+///
+/// The original leaves a not-yet-over session in `FSDSTB` (`FSD.C:1229`)
+/// so a later pass can catch up on keystrokes typed ahead while validation
+/// ran. This crate drops the whole `typahd` buffer (design doc,
+/// "Dropped"), and with it the only reason `FSDSTB` exists: nothing can
+/// ever be queued for it to catch up on, since [`fsdinc`] cannot even be
+/// called again while `state != FSDNPT`/`FSDNEN` (its own top-of-function
+/// `assert!`). So the state this function leaves a not-yet-over session in
+/// is `FSDNPT` directly -- what `FSDSTB` would immediately decay to on its
+/// very next call anyway (`FSD.C:1251-1252`), since `ahdptr` is always `0`
+/// here.
+///
+/// # There is no field-count wraparound in line mode, and no exit through it either
+///
+/// `FSD.C:1199`'s `dir=...; fldi=movfld(fldi,dir,fsdscb->entfld);` passes
+/// **`entfld`** as `movfld`'s last-resort -- a real, already-validated
+/// field index, not the `-1` sentinel [`xitfld`]'s own call uses. Combined
+/// with `vldfld`'s `udwrap && FSDANS` gate (`FSD.C:667`, always false here
+/// since `FSDANS` is never set), `movfld` can only ever answer that same
+/// `entfld` when it cannot otherwise place the cursor -- never a value
+/// outside `[0, numtpl)`. So `FSD.C:1218`'s `else { xitfsd(FSDSAV); }` --
+/// the "(non-ANSI, no wrap)" fallback its own comment names -- is
+/// unreachable through this call: the "no field left to move to" case it
+/// exists to handle cannot arise while `entfld` itself is a real field,
+/// which it always is by construction.
+///
+/// **The session's real exit mechanism for a completed form is the
+/// field-verify callback itself**, setting `scb.state()` to
+/// `FSDSAV`/`FSDQIT` directly (`FSD.H`'s Note 2) -- which is exactly what
+/// `sover`, read *after* the callback, catches. Confirmed against the
+/// decompiled `_ljnvfy`/`vfyadn` call chain
+/// (`re/wg_nt_ghidra/exports/WCCMMUD_decompiled.c:1222`), not assumed:
+/// every one of `_ljnvfy`'s cases falls through to `vfyadn`, the host's
+/// own factory verify routine (imported, ordinal `0xba`) -- not built by
+/// this crate (design doc, "Dropped"). A synthetic `fldvfy` stub that sets
+/// `scb.state()` directly is what this file's own tests use to exercise
+/// this path, the way `fsd_statics.rs` calls real statics by address.
+///
+/// # No entry assertion on `scb.state()`
+///
+/// Unlike [`fsdinc`]'s own top-of-function `assert!`, this function does
+/// **not** check `scb.state() == FSDBUF` on the way in. The real dispatch
+/// point for that check is the caller's decision to resolve `vc` at all
+/// (`FSD.C:1140`'s `switch (fsdscb->state) { case FSDBUF: ...`), which
+/// happens *before* any `fldvfy` call -- and by the time this function
+/// runs, the callback may already have moved `scb.state()` away from
+/// `FSDBUF` (`FSD.H`'s Note 2, see above). Asserting it here would refuse
+/// the exact case this function exists to handle correctly.
+///
+/// # Panics
+///
+/// If `move_field` somehow answers a field outside `[0, numtpl)` despite
+/// the invariant the "no wraparound" section above argues for.
+pub fn fsdprc(
+    form: &Form,
+    spec: &[u8],
+    template: &[u8],
+    scb: &mut Scb,
+    answers: &mut Answers,
+    vc: i16,
+    bufptr: &[u8],
+) -> (Vec<u8>, bool) {
+    let entfld = usize::from(scb.entfld());
+    let field = form.fields[entfld];
+    let mut fldi = scb.crsfld();
+    let reprmt_orig = usize::from(fldi) != entfld;
+    let mut reprmt = reprmt_orig;
+    let mut delta = false;
+    let mut out = Vec::new();
+    let mut rejected = false;
+
+    if vc == verify::VFYOK {
+        delta = store(answers, entfld, bufptr);
+    } else if vc == verify::VFYCHK {
+        match verify_locally(spec, &field, bufptr) {
+            Ok(accepted) => delta = store(answers, entfld, &accepted),
+            Err(message) => {
+                rejected = true;
+                fldi = entfld as u8;
+                if !message.is_empty() {
+                    out.extend(announce(&message, true));
+                    reprmt = true;
+                } else {
+                    out.extend(alarm(true));
+                    out.extend(unentr(form, scb));
+                }
+            }
+        }
+    } else if vc == verify::VFYREJ {
+        // `fldvfy` itself returned VFYREJ directly: `FSD.H` gives it no
+        // channel to hand back a message, so this is always the silent
+        // branch -- the same code `VFYCHK`'s own local-check failure
+        // falls into when it, too, had nothing to say.
+        rejected = true;
+        fldi = entfld as u8;
+        out.extend(alarm(true));
+        out.extend(unentr(form, scb));
+    }
+    // VFYDEF and anything else: no-op, matching the C's `switch(vc)` with
+    // no matching `case`.
+
+    if !rejected && delta && scb.chgcnt() < 255 && scb.state() == state::FSDBUF {
+        scb.set_chgcnt(scb.chgcnt() + 1);
+    }
+
+    let mut exit = None;
+    if !rejected {
+        match scb.xitkey() {
+            0x0f | 0x1b => {
+                // 'O'-64, ESC: abandon the session.
+                out.extend(xitfsd(scb, state::FSDQIT));
+                exit = Some(false);
+            }
+            0x07 => {
+                // 'G'-64: save and exit.
+                out.extend(xitfsd(scb, state::FSDSAV));
+                exit = Some(true);
+            }
+            _ => {}
+        }
+    }
+
+    let sover = exit.is_some() || scb.state() != state::FSDBUF;
+
+    let dir = if 0 < fldi && usize::from(fldi) < entfld {
+        -1
+    } else {
+        1
+    };
+    let landed = move_field(form, i32::from(fldi), dir, Some(entfld), false)
+        .expect("resort is Some(entfld), so movfld always answers its own resort or better");
+
+    if !sover {
+        assert!(
+            landed < form.in_template,
+            "movfld answered field {landed}, past the form's own {} template \
+             fields -- unreachable per fsdprc's own doc comment on vldfld's \
+             udwrap/FSDANS gate",
+            form.in_template
+        );
+        scb.set_crsfld(landed as u8);
+        if reprmt {
+            out.extend(pmtfld(form, template, scb));
+        }
+        defntr(form, spec, scb, &answers.text);
+        out.extend(shoabf(form, scb, 0));
+    }
+
+    // `FSD.C:1229`'s guard, kept exactly: only decay to point mode
+    // (this port's stand-in for `FSDSTB`, see this function's own doc
+    // comment) when `state` is *still* `FSDBUF` here -- `xitfsd` already
+    // moved it away for an explicit exit, and the callback may have moved
+    // it away directly (`FSD.H`'s Note 2) before this function ever ran.
+    // Either way, this must not clobber it.
+    if scb.state() == state::FSDBUF {
+        scb.set_state(state::FSDNPT);
+    }
+
+    (out, delta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5078,6 +5413,351 @@ mod tests {
         assert_eq!(out, b"m");
         assert_eq!(scb.ansbuf(), b"Kaim");
     }
+
+    // --- Task 10: fsdprc's FSDBUF arm ---------------------------------
+
+    /// An `Scb` positioned as `xitfld` would leave one immediately before
+    /// `fsdprc`'s `FSDBUF` arm runs: `entfld` is the field just committed,
+    /// `crsfld` is where `xitfld`'s own `movfld` already advanced to (or
+    /// the sentinel `in_template`, one past the end, for the last field),
+    /// `state` is `FSDBUF`, and `xitkey` is whatever byte triggered the
+    /// commit.
+    fn buffered_scb(entfld: u8, crsfld: u8, xitkey: u8) -> Scb {
+        let mut scb = zeroed_scb();
+        scb.set_entfld(entfld);
+        scb.set_crsfld(crsfld);
+        scb.set_state(state::FSDBUF);
+        scb.set_xitkey(u16::from(xitkey));
+        scb
+    }
+
+    #[test]
+    fn verify_locally_accepts_a_plain_answer_within_type_and_range() {
+        let spec = b"AGE(MIN=1 MAX=99)";
+        let form = compile(b"##", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"42"),
+            Ok(b"42".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_rejects_below_minimum_with_chkmins_own_message() {
+        // A '$' field: MIN=/MAX= are arithmetic (sscanf), unlike '#' and
+        // '?' fields where the C compares as strings -- min_ok's own doc
+        // comment names this, and "5" vs "18" would sort the *wrong* way
+        // on a '#' field ('1' < '5'), which is exactly the trap this test
+        // avoids by using a field type where the comparison is numeric.
+        let spec = b"AGE(MIN=18 MAX=99)";
+        let form = compile(b"$$", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"5"),
+            Err(b"Enter at least 18".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_rejects_above_maximum_with_chkmaxs_own_message() {
+        let spec = b"AGE(MIN=18 MAX=99)";
+        let form = compile(b"$$", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"150"),
+            Err(b"Enter no higher than 99".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_rejects_a_type_mismatch_silently_when_nothing_else_applies() {
+        // '#' field, non-digit: chktyp fails, chkalt has nothing to fall
+        // back on (no ALT= at all) -- no message, matching the C's own
+        // "fsdemg stays empty" outcome.
+        let spec = b"AGE";
+        let form = compile(b"##", spec, MANY);
+        assert_eq!(verify_locally(spec, &form.fields[0], b"xx"), Err(Vec::new()));
+    }
+
+    #[test]
+    fn verify_locally_accepts_an_unequivocal_alt_match_and_rewrites_the_canonical_spelling() {
+        let spec = b"COLOUR(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        // A MULTICHOICE field's chktyp is always false, so this only
+        // accepts through chkalt(1)==1.
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"Brown"),
+            Ok(b"Brown".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_rejects_an_ambiguous_alt_match_with_the_choices_report() {
+        let spec = b"COLOUR(ALT=Black ALT=Blue MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"Bl"),
+            Err(b"Choices:  Black  Blue  ".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_rejects_an_alt_match_with_no_choices_report_off_a_non_multichoice_field() {
+        // ALTERNATES without MULTICHOICE: chktyp CAN pass (it's a plain
+        // '?' field), so this only reaches chkalt via a MIN=/MAX= failure
+        // -- and even then, chkalt's own "Choices:" building is gated on
+        // FFFMCH, which this field does not have. "Zz" matches neither
+        // "Alice" nor "Amy" at all (not even ambiguously), so chkalt
+        // contributes nothing and chkmin's own message survives.
+        let spec = b"NAME(ALT=Alice ALT=Amy MIN=10)";
+        let form = compile(b"??????????", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"Zz"),
+            Err(b"Enter at least 10 character(s)".to_vec())
+        );
+    }
+
+    #[test]
+    fn verify_locally_falls_back_to_an_unequivocal_alt_match_even_off_a_min_max_failure() {
+        // The `||` in `chktyp() && chkmin() && chkmax() || chkalt(1)==1`
+        // is evaluated whether or not the field is MULTICHOICE -- MCH only
+        // gates whether a *failed* chkalt builds a "Choices:" report, not
+        // whether chkalt is consulted at all. "Al" fails chkmin's
+        // MIN=10-characters test but matches "Alice" unambiguously (it
+        // does not also prefix-match "Amy"), so the field is accepted
+        // anyway, canonical spelling and all.
+        let spec = b"NAME(ALT=Alice ALT=Amy MIN=10)";
+        let form = compile(b"??????????", spec, MANY);
+        assert_eq!(
+            verify_locally(spec, &form.fields[0], b"Al"),
+            Ok(b"Alice".to_vec())
+        );
+    }
+
+    #[test]
+    fn choices_message_stops_at_the_maxhlp_budget_with_an_ellipsis() {
+        let spec = b"C(ALT=Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+                       ALT=Bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+                       MULTICHOICE)";
+        let form = compile(b"??????????????????????????????????????????????????????????????????", spec, MANY);
+        let msg = choices_message(spec, &form.fields[0], b"");
+        assert!(msg.ends_with(b"..."), "{}", String::from_utf8_lossy(&msg));
+        assert!(msg.len() <= usize::from(MAXHLP), "{}", String::from_utf8_lossy(&msg));
+    }
+
+    #[test]
+    fn fsdprc_accepts_a_valid_answer_stores_it_and_advances_to_the_next_field() {
+        let spec = b"A(MIN=1 MAX=5) B";
+        let form = compile(b"## ??", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        // xitfld already advanced crsfld to field 1 and set entfld=0.
+        let mut scb = buffered_scb(0, 1, b'\r');
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"## ??",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"3",
+        );
+
+        assert!(changed, "the answer went from blank to \"3\"");
+        assert_eq!(extract(&answers.text, b"A").map(|at| value_at(&answers.text, at)), Some(&b"3"[..]));
+        assert_eq!(scb.state(), state::FSDNPT, "no FSDSTB -- straight back to point mode");
+        assert_eq!(scb.crsfld(), 1, "landed on field B");
+        assert!(!out.is_empty(), "pmtfld/defntr/shoabf produced field B's prompt");
+    }
+
+    #[test]
+    fn fsdprc_rejects_an_out_of_range_answer_announces_it_and_does_not_advance() {
+        let spec = b"A(MIN=10 MAX=99)";
+        let form = compile(b"$$", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        // A single-field form: xitfld's own movfld found nowhere to go, so
+        // crsfld stayed at 0 -- the same field as entfld.
+        let mut scb = buffered_scb(0, 0, b'\r');
+        scb.set_ansbuf(b"3");
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"$$",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"3",
+        );
+
+        assert!(!changed, "rejected -- stfans never ran");
+        assert_eq!(
+            extract(&answers.text, b"A").map(|at| value_at(&answers.text, at)),
+            Some(&b""[..]),
+            "the answer string is untouched"
+        );
+        assert_eq!(scb.state(), state::FSDNPT, "not over -- reprompting the same field");
+        assert_eq!(scb.crsfld(), 0);
+        assert_eq!(
+            out, b"\r\n\r\nEnter at least 10\x07\r\n\r\n",
+            "announce()'s own chrome, then pmtfld's leading \\r\\n for field 0's \
+             redisplay (blank answer, so defntr/shoabf(0) add nothing further) -- {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn fsdprc_rejects_silently_with_just_a_beep_and_erases_what_was_typed_when_there_is_no_message() {
+        let spec = b"A"; // '#' field, no MIN=/MAX=/ALT= at all
+        let form = compile(b"##", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(0, 0, b'\r');
+        scb.set_ansbuf(b"xx");
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"##",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"xx",
+        );
+
+        assert!(!changed);
+        assert_eq!(scb.state(), state::FSDNPT);
+        assert_eq!(
+            out,
+            [b"\x07".as_slice(), b"\x08 \x08\x08 \x08"].concat(),
+            "alarm() then unentr() erasing the two typed characters, no \\r\\n\\r\\n chrome"
+        );
+    }
+
+    #[test]
+    fn fsdprc_ctrl_o_mid_field_exits_via_xitfsd_fsdqit() {
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(0, 1, 0x0f); // 'O'-64
+
+        let (out, _) = fsdprc(
+            &form,
+            spec,
+            b"?? ??",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"",
+        );
+
+        assert_eq!(scb.state(), state::FSDQIT);
+        assert_eq!(out, b"\r\n", "xitfsd's own line break, nothing else");
+    }
+
+    #[test]
+    fn fsdprc_esc_mid_field_exits_via_xitfsd_fsdqit() {
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(0, 1, 0x1b); // ESC
+
+        let (_, _) = fsdprc(
+            &form,
+            spec,
+            b"?? ??",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"",
+        );
+
+        assert_eq!(scb.state(), state::FSDQIT);
+    }
+
+    #[test]
+    fn fsdprc_ctrl_g_exits_via_xitfsd_fsdsav() {
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(0, 1, 0x07); // 'G'-64
+
+        let (_, _) = fsdprc(
+            &form,
+            spec,
+            b"?? ??",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"",
+        );
+
+        assert_eq!(scb.state(), state::FSDSAV);
+    }
+
+    #[test]
+    fn fsdprc_a_rejected_answer_never_reaches_the_exit_key_check() {
+        // vc=VFYREJ (the module said so directly) AND xitkey is 'G'-64 --
+        // if the exit check ran anyway, this would wrongly save.
+        // FSD.C:1174's `if (vc != VFYREJ)` guards the whole thing.
+        let spec = b"A";
+        let form = compile(b"##", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(0, 0, 0x07);
+
+        let (_, changed) = fsdprc(
+            &form,
+            spec,
+            b"##",
+            &mut scb,
+            &mut answers,
+            verify::VFYREJ,
+            b"3",
+        );
+
+        assert!(!changed);
+        assert_eq!(
+            scb.state(),
+            state::FSDNPT,
+            "rejected, so the exit key must never have been consulted"
+        );
+    }
+
+    #[test]
+    fn fsdprc_the_last_field_ends_the_session_when_the_callback_sets_state_directly() {
+        // The real mechanism a completed form uses to end its session:
+        // `fldvfy` (in practice, `vfyadn` via `_ljnvfy`) sets
+        // `scb.state()` to FSDSAV directly, per FSD.H's Note 2 -- not
+        // fsdprc's own movfld/wraparound arithmetic, which this port's own
+        // doc comment on `fsdprc` argues is unreachable in line mode. The
+        // caller (the shim wrapping `machine.call`) re-reads `scb` after
+        // the callback runs and hands THIS function the already-updated
+        // state, which is what this test simulates directly.
+        let spec = b"A";
+        let form = compile(b"##", spec, MANY);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        // The sentinel: xitfld stepped crsfld one past the last field.
+        let mut scb = buffered_scb(0, 1, b'\r');
+        scb.set_state(state::FSDSAV); // the callback already did this
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"##",
+            &mut scb,
+            &mut answers,
+            verify::VFYOK,
+            b"3",
+        );
+
+        assert!(changed, "VFYOK still stores the answer");
+        assert_eq!(scb.state(), state::FSDSAV, "left exactly as the callback set it");
+        assert_eq!(
+            extract(&answers.text, b"A").map(|at| value_at(&answers.text, at)),
+            Some(&b"3"[..])
+        );
+        assert!(
+            out.is_empty(),
+            "sover was already true before this call -- no reprompt, no xitfsd of its own"
+        );
+    }
+
 
     #[test]
     fn a_field_record_is_twenty_three_bytes_with_the_flags_at_twelve() {
