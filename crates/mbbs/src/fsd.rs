@@ -50,7 +50,7 @@ use std::fmt;
 use mbbs16::FarPtr;
 
 /// Maximum length of any one answer. `FSD.H:238`.
-const ANSLEN: u16 = 80;
+pub(crate) const ANSLEN: u16 = 80;
 
 /// Maximum length of a field name. `FSD.H:240`.
 const FLDNAM: u16 = 12;

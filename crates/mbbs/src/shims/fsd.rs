@@ -47,7 +47,7 @@
 //! `btuchi`'s whole family collapses to here -- see [`fsdcon`]'s own doc
 //! comment.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
@@ -840,6 +840,182 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     });
 
     fsdcon(host, chan);
+    crate::shims::text::append(machine, host, &output)?;
+
+    Ok(Ret::Void)
+}
+
+/// This channel's -- rather, this host's -- scratch buffer for
+/// [`fsd::candidate_answer`], allocating it on first use. See
+/// [`crate::Host::fsd_scratch`]'s own doc comment for why one segment,
+/// not one per channel, is the right shape here.
+fn fsd_scratch(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimError> {
+    match host.fsd_scratch {
+        Some(at) => Ok(at),
+        None => {
+            let selector = machine
+                .alloc_segment(usize::from(fsd::ANSLEN) + 1)
+                .map_err(|e| {
+                    ShimError::Failed(format!("fsdprc: no room for a scratch buffer: {e}"))
+                })?;
+            let at = FarPtr {
+                offset: 0,
+                selector,
+            };
+            host.fsd_scratch = Some(at);
+            Ok(at)
+        }
+    }
+}
+
+/// The answer string and every field's `(ansoff, anslen)`, read out of
+/// module memory -- [`fsd::Answers`], built the way [`fsd::store`] (this
+/// port's `stfans()`) needs it, rather than trusted from
+/// [`Host::forms`]'s own cache: `fsdord`'s own doc comment already
+/// explains why a field's mutable members are read live, and `ansoff`/
+/// `anslen` are exactly the members `fsdord` itself already writes.
+fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, ShimError> {
+    let text = answer_string(machine, block.newans())?;
+    let mut offsets = Vec::with_capacity(usize::from(block.numfld()));
+    for i in 0..block.numfld() {
+        let record = field_record(machine, block, i, "fsdprc")?;
+        offsets.push((answer_offset(&record), record[fsd::fld::ANSLEN]));
+    }
+    Ok(fsd::Answers {
+        text,
+        offsets,
+        allans: block.allans(),
+    })
+}
+
+/// `fsdprc()`'s `FSDBUF` arm, wired through `Machine`. `FSD.C:1124-1233`.
+/// The pure decision logic is [`fsd::fsdprc`]; this resolves `vc` --
+/// calling the module's `fldvfy`, if it registered one -- and writes back
+/// whatever changed: the answer string, every field's `ansoff`/`anslen`
+/// (`stfans`'s own writes, `FSD.C:1054-1058`) and `FFFCHG`, the control
+/// block itself, and finally the composed output through
+/// [`crate::shims::text::append`], the same "leave it in `prfbuf` for the
+/// caller to flush" contract [`fsdego`]'s own doc comment already states.
+///
+/// Not wired to any ordinal: `fsdprc` is not among `WCCMMUD.DLL`'s
+/// imports (`FSDBBS.C`'s `fsdsts` calls it directly, from the FSD's own
+/// `CYCLE` dispatch), so this is `pub(crate)` for whatever eventually
+/// builds that dispatch loop (a later task) rather than a shim the
+/// ordinal table resolves to.
+///
+/// # The callback discipline
+///
+/// `fldvfy`'s own `FarPtr` and the scratch buffer's address are read out
+/// of `block` *before* the call, and `block` -- along with the candidate
+/// answer itself -- is **re-read from `Machine`** immediately afterward,
+/// never trusted from the pre-call copy: `VFYOK`'s own contract lets a
+/// module rewrite the answer in place (`FSD.H`'s Note 2), and the same
+/// note lets it set `scb.state()` directly to end the session. Both are
+/// exactly the trap `polrou` already documents (`lib.rs:1128`, cited by
+/// the design doc's "The two callbacks into module code").
+///
+/// `machine.call` is used directly here, matching the design doc's own
+/// description of this call site ("`machine.call` is already legal") and
+/// this plan's own sketch for `goback`/`whndun` -- not the full
+/// `Host::run` service loop `dopoll`/`polrou` use. A callback that itself
+/// calls a further host routine is therefore not serviced; see "Errors".
+///
+/// # Errors
+///
+/// If no session has been prepared; if `fldvfy` does anything other than
+/// return a value directly -- in particular, the real `_ljnvfy`/`vfyadn`
+/// chain MajorMUD uses (`fsd::fsdprc`'s own doc comment traces it) always
+/// calls the still-unbuilt `vfyadn`, so this refuses rather than mis-
+/// handling a call this crate cannot yet service.
+pub(crate) fn fsdprc(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<Ret, ShimError> {
+    let (block, at) = prepared(machine, host, "fsdprc")?;
+    let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        return Err(ShimError::Failed(
+            "fsdprc: no template on record for this channel".into(),
+        ));
+    };
+    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        return Err(ShimError::Failed(format!(
+            "fsdprc: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
+             is cached"
+        )));
+    };
+    let form = live_form(machine, &block, &form)?;
+    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let template_at = host.messages.text(mbk, msgno).map_err(ShimError::Failed)?;
+    let template = machine.read_cstr(template_at)?.to_vec();
+
+    let entfld = block.entfld();
+    let field = form.fields[usize::from(entfld)];
+    let candidate = fsd::candidate_answer(&field, block.ansbuf());
+
+    let scratch = fsd_scratch(machine, host)?;
+    let mut scratch_bytes = candidate;
+    scratch_bytes.push(0);
+    machine.write(scratch, &scratch_bytes)?;
+
+    let vc = if block.flags() & fsd::entry_flags::FSDIGA != 0 {
+        let mut cleared = block.clone();
+        cleared.set_flags(cleared.flags() & !fsd::entry_flags::FSDIGA);
+        machine.write(at, cleared.as_bytes())?;
+        fsd::verify::VFYDEF
+    } else if block.fldvfy() != FarPtr::NULL {
+        let fldvfy = block.fldvfy();
+        // The borrow on `block` ends here: everything after this point
+        // re-reads fresh from `Machine`, per the callback discipline
+        // above.
+        let exit = machine
+            .call(fldvfy, &[u16::from(entfld), scratch.offset, scratch.selector])
+            .map_err(|e| ShimError::Failed(format!("fsdprc: fldvfy call failed: {e}")))?;
+        match exit {
+            Exit::Returned { ax, .. } => ax as i16,
+            other => {
+                return Err(ShimError::Failed(format!(
+                    "fsdprc: fldvfy at {fldvfy} did not return directly ({other:?}) -- a \
+                     nested host call from inside it is not serviced here"
+                )));
+            }
+        }
+    } else {
+        fsd::verify::VFYCHK
+    };
+
+    // Re-read everything the callback (if any ran) could have touched.
+    let mut block = read_block(machine, at)?;
+    let bufptr = machine.read_cstr(scratch)?.to_vec();
+    let mut answers = read_answers(machine, &block)?;
+
+    let (output, changed) = fsd::fsdprc(
+        &form,
+        &spec,
+        &template,
+        &mut block,
+        &mut answers,
+        vc,
+        &bufptr,
+    );
+
+    // `stfans`'s own writes: every field's `(ansoff, anslen)`, and
+    // `FFFCHG` on the one that was just validated. Written for every
+    // field on every call rather than only the ones that moved --
+    // `answers.offsets` already holds the right value either way (a
+    // reject leaves it identical to what module memory already has), and
+    // "always write the current truth" is simpler than tracking which
+    // fields genuinely need it.
+    for i in 0..block.numfld() {
+        let mut record = field_record(machine, &block, i, "fsdprc")?;
+        let (ansoff, anslen) = answers.offsets[usize::from(i)];
+        record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&ansoff.to_le_bytes());
+        record[fsd::fld::ANSLEN] = anslen;
+        if i == u16::from(entfld) && changed {
+            record[fsd::fld::FLAGS] |= fsd::flags::CHANGED;
+        }
+        machine.write(offset(block.flddat(), field_at(i))?, &record)?;
+    }
+    machine.write(block.newans(), &answers.text)?;
+    block.set_allans(answers.allans);
+    machine.write(at, block.as_bytes())?;
+
     crate::shims::text::append(machine, host, &output)?;
 
     Ok(Ret::Void)
@@ -1980,5 +2156,288 @@ mod tests {
         assert_eq!(f.host.users().substt(&f.machine, chan).expect("read"), 0);
         assert!(f.host.fsd_sessions[chan.index()].is_none());
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcon did not run");
+    }
+
+    // --- Task 10: fsdprc, the fldvfy callback wiring --------------------
+
+    /// Leave the session control block the way `xitfld` would just before
+    /// `fsdprc`'s `FSDBUF` arm runs: `entfld` the field just committed,
+    /// `crsfld` wherever `xitfld`'s own `movfld` already advanced to,
+    /// `state` `FSDBUF`, `xitkey` whatever byte triggered the commit, and
+    /// `ansbuf` the candidate answer that was typed.
+    fn set_buffered(f: &mut Fixture, entfld: u8, crsfld: u8, xitkey: u8, ansbuf: &[u8]) {
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        let mut scb = block(f);
+        scb.set_entfld(entfld);
+        scb.set_crsfld(crsfld);
+        scb.set_xitkey(u16::from(xitkey));
+        scb.set_ansbuf(ansbuf);
+        scb.set_state(fsd::state::FSDBUF);
+        f.machine.write(at, scb.as_bytes()).expect("written");
+    }
+
+    /// A synthetic `fldvfy` at `code_offset` in the scratch code segment:
+    /// `mov ax, retval; retf`, ignoring both its arguments. Written well
+    /// past whatever a preceding `f.invoke` call's own thunk-driver
+    /// trampoline used at offset 0, so the two do not collide.
+    fn stub_returning(f: &mut Fixture, code_offset: u16, retval: i16) -> FarPtr {
+        let mut code = vec![0xb8u8];
+        code.extend_from_slice(&(retval as u16).to_le_bytes());
+        code.push(0xcb);
+        let ptr = f.machine.code_ptr(code_offset);
+        f.machine.write(ptr, &code).expect("stub fits");
+        ptr
+    }
+
+    /// A synthetic `fldvfy` that pokes `new_state` directly into `scb`'s
+    /// own `state` byte -- `FSD.H`'s Note 2, "the field verify routine
+    /// ... sets fsdscb->state" -- before returning `retval`. Exercises
+    /// the callback discipline: `fsdprc` must re-read `scb` after this
+    /// call rather than trust the pre-call copy.
+    fn stub_setting_state(
+        f: &mut Fixture,
+        code_offset: u16,
+        scb: FarPtr,
+        new_state: u8,
+        retval: i16,
+    ) -> FarPtr {
+        let mut code = Vec::new();
+        code.push(0xb8); // mov ax, <scb's segment>
+        code.extend_from_slice(&scb.selector.to_le_bytes());
+        code.extend_from_slice(&[0x8e, 0xc0]); // mov es, ax
+        code.extend_from_slice(&[0x26, 0xc6, 0x06]); // mov byte [es:disp16], imm8
+        code.extend_from_slice(&(scb.offset + fsd::scb::STATE).to_le_bytes());
+        code.push(new_state);
+        code.push(0xb8); // mov ax, retval
+        code.extend_from_slice(&(retval as u16).to_le_bytes());
+        code.push(0xcb); // retf
+        let ptr = f.machine.code_ptr(code_offset);
+        f.machine.write(ptr, &code).expect("stub fits");
+        ptr
+    }
+
+    /// A synthetic `fldvfy` that immediately far-calls thunk 0 -- a
+    /// nested host call `fsdprc` does not service, see its own doc
+    /// comment.
+    fn stub_calling_a_thunk(f: &mut Fixture, code_offset: u16) -> FarPtr {
+        let mut code = vec![0x9au8]; // far call
+        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.push(0xcb);
+        let ptr = f.machine.code_ptr(code_offset);
+        f.machine.write(ptr, &code).expect("stub fits");
+        ptr
+    }
+
+    #[test]
+    fn fsdprc_accepts_via_fldvfy_stores_the_rewritten_answer_and_advances() {
+        let mut f = Fixture::new();
+        let (buffer, _) = session(&mut f, "A B", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        // VFYOK: fsdprc must store bufptr as fldvfy left it, without
+        // running any local chktyp/chkmin/chkmax/chkalt check of its own.
+        let fldvfy = stub_returning(&mut f, 0x100, crate::fsd::verify::VFYOK);
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+
+        // entfld=0 ("A"), crsfld=1 ("B") -- xitfld already advanced past
+        // A when Enter committed it.
+        set_buffered(&mut f, 0, 1, b'\r', b"hello");
+        let _ = buffer; // silence unused warning if the field is trivial
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "hello", "the callback's own answer, stored verbatim");
+        assert_eq!(
+            block(&f).state(),
+            fsd::state::FSDNPT,
+            "not over -- straight back to point mode, no FSDSTB"
+        );
+        assert_eq!(block(&f).crsfld(), 1, "landed on field B");
+        assert!(
+            !f.read(f.host.globals().prf_buffer()).is_empty(),
+            "field B's prompt was appended to the print buffer"
+        );
+
+        let scb = block(&f);
+        let record = f
+            .machine
+            .resolve(scb.flddat(), usize::from(crate::fsd::FSDFLD))
+            .expect("field 0's record");
+        assert_eq!(
+            record[crate::fsd::fld::FLAGS] & crate::fsd::flags::CHANGED,
+            crate::fsd::flags::CHANGED,
+            "FFFCHG set on field A's own record in module memory"
+        );
+    }
+
+    #[test]
+    fn fsdprc_rejects_via_fldvfy_and_does_not_advance() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        let fldvfy = stub_returning(&mut f, 0x100, crate::fsd::verify::VFYREJ);
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        set_buffered(&mut f, 0, 0, b'\r', b"nope");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "", "VFYREJ -- nothing stored");
+        assert_eq!(block(&f).state(), fsd::state::FSDNPT, "not over -- reprompting");
+    }
+
+    #[test]
+    fn fsdprc_a_callback_that_sets_state_directly_ends_the_session_and_is_re_read_not_trusted() {
+        // FSD.H's Note 2. This is the real mechanism a completed form
+        // uses -- see fsd::fsdprc's own doc comment on why the "no wrap"
+        // fallback inside fsdprc's own movfld arithmetic is unreachable.
+        // If fsdprc trusted its pre-call copy of `scb` instead of
+        // re-reading after the callback, it would never see FSDSAV here
+        // and would wrongly redisplay the field instead of ending the
+        // session.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        let fldvfy = stub_setting_state(
+            &mut f,
+            0x100,
+            scb_at,
+            fsd::state::FSDSAV,
+            crate::fsd::verify::VFYOK,
+        );
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        // The sentinel: the single field's own xitfld(0) left crsfld
+        // unmoved, then fsdinc stepped it one past the end by hand.
+        set_buffered(&mut f, 0, 1, b'\r', b"done");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        assert_eq!(
+            block(&f).state(),
+            fsd::state::FSDSAV,
+            "left exactly as the callback set it, not overwritten back to FSDNPT"
+        );
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "done", "VFYOK still stored the answer");
+    }
+
+    #[test]
+    fn fsdprc_fsdiga_ignores_the_answer_and_calls_no_callback_at_all() {
+        // The 'U'-64 (move-to-previous-field) path in fsdinc sets FSDIGA
+        // before entering FSDBUF -- fsdprc must clear it and treat this
+        // as VFYDEF without ever touching fldvfy, even if one is
+        // registered. A registered stub that always rejects proves the
+        // callback genuinely did not run: if it had, the reject would
+        // show up as an empty answer and no field advance.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A B", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        let fldvfy = stub_returning(&mut f, 0x100, crate::fsd::verify::VFYREJ);
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        scb.set_flags(scb.flags() | fsd::entry_flags::FSDIGA);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        set_buffered(&mut f, 1, 0, u8::try_from(0x15).unwrap(), b"Al");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        assert_eq!(
+            block(&f).flags() & fsd::entry_flags::FSDIGA,
+            0,
+            "FSDIGA cleared"
+        );
+        assert_eq!(
+            block(&f).state(),
+            fsd::state::FSDNPT,
+            "VFYDEF is not VFYREJ -- the field moves on, matching the stub \
+             never having run at all"
+        );
+    }
+
+    #[test]
+    fn fsdprc_refuses_a_callback_that_makes_a_further_host_call() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        let scb_at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+
+        let fldvfy = stub_calling_a_thunk(&mut f, 0x100);
+        let mut scb = block(&f);
+        scb.set_fldvfy(fldvfy);
+        f.machine.write(scb_at, scb.as_bytes()).expect("written");
+        set_buffered(&mut f, 0, 0, b'\r', b"x");
+
+        let e = crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect_err("refused");
+        assert!(format!("{e}").contains("did not return directly"), "{e}");
+    }
+
+    #[test]
+    fn fsdprc_with_no_fldvfy_validates_locally() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A(MIN=1 MAX=5)", b"\0");
+        let chan = f.console();
+        // fldvfy left NULL -- fsdroom/fsdapr never set one.
+        set_buffered(&mut f, 0, 1, b'\r', b"3");
+
+        crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect("processed");
+
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+            panic!("fsdnan refused")
+        };
+        assert_eq!(f.read(at), "3", "accepted by fsdprc's own local chktyp/chkmin/chkmax");
+    }
+
+    #[test]
+    fn fsdprc_before_any_session_stops_the_module() {
+        let mut f = Fixture::new();
+        current(&mut f);
+        let chan = f.console();
+        let e =
+            crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, chan).expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 }

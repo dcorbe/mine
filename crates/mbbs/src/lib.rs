@@ -551,6 +551,24 @@ pub struct Host {
     /// channel, not one shared by all of them.
     pub(crate) fsd_sessions: Vec<Option<FsdSession>>,
 
+    /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
+    /// hands `fldvfy`: the module reads `char *answer` out of it, and
+    /// `VFYOK`'s own contract (`FSD.H` Note 2) lets it rewrite the bytes
+    /// there in place. `None` until the first field-verify call needs it.
+    ///
+    /// **Not per-channel, unlike [`Host::fsdscb`].** The original's own
+    /// `fsdbuf` (`FSDBBS.C:45`) is a single global buffer too, not one per
+    /// channel -- `alcmem(fsdbln)` runs once, in `inifsd()`. That is safe
+    /// there for the same reason it is safe here: only one channel's
+    /// `fsdprc` ever runs at a time (this host is single-threaded by
+    /// force), and the buffer's whole lifetime is the span of one
+    /// `fldvfy` call, never carried across one. Sized `ANSLEN+1` rather
+    /// than the original's `fsdbln` (`ANSILN*ANSIWD*2`, a much larger
+    /// buffer also used by the ANSI screen paths this crate does not
+    /// build) -- the one purpose this port ever writes it for is a single
+    /// candidate answer, never longer than `ANSLEN`.
+    pub(crate) fsd_scratch: Option<FarPtr>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
 
@@ -794,6 +812,7 @@ impl Host {
             fsdtmp: vec![None; usize::from(terms.count())],
             fsd_state: None,
             fsd_sessions: vec![None; usize::from(terms.count())],
+            fsd_scratch: None,
             heap,
             users,
             asked: Vec::new(),
