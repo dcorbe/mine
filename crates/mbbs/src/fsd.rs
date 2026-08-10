@@ -1816,27 +1816,29 @@ pub fn pmtfld(form: &Form, template: &[u8], scb: &Scb) -> Vec<u8> {
 }
 
 /// `defntr()`, `FSD.C:786-793`. Seed `ansbuf` from the field at
-/// `scb.crsfld()`'s current answer, verbatim, and clear `FSDANT`.
+/// `scb.crsfld()`'s current answer, verbatim; seed `altptr` from whichever
+/// alternate (if any) that answer exactly is; clear `FSDANT`.
 ///
-/// # `ck4alt(1)` is read, and not reproduced
+/// # `ck4alt(1)`, ported as [`exact_alternate`]
 ///
 /// The original's third line, `fsdscb->altptr=ck4alt(1);`, is not a
 /// normalization -- it does not touch `ansbuf` or `answers` at all.
 /// `ck4alt` (`FSD.C:716-729`) only *looks up* whether the answer already
-/// matches one of the field's `ALT=` values and, if so, hands back a
-/// pointer into that alternate's own text; the result feeds `altptr`,
-/// cursor-tracking state `hdlalt`/`altntr` (Task 6/7, not yet ported)
-/// consume while the player is mid-edit of an `ALT=` field. The routine
-/// that *rewrites* an answer to its canonical `ALT=` spelling is
-/// `fsdord()`, already ported as [`ordinal`], and it acts on `newans`
-/// directly -- so by the time `defntr` runs, `answers` already carries
-/// whatever spelling the module's own `fsdord` calls left there, and this
-/// copies it as-is. `altptr` itself is not modeled, for the reason
-/// [`shoabf`]'s own doc comment gives for `ftmptr`.
+/// matches one of the field's `ALT=` values exactly (`tokend=1`) and, if
+/// so, hands back a pointer to it; the result feeds `altptr`, the
+/// cursor-tracking state [`hdlalt`]/[`altntr`] (Task 7) consume while the
+/// player is mid-edit of an `ALT=` field -- most concretely, [`hdlalt`]'s
+/// own space-cycling branch, which cycles *from* whatever `altptr` already
+/// names rather than re-deriving a starting point when a field that already
+/// has an exact-match answer is re-entered. The routine that *rewrites* an
+/// answer to its canonical `ALT=` spelling is `fsdord()`, already ported as
+/// [`ordinal`], and it acts on `newans` directly -- so by the time `defntr`
+/// runs, `answers` already carries whatever spelling the module's own
+/// `fsdord` calls left there, and `ansbuf` copies it as-is.
 ///
 /// The scb-level `anslen` (distinct from a *field's* `anslen` byte -- see
-/// [`Field`]'s own doc comment) is likewise not modeled: nothing this crate
-/// ports before Task 6 reads it.
+/// [`Field`]'s own doc comment) is not modeled: nothing this crate ports
+/// reads it.
 ///
 /// # Finding "the field's current answer"
 ///
@@ -1855,6 +1857,7 @@ pub fn defntr(form: &Form, spec: &[u8], scb: &mut Scb, answers: &[u8]) {
     let name = name_of(spec, field);
     let value = extract(answers, name).map_or(&[][..], |at| value_at(answers, at));
     scb.set_ansbuf(value);
+    scb.set_altptr(exact_alternate(spec, field, value));
     scb.set_flags(scb.flags() & !entry_flags::FSDANT);
 }
 
@@ -3506,9 +3509,10 @@ mod tests {
     fn defntr_seeds_ansbuf_from_the_fields_current_answer_verbatim() {
         // Not normalized to the ALT= value's canonical spelling -- that is
         // fsdord's job (already ported as `ordinal`), which rewrites
-        // `answers` itself before defntr ever runs. `ck4alt(1)`'s own
-        // effect (feeding `altptr`) is not observable here; see defntr's
-        // own doc comment for why.
+        // `answers` itself before defntr ever runs. "br" is not an exact
+        // match for any alternate, so ck4alt(1)'s own effect (feeding
+        // altptr) is not observable in *this* test; see the sibling test
+        // below for that.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
         let form = compile(b"??????", spec, MANY);
         let mut scb = zeroed_scb();
@@ -3523,6 +3527,28 @@ mod tests {
             entry_flags::FSDANS,
             "FSDANT cleared, FSDANS (unrelated) left alone"
         );
+        assert_eq!(scb.altptr(), None, "\"br\" is not an exact match for anything");
+    }
+
+    #[test]
+    fn defntr_seeds_altptr_when_the_current_answer_is_an_exact_alternate() {
+        // `fsdscb->altptr=ck4alt(1);` (FSD.C:791) -- an exact-boundary
+        // match, not the prefix match `hdlalt`'s own space-cycling branch
+        // uses to seed a cycle from scratch. Matters when a session starts
+        // (or a field is re-entered) on a field that already has one of its
+        // own ALT= values as its answer, e.g. re-editing a previously
+        // answered MULTICHOICE field: without this, the first space press
+        // would treat nothing as selected and re-derive from ansbuf instead
+        // of cycling on from what's already chosen.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        defntr(&form, spec, &mut scb, b"C=Brown\0\0");
+
+        assert_eq!(scb.ansbuf(), b"Brown");
+        assert_eq!(scb.altptr(), Some(1), "Brown is ordinal 1");
     }
 
     #[test]
@@ -3535,6 +3561,7 @@ mod tests {
         defntr(&form, spec, &mut scb, b"NAME=\0\0");
 
         assert_eq!(scb.ansbuf(), b"");
+        assert_eq!(scb.altptr(), None);
     }
 
     #[test]
