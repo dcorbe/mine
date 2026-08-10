@@ -1284,6 +1284,45 @@ fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
     out
 }
 
+/// Every alternate that could still be `answer`, in listing order --
+/// `chkalt()`'s own matching loop, `FSD.C:966-1000`, factored out because
+/// [`ordinal`] and [`hdlalt`] both need it and need different things from
+/// its *count*: `ordinal` only cares whether there was exactly one,
+/// `hdlalt`'s own typed-character branch has to tell "nothing matched" (stop
+/// entirely) apart from "more than one still could" (keep typing) -- two
+/// outcomes `chkalt`'s own `int` return already distinguishes and `ordinal`
+/// alone collapsed into a single `None`.
+///
+/// The answer is matched as a *prefix*, after every white-space character in
+/// it has been removed -- `rmvwht`, which is not a trim. So `" b l "` finds
+/// `Black`.
+fn matching_alternates(spec: &[u8], field: &Field, answer: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let wanted = crate::strings::rmvwht(answer);
+    // `bc=toupper(bufptr[0])`, over a NUL-terminated buffer -- so an *empty*
+    // answer reads the terminator and `bc` is 0. That is not a degenerate case
+    // to be refused: `sameto("",tp)` is true of every alternate, so the first
+    // character is the whole of the test, and the only alternate whose first
+    // character is also 0 is a zero-length one. A blank `ALT=` is exactly how
+    // FSD.H:214 says to spell "no answer", and this is how it gets chosen.
+    let upper = |s: &[u8]| s.first().map_or(0, u8::to_ascii_uppercase);
+    let first = upper(&wanted);
+
+    alternates(spec, field)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, alt)| {
+            // `sameto(bufptr,tp)` -- the alternate begins with the answer --
+            // and then `bc == toupper(*tp)`, which for a non-empty answer the
+            // first test already implies and which the original checks
+            // anyway.
+            let same = alt.len() >= wanted.len()
+                && alt[..wanted.len()].eq_ignore_ascii_case(&wanted)
+                && upper(alt) == first;
+            same.then(|| (i as u16, alt.to_vec()))
+        })
+        .collect()
+}
+
 /// Which alternate value an answer is. `chkalt(0)` then `fsdord()`,
 /// `FSD.C:965` and `FSD.C:2244`.
 ///
@@ -1298,42 +1337,13 @@ fn alternates<'a>(spec: &'a [u8], field: &Field) -> Vec<&'a [u8]> {
 /// `ALT=Black ALT=Brown` picks neither, and a host that took the first would be
 /// choosing on the player's behalf. `FSD.H:655` -- "only returns 0..N-1 if
 /// unequivocal match".
-///
-/// The answer is matched as a *prefix*, after every white-space character in it
-/// has been removed -- `rmvwht`, which is not a trim. So `" b l "` finds
-/// `Black`.
 pub fn ordinal(spec: &[u8], field: &Field, answer: &[u8]) -> Option<(u16, Vec<u8>)> {
     // `if (!(fldptr->flags&FFFALT) || foptkn("ALT=",0) == NULL) return 0;`
     if field.flags & flags::ALTERNATES == 0 {
         return None;
     }
-    let wanted = crate::strings::rmvwht(answer);
-    // `bc=toupper(bufptr[0])`, over a NUL-terminated buffer -- so an *empty*
-    // answer reads the terminator and `bc` is 0. That is not a degenerate case
-    // to be refused: `sameto("",tp)` is true of every alternate, so the first
-    // character is the whole of the test, and the only alternate whose first
-    // character is also 0 is a zero-length one. A blank `ALT=` is exactly how
-    // FSD.H:214 says to spell "no answer", and this is how it gets chosen.
-    let upper = |s: &[u8]| s.first().map_or(0, u8::to_ascii_uppercase);
-    let first = upper(&wanted);
-
-    let mut found: Option<(u16, Vec<u8>)> = None;
-    let mut matches = 0usize;
-    for (i, alt) in alternates(spec, field).into_iter().enumerate() {
-        // `sameto(bufptr,tp)` -- the alternate begins with the answer -- and
-        // then `bc == toupper(*tp)`, which for a non-empty answer the first
-        // test already implies and which the original checks anyway.
-        let same = alt.len() >= wanted.len()
-            && alt[..wanted.len()].eq_ignore_ascii_case(&wanted)
-            && upper(alt) == first;
-        if same {
-            if matches == 0 {
-                found = Some((i as u16, alt.to_vec()));
-            }
-            matches += 1;
-        }
-    }
-    if matches == 1 { found } else { None }
+    let mut matches = matching_alternates(spec, field, answer);
+    (matches.len() == 1).then(|| matches.pop().unwrap())
 }
 
 /// Is this answer consistent with the field's type? `chktyp()`, `FSD.C:861`.
