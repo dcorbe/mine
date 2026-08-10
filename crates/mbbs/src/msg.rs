@@ -286,6 +286,47 @@ pub fn value(message: &[u8]) -> &[u8] {
     }
 }
 
+/// `getasc()`: a message with every line break expanded to `\r\n`.
+///
+/// The compact form a `.MCV` stores -- what `getmsg()` hands back -- writes a
+/// line break as a single byte. `getasc` is the same text with each one
+/// doubled, and the FSD is where the difference stops being cosmetic.
+///
+/// # Why the FSD cares, and only in one mode
+///
+/// `fsdroom` chooses between the two on `amode`: `amode == -1 ? getmsg(tmpmsg)
+/// : xlttxv(getasc(tmpmsg),mxmssz)` (`FSDBBS.C:137`). Display-only forms get
+/// the compact text; everything that will be *entered* gets this.
+///
+/// At `ascn=0` the choice is nearly invisible -- the template scanner treats
+/// both `\r` and `\n` as white space, so the same field runs are found either
+/// way, and only their absolute offsets shift. At `ascn=1` it decides the
+/// whole layout: `tmpscn` prints the template into a window where `\r` returns
+/// to column 0 but only `\n` advances a row (see
+/// [`Terminal::write`](crate::fsd::Terminal::write)). MajorMUD's own character
+/// sheet holds 22 line breaks and no `\n` at all, so fed the compact form
+/// every one of its 26 fields lands on row 0 -- "columns right, rows uniformly
+/// wrong."
+///
+/// # `xlttxv` is still not applied
+///
+/// The C composes the two. Text-variable expansion is a content change rather
+/// than a whitespace one, neither of MajorMUD's templates contains the `0x01`
+/// byte that marks one, and applying it at one template call site and not the
+/// others would be worse than applying it nowhere. See
+/// [`fsdrft`](crate::shims::fsd::fsdrft).
+#[must_use]
+pub fn getasc(compact: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(compact.len() + compact.len() / 8);
+    for &byte in compact {
+        match byte {
+            b'\r' | b'\n' => out.extend_from_slice(b"\r\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Bytes of `struct msgblk`, as `MSGUTL.H` declares it: five far pointers, an
 /// `int`, three `long`s and two more `int`s.
 const MSGBLK: usize = 5 * 4 + 2 + 3 * 4 + 2 + 2;

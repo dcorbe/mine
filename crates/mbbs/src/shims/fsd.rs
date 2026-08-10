@@ -190,14 +190,19 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         )));
     }
 
-    let template = crate::shims::msg::message(machine, host, number)?;
-    let template = machine.read_cstr(template)?.to_vec();
+    // The block that is current *now*, which is the one `fsdroom` compiles
+    // against and records for `fsdrft` to come back to later.
+    let curmbk = host
+        .globals()
+        .pointer(machine, "curmbk")
+        .map_err(|e| ShimError::Failed(format!("fsdroom: {e}")))?;
+    let template = fsd_template(machine, host, curmbk, number, amode)?;
     let spec = machine.read_cstr(machine.arg_far(1))?.to_vec();
 
     // `maxfld`, `FSDBBS.C:130`: the field array and the punctuation array share
     // the output buffer, and the punctuation array gets its MBPMAX first.
     let max_fields = (OUTBSZ - MBPMAX) / fsd::FSDFLD;
-    let form = fsd::compile(&template, &spec, max_fields);
+    let form = fsd::compile(&template, &spec, max_fields, ascn_for(amode));
 
     if !form.errors.is_empty() {
         return Err(ShimError::Failed(format!(
@@ -758,6 +763,42 @@ fn fsdcof(host: &mut Host, chan: Chan, scnwid: u16) {
 /// this found nothing already modeling it.
 const ENTERING: u16 = 1;
 
+/// The template text an FSD form is compiled and driven against, for one
+/// `amode`. `FSDBBS.C:137`.
+///
+///
+/// Every place this crate needs the template goes through here, and that is
+/// the point rather than tidiness: a field's `tmpoff` is an offset *into this
+/// string*, so compiling against one form and later reading against the other
+/// would put the punctuation scan, and eventually the module's own redisplay,
+/// on the wrong bytes. [`getasc`](crate::msg::getasc) inserts a byte per line
+/// break, so the two forms disagree from the first one onward.
+fn fsd_template(
+    machine: &Machine,
+    host: &Host,
+    block: FarPtr,
+    number: u16,
+    amode: i16,
+) -> Result<Vec<u8>, ShimError> {
+    let at = host.messages.text(block, number).map_err(ShimError::Failed)?;
+    let compact = machine.read_cstr(at)?.to_vec();
+    Ok(if amode == -1 {
+        compact
+    } else {
+        crate::msg::getasc(&compact)
+    })
+}
+
+/// Which of `fsdppc`'s two scanning modes an `amode` asks for.
+/// `amode == 1` (`FSDBBS.C:139`), and nothing else.
+fn ascn_for(amode: i16) -> fsd::Ascn {
+    if amode == 1 {
+        fsd::Ascn::Ansi
+    } else {
+        fsd::Ascn::Line
+    }
+}
+
 /// `eurmsk`, the high-bit mask `fsdchi` applies to every ordinary byte.
 /// `MAJORBBS.C:311`: `char eurmsk=0x7F;` -- "0x7F if U.S.A. only, 0xFF if
 /// European."
@@ -870,8 +911,7 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
     let form = live_form(machine, &block, &form)?;
     let spec = machine.read_cstr(block.fldspc())?.to_vec();
-    let template_at = host.messages.text(mbk, msgno).map_err(ShimError::Failed)?;
-    let template = machine.read_cstr(template_at)?.to_vec();
+    let template = fsd_template(machine, host, mbk, msgno, amode)?;
     let answers = answer_string(machine, block.newans())?;
 
     block.set_fldvfy(fldvfy);
@@ -1011,12 +1051,11 @@ pub(crate) fn fsdprc(
     };
     let form = live_form(machine, &block, &form)?;
     let spec = machine.read_cstr(block.fldspc())?.to_vec();
-    let template_at = host.messages.text(mbk, msgno).map_err(ShimError::Failed)?;
-    let template = machine.read_cstr(template_at)?.to_vec();
+    let template = fsd_template(machine, host, mbk, msgno, amode)?;
 
     let entfld = block.entfld();
-    let field = form.fields[usize::from(entfld)];
-    let candidate = fsd::candidate_answer(&field, block.ansbuf());
+    let field = &form.fields[usize::from(entfld)];
+    let candidate = fsd::candidate_answer(field, block.ansbuf());
 
     let scratch = fsd_scratch(machine, host)?;
     let mut scratch_bytes = candidate;
@@ -1476,7 +1515,7 @@ mod tests {
         // that is already tested in `fsd`.
         let template = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
         let template = f.machine.read_cstr(template).expect("text").to_vec();
-        let expected = crate::fsd::compile(&template, b"ONE TWO", (4096 - 200) / 23)
+        let expected = crate::fsd::compile(&template, b"ONE TWO", (4096 - 200) / 23, fsd::Ascn::Line)
             .size()
             .expect("fits");
 

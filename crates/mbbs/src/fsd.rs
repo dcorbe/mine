@@ -60,6 +60,15 @@ const FLDNAM: u16 = 12;
 /// Maximum length of the help field. `FSD.H:243`.
 const MAXHLP: u16 = 80;
 
+/// Maximum length of an ANSI cursor-goto command. `FSD.H:241`, where it is
+/// spelled `(2+2+1+2+1)`: `ESC [`, two digits, `;`, two digits, `f`.
+///
+/// Eight is exactly enough for `ESC[99;99f`, which is why `tmpfld` clamps both
+/// coordinates to 98 before adding one to them (`FSD.C:272-277`) -- and why
+/// `FSD.H:233` says the FSD "is fundamentally limited to a 99 by 99 screen,
+/// due to the formatting capability in ibm2ans() and qotnum()".
+pub const GTOLEN: usize = 8;
+
 /// Maximum size of the embedded-punctuation array. `FSDBBS.H:208`.
 pub const MBPMAX: u16 = 200;
 
@@ -123,6 +132,12 @@ pub mod scb {
     pub const MAXANS: u16 = 27;
     /// `char hlplen` -- the help field's width, or 0.
     pub const HLPLEN: u16 = 29;
+    /// `char hlpgto[GTOLEN+1]` -- the cursor-goto command for the help area,
+    /// or an empty string off the ANSI path. `FSD.C:369-376`.
+    pub const HLPGTO: u16 = 30;
+    /// `char hlpatr` -- the help area's display attribute. `0x07` off the ANSI
+    /// path.
+    pub const HLPATR: u16 = 39;
     /// `int hlpoff` -- where the help field starts in the template.
     pub const HLPOFF: u16 = 40;
     /// `int allans` -- the answer string's current length.
@@ -196,6 +211,14 @@ pub mod scb {
 
     /// `char chgcnt` -- count of changes during the session. `FSD.H:320`.
     pub const CHGCNT: u16 = 164;
+
+    /// `char maxy` -- the lowest row any field reached, plus whatever the
+    /// template's own tail added. `FSD.H:321`.
+    ///
+    /// The last byte of the structure, and the one `goback` reads to park the
+    /// cursor below the form on the way out (`FSDBBS.C:228`). Zero off the
+    /// ANSI path, where nothing ever tracks a row.
+    pub const MAXY: u16 = 165;
 }
 
 /// FSD entry-engine state codes, `FSD.H:326-334`. `fsdscb->state` drives
@@ -345,7 +368,7 @@ fn is_space(b: u8) -> bool {
 /// The two members the C struct has that this does not -- `ansoff` and `anslen`
 /// -- belong to `fsdans()`, which installs an answer string. Nothing here has
 /// an answer. See [`FSDFLD`] for why leaving them out costs nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// How many characters of answer fit, punctuation excluded.
     pub width: u8,
@@ -356,6 +379,15 @@ pub struct Field {
 
     /// The display attribute. Always `0x07` off the ANSI path.
     pub attr: u8,
+
+    /// The ANSI command that moves the cursor to this field's first character,
+    /// or empty off the ANSI path. `char ansgto[GTOLEN+1]`, `FSD.H:250`.
+    ///
+    /// Held without its NUL terminator, so an empty vector really does mean
+    /// "no goto" rather than "a goto of length zero" -- which is the
+    /// distinction `shofld` and friends test when they decide whether to emit
+    /// it at all.
+    pub ansgto: Vec<u8>,
 
     /// `FFF*` bits, from the field's options. See [`flags`].
     pub flags: u8,
@@ -388,7 +420,14 @@ impl Field {
     /// is the same zero every run.
     pub fn record(&self, ansoff: u16, anslen: u8) -> [u8; FSDFLD as usize] {
         let mut out = [0u8; FSDFLD as usize];
-        out[fld::ANSGTO] = 0;
+        // `char ansgto[GTOLEN+1]`, NUL-terminated in place. Off the ANSI path
+        // this is empty and the array stays the zeros `alczer` left, which is
+        // what the original does too -- `fsdppc(templt,0)` never writes it.
+        // The clamp cannot fire: the coordinates are clamped to 98 before
+        // formatting, so the longest possible value is `ESC[99;99f`, exactly
+        // GTOLEN.
+        let gto = &self.ansgto[..self.ansgto.len().min(GTOLEN)];
+        out[fld::ANSGTO..fld::ANSGTO + gto.len()].copy_from_slice(gto);
         out[fld::WIDTH] = self.width;
         out[fld::XWIDTH] = self.xwidth;
         out[fld::ATTR] = self.attr;
@@ -418,10 +457,13 @@ impl Field {
     /// rather than to the field, and a caller that needs them has the record.
     pub fn from_record(record: &[u8; FSDFLD as usize]) -> Self {
         let mbpoff = i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]);
+        let gto = &record[fld::ANSGTO..fld::ANSGTO + GTOLEN + 1];
+        let gto = &gto[..gto.iter().position(|&b| b == 0).unwrap_or(GTOLEN)];
         Self {
             width: record[fld::WIDTH],
             xwidth: record[fld::XWIDTH],
             attr: record[fld::ATTR],
+            ansgto: gto.to_vec(),
             flags: record[fld::FLAGS],
             kind: record[fld::FLDTYP],
             spec_at: u16::from_le_bytes([record[fld::FSPOFF], record[fld::FSPOFF + 1]]),
@@ -841,6 +883,21 @@ pub struct Form {
 
     /// Where the help field starts in the template.
     pub help_at: u16,
+
+    /// The ANSI command that moves the cursor to the help area, or empty off
+    /// the ANSI path. `fsdscb->hlpgto`, `FSD.C:369-376`.
+    pub help_gto: Vec<u8>,
+
+    /// The help area's display attribute. `0x07` off the ANSI path.
+    pub help_attr: u8,
+
+    /// The lowest row the template reached. `fsdscb->maxy`, `FSD.C:277-279`
+    /// and `:417-419`.
+    ///
+    /// Zero off the ANSI path. `goback` parks the cursor at `maxy+1` on the
+    /// way out (`FSDBBS.C:228`), so this is the number that decides where a
+    /// finished full-screen session leaves the terminal.
+    pub max_y: u8,
 
     /// Everything wrong with the pair, in the order found.
     ///
@@ -1750,7 +1807,7 @@ const SECCHR: u8 = b'*';
 /// `punctuation` has from `field.punctuation_at` on. Unreachable through
 /// [`fsdlin`], because both come from the same compiled [`Form`]; reachable
 /// only if a caller hands `dspans` a field and a punctuation array that did
-/// not come from one `compile()` call together.
+/// not come from one `compile(, Ascn::Line)` call together.
 fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec<u8>, i16) {
     let answer = c_str(answer);
     let anslen = answer.len() as i16;
@@ -1964,7 +2021,7 @@ pub fn entprp(scb: &mut Scb) {
 /// to decide "blank or literal" in the first place, so position 0 is always
 /// "matches its own kind" and therefore always a space. `skppnc`'s echo loop
 /// can only ever run zero times against a `Form` this crate's own
-/// `compile()` built. It is ported anyway, faithfully, because that is what
+/// `compile(, Ascn::Line)` built. It is ported anyway, faithfully, because that is what
 /// `FSD.C` does and because the loop is not dead against a `Form` built by
 /// hand -- which is exactly how this file's own tests exercise it.
 pub fn skppnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
@@ -2194,9 +2251,9 @@ pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
 /// source-of-truth substitution already says once: drop the answer's last
 /// byte and re-terminate. [`Scb::set_ansbuf`] does both.
 pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
-    let field = form.fields[usize::from(scb.crsfld())];
+    let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
-    if !scb.ansbuf().is_empty() && bstalt(&field, scb) {
+    if !scb.ansbuf().is_empty() && bstalt(field, scb) {
         let mut answer = scb.ansbuf().to_vec();
         answer.pop();
         scb.set_ansbuf(&answer);
@@ -2342,7 +2399,7 @@ fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
 /// through both branches to [`Hdlprt::Ignore`], matching the original's own
 /// fall-through to its final `return(0);`.
 pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
-    let field = form.fields[usize::from(scb.crsfld())];
+    let field = &form.fields[usize::from(scb.crsfld())];
     if field.flags & flags::ALTERNATES == 0 {
         return (Hdlprt::Ignore, Vec::new());
     }
@@ -2358,23 +2415,23 @@ pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
         // would just match the alternate already selected and get stuck
         // instead of falling through to the wrap-to-first step below.
         let mut candidate = if let Some(at) = old {
-            next_alternate(spec, &field, at)
+            next_alternate(spec, field, at)
         } else if !scb.ansbuf().is_empty() {
-            first_alternate_starting_with(spec, &field, scb.ansbuf())
+            first_alternate_starting_with(spec, field, scb.ansbuf())
         } else {
             None
         };
         // `if (altptr == NULL) { altptr=foptkn("ALT=",0); }`, `FSD.C:1443-1445`
         // -- unconditional once the branch above didn't land anywhere: this
         // is the wrap, landing back on the first alternate in the list.
-        if candidate.is_none() && !alternates(spec, &field).is_empty() {
+        if candidate.is_none() && !alternates(spec, field).is_empty() {
             candidate = Some(0);
         }
         match candidate {
             None => (Hdlprt::Ignore, Vec::new()),
             Some(at) if Some(at) == old => (Hdlprt::Ignore, Vec::new()),
             Some(at) => {
-                let spelling = alternates(spec, &field)[usize::from(at)].to_vec();
+                let spelling = alternates(spec, field)[usize::from(at)].to_vec();
                 (Hdlprt::Handled, altntr(form, scb, at, &spelling))
             }
         }
@@ -2385,7 +2442,7 @@ pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
         }
         candidate.push(c);
 
-        let mut matches = matching_alternates(spec, &field, &candidate);
+        let mut matches = matching_alternates(spec, field, &candidate);
         match matches.len() {
             0 => (Hdlprt::Ignore, Vec::new()),
             1 => {
@@ -2466,7 +2523,7 @@ pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
 /// port's own `hdlalt`/`hdlprt` on any `#`/`$` ALT= field a specification
 /// could name.)
 pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
-    let field = form.fields[usize::from(scb.crsfld())];
+    let field = &form.fields[usize::from(scb.crsfld())];
     match field.kind {
         b'Y' | b'?' => {
             if field.flags & flags::MULTICHOICE != 0 {
@@ -3184,7 +3241,7 @@ impl Terminal {
 /// `max_fields` is the host's `maxfld`: how many `struct fsdfld` fit in the
 /// output buffer beside the punctuation array. Scanning stops there rather than
 /// running off the end of a buffer the caller has not got.
-pub fn compile(template: &[u8], spec: &[u8], max_fields: u16) -> Form {
+pub fn compile(template: &[u8], spec: &[u8], max_fields: u16, ascn: Ascn) -> Form {
     let mut form = Form {
         fields: Vec::new(),
         in_template: 0,
@@ -3192,13 +3249,38 @@ pub fn compile(template: &[u8], spec: &[u8], max_fields: u16) -> Form {
         answer_max: 0,
         help_len: 0,
         help_at: 0,
+        help_gto: Vec::new(),
+        help_attr: 0x07,
+        max_y: 0,
         errors: Vec::new(),
     };
     spec_scan(&mut form, spec, max_fields);
     options(&mut form, spec);
-    template_scan(&mut form, template);
+    template_scan(&mut form, template, ascn);
     punctuation(&mut form, template);
     form
+}
+
+/// `fsdppc`'s `ascn` argument (`FSD.C:463`): whether a full-screen entry
+/// session is coming.
+///
+/// It decides one thing, in `tmpscn`: whether the template is *printed* into
+/// an off-screen window so each field's cursor position can be read back
+/// (`FSD.C:311-319`). Everything else the compiler computes is the same either
+/// way.
+///
+/// A bool would do, and the C uses one. This does not, because
+/// `compile(t, s, MANY, false)` at forty call sites says nothing about what
+/// the `false` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ascn {
+    /// `ascn=0`. No screen library, no cursor tracking: every field's
+    /// `ansgto` comes out empty and its `attr` `0x07` (`FSD.C:284-287`).
+    Line,
+
+    /// `ascn=1`. Track the cursor across the template and record where each
+    /// field lands.
+    Ansi,
 }
 
 /// `fspscn()`, `FSD.C:175`: split the specification into named fields.
@@ -3249,6 +3331,7 @@ fn spec_scan(form: &mut Form, spec: &[u8], max_fields: u16) {
             width: 0,
             xwidth: 0,
             attr: 0,
+            ansgto: Vec::new(),
             flags: 0,
             kind: 0,
             spec_at: name_at as u16,
@@ -3347,10 +3430,11 @@ fn options(form: &mut Form, spec: &[u8]) {
 }
 
 /// `tmpfld()`, `FSD.C:265`: record where a field landed in the template.
-fn place(form: &mut Form, index: usize, at: u16, width: u16) {
+fn place(form: &mut Form, index: usize, at: u16, width: u16, look: &Look) {
     let width = u8::try_from(width.min(ANSLEN)).expect("ANSLEN fits in a byte");
     let field = &mut form.fields[index];
-    field.attr = 0x07;
+    field.attr = look.attr;
+    field.ansgto.clone_from(&look.gto);
     field.template_at = at;
     field.xwidth = width;
     field.width = width;
@@ -3358,14 +3442,131 @@ fn place(form: &mut Form, index: usize, at: u16, width: u16) {
     form.answer_max = form.answer_max.saturating_add(u16::from(width));
 }
 
+/// Where the cursor stood, and under what attribute, when one field's run was
+/// reached. The `if (ansiscn)`/`else` pair at the head of `tmpfld`
+/// (`FSD.C:270-287`), as a value.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Look {
+    /// `sprintf(fldptr->ansgto,"\x1B[%d;%df",y+1,x+1)`, or empty.
+    gto: Vec<u8>,
+    /// `curatr.attrib`, or `0x07`.
+    attr: u8,
+}
+
+/// The off-screen window `tmpscn` prints the template into, and the cursor
+/// readback it does per field.
+///
+/// # Why the chunking collapses
+///
+/// The original prints in pieces: at each field run it NUL-punches the
+/// template, `printf`s from the last piece's start up to the run, restores the
+/// byte, and moves `supsrt` to the run (`FSD.C:343-347`), with a final
+/// `printf` of the tail after the loop (`FSD.C:416`). Those pieces are
+/// contiguous and in order, so between them they print the whole template
+/// exactly once -- which means "the cursor when field *k* was reached" is just
+/// "the cursor after writing `template[..k]`". This feeds the tracker lazily
+/// to the same effect, without the NUL-punching.
+struct Painter<'a> {
+    ascn: Ascn,
+    template: &'a [u8],
+    terminal: Terminal,
+    /// How much of `template` has reached the window.
+    fed: usize,
+    /// The first thing the tracker refused, if anything. Kept rather than
+    /// returned so a template with an unmodelled escape still compiles its
+    /// other 25 fields, exactly as `ppcerr` lets `tmpscn` keep scanning.
+    failure: Option<(usize, TerminalError)>,
+}
+
+impl<'a> Painter<'a> {
+    fn new(template: &'a [u8], ascn: Ascn) -> Self {
+        Self {
+            ascn,
+            template,
+            terminal: Terminal::new(),
+            fed: 0,
+            failure: None,
+        }
+    }
+
+    /// Print up to `upto`, read the cursor back, and resume from `resume`.
+    ///
+    /// The two offsets differ only for a `Y/N` field, where the original
+    /// prints up to the `Y` and then restarts from the `/` -- leaving the `Y`
+    /// itself never printed. See [`Painter::look`]'s caller.
+    fn look(&mut self, upto: usize, resume: usize) -> Look {
+        if self.ascn == Ascn::Line {
+            // `FSD.C:284-287`: the whole ANSI branch is skipped and these two
+            // constants are what a field gets. Still correct, still taken.
+            return Look {
+                gto: Vec::new(),
+                attr: 0x07,
+            };
+        }
+        self.feed(upto);
+        self.fed = resume;
+
+        // `if ((y=curcury()) > 98) y=98;` and the same for x (`FSD.C:272-277`).
+        // Both are `char` locals, and the clamp is what keeps the formatted
+        // result inside `ansgto[GTOLEN+1]`. Dead at a 25x80 window, and
+        // reproduced anyway: it is the C's own arithmetic, not a safety net
+        // this port added.
+        let y = self.terminal.y().min(98);
+        let x = self.terminal.x().min(98);
+        Look {
+            gto: format!("\x1b[{};{}f", y + 1, x + 1).into_bytes(),
+            attr: self.terminal.attr(),
+        }
+    }
+
+    /// `if (curcury() > fsdscb->maxy) fsdscb->maxy=curcury();`, `FSD.C:277-279`.
+    ///
+    /// Note it compares the **unclamped** `curcury()` while `ansgto` above is
+    /// built from the clamped copy. Reproduced rather than tidied: at a 25-row
+    /// window the two never differ, but the asymmetry is the C's.
+    fn note_max_y(&self, form: &mut Form) {
+        if self.ascn == Ascn::Ansi {
+            let y = u8::try_from(self.terminal.y()).unwrap_or(u8::MAX);
+            form.max_y = form.max_y.max(y);
+        }
+    }
+
+    /// The trailing `printf("%s",supsrt)` and the `maxy` update after it,
+    /// `FSD.C:416-419`.
+    fn finish(&mut self, form: &mut Form) {
+        if self.ascn == Ascn::Ansi {
+            let end = self.template.len();
+            self.feed(end);
+            self.note_max_y(form);
+        }
+        if let Some((at, error)) = &self.failure {
+            form.errors
+                .push(format!("Template offset {at}: {error}"));
+        }
+    }
+
+    /// Bring the window up to `upto`, remembering the first refusal.
+    fn feed(&mut self, upto: usize) {
+        if self.failure.is_some() || upto <= self.fed {
+            return;
+        }
+        let chunk = &self.template[self.fed..upto];
+        if let Err(e) = self.terminal.write(chunk) {
+            self.failure = Some((self.fed, e));
+        }
+        self.fed = upto;
+    }
+}
+
 /// `tmpscn()`, `FSD.C:299`: find the field runs in the template.
-fn template_scan(form: &mut Form, template: &[u8]) {
+fn template_scan(form: &mut Form, template: &[u8], ascn: Ascn) {
     let end = template
         .iter()
         .position(|b| *b == 0)
         .unwrap_or(template.len());
     let template = &template[..end];
 
+    let mut painter = Painter::new(template, ascn);
     let mut placed = 0usize;
     let mut last = 0u8;
     let mut joining = false;
@@ -3411,10 +3612,19 @@ fn template_scan(form: &mut Form, template: &[u8]) {
                     }
                     form.answer_max = form.answer_max.saturating_add(run);
                 } else if kind == Kind::Exc {
+                    // The help field. `FSD.C:367-377` reads the cursor back
+                    // for it exactly as `tmpfld` does for a real field, but
+                    // *without* the 98 clamp and without touching `maxy` --
+                    // both differences are the C's, not this port's.
+                    let look = painter.look(usize::from(off), usize::from(off));
+                    form.help_gto = look.gto;
+                    form.help_attr = look.attr;
                     form.help_len = u8::try_from(run.min(MAXHLP)).expect("fits");
                     form.help_at = off;
                 } else if placed < form.fields.len() {
-                    place(form, placed, off, run);
+                    let look = painter.look(usize::from(off), usize::from(off));
+                    painter.note_max_y(form);
+                    place(form, placed, off, run, &look);
                     placed += 1;
                     joining = true;
                 }
@@ -3427,7 +3637,17 @@ fn template_scan(form: &mut Form, template: &[u8]) {
                     .get(at + 1)
                     .is_some_and(|b| b.eq_ignore_ascii_case(&b'N'));
                 if off > 0 && before && after && placed < form.fields.len() {
-                    place(form, placed, off - 1, 3);
+                    // `cp[-1]='\0'; printf("%s",supsrt); cp[-1]='Y';
+                    // supsrt=cp;` -- FSD.C:1409-1412. Read the cursor where
+                    // the `Y` stands, then resume printing from the `/`, so
+                    // the `Y` itself is **never printed into the window**.
+                    // Every column after a Y/N field is therefore one to the
+                    // left of where the text really is. That is a bug, and it
+                    // is the original's; MajorMUD's own form has no Y/N field
+                    // so nothing here exercises it.
+                    let look = painter.look(usize::from(off) - 1, usize::from(off));
+                    painter.note_max_y(form);
+                    place(form, placed, off - 1, 3, &look);
                     last = c;
                     let field = &mut form.fields[placed];
                     if field.flags
@@ -3456,6 +3676,7 @@ fn template_scan(form: &mut Form, template: &[u8]) {
             }
         }
     }
+    painter.finish(form);
     form.in_template = placed;
 }
 
@@ -3798,7 +4019,7 @@ pub fn fsdprc(
     bufptr: &[u8],
 ) -> (Vec<u8>, bool) {
     let entfld = usize::from(scb.entfld());
-    let field = form.fields[entfld];
+    let field = &form.fields[entfld];
     let mut fldi = scb.crsfld();
     let reprmt_orig = usize::from(fldi) != entfld;
     let mut reprmt = reprmt_orig;
@@ -3809,7 +4030,7 @@ pub fn fsdprc(
     if vc == verify::VFYOK {
         delta = store(answers, entfld, bufptr);
     } else if vc == verify::VFYCHK {
-        match verify_locally(spec, &field, bufptr) {
+        match verify_locally(spec, field, bufptr) {
             Ok(accepted) => delta = store(answers, entfld, &accepted),
             Err(message) => {
                 rejected = true;
@@ -3907,7 +4128,7 @@ mod tests {
 
     #[test]
     fn a_field_spec_is_a_list_of_names() {
-        let form = compile(b"", b"ONE TWO THREE", MANY);
+        let form = compile(b"", b"ONE TWO THREE", MANY, Ascn::Line);
         assert_eq!(form.fields.len(), 3);
         assert_eq!(form.errors, Vec::<String>::new());
 
@@ -3918,7 +4139,7 @@ mod tests {
 
     #[test]
     fn options_are_read_into_flags() {
-        let form = compile(b"", b"A(MIN=10, MAX=250) B(MULTICHOICE) C(SECRET)", MANY);
+        let form = compile(b"", b"A(MIN=10, MAX=250) B(MULTICHOICE) C(SECRET)", MANY, Ascn::Line);
         assert_eq!(form.fields.len(), 3);
         assert_eq!(form.fields[0].flags, flags::MINMAX | flags::NONNEGATIVE);
         assert_eq!(form.fields[1].flags, flags::MULTICHOICE);
@@ -3930,13 +4151,13 @@ mod tests {
         // `chkops` sets FFFNNG unless the character after `MIN=` is '-'. It is
         // the only thing that reads the option's *value*, so it is the only
         // place a wrong pointer into the spec would show.
-        let form = compile(b"", b"A(MIN=-10)", MANY);
+        let form = compile(b"", b"A(MIN=-10)", MANY, Ascn::Line);
         assert_eq!(form.fields[0].flags, flags::MINMAX);
     }
 
     #[test]
     fn an_option_list_that_never_closes_is_an_error_and_not_a_panic() {
-        let form = compile(b"", b"A(MIN=1", MANY);
+        let form = compile(b"", b"A(MIN=1", MANY, Ascn::Line);
         assert_eq!(form.fields.len(), 1);
         assert_eq!(form.errors.len(), 1);
         assert!(form.errors[0].contains("missing ')'"), "{:?}", form.errors);
@@ -3944,21 +4165,21 @@ mod tests {
 
     #[test]
     fn a_name_longer_than_fldnam_is_named() {
-        let form = compile(b"", b"A_VERY_LONG_NAME_INDEED", MANY);
+        let form = compile(b"", b"A_VERY_LONG_NAME_INDEED", MANY, Ascn::Line);
         assert_eq!(form.errors.len(), 1);
         assert!(form.errors[0].contains("too long"), "{:?}", form.errors);
     }
 
     #[test]
     fn scanning_stops_at_the_field_limit() {
-        let form = compile(b"", b"A B C D E", 3);
+        let form = compile(b"", b"A B C D E", 3, Ascn::Line);
         assert_eq!(form.fields.len(), 3);
     }
 
     #[test]
     fn a_run_of_field_characters_is_a_field_and_a_single_one_is_not() {
         // Two or more, which is why a one-character answer cannot be spelled.
-        let form = compile(b"a ? b ?? c", b"ONE TWO", MANY);
+        let form = compile(b"a ? b ?? c", b"ONE TWO", MANY, Ascn::Line);
         assert_eq!(form.fields.len(), 2, "the spec names two");
         assert_eq!(form.in_template, 1, "the template has room for one");
         assert_eq!(form.fields[0].template_at, 6);
@@ -3968,13 +4189,13 @@ mod tests {
 
     #[test]
     fn white_space_separates_fields_and_punctuation_joins_them() {
-        let apart = compile(b"?? ??", b"A B", MANY);
+        let apart = compile(b"?? ??", b"A B", MANY, Ascn::Line);
         assert_eq!(apart.in_template, 2);
         assert!(apart.punctuation.is_empty());
 
         // `###-####` is one field of seven characters spanning eight, and the
         // punctuation template is what a session prints between the halves.
-        let joined = compile(b"Phone ###-####", b"PHONE", MANY);
+        let joined = compile(b"Phone ###-####", b"PHONE", MANY, Ascn::Line);
         assert_eq!(joined.in_template, 1);
         assert_eq!(joined.fields[0].width, 7);
         assert_eq!(joined.fields[0].xwidth, 8);
@@ -3987,14 +4208,14 @@ mod tests {
     fn dollar_runs_do_not_join_because_only_hash_and_question_are_subfields() {
         // `TMPSFD` is `TMPPND`, so `$` is below it. Two `$$` runs with a dash
         // between are two fields, not one -- unlike the `###-####` above.
-        let form = compile(b"$$-$$", b"A B", MANY);
+        let form = compile(b"$$-$$", b"A B", MANY, Ascn::Line);
         assert_eq!(form.in_template, 2);
         assert!(form.punctuation.is_empty());
     }
 
     #[test]
     fn a_slash_between_y_and_n_makes_a_three_character_choice() {
-        let form = compile(b"Ok Y/N", b"OK", MANY);
+        let form = compile(b"Ok Y/N", b"OK", MANY, Ascn::Line);
         assert_eq!(form.in_template, 1);
         assert_eq!(form.fields[0].template_at, 3, "it starts at the Y");
         assert_eq!(form.fields[0].width, 3);
@@ -4008,14 +4229,14 @@ mod tests {
 
     #[test]
     fn a_yes_no_field_may_not_also_carry_options() {
-        let form = compile(b"Ok Y/N", b"OK(MULTICHOICE)", MANY);
+        let form = compile(b"Ok Y/N", b"OK(MULTICHOICE)", MANY, Ascn::Line);
         assert_eq!(form.errors.len(), 1);
         assert!(form.errors[0].contains("Y/N"), "{:?}", form.errors);
     }
 
     #[test]
     fn a_bang_run_is_the_help_field_and_not_a_field() {
-        let form = compile(b"?? !!!!!", b"F", MANY);
+        let form = compile(b"?? !!!!!", b"F", MANY, Ascn::Line);
         assert_eq!(form.in_template, 1, "the help field is not one of them");
         assert_eq!(form.help_len, 5);
         assert_eq!(form.help_at, 3);
@@ -4026,14 +4247,14 @@ mod tests {
         // MajorMUD's ANSI template is 194 bytes of box drawing, in runs. If
         // `tmpspc[]` were indexed as a signed char those runs would read as
         // field characters and invent fields out of the borders.
-        let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY);
+        let form = compile("\u{c4}\u{c4}\u{c4}\u{c4} ??".as_bytes(), b"A B", MANY, Ascn::Line);
         assert_eq!(form.in_template, 1);
     }
 
     #[test]
     fn an_answer_matching_one_alternate_gives_its_position() {
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             ordinal(spec, &form.fields[0], b"Brown"),
             Some((1, b"Brown".to_vec()))
@@ -4051,7 +4272,7 @@ mod tests {
         // it. That is why FSD.H:656 can say "answer is available via
         // fsdnan(fldi)" -- it has rewritten it.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             ordinal(spec, &form.fields[0], b"br"),
             Some((1, b"Brown".to_vec()))
@@ -4064,7 +4285,7 @@ mod tests {
         // answer, and returning the first would pick a hair colour for the
         // player.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(ordinal(spec, &form.fields[0], b"B"), None);
     }
 
@@ -4072,7 +4293,7 @@ mod tests {
     fn white_space_inside_the_answer_is_removed_before_matching() {
         // `rmvwht(bufptr)` -- every space, not merely the outer ones.
         let spec = b"C(ALT=Black ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             ordinal(spec, &form.fields[0], b" R e d "),
             Some((1, b"Red".to_vec()))
@@ -4085,7 +4306,7 @@ mod tests {
         // position in the option list. Counting only candidates would number
         // the last of five as 0.
         let spec = b"C(ALT=Aa ALT=Bb ALT=Cc ALT=Dd ALT=Ee)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             ordinal(spec, &form.fields[0], b"Ee"),
             Some((4, b"Ee".to_vec()))
@@ -4095,11 +4316,11 @@ mod tests {
     #[test]
     fn a_field_with_no_alternates_has_no_ordinal() {
         let spec = b"C(MIN=1 MAX=9)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(ordinal(spec, &form.fields[0], b"5"), None);
 
         let bare = b"C";
-        let form = compile(b"??????", bare, MANY);
+        let form = compile(b"??????", bare, MANY, Ascn::Line);
         assert_eq!(ordinal(bare, &form.fields[0], b"5"), None);
     }
 
@@ -4110,7 +4331,7 @@ mod tests {
         // does not have and may not have. So NO is 0 and YES is 1, from a
         // string that appears nowhere in the module's field specification.
         let spec = b"OK";
-        let form = compile(b"Ok Y/N", spec, MANY);
+        let form = compile(b"Ok Y/N", spec, MANY, Ascn::Line);
         assert_eq!(form.fields[0].kind, b'Y');
         assert_eq!(
             ordinal(spec, &form.fields[0], b"YES"),
@@ -4129,14 +4350,14 @@ mod tests {
         // first-character test is the whole of it, and only a zero-length
         // alternate has a zero first character.
         let spec = b"C(ALT=Black ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(ordinal(spec, &form.fields[0], b""), None);
         assert_eq!(ordinal(spec, &form.fields[0], b"   "), None);
 
         // FSD.H:214: `ALT=` is how a blank answer is spelled, and it is the one
         // alternate allowed to be a substring of every other.
         let blank = b"C(ALT=Black ALT= ALT=Red)";
-        let form = compile(b"??????", blank, MANY);
+        let form = compile(b"??????", blank, MANY, Ascn::Line);
         assert_eq!(ordinal(blank, &form.fields[0], b""), Some((1, Vec::new())));
     }
 
@@ -4148,7 +4369,7 @@ mod tests {
         // and `fsdord` stores its length in a `char`.
         let long = "A".repeat(200);
         let spec = format!("C(ALT={long}").into_bytes();
-        let form = compile(b"??????", &spec, MANY);
+        let form = compile(b"??????", &spec, MANY, Ascn::Line);
         let alts = alternates(&spec, &form.fields[0]);
         assert_eq!(alts.len(), 1);
         assert_eq!(alts[0].len(), usize::from(ANSLEN));
@@ -4161,7 +4382,7 @@ mod tests {
         // next field's options, and every ordinal after it is counted over
         // somebody else's alternates.
         let spec = b"C(ALT=Red ALT=) D(ALT=Blue ALT=Green)";
-        let form = compile(b"?????? ??????", spec, MANY);
+        let form = compile(b"?????? ??????", spec, MANY, Ascn::Line);
 
         let c = alternates(spec, &form.fields[0]);
         assert_eq!(c, vec![&b"Red"[..], &b""[..]], "C has two, not three");
@@ -4201,7 +4422,7 @@ mod tests {
 
     #[test]
     fn installing_answers_writes_name_equals_value_per_field() {
-        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY, Ascn::Line);
         let a = answers(&form, b"NAME RANK", b"RANK=MAJOR\0\0");
 
         assert_eq!(a.text, b"NAME=\0RANK=MAJOR\0\0");
@@ -4215,7 +4436,7 @@ mod tests {
     fn an_answer_longer_than_the_field_is_truncated_to_its_width() {
         // `stzcpy(cp+1, ..., width+1)`. A default that came through whole
         // would overrun the buffer `fsdroom` sized.
-        let form = compile(b"??", b"A", MANY);
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
         assert_eq!(form.fields[0].width, 2);
         assert_eq!(answers(&form, b"A", b"A=abcdef\0\0").text, b"A=ab\0\0");
     }
@@ -4224,7 +4445,7 @@ mod tests {
     fn a_field_the_template_has_no_room_for_gets_an_empty_answer() {
         // FSD.H Note 1: fields in the spec but not in the template always have
         // zero-length answers, because their width is zero.
-        let form = compile(b"??", b"A B", MANY);
+        let form = compile(b"??", b"A B", MANY, Ascn::Line);
         assert_eq!(form.in_template, 1);
         assert_eq!(
             answers(&form, b"A B", b"A=xy\0B=zz\0\0").text,
@@ -4238,7 +4459,7 @@ mod tests {
         // produce more, every session would overrun the buffer the module
         // allocated from the number this crate gave it.
         let spec = b"NAME(MIN=1) RANK SERIALNO";
-        let form = compile(b"?????????? ?????? ####", spec, MANY);
+        let form = compile(b"?????????? ?????? ####", spec, MANY, Ascn::Line);
         let a = answers(
             &form,
             spec,
@@ -4256,7 +4477,7 @@ mod tests {
     /// along, and `allans` grows by the same delta.
     #[test]
     fn storing_a_longer_answer_moves_every_later_offset() {
-        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY, Ascn::Line);
         let mut a = answers(&form, b"NAME RANK", b"\0");
         assert_eq!(a.offsets, vec![(5u16, 0u8), (11, 0)]);
 
@@ -4270,7 +4491,7 @@ mod tests {
     /// Shorter works the same way in the other direction.
     #[test]
     fn storing_a_shorter_answer_pulls_every_later_offset_back() {
-        let form = compile(b"?????? ??????", b"NAME RANK", MANY);
+        let form = compile(b"?????? ??????", b"NAME RANK", MANY, Ascn::Line);
         let mut a = answers(&form, b"NAME RANK", b"NAME=DANIEL\0\0");
         assert_eq!(a.offsets, vec![(5u16, 6u8), (17, 0)]);
 
@@ -4285,7 +4506,7 @@ mod tests {
     /// engine can count changes (`chgcnt`) without diffing the string itself.
     #[test]
     fn storing_the_same_answer_reports_no_change() {
-        let form = compile(b"??????", b"NAME", MANY);
+        let form = compile(b"??????", b"NAME", MANY, Ascn::Line);
         let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
         assert!(!store(&mut a, 0, b"DAN"));
         assert_eq!(a.text, b"NAME=DAN\0\0", "and nothing moved");
@@ -4296,7 +4517,7 @@ mod tests {
     /// of `FSD.C:1049`.
     #[test]
     fn a_same_length_answer_is_compared_byte_by_byte() {
-        let form = compile(b"??????", b"NAME", MANY);
+        let form = compile(b"??????", b"NAME", MANY, Ascn::Line);
         let mut a = answers(&form, b"NAME", b"NAME=DAN\0\0");
         assert!(store(&mut a, 0, b"dan"), "strcmp is case-sensitive");
         assert_eq!(a.text, b"NAME=dan\0\0");
@@ -4306,7 +4527,7 @@ mod tests {
     /// storing into that field runs the loop zero times. `allans` still moves.
     #[test]
     fn storing_into_the_last_field_moves_nothing_after_it() {
-        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         let mut a = answers(&form, b"A B C", b"\0");
         assert_eq!(a.offsets, vec![(2u16, 0u8), (5, 0), (8, 0)]);
 
@@ -4321,7 +4542,7 @@ mod tests {
     /// at `fldptr` rather than running to the front of the array.
     #[test]
     fn storing_into_a_middle_field_leaves_the_earlier_ones_alone() {
-        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         let mut a = answers(&form, b"A B C", b"A=xx\0C=yy\0\0");
         assert_eq!(a.offsets, vec![(2u16, 2u8), (7, 0), (10, 2)]);
 
@@ -4336,7 +4557,7 @@ mod tests {
     /// a change.
     #[test]
     fn an_embedded_nul_ends_the_answer_being_stored() {
-        let form = compile(b"??????", b"NAME", MANY);
+        let form = compile(b"??????", b"NAME", MANY, Ascn::Line);
         let mut a = answers(&form, b"NAME", b"NAME=DA\0\0");
         assert!(!store(&mut a, 0, b"DA\0NIEL"), "strlen stops at the NUL");
         assert_eq!(a.text, b"NAME=DA\0\0");
@@ -4503,7 +4724,7 @@ mod tests {
         // space or '(', and it is what both the answer string and `fsdxan` are
         // keyed by.
         let spec = b"A(MIN=1) BB";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
         assert_eq!(name_of(spec, &form.fields[0]), b"A");
         assert_eq!(name_of(spec, &form.fields[1]), b"BB");
     }
@@ -4515,7 +4736,7 @@ mod tests {
         // over-long name shows it, and `fsdroom` refuses those -- so this
         // records the difference rather than relying on it.
         let spec = b"A_VERY_LONG_NAME_INDEED";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         assert_eq!(name_of(spec, &form.fields[0]), b"A_VERY_LONG_");
         assert_eq!(
             answers(&form, spec, b"\0").text,
@@ -4706,7 +4927,7 @@ mod tests {
         // "Name: " is six characters of literal text before the field's own
         // `??` run starts.
         let template = b"Name: ??\r\n";
-        let form = compile(template, b"NAME", MANY);
+        let form = compile(template, b"NAME", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -4719,7 +4940,7 @@ mod tests {
         // the PREVIOUS field's `tmpoff+xwidth`, not the template's start --
         // and no leading "\r\n" this time.
         let template = b"A: ?? B: ??";
-        let form = compile(template, b"A B", MANY);
+        let form = compile(template, b"A B", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(1);
 
@@ -4735,7 +4956,7 @@ mod tests {
         // altptr) is not observable in *this* test; see the sibling test
         // below for that.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_flags(entry_flags::FSDANT | entry_flags::FSDANS);
@@ -4762,7 +4983,7 @@ mod tests {
         // would treat nothing as selected and re-derive from ansbuf instead
         // of cycling on from what's already chosen.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -4775,7 +4996,7 @@ mod tests {
     #[test]
     fn defntr_blanks_ansbuf_when_the_field_has_no_answer_yet() {
         let spec = b"NAME";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -4788,7 +5009,7 @@ mod tests {
     #[test]
     fn shoabf_echoes_the_answer_buffer_for_the_current_field() {
         let spec = b"NAME";
-        let form = compile(b"????", spec, MANY);
+        let form = compile(b"????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Kaimon");
@@ -4801,7 +5022,7 @@ mod tests {
     #[test]
     fn shoabf_masks_a_secret_fields_answer() {
         let spec = b"PASS(SECRET)";
-        let form = compile(b"????", spec, MANY);
+        let form = compile(b"????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"xy");
@@ -4826,7 +5047,7 @@ mod tests {
         // assumed: an earlier version of this test asserted "555" and was
         // wrong.
         let template = b"Phone: ###-####";
-        let form = compile(template, b"PHONE", MANY);
+        let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"555");
@@ -4841,7 +5062,7 @@ mod tests {
         // loop breaks before emitting anything -- not even the leading
         // blanks let alone the dash.
         let template = b"Phone: ###-####";
-        let form = compile(template, b"PHONE", MANY);
+        let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"");
@@ -4853,7 +5074,7 @@ mod tests {
     fn fsdlin_calls_pmtfld_defntr_and_shoabf_in_that_fixed_order_and_sets_fsdnpt() {
         let template = b"Name: ??\r\n";
         let spec = b"NAME";
-        let form = compile(template, spec, MANY);
+        let form = compile(template, spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_state(0xff); // anything but FSDNPT, so the assertion below is real
         scb.set_flags(entry_flags::FSDANT);
@@ -4879,7 +5100,7 @@ mod tests {
         // the Form this pure function is handed.
         let template = b"A: ?? B: ??";
         let spec = b"A B";
-        let mut form = compile(template, spec, MANY);
+        let mut form = compile(template, spec, MANY, Ascn::Line);
         form.fields[0].flags |= flags::AVOID;
 
         let mut scb = zeroed_scb();
@@ -4939,11 +5160,11 @@ mod tests {
 
     #[test]
     fn skppnc_positions_ftmptr_but_echoes_nothing_on_a_form_this_engine_compiled() {
-        // The "provably dead" case: `compile()` never puts anything but a
+        // The "provably dead" case: `compile(, Ascn::Line)` never puts anything but a
         // blank in position 0 of a field's own punctuation template. Proven
         // directly rather than merely asserted in the doc comment.
         let template = b"Phone: ###-####";
-        let form = compile(template, b"PHONE", MANY);
+        let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mbpoff = form.fields[0].punctuation_at.expect("this field joins");
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -4954,10 +5175,10 @@ mod tests {
 
     #[test]
     fn skppnc_echoes_a_literal_prefix_on_a_hand_built_form() {
-        // `compile()` cannot produce this shape -- see the doc comment on
+        // `compile(, Ascn::Line)` cannot produce this shape -- see the doc comment on
         // `skppnc` -- but the function does not know that, and a hand-built
-        // `Form` exercises the loop `compile()`'s own output never can.
-        let mut form = compile(b"??", b"A", MANY);
+        // `Form` exercises the loop `compile(, Ascn::Line)`'s own output never can.
+        let mut form = compile(b"??", b"A", MANY, Ascn::Line);
         form.fields[0].punctuation_at = Some(0);
         form.punctuation = b"(-) \0".to_vec();
         let mut scb = zeroed_scb();
@@ -4975,7 +5196,7 @@ mod tests {
         // nothing" here -- this port's clamp reproduces that by
         // construction. `mbpoff` deliberately nonzero, so a naive
         // `ftmptr - mbpoff` without the clamp would underflow.
-        let mut form = compile(b"??", b"A", MANY);
+        let mut form = compile(b"??", b"A", MANY, Ascn::Line);
         form.fields[0].punctuation_at = Some(5);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -4986,7 +5207,7 @@ mod tests {
 
     #[test]
     fn unentr_backspaces_once_per_character_shown() {
-        let mut form = compile(b"??", b"A", MANY);
+        let mut form = compile(b"??", b"A", MANY, Ascn::Line);
         form.fields[0].punctuation_at = Some(5);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -4997,7 +5218,7 @@ mod tests {
 
     #[test]
     fn unentr_with_no_punctuation_erases_the_whole_answer() {
-        let form = compile(b"??", b"A", MANY);
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Al");
@@ -5008,7 +5229,7 @@ mod tests {
     #[test]
     fn bgnter_erases_the_old_answer_then_positions_for_the_new_one() {
         let spec = b"NAME";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Al"); // what was showing before this bgnter() call
@@ -5021,7 +5242,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FSDANS")]
     fn bgnter_refuses_the_ansi_branch_it_does_not_port() {
-        let form = compile(b"??", b"A", MANY);
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
         bgnter(&form, &mut scb);
@@ -5029,7 +5250,7 @@ mod tests {
 
     #[test]
     fn addprt_refuses_a_character_past_the_fields_width() {
-        let form = compile(b"??", b"A", MANY); // width 2
+        let form = compile(b"??", b"A", MANY, Ascn::Line); // width 2
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Al");
@@ -5040,7 +5261,7 @@ mod tests {
 
     #[test]
     fn addprt_refuses_a_space_on_a_nospaces_field() {
-        let form = compile(b"????", b"A(NOSPACES)", MANY);
+        let form = compile(b"????", b"A(NOSPACES)", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5050,7 +5271,7 @@ mod tests {
 
     #[test]
     fn addprt_masks_a_secret_fields_echo_but_not_its_storage() {
-        let form = compile(b"????", b"PASS(SECRET)", MANY);
+        let form = compile(b"????", b"PASS(SECRET)", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5065,7 +5286,7 @@ mod tests {
         // it, exactly as `shoabf`'s own test of this same fixture shows
         // the finished display doing ("555-", not "555").
         let template = b"Phone: ###-####";
-        let form = compile(template, b"PHONE", MANY);
+        let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         skppnc(&form, &mut scb); // bgnter's own precondition: ftmptr positioned
@@ -5083,7 +5304,7 @@ mod tests {
     #[test]
     fn hdlprt_enters_any_character_on_a_plain_text_field() {
         let spec = b"NAME";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5097,7 +5318,7 @@ mod tests {
         // Exercises hdlalt's own first line against a field that really is
         // MULTICHOICE but has no ALT= list to match against.
         let spec = b"F(MULTICHOICE)";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert_eq!(form.fields[0].flags, flags::MULTICHOICE);
@@ -5113,7 +5334,7 @@ mod tests {
         // still entered (the caller's own addprt appends it) but FSDANT
         // gets set to mark that a match is now in progress.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5128,7 +5349,7 @@ mod tests {
     #[test]
     fn hdlprt_enters_a_digit_on_a_numeric_field() {
         let spec = b"AGE";
-        let form = compile(b"###", spec, MANY);
+        let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5140,7 +5361,7 @@ mod tests {
     #[test]
     fn hdlprt_ignores_a_non_digit_on_a_numeric_field_with_no_alternates() {
         let spec = b"AGE";
-        let form = compile(b"###", spec, MANY);
+        let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5152,7 +5373,7 @@ mod tests {
     #[test]
     fn hdlprt_enters_a_leading_minus_on_a_signed_dollar_field() {
         let spec = b"BAL";
-        let form = compile(b"$$$", spec, MANY);
+        let form = compile(b"$$$", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert_eq!(scb.ansbuf(), b"", "nothing typed yet");
@@ -5164,7 +5385,7 @@ mod tests {
     #[test]
     fn hdlprt_refuses_a_minus_on_a_nonnegative_dollar_field() {
         let spec = b"BAL(MIN=0)";
-        let form = compile(b"$$$", spec, MANY);
+        let form = compile(b"$$$", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         assert!(form.fields[0].flags & flags::NONNEGATIVE != 0);
@@ -5181,7 +5402,7 @@ mod tests {
         // behind. This is the state hdlprt's own reset guard has to catch
         // by testing altptr, not just FSDANT: see hdlprt's own doc comment.
         let spec = b"AGE(ALT=UNK)";
-        let form = compile(b"###", spec, MANY);
+        let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"UNK");
@@ -5213,7 +5434,7 @@ mod tests {
         // alternates.
         let template = b"Code: ###-###";
         let spec = b"CODE";
-        let form = compile(template, spec, MANY);
+        let form = compile(template, spec, MANY, Ascn::Line);
         let mbpoff = form.fields[0].punctuation_at.expect("this field joins");
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -5240,7 +5461,7 @@ mod tests {
         // ansbuf non-empty means the digit-accept branch never runs at
         // all, whatever the character is -- it always falls to hdlalt.
         let spec = b"AGE";
-        let form = compile(b"###", spec, MANY);
+        let form = compile(b"###", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"1");
@@ -5261,7 +5482,7 @@ mod tests {
         // fsdinc's own dispatcher (Task 9) will, since Hdlprt::Enter's own
         // contract is "the caller appends it".
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5289,7 +5510,7 @@ mod tests {
     #[test]
     fn hdlalt_rejects_a_character_that_matches_no_alternate_at_all() {
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5309,7 +5530,7 @@ mod tests {
         // which is unconditional once FSDANT is already set (the typed
         // candidate is always ansbuf+c while FSDANT holds).
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Bl");
@@ -5326,7 +5547,7 @@ mod tests {
     #[test]
     fn hdlalt_space_cycles_to_the_first_alternate_from_a_fresh_field() {
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5346,7 +5567,7 @@ mod tests {
         // and the terminal SAVE(ALT=SAVE ALT=EDIT ALT=QUIT MULTICHOICE)
         // field rely on to let a player cycle a 2-3 item list with space.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5390,7 +5611,7 @@ mod tests {
         // at this point holds the last alternate's own spelling, so it
         // matched itself and returned `Ignore` instead of wrapping.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_altptr(Some(2));
@@ -5414,7 +5635,7 @@ mod tests {
         // whose arm falls through to `hdlalt` for any character that is not
         // a digit -- a space included.
         let spec = b"C(ALT=Black ALT=Brown)";
-        let form = compile(b"######", spec, MANY);
+        let form = compile(b"######", spec, MANY, Ascn::Line);
         assert_eq!(form.fields[0].kind, b'#');
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -5432,6 +5653,7 @@ mod tests {
             width: 5,
             xwidth: 5,
             attr: 0,
+            ansgto: Vec::new(),
             flags: flags::MULTICHOICE,
             kind: b'?',
             spec_at: 0,
@@ -5451,6 +5673,7 @@ mod tests {
             width: 5,
             xwidth: 5,
             attr: 0,
+            ansgto: Vec::new(),
             flags: flags::MULTICHOICE,
             kind: b'?',
             spec_at: 0,
@@ -5473,6 +5696,7 @@ mod tests {
             width: 5,
             xwidth: 5,
             attr: 0,
+            ansgto: Vec::new(),
             flags: flags::ALTERNATES,
             kind: b'#',
             spec_at: 0,
@@ -5494,6 +5718,7 @@ mod tests {
             width: 5,
             xwidth: 5,
             attr: 0,
+            ansgto: Vec::new(),
             flags: flags::ALTERNATES,
             kind: b'?',
             spec_at: 0,
@@ -5509,7 +5734,7 @@ mod tests {
 
     #[test]
     fn hdlcbs_does_nothing_on_an_empty_field() {
-        let form = compile(b"??", b"A", MANY);
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5519,7 +5744,7 @@ mod tests {
 
     #[test]
     fn hdlcbs_erases_one_character_with_no_punctuation() {
-        let form = compile(b"??", b"A", MANY);
+        let form = compile(b"??", b"A", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Al");
@@ -5538,7 +5763,7 @@ mod tests {
         // it, not one slot off in either direction. This is the "off-by-one
         // in cursor tracking" case a single isolated call cannot catch.
         let template = b"Phone: ###-####";
-        let form = compile(template, b"PHONE", MANY);
+        let form = compile(template, b"PHONE", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         skppnc(&form, &mut scb);
@@ -5562,7 +5787,7 @@ mod tests {
     #[test]
     fn hdlcbs_refuses_to_erase_a_committed_multichoice_alternate() {
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Black");
@@ -5579,7 +5804,7 @@ mod tests {
         // yes, clearing altptr as a side effect, and hdlcbs proceeds exactly
         // as it would with no ALT= list at all.
         let spec = b"C(ALT=Black ALT=Brown)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(form.fields[0].flags, flags::ALTERNATES);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -5601,7 +5826,7 @@ mod tests {
         // `fsdinc`-level test names, driven directly through addprt/hdlcbs
         // here since `fsdinc` itself is not built yet.
         let spec = b"NAME";
-        let form = compile(b"????????", spec, MANY); // width 8
+        let form = compile(b"????????", spec, MANY, Ascn::Line); // width 8
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
 
@@ -5627,7 +5852,7 @@ mod tests {
     #[test]
     fn xitfld_advances_crsfld_to_the_next_field_and_enters_fsdbuf() {
         let spec = b"A B C";
-        let form = compile(b"?? ?? ??", spec, MANY);
+        let form = compile(b"?? ?? ??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_ansbuf(b"Hi");
@@ -5642,7 +5867,7 @@ mod tests {
     #[test]
     fn xitfld_steps_backward_when_finc_is_negative() {
         let spec = b"A B C";
-        let form = compile(b"?? ?? ??", spec, MANY);
+        let form = compile(b"?? ?? ??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(2);
 
@@ -5660,7 +5885,7 @@ mod tests {
         // e.g. a "you may see but not type into" field), so moving forward
         // from field 0 must land on field 2, not field 1.
         let spec = b"A B C";
-        let mut form = compile(b"?? ?? ??", spec, MANY);
+        let mut form = compile(b"?? ?? ??", spec, MANY, Ascn::Line);
         form.fields[1].flags |= flags::AVOID;
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -5675,7 +5900,7 @@ mod tests {
         // No wrap in line mode (FSDANS unset): movfld's resort (-1, this
         // port's None) means crsfld is simply not written.
         let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(1); // the last field
 
@@ -5689,7 +5914,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FSDANS")]
     fn xitfld_refuses_the_ansi_branch_it_does_not_port() {
-        let form = compile(b"?? ??", b"A B", MANY);
+        let form = compile(b"?? ??", b"A B", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
         xitfld(&form, &mut scb, 1);
@@ -5701,7 +5926,7 @@ mod tests {
         // itself -- not one call per test. Three fields so the middle one
         // (crsfld=1) isn't the boundary case a last-field Enter is.
         let spec = b"A NAME B";
-        let form = compile(b"?? ????????? ??", spec, MANY);
+        let form = compile(b"?? ????????? ??", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(1);
         scb.set_state(state::FSDNPT); // what fsdlin() itself leaves a session in
@@ -5731,7 +5956,7 @@ mod tests {
         // survive FSDNPT->FSDNEN and every backspace correctly, not just
         // the answer buffer).
         let spec = b"NAME";
-        let form = compile(b"????????", spec, MANY); // width 8
+        let form = compile(b"????????", spec, MANY, Ascn::Line); // width 8
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_state(state::FSDNPT);
@@ -5764,7 +5989,7 @@ mod tests {
         // MULTICHOICE ALT= fields cycled with space -- this is the seam
         // Task 7 built and Task 9 has to actually dispatch to.
         let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_state(state::FSDNPT);
@@ -5811,7 +6036,7 @@ mod tests {
         // Ctrl-U itself is what triggered the fallthrough -- FSDNPT's own
         // body only ever runs for `c >= '!'`, and Ctrl-U (0x15) never is.
         let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
 
         // Scenario 1: field B (crsfld=1) has never been typed into this
         // session -- state is still FSDNPT when Ctrl-U arrives, even though
@@ -5867,7 +6092,7 @@ mod tests {
         // comments for the same reordering and why the plain C statement
         // order (`ansbuf[0]='\0'; bgnter();`) does not port literally.
         let spec = b"NAME";
-        let form = compile(b"????????", spec, MANY); // width 8
+        let form = compile(b"????????", spec, MANY, Ascn::Line); // width 8
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_state(state::FSDNPT);
@@ -5886,7 +6111,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "FSDNPT")]
     fn fsdinc_refuses_a_state_outside_fsdnpt_fsdnen() {
-        let form = compile(b"?? ??", b"A B", MANY);
+        let form = compile(b"?? ??", b"A B", MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_state(state::FSDAPT);
         fsdinc(&form, b"A B", &mut scb, b'x'.into());
@@ -5903,7 +6128,7 @@ mod tests {
         // it. So it must no-op cleanly: no output, no state change,
         // typing resumes normally afterward.
         let spec = b"NAME";
-        let form = compile(b"????????", spec, MANY);
+        let form = compile(b"????????", spec, MANY, Ascn::Line);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
         scb.set_state(state::FSDNPT);
@@ -5945,7 +6170,7 @@ mod tests {
     #[test]
     fn verify_locally_accepts_a_plain_answer_within_type_and_range() {
         let spec = b"AGE(MIN=1 MAX=99)";
-        let form = compile(b"##", spec, MANY);
+        let form = compile(b"##", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"42"),
             Ok(b"42".to_vec())
@@ -5960,7 +6185,7 @@ mod tests {
         // on a '#' field ('1' < '5'), which is exactly the trap this test
         // avoids by using a field type where the comparison is numeric.
         let spec = b"AGE(MIN=18 MAX=99)";
-        let form = compile(b"$$", spec, MANY);
+        let form = compile(b"$$", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"5"),
             Err(b"Enter at least 18".to_vec())
@@ -5970,7 +6195,7 @@ mod tests {
     #[test]
     fn verify_locally_rejects_above_maximum_with_chkmaxs_own_message() {
         let spec = b"AGE(MIN=18 MAX=99)";
-        let form = compile(b"$$", spec, MANY);
+        let form = compile(b"$$", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"150"),
             Err(b"Enter no higher than 99".to_vec())
@@ -5983,14 +6208,14 @@ mod tests {
         // back on (no ALT= at all) -- no message, matching the C's own
         // "fsdemg stays empty" outcome.
         let spec = b"AGE";
-        let form = compile(b"##", spec, MANY);
+        let form = compile(b"##", spec, MANY, Ascn::Line);
         assert_eq!(verify_locally(spec, &form.fields[0], b"xx"), Err(Vec::new()));
     }
 
     #[test]
     fn verify_locally_accepts_an_unequivocal_alt_match_and_rewrites_the_canonical_spelling() {
         let spec = b"COLOUR(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         // A MULTICHOICE field's chktyp is always false, so this only
         // accepts through chkalt(1)==1.
         assert_eq!(
@@ -6002,7 +6227,7 @@ mod tests {
     #[test]
     fn verify_locally_rejects_an_ambiguous_alt_match_with_the_choices_report() {
         let spec = b"COLOUR(ALT=Black ALT=Blue MULTICHOICE)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"Bl"),
             Err(b"Choices:  Black  Blue  ".to_vec())
@@ -6018,7 +6243,7 @@ mod tests {
         // "Alice" nor "Amy" at all (not even ambiguously), so chkalt
         // contributes nothing and chkmin's own message survives.
         let spec = b"NAME(ALT=Alice ALT=Amy MIN=10)";
-        let form = compile(b"??????????", spec, MANY);
+        let form = compile(b"??????????", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"Zz"),
             Err(b"Enter at least 10 character(s)".to_vec())
@@ -6035,7 +6260,7 @@ mod tests {
         // does not also prefix-match "Amy"), so the field is accepted
         // anyway, canonical spelling and all.
         let spec = b"NAME(ALT=Alice ALT=Amy MIN=10)";
-        let form = compile(b"??????????", spec, MANY);
+        let form = compile(b"??????????", spec, MANY, Ascn::Line);
         assert_eq!(
             verify_locally(spec, &form.fields[0], b"Al"),
             Ok(b"Alice".to_vec())
@@ -6047,7 +6272,7 @@ mod tests {
         let spec = b"C(ALT=Aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
                        ALT=Bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
                        MULTICHOICE)";
-        let form = compile(b"??????????????????????????????????????????????????????????????????", spec, MANY);
+        let form = compile(b"??????????????????????????????????????????????????????????????????", spec, MANY, Ascn::Line);
         let msg = choices_message(spec, &form.fields[0], b"");
         assert!(msg.ends_with(b"..."), "{}", String::from_utf8_lossy(&msg));
         assert!(msg.len() <= usize::from(MAXHLP), "{}", String::from_utf8_lossy(&msg));
@@ -6056,7 +6281,7 @@ mod tests {
     #[test]
     fn fsdprc_accepts_a_valid_answer_stores_it_and_advances_to_the_next_field() {
         let spec = b"A(MIN=1 MAX=5) B";
-        let form = compile(b"## ??", spec, MANY);
+        let form = compile(b"## ??", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         // xitfld already advanced crsfld to field 1 and set entfld=0.
         let mut scb = buffered_scb(0, 1, b'\r');
@@ -6081,7 +6306,7 @@ mod tests {
     #[test]
     fn fsdprc_rejects_an_out_of_range_answer_announces_it_and_does_not_advance() {
         let spec = b"A(MIN=10 MAX=99)";
-        let form = compile(b"$$", spec, MANY);
+        let form = compile(b"$$", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         // A single-field form: xitfld's own movfld found nowhere to go, so
         // crsfld stayed at 0 -- the same field as entfld.
@@ -6117,7 +6342,7 @@ mod tests {
     #[test]
     fn fsdprc_rejects_silently_with_just_a_beep_and_erases_what_was_typed_when_there_is_no_message() {
         let spec = b"A"; // '#' field, no MIN=/MAX=/ALT= at all
-        let form = compile(b"##", spec, MANY);
+        let form = compile(b"##", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 0, b'\r');
         scb.set_ansbuf(b"xx");
@@ -6144,7 +6369,7 @@ mod tests {
     #[test]
     fn fsdprc_ctrl_o_mid_field_exits_via_xitfsd_fsdqit() {
         let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 1, 0x0f); // 'O'-64
 
@@ -6165,7 +6390,7 @@ mod tests {
     #[test]
     fn fsdprc_esc_mid_field_exits_via_xitfsd_fsdqit() {
         let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 1, 0x1b); // ESC
 
@@ -6185,7 +6410,7 @@ mod tests {
     #[test]
     fn fsdprc_ctrl_g_exits_via_xitfsd_fsdsav() {
         let spec = b"A B";
-        let form = compile(b"?? ??", spec, MANY);
+        let form = compile(b"?? ??", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 1, 0x07); // 'G'-64
 
@@ -6208,7 +6433,7 @@ mod tests {
         // if the exit check ran anyway, this would wrongly save.
         // FSD.C:1174's `if (vc != VFYREJ)` guards the whole thing.
         let spec = b"A";
-        let form = compile(b"##", spec, MANY);
+        let form = compile(b"##", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         let mut scb = buffered_scb(0, 0, 0x07);
 
@@ -6241,7 +6466,7 @@ mod tests {
         // the callback runs and hands THIS function the already-updated
         // state, which is what this test simulates directly.
         let spec = b"A";
-        let form = compile(b"##", spec, MANY);
+        let form = compile(b"##", spec, MANY, Ascn::Line);
         let mut answers = crate::fsd::answers(&form, spec, b"\0");
         // The sentinel: xitfld stepped crsfld one past the last field.
         let mut scb = buffered_scb(0, 1, b'\r');
@@ -6275,7 +6500,7 @@ mod tests {
         // The module's fourteen `or byte [es:bx+n],0x80` sites are every one
         // `23*i+12` -- `seg 3:0x4344` is field 2 at 58 and `seg 3:0x4444` is
         // field 20 at 472.
-        let form = compile(b"Ok Y/N", b"OK", MANY);
+        let form = compile(b"Ok Y/N", b"OK", MANY, Ascn::Line);
         let record = form.fields[0].record(7, 3);
         assert_eq!(record.len(), usize::from(FSDFLD));
         assert_eq!(record[fld::FLAGS], flags::MULTICHOICE | flags::ALTERNATES);
@@ -6293,14 +6518,14 @@ mod tests {
         // `tmpfld()` sets `mbpoff = -1` and `embscn()` overwrites it only for
         // the fields that joined. Zero would name the first punctuation
         // template rather than none.
-        let plain = compile(b"?? ??", b"A B", MANY);
+        let plain = compile(b"?? ??", b"A B", MANY, Ascn::Line);
         let record = plain.fields[0].record(0, 0);
         assert_eq!(
             i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
             -1
         );
 
-        let joined = compile(b"###-####", b"P", MANY);
+        let joined = compile(b"###-####", b"P", MANY, Ascn::Line);
         let record = joined.fields[0].record(0, 0);
         assert_eq!(
             i16::from_le_bytes([record[fld::MBPOFF], record[fld::MBPOFF + 1]]),
@@ -6314,9 +6539,9 @@ mod tests {
         // with, so it has to give back what `record` put in -- flags and all,
         // since the module edits those.
         for form in [
-            compile(b"Ok Y/N", b"OK", MANY),
-            compile(b"###-####", b"P", MANY),
-            compile(b"?? ??", b"A(SECRET) B(MULTICHOICE ALT=x)", MANY),
+            compile(b"Ok Y/N", b"OK", MANY, Ascn::Line),
+            compile(b"###-####", b"P", MANY, Ascn::Line),
+            compile(b"?? ??", b"A(SECRET) B(MULTICHOICE ALT=x)", MANY, Ascn::Line),
         ] {
             for field in &form.fields {
                 assert_eq!(&Field::from_record(&field.record(41, 7)), field);
@@ -6347,7 +6572,7 @@ mod tests {
 
     #[test]
     fn the_size_is_the_three_terms_and_the_nul() {
-        let form = compile(b"?? ??", b"A B", MANY);
+        let form = compile(b"?? ??", b"A B", MANY, Ascn::Line);
         let expected = form.punctuation.len()
             + form.fields.len() * usize::from(FSDFLD)
             + usize::from(form.answer_max)
@@ -6361,7 +6586,7 @@ mod tests {
     /// there is `chkalt`'s job, not this one's.
     #[test]
     fn a_multiple_choice_field_rejects_a_typed_answer_outright() {
-        let form = compile(b"??????", b"COLOUR(MULTICHOICE ALT=RED ALT=BLUE)", MANY);
+        let form = compile(b"??????", b"COLOUR(MULTICHOICE ALT=RED ALT=BLUE)", MANY, Ascn::Line);
         assert_eq!(form.fields[0].flags & flags::MULTICHOICE, flags::MULTICHOICE);
         assert!(!type_ok(&form.fields[0], b"RED"), "not even a listed one");
         assert!(!type_ok(&form.fields[0], b""), "not even an empty one");
@@ -6371,14 +6596,14 @@ mod tests {
     /// rather than exceptional.
     #[test]
     fn a_yes_no_field_rejects_a_typed_answer_because_it_is_multiple_choice() {
-        let form = compile(b"Ok Y/N", b"OK", MANY);
+        let form = compile(b"Ok Y/N", b"OK", MANY, Ascn::Line);
         assert_eq!(form.fields[0].kind, b'Y');
         assert!(!type_ok(&form.fields[0], b"YES"));
 
         // The rest of the arm, reached by clearing the flag `tmpfld` set. `Y`
         // is grouped with `?` in the C, and this is the whole of that grouping:
         // no sign is stripped and no digit is looked for.
-        let mut typed = form.fields[0];
+        let mut typed = form.fields[0].clone();
         typed.flags = 0;
         assert!(type_ok(&typed, b"YES"));
         assert!(type_ok(&typed, b"-"));
@@ -6389,14 +6614,14 @@ mod tests {
     /// `FFFNSP` is the only other thing a `?` field checks.
     #[test]
     fn a_no_spaces_field_rejects_a_space_and_nothing_else_does() {
-        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY, Ascn::Line);
         assert_eq!(spaced.fields[0].flags, flags::NOSPACES);
         assert!(!type_ok(&spaced.fields[0], b"van Gogh"));
         assert!(type_ok(&spaced.fields[0], b"vanGogh"));
         // `strchr(bufptr,' ')` is the literal blank, not `isspace`.
         assert!(type_ok(&spaced.fields[0], b"van\tGogh"));
 
-        let plain = compile(b"??????", b"NAME", MANY);
+        let plain = compile(b"??????", b"NAME", MANY, Ascn::Line);
         assert_eq!(plain.fields[0].flags, 0);
         assert!(type_ok(&plain.fields[0], b"van Gogh"));
     }
@@ -6405,7 +6630,7 @@ mod tests {
     /// is true, measured from the genuine host.
     #[test]
     fn a_hash_field_takes_digits_and_an_empty_answer() {
-        let form = compile(b"####", b"AGE", MANY);
+        let form = compile(b"####", b"AGE", MANY, Ascn::Line);
         assert!(type_ok(&form.fields[0], b"42"));
         assert!(type_ok(&form.fields[0], b""));
         assert!(!type_ok(&form.fields[0], b"-1"), "no sign on a # field");
@@ -6421,7 +6646,7 @@ mod tests {
     /// digit -- `FSD.C:878-881`. This is the whole difference from `#`.
     #[test]
     fn a_dollar_field_takes_a_leading_minus_but_not_an_empty_answer() {
-        let form = compile(b"$$$$", b"BALANCE", MANY);
+        let form = compile(b"$$$$", b"BALANCE", MANY, Ascn::Line);
         assert!(type_ok(&form.fields[0], b"-1"));
         assert!(type_ok(&form.fields[0], b"1"));
         assert!(!type_ok(&form.fields[0], b""), "unlike a # field");
@@ -6435,7 +6660,7 @@ mod tests {
     /// C reads `FFFMCH` and `FFFNSP` in the `?`/`Y` arm and nowhere else.
     #[test]
     fn the_numeric_field_types_ignore_the_flags_the_text_ones_read() {
-        let hashes = compile(b"####", b"AGE(MULTICHOICE NOSPACES)", MANY);
+        let hashes = compile(b"####", b"AGE(MULTICHOICE NOSPACES)", MANY, Ascn::Line);
         assert_eq!(
             hashes.fields[0].flags,
             flags::MULTICHOICE | flags::NOSPACES,
@@ -6443,7 +6668,7 @@ mod tests {
         );
         assert!(type_ok(&hashes.fields[0], b"42"));
 
-        let dollars = compile(b"$$$$", b"AMT(MULTICHOICE NOSPACES)", MANY);
+        let dollars = compile(b"$$$$", b"AMT(MULTICHOICE NOSPACES)", MANY, Ascn::Line);
         assert!(type_ok(&dollars.fields[0], b"-12"));
     }
 
@@ -6452,7 +6677,7 @@ mod tests {
     /// for never gets a `fldtyp`.
     #[test]
     fn a_field_the_template_had_no_room_for_is_consistent_with_anything() {
-        let form = compile(b"", b"A", MANY);
+        let form = compile(b"", b"A", MANY, Ascn::Line);
         assert_eq!(form.in_template, 0);
         assert_eq!(form.fields[0].kind, 0, "embscn never reached it");
         assert!(type_ok(&form.fields[0], b"anything at all"));
@@ -6466,14 +6691,14 @@ mod tests {
     /// plausible one.
     #[test]
     fn an_embedded_nul_ends_the_answer() {
-        let hashes = compile(b"####", b"AGE", MANY);
+        let hashes = compile(b"####", b"AGE", MANY, Ascn::Line);
         assert!(type_ok(&hashes.fields[0], b"12\x00ab"));
 
-        let dollars = compile(b"$$$$", b"AMT", MANY);
+        let dollars = compile(b"$$$$", b"AMT", MANY, Ascn::Line);
         assert!(type_ok(&dollars.fields[0], b"-1\x00a"));
         assert!(!type_ok(&dollars.fields[0], b"\x009"), "an empty answer");
 
-        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY);
+        let spaced = compile(b"??????", b"NAME(NOSPACES)", MANY, Ascn::Line);
         assert!(type_ok(&spaced.fields[0], b"ab\x00 c"));
     }
 
@@ -6486,7 +6711,7 @@ mod tests {
     #[test]
     fn a_text_minimum_that_looks_like_a_length_is_a_length() {
         let spec = b"NAME(MIN=3)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         let field = &form.fields[0];
         assert_eq!(field.flags & flags::MINMAX, flags::MINMAX, "MIN= was read");
 
@@ -6504,7 +6729,7 @@ mod tests {
     #[test]
     fn a_text_minimum_too_long_to_be_a_length_falls_through_to_a_value() {
         let spec = b"CODE(MIN=100)";
-        let form = compile(b"????", spec, MANY);
+        let form = compile(b"????", spec, MANY, Ascn::Line);
         let field = &form.fields[0];
         // "099" sorts before "100", so this is refused on value, and the
         // message is the value message rather than the length one.
@@ -6517,7 +6742,7 @@ mod tests {
 
         // Two digits, but 99 does not fit a two-wide field.
         let spec = b"X(MIN=99)";
-        let form = compile(b"??", spec, MANY);
+        let form = compile(b"??", spec, MANY, Ascn::Line);
         assert_eq!(
             min_ok(spec, &form.fields[0], b"1").unwrap_err(),
             "Enter at least \"99\""
@@ -6525,7 +6750,7 @@ mod tests {
 
         // Three digits that would have fitted: the digit count alone stops it.
         let spec = b"NAME(MIN=003)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert!(min_ok(spec, &form.fields[0], b"ab").is_ok());
     }
 
@@ -6534,7 +6759,7 @@ mod tests {
     #[test]
     fn a_dollar_minimum_compares_numerically_where_a_hash_compares_as_text() {
         let dollars = b"AMT(MIN=9)";
-        let form = compile(b"$$$$", dollars, MANY);
+        let form = compile(b"$$$$", dollars, MANY, Ascn::Line);
         assert!(min_ok(dollars, &form.fields[0], b"10").is_ok(), "10 >= 9");
         assert!(min_ok(dollars, &form.fields[0], b"9").is_ok(), "9 >= 9");
         assert_eq!(
@@ -6543,7 +6768,7 @@ mod tests {
         );
 
         let hashes = b"AGE(MIN=9)";
-        let form = compile(b"####", hashes, MANY);
+        let form = compile(b"####", hashes, MANY, Ascn::Line);
         assert_eq!(
             min_ok(hashes, &form.fields[0], b"10").unwrap_err(),
             "Enter at least \"9\"",
@@ -6556,7 +6781,7 @@ mod tests {
     #[test]
     fn a_maximum_is_never_read_as_a_length() {
         let spec = b"CODE(MAX=3)";
-        let form = compile(b"????", spec, MANY);
+        let form = compile(b"????", spec, MANY, Ascn::Line);
         let field = &form.fields[0];
         assert_eq!(
             max_ok(spec, field, b"abcd").unwrap_err(),
@@ -6566,7 +6791,7 @@ mod tests {
         assert!(max_ok(spec, field, b"2").is_ok());
 
         let spec = b"AMT(MAX=9)";
-        let form = compile(b"$$$$", spec, MANY);
+        let form = compile(b"$$$$", spec, MANY, Ascn::Line);
         assert!(max_ok(spec, &form.fields[0], b"9").is_ok(), "9 <= 9");
         assert_eq!(
             max_ok(spec, &form.fields[0], b"10").unwrap_err(),
@@ -6578,7 +6803,7 @@ mod tests {
     /// `switch` does not name.
     #[test]
     fn a_field_with_no_minimum_passes_everything() {
-        let form = compile(b"??????", b"NAME", MANY);
+        let form = compile(b"??????", b"NAME", MANY, Ascn::Line);
         assert_eq!(form.fields[0].flags, 0, "no options, no flags");
         assert!(min_ok(b"NAME", &form.fields[0], b"").is_ok());
         assert!(max_ok(b"NAME", &form.fields[0], b"zzzzzz").is_ok());
@@ -6586,7 +6811,7 @@ mod tests {
         // A field the template had no run for keeps `fldtyp == 0`, and the C's
         // `switch` has no `default`.
         let spec = b"A(MIN=3)";
-        let form = compile(b"", spec, MANY);
+        let form = compile(b"", spec, MANY, Ascn::Line);
         assert_eq!(form.fields[0].kind, 0);
         assert!(min_ok(spec, &form.fields[0], b"").is_ok());
     }
@@ -6595,7 +6820,7 @@ mod tests {
     #[test]
     fn an_embedded_nul_ends_the_answer_a_minimum_is_measured_against() {
         let spec = b"NAME(MIN=3)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert_eq!(
             min_ok(spec, &form.fields[0], b"ab\x00cd").unwrap_err(),
             "Enter at least 3 character(s)",
@@ -6603,14 +6828,14 @@ mod tests {
         );
 
         let spec = b"NAME(MAX=M)";
-        let form = compile(b"??????", spec, MANY);
+        let form = compile(b"??????", spec, MANY, Ascn::Line);
         assert!(max_ok(spec, &form.fields[0], b"M\x00Z").is_ok());
     }
 
     /// `movfld()`, `FSD.C:675`: step past every field flagged "avoid".
     #[test]
     fn moving_skips_avoided_fields() {
-        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         assert_eq!(form.in_template, 3, "three fields in the template");
         form.fields[1].flags |= flags::AVOID;
         assert_eq!(move_field(&form, 1, 1, Some(99), false), Some(2), "skipped B");
@@ -6622,7 +6847,7 @@ mod tests {
     /// wraps, and only an ANSI session with `udwrap` set wraps.
     #[test]
     fn only_a_wrapping_session_wraps_around_the_ends() {
-        let form = compile(b"?? ?? ??", b"A B C", MANY);
+        let form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         assert_eq!(move_field(&form, 3, 1, Some(99), true), Some(0), "to the top");
         assert_eq!(move_field(&form, 3, 1, Some(99), false), Some(99), "the last resort");
         assert_eq!(move_field(&form, -1, -1, Some(99), true), Some(2), "to the bottom");
@@ -6638,7 +6863,7 @@ mod tests {
     /// A port that dropped it does not fail here, it hangs.
     #[test]
     fn a_form_of_avoided_fields_gives_up_instead_of_spinning() {
-        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         for f in form.fields.iter_mut() {
             f.flags |= flags::AVOID;
         }
@@ -6651,7 +6876,7 @@ mod tests {
         // walk stands on 0, so nothing it ever reaches equals `fldn` and
         // `flast` is the only guard left. Dropping `flast` does not fail the
         // first of these; it hangs on the second.
-        let mut one = compile(b"??", b"A", MANY);
+        let mut one = compile(b"??", b"A", MANY, Ascn::Line);
         one.fields[0].flags |= flags::AVOID;
         assert_eq!(move_field(&one, 0, 1, Some(7), true), Some(7), "fldn ends it");
         assert_eq!(move_field(&one, 1, 1, Some(7), true), Some(7), "flast ends it");
@@ -6664,7 +6889,7 @@ mod tests {
     /// after one look rather than examining any neighbour.
     #[test]
     fn a_zero_step_considers_one_field_and_no_other() {
-        let mut form = compile(b"?? ?? ??", b"A B C", MANY);
+        let mut form = compile(b"?? ?? ??", b"A B C", MANY, Ascn::Line);
         assert_eq!(move_field(&form, 1, 0, None, true), Some(1), "it is usable");
         form.fields[1].flags |= flags::AVOID;
         assert_eq!(move_field(&form, 1, 0, None, true), None, "and B's neighbours");
@@ -6675,7 +6900,7 @@ mod tests {
     /// refusal are the same number.
     #[test]
     fn an_empty_template_wraps_forwards_but_not_backwards() {
-        let form = compile(b"", b"A", MANY);
+        let form = compile(b"", b"A", MANY, Ascn::Line);
         assert_eq!(form.in_template, 0, "the spec named it, the template did not");
         assert_eq!(form.fields.len(), 1, "and it is still a field");
 
