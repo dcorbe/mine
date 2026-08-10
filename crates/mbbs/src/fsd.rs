@@ -186,6 +186,15 @@ pub mod scb {
     /// `FSD.H:314`.
     pub const CRSFLD: u16 = 151;
 
+    /// `char shffld` -- the field whose highlight the deferred cursor shuffle
+    /// still owes a repaint. `FSD.H:317`.
+    ///
+    /// [`cursat`](super::cursat) sets it alongside `crsfld` and they are equal
+    /// almost always; they come apart exactly when `hopfld` moves the cursor
+    /// while `FSDQOT` is set and leaves the repaint owed, which is what
+    /// `fsdqoe` later settles.
+    pub const SHFFLD: u16 = 152;
+
     /// `char *ftmptr` -- pointer into the current field's embedded-
     /// punctuation template, `FSD.H:316`. Computed from `CRSFLD` (151, 1
     /// byte) + `SHFFLD` (1 byte, not otherwise modeled) landing at 153,
@@ -722,6 +731,16 @@ impl Scb {
     /// Set [`Scb::crsfld`].
     pub fn set_crsfld(&mut self, value: u8) {
         self.set_byte(scb::CRSFLD, value);
+    }
+
+    /// `shffld`: the field the deferred cursor shuffle still owes a repaint.
+    /// See [`scb::SHFFLD`].
+    pub fn shffld(&self) -> u8 {
+        self.byte(scb::SHFFLD)
+    }
+    /// Set [`Scb::shffld`].
+    pub fn set_shffld(&mut self, value: u8) {
+        self.set_byte(scb::SHFFLD, value);
     }
 
     /// `ftmptr`: how far [`skppnc`]/[`addprt`]/[`unentr`] have echoed into
@@ -1809,6 +1828,16 @@ const SECCHR: u8 = b'*';
 /// only if a caller hands `dspans` a field and a punctuation array that did
 /// not come from one `compile(, Ascn::Line)` call together.
 fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec<u8>, i16) {
+    // `justfy` is a three-valued enum the C spells as an `int`, and every
+    // branch below tests it against one of the three. A fourth value would
+    // silently take the `else` arm of each test and produce a plausible,
+    // wrong layout -- so refuse it. Every caller is inside this crate, which
+    // makes a bad value a bug here rather than anything a session could
+    // provoke.
+    assert!(
+        (-1..=1).contains(&justfy),
+        "dspans: justfy {justfy} is not 1 (right), 0 (minimum) or -1 (left)"
+    );
     let answer = c_str(answer);
     let anslen = answer.len() as i16;
     let npad = (i16::from(field.width) - anslen).max(0);
@@ -1880,6 +1909,141 @@ fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec
 pub fn shoabf(form: &Form, scb: &Scb, justfy: i16) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     dspans(field, &form.punctuation, scb.ansbuf(), justfy).0
+}
+
+/// `spaces()`, `FSD.C:532-545`: `n` blanks, with `n` clamped to `0..=ANSLEN+1`.
+///
+/// The original works by NUL-punching a static all-blanks buffer and restoring
+/// it afterwards -- an allocation dodge on a machine with no allocator to
+/// spare, not behaviour. Emitting `n` blanks is the whole of what it does.
+///
+/// **The clamp is behaviour and is kept.** `spcblk` is `ANSLEN+2` bytes, so the
+/// bounds are what stop the punch running off it; a caller asking for 200
+/// blanks gets 81, and a caller asking for -3 gets none. Both are reachable --
+/// `bgnter` passes a field's width and `altntr` passes a difference that can go
+/// negative.
+#[must_use]
+pub fn spaces(n: i16) -> Vec<u8> {
+    let n = n.clamp(0, i16::try_from(ANSLEN).expect("80 fits") + 1);
+    vec![b' '; n as usize]
+}
+
+/// `secchs()`, `FSD.C:547-554`: `n` copies of the secret character.
+///
+/// `while (n-- > 0)`, so a negative `n` emits nothing rather than looping.
+#[must_use]
+pub fn secchs(n: i16) -> Vec<u8> {
+    vec![SECCHR; n.max(0) as usize]
+}
+
+/// One field's stored answer, out of the installed answer string.
+///
+/// `fsdscb->newans+fldptr->ansoff` with `fldptr->anslen` bytes -- the answer
+/// `fsdans` put there, not the `ansbuf` an entry in progress is building.
+fn stored_answer(answers: &Answers, fldi: usize) -> &[u8] {
+    let (ansoff, anslen) = answers.offsets[fldi];
+    let at = usize::from(ansoff);
+    let end = (at + usize::from(anslen)).min(answers.text.len());
+    &answers.text[at.min(end)..end]
+}
+
+/// `shofld()`, `FSD.C:632-640`: go to a field, set an attribute, draw its
+/// answer. ANSI only.
+///
+/// Three lines, and the shape of every piece of ANSI painting in the FSD:
+/// the field's `ansgto`, then [`ibm2ans`] of the attribute, then [`dspans`]
+/// of the stored answer. Nothing here reads `ansbuf`; a field being *edited*
+/// is drawn by [`shoabf`] instead.
+#[must_use]
+pub fn shofld(
+    form: &Form,
+    answers: &Answers,
+    fldi: usize,
+    attr: u8,
+    justfy: i16,
+) -> Vec<u8> {
+    let field = &form.fields[fldi];
+    let mut out = field.ansgto.clone();
+    out.extend(ibm2ans(attr));
+    out.extend(dspans(field, &form.punctuation, stored_answer(answers, fldi), justfy).0);
+    out
+}
+
+/// `cursat()`, `FSD.C:642-650`: light a field as the cursor field.
+///
+/// Sets **both** `crsfld` and `shffld` to `fldi` before drawing. That is not
+/// redundant bookkeeping: `shffld` is the field the deferred cursor shuffle
+/// owes a repaint to, and `hopfld` moves `crsfld` on its own while leaving
+/// `shffld` behind (`FSD.C:1370-1377`). Setting them together here is what
+/// makes "no repaint owed" the resting state.
+///
+/// Draws with `fsdscb->crsatr` and `justfy == 1`.
+#[must_use]
+pub fn cursat(form: &Form, answers: &Answers, scb: &mut Scb, fldi: u8) -> Vec<u8> {
+    scb.set_crsfld(fldi);
+    scb.set_shffld(fldi);
+    shofld(form, answers, usize::from(fldi), scb.crsatr(), 1)
+}
+
+/// `gtohlp()`, `FSD.C:732-739`: move to the help area and set its attribute.
+///
+/// The help area's own `ansgto`/`attr` pair, computed by `tmpscn` at the `!`
+/// run (`FSD.C:367-377`) and held here on the [`Form`] rather than the
+/// [`Scb`] -- see [`Form::help_gto`].
+#[must_use]
+pub fn gtohlp(form: &Form) -> Vec<u8> {
+    let mut out = form.help_gto.clone();
+    out.extend(ibm2ans(form.help_attr));
+    out
+}
+
+/// `fsddsp()`, `FSD.C:741-774`: draw the whole screen -- template text and
+/// every filled-in field.
+///
+/// Walks the template, emitting the run of supporting text before each field
+/// and then the field itself: blanks if `FFFAVD` is set (an "avoided" field,
+/// which the module hides), otherwise the stored answer right-justified.
+///
+/// # The help field is blanked, and the original does it destructively
+///
+/// `setmem(templt+fsdscb->hlpoff,fsdscb->hlplen,' ')` overwrites the caller's
+/// template in place -- the comment at `FSD.C:750` says so in as many words,
+/// "may corrupt template (wiping out help field symbols)". This takes a copy
+/// instead. The output is identical and the caller's buffer survives, which
+/// matters here because [`Host::forms`](crate::Host) hands out a cached
+/// template that later calls still read.
+#[must_use]
+pub fn fsddsp(form: &Form, answers: &Answers, template: &[u8]) -> Vec<u8> {
+    let end = template
+        .iter()
+        .position(|b| *b == 0)
+        .unwrap_or(template.len());
+    let mut template = template[..end].to_vec();
+
+    if form.help_len > 0 {
+        let at = usize::from(form.help_at);
+        let to = (at + usize::from(form.help_len)).min(template.len());
+        if at < to {
+            template[at..to].fill(b' ');
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut sp = 0usize;
+    for (fldi, field) in form.fields.iter().enumerate().take(form.in_template) {
+        let np = usize::from(field.template_at).min(template.len());
+        out.extend_from_slice(&template[sp.min(np)..np]);
+        if field.flags & flags::AVOID != 0 {
+            out.extend(spaces(i16::from(field.xwidth)));
+        } else {
+            out.extend(
+                dspans(field, &form.punctuation, stored_answer(answers, fldi), 1).0,
+            );
+        }
+        sp = np + usize::from(field.xwidth);
+    }
+    out.extend_from_slice(&template[sp.min(template.len())..]);
+    out
 }
 
 /// `pmtfld()`, `FSD.C:795-813`. The non-ANSI prompt for the field at
@@ -7167,5 +7331,187 @@ mod tests {
             22,
             "23 rows of template leave the cursor on the last one"
         );
+    }
+
+    // --- Task 5: the ANSI display primitives -----------------------------
+
+    /// A compiled ANSI form over a template, plus answers installed over it.
+    fn ansi_form(template: &[u8], spec: &[u8], old: &[u8]) -> (Form, Answers) {
+        let form = compile(template, spec, MANY, Ascn::Ansi);
+        let answers = answers(&form, spec, old);
+        (form, answers)
+    }
+
+    #[test]
+    fn spaces_clamps_at_both_ends() {
+        // The clamp is `spcblk`'s bounds, and both ends are reachable from
+        // real callers -- `bgnter` passes a width, `altntr` a difference that
+        // can go negative.
+        assert_eq!(spaces(0), b"");
+        assert_eq!(spaces(3), b"   ");
+        assert_eq!(spaces(-3), b"", "a negative count is not a huge one");
+        assert_eq!(
+            spaces(200).len(),
+            usize::from(ANSLEN) + 1,
+            "ANSLEN+1 is as many as spcblk holds"
+        );
+        assert_eq!(spaces(i16::MIN), b"");
+    }
+
+    #[test]
+    fn secchs_emits_the_secret_character() {
+        assert_eq!(secchs(4), b"****");
+        assert_eq!(secchs(0), b"");
+        assert_eq!(secchs(-1), b"", "`while (n-- > 0)` never loops backwards");
+    }
+
+    #[test]
+    fn shofld_is_goto_then_attribute_then_answer() {
+        // The shape of every piece of ANSI painting in the FSD. Built from
+        // the pieces rather than from a literal, so that a change to
+        // `ibm2ans` -- which is measured against the host -- flows through
+        // instead of being contradicted here.
+        let spec = b"NAME";
+        let (form, answers) = ansi_form(b"\x1b[1;37mGiven: ??????\r\n", spec, b"NAME=Kai\0\0");
+
+        let out = shofld(&form, &answers, 0, 0x70, 1);
+        let field = &form.fields[0];
+        assert!(!field.ansgto.is_empty(), "an ANSI form has a goto");
+
+        let mut expected = field.ansgto.clone();
+        expected.extend(ibm2ans(0x70));
+        // `justfy == 1` is "justify right/left" (FSD.C:558): a `$` field pads
+        // on the left, every other kind pads on the right. This is a `?`
+        // field of width 6, so the blanks follow the answer.
+        expected.extend(b"Kai   ");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&expected)
+        );
+    }
+
+    #[test]
+    fn shofld_draws_the_stored_answer_not_the_edit_buffer() {
+        // `shofld` reads `newans+ansoff`; `shoabf` reads `ansbuf`. Confusing
+        // them would paint a half-typed field over a committed one, or the
+        // reverse, and both look plausible in a screenshot.
+        let spec = b"NAME";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"NAME=Kai\0\0");
+        let mut scb = zeroed_scb();
+        scb.set_ansbuf(b"Zzz");
+
+        let stored = shofld(&form, &answers, 0, 0x07, 1);
+        assert!(
+            String::from_utf8_lossy(&stored).contains("Kai"),
+            "{:?}",
+            String::from_utf8_lossy(&stored)
+        );
+        assert!(
+            !String::from_utf8_lossy(&stored).contains("Zzz"),
+            "the edit buffer must not appear"
+        );
+    }
+
+    #[test]
+    fn cursat_sets_both_crsfld_and_shffld() {
+        // Not redundant: `hopfld` moves `crsfld` alone and leaves `shffld`
+        // behind as the repaint it still owes. Setting them together is what
+        // makes "nothing owed" the resting state, so a `cursat` that set only
+        // `crsfld` would leave a stale highlight the first time the cursor
+        // moved under a busy output buffer.
+        let spec = b"A B";
+        let (form, answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsatr(0x70);
+        scb.set_crsfld(0);
+        scb.set_shffld(0);
+
+        let out = cursat(&form, &answers, &mut scb, 1);
+
+        assert_eq!(scb.crsfld(), 1);
+        assert_eq!(scb.shffld(), 1, "shffld moves with it");
+        assert!(
+            out.starts_with(&form.fields[1].ansgto),
+            "and it painted field 1"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains(&String::from_utf8_lossy(&ibm2ans(0x70)).to_string()),
+            "under crsatr, not the field's own attribute"
+        );
+    }
+
+    #[test]
+    fn gtohlp_is_the_help_areas_goto_and_attribute() {
+        let spec = b"A";
+        let (form, _) = ansi_form(b"?? !!!!!!\r\n", spec, b"\0");
+        assert!(form.help_len > 0, "the template has a help run");
+
+        let mut expected = form.help_gto.clone();
+        expected.extend(ibm2ans(form.help_attr));
+        assert_eq!(gtohlp(&form), expected);
+    }
+
+    #[test]
+    fn fsddsp_draws_supporting_text_and_answers_in_template_order() {
+        let spec = b"FIRST SECOND";
+        let template = b"Name: ????? Rank: ???\r\n";
+        let (form, answers) = ansi_form(template, spec, b"FIRST=Kai\0SECOND=Cpl\0\0");
+
+        let out = fsddsp(&form, &answers, template);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "Name: Kai   Rank: Cpl\r\n",
+            "supporting text verbatim, each answer padded out to its run's width"
+        );
+    }
+
+    #[test]
+    fn fsddsp_blanks_an_avoided_field_rather_than_showing_it() {
+        // `FFFAVD` is the flag the *module* sets -- fourteen sites in
+        // WCCMMUD.DLL do -- so this is the arm MajorMUD's own sheet takes for
+        // its computed stats.
+        let spec = b"FIRST SECOND";
+        let template = b"a ????? b ???\r\n";
+        let (mut form, answers) = ansi_form(template, spec, b"FIRST=Kai\0SECOND=Cpl\0\0");
+        form.fields[0].flags |= flags::AVOID;
+
+        let out = fsddsp(&form, &answers, template);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "a       b Cpl\r\n",
+            "the avoided field is five blanks, not its answer"
+        );
+    }
+
+    #[test]
+    fn fsddsp_blanks_the_help_run_without_touching_the_callers_template() {
+        // The original does this with `setmem` straight into the caller's
+        // buffer and says so ("may corrupt template"). This host hands out a
+        // cached template that later calls still read, so it copies -- and
+        // the output has to be identical either way.
+        let spec = b"A";
+        let template = b"x ?? !!!! y\r\n";
+        let (form, answers) = ansi_form(template, spec, b"A=Hi\0\0");
+
+        let before = template.to_vec();
+        let out = fsddsp(&form, &answers, template);
+        assert_eq!(&before, template, "the caller's template is untouched");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "x Hi      y\r\n",
+            "the help run comes out blank"
+        );
+    }
+
+    #[test]
+    fn dspans_refuses_a_justification_it_has_no_arm_for() {
+        let spec = b"A";
+        let form = compile(b"?????", spec, MANY, Ascn::Line);
+        let answers = answers(&form, spec, b"A=Hi\0\0");
+        let bad = std::panic::catch_unwind(|| {
+            dspans(&form.fields[0], &form.punctuation, b"Hi", 2)
+        });
+        assert!(bad.is_err(), "justfy=2 must not silently pick a layout");
+        let _ = answers;
     }
 }
