@@ -1650,7 +1650,11 @@ mod tests {
         {
             let ch = f.host.gsbl_mut().channel_mut(chan);
             ch.echo = true;
-            ch.width = 80;
+            // Deliberately not 80 (the crate's usual default) -- a value
+            // that could only survive here by genuinely being left alone,
+            // not by a `ch.width = 80` mutation coincidentally matching a
+            // fixture that also starts at 80.
+            ch.width = 37;
             ch.raw = false;
         }
 
@@ -1660,7 +1664,7 @@ mod tests {
         assert!(ch.raw, "fsdcon must turn raw input on");
         assert!(!ch.echo, "fsdcon must turn echo off");
         assert_eq!(
-            ch.width, 80,
+            ch.width, 37,
             "fsdcon never calls btutsw (FSDBBS.C:91-101) -- width zeroing is \
              fsdbkg's job, and fsdbkg is not part of line mode"
         );
@@ -1673,17 +1677,23 @@ mod tests {
         {
             let ch = f.host.gsbl_mut().channel_mut(chan);
             ch.echo = true;
-            ch.width = 80;
+            ch.width = 41;
             ch.raw = false;
         }
 
         fsdcon(&mut f.host, chan);
-        fsdcof(&mut f.host, chan, 80);
+        // 41 here is deliberately not the pre-fsdcon width (41 vs. its own
+        // value above) -- fsdcof's argument is what must land, not
+        // whatever fsdcon left in place, which fsdcof_sets_width_from_its_
+        // argument_not_whatever_fsdcon_left_behind proves more directly.
+        // Kept equal to the fixture's own value here only so this test can
+        // also serve as an end-to-end fsdcon-then-fsdcof round trip.
+        fsdcof(&mut f.host, chan, 41);
 
         let ch = f.host.gsbl_mut().channel_mut(chan);
         assert!(!ch.raw, "fsdcof must turn raw input back off");
         assert!(ch.echo, "fsdcof must turn echo back on");
-        assert_eq!(ch.width, 80, "fsdcof restores width from usaptr->scnwid");
+        assert_eq!(ch.width, 41, "fsdcof restores width from usaptr->scnwid");
     }
 
     #[test]
