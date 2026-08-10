@@ -485,11 +485,70 @@ impl Users {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
+    /// Put channel `unum` in state `state`.
+    ///
+    /// The module writes this field itself at 14 sites; this is the same
+    /// write made on the host's behalf, for `fsdego` (`shims/fsd.rs`,
+    /// `FSDBBS.C:210`'s `usrptr->state=fsdstt`) -- the one place a *host*
+    /// routine, rather than the module, has to move a channel into a
+    /// registered state.
+    ///
+    /// # Errors
+    ///
+    /// If the write runs off the segment.
+    pub fn set_state(
+        &mut self,
+        machine: &mut Machine,
+        unum: Chan,
+        state: u16,
+    ) -> Result<(), ShimError> {
+        machine.write(self.state_at(unum), &state.to_le_bytes())?;
+        Ok(())
+    }
+
     /// `&user[unum].state`.
     fn state_at(&self, unum: Chan) -> FarPtr {
         let slot = self.slot(unum);
         FarPtr {
             offset: slot.offset + user::STATE,
+            selector: slot.selector,
+        }
+    }
+
+    /// `user[unum].substt` -- the registered module's own substate.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment.
+    pub fn substt(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
+        let bytes = machine.resolve(self.substt_at(unum), 2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Put channel `unum` in substate `substt`.
+    ///
+    /// `fsdego` (`shims/fsd.rs`) is this crate's one host-side writer
+    /// (`FSDBBS.C:211`'s `usrptr->substt=ENTERING`) -- everywhere else this
+    /// field moves, a module wrote it.
+    ///
+    /// # Errors
+    ///
+    /// If the write runs off the segment.
+    pub fn set_substt(
+        &mut self,
+        machine: &mut Machine,
+        unum: Chan,
+        substt: u16,
+    ) -> Result<(), ShimError> {
+        machine.write(self.substt_at(unum), &substt.to_le_bytes())?;
+        Ok(())
+    }
+
+    /// `&user[unum].substt`.
+    fn substt_at(&self, unum: Chan) -> FarPtr {
+        let slot = self.slot(unum);
+        FarPtr {
+            offset: slot.offset + user::SUBSTT,
             selector: slot.selector,
         }
     }
@@ -1085,5 +1144,59 @@ mod tests {
         let terms = f.host.users().terms();
         assert!(terms.chan(1).is_none(), "nterms is 1");
         assert!(terms.chan(-1).is_none());
+    }
+
+    #[test]
+    fn set_state_writes_where_the_module_reads_state() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+
+        assert_eq!(f.host.users().state(&f.machine, console).expect("read"), 0);
+
+        f.host
+            .users
+            .set_state(&mut f.machine, console, 7)
+            .expect("write");
+        assert_eq!(f.host.users().state(&f.machine, console).expect("read"), 7);
+
+        // The literal `+6`, not `user::STATE`, for the same reason
+        // `polrou_round_trips_through_the_bytes_the_module_reads` uses a
+        // literal `0x24`: an address derived from the constant under test
+        // could only prove the accessor agrees with itself.
+        let slot = f.host.users().slot(console);
+        let at = mbbs16::FarPtr {
+            offset: slot.offset + 6,
+            selector: slot.selector,
+        };
+        assert_eq!(f.machine.resolve(at, 2).expect("in the slot"), &[7, 0]);
+    }
+
+    #[test]
+    fn set_substt_writes_where_the_module_reads_substt() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+
+        assert_eq!(
+            f.host.users().substt(&f.machine, console).expect("read"),
+            0
+        );
+
+        f.host
+            .users
+            .set_substt(&mut f.machine, console, 1)
+            .expect("write");
+        assert_eq!(
+            f.host.users().substt(&f.machine, console).expect("read"),
+            1
+        );
+
+        // The literal `+8`, for the reason `set_state_writes_where_the_
+        // module_reads_state`'s own literal is.
+        let slot = f.host.users().slot(console);
+        let at = mbbs16::FarPtr {
+            offset: slot.offset + 8,
+            selector: slot.selector,
+        };
+        assert_eq!(f.machine.resolve(at, 2).expect("in the slot"), &[1, 0]);
     }
 }

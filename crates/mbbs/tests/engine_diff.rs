@@ -33,6 +33,7 @@ use mbbs16::Machine;
 const B_OPEN: u16 = 0;
 const B_CLOSE: u16 = 1;
 const B_INSERT: u16 = 2;
+const B_GET_EQUAL: u16 = 5;
 const B_GET_NEXT: u16 = 6;
 const B_GET_FIRST: u16 = 12;
 
@@ -275,19 +276,257 @@ fn duplicate_insertion_order_the_real_engine_uses() {
     }
 }
 
+/// Oracle validation for `stpbtvl`'s `Cursor::Ordered` arm
+/// (`shims/btrieve.rs` ~1026-1074, corrected in Task 12): a keyed Get leaves
+/// the file positioned on a *duplicate* key's chain, and a following step
+/// (`stpbtvl`, "no key at all", opt 24 == `B_GET_NEXT`'s step-family
+/// counterpart) must walk on to the next record in that same chain -- not
+/// refuse the call as a module bug, which an earlier version of this arm did.
+///
+/// `shims::btrieve::stpbtvl` itself is `pub(crate)` in `mbbs`, so it cannot be
+/// named from this integration test crate -- only `mbbs::btrieve`'s public
+/// `Btrieve`/`Block`/`Records` types are reachable here. This drives the real
+/// engine through exactly the sequence a module makes (`B_GET_EQUAL` then
+/// `B_GET_NEXT`) and, on the same file, reproduces the *exact* sequence of
+/// public calls `stpbtvl`'s own body makes for that case: the keyed find is
+/// `Records::seek`/`Records::matches` (`shims/btrieve.rs` `qrybtv`,
+/// ~728-729), and the step is `Records::ordered` -> `Records::find_physical`
+/// -> one physical slot forward (`shims/btrieve.rs` ~1046-1063, word for
+/// word). If those two independent readers -- the genuine Btrieve engine
+/// walking its own on-disk chain, and this crate's own reader replaying
+/// `stpbtvl`'s computation -- land on the same record, the fix's own
+/// reasoning ("real Btrieve keeps one physical cursor regardless of how it
+/// was reached") is oracle-backed rather than merely plausible.
+///
+/// This is exactly the character-creation duplicate-name shape the fix's own
+/// doc comment names: a real `WCCUSERS.DAT` (`tests/forge.rs`'s
+/// `insert_duplicate_users` builds the same shape at larger scale, for the
+/// same reason -- key 2, experience, is the one duplicate-permitting key
+/// MajorMUD ships and a fresh character always collides on it), written
+/// directly by this crate's own `Block::insert`/`reindex` rather than through
+/// the live wire engine.
+///
+/// **Why not build the fixture through `B_CREATE`/`B_INSERT` over the wire,
+/// the way `duplicate_insertion_order_the_real_engine_uses` does?** Tried
+/// first, and measured to not work for a test that also needs its own
+/// independent reader on the same bytes: `tools/btrieve-oracle/`'s
+/// `W32MKDE.EXE AUTOSTART` is a persistent process that outlives every
+/// individual `btrvprobe.exe serve` client (`ps aux` shows one running since
+/// this environment's Btrieve prefix was first used), and it never wrote the
+/// on-disk record count back for a file this test created and inserted into
+/// over the wire -- not after `B_CLOSE`, not after an explicit `B_STOP`, not
+/// after the whole `serve` process was killed, not after ten seconds' wait.
+/// Every file this crate created that way still reads a record count of 0 at
+/// `at::RECORDS_HIGH`/`RECORDS_LOW`, even ones from runs minutes old. The
+/// live engine's own subsequent reads (`B_STAT`, `B_GET_FIRST`/`B_GET_NEXT`)
+/// still see the record correctly -- they are served from the Microkernel's
+/// cache, not the disk -- which is exactly why
+/// `duplicate_insertion_order_the_real_engine_uses` (which never reads the
+/// raw file) still passes. This test needs the raw file, so it writes the
+/// raw file itself and only asks the wine engine to *read* it, which has no
+/// such problem: `wccspels_reindexed_matches_our_own_walk_and_the_real_engine`
+/// above reads a file this process never wrote a byte of, over the same
+/// engine, correctly.
+#[test]
+#[ignore = "needs wine and MajorMUD's data files in tmp/"]
+fn keyed_get_then_step_matches_the_real_engines_duplicate_chain_walk() {
+    let Some(data) = data_dir() else {
+        eprintln!("skipped: tmp/ is not present in this checkout");
+        return;
+    };
+    if !wine_on_path() {
+        eprintln!("skipped: wine is not on PATH");
+        return;
+    }
+
+    let name = "WCCUSERS.DAT";
+    let (staged, staged_name) = stage(&data.join(name), name);
+
+    // This crate's own writer: three records that collide on key 2
+    // (experience -- the one duplicate-permitting key `WCCUSERS.DAT` has,
+    // per `tests/forge.rs`'s `insert_duplicate_users`), distinct on keys 0
+    // and 1 (name, owner -- both forbid duplicates).
+    let mut machine = Machine::new().expect("a 16-bit machine");
+    let mut heap = Heap::new(Config::default());
+    let mut btrieve = Btrieve::default();
+    let geometry = Geometry::read(name, &staged).expect("WCCUSERS.DAT's geometry reads");
+    let at = btrieve
+        .open(&mut machine, &mut heap, name, &staged, geometry, geometry.reclen)
+        .expect("opening WCCUSERS.DAT");
+    let block = btrieve.block_mut(at).unwrap_or_else(|e| panic!("{e}"));
+
+    let starting = block.records().unwrap_or_else(|e| panic!("{e}")).len();
+    assert_eq!(starting, 0, "a freshly staged WCCUSERS.DAT should hold no records yet");
+
+    let keys = block.keys().to_vec();
+    let [key0, key1, key2] = keys.as_slice() else {
+        panic!("WCCUSERS.DAT has {} keys, not the 3 this test assumes", keys.len());
+    };
+    let name_seg = match key0.segments.as_slice() {
+        [only] => *only,
+        other => panic!("key 0 has {} segments, not 1", other.len()),
+    };
+    let owner_seg = match key1.segments.as_slice() {
+        [only] => *only,
+        other => panic!("key 1 has {} segments, not 1", other.len()),
+    };
+    let exp_seg = match key2.segments.as_slice() {
+        [only] => *only,
+        other => panic!("key 2 has {} segments, not 1", other.len()),
+    };
+    assert!(key2.duplicates, "key 2 (experience) should permit duplicates");
+
+    let reclen = usize::from(block.geometry().reclen);
+    let tag_count = 3u8;
+    for tag in 0..tag_count {
+        let mut record = vec![0u8; reclen];
+        let name_bytes = format!("Diff{tag:04}").into_bytes();
+        let name_at = usize::from(name_seg.offset);
+        record[name_at..name_at + name_bytes.len()].copy_from_slice(&name_bytes);
+
+        let owner_bytes = format!("Diffowner{tag:04}").into_bytes();
+        let owner_at = usize::from(owner_seg.offset);
+        record[owner_at..owner_at + owner_bytes.len()].copy_from_slice(&owner_bytes);
+
+        // Every record gets the SAME experience value -- 0 -- so they all
+        // collide on key 2.
+        let exp_at = usize::from(exp_seg.offset);
+        let exp_len = usize::from(exp_seg.length);
+        record[exp_at..exp_at + exp_len].fill(0);
+
+        block.insert(&record).unwrap_or_else(|e| panic!("{e}"));
+    }
+    block.reindex().unwrap_or_else(|e| panic!("{e}"));
+
+    // `qrybtv`'s keyed find (`shims/btrieve.rs` ~728-729), and `stpbtvl`'s
+    // `Cursor::Ordered` arm for a GetNext-family step (opt 24): the ordered
+    // position resolves to a physical record, and the step moves one
+    // physical slot forward. Read here, from the live in-memory `Records`,
+    // before `close` -- the same data `reindex` just wrote to disk.
+    let exp_value = vec![0u8; usize::from(exp_seg.length)];
+    let records = block.records().unwrap_or_else(|e| panic!("{e}"));
+    let found_at = records.seek(&keys, 2, &exp_value);
+    assert!(
+        records.matches(&keys, 2, found_at, &exp_value),
+        "our reader should find the colliding experience value on key 2"
+    );
+    let physical = records
+        .ordered(2, found_at)
+        .and_then(|record| records.find_physical(record.position))
+        .expect("the ordered position resolves to a physical record");
+    let next_physical = physical + 1;
+    assert!(next_physical < records.len(), "there is another colliding record to step to");
+    let ours_next_name = {
+        let bytes = &records.physical(next_physical).expect("in range").bytes;
+        let name_at = usize::from(name_seg.offset);
+        String::from_utf8_lossy(&bytes[name_at..name_at + 8]).into_owned()
+    };
+
+    btrieve
+        .close(&mut machine, &mut heap, at)
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    // The real engine's own answer, over the identical bytes this process
+    // just wrote and closed: `B_GET_EQUAL` on key 2's colliding value
+    // positions the cursor on the chain, then `B_GET_NEXT` steps to the next
+    // record in it.
+    let mut engine = Engine::spawn().expect("spawning btrvprobe serve");
+    let open = engine
+        .call(Request {
+            op: B_OPEN,
+            posblk: [0u8; 128],
+            datalen: 0,
+            databuf: Vec::new(),
+            keylen: dos_path(&staged_name).len() as u8,
+            keynum: MODE_READ_ONLY,
+            keybuf: dos_path(&staged_name),
+        })
+        .expect("B_OPEN");
+    assert_eq!(open.status, 0, "opening the fixture read-only should succeed");
+    let geteq = engine
+        .call(Request {
+            op: B_GET_EQUAL,
+            posblk: open.posblk,
+            datalen: 32768,
+            databuf: Vec::new(),
+            keylen: exp_seg.length as u8,
+            keynum: 2,
+            keybuf: exp_value.clone(),
+        })
+        .expect("B_GET_EQUAL");
+    assert_eq!(geteq.status, 0, "the colliding experience value should be found on key 2");
+    let getnext = engine
+        .call(Request {
+            op: B_GET_NEXT,
+            posblk: geteq.posblk,
+            datalen: 32768,
+            databuf: Vec::new(),
+            keylen: 255,
+            keynum: 2,
+            keybuf: vec![0u8; 255],
+        })
+        .expect("B_GET_NEXT");
+    assert_eq!(getnext.status, 0, "stepping within the colliding chain should find the next record");
+    let name_at = usize::from(name_seg.offset);
+    let engine_next_name =
+        String::from_utf8_lossy(&getnext.databuf[name_at..name_at + 8]).into_owned();
+
+    eprintln!("real engine's GetEqual+GetNext landed on {engine_next_name:?}");
+    eprintln!("our reader's seek+Cursor::Ordered step landed on {ours_next_name:?}");
+
+    assert_eq!(
+        ours_next_name, engine_next_name,
+        "stpbtvl's Cursor::Ordered arm (resolve an ordered position to a physical slot, then \
+         step by one physical slot) must land on the same record the real engine's own \
+         GetEqual-then-GetNext does"
+    );
+}
+
 /// `FileSpec` + one `KeySpec`: a 12-byte record, one 4-byte duplicate-
 /// permitting key at position 1. Mirrors `tools/btrieve-oracle/btrvprobe.c`'s
 /// `cmd_create`, which this reuses the shape of rather than re-deriving.
+///
+/// **Correction (Task 12, oracle-validating `stpbtvl`'s `Cursor::Ordered`
+/// fix):** this buffer used to size itself for a 24-byte `KeySpec` and write
+/// `ext_type` at that struct's byte 12. Neither matches
+/// `tools/btrieve-oracle/btrvprobe.c:93-102`'s real `KeySpec`, which is 16
+/// bytes (`position` WORD@0, `length` WORD@2, `flags` WORD@4, `approx_count`
+/// DWORD@6, `ext_type` BYTE@10, `null_value` BYTE@11, `reserved[2]`@12-13,
+/// `number` BYTE@14, `acs_number` BYTE@15) -- byte 12 is `reserved`, which
+/// `cmd_create` never reads. The old buffer's `ext_type` write landed on a
+/// byte the engine ignores, so every file this built came back with
+/// `ext_type` still zero: `keys::parse` read it as `Kind::Text`, not
+/// `Kind::Unsigned`, even though the request asked for `KT_UNSIGNED_BINARY`.
+/// Measured directly with a hex dump of a file this helper created
+/// (`xxd`, offset `0x12c` == the key definition's own `BASE + at::EXTENDED`
+/// in `keys.rs`, which read `00` before this fix and `0e` after) -- not
+/// inferred from any test's assertions, because none of them happened to
+/// check: `duplicate_insertion_order_the_real_engine_uses` only ever reads
+/// file/physical order, which does not touch the key's kind at all, and
+/// `keyed_get_then_step_matches_the_real_engines_duplicate_chain_walk`
+/// (found while chasing this exact bug) ended up building its own fixture a
+/// different way -- directly through `Block::insert`/`reindex`, over a real
+/// `WCCUSERS.DAT`, rather than through this helper -- once it turned out
+/// this crate's own writer can build a correctly-typed key in one step where
+/// getting `B_CREATE` to do it over the wire took two fixes. So no test in
+/// this file currently exercises the corrected `ext_type` byte through an
+/// assertion; the fix stands on the hex dump above and on matching
+/// `cmd_create` byte-for-byte, for whatever next uses this helper for a
+/// keyed search.
+///
+/// `flags = 0x0141` is bit 0 (duplicates permitted) + bit 6 (descending) +
+/// bit 8 (use `ext_type`) -- `cmd_create`'s own comment on the matching line,
+/// not "modifiable" as an earlier version of this doc comment guessed.
 fn create_file_spec() -> Vec<u8> {
-    let mut data = vec![0u8; 16 + 24]; // sizeof(FileSpec) + sizeof(KeySpec)
+    let mut data = vec![0u8; 16 + 16]; // sizeof(FileSpec) + sizeof(KeySpec)
     data[0..2].copy_from_slice(&12u16.to_le_bytes()); // reclen
     data[2..4].copy_from_slice(&512u16.to_le_bytes()); // pagesize
     data[4..6].copy_from_slice(&1u16.to_le_bytes()); // indexes_raw (1 key)
-    // KeySpec at offset 16: position=1, length=4, flags=0x0141 (dup|modifiable|exttype),
-    // ext_type=14 (KT_UNSIGNED_BINARY).
+    // KeySpec at offset 16: position=1, length=4, flags=0x0141 (dup|descending|exttype),
+    // ext_type=14 (KT_UNSIGNED_BINARY) at the KeySpec's own byte 10.
     data[16..18].copy_from_slice(&1u16.to_le_bytes());
     data[18..20].copy_from_slice(&4u16.to_le_bytes());
     data[20..22].copy_from_slice(&0x0141u16.to_le_bytes());
-    data[16 + 12] = 14;
+    data[16 + 10] = 14;
     data
 }

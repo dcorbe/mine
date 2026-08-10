@@ -64,7 +64,7 @@ pub use globals::{GLOBALS, Global, Globals, NTERMS, OUTBSZ};
 pub use heap::{Config, Heap, Region};
 pub use keys::KeySet;
 pub use random::{RAND_MAX, Random, Runaway};
-pub use shims::system::{Agent, Kick, Registration};
+pub use shims::system::{Agent, Dispatch, Kick, Native, Registration};
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
@@ -131,7 +131,7 @@ enum Vector {
 
 impl Vector {
     /// Its position in `struct module` after `descrp`, which is what
-    /// [`Registration::entry`] takes.
+    /// [`Registration::dispatch`] takes.
     ///
     /// `MAJORBBS.H:241-252` fixes the order: `descrp`, `lonrou`, `sttrou`,
     /// `stsrou`, `injrou`, `lofrou`, `huprou`, `mcurou`, `dlarou`, `finrou`.
@@ -491,41 +491,83 @@ pub struct Host {
     /// construction: a host nobody is driving polls nothing.
     pub(crate) polls_left: usize,
 
-    /// Every form `fsdroom` has sized, in the order it was asked. See
-    /// [`Host::forms`].
+    /// Every form `fsdroom` has sized, keyed by the `(message number, amode)`
+    /// it was compiled from. See [`Host::forms`].
     ///
-    /// **Flat, and owed a channel key.** See [`Host::fsdscb`](Host#structfield.fsdscb).
-    pub(crate) forms: Vec<Form>,
+    /// **Channel-keyed as of the commit that added this doc comment.** Used
+    /// to be a flat `Vec<Form>` -- see [`Host::fsdscb`](Host#structfield.fsdscb)'s
+    /// history for why that was a debt -- but the compiled form itself is not
+    /// per-channel state at all: two channels filling out the *same* form
+    /// (the same message number and amode) share one compilation, the way the
+    /// real host's `fsdroom` would have parsed the same template twice and
+    /// gotten the same answer both times. What is per-channel is which form a
+    /// given channel is using, which [`Host::fsdtmp`] records.
+    pub(crate) forms: std::collections::HashMap<(u16, i16), Form>,
 
-    /// Where `struct fsdscb` lives, once `fsdroom` has needed one.
+    /// Where each channel's `struct fsdscb` lives, once its `fsdroom` has
+    /// needed one. Indexed by [`Chan::index`].
     ///
     /// `inifsdscb()`, `FSDBBS.C:64`, allocates `nterms` of them, and the real
-    /// `setfsd(chan)` exists precisely to select among them. `None` until the
-    /// first `fsdroom`, because the module *tests* the `fsdscb` global for
-    /// null -- `seg 3:0x430f` -- and takes another path when it is.
+    /// `setfsd(chan)` exists precisely to select among them -- which this
+    /// mirrors: one segment per channel rather than one segment shared by
+    /// all of them. `None` until that channel's first `fsdroom`, because the
+    /// module *tests* the `fsdscb` global for null -- `seg 3:0x430f` -- and
+    /// takes another path when it is.
     ///
-    /// # This is one control block and it should be `nterms` of them
+    /// # The debt this repays
     ///
-    /// This field and [`forms`](Host#structfield.forms) above are both flat.
-    /// That was a *fact* while `Host::new` fixed the count at one; since the
-    /// count became a caller's input it is a **debt**, and the capability to
-    /// trip it shipped with that change. Two channels in the full-screen data
-    /// entry subsystem at once would share one control block and interleave
-    /// their answers into a single `newans`.
-    ///
-    /// Not fixed here because the FSD is out of scope for the multi-channel
-    /// work -- a *returning* player reaches the realm without touching a single
-    /// `fsd*` routine, which is why raising the count did not have to wait for
-    /// it -- so nothing in this crate can currently reach the hazard. It is
-    /// recorded rather than repaired, and keying both by [`Chan`] belongs with
-    /// whoever builds the form engine.
-    pub(crate) fsdscb: Option<FarPtr>,
+    /// This used to be a single `Option<FarPtr>`, on the reasoning that the
+    /// FSD was out of scope for the multi-channel work and nothing could
+    /// reach the hazard. That reasoning held until [`Host::fsd_state`]
+    /// existed to dispatch a channel into an FSD session at all -- from that
+    /// point on, two channels entering data at once would have shared one
+    /// control block and interleaved their answers into a single `newans`.
+    /// Keyed by channel now, so that cannot happen by construction.
+    pub(crate) fsdscb: Vec<Option<FarPtr>>,
 
-    /// Which message block `fsdroom` last read a template out of, which
-    /// template, and in which mode. `fsdusr->{curmbk,tmpmsg,amode}`,
-    /// `FSDBBS.C:134`, and Rust-side rather than in module memory because
-    /// `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
-    pub(crate) fsdtmp: Option<(FarPtr, u16, i16)>,
+    /// Each channel's `fsdusr->{curmbk,tmpmsg,amode}` -- which message block
+    /// `fsdroom` last read a template out of, which template, and in which
+    /// mode. `FSDBBS.C:134`, and Rust-side rather than in module memory
+    /// because `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
+    /// Indexed by [`Chan::index`], for the same reason [`Host::fsdscb`] is.
+    pub(crate) fsdtmp: Vec<Option<(FarPtr, u16, i16)>>,
+
+    /// The FSD's own `state` slot, registered in [`Host::finish_init`] the
+    /// way `inifsd()` registers FSDBBS as a module. `None` before
+    /// `finish_init` has run.
+    pub(crate) fsd_state: Option<usize>,
+
+    /// Per-channel state an entry session needs that no module can see, so
+    /// it lives only here rather than round-tripping through `Machine` the
+    /// way [`Scb`](fsd::Scb) does.
+    ///
+    /// `FSDBBS.C`'s own home for these is `struct fsdbbs` (`fsdusr`):
+    /// `whndun` there is a far pointer into the module the host must call
+    /// back, and the save/quit flag is `fsdusr->flags & FBSAVE`, read by
+    /// `goback()` after the session's own buffer may already be gone. Both
+    /// are genuinely invisible to the module -- unlike `Scb`'s bytes, which
+    /// the module dereferences directly -- so they are Rust-side. Indexed by
+    /// [`Chan::index`], for the reason [`Host::fsdscb`] is: one session per
+    /// channel, not one shared by all of them.
+    pub(crate) fsd_sessions: Vec<Option<FsdSession>>,
+
+    /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
+    /// hands `fldvfy`: the module reads `char *answer` out of it, and
+    /// `VFYOK`'s own contract (`FSD.H` Note 2) lets it rewrite the bytes
+    /// there in place. `None` until the first field-verify call needs it.
+    ///
+    /// **Not per-channel, unlike [`Host::fsdscb`].** The original's own
+    /// `fsdbuf` (`FSDBBS.C:45`) is a single global buffer too, not one per
+    /// channel -- `alcmem(fsdbln)` runs once, in `inifsd()`. That is safe
+    /// there for the same reason it is safe here: only one channel's
+    /// `fsdprc` ever runs at a time (this host is single-threaded by
+    /// force), and the buffer's whole lifetime is the span of one
+    /// `fldvfy` call, never carried across one. Sized `ANSLEN+1` rather
+    /// than the original's `fsdbln` (`ANSILN*ANSIWD*2`, a much larger
+    /// buffer also used by the ANSI screen paths this crate does not
+    /// build) -- the one purpose this port ever writes it for is a single
+    /// candidate answer, never longer than `ANSLEN`.
+    pub(crate) fsd_scratch: Option<FarPtr>,
 
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap,
@@ -606,9 +648,28 @@ fn caller(machine: &Machine, module: &Module) -> Option<String> {
 /// the module registered at init, and `POLSTS` reaches a callback it installed
 /// at runtime. There is no entry-point number for the second, which is why this
 /// is an enum and not the `usize` it used to be.
-enum Dispatch {
+///
+/// Named `PollTarget` rather than `Dispatch` to leave that name for
+/// [`shims::system::Dispatch`], which is what a channel's `state` itself
+/// resolves to -- a different question from the one this enum answers.
+enum PollTarget {
     Entry(usize),
     Poll,
+}
+
+/// The two things about an FSD session no module can see. See
+/// [`Host::fsd_sessions`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FsdSession {
+    /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
+    /// module passed `NULL` -- `goback()`'s own `else` branch
+    /// (`FSDBBS.C:236`) is what a `None` here means to it.
+    pub whndun: Option<FarPtr>,
+
+    /// Whether the session is exiting to save (`FSDSAV`) or to quit
+    /// (`FSDQIT`). `fsdusr->flags & FBSAVE`, read by `goback()` after
+    /// `xitfsd` decided.
+    pub save: bool,
 }
 
 impl Host {
@@ -746,9 +807,12 @@ impl Host {
             noted: HashSet::new(),
             kicks: Vec::new(),
             polls_left: 0,
-            forms: Vec::new(),
-            fsdscb: None,
-            fsdtmp: None,
+            forms: HashMap::new(),
+            fsdscb: vec![None; usize::from(terms.count())],
+            fsdtmp: vec![None; usize::from(terms.count())],
+            fsd_state: None,
+            fsd_sessions: vec![None; usize::from(terms.count())],
+            fsd_scratch: None,
             heap,
             users,
             asked: Vec::new(),
@@ -772,7 +836,8 @@ impl Host {
     }
 
     /// Every module that has registered, in the order they did.
-    /// Entry `n` of the module channel `chan`'s `state` names.
+    /// Entry `n` of the module channel `chan`'s `state` names -- or, if
+    /// `state` names a host-native registration, the native handler itself.
     ///
     /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`: a channel's
     /// `state` **is** an index into the module table, and `register_module`
@@ -798,7 +863,7 @@ impl Host {
         machine: &Machine,
         chan: Chan,
         n: usize,
-    ) -> io::Result<Result<Option<FarPtr>, ShimError>> {
+    ) -> io::Result<Result<Dispatch, ShimError>> {
         let state = match self.users.state(machine, chan) {
             Ok(state) => state,
             Err(e) => return Ok(Err(e)),
@@ -811,11 +876,78 @@ impl Host {
                  never given, or a registration this host owes has not happened"
             )));
         };
-        Ok(registered.entry(machine, n))
+        Ok(registered.dispatch(machine, n))
+    }
+
+    /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
+    /// dispatch: entry `n` of the FSD's own native slot, run directly
+    /// instead of through a far call.
+    ///
+    /// Entry 2 is `stsrou`, the only one `FSDBBS.C`'s own `fsdmod` ever gave
+    /// a body -- `fsdsts`, folded here into
+    /// [`shims::fsd::fsd_cycle`]. Entry 1 (`sttrou`, reached on `CRSTG`)
+    /// is never real: raw mode means `CRSTG` cannot fire while a session is
+    /// under way (the design doc's "Input" section), so a `CRSTG` reaching
+    /// this slot at all means the channel is in the FSD's `state` without a
+    /// live session -- the same shape as a module that left the entry point
+    /// null, noted rather than refused so [`Host::poll`]'s own "no entry
+    /// registered" fallback handles it exactly as it would a module's own
+    /// null pointer.
+    ///
+    /// Always answers "no far pointer to call": the FSD's own work, when
+    /// there is any, happens right here rather than through a far call --
+    /// that is the whole point of a *native* registration.
+    ///
+    /// # Errors
+    ///
+    /// If [`shims::fsd::fsd_cycle`] does -- in particular, if this channel's
+    /// state names the FSD's own slot but `fsdego` never ran for it, which
+    /// is a bug in whatever set that state rather than a condition to
+    /// silently ignore.
+    fn fsd_dispatch(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+        chan: Chan,
+        n: usize,
+    ) -> Result<Option<FarPtr>, ShimError> {
+        if n != 2 {
+            self.note(format!(
+                "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
+                 which has no handler wired up yet"
+            ));
+            return Ok(None);
+        }
+
+        shims::fsd::fsd_cycle(machine, self, module, chan)?;
+        Ok(None)
     }
 
     pub fn modules(&self) -> &[Registration] {
         &self.modules
+    }
+
+    /// The first *module* registration, skipping any [`Registration::Native`]
+    /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
+    /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
+    /// and neither wants to mistake the FSD's native slot for it.
+    fn first_module(&self) -> Option<&Registration> {
+        self.modules
+            .iter()
+            .find(|r| matches!(r, Registration::Module { .. }))
+    }
+
+    /// The FSD's own `state` slot, the way `register_module`'s caller keeps
+    /// the number it returned.
+    ///
+    /// # Panics
+    ///
+    /// If called before [`Host::finish_init`] has registered it -- nothing
+    /// in this crate can reach a channel's `state` that early, so this is a
+    /// programming error rather than a condition callers should handle.
+    pub(crate) fn fsd_state(&self) -> usize {
+        self.fsd_state
+            .expect("finish_init registers the FSD before anything can reach it")
     }
 
     /// What time it is, and one step later than the last time anyone asked.
@@ -893,17 +1025,14 @@ impl Host {
         &self.kicks
     }
 
-    /// Every form the module asked `fsdroom` to size.
+    /// Every form the module asked `fsdroom` to size, keyed by the
+    /// `(message number, amode)` it was compiled from.
     ///
-    /// A record rather than a session. The real host keeps one control block
-    /// per channel and overwrites it on each call; this keeps them all, because
-    /// what a caller can usefully ask this host is "what did initialisation
-    /// size?" and not "what is channel 0 in the middle of?".
-    ///
-    /// **Nothing fills one in.** A form is a screen and a user, and this host
-    /// has neither -- so these are the shapes of the two screens MajorMUD would
-    /// have put a new player through, measured and then set down.
-    pub fn forms(&self) -> &[Form] {
+    /// A cache, not a session: what a caller can usefully ask this host is
+    /// "what forms exist" and not "what is channel 0 in the middle of" --
+    /// see [`Host::fsdtmp`] and [`Host::fsdscb`] for the per-channel half of
+    /// that question.
+    pub fn forms(&self) -> &std::collections::HashMap<(u16, i16), Form> {
         &self.forms
     }
 
@@ -1115,6 +1244,37 @@ impl Host {
             .write(machine, "vdaptr", &vda.to_bytes())
             .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
         Ok(())
+    }
+
+    /// The channel [`Host::point_curusr`] last made current, read back the
+    /// way the module itself would: out of the `usrnum` global.
+    ///
+    /// Every FSD shim needs to know which channel it is serving, and none of
+    /// them are handed a [`Chan`] argument -- the module's own call
+    /// signatures have no room for one (`fsdroom(msgno, fldspc, amode)`, four
+    /// words, matches `FSDBBS.H:60-67` and `GALP&Q.C:1273`). This is how they
+    /// ask.
+    ///
+    /// # Errors
+    ///
+    /// If `usrnum` does not name a channel of this host -- in particular, if
+    /// nobody is current at all. `MAJORBBS.C:882` sets `usrnum=-1` before any
+    /// module's init runs, and that value survives until the first
+    /// [`Host::point_curusr`], which is exactly the state a module's own
+    /// initialisation runs in. Most callers of this may propagate the error;
+    /// [`crate::shims::fsd::fsdroom`] is the one exception, because it is the
+    /// one FSD routine measured calling in from there.
+    pub(crate) fn current_channel(&self, machine: &Machine) -> Result<Chan, ShimError> {
+        let uno = self
+            .globals()
+            .word(machine, "usrnum")
+            .map_err(|e| ShimError::Failed(format!("current_channel: {e}")))?;
+        self.users.terms().chan(uno as i16).ok_or_else(|| {
+            ShimError::Failed(format!(
+                "current_channel: usrnum is {}, which names no channel",
+                uno as i16
+            ))
+        })
     }
 
     /// Plant a connecting user's account record and channel state, and make
@@ -1339,22 +1499,33 @@ impl Host {
             return self.shim_stop(machine, "connect_state", e).map(Some);
         }
 
-        // `Registration::entry` borrows `self.modules()` immutably, and
+        // `Registration::dispatch` borrows `self.modules()` immutably, and
         // `self.run` needs `self` mutably right after -- so the pointer is
         // read out here and the borrow ends before `run` is ever reached.
         //
-        // `first()` and not the channel's state, on purpose. `cyclon` calls
-        // `if ((rouptr = module[i]->lonrou) != NULL)` over an `i`: a logon is
-        // announced to every registered module, not dispatched to one. This
-        // host makes the first iteration only, which is the whole loop while one
-        // module is registered. The day a second registers, this owes the rest
-        // of the loop -- and the hazard is ordering, not counting: a module that
-        // registered *after* the FSD would stop being `first()`.
+        // The first *module* registration, and not the channel's state, on
+        // purpose. `cyclon` calls `if ((rouptr = module[i]->lonrou) != NULL)`
+        // over an `i`: a logon is announced to every registered module, not
+        // dispatched to one. This host makes the first iteration only, which
+        // is the whole loop while one real module is registered -- and now
+        // that `Host::finish_init` registers the FSD's native slot ahead of
+        // any module, `first_module` (not `modules().first()`) is what keeps
+        // that "one module" reading correct: a `Native` registration has no
+        // `lonrou` to announce (`FSDBBS.C` supplies no module-shaped logon
+        // hook) and skipping past it is not the same thing as counting it as
+        // the sole module. A **second real module** is still owed the rest
+        // of `cyclon`'s loop; that debt is unaffected by this change.
         let lonrou = {
-            let registered = self.modules().first().ok_or_else(|| {
+            let registered = self.first_module().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
             })?;
-            registered.entry(machine, 0)
+            match registered.dispatch(machine, 0) {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                // `first_module` never answers `Native`, but the match stays
+                // exhaustive and the fallback stays correct if that changes.
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
         };
         let lonrou = match lonrou {
             Ok(lonrou) => lonrou,
@@ -1493,7 +1664,7 @@ impl Host {
             return self.shim_stop(machine, "point_curusr", e).map(Some);
         }
 
-        // `Registration::entry` borrows `self.modules()` immutably and
+        // `Registration::dispatch` borrows `self.modules()` immutably and
         // `self.run` needs `self` mutably right after, so the pointer is read
         // out here and the borrow ends before `run` is ever reached -- the same
         // discipline `Host::connect` follows.
@@ -1505,19 +1676,36 @@ impl Host {
         //   the channel's state, like `sttrou`.
         // - `aschup` tests `(rouptr=module[i]->huprou) != NULL` -- an `i`, a
         //   loop over *every* registered module. This host makes the first
-        //   iteration and no more, which is exactly right while one module is
-        //   registered and is owed a loop the day a second one is. It is the
-        //   first slot and not the channel's state deliberately: a hangup is
-        //   news for every module, not just the one holding the channel.
+        //   iteration and no more, which is exactly right while one real
+        //   module is registered and is owed a loop the day a second one is.
+        //   It is the first *module* and not the channel's state
+        //   deliberately: a hangup is news for every module, not just the
+        //   one holding the channel -- `first_module`, not `modules().first()`,
+        //   because the FSD's native slot registers ahead of any module now
+        //   and has no `huprou` to be news to.
+        //
+        // Neither vector has a native-handler shape: `FSDBBS.C` supplies no
+        // `lofrou` or `huprou`, so a `Dispatch::Native` answer here is the
+        // same "no call happened" as a module that left the pointer null --
+        // unlike `poll`'s `sttrou`/`stsrou` dispatch, which is the FSD's own
+        // reason to exist as a state at all.
         let rou = match vector {
-            Vector::Logoff => self.state_entry(machine, chan, vector.entry())?,
+            Vector::Logoff => match self.state_entry(machine, chan, vector.entry())? {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
             Vector::Hangup => {
-                let registered = self.modules().first().ok_or_else(|| {
+                let registered = self.first_module().ok_or_else(|| {
                     io::Error::other(
                         "no module has registered, so there is nothing to disconnect from",
                     )
                 })?;
-                registered.entry(machine, vector.entry())
+                match registered.dispatch(machine, vector.entry()) {
+                    Ok(Dispatch::Module(rou)) => Ok(rou),
+                    Ok(Dispatch::Native(_)) => Ok(None),
+                    Err(e) => Err(e),
+                }
             }
         };
         let rou = match rou {
@@ -1745,7 +1933,7 @@ impl Host {
                 .expect("scan just found a channel with one");
 
             let dispatch = match status {
-                gsbl::Gsbl::CRSTG => Dispatch::Entry(1),
+                gsbl::Gsbl::CRSTG => PollTarget::Entry(1),
                 // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
                 // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
                 // `ABOREQ` and `OUTMT`, and lets everything else fall to
@@ -1753,8 +1941,8 @@ impl Host {
                 // (`MAJORBBS.H:236`) is in "everything else", which is what
                 // makes `fsdnfy()` work at all -- it injects 240 at itself
                 // expecting `stsrou` to run.
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => Dispatch::Entry(2),
-                gsbl::Gsbl::POLSTS => Dispatch::Poll,
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => PollTarget::Entry(2),
+                gsbl::Gsbl::POLSTS => PollTarget::Poll,
                 other => {
                     self.note(format!(
                         "poll: channel {chan} raised status {other}, which nothing here dispatches"
@@ -1787,11 +1975,11 @@ impl Host {
                 // A polling routine is not an entry point and has no index. The
                 // arm diverges either way, so the `match` still yields the index
                 // the `Entry` arm carries.
-                Dispatch::Poll => match self.dopoll(machine, module, chan)? {
+                PollTarget::Poll => match self.dopoll(machine, module, chan)? {
                     Some(outcome) => return Ok(Some(outcome)),
                     None => continue,
                 },
-                Dispatch::Entry(index) => index,
+                PollTarget::Entry(index) => index,
             };
 
             if status == gsbl::Gsbl::CRSTG
@@ -1805,7 +1993,22 @@ impl Host {
             // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
             // is read out here and the borrow ends before `self.run` needs
             // `self` mutably.
+            //
+            // This is the one dispatch site a `Native` registration is
+            // genuinely for -- `inifsd()` registers the FSD so that a
+            // channel's `state` can name it exactly the way one names a
+            // module, and `sttrou`/`stsrou` are the entry points it exists to
+            // answer. `fsd_dispatch` carries that; every other call site in
+            // this file treats `Native` as a hook a module left null instead,
+            // because none of them are input dispatch.
             let entry = self.state_entry(machine, chan, entry_index)?;
+            let entry = match entry {
+                Ok(Dispatch::Module(entry)) => Ok(entry),
+                Ok(Dispatch::Native(Native::Fsd)) => {
+                    self.fsd_dispatch(machine, module, chan, entry_index)
+                }
+                Err(e) => Err(e),
+            };
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
@@ -2068,6 +2271,11 @@ impl Host {
             self.rstchn(machine, chan)
                 .map_err(|e| io::Error::other(format!("rstchn({chan}): {e}")))?;
         }
+        // `inifsd()` registers FSDBBS as an ordinary module during startup;
+        // this is that registration. It must happen before `inited` is set,
+        // so nothing can reach a channel's `state` before the FSD's slot
+        // exists to be named.
+        self.fsd_state = Some(self.register_native(Native::Fsd));
         self.inited = true;
         Ok(())
     }
@@ -2238,8 +2446,20 @@ impl Host {
 
     /// Take a module online, and give it its number.
     fn register(&mut self, description: String, block: FarPtr) -> u16 {
-        self.modules.push(Registration { description, block });
+        self.modules.push(Registration::Module { description, block });
         (self.modules.len() - 1) as u16
+    }
+
+    /// Give a host-native handler a `state` slot, the way [`Host::register`]
+    /// gives a module one. Returns the slot's index, for the same reason
+    /// `register_module` hands its caller a number back: whoever registered
+    /// it is the one who writes it into `user[chan].state`.
+    ///
+    /// [`Host::finish_init`] is this crate's `inifsd()` -- the FSD registers
+    /// its own native slot there, not here.
+    pub(crate) fn register_native(&mut self, native: Native) -> usize {
+        self.modules.push(Registration::Native(native));
+        self.modules.len() - 1
     }
 
     /// Load a module, binding its imports to this host.
@@ -2553,7 +2773,10 @@ impl ImportResolver for Resolver<'_> {
 mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
-    use crate::{Clock, Ended, Host, Kick, Outcome, Terms, gsbl, testing, users};
+    use crate::{
+        Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Registration, Terms, gsbl, testing,
+        users,
+    };
     use mbbs16::{FarPtr, Machine, Ret};
 
     #[test]
@@ -2782,6 +3005,26 @@ mod tests {
     }
 
     #[test]
+    fn finish_init_registers_the_fsd_as_a_native_module() {
+        // `inifsd()` registers FSDBBS as an ordinary module during startup,
+        // the same startup sequence `finish_init` already runs `alcvda` and
+        // the `rstchn` loop for. The FSD's own `state` slot must exist by
+        // the time anything could reach it -- `Host::fsd_state()` is how the
+        // rest of the FSD subsystem finds that slot's number.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let mut host = Host::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
+
+        host.finish_init(&mut machine).expect("finished starting up");
+
+        let n = host.fsd_state();
+        assert_eq!(
+            host.modules()[n],
+            Registration::Native(Native::Fsd),
+            "finish_init did not register the FSD's native slot"
+        );
+    }
+
+    #[test]
     fn a_reset_clears_the_channel_it_names_and_leaves_its_neighbours_alone() {
         // The two tests above share a shape, and three real defects fit through
         // it. Every assertion either of them makes is about the *target*
@@ -2942,27 +3185,35 @@ mod tests {
 
     /// A status is queued, but `poll` still needs somewhere to deliver it --
     /// and here, as in [`connect_with_no_module_registered_is_an_error_not_a_panic`],
-    /// there is a `Module` but nothing has registered.
+    /// there is a `Module` but nothing has registered for this channel's
+    /// state.
     #[test]
     fn poll_with_a_status_queued_but_no_module_registered_is_an_error_not_a_panic() {
         let mut f = Fixture::new();
         let console = f.console();
         let module = f.minimal_module();
+        // `Fixture::new` -> `finish_init` has already registered the FSD's
+        // own native slot at state 0 -- a real registration, just one with
+        // no `sttrou` shape -- so "nothing registered" can no longer be had
+        // by leaving state at its default. A state nothing names at all is
+        // what this test is actually after; see
+        // `poll_refuses_a_state_that_names_no_registered_module`.
+        set_state(&mut f, console, 99);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
             .host
             .poll(&mut f.machine, &module)
-            .expect_err("no module has registered");
+            .expect_err("state 99 names nothing");
         // R19: same reasoning as the `connect` test above -- `is_err()`
         // cannot distinguish this from a `ShimError` out of `point_curusr`,
         // `get_input` or the entry lookup, each a different failure.
         //
         // The wording is `state_entry`'s rather than a bare "no module has
-        // registered": a channel at state 0 with nothing registered and a
-        // channel at state 3 with one module registered are now different
-        // sentences, and conflating them is what this assertion exists to stop.
+        // registered": a channel at a state nothing names and a channel at
+        // state 3 with one module registered are now different sentences,
+        // and conflating them is what this assertion exists to stop.
         assert!(
-            err.to_string().contains("state 0") && err.to_string().contains("0 module(s)"),
+            err.to_string().contains("state 99") && err.to_string().contains("1 module(s)"),
             "expected the missing-registration message, got: {err}"
         );
     }
@@ -2976,9 +3227,10 @@ mod tests {
         let console = f.console();
         let module = f.minimal_module();
         f.host.gsbl_mut().push_input(console, b"look\r");
-        // No module registered, so this errors after `point_curusr` and the
-        // `status` write have already run -- which is exactly what is being
-        // checked.
+        // Whatever `poll` does with the dispatch itself -- error, or reach
+        // the FSD's native slot at the channel's default state -- happens
+        // after `point_curusr` and the `status` write, which is exactly what
+        // is being checked; the outcome of the dispatch is not.
         let _ = f.host.poll(&mut f.machine, &module);
         assert_eq!(
             f.host
@@ -3000,6 +3252,11 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let module = f.minimal_module();
+        // A state nothing names, so the CRSTG dispatch this test wants to
+        // reach still errors -- state 0 is the FSD's own slot now that
+        // `finish_init` registers it, and dispatching there would succeed
+        // with `Ok(None)` instead. See `poll_refuses_a_state_that_names_no_registered_module`.
+        set_state(&mut f, console, 99);
         f.host
             .gsbl_mut()
             .channel_mut(console)
@@ -3007,9 +3264,9 @@ mod tests {
             .push_back(crate::gsbl::Gsbl::OVRFLW);
         f.host.gsbl_mut().push_input(console, b"look\r");
 
-        // No module is registered, so `poll` errors -- but only once it
-        // reaches the CRSTG dispatch, which it does only if the `OVRFLW`
-        // ahead of it did not make `poll` stop and answer `Ok(None)`.
+        // No module is registered for this state, so `poll` errors -- but
+        // only once it reaches the CRSTG dispatch, which it does only if the
+        // `OVRFLW` ahead of it did not make `poll` stop and answer `Ok(None)`.
         let err = f
             .host
             .poll(&mut f.machine, &module)
@@ -3072,13 +3329,17 @@ mod tests {
     }
 
     /// Register a `struct module` whose entry points are these `(index,
-    /// vector)` pairs, and null everywhere else.
+    /// vector)` pairs, and null everywhere else. Returns the module number,
+    /// the same way [`register_named`] does -- since `Host::finish_init`
+    /// registers the FSD's own native slot first, this is no longer always
+    /// zero, and a caller that needs to put a channel in *this* module's
+    /// state has to use the number actually handed back.
     ///
     /// `index` is the position in `struct module` after `descrp` --
-    /// [`Registration::entry`]'s own numbering, which `MAJORBBS.H:241-252`
+    /// [`Registration::dispatch`]'s own numbering, which `MAJORBBS.H:241-252`
     /// fixes: 0 `lonrou`, 1 `sttrou`, 2 `stsrou`, 3 `injrou`, 4 `lofrou`,
     /// 5 `huprou`.
-    fn register_module_with(f: &mut Fixture, entries: &[(usize, FarPtr)]) {
+    fn register_module_with(f: &mut Fixture, entries: &[(usize, FarPtr)]) -> u16 {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         for (n, at) in entries {
@@ -3086,8 +3347,13 @@ mod tests {
             bytes[field..field + 4].copy_from_slice(&at.to_bytes());
         }
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+        let ret = f
+            .invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
+        match ret {
+            Ret::U16(n) => n,
+            other => panic!("register_module returns the module number, not {other:?}"),
+        }
     }
 
     /// 16-bit code that stores `mark` at `at` and returns, leaving `AX` alone.
@@ -3171,8 +3437,13 @@ mod tests {
         let second = f.machine.code_ptr(first_stub.len() as u16);
         let second_stub = marker_stub(marker, 0xb1);
 
-        assert_eq!(register_named(&mut f, "first", &[(1, first)]), 0);
-        assert_eq!(register_named(&mut f, "second", &[(1, second)]), 1);
+        // `Fixture::new` -> `finish_init` has already taken slot 0 for the
+        // FSD's own native registration, so "first" and "second" land one
+        // past where they would have before -- read back rather than
+        // assumed, same reasoning as `register_module_with`.
+        let first_state = register_named(&mut f, "first", &[(1, first)]);
+        let second_state = register_named(&mut f, "second", &[(1, second)]);
+        assert_eq!(second_state, first_state + 1, "registered back to back");
 
         // After the registrations: `Fixture::invoke` builds its trampoline in
         // this same scratch segment at offset zero.
@@ -3180,7 +3451,7 @@ mod tests {
         code.extend_from_slice(&second_stub);
         f.machine.load_code(&code).expect("both stubs fit");
 
-        set_state(&mut f, console, 1);
+        set_state(&mut f, console, second_state);
         f.host.gsbl_mut().push_input(console, b"look\r");
         f.host
             .poll(&mut f.machine, &module)
@@ -3192,6 +3463,187 @@ mod tests {
             0xb1,
             "state 1 must reach the second module's sttrou, not the first's"
         );
+    }
+
+    /// `inifsd()` registers FSDBBS as an ordinary module (`Host::finish_init`
+    /// will do the same, once it exists), so `state_entry` has to answer a
+    /// native registration exactly the way [`Registration::dispatch`] does --
+    /// no far pointer, but the *fact* that this state is host-native rather
+    /// than one nobody registered -- and a channel sitting in a *module's*
+    /// state must be completely unaffected by a native slot existing
+    /// elsewhere in the table.
+    ///
+    /// Mutate the `Dispatch::Native(Native::Fsd) => self.fsd_dispatch(...)`
+    /// arm in `poll` to fall through to `Dispatch::Module(None)` instead and
+    /// the `notes()` assertion below goes red: `poll`'s own "no entry
+    /// registered" note still fires either way (a native slot with nothing
+    /// wired up and a module that left the pointer null look the same from
+    /// there), so only `fsd_dispatch`'s own note tells the two apart.
+    #[test]
+    fn poll_dispatches_to_a_native_registration_without_a_far_call() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        let sttrou = f.machine.code_ptr(0);
+        let stub = returns_stub(1);
+        f.machine.load_code(&stub).expect("the stub fits");
+        // `Fixture::new` -> `finish_init` has already registered the FSD's
+        // own native slot (`Host::fsd_state`), so that is the native
+        // registration this test drives against -- a second one is not
+        // needed, and registering one would only add a slot nothing else
+        // points at.
+        let native = f.host.fsd_state() as u16;
+        let module_state = register_named(&mut f, "MajorMUD", &[(1, sttrou)]);
+        assert_ne!(
+            module_state, native,
+            "the module must not land in the FSD's own slot"
+        );
+
+        // `state_entry` itself, both ways: the native slot answers `Native`,
+        // and the module's own slot still answers `Module` with its far
+        // pointer -- unaffected by a second, native registration existing.
+        set_state(&mut f, console, native);
+        assert_eq!(
+            f.host
+                .state_entry(&f.machine, console, 1)
+                .expect("readable")
+                .expect("no ShimError"),
+            Dispatch::Native(Native::Fsd),
+        );
+        set_state(&mut f, console, module_state);
+        assert_eq!(
+            f.host
+                .state_entry(&f.machine, console, 1)
+                .expect("readable")
+                .expect("no ShimError"),
+            Dispatch::Module(Some(sttrou)),
+        );
+
+        // Now drive it through `poll`, with the channel in the native state:
+        // no far call happens -- `poll` returns cleanly rather than faulting
+        // on a bogus call -- and the native arm was genuinely reached.
+        set_state(&mut f, console, native);
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+        assert_eq!(
+            outcome, None,
+            "a native slot with nothing wired up answers no far pointer, \
+             so no call happens"
+        );
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("fsd_dispatch")),
+            "the native arm must be reached, not folded into Dispatch::Module(None): {:?}",
+            f.host.notes()
+        );
+    }
+
+    /// The design doc's own standing rule, restated as a test:
+    /// `docs/plans/2026-08-08-fsd-subsystem-design.md`, "The standing
+    /// rule" --
+    ///
+    /// ```text
+    /// channel in an FSD session, mid-field, no input delivered
+    ///   -> cycle(max) returns Ended::Idle, not Bound
+    /// ```
+    ///
+    /// A channel mid-FSD-session with nothing left in `channel.input` must
+    /// leave `cycle` idle, not spend its whole pass budget getting nowhere.
+    ///
+    /// Measured, not assumed -- three mutations of `shims::fsd::fsd_cycle`
+    /// were actually run, because the design doc warns that this assertion
+    /// "passes trivially against a spinning implementation until the
+    /// implementation is made to spin on purpose":
+    ///
+    /// 1. Re-arm `CYCLE` unconditionally, every pass (an unconditional
+    ///    `host.gsbl_mut().inject(chan, gsbl::Gsbl::CYCLE);` right before
+    ///    `fsd_cycle`'s final `Ok(())`). This does **not** come back
+    ///    `Bound { next_kick: None }` after five iterations -- `Host::poll`'s
+    ///    own pre-existing runaway guard (`SPINS = 1024`, `lib.rs` ~1943-1953,
+    ///    predates this task entirely) fires first, from *inside* the single
+    ///    `poll()` call this test's first `cycle()` iteration makes, and
+    ///    `cycled` comes back `Err("poll went round 1024 times without
+    ///    dispatching to the module: a status is being read but not
+    ///    consumed")` -- the `assert_eq!` below is never reached.
+    /// 2. Re-arm `CYCLE` a *bounded* number of times instead (measured at 1,
+    ///    10, and 1020 re-arms, all well under 1024): every one of them still
+    ///    converges to `Cycles { iterations: 1, dispatched: 0, ended: Idle }`
+    ///    -- the right answer, just reached by wasting extra spins inside
+    ///    that same `poll()` call. This is not a fluke of the numbers tried:
+    ///    `fsd_dispatch` always answers "no far pointer" for the FSD's native
+    ///    slot (see its own doc, above `Host::fsd_dispatch`), so `poll`'s
+    ///    inner loop `continue`s on every dispatch to this channel and cannot
+    ///    return until `Gsbl::pending()` is already false -- so
+    ///    `Host::cycle`'s outer loop can only ever see `iterations == 1`
+    ///    here. **`Ended::Bound` is not reachable at all** from a bounded
+    ///    `CYCLE`-re-arm bug confined to this one channel: it either resolves
+    ///    correctly (Idle) or trips the unrelated SPINS guard: there is no
+    ///    bounded mutation in between that lands on `Bound`.
+    /// 3. What *does* trip the `assert_eq!` below on its own terms, nowhere
+    ///    near `poll`'s spin counter: leaving a stale [`shims::system::Kick`]
+    ///    registered in `host.kicks` instead of consuming or clearing it (one
+    ///    unconditional push, right before `fsd_cycle`'s final `Ok(())`).
+    ///    `Host::cycle` only reports `Ended::Idle` off an *empty*
+    ///    `self.kicks`; with one left behind it reports
+    ///    `Ended::Waiting { next_kick: 3, polls_cut: true }` on the very
+    ///    first iteration instead, which the assertion below catches
+    ///    cleanly: `Cycles { iterations: 1, dispatched: 0, ended: Waiting {
+    ///    next_kick: 3, polls_cut: true } }`.
+    ///
+    /// So this test's own assertion cannot discriminate the specific
+    /// "spins on CYCLE" shape the design doc's prose describes -- that shape
+    /// is caught by `poll`'s pre-existing SPINS guard instead, one layer
+    /// down -- but it does have real, measured discriminating power against
+    /// a channel-scoped regression of comparable severity (mutation 3).
+    #[test]
+    fn a_channel_mid_field_with_no_input_goes_idle_not_bound() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let chan = f.console();
+        f.host
+            .point_curusr(&mut f.machine, chan)
+            .expect("channel 0 is current");
+
+        let name = f.text("FSDFORM.MSG");
+        let opened = f
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .expect("opened");
+        assert!(matches!(opened, Ret::Far(_)));
+
+        let spec = f.text("NAME RANK");
+        let Ok(Ret::U16(size)) =
+            f.invoke(crate::shims::fsd::fsdroom, &[0, spec.offset, spec.selector, 0])
+        else {
+            panic!("fsdroom refused")
+        };
+        let buffer = f.buffer(size);
+        let defaults = f.bytes(b"\0", false);
+        f.invoke(
+            crate::shims::fsd::fsdapr,
+            &[
+                buffer.offset,
+                buffer.selector,
+                size,
+                defaults.offset,
+                defaults.selector,
+            ],
+        )
+        .expect("prepared");
+        f.invoke(crate::shims::fsd::fsdego, &[0, 0, 0, 0])
+            .expect("handed the channel to the FSD");
+
+        // Enough to fill part of a field, deliberately with no `\r` --
+        // real, pending work (an unfinished keystroke) that fsd_cycle must
+        // drain, but nothing left in `channel.input` once it has.
+        f.host.gsbl_mut().push_input(chan, b"Kai");
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 5).expect("cycled");
+        assert_eq!(
+            cycles.ended,
+            Ended::Idle,
+            "a channel mid-field with no input left must go Idle, not spin to the bound: {cycles:?}"
+        );
+        assert_eq!(cycles.iterations, 1, "the one queued CYCLE is drained on the first pass");
     }
 
     /// A `state` naming a slot nobody registered stops with a reason.
@@ -3210,6 +3662,9 @@ mod tests {
         register_named(&mut f, "only", &[(1, sttrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // `Fixture::new` -> `finish_init` has already taken slot 0 for the
+        // FSD, so two slots are occupied (the FSD, then "only") and the
+        // count the error names has grown to match.
         set_state(&mut f, console, 3);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
@@ -3218,7 +3673,7 @@ mod tests {
             .expect_err("state 3 names nothing");
         let text = err.to_string();
         assert!(
-            text.contains("state 3") && text.contains("1 module(s)"),
+            text.contains("state 3") && text.contains("2 module(s)"),
             "the error names the state and the count, got: {text}"
         );
     }
@@ -3242,9 +3697,13 @@ mod tests {
         let marker = f.bytes(&[0x00], false);
         let stsrou = f.machine.code_ptr(0);
         let stub = marker_stub(marker, 0x2f);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // The channel's `state` defaults to zero, which is the FSD's own
+        // slot now that `finish_init` registers it first -- put the channel
+        // in the module's actual slot the way a real logon would have.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
         f.host
             .poll(&mut f.machine, &module)
@@ -3293,9 +3752,12 @@ mod tests {
         let marker = f.bytes(&[0x00], false);
         let stsrou = f.machine.code_ptr(0);
         let stub = marker_stub(marker, 0x1b);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
+        // See `poll_dispatches_cycle_to_stsrou`'s identical comment: state
+        // zero is the FSD's own slot now, not "only"'s.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().channel_mut(console).raw = true;
         f.host.gsbl_mut().push_input(console, b"\x1b[A");
 
@@ -3375,9 +3837,12 @@ mod tests {
         // A bare `retf`: a stsrou that does its work and does not ask to be
         // called again.
         let stsrou = f.machine.code_ptr(0);
-        register_named(&mut f, "only", &[(2, stsrou)]);
+        let state = register_named(&mut f, "only", &[(2, stsrou)]);
         f.machine.load_code(&[0xcb]).expect("the stub fits");
 
+        // State zero is the FSD's own slot now; see
+        // `poll_dispatches_cycle_to_stsrou`'s identical comment.
+        set_state(&mut f, console, state);
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::CYCLE);
         let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
 
@@ -3449,7 +3914,7 @@ mod tests {
             vectors.push((n, f.machine.code_ptr(code.len() as u16)));
             code.extend_from_slice(&stub);
         }
-        register_module_with(&mut f, &vectors);
+        let state = register_module_with(&mut f, &vectors);
         f.machine.load_code(&code).expect("the stubs fit");
 
         f.host
@@ -3459,6 +3924,14 @@ mod tests {
                 &Connection::ansi("rangerdan").with_keys(["PLAYKEY"]),
             )
             .expect("a user on the channel");
+        // A real logon would have put the channel in the module's own state;
+        // `connect_state` (deliberately, see its own doc comment) does not
+        // touch `state` at all, and it defaults to zero -- which, since
+        // `Host::finish_init` registers the FSD's native slot first, no
+        // longer names this module. `logoff`'s `lofrou` lookup is keyed on
+        // state (`state_entry`), so a test that wants it reached has to put
+        // the channel there itself, the same way the module would.
+        set_state(&mut f, console, state);
         (f, module, console)
     }
 
@@ -3619,20 +4092,30 @@ mod tests {
         );
     }
 
-    /// The one documented `Err` on either path. A host with nothing registered
-    /// has no `struct module` to read a vector out of, and answering `Ok(None)`
-    /// -- which is what "the module supplied no vector" means -- would say a
-    /// module had been asked and had nothing to offer.
+    /// The one documented `Err` on either path. A host with no *module*
+    /// registered has no `struct module` to read a vector out of, and
+    /// answering `Ok(None)` -- which is what "the module supplied no vector"
+    /// means -- would say a module had been asked and had nothing to offer.
     #[test]
     fn disconnecting_with_no_module_registered_is_an_error_not_a_silent_none() {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let console = f.console();
 
+        // `hangup`'s `huprou` lookup is `first_module` -- the FSD's own
+        // native slot, which `finish_init` has already registered, does not
+        // count as a module -- so this stays an error with no setup needed.
         assert!(
             f.host.hangup(&mut f.machine, &module, console).is_err(),
             "hangup with no module registered"
         );
+
+        // `logoff`'s `lofrou` lookup is keyed on the channel's state
+        // instead, and state zero now names the FSD's own slot -- a real
+        // registration, just one with no `lofrou` shape, so it answers
+        // `Ok(None)` rather than erroring. A state nothing names at all is
+        // what "no module registered" means here now.
+        set_state(&mut f, console, 99);
         assert!(
             f.host.logoff(&mut f.machine, &module, console).is_err(),
             "logoff with no module registered"
@@ -3652,11 +4135,14 @@ mod tests {
         let huprou = f.machine.code_ptr(code.len() as u16);
         code.extend_from_slice(&marker_stub(mark, 5));
 
-        register_module_with(&mut f, &[(4, lofrou), (5, huprou)]);
+        let state = register_module_with(&mut f, &[(4, lofrou), (5, huprou)]);
         f.machine.load_code(&code).expect("both stubs fit");
         f.host
             .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("a user on the channel");
+        // `logoff`'s `lofrou` lookup is state-keyed; see `connected_with`'s
+        // identical comment for why this can no longer be left at zero.
+        set_state(&mut f, console, state);
 
         if hangup {
             f.host.hangup(&mut f.machine, &module, console)
