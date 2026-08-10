@@ -2214,13 +2214,24 @@ fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
 /// # The two branches
 ///
 /// A space, on a [`flags::MULTICHOICE`] field, with `FSDQOT` not already set
-/// (i.e. nothing from a previous commit is still pending display): cycles to
-/// the next alternate after whichever is currently selected -- or, if none
-/// is, the first alternate that matches whatever has already been typed --
-/// or, failing that, the very first alternate in the list. If cycling would
-/// land back where it started (a one-alternate list, most commonly),
-/// nothing happens ([`Hdlprt::Ignore`]). Otherwise the landed-on alternate
-/// is committed via [`altntr`] and the character is [`Hdlprt::Handled`].
+/// (i.e. nothing from a previous commit is still pending display): an
+/// if/else-if, not independent fallbacks (`FSD.C:1437-1442`) --
+/// - something is already selected: the next alternate after it, in list
+///   order, and *only* that; a selection that already sits on the last
+///   alternate finds no next one here and falls through empty-handed rather
+///   than trying to match `ansbuf` (which, being that same selection's own
+///   spelling, would just match itself).
+/// - nothing is selected: the first alternate that matches whatever has
+///   already been typed.
+///
+/// Either way, landing empty-handed wraps: the very first alternate in the
+/// list is used instead (`FSD.C:1443-1445`). This is what makes repeated
+/// spaces actually cycle -- last alternate, one more space, back to the
+/// first -- rather than getting stuck once the end is reached. If the
+/// landed-on alternate is the one already selected (a one-alternate list,
+/// most commonly, where "next" and "wrap to first" are the same answer),
+/// nothing happens ([`Hdlprt::Ignore`]). Otherwise it is committed via
+/// [`altntr`] and the character is [`Hdlprt::Handled`].
 ///
 /// Any other character: builds a candidate out of whatever has already been
 /// typed this attempt (`ansbuf`, but only if `FSDANT` says an ambiguous
@@ -2245,10 +2256,24 @@ pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
 
     if c == b' ' && field.flags & flags::MULTICHOICE != 0 && scb.flags() & entry_flags::FSDQOT == 0 {
         let old = scb.altptr();
-        let mut candidate = old.and_then(|at| next_alternate(spec, &field, at));
-        if candidate.is_none() && !scb.ansbuf().is_empty() {
-            candidate = first_alternate_starting_with(spec, &field, scb.ansbuf());
-        }
+        // `if ((altptr=fsdscb->altptr) != NULL) { nxttkn } else if (anslen>0)
+        // { ck4alt }`, `FSD.C:1437-1442` -- an if/else-if, not two
+        // independent fallbacks. When something is already selected
+        // (`old.is_some()`), only `next_alternate` may produce a candidate;
+        // `ansbuf` at that point holds the *current* selection's own
+        // spelling (set by the previous `altntr()`), so seeding from it here
+        // would just match the alternate already selected and get stuck
+        // instead of falling through to the wrap-to-first step below.
+        let mut candidate = if let Some(at) = old {
+            next_alternate(spec, &field, at)
+        } else if !scb.ansbuf().is_empty() {
+            first_alternate_starting_with(spec, &field, scb.ansbuf())
+        } else {
+            None
+        };
+        // `if (altptr == NULL) { altptr=foptkn("ALT=",0); }`, `FSD.C:1443-1445`
+        // -- unconditional once the branch above didn't land anywhere: this
+        // is the wrap, landing back on the first alternate in the list.
         if candidate.is_none() && !alternates(spec, &field).is_empty() {
             candidate = Some(0);
         }
@@ -4118,8 +4143,13 @@ mod tests {
     }
 
     #[test]
-    fn hdlalt_space_cycles_forward_through_the_list_and_wraps_to_ignore() {
-        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+    fn hdlalt_space_cycles_forward_through_the_list_and_wraps_to_the_first_alternate() {
+        // FSD.C:1437-1445: reaching the end of the list is not a dead end --
+        // the next space after the last alternate wraps back to the first
+        // one, exactly the mechanism MajorMUD's own HAIR_COL/EYE_COL fields
+        // and the terminal SAVE(ALT=SAVE ALT=EDIT ALT=QUIT MULTICHOICE)
+        // field rely on to let a player cycle a 2-3 item list with space.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
         let form = compile(b"??????", spec, MANY);
         let mut scb = zeroed_scb();
         scb.set_crsfld(0);
@@ -4138,13 +4168,44 @@ mod tests {
         assert_eq!(v2, Hdlprt::Handled);
         assert_eq!(scb.ansbuf(), b"Brown", "cycled to the next alternate");
 
-        // A third space would cycle back to Black, i.e. nowhere new: with
-        // only two alternates and already on the last, there is no "next".
         scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
-        let (v3, out3) = hdlprt(&form, spec, &mut scb, b' ');
-        assert_eq!(v3, Hdlprt::Ignore, "no next alternate after the last one");
-        assert_eq!(out3, b"");
-        assert_eq!(scb.ansbuf(), b"Brown", "unchanged");
+        let (v3, _) = hdlprt(&form, spec, &mut scb, b' ');
+        assert_eq!(v3, Hdlprt::Handled);
+        assert_eq!(scb.ansbuf(), b"Red", "cycled to the last alternate");
+
+        // The fourth space is the one that matters: one more past the last
+        // alternate must wrap back to the first, not get stuck on "Red".
+        scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+        let (v4, out4) = hdlprt(&form, spec, &mut scb, b' ');
+        assert_eq!(v4, Hdlprt::Handled, "wraps around instead of ignoring the space");
+        assert_eq!(scb.ansbuf(), b"Black", "back to the first alternate");
+        assert_eq!(scb.altptr(), Some(0));
+        assert!(!out4.is_empty(), "the wrap is committed and echoed, like any other cycle step");
+    }
+
+    #[test]
+    fn hdlalt_space_wraps_from_the_last_alternate_straight_to_the_first() {
+        // A tighter, single-step proof of the wrap itself: seed `altptr` at
+        // the last alternate directly (rather than cycling there one space
+        // at a time, as the test above does) and confirm one more space
+        // lands on the first, not on nothing. This is the exact case the
+        // buggy version got wrong: `next_alternate` finds no next entry, and
+        // the old code then tried to seed a candidate from `ansbuf` -- which
+        // at this point holds the last alternate's own spelling, so it
+        // matched itself and returned `Ignore` instead of wrapping.
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_altptr(Some(2));
+        scb.set_ansbuf(b"Red");
+
+        let (verdict, out) = hdlprt(&form, spec, &mut scb, b' ');
+
+        assert_eq!(verdict, Hdlprt::Handled, "wraps instead of getting stuck on the last alternate");
+        assert_eq!(scb.ansbuf(), b"Black", "wrapped to the first alternate");
+        assert_eq!(scb.altptr(), Some(0));
+        assert!(!out.is_empty());
     }
 
     #[test]
