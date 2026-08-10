@@ -145,6 +145,20 @@ pub mod scb {
     /// C string. 81 bytes (`ANSLEN`, 80, plus the terminator), `FSD.H:307`.
     pub const ANSBUF: u16 = 45;
 
+    /// `char entfld` -- which field `fsdinc()` most recently finished typing
+    /// into: [`super::xitfld`] sets this the moment it moves the cursor off
+    /// a field and before the session enters [`state::FSDBUF`], so
+    /// `fsdprc`'s `FSDBUF` arm (Task 10, not yet ported) has a fixed record
+    /// of which field to validate even after `crsfld` has already moved on
+    /// to the next one. `FSD.H:313`. The running total lands here, one byte
+    /// ahead of [`CRSFLD`]: 45 (`ANSBUF`) plus 81 plus 1 (`anslen`, not
+    /// modeled) plus 1 (`ansptr`, not modeled) plus 20 (`typahd[EXTHED]`,
+    /// not modeled -- dropped per the design doc) plus 1 (`ahdptr`, not
+    /// modeled) plus 1 (`hdlahd`, not modeled) -- cross-checked against
+    /// `the_session_control_block_is_the_size_the_header_declares`'s own
+    /// running total.
+    pub const ENTFLD: u16 = 150;
+
     /// `char crsfld` -- `fsdinc()`'s idea of the current cursor field.
     /// `FSD.H:314`.
     pub const CRSFLD: u16 = 151;
@@ -637,6 +651,18 @@ impl Scb {
         let at = usize::from(scb::ANSBUF);
         self.bytes[at..at + value.len()].copy_from_slice(value);
         self.bytes[at + value.len()] = 0;
+    }
+
+    /// `entfld`: which field was just left, recorded by [`xitfld`] the
+    /// instant it moves the cursor off it. See [`scb::ENTFLD`] for why this
+    /// is a separate member from [`Scb::crsfld`] rather than a duplicate of
+    /// it.
+    pub fn entfld(&self) -> u8 {
+        self.byte(scb::ENTFLD)
+    }
+    /// Set [`Scb::entfld`].
+    pub fn set_entfld(&mut self, value: u8) {
+        self.set_byte(scb::ENTFLD, value);
     }
 
     /// `crsfld`: `fsdinc()`'s idea of the current cursor field.
@@ -2124,6 +2150,65 @@ pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
     true
 }
 
+/// `hdlcbs()`, `FSD.C:1571-1585`. Handle a backspace in ASCII (line) mode:
+/// move the cursor destructively, one `"\b \b"` per character erased.
+///
+/// # `ansptr > 0`, ported as "`ansbuf` is not empty"
+///
+/// The same substitution [`addprt`]'s own doc comment already makes: every
+/// caller in this crate's scope only ever edits at the end of the field
+/// currently being typed, so `scb.ansbuf().len()` plays `ansptr`'s role.
+/// `&&` short-circuits in both the original and here, so [`bstalt`] is
+/// never even called on an empty field -- it has nothing to bust through
+/// yet, and calling it anyway would risk clearing an `altptr` a genuinely
+/// empty field never had reason to hold.
+///
+/// # The embedded-punctuation walk
+///
+/// `while (*--fsdscb->ftmptr != ' ')` pre-decrements before testing, so it
+/// steps back over every literal punctuation byte [`addprt`]'s own forward
+/// walk most recently echoed -- the dash in `"###-####"`, for one -- each
+/// one costing its own `"\b \b"`, and stops the instant it lands back on a
+/// blank slot: the value slot the character itself occupied. That slot's
+/// own erase is the unconditional `fsdous("\b \b")` right after the loop,
+/// not part of it, which is why the loop's own body never fires for a field
+/// with no embedded punctuation at all (`fldptr->mbpoff < 0` skips the
+/// whole block).
+///
+/// Terminates for the reason [`unentr`]'s own doc comment gives [`skppnc`]'s
+/// leading walk: [`compile`] never places a value slot anywhere but on a
+/// blank, so stepping back from wherever [`addprt`] last left `ftmptr`
+/// always finds one -- at the very latest, the current field's own leading
+/// slot.
+///
+/// `fsdscb->ansptr--; fsdscb->anslen--; ...ansbuf[anslen]='\0';` -- three
+/// statements that all say the same thing this port's `ansbuf`-is-the-
+/// source-of-truth substitution already says once: drop the answer's last
+/// byte and re-terminate. [`Scb::set_ansbuf`] does both.
+pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
+    let field = form.fields[usize::from(scb.crsfld())];
+    let mut out = Vec::new();
+    if !scb.ansbuf().is_empty() && bstalt(&field, scb) {
+        let mut answer = scb.ansbuf().to_vec();
+        answer.pop();
+        scb.set_ansbuf(&answer);
+
+        if field.punctuation_at.is_some() {
+            let mut at = usize::from(scb.ftmptr());
+            loop {
+                at -= 1;
+                if form.punctuation[at] == b' ' {
+                    break;
+                }
+                out.extend_from_slice(b"\x08 \x08");
+            }
+            scb.set_ftmptr(at as u16);
+        }
+        out.extend_from_slice(b"\x08 \x08");
+    }
+    out
+}
+
 /// Every alternate whose value case-insensitively *starts with* `answer`,
 /// first-in-list first. `ck4alt(0)`'s own search (`foptkn(bufptr,0)` over
 /// `"ALT="+answer`), used by [`hdlalt`]'s space-cycling branch to seed a
@@ -2409,6 +2494,65 @@ pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
         }
         _ => (Hdlprt::Enter, Vec::new()),
     }
+}
+
+/// `xitfld(finc)`, `FSD.C:1336-1353`. Exit entry of the current field and
+/// move the cursor: `finc` is `+1`/`-1`/`0` for higher/lower/stay, the same
+/// convention [`move_field`]'s own doc comment already documents for its
+/// `inc` argument -- `xitfld` is one of [`move_field`]'s six call sites.
+///
+/// # What is ported, and what is not
+///
+/// Four of the original's six statements are mode-neutral and are all that
+/// is here:
+/// - `fsdscb->ansbuf[fsdscb->anslen]='\0'` is not reproduced. It is not
+///   dropped, either -- [`Scb::set_ansbuf`] already keeps `ansbuf`
+///   NUL-terminated on every write, the same standing invariant
+///   [`defntr`]/[`entprp`]'s own doc comments rely on, so the byte this
+///   statement writes is already correct before `xitfld` ever runs.
+/// - `fsdscb->entfld=fsdscb->crsfld` **is** ported, as [`Scb::set_entfld`]:
+///   see [`scb::ENTFLD`]'s own doc comment for why this needed a new
+///   accessor rather than reusing `crsfld`.
+/// - `movfld(fsdscb->crsfld+finc,finc,-1)` is ported as [`move_field`] with
+///   `resort: None` (this port's `-1`) and `wrap: false`. `wrap` is
+///   `udwrap && fsdscb->flags&FSDANS` (`valid_field`'s own doc comment,
+///   already established by [`fsdlin`]'s identical call) -- and `FSDANS` is
+///   never set anywhere in this port's line-mode path, the same fact
+///   [`bgnter`]'s own assertion polices, so `wrap` is `false` regardless of
+///   `udwrap` for exactly the reason [`fsdlin`]'s own call already is.
+/// - `fsdscb->state=FSDBUF` **is** ported.
+///
+/// Two are not:
+/// - `if (fsdscb->flags&FSDANS) { fsdous(fsdscb->flddat[fldn].ansgto); }` --
+///   the one line Task 8 was scoped to treat as dead code in line mode
+///   rather than silently drop. Guarded here the same way [`bgnter`] already
+///   guards its own ANSI branch: an assertion that fires loudly if `FSDANS`
+///   is ever set, rather than a branch nothing can reach yet. (There would
+///   be nothing faithful to send even if it fired -- [`Field::record`]'s own
+///   doc comment explains why every `ansgto` this port ever produces is
+///   zeroed.)
+/// - `fsdscb->ahdptr=0` and `fsdnfy()` -- both entirely outside what this
+///   crate's `fsd.rs` models. `ahdptr` belongs to `typahd`, dropped in full
+///   per the design doc's "Dropped" list (see [`scb::ENTFLD`]'s own doc
+///   comment, which explains the same gap for its neighbours). `fsdnfy()`
+///   is the host-level `CYCLE` re-arm ([`crate::shims::fsd`]'s `Machine`
+///   territory, wired up by Task 9's `fsdinc` dispatcher) -- not a thing a
+///   pure `&Form`/`&mut Scb` function can do at all.
+///
+/// # Panics
+///
+/// If `scb.flags() & FSDANS != 0` -- see above.
+pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) {
+    assert!(
+        scb.flags() & entry_flags::FSDANS == 0,
+        "xitfld: ANSI mode (FSDANS) is not ported -- Stage 5's cursor-goto \
+         echo (`fsdous(fldptr->ansgto)`) is dead code without it"
+    );
+    scb.set_entfld(scb.crsfld());
+    if let Some(fldn) = move_field(form, i32::from(scb.crsfld()) + finc, finc, None, false) {
+        scb.set_crsfld(fldn as u8);
+    }
+    scb.set_state(state::FSDBUF);
 }
 
 /// Compile a template and a field specification. `fsdppc()`, `FSD.C:463`.
@@ -3391,11 +3535,12 @@ mod tests {
         assert_eq!(scb::STATE, 44, "the byte right after allans");
         assert_eq!(scb::ANSBUF, 45, "state's own one byte later");
         assert_eq!(
-            scb::CRSFLD,
-            151,
+            scb::ENTFLD,
+            150,
             "45 (ansbuf) + 81 + 1 (anslen) + 1 (ansptr) + 20 (typahd) + 1 \
-             (ahdptr) + 1 (hdlahd) + 1 (entfld)"
+             (ahdptr) + 1 (hdlahd)"
         );
+        assert_eq!(scb::CRSFLD, 151, "entfld(150) + 1");
         assert_eq!(
             scb::FLAGS,
             157,
@@ -3473,10 +3618,19 @@ mod tests {
     }
 
     #[test]
+    fn scb_entfld_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        scb.set_entfld(4);
+        assert_eq!(scb.entfld(), 4);
+        assert_eq!(scb.crsfld(), 0, "crsfld, right after entfld");
+    }
+
+    #[test]
     fn scb_crsfld_reads_and_writes_its_own_offset() {
         let mut scb = zeroed_scb();
         scb.set_crsfld(9);
         assert_eq!(scb.crsfld(), 9);
+        assert_eq!(scb.entfld(), 0, "entfld, right before crsfld");
         assert_eq!(scb.flags(), 0, "flags, a handful of bytes after crsfld");
     }
 
@@ -4309,6 +4463,194 @@ mod tests {
 
         assert!(bstalt(&field, &mut scb));
         assert_eq!(scb.altptr(), None, "starting over");
+    }
+
+    #[test]
+    fn hdlcbs_does_nothing_on_an_empty_field() {
+        let form = compile(b"??", b"A", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        assert_eq!(hdlcbs(&form, &mut scb), b"", "ansptr==0 short-circuits before bstalt is even called");
+        assert_eq!(scb.ansbuf(), b"");
+    }
+
+    #[test]
+    fn hdlcbs_erases_one_character_with_no_punctuation() {
+        let form = compile(b"??", b"A", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Al");
+
+        assert_eq!(hdlcbs(&form, &mut scb), b"\x08 \x08");
+        assert_eq!(scb.ansbuf(), b"A");
+    }
+
+    #[test]
+    fn hdlcbs_erases_a_literal_separator_along_with_the_digit_before_it() {
+        // "Phone: ###-####", the same fixture as addprt's own phone-number
+        // test: the third digit's own addprt() call echoed "5-" (the digit
+        // plus the literal dash that immediately follows it in the
+        // template), so backspacing it must erase both -- and leave
+        // `ftmptr` exactly where the second digit's own addprt() call left
+        // it, not one slot off in either direction. This is the "off-by-one
+        // in cursor tracking" case a single isolated call cannot catch.
+        let template = b"Phone: ###-####";
+        let form = compile(template, b"PHONE", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        skppnc(&form, &mut scb);
+        addprt(&form, &mut scb, b'5');
+        addprt(&form, &mut scb, b'5');
+        let ftmptr_after_two_digits = scb.ftmptr();
+        addprt(&form, &mut scb, b'5');
+        assert_eq!(scb.ansbuf(), b"555");
+
+        let out = hdlcbs(&form, &mut scb);
+
+        assert_eq!(out, b"\x08 \x08\x08 \x08", "the dash, then the digit itself");
+        assert_eq!(scb.ansbuf(), b"55");
+        assert_eq!(
+            scb.ftmptr(),
+            ftmptr_after_two_digits,
+            "back to exactly where the second digit's own addprt() left it"
+        );
+    }
+
+    #[test]
+    fn hdlcbs_refuses_to_erase_a_committed_multichoice_alternate() {
+        let spec = b"C(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
+        let form = compile(b"??????", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Black");
+        scb.set_altptr(Some(0));
+
+        assert_eq!(hdlcbs(&form, &mut scb), b"", "bstalt refuses -- the committed choice stands");
+        assert_eq!(scb.ansbuf(), b"Black", "unchanged");
+        assert_eq!(scb.altptr(), Some(0), "not busted through");
+    }
+
+    #[test]
+    fn hdlcbs_busts_through_a_non_multichoice_alternates_field_and_erases_normally() {
+        // ALTERNATES without MULTICHOICE on a plain '?' field: bstalt() says
+        // yes, clearing altptr as a side effect, and hdlcbs proceeds exactly
+        // as it would with no ALT= list at all.
+        let spec = b"C(ALT=Black ALT=Brown)";
+        let form = compile(b"??????", spec, MANY);
+        assert_eq!(form.fields[0].flags, flags::ALTERNATES);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Black");
+        scb.set_altptr(Some(0));
+
+        let out = hdlcbs(&form, &mut scb);
+
+        assert_eq!(scb.altptr(), None, "bstalt cleared it as a side effect");
+        assert_eq!(scb.ansbuf(), b"Blac", "one character erased, same as any other field");
+        assert_eq!(out, b"\x08 \x08");
+    }
+
+    #[test]
+    fn hdlcbs_and_addprt_together_correct_a_typo_across_a_sequence_of_keystrokes() {
+        // A whole field's worth of input, not one call in isolation --
+        // "Kaimoon", two backspaces to drop the extra "o", then "n" to
+        // finish "Kaimon". The same fixture Task 9's own planned
+        // `fsdinc`-level test names, driven directly through addprt/hdlcbs
+        // here since `fsdinc` itself is not built yet.
+        let spec = b"NAME";
+        let form = compile(b"????????", spec, MANY); // width 8
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        let mut out = Vec::new();
+        for c in b"Kaimoon" {
+            out.extend(addprt(&form, &mut scb, *c));
+        }
+        assert_eq!(scb.ansbuf(), b"Kaimoon");
+        assert_eq!(out, b"Kaimoon");
+
+        out.clear();
+        out.extend(hdlcbs(&form, &mut scb));
+        out.extend(hdlcbs(&form, &mut scb));
+        assert_eq!(scb.ansbuf(), b"Kaimo", "both trailing o's backspaced off");
+        assert_eq!(out, b"\x08 \x08\x08 \x08");
+
+        out.clear();
+        out.extend(addprt(&form, &mut scb, b'n'));
+        assert_eq!(scb.ansbuf(), b"Kaimon");
+        assert_eq!(out, b"n");
+    }
+
+    #[test]
+    fn xitfld_advances_crsfld_to_the_next_field_and_enters_fsdbuf() {
+        let spec = b"A B C";
+        let form = compile(b"?? ?? ??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Hi");
+
+        xitfld(&form, &mut scb, 1);
+
+        assert_eq!(scb.crsfld(), 1, "the cursor genuinely moved to the next field's index");
+        assert_eq!(scb.entfld(), 0, "entfld records which field was just left");
+        assert_eq!(scb.state(), state::FSDBUF);
+    }
+
+    #[test]
+    fn xitfld_steps_backward_when_finc_is_negative() {
+        let spec = b"A B C";
+        let form = compile(b"?? ?? ??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(2);
+
+        xitfld(&form, &mut scb, -1);
+
+        assert_eq!(scb.crsfld(), 1);
+        assert_eq!(scb.entfld(), 2);
+        assert_eq!(scb.state(), state::FSDBUF);
+    }
+
+    #[test]
+    fn xitfld_skips_an_avoided_field_on_the_way_to_the_next_one() {
+        // Proves xitfld actually calls move_field rather than a hand-rolled
+        // crsfld+finc: field 1 is flagged AVOID (the module's own FFFAVD,
+        // e.g. a "you may see but not type into" field), so moving forward
+        // from field 0 must land on field 2, not field 1.
+        let spec = b"A B C";
+        let mut form = compile(b"?? ?? ??", spec, MANY);
+        form.fields[1].flags |= flags::AVOID;
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+
+        xitfld(&form, &mut scb, 1);
+
+        assert_eq!(scb.crsfld(), 2, "field 1 is AVOID -- skipped over");
+    }
+
+    #[test]
+    fn xitfld_at_the_last_field_leaves_crsfld_in_place_when_there_is_nowhere_to_go() {
+        // No wrap in line mode (FSDANS unset): movfld's resort (-1, this
+        // port's None) means crsfld is simply not written.
+        let spec = b"A B";
+        let form = compile(b"?? ??", spec, MANY);
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1); // the last field
+
+        xitfld(&form, &mut scb, 1);
+
+        assert_eq!(scb.crsfld(), 1, "no next field to move to -- left alone");
+        assert_eq!(scb.entfld(), 1, "still records which field was entered");
+        assert_eq!(scb.state(), state::FSDBUF);
+    }
+
+    #[test]
+    #[should_panic(expected = "FSDANS")]
+    fn xitfld_refuses_the_ansi_branch_it_does_not_port() {
+        let form = compile(b"?? ??", b"A B", MANY);
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        xitfld(&form, &mut scb, 1);
     }
 
     #[test]
