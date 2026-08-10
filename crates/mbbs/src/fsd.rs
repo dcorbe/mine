@@ -2675,6 +2675,64 @@ pub fn addprt(form: &Form, scb: &mut Scb, c: u8) -> Vec<u8> {
     out
 }
 
+/// `hdlnbs()`, `FSD.C:1541-1556`. Handle a backspace in ANSI mode: move the
+/// cursor left by one answer position. `fsdinc`'s `FSDAEN` `\b` arm is the
+/// only caller (Task 10) -- ported here, ahead of it, in the same relative
+/// position the original gives it: right after [`addprt`], right before
+/// [`bstalt`].
+///
+/// # It decrements `ansptr` itself; the caller must not do it again
+///
+/// `fsdscb->ansptr--;` is the function's very first statement. `fsdinc`'s
+/// `FSDAEN` `\b` arm calls this unconditionally on both of its branches and
+/// never touches `ansptr` anywhere near the call -- decrementing it again in
+/// the caller would walk the cursor two columns left for one keystroke.
+///
+/// # Two ways to move the cursor, chosen by embedded punctuation
+///
+/// With none: a single `'\b'` byte -- non-destructive here, unlike ASCII
+/// mode's [`hdlcbs`], because in ANSI mode the actual erasing is a separate
+/// concern ([`dprest`] repainting the tail, or a trailing `" \b"`) and this
+/// function's only job is moving the cursor.
+///
+/// With embedded punctuation: walk [`Scb::ftmptr`] backward, pre-decrementing
+/// before every test exactly the way [`hdlcbs`]'s own punctuation walk does
+/// (`for (j=1 ; *--fsdscb->ftmptr != ' ' ; j++)`) -- but where `hdlcbs` emits
+/// a destructive `"\b \b"` for every literal byte it steps over (ASCII mode
+/// has no relative cursor move to reach for), this counts the steps into `j`
+/// and moves them all at once with [`ansmov`], the same trade every other
+/// ANSI-mode walk in this module makes.
+///
+/// # The `int` return is dropped
+///
+/// The original returns `1` if the field has embedded punctuation, `0`
+/// otherwise (`/* returns 1=has embedded punctuation, 0=not */`,
+/// `FSD.C:1542`), but nothing in `FSD.C` or `FSDBBS.C` ever uses it -- both
+/// real call sites (`FSD.C:1858`, `:1861`) invoke `hdlnbs();` as a bare
+/// statement. This port has nothing to hand the value to and does not
+/// invent a use for it.
+pub fn hdlnbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    scb.set_ansptr(scb.ansptr() - 1);
+    let mut out = Vec::new();
+    if field.punctuation_at.is_some() {
+        let mut at = usize::from(scb.ftmptr());
+        let mut j: i16 = 1;
+        loop {
+            at -= 1;
+            if form.punctuation[at] == b' ' {
+                break;
+            }
+            j += 1;
+        }
+        scb.set_ftmptr(at as u16);
+        out.extend(ansmov(j, b'D'));
+    } else {
+        out.push(0x08);
+    }
+    out
+}
+
 /// What [`hdlprt`] decided about one printable character, mirroring the
 /// original's `int` return: `0`/`1`/`-1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2786,6 +2844,113 @@ pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
         }
         out.extend_from_slice(b"\x08 \x08");
     }
+    out
+}
+
+/// `dprest()`, `FSD.C:1588-1620`. Display the rest of the entry field from
+/// the cursor onward, then move the cursor back left to where it started.
+/// `fsdinc`'s `FSDAEN` arm (Task 10) is the only caller: its `Ctrl-F`,
+/// `DEL` and `\b` cases, after they have edited [`Scb::ansbuf`] mid-field.
+///
+/// # The single biggest trap in Task 10: this reads the *old* length
+///
+/// The C's very first statement is `n=fsdscb->anslen`, and every real caller
+/// has, by that point, already shifted `ansbuf` and written a space into
+/// what will become the new last slot -- but has **not yet** decremented
+/// `anslen` to match. That happens one statement *after* `dprest()`
+/// returns, back in the caller (`fsdscb->ansbuf[--fsdscb->anslen]='\0';`).
+/// So `n` is the length *before* the deletion, and the trailing space the
+/// caller just wrote (not yet truncated away) is what gets painted over the
+/// column the deleted character used to occupy -- with nothing shifted
+/// into it from `dprest`'s own point of view.
+///
+/// This port has no separate `anslen` member: `scb.ansbuf().len()` plays
+/// that role everywhere in this module (see [`scb::ANSPTR`]'s doc comment).
+/// It only plays it *correctly* here because every caller is required to
+/// call [`Scb::set_ansbuf`] with the buffer still at its old, full length
+/// (space-padded at the vacated slot) before calling this function, and
+/// truncate with a **second**, later `set_ansbuf` only after. Get that
+/// order backwards in a caller and this function silently paints one column
+/// short -- a ghost of the deleted character survives on screen -- because
+/// by the time `dprest` runs, `ansbuf().len()` is simply reporting whatever
+/// the caller most recently wrote; there is nothing here that could catch
+/// the mistake. See `fsdinc`'s `FSDAEN` `DEL`/`\b` arms for the two call
+/// sites this governs, and their own doc comments for why each needs a
+/// second `set_ansbuf` after this returns.
+///
+/// # Two branches for the repaint itself
+///
+/// Without embedded punctuation the distance is arithmetic (`n - ansptr`),
+/// and the bytes are either that many copies of the secret mask
+/// ([`secchs`]) or the literal tail of `ansbuf` itself -- `fsdous(ansbuf+i)`,
+/// this port's `&ansbuf[i..]`, which only reaches exactly the string's own
+/// end (not further) because `n` *is* `ansbuf().len()`.
+///
+/// With embedded punctuation the walk is positional: step a **local** copy
+/// of `ftmptr` forward one template slot per column (`cp=fsdscb->ftmptr` at
+/// entry -- unlike every other punctuation walk in this module, this one
+/// does not write [`Scb::ftmptr`] back; repainting the tail does not move
+/// the cursor's own bookmark, only [`ansmov`]'s relative move at the very
+/// end does that, visually), emitting the answer's own character (masked or
+/// not) on every blank slot and the literal template byte otherwise, and
+/// stopping the instant the *answer* index reaches `n` -- not when the
+/// template runs out, since a template can hold more blank slots than the
+/// answer currently fills. The column count `ansmov` moves back by is
+/// incremented once per iteration of this walk regardless of which side of
+/// the blank/literal test fired -- `FSD.C:1596`'s `k++,cp++` sits in the
+/// `for` loop's own increment clause, outside the `if`.
+///
+/// # The secret-field trailing-backspace correction
+///
+/// `if (sec && n >= 1 && ansbuf[n-1] == ' ') fsdous("\b ")`. Every real
+/// caller sets `ansbuf[n-1]` to a space right before calling this (the same
+/// trailing-space trick the rest of this doc comment is about), so on a
+/// [`flags::SECRET`] field this fires every time in practice: [`secchs`] (or
+/// the punctuation walk's masked branch) already drew a `*` for that now-
+/// blank trailing slot -- it has no way to know the slot is really empty,
+/// only that a byte lives there -- and this backs the cursor up one column
+/// and overwrites that stray `*` with a real space, so deleting a character
+/// from a password field does not leave a ghost asterisk behind.
+pub fn dprest(form: &Form, scb: &Scb) -> Vec<u8> {
+    let field = &form.fields[usize::from(scb.crsfld())];
+    let ansbuf = scb.ansbuf();
+    let n = ansbuf.len();
+    let i = usize::from(scb.ansptr());
+    let sec = field.flags & flags::SECRET != 0;
+    let mut out = Vec::new();
+    let k: i16;
+    if field.punctuation_at.is_some() {
+        let mut at = usize::from(scb.ftmptr());
+        let mut j = i;
+        let mut steps: i16 = 0;
+        while j < n {
+            let ch = form.punctuation[at];
+            if ch == b' ' {
+                out.push(if sec {
+                    SECCHR
+                } else {
+                    ansbuf.get(j).copied().unwrap_or(0)
+                });
+                j += 1;
+            } else {
+                out.push(ch);
+            }
+            at += 1;
+            steps += 1;
+        }
+        k = steps;
+    } else {
+        k = i16::try_from(n - i).unwrap_or(i16::MAX);
+        if sec {
+            out.extend(secchs(k));
+        } else {
+            out.extend_from_slice(&ansbuf[i..]);
+        }
+    }
+    if sec && n >= 1 && ansbuf.get(n - 1).copied() == Some(b' ') {
+        out.extend_from_slice(b"\x08 ");
+    }
+    out.extend(ansmov(k, b'D'));
     out
 }
 
@@ -3566,6 +3731,297 @@ fn fsdinc_apt(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i
     out
 }
 
+/// `fsdinc`'s `FSDAEN` case, `FSD.C:1757-1876`: in-field ANSI editing. The
+/// sibling of [`fsdinc_apt`] -- where that arm is cursor-*browse* mode
+/// (moving between fields, and starting entry of one), this is what runs
+/// once entry has actually started, one keystroke at a time, until an exit
+/// key hands back to `FSDAPT`.
+///
+/// No `answers` parameter, unlike [`fsdinc_apt`]: nothing in this arm calls
+/// [`defntr`] (that only happens when `FSDAPT` *starts* entry), so nothing
+/// here reads a field's stored answer -- only the session's own `ansbuf`,
+/// which `scb` already carries.
+///
+/// # Match-arm order does not follow the C's physical case order
+///
+/// The C's `default:` (the printable-character arm) sits in the middle of
+/// the case list, between `END` and `'F'-64`. A `switch` does not care --
+/// every label is reachable regardless of where it is written. A Rust
+/// `match` does care: its wildcard guard arm (`(0x20..256).contains(&key)`)
+/// would catch `DEL`'s literal `0x7F` (127, squarely inside that range) if
+/// it came first, silently typing the delete key into the field as text.
+/// [`fsdinc_apt`] hit the same shape and solved it the same way: every
+/// literal-keystroke arm is written before the printable guard, regardless
+/// of the C's own ordering.
+///
+/// # Six things this arm gets wrong if ported carelessly, in the order the
+/// keys appear below
+///
+/// 1. **`CRSRRT`/`CRSRLF` hand-write `"\x1B[C"`/`"\x1B[D"`** on the no-
+///    embedded-punctuation path (`FSD.C:1786`, `:1801`) rather than calling
+///    [`ansmov`], even though `ansmov(1,'C')`/`ansmov(1,'D')` produce the
+///    identical bytes -- `ansmov`'s own doc comment names this exact
+///    divergence. Matched here literally, with the punctuation path still
+///    routed through `ansmov` because on that path the count is rarely 1.
+/// 2. **`CRSRRT` tests `bstalt()` before the multichoice flag; `HOME`/`END`
+///    test the multichoice flag before `bstalt()`.** `FSD.C:1768-1770` is
+///    `ansptr < anslen && bstalt() && !(flags&FFFMCH)`; `FSD.C:1809-1810`
+///    (`HOME`) and `:1816-1817` (`END`) are `!(flags&FFFMCH) && bstalt()`.
+///    Reproduced case by case, matching each site's own literal order,
+///    rather than factored into one shared guard function that would have
+///    to pick one.
+///
+///    Checked by mutation, honestly reported rather than assumed: swapping
+///    the order does **not** currently fail any test in this crate. The
+///    reason is [`bstalt`]'s own definition, not a gap in coverage --
+///    `bstalt` clears [`Scb::altptr`] (its only side effect) exactly when
+///    it *succeeds*, and it only succeeds for a committed alternate on a
+///    field that is **not** [`flags::MULTICHOICE`]. So whenever the
+///    external multichoice test here would block entry, `bstalt`'s own
+///    internal multichoice check blocks it too, side-effect-free, with the
+///    same net result regardless of which one ran first or whether the
+///    second one even ran at all. The order is preserved anyway because it
+///    is what the original source says, and because a future change to
+///    `bstalt` -- or to which flag combinations are legal -- could make the
+///    two diverge; a test asserting a difference that provably cannot exist
+///    today would be asserting against the wrong thing.
+/// 3. **`Ctrl-F`'s guard reads the *session's* `anslen`** --
+///    `fsdscb->anslen`, this port's `scb.ansbuf().len()` -- **not the
+///    field's stored one.** This is the opposite of [`fsdinc_apt`]'s own
+///    `Ctrl-F`, which reads `fldptr->anslen` (a field's answer as installed
+///    by [`Answers`]) precisely because `FSDAPT`'s guard runs *before*
+///    [`defntr`] reseeds `ansbuf` for this field. `FSDAEN`'s guard runs
+///    *during* entry, after `ansbuf` already holds what is actually being
+///    typed, so the session buffer is the right thing to read here and
+///    would be the wrong thing in `FSDAPT`.
+/// 4. **`DEL` has two branches.** Cursor at the very end deletes nothing
+///    (`i == n`). Deleting the *last* character (`i == n-1`) takes a
+///    shortcut -- `" \b"` and no [`dprest`] call at all. Every other
+///    position shifts the tail and repaints. Both non-refused branches end
+///    in the same truncation.
+/// 5. **`\b` mirrors it**, with [`hdlnbs`] folded into *both* of its
+///    non-refused branches (it moves the cursor left and decrements
+///    `ansptr` itself; nothing here decrements it again).
+/// 6. **The Trap-1 ordering** ([`dprest`]'s own doc comment has the full
+///    account): `DEL`'s shift branch and `\b`'s shift branch both write the
+///    vacated last slot's space, call [`dprest`] while `ansbuf` is still at
+///    its *old* length, and only truncate afterwards. Reversing that order
+///    compiles, runs, and paints the screen one column short.
+///
+/// # `Ctrl-O`/`Ctrl-G`/`ESC` do *not* call `defntr`
+///
+/// Unlike [`fsdinc_apt`]'s identical-looking exit arm (`defntr(); xitkey=c;
+/// xitfld(0);`), `FSD.C:1871-1875` is just `fsdscb->xitkey=c; xitfld(0);` --
+/// no `defntr`. That call only belongs where entry is *starting*; here it
+/// is already underway, and `ansbuf` already holds the answer being
+/// abandoned or committed by `xitfld`.
+///
+/// # `Ctrl-L` is a no-op, same as everywhere else
+///
+/// `fsdqdp()` sets a redisplay flag this host has no reader for. See
+/// [`fsdinc_line`]'s own doc comment for the full reasoning; it applies
+/// here unchanged.
+fn fsdinc_aen(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
+    let mut out = Vec::new();
+    match key {
+        ain::CRSRUP | ain::BAKTAB | 0x15 => {
+            // 'U'-64
+            scb.set_xitkey(key as u16);
+            out.extend(xitfld(form, scb, -1));
+        }
+        0x0c => {
+            // 'L'-64: fsdqdp() -- no-op, see fsdinc_line's own doc comment.
+        }
+        0x0d | 0x09 | ain::CRSRDN => {
+            // '\r', TAB
+            scb.set_xitkey(key as u16);
+            out.extend(xitfld(form, scb, 1));
+        }
+        ain::CRSRRT => {
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            // Trap 2: bstalt() before the multichoice test (FSD.C:1768-1770).
+            if usize::from(scb.ansptr()) < scb.ansbuf().len()
+                && bstalt(field, scb)
+                && field.flags & flags::MULTICHOICE == 0
+            {
+                scb.set_ansptr(scb.ansptr() + 1);
+                if field.punctuation_at.is_some() {
+                    // `for (j=1 ; (ch=*++ftmptr) != ' ' && ch != '\0' ; j++)`
+                    // -- pre-increment, stops on a blank slot or the
+                    // template's own terminator.
+                    let mut at = usize::from(scb.ftmptr());
+                    let mut j: i16 = 1;
+                    at += 1;
+                    while form.punctuation[at] != b' ' && form.punctuation[at] != 0 {
+                        j += 1;
+                        at += 1;
+                    }
+                    scb.set_ftmptr(at as u16);
+                    out.extend(ansmov(j, b'C'));
+                } else {
+                    // Trap 1 of this arm's own doc comment: hand-written to
+                    // match FSD.C:1786's literal, not `ansmov(1, b'C')`.
+                    out.extend_from_slice(b"\x1b[C");
+                }
+            }
+        }
+        ain::CRSRLF => {
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            // Trap 2 again: bstalt() before the multichoice test, same as
+            // CRSRRT (FSD.C:1793-1795).
+            if scb.ansptr() > 0
+                && bstalt(field, scb)
+                && field.flags & flags::MULTICHOICE == 0
+            {
+                scb.set_ansptr(scb.ansptr() - 1);
+                if field.punctuation_at.is_some() {
+                    // `for (j=1 ; *--ftmptr != ' ' ; j++)` -- the same
+                    // pre-decrement walk hdlnbs()/hdlcbs() use.
+                    let mut at = usize::from(scb.ftmptr());
+                    let mut j: i16 = 1;
+                    loop {
+                        at -= 1;
+                        if form.punctuation[at] == b' ' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    scb.set_ftmptr(at as u16);
+                    out.extend(ansmov(j, b'D'));
+                } else {
+                    out.extend_from_slice(b"\x1b[D");
+                }
+            }
+        }
+        ain::HOME => {
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            // Trap 2, reversed: the multichoice test runs BEFORE bstalt()
+            // here (FSD.C:1809-1810), opposite of CRSRRT/CRSRLF above.
+            if field.flags & flags::MULTICHOICE == 0 && bstalt(field, scb) {
+                scb.set_ansptr(0);
+                // Absolute reset, not skppnc(): no echo, and mbpoff itself
+                // (not a walked position) is where ftmptr lands.
+                if let Some(mbpoff) = field.punctuation_at {
+                    scb.set_ftmptr(mbpoff);
+                }
+                out.extend_from_slice(&field.ansgto);
+            }
+        }
+        ain::END => {
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            // Trap 2, reversed, same as HOME (FSD.C:1816-1817).
+            if field.flags & flags::MULTICHOICE == 0 && bstalt(field, scb) {
+                out.extend(skepnc(form, scb));
+            }
+        }
+        0x06 => {
+            // 'F'-64: insert a space at the cursor (not the front -- that's
+            // FSDAPT's own Ctrl-F). Trap 3: the guard reads the SESSION's
+            // anslen (scb.ansbuf().len()), not the field's stored one --
+            // the opposite of FSDAPT's identical-looking guard, and correct
+            // here because ansbuf already holds the answer being edited.
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            if scb.ansbuf().len() >= usize::from(field.width) || !bstalt(field, scb) {
+                // refused: field already full, or a committed alternate
+                // blocks it
+            } else {
+                let i = usize::from(scb.ansptr());
+                let mut buf = scb.ansbuf().to_vec();
+                buf.insert(i, b' ');
+                scb.set_ansbuf(&buf);
+                out.extend(dprest(form, scb));
+            }
+        }
+        ain::DEL | 0x7f => {
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            let i = usize::from(scb.ansptr());
+            let n = scb.ansbuf().len();
+            if i == n || !bstalt(field, scb) {
+                // refused: cursor already at the end, or bstalt blocks it
+            } else if i == n - 1 {
+                // FSD.C:1849-1850. Deleting the very last character: no
+                // shift, no dprest -- just a destructive space-backspace.
+                out.extend_from_slice(b" \x08");
+                let mut buf = scb.ansbuf().to_vec();
+                buf.truncate(n - 1);
+                scb.set_ansbuf(&buf);
+            } else {
+                // Trap 6/dprest's own doc comment: shift, blank the vacated
+                // last slot, paint with dprest() while ansbuf().len() still
+                // reads n -- THEN truncate.
+                let mut buf = scb.ansbuf().to_vec();
+                buf.copy_within(i + 1..n, i);
+                buf[n - 1] = b' ';
+                scb.set_ansbuf(&buf);
+                out.extend(dprest(form, scb));
+                let mut buf = scb.ansbuf().to_vec();
+                buf.truncate(n - 1);
+                scb.set_ansbuf(&buf);
+            }
+        }
+        0x08 => {
+            // '\b'
+            let fldi = usize::from(scb.crsfld());
+            let field = &form.fields[fldi];
+            let i = usize::from(scb.ansptr());
+            if i == 0 || !bstalt(field, scb) {
+                // refused: cursor already at the front, or bstalt blocks it
+            } else {
+                let n = scb.ansbuf().len();
+                if n == i {
+                    // FSD.C:1859-1861. At the end of what's been typed:
+                    // hdlnbs() alone moves the cursor left (and decrements
+                    // ansptr itself -- do not decrement it again here), then
+                    // a destructive space-backspace erases the column. No
+                    // shift, no dprest.
+                    out.extend(hdlnbs(form, scb));
+                    out.extend_from_slice(b" \x08");
+                } else {
+                    // Trap 6, mirrored: shift the tail down into the slot
+                    // being vacated, blank the new last slot, THEN hdlnbs()
+                    // (moves ansptr/cursor left), THEN dprest() -- all while
+                    // ansbuf().len() still reads the old n.
+                    let mut buf = scb.ansbuf().to_vec();
+                    buf.copy_within(i..n, i - 1);
+                    buf[n - 1] = b' ';
+                    scb.set_ansbuf(&buf);
+                    out.extend(hdlnbs(form, scb));
+                    out.extend(dprest(form, scb));
+                }
+                let mut buf = scb.ansbuf().to_vec();
+                buf.truncate(n - 1);
+                scb.set_ansbuf(&buf);
+            }
+        }
+        0x0f | 0x07 | 0x1b => {
+            // 'O'-64, 'G'-64, ESC: abandon or commit the field. No defntr
+            // here -- see this function's own doc comment for why that
+            // differs from fsdinc_apt's identical-looking arm.
+            scb.set_xitkey(key as u16);
+            out.extend(xitfld(form, scb, 0));
+        }
+        // `' ' <= c && c < 256` (`FSD.C:1897`) -- no FSDQOT guard here,
+        // unlike FSDAPT's own printable arm.
+        _ if (i16::from(b' ')..256).contains(&key) => {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let byte = key as u8;
+            let (verdict, prt_out) = hdlprt(form, spec, scb, byte);
+            out.extend(prt_out);
+            if verdict == Hdlprt::Enter {
+                out.extend(addprt(form, scb, byte));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// `fsdinc(c)`, `FSD.C:1623-1642` (preamble) and its outer
 /// `switch(fsdscb->state)`. The FSD's own top-level keystroke dispatcher.
 ///
@@ -3614,12 +4070,8 @@ fn fsdinc_apt(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i
 /// [`state::FSDAEN`], [`state::FSDNPT`] or [`state::FSDNEN`] --
 /// `FSDBUF`/`FSDSTB` (typeahead accumulation between an `fsdinc` call and
 /// `fsdprc` catching up) are dropped per the design doc's "Dropped" list
-/// and are never valid here. If `scb.state()` is `FSDAEN`: that arm is
-/// Task 10, not yet built, and this panics loudly and by name rather than
-/// silently falling through to line-mode handling -- an ANSI session that
-/// reaches in-field editing before Task 10 lands should fail obviously, not
-/// mistype every keystroke as a line-mode one. Ctrl-L does *not* panic --
-/// see [`fsdinc_line`]'s own doc comment.
+/// and are never valid here. Ctrl-L does *not* panic -- see
+/// [`fsdinc_line`]'s own doc comment.
 pub fn fsdinc(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i16) -> Vec<u8> {
     assert!(
         matches!(
@@ -3645,12 +4097,7 @@ pub fn fsdinc(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i
 
     match scb.state() {
         state::FSDAPT => out.extend(fsdinc_apt(form, spec, answers, scb, key)),
-        state::FSDAEN => {
-            unimplemented!(
-                "fsdinc: FSDAEN (in-field ANSI editing, FSD.C:1757-1876) is Task 10, not yet \
-                 built -- key {key} arrived while state was FSDAEN"
-            );
-        }
+        state::FSDAEN => out.extend(fsdinc_aen(form, spec, scb, key)),
         _ => out.extend(fsdinc_line(form, spec, scb, key)),
     }
 
@@ -7797,18 +8244,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FSDAEN")]
-    fn fsdinc_refuses_fsdaen_loudly_because_task_10_does_not_exist_yet() {
-        // FSDAPT is admitted now (this task); FSDAEN is Task 10's, and a
-        // keystroke arriving there must fail loudly by name rather than
-        // silently falling through to fsdinc_line's byte dispatch.
+    fn fsdinc_fsdaen_types_a_character_into_an_already_started_field() {
+        // FSDAEN is now Task 10's real arm, not the loud placeholder panic
+        // this test used to pin. A printable keystroke reaches hdlprt/addprt
+        // and stays in FSDAEN -- no defntr, no state transition.
         let spec = b"A B";
         let form = compile(b"?? ??", spec, MANY, Ascn::Ansi);
         let answers = answers(&form, spec, b"\0");
         let mut scb = zeroed_scb();
         scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
         scb.set_state(state::FSDAEN);
-        fsdinc(&form, spec, &answers, &mut scb, b'x'.into());
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, b'x'.into());
+
+        assert_eq!(out, b"x");
+        assert_eq!(scb.ansbuf(), b"x");
+        assert_eq!(scb.state(), state::FSDAEN, "no exit key, so state is unchanged");
     }
 
     #[test]
@@ -7843,6 +8295,716 @@ mod tests {
         let out = fsdinc(&form, spec, &answers, &mut scb, b'm'.into());
         assert_eq!(out, b"m");
         assert_eq!(scb.ansbuf(), b"Kaim");
+    }
+
+    // --- Stage 5 Task 10: dprest, hdlnbs, fsdinc's FSDAEN arm ------------
+
+    #[test]
+    fn hdlnbs_with_no_punctuation_emits_a_bare_backspace_and_decrements_ansptr() {
+        let spec = b"A";
+        let (form, _) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansptr(2);
+
+        let out = hdlnbs(&form, &mut scb);
+
+        assert_eq!(out, b"\x08");
+        assert_eq!(scb.ansptr(), 1);
+    }
+
+    #[test]
+    fn hdlnbs_with_punctuation_walks_ftmptr_back_and_moves_the_cursor_with_ansmov() {
+        // "###-####": stepping back from the second group's first slot
+        // (index 4) crosses the dash (index 3) and lands on the first
+        // group's last slot (index 2) -- two columns, not one.
+        let spec = b"A";
+        let (form, _) = ansi_form(b"###-####\r\n", spec, b"\0");
+        let mbpoff = form.fields[0].punctuation_at.expect("the run joined");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansptr(3);
+        scb.set_ftmptr(mbpoff + 4);
+
+        let out = hdlnbs(&form, &mut scb);
+
+        assert_eq!(out, b"\x1b[2D");
+        assert_eq!(scb.ansptr(), 2);
+        assert_eq!(scb.ftmptr(), mbpoff + 2);
+    }
+
+    #[test]
+    fn dprest_with_no_punctuation_repaints_the_tail_and_moves_the_cursor_back() {
+        let spec = b"A";
+        let (form, _) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Kimo "); // as if DEL just shifted "Kaimo" -> "Kimo "
+        scb.set_ansptr(1);
+
+        let out = dprest(&form, &scb);
+
+        assert_eq!(out, b"imo \x1b[4D", "the tail, including the padding space");
+    }
+
+    #[test]
+    fn dprest_masks_a_secret_fields_tail_and_corrects_the_trailing_asterisk() {
+        let spec = b"A(SECRET)";
+        let (form, _) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"Kimo ");
+        scb.set_ansptr(1);
+
+        let out = dprest(&form, &scb);
+
+        // secchs(4) is "****", then the trailing-space correction backs up
+        // over the last '*' (drawn for the now-blank slot) and overwrites
+        // it with a real space, then the cursor move.
+        assert_eq!(out, b"****\x08 \x1b[4D");
+    }
+
+    #[test]
+    fn dprest_walks_embedded_punctuation_and_stops_at_the_answers_own_end() {
+        // "###-####", answer "551" (3 chars: the DEL/backspace caller
+        // already shifted so the buffer is 3 long, not padded here since
+        // this is punctuation mode -- dprest measures against ansptr, not a
+        // padding byte).
+        let spec = b"A";
+        let (form, _) = ansi_form(b"###-####\r\n", spec, b"\0");
+        let mbpoff = form.fields[0].punctuation_at.expect("the run joined");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(0);
+        scb.set_ansbuf(b"551");
+        scb.set_ansptr(1);
+        scb.set_ftmptr(mbpoff + 1);
+
+        let out = dprest(&form, &scb);
+
+        // From slot 1: '5' (index1), '1' (index2) -- the answer's own last
+        // two characters -- and stop before the dash, since the answer ends
+        // there (anslen==3). Two columns back.
+        assert_eq!(out, b"51\x1b[2D");
+    }
+
+    #[test]
+    fn dprest_reads_the_length_the_caller_left_in_ansbuf_not_a_separately_tracked_one() {
+        // Pins Trap 1 directly at dprest's own level: given the SAME cursor
+        // position, a longer ansbuf (as a DEL/backspace caller leaves it,
+        // pre-truncation) produces a longer repaint than the already-
+        // truncated buffer would. There is no separate "anslen" to get
+        // wrong independently of ansbuf's own length.
+        let spec = b"A";
+        let (form, _) = ansi_form(b"??????\r\n", spec, b"\0");
+
+        let mut before_truncate = zeroed_scb();
+        before_truncate.set_crsfld(0);
+        before_truncate.set_ansbuf(b"Kimo "); // old length 5, trailing pad
+        before_truncate.set_ansptr(1);
+        let out_before = dprest(&form, &before_truncate);
+
+        let mut after_truncate = zeroed_scb();
+        after_truncate.set_crsfld(0);
+        after_truncate.set_ansbuf(b"Kimo"); // truncated to the new length 4
+        after_truncate.set_ansptr(1);
+        let out_after = dprest(&form, &after_truncate);
+
+        assert_eq!(out_before, b"imo \x1b[4D");
+        assert_eq!(out_after, b"imo\x1b[3D");
+        assert_ne!(
+            out_before, out_after,
+            "calling dprest after truncation paints one column short"
+        );
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrup_baktab_and_ctrl_u_all_exit_toward_the_previous_field() {
+        let spec = b"A B";
+        for key in [ain::CRSRUP, ain::BAKTAB, 0x15] {
+            let (form, answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+            let mut scb = zeroed_scb();
+            scb.set_flags(entry_flags::FSDANS);
+            scb.set_crsfld(1);
+            scb.set_state(state::FSDAEN);
+            typed(&mut scb, b"Hi");
+
+            let out = fsdinc(&form, spec, &answers, &mut scb, key);
+
+            assert_eq!(scb.xitkey(), key as u16, "key {key:#x}");
+            assert_eq!(scb.crsfld(), 0, "key {key:#x} exited toward field 0");
+            assert_eq!(scb.state(), state::FSDBUF);
+            assert!(!out.is_empty());
+        }
+    }
+
+    #[test]
+    fn fsdinc_aen_enter_tab_and_crsrdn_all_exit_toward_the_next_field() {
+        let spec = b"A B";
+        for key in [0x0d, 0x09, ain::CRSRDN] {
+            let (form, answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+            let mut scb = zeroed_scb();
+            scb.set_flags(entry_flags::FSDANS);
+            scb.set_crsfld(0);
+            scb.set_state(state::FSDAEN);
+            typed(&mut scb, b"Hi");
+
+            let out = fsdinc(&form, spec, &answers, &mut scb, key);
+
+            assert_eq!(scb.xitkey(), key as u16, "key {key:#x}");
+            assert_eq!(scb.crsfld(), 1, "key {key:#x} exited toward field 1");
+            assert_eq!(scb.state(), state::FSDBUF);
+            assert!(!out.is_empty());
+        }
+    }
+
+    #[test]
+    fn fsdinc_aen_ctrl_g_and_ctrl_o_and_esc_exit_without_calling_defntr() {
+        // FSD.C:1871-1875 -- unlike FSDAPT's identical-looking exit arm,
+        // there is no defntr() call here. If there were, ansbuf would be
+        // reseeded from the field's STORED answer ("Stored"), clobbering
+        // the session's own in-progress edit ("Live").
+        let spec = b"A";
+        for key in [0x07, 0x0f, 0x1b] {
+            let (form, answers) = ansi_form(b"??????\r\n", spec, b"A=Stored\0\0");
+            let mut scb = zeroed_scb();
+            scb.set_flags(entry_flags::FSDANS);
+            scb.set_crsfld(0);
+            scb.set_state(state::FSDAEN);
+            typed(&mut scb, b"Live");
+
+            fsdinc(&form, spec, &answers, &mut scb, key);
+
+            assert_eq!(scb.xitkey(), key as u16, "key {key:#x}");
+            assert_eq!(
+                scb.ansbuf(),
+                b"Live",
+                "key {key:#x}: defntr must NOT have run"
+            );
+            assert_eq!(scb.state(), state::FSDBUF);
+        }
+    }
+
+    #[test]
+    fn fsdinc_aen_ctrl_l_is_a_no_op() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        typed(&mut scb, b"Hi");
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x0c);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrrt_moves_right_one_position_with_no_punctuation() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(1);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRRT);
+
+        assert_eq!(out, b"\x1b[C", "the literal FSD.C:1786 writes, not ansmov");
+        assert_eq!(scb.ansptr(), 2);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrrt_is_refused_with_the_cursor_already_at_the_end() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        typed(&mut scb, b"Kai");
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRRT);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrrt_crosses_embedded_punctuation_with_ansmov() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"###-####\r\n", spec, b"\0");
+        let mbpoff = form.fields[0].punctuation_at.expect("the run joined");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"555");
+        scb.set_ansptr(2);
+        scb.set_ftmptr(mbpoff + 2);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRRT);
+
+        assert_eq!(out, b"\x1b[2C", "the dash plus the next slot");
+        assert_eq!(scb.ansptr(), 3);
+        assert_eq!(scb.ftmptr(), mbpoff + 4);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrlf_moves_left_one_position_with_no_punctuation() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(2);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRLF);
+
+        assert_eq!(out, b"\x1b[D");
+        assert_eq!(scb.ansptr(), 1);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrlf_is_refused_with_the_cursor_already_at_the_front() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(0);
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRLF);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrlf_crosses_embedded_punctuation_with_ansmov() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"###-####\r\n", spec, b"\0");
+        let mbpoff = form.fields[0].punctuation_at.expect("the run joined");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"5551");
+        scb.set_ansptr(3);
+        scb.set_ftmptr(mbpoff + 4);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::CRSRLF);
+
+        assert_eq!(out, b"\x1b[2D", "the dash plus the slot before it");
+        assert_eq!(scb.ansptr(), 2);
+        assert_eq!(scb.ftmptr(), mbpoff + 2);
+    }
+
+    #[test]
+    fn fsdinc_aen_crsrrt_and_crsrlf_are_refused_on_a_multichoice_field() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        for key in [ain::CRSRRT, ain::CRSRLF] {
+            let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+            let mut scb = zeroed_scb();
+            scb.set_flags(entry_flags::FSDANS);
+            scb.set_crsfld(0);
+            scb.set_state(state::FSDAEN);
+            scb.set_ansbuf(b"Black");
+            scb.set_ansptr(2);
+            let before = scb.clone();
+
+            let out = fsdinc(&form, spec, &answers, &mut scb, key);
+
+            assert_eq!(out, b"", "key {key:#x}");
+            assert_eq!(scb, before, "key {key:#x}");
+        }
+    }
+
+    #[test]
+    fn fsdinc_aen_home_re_emits_the_absolute_goto_and_resets_the_cursor() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(2);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::HOME);
+
+        assert_eq!(out, form.fields[0].ansgto, "absolute, not a relative ansmov");
+        assert_eq!(scb.ansptr(), 0);
+    }
+
+    #[test]
+    fn fsdinc_aen_home_resets_ftmptr_to_mbpoff_without_walking_or_echoing() {
+        // "###-####" is the wrong fixture for this: every field `compile`
+        // produces starts on a blank (value) slot, so `skppnc`'s own echo
+        // loop never fires there regardless of which reset this arm uses --
+        // a mutation routing HOME through `skppnc()` instead of a direct
+        // reset would pass unnoticed against it. A hand-built form with
+        // LEADING literal punctuation (`skppnc`'s own doc comment: `compile`
+        // never produces this shape) is what actually tells the two apart:
+        // `skppnc()` would echo "(-)"; this arm must not.
+        let spec = b"A";
+        let mut form = compile(b"??", spec, MANY, Ascn::Ansi);
+        form.fields[0].punctuation_at = Some(0);
+        form.punctuation = b"(-) \0".to_vec();
+        let answers = answers(&form, spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"5");
+        scb.set_ansptr(1);
+        scb.set_ftmptr(3); // wherever a previous walk had left it
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::HOME);
+
+        assert_eq!(out, form.fields[0].ansgto, "the goto alone -- no skppnc echo");
+        assert_eq!(scb.ftmptr(), 0, "reset directly to mbpoff (0), not walked");
+        assert_eq!(scb.ansptr(), 0);
+    }
+
+    #[test]
+    fn fsdinc_aen_end_walks_to_the_end_of_the_answer() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(1);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::END);
+
+        assert_eq!(out, b"\x1b[2C");
+        assert_eq!(scb.ansptr(), 3);
+    }
+
+    #[test]
+    fn fsdinc_aen_home_and_end_are_refused_on_a_multichoice_field() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        for key in [ain::HOME, ain::END] {
+            let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+            let mut scb = zeroed_scb();
+            scb.set_flags(entry_flags::FSDANS);
+            scb.set_crsfld(0);
+            scb.set_state(state::FSDAEN);
+            scb.set_ansbuf(b"Black");
+            scb.set_ansptr(2);
+            let before = scb.clone();
+
+            let out = fsdinc(&form, spec, &answers, &mut scb, key);
+
+            assert_eq!(out, b"", "key {key:#x}");
+            assert_eq!(scb, before, "key {key:#x}");
+        }
+    }
+
+    #[test]
+    fn fsdinc_aen_ctrl_f_inserts_a_space_at_the_cursor_not_the_front() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0"); // width 6
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Hi");
+        scb.set_ansptr(1);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x06);
+
+        assert_eq!(scb.ansbuf(), b"H i", "inserted between H and i, not at the front");
+        assert_eq!(scb.ansptr(), 1, "Ctrl-F does not move the cursor");
+        assert_eq!(out, b" i\x1b[2D");
+    }
+
+    #[test]
+    fn fsdinc_aen_ctrl_f_guard_reads_the_session_buffer_not_the_fields_stored_answer() {
+        // Trap 2: the guard is fsdscb->anslen (the SESSION's ansbuf, being
+        // edited right now), not fldptr->anslen (the field's installed
+        // answer). Here the stored answer is short (2 chars) but the live
+        // session buffer already fills the field's width (5) -- reading the
+        // stored length would wrongly allow the insert.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"?????\r\n", spec, b"A=Hi\0\0"); // width 5
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        typed(&mut scb, b"ABCDE"); // 5 chars -- fills the field, unlike "Hi"
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x06);
+
+        assert_eq!(out, b"", "refused: the SESSION buffer is already full");
+        assert_eq!(scb, before, "the field's stored anslen (2) must not be consulted");
+    }
+
+    #[test]
+    fn fsdinc_aen_ctrl_f_is_refused_when_bstalt_blocks_a_committed_multichoice_alternate() {
+        // Unlike CRSRRT/CRSRLF/HOME/END, Ctrl-F's own C guard
+        // (`FSD.C:1825`) never tests `flags&FFFMCH` directly -- only
+        // `bstalt()`. So this is only refused because a MULTICHOICE field
+        // with a *committed* alternate makes bstalt() itself return false,
+        // not because of a separate multichoice check.
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let (form, answers) = ansi_form(b"??????????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Black");
+        scb.set_ansptr(2);
+        scb.set_altptr(Some(0));
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x06);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_del_at_the_end_of_the_answer_is_refused() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        typed(&mut scb, b"Kai");
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::DEL);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_del_of_the_last_character_is_a_shortcut_with_no_dprest() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(2); // the last character, index 2
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::DEL);
+
+        assert_eq!(out, b" \x08");
+        assert_eq!(scb.ansbuf(), b"Ka");
+        assert_eq!(scb.ansptr(), 2, "DEL does not move the cursor");
+    }
+
+    #[test]
+    fn fsdinc_aen_del_mid_field_shifts_the_tail_and_repaints_with_the_trailing_space() {
+        // Trap 1, at the fsdinc_aen level: deleting the middle 'a' out of
+        // "Kaimo" must repaint the full old tail INCLUDING the padding
+        // space dprest's own doc comment describes, before the buffer is
+        // truncated to its new, shorter length.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kaimo");
+        scb.set_ansptr(1); // deletes the 'a'
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::DEL);
+
+        assert_eq!(out, b"imo \x1b[4D", "the tail, plus the vacated last column");
+        assert_eq!(scb.ansbuf(), b"Kimo");
+        assert_eq!(scb.ansptr(), 1, "DEL does not move the cursor");
+    }
+
+    #[test]
+    fn fsdinc_aen_del_literal_0x7f_takes_the_delete_arm_not_the_printable_one() {
+        // Trap 7: 0x7F is inside the printable guard's own range
+        // (0x20..256). If the DEL arm were written after that guard in the
+        // match, this byte would be typed into the field as text instead.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kaimo");
+        scb.set_ansptr(1);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x7f);
+
+        assert_eq!(scb.ansbuf(), b"Kimo", "deleted, not typed in as text");
+        assert_eq!(out, b"imo \x1b[4D");
+    }
+
+    #[test]
+    fn fsdinc_aen_del_is_refused_when_bstalt_blocks_a_committed_multichoice_alternate() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Black");
+        scb.set_ansptr(2); // not at the end -- bstalt is what refuses this
+        scb.set_altptr(Some(0));
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, ain::DEL);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_backspace_at_the_front_is_refused() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kai");
+        scb.set_ansptr(0);
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x08);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_backspace_at_the_end_of_typed_text_uses_hdlnbs_then_a_shortcut() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        typed(&mut scb, b"Kai");
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x08);
+
+        assert_eq!(out, b"\x08 \x08", "hdlnbs's bare backspace, then the shortcut erase");
+        assert_eq!(scb.ansbuf(), b"Ka");
+        assert_eq!(scb.ansptr(), 2);
+    }
+
+    #[test]
+    fn fsdinc_aen_backspace_mid_field_shifts_hdlnbs_then_repaints_with_dprest() {
+        // Trap 1 and Trap 6 together: hdlnbs() must run (moving the cursor
+        // AND decrementing ansptr, exactly once) before dprest() paints --
+        // and dprest paints using the OLD, not-yet-truncated ansbuf.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Kaimo");
+        scb.set_ansptr(3); // erases the 'i' at index 2
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x08);
+
+        assert_eq!(
+            out, b"\x08mo \x1b[3D",
+            "hdlnbs's bare backspace, then dprest's repaint from the new cursor"
+        );
+        assert_eq!(scb.ansbuf(), b"Kamo");
+        assert_eq!(scb.ansptr(), 2, "hdlnbs decremented it exactly once");
+    }
+
+    #[test]
+    fn fsdinc_aen_backspace_is_refused_when_bstalt_blocks_a_committed_multichoice_alternate() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Black");
+        scb.set_ansptr(2);
+        scb.set_altptr(Some(0));
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, 0x08);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_a_printable_character_overwrites_at_the_cursor_via_addprt() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_ansbuf(b"Hi");
+        scb.set_ansptr(1);
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, i16::from(b'X'));
+
+        assert_eq!(out, b"X");
+        assert_eq!(scb.ansbuf(), b"HX", "overwritten at the cursor, not appended");
+        assert_eq!(scb.ansptr(), 2);
+        assert_eq!(scb.state(), state::FSDAEN, "no state change on a printable character");
+    }
+
+    #[test]
+    fn fsdinc_aen_an_unmatched_character_on_a_multichoice_field_is_ignored() {
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        let before = scb.clone();
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, i16::from(b'z'));
+
+        assert_eq!(out, b"", "Hdlprt::Ignore -- neither entered nor handled");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdinc_aen_space_cycles_a_multichoice_alternate_via_hdlalt_handled() {
+        // Hdlprt::Handled (an ALT= cycle) does NOT call addprt -- altntr
+        // already echoed the new alternate itself.
+        let spec = b"C(ALT=Black ALT=Brown MULTICHOICE)";
+        let (form, answers) = ansi_form(b"??????\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_crsfld(0);
+        scb.set_state(state::FSDAEN);
+        scb.set_altptr(Some(0)); // "Black" already committed
+        typed(&mut scb, b"Black");
+
+        let out = fsdinc(&form, spec, &answers, &mut scb, i16::from(b' '));
+
+        assert_eq!(scb.ansbuf(), b"Brown", "cycled to the next alternate");
+        assert_eq!(scb.state(), state::FSDAEN);
+        assert!(!out.is_empty());
     }
 
     // --- Task 10: fsdprc's FSDBUF arm ---------------------------------
