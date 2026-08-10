@@ -231,15 +231,25 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     // anyone is current right now.
     host.forms.insert((number, amode), form.clone());
 
-    // `setfsd(usrnum)`, `FSDBBS.C:129`. Every *real* session's `fsdroom` runs
-    // with a channel current -- `fsdapr`'s own doc comment traces MajorMUD's
-    // one call site to after `point_curusr`, and `WCCTEXT.MSG`'s two-form
-    // priming has already happened by then. That priming is the one measured
-    // exception: `_INIT__WCCMMUD` calls `fsdroom` for message 6 and message 7
-    // at calls 7326 and 7328, before any channel has connected at all.
-    // `usrnum` is `-1` there -- confirmed by instrumenting this shim against
-    // `re/WCCMMUD.DLL` across all 18 of this crate's module-level acceptance
-    // tests: 34 `fsdroom` calls, all of them `-1`.
+    // `setfsd(usrnum)`, `FSDBBS.C:129`. `_INIT__WCCMMUD` calls `fsdroom` for
+    // message 6 and message 7 at calls 7326 and 7328, before any channel has
+    // connected at all -- `usrnum` is `-1` there. Once a session is under
+    // way, `fsdapr`'s own doc comment traces MajorMUD's one call site to
+    // after `point_curusr`, so a channel is current by then.
+    //
+    // Confirmed by instrumenting this shim across all 18 of this crate's
+    // module-level acceptance tests: 34 `fsdroom` calls total. The first two
+    // of every `_INIT__WCCMMUD` run (32 of the 34, across the 16 tests that
+    // reach init) are the message-6/message-7 priming above, with
+    // `usrnum=-1`. The other two are ordinary per-channel calls with
+    // `usrnum=0`: one in `entering_the_realm_reaches_character_creation`
+    // (message 6, `amode=1`, refused by the `amode == 1` check above before
+    // it ever reaches [`Host::current_channel`]) and one in
+    // `entering_the_realm_reaches_character_creation_in_line_mode` (message
+    // 7, `amode=0`, a genuine successful mid-session call). So the only
+    // `fsdroom` calls actually measured with no channel current are the
+    // two init-time priming calls; every later, real per-channel call in
+    // this test suite had one.
     //
     // The original's `setfsd(-1)` computes `fsdtbl+(unsigned)(-1)`, a garbage
     // `fsdscb` one struct short of the array, and writes through it anyway --
