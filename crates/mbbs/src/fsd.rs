@@ -158,6 +158,16 @@ pub mod scb {
     /// [`Scb::ftmptr`] for why this port keeps only 2 of those 4 bytes.
     pub const FTMPTR: u16 = 153;
 
+    /// `char *altptr` -- which of the current field's `ALT=` values
+    /// [`super::hdlalt`]/[`super::altntr`] currently have selected, or
+    /// `NULL`. `FSD.H:318`. Sits between `FLAGS` (157, 1 byte) and `XITKEY`
+    /// (162), so the real 4-byte far pointer's own 4 bytes are 158-161 --
+    /// cross-checked the same way [`FTMPTR`]'s own comment is, against
+    /// `the_session_control_block_is_the_size_the_header_declares`'s running
+    /// total. See [`Scb::altptr`] for why this port keeps only 2 of those 4
+    /// bytes, the same substitution [`FTMPTR`] already makes.
+    pub const ALTPTR: u16 = 158;
+
     /// `int xitkey` -- the keystroke that initiated exit of the field.
     /// `FSD.H:319`.
     pub const XITKEY: u16 = 162;
@@ -673,6 +683,52 @@ impl Scb {
     /// Set [`Scb::flags`].
     pub fn set_flags(&mut self, value: u8) {
         self.set_byte(scb::FLAGS, value);
+    }
+
+    /// `altptr`: the ordinal (within [`alternates`]'s own listing order) of
+    /// the alternate [`hdlalt`]/[`altntr`] currently have selected, or
+    /// `None` for the real member's `NULL`.
+    ///
+    /// The real member (`FSD.H:318`) is a 4-byte far pointer into the field
+    /// specification text, sitting right after the matched entry's own
+    /// `ALT=`. This port keeps an ordinal instead -- the same substitution
+    /// [`Scb::ftmptr`]'s own doc comment explains for its pointer: every
+    /// reader of this port's `altptr` already has `spec`/[`alternates`] in
+    /// hand, and none of them dereference a `fldspc`-relative address
+    /// through `Machine`.
+    ///
+    /// Stored as `ordinal + 1`, with `0` standing for `NULL` -- the reverse
+    /// of [`Scb::ftmptr`]'s own `0`-means-"never positioned" choice, and
+    /// deliberately so: unlike an echo position, `0` is a *legitimate*
+    /// ordinal (the very first alternate), so it cannot double as the
+    /// sentinel the way `ftmptr`'s own zero does. An `alczer`'d block's raw
+    /// zero bytes must decode to `None` -- nothing initializes this member
+    /// on purpose, the same way nothing initializes any other entry-session
+    /// field -- so the offset-by-one falls on the *occupied* side, not the
+    /// empty one.
+    pub fn altptr(&self) -> Option<u16> {
+        match self.word(scb::ALTPTR) {
+            0 => None,
+            n => Some(n - 1),
+        }
+    }
+    /// Set [`Scb::altptr`].
+    ///
+    /// # Panics
+    ///
+    /// If `value` is `Some(u16::MAX)`. No field specification in evidence
+    /// carries anywhere near 65535 alternates, and refusing the one ordinal
+    /// the `+1` encoding cannot represent is cheaper than silently storing a
+    /// wrapped `0` (`NULL`) instead.
+    pub fn set_altptr(&mut self, value: Option<u16>) {
+        let stored = match value {
+            None => 0,
+            Some(n) => {
+                assert!(n != u16::MAX, "altptr ordinal {n} has no room left for the +1 encoding");
+                n + 1
+            }
+        };
+        self.set_word(scb::ALTPTR, stored);
     }
 
     /// `xitkey`: the keystroke that initiated exit of the field.
@@ -1826,17 +1882,24 @@ pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers:
 /// than trusted, per this repo's house rule about citing the file and not a
 /// prior summary of it.
 ///
-/// Prepare for entry mode: blank `ansbuf` and clear `FSDANT`.
+/// Prepare for entry mode: blank `ansbuf`, clear `FSDANT`, and null
+/// `altptr`.
 ///
-/// `anslen`, `ansptr` and `altptr` are not modeled. The first two are this
-/// module's standing substitution -- [`bgnter`] and [`fsdlin`] both derive
-/// them from `ansbuf`'s own length rather than storing them separately, and
-/// blanking `ansbuf` here has the same effect `anslen=ansptr=0` would.
-/// `altptr` is [`defntr`]'s own gap, for the same reason: Task 7's
-/// `hdlalt`/`altntr` are what set it, and nothing before them reads it.
+/// `anslen` and `ansptr` are not modeled. Both are this module's standing
+/// substitution -- [`bgnter`] and [`fsdlin`] both derive them from
+/// `ansbuf`'s own length rather than storing them separately, and blanking
+/// `ansbuf` here has the same effect `anslen=ansptr=0` would.
+///
+/// `altptr` **is** modeled, as of Task 7, and this is the routine the
+/// original clears it in (`fsdscb->altptr=NULL;`, `FSD.C:781`) -- not an
+/// afterthought: without this line, a value [`hdlalt`]/[`altntr`] committed
+/// on one field would survive into the next field's fresh entry, and
+/// [`hdlalt`]'s own space-cycling branch reads `altptr` before anything else
+/// this port ports has a chance to reset it.
 pub fn entprp(scb: &mut Scb) {
     scb.set_ansbuf(b"");
     scb.set_flags(scb.flags() & !entry_flags::FSDANT);
+    scb.set_altptr(None);
 }
 
 /// `skppnc()`, `FSD.C:1287-1299`. Position [`Scb::ftmptr`] at the start of
@@ -3095,6 +3158,7 @@ mod tests {
             157,
             "crsfld(151) + 1 (crsfld itself) + 1 (shffld) + 4 (ftmptr)"
         );
+        assert_eq!(scb::ALTPTR, 158, "flags(157) + 1");
         assert_eq!(scb::XITKEY, 162, "flags(157) + 1 + 4 (altptr)");
         assert_eq!(scb::CHGCNT, 164, "xitkey(162) + 2");
     }
@@ -3372,10 +3436,32 @@ mod tests {
     }
 
     #[test]
-    fn entprp_blanks_ansbuf_and_clears_fsdant_only() {
+    fn scb_altptr_reads_and_writes_its_own_offset() {
+        let mut scb = zeroed_scb();
+        assert_eq!(scb.altptr(), None, "an alczer'd block's altptr is NULL");
+
+        scb.set_altptr(Some(0));
+        assert_eq!(scb.altptr(), Some(0), "ordinal 0 does not collide with NULL");
+        assert_eq!(scb.flags(), 0, "flags, right before altptr");
+        assert_eq!(scb.xitkey(), 0, "xitkey, right after altptr");
+
+        scb.set_altptr(Some(4));
+        assert_eq!(scb.altptr(), Some(4));
+
+        scb.set_altptr(None);
+        assert_eq!(scb.altptr(), None, "set_altptr(None) round-trips back to NULL");
+    }
+
+    #[test]
+    fn entprp_blanks_ansbuf_clears_fsdant_and_nulls_altptr() {
+        // `FSD.C:776-784`: `fsdscb->altptr=NULL;` is the entry's third
+        // statement, not an afterthought -- a stale `altptr` surviving into
+        // a fresh field's entry is exactly the cross-field leak Task 7's own
+        // `hdlalt` would otherwise be able to observe.
         let mut scb = zeroed_scb();
         scb.set_ansbuf(b"stale");
         scb.set_flags(entry_flags::FSDANT | entry_flags::FSDANS);
+        scb.set_altptr(Some(2));
 
         entprp(&mut scb);
 
@@ -3385,6 +3471,7 @@ mod tests {
             entry_flags::FSDANS,
             "FSDANT cleared, FSDANS (unrelated) left alone"
         );
+        assert_eq!(scb.altptr(), None);
     }
 
     #[test]
