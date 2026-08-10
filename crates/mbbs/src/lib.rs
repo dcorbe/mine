@@ -692,6 +692,19 @@ enum PollTarget {
 /// [`Host::fsd_sessions`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FsdSession {
+    /// Whether `fsdego` started this session with `fsdent` rather than
+    /// `fsdlin` -- the original's `fsdusr->flags & FBFULL` (`FSDBBS.C:207`,
+    /// `:211`). `goback` reads it to decide whether to park the cursor below
+    /// the form on the way out (`FSDBBS.C:227`).
+    ///
+    /// Written by `fsdego` and read only by tests until Task 12 ports that
+    /// branch of `goback` -- hence the `allow`. Recorded now rather than then
+    /// because it is the original's own `fsdusr->flags` bookkeeping, set at
+    /// the moment the fork is taken; reconstructing it later from `amode`
+    /// would be a second source of truth for one fact.
+    #[allow(dead_code)]
+    pub(crate) full_screen: bool,
+
     /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
     /// module passed `NULL` -- `goback()`'s own `else` branch
     /// (`FSDBBS.C:236`) is what a `None` here means to it.

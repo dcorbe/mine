@@ -2188,6 +2188,45 @@ pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers:
     out
 }
 
+/// `fsdent(inifld)`, `FSD.C:815-834`: begin a full-screen entry session.
+///
+/// Six lines, the ANSI counterpart of [`fsdlin`]:
+///
+///
+/// # `flags = FSDANS` is an assignment, not an or
+///
+/// And nothing ever clears it afterwards. `FSDANS` is not a mode that gets
+/// toggled during a session -- it is "which entry point started this one",
+/// fixed for its lifetime, and the assignment also wipes `FSDQOT`/`FSDSHN`
+/// from whatever came before. [`fsdlin`] does the mirror image with `= 0`.
+///
+/// # The goto really is emitted twice
+///
+/// `cursat` ends in `shofld`, which begins with the field's `ansgto` -- and
+/// then this emits it again. Same paint-then-re-home idiom as [`bgnter`]: the
+/// answer `shofld` drew left the cursor at its end, and the session has to
+/// begin at the field's start.
+///
+/// # Wrapping
+///
+/// `movfld(inifld,1,inifld)`'s `wrap` is the C's `udwrap && fsdscb->flags &
+/// FSDANS`. `FSDANS` was just set, so it comes down to `udwrap` -- a file-scope
+/// `int udwrap=1` (`FSD.C:36`) a sysop can turn off and this host does not
+/// model, so it takes the initialiser. That is the same reasoning [`fsdlin`]'s
+/// own call site uses to arrive at `false`.
+#[must_use]
+pub fn fsdent(form: &Form, answers: &Answers, scb: &mut Scb, inifld: i32) -> Vec<u8> {
+    scb.set_flags(entry_flags::FSDANS);
+    let resort = usize::try_from(inifld).ok();
+    let fldn = move_field(form, inifld, 1, resort, true).unwrap_or(0);
+    let mut out = cursat(form, answers, scb, u8::try_from(fldn).unwrap_or(0));
+    out.extend_from_slice(&form.fields[fldn].ansgto);
+    entprp(scb);
+    scb.set_state(state::FSDAPT);
+    scb.set_chgcnt(0);
+    out
+}
+
 /// `entprp()`, `FSD.C:776-784`.
 ///
 /// **Not** `FSD.C:1776-1784` -- the file has exactly one `entprp`, and this

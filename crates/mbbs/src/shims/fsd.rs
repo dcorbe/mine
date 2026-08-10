@@ -24,9 +24,8 @@
 //!
 //! `fsdbkg` (`FSDBBS.C:185`) writes an ANSI clear-screen, then calls `btutsw`,
 //! `btulok` and `btuoes` against a channel and `fsddsp` to draw every field of
-//! the form. It is a full-screen (ANSI, `amode == 1`) display routine with no
-//! screen to draw on, so it stops the module and names itself -- the right
-//! answer, and one that needs no code.
+//! the form. It was once refused for want of a screen to draw on; Stage 5
+//! built one, and [`fsdbkg`] now paints for real.
 //!
 //! [`fsdego`] (`FSDBBS.C:196`) started out beside it for the same reason: it
 //! arranges for the module's own `fldvfy` and `whndun` -- two far pointers
@@ -37,9 +36,8 @@
 //! `fsdego` itself never needs one -- the callbacks it stores fire later,
 //! from a channel's own dispatch (`Host::poll`, once the FSD's `state` is
 //! current), which is a fresh top-level entry the same way `dopoll`/`polrou`
-//! already are. `amode == 1` (`fsdent`, the full-screen counterpart `fsdego`
-//! would otherwise dispatch to) is still refused, for the same reason
-//! `fsdroom`'s own `amode == 1` is one step earlier.
+//! already are. `amode == 1` dispatches to [`fsd::fsdent`], the full-screen
+//! counterpart of `fsdlin`, as of Stage 5's Task 8.
 //!
 //! `installs fsdchi as the channel's character-input handler through
 //! btuchi` in the original has no equivalent shim at all: `crate::gsbl`'s
@@ -178,13 +176,7 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let number = machine.arg_u16(0);
     let amode = machine.arg_u16(3) as i16;
 
-    if amode == 1 {
-        return Err(ShimError::Failed(format!(
-            "fsdroom(message {number}, amode=1): a full-screen entry session is \
-             scanned against an ANSI screen this host has no way to draw"
-        )));
-    }
-    if amode != 0 && amode != -1 {
+    if amode != 0 && amode != 1 && amode != -1 {
         return Err(ShimError::Failed(format!(
             "fsdroom(message {number}): amode {amode} is neither entry (0/1) nor display (-1)"
         )));
@@ -1006,14 +998,6 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                 .into(),
         ));
     };
-    if amode == 1 {
-        return Err(ShimError::Failed(
-            "fsdego(amode=1): a full-screen entry session (fsdent, FSD.C:816) is not \
-             implemented -- Stage 5. fsdroom already refuses this amode; reaching fsdego with \
-             it recorded means Host::fsdtmp and reality have come apart"
-                .into(),
-        ));
-    }
     let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
         return Err(ShimError::Failed(format!(
             "fsdego: channel {chan} recorded message {msgno} (amode {amode}) but no such form \
@@ -1027,7 +1011,17 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let answers = answer_string(machine, block.newans())?;
 
     block.set_fldvfy(fldvfy);
-    let output = fsd::fsdlin(&form, &spec, &template, &mut block, &answers);
+    // `FSDBBS.C:205-212`: the amode fork. `fsdent(0)` for a full-screen
+    // session and `fsdlin()` for a linear one, and `FBFULL` in the
+    // per-channel flags either way, which `goback` reads on the way out
+    // (`FSDBBS.C:227`).
+    let full_screen = amode == 1;
+    let output = if full_screen {
+        let installed = read_answers(machine, &block)?;
+        fsd::fsdent(&form, &installed, &mut block, 0)
+    } else {
+        fsd::fsdlin(&form, &spec, &template, &mut block, &answers)
+    };
     machine.write(at, block.as_bytes())?;
 
     host
@@ -1041,6 +1035,7 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
         whndun: (whndun != FarPtr::NULL).then_some(whndun),
         save: false,
+        full_screen,
     });
 
     // `ainscb=&fsdusr->ainscb; ainbeg();` -- FSDBBS.C:217-218, *outside* the
@@ -1668,9 +1663,20 @@ mod tests {
 
     /// [`session`], over a named message of `FSDFORM.MSG`.
     fn session_over(f: &mut Fixture, message: u16, spec: &str, defaults: &[u8]) -> (FarPtr, u16) {
+        session_amode(f, message, spec, defaults, 0)
+    }
+
+    /// [`session`], at a chosen `amode` -- 1 for a full-screen form.
+    fn session_amode(
+        f: &mut Fixture,
+        message: u16,
+        spec: &str,
+        defaults: &[u8],
+        amode: u16,
+    ) -> (FarPtr, u16) {
         let _ = open_form(f);
         let spec = f.text(spec);
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[message, spec.offset, spec.selector, 0])
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[message, spec.offset, spec.selector, amode])
         else {
             panic!("fsdroom refused")
         };
@@ -2489,19 +2495,29 @@ mod tests {
     }
 
     #[test]
-    fn a_full_screen_session_is_refused_rather_than_scanned_blind() {
-        // `amode=1` scans the template against an ANSI screen to read each
-        // field's cursor position off it. There is no screen, and a form whose
-        // fields all thought they were at the origin would be worse than none.
+    fn a_full_screen_session_is_scanned_against_the_cursor_tracker() {
+        // This used to assert the opposite: `amode=1` scans the template
+        // against an ANSI screen to read each field's cursor position off it,
+        // there was no screen, and a form whose fields all thought they were
+        // at the origin would have been worse than none. Stage 5 built the
+        // tracker (`fsd::Terminal`, checked field by field against the
+        // genuine host in `tests/fsd_oracle.rs`), so the scan happens.
         let mut f = Fixture::new();
         let _ = open(&mut f);
         let spec = f.text("ONE");
 
-        let e = f
-            .invoke(fsdroom, &[0, spec.offset, spec.selector, 1])
-            .expect_err("refused");
-        assert!(format!("{e}").contains("ANSI screen"), "{e}");
-        assert!(f.host.forms().is_empty());
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
+            panic!("fsdroom(amode=1) refused")
+        };
+        assert!(size > 0);
+        assert!(
+            f.host.forms().contains_key(&(0, 1)),
+            "and the full-screen form is cached under its own amode"
+        );
+        // This file's message 0 has no field runs, so there are no cursor
+        // positions here to look at; `fsdroom_sizes_a_full_screen_form_
+        // instead_of_refusing_it` makes that assertion against a template
+        // that does.
     }
 
     #[test]
@@ -2710,22 +2726,22 @@ mod tests {
     }
 
     #[test]
-    fn fsdego_refuses_a_forged_amode_1_recording_defensively() {
-        // `fsdroom` already refuses `amode == 1` outright (line 175 of this
-        // file), so the module's own call sequence can never reach fsdego
-        // with a full-screen session recorded -- this can only be reached
-        // by a `Host::fsdtmp` that has come apart from reality, forged here
-        // the way `a_field_count_the_module_forged_cannot_index_out_of_the_
-        // segment` forges `numfld`. fsdego refuses independently rather
-        // than trusting fsdroom's gate alone.
+    fn fsdego_refuses_a_forged_amode_recording_defensively() {
+        // `amode == 1` is legitimate since Stage 5's Task 8, so this no
+        // longer forges *that*. What it forges instead is the same class of
+        // fault: a `Host::fsdtmp` that has come apart from `Host::forms`, the
+        // way `a_field_count_the_module_forged_cannot_index_out_of_the_
+        // segment` forges `numfld`. fsdego must refuse on its own terms
+        // rather than index into a form that was never compiled.
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
         let (mbk, msgno, _) = f.host.fsdtmp[chan.index()].expect("recorded by session()");
+        // amode 1 recorded, but only the amode-0 form was ever compiled.
         f.host.fsdtmp[chan.index()] = Some((mbk, msgno, 1));
 
         let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
-        assert!(format!("{e}").contains("amode=1"), "{e}");
+        assert!(format!("{e}").contains("no such form"), "{e}");
 
         // And refusing did not half-mutate anything on the way there.
         assert_eq!(f.host.users().state(&f.machine, chan).expect("read"), 0);
@@ -2911,6 +2927,7 @@ mod tests {
         // test's own focus on `scb.state()`/the stored answer, not on the
         // callback -- that is what the `goback_*` tests below are for.
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: None,
             save: false,
         });
@@ -2979,6 +2996,7 @@ mod tests {
         f.machine.write(marker, &[0xff, 0xff]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: false,
         });
@@ -3035,6 +3053,7 @@ mod tests {
         f.machine.write(marker, &[1, 0]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: true,
         });
@@ -3221,6 +3240,7 @@ mod tests {
             .expect("seeded with a value session.save as u16 can never be");
         let whndun = stub_recording_save(&mut f, 0x100, marker);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: true,
         });
@@ -3261,6 +3281,7 @@ mod tests {
         f.machine.write(marker, &[1, 0]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x100, marker);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: false,
         });
@@ -3285,6 +3306,7 @@ mod tests {
         let chan = f.console();
         entered(&mut f, chan);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: None,
             save: true,
         });
@@ -3314,6 +3336,7 @@ mod tests {
 
         let whndun = stub_that_faults(&mut f, 0x100);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: false,
         });
@@ -3375,6 +3398,7 @@ mod tests {
         f.machine.write(marker, &[0xff, 0xff]).expect("seeded");
         let whndun = stub_recording_save(&mut f, 0x200, marker);
         f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
             whndun: Some(whndun),
             save: false,
         });
@@ -3793,5 +3817,98 @@ mod tests {
             panic!("fsdrft refused")
         };
         assert_eq!(templt, again, "the expansion is cached, not rebuilt");
+    }
+
+    // --- Task 8: fsdent, and the wall falls -------------------------------
+
+    #[test]
+    fn fsdroom_sizes_a_full_screen_form_instead_of_refusing_it() {
+        // The refusal this replaces was unconditional: "a full-screen entry
+        // session is scanned against an ANSI screen this host has no way to
+        // draw". Stage 5 drew one.
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("NAME");
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
+            panic!("fsdroom(amode=1) refused")
+        };
+        assert!(size > 0);
+
+        // And the two forms of one message coexist, because Host::forms is
+        // keyed by (message, amode) -- the ANSI one carries cursor gotos and
+        // the line one does not.
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]).expect("sized");
+        let ansi = f.host.forms()[&(0, 1)].clone();
+        let line = f.host.forms()[&(0, 0)].clone();
+        assert!(!ansi.fields[0].ansgto.is_empty(), "the ANSI form has gotos");
+        assert!(line.fields[0].ansgto.is_empty(), "the line form does not");
+    }
+
+    #[test]
+    fn fsdroom_still_refuses_an_amode_that_is_not_one_of_the_three() {
+        let mut f = Fixture::new();
+        let _ = open_form(&mut f);
+        let spec = f.text("NAME");
+        let e = f
+            .invoke(fsdroom, &[0, spec.offset, spec.selector, 7])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("neither entry"), "{e}");
+    }
+
+    #[test]
+    fn fsdego_starts_a_full_screen_session_and_lights_the_first_field() {
+        // FSDBBS.C:205-207 -> FSD.C:815-834. After this an ANSI player is
+        // looking at a lit field and can do nothing else until Task 9 --
+        // which is the correct intermediate state, not a gap.
+        let mut f = Fixture::new();
+        let _ = session_amode(&mut f, 0, "NAME RANK", b"NAME=Kai\0\0", 1);
+        let chan = f.console();
+        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+
+        let scb = block(&f);
+        assert_eq!(scb.state(), fsd::state::FSDAPT, "cursor-browse mode");
+        assert_eq!(
+            scb.flags(),
+            fsd::entry_flags::FSDANS,
+            "flags = FSDANS is an assignment, not an or -- nothing else survives"
+        );
+        assert_eq!(scb.crsfld(), 0);
+        assert_eq!(scb.shffld(), 0, "cursat set both");
+        assert_eq!(scb.chgcnt(), 0);
+
+        let drawn = f.read(f.host.globals().prf_buffer());
+        let gto = String::from_utf8_lossy(&f.host.forms()[&(0, 1)].fields[0].ansgto).into_owned();
+        assert!(drawn.contains(&gto), "it went to field 0: {drawn:?}");
+        assert!(drawn.contains("Kai"), "and drew its answer: {drawn:?}");
+        assert!(
+            drawn.ends_with(&gto),
+            "and ended back at the field's start -- fsdent emits the goto a \
+             second time after shofld left the cursor at the answer's end: {drawn:?}"
+        );
+
+        assert!(
+            f.host.fsd_sessions[chan.index()]
+                .as_ref()
+                .expect("a session")
+                .full_screen,
+            "FBFULL -- what goback reads to park the cursor below the form"
+        );
+    }
+
+    #[test]
+    fn fsdego_in_line_mode_is_not_marked_full_screen() {
+        // The other half of FBFULL, and the reason the flag is worth storing:
+        // a line-mode session must not take goback's cursor-parking branch.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+
+        let session = f.host.fsd_sessions[chan.index()].as_ref().expect("a session");
+        assert!(!session.full_screen);
+        assert_eq!(block(&f).state(), fsd::state::FSDNPT, "fsdlin's own state");
+        assert_eq!(block(&f).flags(), 0, "and fsdlin zeroes flags outright");
     }
 }
