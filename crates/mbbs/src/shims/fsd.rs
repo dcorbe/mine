@@ -1915,6 +1915,41 @@ mod tests {
     }
 
     #[test]
+    fn fsdego_reads_flddat_flags_live_not_the_host_s_cached_form() {
+        // `_EDIT_CHARACTER_STATS` sets FFFAVD on flddat[i].flags directly,
+        // after fsdroom/fsdapr already cached the form in Host::forms. This
+        // reproduces that: two fields, FFFAVD poked into field 0's *live*
+        // module record only -- Host::forms's copy is left alone, which is
+        // the whole point live_form exists for. If fsdego trusted the cache
+        // instead, movfld(0,1,0) would land the cursor on field 0.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "A B", b"\0");
+        let scb = block(&f);
+
+        let stride = usize::from(crate::fsd::FSDFLD);
+        let mut record = [0u8; crate::fsd::FSDFLD as usize];
+        record.copy_from_slice(f.machine.resolve(scb.flddat(), stride).expect("in range"));
+        record[crate::fsd::fld::FLAGS] |= crate::fsd::flags::AVOID;
+        f.machine.write(scb.flddat(), &record).expect("written");
+
+        assert_eq!(
+            f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::AVOID,
+            0,
+            "Host::forms's cached copy must NOT have FFFAVD set -- only the \
+             live module record does"
+        );
+
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+
+        assert_eq!(
+            block(&f).crsfld(),
+            1,
+            "field 0 is avoided in the live flddat record, so movfld(0,1,0) \
+             must skip it and land the cursor on field 1"
+        );
+    }
+
+    #[test]
     fn fsdego_before_any_session_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
