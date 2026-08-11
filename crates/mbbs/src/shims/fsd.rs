@@ -1470,6 +1470,26 @@ pub(crate) fn goback(
 /// nothing left in `channel.input` leaves this function having queued no
 /// further work, and [`crate::Host::cycle`] is free to go `Idle`.
 ///
+/// # The output-drained edge (Stage 5's Task 11), and why it is here too
+///
+/// This same native slot is also what `Host::poll` reaches for `OUTMT`
+/// (`lib.rs`'s own `poll`, `MAJORBBS.C:152`'s `status==4||status==5` ->
+/// entry 2), not only `CYCLE`/`INBLK`. `poll` writes the `status` global
+/// before dispatching, the same global `fsdsts()` itself reads
+/// (`FSDBBS.C:264`) -- so this function starts by reading it back, and if
+/// it names `OUTMT`, hands off to [`fsd_drain_edge`] instead of touching
+/// `channel.input` at all: an `OUTMT` dispatch is not about input, and
+/// there is nothing in `channel.input` for it to mean.
+///
+/// This is *not* a port of `fsdsts`'s own `OUTMT` handling
+/// (`FSDBBS.C:264-267`, which disarms `oes`/unlocks input and never calls
+/// `fsdqoe`) -- see [`fsd::fsdqoe`]'s own doc comment, "Decision 3", for
+/// why this host substitutes `btuoes`/`OUTMT` for a signal
+/// (`btuche`/the quick-output buffer draining) it has no other way to
+/// reach. [`crate::gsbl::Gsbl::drain_output`] already raises `OUTMT` when
+/// `oes` is armed (Task 6); this is what turns that into `fsdqoe`
+/// (Task 11).
+///
 /// # Errors
 ///
 /// If this channel has no session control block or no
@@ -1496,6 +1516,18 @@ pub(crate) fn fsd_cycle(
             "fsd_cycle: channel {chan} is in the FSD's own state but Host::fsd_sessions has \
              nothing recorded for it -- fsdego never ran, or the session already ended"
         )));
+    }
+
+    // `fsdsts`'s own first line, `FSDBBS.C:264`: `if (status == OUTMT...)`.
+    // See this function's own doc comment, "The output-drained edge", for
+    // why this reads the same global rather than porting that branch's own
+    // body.
+    let status = host
+        .globals()
+        .word(machine, "status")
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    if status == crate::gsbl::Gsbl::OUTMT as u16 {
+        return fsd_drain_edge(machine, host, at, chan);
     }
 
     let mut pending: Vec<u8> = Vec::new();
@@ -1574,6 +1606,74 @@ pub(crate) fn fsd_cycle(
 
     if !pending.is_empty() {
         host.gsbl_mut().transmit(chan, &pending);
+    }
+
+    Ok(())
+}
+
+/// [`fsd::fsdqoe`], wired through `Machine` -- the transport half of
+/// Stage 5's Task 11. Called by [`fsd_cycle`] the instant it sees this
+/// channel dispatched for `OUTMT` rather than `CYCLE`/`INBLK`; see that
+/// function's own doc comment for why that is the right trigger.
+///
+/// Reads the session control block and its form fresh, the same way every
+/// other `fsd_cycle`-adjacent function does, calls the pure [`fsd::fsdqoe`],
+/// writes back whatever it changed, and transmits whatever it produced --
+/// `fsdqoe` most often produces nothing at all (`FSDSHN` clear is the
+/// resting state), in which case this sends nothing rather than an empty
+/// segment.
+///
+/// # Gated on `oes`, defensively
+///
+/// In production an `OUTMT` dispatch cannot reach this function unless
+/// `oes` is armed -- that is the only thing that makes
+/// [`crate::gsbl::Gsbl::drain_output`] queue the status in the first place.
+/// This checks it again anyway: `oes` is armed exactly once per session, by
+/// [`fsdbkg`] alone, so a line-mode channel (nothing in line mode ever
+/// calls it) never should reach the lookups below, and refusing early on a
+/// flag this function can read directly is cheaper than trusting a
+/// caller's own invariant a second time -- the same "one refusing gate
+/// plus a second, independent one" discipline [`fsdego`]'s own doc comment
+/// states for its `amode == 1` check.
+///
+/// # Errors
+///
+/// If this channel has no template on record, or the form it names is not
+/// cached -- both would mean `fsdego` never ran for it, the same
+/// inconsistency [`fsd_cycle`]'s own errors already guard against, reached
+/// here instead because `fsd_cycle` checks `Host::fsdscb`/`fsd_sessions`
+/// before ever reading `status`.
+fn fsd_drain_edge(
+    machine: &mut Machine,
+    host: &mut Host,
+    at: FarPtr,
+    chan: Chan,
+) -> Result<(), ShimError> {
+    if !host.gsbl_mut().channel_mut(chan).oes {
+        return Ok(());
+    }
+    let block = read_block(machine, at)?;
+    let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+        return Err(ShimError::Failed(format!(
+            "fsd_drain_edge: channel {chan} recorded no template -- fsdego's own invariant has \
+             come apart"
+        )));
+    };
+    let Some(form) = host.forms.get(&(msgno, amode)).cloned() else {
+        return Err(ShimError::Failed(format!(
+            "fsd_drain_edge: channel {chan} recorded message {msgno} (amode {amode}) but no \
+             such form is cached"
+        )));
+    };
+    let form = live_form(machine, &block, &form)?;
+    let answers = read_answers(machine, &block)?;
+
+    let mut block = block;
+    let out = fsd::fsdqoe(&form, &answers, &mut block);
+    machine.write(at, block.as_bytes())?;
+
+    if !out.is_empty() {
+        host.gsbl_mut().transmit(chan, &out);
     }
 
     Ok(())
@@ -3915,5 +4015,163 @@ mod tests {
         assert!(!session.full_screen);
         assert_eq!(block(&f).state(), fsd::state::FSDNPT, "fsdlin's own state");
         assert_eq!(block(&f).flags(), 0, "and fsdlin zeroes flags outright");
+    }
+
+    // --- Stage 5's Task 11: the output-drained edge -------------------------
+
+    /// A full-screen session with `fsdbkg`'s own paint already run --
+    /// `oes` armed, the way the module's own call order (`fsdbkg(fsdrft())`
+    /// before `fsdego`, `FSDBBS.C:87` before `:196`) leaves a channel. The
+    /// initial paint (background + `fsdent`'s own field-0 light) is drained
+    /// and discarded so a test's own assertions start from a clean channel.
+    fn ansi_session(f: &mut Fixture, spec: &str, defaults: &[u8]) -> Chan {
+        let _ = session_amode(f, 0, spec, defaults, 1);
+        let chan = f.console();
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        f.invoke(fsdbkg, &[templt.offset, templt.selector])
+            .expect("painted");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        let _ = f.host.gsbl_mut().drain_output(chan);
+        chan
+    }
+
+    /// Simulate the transport actually raising the edge: pop `OUTMT` the
+    /// way [`crate::gsbl::Gsbl::drain_output`] would have queued it, write
+    /// the `status` global the way `Host::poll` would have before
+    /// dispatching (`lib.rs`'s own `poll`, `MAJORBBS.C:152`), and run
+    /// `fsd_cycle` again -- the same native slot `Host::poll` would have
+    /// reached, driven directly so the test does not need a registered
+    /// module's own state table.
+    fn raise_drain_edge(f: &mut Fixture, module: &Module, chan: Chan) {
+        assert_eq!(
+            f.host.gsbl_mut().next_status(chan),
+            Some(crate::gsbl::Gsbl::OUTMT),
+            "nothing to raise the edge from -- the channel drained no output, or oes was \
+             never armed"
+        );
+        f.host
+            .globals()
+            .write(
+                &mut f.machine,
+                "status",
+                &(crate::gsbl::Gsbl::OUTMT as u16).to_le_bytes(),
+            )
+            .expect("placed");
+        fsd_cycle(&mut f.machine, &mut f.host, module, chan).expect("drain edge");
+    }
+
+    #[test]
+    fn fsd_cycle_a_single_cursor_key_produces_the_same_output_whether_or_not_the_drain_edge_fires() {
+        // What makes the two-key test below meaningful. With only one
+        // cursor key in flight, hopfld's own "no big output underway"
+        // branch sets FSDQOT but never FSDSHN -- so fsdqoe's only possible
+        // effect (repainting the field FSDSHN names) has nothing to do.
+        // Raising the edge after a single key must add nothing to what
+        // already went out.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let chan = ansi_session(&mut f, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0");
+
+        queue(&mut f, chan, b"\x1b[B"); // CRSRDN
+        fsd_cycle(&mut f.machine, &mut f.host, &module, chan).expect("one key");
+        let echoed = f.host.gsbl_mut().drain_output(chan);
+        assert!(!echoed.is_empty(), "the key's own repaint did go out: {echoed:?}");
+
+        raise_drain_edge(&mut f, &module, chan);
+        let after_edge = f.host.gsbl_mut().drain_output(chan);
+
+        assert!(
+            after_edge.is_empty(),
+            "fsdqoe has nothing to add after a single key -- a test that only presses one key \
+             cannot tell a working fsdqoe from an absent one: {after_edge:?}"
+        );
+        // Deliberately not asserting anything about `scb.flags()` here.
+        // FSDQOT is internal state a single-key scenario has no other way
+        // to observe than by pressing a *second* key and watching what
+        // happens -- which is exactly the next test. An assertion on
+        // flags here would let this test fail for the wrong reason (an
+        // internal-state check) rather than the reason it exists to prove
+        // (empty output either way) -- verified by disabling the drain
+        // edge in `fsd_cycle` and confirming this test alone still passes
+        // while the next one fails.
+    }
+
+    #[test]
+    fn fsd_cycle_defers_the_second_cursor_keys_repaint_until_the_drain_edge_fires() {
+        // Decision 3 of the Stage 5 plan, made real. Two cursor keys land
+        // in the same push_input batch -- fsd_cycle drains channel.input to
+        // completion in one pass, so there is no chance for a real drain to
+        // land between them. hopfld's own deferred-shuffle protocol
+        // (FSD.C:1356-1381) is what has to notice: the first key paints and
+        // sets FSDQOT; the second sees FSDQOT already set and, per
+        // FSD.C:1370-1377, moves the cursor without repainting and sets
+        // FSDSHN instead. Nothing but the drain edge resolves that debt.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let chan = ansi_session(&mut f, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0");
+
+        queue(&mut f, chan, b"\x1b[B\x1b[B"); // CRSRDN, CRSRDN
+        fsd_cycle(&mut f.machine, &mut f.host, &module, chan).expect("two keys, one pass");
+
+        assert_eq!(
+            block(&f).flags() & (fsd::entry_flags::FSDQOT | fsd::entry_flags::FSDSHN),
+            fsd::entry_flags::FSDQOT | fsd::entry_flags::FSDSHN,
+            "the second key's repaint is still owed: {:?}",
+            block(&f)
+        );
+        let queued = f.host.gsbl_mut().drain_output(chan);
+        assert!(
+            !queued.is_empty(),
+            "the second key's own cursor move (just the goto, no repaint) still went out"
+        );
+
+        raise_drain_edge(&mut f, &module, chan);
+
+        assert_eq!(
+            block(&f).flags() & (fsd::entry_flags::FSDQOT | fsd::entry_flags::FSDSHN),
+            0,
+            "fully resolved: {:?}",
+            block(&f)
+        );
+        let repaint = f.host.gsbl_mut().drain_output(chan);
+        assert!(
+            !repaint.is_empty(),
+            "fsdqoe's own deferred repaint went out once the edge fired: {repaint:?}"
+        );
+    }
+
+    #[test]
+    fn fsd_cycle_ignores_the_drain_edge_for_a_line_mode_session() {
+        // oes is only ever armed by fsdbkg, which nothing in line mode
+        // calls -- so an OUTMT dispatch for a line-mode channel must not
+        // reach fsd::fsdqoe at all, whether or not there happens to be a
+        // session control block behind it.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session(&mut f, "NAME", b"\0");
+        let chan = f.console();
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        let _ = f.host.gsbl_mut().drain_output(chan);
+        assert!(
+            f.host.gsbl_mut().channel_mut(chan).status.is_empty(),
+            "oes was never armed -- nothing to have queued OUTMT"
+        );
+
+        f.host
+            .globals()
+            .write(
+                &mut f.machine,
+                "status",
+                &(crate::gsbl::Gsbl::OUTMT as u16).to_le_bytes(),
+            )
+            .expect("placed");
+        assert!(matches!(
+            fsd_cycle(&mut f.machine, &mut f.host, &module, chan),
+            Ok(())
+        ));
+
+        assert_eq!(block(&f).flags(), 0, "fsdqoe would have had nothing to clear anyway");
     }
 }

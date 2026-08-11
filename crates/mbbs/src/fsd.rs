@@ -4047,14 +4047,16 @@ fn fsdinc_aen(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
 /// does not change here, matching the original's own
 /// `fldptr=fsdscb->flddat+fsdscb->crsfld;` sitting above the `if`.
 ///
-/// Nothing in this crate yet sets `state` to `FSDKHP` -- that is `announce`'s
-/// ANSI branch, Task 11, not built here -- so this prelude is currently
-/// reachable only by a test constructing the state by hand. Ported anyway,
-/// faithfully: five lines of C over machinery ([`gtohlp`], [`spaces`],
-/// `scb.hlplen()`) this crate already has, and skipping it would leave the
-/// `FSDAPT` arm's own assumption -- that whatever ANSI painting the
-/// previous call started has already resolved -- silently unverified for
-/// the one caller (Task 11) that will actually reach it.
+/// `announce`'s ANSI branch (Stage 5's Task 11) is what sets `state` to
+/// `FSDKHP` in real play, on a rejected field with a nonzero `hlplen` --
+/// this prelude is what a session sitting in `FSDKHP` sees the *next*
+/// keystroke land on. The unit test below still constructs the state by
+/// hand, the way this doc comment originally noted was the only way to
+/// reach it before `announce`'s ANSI branch existed: that is a deliberate
+/// choice to keep this prelude's own five lines isolated from whatever
+/// message text a `VFYCHK` rejection happens to produce, not evidence the
+/// path is still synthetic. `shims/fsd.rs::fsd_cycle`'s own tests exercise
+/// the real, `announce`-driven route end to end.
 ///
 /// `longot` -- the C's own local, set only inside this prelude -- records
 /// that it ran, and `fsdscb->flags|=FSDQOT` unconditionally once the switch
@@ -5174,17 +5176,51 @@ fn alarm(beep: bool) -> Vec<u8> {
     if ALMMMX && beep { vec![0x07] } else { Vec::new() }
 }
 
-/// `announce()`, `FSD.C:1072-1096`, else-branch only -- the `FSDANS`
-/// (ANSI help-area) branch is Stage 5, out of scope, and unreachable from
-/// this port's own line-mode path the same way every other `FSDANS` branch
-/// already is ([`bgnter`]/[`xitfld`]'s own guards). A blank line, the
-/// message, [`alarm`], another line break.
-fn announce(message: &[u8], beep: bool) -> Vec<u8> {
-    let mut out = b"\r\n\r\n".to_vec();
-    out.extend_from_slice(message);
-    out.extend(alarm(beep));
-    out.extend_from_slice(b"\r\n");
-    out
+/// `announce()`, `FSD.C:1072-1096`: display a message on the help area, if
+/// there is one, or inline otherwise.
+///
+/// # Two branches, both real now
+///
+/// An earlier version of this function ported the `else` (non-ANSI) branch
+/// only, with a comment calling the `FSDANS` branch "Stage 5, out of scope,
+/// and unreachable" -- true at the time (nothing in this crate could reach
+/// it), false now that Stage 5 exists. The ANSI branch is what makes
+/// [`fsdinc`]'s own `FSDKHP` prelude reachable from real play rather than
+/// only from a test constructing `state` by hand -- see that function's own
+/// doc comment, which this change also has to keep honest.
+///
+/// **`FSD.C:1077`'s `hlplen > 0` guard matters and is not decorative.** A
+/// form with no help area at all (`hlplen == 0`) still wants the beep on a
+/// rejection -- the `else { alarm(beep); }` arm -- but must not set
+/// `state = FSDKHP`: there is no help text to have written, so nothing
+/// needs wiping before the next keystroke, and `FSDKHP`'s own prelude
+/// ([`fsdinc`]) would wipe `hlplen` (zero) bytes of nothing and then fall
+/// through anyway -- harmless, but a state transition with no purpose is
+/// exactly the kind of thing worth not doing.
+///
+/// **The message is truncated to `hlplen`, not the help area's own
+/// template width.** `FSD.C:1079-1081`: `if (strlen(fsdemg) > hlplen)
+/// fsdemg[hlplen]='\0';` -- a message longer than the help area is cut, not
+/// wrapped or refused.
+fn announce(form: &Form, scb: &mut Scb, message: &[u8], beep: bool) -> Vec<u8> {
+    if scb.flags() & entry_flags::FSDANS != 0 {
+        let hlplen = usize::from(scb.hlplen());
+        if hlplen > 0 {
+            let mut out = gtohlp(form);
+            out.extend_from_slice(&message[..message.len().min(hlplen)]);
+            out.extend(alarm(beep));
+            scb.set_state(state::FSDKHP);
+            out
+        } else {
+            alarm(beep)
+        }
+    } else {
+        let mut out = b"\r\n\r\n".to_vec();
+        out.extend_from_slice(message);
+        out.extend(alarm(beep));
+        out.extend_from_slice(b"\r\n");
+        out
+    }
 }
 
 /// `xitfsd()`, `FSD.C:1098-1107`. End the session: a line break (the
@@ -5222,6 +5258,21 @@ fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
 /// module code" section states for `fldvfy` by name, and the same trap
 /// `polrou` already documents (`lib.rs:1128`).
 ///
+/// **Correction, found wiring the ANSI tail (Stage 5's Task 11):** an
+/// earlier version of this function computed `sover` at the *end*, from
+/// whatever `scb.state()` happened to hold after every other branch had
+/// already run -- equivalent to the C's own entry-time read only because,
+/// before this task, nothing between entry and that point ever changed
+/// `scb.state()`. [`announce`]'s ANSI branch changes that: a rejected
+/// field with a nonzero `hlplen` now sets `state = FSDKHP` *during* the
+/// `VFYCHK` switch arm, a live mid-session state ("go wipe the help area
+/// next"), not "the session is over." Reading `scb.state()` again after
+/// that call would have misreported `sover` as `true` for a mere help
+/// message, which -- per the ANSI tail below -- would have skipped
+/// re-homing the cursor onto the field and left it sitting in the help
+/// area instead. `sover` is now captured once, immediately, in the same
+/// place `FSD.C:1144` reads it: before `switch(vc)` runs at all.
+///
 /// Returns the output bytes to send, and whether the field's answer
 /// changed (`FFFCHG`, `fldptr->flags|=FFFCHG` in the original) -- the
 /// caller's to write into `flddat[scb.entfld()].flags` in module memory,
@@ -5245,14 +5296,22 @@ fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
 /// `FSD.C:1199`'s `dir=...; fldi=movfld(fldi,dir,fsdscb->entfld);` passes
 /// **`entfld`** as `movfld`'s last-resort -- a real, already-validated
 /// field index, not the `-1` sentinel [`xitfld`]'s own call uses. Combined
-/// with `vldfld`'s `udwrap && FSDANS` gate (`FSD.C:667`, always false here
-/// since `FSDANS` is never set), `movfld` can only ever answer that same
-/// `entfld` when it cannot otherwise place the cursor -- never a value
-/// outside `[0, numtpl)`. So `FSD.C:1218`'s `else { xitfsd(FSDSAV); }` --
-/// the "(non-ANSI, no wrap)" fallback its own comment names -- is
-/// unreachable through this call: the "no field left to move to" case it
-/// exists to handle cannot arise while `entfld` itself is a real field,
-/// which it always is by construction.
+/// with `vldfld`'s `udwrap && FSDANS` gate (`FSD.C:667`), `movfld` can only
+/// ever answer that same `entfld` when it cannot otherwise place the
+/// cursor -- never a value outside `[0, numtpl)`. `wrap` is passed as
+/// `scb.flags() & FSDANS != 0` (`udwrap` itself is the compiled-in `true`
+/// [`move_field`]'s other callers already assume, per [`hopfld`]'s own doc
+/// comment on the same substitution), so in the **non-ANSI branch this
+/// section describes** -- the only one that reads `landed` unchecked --
+/// `FSDANS` is false by construction (it is the very flag that selects the
+/// other branch), and this section's argument goes through exactly as
+/// before. So `FSD.C:1218`'s `else { xitfsd(FSDSAV); }` -- the "(non-ANSI,
+/// no wrap)" fallback its own comment names -- is unreachable through this
+/// call: the "no field left to move to" case it exists to handle cannot
+/// arise while `entfld` itself is a real field, which it always is by
+/// construction. The ANSI branch has no such fallback in the C either, for
+/// the complementary reason: `wrap == true` there, so [`move_field`] can
+/// never answer `None` and fall back to `resort` in the first place.
 ///
 /// **The session's real exit mechanism for a completed form is the
 /// field-verify callback itself**, setting `scb.state()` to
@@ -5265,6 +5324,30 @@ fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
 /// this crate (design doc, "Dropped"). A synthetic `fldvfy` stub that sets
 /// `scb.state()` directly is what this file's own tests use to exercise
 /// this path, the way `fsd_statics.rs` calls real statics by address.
+///
+/// # The ANSI tail (Stage 5's Task 11), `FSD.C:1200-1209`
+///
+///
+/// `fldptr` here is `flddat+entfld`, unchanged since `FSD.C:1143` -- nothing
+/// in the `switch(vc)` above reassigns it, only `fldi` (this function's own
+/// `fldi`, which by this point already went through `movfld` and is what
+/// this port calls `landed`). So `shofld(fldptr->attr,1)` paints **the
+/// field just committed** ([`field`], bound to `form.fields[entfld]` at the
+/// top of this function), not whichever field the cursor is departing to --
+/// those coincide whenever a session stays on one field across a rejection,
+/// but not in general.
+///
+/// The same `fldptr`-reassignment trap [`hopfld`] and [`fsdqoe`] both
+/// document: `cursat(fldi)` reassigns `fldptr` to the *new* field as a
+/// documented side effect, so the following `fsdous(fldptr->ansgto)` is
+/// `landed`'s own goto, read here as `form.fields[landed].ansgto` rather
+/// than trusted from a value [`cursat`] already moved out from under a
+/// stale read.
+///
+/// `entprp()` is a pure `scb` mutation (blank `ansbuf`, clear `FSDANT`, null
+/// `altptr`) with no output of its own -- see its own doc comment -- so it
+/// contributes nothing to `out` here, matching the C exactly: `entprp()`'s
+/// caller is not the one that prints anything after it.
 ///
 /// # No entry assertion on `scb.state()`
 ///
@@ -5298,6 +5381,12 @@ pub fn fsdprc(
     let mut delta = false;
     let mut out = Vec::new();
     let mut rejected = false;
+    // `sover=(fsdscb->state != FSDBUF);` -- FSD.C:1144, captured *here*,
+    // before `switch(vc)` runs, and never recomputed from a later read of
+    // `scb.state()`. See this function's own "Correction" doc comment,
+    // above, for the bug that shape of recomputation caused once
+    // `announce`'s ANSI branch could change `state` mid-function.
+    let mut sover = scb.state() != state::FSDBUF;
 
     if vc == verify::VFYOK {
         delta = store(answers, entfld, bufptr);
@@ -5308,7 +5397,7 @@ pub fn fsdprc(
                 rejected = true;
                 fldi = entfld as u8;
                 if !message.is_empty() {
-                    out.extend(announce(&message, true));
+                    out.extend(announce(form, scb, &message, true));
                     reprmt = true;
                 } else {
                     out.extend(alarm(true));
@@ -5329,38 +5418,48 @@ pub fn fsdprc(
     // VFYDEF and anything else: no-op, matching the C's `switch(vc)` with
     // no matching `case`.
 
-    if !rejected && delta && scb.chgcnt() < 255 && scb.state() == state::FSDBUF {
+    if !rejected && delta && scb.chgcnt() < 255 && !sover {
         scb.set_chgcnt(scb.chgcnt() + 1);
     }
 
-    let mut exit = None;
     if !rejected {
         match scb.xitkey() {
             0x0f | 0x1b => {
                 // 'O'-64, ESC: abandon the session.
                 out.extend(xitfsd(scb, state::FSDQIT));
-                exit = Some(false);
+                sover = true;
             }
             0x07 => {
                 // 'G'-64: save and exit.
                 out.extend(xitfsd(scb, state::FSDSAV));
-                exit = Some(true);
+                sover = true;
             }
             _ => {}
         }
     }
-
-    let sover = exit.is_some() || scb.state() != state::FSDBUF;
 
     let dir = if 0 < fldi && usize::from(fldi) < entfld {
         -1
     } else {
         1
     };
-    let landed = move_field(form, i32::from(fldi), dir, Some(entfld), false)
+    // `wrap` is `udwrap && fsdscb->flags&FSDANS` (`FSD.C:667`, via
+    // `vldfld`) -- see this function's own "no field-count wraparound"
+    // section for why `udwrap` itself does not need a place to live here.
+    let wrap = scb.flags() & entry_flags::FSDANS != 0;
+    let landed = move_field(form, i32::from(fldi), dir, Some(entfld), wrap)
         .expect("resort is Some(entfld), so movfld always answers its own resort or better");
 
-    if !sover {
+    if scb.flags() & entry_flags::FSDANS != 0 {
+        if landed != entfld || sover {
+            out.extend(shofld(form, answers, entfld, field.attr, 1));
+        }
+        if !sover {
+            out.extend(cursat(form, answers, scb, landed as u8));
+            out.extend_from_slice(&form.fields[landed].ansgto);
+            entprp(scb);
+        }
+    } else if !sover {
         assert!(
             landed < form.in_template,
             "movfld answered field {landed}, past the form's own {} template \
@@ -5376,17 +5475,166 @@ pub fn fsdprc(
         out.extend(shoabf(form, scb, 0));
     }
 
-    // `FSD.C:1229`'s guard, kept exactly: only decay to point mode
+    // `FSD.C:1229`'s guard, kept exactly: only decay out of `FSDBUF`
     // (this port's stand-in for `FSDSTB`, see this function's own doc
     // comment) when `state` is *still* `FSDBUF` here -- `xitfsd` already
     // moved it away for an explicit exit, and the callback may have moved
-    // it away directly (`FSD.H`'s Note 2) before this function ever ran.
-    // Either way, this must not clobber it.
+    // it away directly (`FSD.H`'s Note 2) before this function ever ran,
+    // or `announce`'s ANSI branch may have moved it to `FSDKHP` during the
+    // `VFYCHK` switch arm above. Either way, this must not clobber it.
+    //
+    // The decayed-to state itself is `FSD.C:1253`'s own
+    // `(fsdscb->flags&FSDANS) ? FSDAPT : FSDNPT` -- not `FSDNPT`
+    // unconditionally. An earlier version of this function used `FSDNPT`
+    // unconditionally, which was correct at the time (nothing before Stage
+    // 5 could ever reach this function with `FSDANS` set) and wrong once
+    // Stage 5's ANSI tail, above, could.
     if scb.state() == state::FSDBUF {
-        scb.set_state(state::FSDNPT);
+        scb.set_state(if scb.flags() & entry_flags::FSDANS != 0 {
+            state::FSDAPT
+        } else {
+            state::FSDNPT
+        });
     }
 
     (out, delta)
+}
+
+/// `fsdqoe()`, `FSD.C:1959-2004`: "Report that the quick output buffer has
+/// gone empty." Called after output [`fsdinc`] (in practice, [`hopfld`])
+/// started has truly, completely drained.
+///
+/// # Decision 3: this host has no quick-output buffer, so it substitutes
+///
+/// The real `fsdqoe` is invoked by `fsdchi`'s `c == -1` sentinel
+/// (`FSDBBS.C:345-347`), which fires when `btuche(usrnum,1)`'s echo/quick-
+/// output buffer -- a channel-driver concept underneath GSBL's own output
+/// buffer, and not modeled here -- empties. This host has no such buffer to
+/// drain, so it substitutes the one drain signal it does have: `btuoes`
+/// (armed once per ANSI session by
+/// [`fsdbkg`](crate::shims::fsd::fsdbkg), Task 6) raises `OUTMT`
+/// when [`crate::gsbl::Gsbl::drain_output`] empties a channel's real output
+/// queue, and `shims/fsd.rs::fsd_cycle` reads that status back off the
+/// `status` global the same way the real `fsdsts` does, and calls this
+/// function directly when it sees it -- see `fsd_cycle`'s own doc comment
+/// for the wiring. This is a deliberate substitution, not a literal port:
+/// the real `fsdsts`'s own `OUTMT` handling (`FSDBBS.C:264-267`) does
+/// something else entirely (disarm `oes`, unlock input, return) and never
+/// calls `fsdqoe` at all -- there is no C call site for this function this
+/// host can reach faithfully, because the mechanism it answers to does not
+/// exist here.
+///
+/// # Trap 1: `FSDQOT` clears unconditionally
+///
+/// `fsdscb->flags&=~FSDQOT;` (`FSD.C:1967`) runs before and regardless of
+/// the `FSDSHN` test that follows. The debt it pays off (there was output
+/// in flight this function is now told is gone) is a separate fact from
+/// "was a repaint additionally deferred" (`FSDSHN`), and clearing the first
+/// does not wait on an answer about the second.
+///
+/// # The deferred-shuffle protocol's second half
+///
+/// If `FSDSHN` is set, [`hopfld`]'s own doc comment already worked out
+/// which field is which: `shffld` is the field the cursor *left* and still
+/// owes a non-cursor repaint. **Trap 3**: painting `crsfld` here instead
+/// (an easy slip, since `crsfld` is "the field", the one usually meant)
+/// would repaint the field the cursor is already sitting on -- lit
+/// correctly since [`hopfld`]'s own deferred branch already moved the
+/// cursor there -- and leave the field it left still showing the cursor
+/// attribute. [`cursat`] then turns `crsfld` into the cursor field for
+/// real, which -- per [`cursat`]'s own side effect of setting `shffld` to
+/// match -- is what restores "no repaint owed" as the resting state.
+///
+/// **Trap 2**, the same one [`hopfld`] and `fsdprc`'s own ANSI tail both
+/// have: the final `fsdous(fldptr->ansgto)` reads `fldptr` *after* `cursat`
+/// reassigned it (`FSD.C:646`), so it is the field [`cursat`] just drew --
+/// read here as `form.fields[usize::from(crsfld)].ansgto`, the same local
+/// [`cursat`] was called with, rather than a value [`cursat`] already
+/// mutated `scb.crsfld()` out from under a stale second read.
+///
+/// # Trap 4: `FSDAEN` panics, and this is a deliberate choice
+///
+/// `FSD.C:1980-1998`'s `FSDAEN` case is entirely commented out, with the
+/// comment explaining why: "we don't ever get to this case because the
+/// FSDAEN state never begins when FSDSHN. That's due to the triple
+/// echo-buffer burden of uncursor-cursor-retype... It only takes two
+/// keystrokes to induce this sequence... If they come too fast, the 2nd
+/// keystroke will be ignored." The C's own `case FSDAEN: break;` is
+/// consequently a no-op standing in for logic nobody ever finished, guarded
+/// by a claim of unreachability rather than an assertion of it.
+///
+/// This port checks that claim rather than trusting it, because the
+/// surrounding guards are different code than the C's and could in
+/// principle have let the combination back in: `FSDSHN` is set only by
+/// [`hopfld`]'s own `FSDQOT`-already-set branch -- so `FSDSHN` implies
+/// `FSDQOT` was set at the moment it was set -- and [`fsdinc_apt`]'s
+/// printable-character arm (the only path into `bgnter`, and so the only
+/// path into `FSDAEN`) explicitly refuses to run while `FSDQOT` is set
+/// (`fsdinc_apt_a_printable_character_does_nothing_while_a_shuffle_is_in_progress`).
+/// So within one [`fsdinc`] call, or one `fsd_cycle` pass draining several
+/// keystrokes back to back with no drain edge between them, `bgnter` cannot
+/// run while a shuffle is pending -- `FSDAEN` and `FSDSHN` cannot coexist by
+/// the time this function is ever invoked. That is a state-machine
+/// invariant enforced by this port's own code, not a fact about what a
+/// client can type: no keystroke sequence a user sends can reach this
+/// branch.
+///
+/// **That is why this panics rather than following [`fsdinc_line`]'s own
+/// Ctrl-L precedent of a loud no-op.** `fsdinc_line`'s doc comment argues a
+/// no-op there because `FBRDSP` (the flag Ctrl-L sets) has no reader
+/// anywhere in this file or the original -- a permanently dead flag,
+/// reachable from ordinary user input, that can never matter no matter what
+/// else in this crate does. `FSDAEN`-with-`FSDSHN` is the opposite shape:
+/// not reachable from user input at all (the guards above are structural,
+/// not best-effort), but *would* matter -- a real display bug -- if some
+/// future change to `fsdinc_apt`'s guards or [`hopfld`]'s own flag
+/// discipline ever let it back in. A caller-contract violation belongs in
+/// the category this crate already treats runtime crashes as better than
+/// undefined behaviour for: catching the regression at the exact moment
+/// the invariant breaks, loudly, in tests first, is strictly better than
+/// silently producing a cursor sitting in the wrong place for whichever
+/// player's session found the gap.
+///
+/// # Any other state
+///
+/// The C's `switch (fsdscb->state)` has no `default:` arm. Any state other
+/// than `FSDAPT`/`FSDKHP`/`FSDAEN` that somehow has `FSDSHN` set (never
+/// observed in this crate -- `FSDSHN` is exclusively [`hopfld`]'s to set,
+/// and `hopfld` is exclusively [`fsdinc_apt`]'s to call, both `FSDAPT`-only)
+/// falls through having already cleared both flags and done nothing else,
+/// exactly matching the C's own no-`default:` fallthrough rather than
+/// refusing a state this function has no particular argument against.
+pub fn fsdqoe(form: &Form, answers: &Answers, scb: &mut Scb) -> Vec<u8> {
+    scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
+    let mut out = Vec::new();
+    if scb.flags() & entry_flags::FSDSHN != 0 {
+        scb.set_flags(scb.flags() & !entry_flags::FSDSHN);
+        let crsfld = scb.crsfld();
+        match scb.state() {
+            state::FSDAPT | state::FSDKHP => {
+                let shffld = usize::from(scb.shffld());
+                out.extend(shofld(form, answers, shffld, form.fields[shffld].attr, 1));
+                out.extend(cursat(form, answers, scb, crsfld));
+                out.extend_from_slice(&form.fields[usize::from(crsfld)].ansgto);
+            }
+            state::FSDAEN => {
+                panic!(
+                    "fsdqoe: FSDSHN is set while state is FSDAEN -- FSD.C:1980-1998's own \
+                     comment calls this case unreachable (\"we don't ever get to this case \
+                     because the FSDAEN state never begins when FSDSHN\"), and this port's own \
+                     guards agree structurally: FSDSHN is only ever set as a consequence of \
+                     FSDQOT already having been set (hopfld's own FSDQOT-already-set branch), \
+                     and fsdinc_apt's printable-character arm -- the only path into bgnter, and \
+                     so the only path into FSDAEN -- refuses to run while FSDQOT is set. So this \
+                     combination cannot be produced by anything a client typed; reaching it means \
+                     this crate's own state machine has come apart, which is this function's own \
+                     doc comment's case for panicking here rather than a silent no-op"
+                );
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -7613,6 +7861,185 @@ mod tests {
         assert!(!out.is_empty(), "and it repainted, rather than doing nothing");
     }
 
+    // --- Stage 5's Task 11: fsdqoe -----------------------------------------
+
+    #[test]
+    fn fsdqoe_clears_fsdqot_unconditionally_even_when_fsdshn_is_not_set() {
+        // Mutation guard: an earlier draft conditioned the FSDQOT clear on
+        // FSDSHN being set too, matching the shape of the `if` below it
+        // instead of FSD.C:1967's own unconditional
+        // `fsdscb->flags&=~FSDQOT;`, which runs before the FSDSHN test even
+        // starts.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDQOT);
+        scb.set_state(state::FSDAPT);
+
+        let out = fsdqoe(&form, &answers, &mut scb);
+
+        assert_eq!(out, b"", "FSDSHN was never set -- there is nothing to repaint");
+        assert_eq!(scb.flags(), 0, "but FSDQOT clears regardless");
+    }
+
+    #[test]
+    fn fsdqoe_does_nothing_at_all_when_neither_flag_is_set() {
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDAPT);
+        let before = scb.clone();
+
+        let out = fsdqoe(&form, &answers, &mut scb);
+
+        assert_eq!(out, b"");
+        assert_eq!(scb, before);
+    }
+
+    #[test]
+    fn fsdqoe_turns_off_the_field_the_cursor_left_and_re_homes_the_one_it_is_on() {
+        let spec = b"A B";
+        let (form, answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsatr(0x70);
+        scb.set_crsfld(1); // hopfld already moved the cursor here...
+        scb.set_shffld(0); // ...but left this field owing a repaint.
+        scb.set_flags(entry_flags::FSDQOT | entry_flags::FSDSHN);
+        scb.set_state(state::FSDAPT);
+
+        let out = fsdqoe(&form, &answers, &mut scb);
+
+        assert_eq!(
+            scb.flags() & (entry_flags::FSDQOT | entry_flags::FSDSHN),
+            0,
+            "both debts paid off"
+        );
+        assert_eq!(scb.crsfld(), 1, "unchanged -- the cursor was already there");
+        assert_eq!(scb.shffld(), 1, "cursat resynced shffld to crsfld: nothing owed now");
+        assert!(
+            out.starts_with(&form.fields[0].ansgto),
+            "turns off shffld (the field the cursor LEFT), not crsfld (the one it's on): {out:?}"
+        );
+        assert!(
+            out.ends_with(&form.fields[1].ansgto),
+            "and the final goto is the NEW field's (crsfld), not the old one's (shffld): {out:?}"
+        );
+    }
+
+    #[test]
+    fn fsdqoe_resolves_the_shuffle_from_fsdkhp_too() {
+        // `FSD.C:1973-1974`'s `case FSDAPT: case FSDKHP:` is one arm, not
+        // two -- the help-wipe state gets the identical repaint.
+        let spec = b"A B";
+        let (form, answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_crsfld(1);
+        scb.set_shffld(0);
+        scb.set_flags(entry_flags::FSDSHN);
+        scb.set_state(state::FSDKHP);
+
+        let out = fsdqoe(&form, &answers, &mut scb);
+
+        assert!(!out.is_empty());
+        assert_eq!(scb.flags() & entry_flags::FSDSHN, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "FSDSHN is set while state is FSDAEN")]
+    fn fsdqoe_panics_if_fsdaen_ever_has_fsdshn_set() {
+        // FSD.C:1980-1998's own comment calls this combination
+        // unreachable; see fsdqoe's doc comment, "Trap 4", for why this
+        // port checks that claim with a panic rather than trusting it
+        // with a silent no-op.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDAEN);
+        scb.set_flags(entry_flags::FSDSHN);
+
+        let _ = fsdqoe(&form, &answers, &mut scb);
+    }
+
+    #[test]
+    fn fsdqoe_is_a_silent_no_op_for_a_state_the_switch_has_no_arm_for() {
+        // The C's `switch (fsdscb->state)` has no `default:`. Never
+        // observed in practice -- FSDSHN is exclusively hopfld's to set,
+        // and hopfld is exclusively FSDAPT's to call -- but the fallthrough
+        // itself is still real behaviour to pin down.
+        let spec = b"A";
+        let (form, answers) = ansi_form(b"??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_state(state::FSDNPT);
+        scb.set_flags(entry_flags::FSDSHN | entry_flags::FSDQOT);
+
+        let out = fsdqoe(&form, &answers, &mut scb);
+
+        assert_eq!(out, b"", "no default: arm -- nothing painted");
+        assert_eq!(scb.flags(), 0, "both flags still clear, from the pre-switch work alone");
+    }
+
+    // --- Stage 5's Task 11: announce's ANSI branch --------------------------
+
+    #[test]
+    fn announce_ansi_branch_shows_the_message_in_the_help_area_and_sets_fsdkhp() {
+        let spec = b"A";
+        let (mut form, _answers) = ansi_form(b"??\r\n", spec, b"\0");
+        form.help_len = 40;
+        form.help_gto = b"\x1b[20;1f".to_vec();
+        form.help_attr = 0x07;
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_hlplen(40);
+        scb.set_state(state::FSDAPT);
+
+        let out = announce(&form, &mut scb, b"Enter at least 10", true);
+
+        let mut expected = gtohlp(&form);
+        expected.extend_from_slice(b"Enter at least 10");
+        expected.push(0x07); // alarm(true)
+        assert_eq!(out, expected);
+        assert_eq!(scb.state(), state::FSDKHP);
+    }
+
+    #[test]
+    fn announce_ansi_branch_truncates_the_message_to_hlplen() {
+        let spec = b"A";
+        let (mut form, _answers) = ansi_form(b"??\r\n", spec, b"\0");
+        form.help_len = 5;
+        form.help_gto = b"\x1b[20;1f".to_vec();
+        form.help_attr = 0x07;
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_hlplen(5);
+        scb.set_state(state::FSDAPT);
+
+        let out = announce(&form, &mut scb, b"Enter at least 10 character(s)", true);
+
+        let mut expected = gtohlp(&form);
+        expected.extend_from_slice(b"Enter"); // the first hlplen=5 bytes only
+        expected.push(0x07);
+        assert_eq!(out, expected, "FSD.C:1079-1081 -- cut, not wrapped or refused");
+    }
+
+    #[test]
+    fn announce_ansi_branch_with_no_help_area_just_beeps_and_leaves_state_alone() {
+        // Mutation guard for FSD.C:1077's `if (fsdscb->hlplen > 0)`. Drop
+        // it and this test's `out` gains gtohlp's own goto/attr and the
+        // message, and `state` becomes FSDKHP for a form with no help area
+        // to have written anything into.
+        let spec = b"A";
+        let (form, _answers) = ansi_form(b"??\r\n", spec, b"\0");
+        let mut scb = zeroed_scb();
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_hlplen(0);
+        scb.set_state(state::FSDAPT);
+
+        let out = announce(&form, &mut scb, b"Enter at least 10", true);
+
+        assert_eq!(out, vec![0x07], "just the beep");
+        assert_eq!(scb.state(), state::FSDAPT, "no FSDKHP transition -- nothing to wipe");
+    }
+
     // --- Task 9: fsdinc's FSDAPT arm, plus the FSDKHP prelude ------------
 
     #[test]
@@ -9351,6 +9778,133 @@ mod tests {
         );
     }
 
+    // --- Stage 5's Task 11: fsdprc's ANSI tail ------------------------------
+
+    #[test]
+    fn fsdprc_ansi_accepts_a_valid_answer_and_cursats_the_next_field() {
+        let spec = b"A(MIN=1 MAX=5) B";
+        let (form, mut answers) = ansi_form(b"## ??\r\n", spec, b"\0");
+        let mut scb = buffered_scb(0, 1, b'\r'); // xitfld already moved crsfld to field 1
+        scb.set_flags(entry_flags::FSDANS);
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"## ??\r\n",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"3",
+        );
+
+        assert!(changed);
+        assert_eq!(scb.state(), state::FSDAPT, "ANSI decays to FSDAPT, not FSDNPT");
+        assert_eq!(scb.crsfld(), 1);
+        assert!(
+            out.starts_with(&form.fields[0].ansgto),
+            "turns off the field just committed: {out:?}"
+        );
+        assert!(
+            out.ends_with(&form.fields[1].ansgto),
+            "and re-homes on the new field: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fsdprc_ansi_rejection_with_a_help_message_still_rehomes_the_cursor_on_the_field() {
+        // The bug Stage 5's ANSI tail exposed in code that predates it:
+        // `sover` used to be computed at the *end* of this function, by
+        // which point `announce`'s ANSI branch had already set
+        // `state = FSDKHP` for this very rejection -- misreporting the
+        // session as over (`sover = state != FSDBUF`) and skipping the
+        // `cursat`/goto/`entprp` that puts the cursor back on the field.
+        // FSD.C:1144 reads `sover` BEFORE `switch(vc)` runs at all; this
+        // function now does too.
+        let spec = b"A(MIN=10 MAX=99)";
+        let (mut form, mut answers) = ansi_form(b"$$$$$$$$$$\r\n", spec, b"\0");
+        form.help_len = 40;
+        form.help_gto = b"\x1b[20;1f".to_vec();
+        form.help_attr = 0x07;
+        let mut scb = buffered_scb(0, 0, b'\r');
+        scb.set_flags(entry_flags::FSDANS);
+        scb.set_hlplen(40);
+        typed(&mut scb, b"3");
+
+        let (out, changed) = fsdprc(
+            &form,
+            spec,
+            b"$$$$$$$$$$\r\n",
+            &mut scb,
+            &mut answers,
+            verify::VFYCHK,
+            b"3",
+        );
+
+        assert!(!changed, "rejected -- stfans never ran");
+        assert_eq!(
+            scb.state(),
+            state::FSDKHP,
+            "announce's own transition, not clobbered by the FSDBUF-decay guard"
+        );
+        assert!(
+            out.ends_with(&form.fields[0].ansgto),
+            "the cursor must land back on the field, not stay parked in the help area: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fsdprc_ansi_wraps_to_field_zero_after_the_last_field_when_the_session_does_not_end() {
+        // `wrap` is `udwrap && FSDANS` (FSD.C:667, via vldfld) -- an
+        // earlier version of this function passed `move_field` a hardcoded
+        // `false`, correct only because nothing before Stage 5 could ever
+        // reach this function with FSDANS set. A player who commits the
+        // LAST field without the module's own fldvfy ending the session
+        // (plain VFYOK, not vfyadn's usual FSDSAV) must wrap the cursor
+        // back to field 0, not get stuck parked on the field just left.
+        let spec = b"A B";
+        let (form, mut answers) = ansi_form(b"?? ??\r\n", spec, b"\0");
+        // xitfld's own sentinel for "there was nowhere further to go":
+        // crsfld parked at numtpl, one past the last real field --
+        // buffered_scb's own doc comment names this.
+        let mut scb = buffered_scb(1, form.in_template as u8, b'\r');
+        scb.set_flags(entry_flags::FSDANS);
+
+        let (_, _) = fsdprc(
+            &form,
+            spec,
+            b"?? ??\r\n",
+            &mut scb,
+            &mut answers,
+            verify::VFYOK,
+            b"z",
+        );
+
+        assert_eq!(scb.crsfld(), 0, "wrapped, rather than stuck at the last field");
+        assert_eq!(scb.state(), state::FSDAPT);
+    }
+
+    #[test]
+    fn fsdprc_line_mode_does_not_wrap_after_the_last_field() {
+        // The non-ANSI half of the same fix, pinned so the wrap gate stays
+        // keyed on FSDANS specifically rather than becoming unconditional.
+        let spec = b"A B";
+        let form = compile(b"?? ??\r\n", spec, MANY, Ascn::Line);
+        let mut answers = crate::fsd::answers(&form, spec, b"\0");
+        let mut scb = buffered_scb(1, form.in_template as u8, b'\r');
+
+        let (_, _) = fsdprc(
+            &form,
+            spec,
+            b"?? ??\r\n",
+            &mut scb,
+            &mut answers,
+            verify::VFYOK,
+            b"z",
+        );
+
+        assert_eq!(scb.crsfld(), 1, "line mode has no wrap -- stays parked on the last field");
+        assert_eq!(scb.state(), state::FSDNPT);
+    }
 
     #[test]
     fn a_field_record_is_twenty_three_bytes_with_the_flags_at_twelve() {
