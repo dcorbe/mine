@@ -482,9 +482,28 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// refuses a buffer that is not exactly the file's own `reclen`, because it
 /// has no way to know how many of the buffer's bytes are the record this
 /// module meant to write and how many are read-buffer padding it should not
-/// commit to disk. This host does not write variable-length records at all
-/// -- there is no module call in `WCCMMUD.DLL` that would let this be
-/// exercised, only the possibility if one existed.
+/// commit to disk. This host does not write variable-length records at all,
+/// and that refusal is not hypothetical -- **a live session hit it.**
+///
+/// `re/ne_arity.py 180` (`dupdbtv`'s ordinal, from `re/ordinal_map.tsv`)
+/// finds 23 real call sites for it in `WCCMMUD.DLL`, one at seg 21:0x3354
+/// cleaning the two words `dupdbtv`'s four cdecl arguments clean down to.
+/// `re/exports/WCCMMUD_named.c` shows the path that reaches it:
+/// `_AUTOMATIC_UPDATE_POLLING_ROUTINE` calls `FUN_10a0_3765`, which switches
+/// on a type byte; case 9 `setbtv`s to the handle opened at `maxlen` `0x7e6`
+/// (2,022 -- `WCCTEXT`'s own number, from the paragraph above) and falls
+/// through to `FUN_10a0_32fa`, which calls `dupdbtv`. A board that took this
+/// path stopped with exactly that call: `dupdbtv (WCCTEXT.DAT: ... 2,022-byte
+/// buffer ...), called from seg 21:0x3353` -- one byte off `ne_arity.py`'s
+/// reported site, the expected fixup-vs-return-address difference. The guard
+/// above is what turned that into a stopped module instead of an unlinked
+/// fragment chain nobody noticed until the next read.
+///
+/// An earlier version of this comment claimed no such call existed, without
+/// having run `ne_arity.py` to check. An absence claim nobody checked is a
+/// search result wearing the clothes of a fact. The corrected shape: name
+/// the tool and what it found (or didn't), rather than asserting the thing
+/// itself.
 pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
         ShimError::Failed(
