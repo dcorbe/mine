@@ -5,8 +5,9 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use mbbs::Terms;
-use mbbs_server::conn::{self, default_keys};
+use mbbs_server::conn::{self, Listener, default_keys};
 use mbbs_server::host::Boot;
+use mbbs_server::termcompat::Stack;
 
 const DEFAULT_MODULE: &str = "re/WCCMMUD.DLL";
 const DEFAULT_LISTEN: &str = "127.0.0.1:2323";
@@ -72,9 +73,20 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_MODULE)]
     module: PathBuf,
 
-    /// Address to bind
+    /// Address to bind for a modern client: CP437 transcoded to UTF-8, and
+    /// the ANSI.SYS divergences patched. Repeatable, to listen on more than
+    /// one address.
     #[arg(long, default_value = DEFAULT_LISTEN)]
-    listen: String,
+    listen: Vec<String>,
+
+    /// Address to bind for a period client -- SyncTERM, MegaMUD, or anything
+    /// else that already speaks the host's own CP437/ANSI.SYS on the wire.
+    /// The host's bytes go out essentially untouched (telnet's IAC still
+    /// gets doubled -- that is framing, not rendering). Repeatable; no
+    /// default, since a board with no period clients need not open this
+    /// port at all.
+    #[arg(long)]
+    listen_raw: Vec<String>,
 
     /// Fixed channel count, must be at least 1
     #[arg(long, default_value_t = DEFAULT_TERMS, value_parser = parse_terms)]
@@ -140,15 +152,28 @@ async fn main() -> ExitCode {
         clock_reads: None,
     };
 
-    let addr = match conn::serve(boot, keys, &cli.listen).await {
-        Ok(addr) => addr,
+    // `--listen` gets `Stack::modern`, `--listen-raw` gets `Stack::raw` --
+    // this list, built once here, is the only place a CLI flag turns into a
+    // transport choice. `conn::serve` never asks why; it just binds each
+    // pair in order.
+    let listeners: Vec<Listener<'_>> = cli
+        .listen
+        .iter()
+        .map(|addr| (addr.as_str(), Stack::modern as fn() -> Stack))
+        .chain(cli.listen_raw.iter().map(|addr| (addr.as_str(), Stack::raw as fn() -> Stack)))
+        .collect();
+
+    let addrs = match conn::serve(boot, keys, &listeners).await {
+        Ok(addrs) => addrs,
         Err(e) => {
             eprintln!("mbbs-server: failed to start: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    println!("mbbs-server: listening on {addr}");
+    for addr in &addrs {
+        println!("mbbs-server: listening on {addr}");
+    }
 
     // The accept loop and the host thread are both spawned already; this
     // task's only remaining job is to keep the process alive for them.
@@ -175,11 +200,63 @@ mod tests {
         let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
         assert_eq!(cli.root, std::path::PathBuf::from("tmp"));
         assert_eq!(cli.module, std::path::PathBuf::from("re/WCCMMUD.DLL"));
-        assert_eq!(cli.listen, "127.0.0.1:2323");
+        assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
+        assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
         assert_eq!(cli.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
         assert_eq!(cli.passes, DEFAULT_PASSES);
         assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
+    }
+
+    /// `--listen` repeated binds more than one modern-stack address, in the
+    /// order given.
+    #[test]
+    fn listen_is_repeatable() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--listen",
+            "127.0.0.1:2323",
+            "--listen",
+            "127.0.0.1:2324",
+        ]))
+        .expect("parses");
+        assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string(), "127.0.0.1:2324".to_string()]);
+    }
+
+    /// `--listen-raw` is repeatable too, independent of `--listen`.
+    #[test]
+    fn listen_raw_is_repeatable() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--listen-raw",
+            "127.0.0.1:2325",
+            "--listen-raw",
+            "127.0.0.1:2326",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.listen_raw,
+            vec!["127.0.0.1:2325".to_string(), "127.0.0.1:2326".to_string()]
+        );
+        assert_eq!(
+            cli.listen,
+            vec!["127.0.0.1:2323".to_string()],
+            "--listen keeps its own default even when only --listen-raw is given"
+        );
+    }
+
+    /// `--listen-raw` alone, with no `--listen` on the command line at all,
+    /// still gets `--listen`'s documented default -- `--listen-raw` adds a
+    /// port, it does not replace the modern one.
+    #[test]
+    fn listen_raw_alone_still_defaults_listen() {
+        let cli =
+            Cli::try_parse_from(args(&["--root", "tmp", "--listen-raw", "127.0.0.1:2325"]))
+                .expect("parses");
+        assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
+        assert_eq!(cli.listen_raw, vec!["127.0.0.1:2325".to_string()]);
     }
 
     /// `--help` short-circuits, even with other flags present -- a caller
