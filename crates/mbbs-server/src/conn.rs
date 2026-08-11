@@ -13,19 +13,21 @@
 //! claiming `WILL ECHO` and simply stops writing bytes back -- the client was
 //! already silent.
 //!
-//! **CP437 decoding happens here, and nowhere upstream of here.** GSBL's word
-//! wrap counts bytes as columns, which is only true if the bytes are CP437;
-//! decoding earlier would hand it UTF-8 and break the column math. Inbound
-//! bytes are never translated at all -- GSBL's own default translate table
-//! (`gsbl.rs::translate`) strips the high bit, which is what a real CP437
-//! terminal would already have done to a multi-byte character typed at it.
+//! **Client translation happens here, and nowhere upstream of here.** GSBL's
+//! word wrap counts bytes as columns, which is only true if the bytes it
+//! sees are still CP437; adapting them any earlier would hand it UTF-8 and
+//! break the column math. See [`crate::termcompat`] for the translation
+//! itself -- `pump` below just picks a [`Stack`] and calls it per chunk.
+//! Inbound bytes are never translated at all -- GSBL's own default translate
+//! table (`gsbl.rs::translate`) strips the high bit, which is what a real
+//! CP437 terminal would already have done to a multi-byte character typed at
+//! it.
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
 use mbbs::{Chan, Connection};
-use mud_core::cp437;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -35,6 +37,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::host::{self, Boot};
 use crate::iac::Filter;
 use crate::msg::{In, Out};
+use crate::termcompat::Stack;
 
 const IAC: u8 = 255;
 const WILL: u8 = 251;
@@ -305,13 +308,18 @@ async fn pump(
 ) -> io::Result<()> {
     let mut filter = Filter::default();
     let mut buf = [0u8; 4096];
+    // Every channel is connected ANSI (`Connection::ansi` above), and there
+    // is only one listener today -- so `modern()` is the only `Stack` any
+    // caller can currently reach. Task 5 adds a second listener and a real
+    // per-port choice; this is the seam it plugs into.
+    let mut termcompat = Stack::modern();
 
     loop {
         tokio::select! {
             out = out_rx.recv() => match out {
                 Some(Out::Bytes(bytes)) => {
-                    let text = cp437::decode(&bytes);
-                    if writer.write_all(text.as_bytes()).await.is_err()
+                    let text = termcompat.outbound(&bytes);
+                    if writer.write_all(&text).await.is_err()
                         || writer.flush().await.is_err()
                     {
                         // The write failed -- treat it the same as a read
@@ -353,7 +361,7 @@ async fn pump(
 
 #[cfg(test)]
 mod tests {
-    use super::{Edit, LineEditor, default_keys};
+    use super::{Edit, LineEditor, default_keys, pump};
 
     /// A dead host thread must not leave a fresh connection hanging forever.
     ///
@@ -503,5 +511,65 @@ mod tests {
     fn high_bit_bytes_are_dropped() {
         let mut editor = LineEditor::default();
         assert!(matches!(editor.feed(0xe9), Edit::None));
+    }
+
+    /// `pump` actually applies [`crate::termcompat::Stack::modern`] to every
+    /// `Out::Bytes` chunk, not merely that `Stack` exists somewhere in the
+    /// crate.
+    ///
+    /// This is the gap every `termcompat` unit test leaves open: they prove
+    /// `Stack::modern()` transcodes correctly in isolation, but nothing
+    /// proves `pump` is the one calling it rather than, say,
+    /// `Stack::raw()`. Wiring `pump` to `raw()` was tried by hand while
+    /// writing this test: every existing `mbbs-server` test still passed,
+    /// including the real-socket `two_players`/`sleep` integration tests --
+    /// they only ever assert ASCII substrings via `from_utf8_lossy`, which
+    /// tolerates raw high-bit bytes right past the check. This test sends a
+    /// high-bit CP437 chunk (box drawing, plus 0x82 = 'é') straight through
+    /// a real loopback `TcpStream` and `pump`, with no host thread and no
+    /// module involved, and asserts the client sees the UTF-8 `Stack::modern`
+    /// produces -- not the raw CP437 bytes.
+    #[tokio::test]
+    async fn pump_applies_modern_transcoding_to_every_chunk() {
+        use crate::msg::{In, Out};
+        use mud_core::cp437;
+        use std::sync::mpsc as std_mpsc;
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _peer) = listener.accept().await.expect("accept");
+        let (reader, writer) = server.into_split();
+
+        let (host_tx, _host_rx) = std_mpsc::channel::<In>();
+        let (out_tx, out_rx) = mpsc::channel::<Out>(4);
+        let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+
+        let pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx));
+
+        let cp437_bytes: Vec<u8> = vec![0xC9, 0xCD, 0xCD, 0xBB, 0x82, 0xBA];
+        out_tx
+            .send(Out::Bytes(cp437_bytes.clone()))
+            .await
+            .expect("queue one chunk");
+        drop(out_tx); // no more chunks -- lets pump (and the client read) end
+
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("read until pump closes the socket");
+        pump_task.await.expect("pump task did not panic").expect("pump exited cleanly");
+
+        let want = cp437::decode(&cp437_bytes).into_bytes();
+        assert_eq!(
+            received, want,
+            "pump must hand every Out::Bytes chunk to Stack::modern() before \
+             writing it, not send the host's raw CP437 bytes unchanged"
+        );
     }
 }
