@@ -206,7 +206,13 @@ pub enum Ended {
     Bound { next_kick: Option<u16> },
 
     /// The module stopped, on the pass it stopped on.
-    Stopped(Poison),
+    ///
+    /// `Option<Chan>` names which channel was being serviced when it
+    /// happened, for a driver that wants to say who -- `None` when the stop
+    /// came from [`Host::prcrtk`]'s kick sweep rather than [`Host::poll`]: a
+    /// timer callback has no channel to name (see [`crate::Kick`]'s own
+    /// doc), and that is an honest fact rather than a gap to paper over.
+    Stopped(Poison, Option<Chan>),
 }
 
 /// What a driver should do about an [`Ended`].
@@ -233,7 +239,7 @@ impl Ended {
             Ended::Idle => Wait::Blocked,
             Ended::Waiting { next_kick, .. } => Wait::Until(*next_kick),
             Ended::Bound { .. } => Wait::Now,
-            Ended::Stopped(_) => Wait::Stop,
+            Ended::Stopped(..) => Wait::Stop,
         }
     }
 }
@@ -1944,6 +1950,22 @@ impl Host {
     /// module being unenterable, poisons the machine and comes back as
     /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
     pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
+        Ok(self.poll_with_chan(machine, module)?.map(|(outcome, _chan)| outcome))
+    }
+
+    /// [`Host::poll`], plus the channel an [`Outcome`] belongs to.
+    ///
+    /// Private: the only caller that needs the channel is [`Host::cycle`],
+    /// which wants it to name who a stop happened to in [`Ended::Stopped`].
+    /// Every external caller of `poll` (`crates/mbbs/tests/wccmmud.rs` and
+    /// `ifansi_oracle.rs`, dozens of call sites) only ever wanted the
+    /// `Outcome`, so `poll` keeps that shape and this carries the extra fact
+    /// out through the one caller that has a use for it.
+    fn poll_with_chan(
+        &mut self,
+        machine: &mut Machine,
+        module: &Module,
+    ) -> io::Result<Option<(Outcome, Chan)>> {
         // R23: a status this host does not dispatch (`OVRFLW`, say) is not
         // the same fact as "nothing queued" -- looping past it here, rather
         // than answering `Ok(None)` for it, keeps that distinction from
@@ -2011,7 +2033,9 @@ impl Host {
             // `point_curusr` sets it because the real host's own `curusr`
             // (`MAJORBBS.C:4290`) does.
             if let Err(e) = self.point_curusr(machine, chan) {
-                return self.shim_stop(machine, "point_curusr", e).map(Some);
+                return self
+                    .shim_stop(machine, "point_curusr", e)
+                    .map(|outcome| Some((outcome, chan)));
             }
 
             // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
@@ -2029,7 +2053,7 @@ impl Host {
                 // arm diverges either way, so the `match` still yields the index
                 // the `Entry` arm carries.
                 PollTarget::Poll => match self.dopoll(machine, module, chan)? {
-                    Some(outcome) => return Ok(Some(outcome)),
+                    Some(outcome) => return Ok(Some((outcome, chan))),
                     None => continue,
                 },
                 PollTarget::Entry(index) => index,
@@ -2038,7 +2062,9 @@ impl Host {
             if status == gsbl::Gsbl::CRSTG
                 && let Err(e) = self.get_input(machine, chan)
             {
-                return self.shim_stop(machine, "get_input", e).map(Some);
+                return self
+                    .shim_stop(machine, "get_input", e)
+                    .map(|outcome| Some((outcome, chan)));
             }
 
             // `MAJORBBS.C:2703` keys both of these on the channel's own state:
@@ -2064,7 +2090,11 @@ impl Host {
             };
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) => return self.shim_stop(machine, "entry lookup", e).map(Some),
+                Err(e) => {
+                    return self
+                        .shim_stop(machine, "entry lookup", e)
+                        .map(|outcome| Some((outcome, chan)));
+                }
             };
             let Some(entry) = entry else {
                 // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
@@ -2081,7 +2111,9 @@ impl Host {
                 ));
                 continue;
             };
-            return self.run(machine, module, entry, &[]).map(Some);
+            return self
+                .run(machine, module, entry, &[])
+                .map(|outcome| Some((outcome, chan)));
         }
     }
 
@@ -2183,15 +2215,15 @@ impl Host {
             // It was written as one, and review found that mutating the guard
             // away left all 739 tests passing, which is what unobservable looks
             // like.
-            match self.poll(machine, module)? {
-                Some(Outcome::Stopped(poison)) => {
+            match self.poll_with_chan(machine, module)? {
+                Some((Outcome::Stopped(poison), chan)) => {
                     return Ok(Cycles {
                         iterations,
                         dispatched,
-                        ended: Ended::Stopped(poison),
+                        ended: Ended::Stopped(poison, Some(chan)),
                     });
                 }
-                Some(Outcome::Returned { .. }) => dispatched += 1,
+                Some((Outcome::Returned { .. }, _chan)) => dispatched += 1,
                 // A status that dispatched nothing: a stale `POLSTS`, or an
                 // entry point the module never registered. `poll` has
                 // consumed it either way.
@@ -2222,7 +2254,10 @@ impl Host {
                     return Ok(Cycles {
                         iterations,
                         dispatched,
-                        ended: Ended::Stopped(poison),
+                        // `None`: a kick fired this, and `Kick` carries only
+                        // `delay` and `dstrou` -- no channel exists to name.
+                        // See `Ended::Stopped`'s own doc.
+                        ended: Ended::Stopped(poison, None),
                     });
                 }
             }
@@ -4913,9 +4948,57 @@ mod tests {
         // green -- a driver that blocked forever on a stopped module instead
         // of shutting down, with nothing to say so.
         assert_eq!(
-            Ended::Stopped(mbbs16::Poison::Timeout { cs: 0, ip: 0 }).wait(),
+            Ended::Stopped(mbbs16::Poison::Timeout { cs: 0, ip: 0 }, None).wait(),
             Wait::Stop
         );
+    }
+
+    /// `cycle`'s poll-sourced stop names the exact channel that tripped it.
+    ///
+    /// Nothing before Task 1 (`docs/plans/2026-08-11-survivability-and-the-
+    /// reachable-surface.md`) threaded a channel out of `Ended::Stopped` at
+    /// all, and no test anywhere in this file pinned the wiring `cycle`
+    /// added: `Ended::Stopped(poison, None)` -- silently dropping which
+    /// channel it was -- would compile and pass every other test in this
+    /// crate unchanged, because `polls_cut_says_the_budget_was_the_thing_
+    /// that_stopped_it` and `ended_tells_a_driver_what_to_wait_on` above
+    /// only ever exercise `Waiting`/`Bound`/a hand-built `Stopped`, never
+    /// one `cycle` produced from a real dispatch.
+    #[test]
+    fn cycle_names_the_channel_a_poll_sourced_stop_happened_on() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let module = f.minimal_module();
+
+        // sttrou (index 1): a privileged instruction, HLT, which raises
+        // SIGSEGV inside the sandboxed segment the same way
+        // `crates/mbbs16/tests/fault.rs` pins for `Machine` directly.
+        let sttrou = f.machine.code_ptr(0);
+        let state = register_module_with(&mut f, &[(1, sttrou)]);
+        // Loaded *after* `register_module_with` -- see `connected_with`'s own
+        // doc comment: `Fixture::invoke` uses the same scratch code segment
+        // for its own call trampoline, and `load_code` always writes at
+        // offset zero, so registering first and loading the real stub
+        // second is the only order that leaves the stub standing.
+        f.machine.load_code(&[0xf4]).expect("one byte fits"); // hlt
+
+        f.host
+            .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
+            .expect("a user on the channel");
+        set_state(&mut f, console, state);
+
+        f.host.gsbl_mut().push_input(console, b"look\r");
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 4).expect("cycle runs");
+        match cycles.ended {
+            Ended::Stopped(mbbs16::Poison::Fault { .. }, Some(chan)) => {
+                assert_eq!(
+                    chan, console,
+                    "the stop must name the channel actually being serviced"
+                );
+            }
+            other => panic!("expected a Fault naming the console channel, got {other:?}"),
+        }
     }
 
     /// `MAJORBBS.C:476` is `while (tcklst != ticker)`, which was safe only
