@@ -33,7 +33,20 @@
 //! whatever they held before being freed. Filtering by the marker *before*
 //! grouping by logical id is what tells a freed twin from the live page
 //! (Evidence 3, 3a); every one of the eight fixtures this module is tested
-//! against has zero unresolved logical ids left after that filter.
+//! against has zero *conflicts* left after that filter. Not zero unresolved
+//! ids: a logical id with no live claimant at all is the ordinary case, not
+//! an error, and [`Map::physical`] answers `None` for it.
+//!
+//! # Physical pages 0 and 1 are never ordinary pages
+//!
+//! They are the file control record's own shadow pair. An allocation table
+//! that claims one of them contradicts the format, so this refuses rather
+//! than mapping it: measured across all ten v6 files this repository has,
+//! including the shipped `NEWMP001.VIR`, no live table entry ever names
+//! physical page 0 or 1. Skipping them by their `"FC"` magic alone would not
+//! do -- a file whose page 0 lost that tag would have its control record
+//! handed back as an ordinary claimed page, which is exactly the plausible
+//! wrong answer the plan's Trap 2 exists to forbid.
 //!
 //! # Where further allocation-table blocks live
 //!
@@ -118,10 +131,15 @@ impl Map {
     ///   a wrong pick would be worse than stopping.
     pub fn read(file: &[u8], page_size: u16) -> Result<Self, String> {
         let page_size = usize::from(page_size);
-        if page_size <= ENTRIES {
+        // `ENTRIES + ENTRY`, not `ENTRIES`: a page long enough to reach the
+        // entry array but too short to hold one whole entry would divide out
+        // to zero entries and return an empty map, reporting success for a
+        // file nothing was read from.
+        if page_size < ENTRIES + ENTRY {
             return Err(format!(
                 "{page_size}-byte pages have no room for an allocation-table \
-                 entry, which starts at {ENTRIES:#x}"
+                 entry: the array starts at {ENTRIES:#x} and an entry is \
+                 {ENTRY} bytes"
             ));
         }
         if file.is_empty() || !file.len().is_multiple_of(page_size) {
@@ -153,6 +171,25 @@ impl Map {
                  expected"
                     .to_owned(),
             );
+        }
+
+        // And whichever of them carries the magic must say it is block 1.
+        // The doc comment above claims that position identifies block 1;
+        // checking it is what keeps that a fact rather than an assumption,
+        // and it costs nothing -- all ten v6 files here carry block index 1
+        // on both copies at physical 2 and 3. Without this, a "PP" page at
+        // physical 2 mislabelled block 7 becomes a lone unpaired copy that
+        // is automatically live, since a single copy never reaches the
+        // generation-tie check.
+        for page in [2, 3] {
+            if magic(page) && word(page, BLOCK) != 1 {
+                return Err(format!(
+                    "physical page {page} carries the \"PP\" magic but calls \
+                     itself block {}, and block 1 is the only thing that lives \
+                     there",
+                    word(page, BLOCK)
+                ));
+            }
         }
 
         // Every allocation-table page in the file, however many blocks that
@@ -197,6 +234,21 @@ impl Map {
                 let marker = u16::from_le_bytes([file[at], file[at + 1]]);
                 let claimed_page = u16::from_le_bytes([file[at + 2], file[at + 3]]);
                 if marker != 0 {
+                    // Physical 0 and 1 are the file control record's shadow
+                    // pair. A table claiming one of them contradicts the
+                    // format; refused rather than mapped, because the
+                    // alternative is handing a caller the control record as
+                    // an ordinary page. Skipping such pages by their "FC"
+                    // magic instead would let a file whose page 0 lost that
+                    // tag through silently.
+                    if claimed_page <= 1 {
+                        return Err(format!(
+                            "allocation-table block {block} claims physical \
+                             page {claimed_page}, which is the file control \
+                             record's own shadow pair and cannot hold a \
+                             logical page"
+                        ));
+                    }
                     claimed.insert(u32::from(claimed_page), marker);
                 }
             }
@@ -432,5 +484,63 @@ mod tests {
         let e = Map::read(&file, 512).unwrap_err();
         assert!(e.contains("logical page 7"), "{e}");
         assert!(e.contains('4') && e.contains('5'), "{e}");
+    }
+
+    /// Physical page 0 is the file control record. Nothing in the corpus ever
+    /// claims it -- verified across all ten v6 files this repository has,
+    /// including the shipped `NEWMP001.VIR` -- so a table that does is a
+    /// contradiction rather than an unusual file.
+    ///
+    /// The page's `"FC"` magic is deliberately *not* what excludes it here:
+    /// this fixture leaves page 0 all zero, so a version that skipped the
+    /// control record by its tag alone would map logical 0 to physical 0 and
+    /// hand a caller the control record as an ordinary page.
+    #[test]
+    fn an_allocation_table_that_claims_the_control_record_is_refused() {
+        let mut file = vec![0u8; 512 * 6];
+        let at = |page: usize| page * 512;
+
+        file[at(2)..at(2) + 2].copy_from_slice(MAGIC);
+        file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&1u16.to_le_bytes());
+        file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
+
+        let entry = at(2) + ENTRIES;
+        file[entry..entry + 2].copy_from_slice(&1u16.to_le_bytes()); // marker
+        file[entry + 2..entry + 4].copy_from_slice(&0u16.to_le_bytes()); // physical page 0
+
+        let e = Map::read(&file, 512).unwrap_err();
+        assert!(e.contains("physical page 0"), "{e}");
+        assert!(e.contains("control record"), "{e}");
+    }
+
+    /// A page long enough to reach the entry array but too short to hold one
+    /// whole entry divided out to zero entries and returned an empty map --
+    /// success, for a file nothing had been read from. No real Btrieve page
+    /// is this small; the refusal exists so the answer is never "an empty
+    /// map, and no reason".
+    #[test]
+    fn a_page_too_short_for_one_whole_entry_is_refused_not_answered_empty() {
+        let file = vec![0u8; 14 * 4];
+        for size in [ENTRIES + 1, ENTRIES + ENTRY - 1] {
+            let e = Map::read(&file, size as u16).unwrap_err();
+            assert!(e.contains("no room for an allocation-table entry"), "{e}");
+        }
+    }
+
+    /// Position is what identifies block 1, so the block index found there
+    /// has to agree. A `"PP"` page at physical 2 calling itself block 7 would
+    /// otherwise become a lone unpaired copy -- and a single copy is
+    /// automatically live, never reaching the generation-tie check.
+    #[test]
+    fn a_pp_page_at_physical_two_that_is_not_block_one_is_refused() {
+        let mut file = vec![0u8; 512 * 6];
+        let at = |page: usize| page * 512;
+
+        file[at(2)..at(2) + 2].copy_from_slice(MAGIC);
+        file[at(2) + BLOCK..at(2) + BLOCK + 2].copy_from_slice(&7u16.to_le_bytes());
+        file[at(2) + GENERATION..at(2) + GENERATION + 2].copy_from_slice(&5u16.to_le_bytes());
+
+        let e = Map::read(&file, 512).unwrap_err();
+        assert!(e.contains("block 7"), "{e}");
     }
 }
