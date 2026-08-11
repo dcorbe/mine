@@ -17,11 +17,19 @@
 //! word wrap counts bytes as columns, which is only true if the bytes it
 //! sees are still CP437; adapting them any earlier would hand it UTF-8 and
 //! break the column math. See [`crate::termcompat`] for the translation
-//! itself -- `pump` below just picks a [`Stack`] and calls it per chunk.
-//! Inbound bytes are never translated at all -- GSBL's own default translate
-//! table (`gsbl.rs::translate`) strips the high bit, which is what a real
-//! CP437 terminal would already have done to a multi-byte character typed at
-//! it.
+//! itself -- `pump` below just picks a [`Stack`] and calls it per chunk, in
+//! both directions: `outbound` on the way to the socket, `inbound` on the
+//! way from it.
+//!
+//! **`Filter::feed` must run before `Stack::inbound`, never after.**
+//! `cp437::encode` can synthesize a `0xFF` byte -- CP437's non-breaking
+//! space -- out of an ordinary typed character; `0xFF` also happens to be
+//! telnet's `IAC`. Feeding the IAC filter the client's real bytes first
+//! means it only ever sees genuine telnet commands, never one this
+//! translation layer invented downstream. `pump` below gets this right, but
+//! by construction rather than by anything that would stop a refactor
+//! getting it wrong -- see `iac_filter_runs_before_inbound_transcode` in
+//! this module's tests.
 //!
 //! **One host thread, however many listeners.** [`serve`] can bind more than
 //! one address -- a modern port and a period port, or several of either --
@@ -410,7 +418,11 @@ async fn pump(
                     return Ok(());
                 }
                 Ok(n) => {
+                    // Order matters: the IAC filter must see the client's
+                    // real bytes before `inbound` transcodes them -- see
+                    // the module doc.
                     let bytes = filter.feed(&buf[..n]);
+                    let bytes = termcompat.inbound(&bytes);
                     if !bytes.is_empty() && host_tx.send(In::Input { chan, bytes }).is_err() {
                         // The host thread is gone. Nobody will ever read
                         // another `Input` or send another `Out` -- there is
@@ -638,6 +650,76 @@ mod tests {
             "pump must hand every Out::Bytes chunk to Stack::modern() before \
              writing it, not send the host's raw CP437 bytes unchanged"
         );
+    }
+
+    /// Task 7's pin: `pump`'s read arm must call `Filter::feed` before
+    /// `Stack::inbound`, never the other way around.
+    ///
+    /// `cp437::encode` can synthesize a `0xFF` byte from an ordinary typed
+    /// character: U+00A0 (non-breaking space), typed as UTF-8 `0xC2 0xA0`,
+    /// encodes to CP437's single-byte `0xFF` -- the exact value telnet
+    /// reserves for `IAC` (RFC 854). If `inbound` ran before the IAC
+    /// filter, that synthesized `0xFF` would reach the filter looking
+    /// exactly like the start of a genuine three-byte telnet command
+    /// (`IAC WILL/WONT/DO/DONT <opt>`), and the filter would silently
+    /// consume the very next byte -- the client's `X` -- as that command's
+    /// option byte instead of forwarding it. This test drives the real
+    /// `pump`, not `Stack::inbound` or `Filter::feed` in isolation: a
+    /// primitive-level test would keep passing even if `pump`'s call order
+    /// were swapped, because neither primitive enforces the other runs
+    /// first -- only their order in `pump` does.
+    #[tokio::test]
+    async fn iac_filter_runs_before_inbound_transcode() {
+        use crate::msg::{In, Out};
+        use crate::termcompat::Stack;
+        use std::sync::mpsc as std_mpsc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _peer) = listener.accept().await.expect("accept");
+        let (reader, writer) = server.into_split();
+
+        let (host_tx, host_rx) = std_mpsc::channel::<In>();
+        let (_out_tx, out_rx) = mpsc::channel::<Out>(4);
+        let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+
+        let _pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
+
+        // U+00A0 (non-breaking space) as UTF-8, then a plain 'X'. Neither
+        // byte is telnet's real IAC (255) -- the filter must let both
+        // through untouched, and only `inbound` afterwards turns the first
+        // two bytes into the single CP437 0xFF.
+        client.write_all(&[0xC2, 0xA0, b'X']).await.expect("write");
+
+        // Blocking recv (with a bound -- a pipeline that drops the bytes
+        // silently, as a wrongly-ordered one does, must fail this test
+        // loudly rather than hang it forever) on a std::sync::mpsc::Receiver,
+        // off the async runtime thread: this test's own task must yield
+        // (via `.await`) for `pump`, running as a separate tokio task on
+        // the same current-thread runtime, to ever get polled and send
+        // anything.
+        let received = tokio::task::spawn_blocking(move || host_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .expect("spawn_blocking did not panic")
+            .expect("pump forwarded no In::Input within 5s -- the bytes were dropped");
+
+        match received {
+            In::Input { bytes, .. } => assert_eq!(
+                bytes,
+                vec![0xFF, b'X'],
+                "the non-breaking space must encode to 0xFF and 'X' must survive \
+                 intact -- if inbound ran before the IAC filter, this 0xFF would \
+                 be read as IAC and 'X' would be eaten as a bogus telnet command's \
+                 option byte"
+            ),
+            _ => panic!("expected In::Input, got a different In variant instead"),
+        }
     }
 
     /// The wiring risk Task 5 adds: a listener started with `Stack::raw`

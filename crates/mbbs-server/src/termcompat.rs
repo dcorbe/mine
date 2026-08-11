@@ -11,6 +11,15 @@
 //! client wants CP437 transcoded to UTF-8 ([`Stack::modern`]); a period DOS
 //! terminal, or anything that already speaks CP437 on the wire, wants its
 //! bytes left alone ([`Stack::raw`]).
+//!
+//! **Both directions, same [`Stack`].** `outbound` (host -> client) has
+//! translated CP437 to UTF-8 since before this plan; `inbound` (client ->
+//! host) does the reverse -- UTF-8 to CP437 -- for exactly the same reason
+//! and exactly the same clients: a modern telnet client types UTF-8, and a
+//! period client (or an emulator of one, like SyncTERM) already types
+//! CP437. `inbound` belongs on `Stack`, not as a free function, for the
+//! same reason `home_on_clear` does: it needs to differ between `modern`
+//! and `raw`, and it needs carry-over state across calls (see `pending`).
 
 use mud_core::cp437;
 
@@ -47,6 +56,16 @@ pub struct Stack {
     /// this to `0` in the same step. Unused (stays `0`) when
     /// `home_on_clear` is `false`.
     ed2_match: usize,
+    /// Bytes of an incomplete UTF-8 sequence carried over from the tail of
+    /// the previous `inbound` call -- the same kind of carry-over
+    /// `ed2_match` is for `outbound`, for the same reason: a client's typed
+    /// multi-byte character can land split across two TCP reads exactly
+    /// like a bare `ESC[2J` can. Bounded to at most 3 bytes:
+    /// `std::str::from_utf8` only reports an incomplete-at-the-end error
+    /// for a valid *lead* byte with fewer than its required continuation
+    /// bytes on hand, and the longest UTF-8 sequence is 4 bytes. Unused
+    /// (stays empty) when `transcode` is `false`.
+    pending: Vec<u8>,
 }
 
 impl Stack {
@@ -90,6 +109,7 @@ impl Stack {
             transcode: true,
             home_on_clear: true,
             ed2_match: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -107,6 +127,7 @@ impl Stack {
             transcode: false,
             home_on_clear: false,
             ed2_match: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -134,6 +155,96 @@ impl Stack {
             }
             out
         }
+    }
+
+    /// Adapt one chunk of bytes typed by this connection's client, for the
+    /// host: UTF-8 -> CP437, [`Stack::outbound`]'s reverse. Only
+    /// [`Stack::modern`] does this; [`Stack::raw`] returns `bytes`
+    /// unchanged, because its client already sends CP437 on the wire -- see
+    /// `raw_inbound_leaves_a_cp437_clients_high_bit_bytes_alone` below for
+    /// what transcoding it anyway would do to that client's high-bit bytes.
+    ///
+    /// **ASCII is unaffected**, which is why nothing noticed this gap
+    /// existed until now: every ASCII byte is already both its own one-byte
+    /// UTF-8 encoding and its own CP437 byte, so a session that never types
+    /// outside ASCII sees no difference between a `Stack` that does this
+    /// and one that silently drops it on the floor.
+    ///
+    /// **This must run after `crate::iac::Filter::feed`, never before.**
+    /// `cp437::encode` can *synthesize* a `0xFF` byte -- CP437's
+    /// non-breaking space -- out of an ordinary typed character no
+    /// different from any other (see `mud_core::cp437`'s `HIGH` table,
+    /// last entry). `0xFF` also happens to be telnet's `IAC` (RFC 854). If
+    /// this ran before the IAC filter saw the client's real bytes, a typed
+    /// non-breaking space would look exactly like the start of a genuine
+    /// telnet command and the filter would silently eat whatever character
+    /// followed it -- the same `0xFF`/`IAC` collision `Stack::raw`'s IAC
+    /// doubling exists to prevent outbound, now arriving from the other
+    /// direction. `crates/mbbs-server/src/conn.rs`'s `pump` calls
+    /// `Filter::feed` first for exactly this reason; see its
+    /// `iac_filter_runs_before_inbound_transcode` test, which is worth more
+    /// than this paragraph.
+    ///
+    /// **Invalid UTF-8 does not panic.** A raw-bytes client, or a scripted
+    /// test, can send anything; malformed sequences are decoded lossily,
+    /// the same substitution `String::from_utf8_lossy` makes -- one
+    /// `U+FFFD` per malformed sequence, however many raw bytes it spanned.
+    /// `cp437::encode` maps `U+FFFD` to `?`, outside the codepage like any
+    /// other character it cannot represent, so every malformed sequence
+    /// costs the module exactly one byte -- predictable, because the
+    /// module counts bytes.
+    ///
+    /// **Carry-over.** A multi-byte character can arrive split across two
+    /// reads; the unconsumed tail is held in `self.pending` (bounded to at
+    /// most 3 bytes, see its doc comment) rather than guessed at or
+    /// discarded. A `pending` tail that never resolves -- the connection
+    /// closes mid-character -- is simply lost with it, the same as any
+    /// other buffered state a dropped connection abandons.
+    pub fn inbound(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if !self.transcode {
+            return bytes.to_vec();
+        }
+
+        self.pending.extend_from_slice(bytes);
+
+        let mut text = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    // Sound, not merely convenient: `valid_up_to` is
+                    // exactly the length of a prefix `from_utf8` already
+                    // proved is valid UTF-8, so this can never be the
+                    // unwrap-on-attacker-input this method's doc promises
+                    // not to do.
+                    text.push_str(std::str::from_utf8(&self.pending[..valid_up_to]).unwrap());
+                    match e.error_len() {
+                        // A definite malformed sequence of `len` bytes:
+                        // one replacement character, then keep scanning
+                        // whatever is left of `pending` in this same call.
+                        Some(len) => {
+                            text.push('\u{FFFD}');
+                            self.pending.drain(..valid_up_to + len);
+                        }
+                        // The tail is a valid lead byte with too few
+                        // continuation bytes on hand *so far* -- it may
+                        // still complete once the next chunk arrives.
+                        // Leave it in `pending` and stop; do not guess.
+                        None => {
+                            self.pending.drain(..valid_up_to);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        cp437::encode(&text)
     }
 
     /// Rewrite `ESC[2J` to `ESC[2J ESC[H`, carrying a partial match across
@@ -361,5 +472,159 @@ mod tests {
             got.extend(stack.outbound(&input[split..]));
             assert_eq!(got, want, "split at byte {split} desynced the match state");
         }
+    }
+
+    // -- inbound: UTF-8 -> CP437 (Task 7) --------------------------------
+
+    /// The basic case: a typed UTF-8 accented character comes out as its
+    /// single CP437 byte. 'é' is U+00E9, UTF-8 `0xC3 0xA9`, CP437 `0x82`.
+    #[test]
+    fn modern_inbound_transcodes_utf8_to_cp437() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound(&[0xC3, 0xA9]);
+        assert_eq!(got, vec![0x82]);
+    }
+
+    /// The design reason `inbound` differs by `Stack`, not by chance: a
+    /// client that already speaks CP437 on the wire (a period DOS
+    /// terminal, SyncTERM, MegaMUD) sends single CP437 bytes, not UTF-8.
+    /// `raw()` must leave them alone.
+    #[test]
+    fn raw_inbound_leaves_bytes_alone() {
+        let cp437_e_acute = [0x82u8]; // 'é' in CP437, already one byte
+        let mut stack = Stack::raw();
+        assert_eq!(stack.inbound(&cp437_e_acute), vec![0x82]);
+    }
+
+    /// The separation test: what would go wrong if `raw`'s client were
+    /// wired to `modern` instead. `0x82` alone is a UTF-8 *continuation*
+    /// byte with no lead byte before it -- invalid on its own -- so
+    /// `modern`'s decoder replaces it with one `U+FFFD`, which
+    /// `cp437::encode` maps to `?`. This is why the two stacks are not
+    /// interchangeable: a SyncTERM client wired to a modern port would see
+    /// every accented character it typed turn into a question mark, not
+    /// pass through as the byte it actually sent.
+    #[test]
+    fn raw_inbound_leaves_a_cp437_clients_high_bit_bytes_alone() {
+        let cp437_e_acute = [0x82u8];
+
+        let mut raw = Stack::raw();
+        assert_eq!(raw.inbound(&cp437_e_acute), vec![0x82]);
+
+        let mut modern = Stack::modern();
+        assert_eq!(
+            modern.inbound(&cp437_e_acute),
+            vec![b'?'],
+            "modern must not be handed a client that already speaks CP437"
+        );
+    }
+
+    /// The blind spot this task's own analysis calls out: ASCII is
+    /// identical UTF-8 and CP437, so ASCII-only input cannot distinguish
+    /// `modern` from `raw`, or a working `inbound` from one that does
+    /// nothing at all. This test documents the trap rather than proving
+    /// anything on its own -- the two tests above, which use a real
+    /// high-bit byte, are what actually separates the stacks.
+    #[test]
+    fn ascii_inbound_is_identical_through_both_stacks() {
+        let input = b"hello world 123";
+        let mut modern = Stack::modern();
+        let mut raw = Stack::raw();
+        assert_eq!(modern.inbound(input), raw.inbound(input));
+    }
+
+    /// A 2-byte UTF-8 character split at its one interior point -- the
+    /// lead byte in one `inbound` call, the continuation byte in the next
+    /// -- still produces the single CP437 byte, not two garbled halves.
+    #[test]
+    fn modern_inbound_handles_2byte_char_split_across_calls() {
+        let utf8 = [0xC3u8, 0xA9u8]; // 'é'
+        let mut stack = Stack::modern();
+        let mut got = stack.inbound(&utf8[..1]);
+        got.extend(stack.inbound(&utf8[1..]));
+        assert_eq!(got, vec![0x82]);
+    }
+
+    /// The same for a 3-byte character, split at every interior point.
+    /// '≡' is U+2261, UTF-8 `0xE2 0x89 0xA1`, CP437 `0xF0`.
+    #[test]
+    fn modern_inbound_handles_3byte_char_split_across_calls() {
+        let utf8 = [0xE2u8, 0x89u8, 0xA1u8];
+        for split in 1..utf8.len() {
+            let mut stack = Stack::modern();
+            let mut got = stack.inbound(&utf8[..split]);
+            got.extend(stack.inbound(&utf8[split..]));
+            assert_eq!(got, vec![0xF0], "split at byte {split} corrupted the character");
+        }
+    }
+
+    /// The same 3-byte character fed one byte per call -- three calls, not
+    /// two -- so the carry-over is proven to survive more than one hop.
+    #[test]
+    fn modern_inbound_handles_3byte_char_one_byte_per_call() {
+        let utf8 = [0xE2u8, 0x89u8, 0xA1u8];
+        let mut stack = Stack::modern();
+        let mut got = Vec::new();
+        for &b in &utf8 {
+            got.extend(stack.inbound(&[b]));
+        }
+        assert_eq!(got, vec![0xF0]);
+    }
+
+    /// A truncated lead byte at the very end of a chunk -- as if the
+    /// connection then closed before the character completed -- is held
+    /// as valid-so-far, not immediately guessed at or replaced. This is
+    /// the "does a buffering implementation only pass when given a
+    /// resolving follow-up call" trap: nothing ever resolves this one.
+    #[test]
+    fn modern_inbound_holds_a_truncated_lead_byte_rather_than_guessing() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound(&[0xC3]); // lead byte of 'é'; the rest never arrives
+        assert!(got.is_empty(), "nothing should be emitted while the sequence might still complete");
+    }
+
+    /// A lone continuation byte -- never a valid lead -- does not panic
+    /// and costs the module exactly one byte: `?`, same as any other
+    /// unmappable character.
+    #[test]
+    fn modern_inbound_replaces_invalid_utf8_with_one_question_mark() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound(&[0x80]); // continuation byte, no lead
+        assert_eq!(got, vec![b'?']);
+    }
+
+    /// The malformed byte does not swallow what follows it: an invalid
+    /// byte immediately followed by plain ASCII must not lose the ASCII.
+    #[test]
+    fn modern_inbound_recovers_after_invalid_byte() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound(&[0x80, b'X']);
+        assert_eq!(got, vec![b'?', b'X']);
+    }
+
+    /// The shared-shape trap every test above shares: the malformed byte
+    /// always sits at the very start of the buffer, where `valid_up_to`
+    /// (how much of `pending` was valid before the error) is always `0` --
+    /// so a mutant that drains `..len` instead of the correct
+    /// `..valid_up_to + len` passes every one of them, because `0 + len ==
+    /// len`. Measured: it did, until this test was added. Typing a real
+    /// character before the mistake -- 'é', then a stray continuation
+    /// byte, then 'X' -- puts something ahead of the error and is the one
+    /// case that tells the two apart.
+    #[test]
+    fn modern_inbound_replaces_invalid_byte_after_a_valid_prefix() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound(&[0xC3, 0xA9, 0x80, b'X']); // 'é', then garbage, then 'X'
+        assert_eq!(got, vec![0x82, b'?', b'X']);
+    }
+
+    /// Every possible byte value, all in one chunk: must not panic. A
+    /// scripted test or a raw-bytes client can send anything.
+    #[test]
+    fn modern_inbound_does_not_panic_on_arbitrary_bytes() {
+        let mut stack = Stack::modern();
+        let garbage: Vec<u8> = (0u8..=255).collect();
+        let got = stack.inbound(&garbage);
+        assert!(!got.is_empty());
     }
 }
