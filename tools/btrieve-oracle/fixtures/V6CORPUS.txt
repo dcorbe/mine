@@ -36,6 +36,17 @@ DUPKEY30.DAT      512-byte pages, 12 pages, 30 records, fixed-length
                   (marker 0x0000) and physical 10 (marker 0x4400): the marker
                   settles it in favour of 10.
 
+DUPKEY30SWAPPED.DAT
+                  NOT minted by the oracle -- hand-built from DUPKEY30.DAT by
+                  exchanging its first two 512-byte halves byte-for-byte
+                  (`[0..512)` <-> `[512..1024)`, nothing else touched), so the
+                  live FCR copy (generation 2, 30 records) lands on physical
+                  page 0 instead of page 1. Every other v6 fixture here has its
+                  live FCR copy on page 1, which cannot distinguish "follows
+                  the generation" from "always prefers the second half"; this
+                  one can. Since the oracle did not write it, the "we write,
+                  the oracle reads back" rule does not apply.
+
 NONMONO1.DAT      512-byte pages, 31 pages, variable-length, 19 'V' pages.
 NONMONO2.DAT      512-byte pages, 38 pages, variable-length, 25 'V' pages.
                   The same file immediately before and after deleting a record

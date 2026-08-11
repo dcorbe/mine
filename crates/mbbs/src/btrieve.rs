@@ -70,6 +70,10 @@ mod at {
     pub const VARIABLE_MARK: usize = 0x38;
     /// User flags. Bit 0 is variable-length records, bit 3 is compression.
     pub const USRFLGS: usize = 0x106;
+
+    /// Generation counter. Present in both the v6 control record's shadow
+    /// copies and both the allocation table's; the higher one is live.
+    pub const GENERATION: usize = 0x04;
 }
 
 /// Bits of [`at::USRFLGS`], and what each adds to a record's physical length.
@@ -190,20 +194,52 @@ impl Geometry {
         let size = std::fs::metadata(path)
             .map_err(|e| fail(format!("{}: {e}", path.display())))?
             .len();
-        let bytes = read_head(path, FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
-        if bytes.len() < FCR {
+        // A v6 file's control record is shadowed across physical pages 0 and 1
+        // -- generation counters, not position, say which is live (Evidence 1).
+        // A v5 file has no second copy, so the version is established from the
+        // first `FCR` bytes alone, and only a v6 file requires the read to
+        // reach a second `FCR`-byte half.
+        let raw =
+            read_head(path, 2 * FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        if raw.len() < FCR {
             return Err(fail(format!(
                 "{size} bytes, and a Btrieve file's first page is at least {FCR}"
             )));
         }
 
-        let version = version(&bytes).ok_or_else(|| {
+        let version = version(&raw[..FCR]).ok_or_else(|| {
             fail(format!(
                 "starts {:02x?}, which is neither a v5 file control record \
                  (four zero bytes) nor a v6 one (\"FC\")",
-                &bytes[..4]
+                &raw[..4]
             ))
         })?;
+
+        let bytes: &[u8] = if version == Version::V6 {
+            if raw.len() < 2 * FCR {
+                return Err(fail(format!(
+                    "{size} bytes, and a v6 file's control record is shadowed \
+                     across two {FCR}-byte pages"
+                )));
+            }
+            let generation = |half: &[u8]| {
+                u16::from_le_bytes([half[at::GENERATION], half[at::GENERATION + 1]])
+            };
+            let first = generation(&raw[..FCR]);
+            let second = generation(&raw[FCR..2 * FCR]);
+            match first.cmp(&second) {
+                std::cmp::Ordering::Greater => &raw[..FCR],
+                std::cmp::Ordering::Less => &raw[FCR..2 * FCR],
+                std::cmp::Ordering::Equal => {
+                    return Err(fail(format!(
+                        "both control-record copies claim generation {first}, and \
+                         there is no rule measured for choosing between them"
+                    )));
+                }
+            }
+        } else {
+            &raw[..FCR]
+        };
 
         let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
         let page = word(at::PAGE);
@@ -1451,6 +1487,16 @@ mod tests {
         out
     }
 
+    /// Mark the first `FCR`-byte half of a synthetic v6 file as the live
+    /// control-record copy, by giving it the higher generation. Every v6 test
+    /// below built by [`file`] carries its actual field values in that first
+    /// half, so anything else would make [`Geometry::read`]'s new
+    /// shadow-copy comparison pick a copy of all zeroes.
+    fn mark_first_half_live(bytes: &mut [u8]) {
+        bytes[at::GENERATION..at::GENERATION + 2].copy_from_slice(&2u16.to_le_bytes());
+        bytes[FCR + at::GENERATION..FCR + at::GENERATION + 2].copy_from_slice(&1u16.to_le_bytes());
+    }
+
     /// Read a header out of bytes, by way of a real file.
     ///
     /// A directory per file rather than one shared: tests run in parallel, and
@@ -1514,9 +1560,48 @@ mod tests {
         let mut bytes = file(4096, 1544, 1546, 0, 6);
         bytes[..2].copy_from_slice(b"FC");
         bytes[7] = 0;
+        mark_first_half_live(&mut bytes);
         let geometry = read("NEWMP001.VIR", &bytes).expect("reads");
         assert_eq!(geometry.version, Version::V6);
         assert_eq!(geometry.reclen, 1544);
+    }
+
+    /// A v6 file's control record is shadowed across physical pages 0 and 1,
+    /// and page 0 can be the stale copy: `DUPKEY30.DAT`'s page 0 says the file
+    /// holds no records and its page 1 says thirty. Reading page 0
+    /// unconditionally -- which is what `read_head(path, FCR)` did -- reported
+    /// a populated file as empty, and reported it *without an error*, because
+    /// the two copies agree on every field the self-consistency checks look
+    /// at. Only the counts drift.
+    #[test]
+    fn a_v6_control_record_is_read_from_the_live_shadow_copy() {
+        // `CARGO_MANIFEST_DIR`-relative, not workspace-root-relative -- the
+        // convention `pages.rs`'s `dupkey30()` already uses, because a test
+        // binary's working directory is the crate root, not wherever `cargo
+        // test` was invoked from.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.records, 30, "page 1 is live and says thirty");
+    }
+
+    /// Every other v6 test in this file has its live copy on physical page 1
+    /// -- which alone cannot tell a correct generation comparison apart from
+    /// code that just always prefers the second half. `DUPKEY30SWAPPED.DAT`
+    /// is `DUPKEY30.DAT` with its two shadow-copy halves exchanged by hand --
+    /// byte-for-byte swap of `[0..512)` and `[512..1024)`, nothing else
+    /// touched (see `tools/btrieve-oracle/fixtures/V6CORPUS.txt`) -- so its
+    /// live copy (generation 2, 30 records) is back on physical page 0. This
+    /// is a hand-built fixture, not one the oracle wrote, so the "we write,
+    /// the oracle reads back" rule does not apply to it.
+    #[test]
+    fn the_live_copy_is_found_by_generation_not_by_position() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30SWAPPED.DAT");
+        let geometry = Geometry::read("DUPKEY30SWAPPED.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.records, 30, "page 0 is live here and says thirty");
     }
 
     #[test]
@@ -3079,6 +3164,7 @@ mod tests {
         bytes[..2].copy_from_slice(b"FC");
         bytes[at::USRFLGS] = 0x01;
         bytes[at::VARIABLE_MARK] = 0xff;
+        mark_first_half_live(&mut bytes);
         let e = read("SIX.DAT", &bytes).expect_err("v6 fragments are laid out differently");
         assert!(e.why.contains("V6"), "{e}");
 
@@ -3086,6 +3172,7 @@ mod tests {
         // `NEWMP001.VIR` is.
         let mut fixed = file(512, 100, 100, 0, 2);
         fixed[..2].copy_from_slice(b"FC");
+        mark_first_half_live(&mut fixed);
         assert_eq!(read("SIXFIXED.DAT", &fixed).expect("reads").version, Version::V6);
     }
 }
