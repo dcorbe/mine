@@ -1,0 +1,113 @@
+NONMONO2.DAT -- a version 6 variable-length file with DUPLICATE logical page
+ids, built by the real engine. NONMONO1.DAT is the same file one step earlier.
+
+WHY THIS EXISTS
+
+It is the counterexample that kills the obvious wrong implementation of v6
+page addressing.
+
+In a version 6 file, the page number inside a pointer is a LOGICAL id, not a
+physical position, and every ordinary page stamps its own logical id into its
+header. That makes an appealing shortcut look correct: scan every page once,
+read each one's self-stamp, and you have the logical -> physical map without
+ever parsing the "PP" allocation table. On every freshly-created v6 file that
+shortcut works perfectly, including DUPKEY30.DAT next to this one.
+
+It is wrong. A freed page KEEPS its self-stamp until something reallocates it,
+so after any delete-and-reinsert cycle a single logical id has more than one
+physical claimant and a scan cannot tell which is live. This file is the
+smallest case that exhibits it. Nothing else in the corpus does -- every other
+v6 file on hand was created and filled in one pass, which is the easiest
+possible case and the one that hides this.
+
+If a v6 reader is ever written that resolves logical ids by scanning alone, it
+will pass every other fixture here and silently read the wrong page on this one.
+
+WHAT IT CONTAINS -- measured directly from the bytes, 2026-08-11
+
+    19,456 bytes = 38 pages of 512
+    phys 0: "FC" generation 1      <- STALE control record
+    phys 1: "FC" generation 4      <- LIVE control record
+    phys 2: "PP" generation 1      <- STALE allocation table
+    phys 3: "PP" generation 4      <- LIVE allocation table
+
+    live control record: page 512, keys 1, reclen 12, physical 18,
+                         records 6, usrflgs 0x01 (variable-length)
+
+    22 variable pages ("V"-tagged: byte 1 of the page header is 0x56)
+    THREE logical ids with two physical claimants each:
+
+        logical 11 -> physical 7  and 35
+        logical 14 -> physical 17 and 32
+        logical 26 -> physical 29 and 36
+
+HOW TO RESOLVE THEM -- the whole point of the fixture
+
+The live allocation table (physical page 3, the higher generation) settles
+every one. Its entries start at offset 0x0c, are (page_size - 12) / 4 of them
+(125 at this page size), and each is [u16 marker][u16 page number], both plain
+little-endian -- NOT the high-word-first convention pages.rs uses for record
+positions. A NON-ZERO marker means the named page is claimed; zero means free.
+The marker's value is the claiming page's own type tag (0x5600 = 'V').
+
+    logical -> [(physical, stamp@0x04, PP marker)]
+      11: [(7,  3, 0x5600), (35, 2, 0x0000)]   -> live is physical 7
+      14: [(17, 3, 0x5600), (32, 2, 0x0000)]   -> live is physical 17
+      26: [(29, 0, 0x0000), (36, 1, 0x5600)]   -> live is physical 36
+
+Confirmed three independent ways: the markers agree with each other across all
+three ids; they agree with a determination of logical 14 -> physical 17 reached
+separately via fragment counts; and they agree with DUPKEY30.DAT, where
+physical 5 (marker 0x0000) and physical 10 (marker 0x4400) both claim logical 2.
+
+DO NOT USE THE PER-PAGE STAMP AT OFFSET 0x04 FOR THIS. It happens to pick the
+right page in all three cases above -- note id 26 resolves to the HIGHER
+physical page while the other two resolve to the lower, so a test that always
+picked the lower would fail on it -- but the stamp has no documented meaning,
+it can tie, and nothing establishes it is monotonic. The marker means
+something; the stamp is a coincidence that currently agrees.
+
+NONMONO1.DAT is the same file immediately BEFORE the delete, with 19 variable
+pages and NO duplicate ids. Use the pair: a scan-only implementation passes
+NONMONO1 and fails NONMONO2, which is exactly the regression signal wanted.
+
+REGENERATE IT
+
+    sh tools/btrieve-oracle/build.sh
+    # varprobe_multi.c is committed beside btrvprobe.c; build it the same way.
+    # Pick a name never used before in this Wine prefix -- see btrvprobe.c's
+    # header comment: the Microkernel caches pages by path and outlives its
+    # clients, so reusing a name serves stale pages.
+    WINEPREFIX=$HOME/.btrieve-wine wine varprobe_multi.exe create   'C:\btrieve\<unique>.DAT'
+    WINEPREFIX=$HOME/.btrieve-wine wine varprobe_multi.exe insertN  'C:\btrieve\<unique>.DAT' 6 2000 1
+    # ^ snapshot here is NONMONO1.DAT
+    WINEPREFIX=$HOME/.btrieve-wine wine varprobe_multi.exe delete   'C:\btrieve\<unique>.DAT' 2
+    WINEPREFIX=$HOME/.btrieve-wine wine varprobe_multi.exe reinsert 'C:\btrieve\<unique>.DAT' 99 3000
+    # ^ snapshot here is NONMONO2.DAT
+    cp "$HOME/.btrieve-wine/drive_c/btrieve/<unique>.DAT" tools/btrieve-oracle/fixtures/NONMONO2.DAT
+
+The exact record counts and body sizes above are reconstructed from the run
+that produced this copy, not re-derived from the file; the file's own measured
+state (6 records, reclen 12, three duplicate ids) is what matters and is stated
+above. What must be preserved if it is ever rebuilt is the SHAPE: insert
+several variable-length records, delete one from the middle, then reinsert a
+LONGER one so the engine reuses freed pages out of order. A rebuild that does
+not produce duplicate logical ids has not reproduced this fixture, whatever
+else it got right -- check before trusting it.
+
+WHY IT IS COMMITTED RATHER THAN MINTED ON DEMAND
+
+Minting requires genuine Pervasive Btrieve 6.15 under Wine. The engine is
+authoritative on FORMAT but not on POLICY -- which page an allocator picks,
+when it reuses a freed one -- so a rebuild is not guaranteed to reproduce the
+same physical layout, or any duplicate ids at all. This copy is the measured
+artifact the numbers above describe.
+
+METHODOLOGY NOTE
+
+Letting 6.15 write this file is correct and is NOT a violation of the "we
+write, the oracle reads back" rule. That rule exists to stop the engine
+silently CONVERTING a shipped V5 artifact whose format is the thing under test.
+This file has no prior artifact to protect -- the engine minted it from
+nothing, and for v6 layout the engine IS the authority. Never point a write op
+at tmp/ or any shipped .DAT/.VIR.
