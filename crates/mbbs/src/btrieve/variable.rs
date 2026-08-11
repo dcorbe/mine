@@ -111,6 +111,19 @@ pub(crate) trait Pages {
     fn page(&mut self, number: u32) -> Result<&[u8], String>;
 }
 
+/// [`Pages`], plus the write half [`rewrite_fragment_in_place`] needs.
+///
+/// Kept separate from [`Pages`] rather than folded into it: every reader --
+/// [`Chain::follow`], [`records::walk`](super::records) -- only ever needs to
+/// read a page, and giving a read path write access it never exercises is
+/// exactly the kind of unused capability that turns into a bug the day
+/// someone reaches for it by accident.
+pub(crate) trait PagesMut: Pages {
+    /// Replace the whole of page `number` with `page`, which must be exactly
+    /// one page long.
+    fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String>;
+}
+
 /// The pointer at the end of a fixed record: which page, and which fragment on
 /// it, the record's body starts at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +454,176 @@ impl Chain {
     }
 }
 
+/// Overwrite a single, whole, unfragmented, equal-length fragment in place.
+///
+/// This is the one shape a `dupdbtv` write to `WCCTEXT` ever asks for -- see
+/// the module comment at the top of this file for the measurement -- and it
+/// is validated by the page's own shape, not assumed from that measurement:
+/// the page `pointer` names is re-read and checked before a byte of it is
+/// touched, so a file that does not actually have that shape is refused
+/// rather than corrupted.
+///
+/// # What is checked, in order
+///
+/// - **the file is Btrieve 5.** See [`Chain::follow`]'s doc comment for why a
+///   v6 file's fragments cannot be handled by the same rule.
+/// - **the page `pointer` names says it is that page** ([`Header::read`]).
+/// - **the page holds exactly one fragment.** A page mid-split, or any page
+///   with more on it than the one fragment this pointer names, is refused
+///   rather than guessed at -- a second fragment's entry sits in the same
+///   array this never touches, but nothing here has reason to assume it is
+///   safe to leave alone on a page shaped differently from every one
+///   `WCCTEXT` has.
+/// - **that fragment starts at [`FIRST_FRAGMENT`]** -- the engine's own
+///   status 54 check, reused from [`fragment`].
+/// - **that fragment is not continued.** Rewriting one link of a chain that
+///   spans pages needs the allocator and the entry array this does not
+///   have; refused rather than attempted.
+/// - **that fragment's existing length equals `new_body.len()`.** Anything
+///   shorter or longer needs the free chain, the entry array, or a second
+///   page, all of which are the work a later track does.
+///
+/// # What is written
+///
+/// Only `new_body`, into exactly the byte range the fragment already
+/// occupied. The header, the free chain, the fragment count and the whole
+/// entry array are read and never written --
+/// [`tests::a_matching_shape_is_rewritten_in_place_and_touches_only_the_payload`]
+/// asserts this on the actual bytes, not on the code that is supposed to
+/// produce them.
+///
+/// # Errors
+///
+/// If any of the checks above fails, or the page cannot be read or written
+/// back.
+pub(crate) fn rewrite_fragment_in_place<P: PagesMut>(
+    pages: &mut P,
+    version: Version,
+    pointer: Pointer,
+    new_body: &[u8],
+) -> Result<(), String> {
+    if version != Version::V5 {
+        return Err(format!(
+            "{version:?} lays out its fragments differently -- an in-place rewrite only \
+             handles a version 5 file, the same restriction Chain::follow has \
+             (W32MKDE_decompiled.c:19045) -- and there is no v6 variable-length file to \
+             check an implementation of that against"
+        ));
+    }
+
+    let page = pages.page(pointer.page)?.to_vec();
+    let header = Header::read(&page, pointer.page)?;
+
+    if header.fragments != 1 {
+        return Err(format!(
+            "page {}: holds {} fragments, and an in-place rewrite only handles a page \
+             that holds exactly one",
+            pointer.page, header.fragments
+        ));
+    }
+
+    let found = fragment(&page, pointer.fragment, header)
+        .map_err(|why| format!("page {}: {why}", pointer.page))?;
+
+    if found.continued {
+        return Err(format!(
+            "page {}: fragment {} continues onto another page, and an in-place rewrite \
+             only handles a fragment that is the whole record",
+            pointer.page, pointer.fragment
+        ));
+    }
+
+    if found.length != new_body.len() {
+        return Err(format!(
+            "page {}: fragment {} is {} bytes and the new body is {} -- an in-place \
+             rewrite only handles a replacement of the same length",
+            pointer.page,
+            pointer.fragment,
+            found.length,
+            new_body.len()
+        ));
+    }
+
+    let mut rewritten = page;
+    rewritten[found.at..found.at + found.length].copy_from_slice(new_body);
+    pages.write_page(pointer.page, &rewritten)
+}
+
+/// [`PagesMut`] over an actual file on disk, addressed by page number.
+///
+/// A file handle is opened fresh for each [`Pages::page`] or
+/// [`PagesMut::write_page`] call rather than held open across both --
+/// [`rewrite_fragment_in_place`] touches exactly one page per call, so there
+/// is nothing to be gained by the kind of borrowed, held-open file
+/// [`records::walk`](super::records)'s `Chained` uses to follow a chain
+/// across many pages in one read.
+pub(crate) struct FilePages<'a> {
+    path: &'a std::path::Path,
+    page_len: u16,
+    pages: u32,
+    buffer: Vec<u8>,
+}
+
+impl<'a> FilePages<'a> {
+    /// `page_len` is the file's own page size and `pages` is how many pages
+    /// it currently is -- both `Geometry`'s, passed rather than read again so
+    /// this cannot disagree with the caller about either.
+    pub(crate) fn new(path: &'a std::path::Path, page_len: u16, pages: u32) -> Self {
+        Self {
+            path,
+            page_len,
+            pages,
+            buffer: vec![0u8; usize::from(page_len)],
+        }
+    }
+}
+
+impl Pages for FilePages<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // Page 0 is the file control record and never holds a fragment; see
+        // `records::Chained::page`, which refuses the same thing for the same
+        // reason.
+        if number == 0 || number >= self.pages {
+            return Err(format!(
+                "page {number}, and the file is {} pages",
+                self.pages
+            ));
+        }
+        let mut file = std::fs::File::open(self.path)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let at = u64::from(number) * u64::from(self.page_len);
+        file.seek(SeekFrom::Start(at))
+            .and_then(|_| file.read_exact(&mut self.buffer))
+            .map_err(|e| format!("page {number}: {e}"))?;
+        Ok(&self.buffer)
+    }
+}
+
+impl PagesMut for FilePages<'_> {
+    fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        if page.len() != usize::from(self.page_len) {
+            return Err(format!(
+                "a {}-byte page for a {}-byte page slot",
+                page.len(),
+                self.page_len
+            ));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(self.path)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        let at = u64::from(number) * u64::from(self.page_len);
+        file.seek(SeekFrom::Start(at))
+            .and_then(|_| file.write_all(page))
+            .and_then(|_| file.flush())
+            .map_err(|e| format!("page {number}: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +637,23 @@ mod tests {
                 .get(number as usize)
                 .map(Vec::as_slice)
                 .ok_or_else(|| format!("no page {number}"))
+        }
+    }
+
+    impl PagesMut for Held {
+        fn write_page(&mut self, number: u32, page: &[u8]) -> Result<(), String> {
+            let slot = self
+                .0
+                .get_mut(number as usize)
+                .ok_or_else(|| format!("no page {number}"))?;
+            if slot.len() != page.len() {
+                return Err(format!(
+                    "a {}-byte page for a {number}-byte page slot",
+                    page.len()
+                ));
+            }
+            slot.copy_from_slice(page);
+            Ok(())
         }
     }
 
@@ -732,5 +932,191 @@ mod tests {
         assert_eq!(header.number, 0x1234);
         assert_eq!(header.fragments, 1);
         assert_eq!(header.free_chain, None, "no page after it has room");
+    }
+
+    // `rewrite_fragment_in_place` -- the one shape a `dupdbtv` write to
+    // `WCCTEXT` ever asks for. Deliberately unlike the fixtures above: a
+    // 128-byte page rather than 2,048, a fragment far short of the page's
+    // capacity rather than filling it, and (in the first test) more than one
+    // page in the file with a second one this rewrite is never asked about --
+    // the shape every `Chain::follow` test above shares and none of these
+    // repeat.
+
+    /// The one shape this handles, checked on the actual bytes rather than
+    /// trusted from the code that is supposed to produce them: only the
+    /// payload range changed, not the header, not the entry array, and not a
+    /// page nobody asked about. The new payload differs from the old one in a
+    /// single byte, not every byte -- a rewrite that happened to compare
+    /// lengths and copy without truly overwriting would still pass a test
+    /// whose payload changed in every position.
+    #[test]
+    fn a_matching_shape_is_rewritten_in_place_and_touches_only_the_payload() {
+        let body: Vec<u8> = (0..30u8).collect();
+        let mut new_body = body.clone();
+        new_body[5] = new_body[5].wrapping_add(1);
+
+        let mut pages = Held(vec![
+            blank(128),
+            blank(128),
+            blank(128),
+            page(3, 128, &[(&body, false)]),
+            page(4, 128, &[(b"a neighbour this call was never asked about".as_slice(), false)]),
+        ]);
+        let before = pages.0[3].clone();
+        let neighbour = pages.0[4].clone();
+
+        rewrite_fragment_in_place(&mut pages, Version::V5, pointer(3, 0), &new_body)
+            .expect("an equal-length, single-fragment, non-continued rewrite");
+
+        let after = &pages.0[3];
+        let at = FIRST_FRAGMENT as usize;
+        assert_eq!(&after[at..at + new_body.len()], new_body.as_slice(), "the payload changed");
+        for i in 0..after.len() {
+            if (at..at + new_body.len()).contains(&i) {
+                continue;
+            }
+            assert_eq!(after[i], before[i], "byte {i}, outside the payload, changed");
+        }
+        assert_eq!(pages.0[4], neighbour, "a page this call was never asked about is untouched");
+    }
+
+    /// Rewriting a fragment with the exact bytes it already held is not a
+    /// special no-op case; it goes through the same write as any other
+    /// equal-length body and still succeeds.
+    #[test]
+    fn rewriting_the_same_bytes_back_still_succeeds() {
+        let body = b"identical, byte for byte, before and after".to_vec();
+        let mut pages = Held(vec![blank(96), page(1, 96, &[(&body, false)])]);
+
+        rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), &body)
+            .expect("same length, same bytes, still a valid rewrite");
+
+        let at = FIRST_FRAGMENT as usize;
+        assert_eq!(&pages.0[1][at..at + body.len()], body.as_slice());
+    }
+
+    /// The length check the plan calls out by name: a body a different length
+    /// from the fragment it would replace needs the free chain, the entry
+    /// array, or a second page, none of which this function has -- so it
+    /// refuses instead of silently resizing.
+    #[test]
+    fn a_body_of_a_different_length_is_refused_rather_than_resized() {
+        let body = b"eleven long".to_vec();
+        let mut pages = Held(vec![blank(96), page(1, 96, &[(&body, false)])]);
+        let before = pages.0[1].clone();
+
+        let shorter = b"short".to_vec();
+        let e = rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), &shorter)
+            .expect_err("11 bytes is not 5");
+        assert!(e.contains("an in-place rewrite only handles a replacement of the same length"), "{e}");
+        assert_eq!(pages.0[1], before, "a refused rewrite must not touch the page");
+    }
+
+    /// A page holding more than one fragment is refused whatever the pointed-
+    /// at fragment's own length says, because a second fragment's entry sits
+    /// in the same array this call never touches and nothing here has reason
+    /// to assume that is safe on a page shaped differently from every one
+    /// `WCCTEXT` has. The new body is deliberately the same length as the
+    /// existing fragment 0, so the length check cannot be what refuses this.
+    #[test]
+    fn a_page_holding_more_than_one_fragment_is_refused() {
+        let mut pages = Held(vec![
+            blank(96),
+            page(1, 96, &[(b"one".as_slice(), false), (b"two".as_slice(), false)]),
+        ]);
+        let before = pages.0[1].clone();
+
+        let e = rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), b"one")
+            .expect_err("two fragments on the page");
+        assert!(e.contains("holds 2 fragments"), "{e}");
+        assert_eq!(pages.0[1], before);
+    }
+
+    /// A continued fragment's payload is a pointer to the rest of the record
+    /// on another page, not the whole record -- rewriting it as if it were
+    /// the whole record would corrupt that pointer. Refused, with the new
+    /// body the same length as the old one, so the length check cannot be
+    /// what refuses this either.
+    #[test]
+    fn a_continued_fragment_is_refused_rather_than_rewritten_across_pages() {
+        let mut head = vec![0x00u8, 0x02, 0x00, 0x00]; // page 2, fragment 0
+        head.extend_from_slice(b"half");
+        let mut pages = Held(vec![blank(64), page(1, 64, &[(&head, true)]), page(2, 64, &[(b"rest".as_slice(), false)])]);
+        let before = pages.0[1].clone();
+
+        let e = rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), &head)
+            .expect_err("fragment 0 of page 1 continues onto page 2");
+        assert!(e.contains("continues onto another page"), "{e}");
+        assert_eq!(pages.0[1], before);
+    }
+
+    /// The engine's own status 54 check, reused here: the first live entry
+    /// has to name offset `0x0c`, the same fact [`Chain::follow`] checks on
+    /// the read side.
+    #[test]
+    fn a_rewrite_of_a_page_whose_first_live_fragment_does_not_start_at_twelve_is_refused() {
+        let mut bytes = page(1, 96, &[(b"body".as_slice(), false)]);
+        bytes[96 - 2] = 0x0e; // fragment 0 moved to offset 14
+        let mut pages = Held(vec![blank(96), bytes]);
+        let before = pages.0[1].clone();
+
+        let e = rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), b"body")
+            .expect_err("the header ends at 12");
+        assert!(e.contains("status 54"), "{e}");
+        assert_eq!(pages.0[1], before);
+    }
+
+    /// The page's own number is checked before anything else on it is
+    /// trusted, the same guard [`Chain::follow`] has on the read side.
+    #[test]
+    fn a_rewrite_of_a_page_that_disagrees_about_which_page_it_is_is_refused() {
+        let mut pages = Held(vec![blank(96), page(9, 96, &[(b"body".as_slice(), false)])]);
+        let before = pages.0[1].clone();
+
+        let e = rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), b"body")
+            .expect_err("page 1 says it is page 9");
+        assert!(e.contains("says it is page 9"), "{e}");
+        assert_eq!(pages.0[1], before);
+    }
+
+    /// There is no v6 variable-length file to check an implementation of the
+    /// v6 fragment layout against -- the same reason [`Chain::follow`]
+    /// refuses a v6 file on the read side.
+    #[test]
+    fn a_btrieve_6_file_is_refused_rather_than_rewritten_by_the_version_5_rule() {
+        let mut pages = Held(vec![blank(96), page(1, 96, &[(b"body".as_slice(), false)])]);
+        let before = pages.0[1].clone();
+
+        let e = rewrite_fragment_in_place(&mut pages, Version::V6, pointer(1, 0), b"body")
+            .expect_err("the 0x8000 bit means something else in a v6 file");
+        assert!(e.contains("V6") && e.contains("19045"), "{e}");
+        assert_eq!(pages.0[1], before, "refused before the page was even asked for");
+    }
+
+    /// [`FilePages`] is what a real `Block::update` runs against -- every
+    /// test above uses [`Held`], a `Vec` in memory, which cannot by itself
+    /// prove the disk-facing implementation seeks, reads and writes the
+    /// right bytes.
+    #[test]
+    fn file_pages_reads_and_writes_a_real_file_on_disk() {
+        let dir = crate::testing::scratch("variable-file-pages-round-trip");
+        let path = dir.join("SCRATCH.DAT");
+
+        let body = b"on disk, not held in memory".to_vec();
+        let mut file_bytes = blank(64); // page 0, standing in for the FCR
+        file_bytes.extend_from_slice(&page(1, 64, &[(&body, false)]));
+        std::fs::write(&path, &file_bytes).expect("write the fixture");
+
+        let mut new_body = body.clone();
+        new_body[0] = b'O';
+
+        let mut pages = FilePages::new(&path, 64, 2);
+        rewrite_fragment_in_place(&mut pages, Version::V5, pointer(1, 0), &new_body)
+            .expect("matches the shape");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(&after[..64], &blank(64)[..], "page 0 is untouched");
+        let at = 64 + FIRST_FRAGMENT as usize;
+        assert_eq!(&after[at..at + new_body.len()], new_body.as_slice(), "the payload landed on disk");
     }
 }
