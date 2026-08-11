@@ -1658,6 +1658,33 @@ mod tests {
         assert_eq!(geometry.records, 30, "page 1 is live and says thirty");
     }
 
+    /// Task 2: reading records from a v6 file must refuse and name the
+    /// version, not hand back an empty vector. Before this, `walk` applied
+    /// v5's `page * number` arithmetic to `DUPKEY30.DAT` regardless of its
+    /// version and returned *something* -- wrong, silently -- rather than
+    /// nothing and an error. `DUPKEY30.DAT` is the fixture to catch this
+    /// with precisely because its 30 records make "found nothing" an
+    /// impossible accidental pass: `NEWMP001.VIR` genuinely holds zero
+    /// records, so a walk that resolved no addressing at all still landed on
+    /// the header's own count by coincidence, which is what made the
+    /// original acceptance test in `crates/mbbs/tests/btrieve.rs` vacuous.
+    #[test]
+    fn a_v6_files_records_are_refused_rather_than_walked_with_v5_arithmetic() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+
+        let e = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed)
+            .expect_err("v6 page addressing is not resolved yet");
+        assert!(e.why.contains("V6"), "{e}: names the version");
+        assert!(
+            e.why.contains("logical page"),
+            "{e}: says what is missing, not just that v6 is unsupported"
+        );
+    }
+
     /// Every other v6 test in this file has its live copy on physical page 1
     /// -- which alone cannot tell a correct generation comparison apart from
     /// code that just always prefers the second half. `DUPKEY30SWAPPED.DAT`

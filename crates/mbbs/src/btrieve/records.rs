@@ -23,7 +23,7 @@ use std::path::Path;
 
 use super::keys::Key;
 use super::variable::{Chain, Pages, Pointer};
-use super::{BtvError, Geometry};
+use super::{BtvError, Geometry, Version};
 
 /// Bytes of header at the start of a data page, before the first record.
 ///
@@ -84,10 +84,20 @@ pub struct Records {
 impl Records {
     /// Read every record of a file and sort them by each of its keys.
     ///
+    /// **The single point every record read passes through.** `Block::records`
+    /// calls this; so does half the test suite, directly, which is what makes
+    /// this the entry point to guard rather than `Block::records` -- a check
+    /// placed there would not have covered the callers that never go through
+    /// a `Block` at all.
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read, its free list leaves the file, or the number
-    /// of records found is not the number the header claims.
+    /// If the file is not version 5 -- `walk`'s page arithmetic is v5's, and a
+    /// v6 file's page numbers are logical ids this host does not yet resolve
+    /// to a physical position (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`
+    /// Tasks 3-5 restore that). If the file cannot be read, its free list
+    /// leaves the file, or the number of records found is not the number the
+    /// header claims.
     pub fn read(
         name: &str,
         path: &Path,
@@ -98,6 +108,28 @@ impl Records {
             file: name.to_owned(),
             why,
         };
+
+        // `walk` computes every page's byte offset as `page * number` --
+        // correct only for v5, where a page's number *is* its physical
+        // position. In a v6 file that number is a logical id (Evidence 2 of
+        // the plan above), and nothing here resolves one to the other yet.
+        // Applying v5's arithmetic anyway does not fail: it reads whatever
+        // bytes happen to sit at the wrong offset and reports that as the
+        // file's records. For `NEWMP001.VIR` those bytes describe an empty
+        // page, which happens to match the header's own (genuinely correct)
+        // count of zero -- so the previous version of this function "passed"
+        // that file without ever having resolved a single page address. This
+        // refuses instead of repeating that guess.
+        if geometry.version != Version::V5 {
+            return Err(fail(format!(
+                "is a {:?} file, and this host cannot yet resolve a v6 file's \
+                 logical page numbers -- reading its records would have to \
+                 walk pages by physical position, which is a v5 assumption, \
+                 not this file's",
+                geometry.version
+            )));
+        }
+
         let records = walk(geometry, path).map_err(fail)?;
 
         if records.len() as u32 != geometry.records {
