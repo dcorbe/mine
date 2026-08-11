@@ -385,6 +385,19 @@ pub struct Host {
     spr: FarPtr,
     spr_next: usize,
 
+    /// `l2as`'s rotating buffers, and which one is next.
+    ///
+    /// **Deliberately not `spr`'s pool.** `spr` rotates
+    /// [`shims::text::SPR_BUFFERS`] slots of [`shims::text::SPR_BYTES`] each,
+    /// sized for `%s`-shaped text; sharing that rotation with `l2as` would
+    /// mean a module's `spr` calls could evict an `l2as` result the module
+    /// still holds (or vice versa) sooner than either routine's own contract
+    /// implies -- a behaviour change to `spr` smuggled in by an unrelated
+    /// shim. `l2as` gets its own small rotation instead, in the same
+    /// module-addressable segment `spr`, `mdf` and `empty` already share.
+    l2as: FarPtr,
+    l2as_next: usize,
+
     /// Where `strtok` left off.
     ///
     /// `MAJORBBS.EXE` keeps this as one far `char *` in its own `DGROUP`, at
@@ -769,11 +782,14 @@ impl Host {
         let prf_end = OUTBSZ;
 
         // One segment for everything the host hands a module a pointer into and
-        // then keeps: `spr`'s four buffers, `gmdnam`'s line, and one NUL byte
-        // for `parsin`'s empty-line `margv[0]`. Separate from the globals so
-        // that a module overrunning one of these cannot reach `usrnum`.
+        // then keeps: `spr`'s four buffers, `gmdnam`'s line, one NUL byte for
+        // `parsin`'s empty-line `margv[0]`, and `l2as`'s own small rotation
+        // (see `Host::l2as`'s doc comment for why that is a separate pool
+        // rather than more of `spr`'s). Separate from the globals so that a
+        // module overrunning one of these cannot reach `usrnum`.
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
-        let selector = machine.alloc_segment(spr_bytes + 64 + 1)?;
+        let l2as_bytes = shims::text::L2AS_BYTES as usize * shims::text::L2AS_BUFFERS;
+        let selector = machine.alloc_segment(spr_bytes + 64 + 1 + l2as_bytes)?;
 
         // The per-channel tables come off the module heap, because the real
         // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
@@ -841,6 +857,11 @@ impl Host {
                 selector,
             },
             spr_next: 0,
+            l2as: FarPtr {
+                offset: spr_bytes as u16 + 64 + 1,
+                selector,
+            },
+            l2as_next: 0,
             strtok: FarPtr::NULL,
             datebuf: None,
             mdf: FarPtr {
@@ -2514,6 +2535,17 @@ impl Host {
             selector: self.spr.selector,
         };
         self.spr_next = (self.spr_next + 1) % shims::text::SPR_BUFFERS;
+        at
+    }
+
+    /// The next of `l2as`'s rotating buffers. See [`Host::l2as`] for why this
+    /// is not [`Host::next_spr_buffer`].
+    fn next_l2as_buffer(&mut self) -> FarPtr {
+        let at = FarPtr {
+            offset: self.l2as.offset + (self.l2as_next as u16) * shims::text::L2AS_BYTES,
+            selector: self.l2as.selector,
+        };
+        self.l2as_next = (self.l2as_next + 1) % shims::text::L2AS_BUFFERS;
         at
     }
 

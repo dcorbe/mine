@@ -128,6 +128,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller),
     (MAJORBBS, "parsin", text::parsin, Cleans::Caller),
     (MAJORBBS, "atol", text::atol, Cleans::Caller),
+    (MAJORBBS, "l2as", text::l2as, Cleans::Caller),
     (MAJORBBS, "toupper", text::toupper, Cleans::Caller),
     (MAJORBBS, "tolower", text::tolower, Cleans::Caller),
     (MAJORBBS, "sameas", text::sameas, Cleans::Caller),
@@ -502,6 +503,26 @@ mod tests {
     #[test]
     fn an_unknown_symbol_is_unimplemented() {
         assert!(matches!(entry(MAJORBBS, "nonesuch"), Entry::Unimplemented));
+    }
+
+    /// `l2as`'s own module tests (`shims::text`) all call it by its Rust
+    /// name, which is not how a module reaches it. This goes through `entry`,
+    /// keyed by the DLL and the string the `ROUTINES` table was given, the
+    /// way `WCCMMUD.DLL`'s own import fixups do.
+    #[test]
+    fn l2as_is_wired_to_the_right_behaviour_by_name() {
+        let mut f = Fixture::new();
+        let Entry::Routine(l2as, cleans) = entry(MAJORBBS, "l2as") else {
+            panic!("l2as must be a routine");
+        };
+        assert_eq!(cleans, Cleans::Caller, "14/14 measured sites clean 2 words");
+
+        let value = i32::MIN as u32;
+        let args = [value as u16, (value >> 16) as u16];
+        let Ret::Far(at) = f.invoke(l2as, &args).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-2147483648");
     }
 
     #[test]

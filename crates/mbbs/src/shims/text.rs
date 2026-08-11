@@ -18,7 +18,7 @@
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::fmt::{Args, format};
+use crate::fmt::{Args, Spec, format, integer};
 use crate::shims::ShimError;
 
 /// Bytes in one of `spr`'s rotating buffers.
@@ -41,6 +41,64 @@ pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
     let at = host.next_spr_buffer();
     write_cstr(machine, at, &text, SPR_BYTES)?;
+    Ok(Ret::Far(at))
+}
+
+/// Bytes in one of `l2as`'s rotating buffers.
+///
+/// A signed 32-bit decimal is at most 11 characters -- `i32::MIN` prints
+/// `-2147483648` -- plus the NUL [`write_cstr`] appends. 12 is that number
+/// exactly, not headroom.
+pub const L2AS_BYTES: u16 = 12;
+
+/// How many buffers `l2as` rotates through.
+///
+/// Every call site this shim is known to serve
+/// (`re/exports/WCCMMUD_named.c:8023-8068`, `:21410-21460`) feeds its result
+/// straight to the very next `prf` before calling `l2as` again, so one buffer
+/// would cover everything measured. Matching [`SPR_BUFFERS`]'s width anyway:
+/// nothing rules out a format string built from more than one `l2as` result at
+/// once, the way `prf("%s and %s", spr(...), spr(...))` already does for
+/// `spr`, and four buffers of 12 bytes is 48 bytes total -- cheap insurance
+/// against a call shape the measured sites do not happen to show.
+pub const L2AS_BUFFERS: usize = 4;
+
+/// `char *l2as(long longin)` -- render a signed 32-bit decimal into a buffer
+/// the host owns.
+///
+/// `GCOMM.H:319` declares the signature -- one `long` in, a far `char *` out
+/// -- and `#define ltoa(a) l2as(a)` (`GCOMM.H:254`) redirects `ltoa` straight
+/// onto it, which is why `ltoa`'s well-known contract (radix 10, no thousands
+/// separator -- that is `commas`, `GCOMM.H:488`, a separate post-processing
+/// routine -- a leading `-` for negative values, `0` prints as `"0"`) applies
+/// here too. `wg1/GALDSRC/SRC/ACCOUNT.C:329` calls `l2as(tclptr->dbtlmt*-1L)`
+/// to display a debt as a positive number, which only makes sense if `l2as`
+/// would otherwise have printed the sign; `wg1/GALDSRC/SRC/GALFILUT.C:183-186`
+/// special-cases zero in the *caller*, which only makes sense if `l2as` itself
+/// renders a plain `"0"`.
+///
+/// The 14 relocation sites `re/ne_arity.py` finds (ordinal 377) all clean 2
+/// words, matching a single `long` argument -- not the five-argument shape
+/// `re/exports/WCCMMUD_named.c` shows, which is a Ghidra artifact of an
+/// unresolved import folding nearby stack slots into a fabricated argument
+/// list.
+///
+/// [`Machine::arg_u32`], not `arg_u16`: a `long` is two words, and reading
+/// only the low one would silently misformat every value at or above 65536
+/// while still looking right on anything smaller. The 32 bits are read as
+/// **signed** -- `ul2as` (`GCOMM.H:320`) is the separate unsigned variant --
+/// and `i32::unsigned_abs` gets the magnitude without the negation overflow
+/// `-value` would hit at `i32::MIN`.
+///
+/// Formatting itself is [`integer`], the same converter `%d`/`%ld` use, not a
+/// second implementation -- see `fmt`'s module doc for why that matters.
+pub fn l2as(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let value = machine.arg_u32(0) as i32;
+    let negative = value < 0;
+    let magnitude = u64::from(value.unsigned_abs());
+    let text = integer(magnitude, negative, 10, false, &Spec::default());
+    let at = host.next_l2as_buffer();
+    write_cstr(machine, at, &text, L2AS_BYTES)?;
     Ok(Ret::Far(at))
 }
 
@@ -1728,6 +1786,115 @@ mod tests {
 
         // And the fourth is still readable after the fifth overwrote the first.
         assert_eq!(f.read(seen[3]), "3");
+    }
+
+    /// Argument words for a `long`, laid out the way [`Machine::arg_u32`]
+    /// reads them back: low word first, then high.
+    fn long(v: i32) -> [u16; 2] {
+        let v = v as u32;
+        [v as u16, (v >> 16) as u16]
+    }
+
+    #[test]
+    fn l2as_renders_zero_as_a_bare_zero() {
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(l2as, &long(0)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"0");
+    }
+
+    #[test]
+    fn l2as_prefixes_negative_values_with_a_minus() {
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(l2as, &long(-42)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-42");
+    }
+
+    #[test]
+    fn l2as_reads_the_full_32_bits_not_just_the_low_word() {
+        // >= 65536 is the one magnitude an `arg_u16` mistake gets wrong while
+        // still passing on anything smaller.
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(l2as, &long(100_000)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"100000");
+    }
+
+    #[test]
+    fn l2as_renders_i32_min_without_negation_overflow() {
+        // `i32::MIN`'s magnitude has no positive `i32` counterpart -- `-value`
+        // overflows. `unsigned_abs` is the one way to get here without it.
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(l2as, &long(i32::MIN)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-2147483648");
+    }
+
+    #[test]
+    fn l2as_renders_i32_max() {
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(l2as, &long(i32::MAX)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"2147483647");
+    }
+
+    #[test]
+    fn l2as_rotates_through_its_own_pool_and_wraps_after_l2as_buffers() {
+        let mut f = Fixture::new();
+        let mut seen = Vec::new();
+        for n in 0..=L2AS_BUFFERS {
+            let Ret::Far(at) = f.invoke(l2as, &long(n as i32)).expect("formatted") else {
+                panic!("l2as returns a pointer");
+            };
+            seen.push(at);
+        }
+
+        let mut offsets: Vec<u16> = seen[..L2AS_BUFFERS].iter().map(|p| p.offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), L2AS_BUFFERS, "{seen:?}");
+        assert_eq!(seen[L2AS_BUFFERS], seen[0], "the wrap reuses the first");
+
+        // The third result is still readable after the wrap overwrote the
+        // first.
+        assert_eq!(f.machine.read_cstr(seen[2]).expect("terminated"), b"2");
+    }
+
+    #[test]
+    fn l2as_rotates_independently_of_sprs_pool() {
+        // If `l2as` shared `spr`'s rotation, the three `spr` calls between
+        // these two `l2as` calls would move `l2as`'s next buffer by three
+        // slots instead of one -- exactly the coupling `Host::l2as`'s doc
+        // comment says a separate pool exists to avoid.
+        let mut f = Fixture::new();
+        let template = f.text("%d");
+
+        let Ret::Far(first) = f.invoke(l2as, &long(1)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+
+        for n in 0..3u16 {
+            let args = [template.offset, template.selector, n];
+            f.invoke(spr, &args).expect("formatted");
+        }
+
+        let Ret::Far(second) = f.invoke(l2as, &long(2)).expect("formatted") else {
+            panic!("l2as returns a pointer");
+        };
+
+        assert_eq!(
+            second.offset - first.offset,
+            L2AS_BYTES,
+            "three intervening spr calls moved l2as's rotation by more than one slot"
+        );
+        assert_eq!(f.machine.read_cstr(first).expect("terminated"), b"1");
+        assert_eq!(f.machine.read_cstr(second).expect("terminated"), b"2");
     }
 
     #[test]
