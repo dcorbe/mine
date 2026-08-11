@@ -32,7 +32,7 @@ pub mod keys;
 pub mod pages;
 pub mod records;
 mod variable;
-pub mod v6;
+pub(crate) mod v6;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

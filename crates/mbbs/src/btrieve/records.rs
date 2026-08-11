@@ -25,6 +25,19 @@ use super::keys::Key;
 use super::variable::{Chain, Pages, Pointer};
 use super::{BtvError, Geometry, Version};
 
+/// Bytes of marker a v6 record slot opens with, before the record body.
+///
+/// Evidence 1b of `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`,
+/// measured against 1,580 oracle-dumped records: a v6 page's header is six
+/// bytes exactly as v5's, and slots are `physical` bytes apart from there --
+/// only the body's offset *within* the slot moves. Every slot observed holds
+/// `01 00`; what the two bytes mean is not established, so this reads past
+/// them rather than interpreting them.
+///
+/// Named because three places depend on it and a bare `2` in any of them is
+/// unsearchable.
+const V6_SLOT_MARKER: usize = 2;
+
 /// Where the free list starts, in the file control record.
 const FREE_LIST: usize = 0x10;
 
@@ -560,10 +573,31 @@ fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// v6 page -- a shape neither committed fixture exercises, and Evidence 5
 /// leaves open ("what triggers copy-on-write relocation... is not
 /// established") -- would not be skipped by this the way a v5 free list
-/// entry is. It would not be silently miscounted either: [`Records::read`]
-/// refuses the file the instant this walk's count disagrees with the
-/// header's, which is Trap 2's whole point -- a stop, not a plausible wrong
-/// answer.
+/// entry is.
+///
+/// **What that costs, stated exactly, because an earlier version of this
+/// comment overstated it.** It claimed [`Records::read`]'s count check turns
+/// the case into a refusal, "a stop, not a plausible wrong answer". That is
+/// the likely outcome and it is not a guarantee, and the difference is the
+/// whole of Trap 2. Two ways it goes:
+///
+/// - The deleted slot's leftover bytes satisfy [`looks_empty`]: this stops
+///   there and misses every live record behind it on that page, the count
+///   falls short, and `Records::read` refuses. Loud, correct.
+/// - They do **not** satisfy it -- Evidence 3a establishes that a stale v6
+///   page can hold real leftover content -- and the slot is read as a live
+///   record that is not one. The count is then inflated by a ghost and
+///   deflated by whatever the walk stopped short of, and if those cancel,
+///   the count matches the header exactly and nothing refuses. That is a
+///   wrong answer that counts correctly, which is precisely the shape the
+///   Task 2 correction in the plan documents.
+///
+/// No fixture has an interior deletion, so neither branch is exercised and
+/// the second is a structural argument rather than a demonstrated failure.
+/// It is written down instead of being asserted away because "very probably
+/// refuses" is not what this crate promises elsewhere. Closing it properly
+/// means establishing the v6 free-list representation and consulting it;
+/// until then this is a known hole with a known shape.
 ///
 /// **A record's position embeds the page's LOGICAL id, not its physical
 /// one.** Measured directly against `DUPKEY30.DAT`: physical page 8
@@ -582,7 +616,7 @@ fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// conclusion, from the in-record `[prev][next]` duplicate chain rather
 /// than from insertion order -- see its doc comment.
 fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
-    if geometry.physical < 2 {
+    if usize::from(geometry.physical) < V6_SLOT_MARKER {
         return Err(format!(
             "a {}-byte physical record, too short to hold the two-byte v6 slot \
              marker every record body follows two bytes past (Evidence 1b)",
@@ -646,10 +680,19 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 
             // Evidence 1b: the record body starts two bytes into the slot,
             // past a marker this reads past rather than interprets.
-            let start = usize::from(super::pages::HEADER)
-                + usize::from(geometry.physical) * slot as usize
-                + 2;
-            let content_len = usize::from(geometry.physical) - 2;
+            //
+            // `position(0, slot)` rather than a restated `HEADER + physical *
+            // slot`, so the formula lives only in `Layout::position` -- Trap 1
+            // in miniature otherwise. Page **0**, not this page: `position`
+            // above is deliberately keyed by the *logical* id (Evidence 1c)
+            // while `at` is the *physical* page's byte offset, so the two do
+            // not subtract into an in-page offset the way `walk_v5`'s do. The
+            // offset of a slot within its page is the same for every page, and
+            // page 0 starts at byte 0, so asking for page 0 asks exactly that
+            // question. This subtlety cost a broken refactor: `position - at`
+            // compiles, reads plausibly, and is wrong.
+            let start = layout.position(0, slot) as usize + V6_SLOT_MARKER;
+            let content_len = usize::from(geometry.physical) - V6_SLOT_MARKER;
             let record = &buffer[start..start + content_len];
 
             // Slots fill from the front of a page here too -- see v5's
@@ -677,7 +720,7 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
                 ]);
                 let mut source = MappedPages {
                     file: &file,
-                    page_size: geometry.page,
+                    layout,
                     map: &map,
                 };
                 Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
@@ -702,7 +745,11 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// it already named a physical page (plan Task 6, mandatory mutation (c)).
 struct MappedPages<'a> {
     file: &'a [u8],
-    page_size: u16,
+    /// Carried whole rather than as a bare page size so that where a page
+    /// starts is [`Layout::page_start`]'s answer here too. This held the page
+    /// size and multiplied it out by hand until the branch's final review
+    /// counted the implementations of that one fact and found this a third.
+    layout: super::pages::Layout,
     map: &'a super::v6::Map,
 }
 
@@ -714,8 +761,8 @@ impl Pages for MappedPages<'_> {
                  page for it"
             )
         })?;
-        let at = physical as usize * usize::from(self.page_size);
-        let end = at + usize::from(self.page_size);
+        let at = self.layout.page_start(physical) as usize;
+        let end = at + usize::from(self.layout.page);
         self.file.get(at..end).ok_or_else(|| {
             format!(
                 "logical page {number} resolves to physical {physical}, past the end of a \
