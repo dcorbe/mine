@@ -9,6 +9,11 @@
 //! where the header does not say: `GALFILUT.C:73` passes `stzcpy`'s result
 //! straight to `checkdir`, which is how we know it returns the destination and
 //! not the terminator.
+//!
+//! [`append`] is also where `crate::ifansi::process` runs -- see its doc
+//! comment. `prf` and `prfmsg` both call it, which is why this is the one
+//! place in the host that can consume the `ESC[[ansi|ascii]` construct before
+//! any of it reaches `prfbuf`, the GSBL, or the wire.
 
 use mbbs16::{FarPtr, Machine, Ret};
 
@@ -89,8 +94,32 @@ pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// Put `text` where `prfptr` points, and move `prfptr` past it.
 ///
 /// Shared with `prfmsg`, which is this and a template that came out of a
-/// message file rather than out of the module.
+/// message file rather than out of the module. That sharing is exactly what
+/// makes `append` this host's `FormatOutput`
+/// (`ExportedModuleBase.cs:1133-1138`): [`crate::ifansi::process`] runs here,
+/// over the whole of `text`, before a byte of it is written into `prfbuf` --
+/// **not** downstream in the GSBL or the transport. `btutsw`'s wrap
+/// arithmetic in `crate::gsbl` counts every byte toward the column; running
+/// this after that count has already happened would shrink the string GSBL
+/// wrapped without telling it, which is a wrap bug wearing an IF-ANSI
+/// costume, not a genuine fix.
+///
+/// **Never called with a construct split across two calls, for
+/// `WCCMMUD.DLL`.** `prf` and `prfmsg` each call [`format`] exactly once and
+/// hand the *entire* formatted string to this function in one call --
+/// `format` builds one `Vec<u8>` and returns it whole, it does not stream a
+/// template out piece by piece. Measured over the module: all 269
+/// `ESC[[...]` constructs in `WCCMMUD.DLL` close inside their own
+/// NUL-terminated string, so there is no construct for this function to ever
+/// see arrive half from one call and half from the next. A module without
+/// that property would need `append` to carry state across calls the way
+/// [`crate::ifansi`] alone cannot; this one does not need to, and does not.
+///
+/// See [`channel_ansi`] for how the ANSI/ASCII branch is chosen.
 pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
+    let ansi = channel_ansi(machine, host);
+    let text = &crate::ifansi::process(text, ansi);
+
     let at = host
         .globals()
         .pointer(machine, "prfptr")
@@ -112,6 +141,53 @@ pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(),
         .write(machine, "prfptr", &moved.to_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
+}
+
+/// Whether `append`'s caller is writing for a channel whose terminal
+/// understands ANSI, so [`crate::ifansi::process`] knows which of a
+/// construct's two forms to keep.
+///
+/// `prfbuf`/`prfptr` are one buffer for the whole host (`GCOMM.H:449`), not
+/// one per channel: MajorBBS is cooperatively single-threaded, so exactly one
+/// channel's module code is ever running, and [`Host::current_channel`]
+/// (reading `usrnum` back out of module memory) names it. That is the same
+/// question every FSD shim already asks of the host --
+/// `crate::shims::fsd::fsdroom`'s `if let Ok(chan) = host.current_channel(...)`
+/// is the precedent for tolerating "no channel is current" rather than
+/// treating it as an error -- so this is not the "awkward to reach" case the
+/// plan this module implements warns about: `append` has exactly the
+/// `&Machine`/`&Host` pair `current_channel` needs, with no extra plumbing
+/// and no signature change to `prf` or `prfmsg`.
+///
+/// The flag itself lives in module memory, not in this host's own state:
+/// `Host::connect_state` writes `who.ansi` into `usracc.ansifl` bit `ANSON`
+/// (`users::usracc::ANSIFL`) when a channel connects, and this reads it back
+/// the same way the module's own `_EDIT_CHARACTER_STATS` fork does
+/// (`WCCMMUD_decompiled.c:1799-1805`, cited in `users::Connection::line_mode`).
+///
+/// Defaults to `true` -- the ANSI form -- when no channel is current, or when
+/// the account record cannot be read at all. The first is reachable during a
+/// module's own init routine and by every shim-level test in this crate that
+/// calls `prf`/`prfmsg` without pointing `usrnum` anywhere first; the second
+/// should not be reachable once a host has finished starting up, and `true`
+/// is the same answer as the first default rather than a second guess to
+/// keep track of. Neither default is invented for this function: it is what
+/// MBBSEmu's own `ProcessIfANSI` always answers -- it takes an `isAnsi`
+/// parameter and never reads it -- so a caller with nothing to ask degrades
+/// to the one behaviour every `re/oracle/` capture already exhibits.
+fn channel_ansi(machine: &Machine, host: &Host) -> bool {
+    let Ok(chan) = host.current_channel(machine) else {
+        return true;
+    };
+    let account = host.users().account(chan);
+    let ansifl = FarPtr {
+        offset: account.offset + crate::users::usracc::ANSIFL as u16,
+        selector: account.selector,
+    };
+    match machine.resolve(ansifl, 1) {
+        Ok(bytes) => bytes[0] & 1 != 0,
+        Err(_) => true,
+    }
 }
 
 /// `void clrprf(void)` -- throw away whatever `prf` has queued.
@@ -1674,6 +1750,132 @@ mod tests {
             ],
         );
         assert!(third.is_err(), "the third would overrun");
+    }
+
+    /// `\x1b[[\x1b[1;37m|X]TAIL` -- ANSI form `\x1b[1;37m`, ASCII form `X`,
+    /// then ordinary text that must survive on either branch. Not one of the
+    /// 269 real constructs Task 1's review measured inside `WCCMMUD.DLL` --
+    /// just small enough to read at a glance and exercise both forms.
+    const IFANSI_FIXTURE: &[u8] = b"\x1b[[\x1b[1;37m|X]TAIL";
+
+    #[test]
+    fn prf_strips_ifansi_to_the_ansi_form_on_an_ansi_channel() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        f.host
+            .connect_state(&mut f.machine, chan, &crate::users::Connection::ansi("player"))
+            .expect("connected");
+
+        let template = f.bytes(IFANSI_FIXTURE, true);
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
+    }
+
+    #[test]
+    fn prf_strips_ifansi_to_the_ascii_form_on_a_line_mode_channel() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                chan,
+                &crate::users::Connection::line_mode("player"),
+            )
+            .expect("connected");
+
+        let template = f.bytes(IFANSI_FIXTURE, true);
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "XTAIL");
+    }
+
+    #[test]
+    fn prfmsg_converges_on_the_same_ifansi_stripping_as_prf() {
+        // `prf` and `prfmsg` share `append` -- the whole point of Task 2 --
+        // so a message-file template must be stripped exactly as a module
+        // string is.
+        let dir = crate::testing::scratch("text-ifansi-prfmsg");
+        let mut contents = b"LEVEL0 {IFANSI}\r\n\r\nIFMSG {".to_vec();
+        contents.extend_from_slice(IFANSI_FIXTURE);
+        contents.extend_from_slice(b"} T\r\n");
+        std::fs::write(dir.join("IFANSI.MSG"), &contents).expect("fixture written");
+
+        let mut f = Fixture::rooted(dir);
+        let chan = f.console();
+        f.host
+            .connect_state(&mut f.machine, chan, &crate::users::Connection::ansi("player"))
+            .expect("connected");
+
+        let name = f.text("IFANSI.MSG");
+        f.invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .expect("opened");
+        // `IFMSG` is message 1: `LEVEL0` itself is message 0, exactly as
+        // `SAMPLE.MSG`'s `FMT` is message 8 -- see
+        // `prfmsg_appends_to_the_print_buffer_the_way_prf_does` in
+        // `shims/msg.rs`.
+        f.invoke(crate::shims::msg::prfmsg, &[1]).expect("prfmsg");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
+    }
+
+    #[test]
+    fn prf_with_no_channel_current_defaults_to_the_ansi_form() {
+        // `Fixture::new` leaves `usrnum` at -1 (`MAJORBBS.C:882`) until
+        // something points it somewhere -- exactly the state every *other*
+        // `prf` test in this file already runs in, since none of them call
+        // `point_curusr` or `connect_state`. Defaulting to the ANSI form is
+        // what keeps every one of those tests green: none of their templates
+        // contain an IF-ANSI construct, so the default has never shown
+        // before now.
+        let mut f = Fixture::new();
+        let template = f.bytes(IFANSI_FIXTURE, true);
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
+    }
+
+    #[test]
+    fn channel_ansi_follows_whichever_channel_is_current_not_always_the_first_one() {
+        // Every test above has exactly one channel, so a flag-reader that
+        // hardcoded channel zero -- or cached whichever channel it saw first
+        // -- would pass every one of them. Two channels, one ANSI and one
+        // line-mode, with the *second* one current when `prf` runs, is what
+        // tells "reads the current channel" apart from "reads a channel".
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let a = f.host.users().terms().chan(0).expect("channel 0");
+        let b = f.host.users().terms().chan(1).expect("channel 1");
+
+        f.host
+            .connect_state(&mut f.machine, a, &crate::users::Connection::ansi("ann"))
+            .expect("a connected");
+        f.host
+            .connect_state(
+                &mut f.machine,
+                b,
+                &crate::users::Connection::line_mode("bob"),
+            )
+            .expect("b connected"); // leaves b current
+
+        let template = f.bytes(IFANSI_FIXTURE, true);
+        f.invoke(prf, &Fixture::far(template)).expect("prf for b");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.read(buffer), "XTAIL", "b is line-mode, so the ASCII form");
+
+        f.host
+            .point_curusr(&mut f.machine, a)
+            .expect("a is current now");
+        f.invoke(clrprf, &[]).expect("cleared");
+        f.invoke(prf, &Fixture::far(template)).expect("prf for a");
+        assert_eq!(
+            f.read(buffer),
+            "\x1b[1;37mTAIL",
+            "a is ansi, so the ANSI form"
+        );
     }
 
     #[test]
