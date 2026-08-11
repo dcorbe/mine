@@ -352,26 +352,25 @@ impl Geometry {
         // the logical record, inside the physical one. A file that says it has
         // variable-length records and leaves no room for the pointer is
         // describing something this cannot read.
-        if variable && physical - reclen < 4 {
+        //
+        // v6 needs six, not four: Evidence 1b's own two-byte slot marker sits
+        // between the slot and the logical record on *every* v6 file, fixed
+        // or variable, so the four-byte pointer `walk_v6` reads still comes
+        // right after `reclen` bytes -- but out of a `physical - 2`-byte
+        // content area, not a `physical`-byte one. Checking the v5 floor
+        // against a v6 file would let through a shape that later panics
+        // slicing four bytes out of the two or three actually left, rather
+        // than refusing here the way this house style requires.
+        let pointer_needs = match version {
+            Version::V5 => 4,
+            Version::V6 => 4 + 2,
+        };
+        if variable && physical - reclen < pointer_needs {
             return Err(fail(format!(
                 "variable-length records whose {physical}-byte slot leaves only {} bytes \
-                 after the {reclen}-byte record, and the pointer to the first fragment \
-                 needs four",
+                 after the {reclen}-byte record, and {version:?}'s fragment pointer needs \
+                 {pointer_needs}",
                 physical - reclen
-            )));
-        }
-
-        // A v6 file's fragments are laid out differently -- every one carries a
-        // next-pointer, and the `0x8000` entry bit does not decide
-        // (`W32MKDE_decompiled.c:19045`). `Version` was parsed and never
-        // consulted until here, which is exactly how the v5 rule would have
-        // been applied to a v6 file without anything saying so. Refused at open
-        // time; `variable::Chain::follow` refuses again on its own account.
-        if variable && version != Version::V5 {
-            return Err(fail(format!(
-                "variable-length records in a {version:?} file, whose fragments do not \
-                 follow the v5 rule this host reads them by, and there is no v6 \
-                 variable-length file to check an implementation of that against"
             )));
         }
 
@@ -1730,21 +1729,16 @@ mod tests {
             "physical page 1, at byte offset 2048, is live and says fifty"
         );
 
-        // `FRAG1024.DAT` also has a non-`FCR` page size (1024) and its live
-        // copy's raw record count is 1 -- but it is a *variable-length*
-        // record file, and `Geometry::read` refuses every v6 file of those
-        // outright (`variable && version != V5`, above), independent of this
-        // fix and not yet implemented (plan Task 6). That refusal fires
-        // whichever shadow copy is chosen, since both copies agree on the
-        // variable-length flag (Evidence 1) -- so this fixture cannot
-        // distinguish the page-size fix from the bug on its own, and the most
-        // this test can honestly assert is that the fix still reaches that
-        // refusal rather than a wrong record count or an unrelated error.
+        // `FRAG1024.DAT` also has a non-`FCR` page size (1024), and it is a
+        // *variable-length* v6 file -- Task 6 taught this host to read those,
+        // so it no longer refuses. Its live copy's raw record count is 1.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/btrieve-oracle/fixtures/FRAG1024.DAT");
-        let e = Geometry::read("FRAG1024.DAT", &path).expect_err("variable-length v6 refuses");
-        assert!(e.why.contains("V6"), "{e}");
-        assert!(e.why.contains("variable-length"), "{e}");
+        let geometry = Geometry::read("FRAG1024.DAT", &path).expect("reads, as of Task 6");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.page, 1024);
+        assert!(geometry.variable);
+        assert_eq!(geometry.records, 1, "physical page 1 is live and says one");
     }
 
     #[test]
@@ -3258,7 +3252,7 @@ mod tests {
             bytes[at::VARIABLE_MARK] = 0xff;
             let e = read("NOROOM.DAT", &bytes)
                 .expect_err("there is no room for a fragment pointer");
-            assert!(e.why.contains("needs four"), "{e}");
+            assert!(e.why.contains("needs 4"), "{e}");
         }
 
         // And four is enough, which is exactly what `WCCTEXT` has spare.
@@ -3297,19 +3291,24 @@ mod tests {
         assert!(e.why.contains("trailing blanks"), "{e}");
     }
 
-    /// A v6 file's fragments do not follow the v5 rule
-    /// (`W32MKDE_decompiled.c:19045`), and `Version` had been parsed and never
-    /// consulted anywhere -- which is exactly how the v5 rule would have been
-    /// applied to a v6 file silently.
+    /// Before Task 6, a v6 file's fragments were refused outright -- `Version`
+    /// had been parsed and never consulted anywhere, which is exactly how the
+    /// v5 rule would have been applied to a v6 file silently. Task 6 taught
+    /// `variable::Chain::follow` to read a v6 chain, so `Geometry::read` no
+    /// longer refuses by version alone; this asserts that directly, alongside
+    /// the fixed-length case that was always read.
     #[test]
-    fn a_btrieve_6_file_of_variable_length_records_is_refused() {
-        let mut bytes = file(512, 100, 104, 0, 2);
+    fn a_btrieve_6_file_of_variable_length_records_is_read_not_refused_by_version_alone() {
+        // `physical - reclen == 6`: Evidence 1b's two-byte slot marker plus
+        // the four-byte fragment pointer, the v6 floor this task adds.
+        let mut bytes = file(512, 100, 106, 0, 2);
         bytes[..2].copy_from_slice(b"FC");
         bytes[at::USRFLGS] = 0x01;
         bytes[at::VARIABLE_MARK] = 0xff;
         mark_first_half_live(&mut bytes);
-        let e = read("SIX.DAT", &bytes).expect_err("v6 fragments are laid out differently");
-        assert!(e.why.contains("V6"), "{e}");
+        let geometry = read("SIX.DAT", &bytes).expect("Task 6 reads a v6 variable-length file");
+        assert_eq!(geometry.version, Version::V6);
+        assert!(geometry.variable);
 
         // And a v6 file of *fixed*-length records is still read, which is what
         // `NEWMP001.VIR` is.
@@ -3317,5 +3316,33 @@ mod tests {
         fixed[..2].copy_from_slice(b"FC");
         mark_first_half_live(&mut fixed);
         assert_eq!(read("SIXFIXED.DAT", &fixed).expect("reads").version, Version::V6);
+    }
+
+    /// The v6-specific half of the room check Task 6 adds: a v6 slot needs
+    /// six spare bytes after `reclen`, not v5's four, because Evidence 1b's
+    /// two-byte marker sits in front of the pointer too. Four or five bytes
+    /// of room would let `Geometry::read` succeed and then panic inside
+    /// `records::walk_v6` slicing a four-byte pointer out of a two- or
+    /// three-byte remainder; refusing here is what this house style prefers
+    /// to that crash.
+    #[test]
+    fn a_v6_variable_length_file_needs_six_spare_bytes_not_four() {
+        for physical in [104u16, 105] {
+            let mut bytes = file(512, 100, physical, 0, 2);
+            bytes[..2].copy_from_slice(b"FC");
+            bytes[at::USRFLGS] = 0x01;
+            bytes[at::VARIABLE_MARK] = 0xff;
+            mark_first_half_live(&mut bytes);
+            let e = read("V6NOROOM.DAT", &bytes)
+                .expect_err("a v6 slot marker leaves no room for the pointer at this gap");
+            assert!(e.why.contains("V6") && e.why.contains("needs 6"), "{e}");
+        }
+
+        let mut bytes = file(512, 100, 106, 0, 2);
+        bytes[..2].copy_from_slice(b"FC");
+        bytes[at::USRFLGS] = 0x01;
+        bytes[at::VARIABLE_MARK] = 0xff;
+        mark_first_half_live(&mut bytes);
+        assert!(read("V6ROOM.DAT", &bytes).expect("six is enough").variable);
     }
 }

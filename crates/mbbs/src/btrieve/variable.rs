@@ -53,8 +53,19 @@ use std::collections::HashSet;
 use super::Version;
 
 /// Where a variable page says which page it is: four bytes, high word first,
-/// like every other page pointer in the format.
+/// like every other page pointer in the format. **Version 5 only** -- see
+/// [`LOGICAL`] for what the same two bytes mean in a version 6 file.
 const PAGE_NUMBER: usize = 0x00;
+
+/// Where a v6 variable page's own logical id lives: a `u16`, plain little-
+/// endian, at the same offset every other v6 page in the file uses for its
+/// own logical id (`super::v6::Map`'s own `LOGICAL` constant). A v6 page has
+/// no equivalent of [`PAGE_NUMBER`] -- its first two bytes are a type tag
+/// (`0x5600`, `'V'` in the low byte), not the high half of a four-byte page
+/// number, which is exactly why comparing all four bytes against a physical
+/// page number (the v5 rule) can never hold for v6 (Task 6 ground truth,
+/// `.scratch-v6-exec/NOTES.md`).
+const LOGICAL: usize = 0x02;
 
 /// Where a variable page names the next variable page with room in it.
 ///
@@ -172,10 +183,11 @@ impl Pointer {
 /// A variable page's header: everything before fragment 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Header {
-    /// The page's own number. Checked against the number that was asked for,
-    /// which is what makes [`Pointer::decode`]'s scrambled page number a
-    /// reading rather than an assumption: a wrong decode lands on a page that
-    /// disagrees about which page it is.
+    /// The page's own number -- physical for v5, logical for v6. Checked
+    /// against the number that was asked for, which is what makes
+    /// [`Pointer::decode`]'s scrambled page number a reading rather than an
+    /// assumption: a wrong decode lands on a page that disagrees about which
+    /// page it is.
     number: u32,
 
     /// How many fragments the page holds.
@@ -190,14 +202,25 @@ struct Header {
 
 impl Header {
     /// Read a page's header, and refuse a page that cannot hold one.
-    fn read(page: &[u8], asked: u32) -> Result<Self, String> {
+    ///
+    /// `asked` is what `number` must equal: a physical page for v5, since
+    /// that is what [`PAGE_NUMBER`] holds there, and a **logical** id for v6,
+    /// since v6 has no equivalent field -- its own page number is read off
+    /// [`LOGICAL`] instead (Task 6 ground truth). Reading the v5 way on a v6
+    /// page compares four bytes `[tag_lo][tag_hi][logical_lo][logical_hi]`
+    /// against a physical page number and can never hold; that is the
+    /// reading this refuses by construction rather than by a runtime check.
+    fn read(page: &[u8], asked: u32, version: Version) -> Result<Self, String> {
         if page.len() < FIRST_FRAGMENT as usize {
             return Err(format!(
                 "a {}-byte page, too short for a {FIRST_FRAGMENT}-byte header",
                 page.len()
             ));
         }
-        let number = super::pages::long(&page[PAGE_NUMBER..PAGE_NUMBER + 4]);
+        let number = match version {
+            Version::V5 => super::pages::long(&page[PAGE_NUMBER..PAGE_NUMBER + 4]),
+            Version::V6 => u32::from(u16::from_le_bytes([page[LOGICAL], page[LOGICAL + 1]])),
+        };
         if number != asked {
             return Err(format!("page {asked} says it is page {number}"));
         }
@@ -226,10 +249,17 @@ struct Entry {
 
     /// Whether the fragment starts with four bytes of pointer to the next one.
     ///
-    /// **A v5 rule.** `W32MKDE_decompiled.c:19045` gates it on the file
-    /// version: below `0x600` this bit decides, and at or above it every
-    /// fragment carries the pointer whatever the bit says. See
-    /// [`Chain::follow`].
+    /// **A v5 rule, and only ever consulted for v5.** `W32MKDE_decompiled.c:19045`
+    /// gates it on the file version: below `0x600` this bit decides, and at
+    /// or above it every fragment carries the pointer whatever the bit says.
+    /// The plan this was implemented from claims 0 of 853 live v6 entries
+    /// have it set but says that count was not re-derived; it has been now,
+    /// independently and more narrowly -- every real (non-boundary-overrun)
+    /// entry of every claimed `'V'` page across the four committed v6
+    /// variable-length fixtures, 165 entries, 0 with the bit set. [`fragment`]
+    /// overrides this field for v6 rather than trusting a bit the format
+    /// does not use; see [`Chain::follow`] for what decides continuation
+    /// there instead.
     continued: bool,
 }
 
@@ -254,6 +284,12 @@ impl Entry {
 struct Fragment {
     at: usize,
     length: usize,
+
+    /// Whether the record's chain goes on past this fragment. [`fragment`]
+    /// sets this from [`Entry::continued`] for v5 and unconditionally `true`
+    /// for v6 -- see [`Entry::continued`]'s doc comment for why the entry
+    /// bit is not the answer there, and [`Chain::follow`] for how a v6
+    /// fragment's own leading bytes settle it instead.
     continued: bool,
 }
 
@@ -282,7 +318,14 @@ fn entry_at(len: u32, which: u32) -> Result<usize, String> {
 /// behind it, as MBBSEmu does. Nothing in the corpus distinguishes them --
 /// every `WCCTEXT` fragment is `0x0c..0x7dc` of a 2,048-byte page whose array
 /// starts at `0x7fc`.
-fn fragment(page: &[u8], which: u8, header: Header) -> Result<Fragment, String> {
+///
+/// Everything above is version-independent -- measured directly against the
+/// v6 corpus (Task 6 ground truth): the entry array sits at the same place,
+/// grows the same direction, and fragment 0 starts at the same `0x0c` either
+/// version. Only the returned [`Fragment::continued`] differs from
+/// [`Entry::continued`], and that override is what this version parameter is
+/// for -- see [`Entry::continued`]'s own doc comment.
+fn fragment(page: &[u8], which: u8, header: Header, version: Version) -> Result<Fragment, String> {
     let len = page.len() as u32;
     let count = header.fragments;
 
@@ -357,7 +400,16 @@ fn fragment(page: &[u8], which: u8, header: Header) -> Result<Fragment, String> 
     Ok(Fragment {
         at: entry.offset as usize,
         length: length as usize,
-        continued: entry.continued,
+        continued: match version {
+            Version::V5 => entry.continued,
+            // Every v6 fragment carries a 4-byte prefix, continued or not
+            // (Task 6 ground truth) -- so this is unconditionally true, and
+            // `Chain::follow` is what tells a real next-pointer apart from
+            // the all-ones one that ends the chain, by decoding the prefix
+            // and checking `Pointer::is_end` exactly as it already does for
+            // an ordinary continuation.
+            Version::V6 => true,
+        },
     })
 }
 
@@ -370,30 +422,36 @@ impl Chain {
     /// `into` is the record's fixed part on the way in and the whole record on
     /// the way out, so a caller never has to concatenate.
     ///
-    /// # Only Btrieve 5
+    /// # Two layouts, one loop
     ///
     /// `W32MKDE_decompiled.c:19045`:
     ///
     ///
-    /// **In a v6 file every fragment carries the pointer**, whatever the
-    /// `0x8000` bit says, and the chain ends on `0xffffffff` instead. Applying
-    /// the v5 rule to a v6 file would take four bytes of pointer for four
-    /// bytes of text on every fragment and then stop early. There is no v6
-    /// variable-length file to check an implementation against -- `NEWMP001.VIR`
-    /// is the corpus's only v6 file and holds fixed-length records -- so this
-    /// refuses rather than guesses. [`Geometry::read`](super::Geometry::read)
-    /// refuses the same file at open time; this is the guard that stands
-    /// whether or not the caller did.
+    /// For v5, whether a fragment carries a leading pointer is the entry's
+    /// own `0x8000` bit ([`Entry::continued`]), and a fragment that does not
+    /// carry one is the end of the chain, full stop -- `fragment` reports
+    /// this straight from the entry, unchanged from before Task 6.
+    ///
+    /// **In a v6 file every fragment carries the pointer, whatever the entry
+    /// bit says** (Task 6 ground truth) -- so `fragment` reports `continued`
+    /// as unconditionally `true` for v6, and this loop always decodes the
+    /// leading four bytes and asks [`Pointer::is_end`] whether they are the
+    /// chain's own `0xffffffff` terminator rather than a real next pointer.
+    /// That terminator decodes to the same `page == END_PAGE, fragment ==
+    /// END_FRAGMENT` pair the v5 sentinel already checks at the top of this
+    /// loop, so v6 needs no second stopping condition: the existing
+    /// `at.is_end()` check is what stops it, on the very next iteration,
+    /// without reading another page.
     ///
     /// # Errors
     ///
-    /// If the file is v6, a page cannot be read, a page disagrees about which
-    /// page it is, a fragment is not inside its page, a continued fragment is
-    /// too short to hold the pointer it promises, or the chain revisits a
-    /// fragment it has already been to. The last is in neither the engine nor
-    /// MBBSEmu, both of which would follow such a chain until they ran out of
-    /// memory; a file whose chain re-enters itself is corrupt rather than
-    /// merely long, and the same check guards the free list in
+    /// If a page cannot be read, a page disagrees about which page (v5) or
+    /// logical id (v6) it is, a fragment is not inside its page, a continued
+    /// fragment is too short to hold the pointer it promises, or the chain
+    /// revisits a fragment it has already been to. The last is in neither the
+    /// engine nor MBBSEmu, both of which would follow such a chain until they
+    /// ran out of memory; a file whose chain re-enters itself is corrupt
+    /// rather than merely long, and the same check guards the free list in
     /// [`records`](super::records).
     pub(crate) fn follow(
         pages: &mut impl Pages,
@@ -401,15 +459,6 @@ impl Chain {
         first: Pointer,
         into: &mut Vec<u8>,
     ) -> Result<(), String> {
-        if version != Version::V5 {
-            return Err(format!(
-                "{version:?} lays out its fragments differently -- every fragment carries a \
-                 next-pointer and the 0x8000 entry bit does not mean what it means in a v5 \
-                 file (W32MKDE_decompiled.c:19045) -- and no v6 variable-length file exists \
-                 to check an implementation of that against"
-            ));
-        }
-
         let mut at = first;
         let mut seen = HashSet::new();
 
@@ -425,8 +474,8 @@ impl Chain {
             }
 
             let page = pages.page(at.page)?;
-            let header = Header::read(page, at.page)?;
-            let found = fragment(page, at.fragment, header)
+            let header = Header::read(page, at.page, version)?;
+            let found = fragment(page, at.fragment, header, version)
                 .map_err(|why| format!("page {}: {why}", at.page))?;
             let bytes = &page[found.at..found.at + found.length];
 
@@ -465,8 +514,11 @@ impl Chain {
 ///
 /// # What is checked, in order
 ///
-/// - **the file is Btrieve 5.** See [`Chain::follow`]'s doc comment for why a
-///   v6 file's fragments cannot be handled by the same rule.
+/// - **the file is Btrieve 5.** Task 6 taught [`Chain::follow`] to read a v6
+///   fragment chain, but writing one needs the allocator and the free chain
+///   this does not have -- out of scope by the plan's own "Deliberately out
+///   of scope: v6 writing", so this keeps refusing every v6 file rather than
+///   only the v5 rule's read-side justification, which no longer applies.
 /// - **the page `pointer` names says it is that page** ([`Header::read`]).
 /// - **the page holds exactly one fragment.** A page mid-split, or any page
 ///   with more on it than the one fragment this pointer names, is refused
@@ -504,15 +556,15 @@ pub(crate) fn rewrite_fragment_in_place<P: PagesMut>(
 ) -> Result<(), String> {
     if version != Version::V5 {
         return Err(format!(
-            "{version:?} lays out its fragments differently -- an in-place rewrite only \
-             handles a version 5 file, the same restriction Chain::follow has \
-             (W32MKDE_decompiled.c:19045) -- and there is no v6 variable-length file to \
-             check an implementation of that against"
+            "{version:?} lays out its fragments differently, and rewriting one in place \
+             would need the allocator and the entry array this call does not have \
+             (W32MKDE_decompiled.c:19045) -- v6 writing is out of scope for the plan that \
+             taught the read side (Chain::follow) to handle {version:?}"
         ));
     }
 
     let page = pages.page(pointer.page)?.to_vec();
-    let header = Header::read(&page, pointer.page)?;
+    let header = Header::read(&page, pointer.page, version)?;
 
     if header.fragments != 1 {
         return Err(format!(
@@ -522,7 +574,7 @@ pub(crate) fn rewrite_fragment_in_place<P: PagesMut>(
         ));
     }
 
-    let found = fragment(&page, pointer.fragment, header)
+    let found = fragment(&page, pointer.fragment, header, version)
         .map_err(|why| format!("page {}: {why}", pointer.page))?;
 
     if found.continued {
@@ -688,6 +740,56 @@ mod tests {
         out
     }
 
+    /// A v6-shaped page: the same entry array and fragment layout [`page`]
+    /// builds -- Task 6 measured that much is version-independent -- but a
+    /// `'V'` type tag at `[0x00]` and the page's own **logical** id at
+    /// [`LOGICAL`] rather than a four-byte physical page number, and no entry
+    /// ever gets the `0x80` continuation bit, because Task 6 also measured
+    /// that v6 never sets it (165 real entries checked, 0 set) and does not
+    /// consult it either way.
+    ///
+    /// Continuation is instead in the fragment bytes themselves, exactly as
+    /// on a real v6 page: every one of `fragments` must supply its own
+    /// leading four-byte prefix -- a real pointer to continue on, or
+    /// `[0xff; 4]` to end the chain there -- because [`fragment`] reports
+    /// every v6 fragment as `continued` unconditionally and it is
+    /// [`Chain::follow`] that reads this prefix to decide what happens next.
+    fn page_v6(logical: u16, len: usize, fragments: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        out[0..2].copy_from_slice(&0x5600u16.to_le_bytes()); // 'V' in the low byte
+        out[LOGICAL..LOGICAL + 2].copy_from_slice(&logical.to_le_bytes());
+        out[FREE_CHAIN..FREE_CHAIN + 4].copy_from_slice(&[0xff; 4]);
+        out[FRAGMENT_COUNT..FRAGMENT_COUNT + 2]
+            .copy_from_slice(&(fragments.len() as u16).to_le_bytes());
+
+        let mut at = FIRST_FRAGMENT as usize;
+        for (i, bytes) in fragments.iter().enumerate() {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            let entry = len - 2 * (i + 1);
+            out[entry] = (at & 0xff) as u8;
+            out[entry + 1] = (at >> 8) as u8;
+            at += bytes.len();
+        }
+        let entry = len - 2 * (fragments.len() + 1);
+        out[entry] = (at & 0xff) as u8;
+        out[entry + 1] = (at >> 8) as u8;
+        out
+    }
+
+    /// The four bytes at the front of a v6 fragment that says where the
+    /// chain goes next -- a real pointer, in the same scrambled encoding
+    /// [`pointer`] builds for a fixed record's own trailing four bytes.
+    fn v6_next(page: u32, fragment: u8) -> [u8; 4] {
+        [(page >> 16) as u8, (page & 0xff) as u8, ((page >> 8) & 0xff) as u8, fragment]
+    }
+
+    /// The four bytes at the front of a v6 fragment that says the chain ends
+    /// there -- Task 6 ground truth: unlike v5, every fragment carries this
+    /// prefix, terminal or not, and `[0xff; 4]` is what marks the terminal
+    /// one (it decodes to the same `page == END_PAGE, fragment ==
+    /// END_FRAGMENT` pair [`Pointer::is_end`] already checks).
+    const V6_END: [u8; 4] = [0xff; 4];
+
     /// A page of nothing, for the slots a fixture does not use.
     fn blank(len: usize) -> Vec<u8> {
         vec![0u8; len]
@@ -706,6 +808,12 @@ mod tests {
     fn follow(pages: &mut Held, first: Pointer) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         Chain::follow(pages, Version::V5, first, &mut out)?;
+        Ok(out)
+    }
+
+    fn follow_v6(pages: &mut Held, first: Pointer) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        Chain::follow(pages, Version::V6, first, &mut out)?;
         Ok(out)
     }
 
@@ -895,18 +1003,89 @@ mod tests {
         assert!(e.contains("too short for a 4-byte pointer"), "{e}");
     }
 
-    /// A v6 file's fragments carry a pointer unconditionally, so reading one
-    /// by the v5 rule would eat four bytes of text per fragment and stop at
-    /// the first one whose `0x8000` bit happened to be clear. Refused, because
-    /// there is no v6 variable-length file to check an implementation against.
+    /// Task 6: a v6 chain follows its own leading pointer across pages and
+    /// stops on the all-ones terminator, without ever reading the entry's
+    /// `0x8000` bit -- `page_v6` never sets it, so a test that passed only
+    /// because the bit happened to agree with the prefix would still pass
+    /// here, but [`a_v6_chain_ignores_the_entry_bit_even_when_it_disagrees`]
+    /// rules that out directly.
     #[test]
-    fn a_btrieve_6_file_is_refused_rather_than_read_by_the_version_5_rule() {
-        let mut pages = Held(vec![blank(512), page(1, 512, &[(b"body".as_slice(), false)])]);
-        let mut out = Vec::new();
-        let e = Chain::follow(&mut pages, Version::V6, pointer(1, 0), &mut out)
-            .expect_err("the 0x8000 bit means something else in a v6 file");
-        assert!(e.contains("V6") && e.contains("19045"), "{e}");
-        assert!(out.is_empty(), "and nothing was appended before it refused");
+    fn a_v6_chain_follows_its_own_leading_pointer_to_the_all_ones_terminator() {
+        let mut first = v6_next(2, 0).to_vec();
+        first.extend_from_slice(b"first ");
+        let mut second = V6_END.to_vec();
+        second.extend_from_slice(b"second");
+
+        let mut pages = Held(vec![
+            blank(64),
+            page_v6(1, 64, &[&first]),
+            page_v6(2, 64, &[&second]),
+        ]);
+
+        assert_eq!(
+            follow_v6(&mut pages, pointer(1, 0)).expect("follows"),
+            b"first second",
+            "each fragment's own leading four bytes are consumed, not appended"
+        );
+    }
+
+    /// The entry's `0x8000` bit is not consulted for v6 (Task 6 ground
+    /// truth, 165 real entries measured, 0 set) -- proved here by setting it
+    /// on a fragment whose own prefix says the chain ends, and confirming
+    /// the chain still ends there rather than reading past the record into
+    /// whatever the (nonexistent) next page would have been.
+    #[test]
+    fn a_v6_chain_ignores_the_entry_bit_even_when_it_disagrees() {
+        let mut terminal = V6_END.to_vec();
+        terminal.extend_from_slice(b"only this");
+        let mut bytes = page_v6(1, 64, &[&terminal]);
+        // Fragment 0's entry, second byte: set the bit a v5 reader would
+        // take as "this fragment continues".
+        let entry = 64 - 2;
+        bytes[entry + 1] |= 0x80;
+
+        let mut pages = Held(vec![blank(64), bytes]);
+        assert_eq!(
+            follow_v6(&mut pages, pointer(1, 0)).expect("follows"),
+            b"only this",
+            "the fragment's own 0xffffffff prefix ends the chain regardless of the entry bit"
+        );
+    }
+
+    /// Task 6's counterexample fixture, in miniature: a page holding two
+    /// fragments belonging to two different records (`NONMONO2.DAT`'s
+    /// logical 14, reproduced directly -- see the plan's Evidence 2 and
+    /// `tools/btrieve-oracle/fixtures/V6CORPUS.txt`). Fragment 0 is a
+    /// standalone terminal fragment; fragment 1 is what a *different*
+    /// record's chain reaches this page for. Following by the wrong index
+    /// -- always fragment 0 -- would return fragment 0's text under
+    /// fragment 1's name instead, which is exactly the mutation this guards
+    /// against and exactly what `NONMONO2.DAT`'s own byte-for-byte test
+    /// catches at the file level.
+    #[test]
+    fn a_v6_chain_selects_the_named_fragment_index_not_just_the_page() {
+        let mut frag0 = V6_END.to_vec();
+        frag0.extend_from_slice(b"not this one");
+        let mut frag1 = V6_END.to_vec();
+        frag1.extend_from_slice(b"this one");
+
+        let mut pages = Held(vec![blank(64), page_v6(1, 64, &[&frag0, &frag1])]);
+
+        assert_eq!(follow_v6(&mut pages, pointer(1, 1)).expect("follows"), b"this one");
+        assert_eq!(follow_v6(&mut pages, pointer(1, 0)).expect("follows"), b"not this one");
+    }
+
+    /// [`Header::read`]'s v6 branch compares the logical id, not the v5
+    /// four-byte page number -- a page built for logical 9 refuses when
+    /// asked for logical 1, the same guard v5 has, on the field v6 actually
+    /// uses.
+    #[test]
+    fn a_v6_page_that_disagrees_about_its_logical_id_is_refused() {
+        let mut body = V6_END.to_vec();
+        body.extend_from_slice(b"body");
+        let mut pages = Held(vec![blank(64), page_v6(9, 64, &[&body])]);
+        let e = follow_v6(&mut pages, pointer(1, 0)).expect_err("page 1 is logical 9");
+        assert!(e.contains("says it is page 9"), "{e}");
     }
 
     /// The scrambled order, spelled out on a number where all three bytes
@@ -928,7 +1107,7 @@ mod tests {
     #[test]
     fn a_pages_header_is_its_number_its_free_successor_and_its_fragment_count() {
         let bytes = page(0x1234, 512, &[(b"body".as_slice(), false)]);
-        let header = Header::read(&bytes, 0x1234).expect("a header");
+        let header = Header::read(&bytes, 0x1234, Version::V5).expect("a header");
         assert_eq!(header.number, 0x1234);
         assert_eq!(header.fragments, 1);
         assert_eq!(header.free_chain, None, "no page after it has room");

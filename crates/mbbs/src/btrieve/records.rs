@@ -512,10 +512,12 @@ fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 /// through [`super::v6::Map`] rather than treating it as a physical position
 /// (Evidence 2 of `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`).
 ///
-/// Refuses to open a file whose records are variable-length -- `Geometry::read`
-/// already refuses those before a `Records` is ever built (`variable &&
-/// version != V5`), so nothing here has to decide what a v6 fragment pointer
-/// means; that is Task 6.
+/// **Variable-length records are read too, as of Task 6.** A v6 record's
+/// fixed part is followed by the same four-byte fragment pointer v5 uses
+/// (`variable::Pointer`), but every page number the chain names is a
+/// *logical* id, resolved through the same `map` this function already built
+/// to place the record's own fixed part -- [`MappedPages`] is that
+/// resolution, done once per fragment read rather than reimplemented.
 ///
 /// # Design decisions made here, and why
 ///
@@ -650,12 +652,71 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
                 break;
             }
 
-            let bytes = record[..geometry.reclen as usize].to_vec();
+            let mut bytes = record[..geometry.reclen as usize].to_vec();
+
+            // A variable-length record's fixed part is followed by four
+            // bytes naming its first fragment -- v5's own encoding
+            // (`variable::Pointer::decode`), read from the same offset --
+            // but every page number inside it is a logical id (Evidence 2)
+            // and has to go through `map`, not be read as a physical
+            // position. Copied out before `bytes` grows, same as `walk_v5`.
+            if geometry.variable {
+                let at = usize::from(geometry.reclen);
+                let pointer = Pointer::decode([
+                    record[at],
+                    record[at + 1],
+                    record[at + 2],
+                    record[at + 3],
+                ]);
+                let mut source = MappedPages {
+                    file: &file,
+                    page_size: geometry.page,
+                    map: &map,
+                };
+                Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
+                    .map_err(|why| format!("the record at {position}: {why}"))?;
+            }
+
             records.push(Record { position, bytes });
         }
     }
 
     Ok(records)
+}
+
+/// Whole pages of a v6 file already read into memory, addressed by
+/// **logical** id and resolved through [`super::v6::Map`] -- the fragment-
+/// chain counterpart to [`walk_v6`]'s own resolution of a record's own page.
+/// A v6 fragment pointer names a logical page exactly the way an ordinary
+/// record position does (Evidence 1c and 2), so this is not a second
+/// implementation of that resolution: it is [`Chained`]'s file-backed shape,
+/// reused, with the one extra indirection the map adds -- and the mutation
+/// this exists to make impossible is resolving a fragment pointer as though
+/// it already named a physical page (plan Task 6, mandatory mutation (c)).
+struct MappedPages<'a> {
+    file: &'a [u8],
+    page_size: u16,
+    map: &'a super::v6::Map,
+}
+
+impl Pages for MappedPages<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        let physical = self.map.physical(number).ok_or_else(|| {
+            format!(
+                "logical page {number}, and the allocation table names no live physical \
+                 page for it"
+            )
+        })?;
+        let at = physical as usize * usize::from(self.page_size);
+        let end = at + usize::from(self.page_size);
+        self.file.get(at..end).ok_or_else(|| {
+            format!(
+                "logical page {number} resolves to physical {physical}, past the end of a \
+                 {}-byte file",
+                self.file.len()
+            )
+        })
+    }
 }
 
 /// Whole pages of an open file, for [`Chain::follow`].
