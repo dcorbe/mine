@@ -66,6 +66,12 @@ pub use heap::{Config, Heap, Region};
 pub use keys::KeySet;
 pub use random::{RAND_MAX, Random, Runaway};
 pub use shims::system::{Agent, Dispatch, Kick, Native, Registration};
+// `append` alone, not the rest of `shims::text`: `crates/mbbs/tests/newline_oracle.rs`
+// needs a way to drive `normalize_newlines` from outside this crate (it is a
+// private fn of `shims::text`, unreachable across the crate boundary a
+// `tests/*.rs` file compiles as), and `append` is the narrowest public entry
+// point that reaches it.
+pub use shims::text::append;
 pub use shims::{Cleans, Entry, Shim, ShimError};
 pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};

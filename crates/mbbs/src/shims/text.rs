@@ -184,9 +184,11 @@ pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(),
 /// remain are not a counterexample either -- every one sits inside an FSD
 /// field repaint, immediately before an `ESC[` cursor address (e.g.
 /// `Zinvar\r\x1b[0;1m\x1b[23;1f...`, `re/oracle/oracle_blur_duration.raw`
-/// offset 8773), which is unformatted `btuxnf`-style output that never
-/// passes through `append` at all -- see [`append`]'s own doc comment for
-/// why nothing this function does could have touched it. So the oracle,
+/// offset 8773), which is an FSD field repaint written straight to the wire
+/// via `host.gsbl_mut().transmit(...)` (`crate::shims::fsd::fsd_cycle`,
+/// `fsd_drain_edge`, `outprf` -- `crates/mbbs/src/shims/fsd.rs:1314,1656,1683,1804`)
+/// and never passes through `append` at all -- see [`append`]'s own doc
+/// comment for why nothing this function does could have touched it. So the oracle,
 /// read as the wire rather than as "everything the directory holds", agrees
 /// with MBBSEmu's own algorithm exactly: there is no carve-out to find. The
 /// plan's warning to let the oracle override the mirror when they disagree
@@ -2102,6 +2104,12 @@ mod tests {
         // unmodified bytes off the socket, not one of the cleaned `.log`
         // transcripts `normalize_newlines`'s own doc comment explains why to
         // distrust for this question.
+        //
+        // Note: the plan's own Task 2 acceptance criterion names
+        // `re/oracle/oracle_bank2.raw` for this check, but that file has no
+        // "lawful" text in it at all -- the paragraph lives in
+        // `oracle_m1.raw`, which is what this test reads below. Follow this
+        // citation, not the plan's.
         let oracle = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re/oracle/oracle_m1.raw"),
         )
