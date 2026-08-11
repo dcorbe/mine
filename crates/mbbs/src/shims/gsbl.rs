@@ -18,12 +18,23 @@
 //!
 //! `bturno`, the fifteenth import, is not here: it is a datum, placed in
 //! `globals.rs`, and the module reads it directly at 1,096 fixups.
+//!
+//! Three more live here without being an import at all: `btuhpk`, `btupbc`
+//! and `btucpc`, `WCCMMUD.DLL` never asks for -- `re/exports/imports.txt` has
+//! no site for any of them (Task 1 of `docs/plans/2026-08-11-live-session-defects.md`
+//! is the inventory). They exist because `MAJORBBS.C:3776`'s `rstrxf`
+//! (`crate::shims::screen`) needs their behaviour, and every other GALGSBL
+//! routine lives here rather than wherever its one caller happens to be.
+//! `rstrxf` does not call through this table -- there is no module far call
+//! to dispatch and no stack to read arguments off -- it calls each `apply_*`
+//! function directly with values it already has.
 
 use mbbs16::{Machine, Ret};
 
 use super::ShimError;
 use crate::Host;
 use crate::chan::Chan;
+use crate::gsbl::Gsbl;
 
 /// `-11`: "channel number is out of range". See the module docs for why `-10`
 /// cannot happen.
@@ -143,18 +154,99 @@ pub fn btuxnf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     } else {
         None
     };
-    Ok(match on_channel(host, chan, |g, chan| {
-        let c = g.channel_mut(chan);
-        c.xon = xon as u8;
-        c.xoff = xoff as u8;
-        if let Some((cnt, message)) = page {
-            c.page_lines = cnt;
-            c.page_message = Some(message);
-        }
-    }) {
+    Ok(match on_channel(host, chan, |g, chan| apply_xnf(g, chan, xon, xoff, page)) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
     })
+}
+
+/// The mutation [`btuxnf`] performs, apart from reading the module's stack --
+/// so that [`crate::shims::screen::rstrxf`] (`MAJORBBS.C:3778`) can drive the
+/// same channel-state update with values it already has in hand, rather than
+/// a second copy of these four lines that could drift from the first.
+pub(crate) fn apply_xnf(
+    g: &mut Gsbl,
+    chan: Chan,
+    xon: u16,
+    xoff: i16,
+    page: Option<(u16, Vec<u8>)>,
+) {
+    let c = g.channel_mut(chan);
+    c.xon = xon as u8;
+    c.xoff = xoff as u8;
+    if let Some((cnt, message)) = page {
+        c.page_lines = cnt;
+        c.page_message = Some(message);
+    }
+}
+
+/// `int btuhpk(int chan, int far (*hpkrou)(int chan, char c))` -- install the
+/// routine called for each keystroke received while a channel is in
+/// screen-pause mode (guide `btuhpk`, page 99).
+///
+/// **Not registered as a `WCCMMUD.DLL` import** -- see the module doc comment
+/// on `crate::shims::gsbl` and the inventory in `crate::shims::screen` --
+/// this exists so [`crate::shims::screen::rstrxf`] (the one caller this host
+/// has) has a real GSBL routine to call, the same way every other GALGSBL
+/// entry in the registration table does, and so it is independently testable
+/// through the same `Fixture::invoke` every other one of these fourteen is.
+///
+/// The second argument -- the far pointer to the handler -- is deliberately
+/// never read: see [`crate::gsbl::Channel::pause_handler_installed`] for why
+/// a `bool` is the whole of what this host records.
+pub fn btuhpk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let chan = machine.arg_u16(0) as i16;
+    Ok(match on_channel(host, chan, apply_hpk) {
+        Some(()) => Ret::U16(0),
+        None => Ret::U16(OUT_OF_RANGE),
+    })
+}
+
+/// The mutation [`btuhpk`] performs. See [`apply_xnf`] for why this is
+/// factored out.
+pub(crate) fn apply_hpk(g: &mut Gsbl, chan: Chan) {
+    g.channel_mut(chan).pause_handler_installed = true;
+}
+
+/// `int btupbc(int chan, char pausch)` -- set the screen-pause character
+/// (guide `btupbc`, page 133): transmitting it puts the channel into
+/// screen-pause mode. Zero disables it. The Major BBS uses Control-T (20).
+///
+/// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
+/// applies here unchanged.
+pub fn btupbc(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (chan, pausch) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as u8);
+    Ok(match on_channel(host, chan, |g, chan| apply_pbc(g, chan, pausch)) {
+        Some(()) => Ret::U16(0),
+        None => Ret::U16(OUT_OF_RANGE),
+    })
+}
+
+/// The mutation [`btupbc`] performs. See [`apply_xnf`] for why this is
+/// factored out.
+pub(crate) fn apply_pbc(g: &mut Gsbl, chan: Chan, pausch: u8) {
+    g.channel_mut(chan).pause_char = pausch;
+}
+
+/// `int btucpc(int chan, char cpchar)` -- set the clear-pause-counter
+/// character (guide `btucpc`, page 81): discovered in the output stream, it
+/// resets the pending-lines counter to zero without being transmitted. The
+/// Major BBS uses Control-S (19) to suppress a pause at strategic points.
+///
+/// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
+/// applies here unchanged.
+pub fn btucpc(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (chan, cpchar) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as u8);
+    Ok(match on_channel(host, chan, |g, chan| apply_cpc(g, chan, cpchar)) {
+        Some(()) => Ret::U16(0),
+        None => Ret::U16(OUT_OF_RANGE),
+    })
+}
+
+/// The mutation [`btucpc`] performs. See [`apply_xnf`] for why this is
+/// factored out.
+pub(crate) fn apply_cpc(g: &mut Gsbl, chan: Chan, cpchar: u8) {
+    g.channel_mut(chan).clear_pause_char = cpchar;
 }
 
 /// `int btuclo(int chan)` -- throw away output that has not gone out yet.
@@ -309,6 +401,9 @@ mod tests {
             ("btuclo", f.invoke(btuclo, &[past])),
             ("btucli", f.invoke(btucli, &[past])),
             ("btuibw", f.invoke(btuibw, &[past])),
+            ("btuhpk", f.invoke(btuhpk, &[past, 0, 0])),
+            ("btupbc", f.invoke(btupbc, &[past, 20])),
+            ("btucpc", f.invoke(btucpc, &[past, 19])),
         ] {
             assert_eq!(
                 ret.expect(name),
@@ -550,6 +645,29 @@ mod tests {
         let c = f.host.gsbl().channel(console);
         assert_eq!(c.page_lines, 0);
         assert_eq!(c.page_message, None);
+    }
+
+    #[test]
+    fn btuhpk_records_that_a_handler_was_installed() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert!(
+            !f.host.gsbl().channel(console).pause_handler_installed,
+            "nothing installed one yet"
+        );
+        f.invoke(btuhpk, &[0, 0x1234, 0x5678]).expect("ok");
+        assert!(f.host.gsbl().channel(console).pause_handler_installed);
+    }
+
+    #[test]
+    fn btupbc_and_btucpc_record_their_characters() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(btupbc, &[0, 20]).expect("ok");
+        f.invoke(btucpc, &[0, 19]).expect("ok");
+        let c = f.host.gsbl().channel(console);
+        assert_eq!(c.pause_char, 20, "Control-T, the guide's own example");
+        assert_eq!(c.clear_pause_char, 19, "Control-S, the guide's own example");
     }
 
     #[test]

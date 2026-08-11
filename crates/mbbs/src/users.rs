@@ -97,7 +97,7 @@ pub mod user {
 
 /// Field offsets within `struct usracc` (`UStructs.h:20`, v10 SDK).
 ///
-/// Only the four the module reads. **`UIDSIZ` is 30 here, not the 10 of the
+/// The five this crate reads. **`UIDSIZ` is 30 here, not the 10 of the
 /// v6 header** -- every offset below moves if that is got wrong, and nothing
 /// would report it except the module quietly taking a different branch.
 ///
@@ -105,11 +105,10 @@ pub mod user {
 /// same byte alignment `struct user` uses (`userid[30]`, `psword[10]`,
 /// `usrnam[30]`, `usrad1..4[30]` each, `usrpho[16]`, then the two one-byte
 /// flags `systyp` and `usrprf`) lands `ansifl` at 208 (`0xd0`), `scnwid` at
-/// 209 (`0xd1`) and -- skipping the one-byte `scnbrk` nothing here reads --
-/// `scnfse` at 211 (`0xd3`). Continuing the same sum through `birthd` totals
-/// exactly 301 declared bytes, which is what `USRACC.H:22`'s
-/// `#define USRACCSPARE (338-301)` says it should be -- so the total and the
-/// three offsets confirm each other.
+/// 209 (`0xd1`), `scnbrk` at 210 (`0xd2`) and `scnfse` at 211 (`0xd3`).
+/// Continuing the same sum through `birthd` totals exactly 301 declared
+/// bytes, which is what `USRACC.H:22`'s `#define USRACCSPARE (338-301)` says
+/// it should be -- so the total and the four offsets confirm each other.
 pub mod usracc {
     /// `sizeof(struct usracc)`. `USRACC.H:22`'s `(338-301)` writes the total
     /// down, which is why this is 338 and not a sum.
@@ -120,6 +119,18 @@ pub mod usracc {
     pub const ANSIFL: usize = 0xd0;
     /// `char scnwid` -- screen width in columns.
     pub const SCNWID: usize = 0xd1;
+    /// `char scnbrk` -- screen length for page breaks, i.e. how many lines
+    /// `rstrxf` (`MAJORBBS.C:3776`) tells `btuxnf` to show before pausing
+    /// (`cnt = scnbrk-CTNUOS`). Between `ansifl` and `scnwid`'s neighbour
+    /// `scnfse` in `UStructs.h`'s field order, hence 0xd0+2.
+    ///
+    /// **Never written by [`Host::connect_state`](crate::Host::connect_state)**
+    /// -- it sets `userid`, `ansifl`, `scnwid` and `scnfse` and stops there,
+    /// because this host has no account-level page-break setting to source
+    /// one from. A channel therefore always reads this as whatever its
+    /// account memory happened to hold, ordinarily zero. `rstrxf`'s own doc
+    /// comment says what that does to its computed `cnt`.
+    pub const SCNBRK: usize = 0xd2;
     /// `char scnfse` -- screen length for full-screen stuff.
     pub const SCNFSE: usize = 0xd3;
 }
