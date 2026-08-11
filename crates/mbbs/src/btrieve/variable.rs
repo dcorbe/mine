@@ -67,6 +67,14 @@ const PAGE_NUMBER: usize = 0x00;
 /// `.scratch-v6-exec/NOTES.md`).
 const LOGICAL: usize = 0x02;
 
+/// The byte of a v6 page's two-byte type tag that carries the letter.
+///
+/// The tag reads `0x5600` as a little-endian `u16`, so the `'V'` is at byte 1
+/// and byte 0 is zero. Named rather than written as `1` at the one place that
+/// reads it, because `records::walk_v6` checks the same byte for `0x44` and
+/// the two should be recognisably the same check.
+const TAG: usize = 0x01;
+
 /// Where a variable page names the next variable page with room in it.
 ///
 /// The **write side's** free list, and `0xffffffff` when there is none, which
@@ -219,7 +227,25 @@ impl Header {
         }
         let number = match version {
             Version::V5 => super::pages::long(&page[PAGE_NUMBER..PAGE_NUMBER + 4]),
-            Version::V6 => u32::from(u16::from_le_bytes([page[LOGICAL], page[LOGICAL + 1]])),
+            Version::V6 => {
+                // The tag as well as the id. `v6::Map` is one table over every
+                // kind of page, so a logical id resolves to *a* page, not
+                // necessarily a fragment page -- and a data page's slot-filled
+                // tail can in principle be read as an entry array. `fragment`
+                // would almost certainly refuse it downstream on the "first
+                // live entry sits at 0x0c" check, but "almost certainly errors
+                // out later" is not this crate's standard: `walk_v6` checks the
+                // same tag before reading a page as records, and so does this.
+                if page[TAG] != b'V' {
+                    return Err(format!(
+                        "page {asked} carries the type tag {:#04x}, not {:#04x} \
+                         ('V'), so it is not a fragment page",
+                        page[TAG],
+                        b'V'
+                    ));
+                }
+                u32::from(u16::from_le_bytes([page[LOGICAL], page[LOGICAL + 1]]))
+            }
         };
         if number != asked {
             return Err(format!("page {asked} says it is page {number}"));
@@ -1088,6 +1114,27 @@ mod tests {
         assert!(e.contains("says it is page 9"), "{e}");
     }
 
+    /// A logical id resolves through one map shared by every kind of page, so
+    /// a fragment pointer can name a page that is not a fragment page at all
+    /// -- a data page, whose slot-filled tail would then be read as an entry
+    /// array. Refused on the tag, the same byte `records::walk_v6` checks for
+    /// `0x44` before reading a page as records, rather than left to fail
+    /// further in on a structural check that would *probably* catch it.
+    #[test]
+    fn a_v6_page_that_is_not_a_fragment_page_is_refused_on_its_tag() {
+        let mut body = V6_END.to_vec();
+        body.extend_from_slice(b"body");
+        let mut pages = Held(vec![blank(64), page_v6(1, 64, &[&body])]);
+
+        // Everything else about the page is right -- it is logical 1, which is
+        // what the pointer asks for -- and only the tag says data, not 'V'.
+        pages.0[1][TAG] = 0x44;
+
+        let e = follow_v6(&mut pages, pointer(1, 0)).expect_err("a data page is not a fragment");
+        assert!(e.contains("not a fragment page"), "{e}");
+        assert!(e.contains("0x44"), "{e}");
+    }
+
     /// The scrambled order, spelled out on a number where all three bytes
     /// differ. `0x123456` is byte 0 = `0x12`, byte 1 = `0x56`, byte 2 = `0x34`
     /// -- high, low, mid -- and the fragment index is the fourth byte, per the
@@ -1258,9 +1305,15 @@ mod tests {
         assert_eq!(pages.0[1], before);
     }
 
-    /// There is no v6 variable-length file to check an implementation of the
-    /// v6 fragment layout against -- the same reason [`Chain::follow`]
-    /// refuses a v6 file on the read side.
+    /// Reading a v6 fragment chain is implemented (Task 6) and checked
+    /// byte-for-byte against the engine on four committed fixtures; **writing
+    /// one is not**, and [`rewrite_fragment_in_place`] still refuses it. The
+    /// reason is no longer "there is nothing to check an implementation
+    /// against" -- that was true when this test was written and is not now --
+    /// but that a v6 write needs the allocation-table maintenance the read
+    /// plan puts deliberately out of scope. `Block::writable` refuses every
+    /// v6 write upstream of here for the same reason; this is the same
+    /// refusal at the layer that would do the damage.
     #[test]
     fn a_btrieve_6_file_is_refused_rather_than_rewritten_by_the_version_5_rule() {
         let mut pages = Held(vec![blank(96), page(1, 96, &[(b"body".as_slice(), false)])]);
