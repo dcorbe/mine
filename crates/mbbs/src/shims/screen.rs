@@ -67,34 +67,70 @@
 //! **None of it acts.** `btuxnf`, `btuhpk`, `btupbc` and `btucpc` all record
 //! state (`crate::gsbl::Channel::page_lines`/`page_message`/`pause_char`/
 //! `clear_pause_char`/`pause_handler_installed`) and none of it is ever read
-//! back to actually pause a channel's output. That is not a shortcut unique
-//! to `rstrxf` -- `btuxnf`'s own doc comment made the same call for page mode
-//! before this task existed -- but it is worth re-justifying with MajorMUD's
-//! own evidence rather than inheriting the precedent on faith:
+//! back to actually pause a channel's output. **This is reached, not
+//! hypothetical: long room descriptions, `look` output and `help` text will
+//! scroll straight past without pausing, on paths an ordinary player reaches
+//! every session.** An earlier draft of this comment claimed `btuxnf` "never
+//! once passes a negative `xoff`" and that page mode was unreached. That was
+//! wrong -- it also contradicted `btuxnf`'s own doc comment in
+//! `shims/gsbl.rs`, which already said "eight others (page mode)" before
+//! this file existed, while citing that comment as agreeing. Here is what is
+//! actually measured:
 //!
-//! * `WCCMMUD.DLL` imports `btuxnf` at 14 call sites and **never once** passes
-//!   a negative `xoff` -- every site this crate's own test fixtures and
-//!   `re/exports/imports.txt` cross-check pass positive flow-control values,
-//!   which is the same shape `btuxnf`'s existing doc comment already
-//!   describes. Page mode, as the module itself drives it, is unreached.
-//! * `btuhpk`/`btupbc`/`btucpc` are not module imports **at all** -- the only
-//!   caller either could ever have in this host is `rstrxf`, below. A module
-//!   that never enters page mode has no reason to ever receive a
-//!   screen-pause keystroke, so the handler `btuhpk` would install never
-//!   runs regardless of whether this host remembers it.
-//! * MajorMUD is a telnet-native module built for scroll-and-go clients, not
-//!   the page-at-a-time text UI 1990s dial-up terminals wanted; nothing in
-//!   `re/exports/WCCMMUD_named.c` implements a "more" prompt of its own
-//!   either, which is the other half of the same design choice, one layer up.
+//! * `re/ne_arity.py`'s `call_sites(data, 60, want_module='GALGSBL')` finds
+//!   all 14 of `WCCMMUD.DLL`'s `btuxnf` (GALGSBL ordinal 60) call sites and
+//!   splits them by the stack cleanup that follows: **6 sites clean 6
+//!   bytes** (3 words -- plain flow control, `xon`/`xoff` only) and **8
+//!   sites clean 12 bytes** (6 words -- the page-mode shape, because a
+//!   negative `xoff` pushes two more arguments, `cnt` and the far pointer
+//!   `stg`). **Eight of fourteen select page mode.**
+//! * Two of the eight are visible with full arguments in
+//!   `re/exports/WCCMMUD_named.c`: **line 37977** and **line 62401**, both
+//!   passing `0xffed` -- **-19** as a signed 16-bit value, the same -19
+//!   `rstrxf` itself passes. Their enclosing functions are verified: line
+//!   37977 is inside `_DISPLAY_LONG_TEXT` (declared line 37949), the
+//!   module's paginated-text primitive behind room/protected-room messages
+//!   and item/monster descriptions; line 62401 is inside `_CMD_SYSOP`
+//!   (declared line 61289), which is at least admin-gated.
+//! * Three more are traced to an enclosing function without that same
+//!   full-argument confirmation: line 35993 to `_DISPLAY_DESC_FROM_FILE`
+//!   (reached from `_DISPLAY_ROOM_DESC`, i.e. the `look` command), line
+//!   44741 to `_HELP_TEXT` (the player's `help` command), and line 12020 to
+//!   `_END_RELEASE_NOTE_LISTING` (rare/administrative). **Four of the eight
+//!   page-mode call sites were not identified at all** -- this is not a
+//!   complete map of where MajorMUD enters page mode, and it should not be
+//!   read as one.
+//! * `btuhpk`/`btupbc`/`btucpc` are still not `WCCMMUD.DLL` imports
+//!   themselves -- the module drives page mode through `btuxnf` alone, and
+//!   the only caller either of the other three could ever have in this host
+//!   is `rstrxf`, below. How a genuine board wires up the pause handler and
+//!   pause/clear-pause characters for a module that never imports the
+//!   routines that set them is not measured here -- presumably part of the
+//!   real host's own connection setup, upstream of anything `WCCMMUD.DLL`
+//!   calls.
+//! * MajorMUD has no "more" prompt of its own in
+//!   `re/exports/WCCMMUD_named.c` -- it delegates pause-and-continue
+//!   entirely to the host through `btuxnf`'s page-mode arguments, which is
+//!   what makes this host's non-implementation observable rather than inert.
 //!
-//! **What would show this is wrong:** a live session where output visibly
-//! pauses waiting for a keystroke the host is not modelling, or a module
-//! import of `btuxnf` with a negative `xoff` this crate has not measured.
-//! Neither has been observed. If either turns up, the state these four
+//! **Why the stub stands anyway.** The goal of this host is running a
+//! module headless, not reproducing MajorBBS, and scroll-without-pause
+//! degrades presentation without breaking play -- the text still arrives,
+//! in order, complete, to a client that has its own scrollback. Pagination
+//! means a driver loop that holds output, counts lines and waits for a
+//! keystroke across room entry, `look`, `help` and sysop text, for a return
+//! that is purely cosmetic against a modern client. That trade is approved
+//! and is not being reversed by this task -- what was wrong was calling
+//! those paths "unreached" instead of naming what a player actually sees.
+//!
+//! **What would show this is wrong:** nothing further needs to turn up --
+//! it already has. The concrete next step, if this is ever revisited, is
+//! finishing the map above: the four page-mode call sites `re/ne_arity.py`
+//! located but this pass did not identify. Until then, the state these four
 //! routines already record (`page_lines`, `page_message`, `pause_char`,
-//! `clear_pause_char`, `pause_handler_installed`) is exactly what a real
-//! pagination implementation would need to start from -- recording it now is
-//! what makes that later work additive instead of a rewrite.
+//! `clear_pause_char`, `pause_handler_installed`) is what a real pagination
+//! implementation would start from -- recording it now is what makes that
+//! later work additive instead of a rewrite.
 
 use mbbs16::{FarPtr, Machine, Ret};
 

@@ -14,6 +14,18 @@
 //!
 //! Semantics are from the Worldgroup 1.0 GSBL Development Guide
 //! (`archive/tooling/reference-documents/`), which has a page per routine.
+//!
+//! Page citations here (and in `crate::shims::gsbl`, `crate::shims::screen`)
+//! are the guide's own printed page number -- `GSBL-NNN`, or "guide page
+//! NNN" -- never a `gsblref.pdf` viewer page computed from it. **The two are
+//! not a constant offset apart.** Measured by rendering actual pages: `+7`
+//! holds through the guide's roughly 80-170 range (PDF 156 is GSBL-149
+//! `btusiz`; PDF 175 is GSBL-168 `btutrg`; PDF 165 is GSBL-158 `btusts`), and
+//! `+6` only near `btuxnf`'s p.193. Assuming either offset and applying it
+//! elsewhere lands on the wrong routine -- "+6" against `btuhpk`/`btupbc`/
+//! `btucpc`'s cited pages 99/133/81 lands on `btuhit`/`btuolk`/`btucmd`
+//! instead. Checking a citation means rendering that guide page directly,
+//! never computing a PDF page from one.
 
 use std::collections::VecDeque;
 
