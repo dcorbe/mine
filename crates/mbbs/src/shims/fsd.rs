@@ -4029,27 +4029,48 @@ mod tests {
     }
 
     #[test]
-    fn fsdbkg_zeroes_the_wrap_width_so_escapes_survive_transmit() {
+    fn fsdbkg_zeroes_the_wrap_width_so_a_run_of_text_does_not_displace_a_goto() {
         // Decision 5 of the Stage 5 plan, and the reason this task precedes
-        // anything that lights a field. `Channel::transmit` counts every byte
-        // that is not \r or \n toward the wrap column and knows nothing about
-        // escape sequences, so a cursor-goto sent at a nonzero width can be
-        // split down the middle -- which corrupts the screen in a way that
-        // looks exactly like a cursor-tracker bug.
+        // anything that lights a field.
+        //
+        // This test used to demonstrate a different hazard: that
+        // `Channel::transmit` counted every byte of an escape sequence
+        // toward the wrap column, so a cursor-goto sent at a nonzero width
+        // could be split down the middle. That hazard is gone -- CSI bytes
+        // (`ESC` `[` ... a final byte) no longer count toward the column at
+        // all, and a wrap can now only ever land between two ordinary bytes,
+        // never inside a CSI. See `crates/mbbs/src/gsbl.rs`'s `CsiScan` and
+        // its `transmit` for the fix, and its test
+        // `a_csi_sequence_does_not_advance_the_wrap_column`.
+        //
+        // The hazard that remains is a different one: plain visible text run
+        // long enough to reach the margin still inserts a `\r\n` the module
+        // never asked for -- and for `fsdbkg`'s full-screen paint, every
+        // byte after that point is positioned by an absolute cursor `goto`,
+        // so an uninvited line break shifts everything below it down a row.
+        // `btutsw(usrnum,0)` is what stops that, and it is a real thing the
+        // genuine `fsdbkg` does (`FSDBBS.C:186`) independent of this fix.
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"NAME=Kai\0\0");
         let chan = f.console();
 
-        // A narrow width, and a goto placed where the wrap would land inside
-        // it. Establish first that the hazard is real -- otherwise the second
-        // half of this test proves nothing.
+        // A narrow width, and eleven digits -- one more than the width --
+        // ahead of a goto. Establish first that the hazard is real: the
+        // digits alone are enough to trigger a wrap (the CSI immunity above
+        // has nothing to do with it, since none of these eleven bytes is
+        // part of an escape), and the goto ends up on whatever line the
+        // wrap left the cursor on, not glued to the text that preceded it.
         f.host.gsbl_mut().channel_mut(chan).width = 10;
-        f.host.gsbl_mut().transmit(chan, b"12345678\x1b[12;34f");
+        f.host.gsbl_mut().transmit(chan, b"12345678901\x1b[12;34f");
         let mangled = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
         assert!(
-            !mangled.contains("\x1b[12;34f"),
-            "with a wrap width set, the goto must come out broken -- if it \
-             does not, this test cannot discriminate: {mangled:?}"
+            mangled.contains("\r\n"),
+            "with a wrap width set, eleven columns of plain text must still \
+             wrap -- if it does not, this test cannot discriminate: {mangled:?}"
+        );
+        assert!(
+            mangled.contains("\x1b[12;34f"),
+            "the goto itself is never split -- only where it lands moves: {mangled:?}"
         );
 
         // Now the real thing: fsdbkg's btutsw(usrnum,0).
@@ -4067,11 +4088,12 @@ mod tests {
             "btutsw(usrnum,0)"
         );
 
-        f.host.gsbl_mut().transmit(chan, b"12345678\x1b[12;34f");
+        f.host.gsbl_mut().transmit(chan, b"12345678901\x1b[12;34f");
         let intact = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
-        assert!(
-            intact.contains("\x1b[12;34f"),
-            "after fsdbkg the goto goes out whole: {intact:?}"
+        assert_eq!(
+            intact, "12345678901\u{1b}[12;34f",
+            "after fsdbkg, width is 0: no wrap at all, and the goto follows \
+             the digits directly on the same line: {intact:?}"
         );
     }
 

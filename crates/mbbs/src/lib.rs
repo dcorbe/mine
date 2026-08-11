@@ -31,6 +31,7 @@ pub mod fsd;
 mod globals;
 pub mod gsbl;
 pub mod heap;
+pub mod ifansi;
 pub mod keys;
 pub mod msg;
 pub mod random;
