@@ -369,6 +369,42 @@ pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
+/// `long lngrnd(long min, long max)` -- [`genrdn`] in `long` arithmetic.
+/// `BBSUTILS.C:76-93`, and ordinal 390 of the genuine host.
+///
+/// The upper bound is exclusive, as it is for [`genrdn`]. See
+/// [`between_long`](crate::random::between_long), which is the ported
+/// algorithm; this is only the two arguments and the draw.
+///
+/// # Two words each, and which two
+///
+/// `arg_u16` is indexed in **words**, so a pair of `long`s is `arg_u32(0)` and
+/// `arg_u32(2)` -- not `(0)` and `(1)`, which is [`genrdn`]'s spacing and would
+/// read `min`'s high half as `max`'s low one. Worth stating because the two
+/// shims sit next to each other and differ only here.
+///
+/// # Why this was missing for so long, and what it cost
+///
+/// MajorMUD calls it from 13 sites and **initialisation reaches none of them**
+/// (`tests/wccmmud.rs`'s own record of the init call census says so), so every
+/// in-process test this crate has ever run went green without it. What does
+/// reach it is the module's self-sustaining heartbeat -- the spawner's
+/// boot-fill -- which only runs when something drives `Host::cycle` freely, as
+/// `mbbs-server` does and no test did. The first live telnet session died on
+/// it immediately.
+///
+/// # Errors
+///
+/// If the generator stops generating. See
+/// [`Runaway`](crate::random::Runaway).
+pub fn lngrnd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let (min, max) = (machine.arg_u32(0) as i32, machine.arg_u32(2) as i32);
+    host.random
+        .lngrnd(min, max)
+        .map(|n| Ret::U32(n as u32))
+        .map_err(|e| ShimError::Failed(e.to_string()))
+}
+
 /// `int access(char *path, int amode)` -- is this file there, and may I use it?
 ///
 /// Borland's, re-exported by `MAJORBBS.DLL` as ordinal 850. `amode` is a mask:
@@ -1169,6 +1205,83 @@ mod tests {
             })
             .collect();
         assert!(drawn.len() > 50, "100 draws gave {} values", drawn.len());
+    }
+
+    #[test]
+    fn lngrnd_reads_two_longs_and_not_four_ints() {
+        // The argument-spacing trap, pinned. Each `long` is two words, so
+        // `min` is words 0-1 and `max` is words 2-3. A shim using genrdn's own
+        // `arg_u16(0)`/`arg_u16(1)` spacing would read `min`'s high half as
+        // `max`'s low one and draw from a range the module never asked for.
+        //
+        // The bounds have to be chosen so the wrong reading is *detectable*,
+        // which a first attempt at this test got wrong: with min 0 the
+        // mis-spaced read yields max 0, `lngrnd` returns 0 by its own first
+        // line, and 0 sits happily inside the range the test was asserting.
+        // The mutation survived its own test and was caught only by a
+        // neighbour. So `min` is given a nonzero *high* word here:
+        //
+        //   min = 0x0002_0001 = 131073   (words 0,1 = 0x0001, 0x0002)
+        //   max = 0x0003_0000 = 196608   (words 2,3 = 0x0000, 0x0003)
+        //
+        // Read correctly, no answer can be below 131073. Read with genrdn's
+        // spacing, min becomes word 0 (1) and max word 1 (2), so the answer is
+        // 1 -- outside the asserted range by five orders of magnitude.
+        let mut f = Fixture::new();
+        f.invoke(srand, &[40615]).expect("seeded");
+        for _ in 0..500 {
+            let Ret::U32(n) = f
+                .invoke(lngrnd, &[0x0001, 0x0002, 0x0000, 0x0003])
+                .expect("a number")
+            else {
+                panic!("lngrnd returns a long");
+            };
+            assert!(
+                (131_073..196_608).contains(&n),
+                "{n} is outside 131073..196608 -- the argument words were paired wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn lngrnd_from_zero_never_exceeds_rand_max_however_wide_the_range() {
+        // `rand()` answers 0..=32767 whatever the argument types are, so with
+        // min 0 the loop never runs and the whole routine is one `rand()%max`
+        // that the modulo cannot bite. The observable property of the
+        // generator, through the shim rather than the pure function.
+        let mut f = Fixture::new();
+        f.invoke(srand, &[40615]).expect("seeded");
+        for _ in 0..2000 {
+            // min = 0, max = 0x0003_0000 = 196608.
+            let Ret::U32(n) = f.invoke(lngrnd, &[0, 0, 0, 3]).expect("a number") else {
+                panic!("lngrnd returns a long");
+            };
+            assert!(
+                n <= u32::from(crate::random::RAND_MAX),
+                "{n} is above RAND_MAX, so the first draw was not a single rand()"
+            );
+        }
+    }
+
+    #[test]
+    fn lngrnd_accumulates_to_reach_a_minimum_beyond_rand_max() {
+        // 100000 is past what one rand() can produce, so the loop is the only
+        // way to satisfy it -- and the answer still has to land under max.
+        let mut f = Fixture::new();
+        f.invoke(srand, &[40615]).expect("seeded");
+        for _ in 0..500 {
+            // min = 100000 = 0x0001_86A0, max = 1000000 = 0x000F_4240.
+            let Ret::U32(n) = f
+                .invoke(lngrnd, &[0x86A0, 0x0001, 0x4240, 0x000F])
+                .expect("a number")
+            else {
+                panic!("lngrnd returns a long");
+            };
+            assert!(
+                (100_000..1_000_000).contains(&n),
+                "{n} is outside 100000..1000000"
+            );
+        }
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub const RAND_MAX: u16 = 0x7fff;
 /// working generator. It is here for the one that is not working.
 const PATIENCE: u32 = 10_000;
 
-/// `genrdn` could not reach the number it was asked for.
+/// `genrdn` or `lngrnd` could not reach the number it was asked for.
 ///
 /// The loop `rnum += rand()%(max-rnum)` makes progress only when the generator
 /// gives it something, and one that returns the same value forever would go
@@ -111,18 +111,30 @@ const PATIENCE: u32 = 10_000;
 /// [`mbbs16`]'s watchdog does not reach, so an unbounded loop would hang the
 /// process without saying anything -- which is the one outcome this crate never
 /// accepts.
+///
+/// # Why the bounds are `i32` for a routine whose own are `i16`
+///
+/// [`between`] and [`between_long`] are the same algorithm over `int` and
+/// `long` -- `BBSUTILS.C:49-66` and `:76-93` are the same nine statements with
+/// the type changed -- so they share this one error rather than carrying a
+/// near-identical pair. An `i16` bound widens into an `i32` field exactly, so
+/// `genrdn`'s numbers survive it unchanged; the reverse would not, which is why
+/// the widening goes this way round. `routine` is what keeps the message honest
+/// about which of the two ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Runaway {
-    pub min: i16,
-    pub max: i16,
+    /// `"genrdn"` or `"lngrnd"` -- the name the module actually called.
+    pub routine: &'static str,
+    pub min: i32,
+    pub max: i32,
 }
 
 impl fmt::Display for Runaway {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { min, max } = self;
+        let Self { routine, min, max } = self;
         write!(
             f,
-            "genrdn({min}, {max}): {PATIENCE} draws never reached {min}, \
+            "{routine}({min}, {max}): {PATIENCE} draws never reached {min}, \
              so the generator is not generating"
         )
     }
@@ -168,6 +180,20 @@ impl Random {
     /// See [`Runaway`].
     pub fn genrdn(&mut self, min: i16, max: i16) -> Result<i16, Runaway> {
         between(&mut || self.rand(), min, max)
+    }
+
+    /// `long lngrnd(long min, long max)`.
+    ///
+    /// Draws from the same generator `genrdn` does -- there is one `RANDSEED`
+    /// in the host and both routines call the same `rand` (measured: both
+    /// relocate to segment 1 offset 0x2017). A module interleaving the two
+    /// therefore sees one stream, not two.
+    ///
+    /// # Errors
+    ///
+    /// See [`Runaway`].
+    pub fn lngrnd(&mut self, min: i32, max: i32) -> Result<i32, Runaway> {
+        between_long(&mut || self.rand(), min, max)
     }
 }
 
@@ -226,7 +252,84 @@ pub fn between(next: &mut dyn FnMut() -> u16, min: i16, max: i16) -> Result<i16,
         }
         rnum += (next() as i16) % (max - rnum);
     }
-    Err(Runaway { min, max })
+    Err(Runaway {
+        routine: "genrdn",
+        min: i32::from(min),
+        max: i32::from(max),
+    })
+}
+
+/// `lngrnd`, over any source of numbers. `BBSUTILS.C:76-93`.
+///
+/// [`between`] in `long` arithmetic, and that is not a family resemblance --
+/// the two functions are the same nine statements with `int` changed to `long`
+/// and `addrdn` changed to `addlng`. This is written out rather than shared
+/// with [`between`] through a generic because the one place they *do* differ is
+/// the interesting one, and a generic would hide it: see "The width is the
+/// whole behaviour" below.
+///
+/// # Measured against the host, not inferred from the C alone
+///
+/// The archive has the C (`BBSUTILS.C:76-93`), and the compiled host agrees
+/// with it -- but not obviously. `lngrnd` is ordinal 390 at segment 13 offset
+/// 230 of `MAJORBBS-mbbstd.EXE`, and its two relocated `lcall`s resolve to
+/// `rand` (segment 1 offset 0x2017, ordinal 486) and `lmod@`/`f_lmod@`
+/// (segment 1 offset 0x1ce2, ordinals 655/667) -- Borland's long-modulo
+/// helper, which is what `rand()%max` compiles to when `max` is a `long`. The
+/// `cwd` between them is the `int`-to-`long` promotion of `rand`'s result.
+///
+/// The disassembly also settles a question the C would have left open. Its
+/// early exit compiles to a bare **equality** test (`cmp`/`jne` on each half,
+/// `FSD`-style, at offsets 0x104-0x10c) where the C says `if (min >= max)`.
+/// That is not a divergence and the port follows the **C**: `ASSERT(min <= max)`
+/// sits immediately above it (`BBSUTILS.C:84`), so Borland was entitled to fold
+/// `>=` into `==`. `genrdn` compiles to exactly the same equality test from
+/// exactly the same source, which is what proves the folding rather than
+/// leaving it a guess about one function.
+///
+/// # The width is the whole behaviour
+///
+/// `rand()` answers `0..=RAND_MAX` whatever the caller's types are, so
+/// `rand()%max` for any `max` above 32768 **is just `rand()`** -- the modulo
+/// cannot bite. That is the one property a `long` version has and an `int`
+/// version cannot, and it is exactly why [`RAND_MAX`]'s own doc comment calls
+/// this the single observable property of the generator. A `lngrnd(0, 1000000)`
+/// therefore never answers above 32767 on its first draw, and reaches larger
+/// numbers only by the loop's repeated addition -- which it does only when
+/// `min` demands it.
+///
+/// # Errors
+///
+/// See [`Runaway`].
+pub fn between_long(next: &mut dyn FnMut() -> u16, min: i32, max: i32) -> Result<i32, Runaway> {
+    // Both early exits, in the source's own order, exactly as `between` takes
+    // them -- see that function on why the unreconstructible `ASSERT(min <= max)`
+    // between them cannot change the answer.
+    if max == 0 {
+        return Ok(0);
+    }
+    if min >= max {
+        return Ok(min);
+    }
+
+    // `next()` is at most RAND_MAX, so widening it to i32 is exact and never
+    // negative; `%` therefore cannot make `rnum` negative and `max - rnum`
+    // cannot overflow an i32 (both operands are non-negative here and `max` is
+    // at most i32::MAX). Inside the loop `rnum < min < max`, so the divisor is
+    // at least 2 and never zero -- the same argument `between` makes, and it
+    // survives the widening because it rests on the ordering, not the width.
+    let mut rnum = i32::from(next()) % max;
+    for _ in 0..PATIENCE {
+        if rnum >= min {
+            return Ok(rnum);
+        }
+        rnum += i32::from(next()) % (max - rnum);
+    }
+    Err(Runaway {
+        routine: "lngrnd",
+        min,
+        max,
+    })
 }
 
 #[cfg(test)]
@@ -318,11 +421,109 @@ mod tests {
     }
 
     #[test]
+    fn the_long_upper_bound_is_exclusive_and_the_lower_one_is_not() {
+        // BBSUTILS.C:76-93 is BBSUTILS.C:49-66 with the type changed, so every
+        // promise the int version makes the long version makes too.
+        let mut r = Random::new(1);
+        for _ in 0..10_000 {
+            let n = r.lngrnd(5, 9).expect("a number");
+            assert!((5..9).contains(&n), "{n} is outside 5..9");
+        }
+    }
+
+    #[test]
+    fn a_zero_long_maximum_is_zero_and_an_empty_long_range_is_its_lower_bound() {
+        let mut r = Random::new(1);
+        assert_eq!(r.lngrnd(0, 0), Ok(0));
+        assert_eq!(r.lngrnd(7, 0), Ok(0), "min is not consulted");
+        assert_eq!(r.lngrnd(9, 9), Ok(9));
+        assert_eq!(r.lngrnd(12, 4), Ok(12), "min >= max, per the C's own >=");
+    }
+
+    #[test]
+    fn a_range_wider_than_rand_max_cannot_exceed_it_on_the_first_draw() {
+        // The one property `lngrnd` has that `genrdn` cannot: `rand()` answers
+        // 0..=32767 whatever the argument types are, so `rand()%max` for a max
+        // above 32768 is just `rand()` -- the modulo never bites. With min 0 the
+        // loop never runs, so the whole routine is that single draw and nothing
+        // above RAND_MAX can ever come out, however wide the range.
+        //
+        // This is the assertion that would fail against a "wider generator", and
+        // RAND_MAX's own doc comment calls it the single observable property of
+        // the generator for exactly that reason.
+        let mut r = Random::new(1);
+        for _ in 0..20_000 {
+            let n = r.lngrnd(0, 1_000_000).expect("a number");
+            assert!(
+                (0..=i32::from(RAND_MAX)).contains(&n),
+                "{n} is above RAND_MAX, so the draw was not one rand()"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_range_reaches_past_rand_max_only_by_accumulating() {
+        // The complement of the test above: a `min` beyond RAND_MAX is
+        // unreachable in one draw, so the loop's `rnum += rand()%(max-rnum)` is
+        // the only thing that can satisfy it. If the loop were dropped this
+        // would answer something below 100_000 every time.
+        let mut r = Random::new(1);
+        for _ in 0..2_000 {
+            let n = r.lngrnd(100_000, 1_000_000).expect("a number");
+            assert!(
+                (100_000..1_000_000).contains(&n),
+                "{n} is outside 100_000..1_000_000"
+            );
+        }
+    }
+
+    #[test]
+    fn the_long_routine_and_the_int_one_agree_on_a_range_that_fits_both() {
+        // Same source, same generator, same stream -- so over a range an i16 can
+        // hold, the two must produce identical sequences draw for draw. This is
+        // what says `between_long` is a port of the same nine statements rather
+        // than a lookalike that happens to land in range.
+        let mut a = Random::new(12345);
+        let mut b = Random::new(12345);
+        for i in 0..5_000 {
+            let wide = a.lngrnd(-40, 300).expect("a number");
+            let narrow = b.genrdn(-40, 300).expect("a number");
+            assert_eq!(wide, i32::from(narrow), "diverged at draw {i}");
+        }
+    }
+
+    #[test]
+    fn a_stuck_generator_is_refused_for_the_long_routine_and_named_as_such() {
+        // The Runaway guard is shared, so the routine name is the only thing
+        // telling the operator which of the two actually ran.
+        assert_eq!(
+            between_long(&mut stuck(), 5, 9),
+            Err(Runaway {
+                routine: "lngrnd",
+                min: 5,
+                max: 9
+            })
+        );
+        let said = format!(
+            "{}",
+            between_long(&mut stuck(), 5, 9).expect_err("refused")
+        );
+        assert!(said.starts_with("lngrnd("), "{said}");
+    }
+
+    #[test]
     fn a_generator_that_never_moves_is_refused_rather_than_spun_on() {
         // `rnum += rand()%(max-rnum)` with a generator stuck at zero adds
         // nothing, forever. On the host side of a call there is no watchdog, so
         // an unbounded loop here hangs the process with no diagnostic.
-        assert_eq!(between(&mut stuck(), 5, 9), Err(Runaway { min: 5, max: 9 }));
+        assert_eq!(
+            between(&mut stuck(), 5, 9),
+            Err(Runaway {
+                routine: "genrdn",
+                min: 5,
+                max: 9
+            })
+        );
     }
 
     #[test]

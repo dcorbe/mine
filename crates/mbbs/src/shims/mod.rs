@@ -207,6 +207,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "time", system::time, Cleans::Caller),
     (MAJORBBS, "srand", system::srand, Cleans::Caller),
     (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller),
+    // Caller-cleaned, read off the host rather than assumed from its
+    // neighbours: lngrnd ends in a bare `retf` (segment 13, offset 0x167) with
+    // no immediate, so the module pops its own eight bytes of arguments.
+    (MAJORBBS, "lngrnd", system::lngrnd, Cleans::Caller),
     (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
     (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
