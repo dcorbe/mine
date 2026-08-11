@@ -108,8 +108,8 @@ wrong artifact.
 Oracle dumps
 ------------
 
-DUPKEY30.dump and PP2048.dump are `btrvprobe dump <file> 0` output for the two
-fixed-length v6 fixtures -- one line per record, in key order: ordinal, length,
+DUPKEY30.dump, PP2048.dump and PP2BLOCK.dump are `btrvprobe dump <file> 0`
+output for the three fixed-length v6 fixtures -- one line per record, in key order: ordinal, length,
 and the record bytes as hex. Produced 2026-08-11 by genuine Btrieve 6.15.
 
 They are committed, unlike the 14 MB WCCTEXT dump the v5 byte-for-byte test
