@@ -349,10 +349,37 @@ fn apply(
             Ok(())
         }
         In::Input { chan, bytes } => {
+            if conns[chan.index()].is_none() {
+                // Nobody is connected on this channel in this life. Either
+                // this is a duplicate arriving after `flush` already hung
+                // this same connection up (Path 1: the sender closed and a
+                // queued `Disconnect` drained late), or it crossed a life
+                // boundary entirely -- a connection whose `Out::Close` never
+                // landed (the bounded channel was full, `life`'s `try_send`
+                // silently drops it) survives into a fresh life with a fresh
+                // `Pool` and fresh `conns`, and this is one of its stale
+                // messages (Path 2). Either way, pushing these bytes into
+                // GSBL would land them on whichever *this* life's connection
+                // takes this channel index next -- a stranger's keystrokes
+                // in someone else's session -- so they are dropped instead.
+                return Ok(());
+            }
             host.gsbl_mut().push_input(chan, &bytes);
             Ok(())
         }
         In::Disconnect { chan } => {
+            if conns[chan.index()].is_none() {
+                // Already disconnected in this life -- see the matching
+                // comment on `In::Input` above for the two ways this
+                // arrives. Running `Host::hangup` here would run the
+                // module's `huprou`/`lofrou` against a channel this life
+                // never called `Host::connect` on, and `Pool::give_back`
+                // would be asked to free a channel that was never re-taken.
+                // `Pool::give_back` is idempotent on its own (see its doc),
+                // but `Host::hangup` is not guarded at all -- this check is
+                // what keeps it from running in the first place.
+                return Ok(());
+            }
             host.hangup(machine, module, chan)?;
             pool.give_back(chan);
             conns[chan.index()] = None;
@@ -410,14 +437,24 @@ mod tests {
     //! empty, and a `Disconnect` returning a channel. The real coverage for
     //! the driver loop is Task 12 (two real sockets) and Task 13 (the sleep
     //! meter), both of which run against `re/WCCMMUD.DLL`.
+    //!
+    //! `apply`'s two "channel nobody is connected on" guards (`In::Input` and
+    //! `In::Disconnect`, added for the double-free defect -- see
+    //! `crates/mbbs-server/src/pool.rs`'s `give_back` doc) are the exception:
+    //! they need a real `Host`/`Module`/`Machine`, but not a real `.DLL` --
+    //! `mbbs::testing::Fixture` builds all three without one, which is enough
+    //! to call `apply` directly and inspect `Host::gsbl_mut` afterward. The
+    //! end-to-end version of the same guard, through an actual restart, is
+    //! `crates/mbbs-server/tests/host_supervisor.rs`.
 
     use mbbs::Terms;
+    use tokio::sync::mpsc::Sender;
     use tokio::sync::oneshot;
 
     use crate::pool::Pool;
 
     use super::{Woke, wake};
-    use crate::msg::In;
+    use crate::msg::{In, Out};
     use mbbs::Wait;
 
 
@@ -478,8 +515,12 @@ mod tests {
     }
 
     /// `apply`'s `Disconnect` arm's pool half: giving a channel back makes it
-    /// takeable again. (The `Host::hangup` call itself needs a live module
-    /// and is not reachable from this crate's tests -- see the module doc.)
+    /// takeable again. (The `Host::hangup` *success* path -- a registered
+    /// module actually running `huprou` -- still needs a real `.DLL` and is
+    /// not reachable from this crate's tests. The *guard* that skips
+    /// `Host::hangup` entirely for an unconnected channel is reachable, and
+    /// is covered by `apply_ignores_a_disconnect_for_a_channel_nobody_is_
+    /// connected_on` below.)
     #[test]
     fn a_disconnect_returns_its_channel_to_the_pool() {
         let terms = Terms::new(2);
@@ -490,6 +531,108 @@ mod tests {
 
         pool.give_back(a);
         assert_eq!(pool.take(), Some(a), "disconnect frees the line for reuse");
+    }
+
+    /// `apply`'s `In::Disconnect` guard: a channel nobody is connected to in
+    /// *this* life must be left alone, not handed to `Host::hangup`.
+    ///
+    /// This is the fix for both reachable double-free paths (see
+    /// `crates/mbbs-server/src/pool.rs`'s `give_back` doc and this file's
+    /// module doc, "Surviving a module stop"): a duplicate `Disconnect`
+    /// after `flush` already hung the same connection up in this life
+    /// (Path 1), and a stale `Disconnect` carrying a channel identity from a
+    /// life that has already ended, arriving after a fresh restart gave that
+    /// index a fresh, unconnected `Pool`/`conns` (Path 2). Both look
+    /// identical to `apply` at this point: `conns[chan.index()]` is `None`.
+    ///
+    /// The tripwire is deliberate: this `Fixture` loads a module but never
+    /// runs its ordinal 1, so nothing ever calls `register_module` --
+    /// `Host::hangup` would fail with "no module has registered" if `apply`
+    /// ever reached it. Without the guard, `apply` would propagate that
+    /// `Err`, which is exactly what `life`'s real loop does with it
+    /// (`apply(...)?`): end the whole host thread. With the guard, `apply`
+    /// never calls `Host::hangup` and returns `Ok(())`.
+    #[test]
+    fn apply_ignores_a_disconnect_for_a_channel_nobody_is_connected_on() {
+        use mbbs::testing::Fixture;
+
+        let terms = Terms::new(1);
+        let mut fixture = Fixture::rooted_with_terms(
+            mbbs::testing::scratch("mbbs-server-host-apply-guard-disconnect"),
+            terms,
+        );
+        let module = fixture.minimal_module();
+        let chan = fixture.console();
+
+        let mut pool = Pool::new(terms);
+        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
+
+        let result = super::apply(
+            &mut fixture.host,
+            &mut fixture.machine,
+            &module,
+            &mut pool,
+            &mut conns,
+            In::Disconnect { chan },
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unconnected channel's stale Disconnect must be ignored \
+             rather than reach Host::hangup (which errors here, with no \
+             module registered): {result:?}"
+        );
+        assert_eq!(
+            pool.take(),
+            Some(chan),
+            "the channel must still be free exactly once"
+        );
+        assert!(
+            pool.take().is_none(),
+            "and not a second time -- give_back must never have run"
+        );
+    }
+
+    /// `apply`'s `In::Input` guard, the other half of the same fix.
+    ///
+    /// Proven through `Host::gsbl_mut().take_line`, which only ever answers
+    /// a line `gsbl::Channel::take` actually completed. `bytes` below ends
+    /// in a CR on purpose: without the guard, `push_input` would run and
+    /// that CR would complete a line for a channel nobody is connected to
+    /// in this life -- exactly the "a dead session's keystrokes land on
+    /// whoever this life connects to the channel next" harm the guard on
+    /// `In::Input` exists to prevent (see `apply`'s own comment on that
+    /// arm).
+    #[test]
+    fn apply_ignores_input_for_a_channel_nobody_is_connected_on() {
+        use mbbs::testing::Fixture;
+
+        let terms = Terms::new(1);
+        let mut fixture = Fixture::rooted_with_terms(
+            mbbs::testing::scratch("mbbs-server-host-apply-guard-input"),
+            terms,
+        );
+        let module = fixture.minimal_module();
+        let chan = fixture.console();
+
+        let mut pool = Pool::new(terms);
+        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
+
+        let result = super::apply(
+            &mut fixture.host,
+            &mut fixture.machine,
+            &module,
+            &mut pool,
+            &mut conns,
+            In::Input { chan, bytes: b"EVIL\r".to_vec() },
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fixture.host.gsbl_mut().take_line(chan),
+            None,
+            "bytes for an unconnected channel must never reach GSBL"
+        );
     }
 
     // `RestartPolicy`. Driven entirely by arithmetic on `Instant`, never a

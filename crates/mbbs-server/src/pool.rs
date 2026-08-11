@@ -34,6 +34,10 @@ use mbbs::{Chan, Terms};
 /// zero, which is what every fixture and doc in `crates/mbbs` assumes.
 pub struct Pool {
     free: VecDeque<Chan>,
+    /// Whether channel `i` (by [`Chan::index`]) is currently out with a
+    /// connection. The only thing [`Pool::give_back`] consults to decide
+    /// whether a free is real or a no-op -- see its doc.
+    taken: Vec<bool>,
 }
 
 impl Pool {
@@ -42,18 +46,59 @@ impl Pool {
     pub fn new(terms: Terms) -> Self {
         Self {
             free: terms.all().collect(),
+            taken: vec![false; terms.count().into()],
         }
     }
 
     /// A free channel, or `None` if every line is busy.
     pub fn take(&mut self) -> Option<Chan> {
-        self.free.pop_front()
+        let chan = self.free.pop_front()?;
+        self.taken[chan.index()] = true;
+        Some(chan)
     }
 
     /// Return a channel a connection is done with, behind everything already
     /// free.
-    pub fn give_back(&mut self, chan: Chan) {
+    ///
+    /// **Idempotent.** Freeing a channel that is not currently taken is a
+    /// no-op -- not a panic, and not a second copy of `chan` in the free
+    /// list. That is a real possibility, not a defensive nicety for a case
+    /// that cannot arise: `crates/mbbs-server/src/host.rs` has two call
+    /// sites that can both reach the *same* channel for the *same*
+    /// disconnect. `flush` hangs a channel up when sending its queued output
+    /// fails (the connection's `Sender<Out>` is closed or full); `apply`'s
+    /// `In::Disconnect` arm hangs the same channel up when the connection's
+    /// own EOF message is drained. A dropped sender and a queued
+    /// `Disconnect` are two independent signals of one event, and nothing
+    /// orders them against each other -- so whichever runs second, absent a
+    /// guard, would free a channel the other had already freed, and the
+    /// *next* `take` would then hand that one channel to two different
+    /// connections at once.
+    ///
+    /// A panic would also stop this at the source, and this project's
+    /// default is "runtime crashes are better than undefined behaviour" --
+    /// but a panic here runs on the host thread, and the host thread has
+    /// exactly one of itself: unwinding it ends the whole board, which is
+    /// the very outage `crates/mbbs-server/src/host.rs`'s restart supervisor
+    /// exists to survive. Trading a silently doubled free for a certainly
+    /// crashed board is not the safer failure mode, so this stays a no-op
+    /// instead: cheap to check, and it makes "the same channel handed to two
+    /// connections" structurally unreachable through this method rather than
+    /// merely unlikely in practice.
+    ///
+    /// Returns whether this call actually freed the channel (`true`) or
+    /// found it already free and did nothing (`false`). No caller reads this
+    /// today, which is fine -- the guarantee holds either way -- but the
+    /// signature says honestly that calling `give_back` no longer promises
+    /// unconditionally to grow `free` by one.
+    pub fn give_back(&mut self, chan: Chan) -> bool {
+        let idx = chan.index();
+        if !self.taken[idx] {
+            return false;
+        }
+        self.taken[idx] = false;
         self.free.push_back(chan);
+        true
     }
 }
 
@@ -109,6 +154,67 @@ mod tests {
             "a stack would have answered these three exactly backwards, and a \
              board that reuses one channel is a board that never exercises the \
              others"
+        );
+    }
+
+    /// Every test above shares one shape: it gives a channel back exactly
+    /// once, and only ever a channel it actually took. That shape is
+    /// precisely what let the double-free bug this module now guards
+    /// against ship in the first place -- see `give_back`'s doc for the two
+    /// real call sites that can both reach the same channel for the same
+    /// disconnect. The two tests below violate that shape on purpose: one
+    /// frees a channel nobody took, the other frees the same channel twice.
+    ///
+    /// A channel nobody took is free already -- `Pool::new` starts every
+    /// channel free -- so `give_back` on it must be a no-op: `false`, and no
+    /// second copy in `free`. A duplicate copy would show up here as the
+    /// pool answering `take()` more times than it has channels.
+    #[test]
+    fn give_back_on_a_channel_that_was_never_taken_is_a_no_op() {
+        let terms = Terms::new(2);
+        let mut pool = Pool::new(terms);
+        let stray = terms.chan(0).expect("channel 0");
+
+        assert!(
+            !pool.give_back(stray),
+            "a channel nobody took was not freed by this call"
+        );
+
+        // Still exactly two channels obtainable, not three.
+        let a = pool.take().expect("first");
+        let b = pool.take().expect("second");
+        assert_ne!(a, b);
+        assert!(
+            pool.take().is_none(),
+            "give_back on an untaken channel must not have manufactured a third"
+        );
+    }
+
+    /// The exact shape of Path 1 in the defect this guards against: one
+    /// connection's channel gets freed twice in the same life (`flush`'s
+    /// send-failure path and `apply`'s `In::Disconnect` arm can both reach
+    /// it for the one disconnect). The second `give_back` must be a no-op,
+    /// not a second entry in `free` -- otherwise `take` would hand the one
+    /// real channel to two different connections.
+    #[test]
+    fn give_back_twice_after_one_take_frees_it_only_once() {
+        let terms = Terms::new(1);
+        let mut pool = Pool::new(terms);
+        let a = pool.take().expect("the only channel");
+
+        assert!(pool.give_back(a), "the first give_back genuinely frees it");
+        assert!(
+            !pool.give_back(a),
+            "the second give_back finds it already free and does nothing"
+        );
+
+        // Exactly one channel is obtainable, not two.
+        assert_eq!(pool.take(), Some(a));
+        assert!(
+            pool.take().is_none(),
+            "the duplicate give_back must not have doubled the free list -- \
+             this is the exact mechanism by which two clients would end up \
+             sharing one channel"
         );
     }
 }

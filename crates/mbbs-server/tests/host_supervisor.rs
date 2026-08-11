@@ -18,10 +18,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
+use mbbs::{Chan, Connection};
 use mbbs_server::conn::{self, default_keys};
 use mbbs_server::host::Boot;
+use mbbs_server::msg::{In, Out};
 
 /// How long a single read may block before a test declares a hang rather
 /// than waiting on CI forever.
@@ -233,6 +236,38 @@ mod builder {
         // `Dispatch::Module(None)` for every one of them, so `Host::connect`
         // (which reads `lonrou`, vector 0) is a clean no-op: this module
         // exists to demonstrate a *restart*, not to exercise a logon hook.
+        let mut block = vec![0u8; 25 + 9 * 4];
+        block[..7].copy_from_slice(b"TESTMOD");
+
+        finish(Ne { code, data: block, relocs, entry_offset })
+    }
+
+    /// A module whose ordinal 1 (init) registers with the host and then
+    /// simply returns -- no kick, no fault, ever. For the same-life double-
+    /// free test (Path 1 of the double-free defect this file's
+    /// `apply_ignores_a_disconnect_for_a_channel_nobody_is_connected_on`
+    /// sibling in `crates/mbbs-server/src/host.rs` also covers): that test
+    /// wants one life that keeps running, not a restart, so `flush`'s
+    /// send-failure path and a manually-injected duplicate `Disconnect` can
+    /// both be aimed at the very same connection within it.
+    pub fn boots_and_runs_forever() -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut relocs = Vec::new();
+        let entry_offset = code.len() as u16;
+
+        // register_module(&block) -- block lives at data segment offset 0.
+        mov_ax_own_segment(&mut code, &mut relocs, 2); // block.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 0); // block.offset
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("register_module"));
+        add_sp(&mut code, 4); // one far-pointer argument
+
+        retf(&mut code);
+
+        // Same all-null-vectors shape as `faults_one_second_after_boot`: a
+        // connection's `Host::connect` is a clean no-op, and there is
+        // nothing here to exercise a logon hook.
         let mut block = vec![0u8; 25 + 9 * 4];
         block[..7].copy_from_slice(b"TESTMOD");
 
@@ -464,6 +499,77 @@ fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot {
     }
 }
 
+/// `In::Connect` over a raw `In`/`Out` channel, bypassing sockets and
+/// `conn.rs` entirely -- the same technique
+/// `a_module_that_crash_loops_makes_the_supervisor_give_up` and
+/// `a_module_that_faults_during_boot_is_not_restarted` above use to drive
+/// `host::run` directly. The double-free tests below need this because they
+/// inject messages (a duplicate `Disconnect`, a `Disconnect`/`Input` naming a
+/// channel from a life that already ended) no real client ever sends.
+///
+/// The `Receiver<Out>` is returned rather than dropped so the caller decides
+/// its lifetime: dropping it closes the connection's `Sender<Out>` from the
+/// other end (letting a caller reproduce `flush`'s send-failure path on
+/// purpose), keeping it alive does not.
+async fn connect_raw(tx: &std::sync::mpsc::Sender<In>, who: &str) -> (Option<Chan>, Receiver<Out>) {
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Out>(32);
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(In::Connect {
+        who: Connection::ansi(who).with_keys(std::iter::empty::<&str>()),
+        out: out_tx,
+        reply: reply_tx,
+    })
+    .expect("host thread is alive");
+    let chan = reply_rx.await.expect("host thread answers Connect");
+    (chan, out_rx)
+}
+
+/// Two `In::Connect`s, sent back-to-back with no `.await` between the two
+/// `send`s, so they are already both queued before the host thread can have
+/// processed either one.
+///
+/// This is what makes "at most one of these two may succeed" a meaningful,
+/// non-flaky assertion for the double-free tests below. `apply`'s loop
+/// drains *every* message already queued on one wake before it ever runs a
+/// `cycle` (`host.rs`'s `life`, step 2) -- so two `Connect`s queued together
+/// are always evaluated against the exact same `Pool` snapshot, in the same
+/// life. Calling [`connect_raw`] twice in a row instead -- `.await`ing the
+/// first reply before sending the second -- leaves a real-time gap between
+/// them, and against a module that keeps re-arming a one-second kick
+/// (`faults_one_second_after_boot`), a kick landing in that gap starts a
+/// *fresh* life with its own, legitimately-empty `Pool` -- which would also
+/// answer the second `Connect` with `Some`, for a completely different and
+/// correct reason having nothing to do with a double free. This is not
+/// theoretical: it is exactly what made the cross-life test below flaky
+/// under load before this helper existed.
+async fn connect_two_at_once(
+    tx: &std::sync::mpsc::Sender<In>,
+    who_a: &str,
+    who_b: &str,
+) -> ((Option<Chan>, Receiver<Out>), (Option<Chan>, Receiver<Out>)) {
+    let (out_tx_a, out_rx_a) = tokio::sync::mpsc::channel::<Out>(32);
+    let (reply_tx_a, reply_rx_a) = tokio::sync::oneshot::channel();
+    let (out_tx_b, out_rx_b) = tokio::sync::mpsc::channel::<Out>(32);
+    let (reply_tx_b, reply_rx_b) = tokio::sync::oneshot::channel();
+
+    tx.send(In::Connect {
+        who: Connection::ansi(who_a).with_keys(std::iter::empty::<&str>()),
+        out: out_tx_a,
+        reply: reply_tx_a,
+    })
+    .expect("host thread is alive");
+    tx.send(In::Connect {
+        who: Connection::ansi(who_b).with_keys(std::iter::empty::<&str>()),
+        out: out_tx_b,
+        reply: reply_tx_b,
+    })
+    .expect("host thread is alive");
+
+    let a = reply_rx_a.await.expect("host thread answers Connect");
+    let b = reply_rx_b.await.expect("host thread answers Connect");
+    ((a, out_rx_a), (b, out_rx_b))
+}
+
 /// Ordinal 1 (init) faulting is a broken deployment, not a survivable stop:
 /// `host::run` must return `Err` immediately, with no restart attempted.
 ///
@@ -658,4 +764,190 @@ async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {
     let mut after = TcpStream::connect(addr).await.expect("connect after the restart");
     let mut after_buf = Vec::new();
     read_until(&mut after, &mut after_buf, "Enter your user ID: ").await;
+}
+
+/// Path 1 of the double-free defect fixed alongside this test (see
+/// `crates/mbbs-server/src/pool.rs`'s `give_back` doc, and `host.rs`'s
+/// `apply`): a channel's output-send failure (`flush`) and a queued
+/// `Disconnect` for the *same* connection (`apply`'s `In::Disconnect` arm)
+/// can both reach `Pool::give_back` for the one disconnect. This predates
+/// the restart supervisor entirely -- no module stop and no restart is
+/// needed, just an ordinary client whose socket closed.
+///
+/// `builder::boots_and_runs_forever` is deliberately not one of the
+/// fault-driven modules above: this test wants one life that keeps running,
+/// so the duplicate free lands on the *same* life's `Pool` rather than a
+/// fresh one after a restart -- that cross-life shape is Path 2, the next
+/// test below.
+///
+/// This drives `host::run` directly over a raw `In`/`Out` channel
+/// ([`connect_raw`]) rather than through real sockets: it has to inject a
+/// *duplicate* `Disconnect` by hand, which no real client's `conn.rs` task
+/// ever sends on its own.
+#[tokio::test]
+async fn a_duplicate_disconnect_after_a_send_failure_does_not_let_two_clients_share_a_channel() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-duplicate-disconnect",
+        &builder::boots_and_runs_forever(),
+    );
+    let boot = boot(module, "mbbs-server-host-supervisor-duplicate-disconnect-root", 1);
+
+    let (tx, rx) = std::sync::mpsc::channel::<In>();
+    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+
+    // Connection A takes the only channel. Its output receiver is dropped
+    // immediately -- `flush`'s next `try_send` to it will see `Closed`,
+    // exactly as a real client's dropped `Sender<Out>` looks once its conn
+    // task has exited on EOF (`conn.rs`'s `pump`, the `Ok(0) | Err(_)` arm).
+    let (chan_a, out_rx_a) = connect_raw(&tx, "conn-a").await;
+    let chan_a = chan_a.expect("the only channel");
+    drop(out_rx_a);
+
+    // A byte of input makes GSBL echo it straight back
+    // (`gsbl::Channel::take`, step 11) -- that queues output for the
+    // channel, which is what gives `flush` something to fail to send on its
+    // next pass.
+    tx.send(In::Input { chan: chan_a, bytes: b"x".to_vec() })
+        .expect("host thread is alive");
+
+    // Generous slack for the host thread to wake, drain the message, run a
+    // cycle, and have `flush` discover the closed sender -- hangup, give the
+    // channel back, and clear `conns[0]`. This is Path 1's first, legitimate
+    // free.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The duplicate: a `Disconnect` for the very same channel, arriving
+    // exactly as it would if `apply` drained a queued `Disconnect` after
+    // `flush` had already hung the same connection up moments earlier.
+    // Before this fix, `apply`'s `In::Disconnect` arm had no guard and
+    // `Pool::give_back` had no guard either -- this would push a second
+    // copy of channel 0 into the free list.
+    tx.send(In::Disconnect { chan: chan_a }).expect("host thread is alive");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // With `terms == 1`, at most one of the next two connections may
+    // succeed. Before the fix, the doubled free list would have handed
+    // channel 0 to both. Sent as one batch ([`connect_two_at_once`]) rather
+    // than two separate awaited connects, so there is no real-time gap for
+    // anything else to land in between.
+    let ((chan_b, _out_rx_b), (chan_c, _out_rx_c)) = connect_two_at_once(&tx, "conn-b", "conn-c").await;
+
+    assert!(chan_b.is_some(), "the freed channel must be takeable once");
+    assert!(
+        chan_c.is_none(),
+        "and only once -- a second successful connect on a one-channel \
+         board means the duplicate Disconnect doubled the free list, and \
+         chan_b and chan_c would be the same Chan sharing one real channel: \
+         {chan_c:?}"
+    );
+
+    drop(tx);
+    let result = tokio::time::timeout(Duration::from_secs(5), host_thread)
+        .await
+        .expect("host thread must exit once every sender is dropped")
+        .expect("the host thread did not panic");
+    assert!(result.is_ok(), "the host thread must exit cleanly: {result:?}");
+}
+
+/// Path 2 of the double-free defect: a connection whose `Out::Close` never
+/// lands (`life`'s `let _ = conn.try_send(Out::Close)` silently drops on a
+/// full or closed `Sender<Out>`) can survive past a restart holding a
+/// channel identity that was only ever valid in the life that just ended.
+/// The next life starts with a fresh `Pool` and fresh `conns`
+/// (`host.rs`'s `life`), both all-unconnected, so a message using that stale
+/// identity must be ignored rather than corrupting the new life's
+/// bookkeeping.
+///
+/// This does not attempt to actually wedge a real client's bounded output
+/// queue full -- there is no module output to fill it with here
+/// (`faults_one_second_after_boot` registers no `lonrou`, so nothing is ever
+/// queued for a connected channel to begin with). It instead does directly,
+/// over the raw `In` channel, exactly what a straggling conn task would do
+/// on its own once the restart has happened underneath it: send a
+/// `Disconnect` and an `Input` naming a channel from the life that just
+/// ended. `host::run`'s `rx` is the *same* receiver for the whole
+/// supervisor -- `run` calls `life(&boot, &rx)` in a loop on it, never
+/// building a new one -- so this is exactly the channel a real straggling
+/// conn task would still hold a `Sender` for.
+///
+/// This test's black-box observation is the `Pool` corruption a stale
+/// `Disconnect` would cause (a doubled free list, the same symptom the Path
+/// 1 test above checks for). The stale `Input`'s harm -- a dead session's
+/// keystrokes landing in GSBL for whichever connection takes the channel
+/// next -- is not independently observable through this synthetic module,
+/// which registers no `lonrou` to read them back out; that guard is pinned
+/// precisely at the unit level instead, by
+/// `apply_ignores_input_for_a_channel_nobody_is_connected_on` in
+/// `crates/mbbs-server/src/host.rs`. It is still sent here, alongside the
+/// stale `Disconnect`, so this test also stands as evidence that the guard
+/// does not crash the host thread or otherwise disrupt the new life when
+/// both stale messages arrive together.
+#[tokio::test]
+async fn a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-stale-cross-life",
+        &builder::faults_one_second_after_boot(),
+    );
+    let boot = boot(module, "mbbs-server-host-supervisor-stale-cross-life-root", 1);
+
+    let (tx, rx) = std::sync::mpsc::channel::<In>();
+    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+
+    // The first life: connect once to get a genuine Chan value from *this*
+    // board -- with terms == 1 it can only ever be channel 0, but obtaining
+    // it through a real Connect (rather than minting one by hand) is what
+    // makes this "a channel identity from an earlier life" rather than an
+    // assumption about the type's representation.
+    let (stale_chan, out_rx1) = connect_raw(&tx, "life-one").await;
+    let stale_chan = stale_chan.expect("the only channel, in the first life");
+    drop(out_rx1); // this connection's task, gone without ever sending Disconnect
+
+    // Past the kick's one second, plus slack for the restart itself (a
+    // fresh Machine, a fresh NE load -- this synthetic module is tiny, so
+    // this is generous, not tight; the same budget the fault-driven tests
+    // above use). Every life this module boots re-registers the same
+    // one-second kick, so more than one restart can happen inside this
+    // window -- that is fine: the test only needs to be *some* life after
+    // the one `stale_chan` came from, never specifically the second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // The stale messages: a Disconnect and an Input, both naming
+    // `stale_chan` -- a channel identity from a life that has already
+    // ended -- but arriving at whichever life is running now, which started
+    // with a fresh, all-unconnected Pool and conns.
+    tx.send(In::Disconnect { chan: stale_chan }).expect("host thread is alive");
+    tx.send(In::Input { chan: stale_chan, bytes: b"EVIL\r".to_vec() })
+        .expect("host thread is alive");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // If the stale Disconnect corrupted the current life's Pool (a second
+    // free-list copy of the one channel), the second of these two connects
+    // would succeed when it must not. Sent as one batch
+    // ([`connect_two_at_once`]) rather than two separately-awaited connects:
+    // this module keeps re-arming its one-second kick on every life it
+    // boots, so a real-time gap between two sequential connects risks a
+    // *fresh* restart landing in between, which would answer the second
+    // connect with `Some` for a completely unrelated, correct reason (a new
+    // life's legitimately empty `Pool`) and make this assertion flaky rather
+    // than wrong.
+    let ((b, out_rx_b), (c, out_rx_c)) = connect_two_at_once(&tx, "later-life-b", "later-life-c").await;
+    assert!(b.is_some(), "the current life's channel must still be takeable");
+    assert!(
+        c.is_none(),
+        "and only once -- a second successful connect means the stale \
+         Disconnect doubled the current life's free list: {c:?}"
+    );
+    drop(out_rx_b);
+    drop(out_rx_c);
+
+    drop(tx);
+    let result = tokio::time::timeout(Duration::from_secs(5), host_thread)
+        .await
+        .expect("host thread must exit once every sender is dropped")
+        .expect("the host thread did not panic");
+    assert!(
+        result.is_ok(),
+        "a stale cross-life Disconnect/Input must not poison the machine or \
+         otherwise crash the host thread: {result:?}"
+    );
 }
