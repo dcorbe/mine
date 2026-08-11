@@ -27,6 +27,61 @@ use crate::chan::{Chan, Terms};
 const INPSIZ: usize = 1024;
 const OUTSIZ: usize = 8192;
 
+/// [`Channel::transmit`]'s scanner state for CSI (`ESC` `[` ... final byte),
+/// carried on [`Channel`] rather than kept local to one call for the same
+/// reason `column` and `supplied_lf` are: a sequence can straddle two
+/// `transmit()` calls, since MajorMUD flushes whatever `prf` happened to
+/// accumulate rather than one escape at a time.
+///
+/// CSI -- Control Sequence Introducer, ECMA-48 section 5.4 -- is the ANSI
+/// grammar every colour code and cursor move `WCCMMUD.DLL` writes uses:
+/// `ESC` `[`, zero or more parameter bytes (0x30-0x3F) and intermediate
+/// bytes (0x20-0x2F), then exactly one final byte (0x40-0x7E). Galacticomm's
+/// own `IF-ANSI` (`ESC[[ansi|ascii]`, see `ifansi.rs`) is a Galacticomm
+/// construct layered *on top of* a CSI opener, not a different grammar --
+/// `ifansi.rs` resolves that construct before a byte ever reaches
+/// `transmit`, so by the time bytes get here every escape is an ordinary
+/// CSI. Only `ESC` `[` opens one; a bare `ESC` not followed by `[` is not a
+/// case this host needs to render specially, so it is left exactly as
+/// `transmit` always treated it (see `Text`'s doc, below).
+///
+/// **Why this matters at all**: measured against `re/oracle/oracle_bank2.raw`
+/// (search "make- shift"), the genuine host's `btutsw(chan, 0x4f)` (79) wraps
+/// a room description at 79, 75, 77, 78, 72, 78 *visible* columns, and 79 is
+/// the hard ceiling across all 298 lines of that capture. Its first line is
+/// 97 raw bytes -- `\x1b[79D` (5), `\x1b[K` (3) and `\x1b[0;37;40m` (10), 18
+/// bytes of CSI, none of them visible -- but only 79 columns wide. Before
+/// this fix, every one of those 18 bytes counted as a column here too, and
+/// the wrap fired up to 18 characters early.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CsiScan {
+    /// Not inside anything. A byte here that is `ESC` (0x1B) moves to
+    /// [`CsiScan::Esc`] without yet being emitted or counted -- see that
+    /// variant for why the decision waits.
+    #[default]
+    Text,
+    /// `ESC` has arrived and is being held, unemitted, while its meaning is
+    /// still undecided: the very next byte says whether this was the start
+    /// of a CSI (`[`) or just an opaque byte that happens to be `ESC`.
+    ///
+    /// Deferred rather than emitted-then-corrected because correcting would
+    /// mean either mutating a byte already placed in `out` (impossible once
+    /// `wrap()` may have moved it) or double-emitting it. The cost is that
+    /// one byte can sit unwritten across a call boundary if nothing ever
+    /// follows it -- bounded to that one byte, and closed by the next byte
+    /// this channel is ever given. `WCCMMUD.DLL` never ends a channel's
+    /// output on a bare trailing `ESC`, so in practice the window always
+    /// closes.
+    Esc,
+    /// `ESC` `[` has been confirmed and both bytes emitted, uncounted.
+    /// Every subsequent parameter/intermediate byte (0x20-0x3F) is emitted
+    /// uncounted and this state holds; a final byte (0x40-0x7E) is emitted
+    /// uncounted and returns to `Text`; anything else cannot appear in a
+    /// well-formed CSI, so it aborts the sequence -- see `transmit`'s match
+    /// arm for the rule that follows from that.
+    Csi,
+}
+
 /// One terminal's worth of state.
 pub struct Channel {
     /// Raw bytes that have arrived and not yet been cooked into a line.
@@ -150,6 +205,10 @@ pub struct Channel {
     /// On `Channel` rather than local to `transmit` because the pair can arrive
     /// in two calls -- MajorMUD flushes whatever `prf` happened to accumulate.
     pub(crate) supplied_lf: bool,
+
+    /// [`Channel::transmit`]'s CSI scanner state. See [`CsiScan`] for why
+    /// this lives on the channel rather than local to one call.
+    pub(crate) csi: CsiScan,
 }
 
 impl Default for Channel {
@@ -174,6 +233,7 @@ impl Default for Channel {
             page_lines: 0,
             page_message: None,
             supplied_lf: false,
+            csi: CsiScan::Text,
         }
     }
 }
@@ -686,66 +746,86 @@ impl Channel {
         let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
         let mut column = self.column;
         let mut supplied_lf = self.supplied_lf;
+        let mut csi = self.csi;
 
         for &byte in bytes {
-            match byte {
-                b'\r' => {
-                    // R1 -- guide, `btulfd` page 114: the default on channel
-                    // initialisation is that an explicit LF is necessary
-                    // after every CR to move to the next line, and
-                    // `WCCMMUD.DLL` never calls `btulfd` or `btuhcr`, so the
-                    // default stands. `supplied_lf` remembers that this LF is
-                    // ours, so a module byte stream that already spells out
-                    // `\r\n` -- even split across two `transmit` calls --
-                    // does not get a second one.
-                    out.push(b'\r');
-                    out.push(b'\n');
-                    column = 0;
-                    supplied_lf = true;
-                    continue;
+            match csi {
+                CsiScan::Text => Self::dispatch_normal(
+                    &mut out,
+                    &mut column,
+                    &mut supplied_lf,
+                    &mut csi,
+                    self.width,
+                    byte,
+                ),
+                CsiScan::Esc => {
+                    if byte == b'[' {
+                        // Confirmed: this is a CSI. Both bytes were withheld
+                        // exactly for this moment -- emit them now, uncounted.
+                        out.push(0x1B);
+                        out.push(byte);
+                        csi = CsiScan::Csi;
+                    } else {
+                        // Not a CSI after all. The withheld ESC is an
+                        // ordinary byte, counted exactly as it always was
+                        // before this fix -- then the current byte is
+                        // dispatched fresh, since it was never held back and
+                        // may itself open a new escape.
+                        Self::emit_one(&mut out, &mut column, &mut supplied_lf, self.width, 0x1B);
+                        csi = CsiScan::Text;
+                        Self::dispatch_normal(
+                            &mut out,
+                            &mut column,
+                            &mut supplied_lf,
+                            &mut csi,
+                            self.width,
+                            byte,
+                        );
+                    }
                 }
-                b'\n' if supplied_lf => {
-                    // The other half of a module's own explicit `\r\n` --
-                    // already on the wire as the LF we supplied above.
-                    supplied_lf = false;
-                    continue;
+                CsiScan::Csi => {
+                    if (0x40..=0x7E).contains(&byte) {
+                        // The final byte. Emitted uncounted, like everything
+                        // else in the sequence; the CSI is complete.
+                        out.push(byte);
+                        csi = CsiScan::Text;
+                    } else if (0x20..=0x3F).contains(&byte) {
+                        // A parameter or intermediate byte. Still inside a
+                        // well-formed CSI.
+                        out.push(byte);
+                    } else {
+                        // Malformed: this byte cannot appear in a CSI at all
+                        // (not 0x20-0x7E). The house rule -- matching how a
+                        // real terminal's parser behaves -- is that a byte
+                        // which cannot continue the sequence aborts it and is
+                        // then handled exactly as if no escape were in
+                        // progress. Nothing already emitted as the aborted
+                        // prefix is revisited; only this byte, and everything
+                        // after it, gets ordinary treatment. That keeps the
+                        // rule simple and, crucially, keeps every byte on the
+                        // wire -- nothing is ever buffered pending a final
+                        // byte that might never come, so there is nothing to
+                        // lose and nothing that can hang.
+                        csi = CsiScan::Text;
+                        Self::dispatch_normal(
+                            &mut out,
+                            &mut column,
+                            &mut supplied_lf,
+                            &mut csi,
+                            self.width,
+                            byte,
+                        );
+                    }
                 }
-                b'\n' => {
-                    out.push(b'\n');
-                    continue;
-                }
-                _ => {}
             }
-            supplied_lf = false;
-            if self.width != 0 && column >= self.width {
-                let carried = Self::wrap(&mut out, &mut column, self.width);
-                if byte == b' ' && carried == 0 {
-                    // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
-                    // *becomes* the break `wrap()` just inserted, so it is
-                    // consumed here rather than carried onto the new line as
-                    // a leading indent.
-                    //
-                    // Only when `wrap()` carried nothing, though. When it moved
-                    // a partial word down, this space is not the break: it is
-                    // the separator *after* the word that just moved, and
-                    // consuming it glues that word to the next one. Measured
-                    // against the real module as `thisis`, `andthese`,
-                    // `Streetslead` -- one space lost per wrapped line of the
-                    // first paragraph of world text this host ever drew.
-                    continue;
-                }
-            }
-            out.push(byte);
-            // R10: with the default width of 0, wrap() is never called and
-            // nothing but a CR ever resets column -- so a long enough
-            // channel-lifetime of unwrapped output must not panic once it
-            // passes u16::MAX bytes since the last CR.
-            column = column.saturating_add(1);
         }
 
         // R6, guide `btuxmt` CAUTIONS page 191: a string that will not fit is
         // not output *at all*, and a status 253 is queued. Nothing above this
-        // line has touched the channel, so there is nothing to roll back.
+        // line has touched the channel, so there is nothing to roll back --
+        // `csi` included: a rejected call must not leave the channel
+        // believing it is mid-CSI on the strength of bytes that never
+        // reached the wire.
         if self.output.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
             return;
@@ -753,6 +833,104 @@ impl Channel {
         self.output.extend(out);
         self.column = column;
         self.supplied_lf = supplied_lf;
+        self.csi = csi;
+    }
+
+    /// `Text`-state dispatch: either the byte opens a possible CSI, or it is
+    /// ordinary output. Its own function because two of [`Channel::transmit`]'s
+    /// three [`CsiScan`] arms resolve mid-byte to "handle this byte as if
+    /// nothing were in progress" and need to run the same two-way branch the
+    /// main `Text` arm does.
+    fn dispatch_normal(
+        out: &mut Vec<u8>,
+        column: &mut u16,
+        supplied_lf: &mut bool,
+        csi: &mut CsiScan,
+        width: u16,
+        byte: u8,
+    ) {
+        if byte == 0x1B {
+            // Held, not emitted -- see `CsiScan::Esc`'s doc for why.
+            *csi = CsiScan::Esc;
+        } else {
+            Self::emit_one(out, column, supplied_lf, width, byte);
+        }
+    }
+
+    /// One byte's worth of the pre-CSI-fix `transmit` body: CRLF expansion
+    /// (R1), the wrap check (R9), and the column count (R10). Used for every
+    /// byte `transmit` decides is *not* part of a CSI -- which, before this
+    /// fix, was every byte.
+    fn emit_one(out: &mut Vec<u8>, column: &mut u16, supplied_lf: &mut bool, width: u16, byte: u8) {
+        match byte {
+            b'\r' => {
+                // R1 -- guide, `btulfd` page 114: the default on channel
+                // initialisation is that an explicit LF is necessary after
+                // every CR to move to the next line, and `WCCMMUD.DLL` never
+                // calls `btulfd` or `btuhcr`, so the default stands.
+                // `supplied_lf` remembers that this LF is ours, so a module
+                // byte stream that already spells out `\r\n` -- even split
+                // across two `transmit` calls -- does not get a second one.
+                out.push(b'\r');
+                out.push(b'\n');
+                *column = 0;
+                *supplied_lf = true;
+                return;
+            }
+            b'\n' if *supplied_lf => {
+                // The other half of a module's own explicit `\r\n` -- already
+                // on the wire as the LF we supplied above.
+                *supplied_lf = false;
+                return;
+            }
+            b'\n' => {
+                out.push(b'\n');
+                return;
+            }
+            _ => {}
+        }
+        *supplied_lf = false;
+        // Backspace (0x08) is deliberately not special-cased here: it falls
+        // through and costs a column like any other byte, exactly as it did
+        // before this fix. The oracle cannot settle whether that is right --
+        // all 36 backspace-bearing lines in `oracle_bank2.raw` are 22-31
+        // visible columns, nowhere near the 79-column wrap boundary, so
+        // there is no captured line where it would show. Left alone rather
+        // than guessed at.
+        if width != 0 && *column >= width {
+            let carried = Self::wrap(out, column, width);
+            if byte == b' ' && carried == 0 {
+                // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
+                // *becomes* the break `wrap()` just inserted, so it is
+                // consumed here rather than carried onto the new line as a
+                // leading indent.
+                //
+                // Only when `wrap()` carried nothing, though. When it moved a
+                // partial word down, this space is not the break: it is the
+                // separator *after* the word that just moved, and consuming
+                // it glues that word to the next one.
+                //
+                // This host used to cite the specific words that surfaced
+                // that bug -- `thisis`, `andthese`, `Streetslead`, from
+                // `re/oracle/oracle_bank2.raw`'s Town Square description. The
+                // CSI fix moved every wrap point in that same paragraph (the
+                // description is drawn with ANSI colour codes ahead of and
+                // inside it, which were being counted as columns and are
+                // not), so those three words no longer mark where a wrap
+                // falls in this host's output. The rule they were measured
+                // against did not change; only the line lengths measuring it
+                // did. See `crates/mbbs/tests/wccmmud.rs`,
+                // `a_returning_player_entering_the_realm`, for the citations
+                // re-measured against the oracle after this fix.
+                return;
+            }
+        }
+        out.push(byte);
+        // R10: with the default width of 0, wrap() is never called and
+        // nothing but a CR ever resets column -- so a long enough
+        // channel-lifetime of unwrapped output must not panic once it passes
+        // u16::MAX bytes since the last CR.
+        *column = column.saturating_add(1);
     }
 
     /// Break the line, moving a partial word down with it.
@@ -1412,6 +1590,283 @@ mod tests {
         let long = vec![b'x'; 70_000];
         g.transmit(chan(), &long);
         assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
+    }
+
+    // -- CSI (ESC `[` ... final byte 0x40-0x7E) is invisible to the column
+    // count -----------------------------------------------------------------
+    //
+    // Measured against `re/oracle/oracle_bank2.raw` (search "make- shift"):
+    // the Town Square description wraps at 79, 75, 77, 78, 72, 78 *visible*
+    // columns against a `btutsw(chan, 0x4f)` (79) width, and 79 is the hard
+    // ceiling across all 298 lines of that capture. Its first line is 97 raw
+    // bytes but 79 visible -- `\x1b[79D` (5), `\x1b[K` (3) and `\x1b[0;37;40m`
+    // (10), 18 bytes total, excluded from the count. Before this fix, this
+    // host counted every one of those 18 bytes as a column and wrapped up to
+    // 18 characters early.
+
+    #[test]
+    fn a_csi_sequence_does_not_advance_the_wrap_column() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[31mABCDE");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1b[31mABCDE".to_vec(),
+            "the 5-byte CSI is emitted but counts as zero columns, so the 5 \
+             visible letters that follow fill the width exactly without \
+             wrapping"
+        );
+    }
+
+    #[test]
+    fn a_csi_split_immediately_after_the_esc_is_still_not_counted() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b");
+        g.transmit(chan(), b"[31mABCDE");
+        assert_eq!(g.drain_output(chan()), b"\x1b[31mABCDE".to_vec());
+    }
+
+    #[test]
+    fn a_csi_split_immediately_after_the_bracket_is_still_not_counted() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[");
+        g.transmit(chan(), b"31mABCDE");
+        assert_eq!(g.drain_output(chan()), b"\x1b[31mABCDE".to_vec());
+    }
+
+    #[test]
+    fn a_csi_split_mid_parameter_is_still_not_counted() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[3");
+        g.transmit(chan(), b"1mABCDE");
+        assert_eq!(g.drain_output(chan()), b"\x1b[31mABCDE".to_vec());
+    }
+
+    #[test]
+    fn a_lone_esc_not_starting_a_csi_still_counts_toward_the_column() {
+        // Only `ESC [` opens a CSI. WCCMMUD.DLL never emits a bare ESC --
+        // every escape it writes is a complete CSI (see the IF-ANSI work in
+        // `ifansi.rs`) -- so this is scope discipline, not a case this host
+        // needs to render well: a stray ESC keeps exactly the pre-fix
+        // behaviour of being just another opaque byte that costs a column.
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1bABCDE");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1bABCD\r\nE".to_vec(),
+            "ESC, A, B, C, D fill the five columns; E wraps"
+        );
+    }
+
+    #[test]
+    fn an_esc_with_no_follow_up_yet_is_held_pending_not_lost() {
+        // The deferred half of the scanner: whether ESC counts -- and
+        // whether it is even the start of a CSI -- is not decided until the
+        // next byte is seen, so ESC is not committed to the wire until then
+        // either. This mirrors `supplied_lf`, which already defers a
+        // decision (whether an LF is the module's own or this host's
+        // supplied one) across a call boundary.
+        //
+        // The window this opens is one byte wide and closes as soon as
+        // another byte arrives, from this call or a later one. WCCMMUD.DLL
+        // never ends a channel's output on a bare trailing ESC, so in
+        // practice it always closes.
+        let mut g = one();
+        g.transmit(chan(), b"\x1b");
+        assert!(
+            g.drain_output(chan()).is_empty(),
+            "held pending, not dropped, until the next byte resolves it"
+        );
+        g.transmit(chan(), b"A");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1bA".to_vec(),
+            "resolved as not a CSI: both bytes are now on the wire, in order"
+        );
+    }
+
+    #[test]
+    fn a_malformed_csi_aborts_on_a_control_byte_and_that_byte_gets_ordinary_treatment() {
+        // A C0 control byte is never a CSI parameter, intermediate or final
+        // byte (0x20-0x7E), so it cannot belong to the sequence. The house
+        // rule, chosen because a real terminal's parser works the same way:
+        // a byte that cannot continue the CSI aborts it and is then handled
+        // exactly as if no escape were in progress -- so a stray CR mid-CSI
+        // still moves the wire to the next line rather than being eaten or
+        // hanging the scanner. Nothing already emitted as part of the
+        // aborted prefix is revisited or uncounted-turned-counted; only the
+        // aborting byte, and everything after it, gets ordinary treatment.
+        let mut g = one();
+        g.transmit(chan(), b"\x1b[3\rX");
+        assert_eq!(g.drain_output(chan()), b"\x1b[3\r\nX".to_vec());
+    }
+
+    #[test]
+    fn an_unterminated_csi_holds_state_across_calls_without_losing_bytes() {
+        // No final byte (0x40-0x7E) ever arrives in this call. Every byte is
+        // still emitted -- nothing is buffered and held back to be lost --
+        // and none of them advance the column, since every one of them is a
+        // valid CSI parameter byte (0x30-0x3F) and the scanner has no reason
+        // to abort. This cannot hang: the loop is bounded by `bytes.len()`
+        // regardless of what state it ends in.
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[123456789");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1b[123456789".to_vec(),
+            "an escape that never closes still puts every byte on the wire, \
+             and cannot trigger a wrap since none of it counts"
+        );
+
+        // The final byte can arrive in a later call and still closes the
+        // sequence correctly.
+        g.transmit(chan(), b"m");
+        assert_eq!(g.drain_output(chan()), b"m".to_vec());
+
+        // Ordinary bytes after the close count again.
+        g.transmit(chan(), b"AB");
+        assert_eq!(g.drain_output(chan()), b"AB".to_vec());
+    }
+
+    #[test]
+    fn an_overflowing_call_does_not_commit_a_half_open_csi_either() {
+        // R6's atomicity is per commit, not per byte: a call rejected for
+        // overflow must leave the channel exactly as if it had never been
+        // made, including where the CSI scanner was. Committing the scan
+        // state anyway would leave a channel that thinks it is still inside
+        // a CSI begun by bytes that never reached the wire.
+        //
+        // A width and five more letters, not just `m` alone: the rejected
+        // call's own bytes happen to resolve its *local* scan state back to
+        // `Text` before it overflows (a run of `x`s closes the CSI the
+        // moment the first one lands as a final byte), so a mutant that
+        // commits scan state on the overflow path anyway produces the exact
+        // same bytes for `m` alone as the correct code -- the same blind
+        // spot the two `resume_being_counted` tests above exist for. Five
+        // letters after `m` force the same wrap-or-not distinction: they
+        // only fit without wrapping if `m` closed the *first* call's CSI
+        // uncounted, not if the rejected call's `Text` state leaked through
+        // and made `m` an ordinary, counted byte.
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[3");
+        let huge = vec![b'x'; OUTSIZ + 1];
+        g.transmit(chan(), &huge);
+        assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
+        g.transmit(chan(), b"mABCDE");
+        assert_eq!(g.drain_output(chan()), b"\x1b[3mABCDE".to_vec());
+    }
+
+    #[test]
+    fn the_oracle_s_town_square_line_fits_at_width_79_once_the_csi_prefix_is_excluded() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 79;
+        let line = b"\x1b[79D\x1b[K\x1b[0;37;40m    The market is crowded this morning and every stall along the square is busy";
+        assert_eq!(line.len(), 97, "the oracle's own raw byte count for this line");
+        g.transmit(chan(), line);
+        assert_eq!(
+            g.drain_output(chan()),
+            line.to_vec(),
+            "97 raw bytes, 79 of them visible, and no wrap triggered within \
+             them -- matching the oracle, where this line runs the full 79 \
+             columns before the break"
+        );
+    }
+
+    // -- Column-resumption: every test above shares a blind spot ------------
+    //
+    // Every CSI test that asserts exact bytes with no wrap in reach proves
+    // *at most* that the scanner did not overcount -- undercounting (a
+    // scanner stuck believing it is still inside a CSI after it closed or
+    // aborted) is silent under that shape, because a missed wrap looks
+    // exactly like a correctly-suppressed one until something forces the
+    // column past the width. These two force it.
+
+    #[test]
+    fn after_a_well_formed_csi_closes_ordinary_bytes_resume_being_counted() {
+        // Complements `a_csi_sequence_does_not_advance_the_wrap_column`,
+        // which cannot tell "the CSI cost zero columns" apart from "the
+        // scanner never left `CsiScan::Csi`, so *nothing* after it costs a
+        // column either" -- both produce the same unbroken output for five
+        // letters at width 5. A sixth letter is the difference: it only
+        // wraps if the five before it, and it, were actually counted after
+        // the CSI's final byte returned the scanner to ordinary text.
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[31mABCDEF");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1b[31mABCDE\r\nF".to_vec(),
+            "five columns fill the width exactly; the sixth wraps"
+        );
+    }
+
+    #[test]
+    fn after_an_aborted_csi_ordinary_bytes_resume_being_counted() {
+        // Same blind spot, for the abort path this time:
+        // `a_malformed_csi_aborts_on_a_control_byte...` and
+        // `an_unterminated_csi_holds_state_across_calls_without_losing_bytes`
+        // both only check short follow-ups, whose bytes are identical
+        // whether the scanner correctly returned to `CsiScan::Text` or stayed
+        // stuck in `Csi`. Six ordinary bytes after the abort force the same
+        // wrap-or-not distinction as the test above.
+        let mut g = one();
+        g.channel_mut(chan()).width = 5;
+        g.transmit(chan(), b"\x1b[3\rABCDEF");
+        assert_eq!(
+            g.drain_output(chan()),
+            b"\x1b[3\r\nABCDE\r\nF".to_vec(),
+            "the CR resets the column to zero, and the wrap still lands \
+             exactly where five *counted* columns put it"
+        );
+    }
+
+    // -- CSI grammar boundaries -----------------------------------------------
+    //
+    // 0x20/0x3F bound the parameter/intermediate class and 0x40/0x7E bound
+    // the final-byte class. An off-by-one on any of the four routes that one
+    // byte through the wrong arm -- which, for a single ordinary byte
+    // following it, produces identical output either way (see the blind
+    // spot above). `width = 1` closes that gap cheaply: at width 1, *any*
+    // byte this scanner miscounts sets `column` to something `>= width`,
+    // and the very next byte -- an ordinary letter that would otherwise
+    // sail through untouched -- wraps because of it.
+
+    #[test]
+    fn the_final_byte_boundary_0x40_costs_no_column() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 1;
+        g.transmit(chan(), b"\x1b[@X");
+        assert_eq!(g.drain_output(chan()), b"\x1b[@X".to_vec());
+    }
+
+    #[test]
+    fn the_final_byte_boundary_0x7e_costs_no_column() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 1;
+        g.transmit(chan(), b"\x1b[~X");
+        assert_eq!(g.drain_output(chan()), b"\x1b[~X".to_vec());
+    }
+
+    #[test]
+    fn the_parameter_byte_boundary_0x20_costs_no_column() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 1;
+        g.transmit(chan(), b"\x1b[ mX");
+        assert_eq!(g.drain_output(chan()), b"\x1b[ mX".to_vec());
+    }
+
+    #[test]
+    fn the_parameter_byte_boundary_0x3f_costs_no_column() {
+        let mut g = one();
+        g.channel_mut(chan()).width = 1;
+        g.transmit(chan(), b"\x1b[?mX");
+        assert_eq!(g.drain_output(chan()), b"\x1b[?mX".to_vec());
     }
 
     #[test]
