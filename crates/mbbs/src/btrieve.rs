@@ -632,13 +632,15 @@ impl Block {
 
     /// The file's records, reading them if this is the first time.
     ///
+    /// Both v5 and v6 files reach [`Records::read`](Records::read) the same
+    /// way -- it dispatches on `geometry.version` internally
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`, Task 5).
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read, or holds a different number of records from
-    /// the number its header claims. Also if the file is v6:
-    /// [`Records::read`](Records::read) refuses those until this host can
-    /// resolve their logical page numbers, and every caller here reaches them
-    /// through it.
+    /// If the file cannot be read, holds a different number of records from
+    /// the number its header claims, or -- v6 only -- its allocation table
+    /// cannot be resolved (any refusal of [`v6::Map::read`]).
     pub fn records(&mut self) -> Result<&Records, BtvError> {
         if self.records.is_none() {
             self.records = Some(Records::read(
@@ -1662,31 +1664,30 @@ mod tests {
         assert_eq!(geometry.records, 30, "page 1 is live and says thirty");
     }
 
-    /// Task 2: reading records from a v6 file must refuse and name the
-    /// version, not hand back an empty vector. Before this, `walk` applied
-    /// v5's `page * number` arithmetic to `DUPKEY30.DAT` regardless of its
-    /// version and returned *something* -- wrong, silently -- rather than
-    /// nothing and an error. `DUPKEY30.DAT` is the fixture to catch this
-    /// with precisely because its 30 records make "found nothing" an
-    /// impossible accidental pass: `NEWMP001.VIR` genuinely holds zero
-    /// records, so a walk that resolved no addressing at all still landed on
-    /// the header's own count by coincidence, which is what made the
-    /// original acceptance test in `crates/mbbs/tests/btrieve.rs` vacuous.
+    /// Task 2 made reading records from a v6 file refuse and name the
+    /// version rather than hand back an empty vector -- before that, `walk`
+    /// applied v5's `page * number` arithmetic to `DUPKEY30.DAT` regardless
+    /// of its version and returned *something*, wrong, silently. Task 5
+    /// replaces that refusal with the real path: `DUPKEY30.DAT` is still the
+    /// fixture that catches a regression here, for the same reason it caught
+    /// the original bug -- its 30 records make "found nothing" (or "found
+    /// the wrong thing that happens to count to 30") impossible to pass by
+    /// accident. `crates/mbbs/tests/btrieve.rs`'s
+    /// `dupkey30_reads_byte_for_byte_through_records_read` is the byte-level
+    /// check against the genuine engine's own dump; this one pins the
+    /// higher-level shape -- a v6 file reads through the same `Records::read`
+    /// every v5 file does, with no special-casing at this entry point.
     #[test]
-    fn a_v6_files_records_are_refused_rather_than_walked_with_v5_arithmetic() {
+    fn a_v6_files_records_are_read_correctly_not_refused() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
         let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
         let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
 
-        let e = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed)
-            .expect_err("v6 page addressing is not resolved yet");
-        assert!(e.why.contains("V6"), "{e}: names the version");
-        assert!(
-            e.why.contains("logical page"),
-            "{e}: says what is missing, not just that v6 is unsupported"
-        );
+        let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed)
+            .expect("v6 addressing is resolved as of Task 5");
+        assert_eq!(records.len(), 30, "page 1's live count, walked for real");
     }
 
     /// Every other v6 test in this file has its live copy on physical page 1

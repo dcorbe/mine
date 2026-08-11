@@ -109,6 +109,19 @@ impl Map {
         self.physical.get(&logical).copied()
     }
 
+    /// Every logical id this map resolves, paired with the physical page
+    /// that currently holds it.
+    ///
+    /// [`Self::physical`] serves a caller that already knows which logical
+    /// id it wants; `records::walk` (Task 5 of the plan) does not -- it has
+    /// to visit every claimed page there is, so it needs the whole
+    /// resolution rather than one lookup at a time. Order is unspecified;
+    /// callers that need a particular one (`walk` sorts by logical id, to
+    /// match the record ordering Evidence 1c measures) do it themselves.
+    pub fn entries(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.physical.iter().map(|(&logical, &physical)| (logical, physical))
+    }
+
     /// Build the map from a v6 file already read whole into memory.
     ///
     /// `page_size` is [`super::Geometry`]'s already-established `page` field
