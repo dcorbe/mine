@@ -160,13 +160,20 @@ impl Records {
     /// Zero-cost for v5 (`key_shift` is `0`, so this borrows `bytes`
     /// unchanged) -- `WCCUPDAT.DAT`'s 38,754-record sort must not pay for a
     /// fix a v5 file never needs.
-    fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-        if self.key_shift == 0 {
-            return std::borrow::Cow::Borrowed(bytes);
-        }
-        let mut padded = vec![0u8; self.key_shift];
-        padded.extend_from_slice(bytes);
-        std::borrow::Cow::Owned(padded)
+    pub(crate) fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        keyed(self.key_shift, bytes)
+    }
+
+    /// How far a key's `offset` field is ahead of [`Record::bytes`].
+    ///
+    /// Exposed because three call sites outside this type read key bytes off
+    /// a record and cannot reach [`Self::keyed`] through a `&mut self`
+    /// borrow: [`answer_with_key`](crate::shims::btrieve) and the two in
+    /// `Block::reindex`. They were all missed when `key_shift` was
+    /// introduced, and a key read without it sorts and answers on the wrong
+    /// bytes.
+    pub(crate) fn key_shift(&self) -> usize {
+        self.key_shift
     }
 
     /// Re-derive `order`, `rank` and `ties` from `records`, for the given keys.
@@ -782,6 +789,31 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
         next = super::pages::long(&link);
     }
     Ok(dead)
+}
+
+/// Pad a record's bytes so a key's own `offset` field lands where it was
+/// measured from.
+///
+/// A key definition's `offset` is relative to the **physical slot**, and a
+/// v6 slot opens with a two-byte marker that [`Record::bytes`] does not carry
+/// (Evidence 1b) -- so on a v6 file every key is two bytes further along than
+/// the body it is read out of. `keys.rs`'s own `at::CHAIN` is measured the
+/// same way, from the slot.
+///
+/// Free rather than a method so the three call sites that hold a `&mut
+/// Records`, or no `Records` at all, can use the one implementation instead
+/// of open-coding the shift a fourth time.
+///
+/// Zero-cost for v5, where `shift` is `0` and this borrows `bytes` unchanged:
+/// `WCCUPDAT.DAT`'s 38,754-record sort must not pay for a fix a v5 file never
+/// needs.
+pub(crate) fn keyed(shift: usize, bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if shift == 0 {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut padded = vec![0u8; shift];
+    padded.extend_from_slice(bytes);
+    std::borrow::Cow::Owned(padded)
 }
 
 /// Whether a slot's bytes would be read as unused rather than as a record.

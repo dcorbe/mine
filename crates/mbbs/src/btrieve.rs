@@ -594,6 +594,51 @@ impl Block {
         &self.keys
     }
 
+    /// A record's bytes, padded so a key's own `offset` lands where it was
+    /// measured from -- see [`records::keyed`].
+    ///
+    /// On the `Block` because the shim layer reads key bytes off a record it
+    /// reached through one, and has no other route to the file's version.
+    pub(crate) fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let shift = self.records.as_ref().map_or(0, Records::key_shift);
+        records::keyed(shift, bytes)
+    }
+
+    /// Whether this host will write to the file at all.
+    ///
+    /// # Errors
+    ///
+    /// If the file is v6. Reading one is Tasks 1-6 of
+    /// `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`; **writing one is
+    /// deliberately out of that plan's scope**, and needs the allocation-table
+    /// maintenance, shadow-copy flipping and generation bumping the engine
+    /// does.
+    ///
+    /// This exists because removing the blanket v6 refusal from
+    /// `Records::read` (Task 2, lifted in Task 5) silently un-guarded the
+    /// write path, which had never been v6-safe and was only unreachable
+    /// because every v6 read failed first. A v6 record's `position` carries a
+    /// **logical** page id (Evidence 1c), and `pages::write_record` seeks to a
+    /// position as a literal byte offset -- so an insert or update would have
+    /// landed on whatever physical page happened to sit at the logical id's
+    /// arithmetic, or past the end of the file, while the in-memory model
+    /// recorded a success. Silent corruption, so: refuse.
+    fn writable(&self) -> Result<(), BtvError> {
+        if self.geometry.version != Version::V5 {
+            return Err(BtvError {
+                file: self.name.clone(),
+                why: format!(
+                    "is a {:?} file, and this host reads those but does not write \
+                     them -- a v6 record's position names a logical page, and \
+                     writing one needs the allocation-table maintenance that is \
+                     deliberately out of the read plan's scope",
+                    self.geometry.version
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The `struct btvblk` the module holds.
     pub fn block(&self) -> FarPtr {
         self.block
@@ -710,6 +755,7 @@ impl Block {
     /// records, or the file cannot be written.
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
+        self.writable()?;
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -807,6 +853,7 @@ impl Block {
     /// or the file cannot be written.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
+        self.writable()?;
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -992,6 +1039,13 @@ impl Block {
             fail("reindex called before the records were loaded".to_owned())
         })?;
 
+        // A key's `offset` is measured from the physical slot, and a v6
+        // record's bytes start two bytes into it -- so every key read below
+        // has to be padded the same way `Records`' own sort does. Taken once
+        // here rather than through `Records::keyed`, which this loop cannot
+        // reach: `records` is borrowed immutably for its whole body.
+        let shift = records.key_shift();
+
         let layout = pages::Layout {
             page: self.geometry.page,
             physical: self.geometry.physical,
@@ -1037,8 +1091,11 @@ impl Block {
                 let record = records.ordered(key.number, n).expect("in range");
                 let joins = n > 0
                     && key.compare(
-                        &records.ordered(key.number, n - 1).expect("in range").bytes,
-                        &record.bytes,
+                        &records::keyed(
+                            shift,
+                            &records.ordered(key.number, n - 1).expect("in range").bytes,
+                        ),
+                        &records::keyed(shift, &record.bytes),
                     ) == std::cmp::Ordering::Equal;
                 if joins && key.duplicates {
                     let last = entries.last_mut().expect("a group to join");
@@ -1046,7 +1103,7 @@ impl Block {
                     groups.last_mut().expect("a group to join").push(record.position);
                 } else {
                     entries.push(pages::Entry::unique(
-                        key.extract(&record.bytes),
+                        key.extract(&records::keyed(shift, &record.bytes)),
                         record.position,
                     ));
                     groups.push(vec![record.position]);
@@ -1689,6 +1746,40 @@ mod tests {
         assert_eq!(records.len(), 30, "page 1's live count, walked for real");
     }
 
+    /// A v6 record's key is two bytes further along than the body it is read
+    /// out of, because a key's `offset` is measured from the physical slot
+    /// and [`Record::bytes`] starts past the slot's two-byte marker
+    /// (Evidence 1b).
+    ///
+    /// `DUPKEY30.DAT`'s only key is four bytes at slot offset 2 -- so the key
+    /// of the record whose body begins `09000000 1b000000` is `09000000`, the
+    /// body's own first four bytes, reached by padding rather than by reading
+    /// the body at offset 2 and getting `1b000000`, its *second* field.
+    ///
+    /// The byte-for-byte fixture tests cannot see this: they compare record
+    /// bodies, which are right either way. Only something that reads a key
+    /// notices, which is why this exists separately.
+    #[test]
+    fn a_v6_records_key_is_padded_past_the_slot_marker() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+        let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed).expect("records");
+
+        let key = &parsed[0];
+        for at in 0..records.len() {
+            let record = records.physical(at).expect("in range");
+            let padded = key.extract(&records.keyed(&record.bytes));
+            assert_eq!(
+                padded,
+                record.bytes[..4].to_vec(),
+                "a v6 key is the body's own first four bytes"
+            );
+        }
+    }
+
     /// Every other v6 test in this file has its live copy on physical page 1
     /// -- which alone cannot tell a correct generation comparison apart from
     /// code that just always prefers the second half. `DUPKEY30SWAPPED.DAT`
@@ -1872,6 +1963,50 @@ mod tests {
         let mut bytes = vec![0u8; 16];
         bytes[..2].copy_from_slice(&n.to_le_bytes());
         bytes
+    }
+
+    /// Writing a v6 file is refused, and the refusal is load-bearing.
+    ///
+    /// Until Task 5 the write path was v6-safe only by accident:
+    /// `Records::read` refused every v6 file, and `insert`/`update` call it
+    /// before doing anything, so neither could get started. Task 5 lifted
+    /// that refusal for reads and un-guarded the writes behind it -- and
+    /// `pages::write_record` seeks to a record's `position` as a literal byte
+    /// offset, while a v6 position carries a **logical** page id (Evidence
+    /// 1c). On `DUPKEY30.DAT` logical 2 is physical 10, so an update would
+    /// have written over a different page entirely and reported success.
+    ///
+    /// Found by Task 5's code review, not by any test: every v6 test in this
+    /// crate reads.
+    #[test]
+    fn a_v6_file_is_read_but_never_written() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let mut block = block(path.clone());
+        block.name = "DUPKEY30.DAT".to_owned();
+        block.geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        block.keys = keys::parse("DUPKEY30.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.maxlen = block.geometry.reclen;
+
+        // Reading it works -- that is Tasks 1-5, and the point of the refusal
+        // being on the write path alone.
+        assert_eq!(block.records().expect("v6 reads").len(), 30);
+
+        let bytes = vec![0u8; usize::from(block.geometry.reclen)];
+        let e = block.insert(&bytes).expect_err("v6 inserts are refused");
+        assert!(e.why.contains("does not write"), "{e}");
+        let at = block
+            .records()
+            .expect("read")
+            .physical(0)
+            .expect("a record")
+            .position;
+        let e = block.update(at, &bytes).expect_err("v6 updates are refused");
+        assert!(e.why.contains("does not write"), "{e}");
+
+        // And the file on disk is untouched.
+        assert_eq!(std::fs::read(&path).expect("readable"), fcr, "not one byte written");
     }
 
     /// The trap the plan names: `geometry` is a `Copy` struct held by value on
