@@ -118,7 +118,11 @@ pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// See [`channel_ansi`] for how the ANSI/ASCII branch is chosen.
 pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
     let ansi = channel_ansi(machine, host);
-    let text = &crate::ifansi::process(text, ansi);
+    let text = crate::ifansi::process(text, ansi);
+    // After IF-ANSI, per `FormatOutput`'s own order
+    // (`ExportedModuleBase.cs:1133-1138`) -- see [`normalize_newlines`] for
+    // why, and for the order test that catches a swap.
+    let text = &normalize_newlines(&text);
 
     let at = host
         .globals()
@@ -141,6 +145,92 @@ pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(),
         .write(machine, "prfptr", &moved.to_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
+}
+
+/// `FormatNewLineCarriageReturn`, MBBSEmu's second `FormatOutput` stage
+/// (`ExportedModuleBase.cs:971-1004`), ported literally: every bare `\r` or
+/// `\n` becomes `\r\n`. If the very next byte would have completed the pair
+/// the other way round -- `\r` then `\n`, or `\n` then `\r` -- that byte is
+/// consumed too, so a line ending the module already spelled out in full
+/// does not double. Anything else passes through untouched.
+///
+/// Runs in [`append`], after [`crate::ifansi::process`] and before a byte
+/// reaches `prfbuf` -- both required by `FormatOutput`'s own order
+/// (`ExportedModuleBase.cs:1133-1138`) and by `crate::gsbl::Channel::transmit`'s
+/// wrap arithmetic, which counts every byte toward `column`: inserting a
+/// `\r` downstream of that count would desynchronise the column tracker from
+/// the wire, the same trap this function's sibling stage avoided (`append`'s
+/// own doc comment).
+///
+/// # The oracle does not carve out an exception -- once `re/oracle/` is read
+/// correctly
+///
+/// The plan this function implements
+/// (`docs/plans/2026-08-11-live-session-defects.md`, Task 2) measured
+/// "18,601 bare `\n` survive on the genuine wire" and read that as meaning
+/// the rule cannot be "every `\n` becomes `\r\n`". That measurement counted
+/// all 214 files under `re/oracle/` as one corpus of wire bytes. They are
+/// not. `tools/oracle/mudlib.py:20,39-41` shows `Session.raw` is opened once
+/// and written the *exact* bytes `socket.recv()` returned, nothing else --
+/// genuinely the wire, and that is every `.raw` file. The `.log`/`.json`
+/// files are a second, derived artifact: `tools/oracle/oracle_blur_duration.py:31-32,70`
+/// strips ANSI and decodes CP437 before writing, one record per captured
+/// chunk, terminated by a `\n` **the logging tool adds itself**
+/// (`logf.write(f"{t:.3f} RX {ln}\n")`) -- a record separator with no wire
+/// byte behind it at all.
+///
+/// Filtered to the 120 files that are actually the wire, `re/oracle/`
+/// contains 117,987 `\r\n` and **zero** bare `\n`. The 97 bare `\r` that
+/// remain are not a counterexample either -- every one sits inside an FSD
+/// field repaint, immediately before an `ESC[` cursor address (e.g.
+/// `Zinvar\r\x1b[0;1m\x1b[23;1f...`, `re/oracle/oracle_blur_duration.raw`
+/// offset 8773), which is an FSD field repaint written straight to the wire
+/// via `host.gsbl_mut().transmit(...)` (`crate::shims::fsd::fsd_cycle`,
+/// `fsd_drain_edge`, `outprf` -- `crates/mbbs/src/shims/fsd.rs:1314,1656,1683,1804`)
+/// and never passes through `append` at all -- see [`append`]'s own doc
+/// comment for why nothing this function does could have touched it. So the oracle,
+/// read as the wire rather than as "everything the directory holds", agrees
+/// with MBBSEmu's own algorithm exactly: there is no carve-out to find. The
+/// plan's warning to let the oracle override the mirror when they disagree
+/// is followed here by finding that they do not disagree -- the apparent
+/// conflict was the measurement, not the code.
+///
+/// `crates/mbbs/tests/newline_oracle.rs` pins this against `re/oracle/`
+/// directly, filtered the same way, so a future `.raw` capture that
+/// contradicts it fails a test rather than waiting to be noticed by eye.
+///
+/// # No memory across calls
+///
+/// This function, like the MBBSEmu method it ports, keeps no state between
+/// invocations: a line ending split across two separate `append` calls --
+/// trailing `\r` in one, leading `\n` in the next -- becomes two `\r\n`, not
+/// one. `append`'s own doc comment measures that no `ESC[[...]` construct in
+/// `WCCMMUD.DLL` ever needs cross-call memory; the equivalent claim is not
+/// measured here for a bare `\r`/`\n`. See
+/// `append_has_no_memory_of_a_line_ending_split_across_two_calls` in this
+/// module's tests, which pins today's (unfixed) behaviour rather than
+/// asserting the gap away.
+fn normalize_newlines(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 8);
+    let mut i = 0;
+    while i < text.len() {
+        let byte = text[i];
+        if byte == b'\r' || byte == b'\n' {
+            out.push(b'\r');
+            out.push(b'\n');
+            if let Some(&next) = text.get(i + 1)
+                && ((byte == b'\r' && next == b'\n') || (byte == b'\n' && next == b'\r'))
+            {
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        out.push(byte);
+        i += 1;
+    }
+    out
 }
 
 /// Whether `append`'s caller is writing for a channel whose terminal
@@ -1875,6 +1965,229 @@ mod tests {
             f.read(buffer),
             "\x1b[1;37mTAIL",
             "a is ansi, so the ANSI form"
+        );
+    }
+
+    // -- Task 2: newline normalisation --------------------------------------
+    //
+    // `append` -- MBBSEmu's `FormatOutput` -- runs `crate::ifansi::process`
+    // then `normalize_newlines`, and it is `normalize_newlines` these tests
+    // are about: bare `\r`/`\n` becoming `\r\n`, without doubling a line
+    // ending the module already wrote out in full. Every one of these calls
+    // `append` directly rather than going through `prf`'s `%`-format parser
+    // -- the function under test is `append`, and going around `format`
+    // means a `%` inside a fixture (none here happen to have one) could never
+    // make a newline test fail for a format-string reason instead of a
+    // newline reason.
+
+    #[test]
+    fn append_turns_a_bare_lf_into_crlf() {
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"A\nB").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.machine.read_cstr(buffer).expect("terminated"), b"A\r\nB");
+    }
+
+    #[test]
+    fn append_turns_a_bare_cr_into_crlf() {
+        // The `.MCV` hard-paragraph-break case (`msg.rs:238-245`): a bare
+        // `\r` with no `\n` of its own.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"A\rB").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.machine.read_cstr(buffer).expect("terminated"), b"A\r\nB");
+    }
+
+    #[test]
+    fn append_does_not_double_a_crlf_the_module_already_wrote() {
+        // 38 of the ten recovered `.MCV` files' line endings are already
+        // `\r\n` (a blank line inside a value, `msg.rs:245`) -- these must
+        // reach the wire as one line break, not two.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"A\r\nB").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(
+            f.machine.read_cstr(buffer).expect("terminated"),
+            b"A\r\nB",
+            "not A\\r\\n\\r\\nB"
+        );
+    }
+
+    #[test]
+    fn append_dedups_a_reversed_lf_cr_pair_too() {
+        // `FormatNewLineCarriageReturn` checks both orderings
+        // (`ExportedModuleBase.cs:991-992`) -- unreached by anything
+        // `WCCMMUD.DLL`'s `.MCV` files produce, but this is a port of that
+        // routine, not a rewrite of it.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"A\n\rB").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(f.machine.read_cstr(buffer).expect("terminated"), b"A\r\nB");
+    }
+
+    #[test]
+    fn append_does_not_collapse_two_bare_lfs_into_one_break() {
+        // The shape a naive "runs of \r/\n become one \r\n" implementation
+        // would get wrong: two consecutive bare `\n` (a blank line, in the
+        // `.MCV` soft-wrap encoding) is two line breaks, not one. Dedup only
+        // ever consumes a *complementary* neighbour -- `\r` next to `\n` or
+        // `\n` next to `\r` -- never a second `\n` after a `\n`.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"A\n\nB").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(
+            f.machine.read_cstr(buffer).expect("terminated"),
+            b"A\r\n\r\nB",
+            "a blank line stays a blank line"
+        );
+    }
+
+    #[test]
+    fn append_normalizes_after_ifansi_not_before() {
+        // `\x1b[[A\n|B]\rC` on an ANSI channel: `ifansi::process` selects the
+        // ANSI form `A\n` and concatenates it with the trailing `\rC`,
+        // producing the intermediate string `A\n\rC` -- a bare LF directly
+        // touching a bare CR *only because ifansi already discarded
+        // everything between them* (the `|B]` the ASCII form and the closer
+        // took with it). Normalizing that intermediate string dedups the
+        // `\n\r` at the join into one `\r\n`: `A\r\nC`.
+        //
+        // Run the two stages in the wrong order and the answer changes.
+        // Normalizing the *raw* input first sees `\n` followed by `|` (no
+        // complementary byte -- the `|B]` is still there) and emits a `\r\n`
+        // with nothing to dedup, then later sees the `\r` before `C` with
+        // nothing after it to dedup either -- two independent `\r\n`s, both
+        // still present after `ifansi::process` runs on that already-normalized
+        // text and merely relocates them: `A\r\n\r\nC`. Same fixture, one
+        // extra blank line, and the only variable is which stage ran first.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"\x1b[[A\n|B]\rC").expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(
+            f.machine.read_cstr(buffer).expect("terminated"),
+            b"A\r\nC",
+            "ifansi must run first, or this doubles"
+        );
+    }
+
+    #[test]
+    fn append_composes_with_gsbl_transmit_into_exactly_one_crlf() {
+        // `append` has already turned the module's bare `\n` into `\r\n` by
+        // the time this reaches the GSBL. `Channel::transmit`'s own line
+        // handling (`gsbl.rs`'s `emit_one`) turns a bare `\r` into `\r\n` and
+        // swallows the `\n` immediately after it as the other half of that
+        // *same* pair -- so the two rules have to compose into exactly one
+        // `\r\n` on the wire, not two.
+        let mut f = Fixture::new();
+        let console = f.console();
+        append(&mut f.machine, &mut f.host, b"before\nafter").expect("appended");
+
+        let buffer = f.host.globals().prf_buffer();
+        let normalized = f.machine.read_cstr(buffer).expect("terminated").to_vec();
+        assert_eq!(normalized, b"before\r\nafter", "append's own half of the job");
+
+        f.host.gsbl_mut().transmit(console, &normalized);
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"before\r\nafter".to_vec(),
+            "exactly one CRLF reached the wire, not two"
+        );
+    }
+
+    #[test]
+    fn append_reproduces_the_oracles_bytes_for_the_lawfulness_paragraph() {
+        // The exact symptom the plan names
+        // (`docs/plans/2026-08-11-live-session-defects.md`, Task 2): the
+        // "truly 'lawful' citizen" paragraph, checked against a real capture
+        // rather than a string this test made up. `re/oracle/oracle_m1.raw`
+        // is a `Session.raw` dump (`tools/oracle/mudlib.py:20,39-41`) --
+        // unmodified bytes off the socket, not one of the cleaned `.log`
+        // transcripts `normalize_newlines`'s own doc comment explains why to
+        // distrust for this question.
+        //
+        // Note: the plan's own Task 2 acceptance criterion names
+        // `re/oracle/oracle_bank2.raw` for this check, but that file has no
+        // "lawful" text in it at all -- the paragraph lives in
+        // `oracle_m1.raw`, which is what this test reads below. Follow this
+        // citation, not the plan's.
+        let oracle = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../re/oracle/oracle_m1.raw"),
+        )
+        .expect("re/oracle/oracle_m1.raw is tracked in git");
+        let found = oracle
+            .windows(b"lawful".len())
+            .position(|w| w == b"lawful")
+            .expect("the lawfulness paragraph is in this capture");
+        let expected = &oracle[found - 10..found + 400];
+        assert!(
+            expected.windows(2).filter(|w| *w == b"\r\n").count() >= 3,
+            "sanity: the slice should span several real line breaks"
+        );
+
+        // What the module would have handed the host before this fix: the
+        // `.MCV` encoding (`msg.rs:238-245`) never writes `\r\n` together,
+        // only a bare `\r` (hard break) or a bare `\n` (soft wrap). Standing
+        // every one of the oracle's line breaks up as a bare `\n` is a
+        // strictly harder input than `.MCV` would actually produce, since it
+        // puts every occurrence through this function's "no complementary
+        // byte" branch at once, with nothing to dedup anywhere in the slice.
+        let mut module_input = Vec::with_capacity(expected.len());
+        let mut i = 0;
+        while i < expected.len() {
+            if expected[i..].starts_with(b"\r\n") {
+                module_input.push(b'\n');
+                i += 2;
+            } else {
+                module_input.push(expected[i]);
+                i += 1;
+            }
+        }
+
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, &module_input).expect("appended");
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(
+            f.machine.read_cstr(buffer).expect("terminated"),
+            expected,
+            "byte-identical to the genuine board's wire"
+        );
+    }
+
+    #[test]
+    fn append_has_no_memory_of_a_line_ending_split_across_two_calls() {
+        // The shape every newline test above shares: each hands `append` one
+        // complete, already-joined byte string in a single call. None of
+        // them can tell "no state carries between calls" apart from "correct
+        // state carries between calls", because none of them ever cross a
+        // call boundary at all -- go break that.
+        //
+        // `normalize_newlines` -- like MBBSEmu's `FormatNewLineCarriageReturn`,
+        // which takes a `ReadOnlySpan<byte>` and keeps nothing between calls
+        // -- has no memory either. A module that ended one `prf` call with a
+        // bare `\r` and began the next with the `\n` meant to complete it
+        // gets **two** line breaks, not one: this call's trailing `\r` has no
+        // next byte to dedup against, so it becomes its own `\r\n`; the next
+        // call's leading `\n` has no *previous* byte to dedup against
+        // either, so it becomes a second, independent `\r\n`.
+        //
+        // Documented rather than silently accepted: `append`'s own doc
+        // comment measures, over the whole of `WCCMMUD.DLL`, that every
+        // `ESC[[...]` construct closes inside the single call that produced
+        // it. Nothing here measures the same claim for a bare `\r`/`\n` --
+        // this test pins today's actual behaviour (a doubled break) so a
+        // reader who needs to know stumbles on it here rather than in a live
+        // session, and so that a change which fixes it changes this
+        // assertion on purpose rather than by accident.
+        let mut f = Fixture::new();
+        append(&mut f.machine, &mut f.host, b"text\r").expect("first call");
+        append(&mut f.machine, &mut f.host, b"\nmore").expect("second call");
+
+        let buffer = f.host.globals().prf_buffer();
+        assert_eq!(
+            f.machine.read_cstr(buffer).expect("terminated"),
+            b"text\r\n\r\nmore",
+            "current, documented behaviour: a \\r\\n split across two append() \
+             calls becomes two line breaks, not one"
         );
     }
 

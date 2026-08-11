@@ -7,6 +7,7 @@ pub mod gsbl;
 pub mod memory;
 pub mod msg;
 pub mod runtime;
+pub mod screen;
 pub mod stream;
 pub mod system;
 pub mod text;
@@ -245,6 +246,11 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         Cleans::Caller,
     ),
     (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
+    // "Restore screen-length to usracc setting" -- `MAJORBBS.C:3776` (wg1),
+    // one import, one call site. See `shims::screen`'s own doc comment for
+    // what it does, what it does not, and where its one caller actually
+    // leads.
+    (MAJORBBS, "rstrxf", screen::rstrxf, Cleans::Caller),
     // The current user: the two routines that turn a channel number into the
     // slot it names.
     (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
@@ -314,6 +320,16 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (GALGSBL, "btumil", gsbl::btumil, Cleans::Caller),
     (GALGSBL, "btuibw", gsbl::btuibw, Cleans::Caller),
     (GALGSBL, "btuica", gsbl::btuica, Cleans::Caller),
+    // Three more GALGSBL routines, registered even though `WCCMMUD.DLL`
+    // imports none of them (`re/exports/imports.txt` has no site for any --
+    // see `shims::gsbl`'s own doc comment). `rstrxf`, above, is their one
+    // caller in this host, and calls each directly rather than through this
+    // table -- there is no module far call to dispatch. They are registered
+    // anyway because they are ordinary importable GSBL routines and this is
+    // where every other one lives, in case a future module asks.
+    (GALGSBL, "btuhpk", gsbl::btuhpk, Cleans::Caller),
+    (GALGSBL, "btupbc", gsbl::btupbc, Cleans::Caller),
+    (GALGSBL, "btucpc", gsbl::btucpc, Cleans::Caller),
 ];
 
 /// Every constant the host exports.
@@ -370,6 +386,7 @@ pub fn entry(dll: &str, symbol: &str) -> Entry {
 mod tests {
     use super::*;
     use crate::exports::GALGSBL;
+    use crate::testing::Fixture;
 
     #[test]
     fn a_global_is_a_datum() {
@@ -409,6 +426,77 @@ mod tests {
             entry(MAJORBBS, "fsdego"),
             Entry::Routine(_, Cleans::Caller)
         ));
+    }
+
+    /// Every test in `shims::screen` and `shims::gsbl` calls `rstrxf`,
+    /// `btuhpk`, `btupbc` and `btucpc` by their Rust name --
+    /// `f.invoke(btupbc, ...)`, `f.invoke(rstrxf, ...)` -- which is not how
+    /// a module (or, for `rstrxf`, this crate's own MAJORBBS import
+    /// dispatch) reaches any routine. That path is `entry`, keyed by the DLL
+    /// and the *string* `ROUTINES` was given -- and every one of those tests
+    /// would keep passing even if this table wired `"btupbc"` to
+    /// `gsbl::btucpc`'s behaviour, or `"rstrxf"` to a routine that does
+    /// nothing at all, because none of them go through it. This does.
+    #[test]
+    fn rstrxf_and_its_gsbl_routines_are_wired_to_the_right_behaviour_by_name() {
+        let mut f = Fixture::new();
+        let console = f.console();
+
+        let Entry::Routine(btuhpk, _) = entry(GALGSBL, "btuhpk") else {
+            panic!("btuhpk must be a routine");
+        };
+        let Entry::Routine(btupbc, _) = entry(GALGSBL, "btupbc") else {
+            panic!("btupbc must be a routine");
+        };
+        let Entry::Routine(btucpc, _) = entry(GALGSBL, "btucpc") else {
+            panic!("btucpc must be a routine");
+        };
+        let Entry::Routine(rstrxf, _) = entry(MAJORBBS, "rstrxf") else {
+            panic!("rstrxf must be a routine");
+        };
+
+        f.invoke(btuhpk, &[0, 0, 0]).expect("ok");
+        assert!(f.host.gsbl().channel(console).pause_handler_installed);
+
+        f.invoke(btupbc, &[0, 20]).expect("ok");
+        assert_eq!(
+            f.host.gsbl().channel(console).pause_char,
+            20,
+            "the table's \"btupbc\" must set pause_char, not clear_pause_char"
+        );
+        assert_eq!(
+            f.host.gsbl().channel(console).clear_pause_char,
+            0,
+            "and must not have touched clear_pause_char while doing it"
+        );
+
+        f.invoke(btucpc, &[0, 19]).expect("ok");
+        assert_eq!(
+            f.host.gsbl().channel(console).clear_pause_char,
+            19,
+            "the table's \"btucpc\" must set clear_pause_char, not pause_char"
+        );
+
+        // `page_lines` specifically: nothing above this line touches it, so a
+        // mutant that resolves `"rstrxf"` to some *other* real routine (one
+        // that returns `Ok` without erroring, so `.expect` below would not
+        // catch it either) cannot pass by coasting on a value one of the
+        // three calls above already left correct.
+        f.host
+            .point_curusr(&mut f.machine, console)
+            .expect("channel 0 is current");
+        let account = f.host.users().account(console);
+        let at = mbbs16::FarPtr {
+            offset: account.offset + crate::users::usracc::SCNBRK as u16,
+            selector: account.selector,
+        };
+        f.machine.write(at, &[24]).expect("account memory");
+        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
+        assert_eq!(
+            f.host.gsbl().channel(console).page_lines,
+            22,
+            "the table's \"rstrxf\" must be the real routine: scnbrk(24) - CTNUOS(2)"
+        );
     }
 
     #[test]

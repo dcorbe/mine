@@ -144,7 +144,7 @@ impl Stack {
         };
 
         if self.transcode {
-            cp437::decode(&bytes).into_bytes()
+            expand_c0_glyphs(&cp437::decode(&bytes)).into_bytes()
         } else {
             let mut out = Vec::with_capacity(bytes.len());
             for &b in &bytes {
@@ -278,6 +278,132 @@ impl Stack {
         }
         out
     }
+}
+
+/// Expand CP437's C0-range video glyphs into their Unicode equivalents, for
+/// [`Stack::modern`]'s outbound path only.
+///
+/// **The problem this fixes.** CP437 gives every byte `0x00`-`0x1F` a
+/// printable glyph in the IBM PC's text-mode font -- smiley faces, card
+/// suits, arrows, musical notes -- because on real DOS hardware a byte
+/// written to video memory is just a font index, with no ASCII control
+/// meaning at all. `mud_core::cp437::decode` maps every byte `< 0x80` to
+/// itself (see that module's doc comment: this matches Python's `cp437`
+/// *text* codec, which treats these bytes as controls, not glyphs -- verify
+/// with `python3 -c "print(repr(bytes([0x11]).decode('cp437')))"`, which
+/// prints `'\x11'`, not `'◄'`). On a modern terminal that byte either fires
+/// a real control action (`0x07` rings the bell) or is consumed with zero
+/// width, where DOS drew one column. Everything after it on the line then
+/// lands one column short of where the module's FSD painting code (fixed
+/// absolute `ESC[<row>;<col>f` addressing) put it.
+///
+/// **The mechanism is general; the scope translated here is not, and that
+/// is deliberate.** Every byte `0x00`-`0x1F` has *a* CP437 glyph, but this
+/// function translates exactly one of them: `0x11`. An earlier version of
+/// this fix translated 21 of the 32 -- everything except a hand-picked
+/// exclusion list -- on the reasoning that "other screens and other modules
+/// will use the rest of the range." That reasoning does not hold: a full
+/// scan of the module's text corpus (every `*.MSG`, `*.MCV` and `*.MDF` in
+/// `tmp/`) for C0 bytes other than TAB/LF/CR found
+///
+/// ```text
+/// 0x11 x3      cp437 ◄    files: ['WCCTEXT.MSG']
+/// 0x1B x3089   ESC        files: WCCTEXT/WCCMMUD/WCCMMHLP/WCCMMPLS.MSG
+/// ```
+///
+/// `0x11` is the *only* C0 glyph byte anywhere in the module's static text.
+/// (`re/oracle/`'s 120 `.raw` captures are silent on the runtime cases
+/// below: zero `0x01` bytes, zero `[HP=` prompts -- they cannot be cited
+/// either way.) Nothing else in the corpus is evidence for a glyph, and
+/// runtime output demonstrated the opposite: translating the speculative
+/// 21-byte set caused two live regressions on the very first session that
+/// exercised it --
+///
+/// 1. The in-game prompt started ending in a visible `☺`. MajorMUD emits
+///    `0x01` at the end of `[HP=28/MA=8]:` as a runtime protocol marker,
+///    not text; it was invisible before the 21-byte version and the fix
+///    made it render (see
+///    `modern_leaves_the_prompt_marker_byte_untranslated` below).
+/// 2. A stat-sheet field (Armour Class) came out right-aligned, consistent
+///    with a newly-visible glyph inserted before the value.
+///
+/// So a C0 byte in this range is not reliably a glyph -- it can just as
+/// easily be a protocol marker or other runtime-generated control byte,
+/// and there is no way to tell the two apart except by measuring actual
+/// module data. Widening this map again needs the same kind of evidence
+/// `0x11` has (a byte position in `tmp/*.MSG` immediately bracketed by
+/// glyph-only context, corroborated by a live capture), not "the rest of
+/// the range is probably fine too."
+///
+/// `tmp/WCCTEXT.MSG`'s 3 occurrences of `0x11` sit each immediately after
+/// an SGR sequence and immediately before a run of `0xC4` (─) -- the Point
+/// Cost Chart's `◄──────┤` connector rows -- and a live capture of that
+/// chart on port 2323 has exactly 3 rows misaligned, matching.
+///
+/// **Why this lives here, not in `mud_core::cp437`.** `cp437::decode` is
+/// shared with `mud-client` and `mud-server` -- callers with no stake in
+/// how *this* transport's FSD renders on *this* port. The defect was
+/// created by `Stack::modern`'s outbound translation (the raw port hands
+/// the same byte straight to a client that already draws its own CP437
+/// font and is unaffected), so the fix stays where the defect was made,
+/// same reasoning the per-port `Stack` split itself was built on.
+///
+/// **Why this runs after `cp437::decode`, not before or merged into it.**
+/// This operates on the decoded `char`s, not the raw CP437 bytes: a C0
+/// byte decodes to the literal control character (`0x11` -> `'\u{11}'`)
+/// today, so mapping specific `char`s here is exactly equivalent to
+/// mapping the bytes that produced them, without needing to know anything
+/// about multi-byte UTF-8 layout. Running it on raw bytes instead (before
+/// `cp437::decode`) would require re-deriving UTF-8 boundary logic this
+/// function has no reason to duplicate. Running it before
+/// `home_cursor_after_clear` (which matches literal `ESC[2J` bytes and
+/// carries partial-match state across calls) is not an option either: that
+/// matcher must see the host's original bytes, unmodified, or an
+/// `ESC[2J` split by a translated byte landing mid-pattern could desync
+/// its `ed2_match` counter. The order in `outbound` --
+/// `home_cursor_after_clear` (raw bytes) -> `cp437::decode` (bytes ->
+/// chars) -> `expand_c0_glyphs` (chars -> chars) -- keeps each stage
+/// working on the representation it was designed for.
+///
+/// **Scope is a data question, re-asked every time it changes.** See
+/// [`c0_glyph`]'s doc comment for the one byte translated today and the
+/// standard a new one would have to meet.
+fn expand_c0_glyphs(text: &str) -> String {
+    text.chars().map(|c| c0_glyph(c).unwrap_or(c)).collect()
+}
+
+/// The C0-byte -> video-glyph map itself, as a `char -> char` function so
+/// [`expand_c0_glyphs`] can fold it over decoded text. Returns `None` for
+/// every byte other than `0x11`.
+///
+/// The full range this *could* cover is `0x00`-`0x1F` -- CP437 gives all 32
+/// of them a glyph -- but only `0x11` is translated, because it is the only
+/// one with measured evidence in the module's own data (see
+/// `expand_c0_glyphs`'s doc comment for the corpus scan). Every other C0
+/// byte keeps its control/identity meaning by default, not by an
+/// individually-argued exclusion: with no evidence a byte is glyph content,
+/// the safe assumption is that it is not, because two of them turned out to
+/// be runtime protocol markers the moment this was tested live (`0x01` in
+/// the `[HP=.../MA=...]:` prompt, and whatever produced the Armour Class
+/// misalignment). `0x1B` ESC gets the same treatment as every other
+/// untranslated byte here now, not a special case -- it was never going to
+/// have glyph evidence, since translating it would destroy the escape
+/// sequences this transport exists to carry, but the reasoning that keeps
+/// it out is the same "no evidence, so no" as everything else in the range.
+///
+/// If a future byte earns a place here, it needs `0x11`'s kind of evidence:
+/// a position in `tmp/*.MSG` (or another shipped module's text data)
+/// bracketed by context that is unambiguously glyph, not control -- ideally
+/// corroborated by a live capture the way the Point Cost Chart's 3
+/// misaligned rows corroborated `0x11`. "The rest of the range probably
+/// has similar uses" is exactly the reasoning that put `0x01` in front of a
+/// live player as a smiley face; it is not sufficient on its own a second
+/// time.
+fn c0_glyph(c: char) -> Option<char> {
+    Some(match c {
+        '\u{11}' => '◄', // BLACK LEFT-POINTING POINTER -- the Point Cost Chart's connectors
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -626,5 +752,156 @@ mod tests {
         let garbage: Vec<u8> = (0u8..=255).collect();
         let got = stack.inbound(&garbage);
         assert!(!got.is_empty());
+    }
+
+    // -- C0 glyph expansion (Task 3, live-session-defects; narrowed after --
+    // -- live regressions, see termcompat.rs's `c0_glyph` doc comment)   --
+    //
+    // CP437 gives every byte 0x00-0x1F a printable glyph in the DOS
+    // text-mode font -- arrows, card suits, musical notes -- distinct from
+    // what the same byte means as an ASCII control code. `cp437::decode`
+    // (shared with `mud-client` and `mud-server`, see its own doc comment)
+    // deliberately does not know about this: it maps every byte < 0x80 to
+    // itself, so on a modern terminal a CP437 glyph byte that also happens
+    // to be a real control code either fires that control (BEL rings) or
+    // is swallowed with zero width (most others) -- where DOS drew a
+    // one-column glyph. Bytes after it on the line then land one column
+    // short.
+    //
+    // Only byte 0x11 is translated. It is the only C0 byte with measured
+    // glyph evidence: `tmp/WCCTEXT.MSG` has exactly 3 occurrences, always
+    // immediately after an SGR sequence and immediately before a run of
+    // 0xC4 (─) box-drawing bytes -- the Point Cost Chart's `◄──────┤`
+    // connectors -- and a live capture of that screen on port 2323 has
+    // exactly 3 misaligned rows to match. A full scan of every `*.MSG`,
+    // `*.MCV` and `*.MDF` in `tmp/` for C0 bytes outside TAB/LF/CR found
+    // nothing else: 0x11 x3 (cp437 ◄) and 0x1B x3089 (ESC, correctly never
+    // translated). An earlier version of this function translated 21 of
+    // the 32 C0 bytes on the unmeasured assumption that other modules would
+    // use the rest of the range; live testing immediately produced two
+    // regressions that prove the assumption false -- a runtime protocol
+    // marker (0x01, at the end of the `[HP=28/MA=8]:` prompt) rendering as
+    // a visible ☺, and a stat-sheet field shifting out of alignment. See
+    // `modern_leaves_the_prompt_marker_byte_untranslated` below for the
+    // regression test that pins the first of those.
+
+    /// The exact defect from the live session, reproduced byte-for-byte:
+    /// `WCCTEXT.MSG`'s own SGR-then-0x11-then-0xC4-run-then-0xB4 sequence,
+    /// through `Stack::modern`.
+    #[test]
+    fn modern_expands_the_point_cost_chart_connector_arrow() {
+        let input: &[u8] = b"\x1b[1;30m\x11\xc4\xc4\xc4\xc4\xc4\xc4\xb4";
+        let mut stack = Stack::modern();
+        let got = stack.outbound(input);
+        assert_eq!(got, "\x1b[1;30m◄──────┤".as_bytes());
+    }
+
+    /// The shared-shape check: every other test in this section hands
+    /// `outbound` at most one occurrence of the translated byte per call.
+    /// An implementation bug that translates only the first occurrence it
+    /// finds per call (an early-return, or a `.find()` where a `.map()`
+    /// belongs) would pass every other test in this file and still be
+    /// broken. Two occurrences, one call, must both come out translated.
+    #[test]
+    fn modern_translates_every_glyph_byte_in_one_call_not_just_the_first() {
+        let mut stack = Stack::modern();
+        let got = stack.outbound(&[0x11, b'x', 0x11]);
+        assert_eq!(got, "◄x◄".as_bytes());
+    }
+
+    /// The shared-shape attack on the old test battery: every prior
+    /// "stays a control" test here (and the regression test above, for
+    /// 0x01 specifically) only ever checked bytes drawn from the *original*
+    /// 11-byte exclusion list -- never the 20 bytes the 21-byte version
+    /// used to translate. A bug that left one of those 20 mappings in
+    /// `c0_glyph` (an incomplete narrowing) would have passed every other
+    /// test in this file, the 0x01 regression test included, since none of
+    /// them exercises byte 0x02, say. This test closes that gap directly:
+    /// every byte in the full C0 range except 0x11 -- both the
+    /// always-excluded bytes and the ones this task removed -- must come
+    /// out of `modern()` exactly as it went in, all in one call.
+    #[test]
+    fn modern_never_translates_any_c0_byte_except_0x11() {
+        let controls: Vec<u8> = (0x00u8..=0x1F).filter(|&b| b != 0x11).collect();
+        let mut stack = Stack::modern();
+        let got = stack.outbound(&controls);
+        assert_eq!(got, controls);
+    }
+
+    /// The task's own acceptance case: an `ESC[...]` sequence that
+    /// contains no C0 glyph byte is completely unaffected -- not merely
+    /// "still valid", byte-identical.
+    #[test]
+    fn modern_leaves_esc_sequences_with_no_c0_glyph_bytes_untouched() {
+        let input: &[u8] = b"\x1b[0;7m\x1b[4;20fHello, Adventurer\x1b[0m";
+        let mut stack = Stack::modern();
+        let got = stack.outbound(input);
+        assert_eq!(got, input.to_vec());
+    }
+
+    /// The task's other acceptance case: the raw port -- a period client
+    /// that renders CP437 itself -- must still see byte 0x11 exactly as
+    /// the host sent it, not the 3-byte UTF-8 expansion `modern()` uses.
+    #[test]
+    fn raw_leaves_c0_glyph_bytes_untouched() {
+        let mut stack = Stack::raw();
+        let got = stack.outbound(&[0x11]);
+        assert_eq!(got, vec![0x11]);
+    }
+
+    /// The shared-shape check: every test above hands `outbound` either a
+    /// lone C0 byte or a chunk with no `ESC[2J` in it, so none of them
+    /// proves glyph expansion composes correctly with `home_on_clear` in
+    /// the same call -- a wiring bug that ran expansion on the wrong
+    /// stage (say, before `home_cursor_after_clear` sees the raw bytes,
+    /// or that fed the injected `ESC[H` through the glyph map) would pass
+    /// every test above and still be broken. `ESC[2J` immediately
+    /// followed by a glyph byte must produce both the home and the glyph,
+    /// undisturbed by each other.
+    #[test]
+    fn modern_home_on_clear_and_c0_glyph_expansion_compose_in_one_call() {
+        let mut stack = Stack::modern();
+        let got = stack.outbound(b"\x1b[2J\x11");
+        assert_eq!(got, "\x1b[2J\x1b[H◄".as_bytes());
+    }
+
+    /// The same composition, split across two `outbound` calls right at
+    /// the `ESC[2J` / glyph-byte boundary -- proving `ed2_match`'s
+    /// carry-over state and the (stateless) glyph expansion do not step
+    /// on each other across chunks either.
+    #[test]
+    fn modern_home_on_clear_and_c0_glyph_expansion_compose_across_chunks() {
+        let mut stack = Stack::modern();
+        let mut got = stack.outbound(b"\x1b[2J");
+        got.extend(stack.outbound(&[0x11]));
+        assert_eq!(got, "\x1b[2J\x1b[H◄".as_bytes());
+    }
+
+    /// The regression a live session found: MajorMUD emits `0x01` at the
+    /// end of the `[HP=28/MA=8]:` prompt as a runtime protocol marker, not
+    /// text. The original (over-broad, 21-byte) version of this function
+    /// translated it to `☺` and made it visible on the modern port; `0x11`
+    /// is the only C0 byte with measured glyph evidence in this module's
+    /// text data (see `c0_glyph`'s doc comment), so `0x01` -- and every
+    /// other C0 byte -- must reach the client exactly as the host sent it.
+    #[test]
+    fn modern_leaves_the_prompt_marker_byte_untranslated() {
+        let mut stack = Stack::modern();
+        let got = stack.outbound(b"[HP=28/MA=8]:\x01");
+        assert_eq!(got, b"[HP=28/MA=8]:\x01".to_vec());
+    }
+
+    /// `inbound` is the reverse direction (client -> host, UTF-8 -> CP437)
+    /// and must not know anything about C0 glyph expansion, which is an
+    /// outbound-only, video-font concept. A client that types (or pastes)
+    /// a literal U+25C4 is not asking for CP437 byte 0x11 -- `cp437::HIGH`
+    /// (the only table `encode` consults) has no entry for it, so it maps
+    /// to `?` exactly like any other character outside the codepage. This
+    /// pins that `inbound` was not accidentally wired to the same map.
+    #[test]
+    fn inbound_is_unaffected_by_c0_glyph_expansion() {
+        let mut stack = Stack::modern();
+        let got = stack.inbound("◄".as_bytes());
+        assert_eq!(got, vec![b'?']);
     }
 }

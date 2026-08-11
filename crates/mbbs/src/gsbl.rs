@@ -14,6 +14,18 @@
 //!
 //! Semantics are from the Worldgroup 1.0 GSBL Development Guide
 //! (`archive/tooling/reference-documents/`), which has a page per routine.
+//!
+//! Page citations here (and in `crate::shims::gsbl`, `crate::shims::screen`)
+//! are the guide's own printed page number -- `GSBL-NNN`, or "guide page
+//! NNN" -- never a `gsblref.pdf` viewer page computed from it. **The two are
+//! not a constant offset apart.** Measured by rendering actual pages: `+7`
+//! holds through the guide's roughly 80-170 range (PDF 156 is GSBL-149
+//! `btusiz`; PDF 175 is GSBL-168 `btutrg`; PDF 165 is GSBL-158 `btusts`), and
+//! `+6` only near `btuxnf`'s p.193. Assuming either offset and applying it
+//! elsewhere lands on the wrong routine -- "+6" against `btuhpk`/`btupbc`/
+//! `btucpc`'s cited pages 99/133/81 lands on `btuhit`/`btuolk`/`btucmd`
+//! instead. Checking a citation means rendering that guide page directly,
+//! never computing a PDF page from one.
 
 use std::collections::VecDeque;
 
@@ -200,6 +212,37 @@ pub struct Channel {
     /// Recorded, not acted on -- see `page_lines`.
     pub(crate) page_message: Option<Vec<u8>>,
 
+    /// `btupbc` -- the screen-pause character (guide `btupbc`, page 133):
+    /// when transmitted in the output stream, output pauses and the channel
+    /// goes into screen-pause mode (page 99). Zero disables it. Recorded for
+    /// the same reason as `page_lines` -- **screen-pause mode itself is not
+    /// implemented**, so no transmitted byte is ever compared against this.
+    /// `Channel::transmit` sends every byte the module gives it straight
+    /// through, `pause_char` included.
+    pub(crate) pause_char: u8,
+
+    /// `btucpc` -- the clear-pause-counter character (guide `btucpc`, page
+    /// 81): discovered in the output stream, it resets the pending-lines
+    /// counter to zero without itself being transmitted. The Major BBS uses
+    /// it to insert Control-S at strategic points and suppress a pause that
+    /// would otherwise land there. **Not acted on**, for the same reason as
+    /// `pause_char`: there is no pending-lines counter to reset, because
+    /// there is no pagination.
+    pub(crate) clear_pause_char: u8,
+
+    /// `btuhpk` -- whether a screen-pause keystroke handler has been
+    /// installed (guide `btuhpk`, page 99). The real call installs a far
+    /// pointer to the routine that will be handed each keystroke received
+    /// while paused; this host has exactly one caller of `btuhpk`
+    /// ([`crate::shims::screen::rstrxf`]) and it always installs the same
+    /// routine, `MAJORBBS.C:3793`'s `hpkrou` -- there is only ever one value
+    /// this could hold, so a `bool` records "installed" rather than a far
+    /// pointer nothing would ever call through. **What would reveal this is
+    /// wrong:** the day screen-pause mode is implemented, a "continue"/"go
+    /// nonstop"/"abort" keystroke sent during a pause would have nothing to
+    /// dispatch to -- this field says a handler exists, not what it is.
+    pub(crate) pause_handler_installed: bool,
+
     /// Set when the last byte written was a CR whose LF this host supplied, so
     /// that a module sending an explicit `\r\n` does not get two linefeeds.
     /// On `Channel` rather than local to `transmit` because the pair can arrive
@@ -232,6 +275,9 @@ impl Default for Channel {
             xoff: 0,
             page_lines: 0,
             page_message: None,
+            pause_char: 0,
+            clear_pause_char: 0,
+            pause_handler_installed: false,
             supplied_lf: false,
             csi: CsiScan::Text,
         }
