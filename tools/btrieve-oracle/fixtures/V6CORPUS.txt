@@ -104,3 +104,28 @@ Mint into a scratch directory you created. Never point a write op at tmp/,
 ~/mmud-demo, ~/mmud-survey, or any shipped .DAT/.VIR -- 6.15 may silently
 convert a V5 file it writes, and the validation would then be checking the
 wrong artifact.
+
+Oracle dumps
+------------
+
+DUPKEY30.dump and PP2048.dump are `btrvprobe dump <file> 0` output for the two
+fixed-length v6 fixtures -- one line per record, in key order: ordinal, length,
+and the record bytes as hex. Produced 2026-08-11 by genuine Btrieve 6.15.
+
+They are committed, unlike the 14 MB WCCTEXT dump the v5 byte-for-byte test
+takes through `$BTRIEVE_ORACLE_DUMP`, because 30 and 50 records are small
+enough to keep beside the files they describe. That means the v6 read path can
+be compared against the engine byte-for-byte in a test that needs no Wine, no
+environment variable, and no network -- so it runs by default rather than only
+when someone remembers to arrange an oracle.
+
+Regenerate with:
+
+    export WINEPREFIX=$HOME/.btrieve-wine
+    cp <fixture>.DAT $WINEPREFIX/drive_c/btrieve/<unique-name>.DAT
+    cd $WINEPREFIX/drive_c/btrieve
+    wine btrvprobe.exe dump 'C:\btrieve\<unique-name>.DAT' 0
+
+Never reuse a path you have presented a different file under: the Microkernel
+caches pages by path and outlives its clients, and it will serve the old file's
+pages under the new file's name. That is why the recipe above says "unique".
