@@ -114,8 +114,11 @@ impl Args {
 }
 
 /// One `%...` conversion, as parsed.
+///
+/// `pub(crate)` so [`integer`] can be driven from outside a `%` conversion --
+/// see its doc comment.
 #[derive(Debug, Default, Clone, Copy)]
-struct Spec {
+pub(crate) struct Spec {
     left: bool,
     plus: bool,
     space: bool,
@@ -350,7 +353,13 @@ fn unsigned(
 }
 
 /// Render a number with its flags, precision and width.
-fn integer(value: u64, negative: bool, base: u64, upper: bool, spec: &Spec) -> Vec<u8> {
+///
+/// `pub(crate)`: this is the one place a `long` becomes decimal digits and a
+/// sign, and `shims::text::l2as` reuses it rather than formatting a second
+/// time -- this module's own doc comment (top of file) is the reason why. A
+/// converter that disagreed with `%ld` on so much as `i32::MIN` would be the
+/// exact bug that comment warns about.
+pub(crate) fn integer(value: u64, negative: bool, base: u64, upper: bool, spec: &Spec) -> Vec<u8> {
     let mut digits = Vec::new();
     let mut n = value;
     while n > 0 {

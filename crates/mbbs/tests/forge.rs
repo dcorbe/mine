@@ -336,21 +336,32 @@ fn forge_a_corpus_the_real_engine_can_read() {
     }
     eprintln!("{made} files forged into {}", forge.root.display());
 
-    // Eleven reindexes, and ten each of the two writing variants. The one file
-    // that refuses both is WCCTEXT, the only variable-length file of the
-    // eighteen: `insert` has always refused those, and `update` refuses them
-    // now -- it did not when this forge was first run, and genuine Btrieve
-    // rejected the whole file it produced. See
-    // `docs/plans/2026-08-08-oracle-wash.md`.
-    assert_eq!(made, 31, "expected 11 + 10 + 10 forged files");
+    // Eleven reindexes and eleven updates -- `update` now succeeds for
+    // WCCTEXT too. `docs/plans/2026-08-11-survivability-and-the-reachable-
+    // surface.md` Task 5 Track A gave `Block::update` one shape-checked hole
+    // in its variable-length refusal: an equal-length, single-fragment,
+    // non-continued in-place rewrite, which is exactly the record this forge
+    // exercises -- flipping the last byte of the *fixed* part (see the
+    // `update` closure above) leaves the fragment's own bytes unchanged, so
+    // the new body is the same length as the one already on the page and the
+    // shape matches. `grown` still refuses for WCCTEXT: it is an *insert*,
+    // and `Block::insert` on a variable-length file is unconditional and
+    // untouched by Track A -- multi-fragment splitting and a fragment-page
+    // allocator are a later track's work, not this one's.
+    //
+    // This forge used to record two refusals here, both WCCTEXT, when
+    // `update` also refused unconditionally; genuine Btrieve then rejected
+    // the whole file that had been produced under that older code, with
+    // status 54. See `docs/plans/2026-08-08-oracle-wash.md`.
+    assert_eq!(made, 32, "expected 11 + 11 + 10 forged files");
     assert_eq!(
         skipped.len(),
-        2,
-        "only WCCTEXT should refuse to be written: {skipped:?}"
+        1,
+        "only WCCTEXT's grown (insert) should refuse to be written: {skipped:?}"
     );
     for why in &skipped {
         assert!(
-            why.starts_with("WCCTEXT.VIR ") && why.contains("variable-length"),
+            why.starts_with("WCCTEXT.VIR grown:") && why.contains("variable-length"),
             "unexpected refusal: {why}"
         );
     }

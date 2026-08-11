@@ -16,16 +16,39 @@
 //! observes the real, shipped loop below rather than a copy of it: `Host`
 //! never leaves this thread, so without this the sleep meter would have had
 //! to reimplement the driver to measure it.
+//!
+//! # Surviving a module stop
+//!
+//! A module that faults, overruns its budget, or calls something this host
+//! does not implement poisons the `Machine` it is running on --
+//! [`mbbs16::Machine::call`] then refuses to enter that machine again, for
+//! **every** channel, not just the one that tripped it, and
+//! [`mbbs16::Machine::poison`] deliberately forgets the call frame
+//! (`frame_sp = None`), so there is no resume point to salvage even if a
+//! host wanted one. "Hang up only the offending channel and keep going" is
+//! therefore not a safer, more surgical alternative to a restart -- it is
+//! not available at all: the very next dispatch on any *other* channel would
+//! hit the same refusal, and today that refusal surfaces through a bare `?`
+//! that tells nobody anything.
+//!
+//! So [`run`] is a small supervisor: [`life`] does one machine's whole life
+//! -- build, boot, drive the steady state -- and [`run`] rebuilds a fresh
+//! one when a life ends in [`Ended::Stopped`], up to [`RestartPolicy`]'s
+//! bound. A boot failure (the machine cannot be built, the module cannot be
+//! loaded or relocated, ordinal 1 itself stops, or `finish_init` fails) is a
+//! broken deployment, not a survivable stop, and is not retried: only a stop
+//! reached from the steady-state driver loop restarts.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use mbbs::{Host, Terms, Wait};
-use mbbs16::{Machine, Module};
+use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
+use mbbs16::{Machine, Module, Poison};
 use tokio::sync::mpsc::Sender;
 
 use crate::msg::{In, Out};
@@ -55,6 +78,23 @@ pub struct Boot {
     /// polling this on its own schedule; nothing else in the program
     /// synchronises against it.
     pub clock_reads: Option<Arc<AtomicU64>>,
+
+    /// Where to write a survey of every unimplemented symbol this board
+    /// reaches, or `None` (the default, and the only setting safe for a
+    /// board anyone plays on) to run the way this crate always has.
+    ///
+    /// **This is a diagnostic, not a way to run a board.** See
+    /// `mbbs::survey`'s module doc for what turning it on means: every
+    /// unimplemented import gets a fabricated return instead of a stop, and
+    /// that is wrong behaviour by design, tolerable only for a throwaway
+    /// session whose sole purpose is to enumerate gaps.
+    ///
+    /// Built into one [`mbbs::survey::Shared`] inventory in [`run`], *not*
+    /// in [`life`] -- see [`run`]'s own comment on why. The path is not a
+    /// `PathBuf` per life; every restart within one process keeps writing
+    /// the same file, so the survey a SIGINT interrupts is the whole
+    /// process's, not just its last life's.
+    pub survey: Option<PathBuf>,
 }
 
 /// What one wake yielded.
@@ -100,27 +140,143 @@ fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
     }
 }
 
-/// Build the machine, boot the module, and drive it until [`Wait::Stop`].
+/// How many times [`run`] will rebuild a machine after [`Ended::Stopped`]
+/// before giving up, and over what window. See [`RestartPolicy`].
 ///
-/// This is the whole life of the host thread. It never awaits and holds
-/// `&mut Machine` throughout -- that is forced, not a style choice, by the
-/// three reasons in the module doc.
+/// A module that stops on every life is a bug a restart will not fix --
+/// rebuilding forever would spend a full NE load and relocation pass in a
+/// tight loop, which for a real multi-megabyte `.DLL` is not free the way an
+/// idle poll dispatch is. Five restarts inside a minute is generous room for
+/// a genuine one-off wall (or five different players each finding a
+/// different one) to recover the board unattended, while still bounding a
+/// true crash loop to five module reloads a minute -- noise next to the
+/// ~500 poll dispatches a second this host already spends idling with two
+/// players in the Realm (see `DEFAULT_POLLS_PER_WAKE`'s doc in `main.rs`).
+/// Five and sixty are both arbitrary within that bound; a future operator
+/// with a real crash-loop incident to look at should retune the constant,
+/// not the mechanism.
+const MAX_RESTARTS: usize = 5;
+const RESTART_WINDOW: Duration = Duration::from_secs(60);
+
+/// Bounds how often [`run`] may rebuild the machine after [`Ended::Stopped`].
+///
+/// A bare counter, not a counter-plus-sleep: the window alone already bounds
+/// the worst case (at most [`MAX_RESTARTS`] machine rebuilds in any
+/// [`RESTART_WINDOW`]) regardless of how quickly one life can reach a stop,
+/// so an explicit backoff sleep on top of it would be a second mechanism
+/// enforcing the same bound.
+struct RestartPolicy {
+    /// Every restart still inside `RESTART_WINDOW` of the last [`allow`]
+    /// call, oldest first.
+    ///
+    /// [`allow`]: RestartPolicy::allow
+    recent: VecDeque<Instant>,
+}
+
+impl RestartPolicy {
+    fn new() -> Self {
+        Self { recent: VecDeque::new() }
+    }
+
+    /// Record a stop at `now` and say whether [`run`] may restart.
+    ///
+    /// `now` is a parameter rather than read from the clock here so a test
+    /// can drive the rolling window without a real sleep -- see this
+    /// module's tests, which advance `now` by arithmetic on `Instant`
+    /// instead of waiting sixty real seconds for the window to roll over.
+    fn allow(&mut self, now: Instant) -> bool {
+        while let Some(&oldest) = self.recent.front() {
+            if now.duration_since(oldest) > RESTART_WINDOW {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.recent.len() >= MAX_RESTARTS {
+            false
+        } else {
+            self.recent.push_back(now);
+            true
+        }
+    }
+}
+
+/// How one life of the host thread ended.
+enum LifeEnd {
+    /// Every `Sender<In>` is gone -- see [`Woke::Gone`]. The whole
+    /// supervisor should stop, not just this life.
+    Gone,
+    /// The module stopped inside the steady-state driver loop.
+    ///
+    /// `chan` is `None` when the stop came from [`Host::cycle`]'s kick
+    /// sweep rather than a channel dispatch: a timer callback has no
+    /// channel to name. See [`mbbs::Ended::Stopped`].
+    Stopped { poison: Poison, chan: Option<Chan> },
+}
+
+/// Names who a stop happened to, for [`run`]'s log line -- pulled out as its
+/// own pure function so it has a unit test of its own rather than being
+/// legible only by eyeballing `--nocapture` output. `None` is spelled out
+/// rather than left to a reader's inference, because the honest fact ("a
+/// kick fired, not a player") is exactly the thing a driver reading the log
+/// wants to know and a bare "no channel" does not say.
+fn describe_stop(chan: Option<Chan>) -> String {
+    match chan {
+        Some(chan) => format!("channel {chan}"),
+        None => "no channel (a kick fired, not a player)".to_owned(),
+    }
+}
+
+/// Build a fresh machine, boot `boot.module` on it, and drive the steady
+/// state until the module stops or every connection is gone.
 ///
 /// # Errors
 ///
-/// If the machine cannot be built, the module cannot be loaded or entered, or
-/// the module stops (a poisoned machine ends the thread; see [`Wait::Stop`]).
-pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
+/// If the machine cannot be built, the module cannot be loaded or relocated,
+/// ordinal 1 (the init routine) itself stops, or `finish_init` fails, this
+/// returns `Err` -- a broken deployment, which [`run`] does not retry (see
+/// the module doc). Once the steady state begins, only
+/// [`LifeEnd::Stopped`] is reported through the `Ok` path; any other error
+/// out of `apply`/`cycle`/`flush` (a host bug, not a module poisoning) still
+/// ends the whole supervisor -- restarting on an error this crate does not
+/// understand would hide it, not fix it.
+fn life(
+    boot: &Boot,
+    rx: &std::sync::mpsc::Receiver<In>,
+    survey: Option<&mbbs::survey::Shared>,
+) -> io::Result<LifeEnd> {
     // 1. Build the machine HERE. It is !Send; it cannot be handed in.
     let mut machine = Machine::new()?;
-    let mut host = Host::new(&mut machine, boot.root, boot.terms)?;
+    let mut host = Host::new(&mut machine, boot.root.clone(), boot.terms)?;
+    // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
+    // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
+    // (and everything it owns) is rebuilt from scratch on every restart, and
+    // an inventory attached only to a life's own `Host` would be destroyed
+    // with it.
+    if let Some(inventory) = survey {
+        host.enable_survey(inventory.clone());
+    }
     let file = std::fs::read(&boot.module)?;
     let module = host.load(&mut machine, &file).map_err(io::Error::other)?;
     let entry = module
         .entry(1)
         .ok_or_else(|| io::Error::other("module has no ordinal 1 (the init routine)"))?;
-    host.run(&mut machine, &module, entry, &[])?;
+    match host.run(&mut machine, &module, entry, &[], None)? {
+        Outcome::Returned { .. } => {}
+        // Ordinal 1 itself poisoning the machine is a boot failure, not a
+        // survivable stop: `Host::run` reports it as `Ok(Outcome::Stopped)`
+        // rather than an `Err`, so it has to be checked here rather than
+        // relying on `?` above to catch it. Continuing to `finish_init` on
+        // an already-poisoned machine would be running setup on a machine
+        // that will refuse every call, so this is caught before that.
+        Outcome::Stopped(poison) => {
+            return Err(io::Error::other(format!(
+                "module ordinal 1 (init) stopped before boot completed: {poison}"
+            )));
+        }
+    }
     host.finish_init(&mut machine)?;
+    eprintln!("mbbs-server: module booted, serving {} channel(s)", boot.terms.count());
 
     let terms = boot.terms;
     let mut pool = Pool::new(terms);
@@ -129,10 +285,10 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
 
     loop {
         // 1. Sleep according to what the previous cycle told us to do.
-        let first = match wake(wait, &rx) {
+        let first = match wake(wait, rx) {
             Woke::Message(msg) => Some(msg),
             Woke::Nothing => None,
-            Woke::Gone => return Ok(()),
+            Woke::Gone => return Ok(LifeEnd::Gone),
         };
 
         // 2. Drain every message available, not just the one that woke us --
@@ -156,17 +312,77 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
         // 5. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
 
-        wait = cycles.ended.wait();
-        if let Wait::Stop = wait {
-            for conn in conns.iter().flatten() {
-                let _ = conn.try_send(Out::Close);
+        match cycles.ended {
+            Ended::Stopped(poison, chan) => {
+                for conn in conns.iter().flatten() {
+                    let _ = conn.try_send(Out::Close);
+                }
+                return Ok(LifeEnd::Stopped { poison, chan });
             }
-            return Err(io::Error::other(format!(
-                "the module stopped: {:?}",
-                cycles.ended
-            )));
+            other => wait = other.wait(),
         }
     }
+}
+
+/// Build the machine, boot the module, and drive it -- rebuilding and
+/// reloading everything from scratch whenever the module stops, up to
+/// [`RestartPolicy`]'s bound. See the module doc for why a restart, rather
+/// than hanging up one channel, is the only safe response to a stop.
+///
+/// # Errors
+///
+/// If a life's *boot* fails (see [`life`]), or the module stops more than
+/// [`RestartPolicy`] allows within [`RESTART_WINDOW`].
+pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
+    let mut policy = RestartPolicy::new();
+
+    // Built ONCE, here -- not inside `life` -- and handed to every life by a
+    // shared `Rc<RefCell<_>>`. `life` rebuilds `Machine` and `Host` from
+    // scratch on every restart (see the module doc, "Surviving a module
+    // stop"); an inventory owned by a life's own `Host` would be destroyed
+    // with it, and a survey that lost everything at the first restart would
+    // not be a survey. This thread never crosses a thread boundary (`run` is
+    // always called already running on the dedicated host thread -- see
+    // `crates/mbbs-server/src/conn.rs`'s `std::thread::spawn` call), so
+    // `Rc<RefCell<_>>` is enough; nothing here needs `Arc`.
+    let inventory: Option<mbbs::survey::Shared> = match &boot.survey {
+        Some(path) => Some(std::rc::Rc::new(std::cell::RefCell::new(
+            mbbs::survey::Inventory::new(path)?,
+        ))),
+        None => None,
+    };
+
+    let result = loop {
+        match life(&boot, &rx, inventory.as_ref()) {
+            Err(e) => break Err(e),
+            Ok(LifeEnd::Gone) => break Ok(()),
+            Ok(LifeEnd::Stopped { poison, chan }) => {
+                eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(chan));
+
+                if !policy.allow(Instant::now()) {
+                    break Err(io::Error::other(format!(
+                        "the module stopped {MAX_RESTARTS} times within {RESTART_WINDOW:?}; \
+                         giving up rather than crash-looping"
+                    )));
+                }
+                eprintln!("mbbs-server: restarting the module");
+            }
+        }
+    };
+
+    // The clean-shutdown tier of survey durability -- see `mbbs::survey::Inventory`'s
+    // own doc for the other tier (`Inventory::record`'s per-symbol append,
+    // which is what a `kill -9` or a crash leaves behind instead). Whatever
+    // `result` is, every restart already ran through the same `inventory`,
+    // so this always has the whole process's history to write, not just the
+    // last life's.
+    if let Some(inventory) = &inventory
+        && let Err(e) = inventory.borrow_mut().finish()
+    {
+        eprintln!("mbbs-server: failed to write the final survey inventory: {e}");
+    }
+
+    result
 }
 
 /// Apply one boundary message to the host.
@@ -193,10 +409,37 @@ fn apply(
             Ok(())
         }
         In::Input { chan, bytes } => {
+            if conns[chan.index()].is_none() {
+                // Nobody is connected on this channel in this life. Either
+                // this is a duplicate arriving after `flush` already hung
+                // this same connection up (Path 1: the sender closed and a
+                // queued `Disconnect` drained late), or it crossed a life
+                // boundary entirely -- a connection whose `Out::Close` never
+                // landed (the bounded channel was full, `life`'s `try_send`
+                // silently drops it) survives into a fresh life with a fresh
+                // `Pool` and fresh `conns`, and this is one of its stale
+                // messages (Path 2). Either way, pushing these bytes into
+                // GSBL would land them on whichever *this* life's connection
+                // takes this channel index next -- a stranger's keystrokes
+                // in someone else's session -- so they are dropped instead.
+                return Ok(());
+            }
             host.gsbl_mut().push_input(chan, &bytes);
             Ok(())
         }
         In::Disconnect { chan } => {
+            if conns[chan.index()].is_none() {
+                // Already disconnected in this life -- see the matching
+                // comment on `In::Input` above for the two ways this
+                // arrives. Running `Host::hangup` here would run the
+                // module's `huprou`/`lofrou` against a channel this life
+                // never called `Host::connect` on, and `Pool::give_back`
+                // would be asked to free a channel that was never re-taken.
+                // `Pool::give_back` is idempotent on its own (see its doc),
+                // but `Host::hangup` is not guarded at all -- this check is
+                // what keeps it from running in the first place.
+                return Ok(());
+            }
             host.hangup(machine, module, chan)?;
             pool.give_back(chan);
             conns[chan.index()] = None;
@@ -254,14 +497,24 @@ mod tests {
     //! empty, and a `Disconnect` returning a channel. The real coverage for
     //! the driver loop is Task 12 (two real sockets) and Task 13 (the sleep
     //! meter), both of which run against `re/WCCMMUD.DLL`.
+    //!
+    //! `apply`'s two "channel nobody is connected on" guards (`In::Input` and
+    //! `In::Disconnect`, added for the double-free defect -- see
+    //! `crates/mbbs-server/src/pool.rs`'s `give_back` doc) are the exception:
+    //! they need a real `Host`/`Module`/`Machine`, but not a real `.DLL` --
+    //! `mbbs::testing::Fixture` builds all three without one, which is enough
+    //! to call `apply` directly and inspect `Host::gsbl_mut` afterward. The
+    //! end-to-end version of the same guard, through an actual restart, is
+    //! `crates/mbbs-server/tests/host_supervisor.rs`.
 
     use mbbs::Terms;
+    use tokio::sync::mpsc::Sender;
     use tokio::sync::oneshot;
 
     use crate::pool::Pool;
 
     use super::{Woke, wake};
-    use crate::msg::In;
+    use crate::msg::{In, Out};
     use mbbs::Wait;
 
 
@@ -322,8 +575,12 @@ mod tests {
     }
 
     /// `apply`'s `Disconnect` arm's pool half: giving a channel back makes it
-    /// takeable again. (The `Host::hangup` call itself needs a live module
-    /// and is not reachable from this crate's tests -- see the module doc.)
+    /// takeable again. (The `Host::hangup` *success* path -- a registered
+    /// module actually running `huprou` -- still needs a real `.DLL` and is
+    /// not reachable from this crate's tests. The *guard* that skips
+    /// `Host::hangup` entirely for an unconnected channel is reachable, and
+    /// is covered by `apply_ignores_a_disconnect_for_a_channel_nobody_is_
+    /// connected_on` below.)
     #[test]
     fn a_disconnect_returns_its_channel_to_the_pool() {
         let terms = Terms::new(2);
@@ -334,5 +591,218 @@ mod tests {
 
         pool.give_back(a);
         assert_eq!(pool.take(), Some(a), "disconnect frees the line for reuse");
+    }
+
+    /// `apply`'s `In::Disconnect` guard: a channel nobody is connected to in
+    /// *this* life must be left alone, not handed to `Host::hangup`.
+    ///
+    /// This is the fix for both reachable double-free paths (see
+    /// `crates/mbbs-server/src/pool.rs`'s `give_back` doc and this file's
+    /// module doc, "Surviving a module stop"): a duplicate `Disconnect`
+    /// after `flush` already hung the same connection up in this life
+    /// (Path 1), and a stale `Disconnect` carrying a channel identity from a
+    /// life that has already ended, arriving after a fresh restart gave that
+    /// index a fresh, unconnected `Pool`/`conns` (Path 2). Both look
+    /// identical to `apply` at this point: `conns[chan.index()]` is `None`.
+    ///
+    /// The tripwire is deliberate: this `Fixture` loads a module but never
+    /// runs its ordinal 1, so nothing ever calls `register_module` --
+    /// `Host::hangup` would fail with "no module has registered" if `apply`
+    /// ever reached it. Without the guard, `apply` would propagate that
+    /// `Err`, which is exactly what `life`'s real loop does with it
+    /// (`apply(...)?`): end the whole host thread. With the guard, `apply`
+    /// never calls `Host::hangup` and returns `Ok(())`.
+    #[test]
+    fn apply_ignores_a_disconnect_for_a_channel_nobody_is_connected_on() {
+        use mbbs::testing::Fixture;
+
+        let terms = Terms::new(1);
+        let mut fixture = Fixture::rooted_with_terms(
+            mbbs::testing::scratch("mbbs-server-host-apply-guard-disconnect"),
+            terms,
+        );
+        let module = fixture.minimal_module();
+        let chan = fixture.console();
+
+        let mut pool = Pool::new(terms);
+        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
+
+        let result = super::apply(
+            &mut fixture.host,
+            &mut fixture.machine,
+            &module,
+            &mut pool,
+            &mut conns,
+            In::Disconnect { chan },
+        );
+
+        assert!(
+            result.is_ok(),
+            "an unconnected channel's stale Disconnect must be ignored \
+             rather than reach Host::hangup (which errors here, with no \
+             module registered): {result:?}"
+        );
+        assert_eq!(
+            pool.take(),
+            Some(chan),
+            "the channel must still be free exactly once"
+        );
+        assert!(
+            pool.take().is_none(),
+            "and not a second time -- give_back must never have run"
+        );
+    }
+
+    /// `apply`'s `In::Input` guard, the other half of the same fix.
+    ///
+    /// Proven through `Host::gsbl_mut().take_line`, which only ever answers
+    /// a line `gsbl::Channel::take` actually completed. `bytes` below ends
+    /// in a CR on purpose: without the guard, `push_input` would run and
+    /// that CR would complete a line for a channel nobody is connected to
+    /// in this life -- exactly the "a dead session's keystrokes land on
+    /// whoever this life connects to the channel next" harm the guard on
+    /// `In::Input` exists to prevent (see `apply`'s own comment on that
+    /// arm).
+    #[test]
+    fn apply_ignores_input_for_a_channel_nobody_is_connected_on() {
+        use mbbs::testing::Fixture;
+
+        let terms = Terms::new(1);
+        let mut fixture = Fixture::rooted_with_terms(
+            mbbs::testing::scratch("mbbs-server-host-apply-guard-input"),
+            terms,
+        );
+        let module = fixture.minimal_module();
+        let chan = fixture.console();
+
+        let mut pool = Pool::new(terms);
+        let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
+
+        let result = super::apply(
+            &mut fixture.host,
+            &mut fixture.machine,
+            &module,
+            &mut pool,
+            &mut conns,
+            In::Input { chan, bytes: b"EVIL\r".to_vec() },
+        );
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            fixture.host.gsbl_mut().take_line(chan),
+            None,
+            "bytes for an unconnected channel must never reach GSBL"
+        );
+    }
+
+    // `RestartPolicy`. Driven entirely by arithmetic on `Instant`, never a
+    // real sleep -- see `RestartPolicy::allow`'s own doc for why `now` is a
+    // parameter. Every test below shares that shape (advance `now` by
+    // `Duration` math, never `std::thread::sleep`), which is exactly what
+    // makes `RestartPolicy` testable without paying sixty real seconds per
+    // assertion.
+    use super::{MAX_RESTARTS, RESTART_WINDOW, RestartPolicy, describe_stop};
+    use std::time::{Duration, Instant};
+
+    /// `describe_stop` names a channel when it has one, and says plainly
+    /// when it does not -- the only place these two facts get formatted for
+    /// the log line `run` prints on every stop, so a mutation swapping the
+    /// two arms (or losing the "not a player" honesty) would otherwise only
+    /// be visible by eyeballing `cargo test -- --nocapture` output from
+    /// `tests/host_supervisor.rs`.
+    #[test]
+    fn describe_stop_names_a_channel_or_says_there_is_none() {
+        let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+        assert_eq!(describe_stop(Some(chan)), "channel 0");
+        assert_eq!(describe_stop(None), "no channel (a kick fired, not a player)");
+    }
+
+    /// The first `MAX_RESTARTS` stops, all at the same instant, are every
+    /// one allowed -- and the very next is refused.
+    #[test]
+    fn allows_exactly_max_restarts_then_refuses() {
+        let mut policy = RestartPolicy::new();
+        let now = Instant::now();
+
+        for n in 0..MAX_RESTARTS {
+            assert!(policy.allow(now), "restart {n} of {MAX_RESTARTS} must be allowed");
+        }
+        assert!(
+            !policy.allow(now),
+            "restart {MAX_RESTARTS} (one past the bound) must be refused"
+        );
+    }
+
+    /// A restart older than the window rolls off, freeing exactly the
+    /// capacity it held -- not the whole window's worth at once.
+    ///
+    /// The `MAX_RESTARTS` restarts are staggered a second apart (not all at
+    /// one instant) so that aging them out is gradual too -- restarts
+    /// recorded at the identical instant would all age out together the
+    /// moment any one of them does, which would make "frees its own slot
+    /// and no more" true by accident rather than by the window logic this
+    /// test means to pin.
+    #[test]
+    fn a_restart_older_than_the_window_frees_its_own_slot_and_no_more() {
+        let mut policy = RestartPolicy::new();
+        let t0 = Instant::now();
+
+        for n in 0..MAX_RESTARTS {
+            assert!(policy.allow(t0 + Duration::from_secs(n as u64)), "filling the window from t0");
+        }
+
+        // Just past t0 + RESTART_WINDOW: only the restart recorded at t0
+        // itself has aged out (t0 + 1s is exactly RESTART_WINDOW old here,
+        // which the boundary test below pins as *not* aged out), so exactly
+        // one more is allowed...
+        let past_first = t0 + RESTART_WINDOW + Duration::from_secs(1);
+        assert!(policy.allow(past_first), "one slot must have freed");
+        // ...and the next one, at the same instant, must not be -- the
+        // newly-recorded restart above refilled the slot that just freed,
+        // and the other MAX_RESTARTS - 1 have not aged out yet.
+        assert!(
+            !policy.allow(past_first),
+            "only one slot freed; a second restart at the same instant must be refused"
+        );
+    }
+
+    /// The window's boundary is exclusive: a restart exactly `RESTART_WINDOW`
+    /// old has not yet aged out.
+    ///
+    /// This is the one assertion `a_restart_older_than_the_window_frees_its_own_slot_and_no_more`
+    /// does not cover -- it only exercises *past* the window, one second
+    /// over. A mutation that changed `allow`'s `>` to `>=` would still pass
+    /// every other test in this module and only be caught here.
+    #[test]
+    fn exactly_at_the_window_boundary_has_not_aged_out_yet() {
+        let mut policy = RestartPolicy::new();
+        let t0 = Instant::now();
+
+        for _ in 0..MAX_RESTARTS {
+            assert!(policy.allow(t0), "filling the window at t0");
+        }
+
+        let at_boundary = t0 + RESTART_WINDOW;
+        assert!(
+            !policy.allow(at_boundary),
+            "a restart exactly RESTART_WINDOW old must not have aged out yet"
+        );
+    }
+
+    /// A policy that has never refused anything keeps a bounded history --
+    /// restarts spread out one at a time, each older than the window by the
+    /// time the next arrives, never accumulate.
+    #[test]
+    fn spaced_out_restarts_never_fill_the_window() {
+        let mut policy = RestartPolicy::new();
+        let mut now = Instant::now();
+
+        for n in 0..MAX_RESTARTS * 3 {
+            assert!(
+                policy.allow(now),
+                "restart {n}, always alone in its window, must be allowed"
+            );
+            now += RESTART_WINDOW + Duration::from_secs(1);
+        }
     }
 }

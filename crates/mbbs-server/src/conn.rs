@@ -464,6 +464,7 @@ mod tests {
             polls_per_wake: 1,
             passes: 1,
             clock_reads: None,
+            survey: None,
         };
 
         let bound = super::serve(boot, default_keys(), &[("127.0.0.1:0", super::Stack::modern)])
@@ -870,6 +871,7 @@ mod tests {
             polls_per_wake: 1,
             passes: 1,
             clock_reads: None,
+            survey: None,
         };
 
         let bound = super::serve(

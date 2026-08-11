@@ -712,6 +712,39 @@ impl Block {
         let name = self.name.clone();
 
         if self.geometry.variable {
+            let reclen = usize::from(self.geometry.reclen);
+
+            // The one shape this host rewrites: a buffer with a body beyond
+            // `reclen` (nothing to rewrite in place otherwise), at a position
+            // the model already holds a record at. Everything else -- no
+            // body, an unknown position, or a body
+            // `variable::rewrite_fragment_in_place` itself refuses because the
+            // page it names is not shaped for an in-place rewrite -- keeps
+            // this host's refusal rather than guessing.
+            let has_body = bytes.len().checked_sub(reclen).is_some_and(|n| n > 0);
+            if has_body {
+                let known = self
+                    .records
+                    .as_ref()
+                    .expect("just loaded")
+                    .find_physical(position)
+                    .is_some();
+                if known {
+                    return match self.rewrite_variable(position, bytes) {
+                        Ok(()) => {
+                            self.records
+                                .as_mut()
+                                .expect("just loaded")
+                                .update(&self.keys, position, bytes.to_vec())
+                                .map_err(|why| BtvError { file: name, why })?;
+                            self.dirty = true;
+                            Ok(())
+                        }
+                        Err(why) => Err(BtvError { file: name, why }),
+                    };
+                }
+            }
+
             return Err(BtvError {
                 file: name,
                 why: format!(
@@ -768,6 +801,70 @@ impl Block {
         self.dirty = true;
 
         Ok(())
+    }
+
+    /// Rewrite a variable-length record's fragment in place, and its fixed
+    /// part alongside it, in that order.
+    ///
+    /// The fragment first: [`variable::rewrite_fragment_in_place`] does its
+    /// own validation before it writes a byte, so if the file's shape does
+    /// not match, this returns before the data page's slot has been touched
+    /// at all. The fixed part is written from `bytes[..reclen]`; the four
+    /// bytes of pointer behind it, and anything past those up to `physical`,
+    /// are read off disk and written straight back -- this can never be the
+    /// write that zeros the pointer [`Self::update`]'s blanket refusal exists
+    /// to prevent, because it never puts anything there but what was already
+    /// there.
+    ///
+    /// `bytes` is assumed to be at least `reclen + 1` long and `position` to
+    /// already hold a record -- both are the caller's job, checked in
+    /// [`Self::update`] before this is reached.
+    ///
+    /// # Errors
+    ///
+    /// If the slot cannot be read, [`variable::rewrite_fragment_in_place`]
+    /// refuses the fragment's shape, or the slot cannot be written back.
+    fn rewrite_variable(&self, position: u32, bytes: &[u8]) -> Result<(), String> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let reclen = usize::from(self.geometry.reclen);
+        let physical = usize::from(self.geometry.physical);
+
+        let mut slot = vec![0u8; physical];
+        {
+            let mut file = std::fs::File::open(&self.path)
+                .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            file.seek(SeekFrom::Start(u64::from(position)))
+                .and_then(|_| file.read_exact(&mut slot))
+                .map_err(|e| {
+                    format!("{}: reading position {position}: {e}", self.path.display())
+                })?;
+        }
+
+        let pointer =
+            variable::Pointer::decode([slot[reclen], slot[reclen + 1], slot[reclen + 2], slot[reclen + 3]]);
+
+        let mut pages = variable::FilePages::new(&self.path, self.geometry.page, self.geometry.pages);
+        variable::rewrite_fragment_in_place(
+            &mut pages,
+            self.geometry.version,
+            pointer,
+            &bytes[reclen..],
+        )?;
+
+        slot[..reclen].copy_from_slice(&bytes[..reclen]);
+
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+        let count = self
+            .records
+            .as_ref()
+            .expect("checked by Self::update before this is called")
+            .len() as u32;
+        pages::write_record(&self.path, layout, pages::Slot::Existing(position), &slot, count)
     }
 
     /// Rebuild every key's leaf index page from the records already in memory,
@@ -1853,6 +1950,284 @@ mod tests {
             &after[tail..tail + 4],
             &pointer,
             "the fragment pointer was overwritten"
+        );
+    }
+
+    /// One variable page holding one un-continued fragment, laid out the way
+    /// [`variable`] documents: its own number, no free successor, a fragment
+    /// count of one, the body from `0x0c`, and the two-entry array (fragment
+    /// 0's start and the offset that ends it) at the end of the page.
+    fn variable_page(number: u32, page_len: usize, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; page_len];
+        out[0..2].copy_from_slice(&((number >> 16) as u16).to_le_bytes());
+        out[2..4].copy_from_slice(&(number as u16).to_le_bytes());
+        out[0x06..0x0a].copy_from_slice(&[0xff; 4]);
+        out[0x0a..0x0c].copy_from_slice(&1u16.to_le_bytes());
+        out[0x0c..0x0c + body.len()].copy_from_slice(body);
+        let end = 0x0c + body.len();
+        out[page_len - 2] = 0x0c;
+        out[page_len - 1] = 0x00;
+        out[page_len - 4] = (end & 0xff) as u8;
+        out[page_len - 3] = (end >> 8) as u8;
+        out
+    }
+
+    /// A variable-length file shaped the way `WCCTEXT` measures: one 8-byte
+    /// fixed part, a 4-byte fragment pointer behind it (`physical` - `reclen`
+    /// == 4, nothing else), one record on page 1 whose pointer names page 2,
+    /// fragment 0 -- a single, un-continued fragment holding the record's
+    /// 20-byte variable body.
+    fn seed_variable(dir: &Path) -> PathBuf {
+        let (page, reclen, physical, pages) = (64usize, 8u16, 12u16, 3usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[at::PAGE..at::PAGE + 2].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[6] = 0;
+        bytes[7] = 4;
+        bytes[at::KEYS..at::KEYS + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[at::RECLEN..at::RECLEN + 2].copy_from_slice(&reclen.to_le_bytes());
+        bytes[at::PHYSICAL..at::PHYSICAL + 2].copy_from_slice(&physical.to_le_bytes());
+        bytes[at::RECORDS_HIGH..at::RECORDS_HIGH + 2].copy_from_slice(&0u16.to_le_bytes());
+        bytes[at::RECORDS_LOW..at::RECORDS_LOW + 2].copy_from_slice(&1u16.to_le_bytes());
+        // `at::VARIABLE_MARK` and `at::USRFLGS` are not written: this fixture
+        // is a file `Block::update` reads directly off `self.geometry`,
+        // never through `Geometry::read`, which is the only reader of
+        // either -- and both sit past a page this small (`block()`'s fixed-
+        // length fixture leaves them unwritten for the same reason).
+
+        // Page 1: one data page, one record: a 2-byte key, six bytes of
+        // fixed-part padding, then the pointer to page 2, fragment 0.
+        let header = pages::Header {
+            number: 1,
+            data: true,
+            stamp: 0,
+        };
+        bytes[page..page + 6].copy_from_slice(&header.encode());
+        let record_at = page + 6;
+        bytes[record_at..record_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[record_at + 8..record_at + 12].copy_from_slice(&[0x00, 0x02, 0x00, 0x00]);
+
+        // Page 2: the fragment.
+        let body: Vec<u8> = (0..20u8).collect();
+        let fragment_page = variable_page(2, page, &body);
+        bytes[2 * page..3 * page].copy_from_slice(&fragment_page);
+
+        let path = dir.join("VARIABLE.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    /// A `Block` over [`seed_variable`]'s file, built directly the same way
+    /// [`block`] is.
+    fn block_variable(path: PathBuf) -> Block {
+        let geometry = Geometry {
+            version: Version::V5,
+            page: 64,
+            keys: 1,
+            reclen: 8,
+            physical: 12,
+            records: 1,
+            pages: 3,
+            variable: true,
+        };
+        let keys = vec![Key {
+            number: 0,
+            definition: 0,
+            segments: vec![keys::Segment {
+                offset: 0,
+                length: 2,
+                kind: keys::Kind::Signed,
+                descending: false,
+            }],
+            duplicates: false,
+            chain: None,
+        }];
+        Block {
+            name: "VARIABLE.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FarPtr::NULL,
+            maxlen: 28,
+            data: FarPtr::NULL,
+            key: FarPtr::NULL,
+            records: None,
+            cursor: Cursor::Nowhere,
+            dirty: false,
+        }
+    }
+
+    /// The one shape this host rewrites: an equal-length, single-fragment,
+    /// non-continued body. `Block::update` reaches
+    /// [`variable::rewrite_fragment_in_place`] for it rather than refusing.
+    #[test]
+    fn update_rewrites_a_matching_variable_length_fragment_in_place() {
+        let dir = crate::testing::scratch("block-update-rewrites-variable-length");
+        let path = seed_variable(&dir);
+        let mut block = block_variable(path.clone());
+
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        // A new key and a new body, the same length as the old one (20
+        // bytes) so the shape matches.
+        let mut new_value = vec![0u8; 8];
+        new_value[..2].copy_from_slice(&9u16.to_le_bytes());
+        new_value.extend((100..120u8).collect::<Vec<u8>>());
+
+        block.update(70, &new_value).expect("an equal-length rewrite is handled");
+
+        // The model agrees immediately.
+        let current = block.records().expect("reads").find_physical(70).and_then(|at| {
+            block.records.as_ref().expect("loaded").physical(at)
+        }).expect("still there");
+        assert_eq!(current.bytes, new_value, "the model holds the new value");
+
+        // And so does a fresh read from disk, after the cache is dropped.
+        block.records = None;
+        let reread = block.records().expect("reads from disk");
+        let record = reread.find_physical(70).and_then(|at| reread.physical(at)).expect("still there");
+        assert_eq!(record.bytes, new_value, "a fresh read agrees with the model");
+
+        // Byte-identical everywhere except the fixed part (8 bytes at
+        // position 70) and the fragment's payload (20 bytes at page 2 offset
+        // 0x0c). Not the pointer behind the fixed part, not the fragment
+        // page's header or its entry array, not page 0's other fields.
+        let after = std::fs::read(&path).expect("read back");
+        let fixed_range = 70..70 + 8;
+        let payload_range = 2 * 64 + 0x0c..2 * 64 + 0x0c + 20;
+        for i in 0..after.len() {
+            if fixed_range.contains(&i) || payload_range.contains(&i) {
+                continue;
+            }
+            assert_eq!(after[i], before[i], "byte {i}, outside the fixed part and the payload, changed");
+        }
+        assert_eq!(&after[fixed_range.clone()], &new_value[..8], "the fixed part changed");
+        assert_eq!(&after[payload_range.clone()], &new_value[8..], "the payload changed");
+    }
+
+    /// A body a different length from the fragment it would replace needs a
+    /// second page or the free chain, neither of which this host has yet, so
+    /// it refuses -- the same house style as the length check
+    /// [`variable::rewrite_fragment_in_place`] runs on its own account, named
+    /// distinguishably from the blanket variable-length refusal.
+    #[test]
+    fn update_refuses_a_variable_length_body_of_a_different_length() {
+        let dir = crate::testing::scratch("block-update-refuses-grown-variable-length");
+        let path = seed_variable(&dir);
+        let mut block = block_variable(path.clone());
+
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        let mut new_value = vec![0u8; 8];
+        new_value[..2].copy_from_slice(&9u16.to_le_bytes());
+        new_value.extend((0..21u8).collect::<Vec<u8>>()); // 21, not 20
+
+        let e = block
+            .update(70, &new_value)
+            .expect_err("21 bytes does not match the existing 20-byte fragment");
+        assert!(
+            e.why.contains("an in-place rewrite only handles a replacement of the same length"),
+            "{e}"
+        );
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, before, "a refused rewrite must not touch the file");
+    }
+
+    /// A position the model has no record at is refused before
+    /// [`Block::rewrite_variable`] ever reads a byte from it, whatever the
+    /// buffer's shape -- otherwise `position` is a module-supplied file
+    /// offset that would be read as a record slot with nothing having
+    /// checked it lands on one. The buffer's shape matches (20 bytes of
+    /// body, the same length the fixture's fragment holds), so a check that
+    /// forgot to gate on the model would attempt the rewrite anyway.
+    #[test]
+    fn update_refuses_a_variable_length_write_to_an_unknown_position() {
+        let dir = crate::testing::scratch("block-update-refuses-unknown-position-variable");
+        let path = seed_variable(&dir);
+        let mut block = block_variable(path.clone());
+
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        let mut new_value = vec![0u8; 8];
+        new_value[..2].copy_from_slice(&9u16.to_le_bytes());
+        new_value.extend((100..120u8).collect::<Vec<u8>>());
+
+        let e = block
+            .update(9999, &new_value)
+            .expect_err("9999 holds no record, matching shape or not");
+        assert!(e.why.contains("variable-length"), "{e}");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, before, "a refused rewrite must not touch the file");
+    }
+
+    /// Every fixture above sets `physical - reclen` to exactly four -- the
+    /// pointer and nothing past it. This one does not: two more bytes sit
+    /// behind the pointer, a sentinel this rewrite is never told about and
+    /// must still carry through untouched, the same as the pointer itself.
+    /// [`Block::rewrite_variable`] reads the whole physical slot off disk and
+    /// only ever overwrites its first `reclen` bytes, so this is true by
+    /// construction -- this test is what makes that true by measurement too.
+    fn seed_variable_with_padding_behind_the_pointer(dir: &Path) -> PathBuf {
+        let (page, reclen, physical, pages) = (64usize, 8u16, 14u16, 3usize);
+        let mut bytes = vec![0u8; page * pages];
+        bytes[at::PAGE..at::PAGE + 2].copy_from_slice(&(page as u16).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&pages::to_long(pages::NOWHERE));
+        bytes[6] = 0;
+        bytes[7] = 4;
+        bytes[at::KEYS..at::KEYS + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[at::RECLEN..at::RECLEN + 2].copy_from_slice(&reclen.to_le_bytes());
+        bytes[at::PHYSICAL..at::PHYSICAL + 2].copy_from_slice(&physical.to_le_bytes());
+        bytes[at::RECORDS_HIGH..at::RECORDS_HIGH + 2].copy_from_slice(&0u16.to_le_bytes());
+        bytes[at::RECORDS_LOW..at::RECORDS_LOW + 2].copy_from_slice(&1u16.to_le_bytes());
+
+        let header = pages::Header {
+            number: 1,
+            data: true,
+            stamp: 0,
+        };
+        bytes[page..page + 6].copy_from_slice(&header.encode());
+        let record_at = page + 6;
+        bytes[record_at..record_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[record_at + 8..record_at + 12].copy_from_slice(&[0x00, 0x02, 0x00, 0x00]);
+        // The two bytes past the pointer: not the record, not the pointer,
+        // and named nowhere in this format -- a rewrite has no business
+        // touching them.
+        bytes[record_at + 12..record_at + 14].copy_from_slice(&[0xab, 0xcd]);
+
+        let body: Vec<u8> = (0..20u8).collect();
+        let fragment_page = variable_page(2, page, &body);
+        bytes[2 * page..3 * page].copy_from_slice(&fragment_page);
+
+        let path = dir.join("PADDED.DAT");
+        std::fs::write(&path, &bytes).expect("scratch file");
+        path
+    }
+
+    #[test]
+    fn update_leaves_bytes_behind_the_pointer_untouched_when_physical_exceeds_reclen_plus_four() {
+        let dir = crate::testing::scratch("block-update-variable-length-padding-survives");
+        let path = seed_variable_with_padding_behind_the_pointer(&dir);
+        let mut block = block_variable(path.clone());
+        block.geometry.physical = 14;
+
+        let mut new_value = vec![0u8; 8];
+        new_value[..2].copy_from_slice(&9u16.to_le_bytes());
+        new_value.extend((100..120u8).collect::<Vec<u8>>());
+
+        block.update(70, &new_value).expect("an equal-length rewrite is handled");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            &after[70 + 8..70 + 12],
+            &[0x00, 0x02, 0x00, 0x00],
+            "the fragment pointer survived a physical slot wider than reclen + 4"
+        );
+        assert_eq!(
+            &after[70 + 12..70 + 14],
+            &[0xab, 0xcd],
+            "the two bytes behind the pointer, which this format names nowhere, survived too"
         );
     }
 

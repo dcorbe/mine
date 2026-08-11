@@ -1185,7 +1185,13 @@ pub(crate) fn fsdprc(
         // re-reads fresh from `Machine`, per the callback discipline
         // above.
         let outcome = host
-            .run(machine, module, fldvfy, &[u16::from(entfld), scratch.offset, scratch.selector])
+            .run(
+                machine,
+                module,
+                fldvfy,
+                &[u16::from(entfld), scratch.offset, scratch.selector],
+                Some(chan),
+            )
             .map_err(|e| ShimError::Failed(format!("fsdprc: fldvfy call failed: {e}")))?;
         match outcome {
             crate::Outcome::Returned { ax, .. } => ax as i16,
@@ -1468,7 +1474,7 @@ pub(crate) fn goback(
     match session.whndun {
         Some(whndun) => {
             let outcome = host
-                .run(machine, module, whndun, &[u16::from(session.save)])
+                .run(machine, module, whndun, &[u16::from(session.save)], Some(chan))
                 .map_err(|e| ShimError::Failed(format!("goback: whndun call failed: {e}")))?;
             match outcome {
                 crate::Outcome::Returned { .. } => {}
