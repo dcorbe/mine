@@ -743,7 +743,12 @@ fn ascii_template(
 /// `btuoes(usrnum,1)` asks to be told when it has. The lock is the busy-wait
 /// the design doc replaced with an edge; the `btuoes` arming is what Task 11
 /// turns into that edge, so both are set as real channel state here rather
-/// than dropped, even though nothing reads `oes` yet.
+/// than dropped. [`fsd_drain_edge`]'s own doc comment has the other half:
+/// this lock is released there, on the session's first `OUTMT`, exactly
+/// where the original releases it (`FSDBBS.C:266`) -- Task 12's own
+/// acceptance test found that this port had never ported the release at
+/// all, so a channel `fsdbkg` locked stayed locked for the rest of the
+/// session.
 ///
 /// # Errors
 ///
@@ -1310,15 +1315,40 @@ fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, Shi
 /// `CRSTG` the way the original's `else` branch does
 /// (`btuinj(usrnum,CRSTG)`) -- and flushes once more on the way out.
 ///
-/// # What is not ported: the `FBFULL` cursor park
+/// # The `FBFULL` cursor park, and where `maxy` comes from
 ///
 /// `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
-/// -- parking the cursor below a full-screen (ANSI, `amode==1`) form before
-/// handing the channel back. `FBFULL` is set only by `fsdego`'s `amode==1`
-/// branch (`FSDBBS.C:210`), which this host refuses outright (`fsdego`'s
-/// own doc comment) -- so, like `xitfld`'s `FSDANS` guard (Task 8's own doc
-/// comment on that function), this branch is dead code here: nothing this
-/// host can build yet ever sets the flag that would take it.
+/// -- `FSDBBS.C:227-229` -- parks the cursor below a full-screen (ANSI,
+/// `amode==1`) form before handing the channel back. `FBFULL` is
+/// [`crate::FsdSession::full_screen`], set by `fsdego`'s `amode==1` branch
+/// (`fsdego`'s own doc comment) at the moment the fork is taken, the same
+/// bookkeeping the original does at `FSDBBS.C:207`.
+///
+/// `fsdscb->maxy` (the C's per-session control block, offset 165 --
+/// [`fsd::scb::MAXY`]) is never written by anything in this port. The value
+/// it would hold is computed once, at compile time, by [`fsd::Form::max_y`]
+/// -- see that member's own doc comment, which already names this exact
+/// caller. This function reads `Host::forms` the same way [`fsd_cycle`]
+/// does (`host.fsdtmp[chan]` for the `(msgno, amode)` key, then
+/// `host.forms.get`) rather than adding a second place that carries the
+/// same number: `fsd::scb::MAXY` would need `fsdroom`/`fsdego` to start
+/// writing a field nothing else ever reads, purely so `goback` could read it
+/// back from the one place the C happened to keep it. `Form::max_y` already
+/// has a home; giving `maxy` a second one is not reproducing the original's
+/// *behaviour*, only its *storage*, and the design doc's own instinct
+/// (`Host::forms` caching a `fsdroom` parse instead of re-scanning it on
+/// every call) already made that trade once for this exact structure.
+///
+/// The one place this could matter: the original computes `maxy` afresh
+/// every session (`tmpscn` reruns on every `fsdroom`), while this host
+/// caches [`fsd::Form`] by `(msgno, amode)` and reuses it across sessions.
+/// That is a difference only if the *same* `(msgno, amode)` could compile to
+/// two different `max_y` values on two different calls -- and it cannot:
+/// `compile`/`tmpscn` are pure functions of the template bytes and `ascn`,
+/// both fixed for a given message number, so every session over the same
+/// template produces the same layout and the same `max_y`. Two sessions
+/// sharing one cached `Form` therefore park the cursor exactly where two
+/// independent `tmpscn` runs would have.
 ///
 /// # The colour reset is ported, and is not conditional on ANSI
 ///
@@ -1396,6 +1426,31 @@ pub(crate) fn goback(
     let scnwid = account_scnwid(machine, host, chan)?;
     fsdcof(host, chan, scnwid);
     crate::shims::text::clrprf(machine, host)?;
+
+    // `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
+    // -- FSDBBS.C:227-229. See this function's own doc comment, "The FBFULL
+    // cursor park, and where `maxy` comes from", for why `maxy` is read out
+    // of `Host::forms` rather than a per-session `Scb` member.
+    if session.full_screen {
+        let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
+            return Err(ShimError::Failed(format!(
+                "goback: channel {chan} has FBFULL set but no template on record -- fsdego's \
+                 own invariant has come apart"
+            )));
+        };
+        let Some(form) = host.forms.get(&(msgno, amode)) else {
+            return Err(ShimError::Failed(format!(
+                "goback: channel {chan} recorded message {msgno} (amode {amode}) but no such \
+                 form is cached -- fsdroom and fsdtmp have gone out of sync"
+            )));
+        };
+        // `maxy+1` is `u8+1`; guard the wrap a template that reached row 255
+        // would otherwise cause (`ANSILN` is 25, so the `min` below would
+        // hide it anyway, but the addition itself must not panic or silently
+        // wrap first).
+        let row = u16::from(form.max_y).saturating_add(1).min(fsd::ANSILN);
+        crate::shims::text::append(machine, host, format!("\x1b[{row};1f").as_bytes())?;
+    }
 
     // `prf("\x1B[0;1;32m"); outprf(usrnum);` -- FSDBBS.C:231-232. See this
     // function's own doc comment on why the colour reset is ported
@@ -1623,6 +1678,42 @@ pub(crate) fn fsd_cycle(
 /// resting state), in which case this sends nothing rather than an empty
 /// segment.
 ///
+/// # `btulok(usrnum,0)`, found by Task 12's own acceptance test
+///
+/// `fsdsts`'s real first line is not just "call `fsdqoe`" -- it is
+/// `FSDBBS.C:263-267` in full:
+///
+///
+/// and `fsdqoe` is reached a completely different way in the original: from
+/// `fsdchi`'s own `c == -1` sentinel (`FSDBBS.C:345-347`), the interrupt-level
+/// echo-drain callback `btuche(usrnum,1)` arms (`Channel::raw`'s own doc
+/// comment, "This host has no equivalent"). Decision 3 substitutes `OUTMT`
+/// for that missing signal -- correctly, `fsdqoe`'s own effect is right -- but
+/// an earlier version of this function stopped there and never ported the
+/// `fsdsts` branch above at all, on the theory that `OUTMT` was now spoken
+/// for by `fsdqoe`. It was not: `btulok(usrnum,0)` is `fsdbkg`'s own lock
+/// (`FSDBBS.C:192`, "Turn off keyboard till all displayed") being released,
+/// and **nothing else in this port ever released it**. `Channel::locked` is
+/// set exactly once, by [`fsdbkg`], and until this function set it back
+/// nothing ever cleared it again -- so the very first full-screen paint
+/// locked every session for its own remaining lifetime, silently discarding
+/// every keystroke after it ([`crate::gsbl::Channel::take`]'s own "locked
+/// case" doc comment). Task 12's own acceptance test found this the only
+/// way it could be found: driving a real ANSI session past the first paint
+/// and watching a cursor key vanish -- every shim-level test of this
+/// function stops at `fsdqoe`'s own effect and never presses a key
+/// afterward to notice the channel never took it.
+///
+/// `btuoes(usrnum,0)` -- disarming `oes` -- is deliberately **not** ported
+/// alongside it. The original disarms it because its own `fsdqoe` path
+/// never needs `OUTMT` again (the echo-drain callback carries every later
+/// repaint instead); this port has no echo-drain callback, so `OUTMT` is
+/// `fsdqoe`'s only way to run for the rest of the session, and disarming
+/// `oes` here would silently strand every later deferred cursor shuffle
+/// exactly the way the missing unlock stranded every later keystroke.
+/// Decision 3's own substitution depends on `oes` staying armed for the
+/// session's whole life; this fix must not undo that to fix the other half.
+///
 /// # Gated on `oes`, defensively
 ///
 /// In production an `OUTMT` dispatch cannot reach this function unless
@@ -1634,7 +1725,11 @@ pub(crate) fn fsd_cycle(
 /// flag this function can read directly is cheaper than trusting a
 /// caller's own invariant a second time -- the same "one refusing gate
 /// plus a second, independent one" discipline [`fsdego`]'s own doc comment
-/// states for its `amode == 1` check.
+/// states for its `amode == 1` check. The unlock happens *before* this
+/// gate, not after: `locked` and `oes` are two different flags `fsdbkg` sets
+/// together but this function has two different reasons to treat
+/// separately, and a channel that was locked while `oes` -- for whatever
+/// reason -- was not still deserves to be unlocked.
 ///
 /// # Errors
 ///
@@ -1649,6 +1744,12 @@ fn fsd_drain_edge(
     at: FarPtr,
     chan: Chan,
 ) -> Result<(), ShimError> {
+    // `btulok(usrnum,0)` -- FSDBBS.C:266. See this function's own doc
+    // comment, "btulok(usrnum,0), found by Task 12's own acceptance test",
+    // for why this is not covered by `fsdqoe` below and must not be folded
+    // into the `oes` gate that follows it.
+    host.gsbl_mut().channel_mut(chan).locked = false;
+
     if !host.gsbl_mut().channel_mut(chan).oes {
         return Ok(());
     }
@@ -3429,6 +3530,108 @@ mod tests {
     }
 
     #[test]
+    fn goback_parks_the_cursor_below_a_full_screen_form_and_not_a_line_mode_one() {
+        // `FSDBBS.C:227-229`: `if (fsdusr->flags&FBFULL) prf("\x1B[%d;1f",
+        // min(ANSILN,fsdscb->maxy+1));`, ported now that
+        // `crate::FsdSession::full_screen` has a real reader.
+        //
+        // `Form::max_y` is pinned to a chosen value rather than trusted from
+        // whatever FSDFORM.MSG's own field layout happens to compile to, so
+        // this checks the arithmetic goback does with a number the test
+        // controls (this file's own oracle-checked `fsd::compile(.., ascn=1)`
+        // tests already cover getting `max_y` right in the first place).
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session_amode(&mut f, 0, "A", b"\0", 1);
+        let chan = f.console();
+        entered(&mut f, chan);
+        f.host
+            .forms
+            .get_mut(&(0, 1))
+            .expect("fsdroom cached message 0, amode 1")
+            .max_y = 10;
+        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: true,
+            whndun: None,
+            save: false,
+        });
+
+        assert!(matches!(
+            goback(&mut f.machine, &mut f.host, &module, chan),
+            Ok(Ret::Void)
+        ));
+
+        let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            sent.starts_with("\x1b[11;1f\x1b[0;1;32m"),
+            "the cursor park (maxy+1 = 11, ANSILN not reached) precedes the \
+             unconditional colour reset: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn goback_clamps_the_cursor_park_to_ansiln_and_does_not_overflow_a_saturated_maxy() {
+        // Two things `min(ANSILN,fsdscb->maxy+1)` asks for at once: the clamp
+        // to row 25 (`ANSILN`), and -- this host's own `u8` `maxy`, which the
+        // original's `char maxy` shares -- `maxy+1` must not panic when
+        // `maxy` is already the type's own maximum.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session_amode(&mut f, 0, "A", b"\0", 1);
+        let chan = f.console();
+        entered(&mut f, chan);
+        f.host
+            .forms
+            .get_mut(&(0, 1))
+            .expect("fsdroom cached message 0, amode 1")
+            .max_y = u8::MAX;
+        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: true,
+            whndun: None,
+            save: false,
+        });
+
+        assert!(matches!(
+            goback(&mut f.machine, &mut f.host, &module, chan),
+            Ok(Ret::Void)
+        ));
+
+        let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            sent.starts_with("\x1b[25;1f"),
+            "ANSILN (25) wins over maxy+1 (256): {sent:?}"
+        );
+    }
+
+    #[test]
+    fn goback_does_not_park_the_cursor_for_a_line_mode_session() {
+        // `FBFULL` is unset for a line-mode session (`fsdego`'s `else`
+        // branch, `FSDBBS.C:210-212`), so `goback`'s `if` does not fire and
+        // the first byte out is the unconditional colour reset.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session(&mut f, "A", b"\0");
+        let chan = f.console();
+        entered(&mut f, chan);
+        f.host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
+            full_screen: false,
+            whndun: None,
+            save: false,
+        });
+
+        assert!(matches!(
+            goback(&mut f.machine, &mut f.host, &module, chan),
+            Ok(Ret::Void)
+        ));
+
+        let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
+        assert!(
+            sent.starts_with("\x1b[0;1;32m"),
+            "no cursor park precedes the colour reset in line mode: {sent:?}"
+        );
+    }
+
+    #[test]
     fn a_module_that_dies_inside_whndun_stops_the_host_cleanly() {
         // `Outcome::Stopped` from `whndun` must propagate out of `goback`
         // cleanly -- no half-torn-down session, per the design doc's "The
@@ -4060,6 +4263,60 @@ mod tests {
             )
             .expect("placed");
         fsd_cycle(&mut f.machine, &mut f.host, module, chan).expect("drain edge");
+    }
+
+    #[test]
+    fn the_drain_edge_unlocks_the_channel_fsdbkg_locked() {
+        // Found by Task 12's own acceptance test, not designed in ahead of
+        // it: `fsdbkg` locks the channel (`FSDBBS.C:192`) and nothing but
+        // the session's first `OUTMT` ever releases it in the original
+        // (`FSDBBS.C:264-267`). `fsd_drain_edge`'s own doc comment,
+        // "btulok(usrnum,0)", has the full account of why an earlier version
+        // of this function ported `fsdqoe` alone and left the channel locked
+        // for the rest of the session -- silently discarding every keystroke
+        // after the first paint, which no test before this one pressed a key
+        // late enough to notice.
+        // Not `ansi_session`: that helper's own final `drain_output` finds
+        // nothing to drain, because `fsdego`'s own doc comment says who is
+        // responsible for flushing `prfbuf` -- "(expects caller to
+        // outprf(usrnum))", `FSDBBS.C:196` -- and nothing in `ansi_session`
+        // is that caller. The real module always is (it is what this
+        // function's own doc comment says Task 12's acceptance test found
+        // the bug with), so this test plays that part explicitly: an
+        // `outprf` right after `fsdego`, the same as every other real
+        // caller in this file already does after a bare `f.invoke`.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let _ = session_amode(&mut f, 0, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0", 1);
+        let chan = f.console();
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+            panic!("fsdrft refused")
+        };
+        f.invoke(fsdbkg, &[templt.offset, templt.selector])
+            .expect("painted");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        outprf(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");
+        let painted = f.host.gsbl_mut().drain_output(chan);
+        assert!(!painted.is_empty(), "the initial paint must have reached the channel");
+
+        assert!(
+            f.host.gsbl_mut().channel_mut(chan).locked,
+            "fsdbkg's own lock, still in effect after fsdego"
+        );
+
+        raise_drain_edge(&mut f, &module, chan);
+
+        assert!(
+            !f.host.gsbl_mut().channel_mut(chan).locked,
+            "the session's first OUTMT must release fsdbkg's lock, or no keystroke after the \
+             initial paint ever reaches the channel again"
+        );
+        assert!(
+            f.host.gsbl_mut().channel_mut(chan).oes,
+            "unlike the original, oes must stay armed -- it is fsdqoe's only way to run for \
+             the rest of the session (this function's own doc comment, 'not ported alongside \
+             it')"
+        );
     }
 
     #[test]

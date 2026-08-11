@@ -697,12 +697,12 @@ pub(crate) struct FsdSession {
     /// `:211`). `goback` reads it to decide whether to park the cursor below
     /// the form on the way out (`FSDBBS.C:227`).
     ///
-    /// Written by `fsdego` and read only by tests until Task 12 ports that
-    /// branch of `goback` -- hence the `allow`. Recorded now rather than then
-    /// because it is the original's own `fsdusr->flags` bookkeeping, set at
-    /// the moment the fork is taken; reconstructing it later from `amode`
-    /// would be a second source of truth for one fact.
-    #[allow(dead_code)]
+    /// Written by `fsdego`, and read by `goback` (Task 12) to decide whether
+    /// to emit the `FBFULL` cursor park. Recorded at `fsdego` time rather
+    /// than reconstructed later from `amode`, because it is the original's
+    /// own `fsdusr->flags` bookkeeping, set at the moment the fork is taken;
+    /// reconstructing it later would be a second source of truth for one
+    /// fact.
     pub(crate) full_screen: bool,
 
     /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
