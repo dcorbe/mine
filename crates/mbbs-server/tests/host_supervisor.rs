@@ -329,6 +329,57 @@ mod builder {
         finish(Ne { code, data: block, relocs, entry_offset })
     }
 
+    /// The same shape as [`faults_via_unimplemented_symbol_one_second_after_boot`],
+    /// except the fault stub does not stop *there*: it calls the
+    /// unimplemented symbol and then executes `HLT` right after it, rather
+    /// than nothing at all.
+    ///
+    /// With survey mode off (every other module in this file), this never
+    /// reaches the `HLT` -- the call itself stops the machine, exactly like
+    /// its sibling above. With survey mode on, it does: the call is
+    /// fabricated and recorded instead of stopping anything, execution falls
+    /// through to the `HLT` right after it, and *that* is what restarts the
+    /// board. Built for Task 2's own acceptance (`docs/plans/2026-08-11-survivability-and-the-reachable-surface.md`):
+    /// this fires the identical kick, calling the identical symbol, on every
+    /// single life, which is what makes it possible to tell a survey
+    /// inventory that really survives a restart from one that was silently
+    /// rebuilt empty each time -- the latter could only ever show a count of
+    /// one.
+    pub fn survey_then_faults_one_second_after_boot() -> Vec<u8> {
+        let mut code = Vec::new();
+        let mut relocs = Vec::new();
+        call_far_import(&mut code, &mut relocs, name_offset("definitely_not_a_real_host_routine"));
+        code.push(0xF4); // hlt -- reached only if the call above was continued
+        let dstrou_offset: u16 = 0;
+
+        let entry_offset = code.len() as u16;
+
+        // register_module(&block) -- block lives at data segment offset 0.
+        mov_ax_own_segment(&mut code, &mut relocs, 2); // block.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 0); // block.offset
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("register_module"));
+        add_sp(&mut code, 4); // one far-pointer argument
+
+        // rtkick(1, dstrou = code segment : the stub above).
+        mov_ax_own_segment(&mut code, &mut relocs, 1); // dstrou.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, dstrou_offset); // dstrou.offset
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 1); // delay = 1 (the minimum rtkick accepts)
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("rtkick"));
+        add_sp(&mut code, 6); // one word plus one far-pointer argument
+
+        retf(&mut code);
+
+        let mut block = vec![0u8; 25 + 9 * 4];
+        block[..7].copy_from_slice(b"TESTMOD");
+
+        finish(Ne { code, data: block, relocs, entry_offset })
+    }
+
     /// Where `name` sits in the imported-names table this builder always
     /// writes: `"register_module"`, `"rtkick"`, then
     /// `"definitely_not_a_real_host_routine"`, in that order, right after
@@ -496,6 +547,7 @@ fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot {
         polls_per_wake: 8,
         passes: 32,
         clock_reads: None,
+        survey: None,
     }
 }
 
@@ -949,5 +1001,118 @@ async fn a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool() 
         result.is_ok(),
         "a stale cross-life Disconnect/Input must not poison the machine or \
          otherwise crash the host thread: {result:?}"
+    );
+}
+
+// --- Survey mode (Task 2, docs/plans/2026-08-11-survivability-and-the-reachable-surface.md).
+//
+// `mbbs::survey`'s own unit tests, and `crates/mbbs/src/lib.rs`'s
+// `Host::run` integration tests, cover the mechanics (continuation,
+// counting, deduplication, the cleanup-convention refusal) against an
+// in-memory `Inventory`. What only *this* file can prove is constraint 5:
+// that the inventory survives `host::run`'s own restart loop, which rebuilds
+// `Machine` and `Host` -- everything survey mode touches inside `mbbs` --
+// from scratch on every life. `survey_then_faults_one_second_after_boot`
+// fires the identical kick, calling the identical unimplemented symbol, on
+// every life it boots; if the inventory were rebuilt along with `Host` each
+// time, the file this test reads back could never show more than one
+// occurrence.
+
+/// The inventory a survey session leaves behind is the one shared across
+/// every restart, not a fresh one per life.
+///
+/// If constraint 5 were broken -- an inventory attached to (or owned by) the
+/// per-life `Host` instead of built once in `run` -- this module's kick
+/// would still record its one call each life, but every life would start
+/// counting from zero, and the file `run`'s clean-shutdown `finish()` writes
+/// at the end could never show more than a count of `1` no matter how many
+/// times the board restarted. Driven all the way to `RestartPolicy`'s own
+/// give-up, the same way `a_module_that_crash_loops_makes_the_supervisor_give_up`
+/// is, so the count this test asserts on is a hard lower bound
+/// (`MAX_RESTARTS`, from `host.rs`), not a timing guess.
+#[tokio::test]
+async fn the_survey_inventory_survives_every_restart() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-survey-restart",
+        &builder::survey_then_faults_one_second_after_boot(),
+    );
+    let survey_path = mbbs::testing::scratch("mbbs-server-host-supervisor-survey-restart-out")
+        .join("survey.log");
+    let mut boot = boot(module, "mbbs-server-host-supervisor-survey-restart-root", 1);
+    boot.survey = Some(survey_path.clone());
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    // Same budget `a_module_that_crash_loops_makes_the_supervisor_give_up`
+    // uses for the identical reason: five restarts, a second's kick delay
+    // apiece, plus a fast synthetic-module reload each time.
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx)),
+    )
+    .await
+    .expect("the supervisor must give up well inside 30s, not hang")
+    .expect("the host thread did not panic");
+    assert!(
+        result.is_err(),
+        "this module faults every life; the supervisor must eventually give up: {result:?}"
+    );
+
+    let text = std::fs::read_to_string(&survey_path).expect("the survey file must exist");
+    let row = text
+        .lines()
+        .find(|line| line.contains("definitely_not_a_real_host_routine"))
+        .unwrap_or_else(|| panic!("no row for the recorded symbol in:\n{text}"));
+    let count: u64 = row
+        .split('\t')
+        .next()
+        .expect("a row always has a count column")
+        .parse()
+        .unwrap_or_else(|e| panic!("count column was not a number ({e}): {row:?}"));
+    assert!(
+        count >= 5,
+        "MAX_RESTARTS (5) lives each recorded this same call once; a fresh \
+         per-life inventory could never show more than 1: got {count} in {row:?}"
+    );
+}
+
+/// The other half of constraint 6: what is on disk *without* `host::run`
+/// ever reaching a clean exit -- the closest a test gets to simulating
+/// `kill -9`, since nothing here ever signals or awaits the host thread's
+/// own completion.
+///
+/// `mbbs::survey::Inventory`'s own unit tests already prove `record` flushes
+/// a first sighting to its file directly; this test exists only to prove
+/// `crates/mbbs-server/src/host.rs`'s wiring actually reaches that method at
+/// all, end to end, through a real restart loop, before anything resembling
+/// a graceful shutdown could have run.
+#[tokio::test]
+async fn the_survey_inventory_is_on_disk_long_before_any_clean_shutdown() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-survey-durability",
+        &builder::survey_then_faults_one_second_after_boot(),
+    );
+    let survey_path = mbbs::testing::scratch("mbbs-server-host-supervisor-survey-durability-out")
+        .join("survey.log");
+    let mut boot = boot(module, "mbbs-server-host-supervisor-survey-durability-root", 1);
+    boot.survey = Some(survey_path.clone());
+
+    // Held for the sleep below so the host thread's `wake` does not see
+    // every sender gone and shut down gracefully before the kick ever
+    // fires -- this test's whole point is to look *without* a graceful
+    // shutdown ever having happened.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+
+    // Past the kick's one-second delay, comfortably short of the restart
+    // that follows it -- this reads the file mid-flight, not after `run`
+    // has returned (this test never awaits `_host_thread` at all).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    drop(tx);
+
+    let text = std::fs::read_to_string(&survey_path)
+        .expect("the survey file must already exist -- record() flushes on first sight");
+    assert!(
+        text.contains("MAJORBBS") && text.contains("definitely_not_a_real_host_routine"),
+        "the first sighting must be on disk with no clean shutdown in sight: {text:?}"
     );
 }

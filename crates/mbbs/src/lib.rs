@@ -38,6 +38,7 @@ pub mod random;
 mod shims;
 pub mod strings;
 pub mod stream;
+pub mod survey;
 /// Not `#[cfg(test)]`: `crates/mbbs/tests/wccmmud.rs` is a separate crate that
 /// links against this one built *without* `cfg(test)` (integration tests
 /// never see items gated that way), so this has to be an ordinary `pub mod`
@@ -78,8 +79,8 @@ pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
 use mbbs16::{
-    Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Source,
-    Symbol, Target,
+    Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Ret,
+    Source, Symbol, Target,
 };
 
 /// How a module entry point ended.
@@ -669,6 +670,20 @@ pub struct Host {
     /// Whether [`Host::finish_init`] has run. See it for why this is checked
     /// rather than assumed.
     inited: bool,
+
+    /// The survey inventory, if [`Host::enable_survey`] has attached one.
+    /// `None` -- the default, and the only setting safe for a board anyone
+    /// plays on -- means [`Host::run`] never fabricates a continuation past
+    /// [`Entry::Unimplemented`] and always stops, exactly as it always has.
+    ///
+    /// A `Rc<RefCell<_>>` and not an owned [`survey::Inventory`], because
+    /// this field does not own the survey's *lifetime* -- see
+    /// `crates/mbbs-server/src/host.rs`'s "Surviving a module stop": a
+    /// `Host` is rebuilt from scratch on every restart, so an inventory
+    /// stored here alone would be destroyed with it. The shared handle lets
+    /// something that outlives `Host` (the supervisor in `mbbs-server`) keep
+    /// the same inventory across every life this process has.
+    survey: Option<survey::Shared>,
 }
 
 /// Where in the module the call being refused came from, as a place you can
@@ -902,7 +917,29 @@ impl Host {
             clock_reads: 0,
             trace: std::env::var_os("MBBS_TRACE").is_some(),
             inited: false,
+            survey: None,
         })
+    }
+
+    /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
+    /// every `Entry::Unimplemented` call site it reaches from now on,
+    /// recording each one into `inventory` instead of stopping the module.
+    ///
+    /// # Read `crate::survey`'s module doc before calling this
+    ///
+    /// **This produces wrong behaviour, on purpose, for enumeration only.**
+    /// A fabricated return is a lie the module cannot tell from a real
+    /// answer -- it is not "the call did nothing", it is "the call
+    /// succeeded and returned zero/null", and the module acts on that lie
+    /// for as long as it runs afterwards. Never call this outside a
+    /// throwaway diagnostic session; never call it on a board anyone is
+    /// actually playing on.
+    ///
+    /// `inventory` is a shared handle rather than a value this method takes
+    /// ownership of, because `Host` does not live long enough to be trusted
+    /// with the only copy -- see this struct's own `survey` field.
+    pub fn enable_survey(&mut self, inventory: survey::Shared) {
+        self.survey = Some(inventory);
     }
 
     /// The host's globals.
@@ -1638,7 +1675,7 @@ impl Host {
             }
         }
 
-        self.run(machine, module, lonrou, &[]).map(Some)
+        self.run(machine, module, lonrou, &[], Some(chan)).map(Some)
     }
 
     /// Lost carrier: hand the channel to the module's `huprou`, then reset it.
@@ -1801,7 +1838,7 @@ impl Host {
         // `module[usrptr->state]->lofrou == NULL` -- and it means no call
         // happened, not that one returned zero.
         let outcome = match rou {
-            Some(rou) => Some(self.run(machine, module, rou, &[])?),
+            Some(rou) => Some(self.run(machine, module, rou, &[], Some(chan))?),
             None => None,
         };
 
@@ -1860,7 +1897,7 @@ impl Host {
         };
 
         self.inpolr = Some(chan);
-        let outcome = self.run(machine, module, rou, &[]);
+        let outcome = self.run(machine, module, rou, &[], Some(chan));
         // Cleared before the `?`, so a machine that malfunctioned does not leave
         // `inpolr` naming a channel that is no longer running anything. The
         // original does the same from the `longjmp` landings at
@@ -1932,7 +1969,7 @@ impl Host {
 
         for kick in due {
             *fired += 1;
-            match self.run(machine, module, kick.dstrou, &[])? {
+            match self.run(machine, module, kick.dstrou, &[], None)? {
                 Outcome::Stopped(poison) => return Ok(Some(poison)),
                 Outcome::Returned { .. } => {}
             }
@@ -2133,7 +2170,7 @@ impl Host {
                 continue;
             };
             return self
-                .run(machine, module, entry, &[])
+                .run(machine, module, entry, &[], Some(chan))
                 .map(|outcome| Some((outcome, chan)));
         }
     }
@@ -2610,6 +2647,13 @@ impl Host {
 
     /// Call a module entry point, servicing its imports until it stops.
     ///
+    /// `chan` names which channel this call is being made on -- purely for
+    /// [`survey::Inventory`]'s own record-keeping (see [`Host::enable_survey`]),
+    /// never read for anything else. `None` when the call genuinely has no
+    /// channel to name: [`Host::prcrtk`]'s kick sweep (a timer callback is
+    /// not running on behalf of any player), or the module's own init
+    /// routine, called before any channel exists to connect.
+    ///
     /// # Errors
     ///
     /// If the module cannot be entered, or the machine malfunctions. A module
@@ -2621,11 +2665,19 @@ impl Host {
         module: &Module,
         entry: FarPtr,
         args: &[u16],
+        chan: Option<Chan>,
     ) -> io::Result<Outcome> {
         let mut exit = machine.call(entry, args)?;
         loop {
             let index = match exit {
                 Exit::Returned { ax, dx } => return Ok(Outcome::Returned { ax, dx }),
+                // Never continued past, survey mode or not -- see
+                // `crate::survey`'s module doc. The machine is poisoned
+                // already (`Machine::call`/`resume` do that before handing
+                // back a terminal `Exit`), its globals may be mid-update, and
+                // `Machine::poison` has already forgotten the call frame:
+                // there is no resume point left to fabricate a continuation
+                // into even if this crate wanted to.
                 Exit::Fault { .. } | Exit::Timeout { .. } => {
                     let poison = machine
                         .poisoned()
@@ -2640,18 +2692,62 @@ impl Host {
             // can cause -- it comes from the bridge, and the bridge is the
             // host's. Report it as an unnamed import rather than panicking, so
             // that a loader bug looks like every other refusal.
-            let (from, symbol) = match module.import(index) {
+            let (from, symbol, ordinal) = match module.import(index) {
                 Some(site) => (
                     site.module.clone(),
                     self.symbol_name(&site.module, &site.symbol),
+                    match &site.symbol {
+                        Symbol::Ordinal(n) => Some(*n),
+                        Symbol::Name(_) => None,
+                    },
                 ),
-                None => (String::new(), format!("thunk #{index}")),
+                None => (String::new(), format!("thunk #{index}"), None),
             };
 
             let (shim, cleans) = match shims::entry(&from, &symbol) {
                 Entry::Routine(shim, cleans) => (shim, cleans),
-                Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented => {
-                    let symbol = match caller(machine, module) {
+                other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
+                    let kind = match other {
+                        Entry::Datum => survey::Kind::Datum,
+                        Entry::Absolute(_) => survey::Kind::Absolute,
+                        Entry::Unimplemented => survey::Kind::Unimplemented,
+                        Entry::Routine(..) => unreachable!("matched above"),
+                    };
+                    let context = caller(machine, module);
+
+                    if let Some(inventory) = &self.survey {
+                        inventory.borrow_mut().record(
+                            &from,
+                            &symbol,
+                            ordinal,
+                            chan,
+                            context.as_deref(),
+                            kind,
+                        );
+                    }
+
+                    // Only `Entry::Unimplemented`, only in survey mode, and
+                    // only when the cleanup convention is one this host is
+                    // willing to guess -- see `shims::survey_continue_convention`
+                    // for what "willing" means and why. Every other case
+                    // (survey mode off; `Entry::Datum`/`Entry::Absolute`, a
+                    // mismodelled *type* rather than a missing routine; a
+                    // convention this host refuses to guess) falls through to
+                    // the same stop it always has.
+                    if self.survey.is_some()
+                        && kind == survey::Kind::Unimplemented
+                        && let Some(continue_as) = shims::survey_continue_convention(&symbol)
+                    {
+                        exit = match continue_as {
+                            shims::Cleans::Caller => machine.resume(Ret::Void)?,
+                            shims::Cleans::Callee(bytes) => {
+                                machine.resume_cleaning(Ret::Void, bytes)?
+                            }
+                        };
+                        continue;
+                    }
+
+                    let symbol = match &context {
                         Some(at) => format!("{symbol}, called from {at}"),
                         None => symbol,
                     };
@@ -2897,7 +2993,7 @@ mod tests {
         Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Registration, Terms, gsbl, testing,
         users,
     };
-    use mbbs16::{FarPtr, Machine, Ret};
+    use mbbs16::{FarPtr, Machine, Poison, Ret};
 
     #[test]
     fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {
@@ -5105,5 +5201,480 @@ mod tests {
         let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
         let each = at.elapsed() / busy.iterations as u32;
         eprintln!("{} dispatching passes, {each:?} each", busy.iterations);
+    }
+
+    // --- Survey mode (docs/plans/2026-08-11-survivability-and-the-reachable-surface.md,
+    // Task 2). `Host::run`'s `Entry::Unimplemented` fallthrough, continued
+    // only when a `survey::Inventory` has been attached.
+    //
+    // The shared shape every test below shares, and is deliberately violated
+    // at least once: every OTHER test enables survey mode (so
+    // `survey_mode_off_by_default_still_stops` pins the opposite); every
+    // OTHER test records exactly one symbol once (so
+    // `..._counts_a_repeat_call...` and `..._records_two_different_symbols...`
+    // pin more than one, and the same symbol twice); every OTHER test's
+    // symbol is `Entry::Unimplemented` (so `..._still_stops_on_a_fault...`
+    // and `..._still_stops_on_a_timeout...` pin the two kinds survey mode
+    // must never touch); and every test here inspects the in-memory
+    // `Inventory` (see `survey.rs`'s own durability tests for the file-based
+    // proof that constraint 6 needs -- this module has no reason to
+    // duplicate them).
+
+    /// A shared, in-memory survey inventory -- the harness these tests share.
+    fn survey_inventory() -> std::rc::Rc<std::cell::RefCell<crate::survey::Inventory>> {
+        std::rc::Rc::new(std::cell::RefCell::new(crate::survey::Inventory::in_memory()))
+    }
+
+    /// Code that `lcall`s thunk `indices`, in that order, then `retf`s.
+    ///
+    /// `minimal_module` (used by every test below) imports nothing, so
+    /// `Module::import` answers `None` for any index a raw call names --
+    /// `Host::run` then reports it as an unnamed thunk, `"thunk #N"` (see its
+    /// own comment on `module.import(index)`). That is a real, exercised
+    /// code path (a loader bug looks like this too), and it is enough to
+    /// pin `Host::run`'s continuation/counting/dedup mechanics without a
+    /// full NE import table -- `testing::Fixture::call_with` uses the same
+    /// trick, calling a thunk no module claimed.
+    fn lcall_thunks(machine: &mut Machine, indices: &[u16]) -> FarPtr {
+        let mut code = Vec::new();
+        for &index in indices {
+            code.push(0x9a); // lcall
+            code.extend_from_slice(&machine.thunk_address(index).to_bytes());
+        }
+        code.push(0xcb); // retf
+        machine.load_code(&code).expect("code fits");
+        machine.code_ptr(0)
+    }
+
+    #[test]
+    fn survey_mode_off_by_default_still_stops_on_unimplemented() {
+        let mut f = Fixture::new();
+        assert!(f.host.survey.is_none(), "off unless enable_survey was called");
+        let module = f.minimal_module();
+        let entry = lcall_thunks(&mut f.machine, &[0]);
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        match outcome {
+            Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
+                assert_eq!(module, "");
+                assert!(symbol.starts_with("thunk #0"), "{symbol}");
+            }
+            other => panic!("survey mode is off; must stop, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn survey_mode_continues_past_a_single_unimplemented_call_and_records_it() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let entry = lcall_thunks(&mut f.machine, &[0]);
+        let chan = f.console();
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], Some(chan)).expect("ran");
+        assert_eq!(
+            outcome,
+            Outcome::Returned { ax: 0, dx: 0 },
+            "the module must see the fabricated Ret::Void and reach its own retf"
+        );
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv.count_of("", "thunk #0"), Some(1));
+        let text = inv.render();
+        assert!(text.contains("1\tunimplemented\t-\tthunk #0\t-\t0\t"), "{text}");
+    }
+
+    #[test]
+    fn survey_mode_counts_a_repeat_call_to_the_same_symbol_without_a_second_entry() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let entry = lcall_thunks(&mut f.machine, &[0, 0]);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 1, "one distinct symbol, called twice");
+        assert_eq!(inv.count_of("", "thunk #0"), Some(2));
+    }
+
+    #[test]
+    fn survey_mode_records_two_different_symbols_as_two_entries() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let entry = lcall_thunks(&mut f.machine, &[0, 1]);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 2);
+        assert_eq!(inv.count_of("", "thunk #0"), Some(1));
+        assert_eq!(inv.count_of("", "thunk #1"), Some(1));
+    }
+
+    #[test]
+    fn survey_mode_still_stops_on_a_fault_reached_after_a_continued_call() {
+        // Constraint 1: never continue past `Poison::Fault`. The module
+        // reaches a fabricated return from thunk 0, then walks straight
+        // into `hlt` -- if survey mode's `continue` somehow looped past a
+        // terminal `Exit` instead of returning through the normal
+        // `Exit::Fault` arm, this would come back `Returned` instead.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        let mut code = vec![0x9a];
+        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.push(0xf4); // hlt
+        f.machine.load_code(&code).expect("code fits");
+        let entry = f.machine.code_ptr(0);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        assert!(
+            matches!(outcome, Outcome::Stopped(Poison::Fault { .. })),
+            "a fault after a fabricated return must still stop the machine: {outcome:?}"
+        );
+        assert_eq!(
+            inventory.borrow().len(),
+            1,
+            "the continued call was still recorded on the way through"
+        );
+    }
+
+    #[test]
+    fn survey_mode_still_stops_on_a_timeout_reached_after_a_continued_call() {
+        // Constraint 1: never continue past `Poison::Timeout`, the other
+        // terminal `Exit` survey mode must not paper over.
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        let mut code = vec![0x9a];
+        code.extend_from_slice(&f.machine.thunk_address(0).to_bytes());
+        code.extend_from_slice(&[0xeb, 0xfe]); // jmp $ -- never returns on its own
+        f.machine.load_code(&code).expect("code fits");
+        let entry = f.machine.code_ptr(0);
+        f.machine.set_budget(std::time::Duration::from_millis(20));
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        assert!(
+            matches!(outcome, Outcome::Stopped(Poison::Timeout { .. })),
+            "a timeout after a fabricated return must still stop the machine: {outcome:?}"
+        );
+        assert_eq!(inventory.borrow().len(), 1);
+    }
+
+    /// A minimal NE image with exactly one *genuine* import -- unlike
+    /// `testing::minimal_module_bytes`, which imports nothing at all.
+    ///
+    /// Needed for the two tests below that cannot be reached through
+    /// `lcall_thunks`' "unnamed thunk" trick: an ordinal and an `@`-suffixed
+    /// name are both facts `Host::run` reads off the module's *own*
+    /// `ImportSite` (`module.import(index)`), which is only ever populated
+    /// by `mbbs16::Machine::load_ne` actually resolving a real relocation --
+    /// see `crates/mbbs16/src/ne.rs`'s `map_ne`. `dll` is deliberately never
+    /// `"MAJORBBS"`/`"GALGSBL"`/`"DOSCALLS"`, so `shims::entry` always
+    /// answers `Entry::Unimplemented` for it and the loader gives it a real
+    /// thunk (a `Datum`/`Absolute` classification resolves straight to an
+    /// address or a constant and never gets a thunk at all -- traced by hand
+    /// against `map_ne`, and the reason this file has no equivalent
+    /// `Entry::Datum`-reaches-`Host::run` integration test: as far as this
+    /// crate's loader is concerned, that combination cannot be produced by
+    /// loading any module, only by `Inventory::record`'s own unit tests
+    /// exercising the bookkeeping directly).
+    fn module_with_one_import(dll: &str, symbol: &mbbs16::Symbol) -> Vec<u8> {
+        use mbbs16::Symbol;
+
+        const ALIGN: u16 = 4;
+        const SECTOR: usize = 1 << ALIGN;
+
+        fn pstring_with_ordinal(name: &str, ordinal: u16) -> Vec<u8> {
+            let mut out = vec![name.len() as u8];
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&ordinal.to_le_bytes());
+            out
+        }
+        fn pstring(name: &str) -> Vec<u8> {
+            let mut out = vec![name.len() as u8];
+            out.extend_from_slice(name.as_bytes());
+            out
+        }
+
+        // The imported-names blob: a reserved empty entry at offset 0 (kept
+        // for parity with `minimal_module_bytes`, which nothing here reads),
+        // then the module name, then -- only for a `Symbol::Name` import --
+        // the symbol name.
+        let mut impnames = vec![0u8];
+        let module_name_at = impnames.len() as u16;
+        impnames.extend_from_slice(&pstring(dll));
+        let symbol_name_at = impnames.len() as u16;
+        if let Symbol::Name(name) = symbol {
+            impnames.extend_from_slice(&pstring(name));
+        }
+
+        let mut restab = pstring_with_ordinal("TESTMOD", 0);
+        restab.push(0);
+        let mut nrtab = pstring_with_ordinal("a test module with one import", 0);
+        nrtab.push(0);
+        let entrytab = vec![0u8];
+
+        let mut out = vec![0u8; 0x80];
+        out[0..2].copy_from_slice(b"MZ");
+        out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        out[0x40..0x42].copy_from_slice(b"NE");
+
+        let segtab = 0x80;
+        out.resize(segtab + 8, 0);
+
+        // One module reference: the offset of its name within `impnames`.
+        let modtab = out.len();
+        out.extend_from_slice(&module_name_at.to_le_bytes());
+
+        let imptab = out.len();
+        out.extend_from_slice(&impnames);
+        let restab_at = out.len();
+        out.extend_from_slice(&restab);
+        let entrytab_at = out.len();
+        out.extend_from_slice(&entrytab);
+        let nrtab_at = out.len();
+        out.extend_from_slice(&nrtab);
+
+        while !out.len().is_multiple_of(SECTOR) {
+            out.push(0);
+        }
+        let sector = (out.len() / SECTOR) as u16;
+
+        // The one segment's data: 4 bytes, holding one relocation site
+        // (`SRC_FAR_ADDR`, 4 bytes, additive) at offset 0. Nothing ever
+        // executes or reads this segment's bytes -- the only thing this
+        // relocation is for is making `mbbs16::ne::map_ne` resolve this
+        // import and assign it a thunk, which is what makes
+        // `Module::import(0)` answer `Some`.
+        //
+        // `SRC_FAR_ADDR`, not `SRC_OFFSET`: `Host::check_globals`'s
+        // `addressed_as_data` classifies a symbol as *data* the moment any
+        // one of its fixups is not `FAR_ADDR` (see that fn's own doc), and a
+        // `Host::load` that believes this import is addressed as data would
+        // then refuse to load a module that never placed it -- which,
+        // for `Entry::Unimplemented`, `check_globals` always refuses
+        // (`Why::NotPlaced`). `FAR_ADDR` is the shape "this is a call
+        // target" -- the honest fixup for what this test is actually
+        // pretending to build -- and it is also the one shape
+        // `addressed_as_data` never classifies as data at all, so
+        // `check_globals` never looks at it and `Host::load` succeeds.
+        let data = [0u8; 4];
+        out.extend_from_slice(&data);
+
+        let (target_flag, hi): (u8, u16) = match symbol {
+            Symbol::Name(_) => (0x02, symbol_name_at), // TGT_IMPORTNAME
+            Symbol::Ordinal(n) => (0x01, *n),          // TGT_IMPORTORDINAL
+        };
+        out.extend_from_slice(&1u16.to_le_bytes()); // relocation count
+        out.push(3); // SRC_FAR_ADDR
+        out.push(target_flag | 0x04); // | TGT_ADDITIVE
+        out.extend_from_slice(&0u16.to_le_bytes()); // site offset within segment
+        out.extend_from_slice(&1u16.to_le_bytes()); // module index (1-based)
+        out.extend_from_slice(&hi.to_le_bytes());
+
+        out[segtab..segtab + 2].copy_from_slice(&sector.to_le_bytes());
+        out[segtab + 2..segtab + 4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        // SEG_DATA (0x0001) | SEG_RELOCINFO (0x0100)
+        out[segtab + 4..segtab + 6].copy_from_slice(&0x0101u16.to_le_bytes());
+        out[segtab + 6..segtab + 8].copy_from_slice(&(data.len() as u16).to_le_bytes());
+
+        let w = |out: &mut Vec<u8>, at: usize, v: u16| {
+            out[0x40 + at..0x40 + at + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        w(&mut out, 0x04, (entrytab_at - 0x40) as u16);
+        w(&mut out, 0x06, entrytab.len() as u16);
+        w(&mut out, 0x0c, 0x8001); // a single-data library
+        w(&mut out, 0x0e, 1); // autodata: the one segment
+        w(&mut out, 0x1c, 1); // segment count
+        w(&mut out, 0x1e, 1); // imported module count
+        w(&mut out, 0x20, nrtab.len() as u16);
+        w(&mut out, 0x22, (segtab - 0x40) as u16);
+        w(&mut out, 0x26, (restab_at - 0x40) as u16);
+        w(&mut out, 0x28, (modtab - 0x40) as u16);
+        w(&mut out, 0x2a, (imptab - 0x40) as u16);
+        w(&mut out, 0x32, ALIGN);
+        out[0x40 + 0x2c..0x40 + 0x30].copy_from_slice(&(nrtab_at as u32).to_le_bytes());
+        out[0x40 + 0x36] = 0x02;
+
+        out
+    }
+
+    #[test]
+    fn survey_mode_records_the_ordinal_of_a_genuinely_imported_unimplemented_symbol() {
+        let mut f = Fixture::new();
+        let bytes = module_with_one_import("TESTDLL", &mbbs16::Symbol::Ordinal(42));
+        let module = f.host.load(&mut f.machine, &bytes).expect("loads");
+
+        // Thunk index 0: the module's one and only import, and the first
+        // (and only) relocation `map_ne` ever resolves for it.
+        let entry = lcall_thunks(&mut f.machine, &[0]);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 1);
+        // `Exports::wg101()` has no ordinal table for "TESTDLL", so
+        // `Host::symbol_name` falls back to `#<ordinal>` -- see its own doc.
+        assert_eq!(inv.count_of("TESTDLL", "#42"), Some(1));
+        assert!(
+            inv.render().contains("\tTESTDLL\t#42\t42\t"),
+            "the ordinal must appear in its own column: {}",
+            inv.render()
+        );
+    }
+
+    #[test]
+    fn survey_mode_records_but_refuses_to_continue_past_an_at_suffixed_symbol() {
+        // Constraint 2: an unimplemented symbol shaped like a Borland
+        // runtime helper is recorded like any other, but `Host::run` must
+        // not guess its cleanup convention -- so it still stops, survey mode
+        // or not. `shims::survey_continue_convention` is unit-tested for the
+        // *decision*; this is the end-to-end proof `Host::run` actually
+        // obeys it rather than only recording and then continuing anyway.
+        let mut f = Fixture::new();
+        let bytes = module_with_one_import(
+            "TESTDLL",
+            &mbbs16::Symbol::Name("f_lxdiv@_not_a_real_routine".to_owned()),
+        );
+        let module = f.host.load(&mut f.machine, &bytes).expect("loads");
+        let entry = lcall_thunks(&mut f.machine, &[0]);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
+        match outcome {
+            Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
+                assert_eq!(module, "TESTDLL");
+                assert!(symbol.starts_with("f_lxdiv@_not_a_real_routine"), "{symbol}");
+            }
+            other => panic!("an @-suffixed symbol must still stop: {other:?}"),
+        }
+
+        let inv = inventory.borrow();
+        assert_eq!(
+            inv.len(),
+            1,
+            "recorded even though the host refused to fabricate a return for it"
+        );
+        assert_eq!(inv.count_of("TESTDLL", "f_lxdiv@_not_a_real_routine"), Some(1));
+    }
+
+    // The tests above all call `Host::run` directly, which pins its own
+    // continuation/counting/dedup mechanics but proves nothing about the
+    // `chan` argument each of `Host::run`'s five real callers passes it --
+    // `connect`, `disconnect`, `dopoll`, `poll_with_chan`'s own direct call,
+    // and `prcrtk`'s kick sweep. A mutation swapping `Some(chan)` for `None`
+    // (or vice versa) at any of those call sites would pass every test
+    // above unnoticed. These two close that gap for the two paths a live
+    // session actually takes on every request: logging on, and polling.
+
+    #[test]
+    fn survey_mode_records_the_channel_a_connect_call_was_serviced_on() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+
+        // `register_module_with` runs its own synthetic call through
+        // `Fixture::invoke`, which (like `lcall_thunks`) writes over the
+        // scratch code segment at offset 0 -- so it has to happen BEFORE
+        // `lonrou`'s own code is written, not after, or `connect` would run
+        // whatever `register_module_with` left behind instead. `Host::connect`
+        // reaches `lonrou` through `first_module()`, not the channel's
+        // `state`, so nothing here needs `set_state`.
+        let module_number = register_module_with(&mut f, &[]);
+        let lonrou = lcall_thunks(&mut f.machine, &[0]);
+        register_module_with_lonrou_at(&mut f, module_number, lonrou);
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f
+            .host
+            .connect(&mut f.machine, &module, console, &Connection::ansi("rangerdan"))
+            .expect("connect_state ran");
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { ax: 0, dx: 0 })),
+            "{outcome:?}"
+        );
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 1);
+        assert!(
+            inv.render().contains(&format!("unimplemented\t-\tthunk #0\t-\t{console}\t")),
+            "connect's own channel must be the one recorded: {}",
+            inv.render()
+        );
+    }
+
+    /// Overwrite an already-registered module's `lonrou` (vector 0) in
+    /// place, so a test can build the routine's *code* after registering --
+    /// see `survey_mode_records_the_channel_a_connect_call_was_serviced_on`
+    /// for why the order matters. `register_module_with` only ever writes
+    /// vectors at registration time, which is one call too early for a
+    /// routine built from `lcall_thunks`.
+    fn register_module_with_lonrou_at(f: &mut Fixture, module_number: u16, lonrou: FarPtr) {
+        let Registration::Module { block, .. } = &f.host.modules()[usize::from(module_number)]
+        else {
+            panic!("module {module_number} is not a module registration");
+        };
+        let at = FarPtr {
+            offset: block.offset + 25,
+            selector: block.selector,
+        };
+        f.machine.write(at, &lonrou.to_bytes()).expect("lonrou fits");
+    }
+
+    #[test]
+    fn survey_mode_records_the_channel_a_dopoll_call_was_serviced_on() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let console = f.console();
+        let rou = lcall_thunks(&mut f.machine, &[0]);
+
+        f.host
+            .users
+            .set_polrou(&mut f.machine, console, Some(rou))
+            .expect("channel 0");
+        f.host.refill_polls(&f.machine, 1).expect("armed");
+
+        let inventory = survey_inventory();
+        f.host.enable_survey(inventory.clone());
+
+        let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
+        assert!(
+            matches!(outcome, Some(Outcome::Returned { ax: 0, dx: 0 })),
+            "{outcome:?}"
+        );
+
+        let inv = inventory.borrow();
+        assert_eq!(inv.len(), 1);
+        assert!(
+            inv.render().contains(&format!("unimplemented\t-\tthunk #0\t-\t{console}\t")),
+            "dopoll's own channel must be the one recorded: {}",
+            inv.render()
+        );
     }
 }

@@ -78,6 +78,23 @@ pub struct Boot {
     /// polling this on its own schedule; nothing else in the program
     /// synchronises against it.
     pub clock_reads: Option<Arc<AtomicU64>>,
+
+    /// Where to write a survey of every unimplemented symbol this board
+    /// reaches, or `None` (the default, and the only setting safe for a
+    /// board anyone plays on) to run the way this crate always has.
+    ///
+    /// **This is a diagnostic, not a way to run a board.** See
+    /// `mbbs::survey`'s module doc for what turning it on means: every
+    /// unimplemented import gets a fabricated return instead of a stop, and
+    /// that is wrong behaviour by design, tolerable only for a throwaway
+    /// session whose sole purpose is to enumerate gaps.
+    ///
+    /// Built into one [`mbbs::survey::Shared`] inventory in [`run`], *not*
+    /// in [`life`] -- see [`run`]'s own comment on why. The path is not a
+    /// `PathBuf` per life; every restart within one process keeps writing
+    /// the same file, so the survey a SIGINT interrupts is the whole
+    /// process's, not just its last life's.
+    pub survey: Option<PathBuf>,
 }
 
 /// What one wake yielded.
@@ -223,16 +240,28 @@ fn describe_stop(chan: Option<Chan>) -> String {
 /// out of `apply`/`cycle`/`flush` (a host bug, not a module poisoning) still
 /// ends the whole supervisor -- restarting on an error this crate does not
 /// understand would hide it, not fix it.
-fn life(boot: &Boot, rx: &std::sync::mpsc::Receiver<In>) -> io::Result<LifeEnd> {
+fn life(
+    boot: &Boot,
+    rx: &std::sync::mpsc::Receiver<In>,
+    survey: Option<&mbbs::survey::Shared>,
+) -> io::Result<LifeEnd> {
     // 1. Build the machine HERE. It is !Send; it cannot be handed in.
     let mut machine = Machine::new()?;
     let mut host = Host::new(&mut machine, boot.root.clone(), boot.terms)?;
+    // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
+    // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
+    // (and everything it owns) is rebuilt from scratch on every restart, and
+    // an inventory attached only to a life's own `Host` would be destroyed
+    // with it.
+    if let Some(inventory) = survey {
+        host.enable_survey(inventory.clone());
+    }
     let file = std::fs::read(&boot.module)?;
     let module = host.load(&mut machine, &file).map_err(io::Error::other)?;
     let entry = module
         .entry(1)
         .ok_or_else(|| io::Error::other("module has no ordinal 1 (the init routine)"))?;
-    match host.run(&mut machine, &module, entry, &[])? {
+    match host.run(&mut machine, &module, entry, &[], None)? {
         Outcome::Returned { .. } => {}
         // Ordinal 1 itself poisoning the machine is a boot failure, not a
         // survivable stop: `Host::run` reports it as `Ok(Outcome::Stopped)`
@@ -307,14 +336,31 @@ fn life(boot: &Boot, rx: &std::sync::mpsc::Receiver<In>) -> io::Result<LifeEnd> 
 pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
     let mut policy = RestartPolicy::new();
 
-    loop {
-        match life(&boot, &rx)? {
-            LifeEnd::Gone => return Ok(()),
-            LifeEnd::Stopped { poison, chan } => {
+    // Built ONCE, here -- not inside `life` -- and handed to every life by a
+    // shared `Rc<RefCell<_>>`. `life` rebuilds `Machine` and `Host` from
+    // scratch on every restart (see the module doc, "Surviving a module
+    // stop"); an inventory owned by a life's own `Host` would be destroyed
+    // with it, and a survey that lost everything at the first restart would
+    // not be a survey. This thread never crosses a thread boundary (`run` is
+    // always called already running on the dedicated host thread -- see
+    // `crates/mbbs-server/src/conn.rs`'s `std::thread::spawn` call), so
+    // `Rc<RefCell<_>>` is enough; nothing here needs `Arc`.
+    let inventory: Option<mbbs::survey::Shared> = match &boot.survey {
+        Some(path) => Some(std::rc::Rc::new(std::cell::RefCell::new(
+            mbbs::survey::Inventory::new(path)?,
+        ))),
+        None => None,
+    };
+
+    let result = loop {
+        match life(&boot, &rx, inventory.as_ref()) {
+            Err(e) => break Err(e),
+            Ok(LifeEnd::Gone) => break Ok(()),
+            Ok(LifeEnd::Stopped { poison, chan }) => {
                 eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(chan));
 
                 if !policy.allow(Instant::now()) {
-                    return Err(io::Error::other(format!(
+                    break Err(io::Error::other(format!(
                         "the module stopped {MAX_RESTARTS} times within {RESTART_WINDOW:?}; \
                          giving up rather than crash-looping"
                     )));
@@ -322,7 +368,21 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
                 eprintln!("mbbs-server: restarting the module");
             }
         }
+    };
+
+    // The clean-shutdown tier of survey durability -- see `mbbs::survey::Inventory`'s
+    // own doc for the other tier (`Inventory::record`'s per-symbol append,
+    // which is what a `kill -9` or a crash leaves behind instead). Whatever
+    // `result` is, every restart already ran through the same `inventory`,
+    // so this always has the whole process's history to write, not just the
+    // last life's.
+    if let Some(inventory) = &inventory
+        && let Err(e) = inventory.borrow_mut().finish()
+    {
+        eprintln!("mbbs-server: failed to write the final survey inventory: {e}");
     }
+
+    result
 }
 
 /// Apply one boundary message to the host.

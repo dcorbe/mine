@@ -103,6 +103,17 @@ struct Cli {
     /// Connection keys handed to a new player [default: DEMO,NORMAL,USER]
     #[arg(long, value_delimiter = ',', value_parser = parse_key)]
     keys: Vec<String>,
+
+    /// DIAGNOSTIC ONLY -- DO NOT USE ON A BOARD ANYONE PLAYS ON. Enumerate
+    /// every unimplemented symbol this session reaches by writing to PATH,
+    /// instead of stopping the module the first time one is hit. This makes
+    /// the module produce WRONG BEHAVIOUR from that point on: every
+    /// unimplemented call gets a fabricated zero/null return instead of a
+    /// real answer, and the module cannot tell the difference. Use this only
+    /// for a throwaway session whose sole purpose is to build the list of
+    /// gaps at PATH; never leave it on for real play.
+    #[arg(long, value_name = "PATH")]
+    survey_unimplemented_and_corrupt_the_session: Option<PathBuf>,
 }
 
 /// Range-check `--terms` before it ever reaches `Terms::new`, which panics
@@ -179,6 +190,17 @@ async fn main() -> ExitCode {
         cli.keys.clone()
     };
 
+    if let Some(path) = &cli.survey_unimplemented_and_corrupt_the_session {
+        eprintln!(
+            "mbbs-server: SURVEY MODE IS ON, writing to {}. This board will now \
+             fabricate a return for every unimplemented symbol it reaches instead \
+             of stopping -- that is WRONG BEHAVIOUR, tolerable only for a \
+             throwaway diagnostic session. Do not use this on a board anyone is \
+             actually playing on.",
+            path.display()
+        );
+    }
+
     let boot = Boot {
         root: cli.root.clone(),
         module: cli.module.clone(),
@@ -186,6 +208,7 @@ async fn main() -> ExitCode {
         polls_per_wake: cli.polls_per_wake,
         passes: cli.passes,
         clock_reads: None,
+        survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
     };
 
     let addrs = match conn::serve(boot, keys, &listeners).await {

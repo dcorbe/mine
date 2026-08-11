@@ -383,6 +383,48 @@ pub fn entry(dll: &str, symbol: &str) -> Entry {
     Entry::Unimplemented
 }
 
+/// Whether [`crate::Host::run`]'s survey mode (see `crate::survey`) may
+/// safely fabricate a return and resume the module past a call to an
+/// unimplemented `symbol`, and if so, which convention to clean the call up
+/// with.
+///
+/// An unimplemented symbol has no [`Cleans`] on record -- nothing registered
+/// it, so nothing said who pops its arguments -- and guessing wrong does not
+/// crash anything: it leaves the module's stack quietly wrong, and every
+/// symbol survey mode records afterwards is then downstream of a machine
+/// whose stack pointer no longer means what the module thinks it means. That
+/// would make the survey's own output look authoritative while being
+/// fiction, which is worse than the stop this function exists to let a
+/// caller sometimes avoid.
+///
+/// The rule: default to [`Cleans::Caller`] -- cdecl, "what every MajorBBS
+/// routine does" (see [`Cleans::Caller`]'s own doc) -- and refuse outright
+/// for anything shaped like this crate's one known exception, Borland's own
+/// runtime helpers, all of them named with a trailing `@`
+/// (`f_ldiv@`, `f_lmod@`, `f_ludiv@`, `f_lumod@`, `f_scopy@`).
+///
+/// **`@` alone is not even a reliable *signal* for `Callee`, let alone a way
+/// to know the byte count.** Three more `@`-suffixed routines are already
+/// registered above (`f_lxmul@`, `f_lxlsh@`, `f_lxursh@`) and every one of
+/// them is [`Cleans::Caller`] -- they take their operands in registers and
+/// put nothing on the stack, so there is nothing for either side to clean.
+/// So this cannot distinguish `Caller` from `Callee` among the eight
+/// `@`-suffixed symbols this host has already measured the answer for, and
+/// has no basis at all for guessing a byte count for a ninth this host has
+/// not. Refusing is always safe -- the caller falls back to the ordinary
+/// stop. Guessing a byte count is not, so this never does.
+///
+/// Measured against the whole of `ROUTINES` above: 136 [`Cleans::Caller`]
+/// against 10 [`Cleans::Callee`], and every `Callee` entry is one of the five
+/// `@`-suffixed helpers this function refuses to continue past.
+pub(crate) fn survey_continue_convention(symbol: &str) -> Option<Cleans> {
+    if symbol.contains('@') {
+        None
+    } else {
+        Some(Cleans::Caller)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +642,44 @@ mod convention {
                 ("f_scopy@", Cleans::Callee(runtime::POINTERS)),
             ]
         );
+    }
+
+    #[test]
+    fn survey_continue_convention_defaults_ordinary_symbols_to_caller() {
+        for name in ["gmdnam", "rtihdlr", "register_agent", "l2as", "prf"] {
+            assert_eq!(
+                survey_continue_convention(name),
+                Some(Cleans::Caller),
+                "{name} does not look like a Borland runtime helper"
+            );
+        }
+    }
+
+    #[test]
+    fn survey_continue_convention_refuses_every_at_suffixed_symbol_measured_above() {
+        // Every symbol `only_the_stack_helpers_pop_their_own_arguments` just
+        // pinned as genuinely `Cleans::Callee` must be refused here -- this is
+        // the one case a wrong guess corrupts the module's own stack.
+        for name in ["f_ldiv@", "f_lmod@", "f_ludiv@", "f_lumod@", "f_scopy@"] {
+            assert_eq!(
+                survey_continue_convention(name),
+                None,
+                "{name} is Cleans::Callee and must never be guessed at"
+            );
+        }
+    }
+
+    #[test]
+    fn survey_continue_convention_also_refuses_the_at_suffixed_symbols_that_are_actually_caller() {
+        // `f_lxmul@`, `f_lxlsh@` and `f_lxursh@` are measured `Cleans::Caller`
+        // (they take their operands in registers, nothing is pushed) -- but
+        // `survey_continue_convention` cannot tell that from an unimplemented
+        // symbol's *name* alone, and refusing a symbol it could safely have
+        // continued past is not a correctness bug, only lost coverage. Pinned
+        // so a future "smarter" `@` heuristic has to notice it is narrowing
+        // this on purpose, not by accident.
+        for name in ["f_lxmul@", "f_lxlsh@", "f_lxursh@"] {
+            assert_eq!(survey_continue_convention(name), None);
+        }
     }
 }
