@@ -25,12 +25,6 @@ use super::keys::Key;
 use super::variable::{Chain, Pages, Pointer};
 use super::{BtvError, Geometry, Version};
 
-/// Bytes of header at the start of a data page, before the first record.
-///
-/// Six: four of page number and two of usage count. The high bit of byte 5 is
-/// what marks a page as holding records at all.
-const PAGE_HEADER: u16 = 6;
-
 /// Where the free list starts, in the file control record.
 const FREE_LIST: usize = 0x10;
 
@@ -109,17 +103,17 @@ impl Records {
             why,
         };
 
-        // `walk` computes every page's byte offset as `page * number` --
-        // correct only for v5, where a page's number *is* its physical
-        // position. In a v6 file that number is a logical id (Evidence 2 of
-        // the plan above), and nothing here resolves one to the other yet.
-        // Applying v5's arithmetic anyway does not fail: it reads whatever
-        // bytes happen to sit at the wrong offset and reports that as the
-        // file's records. For `NEWMP001.VIR` those bytes describe an empty
-        // page, which happens to match the header's own (genuinely correct)
-        // count of zero -- so the previous version of this function "passed"
-        // that file without ever having resolved a single page address. This
-        // refuses instead of repeating that guess.
+        // `walk` computes every page's byte offset through
+        // `pages::Layout::page_start`, which treats a page's number as its
+        // physical position -- correct only for v5. In a v6 file that number
+        // is a logical id (Evidence 2 of the plan above), and nothing here
+        // resolves one to the other yet. Applying v5's arithmetic anyway does
+        // not fail: it reads whatever bytes happen to sit at the wrong offset
+        // and reports that as the file's records. For `NEWMP001.VIR` those
+        // bytes describe an empty page, which happens to match the header's
+        // own (genuinely correct) count of zero -- so the previous version of
+        // this function "passed" that file without ever having resolved a
+        // single page address. This refuses instead of repeating that guess.
         if geometry.version != Version::V5 {
             return Err(fail(format!(
                 "is a {:?} file, and this host cannot yet resolve a v6 file's \
@@ -387,9 +381,17 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
     let dead = free_list(&mut file, size)?;
-    let page = u32::from(geometry.page);
-    let physical = u32::from(geometry.physical);
-    let per_page = u32::from((geometry.page - PAGE_HEADER) / geometry.physical);
+
+    // The one place this file's page arithmetic lives -- see
+    // `pages::Layout::position` and `pages::Header::decode` below. Trap 1 in
+    // `docs/plans/2026-08-11-btrieve-v6-page-addressing.md` was this
+    // function reimplementing both instead of calling them.
+    let layout = super::pages::Layout {
+        page: geometry.page,
+        physical: geometry.physical,
+        pages: geometry.pages,
+    };
+    let per_page = layout.per_page();
 
     let mut records = Vec::with_capacity(geometry.records as usize);
     let mut buffer = vec![0u8; geometry.page as usize];
@@ -401,7 +403,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 
     // Page 0 is the file control record, so records start at page 1.
     for number in 1..geometry.pages {
-        let at = page * number;
+        let at = layout.page_start(number);
         file.seek(SeekFrom::Start(u64::from(at)))
             .and_then(|_| file.read_exact(&mut buffer))
             .map_err(|e| format!("page {number}: {e}"))?;
@@ -409,7 +411,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
         // The high bit of the usage count marks a page that holds records. The
         // rest are index pages, and reading one as data would produce records
         // out of B-tree nodes.
-        if buffer[5] & 0x80 == 0 {
+        if !super::pages::Header::decode(&buffer).data {
             continue;
         }
 
@@ -417,12 +419,12 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             if records.len() as u32 == geometry.records {
                 break;
             }
-            let position = at + u32::from(PAGE_HEADER) + physical * slot;
+            let position = layout.position(number, slot);
             if dead.contains(&position) {
                 continue;
             }
 
-            let start = (u32::from(PAGE_HEADER) + physical * slot) as usize;
+            let start = (position - at) as usize;
             let record = &buffer[start..start + geometry.physical as usize];
 
             // Slots are filled from the front -- so the first empty one ends
@@ -573,7 +575,7 @@ mod tests {
 
     /// Where the `n`th record slot of the first data page is.
     fn slot(n: u32) -> u32 {
-        512 + u32::from(PAGE_HEADER) + u32::from(RECLEN) * n
+        512 + u32::from(crate::btrieve::pages::HEADER) + u32::from(RECLEN) * n
     }
 
     /// A page of B-tree index, appended where a walk will meet it.
@@ -593,7 +595,7 @@ mod tests {
     /// A file of one page of control record and `pages` data pages.
     fn file(page: u16, reclen: u16, records: &[&[u8]], free: &[u32]) -> Vec<u8> {
         let physical = reclen;
-        let per_page = (page - PAGE_HEADER) / physical;
+        let per_page = (page - crate::btrieve::pages::HEADER) / physical;
         let pages = 1 + records.len().div_ceil(usize::from(per_page)).max(1);
         let mut out = vec![0u8; usize::from(page) * pages];
 
@@ -631,7 +633,7 @@ mod tests {
             let base = u32::try_from(usize::from(page) * number).expect("small");
             out[usize::try_from(base).unwrap() + 5] |= 0x80;
             for slot in 0..u32::from(per_page) {
-                slots.push(base + u32::from(PAGE_HEADER) + u32::from(physical) * slot);
+                slots.push(base + u32::from(crate::btrieve::pages::HEADER) + u32::from(physical) * slot);
             }
         }
         let mut live = slots.iter().filter(|s| !free.contains(s));
@@ -980,5 +982,132 @@ mod tests {
         let positions = records.positions();
         assert_eq!(positions.len(), 2);
         assert!(!positions.contains(&doomed));
+    }
+
+    /// A second implementation of [`walk`]'s page arithmetic, built once as
+    /// the safety net for the Task 4 refactor
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`) that routes
+    /// `walk` itself through [`super::pages::Layout`]. Until that refactor
+    /// lands, this and `walk` are two independent implementations of the same
+    /// assumption -- Trap 1 in that plan -- so
+    /// [`walk_and_a_layout_based_walk_agree_on_every_shipped_file`] exists to
+    /// prove they agree while that is still true.
+    fn layout_walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+        let mut file =
+            std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let size = u32::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+            .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
+
+        let dead = free_list(&mut file, size)?;
+        let layout = crate::btrieve::pages::Layout {
+            page: geometry.page,
+            physical: geometry.physical,
+            pages: geometry.pages,
+        };
+        let per_page = layout.per_page();
+
+        let mut records = Vec::with_capacity(geometry.records as usize);
+        let mut buffer = vec![0u8; geometry.page as usize];
+        let mut fragment = vec![0u8; geometry.page as usize];
+
+        for number in 1..geometry.pages {
+            // The page's own start, derived from `Layout` rather than
+            // reimplementing its multiplication: a slot-0 position is always
+            // `HEADER` bytes past the page start.
+            let at = layout.position(number, 0) - u32::from(crate::btrieve::pages::HEADER);
+            file.seek(SeekFrom::Start(u64::from(at)))
+                .and_then(|_| file.read_exact(&mut buffer))
+                .map_err(|e| format!("page {number}: {e}"))?;
+
+            if !crate::btrieve::pages::Header::decode(&buffer).data {
+                continue;
+            }
+
+            for slot in 0..per_page {
+                if records.len() as u32 == geometry.records {
+                    break;
+                }
+                let position = layout.position(number, slot);
+                if dead.contains(&position) {
+                    continue;
+                }
+
+                let start = (position - at) as usize;
+                let record = &buffer[start..start + geometry.physical as usize];
+
+                if looks_empty(record, size) {
+                    break;
+                }
+
+                let mut bytes = record[..geometry.reclen as usize].to_vec();
+
+                let pointer = geometry.variable.then(|| {
+                    let at = usize::from(geometry.reclen);
+                    Pointer::decode([record[at], record[at + 1], record[at + 2], record[at + 3]])
+                });
+                if let Some(pointer) = pointer {
+                    let mut source = Chained {
+                        file: &mut file,
+                        buffer: &mut fragment,
+                        pages: geometry.pages,
+                    };
+                    Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
+                        .map_err(|why| format!("the record at {position}: {why}"))?;
+                }
+
+                records.push(Record { position, bytes });
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// Every file MajorMUD ships, by name only -- the shape census belongs to
+    /// `crates/mbbs/tests/btrieve.rs`'s `FILES`, this just needs to open each.
+    const SHIPPED_FILES: &[&str] = &[
+        "NEWMP001.VIR",
+        "WCCACMSR.VIR",
+        "WCCACTS.VIR",
+        "WCCBANKS.VIR",
+        "WCCCLASS.VIR",
+        "WCCGANGS.VIR",
+        "WCCITEMS.VIR",
+        "WCCITOWN.VIR",
+        "WCCKNMSR.VIR",
+        "WCCMP001.VIR",
+        "WCCMSG.VIR",
+        "WCCRACE.VIR",
+        "WCCSHOPS.VIR",
+        "WCCSPELS.VIR",
+        "WCCTEXT.VIR",
+        "WCCUSERS.VIR",
+        "WCCUPDAT.DAT",
+        "WCCUSERS.DAT",
+    ];
+
+    /// `records::walk` and a `Layout`-based walk must agree on every file
+    /// MajorMUD ships, since both implement the same page-arithmetic
+    /// assumption -- Trap 1 in
+    /// `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`. This is the
+    /// safety net for the refactor that collapses them into one: it must pass
+    /// *before* `walk` is touched, and it must keep passing (trivially, once
+    /// `walk` and `layout_walk` share an implementation) after.
+    #[test]
+    #[ignore = "needs MajorMUD's data files in tmp/"]
+    fn walk_and_a_layout_based_walk_agree_on_every_shipped_file() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+        if !dir.join("WCCITEMS.VIR").is_file() {
+            eprintln!("skipped: no MajorMUD data files in tmp/");
+            return;
+        }
+
+        for name in SHIPPED_FILES {
+            let path = dir.join(name);
+            let geometry = Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want = walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} walk: {e}"));
+            let got =
+                layout_walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} layout_walk: {e}"));
+            assert_eq!(want, got, "{name}: walk and layout_walk disagree");
+        }
     }
 }
