@@ -635,7 +635,10 @@ impl Block {
     /// # Errors
     ///
     /// If the file cannot be read, or holds a different number of records from
-    /// the number its header claims.
+    /// the number its header claims. Also if the file is v6:
+    /// [`Records::read`](Records::read) refuses those until this host can
+    /// resolve their logical page numbers, and every caller here reaches them
+    /// through it.
     pub fn records(&mut self) -> Result<&Records, BtvError> {
         if self.records.is_none() {
             self.records = Some(Records::read(
