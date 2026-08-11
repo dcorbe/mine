@@ -897,33 +897,33 @@ impl Channel {
         // visible columns, nowhere near the 79-column wrap boundary, so
         // there is no captured line where it would show. Left alone rather
         // than guessed at.
-        if width != 0 && *column >= width {
-            let carried = Self::wrap(out, column, width);
-            if byte == b' ' && carried == 0 {
-                // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
-                // *becomes* the break `wrap()` just inserted, so it is
-                // consumed here rather than carried onto the new line as a
-                // leading indent.
-                //
-                // Only when `wrap()` carried nothing, though. When it moved a
-                // partial word down, this space is not the break: it is the
-                // separator *after* the word that just moved, and consuming
-                // it glues that word to the next one.
-                //
-                // This host used to cite the specific words that surfaced
-                // that bug -- `thisis`, `andthese`, `Streetslead`, from
-                // `re/oracle/oracle_bank2.raw`'s Town Square description. The
-                // CSI fix moved every wrap point in that same paragraph (the
-                // description is drawn with ANSI colour codes ahead of and
-                // inside it, which were being counted as columns and are
-                // not), so those three words no longer mark where a wrap
-                // falls in this host's output. The rule they were measured
-                // against did not change; only the line lengths measuring it
-                // did. See `crates/mbbs/tests/wccmmud.rs`,
-                // `a_returning_player_entering_the_realm`, for the citations
-                // re-measured against the oracle after this fix.
-                return;
-            }
+        if width != 0 && *column >= width && Self::wrap(out, column, width, byte) {
+            // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
+            // *becomes* the break `wrap()` just inserted, so it is
+            // consumed here rather than carried onto the new line as a
+            // leading indent.
+            //
+            // `wrap()` reports this only when the trigger byte is a
+            // space and either nothing was carried, or the word it found
+            // already filled the line to exactly `width` on its own --
+            // see `wrap()`'s own doc for why those are the only two
+            // cases R9 may fire in.
+            //
+            // This host used to cite the specific words that surfaced
+            // the *first* half of this bug -- `thisis`, `andthese`,
+            // `Streetslead`, from `re/oracle/oracle_bank2.raw`'s Town
+            // Square description, glued together because an early `wrap`
+            // consumed a triggering space that belonged to a word it had
+            // genuinely carried. The CSI fix moved every wrap point in
+            // that paragraph, and a second, narrower bug -- `wrap`
+            // carrying a word that had already fit exactly at `width`,
+            // rather than recognising it needed no carry at all --
+            // surfaced only once wrap points started landing on the
+            // paragraph's real 79-column boundaries. See
+            // `crates/mbbs/tests/wccmmud.rs`,
+            // `a_returning_player_entering_the_realm`, for the citations
+            // measured against the oracle after both fixes.
+            return;
         }
         out.push(byte);
         // R10: with the default width of 0, wrap() is never called and
@@ -933,18 +933,50 @@ impl Channel {
         *column = column.saturating_add(1);
     }
 
-    /// Break the line, moving a partial word down with it.
+    /// Break the line, moving a partial word down with it -- unless the word
+    /// already fit, in which case nothing moves at all.
     ///
     /// Word wrap rather than a hard break: the guide calls `btutsw` wrapping output at word boundaries, and a host that broke mid-word would split every name the
     /// module printed near the margin.
     ///
-    /// Returns **how many bytes it carried onto the new line**, which the
-    /// caller needs in order to decide the fate of the byte that triggered the
-    /// wrap: only a wrap that carried nothing may swallow a triggering SPACE
-    /// (R9). A word at least `width` long has no boundary to break on, so it is
-    /// pushed back and broken at the margin, carrying nothing -- which means
-    /// the answer is always below `width`, and the SPACE a caller writes after
-    /// a carried word therefore always fits on the new line without itself
+    /// Returns **whether the caller's triggering byte was consumed** rather
+    /// than needing to be written. Only a SPACE can be consumed (R9, guide
+    /// `btutsw` page 172: word wrap works by turning a space into a carriage return), and only in the two cases where that SPACE really
+    /// is the break this call just inserted:
+    ///
+    /// 1. **Nothing was carried.** The back-scan below hit the start of
+    ///    `out`, or a word at least `width` long that had no boundary to
+    ///    break on and was pushed back to break at the margin instead. Either
+    ///    way there is no partial word on the new line for the SPACE to
+    ///    glue itself to.
+    /// 2. **A word was found, but it already reached exactly `width` on its
+    ///    own.** This is the case Finding 7's fix (below) missed: back-scan
+    ///    finds a complete word bounded by a real separator, and the old rule
+    ///    carried it unconditionally, unable to tell "this word doesn't fit"
+    ///    apart from "this word already fit, and only the byte *after* it
+    ///    didn't". Measured against `re/oracle/oracle_bank2.raw` (search
+    ///    "make- shift"): the genuine host's `btutsw(chan, 0x4f)` (79) keeps
+    ///    `shift` on the line it already filled to column 79 and opens the
+    ///    next line with `stalls`; this host used to carry `shift` down
+    ///    whole, splitting `make- shift` instead of `shift stalls`. The
+    ///    Galacticomm guide's own worked example (`GSBL-174`/`GSBL-175`,
+    ///    `archive/galacticomm/gsblref.pdf`) needs the same rule: `btutsw`
+    ///    caps each line to `width - 1` characters ("to prevent the user's
+    ///    terminal from doing its own line wrapping", `GSBL-172`) so that a
+    ///    `btutsw(chan, 20)` example's word `to` filling a line to column 19
+    ///    exactly stays there rather than being carried -- see
+    ///    `the_guides_own_worked_example_renders_the_way_the_guide_prints_it`,
+    ///    which cannot reproduce the manual's own printed screen without this
+    ///    rule.
+    ///
+    /// If a word was found and carried for any other reason -- it doesn't
+    /// fit at all, or the trigger byte was not a SPACE and so cannot be R9's
+    /// break regardless -- the caller always writes the trigger byte itself.
+    ///
+    /// A word at least `width` long has no boundary to break on, so it is
+    /// pushed back and broken at the margin, carrying nothing. Short of that,
+    /// a carried word is always below `width` bytes, so the SPACE a caller
+    /// writes after it always fits on the new line without itself
     /// re-triggering the wrap.
     ///
     /// Finding 7, **fixed**. This looks back into the `out` buffer its caller
@@ -956,37 +988,73 @@ impl Channel {
     /// the bytes a channel emitted depended on when a socket task happened to
     /// run. `transmit` building a private buffer and committing once is what
     /// fixed it; see its own comment for why that shape was chosen.
-    fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16) -> u16 {
+    fn wrap(out: &mut Vec<u8>, column: &mut u16, width: u16, byte: u8) -> bool {
         let mut word = Vec::new();
+        // `found_delimiter` distinguishes "the back-scan hit a real SPACE,
+        // LF or CR inside `out`" from "the back-scan ran off the start of
+        // `out` with no delimiter in sight". Only the first can prove a word
+        // already fits: the second means the word's beginning is outside
+        // this `transmit()` call's own buffer (an earlier call committed it),
+        // so its true length is unknown and it is carried exactly as before
+        // -- a known, narrow limitation of chopping one paragraph across
+        // several `transmit()` calls that genuine GSBL, handed one whole
+        // string, never faces. See
+        // `a_second_call_can_carry_a_word_it_began_itself`.
+        let mut found_delimiter = false;
         while let Some(&back) = out.last() {
             if back == b' ' || back == b'\n' || back == b'\r' {
+                found_delimiter = true;
                 break;
             }
             word.push(back);
             out.pop();
             // A word as long as the whole line has no boundary to break on, so
             // break it where the margin falls -- losing it would be worse.
+            // This is orthogonal to the fit-check below: an unbreakable word
+            // is never "already fit", so it always falls through to the
+            // shared tail and reports consumed only via the ordinary
+            // nothing-carried rule.
             if word.len() >= usize::from(width) {
-                for byte in word.drain(..).rev() {
-                    out.push(byte);
+                for b in word.drain(..).rev() {
+                    out.push(b);
                 }
                 break;
             }
         }
+
+        if found_delimiter && byte == b' ' && !word.is_empty() {
+            // The word back-scan found is bounded by a real separator on
+            // both sides and reached exactly `width` -- it already fits.
+            // Put it back untouched (nothing was moved) and break right
+            // where the triggering SPACE would have gone. No trailing-space
+            // strip is needed here the way the shared tail below needs one:
+            // `word` can never contain a space (the scan above stops the
+            // instant it sees one), so putting it back always leaves `out`
+            // ending on a non-space byte.
+            for b in word.into_iter().rev() {
+                out.push(b);
+            }
+            out.extend(b"\r\n");
+            *column = 0;
+            return true;
+        }
+
+        // Every other case: nothing carried (word is empty, whether because
+        // `out` ran out or because the back-scan hit a delimiter
+        // immediately), a word too long to have a boundary, or a word that
+        // does not fit and must move down. All three carry `word` as-is --
+        // zero bytes in the first two -- exactly as before this fix.
         while out.last() == Some(&b' ') {
             out.pop();
         }
         out.extend(b"\r\n");
         *column = 0;
-        for byte in word.into_iter().rev() {
-            out.push(byte);
+        let carried = word.len();
+        for b in word.into_iter().rev() {
+            out.push(b);
             *column += 1;
         }
-        // The loop above counted the carried word into `*column` from zero, so
-        // the new column *is* the carried length. Reported rather than left for
-        // the caller to recompute: it cannot be re-derived from `out` once the
-        // caller has pushed the triggering byte onto it.
-        *column
+        byte == b' ' && carried == 0
     }
 }
 
@@ -1276,15 +1344,43 @@ mod tests {
         // carry fix: the old `transmit` produced `theEngelmann` and
         // `westernNorth`. The defect was never MajorMUD-specific -- it failed
         // Galacticomm's published example.
+        //
+        // `width` is 19, not the 20 passed to `btutsw()` in the example. Page
+        // `GSBL-172` (`archive/galacticomm/gsblref.pdf`) says why: "to prevent
+        // the user's terminal from doing its own line wrapping, each line is
+        // actually limited to width-1 characters". `Channel::width` in this
+        // host is the number of characters a line may hold -- what `btutsw`
+        // calls "width-1" -- not the raw argument a module passes it; the real
+        // `WCCMMUD.DLL` confirms the same convention from the other end,
+        // calling `btutsw(chan, 0x4f)` (79) for a screen this host measures at
+        // 79 usable columns (see `wrap()`'s doc), not 78. This is the one place
+        // that convention has to be applied by hand, because this test is
+        // reproducing the manual's own worked example rather than a module's
+        // call: `width = 19` is what the manual's `btutsw(chan, 20)` actually
+        // buys a paragraph.
+        //
+        // That the word-fit half of `wrap()`'s rule (this task's fix, not the
+        // carry fix above) is exercised even by Galacticomm's own example was
+        // not expected going in: the paragraph's `to` (`"...native to"`) fills
+        // line 3 to column 19 exactly, and only stays there rather than being
+        // carried because of that rule. At `width = 20` -- the value this test
+        // used to carry, matching the raw `btutsw()` argument instead of the
+        // manual's own "width-1" rule -- the *old*, buggy `wrap()` reproduced
+        // this screen by coincidence: always carrying a found word happens to
+        // agree with "cap every line at width-1" when the two are off by
+        // exactly the same one column. `width = 19` removes that coincidence:
+        // the pre-fix `wrap()` cannot reproduce this screen at the width the
+        // manual's own rule calls for, only the fixed one can.
         let mut g = one();
-        g.channel_mut(chan()).width = 20;
+        g.channel_mut(chan()).width = 19;
         g.transmit(chan(), b"The blue form of the Engelmann Spruce ");
         g.transmit(chan(), b"is native to the mountains of western ");
         g.transmit(chan(), b"North America.");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
             "The blue form of\r\nthe Engelmann\r\nSpruce is native to\r\nthe mountains of\r\nwestern North\r\nAmerica.",
-            "the guide's printed rendering, pages 174-175"
+            "the guide's printed rendering, pages 174-175, at the width its own \
+             width-1 rule actually produces"
         );
     }
 
@@ -1340,12 +1436,29 @@ mod tests {
     }
 
     #[test]
-    fn a_word_carried_down_by_the_wrap_keeps_the_space_that_followed_it() {
-        // The other half of R9, and the half that was wrong. When `wrap` carries
-        // a partial word onto the new line, the space that triggered the wrap is
-        // the separator *after* that word -- consuming it glues the next word
-        // on. Measured against the real module: a MajorMUD room description came
-        // out "thisis the centre of Silvermere."
+    fn a_word_that_fills_the_line_exactly_is_not_carried_down() {
+        // This task's fix, in its smallest reproduction. `this` ends at
+        // column 10 exactly (the fifth byte of `12345 `, then four more for
+        // `this`), so the line is already full when the next byte -- the
+        // space before `is` -- arrives. That word already fit; nothing needs
+        // to move. Measured against `re/oracle/oracle_bank2.raw` (search
+        // "make- shift"): the genuine host keeps `shift` on the line it fills
+        // to column 79 and opens the next with `stalls`, not `make-` /
+        // `shift stalls`. See `wrap()`'s doc for the full citation.
+        //
+        // Before this fix, `wrap()` could not tell "this word doesn't fit"
+        // apart from "this word already fit, and only the byte after it
+        // didn't" -- it back-scanned to the space before `this`, found a
+        // complete word, and carried it unconditionally, producing
+        // `12345\r\nthis is`. This test used to pin exactly that output, under
+        // the name `a_word_carried_down_by_the_wrap_keeps_the_space_that_followed_it`,
+        // with a comment explaining why keeping the space was right *given*
+        // the carry -- which was true, but the carry itself was the bug. A
+        // word genuinely carried across a `transmit()` call boundary still
+        // keeps its trailing space exactly that way; see
+        // `a_second_call_can_carry_a_word_it_began_itself`, which is now the
+        // only place in this file where a word both straddles the width
+        // boundary and gets carried.
         //
         // Asserted as a string rather than the byte vector the tests above use:
         // the whole difference is one 0x20, and a `[49, 50, ...]` diff does not
@@ -1355,8 +1468,8 @@ mod tests {
         g.transmit(chan(), b"12345 this is");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "12345\r\nthis is",
-            "the carried word keeps its trailing separator"
+            "12345 this\r\nis",
+            "a word that already fills the line to width is not carried"
         );
     }
 
@@ -1378,56 +1491,90 @@ mod tests {
     }
 
     #[test]
-    fn a_single_byte_word_carried_down_by_the_wrap_keeps_its_space() {
-        // The smallest carry there is: one byte. `wrap` reports 1, and a fix
-        // that reported the carry off by one would read that as nothing carried
-        // and glue `9x`.
+    fn a_single_byte_word_that_fills_the_line_exactly_is_not_carried_either() {
+        // The smallest instance of this task's fix: a carry only one byte
+        // long. `9` lands on column 10 exactly (`12345678 ` is nine bytes),
+        // so it already fits and stays; only the trailing `x` opens the new
+        // line.
+        //
+        // Before this fix, `wrap()` found `9` bounded by a real space on both
+        // sides and carried it regardless -- one byte is still a word as far
+        // as the back-scan is concerned. This test used to pin that carry,
+        // under the name `a_single_byte_word_carried_down_by_the_wrap_keeps_its_space`,
+        // guarding against a fix that read `wrap`'s one-byte report as
+        // "nothing carried" and glued `9x`. That failure mode no longer
+        // applies -- `wrap()` no longer reports a byte count the caller must
+        // interpret, only whether it consumed the trigger -- so there is
+        // nothing left to guard against here beyond the fit rule itself.
         let mut g = one();
         g.channel_mut(chan()).width = 10;
         g.transmit(chan(), b"12345678 9 x");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "12345678\r\n9 x",
-            "a one-byte carry is still a carry"
+            "12345678 9\r\nx",
+            "a one-byte word that fills the line exactly is not carried"
         );
     }
 
     #[test]
-    fn the_longest_possible_carry_leaves_room_for_the_space_it_kept() {
-        // The largest carry there is. A carried word is at most `width - 1`
-        // bytes -- a word `width` long or longer is pushed back and broken at
-        // the margin, carrying nothing -- so the space this now keeps can always
-        // be written without itself re-triggering the wrap. Here the carry is
-        // exactly 9 of a width of 10: the space lands on the last column, and it
-        // is the *next* byte that wraps, where `wrap` finds a line ending in a
-        // space, carries nothing, and R9 applies again.
+    fn the_longest_word_that_can_still_be_found_is_not_carried_either() {
+        // The largest instance of this task's fix. A word `wrap()` can still
+        // recover by back-scanning to a real delimiter is at most `width - 1`
+        // bytes -- one byte more and it has no boundary to break on, and takes
+        // the different, unaffected `word.len() >= width` path tested by
+        // `a_word_longer_than_the_width_is_broken_rather_than_lost`. Here
+        // `abcdefghi` is exactly `width - 1` (9 of 10) bytes, preceded by a
+        // single leading space, so it fills the line to column 10 exactly and
+        // is the longest word this rule ever applies to.
         //
-        // The leading `\r\n` is not this fix: `wrap` strips the trailing spaces
-        // of what is left after it lifts the word off, and here that is the
-        // line's only other byte. It comes out identically without the fix.
+        // Nothing moves: the leading space and `abcdefghi` both stay on line
+        // one untouched, and the trigger space in front of `jk` is consumed,
+        // not carried. Before this fix -- under the name
+        // `the_longest_possible_carry_leaves_room_for_the_space_it_kept` --
+        // `wrap()` carried `abcdefghi` down, stripped the now-dangling leading
+        // space along with it, and needed a *second* wrap event (immediately,
+        // on `j`, against the space it had just written back) to arrive at the
+        // same two lines this fix now reaches directly: `\r\nabcdefghi\r\njk`.
+        // That the two paths used to land on the same bytes is exactly the
+        // coincidence `wrap()`'s doc comment warns about -- it did not hold at
+        // `width = 79`, which is the whole reason this task exists.
         let mut g = one();
         g.channel_mut(chan()).width = 10;
         g.transmit(chan(), b" abcdefghi jk");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "\r\nabcdefghi\r\njk",
-            "a width-1 carry plus its space fills the line exactly"
+            " abcdefghi\r\njk",
+            "a width-1 word that fills the line exactly is not carried, and its \
+             leading space is undisturbed"
         );
     }
 
     #[test]
-    fn two_wraps_in_one_call_each_keep_their_own_separator() {
+    fn two_wraps_in_one_call_need_not_be_the_same_kind() {
         // One `transmit` can wrap many times, and `column` is not reset between
-        // them -- so a fix that only got the first wrap right would still glue
-        // the rest of a paragraph. This is the reduced form of what the real
-        // module drew: three wraps, three lost spaces.
+        // them -- so a fix that only got one of the two rules right would still
+        // mishandle the rest of a paragraph. `this` fills the line to column 10
+        // exactly and is not carried (this task's fix); `abcd` does not fit at
+        // all and is carried, keeping the space that followed it (the earlier
+        // carry fix, still exercised by `a_word_carried_down_by_the_wrap_is_not_glued_to_a_following_letter`
+        // and `a_second_call_can_carry_a_word_it_began_itself`). A regression in
+        // either rule changes this test.
+        //
+        // Before this fix -- under the name
+        // `two_wraps_in_one_call_each_keep_their_own_separator`, with input
+        // `"12345 this is here"` -- both of this call's wraps happened to be
+        // the carry kind, since `wrap()` could not produce the other kind at
+        // all. That input no longer wraps twice: `this` now fits and is not
+        // carried, so `"this is here"` (13 bytes) fits on the second line
+        // without ever reaching column 10 again.
         let mut g = one();
         g.channel_mut(chan()).width = 10;
-        g.transmit(chan(), b"12345 this is here");
+        g.transmit(chan(), b"12345 this abcdefgh is");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "12345\r\nthis is\r\nhere",
-            "two wraps, and neither eats a separator it did not create"
+            "12345 this\r\nabcdefgh\r\nis",
+            "the first wrap consumes its trigger space (exact fit), the second \
+             carries and keeps it (genuine overflow)"
         );
     }
 
@@ -1442,15 +1589,25 @@ mod tests {
         // increment -- produces byte-identical output for every input where the
         // line wraps only once more, and was measured passing all seven of
         // them. Two wraps after the restored space is what exposes it: at the
-        // second wrap the line reads `this is ok`, ten columns exactly, so `ok`
+        // second wrap the line reads `thisx is ok`, ten columns exactly, so `ok`
         // is carried and the break lands before it. Under-count the space and
         // the line is allowed an eleventh column and the break lands after it.
+        //
+        // `this` widened to `thisx` (and unchanged since, other than that one
+        // letter): this task's fix makes a genuine four-letter carry ambiguous
+        // with an exact-fit non-carry depending on exactly what precedes it,
+        // and `this` here would fill line one to column 10 exactly and not be
+        // carried at all -- see
+        // `a_word_that_fills_the_line_exactly_is_not_carried_down`, which now
+        // owns that case. `thisx` guarantees a genuine, five-byte-too-long
+        // carry, keeping this test's actual subject -- the restored space's
+        // column cost -- isolated from the fit rule.
         let mut g = one();
         g.channel_mut(chan()).width = 10;
-        g.transmit(chan(), b"12345 this is ok now");
+        g.transmit(chan(), b"12345 thisx is ok now");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "12345\r\nthis is\r\nok now",
+            "12345\r\nthisx is\r\nok now",
             "the restored space is a column of the new line"
         );
     }
@@ -1507,12 +1664,17 @@ mod tests {
         // R1's `supplied_lf` is cleared before the width check, so a wrap that
         // now writes a space instead of swallowing one must not leave the CR/LF
         // bookkeeping in a state that doubles the module's own linefeed.
+        //
+        // `this` widened to `thisx`, as in the test above and for the same
+        // reason: this test's subject is `supplied_lf`, not the fit rule, and
+        // `this` here would fill line one to column 10 exactly and not be
+        // carried at all.
         let mut g = one();
         g.channel_mut(chan()).width = 10;
-        g.transmit(chan(), b"12345 this is\r\nx");
+        g.transmit(chan(), b"12345 thisx is\r\nx");
         assert_eq!(
             String::from_utf8_lossy(&g.drain_output(chan())),
-            "12345\r\nthis is\r\nx",
+            "12345\r\nthisx is\r\nx",
             "the module's explicit CRLF is still emitted exactly once"
         );
     }
@@ -1531,6 +1693,121 @@ mod tests {
             String::from_utf8_lossy(&g.drain_output(chan())),
             "0123456789\r\n x",
             "one space became the break; the other is ordinary output"
+        );
+    }
+
+    #[test]
+    fn two_spaces_at_an_exact_fit_boundary_both_disappear() {
+        // A narrower edge case inside this task's fix: the byte that fills
+        // the line to `width` can itself be a SPACE, not a letter -- `9`
+        // fills `123456789` to column 9, then the *first* of the two spaces
+        // fills column 10 exactly, legitimately, with no trigger (column was
+        // 9, still under width, when it was pushed). The *second* space is
+        // what triggers `wrap()`.
+        //
+        // Back-scan finds that first space immediately -- `found_delimiter`
+        // is true, but the recovered word is empty, not "a word that already
+        // fit". `wrap()`'s new rule only fires on a *non-empty* word for
+        // exactly this reason: an empty word has nothing to "put back
+        // untouched", and skipping the strip step some other path already
+        // does correctly. Two lines of the paragraph in
+        // `re/oracle/oracle_bank2.raw`'s Town Square description touch this
+        // exact case (see the oracle test below).
+        let mut g = one();
+        g.channel_mut(chan()).width = 10;
+        g.transmit(chan(), b"123456789  x");
+        assert_eq!(
+            String::from_utf8_lossy(&g.drain_output(chan())),
+            "123456789\r\nx",
+            "the space that already filled column 10, and the one that \
+             triggered the wrap, both disappear -- neither is a real word"
+        );
+    }
+
+    #[test]
+    fn the_oracle_s_own_paragraph_wraps_at_its_own_six_line_lengths() {
+        // The measurement this task exists to satisfy, read from the capture
+        // rather than retyped: `re/oracle/oracle_bank2.raw`'s Town Square
+        // description wraps at 79, 75, 77, 78, 72, 78 visible columns on the
+        // genuine board (`btutsw(chan, 0x4f)`, see `wrap()`'s doc), with
+        // `shift` ending line 1 and `stalls` opening line 2.
+        //
+        // The oracle's own six wrapped lines, rejoined with a single space
+        // each, reconstruct the paragraph `WCCMMUD.DLL` actually handed
+        // `btuxmt` -- word wrap works by turning a space into a carriage return (`btutsw`, guide page 172), so undoing a wrap is exactly
+        // replacing its `\r\n` with the one SPACE it replaced, regardless of
+        // whether that wrap consumed the SPACE outright (this task's fix) or
+        // carried a word and stripped the SPACE ahead of it (the earlier
+        // carry fix) -- either way exactly one SPACE from the original text
+        // becomes each break. Feeding that reconstruction back through this
+        // host's own `btutsw(chan, 79)` at `width = 79` must reproduce the
+        // oracle's own six lines exactly: same words, same six lengths.
+        //
+        // Before this task's fix, this reconstruction wraps at 73, 74, 73,
+        // 78, 74, 75 and spills an unwanted seventh line -- the measurement
+        // `crates/mbbs/tests/wccmmud.rs`'s doc comment used to (wrongly)
+        // claim agreed with the oracle.
+        let raw = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../re/oracle/oracle_bank2.raw"
+        ));
+        let start_marker = b"\x1b[0;37;40m    As can be seen";
+        let start = raw
+            .windows(start_marker.len())
+            .position(|w| w == start_marker)
+            .expect("the Town Square description is in the oracle capture");
+        let end_marker = b"a manhole can be seen\r\n";
+        let end_at = raw[start..]
+            .windows(end_marker.len())
+            .position(|w| w == end_marker)
+            .expect("the description ends at its sixth line");
+        let end = start + end_at + end_marker.len();
+        let chunk = &raw[start..end];
+
+        let ansi_prefix = b"\x1b[0;37;40m";
+        let mut lines: Vec<&[u8]> = chunk.split(|&b| b == b'\n').map(|l| {
+            // `split(b'\n')` leaves each line's trailing `\r` on -- strip it
+            // back off so `lines` holds exactly what a bare `\r\n` split
+            // would, without pulling in an extra dependency for that split.
+            l.strip_suffix(b"\r").unwrap_or(l)
+        }).collect();
+        assert_eq!(lines.pop(), Some(&b""[..]), "the chunk ends on its own \\r\\n");
+        assert_eq!(lines.len(), 6, "the six lines the oracle measures: {lines:?}");
+        lines[0] = lines[0]
+            .strip_prefix(ansi_prefix)
+            .expect("line 1 opens with the module's own colour code");
+
+        let oracle_columns: Vec<usize> = lines.iter().map(|l| l.len()).collect();
+        assert_eq!(
+            oracle_columns,
+            vec![79, 75, 77, 78, 72, 78],
+            "the oracle's own measured visible columns, read from the capture \
+             rather than retyped"
+        );
+
+        let unwrapped = lines.join(&b' ');
+
+        let mut g = one();
+        g.channel_mut(chan()).width = 79;
+        g.transmit(chan(), &unwrapped);
+        let output = g.drain_output(chan());
+        let wrapped: Vec<&[u8]> = output.split(|&b| b == b'\n').map(|l| {
+            l.strip_suffix(b"\r").unwrap_or(l)
+        }).collect();
+
+        let our_columns: Vec<usize> = wrapped.iter().map(|l| l.len()).collect();
+        assert_eq!(
+            our_columns,
+            vec![79, 75, 77, 78, 72, 78],
+            "this host's own wrap, run over the oracle's reconstructed \
+             paragraph at the oracle's own width, must match the oracle's \
+             six visible-column lengths exactly: {:?}",
+            wrapped.iter().map(|l| String::from_utf8_lossy(l)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            wrapped, lines,
+            "same six lengths is not enough on its own -- the same words \
+             must land on the same lines, `shift`/`stalls` included"
         );
     }
 
