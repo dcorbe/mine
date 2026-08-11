@@ -1345,32 +1345,46 @@ mod tests {
         // `westernNorth`. The defect was never MajorMUD-specific -- it failed
         // Galacticomm's published example.
         //
-        // `width` is 19, not the 20 passed to `btutsw()` in the example. Page
-        // `GSBL-172` (`archive/galacticomm/gsblref.pdf`) says why: "to prevent
-        // the user's terminal from doing its own line wrapping, each line is
-        // actually limited to width-1 characters". `Channel::width` in this
-        // host is the number of characters a line may hold -- what `btutsw`
-        // calls "width-1" -- not the raw argument a module passes it; the real
-        // `WCCMMUD.DLL` confirms the same convention from the other end,
-        // calling `btutsw(chan, 0x4f)` (79) for a screen this host measures at
-        // 79 usable columns (see `wrap()`'s doc), not 78. This is the one place
-        // that convention has to be applied by hand, because this test is
-        // reproducing the manual's own worked example rather than a module's
-        // call: `width = 19` is what the manual's `btutsw(chan, 20)` actually
-        // buys a paragraph.
+        // `width` is set to 19 by hand here, not to the 20 the manual's
+        // example passes `btutsw()`. That gap is a real discrepancy between
+        // the guide and the genuine board, and it is recorded here rather
+        // than resolved -- do not "tidy" it away in either direction:
+        //
+        // - Page `GSBL-172` (`archive/galacticomm/gsblref.pdf`) says "to
+        //   prevent the user's terminal from doing its own line wrapping,
+        //   each line is actually limited to width-1 characters", and the
+        //   worked example on `GSBL-174/175` duly prints 19-column lines for
+        //   its `btutsw(chan, 20)`. The manual is self-consistent.
+        // - The genuine board is not consistent *with the manual*.
+        //   `WCCMMUD.DLL` calls `btutsw(chan, 0x4f)` (79), and
+        //   `re/oracle/oracle_bank2.raw` wraps at 79 visible columns -- not
+        //   78. Argument and capacity are the same number on the real wire.
+        // - This host follows the board, because the board is the oracle:
+        //   `btutsw` stores its argument verbatim
+        //   (`crates/mbbs/src/shims/gsbl.rs:56`), so `Channel::width` *is*
+        //   the raw argument and `transmit` fills every one of its columns.
+        //   `the_oracle_s_own_paragraph_wraps_at_its_own_six_line_lengths`
+        //   is the test that pins that, against real captured bytes.
+        //
+        // So this test cannot both call `btutsw(chan, 20)` and reproduce the
+        // guide's printed screen; it sets the capacity that screen is
+        // actually rendered at and exercises the wrap algorithm against it,
+        // which is the part of the example worth having. Whether some GSBL
+        // revision really did subtract one and MajorMUD was built against one
+        // that did not is open -- settle it with a capture, not with this
+        // comment.
         //
         // That the word-fit half of `wrap()`'s rule (this task's fix, not the
         // carry fix above) is exercised even by Galacticomm's own example was
         // not expected going in: the paragraph's `to` (`"...native to"`) fills
         // line 3 to column 19 exactly, and only stays there rather than being
         // carried because of that rule. At `width = 20` -- the value this test
-        // used to carry, matching the raw `btutsw()` argument instead of the
-        // manual's own "width-1" rule -- the *old*, buggy `wrap()` reproduced
-        // this screen by coincidence: always carrying a found word happens to
-        // agree with "cap every line at width-1" when the two are off by
-        // exactly the same one column. `width = 19` removes that coincidence:
-        // the pre-fix `wrap()` cannot reproduce this screen at the width the
-        // manual's own rule calls for, only the fixed one can.
+        // used to carry -- the *old*, buggy `wrap()` reproduced this screen by
+        // coincidence, because always carrying a found word happens to agree
+        // with capping every line one column short when the two are off by
+        // exactly the same one. Nineteen removes the coincidence: the pre-fix
+        // `wrap()` cannot reproduce this screen at this width, only the fixed
+        // one can.
         let mut g = one();
         g.channel_mut(chan()).width = 19;
         g.transmit(chan(), b"The blue form of the Engelmann Spruce ");
