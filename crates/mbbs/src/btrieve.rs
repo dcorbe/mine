@@ -197,39 +197,73 @@ impl Geometry {
         // A v6 file's control record is shadowed across physical pages 0 and 1
         // -- generation counters, not position, say which is live (Evidence 1).
         // A v5 file has no second copy, so the version is established from the
-        // first `FCR` bytes alone, and only a v6 file requires the read to
-        // reach a second `FCR`-byte half.
-        let raw =
-            read_head(path, 2 * FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
-        if raw.len() < FCR {
+        // first `FCR` bytes alone, and only a v6 file requires a further read.
+        let head = read_head(path, FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        if head.len() < FCR {
             return Err(fail(format!(
                 "{size} bytes, and a Btrieve file's first page is at least {FCR}"
             )));
         }
 
-        let version = version(&raw[..FCR]).ok_or_else(|| {
+        let version = version(&head).ok_or_else(|| {
             fail(format!(
                 "starts {:02x?}, which is neither a v5 file control record \
                  (four zero bytes) nor a v6 one (\"FC\")",
-                &raw[..4]
+                &head[..4]
             ))
         })?;
 
-        let bytes: &[u8] = if version == Version::V6 {
-            if raw.len() < 2 * FCR {
+        let bytes: Vec<u8> = if version == Version::V6 {
+            // The second shadow copy lives on *physical page 1* -- byte offset
+            // `page_size`, not the fixed `FCR` (512) offset an earlier version
+            // of this function used. Those only coincide when `page_size ==
+            // 512`; `DUPKEY30.DAT`'s 512-byte pages hid that, but a
+            // 2048-byte-paged file compared padding against padding and never
+            // reached page 1 at all (`PP2048.DAT` read 0 of its 50 records).
+            //
+            // `page_size` is read from the first half and trusted *before*
+            // liveness is decided -- Evidence 1 measured it identical between
+            // the two copies, so that trust is safe, but say so here because
+            // it is the one field this function reads before it has chosen
+            // which copy is live.
+            let page_size = u32::from(u16::from_le_bytes([head[at::PAGE], head[at::PAGE + 1]]));
+            let needed = u64::from(page_size) + FCR as u64;
+            if size < needed {
                 return Err(fail(format!(
-                    "{size} bytes, and a v6 file's control record is shadowed \
-                     across two {FCR}-byte pages"
+                    "{size} bytes, too short to hold a second physical page: a \
+                     {page_size}-byte page 0 plus a {FCR}-byte control-record copy \
+                     starting page 1 needs at least {needed}"
+                )));
+            }
+            // Read only the FCR-byte header of physical page 1, not the whole
+            // page -- a page can be many kilobytes, and this file can be tens
+            // of megabytes; nothing here may become a whole-file read.
+            let second = read_at(path, page_size as usize, FCR)
+                .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+            if second.len() < FCR {
+                return Err(fail(format!(
+                    "{size} bytes, too short to hold a second physical page: only \
+                     {} bytes were readable starting at offset {page_size}",
+                    second.len()
+                )));
+            }
+            if &second[..2] != b"FC" {
+                return Err(fail(format!(
+                    "the bytes at offset {page_size} (physical page 1, by this \
+                     file's own {page_size}-byte page size) are {:02x?}, not \
+                     \"FC\" -- there is no second control-record shadow copy \
+                     where this file's page size says one belongs",
+                    &second[..2]
                 )));
             }
             let generation = |half: &[u8]| {
                 u16::from_le_bytes([half[at::GENERATION], half[at::GENERATION + 1]])
             };
-            let first = generation(&raw[..FCR]);
-            let second = generation(&raw[FCR..2 * FCR]);
-            match first.cmp(&second) {
-                std::cmp::Ordering::Greater => &raw[..FCR],
-                std::cmp::Ordering::Less => &raw[FCR..2 * FCR],
+            let first = generation(&head);
+            let second_gen = generation(&second);
+            match first.cmp(&second_gen) {
+                std::cmp::Ordering::Greater => head,
+                std::cmp::Ordering::Less => second,
                 std::cmp::Ordering::Equal => {
                     return Err(fail(format!(
                         "both control-record copies claim generation {first}, and \
@@ -238,7 +272,7 @@ impl Geometry {
                 }
             }
         } else {
-            &raw[..FCR]
+            head
         };
 
         let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
@@ -383,6 +417,29 @@ fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
 
     let mut out = vec![0u8; len];
     let mut file = std::fs::File::open(path)?;
+    let mut got = 0;
+    while got < len {
+        match file.read(&mut out[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    out.truncate(got);
+    Ok(out)
+}
+
+/// The `len` bytes of a file starting at `offset`, or fewer if it is shorter.
+///
+/// Seeks rather than reading from the start, for the same reason
+/// [`read_head`] does not read the whole file: a v6 file's second
+/// control-record copy can start many kilobytes in, and this file can be
+/// tens of megabytes.
+fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset as u64))?;
+    let mut out = vec![0u8; len];
     let mut got = 0;
     while got < len {
         match file.read(&mut out[got..])? {
@@ -1490,11 +1547,26 @@ mod tests {
     /// Mark the first `FCR`-byte half of a synthetic v6 file as the live
     /// control-record copy, by giving it the higher generation. Every v6 test
     /// below built by [`file`] carries its actual field values in that first
-    /// half, so anything else would make [`Geometry::read`]'s new
-    /// shadow-copy comparison pick a copy of all zeroes.
+    /// half, so anything else would make [`Geometry::read`]'s shadow-copy
+    /// comparison pick a copy of all zeroes.
+    ///
+    /// The second copy lives at byte offset `page_size` -- read from the
+    /// fixture's own `at::PAGE` field, not passed in, so this cannot drift
+    /// from what [`Geometry::read`] itself derives it from -- **not** at a
+    /// fixed `FCR` offset. An earlier version of this helper wrote the second
+    /// generation at `FCR + at::GENERATION`, which for a `file(4096, ...)`
+    /// fixture lands *inside physical page 0*, sixteen bytes past the first
+    /// generation it had just written. That fixture was shaped to match the
+    /// bug `Geometry::read` had at the time, which is exactly why the suite
+    /// could not see it. [`Geometry::read`] also now refuses a second
+    /// physical page that does not start with `"FC"`, so this stamps that
+    /// magic too.
     fn mark_first_half_live(bytes: &mut [u8]) {
+        let page_size = usize::from(u16::from_le_bytes([bytes[at::PAGE], bytes[at::PAGE + 1]]));
         bytes[at::GENERATION..at::GENERATION + 2].copy_from_slice(&2u16.to_le_bytes());
-        bytes[FCR + at::GENERATION..FCR + at::GENERATION + 2].copy_from_slice(&1u16.to_le_bytes());
+        bytes[page_size..page_size + 2].copy_from_slice(b"FC");
+        bytes[page_size + at::GENERATION..page_size + at::GENERATION + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
     }
 
     /// Read a header out of bytes, by way of a real file.
@@ -1602,6 +1674,45 @@ mod tests {
         let geometry = Geometry::read("DUPKEY30SWAPPED.DAT", &path).expect("reads");
         assert_eq!(geometry.version, Version::V6);
         assert_eq!(geometry.records, 30, "page 0 is live here and says thirty");
+    }
+
+    /// The shadow copy is not at byte offset `FCR` (512) -- it is at byte
+    /// offset `page_size`, and the two only coincide when `page_size == 512`.
+    /// `DUPKEY30.DAT` (above) has `page_size == 512`, so it cannot catch this:
+    /// the wrong-offset read and the right one land on the same bytes there.
+    /// `PP2048.DAT` has `page_size == 2048`; before this fix its stale copy
+    /// (page 0, generation 1, 0 records) sits at both offset 0 *and* offset
+    /// 512, so a `read_head(path, FCR)`-style implementation comparing
+    /// `[0..512)` against `[512..1024)` compares padding against padding --
+    /// still inside physical page 0 -- and never reaches physical page 1
+    /// (offset 2048, generation 2, 50 records) at all.
+    #[test]
+    fn a_v6_shadow_copy_is_found_at_page_size_not_at_fcr() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/PP2048.DAT");
+        let geometry = Geometry::read("PP2048.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.page, 2048);
+        assert_eq!(
+            geometry.records, 50,
+            "physical page 1, at byte offset 2048, is live and says fifty"
+        );
+
+        // `FRAG1024.DAT` also has a non-`FCR` page size (1024) and its live
+        // copy's raw record count is 1 -- but it is a *variable-length*
+        // record file, and `Geometry::read` refuses every v6 file of those
+        // outright (`variable && version != V5`, above), independent of this
+        // fix and not yet implemented (plan Task 6). That refusal fires
+        // whichever shadow copy is chosen, since both copies agree on the
+        // variable-length flag (Evidence 1) -- so this fixture cannot
+        // distinguish the page-size fix from the bug on its own, and the most
+        // this test can honestly assert is that the fix still reaches that
+        // refusal rather than a wrong record count or an unrelated error.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/FRAG1024.DAT");
+        let e = Geometry::read("FRAG1024.DAT", &path).expect_err("variable-length v6 refuses");
+        assert!(e.why.contains("V6"), "{e}");
+        assert!(e.why.contains("variable-length"), "{e}");
     }
 
     #[test]
