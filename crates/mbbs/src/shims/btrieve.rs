@@ -2343,21 +2343,6 @@ mod tests {
         );
     }
 
-    /// `absbtv` on a never-positioned file is the one refusal of the three
-    /// that the oracle **confirms**: `S1b` measured real Btrieve answering
-    /// status 8, "invalid positioning", for a `Get Position` on a freshly
-    /// opened file. So this one stays a refusal.
-    ///
-    /// The step in the middle is deliberately left as it was and is **not**
-    /// claimed to be oracle-confirmed. `S1d` recorded a `Step Next` on a
-    /// nominally unpositioned file answering with status 0, which would make
-    /// this refusal wrong too -- but that scenario ran on a position block
-    /// that earlier scenarios in the same handle had already moved, so what
-    /// it measured may be "step from where S1 left the file" rather than
-    /// "step from nowhere". Answering that needs a scenario with its own
-    /// fresh handle, which has not been run. Recorded rather than acted on,
-    /// because changing a refusal on an ambiguous measurement is exactly the
-    /// mistake the other three fixes were correcting.
     /// `S6`: a `Get Equal` in one key's order followed by a `Get Next` in
     /// another's is refused by real Btrieve with status 7, "different key
     /// number". This host used to translate between the two orders through
@@ -2373,21 +2358,42 @@ mod tests {
     /// coincidentally passing.
     #[test]
     fn a_next_in_another_keys_order_refuses_rather_than_translating() {
+        let (mut f, _) = two_key_file("btv-shim-crosskey");
+
+        assert!(
+            acquire(&mut f, Some(2), 0, 5),
+            "positioned by key 0, on the record whose key 0 is 2"
+        );
+        assert!(
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 1, 6, 0]).is_err(),
+            "S6: a Get Next in key 1's order is refused, not translated"
+        );
+    }
+
+    /// A two-key file holding three records whose keys order them
+    /// **oppositely**: by key 0 they ascend 1, 2, 3 and by key 1 they ascend
+    /// 3, 2, 1. That opposition is the point -- it means a test can tell
+    /// which key an operation actually followed, instead of only that it
+    /// answered.
+    ///
+    /// Built by this crate's own [`crate::btrieve::create`], because
+    /// `SAMPLE.DAT` has exactly one key and nothing else in the tree has a
+    /// two-key fixture.
+    fn two_key_file(scratch: &str) -> (Fixture, FarPtr) {
         use crate::btrieve::{FileSpec, KeySpec, SegmentSpec, create};
 
-        let int = |offset: u16| SegmentSpec {
-            offset,
-            length: 2,
-            kind: 0x01,
-            descending: false,
-        };
         let key = |offset: u16| KeySpec {
-            segments: vec![int(offset)],
+            segments: vec![SegmentSpec {
+                offset,
+                length: 2,
+                kind: 0x01,
+                descending: false,
+            }],
             duplicates: false,
             modifiable: false,
         };
 
-        let dir = crate::testing::scratch("btv-shim-crosskey");
+        let dir = crate::testing::scratch(scratch);
         create(
             &dir.join("TWOKEY.DAT"),
             &FileSpec {
@@ -2399,7 +2405,7 @@ mod tests {
         .expect("creates a two-key file");
 
         let mut f = Fixture::rooted(dir);
-        open(&mut f, "TWOKEY.DAT", 8);
+        let block = open(&mut f, "TWOKEY.DAT", 8);
 
         for (first, second) in [(1u16, 3u16), (2, 2), (3, 1)] {
             let mut record = [0u8; 8];
@@ -2409,17 +2415,91 @@ mod tests {
             f.invoke(dinsbtv, &Fixture::far(at)).expect("inserts");
         }
 
+        (f, block)
+    }
+
+    /// Where `gabbtvl`'s `keynum` goes, proved by what a following `qnxbtv`
+    /// answers.
+    ///
+    /// **This pair exists because the seam it covers was covered by nothing.**
+    /// The `abi` session measured it on the merged tree: no test anywhere did
+    /// a `gabbtvl` followed by a `qnxbtv`, and all six `gabbtvl` invocations
+    /// passed `keynum = 0` -- so the key-path half of `absolute()`'s argument
+    /// list was pinned by nothing at all, exactly as `loktyp` had been before
+    /// `c6e1e17` pinned word 5. The hole did not move; what changed is that
+    /// [`locate`] now *refuses* a cross-key `Get Next` instead of translating
+    /// it, which made the unpinned word start to matter.
+    ///
+    /// Neither of the pair can pass for the wrong reason:
+    ///
+    /// - if the wrong word were read for `keynum`, the **same-key** case
+    ///   turns into a refusal;
+    /// - if the `S6` refusal regressed to translating, the **cross-key** case
+    ///   turns into an answer.
+    ///
+    /// This one is the same-key case, which is MajorMUD's own usage. It
+    /// checks *which* record comes back rather than merely that one does:
+    /// from the record whose keys are `(2, 2)`, key 1's next is `(1, 3)` and
+    /// key 0's next is `(3, 1)`, so the first field alone says which order
+    /// was followed. `S5` measured genuine Btrieve establishing the key path
+    /// from Get Direct's key number, which is what makes answering correct
+    /// here.
+    #[test]
+    fn a_get_direct_establishes_its_key_and_a_next_on_that_key_answers() {
+        let (mut f, block) = two_key_file("btv-shim-direct-same");
+        let into = buffer(&f, block);
+
         assert!(
             acquire(&mut f, Some(2), 0, 5),
-            "positioned by key 0, on the record whose key 0 is 2"
+            "learn where the record whose key 0 is 2 lives, through key 0"
         );
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        // The same record, but reached through key ONE -- so the cursor this
+        // leaves behind is key 1's, not the key 0 the acquire above used.
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
+        )
+        .expect("get direct, establishing key 1");
+
+        assert_eq!(
+            f.invoke(qnpbtv, &[56]).expect("answers"),
+            Ret::U16(1),
+            "a Get Next on the key gabbtvl established is not a cross-key ask"
+        );
+
+        let record = f.machine.resolve(into, 4).expect("readable");
+        assert_eq!(
+            u16::from_le_bytes([record[0], record[1]]),
+            1,
+            "and it followed KEY 1's order to (1,3) -- key 0's next would be (3,1)"
+        );
+    }
+
+    /// The other half of the pair: same setup, but the `Get Next` names a
+    /// different key than `gabbtvl` established, and is refused. See
+    /// [`a_get_direct_establishes_its_key_and_a_next_on_that_key_answers`].
+    #[test]
+    fn a_get_direct_on_one_key_then_a_next_on_another_refuses() {
+        let (mut f, _) = two_key_file("btv-shim-direct-cross");
+
+        assert!(acquire(&mut f, Some(2), 0, 5), "learn where (2,2) lives");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
+        )
+        .expect("get direct, establishing key 1");
+
         assert!(
-            f.invoke(
-                obtbtvl,
-                &[0, 0, 0, 0, 1, 6, 0],
-            )
-            .is_err(),
-            "S6: a Get Next in key 1's order is refused, not translated"
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 6, 0]).is_err(),
+            "S6: a Get Next in key 0's order, from a key 1 position, refuses"
         );
     }
 
@@ -2447,6 +2527,21 @@ mod tests {
         );
     }
 
+    /// `absbtv` on a never-positioned file is the one refusal of the three
+    /// that the oracle **confirms**: `S1b` measured real Btrieve answering
+    /// status 8, "invalid positioning", for a `Get Position` on a freshly
+    /// opened file. So this one stays a refusal.
+    ///
+    /// The step in the middle is deliberately left as it was and is **not**
+    /// claimed to be oracle-confirmed. `S1d` recorded a `Step Next` on a
+    /// nominally unpositioned file answering with status 0, which would make
+    /// this refusal wrong too -- but that scenario ran on a position block
+    /// that earlier scenarios in the same handle had already moved, so what
+    /// it measured may be "step from where S1 left the file" rather than
+    /// "step from nowhere". Answering that needs a scenario with its own
+    /// fresh handle, which has not been run. Recorded rather than acted on,
+    /// because changing a refusal on an ambiguous measurement is exactly the
+    /// mistake the other three fixes were correcting.
     #[test]
     fn a_step_or_a_position_with_nothing_to_be_next_to_refuses() {
         let mut f = Fixture::new();
