@@ -243,16 +243,18 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
     (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
     (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
-    // Streams: the module's own files, read and written.
-    (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
-    (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
-    (MAJORBBS, "fgets", stream::fgets, Cleans::Caller),
-    (MAJORBBS, "fread", stream::fread, Cleans::Caller),
+    // Streams: the module's own files, read and written. `fprintf` stays
+    // `Wg16`-concrete -- `crate::fmt::format` has no generic core yet (see
+    // `shims::stream::fprintf`'s own doc comment).
+    (MAJORBBS, "fopen", stream::fopen_wg16, Cleans::Caller),
+    (MAJORBBS, "fclose", stream::fclose_wg16, Cleans::Caller),
+    (MAJORBBS, "fgets", stream::fgets_wg16, Cleans::Caller),
+    (MAJORBBS, "fread", stream::fread_wg16, Cleans::Caller),
     (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller),
-    (MAJORBBS, "fflush", stream::fflush, Cleans::Caller),
-    (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
-    (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller),
-    (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller),
+    (MAJORBBS, "fflush", stream::fflush_wg16, Cleans::Caller),
+    (MAJORBBS, "unlink", stream::unlink_wg16, Cleans::Caller),
+    (MAJORBBS, "getdtd", stream::getdtd_wg16, Cleans::Caller),
+    (MAJORBBS, "cntdir", stream::cntdir_wg16, Cleans::Caller),
     // The clock, the audit trail, and coming online.
     (MAJORBBS, "access", system::access, Cleans::Caller),
     (MAJORBBS, "now", system::now, Cleans::Caller),

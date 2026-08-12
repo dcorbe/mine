@@ -43,13 +43,27 @@
 //! answer; a file that is there and will not open is a refusal, because the
 //! module can act on the first and has no way to find out about the second.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use crate::Host;
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::dos;
 use crate::fmt::{Args, format};
 use crate::shims::{NO, ShimError};
 use crate::stream::Mode;
+
+/// The null pointer, in this ABI's own representation.
+///
+/// [`Abi`] has no `NULL` constant (see `shims::user::begin_polling`'s own
+/// doc comment for why: a pointer's bit pattern is not part of the trait,
+/// only how to en-/decode one) -- but [`Abi::ptr_from_bytes`] decoding
+/// [`Abi::PTR_WIDTH`] zero bytes is exactly the null representation both
+/// ABIs agree on, the same reading `begin_polling`'s own null check and
+/// `Host::point_curusr_mem`'s null write already rely on.
+fn null_ptr<A: Abi>() -> A::Ptr {
+    A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])
+}
 
 /// `FILE *fopen(const char *path, const char *mode)` -- open one of the
 /// module's files.
@@ -68,18 +82,35 @@ use crate::stream::Mode;
 /// **`mode.read` here is the base letter, deliberately.** A file that is not
 /// there is `NULL` for `r` and `r+`, and a create for `w`, `w+`, `a` and `a+` --
 /// which is `CheckOpenType`'s `O_CREAT` column and not [`Mode::readable`].
-pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Streams::open_mem`](crate::stream::Streams::open_mem)
+/// is already `impl<A: Abi> Streams<A>` -- converting this routine is
+/// routing through that generic core instead of its `Wg16` facade
+/// ([`Streams::open`](crate::stream::Streams::open)). `Host::dos_name` has
+/// no `A`-dependent behaviour at all (see its own doc comment for why it is
+/// filed under `impl Host<Wg16>` regardless), so it is named through that
+/// concrete type here rather than moved.
+pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `FILE *fopen(const char *path, const char *mode)` -- Borland's, this
     // file's own module doc quotes it, and no Galacticomm header redeclares
     // it (see this file's commit message).
-    let mut args = super::args(machine);
-    let path = args.ptr();
-    let mode = args.ptr();
-    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
-    let spelt = String::from_utf8_lossy(machine.read_cstr(mode)?).into_owned();
+    let path = call.ptr();
+    let mode = call.ptr();
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let spelt = String::from_utf8_lossy(
+        mode.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
 
     let mode = Mode::parse(&spelt).map_err(ShimError::Failed)?;
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
+    let name = Host::<Wg16>::dos_name(&named)
+        .map_err(ShimError::Failed)?
+        .to_owned();
 
     let path = match host.find(&name) {
         Some(path) => path,
@@ -87,7 +118,7 @@ pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
         // Not there, and the module asked to read it. `WCCMMUD.INI` is not
         // shipped -- it is something a sysop writes -- so this is the ordinary
         // case rather than the exceptional one.
-        None if mode.read => return Ok(Ret::Far(FarPtr::NULL)),
+        None if mode.read => return Ok(abi::Ret::Ptr(null_ptr::<A>())),
 
         // Not there, and the module asked to write it. That is a create.
         None => host.root.join(&name),
@@ -95,9 +126,15 @@ pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 
     let cookie = host
         .streams
-        .open(machine, &name, &path, mode)
+        .open_mem(call.mem(), &name, &path, mode)
         .map_err(|e| ShimError::Failed(format!("fopen({named}, {spelt}): {e}")))?;
-    Ok(Ret::Far(cookie))
+    Ok(abi::Ret::Ptr(cookie))
+}
+
+/// The dispatch-table entry for [`fopen`]. See `shims::call`'s own doc
+/// comment.
+pub fn fopen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fopen(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int fclose(FILE *f)` -- close a stream.
@@ -105,14 +142,23 @@ pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// Zero, always: the failure `fclose` reports with `EOF` is one this host would
 /// have refused already. The cookie is retired rather than reused, so using it
 /// afterwards names the file it used to be.
-pub fn fclose(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Streams::close`](crate::stream::Streams::close) never
+/// touched a `Machine`, so this was already `impl<A: Abi> Streams<A>` before
+/// this task.
+pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fclose(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
-    let mut args = super::args(machine);
-    let cookie = args.ptr();
+    let cookie = call.ptr();
     host.streams
         .close(cookie)
         .map_err(|e| ShimError::Failed(format!("fclose: {e}")))?;
-    Ok(Ret::U16(0))
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// The dispatch-table entry for [`fclose`]. See `shims::call`'s own doc
+/// comment.
+pub fn fclose_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fclose(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *fgets(char *s, int n, FILE *f)` -- a line, or `NULL` at the end.
@@ -124,14 +170,18 @@ pub fn fclose(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// **`NULL` at end of file is an answer.** It is how the module finds the end,
 /// since it imports no `feof`.
-pub fn fgets(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Streams::line_mem`](crate::stream::Streams::line_mem)
+/// is already `impl<A: Abi> Streams<A>`, and the terminated line is written
+/// back through [`Call::mem`] and [`mbbs_ptr::ModulePtr::write`] rather than
+/// `Machine::write`.
+pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *fgets(char *s, int n, FILE *f)` -- Borland's; no Galacticomm
     // header redeclares it (`GCOMM.H`'s `mdfgets` is a different routine with
     // the same shape, not this one -- see this file's commit message).
-    let mut args = super::args(machine);
-    let buffer = args.ptr();
-    let n = args.int() as i16;
-    let cookie = args.ptr();
+    let buffer = call.ptr();
+    let n = Into::<u32>::into(call.int()) as i16;
+    let cookie = call.ptr();
 
     // Borland would write the terminator into a buffer it was told has no room
     // for one. A host cannot tell that from a call it has misread, and this is
@@ -144,15 +194,23 @@ pub fn fgets(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 
     let line = host
         .streams
-        .line(machine, cookie, (n - 1) as usize)
+        .line_mem(call.mem(), cookie, (n - 1) as usize)
         .map_err(|e| ShimError::Failed(format!("fgets: {e}")))?;
     let Some(mut line) = line else {
-        return Ok(Ret::Far(FarPtr::NULL));
+        return Ok(abi::Ret::Ptr(null_ptr::<A>()));
     };
 
     line.push(0);
-    machine.write(buffer, &line)?;
-    Ok(Ret::Far(buffer))
+    buffer
+        .write(call.mem(), &line)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(buffer))
+}
+
+/// The dispatch-table entry for [`fgets`]. See `shims::call`'s own doc
+/// comment.
+pub fn fgets_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fgets(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- a block.
@@ -167,17 +225,20 @@ pub fn fgets(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// Only the bytes actually read are written, which leaves the tail of the
 /// module's buffer as it found it.
-pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Streams::read_mem`](crate::stream::Streams::read_mem)
+/// is already `impl<A: Abi> Streams<A>`, and the block is written back
+/// through [`Call::mem`] and [`mbbs_ptr::ModulePtr::write`].
+pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- Borland's;
     // no Galacticomm header redeclares it.
-    let mut args = super::args(machine);
-    let buffer = args.ptr();
-    let size = args.int();
-    let count = args.int();
-    let cookie = args.ptr();
+    let buffer = call.ptr();
+    let size = Into::<u32>::into(call.int()) as u16;
+    let count = Into::<u32>::into(call.int()) as u16;
+    let cookie = call.ptr();
 
     if size == 0 || count == 0 {
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
 
     // `size_t` is 16 bits here, so Borland would have wrapped. A wrap reads the
@@ -192,10 +253,20 @@ pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 
     let bytes = host
         .streams
-        .read(machine, cookie, want as usize)
+        .read_mem(call.mem(), cookie, want as usize)
         .map_err(|e| ShimError::Failed(format!("fread: {e}")))?;
-    machine.write(buffer, &bytes)?;
-    Ok(Ret::U16((bytes.len() / usize::from(size)) as u16))
+    buffer
+        .write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(
+        (bytes.len() / usize::from(size)) as u16,
+    )))
+}
+
+/// The dispatch-table entry for [`fread`]. See `shims::call`'s own doc
+/// comment.
+pub fn fread_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fread(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
@@ -210,6 +281,19 @@ pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// disk. `WRITE.C` is explicit about the difference -- "a write to a text file
 /// does not count generated carriage returns" -- so the answer is the same in
 /// both modes, which is what makes it comparable with `sprintf`.
+///
+/// # The one shim in this file that did not go generic
+///
+/// [`crate::fmt::format`] is `Wg16`-concrete -- it walks the outstanding
+/// call's raw argument words off `&Machine` directly (see `fmt.rs`'s own
+/// doc comment, "Generic type, `Wg16`-concrete body"), and `fmt.rs` is a
+/// different file, out of this task's scope (see `shims::user::getin`'s own
+/// doc comment for the identical shape of this finding: attempting
+/// `fprintf<A: Abi>(call: &mut Call<A>, ..)` and forwarding to
+/// `format(call.cpu, ..)` fails the same way `getin`'s attempt at
+/// `host.get_input(call.cpu, chan)` did -- `A::Cpu` is opaque outside `Abi`
+/// and nothing binds it to `Machine` for an arbitrary `A`). `fprintf` keeps
+/// its Task-4 shape and its own unchanged `ROUTINES` entry.
 pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     // `int fprintf(FILE *f, const char *fmt, ...)` -- Borland's; no
     // Galacticomm header redeclares it. `Args::Call { first: 4 }` stays a
@@ -238,14 +322,23 @@ pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// opened is a module bug whether or not this routine has work to do.
 ///
 /// If a write cache is ever added, this stops being free.
-pub fn fflush(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Streams::name`](crate::stream::Streams::name) never
+/// touched a `Machine`, so this was already `impl<A: Abi> Streams<A>`
+/// before this task.
+pub fn fflush<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fflush(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
-    let mut args = super::args(machine);
-    let cookie = args.ptr();
+    let cookie = call.ptr();
     host.streams
         .name(cookie)
         .map_err(|e| ShimError::Failed(format!("fflush: {e}")))?;
-    Ok(Ret::U16(0))
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// The dispatch-table entry for [`fflush`]. See `shims::call`'s own doc
+/// comment.
+pub fn fflush_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fflush(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int unlink(const char *path)` -- remove a file.
@@ -257,20 +350,32 @@ pub fn fflush(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// A file that *is* there and will not go is a refusal, on the same line
 /// `fopen` draws.
-pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): `Host::dos_name` is named through `Host::<Wg16>` for
+/// the same reason [`fopen`] does -- see that routine's own doc comment.
+pub fn unlink<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int unlink(const char *path)` -- Borland's; no Galacticomm header
     // redeclares it.
-    let mut args = super::args(machine);
-    let path = args.ptr();
-    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
+    let path = call.ptr();
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
 
     let Some(path) = host.find(name) else {
-        return Ok(Ret::U16(NO));
+        return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
     std::fs::remove_file(&path)
         .map_err(|e| ShimError::Failed(format!("unlink({named}): {e}")))?;
-    Ok(Ret::U16(0))
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// The dispatch-table entry for [`unlink`]. See `shims::call`'s own doc
+/// comment.
+pub fn unlink_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    unlink(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long getdtd(int fhdl)` -- when a file was last written, DOS-packed.
@@ -304,13 +409,16 @@ pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// written, or if it was written outside the years DOS can pack. The original
 /// returned whatever DOS left in the registers and could not tell a bad handle
 /// from a real answer; this host stops instead.
-pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): touches no memory at all --
+/// [`Streams::modified`](crate::stream::Streams::modified) and
+/// [`crate::clock::Clock`] are both already ABI-independent.
+pub fn getdtd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `long getdtd(int fhdl)` -- DSKUTL.H:79 per this routine's own doc
     // comment above, and DSKUTL.H is not among re/wg33src/INC's 125 headers
     // -- grepping `getdtd` case-insensitively across all of them finds
     // nothing, confirming "no C source survives" still holds.
-    let mut args = super::args(machine);
-    let fd = args.int();
+    let fd = Into::<u32>::into(call.int());
     let fd = u8::try_from(fd).map_err(|_| ShimError::Failed(format!("getdtd: fd {fd} is not one")))?;
 
     let at = host.streams().modified(fd).map_err(ShimError::Failed)?;
@@ -325,7 +433,15 @@ pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .dos_date()
         .map_err(|why| ShimError::Failed(format!("getdtd: {why}")))?;
 
-    Ok(Ret::U32((u32::from(date) << 16) | u32::from(civil.dos_time())))
+    Ok(abi::Ret::Long(
+        (u32::from(date) << 16) | u32::from(civil.dos_time()),
+    ))
+}
+
+/// The dispatch-table entry for [`getdtd`]. See `shims::call`'s own doc
+/// comment.
+pub fn getdtd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    getdtd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID cntdir(const CHAR *path)` -- count the files and bytes a spec names.
@@ -367,11 +483,19 @@ pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// A directory that will not open is a refusal and not a zero, because "no such
 /// file" and "nobody looked" are the same answer to a module and only one of
 /// them is true.
-pub fn cntdir(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let path = args.ptr();
-    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
+///
+/// Generic (Task 5): `Host::dos_name` is named through `Host::<Wg16>` for
+/// the same reason [`fopen`] does; the three globals are written through
+/// [`Globals::write_mem`](crate::globals::Globals::write_mem) rather than
+/// [`Globals::write`](crate::globals::Globals::write).
+pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let path = call.ptr();
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
     let spec =
         dos::Name::spec(name).map_err(|why| ShimError::Failed(format!("cntdir({named}): {why}")))?;
 
@@ -413,20 +537,28 @@ pub fn cntdir(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let bytes = i32::try_from(bytes)
         .map_err(|_| ShimError::Failed(format!("cntdir({named}): {bytes} bytes is not a long")))?;
 
-    let write = |machine: &mut Machine, host: &Host, name: &str, value: i32| {
+    let write = |mem: &mut A::Mem, host: &Host<A>, name: &str, value: i32| {
         host.globals()
-            .write(machine, name, &value.to_le_bytes())
+            .write_mem(mem, name, &value.to_le_bytes())
             .map_err(|e| ShimError::Failed(e.to_string()))
     };
-    write(machine, host, "numfils", files)?;
-    write(machine, host, "numbyts", bytes)?;
-    write(machine, host, "numbytp", bytes)?;
-    Ok(Ret::Void)
+    write(call.mem(), host, "numfils", files)?;
+    write(call.mem(), host, "numbyts", bytes)?;
+    write(call.mem(), host, "numbytp", bytes)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`cntdir`]. See `shims::call`'s own doc
+/// comment.
+pub fn cntdir_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    cntdir(&mut super::call(machine), host).map(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mbbs16::FarPtr;
+
     use crate::stream::FILE_SIZE;
     use crate::testing::{Fixture, scratch, scratch_with};
 
@@ -457,7 +589,7 @@ mod tests {
         let path = f.text(name);
         let how = f.text(mode);
         f.invoke(
-            fopen,
+            fopen_wg16,
             &[path.offset, path.selector, how.offset, how.selector],
         )
     }
@@ -471,7 +603,7 @@ mod tests {
     fn gets(f: &mut Fixture, fp: FarPtr, n: u16) -> Option<String> {
         let buffer = f.bytes(&vec![0xff; usize::from(n) + 8], false);
         let ret = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
+            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
             .expect("fgets");
         match ret {
             Ret::Far(FarPtr {
@@ -537,7 +669,7 @@ mod tests {
         );
         assert_eq!(gets(&mut f, fp, 64), None, "NULL is how the module finds the end");
 
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
     }
 
     #[test]
@@ -605,7 +737,7 @@ mod tests {
         let fp = opened(&mut f, "LINES.TXT", "rt");
         let buffer = f.buffer(8);
         let e = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
+            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
             .expect_err("a refusal");
         assert!(e.to_string().contains("n of 0"), "{e}");
     }
@@ -621,7 +753,7 @@ mod tests {
         let buffer = f.bytes(&vec![0xff; usize::from(want)], false);
         let got = word(
             f.invoke(
-                fread,
+                fread_wg16,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -662,7 +794,7 @@ mod tests {
             let buffer = f.buffer(200);
             word(
                 f.invoke(
-                    fread,
+                    fread_wg16,
                     &[buffer.offset, buffer.selector, 1, 200, fp.offset, fp.selector],
                 )
                 .expect("fread"),
@@ -682,7 +814,7 @@ mod tests {
         let buffer = f.buffer(64);
         let e = f
             .invoke(
-                fread,
+                fread_wg16,
                 &[buffer.offset, buffer.selector, 256, 256, fp.offset, fp.selector],
             )
             .expect_err("a refusal");
@@ -743,7 +875,7 @@ mod tests {
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
         // Truncated rather than appended to -- the base letter is still `w` --
         // and still a text stream, because a bare `w+` takes `_fmode`'s
@@ -781,18 +913,18 @@ mod tests {
     fn a_handle_used_after_closing_is_refused_by_name() {
         let mut f = Fixture::new();
         let fp = opened(&mut f, "LINES.TXT", "rt");
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
         let buffer = f.buffer(64);
         let e = f
-            .invoke(fgets, &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector])
+            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector])
             .expect_err("a refusal");
         assert!(
             e.to_string().contains("LINES.TXT was closed"),
             "the address is retired, so the refusal can name the file: {e}"
         );
 
-        let e = f.invoke(fclose, &Fixture::far(fp)).expect_err("a refusal");
+        let e = f.invoke(fclose_wg16, &Fixture::far(fp)).expect_err("a refusal");
         assert!(e.to_string().contains("LINES.TXT was closed"), "{e}");
     }
 
@@ -800,7 +932,7 @@ mod tests {
     fn a_handle_this_host_never_issued_is_refused() {
         let mut f = Fixture::new();
         let invented = f.buffer(FILE_SIZE as u16);
-        let e = f.invoke(fclose, &Fixture::far(invented)).expect_err("a refusal");
+        let e = f.invoke(fclose_wg16, &Fixture::far(invented)).expect_err("a refusal");
         assert!(e.to_string().contains("not a stream this host opened"), "{e}");
     }
 
@@ -825,7 +957,7 @@ mod tests {
         let buffer = f.buffer(64);
         let e = f
             .invoke(
-                fgets,
+                fgets_wg16,
                 &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector],
             )
             .expect_err("a refusal");
@@ -873,7 +1005,7 @@ mod tests {
             )
             .expect("fprintf"),
         );
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
         let on_disk = std::fs::read(root.join("OUT.LOG")).expect("the log");
         assert_eq!(on_disk, b"rangerdan has 1234 gold\n");
@@ -900,7 +1032,7 @@ mod tests {
                 )
                 .expect("fprintf"),
             );
-            f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+            f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
             assert_eq!(std::fs::read(root.join(name)).expect(name), expected, "{name}");
             // "A write to a text file does not count generated carriage
@@ -923,7 +1055,7 @@ mod tests {
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
         assert_eq!(
             std::fs::read(root.join("WCCMMUD.LOG")).expect("the log"),
@@ -955,10 +1087,10 @@ mod tests {
         let root = scratch("stream-flush");
         let mut f = Fixture::rooted(root);
         let fp = opened(&mut f, "OUT.LOG", "wt");
-        assert_eq!(word(f.invoke(fflush, &Fixture::far(fp)).expect("fflush")), 0);
+        assert_eq!(word(f.invoke(fflush_wg16, &Fixture::far(fp)).expect("fflush")), 0);
 
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
-        let e = f.invoke(fflush, &Fixture::far(fp)).expect_err("a refusal");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        let e = f.invoke(fflush_wg16, &Fixture::far(fp)).expect_err("a refusal");
         assert!(e.to_string().contains("OUT.LOG was closed"), "{e}");
     }
 
@@ -970,21 +1102,21 @@ mod tests {
         let mut f = Fixture::rooted(root.clone());
 
         let named = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(named)).expect("unlink")), 0);
         assert!(!root.join("LINES.TXT").exists());
 
         // -1 for a file that is not there is the truth, and `_INIT__WCCMMUD`
         // reads it as one -- its single `unlink` is guarded by an `access` that
         // has already said the same thing.
         let again = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(again)).expect("unlink")), NO);
+        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(again)).expect("unlink")), NO);
     }
 
     #[test]
     fn unlink_outside_the_modules_own_directory_is_refused() {
         let mut f = Fixture::rooted(scratch("stream-unlink-path"));
         let named = f.text("D:\\LOGS\\MUD.LOG");
-        let e = f.invoke(unlink, &Fixture::far(named)).expect_err("a refusal");
+        let e = f.invoke(unlink_wg16, &Fixture::far(named)).expect_err("a refusal");
         assert!(e.to_string().contains("names a directory"), "{e}");
     }
 
@@ -1005,7 +1137,7 @@ mod tests {
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
 
         assert_eq!(
             std::fs::read(root.join("WCCRECOV.FLG")).expect("the flag"),
@@ -1014,7 +1146,7 @@ mod tests {
         );
 
         let named = f.text("WCCRECOV.FLG");
-        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(named)).expect("unlink")), 0);
         assert!(!root.join("WCCRECOV.FLG").exists());
     }
 
@@ -1029,7 +1161,7 @@ mod tests {
         let _fp = opened(&mut f, "LINES.TXT", "r");
 
         let Ret::U32(packed) = f
-            .invoke(getdtd, &[u16::from(crate::stream::FIRST_FD)])
+            .invoke(getdtd_wg16, &[u16::from(crate::stream::FIRST_FD)])
             .expect("getdtd")
         else {
             panic!("getdtd returns a long");
@@ -1069,7 +1201,7 @@ mod tests {
         // behind, so a stale handle came back as a date. There is nothing to
         // report here but the absence.
         let mut f = Fixture::new();
-        let e = f.invoke(getdtd, &[99]).expect_err("refused");
+        let e = f.invoke(getdtd_wg16, &[99]).expect_err("refused");
         assert!(format!("{e}").contains("no open stream"), "{e}");
     }
 
@@ -1079,7 +1211,7 @@ mod tests {
         let at = f.text(spec);
         let args = Fixture::far(at);
         assert!(matches!(
-            f.invoke(cntdir, &args).expect("cntdir"),
+            f.invoke(cntdir_wg16, &args).expect("cntdir"),
             Ret::Void
         ));
         let read = |name| f.host.globals().long(&f.machine, name).expect(name);
@@ -1158,7 +1290,7 @@ mod tests {
         for spec in ["D:\\MUD\\*.DAT", "SUBDIR\\*.*", "*"] {
             let at = f.text(spec);
             let args = Fixture::far(at);
-            assert!(f.invoke(cntdir, &args).is_err(), "{spec}");
+            assert!(f.invoke(cntdir_wg16, &args).is_err(), "{spec}");
         }
     }
 }
