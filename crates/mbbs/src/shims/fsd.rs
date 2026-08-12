@@ -46,12 +46,21 @@
 //! comment.
 
 use mbbs16::{FarPtr, Machine, Module, Ret};
+use mbbs_ptr::ModulePtr;
 
-use crate::abi::ModuleMem;
+use crate::abi::{self, Abi, Call, ModuleMem, Wg16};
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::{NO, ShimError};
 use crate::{Chan, Host};
+
+/// Whether `ptr` is the null pointer, in this ABI's own representation --
+/// tested on its own bytes rather than `FarPtr`'s `selector`/`offset`
+/// fields, since `A::Ptr` is opaque to a generic caller. Same reading
+/// `shims::user::begin_polling`'s own null check takes.
+fn is_null<A: Abi>(ptr: A::Ptr) -> bool {
+    A::ptr_to_bytes(ptr).iter().all(|&b| b == 0)
+}
 
 /// This channel's session control block, allocating it on first use.
 ///
@@ -71,36 +80,46 @@ use crate::{Chan, Host};
 /// unconditionally, and a host that only wrote it on first allocation would
 /// leave the global pointing at whichever channel allocated last after a
 /// second channel's `fsdroom` reused its own, already-allocated block.
-fn control_block(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<FarPtr, ShimError> {
+///
+/// Generic (Task 5): [`ModuleMem::alloc_region`] is reached through `mem`
+/// directly rather than `Machine::mem_mut` -- the single caller ([`fsdroom`])
+/// is the only one, so this needs no `Wg16` facade, unlike the several
+/// helpers below that [`fsdprc`] (a different, unconverted routine) also
+/// calls.
+fn control_block<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Result<A::Ptr, ShimError> {
     let at = match host.fsdscb[chan.index()] {
         Some(at) => at,
         None => {
-            // `ModuleMem::alloc_region`, not `Machine::alloc_segment`
-            // directly -- one of the 9 sites Task 6 moves onto the `Abi`
-            // trait's allocator (docs/plans/2026-08-11-abi-abstraction-
-            // implementation.md). Still `Wg16`-concrete: `Host` is not
-            // generic yet, and `alloc_region` already returns the whole
-            // `FarPtr` (offset 0) this used to build by hand.
-            let at = machine
-                .mem_mut()
-                .alloc_region(usize::from(fsd::FSDSCB))
-                .map_err(|e| {
-                    ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
-                })?;
+            let at = mem.alloc_region(usize::from(fsd::FSDSCB)).map_err(|e| {
+                ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
+            })?;
             host.fsdscb[chan.index()] = Some(at);
             at
         }
     };
     host.globals()
-        .write(machine, "fsdscb", &at.to_bytes())
+        .write_mem(mem, "fsdscb", &A::ptr_to_bytes(at))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(at)
 }
 
-/// Read the session control block out of module memory.
-fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
-    let bytes = machine.resolve(at, usize::from(fsd::FSDSCB))?;
+/// Read the session control block out of module memory, against memory
+/// directly rather than a whole `Machine`.
+///
+/// The `Wg16` facade [`read_block`] delegates into -- [`fsdprc`],
+/// `fsd_drain_edge` and `goback` (three routines this task does not convert)
+/// all call the facade directly, and so do this file's own tests.
+fn read_block_mem<A: Abi>(mem: &A::Mem, at: A::Ptr) -> Result<fsd::Scb<A>, ShimError> {
+    let bytes = at
+        .resolve(mem, usize::from(fsd::FSDSCB))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     fsd::Scb::from_bytes(bytes).map_err(|e| ShimError::Failed(e.to_string()))
+}
+
+/// The `Wg16` facade [`read_block_mem`] delegates into. See that function's
+/// own doc comment for who still calls this by name.
+fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
+    read_block_mem::<Wg16>(machine.mem(), at)
 }
 
 /// A pointer `by` bytes past `base`, refusing rather than wrapping.
@@ -108,15 +127,14 @@ fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
 /// A 16-bit offset that wrapped would name a byte near the start of the same
 /// segment, which *resolves* -- so the bounds check downstream would pass and
 /// the module would be handed a pointer into the wrong part of its own buffer.
-fn offset(base: FarPtr, by: usize) -> Result<FarPtr, ShimError> {
-    let offset = u16::try_from(by)
-        .ok()
-        .and_then(|by| base.offset.checked_add(by))
-        .ok_or_else(|| ShimError::Failed(format!("fsd: {base} plus {by} leaves the segment")))?;
-    Ok(FarPtr {
-        offset,
-        selector: base.selector,
-    })
+///
+/// Generic (Task 5): [`Abi::ptr_checked_add`] is the refusing half of
+/// [`Abi::ptr_offset`] -- see that method's own doc comment for why this
+/// crate's one hand-built overflow check moved onto the trait rather than
+/// staying `Wg16`-shaped here.
+fn offset<A: Abi>(base: A::Ptr, by: usize) -> Result<A::Ptr, ShimError> {
+    A::ptr_checked_add(base, by)
+        .ok_or_else(|| ShimError::Failed(format!("fsd: {base} plus {by} leaves the segment")))
 }
 
 /// Where field `n`'s record starts, relative to the field array.
@@ -143,17 +161,17 @@ fn field_at(n: u16) -> usize {
 /// If the run reaches the end of its segment without the empty entry that ends
 /// it -- which is what a pointer to something that is not an answer string
 /// does. The original would have walked on into whatever followed.
-fn answer_string(machine: &Machine, mut at: FarPtr) -> Result<Vec<u8>, ShimError> {
+fn answer_string<A: Abi>(mem: &A::Mem, mut at: A::Ptr) -> Result<Vec<u8>, ShimError> {
     let mut out = Vec::new();
     loop {
-        let entry = machine.read_cstr(at)?;
+        let entry = at.read_cstr(mem).map_err(|e| ShimError::Failed(e.to_string()))?;
         let len = entry.len();
         out.extend_from_slice(entry);
         out.push(0);
         if len == 0 {
             return Ok(out);
         }
-        at = offset(at, len + 1)?;
+        at = offset::<A>(at, len + 1)?;
     }
 }
 
@@ -178,21 +196,20 @@ fn answer_string(machine: &Machine, mut at: FarPtr) -> Result<Vec<u8>, ShimError
 /// screen this host cannot draw; if the template and specification disagree in
 /// any of the ways `fsdppc` counts as an error, which the real host answered
 /// with `catastro`; or if the form is too big for the buffer it must fit in.
-pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fsdroom(int tmpmsg, char *fldspc, int amode)` -- FSDBBS.H:242-245.
     //
     // One of this file's two genuine hoists (the other is `fsdxan`, below):
     // the original reads word 0, then word 3, then word 1 (once
     // `read_cstr(arg_far(1))` runs further down, and again at `set_fldspc`
     // below that). Reading all three up front, in frame order (0, 1, 3), is
-    // behaviour-preserving because `arg_u16`/`arg_far` are infallible -- they
+    // behaviour-preserving because `Call::int`/`ptr` are infallible -- they
     // pull bytes off the frame and cannot fail or have an effect. Nothing
     // that *can* fail or branch moved: the `amode` validation immediately
     // below still runs before `fsd_template` is ever consulted.
-    let mut args = super::args(machine);
-    let number = args.int();
-    let fldspc = args.ptr();
-    let amode = args.int() as i16;
+    let number = Into::<u32>::into(call.int()) as u16;
+    let fldspc = call.ptr();
+    let amode = Into::<u32>::into(call.int()) as i16;
 
     if amode != 0 && amode != 1 && amode != -1 {
         return Err(ShimError::Failed(format!(
@@ -204,10 +221,13 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     // against and records for `fsdrft` to come back to later.
     let curmbk = host
         .globals()
-        .pointer(machine, "curmbk")
+        .pointer_mem(call.mem(), "curmbk")
         .map_err(|e| ShimError::Failed(format!("fsdroom: {e}")))?;
-    let template = fsd_template(machine, host, curmbk, number, amode)?;
-    let spec = machine.read_cstr(fldspc)?.to_vec();
+    let template = fsd_template_mem(call.mem(), host, curmbk, number, amode)?;
+    let spec = fldspc
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     // `maxfld`, `FSDBBS.C:130`: the field array and the punctuation array share
     // the output buffer, and the punctuation array gets its MBPMAX first.
@@ -282,9 +302,9 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     // next thing MajorMUD does with the answer, ever needed -- and leaves the
     // per-channel control block alone rather than corrupt a channel that is
     // not this one.
-    if let Ok(chan) = host.current_channel(machine) {
-        let at = control_block(machine, host, chan)?;
-        let mut scb = read_block(machine, at)?;
+    if let Ok(chan) = host.current_channel_mem(call.mem()) {
+        let at = control_block(call.mem(), host, chan)?;
+        let mut scb = read_block_mem::<A>(call.mem(), at)?;
         scb.set_fldspc(fldspc);
         scb.set_numfld(form.fields.len() as u16);
         scb.set_numtpl(form.in_template as u16);
@@ -292,7 +312,8 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         scb.set_maxans(form.answer_max);
         scb.set_hlplen(form.help_len);
         scb.set_hlpoff(form.help_at);
-        machine.write(at, scb.as_bytes())?;
+        at.write(call.mem(), scb.as_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
 
         // `fsdusr->{curmbk,tmpmsg,amode}`, `FSDBBS.C:134`, for `fsdrft` to
         // come back to. The block is read now rather than at `fsdrft` time
@@ -300,12 +321,18 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         // instructions after this call, at `seg 3:0x3f86`.
         let curmbk = host
             .globals()
-            .pointer(machine, "curmbk")
+            .pointer_mem(call.mem(), "curmbk")
             .map_err(|e| ShimError::Failed(e.to_string()))?;
         host.fsdtmp[chan.index()] = Some((curmbk, number, amode));
     }
 
-    Ok(Ret::U16(size))
+    Ok(abi::Ret::Int(A::Int::from(size)))
+}
+
+/// The dispatch-table entry for [`fsdroom`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdroom_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdroom(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void fsdapr(char *sesbuf, int sbleng, char *answers)` -- lay the session
@@ -337,14 +364,13 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// If no form has been sized; if the module's buffer is smaller than the size
 /// `fsdroom` told it, which the real host answered with `catastro`; or if the
 /// buffer or the answer string will not resolve.
-pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `void fsdapr(char *sesbuf, int sbleng, char *answers)` -- FSDBBS.H:249-252.
-    let mut args = super::args(machine);
-    let buffer = args.ptr();
-    let length = args.int();
-    let defaults = args.ptr();
+    let buffer = call.ptr();
+    let length = Into::<u32>::into(call.int()) as u16;
+    let defaults = call.ptr();
 
-    let chan = host.current_channel(machine)?;
+    let chan = host.current_channel_mem(call.mem())?;
     let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdapr: no form has been sized, and FSDBBS.H:245 has this called after fsdroom()"
@@ -376,9 +402,13 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
     let at = host.fsdscb[chan.index()]
         .ok_or_else(|| ShimError::Failed("fsdapr: no session control block".into()))?;
-    let mut block = read_block(machine, at)?;
-    let spec = machine.read_cstr(block.fldspc())?.to_vec();
-    let old = answer_string(machine, defaults)?;
+    let mut block = read_block_mem::<A>(call.mem(), at)?;
+    let spec = block
+        .fldspc()
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let old = answer_string::<A>(call.mem(), defaults)?;
     let installed = fsd::answers(&form, &spec, &old);
 
     // Punctuation, then the field array, then the answer string: the same three
@@ -390,21 +420,28 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     }
     let newans_at = bytes.len();
     bytes.extend_from_slice(&installed.text);
-    machine.write(buffer, &bytes)?;
+    buffer.write(call.mem(), &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
 
     block.set_mbpunc(buffer);
-    block.set_flddat(offset(buffer, flddat_at)?);
-    block.set_newans(offset(buffer, newans_at)?);
+    block.set_flddat(offset::<A>(buffer, flddat_at)?);
+    block.set_newans(offset::<A>(buffer, newans_at)?);
     block.set_allans(installed.allans);
     // `FSDBBS.C:180`. The one member a caller is invited to change afterwards
     // (`FSDBBS.H:127`), which is why it is set here and not in `fsdroom`.
     block.set_crsatr(0x70);
-    machine.write(at, block.as_bytes())?;
+    at.write(call.mem(), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // `clrprf(); prf("")`, FSDBBS.C:181. `FSDBBS.H:117` tells callers to do
     // their own prf'ing *after* this, for exactly this reason.
-    crate::shims::text::clrprf(machine, host)?;
-    Ok(Ret::Void)
+    crate::shims::text::clrprf_mem(call.mem(), host)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`fsdapr`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdapr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdapr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The session control block, once `fsdapr` has filled one in.
@@ -414,16 +451,19 @@ pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// If `fsdroom` never ran, or `fsdapr` never did. The second shows as a null
 /// `newans`, which is the same test the real host's own `fsdchi` makes at
 /// `FSDBBS.C:340` before touching anything.
-fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarPtr), ShimError> {
-    let chan = host.current_channel(machine)?;
+///
+/// Generic core (Task 5); see [`prepared`] for the `Wg16` facade, which
+/// [`fsdprc`] (a different, unconverted routine) still calls.
+fn prepared_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, who: &str) -> Result<(fsd::Scb<A>, A::Ptr), ShimError> {
+    let chan = host.current_channel_mem(mem)?;
     let at = host.fsdscb[chan.index()].ok_or_else(|| {
         ShimError::Failed(format!(
             "{who}: no form has been sized, so there is no session; FSDBBS.H:245 has \
              fsdroom() first"
         ))
     })?;
-    let block = read_block(machine, at)?;
-    if block.newans() == FarPtr::NULL {
+    let block = read_block_mem::<A>(mem, at)?;
+    if is_null::<A>(block.newans()) {
         return Err(ShimError::Failed(format!(
             "{who}: no answers have been prepared; FSD.H has this called after fsdapr()"
         )));
@@ -431,14 +471,23 @@ fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarP
     Ok((block, at))
 }
 
-/// One `struct fsdfld` out of the field array, bounds-checked.
+/// The `Wg16` facade [`prepared_mem`] delegates into.
+fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarPtr), ShimError> {
+    prepared_mem(machine.mem(), host, who)
+}
+
+/// One `struct fsdfld` out of the field array, bounds-checked, against
+/// memory directly rather than a whole `Machine`.
 ///
 /// The original indexes with no check at all. `FSD.H:635` states the range, and
 /// a field number outside it reads whatever follows the array and calls it an
 /// answer.
-fn field_record(
-    machine: &Machine,
-    block: &fsd::Scb,
+///
+/// The `Wg16` facade [`field_record`] delegates into -- [`fsdprc`] (a
+/// different, unconverted routine) still calls it directly.
+fn field_record_mem<A: Abi>(
+    mem: &A::Mem,
+    block: &fsd::Scb<A>,
     field: u16,
     who: &str,
 ) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
@@ -448,11 +497,23 @@ fn field_record(
             block.numfld()
         )));
     }
-    let at = offset(block.flddat(), field_at(field))?;
-    let bytes = machine.resolve(at, usize::from(fsd::FSDFLD))?;
+    let at = offset::<A>(block.flddat(), field_at(field))?;
+    let bytes = at
+        .resolve(mem, usize::from(fsd::FSDFLD))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let mut out = [0u8; fsd::FSDFLD as usize];
     out.copy_from_slice(bytes);
     Ok(out)
+}
+
+/// The `Wg16` facade [`field_record_mem`] delegates into.
+fn field_record(
+    machine: &Machine,
+    block: &fsd::Scb,
+    field: u16,
+    who: &str,
+) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
+    field_record_mem(machine.mem(), block, field, who)
 }
 
 /// Where a field's answer starts, out of its record.
@@ -476,16 +537,21 @@ fn answer_offset(record: &[u8; fsd::FSDFLD as usize]) -> u16 {
 /// # Errors
 ///
 /// If no session has been prepared, or `fldi` is not a field of it.
-pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *fsdnan(int fldi)` -- FSD.H:639-641.
-    let mut args = super::args(machine);
-    let field = args.int();
-    let (block, _) = prepared(machine, host, "fsdnan")?;
-    let record = field_record(machine, &block, field, "fsdnan")?;
-    Ok(Ret::Far(offset(
+    let field = Into::<u32>::into(call.int()) as u16;
+    let (block, _) = prepared_mem(call.mem(), host, "fsdnan")?;
+    let record = field_record_mem(call.mem(), &block, field, "fsdnan")?;
+    Ok(abi::Ret::Ptr(offset::<A>(
         block.newans(),
         usize::from(answer_offset(&record)),
     )?))
+}
+
+/// The dispatch-table entry for [`fsdnan`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdnan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdnan(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int fsdord(int fldi)` -- which `ALT=` value field `fldi` holds.
@@ -513,23 +579,27 @@ pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// If no session has been prepared, `fldi` is not a field of it, or the
 /// rewritten answer string would not fit the room `fsdroom` reserved.
-pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fsdord(int fldi)` -- FSD.H:657-659.
-    let mut args = super::args(machine);
-    let number = args.int();
-    let (mut block, at) = prepared(machine, host, "fsdord")?;
-    let record = field_record(machine, &block, number, "fsdord")?;
+    let number = Into::<u32>::into(call.int()) as u16;
+    let (mut block, at) = prepared_mem(call.mem(), host, "fsdord")?;
+    let record = field_record_mem(call.mem(), &block, number, "fsdord")?;
     let field = fsd::Field::from_record(&record);
 
-    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let spec = block
+        .fldspc()
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let ansoff = answer_offset(&record);
     let anslen = record[fsd::fld::ANSLEN];
-    let answer = machine
-        .read_cstr(offset(block.newans(), usize::from(ansoff))?)?
+    let answer = offset::<A>(block.newans(), usize::from(ansoff))?
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
     let Some((index, canonical)) = fsd::ordinal(&spec, &field, &answer) else {
-        return Ok(Ret::U16(NO));
+        return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
 
     // `stfans()`, FSD.C:1036: put the canonical spelling back, shift what
@@ -561,12 +631,15 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                 block.allans()
             ))
         })?;
-    let tail = machine
-        .resolve(offset(block.newans(), tail_at)?, tail_len)?
+    let tail = offset::<A>(block.newans(), tail_at)?
+        .resolve(call.mem(), tail_len)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     let mut rewritten = canonical.clone();
     rewritten.extend_from_slice(&tail);
-    machine.write(offset(block.newans(), usize::from(ansoff))?, &rewritten)?;
+    offset::<A>(block.newans(), usize::from(ansoff))?
+        .write(call.mem(), &rewritten)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // `fldptr->anslen = anslen`. `anslen` is a `char` in the C struct and
     // `chkalt`'s value came through `endtkn`, which clamps at ANSLEN -- so this
@@ -578,12 +651,14 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             canonical.len()
         ))
     })?;
-    machine.write(offset(block.flddat(), field_at(number))?, &record)?;
+    offset::<A>(block.flddat(), field_at(number))?
+        .write(call.mem(), &record)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // `while (efptr != fldptr) { efptr->ansoff += anslen-m; efptr--; }` -- the
     // fields *after* this one, and none before.
     for later in number + 1..block.numfld() {
-        let mut record = field_record(machine, &block, later, "fsdord")?;
+        let mut record = field_record_mem(call.mem(), &block, later, "fsdord")?;
         let moved = i32::from(answer_offset(&record)) + grew;
         let moved = u16::try_from(moved).map_err(|_| {
             ShimError::Failed(format!(
@@ -591,7 +666,9 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             ))
         })?;
         record[fsd::fld::ANSOFF..fsd::fld::ANSOFF + 2].copy_from_slice(&moved.to_le_bytes());
-        machine.write(offset(block.flddat(), field_at(later))?, &record)?;
+        offset::<A>(block.flddat(), field_at(later))?
+            .write(call.mem(), &record)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
 
     block.set_allans(u16::try_from(allans).map_err(|_| {
@@ -599,8 +676,15 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             "fsdord({number}): an answer string of {allans} bytes"
         ))
     })?);
-    machine.write(at, block.as_bytes())?;
-    Ok(Ret::U16(index))
+    at.write(call.mem(), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(index)))
+}
+
+/// The dispatch-table entry for [`fsdord`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdord_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdord(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *fsdxan(char *answer, char *name)` -- a field's value, by name.
@@ -632,34 +716,44 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// If the answer string runs to the end of its segment without the empty entry
 /// that ends it, or either pointer will not resolve.
-pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *fsdxan(char *answer, char *name)` -- FSD.H:596-599.
     //
     // This file's other genuine hoist: the original reads `name` (word 2)
     // before `answer` (word 0), out of frame order. Reading both up front, in
     // frame order (0, 2), is behaviour-preserving for the same reason as
-    // `fsdroom`'s hoist above -- `arg_far` is infallible, so which of the two
-    // pointers is read first is not observable. Only `read_cstr(name)`,
+    // `fsdroom`'s hoist above -- `Call::ptr` is infallible, so which of the
+    // two pointers is read first is not observable. Only `read_cstr(name)`,
     // below, can fail, and it still runs exactly once, in the same place
     // relative to everything else.
-    let mut args = super::args(machine);
-    let mut at = args.ptr();
-    let name = args.ptr();
-    let name = machine.read_cstr(name)?.to_vec();
+    let mut at = call.ptr();
+    let name = call.ptr();
+    let name = name
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     loop {
-        let entry = machine.read_cstr(at)?;
+        let entry = at
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
         if entry.is_empty() {
-            return Ok(Ret::Far(at));
+            return Ok(abi::Ret::Ptr(at));
         }
         let len = entry.len();
         if len > name.len()
             && entry[..name.len()].eq_ignore_ascii_case(&name)
             && entry[name.len()] == b'='
         {
-            return Ok(Ret::Far(offset(at, name.len() + 1)?));
+            return Ok(abi::Ret::Ptr(offset::<A>(at, name.len() + 1)?));
         }
-        at = offset(at, len + 1)?;
+        at = offset::<A>(at, len + 1)?;
     }
+}
+
+/// The dispatch-table entry for [`fsdxan`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdxan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdxan(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *fsdrft(void)` -- the template again. `FSDBBS.C:413`.
@@ -694,8 +788,8 @@ pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// If no form has been sized, or the template is not in the file that was
 /// current when one was.
-pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = host.current_channel(machine)?;
+pub fn fsdrft<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = host.current_channel_mem(call.mem())?;
     let Some((block, number, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdrft: no template has been compiled; FSDBBS.C:419 refreshes the one fsdroom \
@@ -703,7 +797,13 @@ pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                 .into(),
         ));
     };
-    ascii_template(machine, host, block, number, amode).map(Ret::Far)
+    ascii_template(call, host, block, number, amode).map(abi::Ret::Ptr)
+}
+
+/// The dispatch-table entry for [`fsdrft`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdrft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdrft(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The template as a pointer the module can hold, in whichever form this
@@ -723,13 +823,17 @@ pub fn fsdrft(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// wrong bytes: the two disagree from the first line break onward. The genuine
 /// host has the same problem and solves it the same way -- `getasc` writes
 /// into a buffer of the host's and returns a pointer to that.
-fn ascii_template(
-    machine: &mut Machine,
-    host: &mut Host,
-    block: FarPtr,
+///
+/// Generic (Task 5): its only caller, [`fsdrft`], is generic now, so this
+/// needs no `Wg16` facade -- unlike the several helpers above that
+/// [`fsdprc`] (a different, unconverted routine) also calls.
+fn ascii_template<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    block: A::Ptr,
     number: u16,
     amode: i16,
-) -> Result<FarPtr, ShimError> {
+) -> Result<A::Ptr, ShimError> {
     let at = host.messages.text(block, number).map_err(ShimError::Failed)?;
     if amode == -1 {
         return Ok(at);
@@ -738,17 +842,20 @@ fn ascii_template(
         return Ok(*cached);
     }
 
-    let compact = machine.read_cstr(at)?.to_vec();
+    let compact = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let mut expanded = crate::msg::getasc(&compact);
     expanded.push(0);
     // `ModuleMem::alloc_region`, not `Machine::alloc_segment` directly --
     // see `control_block`'s identical comment above.
-    let buffer = machine.mem_mut().alloc_region(expanded.len()).map_err(|e| {
+    let buffer = call.mem().alloc_region(expanded.len()).map_err(|e| {
         ShimError::Failed(format!(
             "fsdrft: no room for the ASCII form of message {number}: {e}"
         ))
     })?;
-    machine.write(buffer, &expanded)?;
+    buffer.write(call.mem(), &expanded).map_err(|e| ShimError::Failed(e.to_string()))?;
     host.fsd_ascii.insert((block, number), buffer);
     Ok(buffer)
 }
@@ -787,11 +894,10 @@ fn ascii_template(
 ///
 /// If no channel is current, if no form has been sized for it, or if the
 /// template pointer it was handed is not addressable.
-pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn fsdbkg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `void fsdbkg(char *templt)` -- FSDBBS.H:258-259.
-    let mut args = super::args(machine);
-    let templt = args.ptr();
-    let chan = host.current_channel(machine)?;
+    let templt = call.ptr();
+    let chan = host.current_channel_mem(call.mem())?;
     let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdbkg: no template has been compiled for this channel; FSDBBS.H:245 has \
@@ -806,13 +912,16 @@ pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     };
 
-    let (block, _) = prepared(machine, host, "fsdbkg")?;
-    let form = live_form(machine, &block, &form)?;
-    let answers = read_answers(machine, &block)?;
-    let template = machine.read_cstr(templt)?.to_vec();
+    let (block, _) = prepared_mem(call.mem(), host, "fsdbkg")?;
+    let form = live_form_mem(call.mem(), &block, &form)?;
+    let answers = read_answers_mem(call.mem(), &block)?;
+    let template = templt
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     // `prf("\x1B[0m\x1B[2J\x1B[0m")` -- reset, clear screen, reset again.
-    crate::shims::text::append(machine, host, b"\x1b[0m\x1b[2J\x1b[0m")?;
+    crate::shims::text::append_mem(call.mem(), host, b"\x1b[0m\x1b[2J\x1b[0m")?;
 
     {
         let ch = host.gsbl_mut().channel_mut(chan);
@@ -822,9 +931,15 @@ pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     }
 
     let drawn = fsd::fsddsp(&form, &answers, &template);
-    crate::shims::text::append(machine, host, &drawn)?;
+    crate::shims::text::append_mem(call.mem(), host, &drawn)?;
 
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`fsdbkg`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdbkg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdbkg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int vfyadn(int fldno, char *answer)` -- `FSD.C:2007-2053`. See
@@ -843,6 +958,19 @@ pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// # Errors
 ///
 /// If no session has been prepared, or `fldno` is not a field of it.
+///
+/// # Did not go generic (Task 5)
+///
+/// [`fsd::vfyadn`] -- the entry-engine routine this shim is a thin wrapper
+/// over -- takes `&mut Scb`, i.e. `&mut Scb<Wg16>`: `crate::fsd` (the
+/// 10,900-line compiler and entry engine, `crates/mbbs/src/fsd.rs`) is a
+/// different file from `crates/mbbs/src/shims/fsd.rs`, out of this task's
+/// scope. [`fsdego`], below, is blocked the same way, by `fsd::fsdlin`/
+/// `fsd::fsdent`. Genericising `crate::fsd` itself -- every one of its ~30
+/// `&Scb`/`&mut Scb`-taking functions, the whole entry engine -- is
+/// comparable in size to this task by itself and is not attempted here;
+/// [`fsd::Scb`] itself *is* generic now (this commit), which is what makes
+/// that a later task's job rather than a redesign.
 pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     // `int vfyadn(int fldno, char *answer)` -- FSD.H:584-587.
     let mut args = super::args(machine);
@@ -857,7 +985,7 @@ pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     })?;
     let ansoff = answer_offset(&record);
     let current = machine
-        .read_cstr(offset(block.newans(), usize::from(ansoff))?)?
+        .read_cstr(offset::<Wg16>(block.newans(), usize::from(ansoff))?)?
         .to_vec();
 
     let numtpl = block.numtpl();
@@ -885,7 +1013,10 @@ pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// (`amode == 1`, ANSI, Stage 5) sessions -- `fsdlin` (line mode, what this
 /// host builds) never calls it, and neither `fsdego` nor `fsdcon` do either.
 /// Line mode leaves width exactly as the connection set it.
-fn fsdcon(host: &mut Host, chan: Chan) {
+///
+/// Generic outright (Task 5): touches only `Host::gsbl_mut`, which has never
+/// been `A`-dependent -- terminal state, not module memory.
+fn fsdcon<A: Abi>(host: &mut Host<A>, chan: Chan) {
     let ch = host.gsbl_mut().channel_mut(chan);
     ch.raw = true;
     ch.echo = false;
@@ -897,7 +1028,9 @@ fn fsdcon(host: &mut Host, chan: Chan) {
 /// at `FSDBBS.C:112`). In line mode this is a no-op against what `fsdcon` did
 /// (which never touched width, see its doc comment), but it is still exactly
 /// what the original always does on the way out, so this host does too.
-fn fsdcof(host: &mut Host, chan: Chan, scnwid: u16) {
+///
+/// Generic outright (Task 5), for the same reason [`fsdcon`] is.
+fn fsdcof<A: Abi>(host: &mut Host<A>, chan: Chan, scnwid: u16) {
     let ch = host.gsbl_mut().channel_mut(chan);
     ch.raw = false;
     ch.echo = true;
@@ -920,20 +1053,32 @@ const ENTERING: u16 = 1;
 /// would put the punctuation scan, and eventually the module's own redisplay,
 /// on the wrong bytes. [`getasc`](crate::msg::getasc) inserts a byte per line
 /// break, so the two forms disagree from the first one onward.
-fn fsd_template(
-    machine: &Machine,
-    host: &Host,
-    block: FarPtr,
+///
+/// Generic core (Task 5); see the `Wg16` facade [`fsd_template`] below,
+/// which [`fsdprc`] (a different, unconverted routine) still calls under
+/// that exact name.
+fn fsd_template_mem<A: Abi>(
+    mem: &A::Mem,
+    host: &Host<A>,
+    block: A::Ptr,
     number: u16,
     amode: i16,
 ) -> Result<Vec<u8>, ShimError> {
     let at = host.messages.text(block, number).map_err(ShimError::Failed)?;
-    let compact = machine.read_cstr(at)?.to_vec();
+    let compact = at
+        .read_cstr(mem)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     Ok(if amode == -1 {
         compact
     } else {
         crate::msg::getasc(&compact)
     })
+}
+
+/// The `Wg16` facade [`fsd_template_mem`] delegates into.
+fn fsd_template(machine: &Machine, host: &Host, block: FarPtr, number: u16, amode: i16) -> Result<Vec<u8>, ShimError> {
+    fsd_template_mem(machine.mem(), host, block, number, amode)
 }
 
 /// Which of `fsdppc`'s two scanning modes an `amode` asks for.
@@ -975,17 +1120,26 @@ const EURMSK: i16 = 0x7F;
 /// (fourteen `or byte [...+12],0x80` sites are the only writes into
 /// `flddat[]` anywhere in this crate's own measurements), so `flags` is the
 /// only one refreshed.
-fn live_form(
-    machine: &Machine,
-    block: &fsd::Scb,
+///
+/// Generic core (Task 5); see the `Wg16` facade [`live_form`] below, which
+/// [`fsdprc`], `fsd_drain_edge` and `goback` (routines this task does not
+/// convert) still call under that exact name.
+fn live_form_mem<A: Abi>(
+    mem: &A::Mem,
+    block: &fsd::Scb<A>,
     form: &fsd::Form,
 ) -> Result<fsd::Form, ShimError> {
     let mut form = form.clone();
     for (i, field) in form.fields.iter_mut().enumerate() {
-        let record = field_record(machine, block, i as u16, "fsdego")?;
+        let record = field_record_mem(mem, block, i as u16, "fsdego")?;
         field.flags = record[fsd::fld::FLAGS];
     }
     Ok(form)
+}
+
+/// The `Wg16` facade [`live_form_mem`] delegates into.
+fn live_form(machine: &Machine, block: &fsd::Scb, form: &fsd::Form) -> Result<fsd::Form, ShimError> {
+    live_form_mem(machine.mem(), block, form)
 }
 
 /// `void fsdego(int (*fldvfy)(int,char*), void (*whndun)(int))` -- hand the
@@ -1029,6 +1183,13 @@ fn live_form(
 ///
 /// If no session has been prepared (`fsdroom`/`fsdapr` first), or the
 /// recorded `amode` is `1`.
+///
+/// # Did not go generic (Task 5)
+///
+/// [`fsd::fsdlin`] and [`fsd::fsdent`] both take `&mut Scb`, i.e.
+/// `&mut Scb<Wg16>` -- see [`vfyadn`]'s own doc comment for why
+/// (`crate::fsd` is a different, much larger file, out of this task's
+/// scope) and what would need to change to lift it.
 pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     // `void fsdego(int (*fldvfy)(int fldno, char *answer), void (*whndun)(short save))`
     // -- FSDBBS.H:262-267. Both are far pointers to module code (4 bytes
@@ -1056,7 +1217,7 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let form = live_form(machine, &block, &form)?;
     let spec = machine.read_cstr(block.fldspc())?.to_vec();
     let template = fsd_template(machine, host, mbk, msgno, amode)?;
-    let answers = answer_string(machine, block.newans())?;
+    let answers = answer_string::<Wg16>(machine.mem(), block.newans())?;
 
     block.set_fldvfy(fldvfy);
     // `FSDBBS.C:205-212`: the amode fork. `fsdent(0)` for a full-screen
@@ -1125,11 +1286,15 @@ fn fsd_scratch(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimErr
 /// [`Host::forms`]'s own cache: `fsdord`'s own doc comment already
 /// explains why a field's mutable members are read live, and `ansoff`/
 /// `anslen` are exactly the members `fsdord` itself already writes.
-fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, ShimError> {
-    let text = answer_string(machine, block.newans())?;
+///
+/// Generic core (Task 5); see the `Wg16` facade [`read_answers`] below,
+/// which [`fsdprc`], `fsd_drain_edge` and `goback` (routines this task does
+/// not convert) still call under that exact name.
+fn read_answers_mem<A: Abi>(mem: &A::Mem, block: &fsd::Scb<A>) -> Result<fsd::Answers, ShimError> {
+    let text = answer_string::<A>(mem, block.newans())?;
     let mut offsets = Vec::with_capacity(usize::from(block.numfld()));
     for i in 0..block.numfld() {
-        let record = field_record(machine, block, i, "fsdprc")?;
+        let record = field_record_mem(mem, block, i, "fsdprc")?;
         offsets.push((answer_offset(&record), record[fsd::fld::ANSLEN]));
     }
     Ok(fsd::Answers {
@@ -1137,6 +1302,11 @@ fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, Shi
         offsets,
         allans: block.allans(),
     })
+}
+
+/// The `Wg16` facade [`read_answers_mem`] delegates into.
+fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, ShimError> {
+    read_answers_mem(machine.mem(), block)
 }
 
 /// `fsdprc()`'s `FSDBUF` arm, wired through `Machine`. `FSD.C:1124-1233`.
@@ -1277,7 +1447,7 @@ pub(crate) fn fsdprc(
         if i == u16::from(entfld) && changed {
             record[fsd::fld::FLAGS] |= fsd::flags::CHANGED;
         }
-        machine.write(offset(block.flddat(), field_at(i))?, &record)?;
+        machine.write(offset::<Wg16>(block.flddat(), field_at(i))?, &record)?;
     }
     machine.write(block.newans(), &answers.text)?;
     block.set_allans(answers.allans);
@@ -1340,7 +1510,7 @@ fn outprf(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<(), Shim
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     let text = machine.read_cstr(start)?.to_vec();
     host.gsbl_mut().transmit(chan, &text);
-    crate::shims::text::clrprf(machine, host)?;
+    crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
     Ok(())
 }
 
@@ -1349,7 +1519,7 @@ fn outprf(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<(), Shim
 /// `usrnum` fresh on every call instead of remembering it.
 fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, ShimError> {
     let account = host.users.account(chan);
-    let at = offset(account, crate::users::usracc::SCNWID)?;
+    let at = offset::<Wg16>(account, crate::users::usracc::SCNWID)?;
     Ok(u16::from(machine.resolve(at, 1)?[0]))
 }
 
@@ -1473,7 +1643,7 @@ pub(crate) fn goback(
 
     let scnwid = account_scnwid(machine, host, chan)?;
     fsdcof(host, chan, scnwid);
-    crate::shims::text::clrprf(machine, host)?;
+    crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
 
     // `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
     // -- FSDBBS.C:227-229. See this function's own doc comment, "The FBFULL
@@ -1688,7 +1858,7 @@ pub(crate) fn fsd_cycle(
             // `clrprf(); prf("");` -- FSDBBS.C:279-280, immediately before
             // fsdprc(), so its own composed output starts from an empty
             // print buffer regardless of anything already flushed above.
-            crate::shims::text::clrprf(machine, host)?;
+            crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
             crate::shims::text::append(machine, host, b"")?;
 
             fsdprc(machine, host, module, chan)?;
@@ -1881,7 +2051,7 @@ mod tests {
             .expect("fits");
 
         let args = [0, spec.offset, spec.selector, 0];
-        assert!(matches!(f.invoke(fsdroom, &args), Ok(Ret::U16(n)) if n == expected));
+        assert!(matches!(f.invoke(fsdroom_wg16, &args), Ok(Ret::U16(n)) if n == expected));
 
         assert_eq!(f.host.forms().len(), 1, "{:?}", f.host.forms());
         let form = f.host.forms().get(&(0, 0)).expect("message 0, amode 0");
@@ -1930,14 +2100,14 @@ mod tests {
     ) -> (FarPtr, u16) {
         let _ = open_form(f);
         let spec = f.text(spec);
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[message, spec.offset, spec.selector, amode])
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[message, spec.offset, spec.selector, amode])
         else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(defaults, false);
         f.invoke(
-            fsdapr,
+            fsdapr_wg16,
             &[
                 buffer.offset,
                 buffer.selector,
@@ -2056,14 +2226,14 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE TWO");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]) else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(b"\0", false);
         let e = f
             .invoke(
-                fsdapr,
+                fsdapr_wg16,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2087,7 +2257,7 @@ mod tests {
         let defaults = f.bytes(b"\0", false);
         let e = f
             .invoke(
-                fsdapr,
+                fsdapr_wg16,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2108,7 +2278,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]) else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
@@ -2122,7 +2292,7 @@ mod tests {
 
         let e = f
             .invoke(
-                fsdapr,
+                fsdapr_wg16,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2132,7 +2302,16 @@ mod tests {
                 ],
             )
             .expect_err("refused");
-        assert!(matches!(e, ShimError::BadPointer(_)), "{e}");
+        // `ShimError::BadPointer` before Task 5: `fsdapr` read this pointer
+        // through `machine.read_cstr(at)?`, and `?` converted the
+        // `FarPtrError` through `impl From<mbbs16::FarPtrError> for
+        // ShimError`. The generic `answer_string<A>` cannot: `A::Ptr`'s own
+        // `Error` type has no such `From` for an arbitrary `A` (only
+        // `Wg16`'s `FarPtrError` does), so it reports the same fact as
+        // `ShimError::Failed` instead -- `map_err`, not `?`, the same
+        // house pattern `shims::user::haskey` already established.
+        assert!(matches!(e, ShimError::Failed(_)), "{e}");
+        assert!(format!("{e}").contains("has no terminator"), "{e}");
     }
 
     #[test]
@@ -2142,7 +2321,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open(&mut f);
         let text = f.text("something queued");
-        f.invoke(crate::shims::text::prf, &[text.offset, text.selector])
+        f.invoke(crate::shims::text::prf_wg16, &[text.offset, text.selector])
             .expect("printed");
         assert_eq!(f.read(f.host.globals().prf_buffer()), "something queued");
 
@@ -2168,12 +2347,12 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "MAJOR");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "", "no default, so blank");
@@ -2197,7 +2376,7 @@ mod tests {
         scb.set_newans(moved);
         f.machine.write(at, scb.as_bytes()).expect("written");
 
-        let Ok(Ret::Far(got)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(got)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(got), "COLONEL");
@@ -2210,9 +2389,9 @@ mod tests {
         // follows the array, returned as an answer.
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME RANK", b"\0");
-        let e = f.invoke(fsdnan, &[2]).expect_err("refused");
+        let e = f.invoke(fsdnan_wg16, &[2]).expect_err("refused");
         assert!(format!("{e}").contains("2 fields"), "{e}");
-        let e = f.invoke(fsdnan, &[0xffff]).expect_err("refused");
+        let e = f.invoke(fsdnan_wg16, &[0xffff]).expect_err("refused");
         assert!(format!("{e}").contains("2 fields"), "{e}");
     }
 
@@ -2235,9 +2414,9 @@ mod tests {
         f.machine.write(at, scb.as_bytes()).expect("written");
 
         // 3000 * 23 = 69000, which is not a u16.
-        let e = f.invoke(fsdnan, &[3000]).expect_err("refused");
+        let e = f.invoke(fsdnan_wg16, &[3000]).expect_err("refused");
         assert!(matches!(e, ShimError::Failed(_)), "{e}");
-        let e = f.invoke(fsdord, &[3000]).expect_err("refused");
+        let e = f.invoke(fsdord_wg16, &[3000]).expect_err("refused");
         assert!(matches!(e, ShimError::Failed(_)), "{e}");
     }
 
@@ -2245,15 +2424,15 @@ mod tests {
     fn fsdnan_before_a_session_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        let e = f.invoke(fsdnan_wg16, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
 
         // And after `fsdroom` but before `fsdapr`, when `newans` is still null.
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
-        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        let e = f.invoke(fsdnan_wg16, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdapr"), "{e}");
     }
 
@@ -2262,7 +2441,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
         let _ = session(&mut f, spec, b"COLOUR=Brown\0\0");
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
     }
 
     #[test]
@@ -2272,7 +2451,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Red)";
         let _ = session(&mut f, spec, b"COLOUR=Green\0\0");
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
     }
 
     #[test]
@@ -2285,19 +2464,19 @@ mod tests {
         let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
         let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
 
-        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(before), "Fred");
         let was = block(&f).allans();
 
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Brown", "FSD.H:656");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Fred", "still readable, three bytes further on");
@@ -2316,19 +2495,19 @@ mod tests {
         let spec = "COLOUR(ALT=Black) NAME";
         let _ = session(&mut f, spec, b"COLOUR=B l a c k\0NAME=Fred\0\0");
 
-        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(before), "Fred");
         let was = block(&f).allans();
 
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(0))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(0))));
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Black");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Fred", "four bytes closer, not further");
@@ -2345,7 +2524,7 @@ mod tests {
         let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
         let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
 
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
         let scb = block(&f);
         let record = f
             .machine
@@ -2359,13 +2538,13 @@ mod tests {
 
         // And a second call over the now-canonical answer is a no-op that
         // leaves everything where the first put it.
-        let Ok(Ret::Far(name)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(name)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         let allans = block(&f).allans();
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
         assert_eq!(block(&f).allans(), allans, "nothing moved the second time");
-        let Ok(Ret::Far(again)) = f.invoke(fsdnan, &[1]) else {
+        let Ok(Ret::Far(again)) = f.invoke(fsdnan_wg16, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(again, name);
@@ -2379,7 +2558,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Red)";
         let _ = session(&mut f, spec, b"COLOUR=Red\0\0");
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
 
         let scb = block(&f);
         let mut record = [0u8; crate::fsd::FSDFLD as usize];
@@ -2391,7 +2570,7 @@ mod tests {
         record[crate::fsd::fld::FLAGS] &= !crate::fsd::flags::ALTERNATES;
         f.machine.write(scb.flddat(), &record).expect("written");
 
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
         assert!(
             f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
             "the host's own copy still says otherwise, which is the point"
@@ -2408,7 +2587,7 @@ mod tests {
         let long = "A".repeat(60);
         let spec = format!("C(ALT={long})");
         let _ = session_over(&mut f, 1, &spec, b"C=A\0\0");
-        let e = f.invoke(fsdord, &[0]).expect_err("refused");
+        let e = f.invoke(fsdord_wg16, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("does not fit"), "{e}");
     }
 
@@ -2416,14 +2595,14 @@ mod tests {
     fn fsdord_on_a_field_with_no_alternates_answers_minus_one() {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"NAME=Fred\0\0");
-        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
     }
 
     #[test]
     fn fsdord_outside_the_form_stops_the_module() {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
-        let e = f.invoke(fsdord, &[1]).expect_err("refused");
+        let e = f.invoke(fsdord_wg16, &[1]).expect_err("refused");
         assert!(format!("{e}").contains("1 fields"), "{e}");
     }
 
@@ -2433,7 +2612,7 @@ mod tests {
         let answers = f.bytes(b"NAME=Fred\0RANK=MAJOR\0\0", false);
         let name = f.text("RANK");
         let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan,
+            fsdxan_wg16,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2450,7 +2629,7 @@ mod tests {
         let answers = f.bytes(b"NAME=Fred\0\0", false);
         let name = f.text("RANK");
         let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan,
+            fsdxan_wg16,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2474,7 +2653,7 @@ mod tests {
         let answers = f.bytes(b"A=1\0\0", false);
         let name = f.text("A");
         let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan,
+            fsdxan_wg16,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2488,7 +2667,7 @@ mod tests {
         let answers = f.bytes(b"NAMEX=1\0NAME=2\0\0", false);
         let name = f.text("NAME");
         let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan,
+            fsdxan_wg16,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2510,11 +2689,15 @@ mod tests {
         let name = f.text("A");
         let e = f
             .invoke(
-                fsdxan,
+                fsdxan_wg16,
                 &[junk.offset, junk.selector, name.offset, name.selector],
             )
             .expect_err("refused");
-        assert!(matches!(e, ShimError::BadPointer(_)), "{e}");
+        // `ShimError::Failed`, not `ShimError::BadPointer`, since Task 5 --
+        // see `a_defaults_pointer_that_is_not_an_answer_string_stops_the_module`'s
+        // own comment for why.
+        assert!(matches!(e, ShimError::Failed(_)), "{e}");
+        assert!(format!("{e}").contains("has no terminator"), "{e}");
     }
 
     /// What `fsdrft` hands back, as bytes.
@@ -2525,7 +2708,7 @@ mod tests {
     /// `getasc`'s expansion, which lives in a buffer of the host's
     /// (`FSDBBS.C:137`, and see [`ascii_template`]).
     fn fsdrft_text(f: &mut Fixture) -> Vec<u8> {
-        let Ok(Ret::Far(at)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
         f.machine.read_cstr(at).expect("addressable").to_vec()
@@ -2536,7 +2719,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
@@ -2554,7 +2737,7 @@ mod tests {
         let mut f = Fixture::new();
         let form = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let other = f.text("SAMPLE.MSG");
@@ -2584,9 +2767,9 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
-        f.invoke(fsdroom, &[1, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[1, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 1).expect("message");
@@ -2598,7 +2781,7 @@ mod tests {
     fn fsdrft_before_any_fsdroom_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdrft, &[]).expect_err("refused");
+        let e = f.invoke(fsdrft_wg16, &[]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
@@ -2620,7 +2803,7 @@ mod tests {
             "null until a form has been sized"
         );
 
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let at = f
@@ -2651,14 +2834,14 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
         let first = f
             .host
             .globals()
             .pointer(&f.machine, "fsdscb")
             .expect("placed");
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
         let second = f
             .host
@@ -2690,14 +2873,14 @@ mod tests {
             .expect("channel 0 is current");
         let _ = open_form(&mut f);
         let spec_a = f.text("NAME");
-        let Ok(Ret::U16(size_a)) = f.invoke(fsdroom, &[0, spec_a.offset, spec_a.selector, 0])
+        let Ok(Ret::U16(size_a)) = f.invoke(fsdroom_wg16, &[0, spec_a.offset, spec_a.selector, 0])
         else {
             panic!("fsdroom (channel A) refused");
         };
         let buffer_a = f.buffer(size_a);
         let defaults_a = f.bytes(b"NAME=Alice\0\0", false);
         f.invoke(
-            fsdapr,
+            fsdapr_wg16,
             &[
                 buffer_a.offset,
                 buffer_a.selector,
@@ -2714,14 +2897,14 @@ mod tests {
             .point_curusr(&mut f.machine, b)
             .expect("channel 1 is current");
         let spec_b = f.text("PHONE");
-        let Ok(Ret::U16(size_b)) = f.invoke(fsdroom, &[1, spec_b.offset, spec_b.selector, 0])
+        let Ok(Ret::U16(size_b)) = f.invoke(fsdroom_wg16, &[1, spec_b.offset, spec_b.selector, 0])
         else {
             panic!("fsdroom (channel B) refused");
         };
         let buffer_b = f.buffer(size_b);
         let defaults_b = f.bytes(b"PHONE=5551234\0\0", false);
         f.invoke(
-            fsdapr,
+            fsdapr_wg16,
             &[
                 buffer_b.offset,
                 buffer_b.selector,
@@ -2738,7 +2921,7 @@ mod tests {
         f.host
             .point_curusr(&mut f.machine, a)
             .expect("channel 0 is current again");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan (channel A) refused");
         };
         assert_eq!(
@@ -2760,7 +2943,7 @@ mod tests {
         let _ = open(&mut f);
         let spec = f.text("ONE");
 
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 1]) else {
             panic!("fsdroom(amode=1) refused")
         };
         assert!(size > 0);
@@ -2781,7 +2964,7 @@ mod tests {
         let spec = f.text("ONE");
 
         let e = f
-            .invoke(fsdroom, &[0, spec.offset, spec.selector, 7])
+            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 7])
             .expect_err("refused");
         assert!(format!("{e}").contains("neither entry"), "{e}");
     }
@@ -2795,7 +2978,7 @@ mod tests {
         let spec = f.text("A_VERY_LONG_NAME_INDEED");
 
         let e = f
-            .invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
             .expect_err("refused");
         assert!(format!("{e}").contains("too long"), "{e}");
         assert!(f.host.forms().is_empty());
@@ -3106,7 +3289,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "hello", "the callback's own answer, stored verbatim");
@@ -3153,7 +3336,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "", "VFYREJ -- nothing stored");
@@ -3212,7 +3395,7 @@ mod tests {
             fsd::state::FSDSAV,
             "left exactly as the callback set it, not overwritten back to FSDNPT"
         );
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "done", "VFYOK still stored the answer");
@@ -3417,7 +3600,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "3", "accepted by fsdprc's own local chktyp/chkmin/chkmax");
@@ -3818,7 +4001,7 @@ mod tests {
         // test's concern, and `fsd_cycle` starts every pass with its own
         // `clrprf` only once a field commits -- so drop it here rather than
         // let it leak into the assertions below.
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\r");
         assert!(matches!(
@@ -3875,7 +4058,7 @@ mod tests {
             ),
             Ok(Ret::Void)
         ));
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         // 0x07: Ctrl-G, "save and exit" -- FSD.C:1877-1940's own xitkey.
         queue(&mut f, chan, b"Kaimon\x07");
@@ -3921,7 +4104,7 @@ mod tests {
         let chan = f.console();
 
         assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b");
         assert!(matches!(
@@ -3965,7 +4148,7 @@ mod tests {
         let chan = f.console();
 
         assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b[B");
         assert!(matches!(
@@ -4006,7 +4189,7 @@ mod tests {
         let chan = f.console();
 
         assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         // From FSDNPT -- the state `fsdlin` leaves a fresh session in.
         assert_eq!(block(&f).state(), fsd::state::FSDNPT);
@@ -4054,13 +4237,13 @@ mod tests {
     fn fsdbkg_clears_the_screen_and_draws_the_form() {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0");
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
         assert!(matches!(
-            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
+            f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]),
             Ok(Ret::Void)
         ));
 
@@ -4122,12 +4305,12 @@ mod tests {
         );
 
         // Now the real thing: fsdbkg's btutsw(usrnum,0).
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
         assert!(matches!(
-            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
+            f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]),
             Ok(Ret::Void)
         ));
         assert_eq!(
@@ -4157,10 +4340,10 @@ mod tests {
         assert!(!f.host.gsbl_mut().channel_mut(chan).locked);
         assert!(!f.host.gsbl_mut().channel_mut(chan).oes);
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg, &[templt.offset, templt.selector]).expect("painted");
+        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]).expect("painted");
 
         assert!(f.host.gsbl_mut().channel_mut(chan).locked, "btulok");
         assert!(f.host.gsbl_mut().channel_mut(chan).oes, "btuoes");
@@ -4176,7 +4359,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
         let returned = f.machine.read_cstr(templt).expect("addressable").to_vec();
@@ -4191,7 +4374,7 @@ mod tests {
 
         // And it is stable: the module holds this pointer across calls, so a
         // second fsdrft must not hand out a different buffer.
-        let Ok(Ret::Far(again)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(again)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
         assert_eq!(templt, again, "the expansion is cached, not rebuilt");
@@ -4207,7 +4390,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 1]) else {
             panic!("fsdroom(amode=1) refused")
         };
         assert!(size > 0);
@@ -4215,7 +4398,7 @@ mod tests {
         // And the two forms of one message coexist, because Host::forms is
         // keyed by (message, amode) -- the ANSI one carries cursor gotos and
         // the line one does not.
-        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]).expect("sized");
+        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]).expect("sized");
         let ansi = f.host.forms()[&(0, 1)].clone();
         let line = f.host.forms()[&(0, 0)].clone();
         assert!(!ansi.fields[0].ansgto.is_empty(), "the ANSI form has gotos");
@@ -4228,7 +4411,7 @@ mod tests {
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
         let e = f
-            .invoke(fsdroom, &[0, spec.offset, spec.selector, 7])
+            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 7])
             .expect_err("refused");
         assert!(format!("{e}").contains("neither entry"), "{e}");
     }
@@ -4241,7 +4424,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session_amode(&mut f, 0, "NAME RANK", b"NAME=Kai\0\0", 1);
         let chan = f.console();
-        crate::shims::text::clrprf(&mut f.machine, &mut f.host).expect("cleared");
+        crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
 
@@ -4300,10 +4483,10 @@ mod tests {
     fn ansi_session(f: &mut Fixture, spec: &str, defaults: &[u8]) -> Chan {
         let _ = session_amode(f, 0, spec, defaults, 1);
         let chan = f.console();
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg, &[templt.offset, templt.selector])
+        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
             .expect("painted");
         f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
         let _ = f.host.gsbl_mut().drain_output(chan);
@@ -4359,10 +4542,10 @@ mod tests {
         let module = f.minimal_module();
         let _ = session_amode(&mut f, 0, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0", 1);
         let chan = f.console();
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg, &[templt.offset, templt.selector])
+        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
             .expect("painted");
         f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
         outprf(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");

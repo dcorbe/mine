@@ -1334,6 +1334,31 @@ impl<A: Abi> Host<A> {
         self.modules.len() - 1
     }
 
+    /// The channel [`Host::point_curusr`] last made current, read back the
+    /// way the module itself would: out of the `usrnum` global -- against
+    /// memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Host::current_channel`]'s `Wg16` facade delegates
+    /// into -- same split, same reason. Added for Task 5's `shims::text`
+    /// conversion (`channel_ansi`, which `append` needs).
+    ///
+    /// # Errors
+    ///
+    /// If `usrnum` does not name a channel of this host -- see
+    /// [`Host::current_channel`]'s own doc comment.
+    pub(crate) fn current_channel_mem(&self, mem: &A::Mem) -> Result<Chan, ShimError> {
+        let uno = self
+            .globals()
+            .word_mem(mem, "usrnum")
+            .map_err(|e| ShimError::Failed(format!("current_channel: {e}")))?;
+        self.users.terms().chan(uno as i16).ok_or_else(|| {
+            ShimError::Failed(format!(
+                "current_channel: usrnum is {}, which names no channel",
+                uno as i16
+            ))
+        })
+    }
+
     /// `user[unum].usrcls` -- what kind of channel this is, against memory
     /// directly rather than a whole `Machine`.
     ///
@@ -1769,7 +1794,7 @@ impl Host<Wg16> {
         bytes.push(0);
         machine.write(input, &bytes)?;
 
-        shims::text::parsin(machine, self)?;
+        shims::text::parsin_mem(machine.mem_mut(), self)?;
 
         let margv = self
             .globals()
@@ -1818,16 +1843,7 @@ impl Host<Wg16> {
     /// [`crate::shims::fsd::fsdroom`] is the one exception, because it is the
     /// one FSD routine measured calling in from there.
     pub(crate) fn current_channel(&self, machine: &Machine) -> Result<Chan, ShimError> {
-        let uno = self
-            .globals()
-            .word(machine, "usrnum")
-            .map_err(|e| ShimError::Failed(format!("current_channel: {e}")))?;
-        self.users.terms().chan(uno as i16).ok_or_else(|| {
-            ShimError::Failed(format!(
-                "current_channel: usrnum is {}, which names no channel",
-                uno as i16
-            ))
-        })
+        self.current_channel_mem(machine.mem())
     }
 
     /// Plant a connecting user's account record and channel state, and make
@@ -4124,14 +4140,14 @@ mod tests {
 
         let spec = f.text("NAME RANK");
         let Ok(Ret::U16(size)) =
-            f.invoke(crate::shims::fsd::fsdroom, &[0, spec.offset, spec.selector, 0])
+            f.invoke(crate::shims::fsd::fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
         else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(b"\0", false);
         f.invoke(
-            crate::shims::fsd::fsdapr,
+            crate::shims::fsd::fsdapr_wg16,
             &[
                 buffer.offset,
                 buffer.selector,

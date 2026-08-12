@@ -16,9 +16,11 @@
 //! any of it reaches `prfbuf`, the GSBL, or the wire.
 
 use mbbs16::{FarPtr, Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use crate::Host;
-use crate::fmt::{Args, Spec, format, integer};
+use crate::abi::{self, Abi, Call, Wg16};
+use crate::fmt::{Spec, format_call, integer};
 use crate::shims::ShimError;
 
 /// Bytes in one of `spr`'s rotating buffers.
@@ -37,12 +39,21 @@ pub const SPR_BUFFERS: usize = 4;
 ///
 /// The module keeps the pointer, so the buffer has to outlive the call and the
 /// rotation has to be wide enough that the next few calls do not tread on it.
-pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let ctlstg = super::args(machine).ptr();
-    let (text, _) = format(machine, ctlstg, Args::Call { first: 2 })?;
+///
+/// Generic (Task 5): [`crate::fmt::format_call`] replaces `format`/
+/// `Args::Call` -- `ctlstg` is `call.ptr()`, and by the time it is read,
+/// `call`'s position already marks where the varargs begin.
+pub fn spr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let ctlstg = call.ptr();
+    let (text, _) = format_call(call, ctlstg)?;
     let at = host.next_spr_buffer();
-    write_cstr(machine, at, &text, SPR_BYTES)?;
-    Ok(Ret::Far(at))
+    write_cstr_mem::<A>(call.mem(), at, &text, SPR_BYTES)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`spr`]. See `shims::call`'s own doc comment.
+pub fn spr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    spr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Bytes in one of `l2as`'s rotating buffers.
@@ -93,14 +104,24 @@ pub const L2AS_BUFFERS: usize = 4;
 ///
 /// Formatting itself is [`integer`], the same converter `%d`/`%ld` use, not a
 /// second implementation -- see `fmt`'s module doc for why that matters.
-pub fn l2as(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let value = super::args(machine).long() as i32;
+///
+/// Generic (Task 5): the only argument read is `call.long()`, which is
+/// [`Abi::LONG_WIDTH`] bytes in every ABI met so far -- no width to get wrong
+/// the way an `int` read has.
+pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let value = call.long() as i32;
     let negative = value < 0;
     let magnitude = u64::from(value.unsigned_abs());
     let text = integer(magnitude, negative, 10, false, &Spec::default());
     let at = host.next_l2as_buffer();
-    write_cstr(machine, at, &text, L2AS_BYTES)?;
-    Ok(Ret::Far(at))
+    write_cstr_mem::<A>(call.mem(), at, &text, L2AS_BYTES)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`l2as`]. See `shims::call`'s own doc
+/// comment.
+pub fn l2as_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    l2as(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int sprintf(char *buf, char *fmat, ...)` -- format into the caller's
@@ -108,13 +129,23 @@ pub fn l2as(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// How big the buffer is, only the caller knows. The bounds check is the
 /// segment's, which is the only limit the host can see.
-pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let buffer = args.ptr();
-    let template = args.ptr();
-    let (text, _) = format(machine, template, Args::Call { first: 4 })?;
-    fill(machine, buffer, &text)?;
-    Ok(Ret::U16(text.len() as u16))
+///
+/// Generic (Task 5): [`crate::fmt::format_call`] replaces `format`/
+/// `Args::Call` -- `buffer` and `template` are `call.ptr()`, same as always,
+/// and by the time both are read, `call`'s position already marks where the
+/// varargs begin.
+pub fn sprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let buffer = call.ptr();
+    let template = call.ptr();
+    let (text, _) = format_call(call, template)?;
+    fill::<A>(call.mem(), buffer, &text)?;
+    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+}
+
+/// The dispatch-table entry for [`sprintf`]. See `shims::call`'s own doc
+/// comment.
+pub fn sprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    sprintf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int vsprintf(char *buf, const char *fmat, va_list ap)` -- format into the
@@ -130,14 +161,24 @@ pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// is the caller's own frame in `SS` -- `va_start` is `lea ax,[bp+0x0a]` at
 /// `seg 32:0x0b79`, the word past the last fixed argument -- so the words
 /// behind it are laid out exactly as this routine's own would be.
-pub fn vsprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let buffer = args.ptr();
-    let template = args.ptr();
-    let list = args.ptr();
-    let (text, _) = format(machine, template, Args::List { at: list })?;
-    fill(machine, buffer, &text)?;
-    Ok(Ret::U16(text.len() as u16))
+///
+/// Generic (Task 5): [`crate::fmt::format_va_list`] replaces `format`/
+/// `Args::List` -- `list` names the caller's own frame, not this call's, so
+/// it is read through `call.mem()` on demand rather than through `call`'s
+/// position, same as the `Wg16`-concrete original.
+pub fn vsprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let buffer = call.ptr();
+    let template = call.ptr();
+    let list = call.ptr();
+    let (text, _) = crate::fmt::format_va_list(call, template, list)?;
+    fill::<A>(call.mem(), buffer, &text)?;
+    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+}
+
+/// The dispatch-table entry for [`vsprintf`]. See `shims::call`'s own doc
+/// comment.
+pub fn vsprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    vsprintf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void prf(char *fmat, ...)` -- append to the channel's output.
@@ -146,11 +187,19 @@ pub fn vsprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// **`prfptr` is read back out of module memory every time**, never remembered:
 /// the module moves it itself, and a host that cached it would append over
 /// whatever the module had written.
-pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let fmat = super::args(machine).ptr();
-    let (text, _) = format(machine, fmat, Args::Call { first: 2 })?;
-    append(machine, host, &text)?;
-    Ok(Ret::Void)
+///
+/// Generic (Task 5): [`crate::fmt::format_call`] and [`append_mem`] replace
+/// `format`/`Args::Call` and `append`.
+pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let fmat = call.ptr();
+    let (text, _) = format_call(call, fmat)?;
+    append_mem(call.mem(), host, &text)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`prf`]. See `shims::call`'s own doc comment.
+pub fn prf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    prf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Put `text` where `prfptr` points, and move `prfptr` past it.
@@ -178,8 +227,40 @@ pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// [`crate::ifansi`] alone cannot; this one does not need to, and does not.
 ///
 /// See [`channel_ansi`] for how the ANSI/ASCII branch is chosen.
+///
+/// Generic (Task 5): [`channel_ansi_mem`], [`Globals::pointer_mem`] and
+/// [`write_cstr_mem`] replace their `Wg16`-only namesakes; [`Host::prf_end`]
+/// never touched a `Machine`. The offset arithmetic that used to build a
+/// moved `FarPtr` by hand is [`Abi::ptr_offset`] instead, the same read
+/// [`shims::user::begin_polling`](crate::shims::user::begin_polling) already
+/// established for a computed pointer.
+///
+/// Kept under its original name and `&mut Machine` signature as a `Wg16`
+/// facade: `shims::msg::prfmsg` and `shims::fsd` both call this directly (not
+/// through `Fixture::invoke`), and neither converts in this task -- see
+/// `shims::msg::prfmsg`'s own doc comment for why.
 pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
-    let ansi = channel_ansi(machine, host);
+    append_mem(machine.mem_mut(), host, text)
+}
+
+/// The generic core [`append`] delegates into.
+///
+/// Where the *bound* comes from is different from [`write_cstr_mem`]'s other
+/// callers, and worth spelling out: the old `Wg16`-only body computed
+/// `capacity = end - at.offset` by hand, subtracting a pointer's own
+/// `.offset` field from [`Host::prf_end`] -- and `Abi` has no operation that
+/// subtracts two pointers of an arbitrary ABI (only [`Abi::ptr_offset`],
+/// which adds), so that arithmetic cannot be expressed generically without
+/// assuming `Wg16`'s own byte layout. It does not need to be: `prfbuf` is
+/// allocated as its own dedicated region of exactly [`crate::globals::OUTBSZ`]
+/// bytes (`Globals::new`), and [`Host::prf_end`] is that same constant --
+/// so a write that runs past `prf_end` is *exactly* a write that runs past
+/// the region [`ModulePtr::write`] already refuses on its own. Letting that
+/// write fail on its own bound, instead of re-deriving the identical bound by
+/// hand, is what stays correct for an ABI whose pointer has no
+/// `Wg16`-shaped `.offset` to read.
+pub fn append_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, text: &[u8]) -> Result<(), ShimError> {
+    let ansi = channel_ansi_mem(mem, host);
     let text = crate::ifansi::process(text, ansi);
     // After IF-ANSI, per `FormatOutput`'s own order
     // (`ExportedModuleBase.cs:1133-1138`) -- see [`normalize_newlines`] for
@@ -188,23 +269,22 @@ pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(),
 
     let at = host
         .globals()
-        .pointer(machine, "prfptr")
+        .pointer_mem(mem, "prfptr")
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let end = host.prf_end();
-    if usize::from(at.offset) + text.len() + 1 > usize::from(end) {
-        return Err(ShimError::Failed(format!(
-            "prf would put {} bytes past the end of a {end}-byte buffer",
-            text.len()
-        )));
-    }
 
-    write_cstr(machine, at, text, end - at.offset)?;
-    let moved = FarPtr {
-        offset: at.offset + text.len() as u16,
-        selector: at.selector,
-    };
+    let mut bytes = text.to_vec();
+    bytes.push(0);
+    at.write(mem, &bytes).map_err(|e| {
+        ShimError::Failed(format!(
+            "prf would put {} bytes past the end of the {}-byte buffer: {e}",
+            text.len(),
+            host.prf_end()
+        ))
+    })?;
+
+    let moved = A::ptr_offset(at, text.len() as u16);
     host.globals()
-        .write(machine, "prfptr", &moved.to_bytes())
+        .write_mem(mem, "prfptr", &A::ptr_to_bytes(moved))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
 }
@@ -327,32 +407,53 @@ fn normalize_newlines(text: &[u8]) -> Vec<u8> {
 /// MBBSEmu's own `ProcessIfANSI` always answers -- it takes an `isAnsi`
 /// parameter and never reads it -- so a caller with nothing to ask degrades
 /// to the one behaviour every `re/oracle/` capture already exhibits.
-fn channel_ansi(machine: &Machine, host: &Host) -> bool {
-    let Ok(chan) = host.current_channel(machine) else {
+///
+/// Generic (Task 5): [`Host::current_channel_mem`] and
+/// [`Abi::ptr_offset`] replace `Host::current_channel` and the hand-built
+/// `FarPtr` -- the same reading `Host::class_mem` already offsets `usrcls`
+/// off a channel's slot.
+fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
+    let Ok(chan) = host.current_channel_mem(mem) else {
         return true;
     };
     let account = host.users().account(chan);
-    let ansifl = FarPtr {
-        offset: account.offset + crate::users::usracc::ANSIFL as u16,
-        selector: account.selector,
-    };
-    match machine.resolve(ansifl, 1) {
+    let ansifl = A::ptr_offset(account, crate::users::usracc::ANSIFL as u16);
+    match ansifl.resolve(mem, 1) {
         Ok(bytes) => bytes[0] & 1 != 0,
         Err(_) => true,
     }
 }
 
 /// `void clrprf(void)` -- throw away whatever `prf` has queued.
-pub fn clrprf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn clrprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    clrprf_mem(call.mem(), host).map(|()| abi::Ret::Void)
+}
+
+/// The generic core [`clrprf`] delegates into, against memory directly.
+/// `void clrprf(void)` reads no arguments, so unlike every other shim in this
+/// file, its "generic core" and "no-argument body" are the same split
+/// `shims::fsd::fsdapr` needs: `fsdapr` calls this by name once it converts
+/// (a different file, out of this task's scope), reusing its own `call.mem()`
+/// rather than being handed a `Call<A>` shaped for a routine that has no
+/// arguments of its own to read.
+pub fn clrprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), ShimError> {
     let start = host
         .globals()
-        .pointer(machine, "prfbuf")
+        .pointer_mem(mem, "prfbuf")
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    machine.write(start, &[0])?;
+    start
+        .write(mem, &[0])
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     host.globals()
-        .write(machine, "prfptr", &start.to_bytes())
+        .write_mem(mem, "prfptr", &A::ptr_to_bytes(start))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(Ret::Void)
+    Ok(())
+}
+
+/// The dispatch-table entry for [`clrprf`]. See `shims::call`'s own doc
+/// comment.
+pub fn clrprf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    clrprf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *stzcpy(char *dst, char *src, unsigned num)` -- copy, bounded,
@@ -362,41 +463,64 @@ pub fn clrprf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// characters are copied and the NUL always fits; `strncpy` would copy `num`
 /// and leave an unterminated buffer, which is the bug this routine exists to
 /// avoid.
-pub fn stzcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let num = args.int();
+pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let num = Into::<u32>::into(call.int()) as u16;
 
     if num == 0 {
         // Nowhere to put even the terminator. Copying nothing is the only
         // thing that cannot overrun.
-        return Ok(Ret::Far(dst));
+        return Ok(abi::Ret::Ptr(dst));
     }
-    let text = machine.read_cstr(src)?;
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let take = text.len().min(usize::from(num) - 1);
     let text = text[..take].to_vec();
 
-    write_cstr(machine, dst, &text, num)?;
-    Ok(Ret::Far(dst))
+    write_cstr_mem::<A>(call.mem(), dst, &text, num)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`stzcpy`]. See `shims::call`'s own doc
+/// comment.
+pub fn stzcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    stzcpy(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strcpy(char *dst, char *src)`.
-pub fn strcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let text = machine.read_cstr(src)?.to_vec();
+pub fn strcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let len = text.len() as u16 + 1;
-    write_cstr(machine, dst, &text, len)?;
-    Ok(Ret::Far(dst))
+    write_cstr_mem::<A>(call.mem(), dst, &text, len)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`strcpy`]. See `shims::call`'s own doc
+/// comment.
+pub fn strcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strcpy(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `unsigned strlen(char *s)`.
-pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let s = super::args(machine).ptr();
-    let text = machine.read_cstr(s)?;
-    Ok(Ret::U16(text.len() as u16))
+pub fn strlen<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let text = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+}
+
+/// The dispatch-table entry for [`strlen`]. See `shims::call`'s own doc
+/// comment.
+pub fn strlen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strlen(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void rmvwht(char *string)` -- remove every whitespace character, in place.
@@ -404,13 +528,22 @@ pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// See [`strings::rmvwht`](crate::strings::rmvwht), which is the transcription;
 /// this is only the read and the write-back. The result is never longer than
 /// what was read, so the original's capacity always holds it.
-pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = super::args(machine).ptr();
-    let text = machine.read_cstr(at)?.to_vec();
+pub fn rmvwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let at = call.ptr();
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let tight = crate::strings::rmvwht(&text);
     let capacity = text.len() as u16 + 1;
-    write_cstr(machine, at, &tight, capacity)?;
-    Ok(Ret::Void)
+    write_cstr_mem::<A>(call.mem(), at, &tight, capacity)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rmvwht`]. See `shims::call`'s own doc
+/// comment.
+pub fn rmvwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rmvwht(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *skpwht(char *cp)` -- past the leading spaces.
@@ -418,29 +551,54 @@ pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// The answer is a pointer *into* the caller's own buffer, so the selector is
 /// the one that arrived. See [`strings::skpwht`](crate::strings::skpwht) for
 /// why a tab does not count.
-pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let cp = super::args(machine).ptr();
-    let text = machine.read_cstr(cp)?;
+pub fn skpwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let cp = call.ptr();
+    let text = cp
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let n = crate::strings::skpwht(text) as u16;
-    Ok(Ret::Far(at(cp, n)))
+    Ok(abi::Ret::Ptr(at::<A>(cp, n)))
+}
+
+/// The dispatch-table entry for [`skpwht`]. See `shims::call`'s own doc
+/// comment.
+pub fn skpwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    skpwht(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
-pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let cp = super::args(machine).ptr();
-    let text = machine.read_cstr(cp)?;
+pub fn skpwrd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let cp = call.ptr();
+    let text = cp
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let n = crate::strings::skpwrd(text) as u16;
-    Ok(Ret::Far(at(cp, n)))
+    Ok(abi::Ret::Ptr(at::<A>(cp, n)))
+}
+
+/// The dispatch-table entry for [`skpwrd`]. See `shims::call`'s own doc
+/// comment.
+pub fn skpwrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    skpwrd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
-pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = super::args(machine).ptr();
-    let text = machine.read_cstr(at)?.to_vec();
+pub fn depad<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let at = call.ptr();
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let (kept, removed) = crate::strings::depad(&text);
     let capacity = text.len() as u16 + 1;
-    write_cstr(machine, at, &text[..kept], capacity)?;
-    Ok(Ret::U16(removed))
+    write_cstr_mem::<A>(call.mem(), at, &text[..kept], capacity)?;
+    Ok(abi::Ret::Int(A::Int::from(removed)))
+}
+
+/// The dispatch-table entry for [`depad`]. See `shims::call`'s own doc
+/// comment.
+pub fn depad_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    depad(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void parsin(void)` -- parse `input` into `margv[]`.
@@ -469,7 +627,34 @@ pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// 4. **On an empty line it sets `margv[0]` to an empty string, not to
 ///    null.** The module reads `margv[0]` unguarded, so this host keeps one
 ///    NUL byte of its own for the purpose -- see [`Host::empty`].
-pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): reads no argument of its own (matching
+/// `shims::user::getin`'s prototype, which is what this shim unblocks -- see
+/// this file's own commit message), and [`Globals::address`]/[`size`] never
+/// touched a `Machine` to begin with. `Call<A>` is still the signature this
+/// takes, matching every other converted shim's shape, even though its
+/// `call.mem()` is all that gets used.
+///
+/// [`size`]: crate::globals::Globals::size
+pub fn parsin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    parsin_mem(call.mem(), host).map(|()| abi::Ret::Void)
+}
+
+/// The generic core [`parsin`] delegates into, against memory directly.
+///
+/// **Why this exists separately from [`parsin`]:** `void parsin(void)` reads
+/// no arguments, so it was tempting to give it only the `Call<A>`-taking
+/// shape every other converted shim gets -- but [`Host::get_input`] calls
+/// this directly, from [`Host::poll`] as well as from `getin`, and `poll`
+/// runs with **no outstanding module call on the machine at all**. A
+/// `Call<A>`-taking `parsin` reaches it only through `shims::call`, which
+/// unconditionally reads `Machine::arg_frame()` -- and that panics outside a
+/// real dispatch ("arg_frame() with no outstanding call to read from"),
+/// which is exactly what four of this crate's own `poll` tests caught the
+/// first time this shim tried to route `get_input` through the `_wg16`
+/// facade instead of through this `_mem` core. `shims::text::clrprf` needed
+/// the identical split for the identical reason -- see its own doc comment.
+pub fn parsin_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), ShimError> {
     let input = host
         .globals()
         .address("input")
@@ -488,7 +673,10 @@ pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .address("margn")
         .ok_or_else(|| ShimError::Failed("margn is not placed".into()))?;
 
-    let mut buf = machine.resolve(input, size)?.to_vec();
+    let mut buf = input
+        .resolve(mem, size)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     let mut margv_ends: Vec<u16> = Vec::new(); // offsets into `buf`
     let mut margn_ends: Vec<u16> = Vec::new(); // offsets into `buf`
@@ -544,7 +732,7 @@ pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                     // after `input`.
                     margn_ends.push(i as u16);
                     return write_parse(
-                        machine,
+                        mem,
                         host,
                         input,
                         margv,
@@ -573,7 +761,7 @@ pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         None => 0,
     };
     write_parse(
-        machine,
+        mem,
         host,
         input,
         margv,
@@ -585,59 +773,61 @@ pub fn parsin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     )
 }
 
+/// The dispatch-table entry for [`parsin`]. See `shims::call`'s own doc
+/// comment.
+pub fn parsin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    parsin(&mut super::call(machine), host).map(Into::into)
+}
+
 /// The tail every exit of [`parsin`] shares: write the (possibly modified)
 /// input buffer back, then `margc`, `inplen`, `margv[]` and `margn[]`.
+///
+/// Generic (Task 5): each `margv[n]`/`margn[n]` slot is [`Abi::PTR_WIDTH`]
+/// bytes apart, not a hardcoded 4 -- the stride a hand-built `FarPtr` used to
+/// take for granted.
 #[allow(clippy::too_many_arguments)]
-fn write_parse(
-    machine: &mut Machine,
-    host: &mut Host,
-    input: FarPtr,
-    margv: FarPtr,
-    margn: FarPtr,
+fn write_parse<A: Abi>(
+    mem: &mut A::Mem,
+    host: &mut Host<A>,
+    input: A::Ptr,
+    margv: A::Ptr,
+    margn: A::Ptr,
     buf: &[u8],
     margv_ends: &[u16],
     margn_ends: &[u16],
     inplen: u16,
-) -> Result<Ret, ShimError> {
-    machine.write(input, buf)?;
+) -> Result<(), ShimError> {
+    input.write(mem, buf).map_err(|e| ShimError::Failed(e.to_string()))?;
 
     let margc = margv_ends.len() as u16;
     host.globals()
-        .write(machine, "margc", &margc.to_le_bytes())
+        .write_mem(mem, "margc", &margc.to_le_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     host.globals()
-        .write(machine, "inplen", &inplen.to_le_bytes())
+        .write_mem(mem, "inplen", &inplen.to_le_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     if margc == 0 {
         let empty = host.empty_string();
-        machine.write(margv, &empty.to_bytes())?;
-        return Ok(Ret::Void);
+        margv
+            .write(mem, &A::ptr_to_bytes(empty))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        return Ok(());
     }
 
-    for (n, &at) in margv_ends.iter().enumerate() {
-        let word = FarPtr {
-            offset: input.offset + at,
-            selector: input.selector,
-        };
-        let slot = FarPtr {
-            offset: margv.offset + n as u16 * 4,
-            selector: margv.selector,
-        };
-        machine.write(slot, &word.to_bytes())?;
+    for (n, &offset) in margv_ends.iter().enumerate() {
+        let word = at::<A>(input, offset);
+        let slot = at::<A>(margv, n as u16 * A::PTR_WIDTH as u16);
+        slot.write(mem, &A::ptr_to_bytes(word))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    for (n, &at) in margn_ends.iter().enumerate() {
-        let end = FarPtr {
-            offset: input.offset + at,
-            selector: input.selector,
-        };
-        let slot = FarPtr {
-            offset: margn.offset + n as u16 * 4,
-            selector: margn.selector,
-        };
-        machine.write(slot, &end.to_bytes())?;
+    for (n, &offset) in margn_ends.iter().enumerate() {
+        let end = at::<A>(input, offset);
+        let slot = at::<A>(margn, n as u16 * A::PTR_WIDTH as u16);
+        slot.write(mem, &A::ptr_to_bytes(end))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    Ok(Ret::Void)
+    Ok(())
 }
 
 /// `void rstrin(void)` -- put back the separators that parsing overwrote.
@@ -652,10 +842,13 @@ fn write_parse(
 /// `seg 4:0x5bde` in `MAJORBBS.EXE`; the routine sets up no `bp` frame at all,
 /// which is what settles that it takes no arguments -- the whole of its input
 /// is these two globals.
-pub fn rstrin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): each `margn[n]` slot is [`Abi::PTR_WIDTH`] bytes apart,
+/// not a hardcoded 4, same as [`write_parse`].
+pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let margc = host
         .globals()
-        .word(machine, "margc")
+        .word_mem(call.mem(), "margc")
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
     let margn = host
         .globals()
@@ -663,20 +856,23 @@ pub fn rstrin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .ok_or_else(|| ShimError::Failed("margn is not placed".into()))?;
 
     for i in 0..(margc - 1).max(0) as u16 {
-        let slot = FarPtr {
-            offset: margn.offset + i * 4,
-            selector: margn.selector,
-        };
+        let slot = at::<A>(margn, i * A::PTR_WIDTH as u16);
         // `resolve` is how this crate reads raw bytes out of module memory --
         // `read_cstr` is for strings and there is no buffer-filling `read`.
-        let bytes = machine.resolve(slot, 4)?;
-        let end = FarPtr {
-            offset: u16::from_le_bytes([bytes[0], bytes[1]]),
-            selector: u16::from_le_bytes([bytes[2], bytes[3]]),
-        };
-        machine.write(end, b" ")?;
+        let bytes = slot
+            .resolve(call.mem(), A::PTR_WIDTH)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let end = A::ptr_from_bytes(bytes);
+        end.write(call.mem(), b" ")
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rstrin`]. See `shims::call`'s own doc
+/// comment.
+pub fn rstrin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rstrin(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long atol(char *s)`.
@@ -684,9 +880,11 @@ pub fn rstrin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// Leading whitespace, an optional sign, then digits until something that is
 /// not one. No error: C says the value is undefined on overflow and Borland
 /// wraps, so this wraps.
-pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let s = super::args(machine).ptr();
-    let text = machine.read_cstr(s)?;
+pub fn atol<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let text = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let mut rest = text;
 
     while rest.first().is_some_and(u8::is_ascii_whitespace) {
@@ -712,7 +910,13 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     if negative {
         value = value.wrapping_neg();
     }
-    Ok(Ret::U32(value as u32))
+    Ok(abi::Ret::Long(value as u32))
+}
+
+/// The dispatch-table entry for [`atol`]. See `shims::call`'s own doc
+/// comment.
+pub fn atol_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    atol(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
@@ -720,43 +924,82 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// **1 is equal**, which is the opposite of [`strcmp`] and the reason this
 /// family is worth reading twice. See
 /// [`strings::sameas`](crate::strings::sameas).
-pub fn sameas(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let stg1 = args.ptr();
-    let stg2 = args.ptr();
-    let a = machine.read_cstr(stg1)?.to_vec();
-    let b = machine.read_cstr(stg2)?;
-    Ok(Ret::U16(crate::strings::sameas(&a, b).into()))
+pub fn sameas<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg1 = call.ptr();
+    let stg2 = call.ptr();
+    let a = stg1
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let b = stg2
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::sameas(&a, b)))))
+}
+
+/// The dispatch-table entry for [`sameas`]. See `shims::call`'s own doc
+/// comment.
+pub fn sameas_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    sameas(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int sameto(char *shorts,char *longs)` -- a prefix test, short one first.
-pub fn sameto(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let shorts_ptr = args.ptr();
-    let longs_ptr = args.ptr();
-    let shorts = machine.read_cstr(shorts_ptr)?.to_vec();
-    let longs = machine.read_cstr(longs_ptr)?;
-    Ok(Ret::U16(crate::strings::sameto(&shorts, longs).into()))
+pub fn sameto<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let shorts_ptr = call.ptr();
+    let longs_ptr = call.ptr();
+    let shorts = shorts_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let longs = longs_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::sameto(&shorts, longs)))))
+}
+
+/// The dispatch-table entry for [`sameto`]. See `shims::call`'s own doc
+/// comment.
+pub fn sameto_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    sameto(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int samein(char *shorts,char *longs)` -- a substring test, short one first.
-pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let shorts_ptr = args.ptr();
-    let longs_ptr = args.ptr();
-    let shorts = machine.read_cstr(shorts_ptr)?.to_vec();
-    let longs = machine.read_cstr(longs_ptr)?;
-    Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
+pub fn samein<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let shorts_ptr = call.ptr();
+    let longs_ptr = call.ptr();
+    let shorts = shorts_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let longs = longs_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::samein(&shorts, longs)))))
+}
+
+/// The dispatch-table entry for [`samein`]. See `shims::call`'s own doc
+/// comment.
+pub fn samein_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    samein(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *lastwd(char *string)` -- the last word, in the caller's own buffer.
 ///
 /// See [`strings::lastwd`](crate::strings::lastwd). It writes nothing, and the
 /// selector it answers is the one that arrived.
-pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let s = super::args(machine).ptr();
-    let n = crate::strings::lastwd(machine.read_cstr(s)?) as u16;
-    Ok(Ret::Far(at(s, n)))
+pub fn lastwd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let text = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    let n = crate::strings::lastwd(text) as u16;
+    Ok(abi::Ret::Ptr(at::<A>(s, n)))
+}
+
+/// The dispatch-table entry for [`lastwd`]. See `shims::call`'s own doc
+/// comment.
+pub fn lastwd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    lastwd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void sortstgs(char *stgs[],int num)` -- sort an array of `char *` in place.
@@ -769,26 +1012,41 @@ pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// The pointers move; the strings do not. See
 /// [`strings::sortstgs`](crate::strings::sortstgs) for why the sort is
 /// transcribed rather than delegated.
-pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let array = args.ptr();
-    let num = args.int() as i16;
+pub fn sortstgs<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let array = call.ptr();
+    let num = Into::<u32>::into(call.int()) as i16;
     if num < 2 {
-        return Ok(Ret::Void);
+        return Ok(abi::Ret::Void);
     }
     let num = usize::from(num as u16);
 
-    let slots = machine.resolve(array, num * 4)?.to_vec();
-    let mut items: Vec<(FarPtr, Vec<u8>)> = Vec::with_capacity(num);
-    for slot in slots.chunks_exact(4) {
-        let ptr = FarPtr::from_bytes([slot[0], slot[1], slot[2], slot[3]]);
-        items.push((ptr, machine.read_cstr(ptr)?.to_vec()));
+    let slots = array
+        .resolve(call.mem(), num * A::PTR_WIDTH)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let mut items: Vec<(A::Ptr, Vec<u8>)> = Vec::with_capacity(num);
+    for slot in slots.chunks_exact(A::PTR_WIDTH) {
+        let ptr = A::ptr_from_bytes(slot);
+        let text = ptr
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?
+            .to_vec();
+        items.push((ptr, text));
     }
     crate::strings::sortstgs(&mut items, |a, b| crate::strings::strcmp(&a.1, &b.1));
 
-    let out: Vec<u8> = items.iter().flat_map(|(ptr, _)| ptr.to_bytes()).collect();
-    machine.write(array, &out)?;
-    Ok(Ret::Void)
+    let out: Vec<u8> = items
+        .iter()
+        .flat_map(|(ptr, _)| A::ptr_to_bytes(*ptr))
+        .collect();
+    array.write(call.mem(), &out).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`sortstgs`]. See `shims::call`'s own doc
+/// comment.
+pub fn sortstgs_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    sortstgs(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strtok(char *s,char *delim)` -- the next token, destructively.
@@ -809,36 +1067,52 @@ pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// remainder once with [`Machine::read_cstr`] is the same bytes and one bounds
 /// check -- and it is what turns a cursor left dangling by a `galfree` into
 /// [`ShimError::BadPointer`] rather than a token made of rubbish.
-pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let s = args.ptr();
-    let delim = args.ptr();
-    let delims = machine.read_cstr(delim)?.to_vec();
-    if s != FarPtr::NULL {
+///
+/// Generic (Task 5): the null check on `s` is [`is_null`], not `!= FarPtr::NULL`
+/// -- `A::Ptr` has no such comparison and is opaque to a generic caller, the
+/// same reading [`shims::user::begin_polling`](crate::shims::user::begin_polling)
+/// already established.
+pub fn strtok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let delim = call.ptr();
+    let delims = delim
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    if !is_null::<A>(s) {
         host.strtok = s;
     }
 
     let cursor = host.strtok;
-    let rest = machine.read_cstr(cursor)?;
+    let rest = cursor
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let Some(start) = rest.iter().position(|b| !delims.contains(b)) else {
         // Nothing but delimiters. The cursor ends on the terminator, so every
         // later call answers NULL too.
-        host.strtok = at(cursor, rest.len() as u16);
-        return Ok(Ret::Far(FarPtr::NULL));
+        host.strtok = at::<A>(cursor, rest.len() as u16);
+        return Ok(abi::Ret::Ptr(null_ptr::<A>()));
     };
     let token_len = rest[start..].len();
     let ends_at = rest[start..].iter().position(|b| delims.contains(b));
 
-    let token = at(cursor, start as u16);
+    let token = at::<A>(cursor, start as u16);
     match ends_at {
         Some(n) => {
-            let end = at(token, n as u16);
-            machine.write(end, &[0])?;
-            host.strtok = at(end, 1);
+            let end = at::<A>(token, n as u16);
+            end.write(call.mem(), &[0])
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+            host.strtok = at::<A>(end, 1);
         }
-        None => host.strtok = at(token, token_len as u16),
+        None => host.strtok = at::<A>(token, token_len as u16),
     }
-    Ok(Ret::Far(token))
+    Ok(abi::Ret::Ptr(token))
+}
+
+/// The dispatch-table entry for [`strtok`]. See `shims::call`'s own doc
+/// comment.
+pub fn strtok_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strtok(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strchr(char *s,int c)`.
@@ -848,19 +1122,26 @@ pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// counts**. And the scan compares each byte *before* it tests for the end
 /// (`lodsb / cmp al,bl / jz ... / and al,al / jnz`), so `strchr(s, 0)` answers
 /// a pointer to the terminator rather than `NULL`.
-pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let s = args.ptr();
-    let want = args.int() as u8;
-    let text = machine.read_cstr(s)?;
+pub fn strchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let want = Into::<u32>::into(call.int()) as u8;
+    let text = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     if want == 0 {
-        return Ok(Ret::Far(at(s, text.len() as u16)));
+        return Ok(abi::Ret::Ptr(at::<A>(s, text.len() as u16)));
     }
     Ok(match text.iter().position(|&b| b == want) {
-        Some(i) => Ret::Far(at(s, i as u16)),
-        None => Ret::Far(FarPtr::NULL),
+        Some(i) => abi::Ret::Ptr(at::<A>(s, i as u16)),
+        None => abi::Ret::Ptr(null_ptr::<A>()),
     })
+}
+
+/// The dispatch-table entry for [`strchr`]. See `shims::call`'s own doc
+/// comment.
+pub fn strchr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strchr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strstr(char *hay,char *needle)`.
@@ -870,24 +1151,34 @@ pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the needle, and the path it takes returns `hay` **without reading it**, so
 /// the check comes before the haystack does here too. A needle that is not
 /// there answers `NULL`.
-pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let hay = args.ptr();
-    let needle_ptr = args.ptr();
-    let needle = machine.read_cstr(needle_ptr)?.to_vec();
+pub fn strstr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let hay = call.ptr();
+    let needle_ptr = call.ptr();
+    let needle = needle_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     if needle.is_empty() {
-        return Ok(Ret::Far(hay));
+        return Ok(abi::Ret::Ptr(hay));
     }
-    let text = machine.read_cstr(hay)?;
+    let text = hay
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     if needle.len() > text.len() {
-        return Ok(Ret::Far(FarPtr::NULL));
+        return Ok(abi::Ret::Ptr(null_ptr::<A>()));
     }
     let found = (0..=text.len() - needle.len()).find(|&i| text[i..].starts_with(&needle));
     Ok(match found {
-        Some(i) => Ret::Far(at(hay, i as u16)),
-        None => Ret::Far(FarPtr::NULL),
+        Some(i) => abi::Ret::Ptr(at::<A>(hay, i as u16)),
+        None => abi::Ret::Ptr(null_ptr::<A>()),
     })
+}
+
+/// The dispatch-table entry for [`strstr`]. See `shims::call`'s own doc
+/// comment.
+pub fn strstr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strstr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strcat(char *dst,char *src)`.
@@ -895,14 +1186,25 @@ pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// Ordinal 571, `seg 1:0x26d0`. How much room `dst` has, only the caller knows,
 /// so the bound is the segment's -- the same limit [`fill`] applies to
 /// `sprintf`, and for the same reason.
-pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let end = machine.read_cstr(dst)?.len() as u16;
-    let text = machine.read_cstr(src)?.to_vec();
-    fill(machine, at(dst, end), &text)?;
-    Ok(Ret::Far(dst))
+pub fn strcat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let end = dst
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .len() as u16;
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`strcat`]. See `shims::call`'s own doc
+/// comment.
+pub fn strcat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strcat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strncat(char *dst,char *src,int maxlen)`.
@@ -911,23 +1213,33 @@ pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// then a terminator the routine writes itself at `dst[dstlen + n]`. So at most
 /// `maxlen + 1` bytes land past the end of `dst` and -- unlike [`strncpy`] --
 /// the result is always terminated.
-pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+pub fn strncat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // Hoisted to frame order (0, 2, 4): the original read word 4 (`max`)
     // before word 2 (`src`), which `re/argscan.py` flags OUT-OF-ORDER,SKIPS
-    // and which a forward-only cursor cannot reproduce. `arg_far`/`arg_u16`
-    // are infallible -- they pull bytes off the frame and cannot fail or
+    // and which a forward-only cursor cannot reproduce. `Call::ptr`/`int` are
+    // infallible -- they pull bytes off the frame and cannot fail or
     // branch -- so which of the three is decoded first is not observable;
     // only `read_cstr` can fail, and it still runs exactly where it always
     // did, after every argument is in hand.
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let max = usize::from(args.int());
-    let end = machine.read_cstr(dst)?.len() as u16;
-    let text = machine.read_cstr(src)?;
+    let dst = call.ptr();
+    let src = call.ptr();
+    let max = usize::from(Into::<u32>::into(call.int()) as u16);
+    let end = dst
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .len() as u16;
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let text = text[..text.len().min(max)].to_vec();
-    fill(machine, at(dst, end), &text)?;
-    Ok(Ret::Far(dst))
+    fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`strncat`]. See `shims::call`'s own doc
+/// comment.
+pub fn strncat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strncat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strncpy(char *dst,char *src,unsigned n)`.
@@ -942,31 +1254,30 @@ pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `cx = n`, so the scan reads at most `n` bytes and stops; a blank-padded
 /// fixed-width field with no NUL in it is precisely what this routine is for,
 /// and refusing one would stop a module the real host served.
-pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
+pub fn strncpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // Hoisted to frame order (0, 2, 4): the original read word 4 (`n`)
     // before word 2 (`src`), which `re/argscan.py` flags OUT-OF-ORDER,SKIPS.
-    // `arg_far`/`arg_u16` are infallible reads off the frame, so decoding
+    // `Call::ptr`/`int` are infallible reads off the frame, so decoding
     // `src` before checking `n == 0` is not observable -- `ptr()` never
-    // resolves or dereferences anything, it only pulls 4 bytes out of the
+    // resolves or dereferences anything, it only pulls bytes out of the
     // argument frame. The `n == 0` early return below still runs before
     // `src` is ever *read from* (via `resolve`/`read_cstr`), which is the
     // property that made the original safe on a source that is not there.
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let n = usize::from(args.int());
+    let dst = call.ptr();
+    let src = call.ptr();
+    let n = usize::from(Into::<u32>::into(call.int()) as u16);
     if n == 0 {
         // All three `rep` prefixes are no-ops, so the original dereferences
         // neither pointer. Same reason `stzcpy` returns early on a zero.
-        return Ok(Ret::Far(dst));
+        return Ok(abi::Ret::Ptr(dst));
     }
 
     // What the scan could touch. `n` bytes if they are all inside the segment;
     // otherwise the original only got away with it because a terminator
     // stopped it first, and `read_cstr` is the reader that insists on one.
-    let text = match machine.resolve(src, n) {
+    let text = match src.resolve(call.mem(), n) {
         Ok(bytes) => bytes,
-        Err(_) => machine.read_cstr(src)?,
+        Err(_) => src.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
     };
     let take = text
         .iter()
@@ -976,21 +1287,37 @@ pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
     let mut out = vec![0u8; n];
     out[..take].copy_from_slice(&text[..take]);
-    machine.write(dst, &out)?;
-    Ok(Ret::Far(dst))
+    dst.write(call.mem(), &out).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`strncpy`]. See `shims::call`'s own doc
+/// comment.
+pub fn strncpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strncpy(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int strcmp(char *s1,char *s2)` -- **0 is equal**, unlike [`sameas`].
 ///
 /// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
 /// byte difference, not a sign, and MajorMUD's 48 sites test it both ways.
-pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let a_ptr = args.ptr();
-    let b_ptr = args.ptr();
-    let a = machine.read_cstr(a_ptr)?.to_vec();
-    let b = machine.read_cstr(b_ptr)?;
-    Ok(Ret::U16(crate::strings::strcmp(&a, b) as u16))
+pub fn strcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let a_ptr = call.ptr();
+    let b_ptr = call.ptr();
+    let a = a_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let b = b_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(crate::strings::strcmp(&a, b) as u16)))
+}
+
+/// The dispatch-table entry for [`strcmp`]. See `shims::call`'s own doc
+/// comment.
+pub fn strcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    strcmp(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int toupper(int c)`.
@@ -1004,16 +1331,28 @@ pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// survives as a full word. Everything else is `mov al,cl; mov ah,0` -- cut to
 /// its low byte and zero-extended back -- so `toupper(0x161)` is `toupper('a')`
 /// and answers `0x41`, not `0x141`.
-pub fn toupper(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let c = super::args(machine).int();
-    Ok(Ret::U16(fold(c, crate::strings::toupper)))
+pub fn toupper<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let c = Into::<u32>::into(call.int()) as u16;
+    Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::toupper))))
+}
+
+/// The dispatch-table entry for [`toupper`]. See `shims::call`'s own doc
+/// comment.
+pub fn toupper_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    toupper(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
 /// `sameto` and `samein` fold with.
-pub fn tolower(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let c = super::args(machine).int();
-    Ok(Ret::U16(fold(c, crate::strings::tolower)))
+pub fn tolower<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let c = Into::<u32>::into(call.int()) as u16;
+    Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::tolower))))
+}
+
+/// The dispatch-table entry for [`tolower`]. See `shims::call`'s own doc
+/// comment.
+pub fn tolower_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    tolower(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The `int` wrapper both case-folding routines share: EOF through untouched,
@@ -1046,10 +1385,10 @@ fn fold(c: u16, by: fn(u8) -> u8) -> u16 {
 /// # Errors
 ///
 /// If the text and its terminator do not fit in the segment `at` names.
-fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError> {
+fn fill<A: Abi>(mem: &mut A::Mem, at: A::Ptr, text: &[u8]) -> Result<(), ShimError> {
     let mut bytes = text.to_vec();
     bytes.push(0);
-    machine.write(at, &bytes)?;
+    at.write(mem, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
 }
 
@@ -1066,17 +1405,34 @@ fn fill(machine: &mut Machine, at: FarPtr, text: &[u8]) -> Result<(), ShimError>
 ///
 /// The selector is the caller's own. Rebuilding it from anywhere else would
 /// hand the module an address into the wrong segment.
-fn at(ptr: FarPtr, n: u16) -> FarPtr {
-    FarPtr {
-        offset: ptr.offset + n,
-        selector: ptr.selector,
-    }
+fn at<A: Abi>(ptr: A::Ptr, n: u16) -> A::Ptr {
+    A::ptr_offset(ptr, n)
 }
 
-/// Write `text` and its terminator at `at`, refusing to exceed `capacity`.
-pub fn write_cstr(
-    machine: &mut Machine,
-    at: FarPtr,
+/// The null pointer, in this ABI's own representation.
+///
+/// Same reasoning as `shims::stream::null_ptr`, which this mirrors: `Abi` has
+/// no `NULL` constant, but [`Abi::ptr_from_bytes`] over [`Abi::PTR_WIDTH`]
+/// zero bytes is the null representation both ABIs already agree on.
+fn null_ptr<A: Abi>() -> A::Ptr {
+    A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])
+}
+
+/// Whether `ptr` is the null pointer, in this ABI's own representation --
+/// tested on its own bytes rather than `FarPtr`'s `selector`/`offset`
+/// fields, since `A::Ptr` is opaque to a generic caller. Same reading
+/// `shims::user::begin_polling`'s own null check takes.
+fn is_null<A: Abi>(ptr: A::Ptr) -> bool {
+    A::ptr_to_bytes(ptr).iter().all(|&b| b == 0)
+}
+
+/// Write `text` and its terminator at `at`, refusing to exceed `capacity`,
+/// against memory directly rather than a whole `Machine`.
+///
+/// The `Wg16` facade [`write_cstr`] delegates into.
+pub fn write_cstr_mem<A: Abi>(
+    mem: &mut A::Mem,
+    at: A::Ptr,
     text: &[u8],
     capacity: u16,
 ) -> Result<(), ShimError> {
@@ -1088,8 +1444,15 @@ pub fn write_cstr(
     }
     let mut bytes = text.to_vec();
     bytes.push(0);
-    machine.write(at, &bytes)?;
+    at.write(mem, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
+}
+
+/// Kept under its original name and `&mut Machine` signature: `shims::msg`
+/// (`stgopt`) and `shims::system` still call this directly, and neither
+/// converts in this task.
+pub fn write_cstr(machine: &mut Machine, at: FarPtr, text: &[u8], capacity: u16) -> Result<(), ShimError> {
+    write_cstr_mem::<Wg16>(machine.mem_mut(), at, text, capacity)
 }
 
 #[cfg(test)]
@@ -1101,7 +1464,7 @@ mod tests {
     fn lastwd_answers_a_pointer_into_the_callers_own_string() {
         let mut f = Fixture::new();
         let s = f.text("SHORT MESSAGES LONG");
-        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+        let Ret::Far(p) = f.invoke(lastwd_wg16, &Fixture::far(s)).expect("ok") else {
             panic!("lastwd returns char *");
         };
         assert_eq!(p.selector, s.selector);
@@ -1113,7 +1476,7 @@ mod tests {
     fn lastwd_leaves_the_trailing_padding_where_it_found_it() {
         let mut f = Fixture::new();
         let s = f.text("go north  ");
-        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
+        let Ret::Far(p) = f.invoke(lastwd_wg16, &Fixture::far(s)).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(p), "north  ", "skipped, not stripped");
@@ -1135,7 +1498,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            f.invoke(sortstgs, &[array.offset, array.selector, 3]),
+            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 3]),
             Ok(Ret::Void)
         ));
         let bytes = f.machine.resolve(array, 12).expect("readable").to_vec();
@@ -1157,7 +1520,7 @@ mod tests {
         // error here -- the real one never dereferences it either.
         let mut f = Fixture::new();
         for num in [0u16, 1, (-4i16) as u16] {
-            assert!(matches!(f.invoke(sortstgs, &[0, 0, num]), Ok(Ret::Void)));
+            assert!(matches!(f.invoke(sortstgs_wg16, &[0, 0, num]), Ok(Ret::Void)));
         }
     }
 
@@ -1170,7 +1533,7 @@ mod tests {
         let one = f.text("only");
         let array = f.words(&[one.offset, one.selector, 0, 0]);
         assert!(
-            f.invoke(sortstgs, &[array.offset, array.selector, 2])
+            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 2])
                 .is_err()
         );
     }
@@ -1183,7 +1546,7 @@ mod tests {
         // Two pointers named, one present, and the rest of the segment is not
         // the module's to claim.
         assert!(
-            f.invoke(sortstgs, &[array.offset, array.selector, 900])
+            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 900])
                 .is_err()
         );
     }
@@ -1199,27 +1562,27 @@ mod tests {
         let first = [line.offset, line.selector, delim.offset, delim.selector];
         let again = [0, 0, delim.offset, delim.selector];
 
-        let Ret::Far(one) = f.invoke(strtok, &first).expect("ok") else {
+        let Ret::Far(one) = f.invoke(strtok_wg16, &first).expect("ok") else {
             panic!("strtok returns char *");
         };
         assert_eq!(f.read(one), "go");
 
-        let Ret::Far(two) = f.invoke(strtok, &again).expect("ok") else {
+        let Ret::Far(two) = f.invoke(strtok_wg16, &again).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(two), "north", "a run of two spaces is one gap");
 
-        let Ret::Far(three) = f.invoke(strtok, &again).expect("ok") else {
+        let Ret::Far(three) = f.invoke(strtok_wg16, &again).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(three), "now");
 
         assert_eq!(
-            f.invoke(strtok, &again).expect("ok"),
+            f.invoke(strtok_wg16, &again).expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
         assert_eq!(
-            f.invoke(strtok, &again).expect("ok"),
+            f.invoke(strtok_wg16, &again).expect("ok"),
             Ret::Far(FarPtr::NULL),
             "and it stays exhausted"
         );
@@ -1235,7 +1598,7 @@ mod tests {
         let delim = f.text(",");
 
         f.invoke(
-            strtok,
+            strtok_wg16,
             &[line.offset, line.selector, delim.offset, delim.selector],
         )
         .expect("ok");
@@ -1253,7 +1616,7 @@ mod tests {
         let delim = f.text(",");
         assert_eq!(
             f.invoke(
-                strtok,
+                strtok_wg16,
                 &[line.offset, line.selector, delim.offset, delim.selector]
             )
             .expect("ok"),
@@ -1269,13 +1632,13 @@ mod tests {
         let delim = f.text(" ");
 
         f.invoke(
-            strtok,
+            strtok_wg16,
             &[first.offset, first.selector, delim.offset, delim.selector],
         )
         .expect("ok");
         let Ret::Far(p) = f
             .invoke(
-                strtok,
+                strtok_wg16,
                 &[second.offset, second.selector, delim.offset, delim.selector],
             )
             .expect("ok")
@@ -1294,7 +1657,7 @@ mod tests {
         let empty = f.text("");
         let Ret::Far(p) = f
             .invoke(
-                strtok,
+                strtok_wg16,
                 &[line.offset, line.selector, empty.offset, empty.selector],
             )
             .expect("ok")
@@ -1303,7 +1666,7 @@ mod tests {
         };
         assert_eq!(f.read(p), "go north");
         assert_eq!(
-            f.invoke(strtok, &[0, 0, empty.offset, empty.selector])
+            f.invoke(strtok_wg16, &[0, 0, empty.offset, empty.selector])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL),
             "and then there is no more"
@@ -1317,7 +1680,7 @@ mod tests {
         let mut f = Fixture::new();
         let delim = f.text(" ");
         assert!(
-            f.invoke(strtok, &[0, 0, delim.offset, delim.selector])
+            f.invoke(strtok_wg16, &[0, 0, delim.offset, delim.selector])
                 .is_err()
         );
     }
@@ -1327,12 +1690,12 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("go north");
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'n')])
+            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'n')])
                 .expect("ok"),
-            Ret::Far(at(s, 3))
+            Ret::Far(at::<Wg16>(s, 3))
         );
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'z')])
+            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'z')])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL),
             "absent is NULL, not the terminator"
@@ -1347,13 +1710,13 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("abc");
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
-            Ret::Far(at(s, 3))
+            f.invoke(strchr_wg16, &[s.offset, s.selector, 0]).expect("ok"),
+            Ret::Far(at::<Wg16>(s, 3))
         );
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, 0xff62])
+            f.invoke(strchr_wg16, &[s.offset, s.selector, 0xff62])
                 .expect("ok"),
-            Ret::Far(at(s, 1)),
+            Ret::Far(at::<Wg16>(s, 1)),
             "0xff62 is searched for as 'b'"
         );
     }
@@ -1368,20 +1731,20 @@ mod tests {
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
 
         assert_eq!(
-            f.invoke(strstr, &pair(hay, needle)).expect("ok"),
-            Ret::Far(at(hay, 3))
+            f.invoke(strstr_wg16, &pair(hay, needle)).expect("ok"),
+            Ret::Far(at::<Wg16>(hay, 3))
         );
         assert_eq!(
-            f.invoke(strstr, &pair(hay, empty)).expect("ok"),
+            f.invoke(strstr_wg16, &pair(hay, empty)).expect("ok"),
             Ret::Far(hay),
             "the routine's first test is on the needle"
         );
         assert_eq!(
-            f.invoke(strstr, &pair(hay, missing)).expect("ok"),
+            f.invoke(strstr_wg16, &pair(hay, missing)).expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
         assert_eq!(
-            f.invoke(strstr, &pair(needle, hay)).expect("ok"),
+            f.invoke(strstr_wg16, &pair(needle, hay)).expect("ok"),
             Ret::Far(FarPtr::NULL),
             "a needle longer than the haystack"
         );
@@ -1395,7 +1758,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector];
-        assert_eq!(f.invoke(strcat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strcat_wg16, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.read(dst), "go north");
     }
 
@@ -1408,7 +1771,7 @@ mod tests {
         let src = f.text("abcdefgh");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
 
-        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncpy_wg16, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(
             f.machine.resolve(dst, 8).expect("readable"),
             b"abcd####",
@@ -1423,7 +1786,7 @@ mod tests {
         let src = f.text("ab");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 6];
 
-        f.invoke(strncpy, &args).expect("ok");
+        f.invoke(strncpy_wg16, &args).expect("ok");
         assert_eq!(
             f.machine.resolve(dst, 8).expect("readable"),
             b"ab\0\0\0\0##",
@@ -1451,7 +1814,7 @@ mod tests {
         f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
-        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncpy_wg16, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.machine.resolve(dst, 8).expect("readable"), b"xxxx####");
     }
 
@@ -1462,7 +1825,7 @@ mod tests {
         // early on a `num` of zero.
         let mut f = Fixture::new();
         assert_eq!(
-            f.invoke(strncpy, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
+            f.invoke(strncpy_wg16, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
             Ret::Far(FarPtr::NULL)
         );
     }
@@ -1482,7 +1845,7 @@ mod tests {
         f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
         assert!(
             f.invoke(
-                strncpy,
+                strncpy_wg16,
                 &[dst.offset, dst.selector, src.offset, src.selector, 32]
             )
             .is_err()
@@ -1497,7 +1860,7 @@ mod tests {
         let src = f.text("northwards");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
-        assert_eq!(f.invoke(strncat, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncat_wg16, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.read(dst), "go north", "five of the source, then a NUL");
     }
 
@@ -1512,7 +1875,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0x8000];
-        f.invoke(strncat, &args).expect("ok");
+        f.invoke(strncat_wg16, &args).expect("ok");
         assert_eq!(f.read(dst), "go north", "0x8000 is 32,768, not -32,768");
     }
 
@@ -1527,7 +1890,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
-        f.invoke(strncat, &args).expect("ok");
+        f.invoke(strncat_wg16, &args).expect("ok");
         assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"go \0##");
     }
 
@@ -1536,12 +1899,12 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("");
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
+            f.invoke(strchr_wg16, &[s.offset, s.selector, 0]).expect("ok"),
             Ret::Far(s),
             "the terminator is at offset zero"
         );
         assert_eq!(
-            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'a')])
+            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'a')])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
@@ -1563,7 +1926,7 @@ mod tests {
 
         assert!(
             f.invoke(
-                strncpy,
+                strncpy_wg16,
                 &[
                     near_end.offset,
                     near_end.selector,
@@ -1577,7 +1940,7 @@ mod tests {
         );
         assert!(
             f.invoke(
-                strcat,
+                strcat_wg16,
                 &[near_end.offset, near_end.selector, src.offset, src.selector]
             )
             .is_err(),
@@ -1585,7 +1948,7 @@ mod tests {
         );
         assert!(
             f.invoke(
-                strncat,
+                strncat_wg16,
                 &[
                     near_end.offset,
                     near_end.selector,
@@ -1608,16 +1971,16 @@ mod tests {
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
 
         assert_eq!(
-            f.invoke(strcmp, &pair(short, long)).expect("ok"),
+            f.invoke(strcmp_wg16, &pair(short, long)).expect("ok"),
             Ret::U16((-121i16) as u16),
             "the terminator against 'y'"
         );
         assert_eq!(
-            f.invoke(strcmp, &pair(long, short)).expect("ok"),
+            f.invoke(strcmp_wg16, &pair(long, short)).expect("ok"),
             Ret::U16(121)
         );
         assert_eq!(
-            f.invoke(strcmp, &pair(short, same)).expect("ok"),
+            f.invoke(strcmp_wg16, &pair(short, same)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -1633,11 +1996,11 @@ mod tests {
 
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
         assert_eq!(
-            f.invoke(sameas, &pair(long, lower)).expect("ok"),
+            f.invoke(sameas_wg16, &pair(long, lower)).expect("ok"),
             Ret::U16(1)
         );
         assert_eq!(
-            f.invoke(sameas, &pair(long, longer)).expect("ok"),
+            f.invoke(sameas_wg16, &pair(long, longer)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -1651,22 +2014,22 @@ mod tests {
 
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
         assert_eq!(
-            f.invoke(sameto, &pair(long, longer)).expect("ok"),
+            f.invoke(sameto_wg16, &pair(long, longer)).expect("ok"),
             Ret::U16(1),
             "sameto(shorts, longs): `longer` begins with `long`"
         );
         assert_eq!(
-            f.invoke(sameto, &pair(longer, long)).expect("ok"),
+            f.invoke(sameto_wg16, &pair(longer, long)).expect("ok"),
             Ret::U16(0),
             "and not the other way round"
         );
         assert_eq!(
-            f.invoke(samein, &pair(ong, longer)).expect("ok"),
+            f.invoke(samein_wg16, &pair(ong, longer)).expect("ok"),
             Ret::U16(1),
             "samein(shorts, longs): `ONG` is inside `longer`"
         );
         assert_eq!(
-            f.invoke(samein, &pair(longer, ong)).expect("ok"),
+            f.invoke(samein_wg16, &pair(longer, ong)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -1675,7 +2038,7 @@ mod tests {
     fn the_same_family_refuses_a_pointer_naming_nothing() {
         let mut f = Fixture::new();
         let s = f.text("x");
-        for shim in [sameas, sameto, samein] {
+        for shim in [sameas_wg16, sameto_wg16, samein_wg16] {
             assert!(f.invoke(shim, &[s.offset, s.selector, 0, 0]).is_err());
             assert!(f.invoke(shim, &[0, 0, s.offset, s.selector]).is_err());
         }
@@ -1690,10 +2053,10 @@ mod tests {
             (u16::from(b'7'), u16::from(b'7')),
             (0, 0),
         ] {
-            assert_eq!(f.invoke(toupper, &[input]).expect("folded"), Ret::U16(want));
+            assert_eq!(f.invoke(toupper_wg16, &[input]).expect("folded"), Ret::U16(want));
         }
         assert_eq!(
-            f.invoke(tolower, &[u16::from(b'Z')]).expect("folded"),
+            f.invoke(tolower_wg16, &[u16::from(b'Z')]).expect("folded"),
             Ret::U16(u16::from(b'z'))
         );
     }
@@ -1704,10 +2067,10 @@ mod tests {
         // one argument that survives as a full word. Every other `int` is cut
         // to its low byte: `toupper(0x161)` is `toupper('a')`.
         let mut f = Fixture::new();
-        assert_eq!(f.invoke(toupper, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
-        assert_eq!(f.invoke(tolower, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
-        assert_eq!(f.invoke(toupper, &[0x161]).expect("cut"), Ret::U16(0x41));
-        assert_eq!(f.invoke(tolower, &[0xff41]).expect("cut"), Ret::U16(0x61));
+        assert_eq!(f.invoke(toupper_wg16, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(tolower_wg16, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(toupper_wg16, &[0x161]).expect("cut"), Ret::U16(0x41));
+        assert_eq!(f.invoke(tolower_wg16, &[0xff41]).expect("cut"), Ret::U16(0x61));
     }
 
     #[test]
@@ -1748,7 +2111,7 @@ mod tests {
         // Five bytes of room means four characters and the NUL. `strncpy`
         // would put five characters and no NUL, which is the difference.
         let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
-        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(stzcpy_wg16, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "Newh");
     }
 
@@ -1760,7 +2123,7 @@ mod tests {
         let dst = f.buffer(16);
         let src = f.text("hi");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
-        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(stzcpy_wg16, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "hi");
     }
 
@@ -1770,7 +2133,7 @@ mod tests {
         let dst = f.bytes(b"keep", true);
         let src = f.text("overwrite me");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
-        f.invoke(stzcpy, &args).expect("copied nothing");
+        f.invoke(stzcpy_wg16, &args).expect("copied nothing");
         assert_eq!(f.read(dst), "keep", "not even a terminator fits in zero");
     }
 
@@ -1780,13 +2143,13 @@ mod tests {
         let dst = f.buffer(16);
         let src = f.text("kobold");
         let args = [dst.offset, dst.selector, src.offset, src.selector];
-        assert_eq!(f.invoke(strcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(strcpy_wg16, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "kobold");
 
         let mut f = Fixture::new();
         let at = f.text("kobold");
         assert_eq!(
-            f.invoke(strlen, &Fixture::far(at)).expect("ok"),
+            f.invoke(strlen_wg16, &Fixture::far(at)).expect("ok"),
             Ret::U16(6)
         );
     }
@@ -1804,7 +2167,7 @@ mod tests {
             let mut f = Fixture::new();
             let at = f.text(text);
             assert_eq!(
-                f.invoke(atol, &Fixture::far(at)).expect("parsed"),
+                f.invoke(atol_wg16, &Fixture::far(at)).expect("parsed"),
                 Ret::U32(expect as u32),
                 "{text:?}"
             );
@@ -1821,7 +2184,7 @@ mod tests {
         let mut seen = Vec::new();
         for n in 0..=SPR_BUFFERS {
             let args = [template.offset, template.selector, n as u16];
-            let Ret::Far(at) = f.invoke(spr, &args).expect("formatted") else {
+            let Ret::Far(at) = f.invoke(spr_wg16, &args).expect("formatted") else {
                 panic!("spr returns a pointer");
             };
             seen.push(at);
@@ -1847,7 +2210,7 @@ mod tests {
     #[test]
     fn l2as_renders_zero_as_a_bare_zero() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as, &long(0)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as_wg16, &long(0)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"0");
@@ -1856,7 +2219,7 @@ mod tests {
     #[test]
     fn l2as_prefixes_negative_values_with_a_minus() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as, &long(-42)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as_wg16, &long(-42)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-42");
@@ -1867,7 +2230,7 @@ mod tests {
         // >= 65536 is the one magnitude an `arg_u16` mistake gets wrong while
         // still passing on anything smaller.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as, &long(100_000)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as_wg16, &long(100_000)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"100000");
@@ -1878,7 +2241,7 @@ mod tests {
         // `i32::MIN`'s magnitude has no positive `i32` counterpart -- `-value`
         // overflows. `unsigned_abs` is the one way to get here without it.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as, &long(i32::MIN)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as_wg16, &long(i32::MIN)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-2147483648");
@@ -1887,7 +2250,7 @@ mod tests {
     #[test]
     fn l2as_renders_i32_max() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as, &long(i32::MAX)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as_wg16, &long(i32::MAX)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"2147483647");
@@ -1898,7 +2261,7 @@ mod tests {
         let mut f = Fixture::new();
         let mut seen = Vec::new();
         for n in 0..=L2AS_BUFFERS {
-            let Ret::Far(at) = f.invoke(l2as, &long(n as i32)).expect("formatted") else {
+            let Ret::Far(at) = f.invoke(l2as_wg16, &long(n as i32)).expect("formatted") else {
                 panic!("l2as returns a pointer");
             };
             seen.push(at);
@@ -1924,16 +2287,16 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%d");
 
-        let Ret::Far(first) = f.invoke(l2as, &long(1)).expect("formatted") else {
+        let Ret::Far(first) = f.invoke(l2as_wg16, &long(1)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
 
         for n in 0..3u16 {
             let args = [template.offset, template.selector, n];
-            f.invoke(spr, &args).expect("formatted");
+            f.invoke(spr_wg16, &args).expect("formatted");
         }
 
-        let Ret::Far(second) = f.invoke(l2as, &long(2)).expect("formatted") else {
+        let Ret::Far(second) = f.invoke(l2as_wg16, &long(2)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
 
@@ -1961,7 +2324,7 @@ mod tests {
             text.selector,
             9,
         ];
-        assert_eq!(f.invoke(sprintf, &args).expect("ok"), Ret::U16(6));
+        assert_eq!(f.invoke(sprintf_wg16, &args).expect("ok"), Ret::U16(6));
         assert_eq!(f.read(dst), "gold/9");
     }
 
@@ -1970,15 +2333,15 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("<%d>");
 
-        f.invoke(prf, &[template.offset, template.selector, 1])
+        f.invoke(prf_wg16, &[template.offset, template.selector, 1])
             .expect("first");
-        f.invoke(prf, &[template.offset, template.selector, 2])
+        f.invoke(prf_wg16, &[template.offset, template.selector, 2])
             .expect("second");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "<1><2>", "the second call appends");
 
-        f.invoke(clrprf, &[]).expect("cleared");
+        f.invoke(clrprf_wg16, &[]).expect("cleared");
         assert_eq!(f.read(buffer), "");
         assert_eq!(
             f.host
@@ -1998,7 +2361,7 @@ mod tests {
         // show up as scrambled output much later.
         let mut f = Fixture::new();
         let template = f.text("%d");
-        f.invoke(prf, &[template.offset, template.selector, 1])
+        f.invoke(prf_wg16, &[template.offset, template.selector, 1])
             .expect("first");
 
         let buffer = f.host.globals().prf_buffer();
@@ -2011,7 +2374,7 @@ mod tests {
             .write(&mut f.machine, "prfptr", &moved.to_bytes())
             .expect("moved");
 
-        f.invoke(prf, &[template.offset, template.selector, 2])
+        f.invoke(prf_wg16, &[template.offset, template.selector, 2])
             .expect("second");
         assert_eq!(f.read(moved), "2", "prf wrote where prfptr now points");
         assert_eq!(f.read(buffer), "1", "and left the earlier text alone");
@@ -2026,7 +2389,7 @@ mod tests {
         // Twice over is more than the 4 KiB buffer holds. The real one would
         // simply write past it.
         f.invoke(
-            prf,
+            prf_wg16,
             &[
                 template.offset,
                 template.selector,
@@ -2036,7 +2399,7 @@ mod tests {
         )
         .expect("the first fits");
         let second = f.invoke(
-            prf,
+            prf_wg16,
             &[
                 template.offset,
                 template.selector,
@@ -2047,7 +2410,7 @@ mod tests {
         assert!(second.is_ok(), "two of these still fit");
 
         let third = f.invoke(
-            prf,
+            prf_wg16,
             &[
                 template.offset,
                 template.selector,
@@ -2073,7 +2436,7 @@ mod tests {
             .expect("connected");
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf, &Fixture::far(template)).expect("prf");
+        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
@@ -2092,7 +2455,7 @@ mod tests {
             .expect("connected");
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf, &Fixture::far(template)).expect("prf");
+        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "XTAIL");
@@ -2139,7 +2502,7 @@ mod tests {
         // before now.
         let mut f = Fixture::new();
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf, &Fixture::far(template)).expect("prf");
+        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
@@ -2168,15 +2531,15 @@ mod tests {
             .expect("b connected"); // leaves b current
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf, &Fixture::far(template)).expect("prf for b");
+        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf for b");
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "XTAIL", "b is line-mode, so the ASCII form");
 
         f.host
             .point_curusr(&mut f.machine, a)
             .expect("a is current now");
-        f.invoke(clrprf, &[]).expect("cleared");
-        f.invoke(prf, &Fixture::far(template)).expect("prf for a");
+        f.invoke(clrprf_wg16, &[]).expect("cleared");
+        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf for a");
         assert_eq!(
             f.read(buffer),
             "\x1b[1;37mTAIL",
@@ -2412,7 +2775,7 @@ mod tests {
         // It returns void, so the only observable effect is the buffer.
         let mut f = Fixture::new();
         let at = f.text("  the quick brown fox  ");
-        assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rmvwht_wg16, &Fixture::far(at)), Ok(Ret::Void)));
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
     }
 
@@ -2420,7 +2783,7 @@ mod tests {
     fn rmvwht_handles_a_string_that_is_entirely_whitespace() {
         let mut f = Fixture::new();
         let at = f.text(" \t\r\n ");
-        f.invoke(rmvwht, &Fixture::far(at)).expect("void");
+        f.invoke(rmvwht_wg16, &Fixture::far(at)).expect("void");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"");
     }
 
@@ -2431,7 +2794,7 @@ mod tests {
         // into the wrong segment and the module would read rubbish.
         let mut f = Fixture::new();
         let at = f.text("   abc");
-        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwht_wg16, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwht returns char *");
         };
         assert_eq!(p.selector, at.selector);
@@ -2443,7 +2806,7 @@ mod tests {
     fn skpwht_stops_at_a_tab_because_the_original_tests_one_byte() {
         let mut f = Fixture::new();
         let at = f.text("\tabc");
-        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwht_wg16, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwht returns char *");
         };
         assert_eq!(p.offset, at.offset, "a tab is not 0x20");
@@ -2453,7 +2816,7 @@ mod tests {
     fn skpwrd_answers_the_space_that_ended_the_word() {
         let mut f = Fixture::new();
         let at = f.text("word rest");
-        let Ret::Far(p) = f.invoke(skpwrd, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwrd_wg16, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwrd returns char *");
         };
         assert_eq!(p.offset, at.offset + 4);
@@ -2464,7 +2827,7 @@ mod tests {
     fn depad_truncates_the_buffer_and_returns_the_count() {
         let mut f = Fixture::new();
         let at = f.text("text   ");
-        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
+        let Ret::U16(n) = f.invoke(depad_wg16, &Fixture::far(at)).expect("a count") else {
             panic!("depad returns an int");
         };
         assert_eq!(n, 3, "three characters went");
@@ -2475,7 +2838,7 @@ mod tests {
     fn depad_leaves_a_string_that_needs_nothing_alone() {
         let mut f = Fixture::new();
         let at = f.text("  text");
-        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
+        let Ret::U16(n) = f.invoke(depad_wg16, &Fixture::far(at)).expect("a count") else {
             panic!("depad returns an int");
         };
         assert_eq!(n, 0, "leading padding is not padding");
@@ -2511,7 +2874,7 @@ mod tests {
             .write(&mut f.machine, "margc", &3u16.to_le_bytes())
             .expect("margc");
 
-        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
         assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
     }
 
@@ -2525,7 +2888,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "margc", &0u16.to_le_bytes())
             .expect("margc");
-        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
     }
 
     /// A far pointer, read out of module memory at `at`.
@@ -2549,7 +2912,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -2567,7 +2930,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get   all")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 2);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -2585,7 +2948,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -2604,7 +2967,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         let margn = f.host.globals().address("margn").expect("margn");
         let end0 = read_ptr(&f.machine, slot(margn, 0));
@@ -2632,7 +2995,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold  ")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
 
         let margn = f.host.globals().address("margn").expect("margn");
@@ -2652,8 +3015,8 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
-        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.machine.read_cstr(input).expect("a string"), b"get all gold");
     }
@@ -2665,7 +3028,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         // The offset of the terminating NUL from the start of `input` -- the
         // early-return path inside the inner loop is what sets this, since
@@ -2692,7 +3055,7 @@ mod tests {
         buf[7] = 0;
         f.machine.write(input, &buf).expect("input with a stale tail");
 
-        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 1);
         assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 4);
@@ -2715,7 +3078,7 @@ mod tests {
 
         let ret = f
             .invoke(
-                vsprintf,
+                vsprintf_wg16,
                 &[
                     out.offset,
                     out.selector,
@@ -2742,7 +3105,7 @@ mod tests {
         let list = f.words(&[7]);
 
         f.invoke(
-            vsprintf,
+            vsprintf_wg16,
             &[
                 out.offset,
                 out.selector,
@@ -2770,6 +3133,6 @@ mod tests {
             0,
             0,
         ];
-        assert!(f.invoke(vsprintf, &args).is_err());
+        assert!(f.invoke(vsprintf_wg16, &args).is_err());
     }
 }

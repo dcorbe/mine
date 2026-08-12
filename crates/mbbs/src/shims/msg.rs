@@ -589,7 +589,7 @@ mod tests {
         let other = f.text("OTHER.MSG");
         f.invoke(opnmsg_wg16, &Fixture::far(other)).expect("another file");
         let template = f.text("noise %d");
-        f.invoke(text::prf, &[template.offset, template.selector, 7])
+        f.invoke(text::prf_wg16, &[template.offset, template.selector, 7])
             .expect("some output");
 
         assert_eq!(f.read(first), "DEMO", "the first pointer still reads");

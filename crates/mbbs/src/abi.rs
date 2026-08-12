@@ -181,6 +181,27 @@ pub trait Abi {
     /// let an out-of-range offset compile instead of refusing to build.
     fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr;
 
+    /// Offset `base` by `by` bytes, refusing rather than wrapping if the sum
+    /// would leave the address space this ABI's own pointer can name.
+    ///
+    /// [`Abi::ptr_offset`] exists for a caller that already knows `delta`
+    /// fits (a region [`ModuleMem::alloc_region`] just handed back, at most
+    /// 64 KiB) -- this is for the opposite case: `by` is computed from a
+    /// value module memory holds (`shims::fsd`'s `fsdscb->numfld`,
+    /// `->ansoff`, ...), so a corrupted or hostile one must be refused
+    /// rather than silently wrapped into a pointer at the front of the same
+    /// segment, which would *resolve* and read as a plausible answer. Task
+    /// 5's `shims::fsd::offset` used to do this by hand -- `base.offset`
+    /// plus `by`, checked against `u16` -- which only typechecks for
+    /// `Wg16`'s own `seg:off` shape; this is that check, moved onto the
+    /// `Abi` each implementation answers for its own pointer, the same
+    /// reason [`Abi::ptr_offset`] itself is not one shared formula.
+    ///
+    /// `None` when the ABI has no room to represent the result -- `Wg16`'s
+    /// `u16` offset overflowing, or a future flat `Wg32` address overflowing
+    /// `u32`.
+    fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr>;
+
     /// Reach this ABI's memory through its execution handle.
     ///
     /// A reborrow, not a second field: see the module doc comment ("`Call`
@@ -470,6 +491,15 @@ impl Abi for Wg16 {
         }
     }
 
+    fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr> {
+        let by = u16::try_from(by).ok()?;
+        let offset = base.offset.checked_add(by)?;
+        Some(mbbs16::FarPtr {
+            offset,
+            selector: base.selector,
+        })
+    }
+
     /// `Machine::mem_mut` is the one deliberate exception Task 1's facade
     /// left: every other memory method is a narrow delegation (`resolve`,
     /// `read_cstr`, `write`, ...), but reaching `Segments` generically means
@@ -658,6 +688,11 @@ mod tests {
             // Same reasoning as `mem` below: nothing in `Call`'s frame-read
             // tests places anything, so nothing computes an offset either.
             unreachable!("Call's read tests never allocate memory")
+        }
+
+        fn ptr_checked_add(_base: Self::Ptr, _by: usize) -> Option<Self::Ptr> {
+            // Same reasoning as `ptr_offset` above.
+            unreachable!("Call's read tests never offset a pointer by a module-held value")
         }
 
         fn mem(_cpu: &mut Self::Cpu) -> &mut Self::Mem {

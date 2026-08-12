@@ -47,7 +47,7 @@
 
 use std::fmt;
 
-use mbbs16::FarPtr;
+use crate::abi::{Abi, Wg16};
 
 pub mod ain;
 
@@ -513,12 +513,48 @@ impl Field {
 /// No `Machine` here on purpose. Reading and writing module memory belongs to
 /// the shims; this is the layout and nothing else, which is what keeps this
 /// module testable with no machine present.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scb {
+///
+/// # Generic over `A` for five fields, none of the rest
+///
+/// `fldspc`, `flddat`, `mbpunc`, `newans` and `fldvfy` are the members that
+/// hold a pointer into module memory; every other member is a plain integer
+/// with no ABI-dependent width (`FSD.H`'s `struct fsdscb` is a 16-bit
+/// compiler's layout, and this task widens what a *pointer* looks like, not
+/// what an `int` or `char` does). `A` is `PhantomData` -- the struct carries
+/// no `A::Ptr` value of its own, only bytes -- and it is not part of
+/// `#[derive]` for the same reason `abi.rs`'s `Ret<A>` is not: the derive
+/// macro's generated bound is `A: Trait`, which `Wg16` (a bare marker with no
+/// derives of its own) does not satisfy, so `Clone`/`PartialEq`/`Eq`/`Debug`
+/// are written out by hand below instead.
+pub struct Scb<A: Abi = Wg16> {
     bytes: [u8; FSDSCB as usize],
+    abi: std::marker::PhantomData<A>,
 }
 
-impl Scb {
+impl<A: Abi> Clone for Scb<A> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes,
+            abi: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for Scb<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl<A: Abi> Eq for Scb<A> {}
+
+impl<A: Abi> fmt::Debug for Scb<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scb").field("bytes", &self.bytes).finish()
+    }
+}
+
+impl<A: Abi> Scb<A> {
     /// Read a control block out of exactly [`FSDSCB`] bytes.
     ///
     /// # Errors
@@ -530,7 +566,10 @@ impl Scb {
         let bytes: [u8; FSDSCB as usize] = bytes
             .try_into()
             .map_err(|_| FormError::ShortBlock(bytes.len()))?;
-        Ok(Self { bytes })
+        Ok(Self {
+            bytes,
+            abi: std::marker::PhantomData,
+        })
     }
 
     /// The block, for writing back where it came from.
@@ -538,19 +577,18 @@ impl Scb {
         &self.bytes
     }
 
-    fn ptr(&self, at: u16) -> FarPtr {
+    /// Decode a pointer at byte offset `at`, in this ABI's own width and
+    /// layout -- [`Abi::PTR_WIDTH`]/[`Abi::ptr_from_bytes`], not a hardcoded
+    /// 4, so a future `Wg32` reads its own pointer shape rather than `Wg16`'s.
+    fn ptr(&self, at: u16) -> A::Ptr {
         let at = usize::from(at);
-        FarPtr::from_bytes([
-            self.bytes[at],
-            self.bytes[at + 1],
-            self.bytes[at + 2],
-            self.bytes[at + 3],
-        ])
+        A::ptr_from_bytes(&self.bytes[at..at + A::PTR_WIDTH])
     }
 
-    fn set_ptr(&mut self, at: u16, value: FarPtr) {
+    /// The inverse of [`Scb::ptr`].
+    fn set_ptr(&mut self, at: u16, value: A::Ptr) {
         let at = usize::from(at);
-        self.bytes[at..at + 4].copy_from_slice(&value.to_bytes());
+        self.bytes[at..at + A::PTR_WIDTH].copy_from_slice(&A::ptr_to_bytes(value));
     }
 
     fn word(&self, at: u16) -> u16 {
@@ -572,38 +610,38 @@ impl Scb {
     }
 
     /// `fldspc`: the field specification, in the module's memory.
-    pub fn fldspc(&self) -> FarPtr {
+    pub fn fldspc(&self) -> A::Ptr {
         self.ptr(scb::FLDSPC)
     }
     /// Set [`Scb::fldspc`].
-    pub fn set_fldspc(&mut self, value: FarPtr) {
+    pub fn set_fldspc(&mut self, value: A::Ptr) {
         self.set_ptr(scb::FLDSPC, value);
     }
 
     /// `flddat`: the array of [`Field::record`]s, in the session buffer.
-    pub fn flddat(&self) -> FarPtr {
+    pub fn flddat(&self) -> A::Ptr {
         self.ptr(scb::FLDDAT)
     }
     /// Set [`Scb::flddat`].
-    pub fn set_flddat(&mut self, value: FarPtr) {
+    pub fn set_flddat(&mut self, value: A::Ptr) {
         self.set_ptr(scb::FLDDAT, value);
     }
 
     /// `mbpunc`: the embedded-punctuation templates.
-    pub fn mbpunc(&self) -> FarPtr {
+    pub fn mbpunc(&self) -> A::Ptr {
         self.ptr(scb::MBPUNC)
     }
     /// Set [`Scb::mbpunc`].
-    pub fn set_mbpunc(&mut self, value: FarPtr) {
+    pub fn set_mbpunc(&mut self, value: A::Ptr) {
         self.set_ptr(scb::MBPUNC, value);
     }
 
     /// `newans`: the answer string this session is building.
-    pub fn newans(&self) -> FarPtr {
+    pub fn newans(&self) -> A::Ptr {
         self.ptr(scb::NEWANS)
     }
     /// Set [`Scb::newans`].
-    pub fn set_newans(&mut self, value: FarPtr) {
+    pub fn set_newans(&mut self, value: A::Ptr) {
         self.set_ptr(scb::NEWANS, value);
     }
 
@@ -681,11 +719,11 @@ impl Scb {
 
     /// `fldvfy`: the field verify routine the module gave `fsdego`, or
     /// [`FarPtr::NULL`] if it passed none.
-    pub fn fldvfy(&self) -> FarPtr {
+    pub fn fldvfy(&self) -> A::Ptr {
         self.ptr(scb::FLDVFY)
     }
     /// Set [`Scb::fldvfy`].
-    pub fn set_fldvfy(&mut self, value: FarPtr) {
+    pub fn set_fldvfy(&mut self, value: A::Ptr) {
         self.set_ptr(scb::FLDVFY, value);
     }
 
@@ -5640,6 +5678,7 @@ pub fn fsdqoe(form: &Form, answers: &Answers, scb: &mut Scb) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mbbs16::FarPtr;
 
     /// The maximum this host's 4,096-byte output buffer allows. See the
     /// `fsdroom` shim for where it comes from; a unit test just needs a number
@@ -9968,7 +10007,7 @@ mod tests {
         let mut bytes = [0u8; FSDSCB as usize];
         bytes[45] = b'x'; // ansbuf[0]
         bytes[128] = b'y'; // typahd[0]
-        let mut block = Scb::from_bytes(&bytes).expect("the right length");
+        let mut block = Scb::<Wg16>::from_bytes(&bytes).expect("the right length");
         block.set_numfld(9);
         assert_eq!(block.numfld(), 9);
         assert_eq!(block.as_bytes()[45], b'x');
@@ -9977,8 +10016,8 @@ mod tests {
 
     #[test]
     fn a_control_block_read_from_the_wrong_number_of_bytes_is_refused() {
-        assert!(Scb::from_bytes(&[0u8; 165]).is_err());
-        assert!(Scb::from_bytes(&[0u8; 167]).is_err());
+        assert!(Scb::<Wg16>::from_bytes(&[0u8; 165]).is_err());
+        assert!(Scb::<Wg16>::from_bytes(&[0u8; 167]).is_err());
     }
 
     #[test]
