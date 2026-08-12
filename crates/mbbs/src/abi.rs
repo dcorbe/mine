@@ -50,28 +50,42 @@
 //! no `Segments` at all -- that cheapness is what makes testing a
 //! prototype's byte layout this cheap.
 //!
-//! # What is still open: `Call<Wg16>` is not yet constructible
+//! # `Call` holds one handle, not two
 //!
-//! `Call<'a, A>` is generic and compiles for any `Abi`. Building one for
-//! `Wg16` specifically -- `cpu: &mut Machine, mem: &mut Segments` sourced
-//! from one live module -- does not, for the reason Task 2's version of this
-//! comment gave: `Machine` owns its `Segments` as a private field
-//! (`crates/mbbs16/src/lib.rs:296`), and Task 1 deliberately kept it that
-//! way, adding only a *delegating* facade so `crates/mbbs`'s existing
-//! `&mut Machine` call sites kept compiling -- it never exposes an
-//! independent `&mut Segments`. So `cpu` and `mem` sourced from one real
-//! `Machine` are still two mutable borrows of the same object. Nothing here
-//! resolves that, because nothing here needs to: this task's scope is the
-//! vocabulary, and no shim constructs a `Call` yet. Whoever flips
-//! `pub type Shim` next has to resolve this first, by either finishing the
-//! `Exec`/`Segments` split `mbbs32::Machine`/`Image` already model (the
-//! "second structural refactor" the original comment declined to force ahead
-//! of evidence), or deciding that the 16-bit `Call` is built from one
-//! `&mut Machine` and reaches `mem` through the facade rather than through an
-//! independently-borrowed field. This module's own tests below sidestep the
-//! question the same way `Cursor`'s did: they exercise `Call` against a
-//! minimal fixture `Abi` whose `Cpu`/`Mem` are trivial types, not against
-//! `Wg16`, because the read methods never touch `cpu` or `mem` at all.
+//! An earlier version of this module gave `Call` both `cpu: &'a mut A::Cpu`
+//! and `mem: &'a mut A::Mem` as fields, following the design's Part 1
+//! sketch. That does not compile for `Wg16`: `Machine` owns its `Segments`
+//! as a private field (`crates/mbbs16/src/lib.rs:296`), and Task 1
+//! deliberately kept it that way, adding only a *delegating* facade so
+//! `crates/mbbs`'s existing `&mut Machine` call sites kept compiling --
+//! never an independent `&mut Segments`. So `cpu` and `mem` sourced from one
+//! real `Machine` were two mutable borrows of the same object, and no amount
+//! of care at the call site fixes that; `Call<Wg16>` was simply
+//! unconstructible.
+//!
+//! **The fix:** [`Abi::mem`] turns "borrow `Mem` independently" into "reborrow
+//! it through `Cpu`" -- `fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem`.
+//! `Call` keeps only `cpu`, and [`Call::mem`] calls `A::mem(self.cpu)` on
+//! demand. A reborrow is legal where a second stored borrow was not, because
+//! it does not outlive the single call that produces it; nothing holds two
+//! `'a`-long borrows of the same object anymore. `Wg16`'s implementation is
+//! `mbbs16::Machine::mem_mut`, the one deliberate exception to Task 1's
+//! "delegate a method, never expose the field" rule -- see that method's own
+//! doc comment for why generic access needs the field itself. `Wg32`'s `Cpu`
+//! will not own its `Mem` the same way `Wg16`'s does, and both still answer
+//! `Abi::mem`, which is the point: the bundling lives in the ABI's `Cpu`
+//! type, not in `Call`'s fields, so it serves both shapes instead of only
+//! one. See the implementation plan's "Step 1b: `Call` holds ONE handle, not
+//! two" for the two options weighed and why this one was chosen over
+//! extracting an `Exec` type from `Machine`.
+//!
+//! This module's tests now build a real `Call<Wg16>` from a live
+//! `mbbs16::Machine` (`the_cursor_and_a_real_machine_agree_on_stzcpys_frame`
+//! below), not only the `FixtureAbi` used to test byte arithmetic cheaply.
+//! The fixture tests stay, for the same reason `Cursor`'s do -- they need no
+//! `Machine` at all -- but they no longer stand in for the one path that
+//! matters: whether `Call<Wg16>` can be built from a machine actually
+//! executing a call.
 
 /// What differs between the ABIs a module can be compiled for.
 pub trait Abi {
@@ -114,6 +128,18 @@ pub trait Abi {
 
     /// Decode a C `long` from exactly [`LONG_WIDTH`](Abi::LONG_WIDTH) bytes.
     fn long_from_bytes(bytes: &[u8]) -> u32;
+
+    /// Reach this ABI's memory through its execution handle.
+    ///
+    /// A reborrow, not a second field: see the module doc comment ("`Call`
+    /// holds one handle, not two"). `Wg16`'s `Cpu` (`mbbs16::Machine`) owns
+    /// its `Mem` (`mbbs16::Segments`) outright, so `cpu: &mut Cpu` and
+    /// `mem: &mut Mem` sourced independently from one live module are two
+    /// mutable borrows of the same object -- it does not compile. `Wg32`'s
+    /// `Cpu` will not own its `Mem` the same way, and both still answer this
+    /// one method, which is what lets `Call` stay generic over the
+    /// difference instead of needing a second field only one ABI can fill.
+    fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem;
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -199,15 +225,14 @@ impl<'a, A: Abi> Cursor<'a, A> {
 /// A host call in progress: what a converted shim will take instead of
 /// `&mut Machine`.
 ///
-/// `cpu` and `mem` are borrowed straight from the caller, for as long as the
-/// call runs -- a shim needs both mutably, the same way it always has. The
-/// argument frame is not borrowed at all: it is copied once into `frame` at
-/// construction. See this module's doc comment ("Why `Call` owns its frame")
-/// for why, and ("What is still open") for why a real `Call<Wg16>` cannot yet
-/// be built from one live `Machine`.
+/// `cpu` is the only borrow `Call` holds. Memory is reached through
+/// [`Call::mem`], a reborrow of `cpu` via [`Abi::mem`] -- see this module's
+/// doc comment ("`Call` holds one handle, not two") for why holding a second
+/// `mem: &'a mut A::Mem` field alongside `cpu` does not compile for `Wg16`.
+/// The argument frame is not borrowed at all: it is copied once into `frame`
+/// at construction. See "Why `Call` owns its frame" for that half.
 pub struct Call<'a, A: Abi> {
     pub cpu: &'a mut A::Cpu,
-    pub mem: &'a mut A::Mem,
     frame: Vec<u8>,
     pos: usize,
 }
@@ -215,14 +240,23 @@ pub struct Call<'a, A: Abi> {
 impl<'a, A: Abi> Call<'a, A> {
     /// Begin a call. `frame` is the outstanding call's raw argument bytes --
     /// for `Wg16`, `Machine::arg_frame()` -- copied here rather than
-    /// borrowed, so nothing below re-touches `mem` to read an argument.
-    pub fn new(cpu: &'a mut A::Cpu, mem: &'a mut A::Mem, frame: &[u8]) -> Self {
+    /// borrowed, so nothing below needs `mem` to read an argument.
+    pub fn new(cpu: &'a mut A::Cpu, frame: &[u8]) -> Self {
         Self {
             cpu,
-            mem,
             frame: frame.to_vec(),
             pos: 0,
         }
+    }
+
+    /// Reach this call's memory: a reborrow of `cpu`, not a second stored
+    /// borrow. Callable any number of times, unlike a field, which is exactly
+    /// what makes it compile where `mem: &'a mut A::Mem` did not -- each call
+    /// reborrows `self.cpu` for a shorter lifetime than `'a` instead of
+    /// holding a second independent `'a` borrow of the same underlying
+    /// object for the whole of `Call`'s life.
+    pub fn mem(&mut self) -> &mut A::Mem {
+        A::mem(self.cpu)
     }
 
     /// Take the next `width` bytes of the owned frame and advance past them.
@@ -356,6 +390,15 @@ impl Abi for Wg16 {
     fn long_from_bytes(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes.try_into().expect("LONG_WIDTH bytes"))
     }
+
+    /// `Machine::mem_mut` is the one deliberate exception Task 1's facade
+    /// left: every other memory method is a narrow delegation (`resolve`,
+    /// `read_cstr`, `write`, ...), but reaching `Segments` generically means
+    /// handing back the field itself, not one more method that reads through
+    /// it. See `Machine::mem_mut`'s own doc comment.
+    fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem {
+        cpu.mem_mut()
+    }
 }
 
 impl From<Ret<Wg16>> for mbbs16::Ret {
@@ -482,15 +525,16 @@ mod tests {
     }
 
     /// A minimal `Abi` for exercising `Call`'s frame reads without a real
-    /// `Machine`/`Segments` pair -- see this module's doc comment ("What is
-    /// still open") for why `Call<Wg16>` cannot yet be built from one. `Ptr`
+    /// `Machine`/`Segments` pair -- see this module's doc comment ("`Call`
+    /// holds one handle, not two") for the real path this sidesteps. `Ptr`
     /// and `Int` are `Wg16`'s own real types, and every width and decode
     /// function delegates straight to `Wg16`'s -- only `Cpu` and `Mem` are
     /// replaced, with types `Call`'s read methods never touch.
     struct FixtureAbi;
 
-    /// `Call`'s `mem` field needs an `Abi::Mem`, which needs `ModuleMem`.
-    /// Never actually called: nothing below allocates.
+    /// `Call::mem` needs an `Abi::Mem`, which needs `ModuleMem`. Never
+    /// actually reached: nothing below allocates or calls `Call::mem`, so
+    /// `FixtureAbi::mem` below never runs either.
     struct FixtureMem;
 
     impl ModuleMem for FixtureMem {
@@ -521,6 +565,13 @@ mod tests {
 
         fn long_from_bytes(bytes: &[u8]) -> u32 {
             Wg16::long_from_bytes(bytes)
+        }
+
+        fn mem(_cpu: &mut Self::Cpu) -> &mut Self::Mem {
+            // `Cpu = ()` owns no `FixtureMem` to reborrow -- there is
+            // nothing this could correctly return, which is fine because
+            // `Call`'s frame-read tests below never call `Call::mem`.
+            unreachable!("Call's read tests never call Call::mem")
         }
     }
 
@@ -555,8 +606,7 @@ mod tests {
         .concat();
 
         let mut cpu = ();
-        let mut mem = FixtureMem;
-        let mut call = Call::<FixtureAbi>::new(&mut cpu, &mut mem, &frame);
+        let mut call = Call::<FixtureAbi>::new(&mut cpu, &frame);
         assert_eq!(call.ptr(), dst, "byte 0: dst, matching the cursor's word 0");
         assert_eq!(call.ptr(), src, "byte 4: src, matching the cursor's word 2");
         assert_eq!(call.int(), num, "byte 8: num, matching the cursor's word 4");
@@ -583,11 +633,54 @@ mod tests {
         .concat();
 
         let mut cpu = ();
-        let mut mem = FixtureMem;
-        let mut call = Call::<FixtureAbi>::new(&mut cpu, &mut mem, &frame);
+        let mut call = Call::<FixtureAbi>::new(&mut cpu, &frame);
         assert_eq!(call.int(), unum, "byte 0: unum, matching the cursor's word 0");
         assert_eq!(call.long(), amt, "byte 2: amt, matching the cursor's word 1");
         assert_eq!(call.int(), real, "byte 6: real, matching the cursor's word 3");
+    }
+
+    /// The proof this task exists for: `Call<Wg16>` built from a *live*
+    /// `mbbs16::Machine` -- not `FixtureAbi`'s trivial `Cpu`/`Mem` -- reading
+    /// a real argument frame `Fixture::call` pushed with genuine 16-bit code
+    /// and a genuine `lcall`. See the module doc comment ("`Call` holds one
+    /// handle, not two") for why this was previously impossible to write at
+    /// all: `Call::new` used to take `mem: &mut A::Mem` as a second field,
+    /// and `Machine` has no way to hand out an independent `&mut Segments`
+    /// alongside `&mut Machine`.
+    ///
+    /// `CHAR *stzcpy(CHAR *dst, CHAR *src, UINT num)` --
+    /// `re/wg33src/INC/GCOMM.H:396-400`, the same prototype the fixture
+    /// tests above already check, so all three agree on where cdecl leaves
+    /// its arguments.
+    #[test]
+    fn call_reads_a_real_machines_frame_for_stzcpy() {
+        let mut f = crate::testing::Fixture::new();
+        let dst = f.buffer(16);
+        let src = f.text("Newhaven");
+
+        f.call(&[dst.offset, dst.selector, src.offset, src.selector, 5]);
+
+        // Copied out before `Call::new` takes `&mut f.machine` -- `Call`
+        // itself does the same copy internally (see "Why `Call` owns its
+        // frame"), this just makes the borrow's end visible at the call
+        // site too.
+        let frame = f.machine.arg_frame().to_vec();
+
+        let mut call = Call::<Wg16>::new(&mut f.machine, &frame);
+        assert_eq!(call.ptr(), dst, "byte 0: dst");
+        assert_eq!(call.ptr(), src, "byte 4: src");
+        assert_eq!(call.int(), 5, "byte 8: num");
+
+        // `Call::mem` is the other half of this task: prove it reborrows the
+        // *same* `Segments` the machine actually runs against, not a
+        // disconnected copy, by resolving `src` through it and reading back
+        // the exact bytes `Fixture::text` wrote before the call.
+        let text = call
+            .mem()
+            .read_cstr(src)
+            .expect("src is what Fixture::text wrote")
+            .to_vec();
+        assert_eq!(text, b"Newhaven");
     }
 
     /// The four `Ret<Wg16>` variants, converted at the 16-bit boundary. Values

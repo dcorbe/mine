@@ -865,6 +865,24 @@ impl Machine {
         self.mem.resolve(ptr, len)
     }
 
+    /// Borrow this module's whole address space, mutably.
+    ///
+    /// Every other memory method on `Machine` is a one-line delegation, kept
+    /// deliberately narrow so `crates/mbbs`'s 247 call sites see the same
+    /// surface Task 1 found -- *not* a reason to expose `mem` itself, since a
+    /// bare field would let a caller replace the whole address space instead
+    /// of just reading through it. This one is different in kind: `Abi::mem`
+    /// (`crates/mbbs/src/abi.rs`) needs to reach `Self::Mem` from `Self::Cpu`
+    /// generically, for any ABI, and `Wg16::Cpu` *is* `Machine` -- there is no
+    /// narrower delegation to write, because the whole point is handing back
+    /// `&mut Segments` itself rather than one more method that reads through
+    /// it. So this is the one deliberate exception to "delegate, don't
+    /// expose": a reborrow of the field the struct's own doc comment names,
+    /// not a second copy of it.
+    pub fn mem_mut(&mut self) -> &mut Segments {
+        &mut self.mem
+    }
+
     /// Read a NUL-terminated string through a far pointer, without the NUL.
     ///
     /// Most of the MajorBBS API is shaped this way. The scan stops at the end
