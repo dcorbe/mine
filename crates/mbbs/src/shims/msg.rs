@@ -40,7 +40,9 @@ use crate::shims::{ShimError, text};
 /// initialisation opens a file, reads it, and calls `rstmbk` to put back what
 /// was current before, which only balances if opening saved it.
 pub fn opnmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    let mut args = super::args(machine);
+    let mcvfil = args.ptr();
+    let named = String::from_utf8_lossy(machine.read_cstr(mcvfil)?).into_owned();
     let name = source_name(&named);
 
     let path = host.find(&name).ok_or_else(|| {
@@ -81,7 +83,8 @@ fn source_name(named: &str) -> String {
 
 /// `void clsmsg(FILE *mb)` -- close a message file.
 pub fn clsmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let cookie = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let cookie = args.ptr();
     let current = current(machine, host)?;
     host.messages
         .close(current, cookie)
@@ -94,7 +97,8 @@ pub fn clsmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `curmbk` is written in module memory, not remembered here. What is
 /// remembered is the value it held, so that `rstmbk` has something to put back.
 pub fn setmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let cookie = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let cookie = args.ptr();
 
     // Checked before anything is changed: a `setmbk` of a block that was never
     // opened would otherwise leave `curmbk` naming nothing and the refusal
@@ -133,7 +137,9 @@ pub fn rstmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// these in globals that live for the run -- so this leaks by design, exactly
 /// as the real one did.
 pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let at = message(machine, host, machine.arg_u16(0))?;
+    let mut args = super::args(machine);
+    let msgnum = args.int();
+    let at = message(machine, host, msgnum)?;
     let text = machine.read_cstr(at)?.to_vec();
 
     let size = u16::try_from(text.len() + 1)
@@ -152,9 +158,10 @@ pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `numopt(HWTLOG,-32767,32767)`. A value outside them is a board someone
 /// configured wrongly, so it is named rather than clamped.
 pub fn numopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
-    let floor = machine.arg_u16(1) as i16;
-    let ceiling = machine.arg_u16(2) as i16;
+    let mut args = super::args(machine);
+    let number = args.int();
+    let floor = args.int() as i16;
+    let ceiling = args.int() as i16;
 
     let text = read(machine, host, number)?;
     let name = option(machine, host, number)?;
@@ -176,7 +183,8 @@ pub fn numopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// Across the 91 recovered `.MSG` files every one of the 267 `B` options ends
 /// in `YES` or `NO`, so anything else is not a spelling this has to guess at.
 pub fn ynopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let number = args.int();
     let text = read(machine, host, number)?;
     match value(&text) {
         v if v.eq_ignore_ascii_case(b"YES") => Ok(Ret::U16(1)),
@@ -191,7 +199,8 @@ pub fn ynopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 
 /// `int chropt(int msgnum)` -- an option that is one character.
 pub fn chropt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let number = args.int();
     let text = read(machine, host, number)?;
     match value(&text) {
         [character, ..] => Ok(Ret::U16(u16::from(*character))),
@@ -212,16 +221,26 @@ pub fn chropt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// The list is varargs and terminated by a null pointer, so how many there are
 /// is only discoverable by walking it.
 pub fn tokopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
+    // The list's length isn't known up front, so every pointer is pulled off
+    // the cursor first -- still sequential, just without the `1 + n * 2` word
+    // arithmetic the cursor now does on its own -- and only then walked to
+    // read each one's string, once the cursor's borrow of `machine` is done.
+    let mut args = super::args(machine);
+    let number = args.int();
+    let mut pointers = Vec::new();
+    loop {
+        let at = args.ptr();
+        if at.selector == 0 && at.offset == 0 {
+            break;
+        }
+        pointers.push(at);
+    }
+
     let text = read(machine, host, number)?;
     let wanted = value(&text).to_ascii_uppercase();
 
     let mut tokens = Vec::new();
-    for n in 0usize.. {
-        let at = machine.arg_far(1 + n * 2);
-        if at.selector == 0 && at.offset == 0 {
-            break;
-        }
+    for at in pointers {
         tokens.push(machine.read_cstr(at)?.to_ascii_uppercase());
     }
 
@@ -245,7 +264,9 @@ pub fn tokopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// from the module. The arguments start at word 1, because `msg` is an `int`
 /// and not the far pointer `prf`'s first argument is.
 pub fn prfmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let at = message(machine, host, machine.arg_u16(0))?;
+    let mut args = super::args(machine);
+    let msgnum = args.int();
+    let at = message(machine, host, msgnum)?;
     let (text, _) = format(machine, at, Args::Call { first: 1 })?;
     text::append(machine, host, &text)?;
     Ok(Ret::Void)
