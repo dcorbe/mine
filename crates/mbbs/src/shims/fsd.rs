@@ -173,8 +173,20 @@ fn answer_string(machine: &Machine, mut at: FarPtr) -> Result<Vec<u8>, ShimError
 /// any of the ways `fsdppc` counts as an error, which the real host answered
 /// with `catastro`; or if the form is too big for the buffer it must fit in.
 pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
-    let amode = machine.arg_u16(3) as i16;
+    // `int fsdroom(int tmpmsg, char *fldspc, int amode)` -- FSDBBS.H:242-245.
+    //
+    // One of this file's two genuine hoists (the other is `fsdxan`, below):
+    // the original reads word 0, then word 3, then word 1 (once
+    // `read_cstr(arg_far(1))` runs further down, and again at `set_fldspc`
+    // below that). Reading all three up front, in frame order (0, 1, 3), is
+    // behaviour-preserving because `arg_u16`/`arg_far` are infallible -- they
+    // pull bytes off the frame and cannot fail or have an effect. Nothing
+    // that *can* fail or branch moved: the `amode` validation immediately
+    // below still runs before `fsd_template` is ever consulted.
+    let mut args = super::args(machine);
+    let number = args.int();
+    let fldspc = args.ptr();
+    let amode = args.int() as i16;
 
     if amode != 0 && amode != 1 && amode != -1 {
         return Err(ShimError::Failed(format!(
@@ -189,7 +201,7 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         .pointer(machine, "curmbk")
         .map_err(|e| ShimError::Failed(format!("fsdroom: {e}")))?;
     let template = fsd_template(machine, host, curmbk, number, amode)?;
-    let spec = machine.read_cstr(machine.arg_far(1))?.to_vec();
+    let spec = machine.read_cstr(fldspc)?.to_vec();
 
     // `maxfld`, `FSDBBS.C:130`: the field array and the punctuation array share
     // the output buffer, and the punctuation array gets its MBPMAX first.
@@ -267,7 +279,7 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     if let Ok(chan) = host.current_channel(machine) {
         let at = control_block(machine, host, chan)?;
         let mut scb = read_block(machine, at)?;
-        scb.set_fldspc(machine.arg_far(1));
+        scb.set_fldspc(fldspc);
         scb.set_numfld(form.fields.len() as u16);
         scb.set_numtpl(form.in_template as u16);
         scb.set_mbleng(form.punctuation.len() as u16);
@@ -320,9 +332,11 @@ pub fn fsdroom(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// `fsdroom` told it, which the real host answered with `catastro`; or if the
 /// buffer or the answer string will not resolve.
 pub fn fsdapr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let buffer = machine.arg_far(0);
-    let length = machine.arg_u16(2);
-    let defaults = machine.arg_far(3);
+    // `void fsdapr(char *sesbuf, int sbleng, char *answers)` -- FSDBBS.H:249-252.
+    let mut args = super::args(machine);
+    let buffer = args.ptr();
+    let length = args.int();
+    let defaults = args.ptr();
 
     let chan = host.current_channel(machine)?;
     let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
@@ -457,7 +471,9 @@ fn answer_offset(record: &[u8; fsd::FSDFLD as usize]) -> u16 {
 ///
 /// If no session has been prepared, or `fldi` is not a field of it.
 pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let field = machine.arg_u16(0);
+    // `char *fsdnan(int fldi)` -- FSD.H:639-641.
+    let mut args = super::args(machine);
+    let field = args.int();
     let (block, _) = prepared(machine, host, "fsdnan")?;
     let record = field_record(machine, &block, field, "fsdnan")?;
     Ok(Ret::Far(offset(
@@ -492,7 +508,9 @@ pub fn fsdnan(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// If no session has been prepared, `fldi` is not a field of it, or the
 /// rewritten answer string would not fit the room `fsdroom` reserved.
 pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let number = machine.arg_u16(0);
+    // `int fsdord(int fldi)` -- FSD.H:657-659.
+    let mut args = super::args(machine);
+    let number = args.int();
     let (mut block, at) = prepared(machine, host, "fsdord")?;
     let record = field_record(machine, &block, number, "fsdord")?;
     let field = fsd::Field::from_record(&record);
@@ -609,8 +627,19 @@ pub fn fsdord(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// If the answer string runs to the end of its segment without the empty entry
 /// that ends it, or either pointer will not resolve.
 pub fn fsdxan(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let name = machine.read_cstr(machine.arg_far(2))?.to_vec();
-    let mut at = machine.arg_far(0);
+    // `char *fsdxan(char *answer, char *name)` -- FSD.H:596-599.
+    //
+    // This file's other genuine hoist: the original reads `name` (word 2)
+    // before `answer` (word 0), out of frame order. Reading both up front, in
+    // frame order (0, 2), is behaviour-preserving for the same reason as
+    // `fsdroom`'s hoist above -- `arg_far` is infallible, so which of the two
+    // pointers is read first is not observable. Only `read_cstr(name)`,
+    // below, can fail, and it still runs exactly once, in the same place
+    // relative to everything else.
+    let mut args = super::args(machine);
+    let mut at = args.ptr();
+    let name = args.ptr();
+    let name = machine.read_cstr(name)?.to_vec();
     loop {
         let entry = machine.read_cstr(at)?;
         if entry.is_empty() {
@@ -755,8 +784,10 @@ fn ascii_template(
 /// If no channel is current, if no form has been sized for it, or if the
 /// template pointer it was handed is not addressable.
 pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    // `void fsdbkg(char *templt)` -- FSDBBS.H:258-259.
+    let mut args = super::args(machine);
+    let templt = args.ptr();
     let chan = host.current_channel(machine)?;
-    let templt = machine.arg_far(0);
     let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdbkg: no template has been compiled for this channel; FSDBBS.H:245 has \
@@ -809,8 +840,11 @@ pub fn fsdbkg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// If no session has been prepared, or `fldno` is not a field of it.
 pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let fldno = machine.arg_u16(0);
-    let answer = machine.read_cstr(machine.arg_far(1))?.to_vec();
+    // `int vfyadn(int fldno, char *answer)` -- FSD.H:584-587.
+    let mut args = super::args(machine);
+    let fldno = args.int();
+    let answer = args.ptr();
+    let answer = machine.read_cstr(answer)?.to_vec();
 
     let (mut block, at) = prepared(machine, host, "vfyadn")?;
     let record = field_record(machine, &block, fldno, "vfyadn")?;
@@ -992,8 +1026,13 @@ fn live_form(
 /// If no session has been prepared (`fsdroom`/`fsdapr` first), or the
 /// recorded `amode` is `1`.
 pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let fldvfy = machine.arg_far(0);
-    let whndun = machine.arg_far(2);
+    // `void fsdego(int (*fldvfy)(int fldno, char *answer), void (*whndun)(short save))`
+    // -- FSDBBS.H:262-267. Both are far pointers to module code (4 bytes
+    // each, `Cursor::ptr()`) -- this shim only stores them, so their own
+    // callback signatures don't matter to how they're read.
+    let mut args = super::args(machine);
+    let fldvfy = args.ptr();
+    let whndun = args.ptr();
     let chan = host.current_channel(machine)?;
 
     let (mut block, at) = prepared(machine, host, "fsdego")?;
