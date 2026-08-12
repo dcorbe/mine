@@ -287,10 +287,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // unblocked once `shims::text::parsin`/`Host::get_input` went generic.
     (MAJORBBS, "begin_polling", user::begin_polling_wg16, Cleans::Caller),
     (MAJORBBS, "stop_polling", user::stop_polling_wg16, Cleans::Caller),
-    // `_wg16`: seven of these nine are generic now (see `shims::fsd`'s own
-    // doc comment); `fsdego` and `vfyadn` stay concrete, both blocked on
-    // `crate::fsd::Scb<Wg16>`-only entry-engine routines (`fsdlin`/`fsdent`/
-    // `vfyadn`) in a different, unconverted file.
+    // `_wg16`: all nine of these are generic now (see `shims::fsd`'s own
+    // doc comment); `fsdego` and `vfyadn` were the last two, unblocked once
+    // `crate::fsd`'s entry engine (`fsdlin`/`fsdent`/`vfyadn`) went generic
+    // over `Scb<A>` in its own file.
     (MAJORBBS, "fsdroom", fsd::fsdroom_wg16, Cleans::Caller),
     (MAJORBBS, "fsdapr", fsd::fsdapr_wg16, Cleans::Caller),
     (MAJORBBS, "fsdnan", fsd::fsdnan_wg16, Cleans::Caller),
@@ -298,8 +298,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "fsdxan", fsd::fsdxan_wg16, Cleans::Caller),
     (MAJORBBS, "fsdrft", fsd::fsdrft_wg16, Cleans::Caller),
     (MAJORBBS, "fsdbkg", fsd::fsdbkg_wg16, Cleans::Caller),
-    (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
-    (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
+    (MAJORBBS, "fsdego", fsd::fsdego_wg16, Cleans::Caller),
+    (MAJORBBS, "vfyadn", fsd::vfyadn_wg16, Cleans::Caller),
     (MAJORBBS, "dclvda", system::dclvda_wg16, Cleans::Caller),
     (
         MAJORBBS,

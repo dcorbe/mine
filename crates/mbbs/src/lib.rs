@@ -1338,14 +1338,25 @@ impl<A: Abi> Host<A> {
     /// way the module itself would: out of the `usrnum` global -- against
     /// memory directly rather than a whole `Machine`.
     ///
-    /// The generic core [`Host::current_channel`]'s `Wg16` facade delegates
-    /// into -- same split, same reason. Added for Task 5's `shims::text`
-    /// conversion (`channel_ansi`, which `append` needs).
+    /// Every FSD shim needs to know which channel it is serving, and none of
+    /// them are handed a [`Chan`] argument -- the module's own call
+    /// signatures have no room for one (`fsdroom(msgno, fldspc, amode)`, four
+    /// words, matches `FSDBBS.H:60-67` and `GALP&Q.C:1273`). This is how they
+    /// ask.
+    ///
+    /// No `Wg16` facade: the last `&Machine`-taking caller (`fsdego`) went
+    /// generic in the ABI abstraction's fifth task, so every remaining
+    /// caller already holds `&A::Mem` rather than a whole `Machine`.
     ///
     /// # Errors
     ///
-    /// If `usrnum` does not name a channel of this host -- see
-    /// [`Host::current_channel`]'s own doc comment.
+    /// If `usrnum` does not name a channel of this host -- in particular, if
+    /// nobody is current at all. `MAJORBBS.C:882` sets `usrnum=-1` before any
+    /// module's init runs, and that value survives until the first
+    /// [`Host::point_curusr`], which is exactly the state a module's own
+    /// initialisation runs in. Most callers of this may propagate the error;
+    /// [`crate::shims::fsd::fsdroom`] is the one exception, because it is the
+    /// one FSD routine measured calling in from there.
     pub(crate) fn current_channel_mem(&self, mem: &A::Mem) -> Result<Chan, ShimError> {
         let uno = self
             .globals()
@@ -1843,28 +1854,6 @@ impl Host<Wg16> {
     /// Reborrows into [`Host::point_curusr_mem`] through [`Machine::mem_mut`].
     pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: Chan) -> Result<(), ShimError> {
         self.point_curusr_mem(machine.mem_mut(), uno)
-    }
-
-    /// The channel [`Host::point_curusr`] last made current, read back the
-    /// way the module itself would: out of the `usrnum` global.
-    ///
-    /// Every FSD shim needs to know which channel it is serving, and none of
-    /// them are handed a [`Chan`] argument -- the module's own call
-    /// signatures have no room for one (`fsdroom(msgno, fldspc, amode)`, four
-    /// words, matches `FSDBBS.H:60-67` and `GALP&Q.C:1273`). This is how they
-    /// ask.
-    ///
-    /// # Errors
-    ///
-    /// If `usrnum` does not name a channel of this host -- in particular, if
-    /// nobody is current at all. `MAJORBBS.C:882` sets `usrnum=-1` before any
-    /// module's init runs, and that value survives until the first
-    /// [`Host::point_curusr`], which is exactly the state a module's own
-    /// initialisation runs in. Most callers of this may propagate the error;
-    /// [`crate::shims::fsd::fsdroom`] is the one exception, because it is the
-    /// one FSD routine measured calling in from there.
-    pub(crate) fn current_channel(&self, machine: &Machine) -> Result<Chan, ShimError> {
-        self.current_channel_mem(machine.mem())
     }
 
     /// Plant a connecting user's account record and channel state, and make
@@ -4178,7 +4167,7 @@ mod tests {
             ],
         )
         .expect("prepared");
-        f.invoke(crate::shims::fsd::fsdego, &[0, 0, 0, 0])
+        f.invoke(crate::shims::fsd::fsdego_wg16, &[0, 0, 0, 0])
             .expect("handed the channel to the FSD");
 
         // Enough to fill part of a field, deliberately with no `\r` --
