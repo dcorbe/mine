@@ -44,7 +44,7 @@ use mbbs16::{FarPtr, Machine};
 
 pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
-pub use ops::{Delivery, Op, OpError, Step};
+pub use ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
 pub use records::{Record, Records};
 pub use stat::{deliver, Stat, StatKey};
 
@@ -547,6 +547,10 @@ pub enum Cursor {
 
 /// One open Btrieve file.
 pub struct Block {
+    /// This block's identity for [`ops::LockTable`] -- see [`ops::BlockId`]'s
+    /// own doc comment for why it is not the module's `struct btvblk *`.
+    id: ops::BlockId,
+
     /// What the module named it, for error messages.
     name: String,
 
@@ -1526,6 +1530,11 @@ pub struct Btrieve {
     /// [`Self::begin`]/[`Self::open`] to set that per-block flag, and
     /// [`Self::end`]/[`Self::abort`] to clear it everywhere.
     transaction: bool,
+
+    /// This session's Btrieve locks -- see [`ops::LockTable`]'s own doc
+    /// comment for why this lives here (on the session) rather than on any
+    /// one [`Block`].
+    locks: ops::LockTable,
 }
 
 impl Default for Btrieve {
@@ -1540,6 +1549,7 @@ impl Default for Btrieve {
             stack: [FarPtr::NULL; BBSTSZ],
             mode: 0,
             transaction: false,
+            locks: ops::LockTable::default(),
         }
     }
 }
@@ -1625,6 +1635,7 @@ impl Btrieve {
         machine.write(block, &image).map_err(|e| e.to_string())?;
 
         self.open.push(Block {
+            id: ops::BlockId::fresh(),
             name: name.to_owned(),
             path: path.to_owned(),
             geometry,
@@ -2003,12 +2014,61 @@ impl Btrieve {
         }
 
         let block = self.open.remove(index);
+        // Measured (`docs/lock-oracle-answer.md`): "closing a file releases
+        // every lock it held, immediately." Every lock this session took
+        // while this block was current names it by `BlockId`, and that id
+        // dies with `block` -- release explicitly rather than let the
+        // entries become unreachable, so a later `Block` that happens to
+        // reuse the same name never has to wonder whether a stale entry
+        // could apply to it (it cannot: `BlockId`s never repeat, but a lock
+        // this close forgot to release would sit in the table forever
+        // regardless).
+        self.locks.release_all_for(block.id());
         heap.free(block.key).map_err(fail)?;
         heap.free(block.data).map_err(fail)?;
         heap.free(filnam).map_err(fail)?;
         heap.free(block.block).map_err(fail)?;
 
         Ok(true)
+    }
+
+    /// Take `lock` at `at`'s current position, once a positioning call has
+    /// already found one there. `lock == 0` is always `Ok(())`. The session
+    /// half of [`ops::Block::take_lock`] -- callers only have `at`, a module
+    /// pointer, not a `&mut Block` and a `&mut ops::LockTable` at once, so
+    /// this resolves both from `self` and hands them to the `Block` method
+    /// that knows what to do with them.
+    ///
+    /// # Errors
+    /// If `at` names no open file, or [`ops::OpError`] (mode mixing, or the
+    /// defensive not-positioned case -- see [`ops::Block::take_lock`]).
+    pub fn take_lock(&mut self, at: FarPtr, lock: i16) -> Result<(), String> {
+        let index = self.find(at)?;
+        self.open[index]
+            .take_lock(lock, &mut self.locks)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The raw lock type this session holds at `at`'s current position, if
+    /// any -- test/inspection surface for [`Self::take_lock`].
+    ///
+    /// # Errors
+    /// If `at` names no open file.
+    pub fn lock_at_current(&self, at: FarPtr) -> Result<Option<i16>, String> {
+        let index = self.find(at)?;
+        Ok(self.open[index].lock_at_current(&self.locks))
+    }
+
+    /// Release the lock this session holds at `at`'s current position --
+    /// Btrieve op 27, Unlock, with `keynum = 0` and no data. Always
+    /// succeeds; see [`ops::Block::unlock`].
+    ///
+    /// # Errors
+    /// If `at` names no open file.
+    pub fn unlock_current(&mut self, at: FarPtr) -> Result<(), String> {
+        let index = self.find(at)?;
+        self.open[index].unlock(&mut self.locks);
+        Ok(())
     }
 
     fn find(&self, at: FarPtr) -> Result<usize, String> {
@@ -2377,6 +2437,7 @@ mod tests {
             chain: None,
         }];
         Block {
+            id: ops::BlockId::fresh(),
             name: "SCRATCH.DAT".to_owned(),
             path,
             geometry,
@@ -2837,6 +2898,7 @@ mod tests {
             chain: None,
         }];
         Block {
+            id: ops::BlockId::fresh(),
             name: "VARIABLE.DAT".to_owned(),
             path,
             geometry,
@@ -3082,6 +3144,7 @@ mod tests {
             chain: None,
         }];
         Block {
+            id: ops::BlockId::fresh(),
             name: "INDEXED.DAT".to_owned(),
             path,
             geometry,
@@ -3573,6 +3636,7 @@ mod tests {
             },
         ];
         Block {
+            id: ops::BlockId::fresh(),
             name: "TWOKEY.DAT".to_owned(),
             path,
             geometry,
@@ -3804,6 +3868,53 @@ mod tests {
             .close(&mut machine, &mut heap, at)
             .expect("a second close of the same pointer must be a quiet no-op");
         assert!(!second, "nothing was open the second time");
+    }
+
+    /// Measured (`docs/lock-oracle-answer.md`): "closing a file releases
+    /// every lock it held, immediately." Goes through the real `open`/
+    /// `close`/`take_lock` methods rather than poking `LockTable` directly,
+    /// so a mutation that closed a file without releasing its locks is
+    /// caught even though `close`'s own return value does not change.
+    #[test]
+    fn closing_a_file_releases_every_lock_it_held() {
+        let mut machine = Machine::new().expect("a 16-bit machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let mut btrieve = Btrieve::default();
+
+        let path = seed_indexed(&crate::testing::scratch("btrieve-close-releases-locks"));
+        let at = open_indexed(&mut machine, &mut heap, &mut btrieve, path);
+        btrieve
+            .block_mut(at)
+            .expect("open")
+            .insert(&record(1))
+            .expect("insert");
+        assert!(
+            btrieve
+                .block_mut(at)
+                .expect("open")
+                .query(0, Op::Equal, &1u16.to_le_bytes())
+                .expect("queries"),
+            "positions on the record just inserted"
+        );
+        btrieve.take_lock(at, 100).expect("takes a single lock");
+
+        let id = btrieve.block(at).expect("open").id();
+        let position = btrieve.block(at).expect("open").current().expect("positioned").position;
+        assert_eq!(
+            btrieve.locks.get(id, position),
+            Some(100),
+            "held before close"
+        );
+
+        btrieve
+            .close(&mut machine, &mut heap, at)
+            .expect("closes");
+        assert_eq!(
+            btrieve.locks.get(id, position),
+            None,
+            "released the moment the file closed"
+        );
+        assert!(btrieve.locks.is_empty(), "and nothing else was left behind");
     }
 
     #[test]
@@ -4087,6 +4198,7 @@ mod tests {
             stack: [FarPtr::NULL; BBSTSZ],
             mode: 0,
             transaction: false,
+            locks: ops::LockTable::default(),
         }
     }
 

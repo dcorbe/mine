@@ -63,14 +63,75 @@
 //! Btrieve's own status 22, which `dfaPosError` (`:881`) treats as success
 //! with a truncated answer, not a failure.
 //!
-//! # Locking is out of scope, but the seam is here
+//! # Locking
+//!
+//! `docs/plans/2026-08-12-btrieve-finish.md`'s Task 5 originally answered
+//! "do not build this" -- 191 call sites in `WCCMMUD.DLL`, all pushing a
+//! literal zero `loktyp`, measured two ways. **That answer was reversed by
+//! the repository owner**: "we're not going to skip over implementing
+//! functionality because wccmmud won't need it." A routine with no
+//! counterpart at all (the ABI difference case) legitimately gets an empty
+//! slot; a routine that exists and is merely unexercised by the one module
+//! under test does not. Locks are the second kind, so this module tracks
+//! them for real. `docs/lock-oracle-answer.md` is the measurement this is
+//! built against; nothing here goes beyond what it records.
 //!
 //! Every operation that takes a lock in real Btrieve takes one here too, as
-//! a plain `i16` -- `loktyp`, exactly as `shims/btrieve.rs`'s `unlocked`
-//! reads it. This host has no locking to give a nonzero one, and [`unlocked`]
-//! refuses every value but zero, matching that function's policy exactly.
+//! a plain `i16` -- `loktyp`, exactly as `shims/btrieve.rs` reads it off the
+//! module's stack. [`LockTable`] is the state machine
+//! `docs/lock-oracle-answer.md` measured: a **single**-record lock (`loktyp`
+//! under 300 -- `SLWTBV`/`SLNWBV`, `DFAAPI.H:40-41`, both 100 and 200)
+//! auto-releases when the same session takes another single-record lock; a
+//! **multiple**-record lock (300 or 400, `MLWTBV`/`MLNWBV`, `:42-43`)
+//! accumulates; the two modes cannot be mixed in one session
+//! ([`OpError::LockModeMixed`], real status 93); re-locking a record already
+//! held is a harmless no-op; and a position operation that finds nothing
+//! takes no lock at all, because [`Block::take_lock`] only ever runs after
+//! [`Block::query`]/[`Block::step`]'s own positioning has already succeeded.
 //! Query alone has no lock parameter at either layer: `dfaQuery`'s own
 //! signature has none, and neither does `qrybtv`'s.
+//!
+//! **The wait/no-wait half of `loktyp` is deliberately not decoded.** A wait
+//! bias only has anything to wait *for* when a second client is already
+//! holding a conflicting lock, and single vs. multiple is the only half of
+//! `loktyp` this table's own state depends on -- see [`LockMode::of`].
+//!
+//! ## Cross-client conflict (statuses 84/85) is deferred, not architecturally absent
+//!
+//! This host has exactly one Btrieve client today, so no lock this table
+//! records can ever be contended, and nothing here implements the refusal a
+//! second client's conflicting lock would produce. **This is a deferral with
+//! a stated condition, not a case that cannot arise**: this project is
+//! heading toward a single process serving both a 16-bit and a 32-bit
+//! module, and whether that lands as one `Host` (still one Btrieve client,
+//! conflict still impossible) or two `Host`s (two clients, conflict
+//! reachable) is an open design question. [`LockTable`]'s entries are keyed
+//! by [`BlockId`] and position only, with **no owner field**, because there
+//! is exactly one owner and it does not need naming -- but the shape is
+//! chosen so that adding one is additive: a second client's arrival would
+//! give [`Held`] an `owner` field and every [`LockTable`] method an owner
+//! parameter alongside `block`/`position`, without changing what is tracked
+//! or how the single/multiple/mode-mixing rules above work. Building 84/85
+//! before that owner exists would be conflict-detection code with nothing to
+//! conflict against -- untestable by construction, which is exactly what
+//! this task was told not to write.
+//!
+//! ## The oracle's transaction/wait-lock deadlock is not reproduced, and cannot be
+//!
+//! `docs/lock-oracle-answer.md` records that genuine Btrieve 6.15 hangs
+//! (confirmed blocked past 15 seconds, twice) when a single-record **wait**
+//! lock is taken inside the session's own transaction. That is a measured
+//! defect in the real engine's wait implementation, not a contract to
+//! honour: a host that reproduced it would be a denial of service with a
+//! citation, and this crate already refuses other things the real engine
+//! got wrong rather than copy them (`here_for`'s doc comment is the other
+//! example on this file). The deeper reason it is not reproduced here is
+//! structural rather than a judgement call: **this table never waits at
+//! all**. Waiting is only meaningful against a second client's conflicting
+//! lock, this host has no second client, and the wait/no-wait bias is not
+//! even decoded (above) -- so [`LockTable::acquire`] always returns
+//! immediately, transaction or not, and the precondition for the oracle's
+//! hang never arises. There is no case to special-case.
 
 use std::fmt;
 
@@ -203,8 +264,11 @@ pub enum OpError {
     /// refuses the same condition before reaching the engine at all.
     NoSuchKey(u16),
 
-    /// A lock type this host has no locking to give. See [`unlocked`].
-    LockRefused(i16),
+    /// A lock was requested while the session already held a lock of the
+    /// other mode -- real Btrieve status 93. See [`LockTable::acquire`].
+    /// **No lock is taken when this is returned**, matching the oracle:
+    /// "release the single lock first and the identical call succeeds."
+    LockModeMixed { held: LockMode, wanted: LockMode },
 
     /// [`Block::get_position`], [`Op::Previous`], or [`Step::Next`]/
     /// [`Step::Previous`], with nothing having positioned the file at all
@@ -263,9 +327,11 @@ impl fmt::Display for OpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoSuchKey(key) => write!(f, "no such key: {key}"),
-            Self::LockRefused(lock) => write!(
+            Self::LockModeMixed { held, wanted } => write!(
                 f,
-                "lock type {lock} refused -- this host has no locking to give it"
+                "a {wanted} lock was asked for, but this session already holds a \
+                 {held} lock -- the two modes cannot be mixed in one session \
+                 (real Btrieve status 93)"
             ),
             Self::NotPositioned => write!(f, "the file is not positioned"),
             Self::DifferentKey { current, wanted } => write!(
@@ -294,20 +360,179 @@ impl From<BtvError> for OpError {
     }
 }
 
-/// Refuse a lock type this host cannot honour.
+/// Identifies one open [`Block`] for [`LockTable`], independent of any ABI.
 ///
-/// Exactly `shims/btrieve.rs`'s `unlocked` (`:1668`)'s policy, reproduced
-/// here rather than shared with it: that file is frozen (see `btrieve.rs`'s
-/// top-of-file note), so this is a second copy by necessity, not by choice.
-/// **This is the seam Task 5 (`docs/plans/2026-08-12-btrieve-finish.md`)
-/// widens**, not a decision of its own -- once a lock is tracked rather
-/// than refused, every caller here already threads a plain `i16` through, so
-/// nothing above this function has to change shape to hold real lock state.
-fn unlocked(lock: i16) -> Result<(), OpError> {
-    if lock == 0 {
-        return Ok(());
+/// **Not** the module's `struct btvblk *` (`FarPtr`) -- this module avoids
+/// that type where it can (see its own top-of-file note), and a lock table
+/// keyed by module memory would tie this ABI-independent type back to one
+/// ABI's pointer shape for no reason: nothing here needs to resolve a
+/// `BlockId` back into module memory, only to tell two [`Block`]s apart and
+/// to recognise the same one again. [`Self::fresh`] hands out ordinals from
+/// a single process-wide counter, so two [`Block`]s -- even two opened for
+/// files of the same name in two different tests -- never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(u64);
+
+impl BlockId {
+    /// A `BlockId` no other `Block`, anywhere in this process, already has.
+    pub fn fresh() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
-    Err(OpError::LockRefused(lock))
+}
+
+/// Single or multiple, decoded from the raw `loktyp` [`Block::get`]/
+/// [`Block::step`]/[`Block::acquire_absolute`] were handed -- see
+/// [`Self::of`] for the exact rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// `loktyp` under 300: `SLWTBV` (100) or `SLNWBV` (200),
+    /// `DFAAPI.H:40-41`. At most one held at a time -- taking a second
+    /// auto-releases the first.
+    Single,
+    /// `loktyp` 300 or more: `MLWTBV` (300) or `MLNWBV` (400), `:42-43`.
+    /// Accumulates -- every one taken stays held.
+    Multiple,
+}
+
+impl LockMode {
+    /// Real Btrieve's four lock-type constants split into two 100-wide
+    /// bands, single below 300 and multiple at or above it -- reproduced as
+    /// a threshold rather than an exact match against the four so that a
+    /// `loktyp` this host has never seen still decodes consistently rather
+    /// than doing something undefined. Any nonzero `loktyp` reaches this;
+    /// `0` ("no lock") never does -- see [`LockTable::acquire`].
+    pub fn of(raw: i16) -> Self {
+        if raw >= 300 { Self::Multiple } else { Self::Single }
+    }
+}
+
+impl fmt::Display for LockMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Single => "single-record",
+            Self::Multiple => "multiple-record",
+        })
+    }
+}
+
+/// One lock this session holds: which [`Block`], which record (by physical
+/// position, the same identity [`Block::get_position`] reports), and the
+/// raw `loktyp` the module asked for -- kept verbatim rather than only the
+/// decoded [`LockMode`] so a caller inspecting a held lock (a future
+/// `dfaWasLocked`, or a test) can see exactly what was asked for, not only
+/// which half of it this table's own state machine cared about.
+///
+/// **No owner field.** See [`LockTable`]'s own doc comment for what adding
+/// one would mean and why it is not here yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    block: BlockId,
+    position: u32,
+    raw: i16,
+}
+
+/// This session's Btrieve locks -- one table, shared by every open
+/// [`Block`], because the mode-mixing rule below is a property of the
+/// *session*, not of any one file: `docs/lock-oracle-answer.md` says "the
+/// same session still holds an outstanding single lock", not "the same
+/// file". A `Block` cannot enforce that against a sibling it has no
+/// reference to, so this lives beside the blocks (on `Btrieve`,
+/// `crates/mbbs/src/btrieve.rs`) rather than inside one.
+///
+/// **No owner field, by design, for exactly one reason: there is exactly
+/// one owner.** This host is single-process and single-threaded by
+/// construction, with one Btrieve client. See this module's own "Cross-
+/// client conflict" doc section for the reachability condition under which
+/// that stops being true, and for what adding an owner would mean: [`Held`]
+/// gains an `owner` field, every method below gains an owner parameter, and
+/// the single/multiple/mode-mixing rules are unchanged -- they would simply
+/// be scoped per owner instead of over the one implicit owner this table has
+/// today.
+#[derive(Debug, Default)]
+pub struct LockTable {
+    held: Vec<Held>,
+}
+
+impl LockTable {
+    /// Take `raw` at `block`'s `position`, once a positioning call has
+    /// already found a record there. `raw == 0` -- "no lock was asked for"
+    /// -- is always `Ok(())` and changes nothing.
+    ///
+    /// In order, each measured in `docs/lock-oracle-answer.md`:
+    ///
+    /// 1. **Re-locking a record already held is a no-op**, regardless of
+    ///    mode: "status 0, harmless." Checked first so the record you
+    ///    already hold can never be refused by the mode-mixing rule below,
+    ///    even on the (unmeasured) case of asking for it again in the other
+    ///    mode -- the conservative reading of "the record you already hold
+    ///    cannot un-hold itself".
+    /// 2. **Mode-mixing is refused.** If this session holds any lock at all,
+    ///    a `raw` that decodes to the *other* [`LockMode`] is
+    ///    [`OpError::LockModeMixed`], and nothing is recorded.
+    /// 3. **A single lock replaces whatever single lock this session
+    ///    already held** -- `self.held` can only ever contain locks of one
+    ///    mode at a time (rule 2 forbids mixing), so when the mode is
+    ///    [`LockMode::Single`] every existing entry is this session's one
+    ///    prior single lock, and clearing before pushing is the auto-release
+    ///    rule.
+    /// 4. **A multiple lock is added** without disturbing what is already
+    ///    held.
+    ///
+    /// # Errors
+    /// [`OpError::LockModeMixed`].
+    pub fn acquire(&mut self, block: BlockId, position: u32, raw: i16) -> Result<(), OpError> {
+        if raw == 0 {
+            return Ok(());
+        }
+        let mode = LockMode::of(raw);
+
+        if self.held.iter().any(|h| h.block == block && h.position == position) {
+            return Ok(());
+        }
+
+        if let Some(current) = self.held.first().map(|h| LockMode::of(h.raw))
+            && current != mode
+        {
+            return Err(OpError::LockModeMixed { held: current, wanted: mode });
+        }
+
+        if mode == LockMode::Single {
+            self.held.clear();
+        }
+        self.held.push(Held { block, position, raw });
+        Ok(())
+    }
+
+    /// Release the lock this session holds on `block` at `position`, if any.
+    /// Never an error -- releasing a record that was not locked is what
+    /// [`Block::unlock`] measured as status 0.
+    pub fn release_at(&mut self, block: BlockId, position: u32) {
+        self.held.retain(|h| !(h.block == block && h.position == position));
+    }
+
+    /// Release every lock this session holds on `block`, as
+    /// [`crate::btrieve::Btrieve::close`] does for a file going out of this
+    /// host's reach -- measured: "closing a file releases every lock it
+    /// held, immediately."
+    pub fn release_all_for(&mut self, block: BlockId) {
+        self.held.retain(|h| h.block != block);
+    }
+
+    /// The raw `loktyp` this session holds on `block` at `position`, or
+    /// `None` -- test/inspection surface, not a Btrieve operation of its
+    /// own.
+    pub fn get(&self, block: BlockId, position: u32) -> Option<i16> {
+        self.held
+            .iter()
+            .find(|h| h.block == block && h.position == position)
+            .map(|h| h.raw)
+    }
+
+    /// Whether this session holds no locks at all.
+    pub fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
 }
 
 /// Where `key`'s order the file's current position sits, for [`Op::Next`]/
@@ -459,16 +684,28 @@ impl Block {
     /// Btrieve ops 5-13, `dfaGetLock`/`dfaAcqLock` -- the same nine
     /// comparisons as [`Block::query`], and the record is delivered.
     ///
-    /// `lock` is refused unless zero -- see [`unlocked`].
+    /// `lock` is taken at the found record's position -- see
+    /// [`Block::take_lock`] -- only once [`Block::query`] has already
+    /// succeeded, so a `Get` that finds nothing takes no lock: measured
+    /// ("an operation that fails takes no lock: a Get Equal that finds
+    /// nothing leaves no lock behind").
     ///
     /// # Errors
     ///
-    /// Everything [`Block::query`] can return, plus [`OpError::LockRefused`].
-    pub fn get(&mut self, key: u16, op: Op, value: &[u8], lock: i16) -> Result<Option<Delivery>, OpError> {
-        unlocked(lock)?;
+    /// Everything [`Block::query`] can return, plus [`OpError::
+    /// LockModeMixed`].
+    pub fn get(
+        &mut self,
+        key: u16,
+        op: Op,
+        value: &[u8],
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Option<Delivery>, OpError> {
         if !self.query(key, op, value)? {
             return Ok(None);
         }
+        self.take_lock(lock, locks)?;
         Ok(Some(self.deliver_current(Some(key))?))
     }
 
@@ -509,17 +746,21 @@ impl Block {
     /// after tag 2, not key 0's (which would be tag 3). Real Btrieve status
     /// 0 both times.
     ///
+    /// `lock` is taken at `position` once the record is found, the same
+    /// order [`Block::get`] takes one -- naming nothing takes no lock,
+    /// matching "an operation that fails takes no lock".
+    ///
     /// # Errors
     ///
-    /// [`OpError::LockRefused`] for a nonzero `lock`. [`OpError::NoSuchKey`]
-    /// if the file has no such key. If the records cannot be read.
+    /// [`OpError::LockModeMixed`]. [`OpError::NoSuchKey`] if the file has no
+    /// such key. If the records cannot be read.
     pub fn acquire_absolute(
         &mut self,
         position: u32,
         key: u16,
         lock: i16,
+        locks: &mut LockTable,
     ) -> Result<Option<Delivery>, OpError> {
-        unlocked(lock)?;
         if usize::from(key) >= self.keys().len() {
             return Err(OpError::NoSuchKey(key));
         }
@@ -540,6 +781,7 @@ impl Block {
             None => Cursor::Physical { at: physical },
         };
         self.seek_to(cursor);
+        self.take_lock(lock, locks)?;
         Ok(Some(self.deliver_current(Some(key))?))
     }
 
@@ -549,11 +791,12 @@ impl Block {
     /// Ordered` arm (Task 12's fix, oracle-validated -- see
     /// [`physical_of`]'s doc comment) is reproduced verbatim below.
     ///
-    /// `lock` is refused unless zero -- see [`unlocked`].
+    /// `lock` is taken at the landed position once the step succeeds, the
+    /// same order [`Block::get`] takes one.
     ///
     /// # Errors
     ///
-    /// [`OpError::LockRefused`] for a nonzero `lock`. [`OpError::
+    /// [`OpError::LockModeMixed`]. [`OpError::
     /// NotPositioned`] for [`Step::Next`]/[`Step::Previous`] with nothing
     /// having positioned the file -- **kept as a refusal deliberately,
     /// unlike [`Op::Next`]'s oracle-measured "answers like Lowest"**: the
@@ -571,8 +814,7 @@ impl Block {
     /// it; see this task's final report for the measurement in full.
     /// [`OpError::CursorStale`] if an ordered cursor's record no longer
     /// resolves to a physical one. If the records cannot be read.
-    pub fn step(&mut self, step: Step, lock: i16) -> Result<Option<Delivery>, OpError> {
-        unlocked(lock)?;
+    pub fn step(&mut self, step: Step, lock: i16, locks: &mut LockTable) -> Result<Option<Delivery>, OpError> {
         let cursor = self.cursor();
         let count = self.records()?.len();
 
@@ -603,7 +845,59 @@ impl Block {
             return Ok(None);
         }
         self.seek_to(Cursor::Physical { at });
+        self.take_lock(lock, locks)?;
         Ok(Some(self.deliver_current(None)?))
+    }
+
+    /// This block's identity, for [`LockTable`] -- see [`BlockId`]'s own
+    /// doc comment.
+    pub fn id(&self) -> BlockId {
+        self.id
+    }
+
+    /// Take `lock` at wherever this block is currently positioned, once a
+    /// caller has already positioned it there. `lock == 0` -- no lock was
+    /// asked for -- is always `Ok(())`.
+    ///
+    /// Called by [`Block::get`], [`Block::acquire_absolute`] and
+    /// [`Block::step`] only after their own positioning has already
+    /// succeeded, which is what makes "an operation that fails takes no
+    /// lock" true for all three: this is simply never reached on a miss.
+    ///
+    /// # Errors
+    /// [`OpError::LockModeMixed`]. [`OpError::NotPositioned`] if nothing is
+    /// positioned -- defensive, not reachable through the three callers
+    /// above, the same as [`Block::deliver_current`]'s.
+    pub fn take_lock(&self, lock: i16, locks: &mut LockTable) -> Result<(), OpError> {
+        if lock == 0 {
+            return Ok(());
+        }
+        let position = self.current().ok_or(OpError::NotPositioned)?.position;
+        locks.acquire(self.id, position, lock)
+    }
+
+    /// Release the lock this session holds at wherever this block is
+    /// currently positioned -- Btrieve op 27, Unlock, with `keynum = 0` and
+    /// no data. **Always succeeds**, even with nothing positioned or
+    /// nothing locked there: measured, "status 0 even when nothing is
+    /// locked".
+    ///
+    /// **Not reachable from the 16-bit ABI today.** None of `WCCMMUD.DLL`'s
+    /// seventeen imports is an Unlock call (`shims/btrieve.rs`'s own
+    /// call-site table has no such entry), so nothing in that file calls
+    /// this. It exists for Task 7's future `dfaUnlock`.
+    pub fn unlock(&self, locks: &mut LockTable) {
+        if let Some(record) = self.current() {
+            locks.release_at(self.id, record.position);
+        }
+    }
+
+    /// The raw lock type this session holds at wherever this block is
+    /// currently positioned, if any -- test/inspection surface, not a
+    /// Btrieve operation of its own.
+    pub fn lock_at_current(&self, locks: &LockTable) -> Option<i16> {
+        let record = self.current()?;
+        locks.get(self.id, record.position)
     }
 
     /// The record the cursor currently names, as a [`Delivery`] --
@@ -747,6 +1041,7 @@ mod tests {
             },
         ];
         Block {
+            id: BlockId::fresh(),
             name: "OPS.DAT".to_owned(),
             path,
             geometry,
@@ -781,8 +1076,9 @@ mod tests {
     #[test]
     fn get_equal_on_a_unique_key_finds_the_one_record() {
         let mut b = fixture("get_equal_on_a_unique_key_finds_the_one_record");
+        let mut locks = LockTable::default();
         let d = b
-            .get(0, Op::Equal, &30u16.to_le_bytes(), 0)
+            .get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks)
             .expect("no error")
             .expect("found");
         assert_eq!(tag(&d), 2);
@@ -791,10 +1087,11 @@ mod tests {
     #[test]
     fn get_equal_that_finds_nothing_leaves_the_cursor_where_it_was() {
         let mut b = fixture("get_equal_that_finds_nothing_leaves_the_cursor_where_it_was");
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Ordered { key: 0, at: 2 });
 
-        let miss = b.get(0, Op::Equal, &999u16.to_le_bytes(), 0).expect("no error");
+        let miss = b.get(0, Op::Equal, &999u16.to_le_bytes(), 0, &mut locks).expect("no error");
         assert!(miss.is_none(), "999 is not a key-0 value in the fixture");
         assert_eq!(
             b.cursor(),
@@ -806,27 +1103,30 @@ mod tests {
     #[test]
     fn get_equal_on_a_duplicate_key_lands_on_the_position_ordered_first_match() {
         let mut b = fixture("get_equal_on_a_duplicate_key_lands_on_the_position_ordered_first_match");
+        let mut locks = LockTable::default();
         // key 1 = 1 matches tags 0 and 2 (key0 10 and 30); tag 0 has the
         // lower physical position, so it is first -- Records::reindex's own
         // tie-break, oracle-confirmed for this exact fixture by
         // `position_ops_oracle_scenarios`'s `S3`.
-        let d = b.get(1, Op::Equal, &1u16.to_le_bytes(), 0).unwrap().unwrap();
+        let d = b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 0);
     }
 
     #[test]
     fn get_next_after_equal_on_a_duplicate_continues_to_the_next_match() {
         let mut b = fixture("get_next_after_equal_on_a_duplicate_continues_to_the_next_match");
-        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0).unwrap().unwrap();
-        let d = b.get(1, Op::Next, &[], 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "the second key-1=1 match, tag 2");
     }
 
     #[test]
     fn get_greater_lands_past_every_equal_record_not_on_the_first_one() {
         let mut b = fixture("get_greater_lands_past_every_equal_record_not_on_the_first_one");
+        let mut locks = LockTable::default();
         // key 1 = 1 matches two records (tags 0, 2); Greater must skip both.
-        let d = b.get(1, Op::Greater, &1u16.to_le_bytes(), 0).unwrap().unwrap();
+        let d = b.get(1, Op::Greater, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_ne!(tag(&d), 0);
         assert_ne!(tag(&d), 2, "Greater must not land on an equal record");
     }
@@ -834,15 +1134,17 @@ mod tests {
     #[test]
     fn get_at_most_lands_on_the_last_equal_record_of_a_duplicate_group() {
         let mut b = fixture("get_at_most_lands_on_the_last_equal_record_of_a_duplicate_group");
-        let d = b.get(1, Op::AtMost, &1u16.to_le_bytes(), 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        let d = b.get(1, Op::AtMost, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "the last of the two key-1=1 records");
     }
 
     #[test]
     fn get_lowest_and_highest_find_the_ends_of_key_0() {
         let mut b = fixture("get_lowest_and_highest_find_the_ends_of_key_0");
-        assert_eq!(tag(&b.get(0, Op::Lowest, &[], 0).unwrap().unwrap()), 0);
-        assert_eq!(tag(&b.get(0, Op::Highest, &[], 0).unwrap().unwrap()), 5);
+        let mut locks = LockTable::default();
+        assert_eq!(tag(&b.get(0, Op::Lowest, &[], 0, &mut locks).unwrap().unwrap()), 0);
+        assert_eq!(tag(&b.get(0, Op::Highest, &[], 0, &mut locks).unwrap().unwrap()), 5);
     }
 
     // -- Op::Next / Op::Previous: the oracle-measured cases --
@@ -853,8 +1155,9 @@ mod tests {
         // requested key -- not a refusal, unlike `shims/btrieve.rs`'s
         // `locate`.
         let mut b = fixture("get_next_with_nothing_positioned_behaves_like_lowest");
+        let mut locks = LockTable::default();
         assert_eq!(b.cursor(), Cursor::Nowhere);
-        let d = b.get(0, Op::Next, &[], 0).unwrap().unwrap();
+        let d = b.get(0, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 0);
     }
 
@@ -863,7 +1166,8 @@ mod tests {
         // S1c: measured status 9 ("not found"), not a refusal and not
         // Highest either.
         let mut b = fixture("get_previous_with_nothing_positioned_answers_not_found");
-        let d = b.get(0, Op::Previous, &[], 0).unwrap();
+        let mut locks = LockTable::default();
+        let d = b.get(0, Op::Previous, &[], 0, &mut locks).unwrap();
         assert!(d.is_none());
     }
 
@@ -872,8 +1176,9 @@ mod tests {
         // S6: Get Equal on key 0 (tag 2), then Get Next on key 1 -- real
         // Btrieve status 7, not a translation into key 1's order.
         let mut b = fixture("get_next_on_a_different_key_than_the_current_position_is_refused");
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
-        let err = b.get(1, Op::Next, &[], 0).expect_err("a different key is refused");
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let err = b.get(1, Op::Next, &[], 0, &mut locks).expect_err("a different key is refused");
         assert_eq!(
             err,
             OpError::DifferentKey {
@@ -888,20 +1193,22 @@ mod tests {
         // S4/S4b: Step First, then Get Next on either key -- real Btrieve
         // status 8 both times, not `Records::place_in`'s translation.
         let mut b = fixture("get_next_after_a_step_is_refused_not_translated");
-        b.step(Step::First, 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.step(Step::First, 0, &mut locks).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Physical { at: 0 });
-        let err = b.get(1, Op::Next, &[], 0).expect_err("a physical step establishes no key");
+        let err = b.get(1, Op::Next, &[], 0, &mut locks).expect_err("a physical step establishes no key");
         assert_eq!(err, OpError::NoKeyEstablished);
-        let err0 = b.get(0, Op::Next, &[], 0).expect_err("neither key continues after a step");
+        let err0 = b.get(0, Op::Next, &[], 0, &mut locks).expect_err("neither key continues after a step");
         assert_eq!(err0, OpError::NoKeyEstablished);
     }
 
     #[test]
     fn get_next_at_end_of_file_fails_but_leaves_the_cursor_there() {
         let mut b = fixture("get_next_at_end_of_file_fails_but_leaves_the_cursor_there");
-        b.get(0, Op::Highest, &[], 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(0, Op::Highest, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(b.cursor(), Cursor::Ordered { key: 0, at: 5 });
-        let miss = b.get(0, Op::Next, &[], 0).expect("no error");
+        let miss = b.get(0, Op::Next, &[], 0, &mut locks).expect("no error");
         assert!(miss.is_none());
         assert_eq!(
             b.cursor(),
@@ -909,7 +1216,7 @@ mod tests {
             "S2: the cursor stays on the last record a successful call found"
         );
         // And Get Previous from there steps back to the record before it.
-        let d = b.get(0, Op::Previous, &[], 0).unwrap().unwrap();
+        let d = b.get(0, Op::Previous, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 4);
     }
 
@@ -918,11 +1225,12 @@ mod tests {
     #[test]
     fn step_walks_physical_order_not_key_order() {
         let mut b = fixture("step_walks_physical_order_not_key_order");
+        let mut locks = LockTable::default();
         // Physical order is insertion order here (tags 0..6, in slot
         // order), which key 1's order is NOT (see the fixture table).
-        let first = b.step(Step::First, 0).unwrap().unwrap();
+        let first = b.step(Step::First, 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&first), 0);
-        let next = b.step(Step::Next, 0).unwrap().unwrap();
+        let next = b.step(Step::Next, 0, &mut locks).unwrap().unwrap();
         assert_eq!(next.key, None, "a step has no key");
         assert_eq!(tag(&next), 1, "physical slot 1, tag 1 -- not key 1's next (tag 2)");
     }
@@ -930,26 +1238,29 @@ mod tests {
     #[test]
     fn step_first_and_last_find_the_physical_ends() {
         let mut b = fixture("step_first_and_last_find_the_physical_ends");
-        assert_eq!(tag(&b.step(Step::First, 0).unwrap().unwrap()), 0);
-        assert_eq!(tag(&b.step(Step::Last, 0).unwrap().unwrap()), 5);
+        let mut locks = LockTable::default();
+        assert_eq!(tag(&b.step(Step::First, 0, &mut locks).unwrap().unwrap()), 0);
+        assert_eq!(tag(&b.step(Step::Last, 0, &mut locks).unwrap().unwrap()), 5);
     }
 
     #[test]
     fn step_next_past_end_of_file_finds_nothing() {
         let mut b = fixture("step_next_past_end_of_file_finds_nothing");
-        b.step(Step::Last, 0).unwrap().unwrap();
-        assert!(b.step(Step::Next, 0).unwrap().is_none());
+        let mut locks = LockTable::default();
+        b.step(Step::Last, 0, &mut locks).unwrap().unwrap();
+        assert!(b.step(Step::Next, 0, &mut locks).unwrap().is_none());
     }
 
     #[test]
     fn step_next_and_previous_with_nothing_positioned_are_refused() {
         let mut b = fixture("step_next_and_previous_with_nothing_positioned_are_refused");
+        let mut locks = LockTable::default();
         assert_eq!(
-            b.step(Step::Next, 0).expect_err("nothing has positioned this file"),
+            b.step(Step::Next, 0, &mut locks).expect_err("nothing has positioned this file"),
             OpError::NotPositioned
         );
         assert_eq!(
-            b.step(Step::Previous, 0).expect_err("nothing has positioned this file"),
+            b.step(Step::Previous, 0, &mut locks).expect_err("nothing has positioned this file"),
             OpError::NotPositioned
         );
     }
@@ -970,10 +1281,11 @@ mod tests {
         // (no movement); resolving to the physical slot first lands on
         // slot 2+1=3, tag 3.
         let mut b = fixture("step_after_a_keyed_position_resolves_through_that_keys_order");
-        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0).unwrap().unwrap();
-        let d = b.get(1, Op::Next, &[], 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(1, Op::Equal, &1u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let d = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 2, "key 1 = 1's second match");
-        let d = b.step(Step::Next, 0).unwrap().unwrap();
+        let d = b.step(Step::Next, 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&d), 3, "the physical record after tag 2's slot, not its key-1 rank + 1");
     }
 
@@ -988,7 +1300,8 @@ mod tests {
     #[test]
     fn get_position_reports_the_current_records_physical_position() {
         let mut b = fixture("get_position_reports_the_current_records_physical_position");
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         let position = b.get_position().expect("positioned");
         let expected = b.records().unwrap().find_physical(position).map(|_| ());
         assert!(expected.is_some(), "the reported position must resolve back to a record");
@@ -1002,24 +1315,26 @@ mod tests {
         // key 1 -- lands on tag 1 (key 1's own next after tag 2), not tag 3
         // (key 0's next).
         let mut b = fixture("acquire_absolute_establishes_the_key_path_for_a_following_get_next");
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         let position = b.get_position().unwrap();
         b.seek_to(Cursor::Nowhere); // as though nothing had positioned it
 
-        let direct = b.acquire_absolute(position, 1, 0).unwrap().unwrap();
+        let direct = b.acquire_absolute(position, 1, 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&direct), 2);
         assert_eq!(direct.key.as_deref(), Some(&1u16.to_le_bytes()[..]));
 
-        let next = b.get(1, Op::Next, &[], 0).unwrap().unwrap();
+        let next = b.get(1, Op::Next, &[], 0, &mut locks).unwrap().unwrap();
         assert_eq!(tag(&next), 1, "key 1's own next record after tag 2, not key 0's (tag 3)");
     }
 
     #[test]
     fn acquire_absolute_at_an_unknown_position_finds_nothing_and_keeps_the_cursor() {
         let mut b = fixture("acquire_absolute_at_an_unknown_position_finds_nothing_and_keeps_the_cursor");
-        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         let before = b.cursor();
-        let miss = b.acquire_absolute(999_999, 0, 0).expect("no error");
+        let miss = b.acquire_absolute(999_999, 0, 0, &mut locks).expect("no error");
         assert!(miss.is_none());
         assert_eq!(b.cursor(), before);
     }
@@ -1027,33 +1342,158 @@ mod tests {
     #[test]
     fn acquire_absolute_refuses_a_key_the_file_does_not_have() {
         let mut b = fixture("acquire_absolute_refuses_a_key_the_file_does_not_have");
+        let mut locks = LockTable::default();
         let position = {
-            b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap();
+            b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap();
             b.get_position().unwrap()
         };
         assert_eq!(
-            b.acquire_absolute(position, 2, 0).expect_err("only keys 0 and 1 exist"),
+            b.acquire_absolute(position, 2, 0, &mut locks).expect_err("only keys 0 and 1 exist"),
             OpError::NoSuchKey(2)
         );
     }
 
-    // -- Locking seam --
+    // -- Locking: the state machine, `docs/lock-oracle-answer.md` --
 
     #[test]
-    fn every_delivering_operation_refuses_a_nonzero_lock() {
-        let mut b = fixture("every_delivering_operation_refuses_a_nonzero_lock");
-        assert_eq!(
-            b.get(0, Op::Lowest, &[], 3).expect_err("lock type 3"),
-            OpError::LockRefused(3)
+    fn a_single_lock_auto_releases_when_the_session_takes_another_single_lock() {
+        // Measured: "Lock key 1, then key 2: an outside observer sees key 1
+        // free and key 2 held."
+        let mut b = fixture("a_single_lock_auto_releases_when_the_session_takes_another_single_lock");
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        let a = b.current().unwrap().position;
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        let held = b.current().unwrap().position;
+
+        assert_eq!(locks.get(b.id(), a), None, "the first lock auto-released");
+        assert_eq!(locks.get(b.id(), held), Some(100), "the second is held");
+    }
+
+    #[test]
+    fn a_multiple_lock_accumulates() {
+        // Measured: "lock two records and both stay held."
+        let mut b = fixture("a_multiple_lock_accumulates");
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let a = b.current().unwrap().position;
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let bb = b.current().unwrap().position;
+
+        assert_eq!(locks.get(b.id(), a), Some(300), "the first stays held");
+        assert_eq!(locks.get(b.id(), bb), Some(300), "the second is held too");
+    }
+
+    #[test]
+    fn mixing_a_multiple_lock_in_while_a_single_lock_is_outstanding_is_refused_and_takes_no_lock() {
+        // Measured: "Taking a multiple lock while the same session still
+        // holds an outstanding single lock is refused with 93, and no lock
+        // is taken; release the single lock first and the identical call
+        // succeeds."
+        let mut b = fixture(
+            "mixing_a_multiple_lock_in_while_a_single_lock_is_outstanding_is_refused_and_takes_no_lock",
         );
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        let single = b.current().unwrap().position;
+
+        let err = b
+            .get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks)
+            .expect_err("mode mixing is refused");
         assert_eq!(
-            b.step(Step::First, 3).expect_err("lock type 3"),
-            OpError::LockRefused(3)
+            err,
+            OpError::LockModeMixed {
+                held: LockMode::Single,
+                wanted: LockMode::Multiple
+            }
         );
+        let refused = b.current().unwrap().position;
+        assert_eq!(locks.get(b.id(), refused), None, "the refused record took no lock");
+        assert_eq!(locks.get(b.id(), single), Some(100), "and the held one is untouched");
+
+        // "release the single lock first and the identical call succeeds."
+        locks.release_at(b.id(), single);
+        b.get(0, Op::Equal, &20u16.to_le_bytes(), 300, &mut locks)
+            .expect("no error")
+            .expect("found");
+        assert_eq!(locks.get(b.id(), refused), Some(300), "now taken, in multiple mode");
+    }
+
+    /// The oracle measured only "multiple while single held" (above). This
+    /// completes the rule the other way -- a decision, not a second
+    /// measurement, made because this module's own doc comment states the
+    /// rule session-wide ("the two modes cannot be mixed in one session"),
+    /// not one-directionally, and `docs/lock-oracle-answer.md` names the
+    /// symmetry question open rather than answering it "no".
+    #[test]
+    fn mixing_the_other_direction_a_single_lock_while_multiple_is_outstanding_is_also_refused() {
+        let mut b = fixture(
+            "mixing_the_other_direction_a_single_lock_while_multiple_is_outstanding_is_also_refused",
+        );
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let err = b
+            .get(0, Op::Equal, &20u16.to_le_bytes(), 100, &mut locks)
+            .expect_err("mode mixing, the other direction");
         assert_eq!(
-            b.acquire_absolute(0, 0, 3).expect_err("lock type 3"),
-            OpError::LockRefused(3)
+            err,
+            OpError::LockModeMixed {
+                held: LockMode::Multiple,
+                wanted: LockMode::Single
+            }
         );
+    }
+
+    #[test]
+    fn relocking_a_record_already_held_is_a_harmless_no_op() {
+        // Measured: "Re-locking a record you already hold is fine (status
+        // 0)."
+        let mut b = fixture("relocking_a_record_already_held_is_a_harmless_no_op");
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let a = b.current().unwrap().position;
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks)
+            .expect("re-locking is not refused")
+            .expect("found");
+        assert_eq!(locks.get(b.id(), a), Some(300), "unchanged");
+    }
+
+    #[test]
+    fn a_get_that_finds_nothing_takes_no_lock() {
+        // Measured: "An operation that fails takes no lock: a Get Equal
+        // that finds nothing leaves no lock behind."
+        let mut b = fixture("a_get_that_finds_nothing_takes_no_lock");
+        let mut locks = LockTable::default();
+        let miss = b
+            .get(0, Op::Equal, &999u16.to_le_bytes(), 100, &mut locks)
+            .expect("no error -- a miss is Ok(None), not a refusal");
+        assert!(miss.is_none());
+        assert!(locks.is_empty(), "nothing was found, so nothing was locked");
+    }
+
+    #[test]
+    fn unlock_releases_the_lock_at_the_current_position_and_is_ok_even_with_nothing_locked() {
+        // Measured: "Unlock (op 27) ... releases the lock at the current
+        // position, and is status 0 even when nothing is locked."
+        let mut b = fixture("unlock_releases_the_lock_at_the_current_position_and_is_ok_even_with_nothing_locked");
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 100, &mut locks).unwrap().unwrap();
+        assert_eq!(b.lock_at_current(&locks), Some(100));
+
+        b.unlock(&mut locks);
+        assert_eq!(b.lock_at_current(&locks), None, "released");
+
+        // Unlocking again, with nothing held, does not error -- `unlock`
+        // returns nothing to check, so the assertion is that this line does
+        // not panic and the position stays unlocked.
+        b.unlock(&mut locks);
+        assert_eq!(b.lock_at_current(&locks), None);
     }
 
     // -- Truncation (the returned-length contract) --
@@ -1061,8 +1501,9 @@ mod tests {
     #[test]
     fn a_record_longer_than_maxlen_is_delivered_truncated() {
         let mut b = fixture("a_record_longer_than_maxlen_is_delivered_truncated");
+        let mut locks = LockTable::default();
         b.maxlen = 4; // shorter than RECLEN (8)
-        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_eq!(d.bytes.len(), 4);
         assert!(d.truncated);
     }
@@ -1070,8 +1511,9 @@ mod tests {
     #[test]
     fn a_record_no_longer_than_maxlen_is_not_marked_truncated() {
         let mut b = fixture("a_record_no_longer_than_maxlen_is_not_marked_truncated");
+        let mut locks = LockTable::default();
         assert_eq!(b.maxlen, RECLEN);
-        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0).unwrap().unwrap();
+        let d = b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
         assert_eq!(d.bytes.len(), usize::from(RECLEN));
         assert!(!d.truncated);
     }

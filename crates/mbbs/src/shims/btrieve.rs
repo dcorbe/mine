@@ -831,6 +831,10 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             keynum,
             value,
             into: None,
+            // `qrybtv` has no `loktyp` at either layer -- `int qrybtv(void
+            // *key, int keynum, int qryopt)`, three arguments -- so there is
+            // nothing to lock. See `ops.rs`'s "Locking" doc section.
+            lock: 0,
         },
     )?)))
 }
@@ -870,6 +874,8 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             keynum: -1,
             value: Btrieve::null(),
             into: Some(into),
+            // `int qnpbtv(int getopt)` -- one argument, no `loktyp`.
+            lock: 0,
         },
     )?)))
 }
@@ -885,10 +891,13 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `recptr` may be null, and then the record goes to `bb->data` --
 /// `PLBTVSTF.C:360`.
 ///
-/// `loktyp` is read and refused if it is not zero. Record locking is a
-/// multi-user concern this host has no second user for yet, and a lock silently
-/// not taken is the kind of difference that shows up as two channels writing
-/// over each other much later.
+/// `loktyp` is taken as a lock at the position `locate` finds, once it finds
+/// one -- see `ops.rs`'s "Locking" module doc section and [`take_lock`].
+/// `WCCMMUD.DLL`'s own 112 call sites all push a literal zero (measured,
+/// `docs/lock-oracle-answer.md`), so this is unreachable for MajorMUD today;
+/// it is honoured anyway, on the repository owner's standing instruction not
+/// to skip a real Btrieve feature merely because this module never asks for
+/// it.
 ///
 /// **With no file current it answers 0**, per `PLBTVSTF.C:357` -- and this is
 /// the one initialisation actually reaches. Call 128 of `_INIT__WCCMMUD` is an
@@ -908,7 +917,6 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let keynum = machine.arg_u16(4) as i16;
     let opt = machine.arg_u16(5) as i16;
     let lock = machine.arg_u16(6) as i16;
-    unlocked("obtbtvl", lock)?;
 
     let op = Op::of(opt).ok_or_else(|| {
         ShimError::Failed(format!(
@@ -929,6 +937,7 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
             keynum,
             value,
             into: Some(into),
+            lock,
         },
     )?)))
 }
@@ -967,7 +976,6 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let into = machine.arg_far(0);
     let opt = machine.arg_u16(2) as i16;
     let lock = machine.arg_u16(3) as i16;
-    unlocked("stpbtvl", lock)?;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
@@ -1038,6 +1046,7 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         return Ok(Ret::U16(0));
     }
     file.seek_to(Cursor::Physical { at });
+    take_lock(host, block, lock)?;
     deliver(machine, host, block, into)?;
     Ok(Ret::U16(1))
 }
@@ -1083,8 +1092,8 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `keynum` and nothing else.
 ///
 /// So there is no `loktyp` word to read, and reading one got the caller's
-/// lowest local instead -- which [`unlocked`] then refused as a lock type the
-/// module never asked for. It shared [`absolute`] with `gabbtvl`, which really
+/// lowest local instead -- which was then read as a lock type the module
+/// never asked for. It shared [`absolute`] with `gabbtvl`, which really
 /// does take four (`add sp,12` at all 34 of its sites), and that is how it
 /// survived: the helper was right for one caller and wrong for the other.
 ///
@@ -1146,14 +1155,14 @@ fn absolute(
     lock: i16,
 ) -> Result<bool, ShimError> {
     // `:452` and `:476` both guard before `:479` defaults `recptr` to
-    // `bb->data`. Same ordering point as `obtbtvl`, and the lock is refused
-    // after it for the same reason: with no file current the original returned
-    // before it looked at anything.
+    // `bb->data`. Same ordering point as `obtbtvl`: with no file current the
+    // original returned before it looked at anything, including `lock`, so
+    // `take_lock` runs later -- only once a record has actually been found
+    // (below) -- not here.
     let Some(block) = positioned(machine, host, who)? else {
         note_no_file(host, who);
         return Ok(false);
     };
-    unlocked(who, lock)?;
 
     let into = machine.arg_far(0);
     let position = machine.arg_u32(2);
@@ -1208,6 +1217,7 @@ fn absolute(
         None => Cursor::Physical { at: physical },
     };
     file.seek_to(cursor);
+    take_lock(host, block, lock)?;
 
     // `:484` passes `bb->keyseg`, so Btrieve left the found record's key there.
     answer_with_key(machine, host, block, key)?;
@@ -1240,6 +1250,10 @@ struct Request<'a> {
 
     /// Where the record goes, or `None` for a query, which reads none.
     into: Option<FarPtr>,
+
+    /// The lock type to take once a record is found, or `0` for none --
+    /// `0` for `qrybtv`/`qnpbtv`, which have no `loktyp` at either layer.
+    lock: i16,
 }
 
 /// Position the file a [`Request`] names, and hand back the record if asked.
@@ -1253,6 +1267,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         keynum,
         value,
         into,
+        lock,
     } = req;
     load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
@@ -1414,6 +1429,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         return Ok(false);
     };
     file.seek_to(Cursor::Ordered { key, at });
+    take_lock(host, block, lock)?;
     answer_with_key(machine, host, block, key)?;
 
     if let Some(into) = into {
@@ -1620,56 +1636,53 @@ fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
         .data())
 }
 
-/// Refuse a lock type this host cannot honour.
+/// Take `lock` at `block`'s current position, once `locate`/`absolute`/
+/// `stpbtvl` have already positioned it there.
 ///
-/// `BTVSTF.H:52` defines four: single or multiple, waiting or not. All four
-/// exist so that two channels reading the same record do not tread on each
-/// other, and this host runs one thing at a time -- so a lock is never
-/// contended and never needed. **Taking that as licence to ignore the argument
-/// is the trap**: the day a second channel exists, every lock the module asked
-/// for will have been silently not taken, and what it protects is a character's
-/// inventory.
+/// # Task 5, reversed
 ///
-/// # This refusal is the answer to Task 5, not a placeholder for it
+/// `docs/plans/2026-08-12-btrieve-finish.md` Task 5 first answered "do not
+/// build this": all **191** lock-capable call sites in `WCCMMUD.DLL` --
+/// `obtbtvl` 112, `gabbtv`/`gabbtvl` 34, `stpbtvl` 45 -- push a literal zero
+/// for `loktyp`, established twice by methods sharing no code. **The
+/// repository owner reversed that**: "we're not going to skip over
+/// implementing functionality because wccmmud won't need it." A routine
+/// with no counterpart at all is a legitimate empty slot; a routine that
+/// exists and is merely unexercised by the one module under test is not,
+/// and locks were the second kind. `crates/mbbs/src/btrieve/ops.rs`'s own
+/// "Locking" module doc section is the full account, including what stays
+/// out of scope and why (cross-client conflict, statuses 84/85 -- a
+/// deferral, not an absence) and the one thing measured but deliberately
+/// not reproduced (a wait-lock inside a transaction deadlocking the real
+/// engine).
 ///
-/// `docs/plans/2026-08-12-btrieve-finish.md` Task 5 asked whether to build
-/// lock support, and `docs/lock-oracle-answer.md` is the measurement that
-/// settled it. Two facts, both measured on 2026-08-12:
+/// This function is now a thin call into [`crate::btrieve::Btrieve::
+/// take_lock`], which delegates to [`crate::btrieve::ops::LockTable::
+/// acquire`] -- the actual state machine, ABI-independent and tested on its
+/// own in `ops.rs`. `lock == 0` is always `Ok(())`.
 ///
-/// - **`WCCMMUD.DLL` never asks for a lock.** All **191** lock-capable call
-///   sites -- `obtbtvl` 112, `gabbtv`/`gabbtvl` 34, `stpbtvl` 45 -- push a
-///   literal zero for `loktyp`. Established twice by methods sharing no code:
-///   a backward push-run scan anchored on each site's own stack cleanup, and
-///   a hand disassembly of individual sites.
-/// - **Real lock contention *is* observable**, so the reason not to build
-///   bookkeeping is the call count and not an inability to test it. Two
-///   concurrent Btrieve clients under Wine genuinely block each other
-///   (status 84, and a "wait" variant that really waits).
+/// # This function must run only after positioning has already succeeded
 ///
-/// So this refuses, and `docs/lock-oracle-answer.md` carries the semantics a
-/// future implementer would need -- including two traps that would bite a
-/// naive design: single and multiple lock modes **cannot be mixed in one
-/// session** (status 93), and a wait-lock taken inside the session's own
-/// transaction **deadlocks against it**.
+/// Every caller places this after its own `seek_to`, never before -- moving
+/// it earlier would take a lock ahead of knowing whether a record was even
+/// found, contradicting the measured "an operation that fails takes no
+/// lock". This mirrors [`crate::btrieve::ops::Block::get`]'s own ordering
+/// exactly, and for the same reason.
 ///
-/// # Do not quietly turn this into `Ok(())`
+/// # The two by-value pins this replaces
 ///
-/// Four tests depend on this refusal, and only two of them are about locks.
-/// `a_lock_this_host_cannot_take_is_refused_rather_than_ignored` pins
-/// `obtbtvl`'s lock word by value, and
-/// `gabbtvl_takes_its_lock_from_word_five_by_value` pins `gabbtvl`'s word 5
-/// the same way. The other two are the `gabbtvl` key-path tests, which catch
-/// a lock read from the wrong word only *because* the resulting non-zero
-/// value is refused here -- a pin that exists as a side effect and vanishes
-/// with the mechanism it rides on. A change that accepts locks must
-/// re-establish all of them on some other observable first.
-fn unlocked(who: &str, lock: i16) -> Result<(), ShimError> {
-    if lock == 0 {
-        return Ok(());
-    }
-    Err(ShimError::Failed(format!(
-        "{who} asked for lock type {lock}, and this host has no locking to give it"
-    )))
+/// The refusal this function used to be was load-bearing for
+/// `a_lock_this_host_cannot_take_is_refused_rather_than_ignored` (`obtbtvl`'s
+/// lock word, by value) and `gabbtvl_takes_its_lock_from_word_five_by_value`
+/// (`gabbtvl`'s word 5, by value). Both are re-pinned below on the new
+/// observable this function creates -- a lock is now readable state, so each
+/// asserts "the engine recorded this lock type at this position" rather than
+/// "the call was refused naming this lock type". Same words, same
+/// discrimination by value, checked the hard way (mutate the shim to read
+/// the adjacent word, confirm the test fails) -- see each test's own doc
+/// comment.
+fn take_lock(host: &mut Host, block: FarPtr, lock: i16) -> Result<(), ShimError> {
+    host.btrieve.take_lock(block, lock).map_err(ShimError::Failed)
 }
 
 /// Push what is current and make `block` current, as `setbtv` does.
@@ -2253,10 +2266,12 @@ mod tests {
         // `add sp,10`, which is those five and no more. `aabbtvl`, the
         // four-argument form, is a separate export the module never imports.
         //
-        // This host read a sixth word as `loktyp` because it shared a helper
-        // with `gabbtvl`, which really does take four. The sixth word is the
-        // caller's, and `unlocked` refused anything nonzero in it -- so the
-        // failure was a lock the module never asked for.
+        // This host used to read a sixth word as `loktyp` because it shared a
+        // helper with `gabbtvl`, which really does take four. The sixth word
+        // was the caller's, and any nonzero garbage there used to be refused
+        // as a lock the module never asked for -- fixed by `UNLOCKED`
+        // (`aabbtv`'s own doc comment), which passes a hardcoded `0` instead
+        // of reading a word that is not there.
         //
         // Invoked with exactly five words, which is what gives this teeth: the
         // word above them is the outer frame's return offset and is not zero.
@@ -2662,39 +2677,74 @@ mod tests {
         assert!(f.invoke(stpbtvl, &[0, 0, 99, 0]).is_err());
     }
 
+    /// **Replaces `a_lock_this_host_cannot_take_is_refused_rather_than_
+    /// ignored`, retired now that Task 5 honours locks instead of refusing
+    /// them** (`docs/lock-oracle-answer.md`; see [`take_lock`]'s own doc
+    /// comment for the reversal). The old test asserted a refusal message
+    /// naming "100"; a lock is now readable state instead of a rejection, so
+    /// this asserts the engine recorded it -- same word (`obtbtvl`'s word 6,
+    /// `loktyp`), same by-value discrimination, different observable.
+    ///
+    /// `obtopt = 12` (Lowest, word 5) and `loktyp = 100` (SLWTBV, word 6) are
+    /// two different nonzero values on purpose: reading word 5 for the lock
+    /// instead of word 6 would record lock type 12, not 100, so this fails
+    /// on the wrong word rather than merely on the call failing to error.
+    ///
+    /// **Verified the hard way**: changing `obtbtvl`'s `let lock =
+    /// machine.arg_u16(6)` to `arg_u16(5)` makes this test FAIL --
+    /// `left: Some(12), right: Some(100)` -- confirming it discriminates by
+    /// value rather than by the call merely succeeding either way.
     #[test]
-    fn a_lock_this_host_cannot_take_is_refused_rather_than_ignored() {
-        // One channel is never contended, so every lock would appear to work.
-        // The day there are two, they would all have been silently skipped.
+    fn obtbtvl_records_its_lock_type_by_value() {
         let mut f = Fixture::new();
-        open(&mut f, "SAMPLE.DAT", 64);
-        let e = f
-            .invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
-            .expect_err("SLWTBV is a single record lock with wait");
-        assert!(e.to_string().contains("100"), "{e}");
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
+            .expect("Lowest, single lock with wait -- both are real Btrieve values");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(100),
+            "word 6 is the lock; reading word 5 would have recorded lock type 12 (the opt)"
+        );
     }
 
     /// `gabbtvl` reads its lock from **word 5**, and this proves it by value
     /// rather than by the call merely failing.
     ///
-    /// The frame deliberately carries `keynum = 1` in word 4 and `loktyp = 3`
-    /// in word 5, two *different* non-zero values, and the assertion names
-    /// the 3. Reading word 4 instead would refuse "lock type 1" and fail
-    /// here; passing zeros in both -- which is what every other `gabbtvl`
-    /// test in this file did before `ae4d479` -- could not tell the two words
-    /// apart at all.
+    /// **Retains its name and its word-5 pin across the mechanism change**
+    /// (`docs/plans/2026-08-12-btrieve-finish.md`'s Task 5 acceptance
+    /// criterion: "the mechanism changes; 'word 5, by value' must not").
+    /// What changed is the observable: a refusal message used to be the only
+    /// way to see which word was read; now the lock is state this test reads
+    /// back, so it asserts on that instead.
     ///
-    /// **Why this exists separately from the `gabbtvl` key-path tests.**
-    /// Those two also catch a lock read from word 4, but only *transitively*:
-    /// they pass `keynum = 1`, so the misread lock becomes 1, and
-    /// [`unlocked`] refuses it. That mechanism disappears the moment locks
-    /// stop being refused, and it would take the pin with it while both tests
-    /// carried on passing. This one asserts the value directly, so it depends
-    /// on the refusal's *message* rather than on the refusal being the only
-    /// possible outcome -- and if a future change makes locks succeed, the
-    /// repair instruction is to re-pin word 5 on whatever observable replaces
-    /// the message (the recorded lock type for the position, say), keeping
-    /// "word 5, by value" even though the mechanism changes.
+    /// The frame carries `keynum = 1` in word 4 and `loktyp = 3` in word 5,
+    /// two *different* nonzero values, and the assertion names the 3.
+    /// Reading word 4 instead would record lock type 1, not 3 -- and could
+    /// not even reach that far on `SAMPLE.DAT` (the fixture the old version
+    /// of this test used), which has one key: a `keynum` of 3 misread from
+    /// word 5 would refuse with `NoSuchKey` before any lock is recorded at
+    /// all. This version uses [`two_key_file`] and a real, oracle-shaped
+    /// position instead, so the wrong-word case fails on the *value*
+    /// (`Some(1)` instead of `Some(3)`) rather than on an unrelated key
+    /// error masking the question this test exists to answer.
+    ///
+    /// **Verified the hard way**: changing `gabbtvl`'s `let lock =
+    /// machine.arg_u16(5)` to `arg_u16(4)` makes this test FAIL -- `left:
+    /// Some(1), right: Some(3)`.
+    ///
+    /// **Why this exists separately from the `gabbtvl` key-path tests**
+    /// (`a_get_direct_establishes_its_key_and_a_next_on_that_key_answers`,
+    /// `a_get_direct_on_one_key_then_a_next_on_another_refuses`). Those two
+    /// used to catch a lock read from word 4 *transitively*: they pass
+    /// `keynum = 1`, so a misread lock became 1, and the old blanket refusal
+    /// caught it as a side effect. That mechanism is gone now that locks are
+    /// honoured -- both words would read `1`, a single lock would be taken
+    /// without complaint, and both tests would carry on passing with the
+    /// wrong word, exactly as `docs/plans/2026-08-12-btrieve-finish.md`
+    /// warned. This test is what carries the pin now; the two key-path tests
+    /// are not expected to, and are not changed to try.
     ///
     /// The `abi` session has an equivalent test on its own branch
     /// (`c6e1e17`). Deliberately named differently so the two merge as two
@@ -2702,17 +2752,26 @@ mod tests {
     /// redundant until someone decides so on purpose.
     #[test]
     fn gabbtvl_takes_its_lock_from_word_five_by_value() {
-        let mut f = Fixture::new();
-        open(&mut f, "SAMPLE.DAT", 64);
+        let (mut f, block) = two_key_file("btv-shim-gabbtvl-lock-word-five");
 
-        let e = f
-            .invoke(gabbtvl, &[0, 0, 0, 0, 1, 3])
-            .expect_err("a lock this host cannot give is a refusal");
-
-        let text = e.to_string();
         assert!(
-            text.contains("lock type 3"),
-            "word 5 is the lock; reading word 4 would have said \"lock type 1\": {text}"
+            acquire(&mut f, Some(2), 0, 5),
+            "find the record whose key 0 is 2, to get a real position to lock"
+        );
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 3],
+        )
+        .expect("get direct, then take the lock");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(3),
+            "word 5 is the lock; reading word 4 would have recorded lock type 1"
         );
     }
 
