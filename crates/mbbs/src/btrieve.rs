@@ -33,6 +33,7 @@ pub mod keys;
 mod ops;
 pub mod pages;
 pub mod records;
+mod stat;
 mod variable;
 pub(crate) mod v6;
 
@@ -45,6 +46,7 @@ pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
 pub use ops::{Delivery, Op, OpError, Step};
 pub use records::{Record, Records};
+pub use stat::{deliver, Stat, StatKey};
 
 /// How much of the first page this host reads.
 ///
