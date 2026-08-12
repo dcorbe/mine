@@ -1,6 +1,9 @@
 //! Message files, and the options a module reads out of them.
 //!
-//! Signatures from `GCOMM.H:264-296`:
+//! Signatures from `MCVAPI.H`, except `prfmsg` which is `GCOMM.H:811`:
+//! `opnmsg` `:54`, `clsmsg` `:66`, `rstmbk` `:74`, `numopt` `:89`, `ynopt`
+//! `:95`, `stgopt` `:103`, `tokopt` `:112`. `setmbk` has no prototype of its
+//! own there -- `:43` declares the `curmbk` it sets.
 //!
 //!
 //! The file format and what a value is are [`crate::msg`]'s; this is the part
