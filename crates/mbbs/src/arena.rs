@@ -65,10 +65,7 @@ impl<A: Abi> Default for Arena<A> {
     }
 }
 
-impl<A: Abi> Arena<A>
-where
-    A::Ptr: ModulePtr<Memory = A::Mem>,
-{
+impl<A: Abi> Arena<A> {
     /// Reserve `len` zeroed bytes somewhere stable, and say where.
     ///
     /// The zeroing is written rather than assumed. A fresh region arrives

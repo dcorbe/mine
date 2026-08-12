@@ -90,7 +90,18 @@
 /// What differs between the ABIs a module can be compiled for.
 pub trait Abi {
     /// A pointer as this ABI's modules write one.
-    type Ptr: mbbs_ptr::ModulePtr + Copy + Eq + std::hash::Hash;
+    ///
+    /// Bound to resolve against **this ABI's own memory**, which is what makes
+    /// generic memory access expressible: `ModulePtr` already carries
+    /// `resolve`/`read_cstr`/`write`, but without `Memory = Self::Mem` the
+    /// compiler cannot know that `A::Ptr` reads out of `A::Mem`, so no generic
+    /// caller can use them. `arena.rs` had been carrying this bound privately
+    /// on its own impl; hoisting it here is what lets `Globals`, `Users` and
+    /// eventually every shim body read module memory without naming `FarPtr`.
+    ///
+    /// The cost is that an `Abi` may not pair one ABI's pointer with another's
+    /// memory -- which is the property being bought, not a limitation.
+    type Ptr: mbbs_ptr::ModulePtr<Memory = Self::Mem> + Copy + Eq + std::hash::Hash;
 
     /// What a pointer resolves against. `Segments` for 16-bit; `Image` plus
     /// its allocator for 32-bit. Never the executing machine -- `mbbs32`'s
@@ -559,22 +570,19 @@ mod tests {
     /// replaced, with types `Call`'s read methods never touch.
     struct FixtureAbi;
 
-    /// `Call::mem` needs an `Abi::Mem`, which needs `ModuleMem`. Never
-    /// actually reached: nothing below allocates or calls `Call::mem`, so
-    /// `FixtureAbi::mem` below never runs either.
-    struct FixtureMem;
-
-    impl ModuleMem for FixtureMem {
-        type Ptr = FarPtr;
-
-        fn alloc_region(&mut self, _bytes: usize) -> std::io::Result<Self::Ptr> {
-            unreachable!("Call's read tests never allocate memory")
-        }
-    }
-
     impl Abi for FixtureAbi {
         type Ptr = FarPtr;
-        type Mem = FixtureMem;
+
+        /// `mbbs16::Segments`, not a stub, and not because this fixture ever
+        /// touches memory -- it does not. `Abi::Ptr` is bound
+        /// `ModulePtr<Memory = Self::Mem>`, so an ABI whose `Ptr` is `FarPtr`
+        /// has no choice: `FarPtr` resolves against `Segments` and nothing
+        /// else. That bound is what makes a generic `resolve`/`read_cstr`/
+        /// `write` expressible at all, and the price is that a fixture cannot
+        /// invent its own memory type while borrowing a real pointer type.
+        /// Cheap here, because `Cpu` is still `()` and the reads under test
+        /// never leave the frame.
+        type Mem = mbbs16::Segments;
         type Cpu = ();
         type Int = u16;
 
