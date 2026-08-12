@@ -2537,6 +2537,27 @@ mod tests {
     ///
     /// A non-zero lock has to be refused *by value*, which pins word 5
     /// specifically: read word 4 instead and this call succeeds silently.
+    ///
+    /// # If you are here because this test failed after you changed `unlocked`
+    ///
+    /// Then you have made this host accept a lock it used to refuse, which is
+    /// the point of `docs/plans/2026-08-12-btrieve-finish.md`'s Task 5, and
+    /// this test failed **loudly and on purpose** rather than quietly losing
+    /// what it was holding. Measured, not assumed: making `unlocked` return
+    /// `Ok(())` for every lock fails this test and
+    /// `a_lock_this_host_cannot_take_is_refused_rather_than_ignored`, and
+    /// nothing else.
+    ///
+    /// **Do not repair it by dropping the assertion or by passing a lock the
+    /// new code still refuses.** Either turns it back into a test that cannot
+    /// tell word 4 from word 5, and this is the only thing that can: the two
+    /// are adjacent, the same width, and every other `gabbtvl` test passes
+    /// zero for both.
+    ///
+    /// Repair it by re-pinning on whatever observable replaced the refusal. A
+    /// lock that is *tracked* rather than refused is readable state, so assert
+    /// that the engine recorded lock type 3 against this position. The
+    /// mechanism changes; "word 5, by value" must not.
     #[test]
     fn gabbtvl_reads_its_lock_from_word_five_and_not_from_keynum() {
         let mut f = Fixture::new();
