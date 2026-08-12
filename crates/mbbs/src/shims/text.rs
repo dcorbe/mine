@@ -38,7 +38,8 @@ pub const SPR_BUFFERS: usize = 4;
 /// The module keeps the pointer, so the buffer has to outlive the call and the
 /// rotation has to be wide enough that the next few calls do not tread on it.
 pub fn spr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
+    let ctlstg = super::args(machine).ptr();
+    let (text, _) = format(machine, ctlstg, Args::Call { first: 2 })?;
     let at = host.next_spr_buffer();
     write_cstr(machine, at, &text, SPR_BYTES)?;
     Ok(Ret::Far(at))
@@ -93,7 +94,7 @@ pub const L2AS_BUFFERS: usize = 4;
 /// Formatting itself is [`integer`], the same converter `%d`/`%ld` use, not a
 /// second implementation -- see `fmt`'s module doc for why that matters.
 pub fn l2as(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let value = machine.arg_u32(0) as i32;
+    let value = super::args(machine).long() as i32;
     let negative = value < 0;
     let magnitude = u64::from(value.unsigned_abs());
     let text = integer(magnitude, negative, 10, false, &Spec::default());
@@ -108,8 +109,9 @@ pub fn l2as(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// How big the buffer is, only the caller knows. The bounds check is the
 /// segment's, which is the only limit the host can see.
 pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let buffer = machine.arg_far(0);
-    let template = machine.arg_far(2);
+    let mut args = super::args(machine);
+    let buffer = args.ptr();
+    let template = args.ptr();
     let (text, _) = format(machine, template, Args::Call { first: 4 })?;
     fill(machine, buffer, &text)?;
     Ok(Ret::U16(text.len() as u16))
@@ -129,9 +131,10 @@ pub fn sprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `seg 32:0x0b79`, the word past the last fixed argument -- so the words
 /// behind it are laid out exactly as this routine's own would be.
 pub fn vsprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let buffer = machine.arg_far(0);
-    let template = machine.arg_far(2);
-    let list = machine.arg_far(4);
+    let mut args = super::args(machine);
+    let buffer = args.ptr();
+    let template = args.ptr();
+    let list = args.ptr();
     let (text, _) = format(machine, template, Args::List { at: list })?;
     fill(machine, buffer, &text)?;
     Ok(Ret::U16(text.len() as u16))
@@ -144,7 +147,8 @@ pub fn vsprintf(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the module moves it itself, and a host that cached it would append over
 /// whatever the module had written.
 pub fn prf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
+    let fmat = super::args(machine).ptr();
+    let (text, _) = format(machine, fmat, Args::Call { first: 2 })?;
     append(machine, host, &text)?;
     Ok(Ret::Void)
 }
@@ -359,9 +363,10 @@ pub fn clrprf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// and leave an unterminated buffer, which is the bug this routine exists to
 /// avoid.
 pub fn stzcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
-    let src = machine.arg_far(2);
-    let num = machine.arg_u16(4);
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
+    let num = args.int();
 
     if num == 0 {
         // Nowhere to put even the terminator. Copying nothing is the only
@@ -378,8 +383,10 @@ pub fn stzcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
 /// `char *strcpy(char *dst, char *src)`.
 pub fn strcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
-    let text = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
+    let text = machine.read_cstr(src)?.to_vec();
     let len = text.len() as u16 + 1;
     write_cstr(machine, dst, &text, len)?;
     Ok(Ret::Far(dst))
@@ -387,7 +394,8 @@ pub fn strcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
 /// `unsigned strlen(char *s)`.
 pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let text = machine.read_cstr(machine.arg_far(0))?;
+    let s = super::args(machine).ptr();
+    let text = machine.read_cstr(s)?;
     Ok(Ret::U16(text.len() as u16))
 }
 
@@ -397,7 +405,7 @@ pub fn strlen(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// this is only the read and the write-back. The result is never longer than
 /// what was read, so the original's capacity always holds it.
 pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
+    let at = super::args(machine).ptr();
     let text = machine.read_cstr(at)?.to_vec();
     let tight = crate::strings::rmvwht(&text);
     let capacity = text.len() as u16 + 1;
@@ -411,7 +419,7 @@ pub fn rmvwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the one that arrived. See [`strings::skpwht`](crate::strings::skpwht) for
 /// why a tab does not count.
 pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let cp = machine.arg_far(0);
+    let cp = super::args(machine).ptr();
     let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwht(text) as u16;
     Ok(Ret::Far(at(cp, n)))
@@ -419,7 +427,7 @@ pub fn skpwht(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
 pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let cp = machine.arg_far(0);
+    let cp = super::args(machine).ptr();
     let text = machine.read_cstr(cp)?;
     let n = crate::strings::skpwrd(text) as u16;
     Ok(Ret::Far(at(cp, n)))
@@ -427,7 +435,7 @@ pub fn skpwrd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
 pub fn depad(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
+    let at = super::args(machine).ptr();
     let text = machine.read_cstr(at)?.to_vec();
     let (kept, removed) = crate::strings::depad(&text);
     let capacity = text.len() as u16 + 1;
@@ -677,7 +685,8 @@ pub fn rstrin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// not one. No error: C says the value is undefined on overflow and Borland
 /// wraps, so this wraps.
 pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let text = machine.read_cstr(machine.arg_far(0))?;
+    let s = super::args(machine).ptr();
+    let text = machine.read_cstr(s)?;
     let mut rest = text;
 
     while rest.first().is_some_and(u8::is_ascii_whitespace) {
@@ -712,22 +721,31 @@ pub fn atol(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// family is worth reading twice. See
 /// [`strings::sameas`](crate::strings::sameas).
 pub fn sameas(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let b = machine.read_cstr(machine.arg_far(2))?;
+    let mut args = super::args(machine);
+    let stg1 = args.ptr();
+    let stg2 = args.ptr();
+    let a = machine.read_cstr(stg1)?.to_vec();
+    let b = machine.read_cstr(stg2)?;
     Ok(Ret::U16(crate::strings::sameas(&a, b).into()))
 }
 
 /// `int sameto(char *shorts,char *longs)` -- a prefix test, short one first.
 pub fn sameto(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let longs = machine.read_cstr(machine.arg_far(2))?;
+    let mut args = super::args(machine);
+    let shorts_ptr = args.ptr();
+    let longs_ptr = args.ptr();
+    let shorts = machine.read_cstr(shorts_ptr)?.to_vec();
+    let longs = machine.read_cstr(longs_ptr)?;
     Ok(Ret::U16(crate::strings::sameto(&shorts, longs).into()))
 }
 
 /// `int samein(char *shorts,char *longs)` -- a substring test, short one first.
 pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let shorts = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let longs = machine.read_cstr(machine.arg_far(2))?;
+    let mut args = super::args(machine);
+    let shorts_ptr = args.ptr();
+    let longs_ptr = args.ptr();
+    let shorts = machine.read_cstr(shorts_ptr)?.to_vec();
+    let longs = machine.read_cstr(longs_ptr)?;
     Ok(Ret::U16(crate::strings::samein(&shorts, longs).into()))
 }
 
@@ -736,7 +754,7 @@ pub fn samein(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// See [`strings::lastwd`](crate::strings::lastwd). It writes nothing, and the
 /// selector it answers is the one that arrived.
 pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let s = machine.arg_far(0);
+    let s = super::args(machine).ptr();
     let n = crate::strings::lastwd(machine.read_cstr(s)?) as u16;
     Ok(Ret::Far(at(s, n)))
 }
@@ -752,8 +770,9 @@ pub fn lastwd(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// [`strings::sortstgs`](crate::strings::sortstgs) for why the sort is
 /// transcribed rather than delegated.
 pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let array = machine.arg_far(0);
-    let num = machine.arg_u16(2) as i16;
+    let mut args = super::args(machine);
+    let array = args.ptr();
+    let num = args.int() as i16;
     if num < 2 {
         return Ok(Ret::Void);
     }
@@ -791,8 +810,10 @@ pub fn sortstgs(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// check -- and it is what turns a cursor left dangling by a `galfree` into
 /// [`ShimError::BadPointer`] rather than a token made of rubbish.
 pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let s = machine.arg_far(0);
-    let delims = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let mut args = super::args(machine);
+    let s = args.ptr();
+    let delim = args.ptr();
+    let delims = machine.read_cstr(delim)?.to_vec();
     if s != FarPtr::NULL {
         host.strtok = s;
     }
@@ -828,8 +849,9 @@ pub fn strtok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// (`lodsb / cmp al,bl / jz ... / and al,al / jnz`), so `strchr(s, 0)` answers
 /// a pointer to the terminator rather than `NULL`.
 pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let s = machine.arg_far(0);
-    let want = machine.arg_u16(2) as u8;
+    let mut args = super::args(machine);
+    let s = args.ptr();
+    let want = args.int() as u8;
     let text = machine.read_cstr(s)?;
 
     if want == 0 {
@@ -849,8 +871,10 @@ pub fn strchr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// the check comes before the haystack does here too. A needle that is not
 /// there answers `NULL`.
 pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let hay = machine.arg_far(0);
-    let needle = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let mut args = super::args(machine);
+    let hay = args.ptr();
+    let needle_ptr = args.ptr();
+    let needle = machine.read_cstr(needle_ptr)?.to_vec();
     if needle.is_empty() {
         return Ok(Ret::Far(hay));
     }
@@ -872,9 +896,11 @@ pub fn strstr(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// so the bound is the segment's -- the same limit [`fill`] applies to
 /// `sprintf`, and for the same reason.
 pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
     let end = machine.read_cstr(dst)?.len() as u16;
-    let text = machine.read_cstr(machine.arg_far(2))?.to_vec();
+    let text = machine.read_cstr(src)?.to_vec();
     fill(machine, at(dst, end), &text)?;
     Ok(Ret::Far(dst))
 }
@@ -886,10 +912,19 @@ pub fn strcat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// `maxlen + 1` bytes land past the end of `dst` and -- unlike [`strncpy`] --
 /// the result is always terminated.
 pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
+    // Hoisted to frame order (0, 2, 4): the original read word 4 (`max`)
+    // before word 2 (`src`), which `re/argscan.py` flags OUT-OF-ORDER,SKIPS
+    // and which a forward-only cursor cannot reproduce. `arg_far`/`arg_u16`
+    // are infallible -- they pull bytes off the frame and cannot fail or
+    // branch -- so which of the three is decoded first is not observable;
+    // only `read_cstr` can fail, and it still runs exactly where it always
+    // did, after every argument is in hand.
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
+    let max = usize::from(args.int());
     let end = machine.read_cstr(dst)?.len() as u16;
-    let max = usize::from(machine.arg_u16(4));
-    let text = machine.read_cstr(machine.arg_far(2))?;
+    let text = machine.read_cstr(src)?;
     let text = text[..text.len().min(max)].to_vec();
     fill(machine, at(dst, end), &text)?;
     Ok(Ret::Far(dst))
@@ -908,8 +943,18 @@ pub fn strncat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// fixed-width field with no NUL in it is precisely what this routine is for,
 /// and refusing one would stop a module the real host served.
 pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
-    let n = usize::from(machine.arg_u16(4));
+    // Hoisted to frame order (0, 2, 4): the original read word 4 (`n`)
+    // before word 2 (`src`), which `re/argscan.py` flags OUT-OF-ORDER,SKIPS.
+    // `arg_far`/`arg_u16` are infallible reads off the frame, so decoding
+    // `src` before checking `n == 0` is not observable -- `ptr()` never
+    // resolves or dereferences anything, it only pulls 4 bytes out of the
+    // argument frame. The `n == 0` early return below still runs before
+    // `src` is ever *read from* (via `resolve`/`read_cstr`), which is the
+    // property that made the original safe on a source that is not there.
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
+    let n = usize::from(args.int());
     if n == 0 {
         // All three `rep` prefixes are no-ops, so the original dereferences
         // neither pointer. Same reason `stzcpy` returns early on a zero.
@@ -919,7 +964,6 @@ pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     // What the scan could touch. `n` bytes if they are all inside the segment;
     // otherwise the original only got away with it because a terminator
     // stopped it first, and `read_cstr` is the reader that insists on one.
-    let src = machine.arg_far(2);
     let text = match machine.resolve(src, n) {
         Ok(bytes) => bytes,
         Err(_) => machine.read_cstr(src)?,
@@ -941,8 +985,11 @@ pub fn strncpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
 /// byte difference, not a sign, and MajorMUD's 48 sites test it both ways.
 pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let a = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let b = machine.read_cstr(machine.arg_far(2))?;
+    let mut args = super::args(machine);
+    let a_ptr = args.ptr();
+    let b_ptr = args.ptr();
+    let a = machine.read_cstr(a_ptr)?.to_vec();
+    let b = machine.read_cstr(b_ptr)?;
     Ok(Ret::U16(crate::strings::strcmp(&a, b) as u16))
 }
 
@@ -958,13 +1005,15 @@ pub fn strcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// its low byte and zero-extended back -- so `toupper(0x161)` is `toupper('a')`
 /// and answers `0x41`, not `0x141`.
 pub fn toupper(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::toupper)))
+    let c = super::args(machine).int();
+    Ok(Ret::U16(fold(c, crate::strings::toupper)))
 }
 
 /// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
 /// `sameto` and `samein` fold with.
 pub fn tolower(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    Ok(Ret::U16(fold(machine.arg_u16(0), crate::strings::tolower)))
+    let c = super::args(machine).int();
+    Ok(Ret::U16(fold(c, crate::strings::tolower)))
 }
 
 /// The `int` wrapper both case-folding routines share: EOF through untouched,
