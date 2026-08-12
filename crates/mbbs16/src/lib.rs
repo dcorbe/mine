@@ -749,6 +749,42 @@ impl Machine {
         u32::from(self.arg_u16(n)) | (u32::from(self.arg_u16(n + 1)) << 16)
     }
 
+    /// The outstanding call's raw argument frame, as bytes -- the same bytes
+    /// [`arg_u16`](Machine::arg_u16)/[`arg_far`](Machine::arg_far) read, but
+    /// as a slice a byte-oriented cursor can walk instead of a word index.
+    ///
+    /// `crates/mbbs/src/abi.rs`'s `Cursor` is the caller: it decodes a shim's
+    /// arguments by C type and advances by that type's byte width, so it
+    /// needs the frame as one contiguous `&[u8]` rather than a method that
+    /// answers one word at a time. This is where that slice comes from --
+    /// starting exactly where `arg_u16` starts counting, `sp + 4`, which
+    /// skips the far return address the call pushed.
+    ///
+    /// # How long is the frame?
+    ///
+    /// There is no way to know a callee's arity here -- that lives in the
+    /// routine's own prototype, several layers up, and this method has no
+    /// access to it. So it returns everything from the first argument to the
+    /// end of the stack segment, which is the widest slice that is still
+    /// honestly backed by real memory: nothing past it belongs to this
+    /// module at all. A cursor built from a too-short prototype reads
+    /// garbage from whatever the next call's frame left behind, exactly as
+    /// `arg_u16(n)` would for too-large an `n` today -- that is a host bug in
+    /// the shim's prototype, not something this method is positioned to
+    /// catch.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn arg_frame(&self) -> &[u8] {
+        let sp = self
+            .frame_sp
+            .expect("arg_frame() with no outstanding call to read from");
+        let start = usize::from(sp) + 4;
+        let stack = self.mem.stack();
+        stack.slice(start, stack.len() - start)
+    }
+
     /// Selector of the scratch code segment [`Machine::load_code`] fills.
     ///
     /// Delegates to [`Segments::code_selector`]; kept on `Machine` so the shim

@@ -29,7 +29,8 @@ use crate::gsbl::Gsbl;
 /// the record. Keying a Btrieve read on whatever follows the block is the exact
 /// class of quiet wrongness this crate refuses, so the module stops instead.
 pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let unum = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let unum = args.int() as i16;
     let chan = host
         .users()
         .terms()
@@ -67,7 +68,8 @@ pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// one of the two callers that also owns the silent-no-op behaviour, so the
 /// range check stays here and the body that does not vary moved out.
 pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let uno = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let uno = args.int() as i16;
     let Some(chan) = host.users().terms().chan(uno) else {
         host.note_once(
             "curusr",
@@ -152,7 +154,9 @@ pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// on purpose; it is C's in-place API leaking through an interface that is
 /// otherwise pure.
 pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let lock = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let mut args = super::args(machine);
+    let lock = args.ptr();
+    let lock = machine.read_cstr(lock)?.to_vec();
     let lock = String::from_utf8_lossy(&lock);
     // `globals()` reports `io::Error` and `ShimError` has no `From` for it, so
     // the map_err is the house pattern here -- see `shims/fsd.rs:72`.
@@ -202,8 +206,9 @@ pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a NULL here
 /// is a module bug this host can name.
 pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let unum = machine.arg_u16(0) as i16;
-    let rouptr = machine.arg_far(1);
+    let mut args = super::args(machine);
+    let unum = args.int() as i16;
+    let rouptr = args.ptr();
     if rouptr == FarPtr::NULL {
         return Err(ShimError::Failed(format!(
             "begin_polling({unum}): a null polling routine"
@@ -237,7 +242,8 @@ pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
 ///
 /// If `unum` names no channel.
 pub fn stop_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let unum = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let unum = args.int() as i16;
     let chan = host
         .users()
         .terms()

@@ -16,8 +16,28 @@ pub mod user;
 use mbbs16::{Machine, Ret};
 
 use crate::Host;
+use crate::abi::{Cursor, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
 use crate::globals::GLOBALS;
+
+/// A cursor over the outstanding call's argument frame, decoded for [`Wg16`].
+///
+/// One helper rather than `Cursor::new(machine.arg_frame())` written out at
+/// every shim's first line, because every converted shim needs the identical
+/// two calls and the crate has only one 16-bit `Abi` to name.
+///
+/// Takes `&Machine`, not `&mut Machine`: argument reads are immutable
+/// (`Machine::arg_u16`/`arg_far` always were), and the returned `Cursor`
+/// borrows `machine` for as long as it lives. The plan's own hoisting rule --
+/// read every argument at the top of the function, before any other use of
+/// `machine` -- is what ends that borrow before a shim goes on to call
+/// `&mut Machine` methods; see `crates/mbbs/src/abi.rs`'s module doc for why
+/// that is enough for Task 4, and the implementation plan's Task 5 note for
+/// why it stops being enough once `Call` holds `mem: &mut A::Mem` alongside
+/// a `Cursor` for a whole shim body.
+pub(crate) fn args(machine: &Machine) -> Cursor<'_, Wg16> {
+    Cursor::new(machine.arg_frame())
+}
 
 /// -1, as a 16-bit `int`.
 ///
