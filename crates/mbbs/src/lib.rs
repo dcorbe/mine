@@ -104,11 +104,10 @@ use mbbs16::{
 
 // `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
 // own 64 KiB allocation goes through the `Abi` trait's allocator now, same as
-// `Heap`/`Arena`/`Globals`, rather than `Machine::alloc_segment` directly. See
-// `docs/plans/2026-08-11-abi-abstraction-implementation.md`'s Task 6. `Wg16`
-// is named here only where a generic type needs pinning explicitly (`Host`
-// itself stays un-generified -- that is the next task, not this one).
-use crate::abi::{ModuleMem, Wg16};
+// `Heap`/`Arena`/`Globals`. `Abi` itself is what `Host<A>` is now generic
+// over; `Wg16` is still named explicitly wherever a generic type needs
+// pinning to the one ABI that exists, including `impl Host<Wg16>` below.
+use crate::abi::{Abi, ModuleMem, Wg16};
 
 /// How a module entry point ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,16 +330,24 @@ impl std::fmt::Display for MissingGlobal {
 /// One block per routine rather than one shared block, because the original had
 /// three separate statics and a module may hold an `ncdate` result across an
 /// `nctime` call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DateBuffers {
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type as
+/// plain `DateBuffers` -- see [`Host`]'s own doc comment for why that default
+/// is what keeps `crates/mbbs/src/shims/system.rs` compiling untouched. Not
+/// `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`: the derive macros bound `A:
+/// Trait` on the impl, which is wrong here -- `Wg16` itself implements none of
+/// these, only `A::Ptr` does (`Abi::Ptr: mbbs_ptr::ModulePtr + Copy + Eq +
+/// Hash`, and `ModulePtr` itself requires `Debug`). See `abi.rs`'s `Ret<A>`
+/// for the same trap hit and fixed the same way.
+pub(crate) struct DateBuffers<A: Abi = Wg16> {
     /// 9 bytes: `MM/DD/YY` and its terminator.
-    pub(crate) date: FarPtr,
+    pub(crate) date: A::Ptr,
 
     /// 9 bytes: `HH:MM:SS` and its terminator.
-    pub(crate) time: FarPtr,
+    pub(crate) time: A::Ptr,
 
     /// 10 bytes: `DD-Mon-YY` and its terminator.
-    pub(crate) edat: FarPtr,
+    pub(crate) edat: A::Ptr,
 
     /// One byte, always NUL. What `ncdate(0)` returns -- and a **different**
     /// address from `date`, so a null date leaves an earlier result standing,
@@ -348,8 +355,44 @@ pub(crate) struct DateBuffers {
     /// explicitly at `shims/system.rs:110` rather than trusted to the heap's
     /// zero-fill -- see [`Host::empty`] for the sibling that exists for the
     /// module's first instruction instead of its first date call.
-    pub(crate) empty: FarPtr,
+    pub(crate) empty: A::Ptr,
 }
+
+impl<A: Abi> Clone for DateBuffers<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for DateBuffers<A> {}
+
+impl<A: Abi> std::fmt::Debug for DateBuffers<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DateBuffers")
+            .field("date", &self.date)
+            .field("time", &self.time)
+            .field("edat", &self.edat)
+            .field("empty", &self.empty)
+            .finish()
+    }
+}
+
+impl<A: Abi> PartialEq for DateBuffers<A>
+where
+    A::Ptr: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.date == other.date
+            && self.time == other.time
+            && self.edat == other.edat
+            && self.empty == other.empty
+    }
+}
+
+impl<A: Abi> Eq for DateBuffers<A> where A::Ptr: Eq {}
 
 /// Why a module could not be loaded.
 #[derive(Debug)]
@@ -400,9 +443,26 @@ pub struct Query {
 }
 
 /// One MajorBBS host.
-pub struct Host {
+///
+/// `A` defaults to [`Wg16`] so every existing caller -- every field access
+/// and method call in this file, every `&mut Host` in `crates/mbbs/src/shims/`,
+/// `crates/mbbs-server`, and every test -- keeps naming this type as plain
+/// `Host` and keeps compiling unchanged. See `docs/plans/2026-08-11-abi-
+/// abstraction-implementation.md`'s "Tasks 5 and 6 are in the wrong order,
+/// and `Host` is missing from both": `Host` owns [`Heap`], [`Globals`],
+/// [`TextVars`], [`msg::Messages`], [`stream::Streams`] and [`Users`], each
+/// already generic over `A` (`Heap`/`Arena`/`Globals` in one commit, the other
+/// four one file at a time), so those fields flip to `<A>` here. Every
+/// method stays in `impl Host<Wg16>` below, taking `&mut Machine` exactly as
+/// before -- the same "generic at the type level, `Wg16`-only method surface"
+/// landing point `Globals` chose deliberately, not a partial conversion.
+///
+/// [`btrieve::Btrieve`] stays concrete: it is out of scope here (a concurrent
+/// session owns that file) and a generic struct is free to hold
+/// non-parameterized fields alongside parameterized ones.
+pub struct Host<A: Abi = Wg16> {
     exports: &'static Exports,
-    globals: Globals,
+    globals: Globals<A>,
 
     /// Where the module's own files are: its `.MDF`, its `.MSG` files, and
     /// eventually its Btrieve tables. A DOS module names them without a path
@@ -410,7 +470,7 @@ pub struct Host {
     pub root: PathBuf,
 
     /// `spr`'s rotating buffers, and which one is next.
-    spr: FarPtr,
+    spr: A::Ptr,
     spr_next: usize,
 
     /// `l2as`'s rotating buffers, and which one is next.
@@ -423,7 +483,7 @@ pub struct Host {
     /// implies -- a behaviour change to `spr` smuggled in by an unrelated
     /// shim. `l2as` gets its own small rotation instead, in the same
     /// module-addressable segment `spr`, `mdf` and `empty` already share.
-    l2as: FarPtr,
+    l2as: A::Ptr,
     l2as_next: usize,
 
     /// Where `strtok` left off.
@@ -437,7 +497,7 @@ pub struct Host {
     ///
     /// Starts null, so a `strtok(NULL, ...)` with no `strtok(s, ...)` before it
     /// stops the module rather than reading whatever happened to be there.
-    pub(crate) strtok: FarPtr,
+    pub(crate) strtok: A::Ptr,
 
     /// Where `ncdate`, `nctime` and `ncedat` format, once one of them has run.
     ///
@@ -450,10 +510,10 @@ pub struct Host {
     ///
     /// `None` until something needs them. Allocating in [`Host::new`] would put
     /// four blocks on the heap of a module that may never ask the time.
-    pub(crate) datebuf: Option<DateBuffers>,
+    pub(crate) datebuf: Option<DateBuffers<A>>,
 
     /// The line buffer `gmdnam` returns a pointer into.
-    mdf: FarPtr,
+    mdf: A::Ptr,
 
     /// One NUL byte the host owns and keeps, forever.
     ///
@@ -466,7 +526,7 @@ pub struct Host {
     /// Written explicitly in [`Host::new`] rather than trusted to the
     /// allocator's zero-fill -- see [`DateBuffers::empty`] for the sibling
     /// that gets the same treatment for the same reason, lazily instead.
-    empty: FarPtr,
+    empty: A::Ptr,
 
     /// Where the print buffer ends, so `prf` can refuse to run past it.
     prf_end: u16,
@@ -495,15 +555,21 @@ pub struct Host {
 
     /// The text variables the module has registered. Unlike [`Host::agents`]
     /// these live in memory the module can reach -- see [`TextVars`].
-    pub(crate) textvars: TextVars,
+    pub(crate) textvars: TextVars<A>,
 
     /// The message files that are open, and their text in module memory. Which
     /// one is *current* is not here -- that is `curmbk`, a global the module
     /// can see.
-    pub(crate) messages: msg::Messages,
+    pub(crate) messages: msg::Messages<A>,
 
     /// The Btrieve files that are open, and the stack of which is current.
     /// Which one *is* current is `bb`, for the same reason.
+    ///
+    /// Concrete, not `btrieve::Btrieve<A>` -- out of scope for this
+    /// conversion (a concurrent session owns `crates/mbbs/src/btrieve.rs` and
+    /// `crates/mbbs/src/btrieve/`). A generic struct holding a
+    /// non-parameterized field alongside parameterized ones is ordinary Rust;
+    /// nothing about `Host<A>` requires every field to depend on `A`.
     pub(crate) btrieve: btrieve::Btrieve,
 
     /// The terminal channels. See [`gsbl`].
@@ -512,7 +578,7 @@ pub struct Host {
     /// The streams that are open. No notion of a current one -- `fopen` hands
     /// back a `FILE *` and every routine takes it, so there is no `curmbk` or
     /// `bb` equivalent to keep in module memory.
-    pub(crate) streams: stream::Streams,
+    pub(crate) streams: stream::Streams<A>,
 
     /// Every data file the host created from its virgin copy, in the order it
     /// did. See [`Host::btrieve_file`].
@@ -577,14 +643,14 @@ pub struct Host {
     /// point on, two channels entering data at once would have shared one
     /// control block and interleaved their answers into a single `newans`.
     /// Keyed by channel now, so that cannot happen by construction.
-    pub(crate) fsdscb: Vec<Option<FarPtr>>,
+    pub(crate) fsdscb: Vec<Option<A::Ptr>>,
 
     /// Each channel's `fsdusr->{curmbk,tmpmsg,amode}` -- which message block
     /// `fsdroom` last read a template out of, which template, and in which
     /// mode. `FSDBBS.C:134`, and Rust-side rather than in module memory
     /// because `fsdusr` is ordinal 264 and `WCCMMUD.DLL` never imports it.
     /// Indexed by [`Chan::index`], for the same reason [`Host::fsdscb`] is.
-    pub(crate) fsdtmp: Vec<Option<(FarPtr, u16, i16)>>,
+    pub(crate) fsdtmp: Vec<Option<(A::Ptr, u16, i16)>>,
 
     /// The FSD's own `state` slot, registered in [`Host::finish_init`] the
     /// way `inifsd()` registers FSDBBS as a module. `None` before
@@ -603,7 +669,7 @@ pub struct Host {
     /// the module dereferences directly -- so they are Rust-side. Indexed by
     /// [`Chan::index`], for the reason [`Host::fsdscb`] is: one session per
     /// channel, not one shared by all of them.
-    pub(crate) fsd_sessions: Vec<Option<FsdSession>>,
+    pub(crate) fsd_sessions: Vec<Option<FsdSession<A>>>,
 
     /// Per-channel ANSI keystroke-decoder state, one byte apiece.
     ///
@@ -634,7 +700,7 @@ pub struct Host {
     /// Cached rather than rebuilt because message text does not change once
     /// read, and because a fresh segment per `fsdrft` call would leak one per
     /// redisplay.
-    pub(crate) fsd_ascii: std::collections::HashMap<(FarPtr, u16), FarPtr>,
+    pub(crate) fsd_ascii: std::collections::HashMap<(A::Ptr, u16), A::Ptr>,
 
     /// Scratch memory for the candidate answer `fsdprc`'s `FSDBUF` arm
     /// hands `fldvfy`: the module reads `char *answer` out of it, and
@@ -652,17 +718,17 @@ pub struct Host {
     /// buffer also used by the ANSI screen paths this crate does not
     /// build) -- the one purpose this port ever writes it for is a single
     /// candidate answer, never longer than `ANSLEN`.
-    pub(crate) fsd_scratch: Option<FarPtr>,
+    pub(crate) fsd_scratch: Option<A::Ptr>,
 
     /// The module's heap and its tiled regions.
-    pub(crate) heap: Heap,
+    pub(crate) heap: Heap<A>,
 
     /// The per-channel tables: `user[]`, `extusr[]` and the account block.
     ///
     /// One slot each per channel, allocated at construction because the real
     /// host allocated them before any module's init ran -- `MAJORBBS.C:735-736`
     /// and `ACCOUNT.C:109`. See [`Users`].
-    pub(crate) users: Users,
+    pub(crate) users: Users<A>,
 
     /// Every lock a module has asked about, in order. See [`Host::keys_asked`].
     asked: Vec<Query>,
@@ -758,8 +824,14 @@ enum PollTarget {
 
 /// The two things about an FSD session no module can see. See
 /// [`Host::fsd_sessions`].
-#[derive(Debug, Clone, Default)]
-pub(crate) struct FsdSession {
+///
+/// `A` defaults to [`Wg16`] for the same reason [`DateBuffers`] does. Not
+/// `#[derive(Debug, Clone, Default)]`: same trap, same fix -- see
+/// `DateBuffers`'s own doc comment. `Default` in particular would bound `A:
+/// Default`, which `Wg16` does not implement and does not need to: every
+/// field here defaults on its own (`bool` and `Option<A::Ptr>` both do,
+/// regardless of what `A::Ptr` is).
+pub(crate) struct FsdSession<A: Abi = Wg16> {
     /// Whether `fsdego` started this session with `fsdent` rather than
     /// `fsdlin` -- the original's `fsdusr->flags & FBFULL` (`FSDBBS.C:207`,
     /// `:211`). `goback` reads it to decide whether to park the cursor below
@@ -776,7 +848,7 @@ pub(crate) struct FsdSession {
     /// The `whndun(save)` callback `fsdego` was handed, or `None` if the
     /// module passed `NULL` -- `goback()`'s own `else` branch
     /// (`FSDBBS.C:236`) is what a `None` here means to it.
-    pub whndun: Option<FarPtr>,
+    pub whndun: Option<A::Ptr>,
 
     /// Whether the session is exiting to save (`FSDSAV`) or to quit
     /// (`FSDQIT`). `fsdusr->flags & FBSAVE`, read by `goback()` after
@@ -784,7 +856,40 @@ pub(crate) struct FsdSession {
     pub save: bool,
 }
 
-impl Host {
+impl<A: Abi> Clone for FsdSession<A> {
+    fn clone(&self) -> Self {
+        Self {
+            full_screen: self.full_screen,
+            whndun: self.whndun,
+            save: self.save,
+        }
+    }
+}
+
+impl<A: Abi> std::fmt::Debug for FsdSession<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsdSession")
+            .field("full_screen", &self.full_screen)
+            .field("whndun", &self.whndun)
+            .field("save", &self.save)
+            .finish()
+    }
+}
+
+impl<A: Abi> Default for FsdSession<A> {
+    fn default() -> Self {
+        Self {
+            full_screen: false,
+            whndun: None,
+            save: false,
+        }
+    }
+}
+
+impl Host<Wg16> {
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
     ///
