@@ -151,6 +151,42 @@ impl std::fmt::Display for Poison {
     }
 }
 
+/// What a host call hands back to the module, for [`Machine::resume`].
+///
+/// The 32-bit-cdecl tier of `mbbs16::Ret`: plain 32-bit `cdecl` returns an
+/// `int` (or a pointer -- this ABI is flat, so there is no `mbbs16::Ret::Far`
+/// counterpart) in `EAX`, and anything 64 bits wide in `EDX:EAX`, high half
+/// in `EDX`. Naming the width here rather than a resume method per shape is
+/// the same choice `mbbs16::Ret` makes, for the same reason: a table of
+/// several hundred shims wants the choice explicit at the one place it is
+/// made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ret {
+    /// Nothing to return. Both halves are cleared, so a module that reads
+    /// `EDX` anyway -- mistaking a 32-bit result for a 64-bit one -- sees
+    /// something deterministic.
+    Void,
+
+    /// A 32-bit result -- an `int`, or a pointer, since this ABI has no
+    /// separate segment to carry -- in `EAX`.
+    U32(u32),
+
+    /// A 64-bit result, split `EDX:EAX` with the high half in `EDX`. What a
+    /// `long long` comes back as under cdecl.
+    U64(u64),
+}
+
+impl Ret {
+    /// The `(EAX, EDX)` the module should resume with.
+    fn registers(self) -> (u32, u32) {
+        match self {
+            Self::Void => (0, 0),
+            Self::U32(v) => (v, 0),
+            Self::U64(v) => (v as u32, (v >> 32) as u32),
+        }
+    }
+}
+
 /// A 32-bit module's execution state: its thunk table, its Win32 [`Tib`], and
 /// the crossing context needed to re-enter it.
 ///
@@ -168,6 +204,20 @@ pub struct Machine {
 
     /// The state the assembly is entered through.
     ctx: Ctx,
+
+    /// `ESP` (a linear address) when the module last called out, or `None`
+    /// before its first call and after it has returned. The frame the
+    /// module's own `call` pushed -- one 4-byte near return address -- sits
+    /// at exactly this offset; [`Machine::resume`] reads it back to know
+    /// where to continue.
+    ///
+    /// Unlike `mbbs16::Machine::frame_sp`, nothing needs stepping over to
+    /// reach it: the call thunk here pushes nothing before reaching the
+    /// trampoline (`asm.rs`'s module doc comment -- `EAX`/`ECX` are ordinary
+    /// caller-saved scratch under 32-bit cdecl, so a thunk has nothing of
+    /// the module's to save), so `out_esp` at the moment of [`Exit::Call`]
+    /// already names this address directly.
+    frame_sp: Option<u32>,
 
     /// Set once this machine has faulted, and never cleared. A poisoned
     /// machine refuses to be entered again.
@@ -249,6 +299,7 @@ impl Machine {
             bridge,
             tib,
             ctx: Ctx::default(),
+            frame_sp: None,
             poisoned: None,
         })
     }
@@ -296,20 +347,24 @@ impl Machine {
     /// comes back here as [`Exit::Returned`].
     ///
     /// This crate does not own the [`Image`] being entered, unlike
-    /// `mbbs16::Machine`, which owns its loaded NE module --
-    /// deliberately: nothing through this increment services a call
-    /// ([`Exit::Call`] is where execution stops, not a point some other
-    /// method resumes from), so there is no "outstanding call" state for a
-    /// loaded module to need to outlive across. Keeping the module's own
-    /// mapped memory alive for the duration of this call is the caller's
-    /// job -- an [`Image`] kept in scope across the call, exactly as
-    /// `tib.rs`'s and `asm.rs`'s own tests keep their scratch [`Mapping`]s
-    /// alive across [`asm::enter`].
+    /// `mbbs16::Machine`, which owns its loaded NE module -- deliberately:
+    /// the only state a call leaves behind between crossings is the
+    /// module's own stack, which this `Machine` already owns through its
+    /// [`Tib`], plus the near return address [`Machine::resume`] reads back
+    /// out of it. Keeping the module's own mapped memory -- code, data,
+    /// everything but the stack -- alive is the caller's job, for as long as
+    /// any call issued against it might still be outstanding: across every
+    /// [`Machine::resume`], not only the initial [`Machine::call`]. Exactly
+    /// as `tib.rs`'s and `asm.rs`'s own tests keep their scratch
+    /// [`Mapping`]s alive across [`asm::enter`].
     ///
     /// The stack starts fresh at the top of this machine's [`Tib`] on every
-    /// call, so a call made after a previous one returned [`Exit::Call`] --
-    /// which this crate has no way to resume -- simply abandons whatever
-    /// frame that left behind.
+    /// `call`. An [`Exit::Call`] this returned earlier left a frame this
+    /// machine still remembers -- [`Machine::resume`] is how the module
+    /// continues past it, with the host's answer in `EAX`/`EDX:EAX`. Calling
+    /// `call` again instead of resuming abandons that frame outright: the
+    /// two are not interchangeable, and nothing here enforces which one a
+    /// caller means.
     ///
     /// # Errors
     ///
@@ -345,15 +400,98 @@ impl Machine {
             stack[off..off + 4].copy_from_slice(&arg.to_le_bytes());
         }
 
-        self.run(entry, sp)
+        // A fresh entry point, not a continuation of whatever the last one
+        // left behind: no outstanding frame, and the callee-saved quad
+        // starts at a defined zero rather than some earlier call's leftovers
+        // -- exactly the reset `mbbs16::Machine::call` gives `out_bx`/
+        // `out_si`/`out_di`/`out_bp` before its own `self.run(...)`.
+        self.frame_sp = None;
+        self.ctx.out_ebx = 0;
+        self.ctx.out_esi = 0;
+        self.ctx.out_edi = 0;
+        self.ctx.out_ebp = 0;
+
+        self.run(entry, sp, Ret::Void)
     }
 
-    /// Cross into 32-bit mode and come back.
-    fn run(&mut self, entry: u32, sp: u32) -> io::Result<Exit> {
+    /// Resume the module from its outstanding call, handing back `ret` in
+    /// `EAX` (`EDX:EAX` for a 64-bit result), and re-entering at the
+    /// instruction after the module's own `call`.
+    ///
+    /// There is no `resume_cleaning` counterpart here, unlike
+    /// `mbbs16::Machine`. That method exists there because 16-bit Borland
+    /// huge-model code has genuinely callee-cleaned helpers (`f_lumod@` and
+    /// its family); 32-bit Worldgroup does not carry that quirk forward --
+    /// it is uniformly cdecl. The ten callee-cleaned `F_*@` helpers a reader
+    /// of `WGSERVER.DEF` might expect an analogue for live inside its
+    /// `#ifdef GCDOS` block only, which a plain 32-bit cdecl PE like
+    /// `wccmmud.dll` never takes. A module always cleans its own arguments
+    /// under this ABI, so [`resume`](Machine::resume) is the only shape a
+    /// resume ever needs.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+        let sp = self
+            .frame_sp
+            .expect("resume() with no outstanding call to resume from");
+
+        // The near return address the module's own `call` pushed, read back
+        // rather than assumed -- a module with more than one code section
+        // calls out from any of them. Checked, not merely `debug_assert`ed:
+        // a poisoned or corrupted `frame_sp` below `stack_limit` must not
+        // silently wrap into a plausible-looking offset the way
+        // `mbbs16::Machine::resume_cleaning`'s own comment warns an
+        // unchecked `+= THUNK_SAVES` would -- an out-of-range `sp` here
+        // fails loudly instead.
+        let limit = self.tib.stack_limit();
+        let off = sp
+            .checked_sub(limit)
+            .expect("resume(): the remembered call frame is below this machine's own stack")
+            as usize;
+        let at = {
+            let stack = self.tib.stack_mut();
+            let bytes = stack.get(off..off + 4).expect(
+                "resume(): the remembered call frame is outside this machine's own stack",
+            );
+            u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
+        };
+
+        // Step over the 4 bytes just read, exactly as the module's own `ret`
+        // would when the call it made returns normally: `ESP` ends up where
+        // it stood the instant after the `call` instruction pushed that
+        // return address, with the host's answer now sitting in `EAX`/`EDX`
+        // in its place.
+        self.run(at, sp + 4, ret)
+    }
+
+    /// Cross into 32-bit mode and come back, handing the module `ret` in
+    /// `EAX`/`EDX:EAX` on the way in.
+    fn run(&mut self, entry: u32, sp: u32, ret: Ret) -> io::Result<Exit> {
+        let (eax, edx) = ret.registers();
+
         self.ctx.target_offset = entry;
         self.ctx.target_selector = USER32_CS;
         self.ctx.fs = self.tib.fs_selector();
         self.ctx.esp = sp;
+        self.ctx.eax = eax;
+        self.ctx.edx = edx;
+
+        // Hand the callee-saved quad back exactly as the module left it --
+        // whether that is a fresh call's defined zero (`Machine::call`
+        // primes `out_ebx`/`out_esi`/`out_edi`/`out_ebp` before calling
+        // here) or a resume's leftovers from the crossing that produced the
+        // `Exit::Call` being serviced. The same propagation
+        // `mbbs16::Machine::run` does for `si`/`di`/`bp`/`ds`, one register
+        // wider and one register longer, and for the same reason: a host
+        // call is a callee like any other under cdecl, and losing these
+        // would not crash anything -- it would silently hand the module back
+        // a value it never stored, which is worse.
+        self.ctx.ebx = self.ctx.out_ebx;
+        self.ctx.esi = self.ctx.out_esi;
+        self.ctx.edi = self.ctx.out_edi;
+        self.ctx.ebp = self.ctx.out_ebp;
 
         // The trampoline writes these on every crossing, but a poisoned
         // machine never re-enters `run`, and a fresh `Ctx` starts zeroed
@@ -377,16 +515,19 @@ impl Machine {
             let signo = self.ctx.out_signo as i32;
             let eip = self.ctx.out_eip;
             self.poisoned.get_or_insert(Poison::Fault { signo, eip });
+            self.frame_sp = None;
             return Ok(Exit::Fault { signo, eip });
         }
 
         if self.ctx.out_ecx == KIND_RETURN {
+            self.frame_sp = None;
             return Ok(Exit::Returned {
                 eax: self.ctx.out_eax,
                 edx: self.ctx.out_edx,
             });
         }
 
+        self.frame_sp = Some(self.ctx.out_esp);
         Ok(Exit::Call {
             index: self.ctx.out_eax as u16,
         })

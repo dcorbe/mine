@@ -10,7 +10,7 @@
 //! (which can only ever prove the *first* host symbol's call shape) is
 //! trusted.
 
-use mbbs32::{Exit, Machine, Mapping};
+use mbbs32::{Exit, Machine, Mapping, Ret};
 
 /// A fresh low mapping holding exactly `code`, and the linear address of its
 /// first byte.
@@ -128,5 +128,65 @@ fn a_module_that_faults_poisons_the_machine_and_the_host_survives() {
         PROBE.with(|p| p.get()),
         0x1357_9bdf,
         "the host's thread_local storage did not survive a module fault"
+    );
+}
+
+/// A serviced import call resumes the module *at the instruction after its
+/// `call`*, not merely "with the right value somewhere in EAX".
+///
+/// mov eax, [esp+4]      ; the argument
+/// call <thunk 7>        ; host routine -- returns arg * 2
+/// add eax, 1            ; proves execution CONTINUED past the call
+/// ret
+///
+/// The assertion is on `arg * 2 + 1`, deliberately not on `arg * 2`:
+/// `docs/plans/2026-08-12-btrieve-finish.md` (Task 1) is explicit that a
+/// machine which serviced the call but resumed at the wrong address, or
+/// which never resumed at all and just reported the thunk's own value back
+/// as though it were the module's, would *still* produce `arg * 2` here --
+/// only the `add eax, 1` after the call site distinguishes "resumed
+/// correctly" from either of those failures.
+#[test]
+fn a_serviced_import_call_resumes_and_the_module_sees_the_return_value() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(7);
+
+    // Reserve the mapping first so `call`'s displacement can be computed
+    // against the real address, exactly as
+    // `a_module_that_calls_an_import_reaches_exit_call` does.
+    let (mut mapping, entry) = code_at(&[]);
+    let mut code = vec![
+        0x8b, 0x44, 0x24, 0x04, // mov eax, [esp+4]
+    ];
+    code.push(0xe8); // call rel32
+    let call_site_end = entry + code.len() as u32 + 4;
+    let rel = target.wrapping_sub(call_site_end);
+    code.extend_from_slice(&rel.to_le_bytes());
+    code.extend_from_slice(&[
+        0x83, 0xc0, 0x01, // add eax, 1
+        0xc3, // ret
+    ]);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    const ARG: u32 = 21;
+    let exit = machine.call(entry, &[ARG]).expect("reaches the import call");
+    assert_eq!(
+        exit,
+        Exit::Call { index: 7 },
+        "the module's call did not reach the thunk"
+    );
+
+    // The host's answer to thunk 7: ARG * 2. `resume` hands it back in EAX
+    // and re-enters after the `call` -- `add eax, 1` then runs on top of it.
+    let exit = machine
+        .resume(Ret::U32(ARG * 2))
+        .expect("resumes past the call site");
+    assert_eq!(
+        exit,
+        Exit::Returned {
+            eax: ARG * 2 + 1,
+            edx: 0
+        },
+        "the module did not resume executing after its own call instruction"
     );
 }
