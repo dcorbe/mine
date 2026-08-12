@@ -39,6 +39,7 @@ use std::path::Path;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::abi::{Abi, Wg16};
 use crate::arena::Arena;
 
 /// Bytes of Borland's `FILE`, as `INCLUDE/STDIO.H:104-114` declares it: two
@@ -192,12 +193,12 @@ enum Io {
 }
 
 /// One open stream.
-struct Stream {
+struct Stream<A: Abi = Wg16> {
     /// What the module called it, in the module's own spelling.
     name: String,
 
     /// The `FILE *` the module holds. Unique for the life of the host.
-    cookie: FarPtr,
+    cookie: A::Ptr,
 
     /// What `fileno(fp)` reads out of the struct. One byte, so it is reused
     /// after a close -- unlike the cookie. See [`Streams::close`].
@@ -336,25 +337,45 @@ impl Stream {
 }
 
 /// The streams that are open, and every cookie ever issued.
-#[derive(Default)]
-pub struct Streams {
+///
+/// # Generic type, `Wg16`-concrete body
+///
+/// `Stream::cookie` and `retired`'s addresses are typed `A::Ptr` rather than
+/// `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely `Streams<A>` --
+/// but every method stays in `impl Streams<Wg16>` below, using `&mut Machine`
+/// exactly as before. `A` defaults to [`Wg16`] so every existing caller keeps
+/// naming this type as plain `Streams`. Not `#[derive(Default)]`: the derive
+/// macro bounds `A: Default` on the generated impl, which the bare marker
+/// struct `Wg16` does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>`
+/// for the same problem and fix.
+pub struct Streams<A: Abi = Wg16> {
     /// Where the `FILE` structs live. Deliberately **not** the module heap: a
     /// Borland `FILE` belongs to the runtime's own static `_streams[]` and the
     /// module never allocates or frees one, and putting them on the heap would
     /// make `farcoreleft` depend on how many files had been opened.
-    arena: Arena,
+    arena: Arena<A>,
 
-    open: Vec<Stream>,
+    open: Vec<Stream<A>>,
 
     /// Every cookie that has been closed, and what it named.
     ///
     /// The addresses are never reissued, so a use-after-close is a refusal that
     /// can say *which file* -- rather than a write into whichever stream had
     /// since landed on that address.
-    retired: Vec<(FarPtr, String)>,
+    retired: Vec<(A::Ptr, String)>,
 }
 
-impl Streams {
+impl<A: Abi> Default for Streams<A> {
+    fn default() -> Self {
+        Self {
+            arena: Arena::default(),
+            open: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+}
+
+impl Streams<Wg16> {
     /// Open `path` and give the module a `FILE *` to name it by.
     ///
     /// # Errors
@@ -620,10 +641,7 @@ impl Streams {
     /// Put the stream's `flags` back where the module reads it.
     fn sync(&mut self, machine: &mut Machine, at: usize) -> Result<(), String> {
         let stream = &self.open[at];
-        let field = FarPtr {
-            offset: stream.cookie.offset + FLAGS,
-            selector: stream.cookie.selector,
-        };
+        let field = Wg16::ptr_offset(stream.cookie, FLAGS);
         machine
             .write(field, &stream.flags().to_le_bytes())
             .map_err(|e| format!("{}: {e}", stream.name))
