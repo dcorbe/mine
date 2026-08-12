@@ -6,64 +6,72 @@
 //! pointer being resolved against 32-bit memory -- the compiler rejects it
 //! rather than a runtime check catching it.
 //!
-//! This module adds the vocabulary only. `Wg16` is the sole implementation;
-//! nothing in `crates/mbbs` reads a shim's arguments through it yet -- shims
-//! still take `&mut mbbs16::Machine` and still call `arg_far`/`arg_u16`. That
+//! This module adds the vocabulary: `Abi`, `Cursor`, `Call`, `Ret<A>`, and
+//! `Wg16` as the sole implementation. Nothing in `crates/mbbs` reads a
+//! shim's arguments through any of it yet -- shims still take
+//! `&mut mbbs16::Machine`, still call `arg_far`/`arg_u16`, and still return
+//! `mbbs16::Ret` directly (`crates/mbbs/src/shims/mod.rs:55`). That
 //! conversion is a later task. See
 //! `docs/plans/2026-08-11-abi-abstraction-design.md` (Parts 1 and 2) and
-//! `docs/plans/2026-08-11-abi-abstraction-implementation.md` (Task 2).
+//! `docs/plans/2026-08-11-abi-abstraction-implementation.md` (Tasks 2 and 5).
 //!
-//! # Why there is no `Call` here yet
+//! # Why `Call` owns its frame
 //!
-//! The design sketches a bundle that a converted shim would take instead of
-//! `&mut Machine`:
+//! Task 2's version of this comment left `Call` unbuilt, reasoning that
+//! `mbbs16::Machine` owning its `Segments` outright made `cpu: &mut A::Cpu`
+//! and `mem: &mut A::Mem` two mutable borrows of one object for `Wg16`.
+//! Reviewing that before anything was built on it found a second, independent
+//! problem that would have survived splitting `Cpu` from `Mem` anyway: a real
+//! 16-bit argument frame lives in the *stack segment* (`Machine::arg_u16`,
+//! `crates/mbbs16/src/lib.rs:729`, reads
+//! `self.mem.stack().read_u16(sp + 4 + n * 2)`), so a `Cursor` that borrows
+//! its bytes out of `A::Mem` holds a *shared* borrow of `Mem` for as long as
+//! it lives -- and `Call` needs `mem: &mut A::Mem` at the same time, for the
+//! whole of a shim body. That is a shared and a unique borrow of the same
+//! object held concurrently, and no amount of splitting `Cpu` out of `Mem`
+//! touches it, because both borrows are of `Mem`.
 //!
-//! ```text
-//! pub struct Call<'a, A: Abi> {
-//!     pub cpu: &'a mut A::Cpu,
-//!     pub mem: &'a mut A::Mem,
-//!     pub args: Cursor<'a, A>,
-//! }
-//! ```
+//! **The decision:** `Call` copies the argument frame into an owned
+//! `Vec<u8>` once, at construction (see [`Call::new`]), and reads from that
+//! instead of from `Mem`. The frame is a few bytes and the copy happens once
+//! per host call. `Call::ptr`/`int`/`long` are written directly on `Call`
+//! rather than wrapping a stored `Cursor` -- a stored `Cursor<'_, A>` would
+//! borrow `self.frame`, a field of `Call` itself, which reintroduces the same
+//! shape of problem one level in: that borrow would still be live when a
+//! later read needs `&mut self` to advance position. Building a fresh
+//! `Cursor` per read and decoding through it was tried and rejected too: it
+//! puts a read's byte width in two places at once (inside the throwaway
+//! `Cursor`'s own `take`, and again in `Call`'s separately-tracked position),
+//! and a mutation to only one of them can pass every test silently -- exactly
+//! the failure this whole cursor design exists to prevent. So `Call::take`
+//! duplicates `Cursor::take` outright, a few lines, both in this module: one
+//! function, one width, one advance, per read. `Cursor` itself is unchanged
+//! and kept for the fixture tests below, which need no `Call`, no `Machine`,
+//! no `Segments` at all -- that cheapness is what makes testing a
+//! prototype's byte layout this cheap.
 //!
-//! Building that for `Wg16` does not typecheck as written. `Abi::Cpu` for
-//! 16-bit is `mbbs16::Machine`, and `Abi::Mem` is `mbbs16::Segments` -- but
-//! `Machine` *owns* a `Segments` as its `mem` field (see
-//! `crates/mbbs16/src/lib.rs`'s `Machine::mem`). `&mut A::Cpu` and
-//! `&mut A::Mem` held at once are therefore two mutable borrows of one
-//! object, which the borrow checker refuses. The design's own diagram says
-//! `mbbs32` already draws this line cleanly because `mbbs32::Machine` does
-//! not own its `Image`; `mbbs16::Machine` does own its `Segments`, and Task 1
-//! deliberately left it that way -- it added a delegating facade so
-//! `crates/mbbs`'s 247 existing `&mut Machine` call sites keep compiling,
-//! which is incompatible with also handing out an independent `&mut Segments`
-//! from the same value.
+//! # What is still open: `Call<Wg16>` is not yet constructible
 //!
-//! Resolving that by extracting an `Exec` type (mirroring `mbbs32::Machine`
-//! exactly) is a second structural refactor of `mbbs16::Machine`, on top of
-//! the one Task 1 just finished. Task 2 does not ask for `Call`, only for
-//! `Abi`, `Cursor` and `Wg16` to exist -- so rather than force that split
-//! ahead of evidence, `Call` is left unbuilt and the borrow question is
-//! deferred to the task that actually constructs one. Two things make that
-//! deferral cheap rather than a debt:
-//!
-//! - **`Cursor` never needs `&mut Cpu`.** Argument reads are immutable
-//!   (`Machine::arg_u16`/`arg_far`/`arg_u32` all take `&self`), and they read
-//!   from the stack segment, not from execution state. So a cursor only ever
-//!   needs a read-only view of the bytes making up one call's argument frame
-//!   -- not a live, mutably-borrowed `&Mem`, and certainly not `&Cpu`.
-//! - So `Cursor` here holds a **borrowed byte slice** rather than a `Mem`
-//!   reference: `frame` position plus the bytes, decoded through the `Abi`.
-//!   That sidesteps the aliasing question entirely for argument reading, and
-//!   it is also what makes a cheap fixture possible -- see [`fixture_cursor`]
-//!   below, which needs no `Machine`, no `Segments`, no thunk table, just an
-//!   array of bytes.
-//!
-//! Whether `Call<A>` ends up holding `&mut A::Cpu` alongside a `Cursor`
-//! borrowed from `A::Mem` (which would need `Cpu` split from `Mem` after
-//! all), or whether the 16-bit `Call` instead holds one `&mut Machine` and
-//! reaches memory through its facade, is a decision to make against real
-//! call sites in the task that builds `Call` -- not here, from a diagram.
+//! `Call<'a, A>` is generic and compiles for any `Abi`. Building one for
+//! `Wg16` specifically -- `cpu: &mut Machine, mem: &mut Segments` sourced
+//! from one live module -- does not, for the reason Task 2's version of this
+//! comment gave: `Machine` owns its `Segments` as a private field
+//! (`crates/mbbs16/src/lib.rs:296`), and Task 1 deliberately kept it that
+//! way, adding only a *delegating* facade so `crates/mbbs`'s existing
+//! `&mut Machine` call sites kept compiling -- it never exposes an
+//! independent `&mut Segments`. So `cpu` and `mem` sourced from one real
+//! `Machine` are still two mutable borrows of the same object. Nothing here
+//! resolves that, because nothing here needs to: this task's scope is the
+//! vocabulary, and no shim constructs a `Call` yet. Whoever flips
+//! `pub type Shim` next has to resolve this first, by either finishing the
+//! `Exec`/`Segments` split `mbbs32::Machine`/`Image` already model (the
+//! "second structural refactor" the original comment declined to force ahead
+//! of evidence), or deciding that the 16-bit `Call` is built from one
+//! `&mut Machine` and reaches `mem` through the facade rather than through an
+//! independently-borrowed field. This module's own tests below sidestep the
+//! question the same way `Cursor`'s did: they exercise `Call` against a
+//! minimal fixture `Abi` whose `Cpu`/`Mem` are trivial types, not against
+//! `Wg16`, because the read methods never touch `cpu` or `mem` at all.
 
 /// What differs between the ABIs a module can be compiled for.
 pub trait Abi {
@@ -188,6 +196,137 @@ impl<'a, A: Abi> Cursor<'a, A> {
     }
 }
 
+/// A host call in progress: what a converted shim will take instead of
+/// `&mut Machine`.
+///
+/// `cpu` and `mem` are borrowed straight from the caller, for as long as the
+/// call runs -- a shim needs both mutably, the same way it always has. The
+/// argument frame is not borrowed at all: it is copied once into `frame` at
+/// construction. See this module's doc comment ("Why `Call` owns its frame")
+/// for why, and ("What is still open") for why a real `Call<Wg16>` cannot yet
+/// be built from one live `Machine`.
+pub struct Call<'a, A: Abi> {
+    pub cpu: &'a mut A::Cpu,
+    pub mem: &'a mut A::Mem,
+    frame: Vec<u8>,
+    pos: usize,
+}
+
+impl<'a, A: Abi> Call<'a, A> {
+    /// Begin a call. `frame` is the outstanding call's raw argument bytes --
+    /// for `Wg16`, `Machine::arg_frame()` -- copied here rather than
+    /// borrowed, so nothing below re-touches `mem` to read an argument.
+    pub fn new(cpu: &'a mut A::Cpu, mem: &'a mut A::Mem, frame: &[u8]) -> Self {
+        Self {
+            cpu,
+            mem,
+            frame: frame.to_vec(),
+            pos: 0,
+        }
+    }
+
+    /// Take the next `width` bytes of the owned frame and advance past them.
+    ///
+    /// Deliberately shaped like [`Cursor::take`] rather than sharing it --
+    /// see this module's doc comment for why building a `Cursor` per read
+    /// was tried and rejected. `self.pos` is advanced *before* the borrow of
+    /// `self.frame` is taken, so the two never overlap: nothing here holds an
+    /// immutable borrow of `self` across the mutation the way a stored
+    /// `Cursor` would.
+    ///
+    /// # Panics
+    ///
+    /// If fewer than `width` bytes remain -- the same contract as
+    /// [`Cursor::take`], for the same reason: a `Call` reading past its own
+    /// frame is a host bug in the shim's prototype, not something a module
+    /// caused.
+    fn take(&mut self, width: usize) -> &[u8] {
+        let start = self.pos;
+        self.pos += width;
+        &self.frame[start..self.pos]
+    }
+
+    /// The next argument, as a pointer.
+    pub fn ptr(&mut self) -> A::Ptr {
+        A::ptr_from_bytes(self.take(A::PTR_WIDTH))
+    }
+
+    /// The next argument, as a C `int`.
+    pub fn int(&mut self) -> A::Int {
+        A::int_from_bytes(self.take(A::INT_WIDTH))
+    }
+
+    /// The next argument, as a C `long`.
+    pub fn long(&mut self) -> u32 {
+        A::long_from_bytes(self.take(A::LONG_WIDTH))
+    }
+}
+
+/// What a host call hands back to the module, generic over the ABI's width
+/// and pointer representation.
+///
+/// Mirrors `mbbs16::Ret` with the two ABI-dependent shapes generalised:
+/// `Far(FarPtr)` becomes `Ptr(A::Ptr)` and `U16(u16)` becomes `Int(A::Int)`.
+/// `Void` and the 32-bit `Long` do not vary -- a `long` is
+/// [`Abi::LONG_WIDTH`] bytes in every ABI this crate has met so far (4, in
+/// both), so there is nothing for an ABI to name here the way `PTR_WIDTH` and
+/// `INT_WIDTH` do for the other two.
+///
+/// `mbbs16::Ret` itself is unchanged and stays that way -- it is what
+/// `Machine::resume` takes, and this crate does not get to add a generic
+/// parameter to a type `mbbs16` owns. So the 16-bit boundary is a conversion,
+/// not a shared type: see `impl From<Ret<Wg16>> for mbbs16::Ret` below.
+///
+/// *Where* the value lands is deliberately not this type's business, the same
+/// way it was not `mbbs16::Ret`'s: 16-bit Worldgroup returns a pointer in
+/// `DX:AX` (`mbbs16::Ret::Far`'s own doc comment); 32-bit Worldgroup returns
+/// one in `EAX` alone. Each `Abi` implementation's own conversion decides
+/// that placement.
+pub enum Ret<A: Abi> {
+    /// Nothing to return.
+    Void,
+
+    /// A C `int`.
+    Int(A::Int),
+
+    /// A C `long`: [`Abi::LONG_WIDTH`] bytes in every ABI met so far.
+    Long(u32),
+
+    /// A pointer, in this ABI's own representation.
+    Ptr(A::Ptr),
+}
+
+// Manual, not `#[derive(..)]`. The derive macro's generated bound is `A:
+// Trait` -- wrong here, because `Ret<A>`'s fields are `A::Int`/`A::Ptr`
+// (associated types), not `A` itself, and a derived `Debug` in particular
+// would generate a bound that does not imply the one the `write!` call
+// actually needs. `Clone`/`Copy` happen to be the one case a naive derive
+// would still compile, purely because `Abi::Ptr`/`Abi::Int` already require
+// `Copy` in the trait itself -- but relying on that coincidence for some
+// derives and not others is worse than just writing all of them the same way.
+impl<A: Abi> Clone for Ret<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for Ret<A> {}
+
+impl<A: Abi> std::fmt::Debug for Ret<A>
+where
+    A::Int: std::fmt::Debug,
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Void => write!(f, "Void"),
+            Self::Int(v) => f.debug_tuple("Int").field(v).finish(),
+            Self::Long(v) => f.debug_tuple("Long").field(v).finish(),
+            Self::Ptr(v) => f.debug_tuple("Ptr").field(v).finish(),
+        }
+    }
+}
+
 /// The ABI Galacticomm's 16-bit modules were compiled for: Borland huge
 /// model, `seg:off` pointers, cdecl with ten callee-cleaned exceptions (see
 /// `Cleans::Callee` in `crates/mbbs/src/shims/mod.rs`).
@@ -216,6 +355,27 @@ impl Abi for Wg16 {
 
     fn long_from_bytes(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes.try_into().expect("LONG_WIDTH bytes"))
+    }
+}
+
+impl From<Ret<Wg16>> for mbbs16::Ret {
+    /// The 16-bit boundary conversion this module's doc comment names:
+    /// `Machine::resume` still takes `mbbs16::Ret`, unchanged, so this is
+    /// where a `Ret<Wg16>` a converted shim hands back becomes it.
+    ///
+    /// `Ptr` maps to `Far` and `Int` maps to `U16` with no repacking --
+    /// `Wg16::Ptr` already is `FarPtr` and `Wg16::Int` already is `u16` -- so
+    /// there is no width or byte order to get wrong here, only the variant to
+    /// pick correctly. `Int`/`Long` both carry a plain integer, which is
+    /// exactly the shape a swap between the two would not be caught by the
+    /// type checker; the mutation test below is aimed at exactly that.
+    fn from(ret: Ret<Wg16>) -> Self {
+        match ret {
+            Ret::Void => mbbs16::Ret::Void,
+            Ret::Int(v) => mbbs16::Ret::U16(v),
+            Ret::Long(v) => mbbs16::Ret::U32(v),
+            Ret::Ptr(v) => mbbs16::Ret::Far(v),
+        }
     }
 }
 
@@ -319,5 +479,146 @@ mod tests {
         assert_eq!(c.int(), unum, "byte 0: unum, word 0 under arg_u16(0)");
         assert_eq!(c.long(), amt, "byte 2: amt, word 1 under arg_u32(1)");
         assert_eq!(c.int(), real, "byte 6: real, word 3 under arg_u16(3)");
+    }
+
+    /// A minimal `Abi` for exercising `Call`'s frame reads without a real
+    /// `Machine`/`Segments` pair -- see this module's doc comment ("What is
+    /// still open") for why `Call<Wg16>` cannot yet be built from one. `Ptr`
+    /// and `Int` are `Wg16`'s own real types, and every width and decode
+    /// function delegates straight to `Wg16`'s -- only `Cpu` and `Mem` are
+    /// replaced, with types `Call`'s read methods never touch.
+    struct FixtureAbi;
+
+    /// `Call`'s `mem` field needs an `Abi::Mem`, which needs `ModuleMem`.
+    /// Never actually called: nothing below allocates.
+    struct FixtureMem;
+
+    impl ModuleMem for FixtureMem {
+        type Ptr = FarPtr;
+
+        fn alloc_region(&mut self, _bytes: usize) -> std::io::Result<Self::Ptr> {
+            unreachable!("Call's read tests never allocate memory")
+        }
+    }
+
+    impl Abi for FixtureAbi {
+        type Ptr = FarPtr;
+        type Mem = FixtureMem;
+        type Cpu = ();
+        type Int = u16;
+
+        const PTR_WIDTH: usize = Wg16::PTR_WIDTH;
+        const INT_WIDTH: usize = Wg16::INT_WIDTH;
+        const LONG_WIDTH: usize = Wg16::LONG_WIDTH;
+
+        fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
+            Wg16::ptr_from_bytes(bytes)
+        }
+
+        fn int_from_bytes(bytes: &[u8]) -> Self::Int {
+            Wg16::int_from_bytes(bytes)
+        }
+
+        fn long_from_bytes(bytes: &[u8]) -> u32 {
+            Wg16::long_from_bytes(bytes)
+        }
+    }
+
+    /// Same prototype and same frame as
+    /// `the_cursor_walks_stzcpys_frame_at_the_same_offsets_arg_far_and_arg_u16_read`
+    /// above -- `CHAR *stzcpy(CHAR *dst, const CHAR *src, UINT num)`,
+    /// `re/wg33src/INC/GCOMM.H:396-400` -- read through `Call` instead of
+    /// `Cursor`, to prove the two agree. All three reads chained (not just
+    /// the last one) matters: `int()` is the frame's last argument, so a
+    /// mutation to only its own advance would go unnoticed by a test that
+    /// read nothing after it. Nothing does here either, but the frame is
+    /// exactly 10 bytes -- `ptr` + `ptr` + `int` -- so an `int()` that
+    /// advances (or decodes) the wrong width still has nowhere further to go
+    /// unnoticed within its own read: see the mutation below.
+    #[test]
+    fn call_reads_stzcpys_frame_at_the_same_offsets_the_cursor_does() {
+        let dst = FarPtr {
+            offset: 0x1000,
+            selector: 0x0038,
+        };
+        let src = FarPtr {
+            offset: 0x2000,
+            selector: 0x0040,
+        };
+        let num: u16 = 16;
+
+        let frame = [
+            dst.to_bytes().as_slice(),
+            src.to_bytes().as_slice(),
+            &num.to_le_bytes(),
+        ]
+        .concat();
+
+        let mut cpu = ();
+        let mut mem = FixtureMem;
+        let mut call = Call::<FixtureAbi>::new(&mut cpu, &mut mem, &frame);
+        assert_eq!(call.ptr(), dst, "byte 0: dst, matching the cursor's word 0");
+        assert_eq!(call.ptr(), src, "byte 4: src, matching the cursor's word 2");
+        assert_eq!(call.int(), num, "byte 8: num, matching the cursor's word 4");
+    }
+
+    /// `INT otstcrd(INT unum, LONG amt, GBOOL real)` --
+    /// `re/wg33src/INC/USRACC.H:82` -- the same prototype
+    /// `the_cursor_walks_otstcrds_frame_at_the_same_offsets_arg_u16_and_arg_u32_read`
+    /// above uses, read through `Call`. Covers `.long()`, which the stzcpy
+    /// test above does not, and puts a read *after* the `long()` call (the
+    /// trailing `int()`), so a mutation to `long`'s advance -- not just
+    /// `int`'s -- has somewhere to go wrong and be caught.
+    #[test]
+    fn call_reads_otstcrds_frame_at_the_same_offsets_the_cursor_does() {
+        let unum: u16 = 7;
+        let amt: u32 = 500;
+        let real: u16 = 1;
+
+        let frame = [
+            unum.to_le_bytes().as_slice(),
+            &amt.to_le_bytes(),
+            &real.to_le_bytes(),
+        ]
+        .concat();
+
+        let mut cpu = ();
+        let mut mem = FixtureMem;
+        let mut call = Call::<FixtureAbi>::new(&mut cpu, &mut mem, &frame);
+        assert_eq!(call.int(), unum, "byte 0: unum, matching the cursor's word 0");
+        assert_eq!(call.long(), amt, "byte 2: amt, matching the cursor's word 1");
+        assert_eq!(call.int(), real, "byte 6: real, matching the cursor's word 3");
+    }
+
+    /// The four `Ret<Wg16>` variants, converted at the 16-bit boundary. Values
+    /// are chosen with a distinct high and low half (`0x1234`, `0x5678`) so a
+    /// transposition -- offset and selector swapped, or the `U16`/`U32` halves
+    /// swapped -- would be caught rather than accidentally agreeing.
+    #[test]
+    fn ret_wg16_converts_to_mbbs16_ret_for_all_four_variants() {
+        assert_eq!(mbbs16::Ret::from(Ret::<Wg16>::Void), mbbs16::Ret::Void);
+        assert_eq!(
+            mbbs16::Ret::from(Ret::<Wg16>::Int(0x1234)),
+            mbbs16::Ret::U16(0x1234)
+        );
+        assert_eq!(
+            mbbs16::Ret::from(Ret::<Wg16>::Long(0x1234_5678)),
+            mbbs16::Ret::U32(0x1234_5678)
+        );
+
+        // `Ret::Far`'s own doc comment: "segment in DX, offset in AX" --
+        // i.e. `FarPtr::offset` is the low half and `FarPtr::selector` is the
+        // high half, the same order a `long`'s `U32` splits. `Ret::Ptr` must
+        // carry that pair through unchanged, offset staying offset and
+        // selector staying selector, not swapped.
+        let ptr = FarPtr {
+            offset: 0x5678,
+            selector: 0x1234,
+        };
+        assert_eq!(
+            mbbs16::Ret::from(Ret::<Wg16>::Ptr(ptr)),
+            mbbs16::Ret::Far(ptr),
+            "offset (AX) and selector (DX) must land unswapped"
+        );
     }
 }
