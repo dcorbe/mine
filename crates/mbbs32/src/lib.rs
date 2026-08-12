@@ -309,6 +309,23 @@ impl Machine {
         self.poisoned.as_ref()
     }
 
+    /// The linear address of the outstanding call's near return address --
+    /// `None` before any call and after the module has returned. Mirrors
+    /// `mbbs16::Machine::frame_sp`, which exists for the same reason: a
+    /// diagnostic a caller can read without this crate needing to expose the
+    /// stack itself. `examples/init_trace.rs` uses it to report how much
+    /// stack margin is left above a given call, since [`Machine::arg_u32`]
+    /// panics rather than silently reading past this machine's own stack.
+    pub fn frame_sp(&self) -> Option<u32> {
+        self.frame_sp
+    }
+
+    /// The module's stack's high end -- one past the last mapped byte.
+    /// Diagnostic-only, for the same reason as [`Machine::frame_sp`].
+    pub fn stack_base(&self) -> u32 {
+        self.tib.stack_base()
+    }
+
     /// The linear address a module should `call` to reach import `index`.
     ///
     /// Meant to be handed to [`Image::patch_thunk_addresses`] as the
@@ -486,6 +503,36 @@ impl Machine {
         // return address, with the host's answer now sitting in `EAX`/`EDX`
         // in its place.
         self.run(at, sp + 4, ret)
+    }
+
+    /// Read the `n`th 32-bit cdecl argument of the outstanding call.
+    ///
+    /// Arguments sit immediately above the near return address the module's
+    /// own `call` pushed -- cdecl pushes right to left, so argument 0 is the
+    /// one nearest the frame. The 32-bit-cdecl analogue of
+    /// `mbbs16::Machine::arg_u16`, one word wider and with no segment half to
+    /// read separately, since this ABI is flat.
+    ///
+    /// Added for `crates/mbbs32/examples/init_trace.rs`
+    /// (`docs/plans/2026-08-12-btrieve-finish.md`, Task 2): a recorder that
+    /// only ever calls `resume`, never a real shim, still needs to see what
+    /// was asked for in order to print it.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call.
+    pub fn arg_u32(&self, n: usize) -> u32 {
+        let sp = self
+            .frame_sp
+            .expect("arg_u32() with no outstanding call to read from");
+        let limit = self.tib.stack_limit();
+        let off = (sp - limit) as usize + 4 + n * 4;
+        let bytes = self
+            .tib
+            .stack()
+            .get(off..off + 4)
+            .expect("arg_u32(): argument slot runs past this machine's own stack");
+        u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
     }
 
     /// Cross into 32-bit mode and come back, handing the module `ret` in

@@ -274,6 +274,13 @@ impl Tib {
     pub(crate) fn stack_mut(&mut self) -> &mut [u8] {
         self.stack.as_mut_slice()
     }
+
+    /// The stack's contents, read-only -- for [`Machine::arg_u32`] to read a
+    /// cdecl argument back off an outstanding call's frame without needing
+    /// `&mut self` (`crates/mbbs32/src/lib.rs`, near `resume`).
+    pub(crate) fn stack(&self) -> &[u8] {
+        self.stack.as_slice()
+    }
 }
 
 impl Drop for Tib {
