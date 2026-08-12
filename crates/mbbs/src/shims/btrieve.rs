@@ -2524,6 +2524,51 @@ mod tests {
         assert_eq!(f.invoke(absbtv, &[]).expect("answers"), Ret::U32(0));
     }
 
+    /// `lock` is word 5 and `keynum` is word 4, and nothing else here tells
+    /// them apart.
+    ///
+    /// Every other `gabbtvl` test passes `keynum = 0, lock = 0`, so trading the
+    /// two reads is invisible -- measured, not supposed: swapping them during
+    /// the cursor conversion of this file failed nothing at all, 1274/0 and
+    /// 19/0. That is a hole exactly where this file is least able to afford
+    /// one, because `gabbtvl` is the one routine whose reads used to span two
+    /// functions and so the one whose argument order was restructured rather
+    /// than merely rewritten.
+    ///
+    /// A non-zero lock has to be refused *by value*, which pins word 5
+    /// specifically: read word 4 instead and this call succeeds silently.
+    #[test]
+    fn gabbtvl_reads_its_lock_from_word_five_and_not_from_keynum() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        let refused = f
+            .invoke(
+                gabbtvl,
+                &[0, 0, position as u16, (position >> 16) as u16, 0, 3],
+            )
+            .expect_err("a lock this host cannot give is a refusal");
+        assert!(
+            format!("{refused}").contains("lock type 3"),
+            "the refusal must name the lock it was asked for, or it is not \
+             evidence that word 5 is what was read: {refused}"
+        );
+
+        // And the same word at zero is not refused, so the refusal above is
+        // the lock's doing rather than anything about this position.
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 0, 0],
+        )
+        .expect("no lock asked for, so nothing to refuse");
+        assert_eq!(got(&f, into), 6);
+    }
+
     #[test]
     fn gabbtvl_with_no_file_current_answers_with_nothing_at_all() {
         // The odd one out in a family that otherwise returns an int: `:452`
