@@ -1,7 +1,8 @@
-//! Borland's `printf`, over a 16-bit module's arguments.
+//! Borland's `printf`, over a module's arguments.
 //!
-//! `spr`, `sprintf`, `prf` and `shocst` are all one engine and a different
-//! destination, so this is written once and a bug here is a bug in all of them.
+//! `spr`, `sprintf`, `prf`, `fprintf`, `shocst` and `prfmsg` are all one
+//! engine and a different destination, so this is written once and a bug
+//! here is a bug in all of them.
 //!
 //! # Where the arguments are
 //!
@@ -9,12 +10,12 @@
 //! call frame in declaration order and the format string is the only one whose
 //! position is known. Everything after it is found by *reading the format
 //! string* -- there is no other record of how many there are or how wide each
-//! is. A conversion that consumes the wrong number of words does not fail; it
+//! is. A conversion that consumes the wrong number of bytes does not fail; it
 //! shifts every argument after it, and the output looks like data.
 //!
-//! A `v`-spelled routine is handed an [`Args::List`] instead: a `va_list`
-//! pointing at the *caller's* frame, whose words are laid out identically. The
-//! walk below cannot tell the difference and must not have to.
+//! A `v`-spelled routine is handed a `va_list` instead: a pointer into the
+//! *caller's* frame, whose bytes are laid out identically. The walk below
+//! cannot tell the difference and must not have to.
 //!
 //! Widths follow from the model Galacticomm built with, which is Borland's
 //! **huge**: an `int` is one word, a `long` two, and `char *` is *far* and
@@ -26,124 +27,38 @@
 //! Not a passthrough and not an empty string. An unimplemented conversion has
 //! already consumed the wrong number of arguments by the time anyone notices,
 //! so it stops the module instead -- the same rule as everything else here.
+//!
+//! # Generic core, `Wg16` facade
+//!
+//! [`format_call`] and [`format_va_list`] are `fn<A: Abi>`: they read the
+//! format string and every argument through [`Call<A>`], the same handle a
+//! converted shim already holds, and touch memory through [`Call::mem`]
+//! rather than a whole `&mut Machine`. Nothing here needs a word-index
+//! parameter the way [`Args::Call`]'s old `first` field did -- a `Call<A>`
+//! *is* a cursor already standing wherever the fixed arguments left off (see
+//! `crates/mbbs/src/abi.rs`'s "Why `Call` owns its frame"), so the generic
+//! walk just keeps reading through it. That is the design's own predicted
+//! improvement over the word-index scheme, and it holds without
+//! qualification: nothing about the walk below cares whether `A` is `Wg16`
+//! or a future `Wg32`, because [`Abi::INT_WIDTH`]/[`Abi::LONG_WIDTH`]/
+//! [`Abi::PTR_WIDTH`] are exactly the widths [`Call::int`]/[`Call::long`]/
+//! [`Call::ptr`] already advance by.
+//!
+//! `format` itself stays [`Wg16`]-concrete, under its original name and
+//! (almost -- see its own doc comment) its original signature, because six
+//! call sites across four other files (`msg::prfmsg`, `text::spr`/`sprintf`/
+//! `vsprintf`/`prf`, `system::shocst`/`catastro`, and `stream::fprintf` if it
+//! is not converted) still hold a whole `&mut Machine` and construct the
+//! word-indexed [`Args`] this crate used before `Call` existed. Converting
+//! those is each file's own task, not this one's -- see the module doc
+//! comment on why `fmt.rs` alone was worth doing first regardless: every one
+//! of those six routines was blocked on this file, and now none of them are.
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::{Abi, Call, Wg16};
 use crate::shims::ShimError;
-
-/// Where a `printf` walk reads its arguments from.
-///
-/// `printf` and `vprintf` are one engine over two argument sources, and the
-/// only thing that differs between them is where word `n` of the variadic list
-/// is found. Naming the source rather than passing a word index keeps that the
-/// *only* difference: every conversion, width and pointer rule below is written
-/// once, and both spellings get the same one.
-///
-/// # Generic type, `Wg16`-concrete body
-///
-/// `List.at` is typed `A::Ptr` rather than `FarPtr` so this is genuinely
-/// `Args<A>` -- but [`format`] and every method below stay `Wg16`-concrete,
-/// taking `&Machine` exactly as before: the walk reads 16-bit *words* off a
-/// real argument frame, which has no ABI-generic equivalent yet (that is
-/// Task 5's `Call`/`Cursor`, not this one). `A` defaults to [`Wg16`] so every
-/// existing `Args::Call`/`Args::List` at a shim call site compiles unchanged.
-/// Not `#[derive(Debug, Clone, Copy)]`: the derive macros bound `A: Trait` on
-/// the generated impls, which the bare marker struct `Wg16` does not satisfy
-/// -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
-pub enum Args<A: Abi = Wg16> {
-    /// The outstanding call's own stack, from argument word `first` on.
-    ///
-    /// What `prf`, `spr`, `sprintf`, `fprintf`, `shocst` and `prfmsg` have: the
-    /// variadic arguments follow the fixed ones in the same frame. `first`
-    /// counts argument *words* and not arguments, because a far `char *` is two
-    /// of them and a near one is not.
-    Call { first: usize },
-
-    /// A `va_list`: consecutive words from a far pointer into module memory.
-    ///
-    /// Borland's `va_list` is `void *`, which under the huge model is far, and
-    /// `va_start` sets it to the address just past the last fixed argument --
-    /// so it points into the *caller's* frame in `SS` and the words behind it
-    /// are laid out exactly as [`Args::Call`]'s are.
-    List { at: A::Ptr },
-}
-
-impl<A: Abi> Clone for Args<A> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<A: Abi> Copy for Args<A> {}
-
-impl<A: Abi> std::fmt::Debug for Args<A>
-where
-    A::Ptr: std::fmt::Debug,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Call { first } => f.debug_struct("Call").field("first", first).finish(),
-            Self::List { at } => f.debug_struct("List").field("at", at).finish(),
-        }
-    }
-}
-
-impl Args<Wg16> {
-    /// Word `n` of the variadic list, counting from its first word.
-    ///
-    /// # Errors
-    ///
-    /// If a `va_list` names nothing of the module's, or walks off the end of
-    /// what it names. Neither can happen to [`Args::Call`]: those words are the
-    /// frame the host was called through.
-    ///
-    /// # Panics
-    ///
-    /// [`Args::Call`] panics if the module is not stopped at a call, since that
-    /// is where its arguments are. [`Args::List`] does not need a frame at all.
-    fn word(self, machine: &Machine, n: usize) -> Result<u16, ShimError> {
-        match self {
-            Self::Call { first } => Ok(machine.arg_u16(first + n)),
-            Self::List { at } => {
-                // A `va_list` that walks past 0xffff has left its segment,
-                // which no legitimate one does -- and wrapping the offset would
-                // read the front of the segment as though it were the back.
-                let offset = usize::from(at.offset)
-                    .checked_add(n * 2)
-                    .and_then(|offset| u16::try_from(offset).ok())
-                    .ok_or_else(|| {
-                        ShimError::Failed(format!("a va_list at {at} ran off word {n}"))
-                    })?;
-                let word = machine.resolve(
-                    FarPtr {
-                        offset,
-                        selector: at.selector,
-                    },
-                    2,
-                )?;
-                Ok(u16::from_le_bytes([word[0], word[1]]))
-            }
-        }
-    }
-
-    /// Words `n` and `n + 1` as one 32-bit value, low half first.
-    ///
-    /// A `long`, and also the shape a far pointer arrives in. Which of the two
-    /// a given argument is depends on the format string, so the choice belongs
-    /// to the walk.
-    fn long(self, machine: &Machine, n: usize) -> Result<u32, ShimError> {
-        Ok(u32::from(self.word(machine, n)?) | (u32::from(self.word(machine, n + 1)?) << 16))
-    }
-
-    /// Words `n` and `n + 1` as a far pointer: offset first, then selector.
-    fn far(self, machine: &Machine, n: usize) -> Result<FarPtr, ShimError> {
-        Ok(FarPtr {
-            offset: self.word(machine, n)?,
-            selector: self.word(machine, n + 1)?,
-        })
-    }
-}
 
 /// One `%...` conversion, as parsed.
 ///
@@ -159,37 +74,169 @@ pub(crate) struct Spec {
     width: usize,
     precision: Option<usize>,
     long: bool,
-    /// Set by `%N`: this pointer is one word, an offset into the module's own
-    /// `DGROUP`, rather than the two-word far pointer the huge model defaults
-    /// to. Getting it backwards eats the next argument as a selector.
+    /// Set by `%N`: this pointer is one argument word, an offset into the
+    /// module's own `DGROUP`, rather than the two-word far pointer the huge
+    /// model defaults to. Getting it backwards eats the next argument as a
+    /// selector.
     near: bool,
 }
 
-/// Format `template` with the arguments `args` names.
+/// Where the varargs after the format string come from, once a source is
+/// picked: either wherever [`Call<A>`]'s own position stands, or a `va_list`
+/// walked on demand.
 ///
-/// Returns the bytes, and how many argument words the walk consumed -- which is
-/// what a test needs to check that a conversion took the width it should. A
-/// conversion that consumes the wrong number does not fail; it shifts every
-/// argument after it, and the output looks like data.
+/// Not [`Args`]: that type is the *word-indexed* compatibility shape the
+/// `Wg16` facade still hands its unconverted callers' choices through. This
+/// one is what the shared walk in [`walk`] actually reads from, and it is
+/// deliberately not `pub` -- nothing outside this file has any argument
+/// source but a live `Call<A>`, and [`format_va_list`] builds this variant
+/// internally rather than asking a caller to.
+enum Vararg<A: Abi> {
+    /// Keep reading through `call`'s own position. What every routine here
+    /// has except a `v`-spelled one.
+    Call,
+
+    /// A `va_list`: consecutive bytes from a pointer into the *caller's*
+    /// frame, resolved on demand rather than copied up front -- unlike
+    /// `Call`'s own frame, nothing bounds how large the segment behind a
+    /// `va_list` is before the format string says how far to walk it, so
+    /// copying it all in advance would be copying memory that is not this
+    /// call's to claim.
+    List { at: A::Ptr, pos: u16 },
+}
+
+impl<A: Abi> Vararg<A> {
+    /// The next argument as a C `int`.
+    fn int(&mut self, call: &mut Call<A>) -> Result<A::Int, ShimError> {
+        match self {
+            Self::Call => Ok(call.int()),
+            Self::List { at, pos } => {
+                let bytes = Self::list_take(call.mem(), *at, pos, A::INT_WIDTH)?;
+                Ok(A::int_from_bytes(&bytes))
+            }
+        }
+    }
+
+    /// The next argument as a C `long`.
+    fn long(&mut self, call: &mut Call<A>) -> Result<u32, ShimError> {
+        match self {
+            Self::Call => Ok(call.long()),
+            Self::List { at, pos } => {
+                let bytes = Self::list_take(call.mem(), *at, pos, A::LONG_WIDTH)?;
+                Ok(A::long_from_bytes(&bytes))
+            }
+        }
+    }
+
+    /// The next argument as a far/flat pointer, in this ABI's own
+    /// representation.
+    fn ptr(&mut self, call: &mut Call<A>) -> Result<A::Ptr, ShimError> {
+        match self {
+            Self::Call => Ok(call.ptr()),
+            Self::List { at, pos } => {
+                let bytes = Self::list_take(call.mem(), *at, pos, A::PTR_WIDTH)?;
+                Ok(A::ptr_from_bytes(&bytes))
+            }
+        }
+    }
+
+    /// Resolve `width` bytes at `*pos` past `at`, in module memory, and
+    /// advance `pos` past them.
+    ///
+    /// An associated function rather than a free one so `A` is fixed by
+    /// `Self` at every call site above -- `A::Mem`/`A::Ptr` alone do not
+    /// determine `A` for type inference, since an associated-type projection
+    /// is not invertible.
+    ///
+    /// # Errors
+    ///
+    /// If `*pos + width` would not fit in a `u16` -- a `va_list` that has
+    /// walked past 0xffff has left its segment, which no legitimate one
+    /// does, and wrapping the offset would read the front of the segment as
+    /// though it were the back -- or if `at` names nothing of the module's,
+    /// or the read would leave what it names.
+    fn list_take(mem: &A::Mem, at: A::Ptr, pos: &mut u16, width: usize) -> Result<Vec<u8>, ShimError> {
+        let next = usize::from(*pos)
+            .checked_add(width)
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| {
+                ShimError::Failed(format!("a va_list at {at} ran off by {width} bytes"))
+            })?;
+        let ptr = A::ptr_offset(at, *pos);
+        let bytes = ptr
+            .resolve(mem, width)
+            .map_err(|e| ShimError::Failed(e.to_string()))?
+            .to_vec();
+        *pos = next;
+        Ok(bytes)
+    }
+}
+
+/// Format `template` with the varargs that follow it, read through `call`
+/// from wherever its position currently stands.
+///
+/// The generic replacement for [`Args::Call`]: a converted shim reads its
+/// fixed arguments off `call` with [`Call::int`]/[`Call::ptr`]/[`Call::long`]
+/// exactly as it always would, and by the time it reaches the format
+/// string's varargs, `call`'s position already marks where they begin --
+/// there is nothing left to tell this function beyond that.
+///
+/// Returns the bytes, and how many bytes of `call`'s frame the walk consumed
+/// past its starting position -- what a test needs to check that a
+/// conversion took the width it should. A conversion that consumes the wrong
+/// number does not fail; it shifts every argument after it, and the output
+/// looks like data.
 ///
 /// # Errors
 ///
 /// If the format string or a `%s` argument names memory outside the module's
-/// segments, if a `va_list` walks off its own segment, or if the format asks
-/// for a conversion this does not implement.
-///
-/// # Panics
-///
-/// If `args` is [`Args::Call`] and the module is not stopped at a call, since
-/// that is where those arguments are.
-pub fn format(
-    machine: &Machine,
-    template: FarPtr,
-    args: Args,
+/// reach, or if the format asks for a conversion this does not implement.
+pub fn format_call<A: Abi>(
+    call: &mut Call<A>,
+    template: A::Ptr,
 ) -> Result<(Vec<u8>, usize), ShimError> {
-    let template = machine.read_cstr(template)?.to_vec();
+    walk(call, template, &mut Vararg::Call)
+}
+
+/// Format `template` with the varargs a `va_list` at `at` names.
+///
+/// The generic replacement for [`Args::List`]. `at` points into the
+/// *caller's* frame -- `va_start` sets it to the word past the last fixed
+/// argument, so the bytes behind it are laid out exactly as [`format_call`]'s
+/// own are -- and are read through `call.mem()` on demand, not through
+/// `call`'s own position: a `va_list` names someone else's frame, not this
+/// call's.
+///
+/// # Errors
+///
+/// As [`format_call`], plus if the `va_list` walks off its own segment or
+/// names nothing of the module's.
+pub fn format_va_list<A: Abi>(
+    call: &mut Call<A>,
+    template: A::Ptr,
+    at: A::Ptr,
+) -> Result<(Vec<u8>, usize), ShimError> {
+    walk(call, template, &mut Vararg::List { at, pos: 0 })
+}
+
+/// The shared walk both public entry points -- and the `Wg16` facade -- run.
+/// Everything conversion-specific lives here exactly once, which is the
+/// whole reason [`Vararg`] exists: the only thing that differs between a
+/// `Call`-sourced and a `va_list`-sourced format is where word `n` of the
+/// variadic list comes from, and naming that source rather than threading a
+/// word offset keeps every conversion, width and pointer rule below written
+/// once for both.
+fn walk<A: Abi>(
+    call: &mut Call<A>,
+    template: A::Ptr,
+    args: &mut Vararg<A>,
+) -> Result<(Vec<u8>, usize), ShimError> {
+    let template = template
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let mut out = Vec::new();
-    let mut arg = 0usize;
+    let mut consumed = 0usize;
     let mut rest = template.as_slice();
 
     while let Some((&byte, tail)) = rest.split_first() {
@@ -199,54 +246,56 @@ pub fn format(
             continue;
         }
 
-        let (spec, conv, tail) = parse(rest, machine, args, &mut arg)?;
+        let (spec, conv, tail) = parse(rest, call, args, &mut consumed)?;
         rest = tail;
 
         match conv {
             b'%' => out.push(b'%'),
             b'c' => {
-                // A `char` promotes to `int` before it is pushed, so it arrives
-                // as a whole word and the low half is the character.
-                let value = args.word(machine, arg)? as u8;
-                arg += 1;
+                // A `char` promotes to `int` before it is pushed, so it
+                // arrives as a whole argument and the low byte is the
+                // character.
+                let value = Into::<u32>::into(args.int(call)?) as u8;
+                consumed += A::INT_WIDTH;
                 pad(&mut out, &[value], &spec);
             }
             b's' => {
-                let at = pointer(machine, args, spec.near, arg)?;
-                arg += if spec.near { 1 } else { 2 };
-                let text = machine.read_cstr(at)?;
+                let at = pointer(call, args, spec.near)?;
+                consumed += if spec.near { A::INT_WIDTH } else { A::PTR_WIDTH };
+                let text = at
+                    .read_cstr(call.mem())
+                    .map_err(|e| ShimError::Failed(e.to_string()))?;
                 let text = &text[..spec.precision.unwrap_or(text.len()).min(text.len())];
                 pad(&mut out, text, &spec);
             }
             b'p' => {
-                let at = pointer(machine, args, false, arg)?;
-                arg += 2;
-                let text = format!("{:04X}:{:04X}", at.selector, at.offset);
-                pad(&mut out, text.as_bytes(), &spec);
+                let at = pointer(call, args, false)?;
+                consumed += A::PTR_WIDTH;
+                pad(&mut out, format!("{at}").as_bytes(), &spec);
             }
             b'd' | b'i' => {
-                let (value, size) = signed(machine, args, &spec, arg)?;
-                arg += size;
+                let (value, size) = signed(call, args, &spec)?;
+                consumed += size;
                 out.extend_from_slice(&integer(value.unsigned_abs(), value < 0, 10, false, &spec));
             }
             b'u' => {
-                let (value, size) = unsigned(machine, args, &spec, arg)?;
-                arg += size;
+                let (value, size) = unsigned(call, args, &spec)?;
+                consumed += size;
                 out.extend_from_slice(&integer(value, false, 10, false, &spec));
             }
             b'o' => {
-                let (value, size) = unsigned(machine, args, &spec, arg)?;
-                arg += size;
+                let (value, size) = unsigned(call, args, &spec)?;
+                consumed += size;
                 out.extend_from_slice(&integer(value, false, 8, false, &spec));
             }
             b'x' | b'X' => {
-                let (value, size) = unsigned(machine, args, &spec, arg)?;
-                arg += size;
+                let (value, size) = unsigned(call, args, &spec)?;
+                consumed += size;
                 out.extend_from_slice(&integer(value, false, 16, conv == b'X', &spec));
             }
             other => {
                 // `%f`, `%e`, `%g` and `%n` land here. Each has already been
-                // given the wrong number of argument words by the time this
+                // given the wrong number of argument bytes by the time this
                 // returns, so there is nothing to carry on with.
                 return Err(ShimError::Failed(format!(
                     "%{} is a conversion the host does not implement",
@@ -256,18 +305,18 @@ pub fn format(
         }
     }
 
-    Ok((out, arg))
+    Ok((out, consumed))
 }
 
 /// Parse everything between the `%` and the conversion letter.
 ///
-/// `*` takes its value from the argument list, which is why this needs to
-/// advance `arg` as it goes.
-fn parse<'a>(
+/// `*` takes its value from the argument list, which is why this needs
+/// `call`/`args` and advances `consumed` as it goes.
+fn parse<'a, A: Abi>(
     mut rest: &'a [u8],
-    machine: &Machine,
-    args: Args,
-    arg: &mut usize,
+    call: &mut Call<A>,
+    args: &mut Vararg<A>,
+    consumed: &mut usize,
 ) -> Result<(Spec, u8, &'a [u8]), ShimError> {
     let mut spec = Spec::default();
 
@@ -288,8 +337,8 @@ fn parse<'a>(
 
     if rest.first() == Some(&b'*') {
         // A negative width means left-aligned, which is how C spells it.
-        let n = args.word(machine, *arg)? as i16;
-        *arg += 1;
+        let n = Into::<u32>::into(args.int(call)?) as i16;
+        *consumed += A::INT_WIDTH;
         if n < 0 {
             spec.left = true;
         }
@@ -304,8 +353,8 @@ fn parse<'a>(
     if rest.first() == Some(&b'.') {
         rest = &rest[1..];
         if rest.first() == Some(&b'*') {
-            spec.precision = Some(args.word(machine, *arg)? as usize);
-            *arg += 1;
+            spec.precision = Some(Into::<u32>::into(args.int(call)?) as usize);
+            *consumed += A::INT_WIDTH;
             rest = &rest[1..];
         } else {
             let (n, tail) = digits(rest);
@@ -344,43 +393,44 @@ fn digits(rest: &[u8]) -> (Option<usize>, &[u8]) {
     (Some(n), &rest[end..])
 }
 
-/// The pointer at argument word `at`.
-fn pointer(machine: &Machine, args: Args, near: bool, at: usize) -> Result<FarPtr, ShimError> {
+/// The pointer the next argument names.
+fn pointer<A: Abi>(call: &mut Call<A>, args: &mut Vararg<A>, near: bool) -> Result<A::Ptr, ShimError> {
     if near {
-        // A near pointer is an offset into the module's own globals, which is
-        // the segment its `DS` names.
-        Ok(FarPtr {
-            offset: args.word(machine, at)?,
-            selector: machine.data_selector(),
-        })
+        // A near pointer is one argument word: an offset into the module's
+        // own globals, which is the segment `Abi::data_ptr` names -- see its
+        // own doc comment for why this could not be built from anything else
+        // in `Abi`.
+        let raw = Into::<u32>::into(args.int(call)?) as u16;
+        Ok(A::ptr_offset(A::data_ptr(call.cpu), raw))
     } else {
-        args.far(machine, at)
+        args.ptr(call)
     }
 }
 
-fn signed(
-    machine: &Machine,
-    args: Args,
+fn signed<A: Abi>(
+    call: &mut Call<A>,
+    args: &mut Vararg<A>,
     spec: &Spec,
-    at: usize,
 ) -> Result<(i64, usize), ShimError> {
     if spec.long {
-        Ok((i64::from(args.long(machine, at)? as i32), 2))
+        Ok((i64::from(args.long(call)? as i32), A::LONG_WIDTH))
     } else {
-        Ok((i64::from(args.word(machine, at)? as i16), 1))
+        Ok((
+            i64::from(Into::<u32>::into(args.int(call)?) as i16),
+            A::INT_WIDTH,
+        ))
     }
 }
 
-fn unsigned(
-    machine: &Machine,
-    args: Args,
+fn unsigned<A: Abi>(
+    call: &mut Call<A>,
+    args: &mut Vararg<A>,
     spec: &Spec,
-    at: usize,
 ) -> Result<(u64, usize), ShimError> {
     if spec.long {
-        Ok((u64::from(args.long(machine, at)?), 2))
+        Ok((u64::from(args.long(call)?), A::LONG_WIDTH))
     } else {
-        Ok((u64::from(args.word(machine, at)?), 1))
+        Ok((u64::from(Into::<u32>::into(args.int(call)?)), A::INT_WIDTH))
     }
 }
 
@@ -467,24 +517,136 @@ fn pad(out: &mut Vec<u8>, text: &[u8], spec: &Spec) {
     }
 }
 
+// ---- The `Wg16` compatibility facade ------------------------------------
+//
+// Everything below exists for six call sites this task does not touch:
+// `msg::prfmsg`, `text::spr`/`sprintf`/`vsprintf`/`prf`, `system::shocst`/
+// `catastro`, and `stream::fprintf` if it stays unconverted. Each already
+// holds a whole `&mut Machine` and constructs `Args::Call { first: N }` or
+// `Args::List { at }` -- the word-indexed shape this crate used before
+// `Call<A>` existed -- so `Args` and `format` keep exactly that shape rather
+// than moving onto `Vararg`, which no caller outside this file ever
+// constructs.
+
+/// Where a `Wg16` caller's printf walk reads its arguments from.
+///
+/// Not generic. Task 2 made this type generic in anticipation of a walk that
+/// would stay `Wg16`-concrete indefinitely (see git history); now that
+/// [`format_call`]/[`format_va_list`] are the generic entry points and
+/// nothing constructs an `Args<A>` for any `A` but `Wg16`, carrying the type
+/// parameter bought nothing and cost a reader having to notice it was never
+/// instantiated any other way. `first`/`at` are unchanged from before: `first`
+/// is a **word** index (not `Call`'s byte position) because every one of
+/// this facade's six remaining callers already computed a word count against
+/// `Machine::arg_u16`, and changing that unit would be a needless second
+/// change bundled into this one.
+#[derive(Debug, Clone, Copy)]
+pub enum Args {
+    /// The outstanding call's own stack, from argument word `first` on.
+    ///
+    /// `first` counts argument *words* and not arguments, because a far
+    /// `char *` is two of them and a near one is not.
+    Call { first: usize },
+
+    /// A `va_list`: consecutive words from a far pointer into module memory.
+    List { at: FarPtr },
+}
+
+/// Format `template` with the arguments `args` names, for a caller that
+/// still holds a whole `&mut Machine`.
+///
+/// `Args::Call` builds a [`Call<Wg16>`] over the outstanding call's frame --
+/// the same one [`crate::shims::call`] builds for a converted shim -- and
+/// skips `first` argument words before handing it to [`format_call`].
+/// `first` is a word count; `Wg16`'s [`Call::int`] always advances by one
+/// word ([`Abi::INT_WIDTH`] is 2), so skipping `first` of them advances the
+/// position by exactly the `first * 2` bytes the old word-indexed reader
+/// used to start from -- the value read each time is discarded, which is
+/// safe because nothing about *decoding* a fixed argument can fail; only
+/// resolving a pointer through it can, and nothing here does that.
+///
+/// **`Args::List` builds its `Call<Wg16>` over an empty frame, deliberately,
+/// and never touches `Machine::arg_frame`.** A `va_list` walk reads
+/// exclusively through [`Call::mem`], never through [`Call::int`]/
+/// [`Call::ptr`]/[`Call::long`] -- see [`Vararg::List`]'s own doc comment --
+/// so no bytes from an outstanding call are ever needed. That is not just
+/// cheaper: `Machine::arg_frame` panics unless the module is stopped at a
+/// call, and a `va_list` is exactly the case that should not require one --
+/// it is what makes a `va_list` format usable from a routine whose own frame
+/// holds something else, or from no outstanding call at all (see this
+/// module's tests, which format a `va_list` with no [`crate::testing::Fixture::call`]
+/// beforehand).
+///
+/// # A necessary widening from the signature this replaces
+///
+/// The function this facade stood in for took `&Machine`, because nothing in
+/// it ever wrote to module memory. Building a [`Call<Wg16>`] needs
+/// `&mut Machine` regardless -- [`Call::new`] takes `cpu: &'a mut A::Cpu` so
+/// that [`Call::mem`] can reborrow it, and there is no narrower handle to
+/// build one from (see `crates/mbbs/src/abi.rs`'s "`Call` holds one handle,
+/// not two"). Every one of this facade's six call sites already holds
+/// `&mut Machine` -- none of them ever had only `&Machine` to give it -- so
+/// widening the parameter breaks no caller; it only stops discarding
+/// mutability those callers were never short of.
+///
+/// # Errors
+///
+/// As [`format_call`]/[`format_va_list`].
+///
+/// # Panics
+///
+/// If `args` is [`Args::Call`] and the module is not stopped at a call,
+/// since that is where those arguments are. [`Args::List`] does not need a
+/// frame at all, per above.
+pub fn format(
+    machine: &mut Machine,
+    template: FarPtr,
+    args: Args,
+) -> Result<(Vec<u8>, usize), ShimError> {
+    match args {
+        Args::Call { first } => {
+            let frame = machine.arg_frame().to_vec();
+            let mut call = Call::<Wg16>::new(machine, &frame);
+            for _ in 0..first {
+                call.int();
+            }
+            format_call(&mut call, template)
+        }
+        Args::List { at } => {
+            let mut call = Call::<Wg16>::new(machine, &[]);
+            format_va_list(&mut call, template, at)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    /// A [`Call<Wg16>`] over the outstanding call's frame -- the same two
+    /// lines [`format`] and `crate::shims::call` both build, repeated here so
+    /// this module's tests need no dependency on `crate::shims`.
+    fn call(f: &mut Fixture) -> Call<'_, Wg16> {
+        let frame = f.machine.arg_frame().to_vec();
+        Call::new(&mut f.machine, &frame)
+    }
 
     /// One case: a format string, the argument words, and what should come out.
     fn check(template: &str, args: &[u16], expect: &str) {
         let mut f = Fixture::new();
         let at = f.text(template);
         f.call(args);
-        let (bytes, _) = format(&f.machine, at, Args::Call { first: 0 }).expect("formatted");
+        let (bytes, _) = format(&mut f.machine, at, Args::Call { first: 0 }).expect("formatted");
         assert_eq!(String::from_utf8_lossy(&bytes), expect, "{template:?}");
     }
 
-    /// The rendering, and the argument word the walk stopped at.
-    fn walk(f: &Fixture, template: FarPtr) -> (String, usize) {
-        let (bytes, next) =
-            format(&f.machine, template, Args::Call { first: 0 }).expect("formatted");
+    /// The rendering, and the bytes the walk stopped at -- through
+    /// [`format_call`] directly, proving the generic entry point (not just
+    /// the `Wg16` facade over it) produces the same thing.
+    fn walk(f: &mut Fixture, template: FarPtr) -> (String, usize) {
+        let mut call = call(f);
+        let (bytes, next) = format_call(&mut call, template).expect("formatted");
         (String::from_utf8_lossy(&bytes).into_owned(), next)
     }
 
@@ -521,7 +683,7 @@ mod tests {
         let template = f.text("<%s>");
         let text = f.text("Newhaven");
         f.call(&Fixture::far(text));
-        assert_eq!(walk(&f, template).0, "<Newhaven>");
+        assert_eq!(walk(&mut f, template).0, "<Newhaven>");
     }
 
     #[test]
@@ -532,7 +694,7 @@ mod tests {
         let template = f.text("%s has %d");
         let text = f.text("a kobold");
         f.call(&[text.offset, text.selector, 12]);
-        assert_eq!(walk(&f, template).0, "a kobold has 12");
+        assert_eq!(walk(&mut f, template).0, "a kobold has 12");
     }
 
     #[test]
@@ -545,7 +707,7 @@ mod tests {
         };
         f.machine.write(at, b"gold\0").expect("fits");
         f.call(&[at.offset, 9]);
-        assert_eq!(walk(&f, template).0, "gold/9");
+        assert_eq!(walk(&mut f, template).0, "gold/9");
     }
 
     #[test]
@@ -583,7 +745,7 @@ mod tests {
         let template = f.text("[%.*s]");
         let text = f.text("Newhaven");
         f.call(&[3, text.offset, text.selector]);
-        assert_eq!(walk(&f, template).0, "[New]");
+        assert_eq!(walk(&mut f, template).0, "[New]");
     }
 
     #[test]
@@ -595,7 +757,7 @@ mod tests {
             .flatten()
             .collect();
         f.call(&args);
-        assert_eq!(walk(&f, template).0, "[Rang][  Ranger][Ranger  ]");
+        assert_eq!(walk(&mut f, template).0, "[Rang][  Ranger][Ranger  ]");
     }
 
     #[test]
@@ -606,26 +768,35 @@ mod tests {
 
     #[test]
     fn a_pointer_prints_as_selector_and_offset() {
-        check("%p", &[0x1234, 0x00af], "00AF:1234");
+        // Lower case: `%p` now defers to `A::Ptr`'s own `Display` (see
+        // `format`'s doc for why the generic walk cannot reconstruct
+        // `FarPtr`'s fields by hand) rather than reimplementing the same
+        // `seg:off` rendering `mbbs16::FarPtr::fmt` already gives -- one
+        // place that decides how a pointer prints, not two that could
+        // disagree. WCCMMUD.DLL's decompiled sources have no `%p` conversion
+        // at all (`grep -c %p` over `WCCMMUD_named.c` is 0), so nothing
+        // measured depends on the case that changed.
+        check("%p", &[0x1234, 0x00af], "00af:1234");
     }
 
     #[test]
-    fn the_walk_reports_where_it_stopped() {
+    fn the_walk_reports_how_many_bytes_it_consumed() {
         let mut f = Fixture::new();
         let template = f.text("%d %ld %c");
         f.call(&[1, 2, 0, u16::from(b'z')]);
-        assert_eq!(walk(&f, template), ("1 2 z".to_owned(), 4));
+        // 2 (int) + 4 (long) + 2 (int, promoted char) = 8 bytes.
+        assert_eq!(walk(&mut f, template), ("1 2 z".to_owned(), 8));
     }
 
     #[test]
     fn a_conversion_the_host_does_not_implement_is_an_error() {
         // Not a passthrough and not an empty field. By the time `%f` is
-        // reached its four words have already not been consumed, so every
+        // reached its arguments have already not been consumed, so every
         // argument after it would be read from the wrong place.
         let mut f = Fixture::new();
         let template = f.text("%f");
         f.call(&[0, 0, 0, 0]);
-        assert!(format(&f.machine, template, Args::Call { first: 0 }).is_err());
+        assert!(format(&mut f.machine, template, Args::Call { first: 0 }).is_err());
     }
 
     #[test]
@@ -633,7 +804,7 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("all done %");
         f.call(&[]);
-        assert!(format(&f.machine, template, Args::Call { first: 0 }).is_err());
+        assert!(format(&mut f.machine, template, Args::Call { first: 0 }).is_err());
     }
 
     #[test]
@@ -648,10 +819,14 @@ mod tests {
         let text = f.text("a kobold");
         let list = f.words(&[text.offset, text.selector, 12]);
 
-        let (bytes, next) =
-            format(&f.machine, template, Args::List { at: list }).expect("formatted");
+        // Not `call(&mut f)`: that helper reads `Machine::arg_frame`, which
+        // panics with no outstanding call. An empty frame is enough --
+        // `format_va_list` never reads through `Call`'s own position, only
+        // through `Call::mem`, which this still has.
+        let mut call = Call::<Wg16>::new(&mut f.machine, &[]);
+        let (bytes, next) = format_va_list(&mut call, template, list).expect("formatted");
         assert_eq!(String::from_utf8_lossy(&bytes), "a kobold has 12");
-        assert_eq!(next, 3, "two words for the far pointer and one for the int");
+        assert_eq!(next, 6, "four bytes for the far pointer, two for the int");
     }
 
     #[test]
@@ -675,13 +850,14 @@ mod tests {
         let template = f.text("%s|%ld|%c|%05d");
         let args = words(&mut f);
         f.call(&args);
-        let framed = format(&f.machine, template, Args::Call { first: 0 }).expect("formatted");
+        let framed = format(&mut f.machine, template, Args::Call { first: 0 }).expect("formatted");
 
         let mut g = Fixture::new();
         let template = g.text("%s|%ld|%c|%05d");
         let args = words(&mut g);
         let list = g.words(&args);
-        let listed = format(&g.machine, template, Args::List { at: list }).expect("formatted");
+        let listed =
+            format(&mut g.machine, template, Args::List { at: list }).expect("formatted");
 
         assert_eq!(framed, listed);
         assert_eq!(String::from_utf8_lossy(&framed.0), "gold|100000|x|00042");
@@ -695,7 +871,7 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%d");
         let at = FarPtr::NULL;
-        assert!(format(&f.machine, template, Args::List { at }).is_err());
+        assert!(format(&mut f.machine, template, Args::List { at }).is_err());
     }
 
     #[test]
@@ -713,6 +889,39 @@ mod tests {
         };
         f.machine.write(at, &7u16.to_le_bytes()).expect("fits");
 
-        assert!(format(&f.machine, template, Args::List { at }).is_err());
+        assert!(format(&mut f.machine, template, Args::List { at }).is_err());
+    }
+
+    /// [`format_call`], exercised directly with no `Wg16` `Args` in sight --
+    /// the shape a converted `fprintf` (or any future converted printf
+    /// routine) actually calls.
+    #[test]
+    fn format_call_reads_straight_through_a_calls_own_position() {
+        let mut f = Fixture::new();
+        let template = f.text("%s has %d gold");
+        let who = f.text("rangerdan");
+        f.call(&[who.offset, who.selector, 1234]);
+
+        let mut call = call(&mut f);
+        let (bytes, consumed) = format_call(&mut call, template).expect("formatted");
+        assert_eq!(String::from_utf8_lossy(&bytes), "rangerdan has 1234 gold");
+        assert_eq!(consumed, 6, "four bytes for the far pointer, two for the int");
+    }
+
+    /// The same proof [`crate::abi`]'s own tests make for `Call::ptr`/`int`/
+    /// `long`: a fixed argument consumed *before* the vararg walk begins
+    /// leaves `call`'s position exactly where the format string's own
+    /// arguments start, with no word-index needed to say so.
+    #[test]
+    fn format_call_starts_wherever_the_fixed_arguments_left_the_call() {
+        let mut f = Fixture::new();
+        let template = f.text("%d");
+        f.call(&[0xdead, 7]); // a fixed word, then the one vararg.
+
+        let mut call = call(&mut f);
+        let _ = call.int(); // consume the fixed argument, as a real shim would.
+        let (bytes, consumed) = format_call(&mut call, template).expect("formatted");
+        assert_eq!(String::from_utf8_lossy(&bytes), "7");
+        assert_eq!(consumed, 2);
     }
 }

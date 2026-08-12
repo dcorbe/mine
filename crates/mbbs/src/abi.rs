@@ -192,6 +192,22 @@ pub trait Abi {
     /// one method, which is what lets `Call` stay generic over the
     /// difference instead of needing a second field only one ABI can fill.
     fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem;
+
+    /// The base of this ABI's own data segment -- offset zero, in the
+    /// module's own `DGROUP` -- as a pointer.
+    ///
+    /// What `crate::fmt`'s `%N` conversion names: a near pointer's one
+    /// argument word is an offset into the module's *own* data, not into any
+    /// region a `ModuleMem::alloc_region` call handed back, so it cannot be
+    /// expressed as [`Abi::ptr_offset`] from something a caller already has
+    /// -- nothing else in this trait names the module's own data segment at
+    /// all. `Wg16`'s is `Machine::data_selector()` at offset 0, the same
+    /// selector `crate::fmt`'s near-pointer conversion used to build by hand
+    /// before the format walk went generic. A future `Wg32`, with one flat
+    /// address space and no near/far distinction, would answer the same base
+    /// its ordinary pointers already use -- there being nothing else it
+    /// could mean once "near" and "far" collapse to the same address space.
+    fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr;
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -462,6 +478,13 @@ impl Abi for Wg16 {
     fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem {
         cpu.mem_mut()
     }
+
+    fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
+        mbbs16::FarPtr {
+            offset: 0,
+            selector: cpu.data_selector(),
+        }
+    }
 }
 
 impl From<Ret<Wg16>> for mbbs16::Ret {
@@ -642,6 +665,13 @@ mod tests {
             // nothing this could correctly return, which is fine because
             // `Call`'s frame-read tests below never call `Call::mem`.
             unreachable!("Call's read tests never call Call::mem")
+        }
+
+        fn data_ptr(_cpu: &Self::Cpu) -> Self::Ptr {
+            // Same reasoning as `mem` above: `Cpu = ()` has no data segment
+            // to name, which is fine because `Call`'s frame-read tests below
+            // never format a near pointer.
+            unreachable!("Call's read tests never call Abi::data_ptr")
         }
     }
 

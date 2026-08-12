@@ -243,14 +243,15 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
     (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
     (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
-    // Streams: the module's own files, read and written. `fprintf` stays
-    // `Wg16`-concrete -- `crate::fmt::format` has no generic core yet (see
-    // `shims::stream::fprintf`'s own doc comment).
+    // Streams: the module's own files, read and written. All nine are
+    // generic now -- `fprintf` converted once `crate::fmt::format_call`
+    // existed for it to route through (see `shims::stream::fprintf`'s own
+    // doc comment).
     (MAJORBBS, "fopen", stream::fopen_wg16, Cleans::Caller),
     (MAJORBBS, "fclose", stream::fclose_wg16, Cleans::Caller),
     (MAJORBBS, "fgets", stream::fgets_wg16, Cleans::Caller),
     (MAJORBBS, "fread", stream::fread_wg16, Cleans::Caller),
-    (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller),
+    (MAJORBBS, "fprintf", stream::fprintf_wg16, Cleans::Caller),
     (MAJORBBS, "fflush", stream::fflush_wg16, Cleans::Caller),
     (MAJORBBS, "unlink", stream::unlink_wg16, Cleans::Caller),
     (MAJORBBS, "getdtd", stream::getdtd_wg16, Cleans::Caller),

@@ -49,7 +49,7 @@ use mbbs_ptr::ModulePtr;
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::dos;
-use crate::fmt::{Args, format};
+use crate::fmt::format_call;
 use crate::shims::{NO, ShimError};
 use crate::stream::Mode;
 
@@ -272,42 +272,36 @@ pub fn fread_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimErr
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
 /// with a destination.
 ///
-/// [`crate::fmt::Args::Call`]'s `first` is an **absolute** word index into the call
-/// frame, so it is 4: the far `FILE *` is words 0-1 and the far template words
-/// 2-3. The same layout `sprintf` has, and unlike `prfmsg`, whose fixed argument
-/// is one word.
-///
 /// Returns the bytes the module asked to write, not the bytes that reached the
 /// disk. `WRITE.C` is explicit about the difference -- "a write to a text file
 /// does not count generated carriage returns" -- so the answer is the same in
 /// both modes, which is what makes it comparable with `sprintf`.
 ///
-/// # The one shim in this file that did not go generic
+/// # The blocker this needed is gone
 ///
-/// [`crate::fmt::format`] is `Wg16`-concrete -- it walks the outstanding
-/// call's raw argument words off `&Machine` directly (see `fmt.rs`'s own
-/// doc comment, "Generic type, `Wg16`-concrete body"), and `fmt.rs` is a
-/// different file, out of this task's scope (see `shims::user::getin`'s own
-/// doc comment for the identical shape of this finding: attempting
-/// `fprintf<A: Abi>(call: &mut Call<A>, ..)` and forwarding to
-/// `format(call.cpu, ..)` fails the same way `getin`'s attempt at
-/// `host.get_input(call.cpu, chan)` did -- `A::Cpu` is opaque outside `Abi`
-/// and nothing binds it to `Machine` for an arbitrary `A`). `fprintf` keeps
-/// its Task-4 shape and its own unchanged `ROUTINES` entry.
-pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+/// [`crate::fmt::format_call`] is what unblocked this: `fmt.rs`'s own module
+/// doc comment describes why the generic walk needed to read through
+/// `Call<A>`'s own position rather than a `&Machine` and a word index. Once
+/// that existed, this routine converted the same way every other one in this
+/// file did -- `cookie` and `template` are `call.ptr()` same as always, and
+/// by the time both are read, `call`'s position already marks where the
+/// format string's own varargs begin, which is all `format_call` needs.
+pub fn fprintf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fprintf(FILE *f, const char *fmt, ...)` -- Borland's; no
-    // Galacticomm header redeclares it. `Args::Call { first: 4 }` stays a
-    // literal word index into the frame -- the varargs it walks are not
-    // named arguments the cursor reads, exactly as `prfmsg`'s equivalent
-    // stayed literal when `shims/msg.rs` converted (see eeda7b3).
-    let mut args = super::args(machine);
-    let cookie = args.ptr();
-    let template = args.ptr();
-    let (text, _) = format(machine, template, Args::Call { first: 4 })?;
+    // Galacticomm header redeclares it.
+    let cookie = call.ptr();
+    let template = call.ptr();
+    let (text, _) = format_call(call, template)?;
     host.streams
         .write(cookie, &text)
         .map_err(|e| ShimError::Failed(format!("fprintf: {e}")))?;
-    Ok(Ret::U16(text.len() as u16))
+    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+}
+
+/// The dispatch-table entry for [`fprintf`]. See `shims::call`'s own doc
+/// comment.
+pub fn fprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fprintf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int fflush(FILE *f)` -- push what is buffered.
@@ -871,7 +865,7 @@ mod tests {
 
         let template = f.text("a\nb\n");
         f.invoke(
-            fprintf,
+            fprintf_wg16,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
@@ -992,7 +986,7 @@ mod tests {
         let who = f.text("rangerdan");
         let wrote = word(
             f.invoke(
-                fprintf,
+                fprintf_wg16,
                 &[
                     fp.offset,
                     fp.selector,
@@ -1027,7 +1021,7 @@ mod tests {
             let template = f.text("a\nb\n");
             let wrote = word(
                 f.invoke(
-                    fprintf,
+                    fprintf_wg16,
                     &[fp.offset, fp.selector, template.offset, template.selector],
                 )
                 .expect("fprintf"),
@@ -1051,7 +1045,7 @@ mod tests {
         let fp = opened(&mut f, "wccmmud.log", "at");
         let template = f.text("second\n");
         f.invoke(
-            fprintf,
+            fprintf_wg16,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
@@ -1075,7 +1069,7 @@ mod tests {
         let template = f.text("no");
         let e = f
             .invoke(
-                fprintf,
+                fprintf_wg16,
                 &[fp.offset, fp.selector, template.offset, template.selector],
             )
             .expect_err("a refusal");
@@ -1133,7 +1127,7 @@ mod tests {
         let fp = opened(&mut f, "WCCRECOV.FLG", "w");
         let template = f.text("MajorMUD Recovery required\n");
         f.invoke(
-            fprintf,
+            fprintf_wg16,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
