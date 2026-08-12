@@ -23,6 +23,10 @@ re/ghidra_proj/
 re/wg_nt_ghidra/
 re/wccmmpls_ghidra/
 re/wg_nt_ref/
+# Worldgroup 3.3 host source, 4,868 files / 73 MB. Re-extract with
+# `unzip archive/galacticomm/source33.zip -d re/wg33src` -- a plain zip, unlike
+# the activation-encrypted developer kits in archive/galacticomm/wg32sdk.zip.
+re/wg33src/
 # Pervasive Btrieve 6.15 engine: staged binaries, Ghidra project and the 1.6 MB
 # of decompiled C. Regenerable -- re-run tools/btrieve-oracle/ and the
 # analyzeHeadless invocation recorded in docs/plans/2026-08-08-btrieve-real-oracle.md.
