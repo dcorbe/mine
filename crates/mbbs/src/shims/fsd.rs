@@ -47,6 +47,7 @@
 
 use mbbs16::{FarPtr, Machine, Module, Ret};
 
+use crate::abi::ModuleMem;
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::{NO, ShimError};
@@ -74,13 +75,18 @@ fn control_block(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<F
     let at = match host.fsdscb[chan.index()] {
         Some(at) => at,
         None => {
-            let selector = machine.alloc_segment(usize::from(fsd::FSDSCB)).map_err(|e| {
-                ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
-            })?;
-            let at = FarPtr {
-                offset: 0,
-                selector,
-            };
+            // `ModuleMem::alloc_region`, not `Machine::alloc_segment`
+            // directly -- one of the 9 sites Task 6 moves onto the `Abi`
+            // trait's allocator (docs/plans/2026-08-11-abi-abstraction-
+            // implementation.md). Still `Wg16`-concrete: `Host` is not
+            // generic yet, and `alloc_region` already returns the whole
+            // `FarPtr` (offset 0) this used to build by hand.
+            let at = machine
+                .mem_mut()
+                .alloc_region(usize::from(fsd::FSDSCB))
+                .map_err(|e| {
+                    ShimError::Failed(format!("fsdroom: no room for a session block: {e}"))
+                })?;
             host.fsdscb[chan.index()] = Some(at);
             at
         }
@@ -735,15 +741,13 @@ fn ascii_template(
     let compact = machine.read_cstr(at)?.to_vec();
     let mut expanded = crate::msg::getasc(&compact);
     expanded.push(0);
-    let selector = machine.alloc_segment(expanded.len()).map_err(|e| {
+    // `ModuleMem::alloc_region`, not `Machine::alloc_segment` directly --
+    // see `control_block`'s identical comment above.
+    let buffer = machine.mem_mut().alloc_region(expanded.len()).map_err(|e| {
         ShimError::Failed(format!(
             "fsdrft: no room for the ASCII form of message {number}: {e}"
         ))
     })?;
-    let buffer = FarPtr {
-        offset: 0,
-        selector,
-    };
     machine.write(buffer, &expanded)?;
     host.fsd_ascii.insert((block, number), buffer);
     Ok(buffer)
@@ -1101,15 +1105,14 @@ fn fsd_scratch(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimErr
     match host.fsd_scratch {
         Some(at) => Ok(at),
         None => {
-            let selector = machine
-                .alloc_segment(usize::from(fsd::ANSLEN) + 1)
+            // `ModuleMem::alloc_region`, not `Machine::alloc_segment`
+            // directly -- see `control_block`'s identical comment above.
+            let at = machine
+                .mem_mut()
+                .alloc_region(usize::from(fsd::ANSLEN) + 1)
                 .map_err(|e| {
                     ShimError::Failed(format!("fsdprc: no room for a scratch buffer: {e}"))
                 })?;
-            let at = FarPtr {
-                offset: 0,
-                selector,
-            };
             host.fsd_scratch = Some(at);
             Ok(at)
         }
