@@ -1386,6 +1386,34 @@ mod tests {
         assert_eq!(locks.get(b.id(), bb), Some(300), "the second is held too");
     }
 
+    /// [`Block::get`]'s own lock tests above all go through `get` -- every
+    /// one of `step`/`acquire_absolute`'s own `take_lock` calls was
+    /// otherwise unreached by anything asserting on a *held* lock (only on
+    /// the old blanket refusal, gone now). Measured: deleting either call
+    /// entirely left the whole suite green. These two close that gap.
+    #[test]
+    fn step_takes_a_lock_at_the_position_it_lands_on() {
+        let mut b = fixture("step_takes_a_lock_at_the_position_it_lands_on");
+        let mut locks = LockTable::default();
+
+        b.step(Step::First, 100, &mut locks).unwrap().unwrap();
+        let position = b.current().unwrap().position;
+        assert_eq!(locks.get(b.id(), position), Some(100));
+    }
+
+    #[test]
+    fn acquire_absolute_takes_a_lock_at_the_position_it_lands_on() {
+        let mut b = fixture("acquire_absolute_takes_a_lock_at_the_position_it_lands_on");
+        let mut locks = LockTable::default();
+
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap().unwrap();
+        let position = b.get_position().unwrap();
+        b.seek_to(Cursor::Nowhere);
+
+        b.acquire_absolute(position, 1, 100, &mut locks).unwrap().unwrap();
+        assert_eq!(locks.get(b.id(), position), Some(100));
+    }
+
     #[test]
     fn mixing_a_multiple_lock_in_while_a_single_lock_is_outstanding_is_refused_and_takes_no_lock() {
         // Measured: "Taking a multiple lock while the same session still
