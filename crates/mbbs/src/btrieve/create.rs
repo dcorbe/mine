@@ -381,7 +381,7 @@ fn validate(spec: &FileSpec) -> Result<u16, String> {
     if spec.record_length == 0 {
         return Err("a record length of zero".to_owned());
     }
-    if spec.page_size < MIN_PAGE || spec.page_size % MIN_PAGE != 0 {
+    if spec.page_size < MIN_PAGE || !spec.page_size.is_multiple_of(MIN_PAGE) {
         return Err(format!(
             "a page length of {}, which is not a multiple of {MIN_PAGE}",
             spec.page_size
