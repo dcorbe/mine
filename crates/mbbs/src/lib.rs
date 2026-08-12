@@ -1178,6 +1178,28 @@ impl Host {
         &self.notes
     }
 
+    /// Take every note recorded so far, leaving none behind.
+    ///
+    /// [`Self::notes`] alone makes this list write-only in practice: nothing
+    /// ever removes an entry, so a long-lived host accumulates one string per
+    /// note for as long as it runs. That is not hypothetical -- one session
+    /// driving a character into the Realm recorded 4,962 notes, all but a
+    /// handful of them the same `setbtv` stack overflow, and a caller reading
+    /// `notes()` has no way to tell which of them it has already seen.
+    ///
+    /// So a caller that wants to *report* notes drains them, and a caller that
+    /// wants to *assert* on them (every test in this crate) borrows them. The
+    /// two cannot be the same method: draining in `notes()` would need `&mut
+    /// self` and would make two consecutive reads disagree.
+    ///
+    /// [`Self::note_once`]'s `noted` set is deliberately **not** cleared here.
+    /// Its promise is "once per host", not "once per drain" -- resetting it
+    /// would turn every drain into a fresh licence to repeat, which is the
+    /// flood it exists to prevent.
+    pub fn drain_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
     /// Record something the module cannot be told. See [`Host::notes`].
     pub(crate) fn note(&mut self, what: String) {
         self.notes.push(what);
@@ -3520,6 +3542,54 @@ mod tests {
         assert!(
             f.host.notes().len() > notes_before,
             "a command dropped for lack of an entry point must leave a note"
+        );
+    }
+
+    /// `drain_notes` hands over what `notes` was showing and leaves the list
+    /// empty, so a caller reporting notes never reports one twice.
+    ///
+    /// Driven through a real note rather than by pushing onto the field: the
+    /// point is that the reporting path and the recording path agree, and a
+    /// test that writes `self.notes` directly would pass against a
+    /// `drain_notes` that drained some *other* list.
+    #[test]
+    fn draining_notes_takes_them_and_leaves_none_behind() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let module = f.minimal_module();
+        let mut bytes = b"MajorMUD".to_vec();
+        bytes.resize(25 + 9 * 4, 0);
+        let block = f.bytes(&bytes, false);
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .expect("registered");
+
+        f.host.gsbl_mut().push_input(console, b"look\r");
+        f.host.poll(&mut f.machine, &module).expect("no fault");
+
+        let seen = f.host.notes().to_vec();
+        assert!(!seen.is_empty(), "the dropped command left a note to drain");
+
+        assert_eq!(f.host.drain_notes(), seen, "the drain yields what was there");
+        assert!(f.host.notes().is_empty(), "and leaves nothing behind");
+        assert!(
+            f.host.drain_notes().is_empty(),
+            "a second drain with nothing recorded in between yields nothing"
+        );
+    }
+
+    /// Draining must not reset `note_once`'s memory. Its promise is once per
+    /// host, and a drain that cleared `noted` would turn every report into a
+    /// licence for the next flood.
+    #[test]
+    fn draining_notes_does_not_re_arm_note_once() {
+        let mut f = Fixture::new();
+        f.host.note_once("a-key", "the first and only time".to_owned());
+        assert_eq!(f.host.drain_notes().len(), 1, "recorded once");
+
+        f.host.note_once("a-key", "the first and only time".to_owned());
+        assert!(
+            f.host.drain_notes().is_empty(),
+            "the same key after a drain must still be suppressed"
         );
     }
 

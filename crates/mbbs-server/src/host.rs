@@ -227,6 +227,57 @@ fn describe_stop(chan: Option<Chan>) -> String {
     }
 }
 
+/// Turn a batch of notes into the lines to print, collapsing each run of
+/// identical ones into a single line with a count.
+///
+/// **The collapsing is not cosmetic.** `Host::note` has no per-message
+/// suppression of its own -- that is `note_once`, and only some call sites
+/// use it -- so one note inside a loop the module runs to completion arrives
+/// thousands of times. Measured: a single session driving a character into
+/// the Realm recorded 4,962 notes, 4,962 of them the *same* `setbtv` stack
+/// overflow. Printed one per line that buries the twenty-odd distinct notes
+/// around it, which is the same as not reporting them at all.
+///
+/// Runs are collapsed **within one batch and never across batches**, so a
+/// line's count is always the whole run and nothing has to be remembered
+/// between calls. The cost is that a note repeating once per driver turn
+/// prints once per turn -- a note that repeats *forever* at a slow rate is
+/// `note_once`'s job, not this function's, and pretending otherwise here
+/// would mean holding a run open indefinitely and never printing its tally.
+fn collapse(notes: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < notes.len() {
+        let mut end = at + 1;
+        while end < notes.len() && notes[end] == notes[at] {
+            end += 1;
+        }
+        out.push(match end - at {
+            1 => notes[at].clone(),
+            n => format!("{} [x{n}]", notes[at]),
+        });
+        at = end;
+    }
+    out
+}
+
+/// Drain everything the host has recorded since the last call and print it.
+///
+/// `Host::notes` is the host's only way to say something the *module* cannot
+/// be told -- a status nothing dispatches, a command dropped for lack of an
+/// entry point, a `setbtv` stack that overflowed, the clock going backwards.
+/// Every one of those is a fact about this host's fidelity, and until this
+/// existed the binary never read the list: the notes accumulated in memory
+/// for the life of the process and were discarded with it. Draining rather
+/// than borrowing is what keeps the same note from being reported on every
+/// turn of the driver loop, and is also what stops the list growing without
+/// bound -- see `Host::drain_notes`.
+fn report_notes(host: &mut Host) {
+    for line in collapse(&host.drain_notes()) {
+        eprintln!("mbbs-server: note: {line}");
+    }
+}
+
 /// Build a fresh machine, boot `boot.module` on it, and drive the steady
 /// state until the module stops or every connection is gone.
 ///
@@ -276,6 +327,11 @@ fn life(
         }
     }
     host.finish_init(&mut machine)?;
+    // Boot has its own notes -- every `opnbtv` whose `maxlen` disagrees with
+    // the file, every `setbtv` stack overflow during init -- and they are
+    // reported here rather than waiting for the first driver turn, so a board
+    // that boots and then sits idle still says what it noticed on the way up.
+    report_notes(&mut host);
     eprintln!("mbbs-server: module booted, serving {} channel(s)", boot.terms.count());
 
     let terms = boot.terms;
@@ -311,6 +367,12 @@ fn life(
 
         // 5. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
+
+        // 6. Say whatever this turn noticed. Ahead of the `Ended::Stopped`
+        //    arm below on purpose: the notes from the turn that ended the
+        //    life are the ones most worth having, and a drain placed after
+        //    that `return` would never run on the turn that mattered.
+        report_notes(&mut host);
 
         match cycles.ended {
             Ended::Stopped(poison, chan) => {
@@ -513,9 +575,52 @@ mod tests {
 
     use crate::pool::Pool;
 
-    use super::{Woke, wake};
+    use super::{Woke, collapse, wake};
     use crate::msg::{In, Out};
     use mbbs::Wait;
+
+    fn lines(notes: &[&str]) -> Vec<String> {
+        notes.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A run of identical notes collapses to one line carrying the count,
+    /// and the count is the length of the run rather than of the batch.
+    #[test]
+    fn collapse_folds_a_run_into_one_line_with_its_count() {
+        let got = collapse(&lines(&["a", "b", "b", "b", "c"]));
+        assert_eq!(got, lines(&["a", "b [x3]", "c"]));
+    }
+
+    /// Only *consecutive* notes fold. Two separated runs of the same message
+    /// are two facts about two moments, and merging them would report a
+    /// history that did not happen.
+    #[test]
+    fn collapse_does_not_fold_across_an_interruption() {
+        let got = collapse(&lines(&["b", "b", "a", "b", "b"]));
+        assert_eq!(got, lines(&["b [x2]", "a", "b [x2]"]));
+    }
+
+    /// A run that ends the batch still gets its tally -- the loop must not
+    /// leave the last run unemitted.
+    #[test]
+    fn collapse_emits_a_run_that_reaches_the_end() {
+        assert_eq!(collapse(&lines(&["a", "z", "z"])), lines(&["a", "z [x2]"]));
+        assert_eq!(collapse(&lines(&["z", "z"])), lines(&["z [x2]"]));
+    }
+
+    /// Nothing recorded means nothing printed: an empty batch must not emit
+    /// a blank line or a `[x0]`.
+    #[test]
+    fn collapse_of_nothing_is_nothing() {
+        assert!(collapse(&[]).is_empty());
+    }
+
+    /// A single note keeps its exact text. The count suffix is for runs, and
+    /// a `[x1]` on every ordinary line would be noise on the common case.
+    #[test]
+    fn collapse_leaves_a_lone_note_exactly_as_recorded() {
+        assert_eq!(collapse(&lines(&["the clock went backwards"])), lines(&["the clock went backwards"]));
+    }
 
 
     /// A driver whose senders are all gone must stop, not spin.
