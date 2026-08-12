@@ -122,7 +122,8 @@ const MODES: [i16; 5] = [0, -1, -2, -3, -4];
 /// kept and never used, which is the shape of a value that turns out to have
 /// meant something.
 pub fn omdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mode = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let mode = args.int() as i16;
     if !MODES.contains(&mode) {
         return Err(ShimError::Failed(format!(
             "omdbtv({mode}), which is none of the five modes BTVSTF.H defines"
@@ -160,8 +161,10 @@ pub fn omdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// real host did that too, and a host that had refused on overflow instead
 /// would have stopped MajorMUD at its eleventh data file.
 pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
-    let maxlen = machine.arg_u16(2);
+    let mut args = super::args(machine);
+    let filnam = args.ptr();
+    let maxlen = args.int();
+    let named = String::from_utf8_lossy(machine.read_cstr(filnam)?).into_owned();
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
 
     let path = host.btrieve_file(&name).map_err(ShimError::Failed)?;
@@ -239,7 +242,8 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// host opened is refused: the real host would have handed it to Btrieve as a
 /// position block and read 128 bytes of whatever it was.
 pub fn setbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let block = args.ptr();
     if block != Btrieve::null() {
         host.btrieve.block(block).map_err(ShimError::Failed)?;
     }
@@ -392,6 +396,8 @@ pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// so it asks whether a record with this value is already in that key's
 /// order.
 pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let mut args = super::args(machine);
+    let recptr = args.ptr();
     let block = positioned(machine, host, "dinsbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "dinsbtv with no Btrieve file current -- PLBTVSTF.C:598 has no \
@@ -403,7 +409,6 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let length = file.maxlen();
-    let recptr = machine.arg_far(0);
     let recptr = match recptr == Btrieve::null() {
         true => file.data(),
         false => recptr,
@@ -505,6 +510,8 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// the tool and what it found (or didn't), rather than asserting the thing
 /// itself.
 pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let mut args = super::args(machine);
+    let recptr = args.ptr();
     let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "dupdbtv with no Btrieve file current -- PLBTVSTF.C:550 has no \
@@ -527,7 +534,6 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         })?
         .position;
     let length = file.maxlen();
-    let recptr = machine.arg_far(0);
     let recptr = match recptr == Btrieve::null() {
         true => file.data(),
         false => recptr,
@@ -645,7 +651,8 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// here rather than leaking a tiled descriptor per close, which would fail a
 /// long-running board rather than this one.
 pub fn clsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let bbp = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let bbp = args.ptr();
 
     // Unconditional, and before anything below decides whether there is a
     // file to close -- see this routine's doc comment.
@@ -811,9 +818,10 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         return Ok(Ret::U16(0));
     };
 
-    let value = machine.arg_far(0);
-    let keynum = machine.arg_u16(2) as i16;
-    let opt = machine.arg_u16(3) as i16;
+    let mut args = super::args(machine);
+    let value = args.ptr();
+    let keynum = args.int() as i16;
+    let opt = args.int() as i16;
 
     // `qrybtv` takes the *get key* codes, fifty above the acquire family's.
     let op = Op::of(opt - 50).ok_or_else(|| {
@@ -852,7 +860,8 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         return Ok(Ret::U16(0));
     };
 
-    let opt = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let opt = args.int() as i16;
     let op = Op::of(opt - 50).ok_or_else(|| {
         ShimError::Failed(format!("qnpbtv with option {opt}, which is not a get operation"))
     })?;
@@ -903,11 +912,12 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         return Ok(Ret::U16(0));
     };
 
-    let into = machine.arg_far(0);
-    let value = machine.arg_far(2);
-    let keynum = machine.arg_u16(4) as i16;
-    let opt = machine.arg_u16(5) as i16;
-    let lock = machine.arg_u16(6) as i16;
+    let mut args = super::args(machine);
+    let into = args.ptr();
+    let value = args.ptr();
+    let keynum = args.int() as i16;
+    let opt = args.int() as i16;
+    let lock = args.int() as i16;
     unlocked("obtbtvl", lock)?;
 
     let op = Op::of(opt).ok_or_else(|| {
@@ -964,9 +974,10 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         )
     })?;
 
-    let into = machine.arg_far(0);
-    let opt = machine.arg_u16(2) as i16;
-    let lock = machine.arg_u16(3) as i16;
+    let mut args = super::args(machine);
+    let into = args.ptr();
+    let opt = args.int() as i16;
+    let lock = args.int() as i16;
     unlocked("stpbtvl", lock)?;
 
     let into = match into == Btrieve::null() {
@@ -1100,8 +1111,21 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// With no file current it answers 0, per the guard at `:476`.
 pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    let mut args = super::args(machine);
+    let into = args.ptr();
+    let position = args.long();
+    let keynum = args.int() as i16;
     Ok(Ret::U16(u16::from(absolute(
-        machine, host, "aabbtv", false, UNLOCKED,
+        machine,
+        host,
+        Position {
+            who: "aabbtv",
+            fatal: false,
+            lock: UNLOCKED,
+            into,
+            position,
+            keynum,
+        },
     )?)))
 }
 
@@ -1123,10 +1147,72 @@ const UNLOCKED: i16 = 0;
 /// current it does not fail, does not stop the module, and above all does not
 /// write into the module's record buffer -- which is the whole of what a caller
 /// could observe.
+///
+/// # The one shim in this file a single cursor can't read verbatim
+///
+/// `loktyp` is this routine's fourth and *last* argument -- word 5, past the
+/// three (`recptr`, `abspos`, `keynum`) [`absolute`] also reads for
+/// [`aabbtv`], which has no fourth argument at all: its frame ends at word 4.
+/// A `Cursor` only moves forward, so there is no way to read word 5 without
+/// first reading past words 0-4, and `absolute` cannot do that generically
+/// for both callers without reading a word `aabbtv`'s frame does not have.
+///
+/// So this cursor walks all four of gabbtvl's words itself, in true stack
+/// order, and `absolute` takes `into`/`position`/`keynum` already read
+/// instead of reading them a second time off a cursor that has moved past
+/// them. `lock` is still computed here, before the call to `absolute` -- not
+/// inside it -- so `absolute` still receives it as a plain value and still
+/// consults it with [`unlocked`] immediately after [`positioned`]'s
+/// no-file-current guard, exactly as before this file read its arguments
+/// through a cursor. See `absolute`'s own doc comment for why that guard,
+/// then lock, then everything else ordering is load-bearing and was kept.
 pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let lock = machine.arg_u16(5) as i16;
-    absolute(machine, host, "gabbtvl", true, lock)?;
+    let mut args = super::args(machine);
+    let into = args.ptr();
+    let position = args.long();
+    let keynum = args.int() as i16;
+    let lock = args.int() as i16;
+    absolute(
+        machine,
+        host,
+        Position {
+            who: "gabbtvl",
+            fatal: true,
+            lock,
+            into,
+            position,
+            keynum,
+        },
+    )?;
     Ok(Ret::Void)
+}
+
+/// What `aabbtv` and `gabbtvl` supply to [`absolute`], bundled into one type
+/// rather than passed as six more parameters -- clippy already has an opinion
+/// about `absolute` at seven, and the file already has a precedent for this
+/// shape in [`Request`], below.
+struct Position {
+    /// The routine asking, for anything it has to refuse or note by name.
+    who: &'static str,
+
+    /// Whether a position naming no record is a refusal ([`gabbtvl`]) or a
+    /// quiet `false` ([`aabbtv`]). See [`absolute`]'s own doc comment.
+    fatal: bool,
+
+    /// **The caller's**, not read here -- the two callers don't have the same
+    /// arguments; see [`aabbtv`]'s doc comment for why `gabbtvl` has a fourth
+    /// word to read and `aabbtv` does not.
+    lock: i16,
+
+    /// Where the record goes, or the module's null for `bb->data`.
+    into: FarPtr,
+
+    /// The file position to acquire -- Btrieve's Get Position number, what
+    /// [`absbtv`] hands back.
+    position: u32,
+
+    /// Which key's order the position lands in, negative for `bb->lastkn`.
+    keynum: i16,
 }
 
 /// The body of `aabbtv` and `gabbtvl`. Returns whether a record was delivered.
@@ -1136,15 +1222,25 @@ pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// `gabbtvl`, which `:455` sends to `posbtverr` in the second case only -- so
 /// `fatal` turns the second into a refusal and never the first.
 ///
-/// **`lock` is the caller's** rather than read here, because the two callers do
-/// not have the same arguments. See [`aabbtv`].
-fn absolute(
-    machine: &mut Machine,
-    host: &mut Host,
-    who: &str,
-    fatal: bool,
-    lock: i16,
-) -> Result<bool, ShimError> {
+/// **Every field of [`Position`] is the caller's**, not read here. `lock`
+/// always was -- the two callers don't have the same arguments, see
+/// [`aabbtv`]. `into`/`position`/`keynum` joined it once this file started
+/// reading arguments through a cursor: `gabbtvl`'s cursor has already walked
+/// past these three by the time it reaches its own `loktyp` (see that
+/// routine's doc comment), so it reads them itself rather than asking this
+/// function to read the same bytes again off a cursor that has moved on.
+/// `aabbtv` now reads its own three the same way, so both callers share one
+/// shape instead of one reading through `absolute` and the other around it.
+fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<bool, ShimError> {
+    let Position {
+        who,
+        fatal,
+        lock,
+        into,
+        position,
+        keynum,
+    } = req;
+
     // `:452` and `:476` both guard before `:479` defaults `recptr` to
     // `bb->data`. Same ordering point as `obtbtvl`, and the lock is refused
     // after it for the same reason: with no file current the original returned
@@ -1154,10 +1250,6 @@ fn absolute(
         return Ok(false);
     };
     unlocked(who, lock)?;
-
-    let into = machine.arg_far(0);
-    let position = machine.arg_u32(2);
-    let keynum = machine.arg_u16(4) as i16;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
