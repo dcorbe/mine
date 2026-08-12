@@ -4118,7 +4118,7 @@ mod tests {
 
         let name = f.text("FSDFORM.MSG");
         let opened = f
-            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
             .expect("opened");
         assert!(matches!(opened, Ret::Far(_)));
 

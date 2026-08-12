@@ -190,16 +190,19 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "strtok", text::strtok, Cleans::Caller),
     (MAJORBBS, "lastwd", text::lastwd, Cleans::Caller),
     (MAJORBBS, "sortstgs", text::sortstgs, Cleans::Caller),
-    // Message files, and the options in them.
-    (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
-    (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller),
-    (MAJORBBS, "setmbk", msg::setmbk, Cleans::Caller),
-    (MAJORBBS, "rstmbk", msg::rstmbk, Cleans::Caller),
+    // Message files, and the options in them. `_wg16`: eight of these ten are
+    // generic now (see `shims::msg`'s own doc comment); `stgopt` and `prfmsg`
+    // stay concrete, each blocked on a `shims::text` routine that has not
+    // converted yet.
+    (MAJORBBS, "opnmsg", msg::opnmsg_wg16, Cleans::Caller),
+    (MAJORBBS, "clsmsg", msg::clsmsg_wg16, Cleans::Caller),
+    (MAJORBBS, "setmbk", msg::setmbk_wg16, Cleans::Caller),
+    (MAJORBBS, "rstmbk", msg::rstmbk_wg16, Cleans::Caller),
     (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller),
-    (MAJORBBS, "numopt", msg::numopt, Cleans::Caller),
-    (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller),
-    (MAJORBBS, "chropt", msg::chropt, Cleans::Caller),
-    (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller),
+    (MAJORBBS, "numopt", msg::numopt_wg16, Cleans::Caller),
+    (MAJORBBS, "ynopt", msg::ynopt_wg16, Cleans::Caller),
+    (MAJORBBS, "chropt", msg::chropt_wg16, Cleans::Caller),
+    (MAJORBBS, "tokopt", msg::tokopt_wg16, Cleans::Caller),
     (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller),
     // Memory the module owns, and the leaves that move bytes about.
     (MAJORBBS, "alcmem", memory::alcmem_wg16, Cleans::Caller),

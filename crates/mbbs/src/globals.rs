@@ -412,6 +412,28 @@ impl<A: Abi> Globals<A> {
         }
         at.write(mem, bytes).map_err(|e| io::Error::other(e.to_string()))
     }
+
+    /// Read a global as a pointer, against memory directly rather than a
+    /// whole `Machine`.
+    ///
+    /// The generic core [`Globals::pointer`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    /// Added for `shims::msg`'s Task 5 conversion, which reads `curmbk` (and
+    /// `shims::text`'s `prfptr`, once that file converts) as a pointer rather
+    /// than a word.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn pointer_mem(&self, mem: &A::Mem, name: &str) -> io::Result<A::Ptr> {
+        let at = self
+            .address(name)
+            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
+        let bytes = at
+            .resolve(mem, A::PTR_WIDTH)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(A::ptr_from_bytes(bytes))
+    }
 }
 
 impl Globals<Wg16> {
@@ -536,18 +558,14 @@ impl Globals<Wg16> {
 
     /// Read a global as a far pointer.
     ///
+    /// Reborrows into [`Globals::pointer_mem`] through [`Machine::mem`] --
+    /// the same facade shape `word` uses over `word_mem`.
+    ///
     /// # Errors
     ///
     /// If `name` is not a global.
     pub fn pointer(&self, machine: &Machine, name: &str) -> io::Result<FarPtr> {
-        let at = self
-            .address(name)
-            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
-        let bytes = machine.resolve(at, 4).map_err(io::Error::other)?;
-        Ok(FarPtr {
-            offset: u16::from_le_bytes([bytes[0], bytes[1]]),
-            selector: u16::from_le_bytes([bytes[2], bytes[3]]),
-        })
+        self.pointer_mem(machine.mem(), name)
     }
 }
 

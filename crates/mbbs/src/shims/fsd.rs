@@ -1856,7 +1856,7 @@ mod tests {
         current(f);
         let name = f.text("SAMPLE.MSG");
         let block = f
-            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
             .expect("opened");
         match block {
             Ret::Far(at) => at,
@@ -1899,7 +1899,7 @@ mod tests {
         current(f);
         let name = f.text("FSDFORM.MSG");
         let block = f
-            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
             .expect("opened");
         match block {
             Ret::Far(at) => at,
@@ -2558,10 +2558,10 @@ mod tests {
             .expect("sized");
 
         let other = f.text("SAMPLE.MSG");
-        let Ok(Ret::Far(block)) = f.invoke(crate::shims::msg::opnmsg, &Fixture::far(other)) else {
+        let Ok(Ret::Far(block)) = f.invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(other)) else {
             panic!("opnmsg refused")
         };
-        f.invoke(crate::shims::msg::setmbk, &Fixture::far(block))
+        f.invoke(crate::shims::msg::setmbk_wg16, &Fixture::far(block))
             .expect("current");
 
         let expected = f

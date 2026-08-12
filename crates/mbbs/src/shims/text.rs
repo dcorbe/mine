@@ -2116,7 +2116,7 @@ mod tests {
             .expect("connected");
 
         let name = f.text("IFANSI.MSG");
-        f.invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
+        f.invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
             .expect("opened");
         // `IFMSG` is message 1: `LEVEL0` itself is message 0, exactly as
         // `SAMPLE.MSG`'s `FMT` is message 8 -- see

@@ -22,8 +22,10 @@
 //! the real host, and the only one in this file.
 
 use mbbs16::{FarPtr, Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use crate::Host;
+use crate::abi::{self, Abi, Call};
 use crate::fmt::{Args, format};
 use crate::msg::{MsgFile, value};
 use crate::shims::{ShimError, text};
@@ -42,10 +44,21 @@ use crate::shims::{ShimError, text};
 /// between. MajorMUD relies on the other half of the same fact -- its
 /// initialisation opens a file, reads it, and calls `rstmbk` to put back what
 /// was current before, which only balances if opening saved it.
-pub fn opnmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let mcvfil = args.ptr();
-    let named = String::from_utf8_lossy(machine.read_cstr(mcvfil)?).into_owned();
+///
+/// Generic (Task 5): [`Messages::open_mem`](crate::msg::Messages::open_mem)
+/// is already `impl<A: Abi> Messages<A>` -- converting this routine is
+/// routing through that generic core instead of its `Wg16` facade
+/// ([`Messages::open`](crate::msg::Messages::open)). `host.find`/`host.root`
+/// have no `A`-dependent behaviour at all (`Host<A>::find` was already
+/// `impl<A: Abi> Host<A>`, and `root` is a bare `PathBuf`).
+pub fn opnmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mcvfil = call.ptr();
+    let named = String::from_utf8_lossy(
+        mcvfil
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
     let name = source_name(&named);
 
     let path = host.find(&name).ok_or_else(|| {
@@ -60,13 +73,19 @@ pub fn opnmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
     let cookie = host
         .messages
-        .open(machine, &name, &file)
+        .open_mem(call.mem(), &name, &file)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    let previous = current(machine, host)?;
+    let previous = current_mem(call.mem(), host)?;
     host.messages.push(previous);
-    set_current(machine, host, cookie)?;
-    Ok(Ret::Far(cookie))
+    set_current_mem(call.mem(), host, cookie)?;
+    Ok(abi::Ret::Ptr(cookie))
+}
+
+/// The dispatch-table entry for [`opnmsg`]. See `shims::call`'s own doc
+/// comment.
+pub fn opnmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    opnmsg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The file to read for the message file a module named.
@@ -85,40 +104,67 @@ fn source_name(named: &str) -> String {
 }
 
 /// `void clsmsg(FILE *mb)` -- close a message file.
-pub fn clsmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let cookie = args.ptr();
-    let current = current(machine, host)?;
+///
+/// Generic (Task 5): [`Messages::close`](crate::msg::Messages::close) never
+/// touched a `Machine`, so this was already `impl<A: Abi> Messages<A>`
+/// before this task.
+pub fn clsmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let cookie = call.ptr();
+    let current = current_mem(call.mem(), host)?;
     host.messages
         .close(current, cookie)
         .map_err(ShimError::Failed)?;
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`clsmsg`]. See `shims::call`'s own doc
+/// comment.
+pub fn clsmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    clsmsg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void setmbk(FILE *mb)` -- read options from this file until told otherwise.
 ///
 /// `curmbk` is written in module memory, not remembered here. What is
 /// remembered is the value it held, so that `rstmbk` has something to put back.
-pub fn setmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let cookie = args.ptr();
+///
+/// Generic (Task 5): [`Messages::name`](crate::msg::Messages::name) and
+/// [`Messages::push`](crate::msg::Messages::push) never touched a `Machine`;
+/// only [`current_mem`]/[`set_current_mem`] read and write module memory.
+pub fn setmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let cookie = call.ptr();
 
     // Checked before anything is changed: a `setmbk` of a block that was never
     // opened would otherwise leave `curmbk` naming nothing and the refusal
     // would land on whichever option was read next.
     host.messages.name(cookie).map_err(ShimError::Failed)?;
 
-    let previous = current(machine, host)?;
+    let previous = current_mem(call.mem(), host)?;
     host.messages.push(previous);
-    set_current(machine, host, cookie)?;
-    Ok(Ret::Void)
+    set_current_mem(call.mem(), host, cookie)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`setmbk`]. See `shims::call`'s own doc
+/// comment.
+pub fn setmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    setmbk(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void rstmbk(void)` -- go back to the message file that was current before.
-pub fn rstmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Messages::pop`](crate::msg::Messages::pop) never
+/// touched a `Machine`; only [`set_current_mem`] writes module memory.
+pub fn rstmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let previous = host.messages.pop().map_err(ShimError::Failed)?;
-    set_current(machine, host, previous)?;
-    Ok(Ret::Void)
+    set_current_mem(call.mem(), host, previous)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rstmbk`]. See `shims::call`'s own doc
+/// comment.
+pub fn rstmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rstmbk(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *stgopt(int msgnum)` -- a message's text, whole.
@@ -139,6 +185,14 @@ pub fn rstmbk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// Most call sites never free what they get -- `ACCOUNT.C` and `BBSRIP.C` put
 /// these in globals that live for the run -- so this leaks by design, exactly
 /// as the real one did.
+///
+/// # Did not go generic (Task 5)
+///
+/// [`text::write_cstr`] takes `&mut Machine`, not `&mut A::Mem` -- `text.rs`
+/// is a different file, out of this task's scope (the next one, taken
+/// together with `fsd.rs`). [`Heap::reserve`](crate::heap::Heap::reserve) is
+/// already generic, so the *allocation* half of this routine is not what
+/// blocks it -- only the write into the block that follows.
 pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let mut args = super::args(machine);
     let msgnum = args.int();
@@ -160,14 +214,17 @@ pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// The bounds are the module's own, and real: `ACCOUNT.C:117` asks for
 /// `numopt(HWTLOG,-32767,32767)`. A value outside them is a board someone
 /// configured wrongly, so it is named rather than clamped.
-pub fn numopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let number = args.int();
-    let floor = args.int() as i16;
-    let ceiling = args.int() as i16;
+///
+/// Generic (Task 5): the three `int` arguments are `call.int()`, widened and
+/// narrowed through [`Abi::Int`]'s `Into<u32>` bound exactly as
+/// `shims::user::uacoff` does; [`read_mem`]/[`option_mem`] read module memory.
+pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let number = Into::<u32>::into(call.int()) as u16;
+    let floor = Into::<u32>::into(call.int()) as i16;
+    let ceiling = Into::<u32>::into(call.int()) as i16;
 
-    let text = read(machine, host, number)?;
-    let name = option(machine, host, number)?;
+    let text = read_mem(call.mem(), host, number)?;
+    let name = option_mem(call.mem(), host, number)?;
     let text = String::from_utf8_lossy(value(&text)).into_owned();
 
     let parsed: i32 = text
@@ -178,40 +235,62 @@ pub fn numopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             "{name} is {parsed}, outside the {floor}..={ceiling} this module accepts"
         )));
     }
-    Ok(Ret::U16(parsed as i16 as u16))
+    Ok(abi::Ret::Int(A::Int::from(parsed as i16 as u16)))
+}
+
+/// The dispatch-table entry for [`numopt`]. See `shims::call`'s own doc
+/// comment.
+pub fn numopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    numopt(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int ynopt(int msgnum)`.
 ///
 /// Across the 91 recovered `.MSG` files every one of the 267 `B` options ends
 /// in `YES` or `NO`, so anything else is not a spelling this has to guess at.
-pub fn ynopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let number = args.int();
-    let text = read(machine, host, number)?;
+///
+/// Generic (Task 5): [`read_mem`]/[`option_mem`] read module memory; the
+/// answer is built through [`Abi::Int::from`], the same as
+/// `shims::user::haskey`'s boolean.
+pub fn ynopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let number = Into::<u32>::into(call.int()) as u16;
+    let text = read_mem(call.mem(), host, number)?;
     match value(&text) {
-        v if v.eq_ignore_ascii_case(b"YES") => Ok(Ret::U16(1)),
-        v if v.eq_ignore_ascii_case(b"NO") => Ok(Ret::U16(0)),
+        v if v.eq_ignore_ascii_case(b"YES") => Ok(abi::Ret::Int(A::Int::from(1u16))),
+        v if v.eq_ignore_ascii_case(b"NO") => Ok(abi::Ret::Int(A::Int::from(0u16))),
         other => Err(ShimError::Failed(format!(
             "{} is {:?}, which is neither YES nor NO",
-            option(machine, host, number)?,
+            option_mem(call.mem(), host, number)?,
             String::from_utf8_lossy(other)
         ))),
     }
 }
 
+/// The dispatch-table entry for [`ynopt`]. See `shims::call`'s own doc
+/// comment.
+pub fn ynopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    ynopt(&mut super::call(machine), host).map(Into::into)
+}
+
 /// `int chropt(int msgnum)` -- an option that is one character.
-pub fn chropt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let number = args.int();
-    let text = read(machine, host, number)?;
+///
+/// Generic (Task 5): [`read_mem`]/[`option_mem`] read module memory.
+pub fn chropt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let number = Into::<u32>::into(call.int()) as u16;
+    let text = read_mem(call.mem(), host, number)?;
     match value(&text) {
-        [character, ..] => Ok(Ret::U16(u16::from(*character))),
+        [character, ..] => Ok(abi::Ret::Int(A::Int::from(u16::from(*character)))),
         [] => Err(ShimError::Failed(format!(
             "{} is empty, and a character option needs a character",
-            option(machine, host, number)?
+            option_mem(call.mem(), host, number)?
         ))),
     }
+}
+
+/// The dispatch-table entry for [`chropt`]. See `shims::call`'s own doc
+/// comment.
+pub fn chropt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    chropt(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int tokopt(int msgnum, char *tok, ..., NULL)` -- which of these the option
@@ -223,35 +302,42 @@ pub fn chropt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// The list is varargs and terminated by a null pointer, so how many there are
 /// is only discoverable by walking it.
-pub fn tokopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): the null terminator that ends the list is tested on the
+/// pointer's own bytes ([`Abi::ptr_to_bytes`]), not `FarPtr`'s
+/// `selector`/`offset` fields -- the same reading `shims::user::begin_polling`
+/// tests a null routine pointer, since `A::Ptr` is opaque to a generic caller.
+pub fn tokopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // The list's length isn't known up front, so every pointer is pulled off
-    // the cursor first -- still sequential, just without the `1 + n * 2` word
-    // arithmetic the cursor now does on its own -- and only then walked to
-    // read each one's string, once the cursor's borrow of `machine` is done.
-    let mut args = super::args(machine);
-    let number = args.int();
+    // `call` first -- still sequential, just without the `1 + n * 2` word
+    // arithmetic `Call::ptr` does on its own -- and only then walked to read
+    // each one's string.
+    let number = Into::<u32>::into(call.int()) as u16;
     let mut pointers = Vec::new();
     loop {
-        let at = args.ptr();
-        if at.selector == 0 && at.offset == 0 {
+        let at = call.ptr();
+        if A::ptr_to_bytes(at).iter().all(|&b| b == 0) {
             break;
         }
         pointers.push(at);
     }
 
-    let text = read(machine, host, number)?;
+    let text = read_mem(call.mem(), host, number)?;
     let wanted = value(&text).to_ascii_uppercase();
 
     let mut tokens = Vec::new();
     for at in pointers {
-        tokens.push(machine.read_cstr(at)?.to_ascii_uppercase());
+        let bytes = at
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        tokens.push(bytes.to_ascii_uppercase());
     }
 
     match tokens.iter().position(|t| *t == wanted) {
-        Some(at) => Ok(Ret::U16(at as u16 + 1)),
+        Some(at) => Ok(abi::Ret::Int(A::Int::from(at as u16 + 1))),
         None => Err(ShimError::Failed(format!(
             "{} is {:?}, which is none of {:?}",
-            option(machine, host, number)?,
+            option_mem(call.mem(), host, number)?,
             String::from_utf8_lossy(&wanted),
             tokens
                 .iter()
@@ -261,11 +347,30 @@ pub fn tokopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     }
 }
 
+/// The dispatch-table entry for [`tokopt`]. See `shims::call`'s own doc
+/// comment.
+pub fn tokopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    tokopt(&mut super::call(machine), host).map(Into::into)
+}
+
 /// `void prfmsg(int msg,...)` -- append a message to the channel's output.
 ///
 /// `prf` with the template coming from the current message block instead of
 /// from the module. The arguments start at word 1, because `msg` is an `int`
 /// and not the far pointer `prf`'s first argument is.
+///
+/// # Did not go generic (Task 5)
+///
+/// Only half unblocked: [`crate::fmt::format_call`] removes the *formatting*
+/// blocker this routine used to have -- once `msgnum` is read with
+/// `call.int()`, `call`'s position already marks where the varargs begin, so
+/// `format_call(call, template)` could replace `format(machine, at,
+/// Args::Call { first: 1 })` outright. What still blocks it is
+/// [`text::append`], which takes `&mut Machine` and reaches
+/// `channel_ansi`/`normalize_newlines`/`Host::current_channel` -- all
+/// `text.rs`-private or `Wg16`-only, out of this task's scope (the next one,
+/// taken together with `fsd.rs`, which touches `text.rs` and could unblock
+/// this then).
 pub fn prfmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let mut args = super::args(machine);
     let msgnum = args.int();
@@ -276,28 +381,51 @@ pub fn prfmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 }
 
 /// What `curmbk` holds, read back out of module memory every time.
-fn current(machine: &Machine, host: &Host) -> Result<FarPtr, ShimError> {
+///
+/// Generic core (Task 5). No `Wg16` facade under the old `current` name: only
+/// [`message_mem`] called it, and that has its own facade -- see
+/// [`message`]'s doc comment.
+fn current_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> Result<A::Ptr, ShimError> {
     host.globals()
-        .pointer(machine, "curmbk")
+        .pointer_mem(mem, "curmbk")
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
-fn set_current(machine: &mut Machine, host: &Host, block: FarPtr) -> Result<(), ShimError> {
+/// Generic core (Task 5). No `Wg16` facade under the old `set_current` name,
+/// for the same reason [`current_mem`] has none.
+fn set_current_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     host.globals()
-        .write(machine, "curmbk", &block.to_bytes())
+        .write_mem(mem, "curmbk", &A::ptr_to_bytes(block))
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
 /// Where message `n` of the current block was interned.
-pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
-    let block = current(machine, host)?;
+///
+/// Generic core (Task 5); see [`message`] for the `Wg16` facade, which
+/// `shims::fsd`'s tests call directly by this exact name and signature.
+pub(crate) fn message_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Result<A::Ptr, ShimError> {
+    let block = current_mem(mem, host)?;
     host.messages.text(block, n).map_err(ShimError::Failed)
 }
 
+/// The `Wg16` facade [`message_mem`] delegates into -- kept under its
+/// original name and signature: `shims::fsd`'s tests call this directly
+/// (not through `Fixture::invoke`), and [`stgopt`]/[`prfmsg`] still call it
+/// as `(&Machine, &Host, u16)`.
+pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
+    message_mem(machine.mem(), host, n)
+}
+
 /// The text of message `n` of the current block.
-fn read(machine: &Machine, host: &Host, n: u16) -> Result<Vec<u8>, ShimError> {
-    let at = message(machine, host, n)?;
-    Ok(machine.read_cstr(at)?.to_vec())
+///
+/// Generic core (Task 5); see the `Wg16` facade [`stgopt`]/[`prfmsg`] still
+/// need -- there is none by this exact old name, because nothing outside this
+/// file called the old `read` directly (unlike [`message`]).
+fn read_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Result<Vec<u8>, ShimError> {
+    let at = message_mem(mem, host, n)?;
+    at.read_cstr(mem)
+        .map(|s| s.to_vec())
+        .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
 /// How to name message `n` in a refusal.
@@ -306,8 +434,12 @@ fn read(machine: &Machine, host: &Host, n: u16) -> Result<Vec<u8>, ShimError> {
 /// module sees, and the module knows `n` as a constant whose name lives only in
 /// its own header -- so the file and the number is as close as the host can get,
 /// and it is enough to find the line.
-fn option(machine: &Machine, host: &Host, n: u16) -> Result<String, ShimError> {
-    let block = current(machine, host)?;
+///
+/// Generic core (Task 5); [`numopt`]/[`ynopt`]/[`chropt`]/[`tokopt`] all call
+/// this by name -- there is no separate `Wg16` facade, since nothing outside
+/// this file called the old `option` directly (unlike [`message`]).
+fn option_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Result<String, ShimError> {
+    let block = current_mem(mem, host)?;
     let name = host.messages.name(block).map_err(ShimError::Failed)?;
     Ok(format!("message {n} of {name}"))
 }
@@ -321,7 +453,7 @@ mod tests {
     /// Open a file, which also makes it current.
     fn open(f: &mut Fixture, name: &str) -> FarPtr {
         let at = f.text(name);
-        let Ret::Far(cookie) = f.invoke(opnmsg, &Fixture::far(at)).expect("opens") else {
+        let Ret::Far(cookie) = f.invoke(opnmsg_wg16, &Fixture::far(at)).expect("opens") else {
             panic!("opnmsg returns a pointer");
         };
         cookie
@@ -345,7 +477,7 @@ mod tests {
         let mut f = Fixture::new();
         let name = f.text("sample.msg");
         assert!(matches!(
-            f.invoke(opnmsg, &Fixture::far(name)).expect("opens"),
+            f.invoke(opnmsg_wg16, &Fixture::far(name)).expect("opens"),
             Ret::Far(_)
         ));
     }
@@ -354,7 +486,7 @@ mod tests {
     fn opnmsg_names_a_file_it_cannot_find() {
         let mut f = Fixture::new();
         let name = f.text("NOSUCH.MSG");
-        let e = f.invoke(opnmsg, &Fixture::far(name)).expect_err("no file");
+        let e = f.invoke(opnmsg_wg16, &Fixture::far(name)).expect_err("no file");
         assert!(e.to_string().contains("NOSUCH.MSG"), "{e}");
     }
 
@@ -374,9 +506,9 @@ mod tests {
         assert_ne!(first, second, "two files are two blocks");
         assert_eq!(curmbk(&f), second);
 
-        f.invoke(rstmbk, &[]).expect("back to the first");
+        f.invoke(rstmbk_wg16, &[]).expect("back to the first");
         assert_eq!(curmbk(&f), first);
-        f.invoke(rstmbk, &[]).expect("back to none");
+        f.invoke(rstmbk_wg16, &[]).expect("back to none");
         assert_eq!(curmbk(&f), nothing);
     }
 
@@ -386,9 +518,9 @@ mod tests {
         let first = opened(&mut f);
         let second = open(&mut f, "OTHER.MSG");
 
-        f.invoke(setmbk, &Fixture::far(first)).expect("set");
+        f.invoke(setmbk_wg16, &Fixture::far(first)).expect("set");
         assert_eq!(curmbk(&f), first);
-        f.invoke(rstmbk, &[]).expect("restored");
+        f.invoke(rstmbk_wg16, &[]).expect("restored");
         assert_eq!(curmbk(&f), second, "back to what opening OTHER made current");
     }
 
@@ -400,7 +532,7 @@ mod tests {
             offset: 0x40,
             selector: f.host.globals().selector(),
         };
-        assert!(f.invoke(setmbk, &Fixture::far(nonsense)).is_err());
+        assert!(f.invoke(setmbk_wg16, &Fixture::far(nonsense)).is_err());
         assert_eq!(curmbk(&f), before, "and left curmbk where it was");
     }
 
@@ -409,7 +541,7 @@ mod tests {
         // Rather than leaving `curmbk` at whatever seemed likely -- after which
         // every option read would come from that guess.
         let mut f = Fixture::new();
-        assert!(f.invoke(rstmbk, &[]).is_err());
+        assert!(f.invoke(rstmbk_wg16, &[]).is_err());
     }
 
     #[test]
@@ -455,7 +587,7 @@ mod tests {
 
         f.invoke(stgopt, &[2]).expect("another option");
         let other = f.text("OTHER.MSG");
-        f.invoke(opnmsg, &Fixture::far(other)).expect("another file");
+        f.invoke(opnmsg_wg16, &Fixture::far(other)).expect("another file");
         let template = f.text("noise %d");
         f.invoke(text::prf, &[template.offset, template.selector, 7])
             .expect("some output");
@@ -467,14 +599,14 @@ mod tests {
     fn numopt_reads_the_number_off_the_end_of_the_prompt() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
+        assert_eq!(f.invoke(numopt_wg16, &[2, 0, 32767]).expect("read"), Ret::U16(60));
     }
 
     #[test]
     fn numopt_outside_its_bounds_refuses_and_names_the_message() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let e = f.invoke(numopt, &[2, 0, 50]).expect_err("60 is over 50");
+        let e = f.invoke(numopt_wg16, &[2, 0, 50]).expect_err("60 is over 50");
         assert!(e.to_string().contains("60"), "{e}");
         assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
     }
@@ -487,7 +619,7 @@ mod tests {
         opened(&mut f);
         let floor = (-32767i16) as u16;
         assert_eq!(
-            f.invoke(numopt, &[5, floor, 32767]).expect("read"),
+            f.invoke(numopt_wg16, &[5, floor, 32767]).expect("read"),
             Ret::U16((-5i16) as u16)
         );
     }
@@ -496,10 +628,10 @@ mod tests {
     fn ynopt_and_chropt() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert_eq!(f.invoke(ynopt, &[3]).expect("read"), Ret::U16(1));
-        assert_eq!(f.invoke(ynopt, &[4]).expect("read"), Ret::U16(0));
+        assert_eq!(f.invoke(ynopt_wg16, &[3]).expect("read"), Ret::U16(1));
+        assert_eq!(f.invoke(ynopt_wg16, &[4]).expect("read"), Ret::U16(0));
         assert_eq!(
-            f.invoke(chropt, &[6]).expect("read"),
+            f.invoke(chropt_wg16, &[6]).expect("read"),
             Ret::U16(u16::from(b'='))
         );
     }
@@ -508,7 +640,7 @@ mod tests {
     fn ynopt_on_something_that_is_neither_refuses() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert!(f.invoke(ynopt, &[1]).is_err(), "DEMO is not yes or no");
+        assert!(f.invoke(ynopt_wg16, &[1]).is_err(), "DEMO is not yes or no");
     }
 
     #[test]
@@ -531,10 +663,10 @@ mod tests {
             0,
             0,
         ];
-        assert_eq!(f.invoke(tokopt, &args).expect("matched"), Ret::U16(3));
+        assert_eq!(f.invoke(tokopt_wg16, &args).expect("matched"), Ret::U16(3));
 
         let short = [7, high.offset, high.selector, medium.offset, medium.selector, 0, 0];
-        assert!(f.invoke(tokopt, &short).is_err(), "NONE is in neither");
+        assert!(f.invoke(tokopt_wg16, &short).is_err(), "NONE is in neither");
     }
 
     #[test]
@@ -582,15 +714,15 @@ mod tests {
         // to. Forgetting either leaves `curmbk` naming a block the host has no
         // record of, and every option read after that is a refusal about the
         // wrong thing.
-        assert!(f.invoke(clsmsg, &Fixture::far(second)).is_err());
-        assert!(f.invoke(clsmsg, &Fixture::far(first)).is_err());
+        assert!(f.invoke(clsmsg_wg16, &Fixture::far(second)).is_err());
+        assert!(f.invoke(clsmsg_wg16, &Fixture::far(first)).is_err());
 
-        f.invoke(rstmbk, &[]).expect("back to the first");
-        f.invoke(rstmbk, &[]).expect("back to none");
+        f.invoke(rstmbk_wg16, &[]).expect("back to the first");
+        f.invoke(rstmbk_wg16, &[]).expect("back to none");
 
-        f.invoke(clsmsg, &Fixture::far(second)).expect("no longer in use");
+        f.invoke(clsmsg_wg16, &Fixture::far(second)).expect("no longer in use");
         assert!(
-            f.invoke(setmbk, &Fixture::far(second)).is_err(),
+            f.invoke(setmbk_wg16, &Fixture::far(second)).is_err(),
             "a closed block is not one to set"
         );
     }
