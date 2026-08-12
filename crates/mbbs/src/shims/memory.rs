@@ -32,14 +32,16 @@ use mbbs16::{FarPtr, Machine, Ret};
 use crate::Host;
 use crate::shims::ShimError;
 
-/// `char *alcmem(unsigned size)` -- reserve memory the module will free.
+/// `VOID *alcmem(UINT size)` -- `GCOMM.H:256-258` -- reserve memory the
+/// module will free.
 ///
 /// A `size` of zero, or a heap with no room, is a refusal. The real host
 /// returned null for both, and step 7's trace is what that costs: `alczer`
 /// answered null at call 183 and the module dereferenced it eighteen calls
 /// later, where the fault named module code rather than the lie.
 pub fn alcmem(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let size = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let size = args.int();
     let at = host
         .heap
         .alloc(machine, size)
@@ -47,12 +49,13 @@ pub fn alcmem(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
-/// `char *alczer(unsigned size)` -- reserve memory, zeroed.
+/// `VOID *alczer(UINT nbytes)` -- `GCOMM.H:274-276` -- reserve memory, zeroed.
 ///
 /// Zeroed here rather than assumed: reused space holds whatever the last owner
 /// left, and a module that trusts `alczer` and gets `alcmem` finds out slowly.
 pub fn alczer(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let size = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let size = args.int();
     let at = host
         .heap
         .alloc(machine, size)
@@ -61,16 +64,17 @@ pub fn alczer(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
-/// `void galfree(void *ptr)` -- give memory back.
+/// `VOID galfree(VOID *block)` -- `GCOMM.H:771-773` -- give memory back.
 pub fn galfree(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let at = args.ptr();
     host.heap
         .free(at)
         .map_err(|e| ShimError::Failed(format!("galfree: {e}")))?;
     Ok(Ret::Void)
 }
 
-/// `unsigned long farcoreleft(void)` -- how much memory is left.
+/// `LONG farcoreleft(VOID)` -- `GCOMM.H:147` -- how much memory is left.
 ///
 /// A policy, not a fact: modules size their caches off this. See
 /// [`Config::heap`](crate::Config::heap) for what the number is and why.
@@ -86,8 +90,14 @@ pub fn farcoreleft(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// window. The module walks between tiles itself, so every descriptor has to
 /// exist first -- see [`Machine::alloc_tiled`](mbbs16::Machine::alloc_tiled).
 pub fn alctile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let qty = machine.arg_u16(0);
-    let size = machine.arg_u16(1);
+    // No vendor prototype: `alctile` is not declared anywhere in
+    // re/wg33src/INC's 125 headers. It is genuinely 16-bit-only -- segment
+    // tiling has no flat-memory counterpart -- and the 32-bit module imports
+    // `alcblok`/`ptrblok` instead, which are among the 56 unimplemented
+    // symbols and out of scope here.
+    let mut args = super::args(machine);
+    let qty = args.int();
+    let size = args.int();
     let at = host
         .heap
         .alloc_tiled(machine, qty, size)
@@ -108,9 +118,10 @@ pub fn alctile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// An index past the last tile is refused: without the region's shape the host
 /// would hand back a selector belonging to something else entirely.
 pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let base = machine.arg_far(0);
-    // Word 2: the far pointer before it is two words, not one.
-    let index = machine.arg_u16(2);
+    // No vendor prototype either, for the same reason as `alctile` above.
+    let mut args = super::args(machine);
+    let base = args.ptr();
+    let index = args.int();
 
     let region = host.heap.region(base.selector).ok_or_else(|| {
         ShimError::Failed(format!("ptrtile: {base:?} is not a tiled region"))
@@ -128,45 +139,58 @@ pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     }))
 }
 
-/// `void setmem(void *p, unsigned n, char c)` -- fill.
+/// `#define setmem(p,n,c) memset(p,c,n)` -- `GCOMM.H:143` -- fill.
 ///
-/// **Count then fill**, which is `memset`'s arguments the other way round.
+/// Not a function prototype -- `setmem` is a macro over the ANSI C runtime's
+/// `memset`, and `memset` itself is declared nowhere in `re/wg33src/INC`. But
+/// the macro is the vendor's own statement of the argument order, which is
+/// this file's whole reason for existing: **count then fill**, `memset`'s
+/// arguments the other way round.
 pub fn setmem(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let at = machine.arg_far(0);
-    let count = machine.arg_u16(2);
+    let mut args = super::args(machine);
+    let at = args.ptr();
+    let count = args.int();
     // A `char` argument still arrives as a whole word; the fill is its low byte.
-    let fill = machine.arg_u16(3) as u8;
+    let fill = args.int() as u8;
     machine.write(at, &vec![fill; usize::from(count)])?;
     Ok(Ret::Void)
 }
 
-/// `void movmem(void *src, void *dst, unsigned n)` -- copy, overlapping allowed.
+/// `VOID galmovmem(VOID *src, VOID *dst, USHORT nbytes)` -- `GCOMM.H:163-164`,
+/// behind `#define movmem(s,d,n) galmovmem(s,d,n)` (`:166`) -- copy,
+/// overlapping allowed.
 ///
 /// **Source first**, which is the opposite of `memcpy` immediately below.
 pub fn movmem(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let src = machine.arg_far(0);
-    let dst = machine.arg_far(2);
-    let count = machine.arg_u16(4);
+    let mut args = super::args(machine);
+    let src = args.ptr();
+    let dst = args.ptr();
+    let count = args.int();
     let bytes = machine.resolve(src, usize::from(count))?.to_vec();
     machine.write(dst, &bytes)?;
     Ok(Ret::Void)
 }
 
-/// `void *memcpy(void *dst, void *src, unsigned n)` -- destination first.
+/// `void *memcpy(void *dst, const void *src, size_t n)` -- destination
+/// first. Borland's; no Galacticomm header redeclares it (see this file's
+/// commit message).
 pub fn memcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let dst = machine.arg_far(0);
-    let src = machine.arg_far(2);
-    let count = machine.arg_u16(4);
+    let mut args = super::args(machine);
+    let dst = args.ptr();
+    let src = args.ptr();
+    let count = args.int();
     let bytes = machine.resolve(src, usize::from(count))?.to_vec();
     machine.write(dst, &bytes)?;
     Ok(Ret::Far(dst))
 }
 
-/// `int memcmp(void *a, void *b, unsigned n)`.
+/// `int memcmp(const void *a, const void *b, size_t n)`. Borland's; no
+/// Galacticomm header redeclares it.
 pub fn memcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let a = machine.arg_far(0);
-    let b = machine.arg_far(2);
-    let count = usize::from(machine.arg_u16(4));
+    let mut args = super::args(machine);
+    let a = args.ptr();
+    let b = args.ptr();
+    let count = usize::from(args.int());
 
     let left = machine.resolve(a, count)?.to_vec();
     let right = machine.resolve(b, count)?;
