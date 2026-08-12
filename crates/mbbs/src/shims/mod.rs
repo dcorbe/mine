@@ -16,7 +16,7 @@ pub mod user;
 use mbbs16::{Machine, Ret};
 
 use crate::Host;
-use crate::abi::{Cursor, Wg16};
+use crate::abi::{Call, Cursor, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
 use crate::globals::GLOBALS;
 
@@ -37,6 +37,33 @@ use crate::globals::GLOBALS;
 /// a `Cursor` for a whole shim body.
 pub(crate) fn args(machine: &Machine) -> Cursor<'_, Wg16> {
     Cursor::new(machine.arg_frame())
+}
+
+/// A [`Call<Wg16>`] over the outstanding call's argument frame.
+///
+/// The `Wg16` half of bridging a shim written against the generic
+/// `fn<A: Abi>(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`
+/// shape into the (still concrete) [`Shim`] the dispatch table wants -- see
+/// `shims::user`'s `uacoff_wg16` and its four siblings for the other half
+/// (converting the `abi::Ret<Wg16>` a generic shim hands back into
+/// `mbbs16::Ret`, which `Into::into` already does via `crate::abi`'s
+/// `impl From<abi::Ret<Wg16>> for mbbs16::Ret`).
+///
+/// `Shim` itself stays `Wg16`-concrete rather than going generic
+/// (`Shim<A>`), because a bare `fn` pointer is one exact signature and not
+/// every entry in `ROUTINES` has been converted -- see
+/// `docs/plans/2026-08-11-abi-abstraction-implementation.md`'s Task 5 for the
+/// two options weighed and why this one was chosen: the alternative is a
+/// change to every one of the table's other entries, which is the work the
+/// remaining ten files still owe.
+///
+/// Computes the frame before taking `machine` mutably -- the same ordering
+/// [`Call::new`]'s own doc comment describes, and why this takes
+/// `&mut Machine` rather than composing with [`args`] above, which only
+/// borrows `machine` immutably.
+pub(crate) fn call(machine: &mut Machine) -> Call<'_, Wg16> {
+    let frame = machine.arg_frame().to_vec();
+    Call::new(machine, &frame)
 }
 
 /// -1, as a 16-bit `int`.
@@ -236,8 +263,12 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
     (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
-    (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller),
-    (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller),
+    // `_wg16`: these five are converted to the generic `Call<A>`/`Host<A>`
+    // shape (see `shims::user`'s own doc comment); the table entry is the
+    // monomorphised bridge, not the shim itself. `getin` is the one sixth
+    // routine that stays as it was -- see its doc comment for why.
+    (MAJORBBS, "begin_polling", user::begin_polling_wg16, Cleans::Caller),
+    (MAJORBBS, "stop_polling", user::stop_polling_wg16, Cleans::Caller),
     (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller),
     (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller),
     (MAJORBBS, "fsdnan", fsd::fsdnan, Cleans::Caller),
@@ -274,10 +305,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "rstrxf", screen::rstrxf, Cleans::Caller),
     // The current user: the two routines that turn a channel number into the
     // slot it names.
-    (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
-    (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
+    (MAJORBBS, "curusr", user::curusr_wg16, Cleans::Caller),
+    (MAJORBBS, "uacoff", user::uacoff_wg16, Cleans::Caller),
     (MAJORBBS, "getin", user::getin, Cleans::Caller),
-    (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+    (MAJORBBS, "haskey", user::haskey_wg16, Cleans::Caller),
     // Billing, which this host does not do. Both answer yes; `shims::credits`
     // is where that decision is written down. `Cleans::Caller` is measured --
     // `re/ne_arity.py` reads `add sp,8` after all three `otstcrd` sites and

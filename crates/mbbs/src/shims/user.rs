@@ -8,12 +8,27 @@
 //! not have computed -- which is the point. `user[]`, `extusr[]` and the
 //! account block are three arrays with one index between them, and these are
 //! the two routines that hold the index still.
+//!
+//! # Task 5: the template file for `Call`-shaped shims
+//!
+//! Five of these six routines are now generic:
+//! `fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`, taking
+//! their arguments through [`Call`] rather than [`super::args`]'s bare
+//! `Cursor`, and touching module memory through [`Call::mem`] rather than a
+//! whole `&mut Machine`. Each keeps its C name for the generic core (matching
+//! `docs/plans/2026-08-11-abi-abstraction-implementation.md`'s Task 5
+//! "target shape"), and gets a `_wg16`-suffixed sibling that bridges it into
+//! the (still concrete) [`super::Shim`] the dispatch table wants -- see
+//! `shims::call`'s own doc comment for why the table itself does not go
+//! generic in this task, and [`getin`]'s doc comment for the one routine that
+//! stayed behind.
 
 use mbbs16::{Machine, Ret};
-use mbbs16::FarPtr;
+use mbbs_ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
+use crate::abi::{self, Abi, Call};
 use crate::gsbl::Gsbl;
 
 /// `struct usracc *uacoff(int unum)` -- the channel's account record.
@@ -28,15 +43,26 @@ use crate::gsbl::Gsbl;
 /// to `obtbtvl(..., key, 0, 5, 0)` as a key, which is `userid` at offset 0 of
 /// the record. Keying a Btrieve read on whatever follows the block is the exact
 /// class of quiet wrongness this crate refuses, so the module stops instead.
-pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let unum = args.int() as i16;
+///
+/// Generic (Task 5): the only argument read is `call.int()`, widened through
+/// [`Abi::Int`]'s `Into<u32>` bound and truncated back to `i16` -- the same
+/// value either ABI's `int()` decodes, since a real channel number always
+/// fits in 16 bits regardless of how wide this ABI's `int` is.
+pub fn uacoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
     let chan = host
         .users()
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("uacoff({unum}): there is no such channel")))?;
-    Ok(Ret::Far(host.users().account(chan)))
+    Ok(abi::Ret::Ptr(host.users().account(chan)))
+}
+
+/// The dispatch-table entry for [`uacoff`]: builds a [`Call<Wg16>`] over the
+/// outstanding call's frame and converts its `abi::Ret<Wg16>` back into
+/// `mbbs16::Ret`. See `shims::call`'s own doc comment.
+pub fn uacoff_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    uacoff(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void curusr(int uno)` -- make `uno` the current channel.
@@ -67,18 +93,28 @@ pub fn uacoff(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// needs the identical repointing when a channel connects, and this is the
 /// one of the two callers that also owns the silent-no-op behaviour, so the
 /// range check stays here and the body that does not vary moved out.
-pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let uno = args.int() as i16;
+///
+/// Generic (Task 5): [`Host::point_curusr`](crate::Host::point_curusr)'s
+/// generic core, [`Host::point_curusr_mem`](crate::Host::point_curusr_mem),
+/// is what unblocked this one -- it was `impl Host<Wg16>`-only until this
+/// task, following exactly the `_mem` split `Globals`/`Users` already use.
+pub fn curusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uno = Into::<u32>::into(call.int()) as i16;
     let Some(chan) = host.users().terms().chan(uno) else {
         host.note_once(
             "curusr",
             format!("curusr({uno}): there is no such channel, so nothing changed"),
         );
-        return Ok(Ret::Void);
+        return Ok(abi::Ret::Void);
     };
-    host.point_curusr(machine, chan)?;
-    Ok(Ret::Void)
+    host.point_curusr_mem(call.mem(), chan)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`curusr`]. See `shims::call`'s own doc
+/// comment.
+pub fn curusr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    curusr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *getin(void)` -- get input, parse it, and hand back the first
@@ -95,6 +131,24 @@ pub fn curusr(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `paccin()` then `parsin()` -- is [`Host::get_input`], because
 /// [`Host::poll`](crate::Host::poll) needs it too and this is the one call
 /// site among the two that has an argument stack to read from at all.
+///
+/// # The one shim in this file that did not go generic
+///
+/// [`Host::get_input`](crate::Host::get_input) calls
+/// `shims::text::parsin(machine, self)` -- `shims/text.rs` is a different
+/// file, out of this task's scope (ten more files follow this one, in order,
+/// and the point of doing them one at a time is that a shim's own file is
+/// touched and nothing else's). `parsin` still takes `&mut Machine` and
+/// returns `mbbs16::Ret` directly, so `get_input` cannot be generified
+/// without it, and `getin` cannot be generified without `get_input`. This is
+/// exactly the kind of finding the task exists to surface rather than paper
+/// over: attempting `fn getin<A: Abi>(call: &mut Call<A>, host: &mut
+/// Host<A>)` and forwarding to `host.get_input(call.cpu, chan)` fails with
+/// `expected &mut Machine, found &mut A::Cpu` -- `A::Cpu` is opaque outside
+/// the `Abi` trait, and nothing binds it to `Machine` for an arbitrary `A`.
+/// `getin` keeps its Task-4 shape (a bare `Cursor`, not `Call` -- it reads no
+/// arguments, so there was nothing to convert either way) and its own
+/// `ROUTINES` entry unchanged.
 pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let usrnum = host
         .globals()
@@ -141,9 +195,16 @@ pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// `low_haskey` reaches `lockbit(lock,0)`, which opens with `strupr(lock)` and
 /// uppercases the caller's string **in place** -- the module's own static
-/// config data. This shim does not: it takes `&Machine`, folds a host-side
-/// copy, and leaves module memory alone. Three reasons, recorded because this
-/// is the first place this crate is knowingly unfaithful to a measured byte.
+/// config data. This shim does not: it reads the lock into a host-side
+/// `String` and folds that, leaving module memory alone. Three reasons,
+/// recorded because this is the first place this crate is knowingly
+/// unfaithful to a measured byte.
+///
+/// Generic (Task 5): `host.class(machine, chan)` became
+/// `host.class_mem(call.mem(), chan)` -- [`Host::class`](crate::Host::class)
+/// was also `impl Host<Wg16>`-only until this task, for the same reason
+/// [`Host::point_curusr`](crate::Host::point_curusr) was (see [`curusr`]'s
+/// doc comment).
 ///
 /// It is unobservable to this module: those lock strings live in a table at
 /// `seg 0x1258` and reach `haskey` and nothing else -- no `prf`, no `strcpy`,
@@ -153,16 +214,22 @@ pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// module's static data from a predicate is a side effect nobody would design
 /// on purpose; it is C's in-place API leaking through an interface that is
 /// otherwise pure.
-pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let lock = args.ptr();
-    let lock = machine.read_cstr(lock)?.to_vec();
+pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let lock = call.ptr();
+    // `A::Ptr::Error` has no `From` into `ShimError` for an arbitrary `A` --
+    // only `Wg16`'s `FarPtrError` does (`crate::shims::ShimError`'s own
+    // `impl From`) -- so this is `map_err`, not `?`, unlike the `Wg16`-only
+    // original.
+    let lock = lock
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let lock = String::from_utf8_lossy(&lock);
     // `globals()` reports `io::Error` and `ShimError` has no `From` for it, so
     // the map_err is the house pattern here -- see `shims/fsd.rs:72`.
     let unum = host
         .globals()
-        .word(machine, "usrnum")
+        .word_mem(call.mem(), "usrnum")
         .map_err(|e| ShimError::Failed(format!("haskey: usrnum: {e}")))? as i16;
 
     // `LOCKNKEY.C:194`. Three cases, and they are not the same one -- which is
@@ -180,11 +247,17 @@ pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             // comparison is written out rather than folded away so that it
             // starts telling the truth on its own the day this host grows an
             // internal channel.
-            None => host.class(machine, chan)? == BBSPRV,
+            None => host.class_mem(call.mem(), chan)? == BBSPRV,
         },
     };
     host.asked_for_key(unum, &lock, answer);
-    Ok(Ret::U16(answer.into()))
+    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
+}
+
+/// The dispatch-table entry for [`haskey`]. See `shims::call`'s own doc
+/// comment.
+pub fn haskey_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    haskey(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void begin_polling(int unum, void (*rouptr)())` -- start calling `rouptr`
@@ -205,11 +278,16 @@ pub fn haskey(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// of `WCCMMUD.DLL`'s call sites pass a real routine and the only computed one
 /// (`WCCMMUD_named.c:11831`) carries a fixed non-zero selector, so a NULL here
 /// is a module bug this host can name.
-pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let unum = args.int() as i16;
-    let rouptr = args.ptr();
-    if rouptr == FarPtr::NULL {
+///
+/// Generic (Task 5): the NULL check used to compare against `FarPtr::NULL`;
+/// there is no such constant on [`Abi`] (a pointer's own bit pattern is not
+/// part of the trait, only how to resolve/offset/en-\/decode one), so it
+/// tests the pointer's own bytes instead, the same way
+/// [`Users::polrou_mem`](crate::users::Users::polrou_mem) already does.
+pub fn begin_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let rouptr = call.ptr();
+    if A::ptr_to_bytes(rouptr).iter().all(|b| *b == 0) {
         return Err(ShimError::Failed(format!(
             "begin_polling({unum}): a null polling routine"
         )));
@@ -224,11 +302,18 @@ pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("begin_polling({unum}): there is no such channel")))?;
-    if host.users().polrou(machine, chan)?.is_none() && host.inpolr != Some(chan) {
+    if host.users().polrou_mem(call.mem(), chan)?.is_none() && host.inpolr != Some(chan) {
         host.gsbl_mut().inject(chan, Gsbl::POLSTS);
     }
-    host.users.set_polrou(machine, chan, Some(rouptr))
-        .map(|()| Ret::Void)
+    host.users
+        .set_polrou_mem(call.mem(), chan, Some(rouptr))
+        .map(|()| abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`begin_polling`]. See `shims::call`'s own
+/// doc comment.
+pub fn begin_polling_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    begin_polling(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void stop_polling(int unum)` -- `user[unum].polrou=NULL`.
@@ -241,15 +326,22 @@ pub fn begin_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
 /// # Errors
 ///
 /// If `unum` names no channel.
-pub fn stop_polling(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let unum = args.int() as i16;
+pub fn stop_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
     let chan = host
         .users()
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("stop_polling({unum}): there is no such channel")))?;
-    host.users.set_polrou(machine, chan, None).map(|()| Ret::Void)
+    host.users
+        .set_polrou_mem(call.mem(), chan, None)
+        .map(|()| abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`stop_polling`]. See `shims::call`'s own
+/// doc comment.
+pub fn stop_polling_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    stop_polling(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
@@ -264,7 +356,7 @@ mod tests {
     fn uacoff_hands_back_the_channels_account_record() {
         let mut f = Fixture::new();
         let console = f.console();
-        let Ret::Far(at) = f.invoke(uacoff, &[0]).expect("channel 0") else {
+        let Ret::Far(at) = f.invoke(uacoff_wg16, &[0]).expect("channel 0") else {
             panic!("uacoff returns a pointer");
         };
         assert_eq!(at, f.host.users().account(console));
@@ -276,16 +368,16 @@ mod tests {
         // last record. The module would then have keyed a Btrieve read on them.
         // There is no answer here that is not a lie, so the module stops.
         let mut f = Fixture::new();
-        assert!(f.invoke(uacoff, &[-1i16 as u16]).is_err());
+        assert!(f.invoke(uacoff_wg16, &[-1i16 as u16]).is_err());
         let past = f.host.users().terms().count();
-        assert!(f.invoke(uacoff, &[past]).is_err());
+        assert!(f.invoke(uacoff_wg16, &[past]).is_err());
     }
 
     #[test]
     fn curusr_repoints_every_global_that_names_the_current_channel() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(curusr, &[0]).expect("channel 0");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0");
 
         let g = f.host.globals();
         assert_eq!(g.word(&f.machine, "usrnum").expect("usrnum") as i16, 0);
@@ -308,7 +400,7 @@ mod tests {
         // handing it a pointer to nothing would be worse than handing it zero.
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(curusr, &[0]).expect("channel 0");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
             mbbs16::FarPtr::NULL
@@ -316,7 +408,7 @@ mod tests {
 
         f.invoke(crate::shims::system::dclvda, &[256]).expect("declared");
         f.host.alcvda(&mut f.machine).expect("allocated");
-        f.invoke(curusr, &[0]).expect("channel 0 again");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0 again");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
             f.host.users().vda(console).expect("allocated")
@@ -329,10 +421,10 @@ mod tests {
         // Silent, and modules rely on it: `curusr(-1)` is how the host itself
         // says "nobody" at `MAJORBBS.C:882`.
         let mut f = Fixture::new();
-        f.invoke(curusr, &[0]).expect("channel 0");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0");
         let before = f.host.globals().pointer(&f.machine, "usrptr").expect("usrptr");
 
-        f.invoke(curusr, &[-1i16 as u16]).expect("a no-op, not an error");
+        f.invoke(curusr_wg16, &[-1i16 as u16]).expect("a no-op, not an error");
         assert_eq!(f.host.globals().word(&f.machine, "usrnum").expect("usrnum") as i16, 0);
         assert_eq!(f.host.globals().pointer(&f.machine, "usrptr").expect("usrptr"), before);
     }
@@ -343,7 +435,7 @@ mod tests {
         // module. A run where it happened must be tellable from one where it
         // did not.
         let mut f = Fixture::new();
-        f.invoke(curusr, &[99]).expect("a no-op");
+        f.invoke(curusr_wg16, &[99]).expect("a no-op");
         assert!(
             f.host.notes().iter().any(|n| n.contains("curusr")),
             "notes: {:?}",
@@ -355,7 +447,7 @@ mod tests {
     fn getin_takes_a_ready_line_and_hands_back_its_first_argument() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(curusr, &[0]).expect("channel 0");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0");
         f.host.gsbl_mut().push_input(console, b"get all gold\r");
 
         let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
@@ -380,7 +472,7 @@ mod tests {
         // take. `getin` must not fault, and the module still dereferences
         // `margv[0]` unguarded on whatever it gets back.
         let mut f = Fixture::new();
-        f.invoke(curusr, &[0]).expect("channel 0");
+        f.invoke(curusr_wg16, &[0]).expect("channel 0");
 
         let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
             panic!("getin returns char *margv[0]");
@@ -404,13 +496,13 @@ mod tests {
 
         let lock = f.text("USER");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(1));
 
         let lock = f.text("WCCSYSOP");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(0));
     }
@@ -429,7 +521,7 @@ mod tests {
 
         let lock = f.text("");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(0), "not 1 -- the null check comes first");
     }
@@ -463,7 +555,7 @@ mod tests {
 
         let lock = f.text("USER");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(0));
     }
@@ -488,7 +580,7 @@ mod tests {
 
         let lock = f.text("USER|WCCSYSOP");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(1));
     }
@@ -511,7 +603,7 @@ mod tests {
 
         let lock = f.text("user");
         let got = f
-            .invoke(super::haskey, &crate::testing::Fixture::far(lock))
+            .invoke(super::haskey_wg16, &crate::testing::Fixture::far(lock))
             .expect("answered");
         assert_eq!(got, mbbs16::Ret::U16(1), "matched case-insensitively");
         assert_eq!(f.read(lock), "user", "and left the module's string alone");
@@ -525,7 +617,7 @@ mod tests {
         let console = f.console();
         let rou = f.machine.code_ptr(0);
 
-        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+        f.invoke(begin_polling_wg16, &[0, rou.offset, rou.selector])
             .expect("installed");
 
         assert_eq!(
@@ -546,7 +638,7 @@ mod tests {
         let rou = f.machine.code_ptr(0);
         f.host.inpolr = Some(console);
 
-        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+        f.invoke(begin_polling_wg16, &[0, rou.offset, rou.selector])
             .expect("installed");
 
         assert_eq!(
@@ -569,11 +661,11 @@ mod tests {
         let first = f.machine.code_ptr(0);
         let second = f.machine.code_ptr(1);
 
-        f.invoke(begin_polling, &[0, first.offset, first.selector])
+        f.invoke(begin_polling_wg16, &[0, first.offset, first.selector])
             .expect("installed");
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::POLSTS));
 
-        f.invoke(begin_polling, &[0, second.offset, second.selector])
+        f.invoke(begin_polling_wg16, &[0, second.offset, second.selector])
             .expect("replaced");
 
         assert_eq!(
@@ -593,11 +685,11 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let rou = f.machine.code_ptr(0);
-        f.invoke(begin_polling, &[0, rou.offset, rou.selector])
+        f.invoke(begin_polling_wg16, &[0, rou.offset, rou.selector])
             .expect("installed");
         let _ = f.host.gsbl_mut().next_status(console);
 
-        f.invoke(stop_polling, &[0]).expect("stopped");
+        f.invoke(stop_polling_wg16, &[0]).expect("stopped");
 
         assert_eq!(
             f.host.users().polrou(&f.machine, console).expect("channel 0"),
@@ -611,11 +703,11 @@ mod tests {
         let mut f = Fixture::new();
         let rou = f.machine.code_ptr(0);
         assert!(
-            f.invoke(begin_polling, &[1, rou.offset, rou.selector])
+            f.invoke(begin_polling_wg16, &[1, rou.offset, rou.selector])
                 .is_err(),
             "nterms is 1, so channel 1 does not exist"
         );
-        assert!(f.invoke(stop_polling, &[1]).is_err());
+        assert!(f.invoke(stop_polling_wg16, &[1]).is_err());
     }
 
     /// All nine call sites pass a real pointer, and the one computed pointer
@@ -625,7 +717,7 @@ mod tests {
     fn a_null_polling_routine_is_refused_rather_than_installed() {
         let mut f = Fixture::new();
         let console = f.console();
-        assert!(f.invoke(begin_polling, &[0, 0, 0]).is_err());
+        assert!(f.invoke(begin_polling_wg16, &[0, 0, 0]).is_err());
         assert_eq!(
             f.host.gsbl_mut().next_status(console),
             None,

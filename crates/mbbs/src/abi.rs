@@ -114,7 +114,17 @@ pub trait Abi {
     /// A C `int` in this ABI. `u16` for 16-bit, `u32` for 32-bit -- an
     /// associated type so a shim that stuffs one into a `u16` stops
     /// compiling rather than truncating in silence.
-    type Int: Copy + Into<u32>;
+    ///
+    /// `From<u16>` (the other direction from `Into<u32>` above) is what a
+    /// generic shim body needs to *build* one from a small computed value --
+    /// `shims::user::haskey`'s boolean answer, for instance -- without
+    /// knowing this ABI's width. `u16::from` is the identity for `Wg16`'s own
+    /// `Int` and a free zero-extend for a wider one, which is exactly what a
+    /// small `int` returned from a `bool` should do in either ABI. Free for
+    /// every implementation so far: `u16: From<u16>` and `u32: From<u16>` are
+    /// both in `std`, so neither `Wg16` nor a future `Wg32` writes an impl
+    /// for this, only names the bound.
+    type Int: Copy + Into<u32> + From<u16>;
 
     /// Bytes a pointer occupies in this ABI's argument frame. 4 in both ABIs
     /// today, for different reasons: `seg:off` in 16-bit, flat in 32-bit --

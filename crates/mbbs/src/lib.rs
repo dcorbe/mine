@@ -108,6 +108,11 @@ use mbbs16::{
 // over; `Wg16` is still named explicitly wherever a generic type needs
 // pinning to the one ABI that exists, including `impl Host<Wg16>` below.
 use crate::abi::{Abi, ModuleMem, Wg16};
+// `ModulePtr` for `A::Ptr::resolve`/`write` below -- `Host::class_mem` and
+// `Host::point_curusr_mem` are this file's first two generic-core methods
+// that touch a pointer's own memory access rather than only `Globals`'/
+// `Users`'/`Heap`'s already-generic surface.
+use mbbs_ptr::ModulePtr;
 
 /// How a module entry point ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1329,6 +1334,61 @@ impl<A: Abi> Host<A> {
         self.modules.len() - 1
     }
 
+    /// `user[unum].usrcls` -- what kind of channel this is, against memory
+    /// directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Host::class`]'s `Wg16` facade delegates into -- see
+    /// [`Globals`]'s own doc comment ("Generic core, `Wg16`-facade names")
+    /// for why the split exists and why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off a segment.
+    pub(crate) fn class_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
+        let at = A::ptr_offset(self.users().slot(unum), users::user::USRCLS);
+        let bytes = at.resolve(mem, 2).map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Point the four globals that name "the current channel" -- `usrnum`,
+    /// `usrptr`, `usaptr` and `vdaptr` -- at `uno`, against memory directly
+    /// rather than a whole `Machine`.
+    ///
+    /// The generic core [`Host::point_curusr`]'s `Wg16` facade delegates
+    /// into -- same split, same reason.
+    ///
+    /// Null is written as `PTR_WIDTH` zero bytes rather than through an
+    /// ABI-specific `NULL` constant, the same way
+    /// [`Users::set_polrou_mem`](crate::users::Users::set_polrou_mem) writes
+    /// a cleared polling routine.
+    ///
+    /// # Errors
+    ///
+    /// If a write runs off a segment.
+    pub(crate) fn point_curusr_mem(&mut self, mem: &mut A::Mem, uno: Chan) -> Result<(), ShimError> {
+        let slot = self.users().slot(uno);
+        let account = self.users().account(uno);
+        let vda = self.users().vda(uno);
+
+        self.globals()
+            .write_mem(mem, "usrnum", &uno.number().to_le_bytes())
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write_mem(mem, "usrptr", &A::ptr_to_bytes(slot))
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        self.globals()
+            .write_mem(mem, "usaptr", &A::ptr_to_bytes(account))
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        let vda_bytes = match vda {
+            Some(ptr) => A::ptr_to_bytes(ptr),
+            None => vec![0u8; A::PTR_WIDTH],
+        };
+        self.globals()
+            .write_mem(mem, "vdaptr", &vda_bytes)
+            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
+        Ok(())
+    }
+
     /// The C name of an imported symbol, or something that identifies it when
     /// the host has no name for it.
     fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
@@ -1652,14 +1712,10 @@ impl Host<Wg16> {
     /// # Errors
     ///
     /// If the read runs off a segment.
+    ///
+    /// Reborrows into [`Host::class_mem`] through [`Machine::mem`].
     pub fn class(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        let slot = self.users().slot(unum);
-        let at = FarPtr {
-            offset: slot.offset + users::user::USRCLS,
-            selector: slot.selector,
-        };
-        let bytes = machine.resolve(at, 2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.class_mem(machine.mem(), unum)
     }
 
     /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
@@ -1737,24 +1793,10 @@ impl Host<Wg16> {
     /// # Errors
     ///
     /// If a write runs off a segment.
+    ///
+    /// Reborrows into [`Host::point_curusr_mem`] through [`Machine::mem_mut`].
     pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: Chan) -> Result<(), ShimError> {
-        let slot = self.users().slot(uno);
-        let account = self.users().account(uno);
-        let vda = self.users().vda(uno).unwrap_or(FarPtr::NULL);
-
-        self.globals()
-            .write(machine, "usrnum", &uno.number().to_le_bytes())
-            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
-        self.globals()
-            .write(machine, "usrptr", &slot.to_bytes())
-            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
-        self.globals()
-            .write(machine, "usaptr", &account.to_bytes())
-            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
-        self.globals()
-            .write(machine, "vdaptr", &vda.to_bytes())
-            .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
-        Ok(())
+        self.point_curusr_mem(machine.mem_mut(), uno)
     }
 
     /// The channel [`Host::point_curusr`] last made current, read back the
@@ -4740,7 +4782,7 @@ mod tests {
         // isn't already uppercase.
         for lock in ["USER", "wccsysop"] {
             let at = f.text(lock);
-            f.invoke(crate::shims::user::haskey, &Fixture::far(at))
+            f.invoke(crate::shims::user::haskey_wg16, &Fixture::far(at))
                 .expect("answered");
         }
 
