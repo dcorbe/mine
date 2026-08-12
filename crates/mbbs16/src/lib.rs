@@ -775,14 +775,42 @@ impl Machine {
     ///
     /// # Panics
     ///
-    /// If the module is not stopped at a call.
+    /// If the module is not stopped at a call, or if the frame begins past the
+    /// end of the stack segment -- see below.
+    ///
+    /// # Why the length is computed with `checked_sub`
+    ///
+    /// `frame_sp` is `out_sp + THUNK_SAVES`, and [`Machine::resume`] checks
+    /// only that that addition does not leave `u16` -- so `out_sp = 0xfffb`
+    /// yields `frame_sp = 0xffff`, and `start` is then `0x10003`: three bytes
+    /// past a 64 KiB stack. `stack.len() - start` underflows there.
+    ///
+    /// In debug that is a subtraction-overflow panic. In release it wraps to
+    /// `usize::MAX - 2`, and -- this is the part worth stating -- that wrapped
+    /// length **defeats [`seg::Segment::slice`]'s own bounds assertion**,
+    /// because `offset + len` wraps in turn and lands back on exactly
+    /// `self.len`. The assert passes and `from_raw_parts` is handed a length
+    /// near `usize::MAX` at an out-of-bounds address, which is undefined
+    /// behaviour rather than a crash.
+    ///
+    /// `resume` guards the adjacent case one screen up and says why; this is
+    /// the same hazard reached from the other side, so it is checked the same
+    /// way. A module whose stack has drifted into the last few bytes of its
+    /// segment is broken, and saying so is the point.
     pub fn arg_frame(&self) -> &[u8] {
         let sp = self
             .frame_sp
             .expect("arg_frame() with no outstanding call to read from");
         let start = usize::from(sp) + 4;
         let stack = self.mem.stack();
-        stack.slice(start, stack.len() - start)
+        let len = stack.len().checked_sub(start).unwrap_or_else(|| {
+            panic!(
+                "the module called out at SP={sp:#06x}, so its argument frame \
+                 begins at {start:#x} -- past the end of its {} byte stack",
+                stack.len()
+            )
+        });
+        stack.slice(start, len)
     }
 
     /// Selector of the scratch code segment [`Machine::load_code`] fills.

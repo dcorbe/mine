@@ -316,10 +316,22 @@ impl Segment {
     ///
     /// If the range leaves the segment. Callers bounds-check first and report
     /// that as an error; reaching the panic is a host bug, not a module one.
+    ///
+    /// The check is `checked_add` rather than `offset + len`, because this
+    /// guard stands directly in front of a `from_raw_parts` and a plain
+    /// addition wraps in release. A caller that arrives with a length already
+    /// underflowed to near `usize::MAX` makes `offset + len` wrap back to
+    /// something small, and the assertion then *passes* on the way to
+    /// constructing an unbounded slice at an out-of-bounds address. That is
+    /// undefined behaviour reached through a bounds check, which is worse than
+    /// having no bounds check at all -- it reads as safe. `Machine::arg_frame`
+    /// could reach it before it was fixed to use `checked_sub`.
     pub(crate) fn slice(&self, offset: usize, len: usize) -> &[u8] {
         assert!(
-            offset + len <= self.len,
-            "slice past the end of the segment"
+            offset.checked_add(len).is_some_and(|end| end <= self.len),
+            "slice past the end of the segment: {offset:#x} + {len:#x} \
+             leaves a {} byte segment",
+            self.len
         );
         // SAFETY: bounds checked, and the mapping is readable for its whole
         // length and outlives the borrow.
@@ -564,6 +576,35 @@ mod tests {
                 "entry {entry} still names the region that was just unmapped"
             );
         }
+    }
+
+    /// The bounds check must not be defeatable by the arithmetic inside it.
+    ///
+    /// `Machine::arg_frame` computed its length as `stack.len() - start`, which
+    /// underflows once the frame begins past the end of the segment. In release
+    /// that wraps to nearly `usize::MAX`, and with a plain `offset + len` the
+    /// assertion then wraps *back* to exactly `self.len` and passes -- handing
+    /// `from_raw_parts` an unbounded slice at an out-of-bounds address. The
+    /// numbers here are that case: a 64 KiB segment, a frame starting three
+    /// bytes past its end.
+    #[test]
+    #[should_panic(expected = "slice past the end of the segment")]
+    fn a_length_that_has_already_wrapped_cannot_pass_the_bounds_check() {
+        let _guard = SERIALISE.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let segment = Segment::new(0x10000, false).expect("a 64 KiB segment");
+        let start = 0x10003usize;
+        let wrapped = segment.len().wrapping_sub(start);
+
+        // The defeat, stated as an assertion so this test fails loudly if the
+        // premise ever stops holding rather than passing for the wrong reason.
+        assert_eq!(
+            start.wrapping_add(wrapped),
+            segment.len(),
+            "the wrapped length must land back on len, or this tests nothing"
+        );
+
+        let _ = segment.slice(start, wrapped);
     }
 
     #[test]
