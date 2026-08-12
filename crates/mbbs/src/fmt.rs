@@ -29,6 +29,7 @@
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::abi::{Abi, Wg16};
 use crate::shims::ShimError;
 
 /// Where a `printf` walk reads its arguments from.
@@ -38,8 +39,19 @@ use crate::shims::ShimError;
 /// is found. Naming the source rather than passing a word index keeps that the
 /// *only* difference: every conversion, width and pointer rule below is written
 /// once, and both spellings get the same one.
-#[derive(Debug, Clone, Copy)]
-pub enum Args {
+///
+/// # Generic type, `Wg16`-concrete body
+///
+/// `List.at` is typed `A::Ptr` rather than `FarPtr` so this is genuinely
+/// `Args<A>` -- but [`format`] and every method below stay `Wg16`-concrete,
+/// taking `&Machine` exactly as before: the walk reads 16-bit *words* off a
+/// real argument frame, which has no ABI-generic equivalent yet (that is
+/// Task 5's `Call`/`Cursor`, not this one). `A` defaults to [`Wg16`] so every
+/// existing `Args::Call`/`Args::List` at a shim call site compiles unchanged.
+/// Not `#[derive(Debug, Clone, Copy)]`: the derive macros bound `A: Trait` on
+/// the generated impls, which the bare marker struct `Wg16` does not satisfy
+/// -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
+pub enum Args<A: Abi = Wg16> {
     /// The outstanding call's own stack, from argument word `first` on.
     ///
     /// What `prf`, `spr`, `sprintf`, `fprintf`, `shocst` and `prfmsg` have: the
@@ -54,10 +66,30 @@ pub enum Args {
     /// `va_start` sets it to the address just past the last fixed argument --
     /// so it points into the *caller's* frame in `SS` and the words behind it
     /// are laid out exactly as [`Args::Call`]'s are.
-    List { at: FarPtr },
+    List { at: A::Ptr },
 }
 
-impl Args {
+impl<A: Abi> Clone for Args<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for Args<A> {}
+
+impl<A: Abi> std::fmt::Debug for Args<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Call { first } => f.debug_struct("Call").field("first", first).finish(),
+            Self::List { at } => f.debug_struct("List").field("at", at).finish(),
+        }
+    }
+}
+
+impl Args<Wg16> {
     /// Word `n` of the variadic list, counting from its first word.
     ///
     /// # Errors
