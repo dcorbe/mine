@@ -166,9 +166,15 @@ impl Layout {
         u32::from(self.page.saturating_sub(HEADER) / self.physical)
     }
 
+    /// A page's own byte offset in the file -- before its header, where
+    /// [`std::io::Seek`] has to land to read the whole page.
+    pub fn page_start(self, page: u32) -> u32 {
+        u32::from(self.page) * page
+    }
+
     /// The file position of a slot.
     pub fn position(self, page: u32, slot: u32) -> u32 {
-        u32::from(self.page) * page + u32::from(HEADER) + u32::from(self.physical) * slot
+        self.page_start(page) + u32::from(HEADER) + u32::from(self.physical) * slot
     }
 
     /// Which page and slot a file position is, or `None` if it is not on a slot

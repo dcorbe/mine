@@ -1421,7 +1421,13 @@ fn answer_with_key(
         .keys()
         .get(usize::from(key))
         .ok_or_else(|| ShimError::Failed(format!("{} has no key {key}", file.name())))?
-        .extract(&record.bytes);
+        // Padded: a key's `offset` is measured from the physical slot, and a
+        // v6 record's bytes start two bytes into it. Without this, every
+        // opcode that fills the module's key buffer -- `qrybtv`, `qnpbtv`,
+        // `obtbtvl`, `aabbtvl`, `gabbtvl` -- hands back the wrong bytes on a
+        // v6 file, and no byte-for-byte record test can see it because the
+        // record body it compares is right.
+        .extract(&file.keyed(&record.bytes));
     let buffer = file.key();
     machine.write(buffer, &bytes)?;
     Ok(())

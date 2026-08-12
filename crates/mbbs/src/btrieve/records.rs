@@ -23,13 +23,20 @@ use std::path::Path;
 
 use super::keys::Key;
 use super::variable::{Chain, Pages, Pointer};
-use super::{BtvError, Geometry};
+use super::{BtvError, Geometry, Version};
 
-/// Bytes of header at the start of a data page, before the first record.
+/// Bytes of marker a v6 record slot opens with, before the record body.
 ///
-/// Six: four of page number and two of usage count. The high bit of byte 5 is
-/// what marks a page as holding records at all.
-const PAGE_HEADER: u16 = 6;
+/// Evidence 1b of `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`,
+/// measured against 1,580 oracle-dumped records: a v6 page's header is six
+/// bytes exactly as v5's, and slots are `physical` bytes apart from there --
+/// only the body's offset *within* the slot moves. Every slot observed holds
+/// `01 00`; what the two bytes mean is not established, so this reads past
+/// them rather than interpreting them.
+///
+/// Named because three places depend on it and a bare `2` in any of them is
+/// unsearchable.
+const V6_SLOT_MARKER: usize = 2;
 
 /// Where the free list starts, in the file control record.
 const FREE_LIST: usize = 0x10;
@@ -79,15 +86,52 @@ pub struct Records {
     /// For each key, how many adjacent pairs in its order carry the same key
     /// value. See [`Self::ties`].
     ties: Vec<usize>,
+
+    /// How many leading bytes a key's own `offset` field is measured past
+    /// [`Record::bytes`]'s own start -- zero for v5, two for v6.
+    ///
+    /// A key definition's `offset` is read straight off the file control
+    /// record (`keys.rs`'s `at::OFFSET`, applied with no version-specific
+    /// adjustment -- Evidence 5's "keys.rs is already correct for v6" is
+    /// true of *parsing*, not of what coordinate system the number it reads
+    /// is in). Measured against `DUPKEY30.DAT`: its one key reads `offset:
+    /// 2`, and `keys.rs`'s `at::CHAIN` reads a duplicate-chain offset of 14
+    /// on the same file, which is `physical - 8`, not `reclen - 8` -- both
+    /// numbers are relative to the **physical slot**, the coordinate system
+    /// `at::CHAIN`'s own doc comment already established. But
+    /// [`Record::bytes`] is `reclen` bytes with Evidence 1b's two-byte v6
+    /// slot marker already read past and discarded (`walk_v6`), so applying
+    /// the FCR's own offset to it unmodified reads two bytes into the next
+    /// field. [`Self::keyed`] pads it back on, only for the span of one
+    /// comparison, so this is a coordinate fix confined to how a key is
+    /// *applied* -- `keys.rs` itself stays exactly as version-independent as
+    /// Evidence 5 says it is.
+    key_shift: usize,
 }
 
 impl Records {
     /// Read every record of a file and sort them by each of its keys.
     ///
+    /// **The single point every record read passes through.** `Block::records`
+    /// calls this; so does half the test suite, directly, which is what makes
+    /// this the entry point to guard rather than `Block::records` -- a check
+    /// placed there would not have covered the callers that never go through
+    /// a `Block` at all.
+    ///
+    /// Both versions are read here: [`walk`] dispatches on `geometry.version`
+    /// and resolves a v6 file's logical page numbers through [`super::v6::Map`]
+    /// rather than applying v5's `page * number` arithmetic to them
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`, Task 5 --
+    /// Task 2 refused every v6 file outright, and this is what replaces that
+    /// refusal with the real path it promised).
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read, its free list leaves the file, or the number
-    /// of records found is not the number the header claims.
+    /// If the file cannot be read, its free list leaves the file (v5 only --
+    /// see [`walk`]'s v6 doc comment for why a v6 walk does not consult one),
+    /// the v6 allocation table cannot be resolved (any of [`super::v6::Map::read`]'s
+    /// own refusals), or the number of records found is not the number the
+    /// header claims.
     pub fn read(
         name: &str,
         path: &Path,
@@ -98,6 +142,7 @@ impl Records {
             file: name.to_owned(),
             why,
         };
+
         let records = walk(geometry, path).map_err(fail)?;
 
         if records.len() as u32 != geometry.records {
@@ -108,14 +153,40 @@ impl Records {
             )));
         }
 
+        let key_shift = if geometry.version == Version::V6 { 2 } else { 0 };
+
         let mut me = Self {
             records,
             order: Vec::new(),
             rank: Vec::new(),
             ties: Vec::new(),
+            key_shift,
         };
         me.reindex(keys);
         Ok(me)
+    }
+
+    /// A record's bytes, padded so a key's own `offset` field lands where it
+    /// was measured from. See [`Self::key_shift`] for why this is needed at
+    /// all and why it is confined to here rather than to `keys.rs`.
+    ///
+    /// Zero-cost for v5 (`key_shift` is `0`, so this borrows `bytes`
+    /// unchanged) -- `WCCUPDAT.DAT`'s 38,754-record sort must not pay for a
+    /// fix a v5 file never needs.
+    pub(crate) fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        keyed(self.key_shift, bytes)
+    }
+
+    /// How far a key's `offset` field is ahead of [`Record::bytes`].
+    ///
+    /// Exposed because three call sites outside this type read key bytes off
+    /// a record and cannot reach [`Self::keyed`] through a `&mut self`
+    /// borrow: [`answer_with_key`](crate::shims::btrieve) and the two in
+    /// `Block::reindex`. They were all missed when `key_shift` was
+    /// introduced, and a key read without it sorts and answers on the wrong
+    /// bytes.
+    pub(crate) fn key_shift(&self) -> usize {
+        self.key_shift
     }
 
     /// Re-derive `order`, `rank` and `ties` from `records`, for the given keys.
@@ -137,7 +208,10 @@ impl Records {
             // a second pass over the same file. See [`Self::ties`] for what
             // that tie-break is and is not.
             sorted.sort_by(|a, b| {
-                match key.compare(&self.records[*a].bytes, &self.records[*b].bytes) {
+                match key.compare(
+                    &self.keyed(&self.records[*a].bytes),
+                    &self.keyed(&self.records[*b].bytes),
+                ) {
                     Ordering::Equal => self.records[*a].position.cmp(&self.records[*b].position),
                     other => other,
                 }
@@ -149,8 +223,10 @@ impl Records {
             let tied = sorted
                 .windows(2)
                 .filter(|pair| {
-                    key.compare(&self.records[pair[0]].bytes, &self.records[pair[1]].bytes)
-                        == Ordering::Equal
+                    key.compare(
+                        &self.keyed(&self.records[pair[0]].bytes),
+                        &self.keyed(&self.records[pair[1]].bytes),
+                    ) == Ordering::Equal
                 })
                 .count();
             order.push(sorted);
@@ -250,7 +326,8 @@ impl Records {
         };
         let definition = &keys[usize::from(key)];
         order.partition_point(|record| {
-            definition.compare_value(&self.records[*record].bytes, value) == Ordering::Less
+            definition.compare_value(&self.keyed(&self.records[*record].bytes), value)
+                == Ordering::Less
         })
     }
 
@@ -259,7 +336,7 @@ impl Records {
         let Some(record) = self.ordered(key, at) else {
             return false;
         };
-        keys[usize::from(key)].compare_value(&record.bytes, value) == Ordering::Equal
+        keys[usize::from(key)].compare_value(&self.keyed(&record.bytes), value) == Ordering::Equal
     }
 
     /// Add a record at a position nothing else occupies.
@@ -345,7 +422,24 @@ impl Records {
 }
 
 /// Walk the data pages and collect every live record.
+///
+/// Dispatches on the file's version: [`walk_v5`] and [`walk_v6`] share the
+/// same arithmetic ([`super::pages::Layout`], [`super::pages::Header::decode`])
+/// but differ in what a page's number means and where the free-standing
+/// slot content starts -- see [`walk_v6`]'s doc comment for the differences
+/// and why each is what it is.
 fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+    match geometry.version {
+        Version::V5 => walk_v5(geometry, path),
+        Version::V6 => walk_v6(geometry, path),
+    }
+}
+
+/// Walk a version 5 file's data pages, in physical order.
+///
+/// A page's own number *is* its physical position for v5, so this is a
+/// linear scan of `1..geometry.pages` -- no allocation table, no logical ids.
+fn walk_v5(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let size = u32::try_from(
         file.metadata()
@@ -355,9 +449,17 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
     let dead = free_list(&mut file, size)?;
-    let page = u32::from(geometry.page);
-    let physical = u32::from(geometry.physical);
-    let per_page = u32::from((geometry.page - PAGE_HEADER) / geometry.physical);
+
+    // The one place this file's page arithmetic lives -- see
+    // `pages::Layout::position` and `pages::Header::decode` below. Trap 1 in
+    // `docs/plans/2026-08-11-btrieve-v6-page-addressing.md` was this
+    // function reimplementing both instead of calling them.
+    let layout = super::pages::Layout {
+        page: geometry.page,
+        physical: geometry.physical,
+        pages: geometry.pages,
+    };
+    let per_page = layout.per_page();
 
     let mut records = Vec::with_capacity(geometry.records as usize);
     let mut buffer = vec![0u8; geometry.page as usize];
@@ -369,7 +471,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
 
     // Page 0 is the file control record, so records start at page 1.
     for number in 1..geometry.pages {
-        let at = page * number;
+        let at = layout.page_start(number);
         file.seek(SeekFrom::Start(u64::from(at)))
             .and_then(|_| file.read_exact(&mut buffer))
             .map_err(|e| format!("page {number}: {e}"))?;
@@ -377,7 +479,7 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
         // The high bit of the usage count marks a page that holds records. The
         // rest are index pages, and reading one as data would produce records
         // out of B-tree nodes.
-        if buffer[5] & 0x80 == 0 {
+        if !super::pages::Header::decode(&buffer).data {
             continue;
         }
 
@@ -385,12 +487,12 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             if records.len() as u32 == geometry.records {
                 break;
             }
-            let position = at + u32::from(PAGE_HEADER) + physical * slot;
+            let position = layout.position(number, slot);
             if dead.contains(&position) {
                 continue;
             }
 
-            let start = (u32::from(PAGE_HEADER) + physical * slot) as usize;
+            let start = (position - at) as usize;
             let record = &buffer[start..start + geometry.physical as usize];
 
             // Slots are filled from the front -- so the first empty one ends
@@ -424,6 +526,251 @@ fn walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
     }
 
     Ok(records)
+}
+
+/// Walk a version 6 file's claimed data pages, resolving every page number
+/// through [`super::v6::Map`] rather than treating it as a physical position
+/// (Evidence 2 of `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`).
+///
+/// **Variable-length records are read too, as of Task 6.** A v6 record's
+/// fixed part is followed by the same four-byte fragment pointer v5 uses
+/// (`variable::Pointer`), but every page number the chain names is a
+/// *logical* id, resolved through the same `map` this function already built
+/// to place the record's own fixed part -- [`MappedPages`] is that
+/// resolution, done once per fragment read rather than reimplemented.
+///
+/// # Design decisions made here, and why
+///
+/// **The whole file is read into memory, once.** [`super::v6::Map::read`]
+/// already requires a whole-file slice -- that is Task 3's established
+/// signature, tested against eight fixtures -- so a v6 walk cannot avoid
+/// that read, and this reuses the same buffer to read every claimed page
+/// too rather than opening the file a second time. Every v6 file this
+/// repository has measured is under 100 KB, and the one v6 file MajorMUD
+/// ships that might not be tiny -- `NEWMP001.VIR` -- is the map template
+/// the module never opens (see this plan's "Why this is a separate plan").
+/// So this cost is not paid by anything that runs today. A v6 file large
+/// enough to make slurping it a real problem would need `Map::read` itself
+/// to stream, which is out of scope here -- v5's `walk_v5` keeps streaming,
+/// unchanged, because it is what `WCCUPDAT.DAT`'s 77 MB needs.
+///
+/// **No free list is consulted.** `records::free_list` seeks from byte
+/// offset [`FREE_LIST`] unconditionally -- physical page 0, always -- which
+/// is the identical shadow-copy bug Task 1 fixed for the control record: on
+/// a v6 file whose live copy is page 1, it reads the stale one. Measured on
+/// both fixtures below, the candidate fields at `0x20`/`0x24` happen to
+/// agree between the two copies but `0x28` does not (`03000000` on
+/// `DUPKEY30.DAT`'s stale page 0, `06000000` on its live page 1), so "the
+/// copies agree anyway" is not a defence available here even if this
+/// wanted to reuse `free_list` against the live copy. More fundamentally,
+/// whether a v6 free list even uses the same on-disk representation as
+/// v5's is simply not established (Evidence 5) -- so rather than guess,
+/// this reads no free list at all for v6, and relies on the same
+/// empty-slot test v5 uses to find the tail of a page's live records
+/// ([`looks_empty`], applied to the two bytes past the slot's marker --
+/// verified to correctly end both `DUPKEY30.DAT`'s 7-record page and
+/// `PP2048.DAT`'s 50-record one). A record deleted from the *middle* of a
+/// v6 page -- a shape neither committed fixture exercises, and Evidence 5
+/// leaves open ("what triggers copy-on-write relocation... is not
+/// established") -- would not be skipped by this the way a v5 free list
+/// entry is.
+///
+/// **What that costs, stated exactly, because an earlier version of this
+/// comment overstated it.** It claimed [`Records::read`]'s count check turns
+/// the case into a refusal, "a stop, not a plausible wrong answer". That is
+/// the likely outcome and it is not a guarantee, and the difference is the
+/// whole of Trap 2. Two ways it goes:
+///
+/// - The deleted slot's leftover bytes satisfy [`looks_empty`]: this stops
+///   there and misses every live record behind it on that page, the count
+///   falls short, and `Records::read` refuses. Loud, correct.
+/// - They do **not** satisfy it -- Evidence 3a establishes that a stale v6
+///   page can hold real leftover content -- and the slot is read as a live
+///   record that is not one. The count is then inflated by a ghost and
+///   deflated by whatever the walk stopped short of, and if those cancel,
+///   the count matches the header exactly and nothing refuses. That is a
+///   wrong answer that counts correctly, which is precisely the shape the
+///   Task 2 correction in the plan documents.
+///
+/// No fixture has an interior deletion, so neither branch is exercised and
+/// the second is a structural argument rather than a demonstrated failure.
+/// It is written down instead of being asserted away because "very probably
+/// refuses" is not what this crate promises elsewhere. Closing it properly
+/// means establishing the v6 free-list representation and consulting it;
+/// until then this is a known hole with a known shape.
+///
+/// **A record's position embeds the page's LOGICAL id, not its physical
+/// one.** Measured directly against `DUPKEY30.DAT`: physical page 8
+/// (logical 5) holds the file's last seven inserted records and physical
+/// page 10 (logical 2) holds the first twenty-three, but logical 2 is less
+/// than logical 5 while physical 10 is greater than physical 8 -- the
+/// allocator did not hand out physical pages in insertion order, but the
+/// logical id it assigned each one preserves it. The duplicate-key group
+/// for value 7 (insertion indices 21-23) spans both pages, and it only
+/// comes back in the real engine's own insertion order -- what
+/// `Records::reindex`'s tie-break assumes duplicates are in -- when
+/// positions sort by logical page: sorting by physical page would put
+/// index 23 (physical 8) ahead of indices 21-22 (physical 10) and fail the
+/// byte-for-byte comparison this task's tests make. `pages.rs`'s own
+/// `dupkey30_records` test helper independently reaches the same
+/// conclusion, from the in-record `[prev][next]` duplicate chain rather
+/// than from insertion order -- see its doc comment.
+fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+    if usize::from(geometry.physical) < V6_SLOT_MARKER {
+        return Err(format!(
+            "a {}-byte physical record, too short to hold the two-byte v6 slot \
+             marker every record body follows two bytes past (Evidence 1b)",
+            geometry.physical
+        ));
+    }
+
+    let file = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let size = u32::try_from(file.len())
+        .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
+
+    let map = super::v6::Map::read(&file, geometry.page)?;
+
+    let layout = super::pages::Layout {
+        page: geometry.page,
+        physical: geometry.physical,
+        pages: geometry.pages,
+    };
+    let per_page = layout.per_page();
+
+    // Ascending by logical id -- the tie-break this walk's doc comment
+    // measures, and what keeps `records` sorted by `position` the way a v5
+    // walk's ascending physical scan always has.
+    let mut claimed: Vec<(u32, u32)> = map.entries().collect();
+    claimed.sort_unstable_by_key(|&(logical, _)| logical);
+
+    let mut records = Vec::with_capacity(geometry.records as usize);
+
+    for (logical, physical_page) in claimed {
+        if records.len() as u32 == geometry.records {
+            break;
+        }
+
+        let at = layout.page_start(physical_page);
+        let end = at
+            .checked_add(u32::from(geometry.page))
+            .filter(|&end| end <= size)
+            .ok_or_else(|| {
+                format!(
+                    "the allocation table names physical page {physical_page} for \
+                     logical page {logical}, past the end of a {size}-byte file"
+                )
+            })?;
+        let buffer = &file[at as usize..end as usize];
+
+        // Evidence 3/3a: claimed alone is not enough to mean "read this as
+        // records" -- the tag's high byte has to say "data" (`0x44`; this
+        // module's own doc comment notes the same tag also covers index
+        // content), and within that, the header's own data bit -- the same
+        // field `Header::decode` reads for v5, at the same offset either
+        // version -- is what tells a leaf of records from a B-tree node.
+        if buffer[1] != 0x44 || !super::pages::Header::decode(buffer).data {
+            continue;
+        }
+
+        for slot in 0..per_page {
+            if records.len() as u32 == geometry.records {
+                break;
+            }
+            let position = layout.position(logical, slot);
+
+            // Evidence 1b: the record body starts two bytes into the slot,
+            // past a marker this reads past rather than interprets.
+            //
+            // `position(0, slot)` rather than a restated `HEADER + physical *
+            // slot`, so the formula lives only in `Layout::position` -- Trap 1
+            // in miniature otherwise. Page **0**, not this page: `position`
+            // above is deliberately keyed by the *logical* id (Evidence 1c)
+            // while `at` is the *physical* page's byte offset, so the two do
+            // not subtract into an in-page offset the way `walk_v5`'s do. The
+            // offset of a slot within its page is the same for every page, and
+            // page 0 starts at byte 0, so asking for page 0 asks exactly that
+            // question. This subtlety cost a broken refactor: `position - at`
+            // compiles, reads plausibly, and is wrong.
+            let start = layout.position(0, slot) as usize + V6_SLOT_MARKER;
+            let content_len = usize::from(geometry.physical) - V6_SLOT_MARKER;
+            let record = &buffer[start..start + content_len];
+
+            // Slots fill from the front of a page here too -- see v5's
+            // identical comment in `walk_v5` -- so the first one that looks
+            // unwritten ends this page's live records.
+            if looks_empty(record, size) {
+                break;
+            }
+
+            let mut bytes = record[..geometry.reclen as usize].to_vec();
+
+            // A variable-length record's fixed part is followed by four
+            // bytes naming its first fragment -- v5's own encoding
+            // (`variable::Pointer::decode`), read from the same offset --
+            // but every page number inside it is a logical id (Evidence 2)
+            // and has to go through `map`, not be read as a physical
+            // position. Copied out before `bytes` grows, same as `walk_v5`.
+            if geometry.variable {
+                let at = usize::from(geometry.reclen);
+                let pointer = Pointer::decode([
+                    record[at],
+                    record[at + 1],
+                    record[at + 2],
+                    record[at + 3],
+                ]);
+                let mut source = MappedPages {
+                    file: &file,
+                    layout,
+                    map: &map,
+                };
+                Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
+                    .map_err(|why| format!("the record at {position}: {why}"))?;
+            }
+
+            records.push(Record { position, bytes });
+        }
+    }
+
+    Ok(records)
+}
+
+/// Whole pages of a v6 file already read into memory, addressed by
+/// **logical** id and resolved through [`super::v6::Map`] -- the fragment-
+/// chain counterpart to [`walk_v6`]'s own resolution of a record's own page.
+/// A v6 fragment pointer names a logical page exactly the way an ordinary
+/// record position does (Evidence 1c and 2), so this is not a second
+/// implementation of that resolution: it is [`Chained`]'s file-backed shape,
+/// reused, with the one extra indirection the map adds -- and the mutation
+/// this exists to make impossible is resolving a fragment pointer as though
+/// it already named a physical page (plan Task 6, mandatory mutation (c)).
+struct MappedPages<'a> {
+    file: &'a [u8],
+    /// Carried whole rather than as a bare page size so that where a page
+    /// starts is [`Layout::page_start`]'s answer here too. This held the page
+    /// size and multiplied it out by hand until the branch's final review
+    /// counted the implementations of that one fact and found this a third.
+    layout: super::pages::Layout,
+    map: &'a super::v6::Map,
+}
+
+impl Pages for MappedPages<'_> {
+    fn page(&mut self, number: u32) -> Result<&[u8], String> {
+        let physical = self.map.physical(number).ok_or_else(|| {
+            format!(
+                "logical page {number}, and the allocation table names no live physical \
+                 page for it"
+            )
+        })?;
+        let at = self.layout.page_start(physical) as usize;
+        let end = at + usize::from(self.layout.page);
+        self.file.get(at..end).ok_or_else(|| {
+            format!(
+                "logical page {number} resolves to physical {physical}, past the end of a \
+                 {}-byte file",
+                self.file.len()
+            )
+        })
+    }
 }
 
 /// Whole pages of an open file, for [`Chain::follow`].
@@ -491,6 +838,31 @@ fn free_list(file: &mut std::fs::File, size: u32) -> Result<HashSet<u32>, String
     Ok(dead)
 }
 
+/// Pad a record's bytes so a key's own `offset` field lands where it was
+/// measured from.
+///
+/// A key definition's `offset` is relative to the **physical slot**, and a
+/// v6 slot opens with a two-byte marker that [`Record::bytes`] does not carry
+/// (Evidence 1b) -- so on a v6 file every key is two bytes further along than
+/// the body it is read out of. `keys.rs`'s own `at::CHAIN` is measured the
+/// same way, from the slot.
+///
+/// Free rather than a method so the three call sites that hold a `&mut
+/// Records`, or no `Records` at all, can use the one implementation instead
+/// of open-coding the shift a fourth time.
+///
+/// Zero-cost for v5, where `shift` is `0` and this borrows `bytes` unchanged:
+/// `WCCUPDAT.DAT`'s 38,754-record sort must not pay for a fix a v5 file never
+/// needs.
+pub(crate) fn keyed(shift: usize, bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if shift == 0 {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut padded = vec![0u8; shift];
+    padded.extend_from_slice(bytes);
+    std::borrow::Cow::Owned(padded)
+}
+
 /// Whether a slot's bytes would be read as unused rather than as a record.
 ///
 /// An unused slot is all zero except for four bytes of free-list pointer, and
@@ -541,7 +913,7 @@ mod tests {
 
     /// Where the `n`th record slot of the first data page is.
     fn slot(n: u32) -> u32 {
-        512 + u32::from(PAGE_HEADER) + u32::from(RECLEN) * n
+        512 + u32::from(crate::btrieve::pages::HEADER) + u32::from(RECLEN) * n
     }
 
     /// A page of B-tree index, appended where a walk will meet it.
@@ -561,7 +933,7 @@ mod tests {
     /// A file of one page of control record and `pages` data pages.
     fn file(page: u16, reclen: u16, records: &[&[u8]], free: &[u32]) -> Vec<u8> {
         let physical = reclen;
-        let per_page = (page - PAGE_HEADER) / physical;
+        let per_page = (page - crate::btrieve::pages::HEADER) / physical;
         let pages = 1 + records.len().div_ceil(usize::from(per_page)).max(1);
         let mut out = vec![0u8; usize::from(page) * pages];
 
@@ -599,7 +971,7 @@ mod tests {
             let base = u32::try_from(usize::from(page) * number).expect("small");
             out[usize::try_from(base).unwrap() + 5] |= 0x80;
             for slot in 0..u32::from(per_page) {
-                slots.push(base + u32::from(PAGE_HEADER) + u32::from(physical) * slot);
+                slots.push(base + u32::from(crate::btrieve::pages::HEADER) + u32::from(physical) * slot);
             }
         }
         let mut live = slots.iter().filter(|s| !free.contains(s));
@@ -948,5 +1320,268 @@ mod tests {
         let positions = records.positions();
         assert_eq!(positions.len(), 2);
         assert!(!positions.contains(&doomed));
+    }
+
+    /// A v6 page's own six-byte header: a tag at `[0x00]`, its logical id at
+    /// `[0x02]`, and a flags word at `[0x04]` whose bit 15 is the same
+    /// "holds records" bit `Header::decode` reads for v5, at the same
+    /// offset either version.
+    fn v6_page_header(tag: u16, logical: u16, data: bool) -> [u8; 6] {
+        let mut out = [0u8; 6];
+        out[0..2].copy_from_slice(&tag.to_le_bytes());
+        out[2..4].copy_from_slice(&logical.to_le_bytes());
+        let flags: u16 = if data { 0x8000 } else { 0 };
+        out[4..6].copy_from_slice(&flags.to_le_bytes());
+        out
+    }
+
+    /// A hand-built v6 file, six 512-byte pages: a shadow FCR pair (0/1), a
+    /// shadow allocation-table pair (2/3) claiming exactly one data page
+    /// (physical 4), and a *second* data page (physical 5) that carries the
+    /// same `0x44` data tag and a header shaped just like page 4's, but that
+    /// the allocation table never names.
+    ///
+    /// `PHYSICAL = 6` is a two-byte v6 slot marker plus a four-byte record
+    /// body and nothing else (Evidence 1b, minus the duplicate-chain
+    /// overhead `DUPKEY30.DAT` also carries) -- the minimum shape that can
+    /// tell "read the body at slot + 2" apart from "at slot + 0", and
+    /// "visited because claimed" apart from "visited because it merely
+    /// carries the data tag".
+    ///
+    /// Page 4 (claimed, logical 2) holds two live records, `b"AAAA"` and
+    /// `b"BBBB"`. Page 5 (unclaimed, logical 1 -- lower, so a scan that
+    /// ignores the allocation table and sorts by logical id visits it
+    /// *first*) holds two records of its own, `b"XXXX"` and `b"YYYY"`, that
+    /// no correct reading of this file should ever return. `keys` is left
+    /// at zero: this fixture is about which *pages* a walk visits, not about
+    /// key parsing, so the test below hands `Records::read` an empty key
+    /// slice directly rather than exercising `keys::parse`.
+    fn v6_stale_twin_fixture() -> Vec<u8> {
+        const PAGE: usize = 512;
+        const RECLEN: u16 = 4;
+        const PHYSICAL: u16 = 6;
+
+        let mut out = vec![0u8; PAGE * 6];
+        let word = |out: &mut [u8], at: usize, value: u16| {
+            out[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        };
+
+        // Page 0: the stale FCR shadow copy -- generation 1. `Geometry::read`
+        // derives `page_size` from *this* half before it knows which copy is
+        // live (Evidence 1a), so the page length has to be here too, not
+        // only on page 1.
+        out[0..2].copy_from_slice(b"FC");
+        word(&mut out, 0x04, 1);
+        word(&mut out, 0x08, PAGE as u16);
+
+        // Page 1: the live FCR shadow copy (generation 2), carrying every
+        // field a fixed-length v6 file needs.
+        let p1 = PAGE;
+        out[p1..p1 + 2].copy_from_slice(b"FC");
+        word(&mut out, p1 + 0x04, 2);
+        word(&mut out, p1 + 0x08, PAGE as u16);
+        word(&mut out, p1 + 0x14, 0); // key count
+        word(&mut out, p1 + 0x16, RECLEN);
+        word(&mut out, p1 + 0x18, PHYSICAL);
+        word(&mut out, p1 + 0x1a, 0); // record count, high
+        word(&mut out, p1 + 0x1c, 2); // record count, low -- two live records
+
+        // Page 2: the stale allocation-table shadow copy -- magic, block
+        // index and a lower generation, no entries needed.
+        let p2 = PAGE * 2;
+        out[p2..p2 + 2].copy_from_slice(b"PP");
+        word(&mut out, p2 + 0x02, 1);
+        word(&mut out, p2 + 0x04, 1);
+
+        // Page 3: the live allocation-table shadow copy, claiming exactly
+        // one page -- physical 4, marker `0x4400` (this format's own data
+        // tag, which is what every marker observed in the real corpus is).
+        let p3 = PAGE * 3;
+        out[p3..p3 + 2].copy_from_slice(b"PP");
+        word(&mut out, p3 + 0x02, 1);
+        word(&mut out, p3 + 0x04, 2);
+        word(&mut out, p3 + 0x0c, 0x4400); // entry 0's marker
+        word(&mut out, p3 + 0x0e, 4); // entry 0's physical page
+
+        // Page 4: the one page the allocation table actually claims.
+        // Logical 2, two live records front-packed, the rest zero -- so
+        // `looks_empty` stops the scan there, same as the real corpus.
+        let p4 = PAGE * 4;
+        out[p4..p4 + 6].copy_from_slice(&v6_page_header(0x4400, 2, true));
+        out[p4 + 6..p4 + 8].copy_from_slice(&1u16.to_le_bytes());
+        out[p4 + 8..p4 + 12].copy_from_slice(b"AAAA");
+        out[p4 + 12..p4 + 14].copy_from_slice(&1u16.to_le_bytes());
+        out[p4 + 14..p4 + 18].copy_from_slice(b"BBBB");
+
+        // Page 5: the stale-twin shape (Evidence 3/3a) -- except *not*
+        // empty, so a reading that visits it anyway produces bytes no real
+        // Btrieve ever returned for this file.
+        let p5 = PAGE * 5;
+        out[p5..p5 + 6].copy_from_slice(&v6_page_header(0x4400, 1, true));
+        out[p5 + 6..p5 + 8].copy_from_slice(&1u16.to_le_bytes());
+        out[p5 + 8..p5 + 12].copy_from_slice(b"XXXX");
+        out[p5 + 12..p5 + 14].copy_from_slice(&1u16.to_le_bytes());
+        out[p5 + 14..p5 + 18].copy_from_slice(b"YYYY");
+
+        out
+    }
+
+    /// The claimed-page filter, exercised directly. Dropping it -- Task 5's
+    /// mandatory mutation (b) -- makes this fail: `v6_stale_twin_fixture`
+    /// carries a second `0x44`-tagged page the allocation table never
+    /// claims, holding bytes no correct reading of the file should surface.
+    ///
+    /// **Neither committed oracle fixture catches this mutation on its
+    /// own.** Measured directly: `DUPKEY30.DAT`'s and `PP2048.DAT`'s own
+    /// stale twins (physical 5 in both) happen to `looks_empty` regardless
+    /// of whether the claimed-page filter runs at all, because their first
+    /// four content bytes decode as a small `long` with an all-zero tail --
+    /// the same shape a genuinely unused slot has. That is a real, measured
+    /// property of those two files, not something this design is entitled
+    /// to rely on in general: Evidence 3a is explicit that a stale twin can
+    /// hold real leftover content (`NONMONO2.DAT`'s three duplicate logical
+    /// ids all disagree in their *bodies*, not just their headers). This
+    /// fixture is built to say so where the real corpus happens not to.
+    #[test]
+    fn a_stale_page_sharing_the_data_tag_but_not_claimed_is_never_visited() {
+        let bytes = v6_stale_twin_fixture();
+        let dir = crate::testing::scratch("btv-rec-v6-stale-twin");
+        let path = dir.join("STALETWIN.DAT");
+        std::fs::write(&path, &bytes).expect("written");
+
+        let geometry = Geometry::read("STALETWIN.DAT", &path).expect("a v6 shape");
+        assert_eq!(geometry.version, Version::V6);
+
+        let records = Records::read("STALETWIN.DAT", &path, &geometry, &[]).expect("reads");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.physical(0).expect("first").bytes, b"AAAA");
+        assert_eq!(records.physical(1).expect("second").bytes, b"BBBB");
+    }
+
+    /// A second implementation of [`walk`]'s page arithmetic, built once as
+    /// the safety net for the Task 4 refactor
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`) that routes
+    /// `walk` itself through [`super::pages::Layout`]. Until that refactor
+    /// lands, this and `walk` are two independent implementations of the same
+    /// assumption -- Trap 1 in that plan -- so
+    /// [`walk_and_a_layout_based_walk_agree_on_every_shipped_file`] exists to
+    /// prove they agree while that is still true.
+    fn layout_walk(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
+        let mut file =
+            std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let size = u32::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+            .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
+
+        let dead = free_list(&mut file, size)?;
+        let layout = crate::btrieve::pages::Layout {
+            page: geometry.page,
+            physical: geometry.physical,
+            pages: geometry.pages,
+        };
+        let per_page = layout.per_page();
+
+        let mut records = Vec::with_capacity(geometry.records as usize);
+        let mut buffer = vec![0u8; geometry.page as usize];
+        let mut fragment = vec![0u8; geometry.page as usize];
+
+        for number in 1..geometry.pages {
+            // The page's own start, derived from `Layout` rather than
+            // reimplementing its multiplication: a slot-0 position is always
+            // `HEADER` bytes past the page start.
+            let at = layout.position(number, 0) - u32::from(crate::btrieve::pages::HEADER);
+            file.seek(SeekFrom::Start(u64::from(at)))
+                .and_then(|_| file.read_exact(&mut buffer))
+                .map_err(|e| format!("page {number}: {e}"))?;
+
+            if !crate::btrieve::pages::Header::decode(&buffer).data {
+                continue;
+            }
+
+            for slot in 0..per_page {
+                if records.len() as u32 == geometry.records {
+                    break;
+                }
+                let position = layout.position(number, slot);
+                if dead.contains(&position) {
+                    continue;
+                }
+
+                let start = (position - at) as usize;
+                let record = &buffer[start..start + geometry.physical as usize];
+
+                if looks_empty(record, size) {
+                    break;
+                }
+
+                let mut bytes = record[..geometry.reclen as usize].to_vec();
+
+                let pointer = geometry.variable.then(|| {
+                    let at = usize::from(geometry.reclen);
+                    Pointer::decode([record[at], record[at + 1], record[at + 2], record[at + 3]])
+                });
+                if let Some(pointer) = pointer {
+                    let mut source = Chained {
+                        file: &mut file,
+                        buffer: &mut fragment,
+                        pages: geometry.pages,
+                    };
+                    Chain::follow(&mut source, geometry.version, pointer, &mut bytes)
+                        .map_err(|why| format!("the record at {position}: {why}"))?;
+                }
+
+                records.push(Record { position, bytes });
+            }
+        }
+
+        Ok(records)
+    }
+
+    /// Every file MajorMUD ships, by name only -- the shape census belongs to
+    /// `crates/mbbs/tests/btrieve.rs`'s `FILES`, this just needs to open each.
+    const SHIPPED_FILES: &[&str] = &[
+        "NEWMP001.VIR",
+        "WCCACMSR.VIR",
+        "WCCACTS.VIR",
+        "WCCBANKS.VIR",
+        "WCCCLASS.VIR",
+        "WCCGANGS.VIR",
+        "WCCITEMS.VIR",
+        "WCCITOWN.VIR",
+        "WCCKNMSR.VIR",
+        "WCCMP001.VIR",
+        "WCCMSG.VIR",
+        "WCCRACE.VIR",
+        "WCCSHOPS.VIR",
+        "WCCSPELS.VIR",
+        "WCCTEXT.VIR",
+        "WCCUSERS.VIR",
+        "WCCUPDAT.DAT",
+        "WCCUSERS.DAT",
+    ];
+
+    /// `records::walk` and a `Layout`-based walk must agree on every file
+    /// MajorMUD ships, since both implement the same page-arithmetic
+    /// assumption -- Trap 1 in
+    /// `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`. This is the
+    /// safety net for the refactor that collapses them into one: it must pass
+    /// *before* `walk` is touched, and it must keep passing (trivially, once
+    /// `walk` and `layout_walk` share an implementation) after.
+    #[test]
+    #[ignore = "needs MajorMUD's data files in tmp/"]
+    fn walk_and_a_layout_based_walk_agree_on_every_shipped_file() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+        if !dir.join("WCCITEMS.VIR").is_file() {
+            eprintln!("skipped: no MajorMUD data files in tmp/");
+            return;
+        }
+
+        for name in SHIPPED_FILES {
+            let path = dir.join(name);
+            let geometry = Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let want = walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} walk: {e}"));
+            let got =
+                layout_walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} layout_walk: {e}"));
+            assert_eq!(want, got, "{name}: walk and layout_walk disagree");
+        }
     }
 }

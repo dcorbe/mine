@@ -32,6 +32,7 @@ pub mod keys;
 pub mod pages;
 pub mod records;
 mod variable;
+pub(crate) mod v6;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -70,6 +71,10 @@ mod at {
     pub const VARIABLE_MARK: usize = 0x38;
     /// User flags. Bit 0 is variable-length records, bit 3 is compression.
     pub const USRFLGS: usize = 0x106;
+
+    /// Generation counter. Present in both the v6 control record's shadow
+    /// copies and both the allocation table's; the higher one is live.
+    pub const GENERATION: usize = 0x04;
 }
 
 /// Bits of [`at::USRFLGS`], and what each adds to a record's physical length.
@@ -190,20 +195,86 @@ impl Geometry {
         let size = std::fs::metadata(path)
             .map_err(|e| fail(format!("{}: {e}", path.display())))?
             .len();
-        let bytes = read_head(path, FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
-        if bytes.len() < FCR {
+        // A v6 file's control record is shadowed across physical pages 0 and 1
+        // -- generation counters, not position, say which is live (Evidence 1).
+        // A v5 file has no second copy, so the version is established from the
+        // first `FCR` bytes alone, and only a v6 file requires a further read.
+        let head = read_head(path, FCR).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+        if head.len() < FCR {
             return Err(fail(format!(
                 "{size} bytes, and a Btrieve file's first page is at least {FCR}"
             )));
         }
 
-        let version = version(&bytes).ok_or_else(|| {
+        let version = version(&head).ok_or_else(|| {
             fail(format!(
                 "starts {:02x?}, which is neither a v5 file control record \
                  (four zero bytes) nor a v6 one (\"FC\")",
-                &bytes[..4]
+                &head[..4]
             ))
         })?;
+
+        let bytes: Vec<u8> = if version == Version::V6 {
+            // The second shadow copy lives on *physical page 1* -- byte offset
+            // `page_size`, not the fixed `FCR` (512) offset an earlier version
+            // of this function used. Those only coincide when `page_size ==
+            // 512`; `DUPKEY30.DAT`'s 512-byte pages hid that, but a
+            // 2048-byte-paged file compared padding against padding and never
+            // reached page 1 at all (`PP2048.DAT` read 0 of its 50 records).
+            //
+            // `page_size` is read from the first half and trusted *before*
+            // liveness is decided -- Evidence 1 measured it identical between
+            // the two copies, so that trust is safe, but say so here because
+            // it is the one field this function reads before it has chosen
+            // which copy is live.
+            let page_size = u32::from(u16::from_le_bytes([head[at::PAGE], head[at::PAGE + 1]]));
+            let needed = u64::from(page_size) + FCR as u64;
+            if size < needed {
+                return Err(fail(format!(
+                    "{size} bytes, too short to hold a second physical page: a \
+                     {page_size}-byte page 0 plus a {FCR}-byte control-record copy \
+                     starting page 1 needs at least {needed}"
+                )));
+            }
+            // Read only the FCR-byte header of physical page 1, not the whole
+            // page -- a page can be many kilobytes, and this file can be tens
+            // of megabytes; nothing here may become a whole-file read.
+            let second = read_at(path, page_size as usize, FCR)
+                .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+            if second.len() < FCR {
+                return Err(fail(format!(
+                    "{size} bytes, too short to hold a second physical page: only \
+                     {} bytes were readable starting at offset {page_size}",
+                    second.len()
+                )));
+            }
+            if &second[..2] != b"FC" {
+                return Err(fail(format!(
+                    "the bytes at offset {page_size} (physical page 1, by this \
+                     file's own {page_size}-byte page size) are {:02x?}, not \
+                     \"FC\" -- there is no second control-record shadow copy \
+                     where this file's page size says one belongs",
+                    &second[..2]
+                )));
+            }
+            let generation = |half: &[u8]| {
+                u16::from_le_bytes([half[at::GENERATION], half[at::GENERATION + 1]])
+            };
+            let first = generation(&head);
+            let second_gen = generation(&second);
+            match first.cmp(&second_gen) {
+                std::cmp::Ordering::Greater => head,
+                std::cmp::Ordering::Less => second,
+                std::cmp::Ordering::Equal => {
+                    return Err(fail(format!(
+                        "both control-record copies claim generation {first}, and \
+                         there is no rule measured for choosing between them"
+                    )));
+                }
+            }
+        } else {
+            head
+        };
 
         let word = |offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
         let page = word(at::PAGE);
@@ -281,26 +352,25 @@ impl Geometry {
         // the logical record, inside the physical one. A file that says it has
         // variable-length records and leaves no room for the pointer is
         // describing something this cannot read.
-        if variable && physical - reclen < 4 {
+        //
+        // v6 needs six, not four: Evidence 1b's own two-byte slot marker sits
+        // between the slot and the logical record on *every* v6 file, fixed
+        // or variable, so the four-byte pointer `walk_v6` reads still comes
+        // right after `reclen` bytes -- but out of a `physical - 2`-byte
+        // content area, not a `physical`-byte one. Checking the v5 floor
+        // against a v6 file would let through a shape that later panics
+        // slicing four bytes out of the two or three actually left, rather
+        // than refusing here the way this house style requires.
+        let pointer_needs = match version {
+            Version::V5 => 4,
+            Version::V6 => 4 + 2,
+        };
+        if variable && physical - reclen < pointer_needs {
             return Err(fail(format!(
                 "variable-length records whose {physical}-byte slot leaves only {} bytes \
-                 after the {reclen}-byte record, and the pointer to the first fragment \
-                 needs four",
+                 after the {reclen}-byte record, and {version:?}'s fragment pointer needs \
+                 {pointer_needs}",
                 physical - reclen
-            )));
-        }
-
-        // A v6 file's fragments are laid out differently -- every one carries a
-        // next-pointer, and the `0x8000` entry bit does not decide
-        // (`W32MKDE_decompiled.c:19045`). `Version` was parsed and never
-        // consulted until here, which is exactly how the v5 rule would have
-        // been applied to a v6 file without anything saying so. Refused at open
-        // time; `variable::Chain::follow` refuses again on its own account.
-        if variable && version != Version::V5 {
-            return Err(fail(format!(
-                "variable-length records in a {version:?} file, whose fragments do not \
-                 follow the v5 rule this host reads them by, and there is no v6 \
-                 variable-length file to check an implementation of that against"
             )));
         }
 
@@ -347,6 +417,29 @@ fn read_head(path: &Path, len: usize) -> std::io::Result<Vec<u8>> {
 
     let mut out = vec![0u8; len];
     let mut file = std::fs::File::open(path)?;
+    let mut got = 0;
+    while got < len {
+        match file.read(&mut out[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    out.truncate(got);
+    Ok(out)
+}
+
+/// The `len` bytes of a file starting at `offset`, or fewer if it is shorter.
+///
+/// Seeks rather than reading from the start, for the same reason
+/// [`read_head`] does not read the whole file: a v6 file's second
+/// control-record copy can start many kilobytes in, and this file can be
+/// tens of megabytes.
+fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset as u64))?;
+    let mut out = vec![0u8; len];
     let mut got = 0;
     while got < len {
         match file.read(&mut out[got..])? {
@@ -501,6 +594,51 @@ impl Block {
         &self.keys
     }
 
+    /// A record's bytes, padded so a key's own `offset` lands where it was
+    /// measured from -- see [`records::keyed`].
+    ///
+    /// On the `Block` because the shim layer reads key bytes off a record it
+    /// reached through one, and has no other route to the file's version.
+    pub(crate) fn keyed<'a>(&self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        let shift = self.records.as_ref().map_or(0, Records::key_shift);
+        records::keyed(shift, bytes)
+    }
+
+    /// Whether this host will write to the file at all.
+    ///
+    /// # Errors
+    ///
+    /// If the file is v6. Reading one is Tasks 1-6 of
+    /// `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`; **writing one is
+    /// deliberately out of that plan's scope**, and needs the allocation-table
+    /// maintenance, shadow-copy flipping and generation bumping the engine
+    /// does.
+    ///
+    /// This exists because removing the blanket v6 refusal from
+    /// `Records::read` (Task 2, lifted in Task 5) silently un-guarded the
+    /// write path, which had never been v6-safe and was only unreachable
+    /// because every v6 read failed first. A v6 record's `position` carries a
+    /// **logical** page id (Evidence 1c), and `pages::write_record` seeks to a
+    /// position as a literal byte offset -- so an insert or update would have
+    /// landed on whatever physical page happened to sit at the logical id's
+    /// arithmetic, or past the end of the file, while the in-memory model
+    /// recorded a success. Silent corruption, so: refuse.
+    fn writable(&self) -> Result<(), BtvError> {
+        if self.geometry.version != Version::V5 {
+            return Err(BtvError {
+                file: self.name.clone(),
+                why: format!(
+                    "is a {:?} file, and this host reads those but does not write \
+                     them -- a v6 record's position names a logical page, and \
+                     writing one needs the allocation-table maintenance that is \
+                     deliberately out of the read plan's scope",
+                    self.geometry.version
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// The `struct btvblk` the module holds.
     pub fn block(&self) -> FarPtr {
         self.block
@@ -538,10 +676,15 @@ impl Block {
 
     /// The file's records, reading them if this is the first time.
     ///
+    /// Both v5 and v6 files reach [`Records::read`](Records::read) the same
+    /// way -- it dispatches on `geometry.version` internally
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`, Task 5).
+    ///
     /// # Errors
     ///
-    /// If the file cannot be read, or holds a different number of records from
-    /// the number its header claims.
+    /// If the file cannot be read, holds a different number of records from
+    /// the number its header claims, or -- v6 only -- its allocation table
+    /// cannot be resolved (any refusal of [`v6::Map::read`]).
     pub fn records(&mut self) -> Result<&Records, BtvError> {
         if self.records.is_none() {
             self.records = Some(Records::read(
@@ -612,6 +755,7 @@ impl Block {
     /// records, or the file cannot be written.
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
+        self.writable()?;
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -709,6 +853,7 @@ impl Block {
     /// or the file cannot be written.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
+        self.writable()?;
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -894,6 +1039,13 @@ impl Block {
             fail("reindex called before the records were loaded".to_owned())
         })?;
 
+        // A key's `offset` is measured from the physical slot, and a v6
+        // record's bytes start two bytes into it -- so every key read below
+        // has to be padded the same way `Records`' own sort does. Taken once
+        // here rather than through `Records::keyed`, which this loop cannot
+        // reach: `records` is borrowed immutably for its whole body.
+        let shift = records.key_shift();
+
         let layout = pages::Layout {
             page: self.geometry.page,
             physical: self.geometry.physical,
@@ -939,8 +1091,11 @@ impl Block {
                 let record = records.ordered(key.number, n).expect("in range");
                 let joins = n > 0
                     && key.compare(
-                        &records.ordered(key.number, n - 1).expect("in range").bytes,
-                        &record.bytes,
+                        &records::keyed(
+                            shift,
+                            &records.ordered(key.number, n - 1).expect("in range").bytes,
+                        ),
+                        &records::keyed(shift, &record.bytes),
                     ) == std::cmp::Ordering::Equal;
                 if joins && key.duplicates {
                     let last = entries.last_mut().expect("a group to join");
@@ -948,7 +1103,7 @@ impl Block {
                     groups.last_mut().expect("a group to join").push(record.position);
                 } else {
                     entries.push(pages::Entry::unique(
-                        key.extract(&record.bytes),
+                        key.extract(&records::keyed(shift, &record.bytes)),
                         record.position,
                     ));
                     groups.push(vec![record.position]);
@@ -1451,6 +1606,31 @@ mod tests {
         out
     }
 
+    /// Mark the first `FCR`-byte half of a synthetic v6 file as the live
+    /// control-record copy, by giving it the higher generation. Every v6 test
+    /// below built by [`file`] carries its actual field values in that first
+    /// half, so anything else would make [`Geometry::read`]'s shadow-copy
+    /// comparison pick a copy of all zeroes.
+    ///
+    /// The second copy lives at byte offset `page_size` -- read from the
+    /// fixture's own `at::PAGE` field, not passed in, so this cannot drift
+    /// from what [`Geometry::read`] itself derives it from -- **not** at a
+    /// fixed `FCR` offset. An earlier version of this helper wrote the second
+    /// generation at `FCR + at::GENERATION`, which for a `file(4096, ...)`
+    /// fixture lands *inside physical page 0*, sixteen bytes past the first
+    /// generation it had just written. That fixture was shaped to match the
+    /// bug `Geometry::read` had at the time, which is exactly why the suite
+    /// could not see it. [`Geometry::read`] also now refuses a second
+    /// physical page that does not start with `"FC"`, so this stamps that
+    /// magic too.
+    fn mark_first_half_live(bytes: &mut [u8]) {
+        let page_size = usize::from(u16::from_le_bytes([bytes[at::PAGE], bytes[at::PAGE + 1]]));
+        bytes[at::GENERATION..at::GENERATION + 2].copy_from_slice(&2u16.to_le_bytes());
+        bytes[page_size..page_size + 2].copy_from_slice(b"FC");
+        bytes[page_size + at::GENERATION..page_size + at::GENERATION + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+    }
+
     /// Read a header out of bytes, by way of a real file.
     ///
     /// A directory per file rather than one shared: tests run in parallel, and
@@ -1514,9 +1694,142 @@ mod tests {
         let mut bytes = file(4096, 1544, 1546, 0, 6);
         bytes[..2].copy_from_slice(b"FC");
         bytes[7] = 0;
+        mark_first_half_live(&mut bytes);
         let geometry = read("NEWMP001.VIR", &bytes).expect("reads");
         assert_eq!(geometry.version, Version::V6);
         assert_eq!(geometry.reclen, 1544);
+    }
+
+    /// A v6 file's control record is shadowed across physical pages 0 and 1,
+    /// and page 0 can be the stale copy: `DUPKEY30.DAT`'s page 0 says the file
+    /// holds no records and its page 1 says thirty. Reading page 0
+    /// unconditionally -- which is what `read_head(path, FCR)` did -- reported
+    /// a populated file as empty, and reported it *without an error*, because
+    /// the two copies agree on every field the self-consistency checks look
+    /// at. Only the counts drift.
+    #[test]
+    fn a_v6_control_record_is_read_from_the_live_shadow_copy() {
+        // `CARGO_MANIFEST_DIR`-relative, not workspace-root-relative -- the
+        // convention `pages.rs`'s `dupkey30()` already uses, because a test
+        // binary's working directory is the crate root, not wherever `cargo
+        // test` was invoked from.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.records, 30, "page 1 is live and says thirty");
+    }
+
+    /// Task 2 made reading records from a v6 file refuse and name the
+    /// version rather than hand back an empty vector -- before that, `walk`
+    /// applied v5's `page * number` arithmetic to `DUPKEY30.DAT` regardless
+    /// of its version and returned *something*, wrong, silently. Task 5
+    /// replaces that refusal with the real path: `DUPKEY30.DAT` is still the
+    /// fixture that catches a regression here, for the same reason it caught
+    /// the original bug -- its 30 records make "found nothing" (or "found
+    /// the wrong thing that happens to count to 30") impossible to pass by
+    /// accident. `crates/mbbs/tests/btrieve.rs`'s
+    /// `dupkey30_reads_byte_for_byte_through_records_read` is the byte-level
+    /// check against the genuine engine's own dump; this one pins the
+    /// higher-level shape -- a v6 file reads through the same `Records::read`
+    /// every v5 file does, with no special-casing at this entry point.
+    #[test]
+    fn a_v6_files_records_are_read_correctly_not_refused() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+
+        let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed)
+            .expect("v6 addressing is resolved as of Task 5");
+        assert_eq!(records.len(), 30, "page 1's live count, walked for real");
+    }
+
+    /// A v6 record's key is two bytes further along than the body it is read
+    /// out of, because a key's `offset` is measured from the physical slot
+    /// and [`Record::bytes`] starts past the slot's two-byte marker
+    /// (Evidence 1b).
+    ///
+    /// `DUPKEY30.DAT`'s only key is four bytes at slot offset 2 -- so the key
+    /// of the record whose body begins `09000000 1b000000` is `09000000`, the
+    /// body's own first four bytes, reached by padding rather than by reading
+    /// the body at offset 2 and getting `1b000000`, its *second* field.
+    ///
+    /// The byte-for-byte fixture tests cannot see this: they compare record
+    /// bodies, which are right either way. Only something that reads a key
+    /// notices, which is why this exists separately.
+    #[test]
+    fn a_v6_records_key_is_padded_past_the_slot_marker() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+        let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed).expect("records");
+
+        let key = &parsed[0];
+        for at in 0..records.len() {
+            let record = records.physical(at).expect("in range");
+            let padded = key.extract(&records.keyed(&record.bytes));
+            assert_eq!(
+                padded,
+                record.bytes[..4].to_vec(),
+                "a v6 key is the body's own first four bytes"
+            );
+        }
+    }
+
+    /// Every other v6 test in this file has its live copy on physical page 1
+    /// -- which alone cannot tell a correct generation comparison apart from
+    /// code that just always prefers the second half. `DUPKEY30SWAPPED.DAT`
+    /// is `DUPKEY30.DAT` with its two shadow-copy halves exchanged by hand --
+    /// byte-for-byte swap of `[0..512)` and `[512..1024)`, nothing else
+    /// touched (see `tools/btrieve-oracle/fixtures/V6CORPUS.txt`) -- so its
+    /// live copy (generation 2, 30 records) is back on physical page 0. This
+    /// is a hand-built fixture, not one the oracle wrote, so the "we write,
+    /// the oracle reads back" rule does not apply to it.
+    #[test]
+    fn the_live_copy_is_found_by_generation_not_by_position() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30SWAPPED.DAT");
+        let geometry = Geometry::read("DUPKEY30SWAPPED.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.records, 30, "page 0 is live here and says thirty");
+    }
+
+    /// The shadow copy is not at byte offset `FCR` (512) -- it is at byte
+    /// offset `page_size`, and the two only coincide when `page_size == 512`.
+    /// `DUPKEY30.DAT` (above) has `page_size == 512`, so it cannot catch this:
+    /// the wrong-offset read and the right one land on the same bytes there.
+    /// `PP2048.DAT` has `page_size == 2048`; before this fix its stale copy
+    /// (page 0, generation 1, 0 records) sits at both offset 0 *and* offset
+    /// 512, so a `read_head(path, FCR)`-style implementation comparing
+    /// `[0..512)` against `[512..1024)` compares padding against padding --
+    /// still inside physical page 0 -- and never reaches physical page 1
+    /// (offset 2048, generation 2, 50 records) at all.
+    #[test]
+    fn a_v6_shadow_copy_is_found_at_page_size_not_at_fcr() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/PP2048.DAT");
+        let geometry = Geometry::read("PP2048.DAT", &path).expect("reads");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.page, 2048);
+        assert_eq!(
+            geometry.records, 50,
+            "physical page 1, at byte offset 2048, is live and says fifty"
+        );
+
+        // `FRAG1024.DAT` also has a non-`FCR` page size (1024), and it is a
+        // *variable-length* v6 file -- Task 6 taught this host to read those,
+        // so it no longer refuses. Its live copy's raw record count is 1.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/FRAG1024.DAT");
+        let geometry = Geometry::read("FRAG1024.DAT", &path).expect("reads, as of Task 6");
+        assert_eq!(geometry.version, Version::V6);
+        assert_eq!(geometry.page, 1024);
+        assert!(geometry.variable);
+        assert_eq!(geometry.records, 1, "physical page 1 is live and says one");
     }
 
     #[test]
@@ -1650,6 +1963,50 @@ mod tests {
         let mut bytes = vec![0u8; 16];
         bytes[..2].copy_from_slice(&n.to_le_bytes());
         bytes
+    }
+
+    /// Writing a v6 file is refused, and the refusal is load-bearing.
+    ///
+    /// Until Task 5 the write path was v6-safe only by accident:
+    /// `Records::read` refused every v6 file, and `insert`/`update` call it
+    /// before doing anything, so neither could get started. Task 5 lifted
+    /// that refusal for reads and un-guarded the writes behind it -- and
+    /// `pages::write_record` seeks to a record's `position` as a literal byte
+    /// offset, while a v6 position carries a **logical** page id (Evidence
+    /// 1c). On `DUPKEY30.DAT` logical 2 is physical 10, so an update would
+    /// have written over a different page entirely and reported success.
+    ///
+    /// Found by Task 5's code review, not by any test: every v6 test in this
+    /// crate reads.
+    #[test]
+    fn a_v6_file_is_read_but_never_written() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
+        let mut block = block(path.clone());
+        block.name = "DUPKEY30.DAT".to_owned();
+        block.geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        block.keys = keys::parse("DUPKEY30.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.maxlen = block.geometry.reclen;
+
+        // Reading it works -- that is Tasks 1-5, and the point of the refusal
+        // being on the write path alone.
+        assert_eq!(block.records().expect("v6 reads").len(), 30);
+
+        let bytes = vec![0u8; usize::from(block.geometry.reclen)];
+        let e = block.insert(&bytes).expect_err("v6 inserts are refused");
+        assert!(e.why.contains("does not write"), "{e}");
+        let at = block
+            .records()
+            .expect("read")
+            .physical(0)
+            .expect("a record")
+            .position;
+        let e = block.update(at, &bytes).expect_err("v6 updates are refused");
+        assert!(e.why.contains("does not write"), "{e}");
+
+        // And the file on disk is untouched.
+        assert_eq!(std::fs::read(&path).expect("readable"), fcr, "not one byte written");
     }
 
     /// The trap the plan names: `geometry` is a `Copy` struct held by value on
@@ -3030,7 +3387,7 @@ mod tests {
             bytes[at::VARIABLE_MARK] = 0xff;
             let e = read("NOROOM.DAT", &bytes)
                 .expect_err("there is no room for a fragment pointer");
-            assert!(e.why.contains("needs four"), "{e}");
+            assert!(e.why.contains("needs 4"), "{e}");
         }
 
         // And four is enough, which is exactly what `WCCTEXT` has spare.
@@ -3069,23 +3426,58 @@ mod tests {
         assert!(e.why.contains("trailing blanks"), "{e}");
     }
 
-    /// A v6 file's fragments do not follow the v5 rule
-    /// (`W32MKDE_decompiled.c:19045`), and `Version` had been parsed and never
-    /// consulted anywhere -- which is exactly how the v5 rule would have been
-    /// applied to a v6 file silently.
+    /// Before Task 6, a v6 file's fragments were refused outright -- `Version`
+    /// had been parsed and never consulted anywhere, which is exactly how the
+    /// v5 rule would have been applied to a v6 file silently. Task 6 taught
+    /// `variable::Chain::follow` to read a v6 chain, so `Geometry::read` no
+    /// longer refuses by version alone; this asserts that directly, alongside
+    /// the fixed-length case that was always read.
     #[test]
-    fn a_btrieve_6_file_of_variable_length_records_is_refused() {
-        let mut bytes = file(512, 100, 104, 0, 2);
+    fn a_btrieve_6_file_of_variable_length_records_is_read_not_refused_by_version_alone() {
+        // `physical - reclen == 6`: Evidence 1b's two-byte slot marker plus
+        // the four-byte fragment pointer, the v6 floor this task adds.
+        let mut bytes = file(512, 100, 106, 0, 2);
         bytes[..2].copy_from_slice(b"FC");
         bytes[at::USRFLGS] = 0x01;
         bytes[at::VARIABLE_MARK] = 0xff;
-        let e = read("SIX.DAT", &bytes).expect_err("v6 fragments are laid out differently");
-        assert!(e.why.contains("V6"), "{e}");
+        mark_first_half_live(&mut bytes);
+        let geometry = read("SIX.DAT", &bytes).expect("Task 6 reads a v6 variable-length file");
+        assert_eq!(geometry.version, Version::V6);
+        assert!(geometry.variable);
 
         // And a v6 file of *fixed*-length records is still read, which is what
         // `NEWMP001.VIR` is.
         let mut fixed = file(512, 100, 100, 0, 2);
         fixed[..2].copy_from_slice(b"FC");
+        mark_first_half_live(&mut fixed);
         assert_eq!(read("SIXFIXED.DAT", &fixed).expect("reads").version, Version::V6);
+    }
+
+    /// The v6-specific half of the room check Task 6 adds: a v6 slot needs
+    /// six spare bytes after `reclen`, not v5's four, because Evidence 1b's
+    /// two-byte marker sits in front of the pointer too. Four or five bytes
+    /// of room would let `Geometry::read` succeed and then panic inside
+    /// `records::walk_v6` slicing a four-byte pointer out of a two- or
+    /// three-byte remainder; refusing here is what this house style prefers
+    /// to that crash.
+    #[test]
+    fn a_v6_variable_length_file_needs_six_spare_bytes_not_four() {
+        for physical in [104u16, 105] {
+            let mut bytes = file(512, 100, physical, 0, 2);
+            bytes[..2].copy_from_slice(b"FC");
+            bytes[at::USRFLGS] = 0x01;
+            bytes[at::VARIABLE_MARK] = 0xff;
+            mark_first_half_live(&mut bytes);
+            let e = read("V6NOROOM.DAT", &bytes)
+                .expect_err("a v6 slot marker leaves no room for the pointer at this gap");
+            assert!(e.why.contains("V6") && e.why.contains("needs 6"), "{e}");
+        }
+
+        let mut bytes = file(512, 100, 106, 0, 2);
+        bytes[..2].copy_from_slice(b"FC");
+        bytes[at::USRFLGS] = 0x01;
+        bytes[at::VARIABLE_MARK] = 0xff;
+        mark_first_half_live(&mut bytes);
+        assert!(read("V6ROOM.DAT", &bytes).expect("six is enough").variable);
     }
 }

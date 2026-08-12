@@ -1,0 +1,131 @@
+V6 fixture corpus -- provenance and measured shape
+==================================================
+
+Every file here was minted from nothing by genuine Pervasive Btrieve 6.15
+running under Wine, on 2026-08-11, by the probes in the parent directory
+(`ppprobe.c`, `varprobe_multi.c`). None is a converted copy of a shipped V5
+file, so the "we write, the oracle reads back" rule is not in play: for a file
+the engine created, the engine is the authority on layout.
+
+They were minted into scratch directories inside a *worktree*, which is not
+durable -- a landed worktree is reaped. These are the ones the v6 page
+addressing work asserts against, promoted here and committed so the tests have
+inputs that outlive the session that made them. The measurements below were
+re-derived here, from these copies, not carried over from the plan.
+
+Field key
+---------
+
+A v6 file's physical page 0/1 hold shadow copies of the file control record
+("FC") and 2/3 the first allocation table pair ("PP"); within a shadow pair the
+higher generation at [0x04] is live. Every other page carries a two-byte type
+tag at [0x00] whose *second* byte is a letter -- 0x44 'D' data, 0x56 'V'
+variable/fragment, 0x45 'E' (seen only on freed pages), 0x80 free/template,
+0x00 never written -- and its own logical id at [0x02].
+
+"claimed" below means the live PP table carries a non-zero marker for that
+physical page. Pages absent from the table are unclaimed, exactly as if their
+marker were zero.
+
+---------------------------------------------------------------------------
+DUPKEY30.DAT      512-byte pages, 12 pages, 30 records, fixed-length
+                  Pre-existing; listed here for completeness (DUPKEY30.txt).
+                  FCR generations 1/2 -- physical page 0 is STALE and says the
+                  file holds no records, physical 1 is live and says thirty.
+                  One PP block. Logical 2 has two claimants, physical 5
+                  (marker 0x0000) and physical 10 (marker 0x4400): the marker
+                  settles it in favour of 10.
+
+DUPKEY30SWAPPED.DAT
+                  NOT minted by the oracle -- hand-built from DUPKEY30.DAT by
+                  exchanging its first two 512-byte halves byte-for-byte
+                  (`[0..512)` <-> `[512..1024)`, nothing else touched), so the
+                  live FCR copy (generation 2, 30 records) lands on physical
+                  page 0 instead of page 1. Every other v6 fixture here has its
+                  live FCR copy on page 1, which cannot distinguish "follows
+                  the generation" from "always prefers the second half"; this
+                  one can. Since the oracle did not write it, the "we write,
+                  the oracle reads back" rule does not apply.
+
+NONMONO1.DAT      512-byte pages, 31 pages, variable-length, 19 'V' pages.
+NONMONO2.DAT      512-byte pages, 38 pages, variable-length, 25 'V' pages.
+                  The same file immediately before and after deleting a record
+                  and reinserting a longer one (NONMONO2.txt). The pair is the
+                  regression signal for the whole map: an implementation that
+                  scans page headers without consulting the allocation table
+                  passes NONMONO1 and fails NONMONO2, where six logical ids
+                  have two physical claimants each. Three of them:
+
+                      logical 11 -> physical 7   (35 is the freed twin)
+                      logical 14 -> physical 17  (32 is the freed twin)
+                      logical 26 -> physical 36  (29 is the freed twin)
+
+                  Note 26 resolves to the HIGHER physical page while 11 and 14
+                  resolve to the lower, so "always take the lower" passes two
+                  of three. Assert all three.
+
+PP2048.DAT        2048-byte pages, 10 pages, 50 records. Was grow2048_50.DAT.
+                  The only fixture here that is not 512-byte-paged, and so the
+                  only one that catches an entry-capacity formula hard-coded
+                  for 512: (2048-12)/4 = 509 entries per PP page against 125.
+
+PP2BLOCK.DAT      512-byte pages, 156 pages, 1500 records. Was grow512_1500.DAT.
+                  The only fixture with a SECOND PP block, at physical 130/131.
+                  Its block indices at [0x02] are 1 and 2, and the generations
+                  show that generation is file-global rather than per-block:
+
+                      block 1: physical 2 gen 1,  physical 3   gen 21  <- live
+                      block 2: physical 130 gen 20, physical 131 gen 21 <- live
+
+                  Where a second block lands is NOT established -- only two
+                  were ever forced into existence -- so find blocks by scanning
+                  for the "PP" magic, never by a formula off the first pair.
+
+FRAG5.DAT         512-byte pages, 13 pages. Was myexp512_r12_t2000.DAT.
+                  A five-page fragment chain, physical 8..12 holding logical
+                  ids 5..9, each pointing at the next by logical id.
+
+FRAG21.DAT        512-byte pages, 30 pages, 21 'V' pages. Was
+                  big512_r12_t10000.DAT. A long chain: catches an
+                  implementation that works for a handful of fragments.
+
+FRAG1024.DAT      1024-byte pages, 19 pages, 10 'V' pages. Was
+                  big1024_r12_t10000.DAT. The same record at a different page
+                  size, so the chain length differs for the same payload.
+
+Rebuilding
+----------
+
+    tools/btrieve-oracle/build.sh          # builds the probes under Wine
+    ppprobe.exe create <file> <pagesize>   # PP corpus
+    varprobe_multi.exe create|insertN|delete|reinsert <file>
+
+Mint into a scratch directory you created. Never point a write op at tmp/,
+~/mmud-demo, ~/mmud-survey, or any shipped .DAT/.VIR -- 6.15 may silently
+convert a V5 file it writes, and the validation would then be checking the
+wrong artifact.
+
+Oracle dumps
+------------
+
+DUPKEY30.dump, PP2048.dump and PP2BLOCK.dump are `btrvprobe dump <file> 0`
+output for the three fixed-length v6 fixtures -- one line per record, in key order: ordinal, length,
+and the record bytes as hex. Produced 2026-08-11 by genuine Btrieve 6.15.
+
+They are committed, unlike the 14 MB WCCTEXT dump the v5 byte-for-byte test
+takes through `$BTRIEVE_ORACLE_DUMP`, because 30 and 50 records are small
+enough to keep beside the files they describe. That means the v6 read path can
+be compared against the engine byte-for-byte in a test that needs no Wine, no
+environment variable, and no network -- so it runs by default rather than only
+when someone remembers to arrange an oracle.
+
+Regenerate with:
+
+    export WINEPREFIX=$HOME/.btrieve-wine
+    cp <fixture>.DAT $WINEPREFIX/drive_c/btrieve/<unique-name>.DAT
+    cd $WINEPREFIX/drive_c/btrieve
+    wine btrvprobe.exe dump 'C:\btrieve\<unique-name>.DAT' 0
+
+Never reuse a path you have presented a different file under: the Microkernel
+caches pages by path and outlives its clients, and it will serve the old file's
+pages under the new file's name. That is why the recipe above says "unique".
