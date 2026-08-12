@@ -391,6 +391,104 @@ pub fn write_record(
         .map_err(|e| fail("writing the file control record", e))
 }
 
+/// Remove one record from its slot, splicing that slot onto the head of the
+/// file's own free list -- the write-side mirror of the reuse
+/// [`write_record`]'s `Slot::Free` case already assumes.
+///
+/// Measured against genuine Pervasive Btrieve 6.15
+/// (`tools/btrieve-oracle/delprobe.c`, `docs/delete-oracle-answer.md`): on a
+/// copy of the real, shipped `WCCCLASS.DAT` (15 records, no prior deletes),
+/// deleting the record at file offset 3843 left [`fcr::FREE`] holding exactly
+/// 3843, and the four bytes AT offset 3843 held `0x16ce` -- the file's own
+/// free-list head **before** this delete, encoded the same
+/// [`long`]/high-word-first way every other record pointer in this format
+/// is. Every byte of the slot from offset 4 to its end was zero. Both
+/// persisted across a close and reopen, and a later insert was measured to
+/// land back at offset 3843 -- reusing exactly this slot -- with the file's
+/// free-list head advancing to 0x16ce, the very value this delete wrote as
+/// the forwarding link. That is the read half of [`Layout::next_slot`]'s
+/// `Slot::Free` reuse, now confirmed from the write half too.
+///
+/// `records` is the file's record count **after** this delete, the same
+/// convention [`write_record`]'s own `records` parameter uses.
+///
+/// This never adds or removes a page, so unlike [`write_record`] it never
+/// touches [`fcr::PAGES`] or [`fcr::HIGHEST`] -- deleting a record shrinks
+/// nothing about the file's own extent, only what one slot inside it holds.
+///
+/// # Errors
+///
+/// If `position` is not a slot boundary of this layout, if the layout's
+/// physical length is too short to hold a four-byte forwarding link (see
+/// [`records::tests`](super::records)'s `RECLEN` comment: a record shorter
+/// than four bytes cannot be on a free list at all, so no real Btrieve file
+/// has one), or if the file cannot be opened, sought, read or written.
+pub fn delete_record(
+    path: &std::path::Path,
+    layout: Layout,
+    position: u32,
+    records: u32,
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if layout.slot_of(position).is_none() {
+        return Err(format!(
+            "{}: {position} is not a record slot of a {}-byte page holding \
+             {}-byte records",
+            path.display(),
+            layout.page,
+            layout.physical
+        ));
+    }
+    if layout.physical < 4 {
+        return Err(format!(
+            "{}: a {}-byte physical slot is too short to hold a four-byte \
+             free-list link -- no real Btrieve file has one this small",
+            path.display(),
+            layout.physical
+        ));
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
+    let fail = |what: &str, e: std::io::Error| format!("{}: {what}: {e}", path.display());
+
+    // The free list's head BEFORE this delete -- becomes the forwarding link
+    // this delete writes into the slot it is freeing, exactly mirroring how
+    // `write_record`'s `Slot::Free` case reads a slot's own forwarding link
+    // before overwriting it with a live record.
+    let mut head = [0u8; 4];
+    file.seek(SeekFrom::Start(fcr::FREE as u64))
+        .and_then(|_| file.read_exact(&mut head))
+        .map_err(|e| fail("reading the free-list head", e))?;
+
+    let mut slack = vec![0u8; usize::from(layout.physical)];
+    slack[..4].copy_from_slice(&head);
+
+    file.seek(SeekFrom::Start(u64::from(position)))
+        .and_then(|_| file.write_all(&slack))
+        .map_err(|e| fail("clearing a deleted record's slot", e))?;
+
+    // Page 0 -- see `write_record`'s identical comment on why this reads and
+    // rewrites the whole first page rather than seeking to each field.
+    let mut fcr = vec![0u8; usize::from(layout.page)];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut fcr))
+        .map_err(|e| fail("reading the file control record", e))?;
+
+    fcr[fcr::RECORDS_HIGH..fcr::RECORDS_HIGH + 4].copy_from_slice(&to_long(records));
+    fcr[fcr::FREE..fcr::FREE + 4].copy_from_slice(&to_long(position));
+
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&fcr))
+        .and_then(|_| file.flush())
+        .map_err(|e| fail("writing the file control record", e))
+}
+
 /// Write one duplicate chain's `[prev][next]` pair into a record on disk.
 ///
 /// Eight bytes at `position + offset`, and nothing else: no record count, no
@@ -2204,6 +2302,105 @@ mod tests {
             "the refused write touched nothing -- it was already zero"
         );
         assert_eq!(long(&bytes[0x1a..0x1e]), 0, "the record count was not bumped either");
+    }
+
+    /// The measured shape from `docs/delete-oracle-answer.md`: deleting a
+    /// record with an EMPTY free list (`fcr::FREE` already `NOWHERE`) writes
+    /// `NOWHERE` itself as the forwarding link -- the deleted slot becomes a
+    /// one-entry list whose tail says "nothing follows", exactly the same
+    /// value [`write_record`]'s `Slot::Free` case would read back if this
+    /// slot were reused next.
+    #[test]
+    fn deleting_the_only_record_makes_its_slot_the_free_lists_one_entry() {
+        let dir = crate::testing::scratch("pages-delete-only-record");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let at = layout.position(4, 0);
+        write_record(&path, layout, Slot::Existing(at), &[0xab; 16], 1).expect("seed a record");
+
+        delete_record(&path, layout, at, 0).expect("delete");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            long(&bytes[at as usize..at as usize + 4]),
+            NOWHERE,
+            "the freed slot's forwarding link: nothing was free before this delete"
+        );
+        assert!(
+            bytes[at as usize + 4..at as usize + 20].iter().all(|b| *b == 0),
+            "every byte behind the link is zero"
+        );
+        assert_eq!(long(&bytes[fcr::FREE..fcr::FREE + 4]), at, "the free-list head is the deleted slot");
+        assert_eq!(long(&bytes[fcr::RECORDS_HIGH..fcr::RECORDS_HIGH + 4]), 0, "the count dropped to zero");
+    }
+
+    /// The general case, matching what was actually measured against
+    /// `WCCCLASS.DAT`: the free list is already non-empty (some earlier
+    /// delete, or -- as on the real shipped file -- reserved capacity from
+    /// however it was originally built), and this delete's slot must become
+    /// the new head with the OLD head as its own forwarding link, not
+    /// `NOWHERE`. A mutation that always wrote `NOWHERE` regardless of the
+    /// prior head would pass the test above and fail only this one.
+    #[test]
+    fn deleting_a_record_links_it_ahead_of_whatever_was_already_free() {
+        let dir = crate::testing::scratch("pages-delete-links-ahead-of-existing-free");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let first = layout.position(4, 0);
+        let second = layout.position(4, 1);
+        write_record(&path, layout, Slot::Existing(first), &[0xab; 16], 1).expect("seed record 1");
+        write_record(&path, layout, Slot::Existing(second), &[0xcd; 16], 2).expect("seed record 2");
+
+        delete_record(&path, layout, first, 1).expect("delete the first");
+        delete_record(&path, layout, second, 0).expect("delete the second");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            long(&bytes[fcr::FREE..fcr::FREE + 4]),
+            second,
+            "the head is the MOST recently deleted slot"
+        );
+        assert_eq!(
+            long(&bytes[second as usize..second as usize + 4]),
+            first,
+            "the second deletion's forwarding link is the first deletion's slot"
+        );
+        assert_eq!(
+            long(&bytes[first as usize..first as usize + 4]),
+            NOWHERE,
+            "the first deletion's own link is still NOWHERE -- it has no successor"
+        );
+        assert_eq!(long(&bytes[fcr::RECORDS_HIGH..fcr::RECORDS_HIGH + 4]), 0);
+    }
+
+    /// A position that is not on a slot boundary must be refused, the same
+    /// as [`write_chain`] already refuses one -- deleting at an invented
+    /// offset would corrupt whatever record actually owns those bytes.
+    #[test]
+    fn deleting_at_a_position_that_is_not_a_slot_boundary_is_refused() {
+        let dir = crate::testing::scratch("pages-delete-refuses-non-slot-position");
+        let path = seed(&dir);
+        let layout = Layout {
+            page: 64,
+            physical: 20,
+            pages: 5,
+        };
+        let at = layout.position(4, 0);
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        let e = delete_record(&path, layout, at + 1, 0).expect_err("not a slot boundary");
+        assert!(e.contains(&(at + 1).to_string()), "{e}");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, before, "a refused delete must not touch the file");
     }
 
     /// `write_chain`'s bound against a page holding exactly one record --

@@ -66,3 +66,25 @@ wccmdact.ini
 
 # Build artifact of tools/btrieve-oracle/build.sh
 tools/btrieve-oracle/btrvprobe.exe
+
+# Build artifact of tools/btrieve-oracle/updprobe.c (Task 4's Q1/Q2/Q3 probe)
+tools/btrieve-oracle/updprobe.exe
+
+# Build artifact of tools/btrieve-oracle/xactprobe.c (Task 6's transaction probe)
+tools/btrieve-oracle/xactprobe.exe
+
+# Build artifact of tools/btrieve-oracle/delprobe.c (Block::delete's oracle probe)
+tools/btrieve-oracle/delprobe.exe
+
+# Build artifact of tools/btrieve-oracle/crtprobe.c -- built by hand, see
+# that file's own header comment.
+tools/btrieve-oracle/crtprobe.exe
+
+# Build artifact of tools/btrieve-oracle/statprobe.c (Btrieve op 15/STAT's
+# oracle probe) -- built by hand, see that file's own header comment.
+tools/btrieve-oracle/statprobe.exe
+
+# Build artifact of tools/btrieve-oracle/seedprobe.c (Task 5's lock probe
+# seeds a fixture in ONE process: 24 sequential fresh wine processes wedge
+# the Microkernel, which sweep.sh's own header also warns about).
+tools/btrieve-oracle/seedprobe.exe

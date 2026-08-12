@@ -56,6 +56,13 @@ const ALLOWED: &[&str] = &[
     "abi.rs",
     "arena.rs",
     "btrieve.rs",
+    // Arrived with the Btrieve locking work merged from `btrieve-finish`, and
+    // caught by this test on the merge rather than noticed by hand -- which is
+    // what it is for. They are engine files behind the seventeen `btv*` shims,
+    // which are the last unconverted block in `ROUTINES`, so they leave this
+    // list in the same commit those shims take a `Call<A>`.
+    "btrieve/ops.rs",
+    "btrieve/stat.rs",
     "fmt.rs",
     "fsd.rs",
     "globals.rs",

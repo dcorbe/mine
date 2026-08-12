@@ -839,6 +839,10 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             keynum,
             value,
             into: None,
+            // `qrybtv` has no `loktyp` at either layer -- `int qrybtv(void
+            // *key, int keynum, int qryopt)`, three arguments -- so there is
+            // nothing to lock. See `ops.rs`'s "Locking" doc section.
+            lock: 0,
         },
     )?)))
 }
@@ -879,6 +883,8 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             keynum: -1,
             value: Btrieve::null(),
             into: Some(into),
+            // `int qnpbtv(int getopt)` -- one argument, no `loktyp`.
+            lock: 0,
         },
     )?)))
 }
@@ -894,10 +900,13 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `recptr` may be null, and then the record goes to `bb->data` --
 /// `PLBTVSTF.C:360`.
 ///
-/// `loktyp` is read and refused if it is not zero. Record locking is a
-/// multi-user concern this host has no second user for yet, and a lock silently
-/// not taken is the kind of difference that shows up as two channels writing
-/// over each other much later.
+/// `loktyp` is taken as a lock at the position `locate` finds, once it finds
+/// one -- see `ops.rs`'s "Locking" module doc section and [`take_lock`].
+/// `WCCMMUD.DLL`'s own 112 call sites all push a literal zero (measured,
+/// `docs/lock-oracle-answer.md`), so this is unreachable for MajorMUD today;
+/// it is honoured anyway, on the repository owner's standing instruction not
+/// to skip a real Btrieve feature merely because this module never asks for
+/// it.
 ///
 /// **With no file current it answers 0**, per `PLBTVSTF.C:357` -- and this is
 /// the one initialisation actually reaches. Call 128 of `_INIT__WCCMMUD` is an
@@ -918,7 +927,6 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let keynum = args.int() as i16;
     let opt = args.int() as i16;
     let lock = args.int() as i16;
-    unlocked("obtbtvl", lock)?;
 
     let op = Op::of(opt).ok_or_else(|| {
         ShimError::Failed(format!(
@@ -939,6 +947,7 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
             keynum,
             value,
             into: Some(into),
+            lock,
         },
     )?)))
 }
@@ -978,7 +987,6 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let into = args.ptr();
     let opt = args.int() as i16;
     let lock = args.int() as i16;
-    unlocked("stpbtvl", lock)?;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
@@ -1049,6 +1057,7 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         return Ok(Ret::U16(0));
     }
     file.seek_to(Cursor::Physical { at });
+    take_lock(host, block, lock)?;
     deliver(machine, host, block, into)?;
     Ok(Ret::U16(1))
 }
@@ -1094,8 +1103,8 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `keynum` and nothing else.
 ///
 /// So there is no `loktyp` word to read, and reading one got the caller's
-/// lowest local instead -- which [`unlocked`] then refused as a lock type the
-/// module never asked for. It shared [`absolute`] with `gabbtvl`, which really
+/// lowest local instead -- which was then read as a lock type the module
+/// never asked for. It shared [`absolute`] with `gabbtvl`, which really
 /// does take four (`add sp,12` at all 34 of its sites), and that is how it
 /// survived: the helper was right for one caller and wrong for the other.
 ///
@@ -1242,14 +1251,14 @@ fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<boo
     } = req;
 
     // `:452` and `:476` both guard before `:479` defaults `recptr` to
-    // `bb->data`. Same ordering point as `obtbtvl`, and the lock is refused
-    // after it for the same reason: with no file current the original returned
-    // before it looked at anything.
+    // `bb->data`. Same ordering point as `obtbtvl`: with no file current the
+    // original returned before it looked at anything, including `lock`, so
+    // `take_lock` runs later -- only once a record has actually been found
+    // (below) -- not here.
     let Some(block) = positioned(machine, host, who)? else {
         note_no_file(host, who);
         return Ok(false);
     };
-    unlocked(who, lock)?;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
@@ -1300,6 +1309,7 @@ fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<boo
         None => Cursor::Physical { at: physical },
     };
     file.seek_to(cursor);
+    take_lock(host, block, lock)?;
 
     // `:484` passes `bb->keyseg`, so Btrieve left the found record's key there.
     answer_with_key(machine, host, block, key)?;
@@ -1332,6 +1342,10 @@ struct Request<'a> {
 
     /// Where the record goes, or `None` for a query, which reads none.
     into: Option<FarPtr>,
+
+    /// The lock type to take once a record is found, or `0` for none --
+    /// `0` for `qrybtv`/`qnpbtv`, which have no `loktyp` at either layer.
+    lock: i16,
 }
 
 /// Position the file a [`Request`] names, and hand back the record if asked.
@@ -1345,6 +1359,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         keynum,
         value,
         into,
+        lock,
     } = req;
     load(host, block)?;
     let key = key_number(machine, host, block, keynum)?;
@@ -1413,18 +1428,42 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         .ordered_len(key)
         .ok_or_else(|| ShimError::Failed(format!("{who} on {name} by key {key}, which it has not")))?;
 
-    // Where the file is now, in this key's order. A cursor left by a step, or
-    // by a query on a different key, is translated through the record's place
-    // rather than reused as an index -- the two orders have nothing to do with
-    // each other.
-    let here = match cursor {
-        Cursor::Ordered { key: had, at } if had == key => Some(at),
-        Cursor::Ordered { key: had, at } => records
-            .ordered(had, at)
-            .and_then(|r| records.find_physical(r.position))
-            .and_then(|physical| records.place_in(key, physical)),
-        Cursor::Physical { at } => records.place_in(key, at),
-        Cursor::Nowhere => None,
+    // Where the file is now, in this key's order -- and **only** `Next` and
+    // `Previous` may ask, because they are the only two operations whose
+    // answer depends on where the file already is. A `Get Equal` does not
+    // care what the cursor holds, so it must not be refused for holding the
+    // wrong sort of cursor.
+    //
+    // **A cursor from another key, or from a step, is refused rather than
+    // translated.** An earlier version translated one through
+    // `Records::place_in` on the reasoning that the two orders describe the
+    // same records. Genuine Btrieve 6.15 does not do that, measured in
+    // `crates/mbbs/tests/btrieve.rs::position_ops_oracle_scenarios`:
+    //
+    //   - `S6` -- `Get Equal` on key 0, then `Get Next` on key 1: status 7,
+    //     "different key number". Not an answer in key 1's order.
+    //   - `S4`/`S4b` -- `Step First`, then `Get Next` on *either* key:
+    //     status 8. A step establishes no key context at all.
+    //
+    // Both are error statuses rather than the 4/9 this layer turns into a
+    // zero, so both stop the module, which is what `PLBTVSTF.C` does with a
+    // status it has no mapping for. Translating produced a *plausible*
+    // record instead, which is the worse failure: the module cannot tell it
+    // asked a question the original would have refused.
+    let here: Result<Option<usize>, String> = match cursor {
+        Cursor::Ordered { key: had, at } if had == key => Ok(Some(at)),
+        Cursor::Ordered { key: had, .. } => Err(format!(
+            "{who} asked {name} for the next record in key {key}'s order, but \
+             the file is positioned in key {had}'s. Real Btrieve refuses this \
+             with status 7, \"different key number\", rather than translating \
+             between the two orders -- measured, S6"
+        )),
+        Cursor::Physical { .. } => Err(format!(
+            "{who} asked {name} for the next record in key {key}'s order, but \
+             the file was positioned by a step, which establishes no key at \
+             all. Real Btrieve refuses this with status 8 -- measured, S4"
+        )),
+        Cursor::Nowhere => Ok(None),
     };
 
     let found = match op {
@@ -1452,23 +1491,27 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
             at.checked_sub(1)
         }
         Op::Less => records.seek(&definitions, key, &wanted).checked_sub(1),
-        Op::Next => match here {
+        Op::Next => match here.map_err(ShimError::Failed)? {
             Some(at) => Some(at + 1).filter(|at| *at < count),
-            None => {
-                return Err(ShimError::Failed(format!(
-                    "{who} asked {name} for the next record and nothing has \
-                     positioned it, so there is no record to be next to"
-                )));
-            }
+            // **An unpositioned `Get Next` is not an error -- it answers.**
+            // `S1` measured genuine Btrieve returning status 0 and the
+            // *first* record for a `Get Next` on a freshly opened file that
+            // nothing has positioned: it behaves as `Get Lowest`.
+            //
+            // This used to refuse, which stopped the module. That is the
+            // most damaging shape a divergence can take here -- the other
+            // two in this function make the host more permissive than the
+            // original and merely lose a refusal, where this one invented a
+            // fatal error in a case the original answered normally.
+            None => (count > 0).then_some(0),
         },
-        Op::Previous => match here {
+        Op::Previous => match here.map_err(ShimError::Failed)? {
             Some(at) => at.checked_sub(1),
-            None => {
-                return Err(ShimError::Failed(format!(
-                    "{who} asked {name} for the previous record and nothing has \
-                     positioned it"
-                )));
-            }
+            // `S1c`: the mirror of `S1` is *not* symmetric. An unpositioned
+            // `Get Previous` measured status 9, "end of file" -- which this
+            // layer turns into a zero, an answer meaning "no such record",
+            // rather than into a refusal.
+            None => None,
         },
     };
 
@@ -1478,6 +1521,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         return Ok(false);
     };
     file.seek_to(Cursor::Ordered { key, at });
+    take_lock(host, block, lock)?;
     answer_with_key(machine, host, block, key)?;
 
     if let Some(into) = into {
@@ -1684,22 +1728,53 @@ fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
         .data())
 }
 
-/// Refuse a lock type this host cannot honour.
+/// Take `lock` at `block`'s current position, once `locate`/`absolute`/
+/// `stpbtvl` have already positioned it there.
 ///
-/// `BTVSTF.H:52` defines four: single or multiple, waiting or not. All four
-/// exist so that two channels reading the same record do not tread on each
-/// other, and this host runs one thing at a time -- so a lock is never
-/// contended and never needed. **Taking that as licence to ignore the argument
-/// is the trap**: the day a second channel exists, every lock the module asked
-/// for will have been silently not taken, and what it protects is a character's
-/// inventory.
-fn unlocked(who: &str, lock: i16) -> Result<(), ShimError> {
-    if lock == 0 {
-        return Ok(());
-    }
-    Err(ShimError::Failed(format!(
-        "{who} asked for lock type {lock}, and this host has no locking to give it"
-    )))
+/// # Task 5, reversed
+///
+/// `docs/plans/2026-08-12-btrieve-finish.md` Task 5 first answered "do not
+/// build this": all **191** lock-capable call sites in `WCCMMUD.DLL` --
+/// `obtbtvl` 112, `gabbtv`/`gabbtvl` 34, `stpbtvl` 45 -- push a literal zero
+/// for `loktyp`, established twice by methods sharing no code. **The
+/// repository owner reversed that**: "we're not going to skip over
+/// implementing functionality because wccmmud won't need it." A routine
+/// with no counterpart at all is a legitimate empty slot; a routine that
+/// exists and is merely unexercised by the one module under test is not,
+/// and locks were the second kind. `crates/mbbs/src/btrieve/ops.rs`'s own
+/// "Locking" module doc section is the full account, including what stays
+/// out of scope and why (cross-client conflict, statuses 84/85 -- a
+/// deferral, not an absence) and the one thing measured but deliberately
+/// not reproduced (a wait-lock inside a transaction deadlocking the real
+/// engine).
+///
+/// This function is now a thin call into [`crate::btrieve::Btrieve::
+/// take_lock`], which delegates to [`crate::btrieve::ops::LockTable::
+/// acquire`] -- the actual state machine, ABI-independent and tested on its
+/// own in `ops.rs`. `lock == 0` is always `Ok(())`.
+///
+/// # This function must run only after positioning has already succeeded
+///
+/// Every caller places this after its own `seek_to`, never before -- moving
+/// it earlier would take a lock ahead of knowing whether a record was even
+/// found, contradicting the measured "an operation that fails takes no
+/// lock". This mirrors [`crate::btrieve::ops::Block::get`]'s own ordering
+/// exactly, and for the same reason.
+///
+/// # The two by-value pins this replaces
+///
+/// The refusal this function used to be was load-bearing for
+/// `a_lock_this_host_cannot_take_is_refused_rather_than_ignored` (`obtbtvl`'s
+/// lock word, by value) and `gabbtvl_takes_its_lock_from_word_five_by_value`
+/// (`gabbtvl`'s word 5, by value). Both are re-pinned below on the new
+/// observable this function creates -- a lock is now readable state, so each
+/// asserts "the engine recorded this lock type at this position" rather than
+/// "the call was refused naming this lock type". Same words, same
+/// discrimination by value, checked the hard way (mutate the shim to read
+/// the adjacent word, confirm the test fails) -- see each test's own doc
+/// comment.
+fn take_lock(host: &mut Host, block: FarPtr, lock: i16) -> Result<(), ShimError> {
+    host.btrieve.take_lock(block, lock).map_err(ShimError::Failed)
 }
 
 /// Push what is current and make `block` current, as `setbtv` does.
@@ -2283,10 +2358,12 @@ mod tests {
         // `add sp,10`, which is those five and no more. `aabbtvl`, the
         // four-argument form, is a separate export the module never imports.
         //
-        // This host read a sixth word as `loktyp` because it shared a helper
-        // with `gabbtvl`, which really does take four. The sixth word is the
-        // caller's, and `unlocked` refused anything nonzero in it -- so the
-        // failure was a lock the module never asked for.
+        // This host used to read a sixth word as `loktyp` because it shared a
+        // helper with `gabbtvl`, which really does take four. The sixth word
+        // was the caller's, and any nonzero garbage there used to be refused
+        // as a lock the module never asked for -- fixed by `UNLOCKED`
+        // (`aabbtv`'s own doc comment), which passes a hardcoded `0` instead
+        // of reading a word that is not there.
         //
         // Invoked with exactly five words, which is what gives this teeth: the
         // word above them is the outer frame's return offset and is not zero.
@@ -2358,15 +2435,258 @@ mod tests {
         assert_eq!(names, ["alpha", "beta", "gamma"]);
     }
 
+    /// **This test used to assert the opposite, and the opposite was wrong.**
+    ///
+    /// Its reasoning was that "the record after nowhere" is not a record and
+    /// that returning the first one would be answering a different question.
+    /// That is a good argument and it is not what genuine Btrieve 6.15 does.
+    /// `crates/mbbs/tests/btrieve.rs::position_ops_oracle_scenarios` `S1`
+    /// measured a `Get Next` on a freshly opened, never-positioned file
+    /// returning **status 0 and the first record** -- it behaves as
+    /// `Get Lowest`.
+    ///
+    /// The old behaviour was the most damaging kind of divergence available
+    /// here: a host error, which stops the module, in a case where the
+    /// original answered normally. A module that opens a file and steps
+    /// straight into `qnxbtv` was killed by this host and served by the real
+    /// one.
+    ///
+    /// `S1c` measured the mirror case and it is **not** symmetric: an
+    /// unpositioned `Get Previous` gives status 9, which this layer turns
+    /// into a zero -- "no such record", an answer -- rather than a refusal.
     #[test]
-    fn a_next_with_nothing_to_be_next_to_refuses() {
-        // Btrieve would have answered with whatever its position block happened
-        // to hold. There is no honest answer: "the record after nowhere" is not
-        // a record, and returning the first one would be a different question's
-        // answer.
+    fn an_unpositioned_next_answers_with_the_lowest_record() {
+        // What the record *is* is a property of the fixture, so this asks the
+        // question that actually matters instead of naming a record: does an
+        // unpositioned Get Next land where an explicit Get Lowest lands?
+        // Hard-coding the answer here would pass just as well if `Next`
+        // returned some other record for some other reason.
+        let lowest = {
+            let mut f = Fixture::new();
+            let block = open(&mut f, "SAMPLE.DAT", 64);
+            let into = buffer(&f, block);
+            assert!(acquire(&mut f, None, 0, 12), "an explicit Get Lowest");
+            f.machine.resolve(into, 64).expect("readable").to_vec()
+        };
+
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+        assert_eq!(
+            f.invoke(qnpbtv, &[56]).expect("answers"),
+            Ret::U16(1),
+            "S1: an unpositioned Get Next answers rather than refusing"
+        );
+        assert_eq!(
+            f.machine.resolve(into, 64).expect("readable"),
+            &lowest[..],
+            "and it answers with the same record an explicit Get Lowest gives"
+        );
+    }
+
+    /// `S6`: a `Get Equal` in one key's order followed by a `Get Next` in
+    /// another's is refused by real Btrieve with status 7, "different key
+    /// number". This host used to translate between the two orders through
+    /// `Records::place_in` and answer.
+    ///
+    /// Needs a file with two keys, which `SAMPLE.DAT` is not -- it has
+    /// exactly one. So the fixture is built by this crate's own
+    /// [`crate::btrieve::create`], the Btrieve `Create` this task added, with
+    /// the two keys deliberately ordering the same three records
+    /// *oppositely*: key 0 ascending 1,2,3 is key 1 descending 3,2,1. That
+    /// way a translation would not merely be unmeasured, it would land on a
+    /// visibly different record, so this test fails loudly rather than
+    /// coincidentally passing.
+    #[test]
+    fn a_next_in_another_keys_order_refuses_rather_than_translating() {
+        let (mut f, _) = two_key_file("btv-shim-crosskey");
+
+        assert!(
+            acquire(&mut f, Some(2), 0, 5),
+            "positioned by key 0, on the record whose key 0 is 2"
+        );
+        assert!(
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 1, 6, 0]).is_err(),
+            "S6: a Get Next in key 1's order is refused, not translated"
+        );
+    }
+
+    /// A two-key file holding three records whose keys order them
+    /// **oppositely**: by key 0 they ascend 1, 2, 3 and by key 1 they ascend
+    /// 3, 2, 1. That opposition is the point -- it means a test can tell
+    /// which key an operation actually followed, instead of only that it
+    /// answered.
+    ///
+    /// Built by this crate's own [`crate::btrieve::create`], because
+    /// `SAMPLE.DAT` has exactly one key and nothing else in the tree has a
+    /// two-key fixture.
+    fn two_key_file(scratch: &str) -> (Fixture, FarPtr) {
+        use crate::btrieve::{FileSpec, KeySpec, SegmentSpec, create};
+
+        let key = |offset: u16| KeySpec {
+            segments: vec![SegmentSpec {
+                offset,
+                length: 2,
+                kind: 0x01,
+                descending: false,
+            }],
+            duplicates: false,
+            modifiable: false,
+        };
+
+        let dir = crate::testing::scratch(scratch);
+        create(
+            &dir.join("TWOKEY.DAT"),
+            &FileSpec {
+                record_length: 8,
+                page_size: 512,
+                keys: vec![key(0), key(2)],
+            },
+        )
+        .expect("creates a two-key file");
+
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "TWOKEY.DAT", 8);
+
+        for (first, second) in [(1u16, 3u16), (2, 2), (3, 1)] {
+            let mut record = [0u8; 8];
+            record[0..2].copy_from_slice(&first.to_le_bytes());
+            record[2..4].copy_from_slice(&second.to_le_bytes());
+            let at = f.bytes(&record, false);
+            f.invoke(dinsbtv, &Fixture::far(at)).expect("inserts");
+        }
+
+        (f, block)
+    }
+
+    /// Where `gabbtvl`'s `keynum` goes, proved by what a following `qnxbtv`
+    /// answers.
+    ///
+    /// **This pair exists because the seam it covers was covered by nothing.**
+    /// The `abi` session measured it on the merged tree: no test anywhere did
+    /// a `gabbtvl` followed by a `qnxbtv`, and all six `gabbtvl` invocations
+    /// passed `keynum = 0` -- so the key-path half of `absolute()`'s argument
+    /// list was pinned by nothing at all, exactly as `loktyp` had been before
+    /// `c6e1e17` pinned word 5. The hole did not move; what changed is that
+    /// [`locate`] now *refuses* a cross-key `Get Next` instead of translating
+    /// it, which made the unpinned word start to matter.
+    ///
+    /// Neither of the pair can pass for the wrong reason:
+    ///
+    /// - if the wrong word were read for `keynum`, the **same-key** case
+    ///   turns into a refusal;
+    /// - if the `S6` refusal regressed to translating, the **cross-key** case
+    ///   turns into an answer.
+    ///
+    /// This one is the same-key case, which is MajorMUD's own usage. It
+    /// checks *which* record comes back rather than merely that one does:
+    /// from the record whose keys are `(2, 2)`, key 1's next is `(1, 3)` and
+    /// key 0's next is `(3, 1)`, so the first field alone says which order
+    /// was followed. `S5` measured genuine Btrieve establishing the key path
+    /// from Get Direct's key number, which is what makes answering correct
+    /// here.
+    #[test]
+    fn a_get_direct_establishes_its_key_and_a_next_on_that_key_answers() {
+        let (mut f, block) = two_key_file("btv-shim-direct-same");
+        let into = buffer(&f, block);
+
+        assert!(
+            acquire(&mut f, Some(2), 0, 5),
+            "learn where the record whose key 0 is 2 lives, through key 0"
+        );
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        // The same record, but reached through key ONE -- so the cursor this
+        // leaves behind is key 1's, not the key 0 the acquire above used.
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
+        )
+        .expect("get direct, establishing key 1");
+
+        assert_eq!(
+            f.invoke(qnpbtv, &[56]).expect("answers"),
+            Ret::U16(1),
+            "a Get Next on the key gabbtvl established is not a cross-key ask"
+        );
+
+        let record = f.machine.resolve(into, 4).expect("readable");
+        assert_eq!(
+            u16::from_le_bytes([record[0], record[1]]),
+            1,
+            "and it followed KEY 1's order to (1,3) -- key 0's next would be (3,1)"
+        );
+    }
+
+    /// The other half of the pair: same setup, but the `Get Next` names a
+    /// different key than `gabbtvl` established, and is refused. See
+    /// [`a_get_direct_establishes_its_key_and_a_next_on_that_key_answers`].
+    #[test]
+    fn a_get_direct_on_one_key_then_a_next_on_another_refuses() {
+        let (mut f, _) = two_key_file("btv-shim-direct-cross");
+
+        assert!(acquire(&mut f, Some(2), 0, 5), "learn where (2,2) lives");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
+        )
+        .expect("get direct, establishing key 1");
+
+        assert!(
+            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 6, 0]).is_err(),
+            "S6: a Get Next in key 0's order, from a key 1 position, refuses"
+        );
+    }
+
+    /// `S4`/`S4b`: a step establishes no key context, so a `Get Next`
+    /// afterwards is refused by real Btrieve with status 8 -- on *either*
+    /// key of the two-key fixture the oracle scenario used, which is what
+    /// rules out "it just means a different key".
+    ///
+    /// This host used to translate the physical position into key order
+    /// through `Records::place_in` and answer. That produced a *plausible*
+    /// record, which is worse than a refusal: nothing downstream can tell
+    /// that the question was one the original would not have answered.
+    #[test]
+    fn a_next_after_a_step_refuses_rather_than_translating_the_position() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(qnpbtv, &[56]).is_err());
+
+        assert!(
+            f.invoke(stpbtvl, &[0, 0, 33, 0]).is_ok(),
+            "step to the first record in physical order"
+        );
+        assert!(
+            f.invoke(qnpbtv, &[56]).is_err(),
+            "S4: and a Get Next afterwards is refused, not translated"
+        );
+    }
+
+    /// `absbtv` on a never-positioned file is the one refusal of the three
+    /// that the oracle **confirms**: `S1b` measured real Btrieve answering
+    /// status 8, "invalid positioning", for a `Get Position` on a freshly
+    /// opened file. So this one stays a refusal.
+    ///
+    /// The step in the middle is deliberately left as it was and is **not**
+    /// claimed to be oracle-confirmed. `S1d` recorded a `Step Next` on a
+    /// nominally unpositioned file answering with status 0, which would make
+    /// this refusal wrong too -- but that scenario ran on a position block
+    /// that earlier scenarios in the same handle had already moved, so what
+    /// it measured may be "step from where S1 left the file" rather than
+    /// "step from nowhere". Answering that needs a scenario with its own
+    /// fresh handle, which has not been run. Recorded rather than acted on,
+    /// because changing a refusal on an ambiguous measurement is exactly the
+    /// mistake the other three fixes were correcting.
+    #[test]
+    fn a_step_or_a_position_with_nothing_to_be_next_to_refuses() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
         assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
         assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
     }
@@ -2449,16 +2769,102 @@ mod tests {
         assert!(f.invoke(stpbtvl, &[0, 0, 99, 0]).is_err());
     }
 
+    /// **Replaces `a_lock_this_host_cannot_take_is_refused_rather_than_
+    /// ignored`, retired now that Task 5 honours locks instead of refusing
+    /// them** (`docs/lock-oracle-answer.md`; see [`take_lock`]'s own doc
+    /// comment for the reversal). The old test asserted a refusal message
+    /// naming "100"; a lock is now readable state instead of a rejection, so
+    /// this asserts the engine recorded it -- same word (`obtbtvl`'s word 6,
+    /// `loktyp`), same by-value discrimination, different observable.
+    ///
+    /// `obtopt = 12` (Lowest, word 5) and `loktyp = 100` (SLWTBV, word 6) are
+    /// two different nonzero values on purpose: reading word 5 for the lock
+    /// instead of word 6 would record lock type 12, not 100, so this fails
+    /// on the wrong word rather than merely on the call failing to error.
+    ///
+    /// **Verified the hard way**: changing `obtbtvl`'s `let lock =
+    /// machine.arg_u16(6)` to `arg_u16(5)` makes this test FAIL --
+    /// `left: Some(12), right: Some(100)` -- confirming it discriminates by
+    /// value rather than by the call merely succeeding either way.
     #[test]
-    fn a_lock_this_host_cannot_take_is_refused_rather_than_ignored() {
-        // One channel is never contended, so every lock would appear to work.
-        // The day there are two, they would all have been silently skipped.
+    fn obtbtvl_records_its_lock_type_by_value() {
         let mut f = Fixture::new();
-        open(&mut f, "SAMPLE.DAT", 64);
-        let e = f
-            .invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
-            .expect_err("SLWTBV is a single record lock with wait");
-        assert!(e.to_string().contains("100"), "{e}");
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
+            .expect("Lowest, single lock with wait -- both are real Btrieve values");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(100),
+            "word 6 is the lock; reading word 5 would have recorded lock type 12 (the opt)"
+        );
+    }
+
+    /// `gabbtvl` reads its lock from **word 5**, and this proves it by value
+    /// rather than by the call merely failing.
+    ///
+    /// **Retains its name and its word-5 pin across the mechanism change**
+    /// (`docs/plans/2026-08-12-btrieve-finish.md`'s Task 5 acceptance
+    /// criterion: "the mechanism changes; 'word 5, by value' must not").
+    /// What changed is the observable: a refusal message used to be the only
+    /// way to see which word was read; now the lock is state this test reads
+    /// back, so it asserts on that instead.
+    ///
+    /// The frame carries `keynum = 1` in word 4 and `loktyp = 3` in word 5,
+    /// two *different* nonzero values, and the assertion names the 3.
+    /// Reading word 4 instead would record lock type 1, not 3 -- and could
+    /// not even reach that far on `SAMPLE.DAT` (the fixture the old version
+    /// of this test used), which has one key: a `keynum` of 3 misread from
+    /// word 5 would refuse with `NoSuchKey` before any lock is recorded at
+    /// all. This version uses [`two_key_file`] and a real, oracle-shaped
+    /// position instead, so the wrong-word case fails on the *value*
+    /// (`Some(1)` instead of `Some(3)`) rather than on an unrelated key
+    /// error masking the question this test exists to answer.
+    ///
+    /// **Verified the hard way**: changing `gabbtvl`'s `let lock =
+    /// machine.arg_u16(5)` to `arg_u16(4)` makes this test FAIL -- `left:
+    /// Some(1), right: Some(3)`.
+    ///
+    /// **Why this exists separately from the `gabbtvl` key-path tests**
+    /// (`a_get_direct_establishes_its_key_and_a_next_on_that_key_answers`,
+    /// `a_get_direct_on_one_key_then_a_next_on_another_refuses`). Those two
+    /// used to catch a lock read from word 4 *transitively*: they pass
+    /// `keynum = 1`, so a misread lock became 1, and the old blanket refusal
+    /// caught it as a side effect. That mechanism is gone now that locks are
+    /// honoured -- both words would read `1`, a single lock would be taken
+    /// without complaint, and both tests would carry on passing with the
+    /// wrong word, exactly as `docs/plans/2026-08-12-btrieve-finish.md`
+    /// warned. This test is what carries the pin now; the two key-path tests
+    /// are not expected to, and are not changed to try.
+    ///
+    /// The `abi` session has an equivalent test on its own branch
+    /// (`c6e1e17`). Deliberately named differently so the two merge as two
+    /// tests rather than as a conflict; both pin the same word and neither is
+    /// redundant until someone decides so on purpose.
+    #[test]
+    fn gabbtvl_takes_its_lock_from_word_five_by_value() {
+        let (mut f, block) = two_key_file("btv-shim-gabbtvl-lock-word-five");
+
+        assert!(
+            acquire(&mut f, Some(2), 0, 5),
+            "find the record whose key 0 is 2, to get a real position to lock"
+        );
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+            panic!("absbtv answers with a position");
+        };
+
+        f.invoke(
+            gabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 1, 3],
+        )
+        .expect("get direct, then take the lock");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(3),
+            "word 5 is the lock; reading word 4 would have recorded lock type 1"
+        );
     }
 
     // # With no Btrieve file current
@@ -2568,25 +2974,26 @@ mod tests {
             panic!("absbtv returns a long");
         };
 
-        let refused = f
-            .invoke(
-                gabbtvl,
-                &[0, 0, position as u16, (position >> 16) as u16, 0, 3],
-            )
-            .expect_err("a lock this host cannot give is a refusal");
-        assert!(
-            format!("{refused}").contains("lock type 3"),
-            "the refusal must name the lock it was asked for, or it is not \
-             evidence that word 5 is what was read: {refused}"
-        );
-
-        // And the same word at zero is not refused, so the refusal above is
-        // the lock's doing rather than anything about this position.
         f.invoke(
             gabbtvl,
-            &[0, 0, position as u16, (position >> 16) as u16, 0, 0],
+            &[0, 0, position as u16, (position >> 16) as u16, 0, 3],
         )
-        .expect("no lock asked for, so nothing to refuse");
+        .expect("get direct, then take the lock");
+
+        // `keynum` is 0 here, so a read from word 4 records NO lock at all
+        // rather than the wrong one -- `None` against `Some(3)`. That is a
+        // different failure signature from
+        // `gabbtvl_takes_its_lock_from_word_five_by_value`, which passes
+        // `keynum = 1` and so fails as `Some(1)`. Both pin word 5; keeping
+        // both means the defect is caught whichever way the neighbouring
+        // word happens to be set at the call site.
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(3),
+            "word 5 is the lock; reading word 4 would have recorded nothing"
+        );
+
+        // And the record still arrived, so the lock did not cost the read.
         assert_eq!(got(&f, into), 6);
     }
 
