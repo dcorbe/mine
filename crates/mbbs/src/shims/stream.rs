@@ -3,13 +3,23 @@
 //! Borland's, re-exported by `MAJORBBS.DLL`:
 //!
 //!
-//! And two of Galacticomm's own, from `DSKUTL.H`, which ask about a file
-//! rather than holding one open:
+//! And two of Galacticomm's own, which ask about a file rather than holding
+//! one open:
 //!
 //!
 //! `getdtd` takes a descriptor this crate handed out; `cntdir` takes a path and
 //! never opens anything, and leaves its whole answer in three host globals.
 //! What a *name* is -- the eleven bytes DOS matched on -- is [`crate::dos`]'s.
+//!
+//! **Correction, found converting these two to a cursor
+//! (docs/plans/2026-08-11-abi-abstraction-implementation.md's Task 4-5):**
+//! only `getdtd` is `DSKUTL.H`'s, and `DSKUTL.H` genuinely does not survive --
+//! it is not among the 125 headers in `re/wg33src/INC/`, so grepping the bare
+//! name finds nothing, which is the closest thing to proof of absence this
+//! crate can offer. `cntdir` is a different header's: `re/wg33src/INC/FIOAPI.H`
+//! declares it, at lines 174-176, alongside the very `numfils`/`numbyts`/
+//! `numbytp` globals [`cntdir`]'s own doc comment already cites -- so it was
+//! mis-attributed here, not genuinely missing.
 //!
 //! What a stream *is* -- the struct, the modes, the text translation -- is
 //! [`crate::stream`]'s. This is the part that knows about the module.
@@ -59,8 +69,14 @@ use crate::stream::Mode;
 /// there is `NULL` for `r` and `r+`, and a create for `w`, `w+`, `a` and `a+` --
 /// which is `CheckOpenType`'s `O_CREAT` column and not [`Mode::readable`].
 pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
-    let spelt = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(2))?).into_owned();
+    // `FILE *fopen(const char *path, const char *mode)` -- Borland's, this
+    // file's own module doc quotes it, and no Galacticomm header redeclares
+    // it (see this file's commit message).
+    let mut args = super::args(machine);
+    let path = args.ptr();
+    let mode = args.ptr();
+    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
+    let spelt = String::from_utf8_lossy(machine.read_cstr(mode)?).into_owned();
 
     let mode = Mode::parse(&spelt).map_err(ShimError::Failed)?;
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
@@ -90,7 +106,9 @@ pub fn fopen(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// have refused already. The cookie is retired rather than reused, so using it
 /// afterwards names the file it used to be.
 pub fn fclose(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let cookie = machine.arg_far(0);
+    // `int fclose(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
+    let mut args = super::args(machine);
+    let cookie = args.ptr();
     host.streams
         .close(cookie)
         .map_err(|e| ShimError::Failed(format!("fclose: {e}")))?;
@@ -107,9 +125,13 @@ pub fn fclose(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// **`NULL` at end of file is an answer.** It is how the module finds the end,
 /// since it imports no `feof`.
 pub fn fgets(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let buffer = machine.arg_far(0);
-    let n = machine.arg_u16(2) as i16;
-    let cookie = machine.arg_far(3);
+    // `char *fgets(char *s, int n, FILE *f)` -- Borland's; no Galacticomm
+    // header redeclares it (`GCOMM.H`'s `mdfgets` is a different routine with
+    // the same shape, not this one -- see this file's commit message).
+    let mut args = super::args(machine);
+    let buffer = args.ptr();
+    let n = args.int() as i16;
+    let cookie = args.ptr();
 
     // Borland would write the terminator into a buffer it was told has no room
     // for one. A host cannot tell that from a call it has misread, and this is
@@ -146,10 +168,13 @@ pub fn fgets(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// Only the bytes actually read are written, which leaves the tail of the
 /// module's buffer as it found it.
 pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let buffer = machine.arg_far(0);
-    let size = machine.arg_u16(2);
-    let count = machine.arg_u16(3);
-    let cookie = machine.arg_far(4);
+    // `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- Borland's;
+    // no Galacticomm header redeclares it.
+    let mut args = super::args(machine);
+    let buffer = args.ptr();
+    let size = args.int();
+    let count = args.int();
+    let cookie = args.ptr();
 
     if size == 0 || count == 0 {
         return Ok(Ret::U16(0));
@@ -186,8 +211,15 @@ pub fn fread(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// does not count generated carriage returns" -- so the answer is the same in
 /// both modes, which is what makes it comparable with `sprintf`.
 pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let cookie = machine.arg_far(0);
-    let (text, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
+    // `int fprintf(FILE *f, const char *fmt, ...)` -- Borland's; no
+    // Galacticomm header redeclares it. `Args::Call { first: 4 }` stays a
+    // literal word index into the frame -- the varargs it walks are not
+    // named arguments the cursor reads, exactly as `prfmsg`'s equivalent
+    // stayed literal when `shims/msg.rs` converted (see eeda7b3).
+    let mut args = super::args(machine);
+    let cookie = args.ptr();
+    let template = args.ptr();
+    let (text, _) = format(machine, template, Args::Call { first: 4 })?;
     host.streams
         .write(cookie, &text)
         .map_err(|e| ShimError::Failed(format!("fprintf: {e}")))?;
@@ -207,7 +239,9 @@ pub fn fprintf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 ///
 /// If a write cache is ever added, this stops being free.
 pub fn fflush(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let cookie = machine.arg_far(0);
+    // `int fflush(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
+    let mut args = super::args(machine);
+    let cookie = args.ptr();
     host.streams
         .name(cookie)
         .map_err(|e| ShimError::Failed(format!("fflush: {e}")))?;
@@ -224,7 +258,11 @@ pub fn fflush(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// A file that *is* there and will not go is a refusal, on the same line
 /// `fopen` draws.
 pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    // `int unlink(const char *path)` -- Borland's; no Galacticomm header
+    // redeclares it.
+    let mut args = super::args(machine);
+    let path = args.ptr();
+    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
 
     let Some(path) = host.find(name) else {
@@ -267,7 +305,12 @@ pub fn unlink(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// returned whatever DOS left in the registers and could not tell a bad handle
 /// from a real answer; this host stops instead.
 pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let fd = machine.arg_u16(0);
+    // `long getdtd(int fhdl)` -- DSKUTL.H:79 per this routine's own doc
+    // comment above, and DSKUTL.H is not among re/wg33src/INC's 125 headers
+    // -- grepping `getdtd` case-insensitively across all of them finds
+    // nothing, confirming "no C source survives" still holds.
+    let mut args = super::args(machine);
+    let fd = args.int();
     let fd = u8::try_from(fd).map_err(|_| ShimError::Failed(format!("getdtd: fd {fd} is not one")))?;
 
     let at = host.streams().modified(fd).map_err(ShimError::Failed)?;
@@ -285,11 +328,15 @@ pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::U32((u32::from(date) << 16) | u32::from(civil.dos_time())))
 }
 
-/// `void cntdir(char *path)` -- count the files and bytes a spec names.
+/// `VOID cntdir(const CHAR *path)` -- count the files and bytes a spec names.
+/// `re/wg33src/INC/FIOAPI.H:174-176` -- this file's own module doc has the
+/// correction: it was long attributed to `DSKUTL.H`, which is the neighbour
+/// that genuinely does not survive.
 ///
-/// `DSKUTL.H:56-58`, and no C source survives. It returns nothing: everything it
-/// produces it leaves in the globals `numfils`, `numbyts` and `numbytp`, which
-/// `DSKUTL.H:23-26` declares and which live in module memory. Four recovered
+/// No C source (the `.C`, as opposed to the header) survives. It returns
+/// nothing: everything it produces it leaves in the globals `numfils`,
+/// `numbyts` and `numbytp`, which `FIOAPI.H:134-137` declares and which live
+/// in module memory. Four recovered
 /// call sites pin the semantics -- `ACCOUNT.C:98`, `BBSRIP.C:314`,
 /// `GALMHS.C:366` and `CHANDIR.C:98` -- and between them they establish that
 /// `numfils` counts what a `fnd1st`/`fndnxt` loop would have returned, that a
@@ -321,7 +368,9 @@ pub fn getdtd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// file" and "nobody looked" are the same answer to a module and only one of
 /// them is true.
 pub fn cntdir(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
+    let mut args = super::args(machine);
+    let path = args.ptr();
+    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
     let spec =
         dos::Name::spec(name).map_err(|why| ShimError::Failed(format!("cntdir({named}): {why}")))?;
