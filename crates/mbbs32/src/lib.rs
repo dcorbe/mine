@@ -49,6 +49,7 @@ mod fault;
 pub mod flatptr;
 mod image;
 mod map;
+mod mem;
 mod pe;
 mod tib;
 
@@ -58,6 +59,7 @@ use asm::{Ctx, USER32_CS, current_cs, trampoline};
 pub use flatptr::{Flat32Ptr, Flat32PtrError};
 pub use image::{Image, Import32, ImportResolver, ThunkSite};
 pub use map::Mapping;
+pub use mem::Memory;
 pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section, Symbol};
 use tib::{DEFAULT_STACK_LEN, Tib};
 

@@ -87,6 +87,10 @@
 //! matters: whether `Call<Wg16>` can be built from a machine actually
 //! executing a call.
 
+mod wg32;
+
+pub use wg32::{Wg32, Wg32Cpu};
+
 /// What differs between the ABIs a module can be compiled for.
 pub trait Abi {
     /// A pointer as this ABI's modules write one.

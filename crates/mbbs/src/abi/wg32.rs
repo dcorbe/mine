@@ -1,0 +1,198 @@
+//! `Wg32`: the flat 32-bit cdecl ABI Worldgroup NT modules were compiled
+//! for.
+//!
+//! The second [`Abi`] implementation -- and the whole reason Task 2 built a
+//! trait rather than a `Machine`-shaped struct: a trait with one
+//! implementation is not known to be an abstraction, only hoped to be one.
+//! Building this surfaced three places the rest of this crate family was,
+//! without saying so, shaped only for `Wg16`. All three are load-bearing
+//! enough to explain here rather than only in a commit message: two are
+//! compile-time trait-bound collisions (below), and the third is a
+//! process-wide runtime one -- no test module lives in this file at all; see
+//! the comment in its place, at the bottom, for why and where its tests
+//! actually live.
+//!
+//! # Collision 1: `Abi::Ptr`'s bound forced `Abi::Mem`'s shape
+//!
+//! `Abi::Ptr` is bound `mbbs_ptr::ModulePtr<Memory = Self::Mem>`. Before this
+//! file existed, `mbbs32::Flat32Ptr`'s only `ModulePtr` impl
+//! (`crates/mbbs32/src/flatptr.rs`) answered `type Memory = mbbs32::Image`
+//! -- and `mbbs-ptr`'s own doc comment said as much: "concretely ...
+//! `mbbs32::Image` for `Flat32Ptr`". So `type Mem = Image` was the only
+//! choice that would satisfy the bound at all, and everything else this
+//! design says about a 32-bit `Mem` -- "Image plus its allocator", "a 32-bit
+//! allocator gets its own `Mapping`" (design doc, Part 3 and its correction
+//! #2) -- was unreachable without widening `Image` itself into an
+//! allocator, which both that correction and this task's own brief reject:
+//! `Image` is a fixed-size mapping made once at load, and staying that way
+//! is deliberate (`crates/mbbs32/src/image.rs`'s own module doc comment).
+//!
+//! Neither horn is acceptable, so the actual fix reaches one file this
+//! task's brief did not originally name: `crates/mbbs32/src/flatptr.rs`'s
+//! `ModulePtr` impl now answers `type Memory = mbbs32::Memory`, a new type
+//! (`crates/mbbs32/src/mem.rs`) that owns the loaded `Image` *and* a second
+//! `Mapping` for host-allocated regions -- exactly the `tib`-owns-its-own-
+//! stack-mapping precedent the design cites, just written down where the
+//! trait bound could actually see it. `Image` itself is untouched: still a
+//! fixed-size mapping, still made once at load, still with no
+//! allocate-more operation. This is not a workaround chosen to make the
+//! bound typecheck; it is the design's own Part 3 architecture, applied to
+//! the one file that had baked in the older answer before a second `Abi`
+//! existed to test it against.
+//!
+//! # Collision 2: `Abi::Cpu` cannot be bare `mbbs32::Machine`
+//!
+//! `Abi::mem` is `fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem` -- a
+//! reborrow, not a second field (see `Call`'s "holds one handle, not two").
+//! For `Wg16` that works because `mbbs16::Machine` owns its `Segments`
+//! outright. `mbbs32::Machine` does not own an `Image` "unlike
+//! `mbbs16::Machine`... **deliberately**" (`crates/mbbs32/src/lib.rs`,
+//! `Machine`'s own doc comment) -- so there is no `&mut Self::Mem` inside a
+//! bare `mbbs32::Machine` for `Abi::mem` to reborrow. `type Cpu =
+//! mbbs32::Machine` compiles as a bare assignment, but `fn mem` cannot then
+//! be implemented for it at all: there is nothing in a `Machine` to return
+//! `&mut`.
+//!
+//! [`Wg32Cpu`] is the fix, and it is not a new idea: it is the design's own
+//! later correction, restated here as code -- "`Wg32::Cpu` is a struct the
+//! host builds holding a `Machine` and its `Image`"
+//! (`docs/plans/2026-08-11-abi-abstraction-implementation.md`, "Tasks 5 and
+//! 6 are in the wrong order"). `Wg32::Cpu` is that struct, not bare
+//! `mbbs32::Machine`.
+
+use super::{Abi, ModuleMem};
+
+/// Execution plus memory, bundled because `Abi::mem` needs somewhere to
+/// reborrow `&mut mbbs32::Memory` out of `&mut Self::Cpu`, and a bare
+/// `mbbs32::Machine` has nowhere to keep one -- see this module's doc
+/// comment ("Collision 2").
+///
+/// Public fields, not a constructor-only opaque struct: this is a bundle a
+/// host builds once, at module load, out of two things it already has to
+/// build anyway (a `Machine` to run code, a `Memory` to hold the loaded
+/// image) -- there is no invariant between them for a constructor to
+/// enforce beyond "both exist".
+pub struct Wg32Cpu {
+    pub machine: mbbs32::Machine,
+    pub mem: mbbs32::Memory,
+}
+
+impl Wg32Cpu {
+    pub fn new(machine: mbbs32::Machine, mem: mbbs32::Memory) -> Self {
+        Self { machine, mem }
+    }
+}
+
+/// The ABI Worldgroup NT modules were compiled for: flat 32-bit addresses,
+/// cdecl throughout (no `Cleans::Callee` -- see the design's Part 2, "32-bit
+/// Worldgroup is uniformly cdecl").
+pub struct Wg32;
+
+impl Abi for Wg32 {
+    type Ptr = mbbs32::Flat32Ptr;
+    type Mem = mbbs32::Memory;
+    type Cpu = Wg32Cpu;
+
+    /// `u32`, not `u16` -- the single number this whole abstraction exists
+    /// to get right. See [`Abi::INT_WIDTH`] below and this crate's mutation
+    /// test: setting it to `2` (matching `Wg16`) is the one bug a second
+    /// `Abi` implementation was built to catch, and it does.
+    type Int = u32;
+
+    const PTR_WIDTH: usize = 4;
+    const INT_WIDTH: usize = 4;
+    const LONG_WIDTH: usize = 4;
+
+    fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
+        mbbs32::Flat32Ptr(u32::from_le_bytes(
+            bytes.try_into().expect("PTR_WIDTH bytes"),
+        ))
+    }
+
+    fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8> {
+        ptr.0.to_le_bytes().to_vec()
+    }
+
+    fn int_from_bytes(bytes: &[u8]) -> Self::Int {
+        u32::from_le_bytes(bytes.try_into().expect("INT_WIDTH bytes"))
+    }
+
+    fn long_from_bytes(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes.try_into().expect("LONG_WIDTH bytes"))
+    }
+
+    /// Plain addition, unchecked -- the same shape `Wg16::ptr_offset` uses
+    /// for its own pointer's offset field. Callers of this method only ever pass
+    /// `delta` bytes into a region [`ModuleMem::alloc_region`] just handed
+    /// back (see [`Abi::ptr_offset`]'s own doc comment), which is at most a
+    /// few tens of kilobytes -- nowhere near `u32::MAX` -- so there is no
+    /// realistic overflow for a checked version to catch that a debug build's
+    /// own overflow panic would not already catch first.
+    fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr {
+        mbbs32::Flat32Ptr(base.0 + u32::from(delta))
+    }
+
+    fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr> {
+        let by = u32::try_from(by).ok()?;
+        base.0.checked_add(by).map(mbbs32::Flat32Ptr)
+    }
+
+    fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem {
+        &mut cpu.mem
+    }
+
+    /// The module's own loaded image, at its own base -- there is no
+    /// near/far distinction left to collapse once every pointer is already
+    /// flat, so "the module's own data segment" and "an ordinary pointer
+    /// into it" are the same address. See [`Abi::data_ptr`]'s own doc
+    /// comment.
+    fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
+        mbbs32::Flat32Ptr(cpu.mem.image().base())
+    }
+}
+
+/// `mbbs32::Memory`'s host-allocation half, named through the trait
+/// `crates/mbbs`'s generic `Heap`/`Arena`/`Globals` already grow through.
+/// Thin delegation on purpose -- `mbbs32::Memory::alloc` (not named
+/// `alloc_region` itself, so this impl body calls it rather than
+/// recursing) already is the bump allocator; this is only the seam that
+/// lets `A::Mem::alloc_region` reach it generically.
+impl ModuleMem for mbbs32::Memory {
+    type Ptr = mbbs32::Flat32Ptr;
+
+    fn alloc_region(&mut self, bytes: usize) -> std::io::Result<Self::Ptr> {
+        self.alloc(bytes)
+    }
+}
+
+// No `#[cfg(test)] mod tests` here, unlike every sibling `Abi` file --
+// deliberately. Any test that builds a real `Wg32Cpu` must build a real
+// `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally calls
+// `mbbs32::fault::arm`, which installs this process's SIGSEGV/SIGILL/
+// SIGBUS/SIGFPE handlers. `crates/mbbs32/src/fault.rs`'s own module doc
+// comment says why that is not safe to do here: "This handler and mbbs16's
+// cannot both be installed... There is exactly one SIGSEGV disposition per
+// process." `cargo test -p mbbs --lib` runs every unit test -- 16-bit and
+// now 32-bit -- in ONE process, so a `Wg32Cpu`-building test in *this* file
+// would install `mbbs32`'s handler over top of whatever `mbbs16`'s own
+// tests need armed, and never restore it.
+//
+// This was not theoretical: an earlier version of this file built a real
+// `Wg32Cpu` right here and `cargo test -p mbbs --lib` went from 1281/0 to
+// 1282/3 -- `tests::survey_mode_still_stops_on_a_fault_reached_after_a_continued_call`,
+// `tests::cycle_names_the_channel_a_poll_sourced_stop_happened_on`, and
+// `shims::fsd::tests::a_module_that_dies_inside_whndun_stops_the_host_cleanly`
+// all failed, every one of them an `mbbs16` fault-recovery test running
+// *after* this file's test had already clobbered the process's SIGSEGV
+// handler. See this task's report for what that means for production, not
+// only for tests: nothing in either crate yet arbitrates one process running
+// both ABIs at once (`fault.rs`'s own words: "Running both ABIs in one
+// process needs a single arbiter dispatching three ways on the faulting
+// CS... deliberately NOT built here").
+//
+// The tests that need a real `Wg32Cpu` -- `Call<Wg32>`'s offset-divergence
+// proof among them -- live in `crates/mbbs/tests/wg32_abi.rs` instead: a
+// separate `cargo test` integration binary is a separate OS process, with
+// its own independent signal disposition table, so arming `mbbs32`'s
+// handler there cannot reach any `mbbs16` test no matter how `cargo test`
+// schedules the two binaries.

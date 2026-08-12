@@ -442,6 +442,7 @@ dependencies = [
  "libc",
  "mbbs-ptr",
  "mbbs16",
+ "mbbs32",
 ]
 
 [[package]]

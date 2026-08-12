@@ -14,8 +14,10 @@ use std::fmt;
 /// value a module holds (see `crates/mbbs/src/heap.rs`'s `blocks` map).
 pub trait ModulePtr: Copy + Eq + std::hash::Hash + fmt::Debug + fmt::Display {
     /// What this pointer resolves against: a module's *memory*, and nothing
-    /// else. Concretely `mbbs16::Segments` for `FarPtr` and `mbbs32::Image`
-    /// for `Flat32Ptr`.
+    /// else. Concretely `mbbs16::Segments` for `FarPtr` and `mbbs32::Memory`
+    /// for `Flat32Ptr` -- the module's loaded `Image` plus the host's own
+    /// allocation arena, not `Image` alone (a `Flat32Ptr` the host handed
+    /// out of `alloc_region` resolves against memory `Image` never owned).
     ///
     /// It was `mbbs16::Machine` until `Segments` was split out of it, on the
     /// reasoning that `Machine` owned both execution and memory and so was

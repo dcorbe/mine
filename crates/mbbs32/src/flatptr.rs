@@ -1,9 +1,14 @@
-//! A 32-bit module's pointer: a linear address into its mapped [`Image`].
+//! A 32-bit module's pointer: a linear address into its [`Memory`] -- the
+//! module's mapped `Image`, or a region the host allocated in that same
+//! `Memory`'s arena.
 //!
-//! **Linear, not an RVA.** [`Image::base()`] is almost never the module's
-//! own `ImageBase` -- `Mapping::new` never requests a fixed address. A
-//! `Flat32Ptr` therefore converts to an rva by subtracting `image.base()`,
-//! not by being one directly.
+//! **Linear, not an RVA.** `Image::base()` is almost never the module's own
+//! `ImageBase` -- `Mapping::new` never requests a fixed address. A
+//! `Flat32Ptr` therefore converts to an rva by subtracting the containing
+//! mapping's own base, not by being one directly. Which mapping contains it
+//! is [`Memory`]'s question to answer (`Memory::read_at`/`write_at`/
+//! `tail_from`), not this module's -- see that type's own doc comment for
+//! why the image and the arena are two separate `Mapping`s rather than one.
 //!
 //! **Constructible only from a linear address, never from another
 //! pointer type's bits.** `FarPtr` is also 32 bits total
@@ -13,7 +18,7 @@
 
 use mbbs_ptr::ModulePtr;
 
-use crate::Image;
+use crate::Memory;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Flat32Ptr(pub u32);
@@ -46,35 +51,24 @@ impl std::fmt::Display for Flat32Ptr {
 }
 
 impl ModulePtr for Flat32Ptr {
-    type Memory = Image;
+    type Memory = Memory;
     type Error = Flat32PtrError;
 
-    fn resolve<'m>(&self, memory: &'m Image, len: usize) -> Result<&'m [u8], Flat32PtrError> {
-        let rva = self.0.wrapping_sub(memory.base());
+    fn resolve<'m>(&self, memory: &'m Memory, len: usize) -> Result<&'m [u8], Flat32PtrError> {
         memory
-            .read_at(rva, len)
-            .map_err(|_| Flat32PtrError::OutOfBounds { addr: self.0, len })
+            .read_at(self.0, len)
+            .ok_or(Flat32PtrError::OutOfBounds { addr: self.0, len })
     }
 
-    fn read_cstr<'m>(&self, memory: &'m Image) -> Result<&'m [u8], Flat32PtrError> {
-        let rva = self.0.wrapping_sub(memory.base());
-
-        // A pointer with zero bytes left before the image ends is refused as
-        // OutOfBounds, not treated as an empty Unterminated string -- the
+    fn read_cstr<'m>(&self, memory: &'m Memory) -> Result<&'m [u8], Flat32PtrError> {
+        // A pointer with zero bytes left before its mapping ends is refused
+        // as OutOfBounds, not treated as an empty Unterminated string -- the
         // same distinction `FarPtr::read_cstr` (mbbs16/src/lib.rs) draws via
-        // its own `filter(|n| *n > 0)`. Kept explicit here rather than
-        // saturating to zero and letting the terminator scan fail on an
-        // empty slice, so the two ModulePtr impls agree at this boundary.
-        let avail = memory
-            .as_slice()
-            .len()
-            .checked_sub(rva as usize)
-            .filter(|n| *n > 0)
-            .ok_or(Flat32PtrError::OutOfBounds { addr: self.0, len: 1 })?;
-
+        // its own `filter(|n| *n > 0)`; `Memory::tail_from` draws it the same
+        // way, so the two `ModulePtr` impls agree at this boundary.
         let tail = memory
-            .read_at(rva, avail)
-            .map_err(|_| Flat32PtrError::OutOfBounds { addr: self.0, len: 1 })?;
+            .tail_from(self.0)
+            .ok_or(Flat32PtrError::OutOfBounds { addr: self.0, len: 1 })?;
         let n = tail
             .iter()
             .position(|&b| b == 0)
@@ -82,11 +76,10 @@ impl ModulePtr for Flat32Ptr {
         Ok(&tail[..n])
     }
 
-    fn write(&self, memory: &mut Image, bytes: &[u8]) -> Result<(), Flat32PtrError> {
-        let rva = self.0.wrapping_sub(memory.base());
+    fn write(&self, memory: &mut Memory, bytes: &[u8]) -> Result<(), Flat32PtrError> {
         memory
-            .write_at(rva, bytes)
-            .map_err(|_| Flat32PtrError::OutOfBounds { addr: self.0, len: bytes.len() })
+            .write_at(self.0, bytes)
+            .ok_or(Flat32PtrError::OutOfBounds { addr: self.0, len: bytes.len() })
     }
 }
 
@@ -94,6 +87,12 @@ impl ModulePtr for Flat32Ptr {
 mod tests {
     use super::*;
     use crate::pe::PeImage;
+    use crate::{Image, Memory};
+
+    /// Arena size for tests that only ever exercise `Memory`'s image half.
+    /// Unused, but `Mapping::new(0)` fails (`mmap(len = 0)` is refused), so
+    /// `Memory::new` needs some positive length.
+    const TEST_ARENA_LEN: usize = 0x1000;
 
     /// `size_of_image` this fixture's optional header plants -- large enough
     /// that a one-section image maps comfortably inside it, with room past
@@ -156,28 +155,36 @@ mod tests {
         Image::load(file, &image).expect("fixture loads")
     }
 
+    /// `load`, wrapped in the `Memory` a `Flat32Ptr` actually resolves
+    /// against -- `TEST_ARENA_LEN` bytes of arena that none of these tests
+    /// exercise (they are all about the image half).
+    fn mem(file: &[u8]) -> Memory {
+        Memory::new(load(file), TEST_ARENA_LEN).expect("arena mapping")
+    }
+
     #[test]
     fn a_linear_address_resolves_through_its_image() {
         // Arrange: a known byte pattern at rva 0x1010 (file offset
         // RAW_OFFSET + 0x10, inside the CODE section's raw data).
         let mut file = minimal_with_one_section();
         file[RAW_OFFSET + 0x10..RAW_OFFSET + 0x14].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let image = load(&file);
+        let image = mem(&file);
 
         // `Mapping::new` (map.rs) never asks mmap for a fixed address --
-        // `MAP_32BIT`, no `MAP_FIXED` -- so `image.base()` is a real,
+        // `MAP_32BIT`, no `MAP_FIXED` -- so `image.image().base()` is a real,
         // kernel-chosen address. It is never 0 (Linux refuses to hand back
         // the zero page), and it dwarfs this fixture's rva scale (a few
         // KiB). That is exactly the property `Image::relocate`'s own
         // nonzero-delta tests (`tests/map.rs`) lean on, applied here to
         // `Flat32Ptr` instead of to relocation: a `resolve` that forgot to
-        // subtract `memory.base()` and used `self.0` directly as the rva
-        // would ask `Image::read_at` for a multi-hundred-megabyte offset,
-        // far past `SIZE_OF_IMAGE` (0x2000) -- an `Err`, not a
-        // coincidentally correct answer. Only an implementation that
-        // actually computes `self.0 - memory.base()` can pass this.
+        // subtract the containing mapping's own base and used `self.0`
+        // directly as the rva would ask `Image::read_at` for a
+        // multi-hundred-megabyte offset, far past `SIZE_OF_IMAGE` (0x2000)
+        // -- an `Err`, not a coincidentally correct answer. Only an
+        // implementation that actually computes `self.0 - base` can pass
+        // this.
         let rva = 0x1010u32;
-        let base = image.base();
+        let base = image.image().base();
         assert_ne!(base, 0, "a real mmap base is never the null address");
         assert!(
             base > SIZE_OF_IMAGE,
@@ -192,9 +199,9 @@ mod tests {
     #[test]
     fn a_pointer_past_the_image_is_refused() {
         let file = minimal_with_one_section();
-        let image = load(&file);
+        let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
         let err = ptr.resolve(&image, 1).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
@@ -205,16 +212,16 @@ mod tests {
         file[RAW_OFFSET + 0x20..RAW_OFFSET + 0x26].copy_from_slice(b"hello\0");
         // Past the terminator: must not show up in the answer.
         file[RAW_OFFSET + 0x26] = b'X';
-        let image = load(&file);
+        let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.base() + 0x1020);
+        let ptr = Flat32Ptr(image.image().base() + 0x1020);
         assert_eq!(ptr.read_cstr(&image).unwrap(), b"hello");
     }
 
     #[test]
     fn read_cstr_without_a_terminator_before_the_images_end_is_unterminated() {
         let file = minimal_with_one_section();
-        let mut image = load(&file);
+        let mut image = mem(&file);
 
         // Overwrite the entire tail of the image, from rva 0x1000 to
         // SIZE_OF_IMAGE, with a non-zero byte -- a fresh mapping's
@@ -223,9 +230,12 @@ mod tests {
         // `read_cstr`'s "ran off the end" path is exercised at all.
         let rva = 0x1000u32;
         let tail_len = (SIZE_OF_IMAGE - rva) as usize;
-        image.write_at(rva, &vec![0xAAu8; tail_len]).unwrap();
+        image
+            .image_mut()
+            .write_at(rva, &vec![0xAAu8; tail_len])
+            .unwrap();
 
-        let ptr = Flat32Ptr(image.base() + rva);
+        let ptr = Flat32Ptr(image.image().base() + rva);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
     }
@@ -236,9 +246,9 @@ mod tests {
         // scan -- that is a distinct failure from "scanned some bytes, found
         // no terminator," and FarPtr::read_cstr draws the same distinction.
         let file = minimal_with_one_section();
-        let image = load(&file);
+        let image = mem(&file);
 
-        let ptr = Flat32Ptr(image.base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
@@ -253,12 +263,12 @@ mod tests {
         // enough to scan, and scanning it and finding no terminator is
         // Unterminated, not OutOfBounds.
         let file = minimal_with_one_section();
-        let mut image = load(&file);
+        let mut image = mem(&file);
 
         let rva = SIZE_OF_IMAGE - 1;
-        image.write_at(rva, &[0xAA]).unwrap();
+        image.image_mut().write_at(rva, &[0xAA]).unwrap();
 
-        let ptr = Flat32Ptr(image.base() + rva);
+        let ptr = Flat32Ptr(image.image().base() + rva);
         let err = ptr.read_cstr(&image).unwrap_err();
         assert_eq!(err, Flat32PtrError::Unterminated { addr: ptr.0 });
     }
@@ -266,25 +276,25 @@ mod tests {
     #[test]
     fn write_then_resolve_sees_the_write() {
         let file = minimal_with_one_section();
-        let mut image = load(&file);
+        let mut image = mem(&file);
 
-        let ptr = Flat32Ptr(image.base() + 0x1030);
+        let ptr = Flat32Ptr(image.image().base() + 0x1030);
         ptr.write(&mut image, &[1, 2, 3, 4]).unwrap();
         assert_eq!(ptr.resolve(&image, 4).unwrap(), &[1, 2, 3, 4]);
     }
 
     #[test]
     fn write_past_the_image_is_refused() {
-        // write()'s delegation to Image::write_at is otherwise untested on
+        // write()'s delegation to Memory::write_at is otherwise untested on
         // its error path -- Image::write_at's own out-of-bounds case is
         // covered directly (image.rs), which proves the primitive but not
         // that Flat32Ptr::write forwards its failure rather than discarding
         // it. A mutation that kept the write_at call but always returned
         // Ok(()) passed the whole suite until this test existed.
         let file = minimal_with_one_section();
-        let mut image = load(&file);
+        let mut image = mem(&file);
 
-        let ptr = Flat32Ptr(image.base() + SIZE_OF_IMAGE);
+        let ptr = Flat32Ptr(image.image().base() + SIZE_OF_IMAGE);
         let err = ptr.write(&mut image, &[0]).unwrap_err();
         assert_eq!(err, Flat32PtrError::OutOfBounds { addr: ptr.0, len: 1 });
     }
