@@ -452,10 +452,32 @@ pub struct Query {
 /// and `Host` is missing from both": `Host` owns [`Heap`], [`Globals`],
 /// [`TextVars`], [`msg::Messages`], [`stream::Streams`] and [`Users`], each
 /// already generic over `A` (`Heap`/`Arena`/`Globals` in one commit, the other
-/// four one file at a time), so those fields flip to `<A>` here. Every
-/// method stays in `impl Host<Wg16>` below, taking `&mut Machine` exactly as
-/// before -- the same "generic at the type level, `Wg16`-only method surface"
-/// landing point `Globals` chose deliberately, not a partial conversion.
+/// four one file at a time), so those fields flip to `<A>` here.
+///
+/// # Split method surface, like `Users`
+///
+/// Unlike `Heap`/`Globals`/`TextVars`/`Messages`/`Streams` -- each of which
+/// landed as "generic at the type level, `Wg16`-only method surface" on
+/// purpose -- part of `Host`'s own surface is genuinely generic, the same way
+/// [`Users::nth`] and its dependents turned out to be. Every accessor and
+/// piece of bookkeeping that never touches a `Machine` lives in `impl<A:
+/// Abi> Host<A>`: field accessors (`globals`, `heap`, `users`, `textvars`,
+/// `messages`, `streams`, ...), the notes/audit/keys-asked logs, the module
+/// filesystem helpers, and `next_spr_buffer`/`next_l2as_buffer`/`mdf_buffer`/
+/// `empty_string`, which now build their pointers through [`Abi::ptr_offset`]
+/// instead of a hand-built `FarPtr`. A handful of those
+/// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`)
+/// read or build [`Registration`]/[`Agent`]/[`Kick`], which are concrete
+/// `FarPtr`-typed structs with no `Abi` parameter of their own -- moving
+/// their *accessors* here costs nothing (the fields they read are not
+/// parameterized by `A` either), but the module dispatch table itself will
+/// not serve a 32-bit module until those three types grow one too. Not this
+/// task's scope; see the doc comment on `impl<A: Abi> Host<A>` below.
+///
+/// Everything that reads or writes module memory -- every method taking
+/// `&mut Machine`/`&Machine`, plus [`Host::check_globals`] (no `Machine`
+/// parameter, but built entirely around `mbbs16::NeImage`, the 16-bit NE
+/// format `Host::load` parses) -- stays in `impl Host<Wg16>`.
 ///
 /// [`btrieve::Btrieve`] stays concrete: it is out of scope here (a concurrent
 /// session owns that file) and a generic struct is free to hold
@@ -889,7 +911,480 @@ impl<A: Abi> Default for FsdSession<A> {
     }
 }
 
+/// Every method here works purely off the fields `Host<A>` already owns --
+/// field accessors, pointer arithmetic through [`Abi::ptr_offset`],
+/// bookkeeping vectors and maps -- and never needs a `Machine`. See the
+/// struct's own doc comment ("Split method surface, like `Users`") for
+/// which methods that includes and the one caveat: a few of them
+/// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`)
+/// read or build [`Registration`]/[`Agent`]/[`Kick`], concrete `FarPtr`-typed
+/// structs that are not themselves generic over `A` -- living here costs
+/// nothing today (the fields are not parameterized either) but does not by
+/// itself make the module dispatch table serve a second ABI; that is those
+/// types' own conversion, not attempted here.
+impl<A: Abi> Host<A> {
+    /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
+    /// every `Entry::Unimplemented` call site it reaches from now on,
+    /// recording each one into `inventory` instead of stopping the module.
+    ///
+    /// # Read `crate::survey`'s module doc before calling this
+    ///
+    /// **This produces wrong behaviour, on purpose, for enumeration only.**
+    /// A fabricated return is a lie the module cannot tell from a real
+    /// answer -- it is not "the call did nothing", it is "the call
+    /// succeeded and returned zero/null", and the module acts on that lie
+    /// for as long as it runs afterwards. Never call this outside a
+    /// throwaway diagnostic session; never call it on a board anyone is
+    /// actually playing on.
+    ///
+    /// `inventory` is a shared handle rather than a value this method takes
+    /// ownership of, because `Host` does not live long enough to be trusted
+    /// with the only copy -- see this struct's own `survey` field.
+    pub fn enable_survey(&mut self, inventory: survey::Shared) {
+        self.survey = Some(inventory);
+    }
+
+    /// The host's globals.
+    pub fn globals(&self) -> &Globals<A> {
+        &self.globals
+    }
+
+    /// Every line `shocst` has produced, oldest first.
+    pub fn audit(&self) -> &[String] {
+        &self.audit
+    }
+
+    pub fn modules(&self) -> &[Registration] {
+        &self.modules
+    }
+
+    /// The first *module* registration, skipping any [`Registration::Native`]
+    /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
+    /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
+    /// and neither wants to mistake the FSD's native slot for it.
+    fn first_module(&self) -> Option<&Registration> {
+        self.modules
+            .iter()
+            .find(|r| matches!(r, Registration::Module { .. }))
+    }
+
+    /// The FSD's own `state` slot, the way `register_module`'s caller keeps
+    /// the number it returned.
+    ///
+    /// # Panics
+    ///
+    /// If called before [`Host::finish_init`] has registered it -- nothing
+    /// in this crate can reach a channel's `state` that early, so this is a
+    /// programming error rather than a condition callers should handle.
+    pub(crate) fn fsd_state(&self) -> usize {
+        self.fsd_state
+            .expect("finish_init registers the FSD before anything can reach it")
+    }
+
+    /// What time it is, and one step later than the last time anyone asked.
+    ///
+    /// **Reading the clock moves it**, under [`Clock::stepped`]. The returned
+    /// value is a frozen snapshot, so `now`'s `.civil()` and `time`'s `.epoch()`
+    /// stay consistent within one call; it is the *next* read that has moved.
+    /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
+    /// only a counter for them.
+    pub fn clock(&mut self) -> Clock {
+        self.clock = self.clock.advanced();
+        self.clock_reads += 1;
+        self.clock
+    }
+
+    /// How many times the clock has been read, host and module together.
+    ///
+    /// Under [`Clock::stepped`] a read is also a step, so how far invented time
+    /// has run is a function of how often the module looked at it -- a property
+    /// of the module, which no host-side argument bounds. This is how the size
+    /// of that is measured instead of argued about, the way
+    /// [`Host::keys_asked`] measures locks. The host's own share of these is
+    /// [`Cycles::iterations`]; the rest is the module's.
+    pub fn clock_reads(&self) -> u64 {
+        self.clock_reads
+    }
+
+    /// Freeze the clock, or hand the host a different one.
+    ///
+    /// **A pinned clock is what makes a run reproducible.** MajorMUD seeds its
+    /// generator with `srand(time(NULL))` six calls into initialisation, so
+    /// without this no test can assert what the module *built* -- only how many
+    /// calls it took to build it. See [`Clock`] for the hazard a frozen clock
+    /// carries.
+    pub fn set_clock(&mut self, clock: Clock) {
+        self.clock = clock;
+    }
+
+    /// Every client/server agent that has registered, in the order it did.
+    ///
+    /// **Nothing dispatches to them.** An agent is one end of the Galacticomm
+    /// Client/Server protocol and the other end is a Worldgroup client, which
+    /// this host has no way to be talking to. So this is the record of what a
+    /// client/server layer would call into, in the same sense that
+    /// [`Host::kicks`] is a record of what a main loop would owe.
+    pub fn agents(&self) -> &[Agent] {
+        &self.agents
+    }
+
+    /// The text variables that have been registered.
+    ///
+    /// Unlike [`Host::agents`] and [`Host::kicks`] this is **not** only a
+    /// record: the table is real module memory and the `txtvars` global points
+    /// at it, so the module can walk it whether or not this host ever
+    /// substitutes anything. What is still owed is `findtvar` and the
+    /// substitution itself.
+    pub fn textvars(&self) -> &TextVars<A> {
+        &self.textvars
+    }
+
+    /// Every callback the module asked `rtkick` to run later.
+    ///
+    /// [`Host::cycle`] runs them, once per elapsed second, the same way the
+    /// real host's main loop did: `rtkick` is a one-shot timer measured in
+    /// seconds, and `MAJORBBS.C:476-480` ran `prcrtk()` once per elapsed
+    /// second. `Host::cycle` tracks elapsed seconds against its own clock and
+    /// calls [`Host::prcrtk`] the same number of times, catching up in one
+    /// pass if more than a second has elapsed since the last call.
+    ///
+    /// So this list is not only a record: it is served, on the schedule above.
+    /// MajorMUD registers two during initialisation -- a one-second heartbeat
+    /// into its own segment 6, and a second one-second callback into segment
+    /// 10, which is the last thing it does before it asks for a random number.
+    pub fn kicks(&self) -> &[Kick] {
+        &self.kicks
+    }
+
+    /// Every form the module asked `fsdroom` to size, keyed by the
+    /// `(message number, amode)` it was compiled from.
+    ///
+    /// A cache, not a session: what a caller can usefully ask this host is
+    /// "what forms exist" and not "what is channel 0 in the middle of" --
+    /// see [`Host::fsdtmp`] and [`Host::fsdscb`] for the per-channel half of
+    /// that question.
+    pub fn forms(&self) -> &std::collections::HashMap<(u16, i16), Form> {
+        &self.forms
+    }
+
+    /// The message files that are open.
+    pub fn messages(&self) -> &msg::Messages<A> {
+        &self.messages
+    }
+
+    /// The Btrieve files that are open.
+    pub fn btrieve(&self) -> &btrieve::Btrieve {
+        &self.btrieve
+    }
+
+    /// The streams that are open.
+    pub fn streams(&self) -> &stream::Streams<A> {
+        &self.streams
+    }
+
+    /// Every data file the host created from its virgin copy.
+    pub fn installed(&self) -> &[String] {
+        &self.installed
+    }
+
+    /// Everything the host did that the module could not be told about.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// Take every note recorded so far, leaving none behind.
+    ///
+    /// [`Self::notes`] alone makes this list write-only in practice: nothing
+    /// ever removes an entry, so a long-lived host accumulates one string per
+    /// note for as long as it runs. That is not hypothetical -- one session
+    /// driving a character into the Realm recorded 4,962 notes, all but a
+    /// handful of them the same `setbtv` stack overflow, and a caller reading
+    /// `notes()` has no way to tell which of them it has already seen.
+    ///
+    /// So a caller that wants to *report* notes drains them, and a caller that
+    /// wants to *assert* on them (every test in this crate) borrows them. The
+    /// two cannot be the same method: draining in `notes()` would need `&mut
+    /// self` and would make two consecutive reads disagree.
+    ///
+    /// [`Self::note_once`]'s `noted` set is deliberately **not** cleared here.
+    /// Its promise is "once per host", not "once per drain" -- resetting it
+    /// would turn every drain into a fresh licence to repeat, which is the
+    /// flood it exists to prevent.
+    pub fn drain_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// Record something the module cannot be told. See [`Host::notes`].
+    pub(crate) fn note(&mut self, what: String) {
+        self.notes.push(what);
+    }
+
+    /// Record something once, however many times it happens.
+    ///
+    /// For a note whose cause can repeat without changing: a `qrybtv` with no
+    /// Btrieve file current inside a loop would otherwise put thousands of
+    /// identical lines in [`Host::notes`], and a channel that has to be skimmed
+    /// is one nobody reads.
+    ///
+    /// `key` is what "the same thing" means -- usually the routine's name --
+    /// and is kept apart from `what` so a message carrying a file name still
+    /// reports once.
+    pub(crate) fn note_once(&mut self, key: &str, what: String) {
+        if self.noted.insert(key.to_owned()) {
+            self.notes.push(what);
+        }
+    }
+
+    /// The module's heap.
+    pub fn heap(&self) -> &Heap<A> {
+        &self.heap
+    }
+
+    /// The per-channel tables. See [`Users`].
+    pub fn users(&self) -> &Users<A> {
+        &self.users
+    }
+
+    /// Every lock a module has asked about, in order.
+    ///
+    /// The lock names are sysop-editable text in the module's `.MSG` --
+    /// `PLAYKEY {USER}` is a default, not a measurement -- and most call
+    /// sites are guarded by `if (lockname[0] != '\0')`, so which ones a
+    /// module actually asks about is a property of the installed
+    /// configuration and not of the DLL. Reading the sequence off a real run
+    /// is the only way to know it.
+    ///
+    /// This is how `a_connected_channel_takes_a_command_and_answers`
+    /// (`tests/wccmmud.rs`) pins which gates the module walked and what each
+    /// answered, rather than trusting the call count alone. A key set that
+    /// grants too much still moves that count while quietly putting the
+    /// module on a different branch -- MajorMUD's namespace has negative
+    /// locks -- and that is not hypothetical here: two of the five locks the
+    /// meter test's run asks about are ban keys, and a mutation that answered
+    /// every lock `true` was caught by the call count moving, not by luck.
+    pub fn keys_asked(&self) -> &[Query] {
+        &self.asked
+    }
+
+    /// Record a `haskey` call. See [`Host::keys_asked`].
+    pub(crate) fn asked_for_key(&mut self, chan: i16, lock: &str, answer: bool) {
+        self.asked.push(Query {
+            chan,
+            lock: lock.to_string(),
+            answer,
+        });
+    }
+
+    /// The terminal channels.
+    pub fn gsbl(&self) -> &gsbl::Gsbl {
+        &self.gsbl
+    }
+
+    /// The terminal channels, mutably. The transport pushes bytes in and drains
+    /// them out through this.
+    pub fn gsbl_mut(&mut self) -> &mut gsbl::Gsbl {
+        &mut self.gsbl
+    }
+
+    /// How many host calls this host has serviced.
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    /// Print every host call as it is serviced, numbered.
+    ///
+    /// Where a module *stopped* is in the outcome, but how it got there is only
+    /// visible as a sequence -- and every step of this host so far has found the
+    /// order the module actually asks in differing from what was predicted for
+    /// it. On by default when `MBBS_TRACE` is set in the environment, so that
+    /// producing the sequence never means editing code to get it.
+    pub fn set_trace(&mut self, trace: bool) {
+        self.trace = trace;
+    }
+
+    /// Find one of the module's files, whatever case it named it in.
+    ///
+    /// DOS filenames are case-insensitive and a module's are all upper case in
+    /// some places and not in others; the filesystem underneath is not. An
+    /// exact match first, then one scan of the directory -- so the ordinary
+    /// case costs nothing and the awkward one still works.
+    pub fn find(&self, name: &str) -> Option<PathBuf> {
+        let exact = self.root.join(name);
+        if exact.is_file() {
+            return Some(exact);
+        }
+        std::fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+            .map(|e| e.path())
+    }
+
+    /// Find one of the module's Btrieve files, installing it if this is a fresh
+    /// board.
+    ///
+    /// A MajorMUD distribution ships fifteen `.VIR` files and no `.DAT`, and the
+    /// module opens `.DAT`. The `.VIR` is the *virgin* copy -- the pristine
+    /// content, ready to be played on -- and turning one into the other is an
+    /// install step that the sysop's `WCCMISC.BAT` and the setup program did
+    /// between them. It is done here, once per file, and said out loud.
+    ///
+    /// This is the one place the host creates something rather than reading it,
+    /// so it is worth being exact about what it is not: it never invents a file
+    /// that has no virgin copy, and it never writes to the `.VIR` itself. A
+    /// `.DAT` this host cannot account for is a refusal, because the failure it
+    /// replaces -- handing the module an empty file where the game's content
+    /// should be -- looks exactly like a working board with no items in it.
+    ///
+    /// # Errors
+    ///
+    /// If neither the file nor a virgin copy of it is there, or the copy fails.
+    pub fn btrieve_file(&mut self, name: &str) -> Result<PathBuf, String> {
+        if let Some(path) = self.find(name) {
+            return Ok(path);
+        }
+
+        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+        let virgin = format!("{stem}.VIR");
+        let from = self.find(&virgin).ok_or_else(|| {
+            format!(
+                "no {name} in {}, and no {virgin} to install it from",
+                self.root.display()
+            )
+        })?;
+
+        // Copied beside the destination and then renamed onto it, because a
+        // rename within a directory is the one filesystem operation that
+        // cannot be seen half-done. `WCCMP001.DAT` is 43 MB, and a plain copy
+        // interrupted -- or merely *read* while it is still going -- is a file
+        // whose header says it has 29,232 pages and whose body does not. That
+        // file would then look installed forever after.
+        let to = self.root.join(name);
+        let part = self
+            .root
+            .join(format!("{name}.{}.part", std::process::id()));
+        std::fs::copy(&from, &part)
+            .and_then(|_| std::fs::rename(&part, &to))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                format!("installing {name} from {}: {e}", from.display())
+            })?;
+        self.installed.push(name.to_owned());
+        self.note(format!(
+            "installed {name} from {} -- this board had never been played on",
+            from.display()
+        ));
+        Ok(to)
+    }
+
+    /// The next of `spr`'s rotating buffers.
+    ///
+    /// Built through [`Abi::ptr_offset`] rather than a hand-built `FarPtr` --
+    /// `self.spr` is `A::Ptr`, opaque outside the `Abi` trait, so this is what
+    /// makes the rotation itself real for any ABI rather than only `Wg16`.
+    fn next_spr_buffer(&mut self) -> A::Ptr {
+        let at = A::ptr_offset(self.spr, (self.spr_next as u16) * shims::text::SPR_BYTES);
+        self.spr_next = (self.spr_next + 1) % shims::text::SPR_BUFFERS;
+        at
+    }
+
+    /// The next of `l2as`'s rotating buffers. See [`Host::l2as`] for why this
+    /// is not [`Host::next_spr_buffer`].
+    fn next_l2as_buffer(&mut self) -> A::Ptr {
+        let at = A::ptr_offset(self.l2as, (self.l2as_next as u16) * shims::text::L2AS_BYTES);
+        self.l2as_next = (self.l2as_next + 1) % shims::text::L2AS_BUFFERS;
+        at
+    }
+
+    /// The line buffer `gmdnam` writes into.
+    fn mdf_buffer(&self) -> A::Ptr {
+        self.mdf
+    }
+
+    /// One NUL byte the host owns and keeps. See [`Host::empty`].
+    fn empty_string(&self) -> A::Ptr {
+        self.empty
+    }
+
+    /// One past the last byte `prf` may write.
+    fn prf_end(&self) -> u16 {
+        self.prf_end
+    }
+
+    /// Take a module online, and give it its number.
+    fn register(&mut self, description: String, block: FarPtr) -> u16 {
+        self.modules.push(Registration::Module { description, block });
+        (self.modules.len() - 1) as u16
+    }
+
+    /// Give a host-native handler a `state` slot, the way [`Host::register`]
+    /// gives a module one. Returns the slot's index, for the same reason
+    /// `register_module` hands its caller a number back: whoever registered
+    /// it is the one who writes it into `user[chan].state`.
+    ///
+    /// [`Host::finish_init`] is this crate's `inifsd()` -- the FSD registers
+    /// its own native slot there, not here.
+    pub(crate) fn register_native(&mut self, native: Native) -> usize {
+        self.modules.push(Registration::Native(native));
+        self.modules.len() - 1
+    }
+
+    /// The C name of an imported symbol, or something that identifies it when
+    /// the host has no name for it.
+    fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
+        match symbol {
+            Symbol::Name(name) => exports::c_name(name).into_string(),
+            Symbol::Ordinal(n) => self
+                .exports
+                .name(from, *n)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("#{n}")),
+        }
+    }
+}
+
+/// Everything that reads or writes module memory, plus
+/// [`Host::check_globals`] (no `Machine` parameter, but built around
+/// `mbbs16::NeImage`, which `Host::load` parses -- 16-bit-format-specific
+/// by construction, same as `Host::load` itself) and [`Host::dos_name`] (no
+/// `Machine` parameter and no use of `Self` at all -- it stays here purely
+/// because it has no `self`: every call site names it as `Host::dos_name(...)`,
+/// and with no argument or return type mentioning `A`, `rustc` cannot infer
+/// which `Abi` a bare `impl<A: Abi> Host<A>` copy would mean, only reporting
+/// "type annotations needed" -- moving it into the generic block would force
+/// every one of those call sites to spell out `Host::<Wg16>::dos_name(...)`
+/// for a function that has no ABI-dependent behaviour to abstract over).
 impl Host<Wg16> {
+    /// The file a module named, with the directory it is allowed to name
+    /// stripped off.
+    ///
+    /// A module builds its filenames from `DATADIR`, an option in its `.MSG`.
+    /// MajorMUD's is empty, so what `spr` produces is `.\WCCITEMS.DAT` -- the
+    /// module's own directory, which is [`Host::root`] and is where this host
+    /// looks anyway. That prefix is accepted and removed.
+    ///
+    /// **Any other directory is refused rather than stripped.** A module
+    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
+    /// the file of the same name from somewhere else would be the exact failure
+    /// this crate exists to avoid -- with the added charm that a board with two
+    /// installs would silently play the wrong one.
+    ///
+    /// # Errors
+    ///
+    /// If the name has a directory component other than `.\`.
+    pub fn dos_name(named: &str) -> Result<&str, String> {
+        let bare = named
+            .strip_prefix(".\\")
+            .or_else(|| named.strip_prefix("./"))
+            .unwrap_or(named);
+        if bare.contains(['\\', '/', ':']) {
+            return Err(format!(
+                "{named} names a directory; this host only opens a module's own"
+            ));
+        }
+        Ok(bare)
+    }
+
     /// Build a host over a machine, placing its globals in memory the module
     /// will be able to address.
     ///
@@ -1061,37 +1556,6 @@ impl Host<Wg16> {
         })
     }
 
-    /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
-    /// every `Entry::Unimplemented` call site it reaches from now on,
-    /// recording each one into `inventory` instead of stopping the module.
-    ///
-    /// # Read `crate::survey`'s module doc before calling this
-    ///
-    /// **This produces wrong behaviour, on purpose, for enumeration only.**
-    /// A fabricated return is a lie the module cannot tell from a real
-    /// answer -- it is not "the call did nothing", it is "the call
-    /// succeeded and returned zero/null", and the module acts on that lie
-    /// for as long as it runs afterwards. Never call this outside a
-    /// throwaway diagnostic session; never call it on a board anyone is
-    /// actually playing on.
-    ///
-    /// `inventory` is a shared handle rather than a value this method takes
-    /// ownership of, because `Host` does not live long enough to be trusted
-    /// with the only copy -- see this struct's own `survey` field.
-    pub fn enable_survey(&mut self, inventory: survey::Shared) {
-        self.survey = Some(inventory);
-    }
-
-    /// The host's globals.
-    pub fn globals(&self) -> &Globals {
-        &self.globals
-    }
-
-    /// Every line `shocst` has produced, oldest first.
-    pub fn audit(&self) -> &[String] {
-        &self.audit
-    }
-
     /// Every module that has registered, in the order they did.
     /// Entry `n` of the module channel `chan`'s `state` names -- or, if
     /// `state` names a host-native registration, the native handler itself.
@@ -1180,197 +1644,6 @@ impl Host<Wg16> {
         Ok(None)
     }
 
-    pub fn modules(&self) -> &[Registration] {
-        &self.modules
-    }
-
-    /// The first *module* registration, skipping any [`Registration::Native`]
-    /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
-    /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
-    /// and neither wants to mistake the FSD's native slot for it.
-    fn first_module(&self) -> Option<&Registration> {
-        self.modules
-            .iter()
-            .find(|r| matches!(r, Registration::Module { .. }))
-    }
-
-    /// The FSD's own `state` slot, the way `register_module`'s caller keeps
-    /// the number it returned.
-    ///
-    /// # Panics
-    ///
-    /// If called before [`Host::finish_init`] has registered it -- nothing
-    /// in this crate can reach a channel's `state` that early, so this is a
-    /// programming error rather than a condition callers should handle.
-    pub(crate) fn fsd_state(&self) -> usize {
-        self.fsd_state
-            .expect("finish_init registers the FSD before anything can reach it")
-    }
-
-    /// What time it is, and one step later than the last time anyone asked.
-    ///
-    /// **Reading the clock moves it**, under [`Clock::stepped`]. The returned
-    /// value is a frozen snapshot, so `now`'s `.civil()` and `time`'s `.epoch()`
-    /// stay consistent within one call; it is the *next* read that has moved.
-    /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
-    /// only a counter for them.
-    pub fn clock(&mut self) -> Clock {
-        self.clock = self.clock.advanced();
-        self.clock_reads += 1;
-        self.clock
-    }
-
-    /// How many times the clock has been read, host and module together.
-    ///
-    /// Under [`Clock::stepped`] a read is also a step, so how far invented time
-    /// has run is a function of how often the module looked at it -- a property
-    /// of the module, which no host-side argument bounds. This is how the size
-    /// of that is measured instead of argued about, the way
-    /// [`Host::keys_asked`] measures locks. The host's own share of these is
-    /// [`Cycles::iterations`]; the rest is the module's.
-    pub fn clock_reads(&self) -> u64 {
-        self.clock_reads
-    }
-
-    /// Freeze the clock, or hand the host a different one.
-    ///
-    /// **A pinned clock is what makes a run reproducible.** MajorMUD seeds its
-    /// generator with `srand(time(NULL))` six calls into initialisation, so
-    /// without this no test can assert what the module *built* -- only how many
-    /// calls it took to build it. See [`Clock`] for the hazard a frozen clock
-    /// carries.
-    pub fn set_clock(&mut self, clock: Clock) {
-        self.clock = clock;
-    }
-
-    /// Every client/server agent that has registered, in the order it did.
-    ///
-    /// **Nothing dispatches to them.** An agent is one end of the Galacticomm
-    /// Client/Server protocol and the other end is a Worldgroup client, which
-    /// this host has no way to be talking to. So this is the record of what a
-    /// client/server layer would call into, in the same sense that
-    /// [`Host::kicks`] is a record of what a main loop would owe.
-    pub fn agents(&self) -> &[Agent] {
-        &self.agents
-    }
-
-    /// The text variables that have been registered.
-    ///
-    /// Unlike [`Host::agents`] and [`Host::kicks`] this is **not** only a
-    /// record: the table is real module memory and the `txtvars` global points
-    /// at it, so the module can walk it whether or not this host ever
-    /// substitutes anything. What is still owed is `findtvar` and the
-    /// substitution itself.
-    pub fn textvars(&self) -> &TextVars {
-        &self.textvars
-    }
-
-    /// Every callback the module asked `rtkick` to run later.
-    ///
-    /// [`Host::cycle`] runs them, once per elapsed second, the same way the
-    /// real host's main loop did: `rtkick` is a one-shot timer measured in
-    /// seconds, and `MAJORBBS.C:476-480` ran `prcrtk()` once per elapsed
-    /// second. `Host::cycle` tracks elapsed seconds against its own clock and
-    /// calls [`Host::prcrtk`] the same number of times, catching up in one
-    /// pass if more than a second has elapsed since the last call.
-    ///
-    /// So this list is not only a record: it is served, on the schedule above.
-    /// MajorMUD registers two during initialisation -- a one-second heartbeat
-    /// into its own segment 6, and a second one-second callback into segment
-    /// 10, which is the last thing it does before it asks for a random number.
-    pub fn kicks(&self) -> &[Kick] {
-        &self.kicks
-    }
-
-    /// Every form the module asked `fsdroom` to size, keyed by the
-    /// `(message number, amode)` it was compiled from.
-    ///
-    /// A cache, not a session: what a caller can usefully ask this host is
-    /// "what forms exist" and not "what is channel 0 in the middle of" --
-    /// see [`Host::fsdtmp`] and [`Host::fsdscb`] for the per-channel half of
-    /// that question.
-    pub fn forms(&self) -> &std::collections::HashMap<(u16, i16), Form> {
-        &self.forms
-    }
-
-    /// The message files that are open.
-    pub fn messages(&self) -> &msg::Messages {
-        &self.messages
-    }
-
-    /// The Btrieve files that are open.
-    pub fn btrieve(&self) -> &btrieve::Btrieve {
-        &self.btrieve
-    }
-
-    /// The streams that are open.
-    pub fn streams(&self) -> &stream::Streams {
-        &self.streams
-    }
-
-    /// Every data file the host created from its virgin copy.
-    pub fn installed(&self) -> &[String] {
-        &self.installed
-    }
-
-    /// Everything the host did that the module could not be told about.
-    pub fn notes(&self) -> &[String] {
-        &self.notes
-    }
-
-    /// Take every note recorded so far, leaving none behind.
-    ///
-    /// [`Self::notes`] alone makes this list write-only in practice: nothing
-    /// ever removes an entry, so a long-lived host accumulates one string per
-    /// note for as long as it runs. That is not hypothetical -- one session
-    /// driving a character into the Realm recorded 4,962 notes, all but a
-    /// handful of them the same `setbtv` stack overflow, and a caller reading
-    /// `notes()` has no way to tell which of them it has already seen.
-    ///
-    /// So a caller that wants to *report* notes drains them, and a caller that
-    /// wants to *assert* on them (every test in this crate) borrows them. The
-    /// two cannot be the same method: draining in `notes()` would need `&mut
-    /// self` and would make two consecutive reads disagree.
-    ///
-    /// [`Self::note_once`]'s `noted` set is deliberately **not** cleared here.
-    /// Its promise is "once per host", not "once per drain" -- resetting it
-    /// would turn every drain into a fresh licence to repeat, which is the
-    /// flood it exists to prevent.
-    pub fn drain_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.notes)
-    }
-
-    /// Record something the module cannot be told. See [`Host::notes`].
-    pub(crate) fn note(&mut self, what: String) {
-        self.notes.push(what);
-    }
-
-    /// Record something once, however many times it happens.
-    ///
-    /// For a note whose cause can repeat without changing: a `qrybtv` with no
-    /// Btrieve file current inside a loop would otherwise put thousands of
-    /// identical lines in [`Host::notes`], and a channel that has to be skimmed
-    /// is one nobody reads.
-    ///
-    /// `key` is what "the same thing" means -- usually the routine's name --
-    /// and is kept apart from `what` so a message carrying a file name still
-    /// reports once.
-    pub(crate) fn note_once(&mut self, key: &str, what: String) {
-        if self.noted.insert(key.to_owned()) {
-            self.notes.push(what);
-        }
-    }
-
-    /// The module's heap.
-    pub fn heap(&self) -> &Heap {
-        &self.heap
-    }
-
-    /// The per-channel tables. See [`Users`].
-    pub fn users(&self) -> &Users {
-        &self.users
-    }
-
     /// `user[unum].usrcls` -- what kind of channel this is.
     ///
     /// Zero for every channel this host makes, which is neither `ONLINE` nor
@@ -1387,47 +1660,6 @@ impl Host<Wg16> {
         };
         let bytes = machine.resolve(at, 2)?;
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
-
-    /// Every lock a module has asked about, in order.
-    ///
-    /// The lock names are sysop-editable text in the module's `.MSG` --
-    /// `PLAYKEY {USER}` is a default, not a measurement -- and most call
-    /// sites are guarded by `if (lockname[0] != '\0')`, so which ones a
-    /// module actually asks about is a property of the installed
-    /// configuration and not of the DLL. Reading the sequence off a real run
-    /// is the only way to know it.
-    ///
-    /// This is how `a_connected_channel_takes_a_command_and_answers`
-    /// (`tests/wccmmud.rs`) pins which gates the module walked and what each
-    /// answered, rather than trusting the call count alone. A key set that
-    /// grants too much still moves that count while quietly putting the
-    /// module on a different branch -- MajorMUD's namespace has negative
-    /// locks -- and that is not hypothetical here: two of the five locks the
-    /// meter test's run asks about are ban keys, and a mutation that answered
-    /// every lock `true` was caught by the call count moving, not by luck.
-    pub fn keys_asked(&self) -> &[Query] {
-        &self.asked
-    }
-
-    /// Record a `haskey` call. See [`Host::keys_asked`].
-    pub(crate) fn asked_for_key(&mut self, chan: i16, lock: &str, answer: bool) {
-        self.asked.push(Query {
-            chan,
-            lock: lock.to_string(),
-            answer,
-        });
-    }
-
-    /// The terminal channels.
-    pub fn gsbl(&self) -> &gsbl::Gsbl {
-        &self.gsbl
-    }
-
-    /// The terminal channels, mutably. The transport pushes bytes in and drains
-    /// them out through this.
-    pub fn gsbl_mut(&mut self) -> &mut gsbl::Gsbl {
-        &mut self.gsbl
     }
 
     /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
@@ -2606,181 +2838,6 @@ impl Host<Wg16> {
         Ok(())
     }
 
-    /// How many host calls this host has serviced.
-    pub fn calls(&self) -> u64 {
-        self.calls
-    }
-
-    /// Print every host call as it is serviced, numbered.
-    ///
-    /// Where a module *stopped* is in the outcome, but how it got there is only
-    /// visible as a sequence -- and every step of this host so far has found the
-    /// order the module actually asks in differing from what was predicted for
-    /// it. On by default when `MBBS_TRACE` is set in the environment, so that
-    /// producing the sequence never means editing code to get it.
-    pub fn set_trace(&mut self, trace: bool) {
-        self.trace = trace;
-    }
-
-    /// Find one of the module's files, whatever case it named it in.
-    ///
-    /// DOS filenames are case-insensitive and a module's are all upper case in
-    /// some places and not in others; the filesystem underneath is not. An
-    /// exact match first, then one scan of the directory -- so the ordinary
-    /// case costs nothing and the awkward one still works.
-    pub fn find(&self, name: &str) -> Option<PathBuf> {
-        let exact = self.root.join(name);
-        if exact.is_file() {
-            return Some(exact);
-        }
-        std::fs::read_dir(&self.root)
-            .ok()?
-            .filter_map(Result::ok)
-            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-            .map(|e| e.path())
-    }
-
-    /// The file a module named, with the directory it is allowed to name
-    /// stripped off.
-    ///
-    /// A module builds its filenames from `DATADIR`, an option in its `.MSG`.
-    /// MajorMUD's is empty, so what `spr` produces is `.\WCCITEMS.DAT` -- the
-    /// module's own directory, which is [`Host::root`] and is where this host
-    /// looks anyway. That prefix is accepted and removed.
-    ///
-    /// **Any other directory is refused rather than stripped.** A module
-    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
-    /// the file of the same name from somewhere else would be the exact failure
-    /// this crate exists to avoid -- with the added charm that a board with two
-    /// installs would silently play the wrong one.
-    ///
-    /// # Errors
-    ///
-    /// If the name has a directory component other than `.\`.
-    pub fn dos_name(named: &str) -> Result<&str, String> {
-        let bare = named
-            .strip_prefix(".\\")
-            .or_else(|| named.strip_prefix("./"))
-            .unwrap_or(named);
-        if bare.contains(['\\', '/', ':']) {
-            return Err(format!(
-                "{named} names a directory; this host only opens a module's own"
-            ));
-        }
-        Ok(bare)
-    }
-
-    /// Find one of the module's Btrieve files, installing it if this is a fresh
-    /// board.
-    ///
-    /// A MajorMUD distribution ships fifteen `.VIR` files and no `.DAT`, and the
-    /// module opens `.DAT`. The `.VIR` is the *virgin* copy -- the pristine
-    /// content, ready to be played on -- and turning one into the other is an
-    /// install step that the sysop's `WCCMISC.BAT` and the setup program did
-    /// between them. It is done here, once per file, and said out loud.
-    ///
-    /// This is the one place the host creates something rather than reading it,
-    /// so it is worth being exact about what it is not: it never invents a file
-    /// that has no virgin copy, and it never writes to the `.VIR` itself. A
-    /// `.DAT` this host cannot account for is a refusal, because the failure it
-    /// replaces -- handing the module an empty file where the game's content
-    /// should be -- looks exactly like a working board with no items in it.
-    ///
-    /// # Errors
-    ///
-    /// If neither the file nor a virgin copy of it is there, or the copy fails.
-    pub fn btrieve_file(&mut self, name: &str) -> Result<PathBuf, String> {
-        if let Some(path) = self.find(name) {
-            return Ok(path);
-        }
-
-        let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
-        let virgin = format!("{stem}.VIR");
-        let from = self.find(&virgin).ok_or_else(|| {
-            format!(
-                "no {name} in {}, and no {virgin} to install it from",
-                self.root.display()
-            )
-        })?;
-
-        // Copied beside the destination and then renamed onto it, because a
-        // rename within a directory is the one filesystem operation that
-        // cannot be seen half-done. `WCCMP001.DAT` is 43 MB, and a plain copy
-        // interrupted -- or merely *read* while it is still going -- is a file
-        // whose header says it has 29,232 pages and whose body does not. That
-        // file would then look installed forever after.
-        let to = self.root.join(name);
-        let part = self
-            .root
-            .join(format!("{name}.{}.part", std::process::id()));
-        std::fs::copy(&from, &part)
-            .and_then(|_| std::fs::rename(&part, &to))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&part);
-                format!("installing {name} from {}: {e}", from.display())
-            })?;
-        self.installed.push(name.to_owned());
-        self.note(format!(
-            "installed {name} from {} -- this board had never been played on",
-            from.display()
-        ));
-        Ok(to)
-    }
-
-    /// The next of `spr`'s rotating buffers.
-    fn next_spr_buffer(&mut self) -> FarPtr {
-        let at = FarPtr {
-            offset: self.spr.offset + (self.spr_next as u16) * shims::text::SPR_BYTES,
-            selector: self.spr.selector,
-        };
-        self.spr_next = (self.spr_next + 1) % shims::text::SPR_BUFFERS;
-        at
-    }
-
-    /// The next of `l2as`'s rotating buffers. See [`Host::l2as`] for why this
-    /// is not [`Host::next_spr_buffer`].
-    fn next_l2as_buffer(&mut self) -> FarPtr {
-        let at = FarPtr {
-            offset: self.l2as.offset + (self.l2as_next as u16) * shims::text::L2AS_BYTES,
-            selector: self.l2as.selector,
-        };
-        self.l2as_next = (self.l2as_next + 1) % shims::text::L2AS_BUFFERS;
-        at
-    }
-
-    /// The line buffer `gmdnam` writes into.
-    fn mdf_buffer(&self) -> FarPtr {
-        self.mdf
-    }
-
-    /// One NUL byte the host owns and keeps. See [`Host::empty`].
-    fn empty_string(&self) -> FarPtr {
-        self.empty
-    }
-
-    /// One past the last byte `prf` may write.
-    fn prf_end(&self) -> u16 {
-        self.prf_end
-    }
-
-    /// Take a module online, and give it its number.
-    fn register(&mut self, description: String, block: FarPtr) -> u16 {
-        self.modules.push(Registration::Module { description, block });
-        (self.modules.len() - 1) as u16
-    }
-
-    /// Give a host-native handler a `state` slot, the way [`Host::register`]
-    /// gives a module one. Returns the slot's index, for the same reason
-    /// `register_module` hands its caller a number back: whoever registered
-    /// it is the one who writes it into `user[chan].state`.
-    ///
-    /// [`Host::finish_init`] is this crate's `inifsd()` -- the FSD registers
-    /// its own native slot there, not here.
-    pub(crate) fn register_native(&mut self, native: Native) -> usize {
-        self.modules.push(Registration::Native(native));
-        self.modules.len() - 1
-    }
-
     /// Load a module, binding its imports to this host.
     ///
     /// The globals the module addresses are checked *before* anything is
@@ -2990,19 +3047,6 @@ impl Host<Wg16> {
                 symbol,
             },
         )
-    }
-
-    /// The C name of an imported symbol, or something that identifies it when
-    /// the host has no name for it.
-    fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
-        match symbol {
-            Symbol::Name(name) => exports::c_name(name).into_string(),
-            Symbol::Ordinal(n) => self
-                .exports
-                .name(from, *n)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("#{n}")),
-        }
     }
 
     /// Every global the module addresses that the host cannot honestly place.
