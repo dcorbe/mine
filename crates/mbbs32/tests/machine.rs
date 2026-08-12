@@ -224,3 +224,191 @@ fn resume_on_a_poisoned_machine_returns_a_graceful_error() {
         "error did not mention the machine is poisoned: {err}"
     );
 }
+
+/// `frame_sp` must be cleared by the `Exit::Returned` arm of `run`, not left
+/// pointing at a frame `resume()` already consumed.
+/// `docs/plans/2026-08-12-btrieve-finish.md` (Task 1 review, Finding 4):
+/// removing that clear leaves every test passing, because no existing test
+/// resumes a call, lets the module return normally, and then tries to
+/// resume again. Unlike a bare `call()` followed by `resume()` (whose
+/// `frame_sp` was already `None` from `call`'s own pre-`run` reset, so the
+/// clear-on-return would be invisible there too), this drives `frame_sp`
+/// through `Some` first via an actual serviced `Exit::Call`, so only the
+/// `Exit::Returned` arm's own clear can make the second `resume()` panic.
+#[test]
+#[should_panic(expected = "no outstanding call")]
+fn resuming_after_the_module_has_already_returned_panics() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(9);
+
+    // call rel32 ; ret -- the module makes exactly one host call, then
+    // returns as soon as it is resumed past it.
+    let (mut mapping, entry) = code_at(&[]);
+    let mut code = vec![0xe8u8];
+    let rel = target.wrapping_sub(entry + 5);
+    code.extend_from_slice(&rel.to_le_bytes());
+    code.push(0xc3); // ret
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 9 });
+
+    let exit = machine
+        .resume(Ret::Void)
+        .expect("resumes past the call site and the module returns");
+    assert_eq!(exit, Exit::Returned { eax: 0, edx: 0 });
+
+    // frame_sp must have been cleared by the Exit::Returned arm above;
+    // resuming again with no outstanding call must panic, not silently
+    // reuse the frame the previous resume() already consumed.
+    let _ = machine.resume(Ret::Void);
+}
+
+/// The callee-saved quad (`EBX`/`ESI`/`EDI`/`EBP`) must survive a serviced
+/// host call, not just a bare crossing. `docs/plans/2026-08-12-btrieve-finish.md`
+/// (Task 1 review, Finding 2): `run()`'s propagation --
+/// `self.ctx.ebx = self.ctx.out_ebx` and its three siblings -- is completely
+/// unexercised; replacing all four right-hand sides with `0` leaves every
+/// test passing. `asm.rs::tests::callee_saved_registers_survive_a_crossing`
+/// only proves the raw crossing preserves these registers *within one*
+/// `run()` call; it says nothing about `Machine::resume` carrying them
+/// *across* one, which is what a module relies on when it calls a host
+/// routine with live values in these registers (as `wccmmud.dll` does).
+///
+/// Distinct sentinels per register, each written to a scratch slot in the
+/// module's own mapping *after* the host call returns, so the test can read
+/// all four back independently and say which one -- if any -- was lost,
+/// rather than only that something was.
+///
+/// Deliberately avoids EBP as a frame pointer: this code never needs
+/// stack-relative addressing (arguments and the scratch address are all
+/// referenced directly), so EBP is free to carry a plain sentinel like the
+/// other three.
+#[test]
+fn callee_saved_registers_survive_a_serviced_host_call() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(11);
+
+    const EBX_SENTINEL: u32 = 0x1111_1111;
+    const ESI_SENTINEL: u32 = 0x2222_2222;
+    const EDI_SENTINEL: u32 = 0x3333_3333;
+    const EBP_SENTINEL: u32 = 0x4444_4444;
+    const SCRATCH_OFFSET: u32 = 3072; // well clear of the code below
+
+    let (mut mapping, entry) = code_at(&[]);
+    let scratch_addr = entry + SCRATCH_OFFSET;
+
+    let mut code = vec![0xbbu8]; // mov ebx, imm32
+    code.extend_from_slice(&EBX_SENTINEL.to_le_bytes());
+    code.push(0xbe); // mov esi, imm32
+    code.extend_from_slice(&ESI_SENTINEL.to_le_bytes());
+    code.push(0xbf); // mov edi, imm32
+    code.extend_from_slice(&EDI_SENTINEL.to_le_bytes());
+    code.push(0xbd); // mov ebp, imm32
+    code.extend_from_slice(&EBP_SENTINEL.to_le_bytes());
+
+    code.push(0xe8); // call rel32
+    let call_site_end = entry + code.len() as u32 + 4;
+    let rel = target.wrapping_sub(call_site_end);
+    code.extend_from_slice(&rel.to_le_bytes());
+
+    // The host call returns here. If `run()` failed to carry EBX/ESI/EDI/EBP
+    // forward into the resumed entry, these would read back as 0 (or
+    // whatever `Ctx::default()` leaves), not the sentinels above.
+    code.push(0x89); // mov [scratch_addr], ebx
+    code.push(0x1d);
+    code.extend_from_slice(&scratch_addr.to_le_bytes());
+    code.push(0x89); // mov [scratch_addr+4], esi
+    code.push(0x35);
+    code.extend_from_slice(&(scratch_addr + 4).to_le_bytes());
+    code.push(0x89); // mov [scratch_addr+8], edi
+    code.push(0x3d);
+    code.extend_from_slice(&(scratch_addr + 8).to_le_bytes());
+    code.push(0x89); // mov [scratch_addr+12], ebp
+    code.push(0x2d);
+    code.extend_from_slice(&(scratch_addr + 12).to_le_bytes());
+    code.push(0xc3); // ret
+
+    assert!(
+        code.len() <= SCRATCH_OFFSET as usize,
+        "test code overran the scratch region"
+    );
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 11 });
+
+    let exit = machine
+        .resume(Ret::Void)
+        .expect("resumes past the call site");
+    assert_eq!(exit, Exit::Returned { eax: 0, edx: 0 });
+
+    let scratch = &mapping.as_mut_slice()[SCRATCH_OFFSET as usize..SCRATCH_OFFSET as usize + 16];
+    let read_u32 = |off: usize| u32::from_le_bytes(scratch[off..off + 4].try_into().unwrap());
+    assert_eq!(read_u32(0), EBX_SENTINEL, "EBX was not preserved across the host call");
+    assert_eq!(read_u32(4), ESI_SENTINEL, "ESI was not preserved across the host call");
+    assert_eq!(read_u32(8), EDI_SENTINEL, "EDI was not preserved across the host call");
+    assert_eq!(read_u32(12), EBP_SENTINEL, "EBP was not preserved across the host call");
+}
+
+/// `Ret::U64` must split `EDX:EAX`, high half in `EDX`. Nothing calls
+/// `resume(Ret::U64(_))` today (`docs/plans/2026-08-12-btrieve-finish.md`,
+/// Task 1 review, Finding 3), so mutating `Ret::registers()`'s `U64` arm to
+/// always emit a `0` high half is undetected.
+#[test]
+fn resume_with_ret_u64_splits_across_edx_and_eax() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(13);
+
+    // call rel32 ; ret -- the module hands back exactly what it was resumed
+    // with, unmodified, so the split is observable in Exit::Returned.
+    let (mut mapping, entry) = code_at(&[]);
+    let mut code = vec![0xe8u8];
+    let rel = target.wrapping_sub(entry + 5);
+    code.extend_from_slice(&rel.to_le_bytes());
+    code.push(0xc3); // ret
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 13 });
+
+    const VALUE: u64 = 0x1122_3344_5566_7788;
+    let exit = machine
+        .resume(Ret::U64(VALUE))
+        .expect("resumes past the call site");
+    assert_eq!(
+        exit,
+        Exit::Returned {
+            eax: 0x5566_7788,
+            edx: 0x1122_3344,
+        },
+        "Ret::U64 did not split EDX:EAX correctly"
+    );
+}
+
+/// `Ret::Void` must clear both `EAX` and `EDX`.
+/// `docs/plans/2026-08-12-btrieve-finish.md` (Task 1 review, Finding 3).
+#[test]
+fn resume_with_ret_void_clears_eax_and_edx() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(15);
+
+    let (mut mapping, entry) = code_at(&[]);
+    let mut code = vec![0xe8u8];
+    let rel = target.wrapping_sub(entry + 5);
+    code.extend_from_slice(&rel.to_le_bytes());
+    code.push(0xc3); // ret
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 15 });
+
+    let exit = machine
+        .resume(Ret::Void)
+        .expect("resumes past the call site");
+    assert_eq!(
+        exit,
+        Exit::Returned { eax: 0, edx: 0 },
+        "Ret::Void did not clear both EAX and EDX"
+    );
+}
