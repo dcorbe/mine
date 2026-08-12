@@ -88,3 +88,6 @@ tools/btrieve-oracle/statprobe.exe
 # seeds a fixture in ONE process: 24 sequential fresh wine processes wedge
 # the Microkernel, which sweep.sh's own header also warns about).
 tools/btrieve-oracle/seedprobe.exe
+# Build artifact of tools/btrieve-oracle/crtprobe.c -- built by hand, see
+# that file's own header comment.
+tools/btrieve-oracle/crtprobe.exe
