@@ -429,10 +429,32 @@ impl Machine {
     /// under this ABI, so [`resume`](Machine::resume) is the only shape a
     /// resume ever needs.
     ///
+    /// # Errors
+    ///
+    /// If this machine is [`Machine::poisoned`].
+    ///
     /// # Panics
     ///
     /// If the module is not stopped at a call.
     pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+        // Stated once, not left to depend on `frame_sp` happening to be
+        // cleared alongside `poisoned` in `run`'s `Fault` arm below -- that
+        // coupling is an accident of implementation, not a guard: removing
+        // `frame_sp = None` from the `Fault` arm alone leaves every test in
+        // this crate passing, because the one case exercised (a fault during
+        // a fresh `call`) already has `frame_sp` at `None` from `call`'s own
+        // reset just above. A fault taken on a *resumed* call would leave
+        // `frame_sp` stale and `Some`, and without this check that stale
+        // value would carry this method past the `.expect()` below and into
+        // `run` on a poisoned machine -- exactly what `run`'s own SAFETY
+        // comment says never happens. Mirrors [`Machine::call`]'s check:
+        // same error type, same message.
+        if let Some(poison) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "refusing to enter a poisoned module: {poison}"
+            )));
+        }
+
         let sp = self
             .frame_sp
             .expect("resume() with no outstanding call to resume from");

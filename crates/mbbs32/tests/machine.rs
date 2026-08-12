@@ -190,3 +190,37 @@ fn a_serviced_import_call_resumes_and_the_module_sees_the_return_value() {
         "the module did not resume executing after its own call instruction"
     );
 }
+
+/// `resume()` on a poisoned machine must refuse gracefully, exactly as
+/// `Machine::call` already does -- not depend on `frame_sp` happening to be
+/// `None` too. `docs/plans/2026-08-12-btrieve-finish.md` (Task 1 review,
+/// Finding 1): removing `frame_sp = None` from `run`'s `Fault` arm leaves
+/// every test passing today, because the only fault path exercised (one
+/// taken during a fresh `call`) already has `frame_sp` at `None` from
+/// `call`'s own reset. This test pins the guard directly, not the
+/// coincidence.
+#[test]
+fn resume_on_a_poisoned_machine_returns_a_graceful_error() {
+    let mut machine = Machine::new().expect("a Machine");
+
+    // mov eax, [0] -- the same faulting instruction
+    // `a_module_that_faults_poisons_the_machine_and_the_host_survives` uses.
+    let (_code, entry) = code_at(&[0xa1, 0x00, 0x00, 0x00, 0x00]);
+
+    let exit = machine
+        .call(entry, &[])
+        .expect("a fault is recovered, not fatal to the test process");
+    assert!(
+        matches!(exit, Exit::Fault { .. }),
+        "expected Exit::Fault, got {exit:?}"
+    );
+    assert!(machine.poisoned().is_some(), "the machine must be poisoned");
+
+    let err = machine
+        .resume(Ret::Void)
+        .expect_err("resume() on a poisoned machine must return an error, not panic");
+    assert!(
+        err.to_string().contains("poisoned"),
+        "error did not mention the machine is poisoned: {err}"
+    );
+}
