@@ -202,16 +202,24 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller),
     (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller),
     // Memory the module owns, and the leaves that move bytes about.
-    (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller),
-    (MAJORBBS, "alczer", memory::alczer, Cleans::Caller),
-    (MAJORBBS, "galfree", memory::galfree, Cleans::Caller),
-    (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller),
+    (MAJORBBS, "alcmem", memory::alcmem_wg16, Cleans::Caller),
+    (MAJORBBS, "alczer", memory::alczer_wg16, Cleans::Caller),
+    (MAJORBBS, "galfree", memory::galfree_wg16, Cleans::Caller),
+    (
+        MAJORBBS,
+        "farcoreleft",
+        memory::farcoreleft_wg16,
+        Cleans::Caller,
+    ),
+    // `alctile`/`ptrtile` stay `Wg16`-concrete: segment tiling has no
+    // flat-memory counterpart (see `shims::memory`'s own doc comment on
+    // `alctile`).
     (MAJORBBS, "alctile", memory::alctile, Cleans::Caller),
     (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller),
-    (MAJORBBS, "setmem", memory::setmem, Cleans::Caller),
-    (MAJORBBS, "movmem", memory::movmem, Cleans::Caller),
-    (MAJORBBS, "memcpy", memory::memcpy, Cleans::Caller),
-    (MAJORBBS, "memcmp", memory::memcmp, Cleans::Caller),
+    (MAJORBBS, "setmem", memory::setmem_wg16, Cleans::Caller),
+    (MAJORBBS, "movmem", memory::movmem_wg16, Cleans::Caller),
+    (MAJORBBS, "memcpy", memory::memcpy_wg16, Cleans::Caller),
+    (MAJORBBS, "memcmp", memory::memcmp_wg16, Cleans::Caller),
     // Btrieve: opening a module's data files, and which one is current.
     (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
     (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),

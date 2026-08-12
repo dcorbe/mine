@@ -439,7 +439,7 @@ mod tests {
             Some(5),
             "four characters and a terminator, from the module's heap"
         );
-        f.invoke(crate::shims::memory::galfree, &Fixture::far(at))
+        f.invoke(crate::shims::memory::galfree_wg16, &Fixture::far(at))
             .expect("the module owns it");
     }
 

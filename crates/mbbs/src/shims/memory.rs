@@ -28,8 +28,10 @@
 //! `setmem(p, 4, 4)` would pass either way.
 
 use mbbs16::{FarPtr, Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use crate::Host;
+use crate::abi::{self, Abi, Call};
 use crate::shims::ShimError;
 
 /// `VOID *alcmem(UINT size)` -- `GCOMM.H:256-258` -- reserve memory the
@@ -39,48 +41,93 @@ use crate::shims::ShimError;
 /// returned null for both, and step 7's trace is what that costs: `alczer`
 /// answered null at call 183 and the module dereferenced it eighteen calls
 /// later, where the fault named module code rather than the lie.
-pub fn alcmem(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let size = args.int();
+///
+/// Generic (Task 5): [`Heap::reserve`](crate::heap::Heap::reserve) is
+/// already `impl<A: Abi> Heap<A>` -- unlike [`Heap::alloc`](crate::heap::Heap::alloc),
+/// which is the `Wg16` facade this used to call, it takes `&mut A::Mem`
+/// straight from [`Call::mem`] rather than a whole `&mut Machine`.
+pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let size = Into::<u32>::into(call.int()) as u16;
     let at = host
         .heap
-        .alloc(machine, size)
+        .reserve(call.mem(), size)
         .map_err(|e| ShimError::Failed(format!("alcmem: {e}")))?;
-    Ok(Ret::Far(at))
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`alcmem`]. See `shims::call`'s own doc
+/// comment.
+pub fn alcmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    alcmem(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID *alczer(UINT nbytes)` -- `GCOMM.H:274-276` -- reserve memory, zeroed.
 ///
 /// Zeroed here rather than assumed: reused space holds whatever the last owner
 /// left, and a module that trusts `alczer` and gets `alcmem` finds out slowly.
-pub fn alczer(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let size = args.int();
+///
+/// Generic (Task 5): same [`Heap::reserve`](crate::heap::Heap::reserve) core
+/// as [`alcmem`], and the zero-fill writes through
+/// [`mbbs_ptr::ModulePtr::write`] on [`Call::mem`] rather than
+/// `Machine::write`.
+pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let size = Into::<u32>::into(call.int()) as u16;
     let at = host
         .heap
-        .alloc(machine, size)
+        .reserve(call.mem(), size)
         .map_err(|e| ShimError::Failed(format!("alczer: {e}")))?;
-    machine.write(at, &vec![0u8; usize::from(size)])?;
-    Ok(Ret::Far(at))
+    // `A::Ptr::Error` has no `From` into `ShimError` for an arbitrary `A` --
+    // only `Wg16`'s `FarPtrError` does -- so this is `map_err`, not `?`,
+    // unlike the `Wg16`-only original (`shims::user::haskey`'s own comment
+    // has the same note).
+    at.write(call.mem(), &vec![0u8; usize::from(size)])
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`alczer`]. See `shims::call`'s own doc
+/// comment.
+pub fn alczer_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    alczer(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID galfree(VOID *block)` -- `GCOMM.H:771-773` -- give memory back.
-pub fn galfree(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let at = args.ptr();
+///
+/// Generic (Task 5): [`Heap::free`](crate::heap::Heap::free) never touched a
+/// `Machine`, so this was already `impl<A: Abi> Heap<A>` before this task.
+pub fn galfree<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let at = call.ptr();
     host.heap
         .free(at)
         .map_err(|e| ShimError::Failed(format!("galfree: {e}")))?;
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`galfree`]. See `shims::call`'s own doc
+/// comment.
+pub fn galfree_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    galfree(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `LONG farcoreleft(VOID)` -- `GCOMM.H:147` -- how much memory is left.
 ///
 /// A policy, not a fact: modules size their caches off this. See
 /// [`Config::heap`](crate::Config::heap) for what the number is and why.
-pub fn farcoreleft(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic (Task 5): [`Heap::left`](crate::heap::Heap::left) never touched a
+/// `Machine` either, and reads no argument -- the `call` parameter is unused.
+pub fn farcoreleft<A: Abi>(
+    _call: &mut Call<A>,
+    host: &mut Host<A>,
+) -> Result<abi::Ret<A>, ShimError> {
     let left = host.heap.left();
-    Ok(Ret::U32(u32::try_from(left).unwrap_or(u32::MAX)))
+    Ok(abi::Ret::Long(u32::try_from(left).unwrap_or(u32::MAX)))
+}
+
+/// The dispatch-table entry for [`farcoreleft`]. See `shims::call`'s own doc
+/// comment.
+pub fn farcoreleft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    farcoreleft(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void *alctile(int qty, int size)` -- one region of `qty` tiles.
@@ -146,14 +193,23 @@ pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// the macro is the vendor's own statement of the argument order, which is
 /// this file's whole reason for existing: **count then fill**, `memset`'s
 /// arguments the other way round.
-pub fn setmem(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let at = args.ptr();
-    let count = args.int();
+///
+/// Generic (Task 5): the fill and the write go through [`Call::mem`] and
+/// [`mbbs_ptr::ModulePtr::write`] rather than a whole `&mut Machine`.
+pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let at = call.ptr();
+    let count = Into::<u32>::into(call.int()) as u16;
     // A `char` argument still arrives as a whole word; the fill is its low byte.
-    let fill = args.int() as u8;
-    machine.write(at, &vec![fill; usize::from(count)])?;
-    Ok(Ret::Void)
+    let fill = Into::<u32>::into(call.int()) as u8;
+    at.write(call.mem(), &vec![fill; usize::from(count)])
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`setmem`]. See `shims::call`'s own doc
+/// comment.
+pub fn setmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    setmem(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID galmovmem(VOID *src, VOID *dst, USHORT nbytes)` -- `GCOMM.H:163-164`,
@@ -161,45 +217,84 @@ pub fn setmem(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
 /// overlapping allowed.
 ///
 /// **Source first**, which is the opposite of `memcpy` immediately below.
-pub fn movmem(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let src = args.ptr();
-    let dst = args.ptr();
-    let count = args.int();
-    let bytes = machine.resolve(src, usize::from(count))?.to_vec();
-    machine.write(dst, &bytes)?;
-    Ok(Ret::Void)
+///
+/// Generic (Task 5): reads through [`mbbs_ptr::ModulePtr::resolve`] and
+/// writes through [`mbbs_ptr::ModulePtr::write`], both against [`Call::mem`].
+pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let src = call.ptr();
+    let dst = call.ptr();
+    let count = Into::<u32>::into(call.int()) as u16;
+    let bytes = src
+        .resolve(call.mem(), usize::from(count))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    dst.write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`movmem`]. See `shims::call`'s own doc
+/// comment.
+pub fn movmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    movmem(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void *memcpy(void *dst, const void *src, size_t n)` -- destination
 /// first. Borland's; no Galacticomm header redeclares it (see this file's
 /// commit message).
-pub fn memcpy(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let dst = args.ptr();
-    let src = args.ptr();
-    let count = args.int();
-    let bytes = machine.resolve(src, usize::from(count))?.to_vec();
-    machine.write(dst, &bytes)?;
-    Ok(Ret::Far(dst))
+///
+/// Generic (Task 5): same shape as [`movmem`], with `dst`/`src` read in the
+/// other order.
+pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let count = Into::<u32>::into(call.int()) as u16;
+    let bytes = src
+        .resolve(call.mem(), usize::from(count))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    dst.write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// The dispatch-table entry for [`memcpy`]. See `shims::call`'s own doc
+/// comment.
+pub fn memcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    memcpy(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int memcmp(const void *a, const void *b, size_t n)`. Borland's; no
 /// Galacticomm header redeclares it.
-pub fn memcmp(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let a = args.ptr();
-    let b = args.ptr();
-    let count = usize::from(args.int());
+///
+/// Generic (Task 5): both reads go through [`mbbs_ptr::ModulePtr::resolve`]
+/// on [`Call::mem`]; the answer is built through [`Abi::Int`]'s `From<u16>`
+/// the same way [`shims::user::haskey`](crate::shims::user::haskey) builds
+/// its boolean answer.
+pub fn memcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let a = call.ptr();
+    let b = call.ptr();
+    let count = usize::from(Into::<u32>::into(call.int()) as u16);
 
-    let left = machine.resolve(a, count)?.to_vec();
-    let right = machine.resolve(b, count)?;
+    let left = a
+        .resolve(call.mem(), count)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let right = b
+        .resolve(call.mem(), count)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let answer = match left.as_slice().cmp(right) {
         std::cmp::Ordering::Less => -1i16,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Ret::U16(answer as u16))
+    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
+}
+
+/// The dispatch-table entry for [`memcmp`]. See `shims::call`'s own doc
+/// comment.
+pub fn memcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    memcmp(&mut super::call(machine), host).map(Into::into)
 }
 
 #[cfg(test)]
@@ -214,16 +309,16 @@ mod tests {
     #[test]
     fn alcmem_hands_out_distinct_memory_that_galfree_takes_back() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem, &[256]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem_wg16, &[256]).expect("a") else {
             panic!("alcmem returns a pointer")
         };
-        let Ret::Far(b) = f.invoke(alcmem, &[256]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alcmem_wg16, &[256]).expect("b") else {
             panic!("alcmem returns a pointer")
         };
         assert_ne!(a, b);
 
-        f.invoke(galfree, &far(a)).expect("freed");
-        let Ret::Far(c) = f.invoke(alcmem, &[256]).expect("c") else {
+        f.invoke(galfree_wg16, &far(a)).expect("freed");
+        let Ret::Far(c) = f.invoke(alcmem_wg16, &[256]).expect("c") else {
             panic!("alcmem returns a pointer")
         };
         assert_eq!(a, c, "the freed space came back");
@@ -232,13 +327,13 @@ mod tests {
     #[test]
     fn alczer_is_zeroed_even_in_space_that_was_used() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem, &[64]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem_wg16, &[64]).expect("a") else {
             panic!("pointer")
         };
         f.machine.write(a, &[0xcc; 64]).expect("dirtied");
-        f.invoke(galfree, &far(a)).expect("freed");
+        f.invoke(galfree_wg16, &far(a)).expect("freed");
 
-        let Ret::Far(b) = f.invoke(alczer, &[64]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alczer_wg16, &[64]).expect("b") else {
             panic!("pointer")
         };
         assert_eq!(b, a, "the same space, so the test means something");
@@ -252,27 +347,27 @@ mod tests {
     #[test]
     fn galfree_of_something_never_allocated_refuses_by_name() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem, &[64]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem_wg16, &[64]).expect("a") else {
             panic!("pointer")
         };
         let stray = FarPtr {
             offset: a.offset + 8,
             selector: a.selector,
         };
-        let e = f.invoke(galfree, &far(stray)).expect_err("not a block");
+        let e = f.invoke(galfree_wg16, &far(stray)).expect_err("not a block");
         assert!(e.to_string().contains("galfree"), "{e}");
 
-        f.invoke(galfree, &far(a)).expect("this one is");
-        assert!(f.invoke(galfree, &far(a)).is_err(), "but not twice");
+        f.invoke(galfree_wg16, &far(a)).expect("this one is");
+        assert!(f.invoke(galfree_wg16, &far(a)).is_err(), "but not twice");
     }
 
     #[test]
     fn the_heap_crosses_a_segment_and_still_works_from_16_bit_code() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem, &[40_000]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem_wg16, &[40_000]).expect("a") else {
             panic!("pointer")
         };
-        let Ret::Far(b) = f.invoke(alcmem, &[40_000]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alcmem_wg16, &[40_000]).expect("b") else {
             panic!("pointer")
         };
         assert_ne!(a.selector, b.selector, "two of these need two segments");
@@ -285,19 +380,19 @@ mod tests {
     #[test]
     fn farcoreleft_falls_by_what_was_taken_and_rises_when_it_is_given_back() {
         let mut f = Fixture::new();
-        let Ret::U32(before) = f.invoke(farcoreleft, &[]).expect("asked") else {
+        let Ret::U32(before) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
             panic!("farcoreleft returns a long")
         };
-        let Ret::Far(a) = f.invoke(alcmem, &[1000]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem_wg16, &[1000]).expect("a") else {
             panic!("pointer")
         };
-        let Ret::U32(during) = f.invoke(farcoreleft, &[]).expect("asked") else {
+        let Ret::U32(during) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
             panic!("long")
         };
         assert_eq!(during, before - 1000);
 
-        f.invoke(galfree, &far(a)).expect("freed");
-        let Ret::U32(after) = f.invoke(farcoreleft, &[]).expect("asked") else {
+        f.invoke(galfree_wg16, &far(a)).expect("freed");
+        let Ret::U32(after) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
             panic!("long")
         };
         assert_eq!(after, before);
@@ -377,7 +472,7 @@ mod tests {
         );
 
         // And a pointer that is not a region at all.
-        let heap = f.invoke(alcmem, &[64]).expect("a");
+        let heap = f.invoke(alcmem_wg16, &[64]).expect("a");
         let Ret::Far(heap) = heap else { panic!("pointer") };
         assert!(f.invoke(ptrtile, &[heap.offset, heap.selector, 0]).is_err());
     }
@@ -388,7 +483,7 @@ mod tests {
         // `setmem(p, 4, 4)` this test would pass either way round.
         let mut f = Fixture::new();
         let at = f.bytes(&[0xff; 16], false);
-        f.invoke(setmem, &[at.offset, at.selector, 4, 0x41])
+        f.invoke(setmem_wg16, &[at.offset, at.selector, 4, 0x41])
             .expect("filled");
         assert_eq!(
             f.machine.resolve(at, 6).expect("readable"),
@@ -402,7 +497,7 @@ mod tests {
         let mut f = Fixture::new();
         let src = f.bytes(b"source", false);
         let dst = f.bytes(b"DEST!!", false);
-        f.invoke(movmem, &[src.offset, src.selector, dst.offset, dst.selector, 6])
+        f.invoke(movmem_wg16, &[src.offset, src.selector, dst.offset, dst.selector, 6])
             .expect("moved");
         assert_eq!(
             f.machine.resolve(dst, 6).expect("readable"),
@@ -418,7 +513,7 @@ mod tests {
         let dst = f.bytes(b"DEST!!", false);
         let src = f.bytes(b"source", false);
         assert_eq!(
-            f.invoke(memcpy, &[dst.offset, dst.selector, src.offset, src.selector, 6])
+            f.invoke(memcpy_wg16, &[dst.offset, dst.selector, src.offset, src.selector, 6])
                 .expect("copied"),
             Ret::Far(dst)
         );
@@ -433,11 +528,11 @@ mod tests {
         let c = f.bytes(b"abc", false);
 
         let args = |x: FarPtr, y: FarPtr| [x.offset, x.selector, y.offset, y.selector, 3];
-        assert_eq!(f.invoke(memcmp, &args(a, c)).expect("same"), Ret::U16(0));
+        assert_eq!(f.invoke(memcmp_wg16, &args(a, c)).expect("same"), Ret::U16(0));
         assert_eq!(
-            f.invoke(memcmp, &args(a, b)).expect("less"),
+            f.invoke(memcmp_wg16, &args(a, b)).expect("less"),
             Ret::U16((-1i16) as u16)
         );
-        assert_eq!(f.invoke(memcmp, &args(b, a)).expect("more"), Ret::U16(1));
+        assert_eq!(f.invoke(memcmp_wg16, &args(b, a)).expect("more"), Ret::U16(1));
     }
 }
