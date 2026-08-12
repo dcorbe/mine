@@ -40,6 +40,7 @@ use std::io;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::abi::{Abi, Wg16};
 use crate::arena::Arena;
 
 /// One `.MSG` file, as a numbered list of messages.
@@ -332,16 +333,16 @@ pub fn getasc(compact: &[u8]) -> Vec<u8> {
 const MSGBLK: usize = 5 * 4 + 2 + 3 * 4 + 2 + 2;
 
 /// One open message file.
-struct Block {
+struct Block<A: Abi = Wg16> {
     /// What it was opened as, for error messages.
     name: String,
 
     /// The `msgblk`-shaped region the module was handed, which is also this
     /// block's identity: `setmbk` and `clsmsg` name it and nothing else does.
-    cookie: FarPtr,
+    cookie: A::Ptr,
 
     /// Where each message's text was interned, by message number.
-    text: Vec<FarPtr>,
+    text: Vec<A::Ptr>,
 }
 
 /// Every message file the host has open, and which one is current.
@@ -351,16 +352,35 @@ struct Block {
 /// the same rule `prfptr` is under, and for the same reason. What is here is
 /// the stack of blocks to restore, which the module cannot see and has no way
 /// to change.
-#[derive(Default)]
-pub struct Messages {
-    arena: Arena,
-    open: Vec<Block>,
+/// # Generic type, `Wg16`-concrete body
+///
+/// `Block::cookie`/`text` and `saved`'s addresses are typed `A::Ptr` rather
+/// than `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely
+/// `Messages<A>` -- but every method stays in `impl Messages<Wg16>` below,
+/// using `&mut Machine` exactly as before. `A` defaults to [`Wg16`] so every
+/// existing caller keeps naming this type as plain `Messages`. Not
+/// `#[derive(Default)]`: the derive macro bounds `A: Default` on the
+/// generated impl, which the bare marker struct `Wg16` does not satisfy --
+/// see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
+pub struct Messages<A: Abi = Wg16> {
+    arena: Arena<A>,
+    open: Vec<Block<A>>,
 
     /// What `curmbk` held before each unmatched `setmbk`, oldest first.
-    saved: Vec<FarPtr>,
+    saved: Vec<A::Ptr>,
 }
 
-impl Messages {
+impl<A: Abi> Default for Messages<A> {
+    fn default() -> Self {
+        Self {
+            arena: Arena::default(),
+            open: Vec::new(),
+            saved: Vec::new(),
+        }
+    }
+}
+
+impl Messages<Wg16> {
     /// Open a message file, and give the module something to name it by.
     ///
     /// The cookie is backed by a real, zeroed, `msgblk`-shaped region rather
@@ -392,10 +412,7 @@ impl Messages {
         })?;
 
         // `lngcnt` and `msgcnt` are the last two `int`s of the struct.
-        let tail = FarPtr {
-            offset: cookie.offset + (MSGBLK - 4) as u16,
-            selector: cookie.selector,
-        };
+        let tail = Wg16::ptr_offset(cookie, (MSGBLK - 4) as u16);
         let mut fields = 1u16.to_le_bytes().to_vec();
         fields.extend_from_slice(&count.to_le_bytes());
         machine.write(tail, &fields).map_err(io::Error::other)?;
