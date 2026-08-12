@@ -132,11 +132,13 @@
 //! implementation would start from -- recording it now is what makes that
 //! later work additive instead of a rewrite.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use super::ShimError;
 use super::gsbl::{apply_cpc, apply_hpk, apply_pbc, apply_xnf};
 use crate::Host;
+use crate::abi::{self, Abi, Call};
 use crate::chan::Chan;
 
 /// `MAJORBBS.H:31`: `#define CTNUOS 2` -- "screen length code used for
@@ -160,13 +162,13 @@ const PAUSE_MESSAGE: &[u8] = b"Press any key to continue...";
 /// `scnbrk-CTNUOS` as a *signed* subtraction (`MAJORBBS.C:3778`), so an
 /// unsigned read here would turn a legitimately negative `cnt` into a huge
 /// positive one for the wrong reason.
-fn account_scnbrk(machine: &Machine, host: &Host, chan: Chan) -> Result<i8, ShimError> {
+fn account_scnbrk<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: Chan) -> Result<i8, ShimError> {
     let account = host.users().account(chan);
-    let at = FarPtr {
-        offset: account.offset + crate::users::usracc::SCNBRK as u16,
-        selector: account.selector,
-    };
-    Ok(machine.resolve(at, 1)?[0] as i8)
+    let at = A::ptr_offset(account, crate::users::usracc::SCNBRK as u16);
+    let byte = at
+        .resolve(mem, 1)
+        .map_err(|e| ShimError::Failed(e.to_string()))?[0];
+    Ok(byte as i8)
 }
 
 /// `void rstrxf(void)` -- restore screen-length to the account setting.
@@ -185,9 +187,15 @@ fn account_scnbrk(machine: &Machine, host: &Host, chan: Chan) -> Result<i8, Shim
 /// on (see [`crate::shims::gsbl::apply_xnf`]'s doc comment). This is `rstrxf`
 /// computed faithfully against a host that does not model `scnbrk`, not a
 /// special case carved out for it.
-pub fn rstrxf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = host.current_channel(machine)?;
-    let scnbrk = account_scnbrk(machine, host, chan)?;
+///
+/// Generic: reads no argument of its own. Reached **only** through module
+/// dispatch (its one `ROUTINES` entry, and its own module doc comment's "one
+/// real call site") -- never as an internal helper with no call frame -- so
+/// there is no `arg_frame()` panic to guard against the way `clrprf`/`parsin`
+/// had to (`shims::text`'s own doc comment).
+pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = host.current_channel_mem(call.mem())?;
+    let scnbrk = account_scnbrk(call.mem(), host, chan)?;
     let cnt = (i16::from(scnbrk) - CTNUOS) as u16;
 
     let g = host.gsbl_mut();
@@ -196,13 +204,20 @@ pub fn rstrxf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     apply_pbc(g, chan, 20);
     apply_cpc(g, chan, 19);
 
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rstrxf`]. See `shims::call`'s own doc
+/// comment.
+pub fn rstrxf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rstrxf(&mut super::call(machine), host).map(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+    use mbbs16::FarPtr;
 
     /// Point `usrnum` at the fixture's own console -- the same helper
     /// `crate::shims::fsd`'s tests use, for the same reason: `rstrxf` asks
@@ -231,7 +246,7 @@ mod tests {
         let chan = current(&mut f);
         write_scnbrk(&mut f, chan, 24);
 
-        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
 
         let c = f.host.gsbl().channel(chan);
         assert_eq!((c.xon, c.xoff), (0, 0xed), "0, -19 as btuxnf would store it");
@@ -251,7 +266,7 @@ mod tests {
         let chan = current(&mut f);
         // scnbrk left at its default -- no write_scnbrk call.
 
-        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
 
         let c = f.host.gsbl().channel(chan);
         assert_eq!(c.page_lines, 0xfffe, "-2 as the u16 btuxnf's cnt would hold");
@@ -269,7 +284,7 @@ mod tests {
         let chan = current(&mut f);
         write_scnbrk(&mut f, chan, -5);
 
-        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
 
         assert_eq!(
             f.host.gsbl().channel(chan).page_lines,
@@ -287,7 +302,7 @@ mod tests {
             .expect("channel 1 is current");
         write_scnbrk(&mut f, one, 10);
 
-        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
 
         let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
         assert_eq!(

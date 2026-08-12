@@ -327,7 +327,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // one import, one call site. See `shims::screen`'s own doc comment for
     // what it does, what it does not, and where its one caller actually
     // leads.
-    (MAJORBBS, "rstrxf", screen::rstrxf, Cleans::Caller),
+    (MAJORBBS, "rstrxf", screen::rstrxf_wg16, Cleans::Caller),
     // The current user: the two routines that turn a channel number into the
     // slot it names.
     (MAJORBBS, "curusr", user::curusr_wg16, Cleans::Caller),
@@ -382,21 +382,23 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
         Cleans::Callee(runtime::POINTERS),
     ),
     // The GSBL terminal layer. Fourteen routines, seventy-seven call sites,
-    // none of them reached by initialisation.
-    (GALGSBL, "btutsw", gsbl::btutsw, Cleans::Caller),
-    (GALGSBL, "btuxct", gsbl::btuxct, Cleans::Caller),
-    (GALGSBL, "btuxnf", gsbl::btuxnf, Cleans::Caller),
-    (GALGSBL, "btuxmt", gsbl::btuxmt, Cleans::Caller),
-    (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller),
-    (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller),
-    (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller),
-    (GALGSBL, "btucli", gsbl::btucli, Cleans::Caller),
-    (GALGSBL, "btuinj", gsbl::btuinj, Cleans::Caller),
-    (GALGSBL, "btutrg", gsbl::btutrg, Cleans::Caller),
-    (GALGSBL, "btuech", gsbl::btuech, Cleans::Caller),
-    (GALGSBL, "btumil", gsbl::btumil, Cleans::Caller),
-    (GALGSBL, "btuibw", gsbl::btuibw, Cleans::Caller),
-    (GALGSBL, "btuica", gsbl::btuica, Cleans::Caller),
+    // none of them reached by initialisation. `_wg16`: all seventeen (the
+    // fourteen imports plus the three below) are generic now -- see
+    // `shims::gsbl`'s own doc comment.
+    (GALGSBL, "btutsw", gsbl::btutsw_wg16, Cleans::Caller),
+    (GALGSBL, "btuxct", gsbl::btuxct_wg16, Cleans::Caller),
+    (GALGSBL, "btuxnf", gsbl::btuxnf_wg16, Cleans::Caller),
+    (GALGSBL, "btuxmt", gsbl::btuxmt_wg16, Cleans::Caller),
+    (GALGSBL, "btuoes", gsbl::btuoes_wg16, Cleans::Caller),
+    (GALGSBL, "btuclo", gsbl::btuclo_wg16, Cleans::Caller),
+    (GALGSBL, "btulok", gsbl::btulok_wg16, Cleans::Caller),
+    (GALGSBL, "btucli", gsbl::btucli_wg16, Cleans::Caller),
+    (GALGSBL, "btuinj", gsbl::btuinj_wg16, Cleans::Caller),
+    (GALGSBL, "btutrg", gsbl::btutrg_wg16, Cleans::Caller),
+    (GALGSBL, "btuech", gsbl::btuech_wg16, Cleans::Caller),
+    (GALGSBL, "btumil", gsbl::btumil_wg16, Cleans::Caller),
+    (GALGSBL, "btuibw", gsbl::btuibw_wg16, Cleans::Caller),
+    (GALGSBL, "btuica", gsbl::btuica_wg16, Cleans::Caller),
     // Three more GALGSBL routines, registered even though `WCCMMUD.DLL`
     // imports none of them (`re/exports/imports.txt` has no site for any --
     // see `shims::gsbl`'s own doc comment). `rstrxf`, above, is their one
@@ -404,9 +406,9 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // table -- there is no module far call to dispatch. They are registered
     // anyway because they are ordinary importable GSBL routines and this is
     // where every other one lives, in case a future module asks.
-    (GALGSBL, "btuhpk", gsbl::btuhpk, Cleans::Caller),
-    (GALGSBL, "btupbc", gsbl::btupbc, Cleans::Caller),
-    (GALGSBL, "btucpc", gsbl::btucpc, Cleans::Caller),
+    (GALGSBL, "btuhpk", gsbl::btuhpk_wg16, Cleans::Caller),
+    (GALGSBL, "btupbc", gsbl::btupbc_wg16, Cleans::Caller),
+    (GALGSBL, "btucpc", gsbl::btucpc_wg16, Cleans::Caller),
 ];
 
 /// Every constant the host exports.
