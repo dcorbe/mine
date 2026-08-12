@@ -13,11 +13,18 @@ use std::fmt;
 /// `Copy + Eq + Hash` because a host keys allocations by the exact pointer
 /// value a module holds (see `crates/mbbs/src/heap.rs`'s `blocks` map).
 pub trait ModulePtr: Copy + Eq + std::hash::Hash + fmt::Debug + fmt::Display {
-    /// What this pointer resolves against. Concretely `mbbs16::Machine` for
-    /// `FarPtr` (which owns both execution and memory) and `mbbs32::Image`
-    /// for `Flat32Ptr` (which owns only memory -- `mbbs32::Machine` does
-    /// not own a loaded `Image`; see that crate's `Machine::call` doc
-    /// comment).
+    /// What this pointer resolves against: a module's *memory*, and nothing
+    /// else. Concretely `mbbs16::Segments` for `FarPtr` and `mbbs32::Image`
+    /// for `Flat32Ptr`.
+    ///
+    /// It was `mbbs16::Machine` until `Segments` was split out of it, on the
+    /// reasoning that `Machine` owned both execution and memory and so was
+    /// the only thing a `FarPtr` could be resolved against. That is no longer
+    /// true and was never desirable -- it meant a caller needed a whole
+    /// machine, thunk table and watchdog included, to read one pointer.
+    /// `mbbs32` never had the problem: its `Machine` does not own a loaded
+    /// `Image` at all (see that crate's `Machine::call` doc comment), which
+    /// is what made the asymmetry visible in the first place.
     type Memory;
 
     /// This pointer's error type. An associated type, not a shared enum,

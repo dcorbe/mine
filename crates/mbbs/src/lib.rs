@@ -20,6 +20,24 @@
 //! return an error the module can interpret. It stops the module, naming the
 //! symbol -- see [`Poison::Unimplemented`](mbbs16::Poison::Unimplemented).
 
+/// The vocabulary for serving more than one ABI: [`abi::Abi`], [`abi::Cursor`]
+/// and the single implementation [`abi::Wg16`].
+///
+/// `pub` for a different reason than its neighbours, so it is worth saying
+/// which. `btrieve`, `fsd`, `msg` and the rest are public because
+/// `crates/mbbs/tests/*.rs` are separate compilation units that `use` them.
+/// Nothing uses this one yet -- Task 2 of the ABI plan builds the vocabulary
+/// and converts nothing, so every item here is unreferenced by construction,
+/// and as a private module it would be six dead-code warnings against a
+/// baseline that is meant to stay flat.
+///
+/// `pub` rather than `#[allow(dead_code)]` because this is the crate's
+/// intended surface, not a suppression: the shim signature itself is what
+/// locks this host to 16-bit pointers, so `Abi` is what the shim layer will
+/// eventually be written in terms of. If Tasks 4 and 5 land on a different
+/// shape than [`abi::Cursor`] -- the borrow question its own doc comment
+/// leaves open is a live one -- then what is left over should be deleted, not
+/// left public to keep the lint quiet.
 pub mod abi;
 mod arena;
 pub mod btrieve;
