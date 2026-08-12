@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::io;
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, ModuleMem, Wg16};
 
@@ -314,19 +315,31 @@ pub const NTERMS: u16 = 1;
 
 /// The host's globals, placed in a region the module can address.
 ///
-/// # Generic type, `Wg16`-concrete body
+/// # Generic core, `Wg16`-facade names
 ///
 /// `base` and `prf` are typed `A::Ptr` rather than `FarPtr` so this struct is
-/// genuinely `Globals<A>` -- but every method stays in `impl Globals<Wg16>`
-/// below, using `&mut Machine` exactly as before. Nothing here places more
-/// than two regions, ever (the globals block, and `prfbuf`'s own small one),
-/// so unlike `Heap`/`Arena` there is no growable-pool algorithm worth writing
-/// once and sharing; the only thing this task's scope actually requires is
-/// that construction goes through
-/// [`ModuleMem::alloc_region`](crate::abi::ModuleMem::alloc_region) rather
-/// than `Machine::alloc_segment` directly, which it now does. `A` defaults to
-/// [`Wg16`] so every existing caller keeps naming this type as plain
-/// `Globals`.
+/// genuinely `Globals<A>`. [`Globals::new`] and the MajorBBS-specific readers
+/// (`pointer`, `long`, `selector`, `prf_buffer`) stay `impl Globals<Wg16>`-only,
+/// using `&Machine`/`&mut Machine` exactly as before -- construction and 32-bit
+/// widths are a later task's concern. `address` and `size` moved onto
+/// `impl<A: Abi> Globals<A>` outright: neither ever touched a `Machine`, so
+/// generalising them changed nothing a caller can observe (`A` defaults to
+/// [`Wg16`], so `Globals::address` still returns `Option<FarPtr>` at every
+/// existing call site).
+///
+/// `word` and `write` are different: their *bodies* read and write module
+/// memory, so going generic changes their signature from `&Machine`/
+/// `&mut Machine` to `&A::Mem`/`&mut A::Mem` -- a real break for the dozens of
+/// shim call sites built against the old ones. So both keep their original
+/// name and signature in `impl Globals<Wg16>` (delegating into the generic
+/// core below through [`Machine::mem`]/[`Machine::mem_mut`], the same
+/// reborrow-facade shape `Heap::alloc` uses over `Heap::reserve`), and the
+/// generic core gets new names -- `word_mem`/`write_mem` -- naming the
+/// parameter that is actually new: `A::Mem` in place of a whole `Machine`.
+/// Nothing here places more than two regions, ever (the globals block, and
+/// `prfbuf`'s own small one), so unlike `Heap`/`Arena` there is no
+/// growable-pool algorithm to share -- the only thing generic access buys
+/// here is a caller that has `A::Mem` but not a whole `A::Cpu`/`Machine`.
 pub struct Globals<A: Abi = Wg16> {
     base: A::Ptr,
     offsets: HashMap<&'static str, u16>,
@@ -334,6 +347,71 @@ pub struct Globals<A: Abi = Wg16> {
     /// Where `prfbuf` points: the print buffer, in a region of its own so that
     /// a module overrunning it cannot reach the globals.
     prf: A::Ptr,
+}
+
+impl<A: Abi> Globals<A> {
+    /// Where a global lives, or `None` for a name the host does not place.
+    ///
+    /// Generic outright: this never touched a `Machine`, only the offsets
+    /// table built at construction and `A::ptr_offset` to place the result
+    /// relative to `base`. `base.offset` is always 0 -- every `Globals<A>` is
+    /// built from a single fresh [`ModuleMem::alloc_region`] -- so this is the
+    /// same address `impl Globals<Wg16>`'s hand-built `FarPtr` used to
+    /// compute, expressed through the ABI's own offsetting rule instead of
+    /// naming `FarPtr`'s fields directly.
+    pub fn address(&self, name: &str) -> Option<A::Ptr> {
+        let offset = *self.offsets.get(name)?;
+        Some(A::ptr_offset(self.base, offset))
+    }
+
+    /// How many bytes a global occupies, or `None` for one the host does not
+    /// place.
+    ///
+    /// Generic outright: a lookup in a table keyed by name, with nothing
+    /// ABI-shaped in it at all.
+    pub fn size(&self, name: &str) -> Option<u16> {
+        self.sizes.get(name).copied()
+    }
+
+    /// Read a global as a word, against memory directly rather than a whole
+    /// `Machine`.
+    ///
+    /// The generic core [`Globals::word`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn word_mem(&self, mem: &A::Mem, name: &str) -> io::Result<u16> {
+        let at = self
+            .address(name)
+            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
+        let bytes = at.resolve(mem, 2).map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Overwrite a global, against memory directly rather than a whole
+    /// `Machine`.
+    ///
+    /// The generic core [`Globals::write`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global, or `bytes` is longer than it.
+    pub fn write_mem(&self, mem: &mut A::Mem, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let at = self
+            .address(name)
+            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
+        let size = usize::from(self.size(name).expect("placed, so it has a size"));
+        if bytes.len() > size {
+            return Err(io::Error::other(format!(
+                "{} bytes will not fit in {name}, which is {size}",
+                bytes.len()
+            )));
+        }
+        at.write(mem, bytes).map_err(|e| io::Error::other(e.to_string()))
+    }
 }
 
 impl Globals<Wg16> {
@@ -410,37 +488,17 @@ impl Globals<Wg16> {
         self.prf
     }
 
-    /// Where a global lives, or `None` for a name the host does not place.
-    pub fn address(&self, name: &str) -> Option<FarPtr> {
-        Some(FarPtr {
-            offset: *self.offsets.get(name)?,
-            selector: self.base.selector,
-        })
-    }
-
-    /// How many bytes a global occupies, or `None` for one the host does not
-    /// place.
-    pub fn size(&self, name: &str) -> Option<u16> {
-        self.sizes.get(name).copied()
-    }
-
     /// Overwrite a global.
+    ///
+    /// Reborrows into [`Globals::write_mem`] through [`Machine::mem_mut`] --
+    /// the same facade shape `Heap::alloc` uses over `Heap::reserve` -- so the
+    /// bounds check and the actual write live in exactly one place.
     ///
     /// # Errors
     ///
     /// If `name` is not a global, or `bytes` is longer than it.
     pub fn write(&self, machine: &mut Machine, name: &str, bytes: &[u8]) -> io::Result<()> {
-        let at = self
-            .address(name)
-            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
-        let size = usize::from(self.size(name).expect("placed, so it has a size"));
-        if bytes.len() > size {
-            return Err(io::Error::other(format!(
-                "{} bytes will not fit in {name}, which is {size}",
-                bytes.len()
-            )));
-        }
-        machine.write(at, bytes).map_err(io::Error::other)
+        self.write_mem(machine.mem_mut(), name, bytes)
     }
 
     /// Read a global as a word.
@@ -448,15 +506,15 @@ impl Globals<Wg16> {
     /// Read rather than remembered. `margc` and `tfstate` are the host's
     /// globals but the module's to change.
     ///
+    /// Reborrows into [`Globals::word_mem`] through [`Machine::mem`] -- the
+    /// read-only counterpart to `write`'s [`Machine::mem_mut`] reborrow, added
+    /// alongside it for exactly this.
+    ///
     /// # Errors
     ///
     /// If `name` is not a global.
     pub fn word(&self, machine: &Machine, name: &str) -> io::Result<u16> {
-        let at = self
-            .address(name)
-            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
-        let bytes = machine.resolve(at, 2).map_err(io::Error::other)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.word_mem(machine.mem(), name)
     }
 
     /// Read a global as a `long`.

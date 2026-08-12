@@ -865,6 +865,19 @@ impl Machine {
         self.mem.resolve(ptr, len)
     }
 
+    /// Borrow this module's whole address space, immutably.
+    ///
+    /// The read-only counterpart to [`Machine::mem_mut`], for the same reason:
+    /// a generic caller with only `&Machine` -- `Globals::word`'s `Wg16`
+    /// facade, `crates/mbbs/src/globals.rs`, is the first -- needs `&Segments`
+    /// to hand to a `ModulePtr::resolve` that reads generically, and there is
+    /// no narrower delegation to write for the same reason `mem_mut` has none:
+    /// the whole point is handing back the field itself. See `mem_mut`'s own
+    /// doc comment for the fuller reasoning, which applies unchanged here.
+    pub fn mem(&self) -> &Segments {
+        &self.mem
+    }
+
     /// Borrow this module's whole address space, mutably.
     ///
     /// Every other memory method on `Machine` is a one-line delegation, kept
