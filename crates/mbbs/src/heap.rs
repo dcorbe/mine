@@ -24,12 +24,42 @@
 //! naming the pointer, rather than damage. That is a difference from the real
 //! host -- which would have shrugged and carried on corrupting itself -- and it
 //! is the intended one.
+//!
+//! # Generic core, 16-bit-only skin
+//!
+//! The algorithm above -- first-fit across regions already mapped, block
+//! sizes kept host-side keyed by the pointer -- is written once, over
+//! `A: Abi`, and grows a region at a time through
+//! [`ModuleMem::alloc_region`](crate::abi::ModuleMem::alloc_region) rather
+//! than `mbbs16::Machine::alloc_segment` directly: see [`Heap::reserve`].
+//!
+//! What does **not** move onto that generic core is `alcmem`/`galfree`'s
+//! actual public surface, or `alctile`. Every shim call site --
+//! `shims/system.rs`, `users.rs`, `btrieve.rs`, and others -- was written
+//! against `Heap::alloc(&mut Machine, ..)`, and this task's job is to change
+//! what backs that call, not to touch the 114 shim bodies that make it.
+//! [`Heap::alloc`] and [`Heap::alloc_tiled`] stay `impl Heap<Wg16>`-only
+//! methods with their original `&mut Machine` signatures, each a one-line
+//! reborrow into the generic core (`machine.mem_mut()`) -- the same
+//! delegating-facade shape Task 1 gave `Machine` over `Segments`.
+//! `alloc_tiled` in particular has no generic core to delegate deeper than
+//! that: LDT tile chaining is `Wg16`-only forever (its 32-bit counterpart is
+//! `alcblok`/`ptrblok`, an unrelated mechanism, out of scope here).
+//!
+//! `A` defaults to [`Wg16`](crate::abi::Wg16), so every existing caller keeps
+//! naming this type as plain `Heap`.
 
 use std::collections::HashMap;
 
-use mbbs16::{FarPtr, Machine};
+use crate::abi::{Abi, ModuleMem, Wg16};
 
-/// Bytes in one of the heap's segments, which is as much as one can address.
+/// Bytes in one of the heap's regions, which is as much as one 16-bit segment
+/// can address. Kept as the shared growth policy for now because only `Wg16`
+/// exists to measure a different one against -- a 32-bit `Heap` may one day
+/// want regions sized differently, at which point this stops being a bare
+/// constant and becomes something the `Abi` states, the way
+/// [`Abi::PTR_WIDTH`](crate::abi::Abi::PTR_WIDTH) already does for argument
+/// widths.
 const SEGMENT: u16 = u16::MAX;
 
 /// How much memory a module may have, and how it is laid out.
@@ -53,33 +83,58 @@ impl Default for Config {
     }
 }
 
-/// One free or allocated run of bytes within a heap segment.
+/// One free or allocated run of bytes within a heap region.
 #[derive(Debug, Clone, Copy)]
 struct Span {
     at: u16,
     len: u16,
 }
 
-/// One 64 KiB segment of heap, and what is free in it.
-struct Arena {
-    selector: u16,
+/// One region of heap, and what is free in it.
+struct Arena<A: Abi> {
+    base: A::Ptr,
     /// Free spans, in address order and never touching -- adjacent ones are
     /// merged on free, or a heap that had been used would stop being able to
     /// answer for its own capacity.
     free: Vec<Span>,
 }
 
-/// The module's heap and its tiled regions.
-pub struct Heap {
-    config: Config,
-    arenas: Vec<Arena>,
+/// Where a live allocation sits: which region, how far into it, how long.
+///
+/// Kept host-side rather than reconstructed from the pointer, because a
+/// generic `A::Ptr` cannot be decomposed back into "which region" and "how
+/// far into it" the way a `FarPtr`'s `selector`/`offset` could be read
+/// directly -- `mbbs_ptr::ModulePtr` has no such operation, deliberately (see
+/// its own doc comment). Recording the decomposition at allocation time, once,
+/// is simpler than adding one.
+struct Block {
+    region: usize,
+    at: u16,
+    len: u16,
+}
 
-    /// How long each live allocation is, by where it starts.
-    blocks: HashMap<FarPtr, u16>,
+/// The module's heap and its tiled regions.
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
+/// as plain `Heap` -- see this module's doc comment ("Generic core, 16-bit-only
+/// skin").
+pub struct Heap<A: Abi = Wg16> {
+    config: Config,
+    regions: Vec<Arena<A>>,
+
+    /// How long each live allocation is, and where, by the pointer handed out
+    /// for it.
+    blocks: HashMap<A::Ptr, Block>,
 
     /// Every tiled region: the first tile's selector, how many tiles, how big.
     /// Needed because `ptrtile` is otherwise unanswerable -- the host cannot
     /// tell a tile index that is inside a region from one past its end.
+    ///
+    /// `Region` (the public, `alctile`-facing one -- not [`Arena`] above,
+    /// which is this module's private per-region free list) stays keyed by a
+    /// raw `u16` selector rather than `A::Ptr`: `alctile`'s tiling is
+    /// `Wg16`-only regardless of `A` (see this module's doc comment), so
+    /// there is no ABI to be generic over here.
     tiles: Vec<Region>,
 }
 
@@ -91,16 +146,16 @@ pub struct Region {
     pub size: u16,
 }
 
-impl Heap {
+impl<A: Abi> Heap<A> {
     /// A heap that has not reserved anything yet.
     ///
-    /// Segments are mapped as they are needed rather than up front: a module
+    /// Regions are mapped as they are needed rather than up front: a module
     /// that allocates nothing should cost nothing, and eight megabytes of
     /// untouched mapping is eight megabytes.
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            arenas: Vec::new(),
+            regions: Vec::new(),
             blocks: HashMap::new(),
             tiles: Vec::new(),
         }
@@ -108,18 +163,18 @@ impl Heap {
 
     /// How many bytes are left, as `farcoreleft` reports it.
     ///
-    /// The genuine remaining capacity: what is free in the segments already
+    /// The genuine remaining capacity: what is free in the regions already
     /// mapped, plus what could still be mapped.
     ///
-    /// "Could still be mapped" is whole segments and no remainder. A heap
-    /// configured at eight megabytes holds 128 segments of 65,535 bytes and 128
+    /// "Could still be mapped" is whole regions and no remainder. A heap
+    /// configured at eight megabytes holds 128 regions of 65,535 bytes and 128
     /// bytes over, and those 128 can never be handed to anybody -- counting
     /// them would make this number wrong by exactly the amount a module sizing
     /// a cache off it would then fail to get.
     pub fn left(&self) -> usize {
-        let spare = (self.capacity() - self.arenas.len()) * SEGMENT as usize;
+        let spare = (self.capacity() - self.regions.len()) * SEGMENT as usize;
         let free: usize = self
-            .arenas
+            .regions
             .iter()
             .flat_map(|a| &a.free)
             .map(|s| usize::from(s.len))
@@ -127,17 +182,22 @@ impl Heap {
         free + spare
     }
 
-    /// How many segments this heap may ever have.
+    /// How many regions this heap may ever have.
     fn capacity(&self) -> usize {
         self.config.heap / SEGMENT as usize
     }
 
-    /// Reserve `size` bytes.
+    /// Reserve `size` bytes, growing through
+    /// [`ModuleMem::alloc_region`] if nothing already mapped has room.
+    ///
+    /// The generic core `alcmem`/`alczer` both back, through
+    /// [`Heap::alloc`]'s `Wg16` facade -- see this module's doc comment for
+    /// why the facade exists and why shim call sites still say `alloc`.
     ///
     /// # Errors
     ///
     /// If `size` is zero, or the heap has no room and may not grow.
-    pub fn alloc(&mut self, machine: &mut Machine, size: u16) -> Result<FarPtr, String> {
+    pub fn reserve(&mut self, mem: &mut A::Mem, size: u16) -> Result<A::Ptr, String> {
         if size == 0 {
             // `alcmem(0)` has no useful answer: a pointer to nothing that
             // `galfree` must still accept. The real host returned something;
@@ -145,30 +205,30 @@ impl Heap {
             return Err("an allocation of zero bytes".to_owned());
         }
 
-        if let Some(at) = self.take(size) {
-            self.blocks.insert(at, size);
-            return Ok(at);
+        if let Some((region, at, ptr)) = self.take(size) {
+            self.blocks.insert(ptr, Block { region, at, len: size });
+            return Ok(ptr);
         }
 
         // Nothing had room. Grow, if the configured total allows it.
-        if self.arenas.len() == self.capacity() {
+        if self.regions.len() == self.capacity() {
             return Err(format!(
                 "{size} bytes, and the {}-byte heap has {} left",
                 self.config.heap,
                 self.left()
             ));
         }
-        let selector = machine
-            .alloc_segment(SEGMENT as usize)
+        let base = mem
+            .alloc_region(SEGMENT as usize)
             .map_err(|e| e.to_string())?;
-        self.arenas.push(Arena {
-            selector,
+        self.regions.push(Arena {
+            base,
             free: vec![Span { at: 0, len: SEGMENT }],
         });
 
-        let at = self.take(size).expect("a fresh segment has room");
-        self.blocks.insert(at, size);
-        Ok(at)
+        let (region, at, ptr) = self.take(size).expect("a fresh region has room");
+        self.blocks.insert(ptr, Block { region, at, len: size });
+        Ok(ptr)
     }
 
     /// Give `at` back.
@@ -177,58 +237,40 @@ impl Heap {
     ///
     /// If `at` was never allocated, or has already been freed. Both are module
     /// bugs the real host would have absorbed silently.
-    pub fn free(&mut self, at: FarPtr) -> Result<(), String> {
-        let len = self
+    pub fn free(&mut self, at: A::Ptr) -> Result<(), String> {
+        let block = self
             .blocks
             .remove(&at)
             .ok_or_else(|| format!("{at:?} was not allocated, or was freed already"))?;
 
-        let arena = self
-            .arenas
-            .iter_mut()
-            .find(|a| a.selector == at.selector)
-            .expect("an allocated block is in one of our arenas");
+        let region = &mut self.regions[block.region];
 
         // Insert in address order, then merge with either neighbour it now
         // touches. Without the merge, allocating and freeing the same block
         // repeatedly would leave the heap unable to satisfy anything larger.
-        let index = arena.free.partition_point(|s| s.at < at.offset);
-        arena.free.insert(index, Span { at: at.offset, len });
+        let index = region.free.partition_point(|s| s.at < block.at);
+        region.free.insert(
+            index,
+            Span {
+                at: block.at,
+                len: block.len,
+            },
+        );
 
-        let mut merged: Vec<Span> = Vec::with_capacity(arena.free.len());
-        for span in arena.free.drain(..) {
+        let mut merged: Vec<Span> = Vec::with_capacity(region.free.len());
+        for span in region.free.drain(..) {
             match merged.last_mut() {
                 Some(last) if last.at + last.len == span.at => last.len += span.len,
                 _ => merged.push(span),
             }
         }
-        arena.free = merged;
+        region.free = merged;
         Ok(())
     }
 
     /// How long the block at `at` is, or `None` if nothing is.
-    pub fn block(&self, at: FarPtr) -> Option<u16> {
-        self.blocks.get(&at).copied()
-    }
-
-    /// Reserve a tiled region and remember its shape.
-    ///
-    /// # Errors
-    ///
-    /// If the region cannot be mapped or the LDT has no run that long.
-    pub fn alloc_tiled(
-        &mut self,
-        machine: &mut Machine,
-        qty: u16,
-        size: u16,
-    ) -> Result<FarPtr, String> {
-        let at = machine.alloc_tiled(qty, size).map_err(|e| e.to_string())?;
-        self.tiles.push(Region {
-            selector: at.selector,
-            qty,
-            size,
-        });
-        Ok(at)
+    pub fn block(&self, at: A::Ptr) -> Option<u16> {
+        self.blocks.get(&at).map(|b| b.len)
     }
 
     /// Which tiled region `selector` names the first tile of.
@@ -241,39 +283,81 @@ impl Heap {
         &self.tiles
     }
 
-    /// How many heap segments are mapped.
+    /// How many heap regions are mapped.
     pub fn segments(&self) -> usize {
-        self.arenas.len()
+        self.regions.len()
     }
 
-    /// First fit across the segments already mapped.
-    fn take(&mut self, size: u16) -> Option<FarPtr> {
-        for arena in &mut self.arenas {
-            // `continue`, not `?`: a segment with no room means try the next
+    /// First fit across the regions already mapped: which region, how far
+    /// into it, and the pointer that offset resolves to.
+    fn take(&mut self, size: u16) -> Option<(usize, u16, A::Ptr)> {
+        for (index, region) in self.regions.iter_mut().enumerate() {
+            // `continue`, not `?`: a region with no room means try the next
             // one, not that the heap is full.
-            let Some(found) = arena.free.iter().position(|s| s.len >= size) else {
+            let Some(found) = region.free.iter().position(|s| s.len >= size) else {
                 continue;
             };
-            let span = &mut arena.free[found];
-            let at = FarPtr {
-                offset: span.at,
-                selector: arena.selector,
-            };
+            let span = &mut region.free[found];
+            let at = span.at;
             if span.len == size {
-                arena.free.remove(found);
+                region.free.remove(found);
             } else {
                 span.at += size;
                 span.len -= size;
             }
-            return Some(at);
+            let ptr = A::ptr_offset(region.base, at);
+            return Some((index, at, ptr));
         }
         None
+    }
+}
+
+/// The `Wg16` facade: `alcmem`/`galfree`'s and `alctile`'s original public
+/// names and `&mut Machine` signatures, unchanged since before this task, so
+/// every shim call site keeps compiling. See this module's doc comment
+/// ("Generic core, 16-bit-only skin").
+impl Heap<Wg16> {
+    /// `alcmem`'s host half. A one-line reborrow into [`Heap::reserve`] --
+    /// see `crates/mbbs/src/abi.rs`'s "Call holds one handle, not two" for why
+    /// a reborrow through `Machine::mem_mut`, not a second stored borrow, is
+    /// what makes a generic core reachable from a `&mut Machine` call site at
+    /// all.
+    ///
+    /// # Errors
+    ///
+    /// If `size` is zero, or the heap has no room and may not grow.
+    pub fn alloc(&mut self, machine: &mut mbbs16::Machine, size: u16) -> Result<mbbs16::FarPtr, String> {
+        self.reserve(machine.mem_mut(), size)
+    }
+
+    /// `alctile`'s host half. Stays `Wg16`-only by construction: LDT tile
+    /// chaining (`Machine::alloc_tiled`) has no 32-bit counterpart --
+    /// `alcblok`/`ptrblok` are a different mechanism entirely, out of scope
+    /// here (see the implementation plan's Task 6).
+    ///
+    /// # Errors
+    ///
+    /// If the region cannot be mapped or the LDT has no run that long.
+    pub fn alloc_tiled(
+        &mut self,
+        machine: &mut mbbs16::Machine,
+        qty: u16,
+        size: u16,
+    ) -> Result<mbbs16::FarPtr, String> {
+        let at = machine.alloc_tiled(qty, size).map_err(|e| e.to_string())?;
+        self.tiles.push(Region {
+            selector: at.selector,
+            qty,
+            size,
+        });
+        Ok(at)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mbbs16::{FarPtr, Machine};
 
     fn heap() -> (Machine, Heap) {
         (

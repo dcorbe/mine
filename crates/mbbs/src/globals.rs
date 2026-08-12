@@ -36,6 +36,8 @@ use std::io;
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::abi::{Abi, ModuleMem, Wg16};
+
 /// `MAJORBBS.H:23` -- input buffer size for each channel.
 const INPSIZ: u16 = 256;
 /// `MAJORBBS.H:398` -- max number of global command handlers.
@@ -310,22 +312,36 @@ pub const OUTBSZ: u16 = 4096;
 /// where that comes from.
 pub const NTERMS: u16 = 1;
 
-/// The host's globals, placed in a segment the module can address.
-pub struct Globals {
-    selector: u16,
+/// The host's globals, placed in a region the module can address.
+///
+/// # Generic type, `Wg16`-concrete body
+///
+/// `base` and `prf` are typed `A::Ptr` rather than `FarPtr` so this struct is
+/// genuinely `Globals<A>` -- but every method stays in `impl Globals<Wg16>`
+/// below, using `&mut Machine` exactly as before. Nothing here places more
+/// than two regions, ever (the globals block, and `prfbuf`'s own small one),
+/// so unlike `Heap`/`Arena` there is no growable-pool algorithm worth writing
+/// once and sharing; the only thing this task's scope actually requires is
+/// that construction goes through
+/// [`ModuleMem::alloc_region`](crate::abi::ModuleMem::alloc_region) rather
+/// than `Machine::alloc_segment` directly, which it now does. `A` defaults to
+/// [`Wg16`] so every existing caller keeps naming this type as plain
+/// `Globals`.
+pub struct Globals<A: Abi = Wg16> {
+    base: A::Ptr,
     offsets: HashMap<&'static str, u16>,
     sizes: HashMap<&'static str, u16>,
-    /// Where `prfbuf` points: the print buffer, in a segment of its own so that
+    /// Where `prfbuf` points: the print buffer, in a region of its own so that
     /// a module overrunning it cannot reach the globals.
-    prf: FarPtr,
+    prf: A::Ptr,
 }
 
-impl Globals {
+impl Globals<Wg16> {
     /// Place every global, and initialise the ones that are not zero.
     ///
     /// # Errors
     ///
-    /// If the segments cannot be mapped.
+    /// If the regions cannot be mapped.
     pub fn new(machine: &mut Machine, terms: crate::Terms) -> io::Result<Self> {
         let mut offsets = HashMap::with_capacity(GLOBALS.len());
         let mut sizes = HashMap::with_capacity(GLOBALS.len());
@@ -340,14 +356,11 @@ impl Globals {
             at += global.size;
         }
 
-        let selector = machine.alloc_segment(usize::from(at))?;
-        let prf = FarPtr {
-            offset: 0,
-            selector: machine.alloc_segment(usize::from(OUTBSZ))?,
-        };
+        let base = machine.mem_mut().alloc_region(usize::from(at))?;
+        let prf = machine.mem_mut().alloc_region(usize::from(OUTBSZ))?;
 
         let globals = Self {
-            selector,
+            base,
             offsets,
             sizes,
             prf,
@@ -389,7 +402,7 @@ impl Globals {
 
     /// The segment the globals live in.
     pub fn selector(&self) -> u16 {
-        self.selector
+        self.base.selector
     }
 
     /// Where the print buffer starts.
@@ -401,7 +414,7 @@ impl Globals {
     pub fn address(&self, name: &str) -> Option<FarPtr> {
         Some(FarPtr {
             offset: *self.offsets.get(name)?,
-            selector: self.selector,
+            selector: self.base.selector,
         })
     }
 

@@ -102,6 +102,14 @@ use mbbs16::{
     Source, Symbol, Target,
 };
 
+// `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
+// own 64 KiB allocation goes through the `Abi` trait's allocator now, same as
+// `Heap`/`Arena`/`Globals`, rather than `Machine::alloc_segment` directly. See
+// `docs/plans/2026-08-11-abi-abstraction-implementation.md`'s Task 6. `Wg16`
+// is named here only where a generic type needs pinning explicitly (`Host`
+// itself stays un-generified -- that is the next task, not this one).
+use crate::abi::{ModuleMem, Wg16};
+
 /// How a module entry point ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -812,7 +820,7 @@ impl Host {
         // reads of `globals::NTERMS` -- see `crate::chan` for what the three
         // separate reads cost, and for the measurement that showed one of the
         // two directions of disagreement was completely silent.
-        let globals = Globals::new(machine, terms)?;
+        let globals = Globals::<Wg16>::new(machine, terms)?;
         let prf_end = OUTBSZ;
 
         // One segment for everything the host hands a module a pointer into and
@@ -823,13 +831,21 @@ impl Host {
         // module overrunning one of these cannot reach `usrnum`.
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
         let l2as_bytes = shims::text::L2AS_BYTES as usize * shims::text::L2AS_BUFFERS;
-        let selector = machine.alloc_segment(spr_bytes + 64 + 1 + l2as_bytes)?;
+        // `ModuleMem::alloc_region`, not `Machine::alloc_segment` directly --
+        // one of the 9 sites Task 6 moves onto the `Abi` trait's allocator.
+        // `Host` itself is not generic yet, so this is `Wg16` concretely: the
+        // region it returns is always `offset: 0`, and every FarPtr built
+        // below is this same `selector` at a chosen offset within it.
+        let selector = machine
+            .mem_mut()
+            .alloc_region(spr_bytes + 64 + 1 + l2as_bytes)?
+            .selector;
 
         // The per-channel tables come off the module heap, because the real
         // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
         // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
         // module allocates from. So the heap has to exist before they do.
-        let mut heap = Heap::new(Config::default());
+        let mut heap = Heap::<Wg16>::new(Config::default());
         let users = users::Users::new(machine, &mut heap, terms)?;
 
         // The three authorities, checked against each other once.

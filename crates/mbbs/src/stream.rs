@@ -408,7 +408,7 @@ impl Streams {
 
         let cookie = self
             .arena
-            .reserve(machine, FILE_SIZE)
+            .reserve(machine.mem_mut(), FILE_SIZE)
             .map_err(|e| format!("{name}: {e}"))?;
 
         let stream = Stream {

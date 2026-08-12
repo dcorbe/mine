@@ -382,10 +382,10 @@ impl Messages {
     ) -> io::Result<FarPtr> {
         let mut text = Vec::with_capacity(file.len());
         for message in file.messages() {
-            text.push(self.arena.intern(machine, message)?);
+            text.push(self.arena.intern(machine.mem_mut(), message)?);
         }
 
-        let cookie = self.arena.reserve(machine, MSGBLK)?;
+        let cookie = self.arena.reserve(machine.mem_mut(), MSGBLK)?;
         let count = u16::try_from(file.len()).map_err(|_| {
             io::Error::other(format!("{name} has {} messages, which is more \
                 than a 16-bit msgcnt holds", file.len()))

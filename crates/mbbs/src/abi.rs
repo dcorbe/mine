@@ -129,6 +129,26 @@ pub trait Abi {
     /// Decode a C `long` from exactly [`LONG_WIDTH`](Abi::LONG_WIDTH) bytes.
     fn long_from_bytes(bytes: &[u8]) -> u32;
 
+    /// Build a pointer `delta` bytes into a region [`ModuleMem::alloc_region`]
+    /// handed back.
+    ///
+    /// `Heap` and `Arena` (`crates/mbbs/src/heap.rs`,
+    /// `crates/mbbs/src/arena.rs`) both pack many small placements into ONE
+    /// region rather than taking a fresh region per placement -- that packing
+    /// is the entire reason either type exists -- so both need to turn "a
+    /// region's base" plus "how far into it" into an addressable pointer,
+    /// generically, with no idea what shape `Self::Ptr` actually has.
+    /// `Wg16`'s is `seg:off`: offsetting means adding to `offset` and leaving
+    /// `selector` alone. `Wg32`'s will be a flat address -- ordinary integer
+    /// addition -- when Task 3 implements it.
+    ///
+    /// `delta` is `u16`, not `usize`: nothing here ever offsets past the end
+    /// of one region, and no region this crate hands out today exceeds
+    /// 64 KiB -- `Wg16`'s only backing implementation refuses more (see
+    /// `ModuleMem::alloc_region`'s own doc comment). A wider type would only
+    /// let an out-of-range offset compile instead of refusing to build.
+    fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr;
+
     /// Reach this ABI's memory through its execution handle.
     ///
     /// A reborrow, not a second field: see the module doc comment ("`Call`
@@ -391,6 +411,13 @@ impl Abi for Wg16 {
         u32::from_le_bytes(bytes.try_into().expect("LONG_WIDTH bytes"))
     }
 
+    fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr {
+        mbbs16::FarPtr {
+            offset: base.offset + delta,
+            selector: base.selector,
+        }
+    }
+
     /// `Machine::mem_mut` is the one deliberate exception Task 1's facade
     /// left: every other memory method is a narrow delegation (`resolve`,
     /// `read_cstr`, `write`, ...), but reaching `Segments` generically means
@@ -565,6 +592,12 @@ mod tests {
 
         fn long_from_bytes(bytes: &[u8]) -> u32 {
             Wg16::long_from_bytes(bytes)
+        }
+
+        fn ptr_offset(_base: Self::Ptr, _delta: u16) -> Self::Ptr {
+            // Same reasoning as `mem` below: nothing in `Call`'s frame-read
+            // tests places anything, so nothing computes an offset either.
+            unreachable!("Call's read tests never allocate memory")
         }
 
         fn mem(_cpu: &mut Self::Cpu) -> &mut Self::Mem {
