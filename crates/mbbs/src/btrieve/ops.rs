@@ -1386,6 +1386,44 @@ mod tests {
         assert_eq!(locks.get(b.id(), bb), Some(300), "the second is held too");
     }
 
+    /// [`LockTable::release_all_for`] must release **only** the block it is
+    /// given.
+    ///
+    /// **A measured gap, not a hypothetical.** Every other lock test in this
+    /// module uses a single [`Block`], so none of them could tell a
+    /// per-block release from a global one. Replacing the body with
+    /// `self.held.clear()` -- so closing one file released every *other*
+    /// file's locks too -- left the entire suite of 1358 green.
+    ///
+    /// That is the shape those tests share rather than a gap in any one of
+    /// them, which is why this test opens a second file and does nothing
+    /// else interesting: two blocks is the only thing the rest of the module
+    /// never does.
+    #[test]
+    fn closing_one_file_leaves_another_files_locks_alone() {
+        let mut one = fixture("closing_one_file_leaves_another_alone_one");
+        let mut two = fixture("closing_one_file_leaves_another_alone_two");
+        let mut locks = LockTable::default();
+
+        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let in_one = one.current().unwrap().position;
+        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let in_two = two.current().unwrap().position;
+
+        locks.release_all_for(one.id());
+
+        assert_eq!(
+            locks.get(one.id(), in_one),
+            None,
+            "the closed file's own lock is released"
+        );
+        assert_eq!(
+            locks.get(two.id(), in_two),
+            Some(300),
+            "and the other file's lock is untouched -- a release is per block"
+        );
+    }
+
     /// [`Block::get`]'s own lock tests above all go through `get` -- every
     /// one of `step`/`acquire_absolute`'s own `take_lock` calls was
     /// otherwise unreached by anything asserting on a *held* lock (only on
