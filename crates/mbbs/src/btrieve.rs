@@ -1141,6 +1141,118 @@ impl Block {
         pages::write_record(&self.path, layout, pages::Slot::Existing(position), &slot, count)
     }
 
+    /// Remove the record at `position`, as `delbtv` (Btrieve operation 4)
+    /// does: take it out of the in-memory model and splice its slot onto the
+    /// head of the file's own free list on disk.
+    ///
+    /// Existence is checked against the model **before** anything is
+    /// written, the same reason [`Self::update`] checks first: `position` is
+    /// a module's word for a file offset, not a slot this layer chose, and
+    /// deleting whatever happens to sit at an unverified offset would erase
+    /// bytes that were never a record at all.
+    ///
+    /// **Variable-length files refuse, for the same reason [`Self::update`]
+    /// already refuses to write one.** A variable-length record's fragment
+    /// lives on a separate page, reached through the four-byte pointer
+    /// between `reclen` and `physical` in its slot (see [`Self::update`]'s
+    /// doc comment and [`Self::rewrite_variable`]). Deleting the slot without
+    /// also freeing that fragment page would leak it forever; deleting the
+    /// fragment page too is a real feature this host has not measured or
+    /// implemented. Measured (`tools/btrieve-oracle/delprobe.c`,
+    /// `docs/delete-oracle-answer.md`): a genuine delete of a variable-length
+    /// record succeeds at the API level (status 0) on the real engine, but
+    /// what it does to the fragment chain was not traced byte-for-byte, so
+    /// this host refuses rather than guess -- the identical precedent
+    /// [`Self::update`]'s own doc comment sets for the same shape of file.
+    ///
+    /// Measured against the real engine, on a copy of the real, shipped
+    /// `WCCCLASS.DAT` (fixed-length, no confounding shadow-paged or
+    /// freshly-`B_CREATE`d artifacts -- see `docs/delete-oracle-answer.md`
+    /// for why that file was chosen over a synthetic fixture): deleting the
+    /// record at file offset 3843 left the file control record's free-list
+    /// head ([`pages::fcr::FREE`]) holding exactly 3843, the deleted slot's
+    /// own first four bytes holding `0x16ce` -- the free-list head's value
+    /// **before** this delete, now a forwarding link -- and every byte behind
+    /// that zero. The record count dropped by one and both changes persisted
+    /// across a close and reopen. A later insert was measured to land back
+    /// at offset 3843, reusing the freed slot, with the free-list head
+    /// advancing to `0x16ce` -- confirming [`pages::Layout::next_slot`]'s
+    /// `Slot::Free` reuse from the write side, not only the read side it
+    /// already assumed. See [`pages::delete_record`] for the on-disk half.
+    ///
+    /// Also measured: a second `B_DELETE` with no repositioning in between,
+    /// and a `B_DELETE` with no position established at all, both gave
+    /// status 8 ("invalid positioning") -- the same status either way,
+    /// because a delete consumes the position exactly as fully as never
+    /// having one. This host gives the equivalent refusal by requiring
+    /// `position` to still name a record in the model; nothing here tracks
+    /// "the position a delete just consumed" as a distinct state, because the
+    /// model already stops naming that position the moment this call
+    /// succeeds -- a caller that calls `delete` again with the same
+    /// `position` hits the "holds no record" refusal below, the same
+    /// observable the real engine's status 8 gives.
+    ///
+    /// # Errors
+    ///
+    /// If the records cannot be read, the file holds variable-length
+    /// records, `position` holds no record, or the file cannot be written.
+    pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
+        self.records()?;
+        self.writable()?;
+        let name = self.name.clone();
+
+        if self.geometry.variable {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "holds variable-length records up to {} bytes, and this host does \
+                     not delete them -- a variable-length record's fragment lives on a \
+                     separate page reached through the pointer behind its fixed part, \
+                     and this host has not measured or implemented freeing that page, \
+                     the same reasoning `Self::update` already gives for refusing to \
+                     write this shape of file",
+                    self.geometry.reclen
+                ),
+            });
+        }
+
+        let records = self.records.as_ref().expect("just loaded");
+        if records.find_physical(position).is_none() {
+            return Err(BtvError {
+                file: name,
+                why: format!("position {position} holds no record"),
+            });
+        }
+        let count = records.len() as u32 - 1;
+
+        let layout = pages::Layout {
+            page: self.geometry.page,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+
+        // The last point before this write actually changes anything -- see
+        // `Self::capture_for_journal`'s doc comment for why it is taken here
+        // rather than at the top of the function.
+        self.capture_for_journal()?;
+
+        pages::delete_record(&self.path, layout, position, count).map_err(|why| BtvError {
+            file: name.clone(),
+            why,
+        })?;
+
+        self.records
+            .as_mut()
+            .expect("just loaded")
+            .delete(&self.keys, position)
+            .map_err(|why| BtvError { file: name, why })?;
+
+        self.geometry.records = count;
+        self.dirty = true;
+
+        Ok(())
+    }
+
     /// Rebuild every key's leaf index page from the records already in memory,
     /// in that key's order, and update the file control record's per-key
     /// record count to match.
@@ -2320,6 +2432,8 @@ mod tests {
             .expect("a record")
             .position;
         let e = block.update(at, &bytes).expect_err("v6 updates are refused");
+        assert!(e.why.contains("does not write"), "{e}");
+        let e = block.delete(at).expect_err("v6 deletes are refused");
         assert!(e.why.contains("does not write"), "{e}");
 
         // And the file on disk is untouched.
@@ -3804,6 +3918,149 @@ mod tests {
         assert!(read("V6ROOM.DAT", &bytes).expect("six is enough").variable);
     }
 
+    // `Block::delete` (Btrieve operation 4, `delbtv`). Semantics measured
+    // against genuine Btrieve 6.15 with `tools/btrieve-oracle/delprobe.c`;
+    // see `Block::delete`'s and `pages::delete_record`'s doc comments for the
+    // raw probe output each test below is reproducing.
+
+    #[test]
+    fn delete_refuses_a_variable_length_file() {
+        let dir = crate::testing::scratch("block-delete-refuses-variable-length");
+        let path = seed_variable(&dir);
+        let mut block = block_variable(path.clone());
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        let e = block
+            .delete(64 + 6)
+            .expect_err("a variable-length file refuses delete, the same as insert and update");
+        assert!(e.why.contains("variable-length"), "{e}");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, before, "a refused delete must not touch the file");
+    }
+
+    /// `position` is a module's word for a file offset, not a slot this layer
+    /// chose -- deleting at one the model does not recognise must refuse
+    /// rather than clear whatever bytes happen to be there.
+    #[test]
+    fn delete_refuses_a_position_that_holds_no_record() {
+        let dir = crate::testing::scratch("block-delete-refuses-unknown-position");
+        let path = seed(&dir);
+        let mut block = block(path.clone());
+        block.insert(&record(1)).expect("seed a record");
+        let before = std::fs::read(&path).expect("read the fixture");
+
+        let e = block.delete(9999).expect_err("9999 holds no record");
+        assert!(e.why.contains("9999"), "{e}");
+
+        let after = std::fs::read(&path).expect("read back");
+        assert_eq!(after, before, "a refused delete must not touch the file");
+    }
+
+    /// The measured shape end to end at the `Block` level: the record leaves
+    /// the in-memory model, the file control record's free-list head becomes
+    /// the deleted position, the deleted slot's own bytes hold the forwarding
+    /// link `pages::delete_record`'s doc comment describes, and the record
+    /// count drops by one -- all four surviving a dropped cache and a fresh
+    /// read off disk, the same check
+    /// [`a_block_that_writes_is_readable_after_its_cache_is_dropped`] makes
+    /// for insert.
+    #[test]
+    fn delete_removes_the_record_from_the_model_and_updates_the_free_list_on_disk() {
+        let dir = crate::testing::scratch("block-delete-updates-free-list");
+        let path = seed(&dir);
+        let mut block = block(path.clone());
+        let first = block.insert(&record(1)).expect("first insert");
+        let second = block.insert(&record(2)).expect("second insert");
+
+        block.delete(first).expect("delete");
+
+        assert!(
+            block.records().expect("reads").find_physical(first).is_none(),
+            "gone from the in-memory model"
+        );
+        assert!(
+            block.records().expect("reads").find_physical(second).is_some(),
+            "the other record is untouched"
+        );
+        assert_eq!(block.geometry.records, 1, "the model's own count dropped by one");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            pages::long(&bytes[pages::fcr::FREE..pages::fcr::FREE + 4]),
+            first,
+            "the free-list head is the deleted position"
+        );
+        assert_eq!(
+            pages::long(&bytes[first as usize..first as usize + 4]),
+            pages::NOWHERE,
+            "the deleted slot's own forwarding link -- nothing was free before this delete"
+        );
+        assert_eq!(
+            pages::long(&bytes[pages::fcr::RECORDS_HIGH..pages::fcr::RECORDS_HIGH + 4]),
+            1,
+            "the on-disk record count dropped by one"
+        );
+
+        // Cache dropped, fresh read off disk: the deletion reached the file,
+        // not only the `Records` cache.
+        block.records = None;
+        let reread = block.records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 1, "disk has only the surviving record");
+        assert!(reread.find_physical(second).is_some());
+        assert!(reread.find_physical(first).is_none());
+    }
+
+    /// Closes the loop `pages::delete_record`'s doc comment describes from
+    /// the write side: a slot freed by `Block::delete` is the slot the very
+    /// next `Block::insert` reuses, at the `Block` level rather than
+    /// `pages::Layout::next_slot`'s own unit tests. A mutation that deleted
+    /// the record everywhere BUT forgot to update the on-disk free-list head
+    /// would still pass every assertion in the test above that only reads
+    /// `fcr::FREE` once -- this one only passes if a REAL subsequent write
+    /// consults it.
+    #[test]
+    fn a_slot_freed_by_delete_is_reused_by_the_next_insert() {
+        let dir = crate::testing::scratch("block-delete-slot-is-reused");
+        let path = seed(&dir);
+        let mut block = block(path);
+        let first = block.insert(&record(1)).expect("first insert");
+        block.insert(&record(2)).expect("second insert");
+
+        block.delete(first).expect("delete the first");
+        let reused = block.insert(&record(3)).expect("third insert");
+
+        assert_eq!(reused, first, "the freed slot came back, not a fresh one");
+        assert_eq!(block.geometry.pages, 5, "no new page was needed");
+    }
+
+    /// The two-entry case: `pages::delete_record`'s doc comment on
+    /// `Layout::next_slot`'s pop-from-head reuse only has one entry to prove
+    /// itself against in the test above. Deleting a SECOND record must link
+    /// it ahead of the first, not overwrite the list's only entry -- a
+    /// mutation that always wrote `NOWHERE` as the forwarding link (ignoring
+    /// whatever the free-list head already was) would pass the single-delete
+    /// test above but strand the first deletion's slot here, unreachable
+    /// from the head.
+    #[test]
+    fn two_deletes_leave_a_two_entry_free_list_in_lifo_order() {
+        let dir = crate::testing::scratch("block-delete-two-entry-free-list");
+        let path = seed(&dir);
+        let mut block = block(path);
+        let first = block.insert(&record(1)).expect("first insert");
+        let second = block.insert(&record(2)).expect("second insert");
+        block.insert(&record(3)).expect("third insert");
+
+        block.delete(first).expect("delete the first");
+        block.delete(second).expect("delete the second");
+
+        // LIFO: the most recently deleted slot comes back first.
+        let reused_second = block.insert(&record(4)).expect("fourth insert");
+        assert_eq!(reused_second, second, "the second deletion's slot is reused first");
+        let reused_first = block.insert(&record(5)).expect("fifth insert");
+        assert_eq!(reused_first, first, "the first deletion's slot comes back second");
+    }
+
     // Task 6: transactions. Ops 19/20/21 (`dfaBegTrans`/`dfaEndTrans`/
     // `dfaAbtTrans`) as ABI-independent `Btrieve` methods -- semantics only,
     // no shim registration (that is Task 7's marshalling, blocked on the
@@ -4010,6 +4267,78 @@ mod tests {
                 .bytes[0],
             1,
             "the pre-transaction value, not the update, survives on disk"
+        );
+    }
+
+    /// Reproduces `xactprobe`'s `abort_delete` scenario: `delete status=0
+    /// (OK)`, then `get-inside-txn status=4 (key value not found)`, and after
+    /// `abort`, `get-after-abort-same-session status=0 (OK) tag=33` and
+    /// `get-after-close-reopen status=0 (OK) tag=33` -- the record comes back
+    /// both in the same session and after a fresh read off disk.
+    #[test]
+    fn abort_undoes_a_delete_both_in_memory_and_on_disk() {
+        let dir = crate::testing::scratch("txn-abort-undoes-delete");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+        // A second record from before the transaction, so this test can also
+        // see that abort's restore does not disturb it -- the same shape
+        // `abort_undoes_an_insert_both_in_memory_and_on_disk` uses a baseline
+        // for.
+        let survivor = btrieve.open[0].insert(&record(1)).expect("survivor insert");
+        let position = btrieve.open[0].insert(&record(9)).expect("baseline insert");
+
+        btrieve.begin().expect("begin");
+        btrieve.open[0].delete(position).expect("delete inside the transaction");
+        assert!(
+            btrieve.open[0].records().expect("reads").find_physical(position).is_none(),
+            "gone before abort, matching xactprobe's get-inside-txn status 4"
+        );
+
+        btrieve.abort().expect("abort");
+
+        assert!(!btrieve.open[0].txn_active, "the block is no longer covered");
+        assert!(btrieve.open[0].pre_image.is_none(), "the pre-image is discarded, not kept");
+        assert_eq!(btrieve.open[0].geometry.records, 2, "the count reverts too");
+
+        let model = btrieve.open[0].records().expect("in-memory model after abort");
+        assert!(model.find_physical(position).is_some(), "the deleted record comes back");
+        assert!(model.find_physical(survivor).is_some(), "the survivor is undisturbed");
+
+        // And a fresh read off disk, cache dropped, agrees with the model --
+        // the rollback reached the file, not only the `Records` cache.
+        btrieve.open[0].records = None;
+        let reread = btrieve.open[0].records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 2, "disk has both records again");
+        assert!(reread.find_physical(position).is_some());
+        assert!(reread.find_physical(survivor).is_some());
+    }
+
+    /// `Self::capture_for_journal`'s doc comment says a call that returns
+    /// `Err` never captures one -- checked here for `delete` specifically,
+    /// the same way its placement is checked for insert and update by every
+    /// refusal test in this module running outside a transaction (where a
+    /// stray capture is invisible: nothing ever reads `pre_image` if
+    /// `txn_active` is false). Moving the call to the top of `delete`, ahead
+    /// of the "holds no record" refusal, passed every other test in this
+    /// module -- capturing a pre-image is idempotent and no bytes change
+    /// between "top of function" and "just before the write" on a call that
+    /// is about to fail anyway, so a snapshot taken early is byte-identical
+    /// to one taken late. The only thing that mutation changes is whether
+    /// `pre_image` becomes `Some` on a call that never wrote anything, and
+    /// that is what this test pins.
+    #[test]
+    fn a_refused_delete_inside_a_transaction_does_not_capture_a_pre_image() {
+        let dir = crate::testing::scratch("txn-refused-delete-no-pre-image");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+        btrieve.open[0].insert(&record(1)).expect("seed a record");
+
+        btrieve.begin().expect("begin");
+        btrieve.open[0].delete(9999).expect_err("9999 holds no record");
+
+        assert!(
+            btrieve.open[0].pre_image.is_none(),
+            "a refused delete wrote nothing, so there is nothing to have captured"
         );
     }
 

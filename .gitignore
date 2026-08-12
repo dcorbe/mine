@@ -72,3 +72,6 @@ tools/btrieve-oracle/updprobe.exe
 
 # Build artifact of tools/btrieve-oracle/xactprobe.c (Task 6's transaction probe)
 tools/btrieve-oracle/xactprobe.exe
+
+# Build artifact of tools/btrieve-oracle/delprobe.c (Block::delete's oracle probe)
+tools/btrieve-oracle/delprobe.exe

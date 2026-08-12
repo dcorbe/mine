@@ -396,15 +396,18 @@ impl Records {
 
     /// Remove the record at `position`.
     ///
-    /// `pub(crate)` rather than `pub`: this only removes `position` from the
-    /// in-memory model, and there is no `Block::delete` yet to remove the
-    /// on-disk slot or add it to the free list. Calling this alone would
-    /// take `position` out of [`Self::positions`] while the slot on disk is
-    /// still live -- `Layout::next_slot`'s free-list-then-existing-gap
-    /// search does not consult the free list on disk either, so nothing
-    /// stops `next_slot` from handing that same still-live position back as
-    /// `Slot::Existing` and having a later insert overwrite it. Widen this
-    /// once `Block::delete` exists to keep the two in step.
+    /// `pub(crate)` rather than `pub`, and it stays that way: this only
+    /// removes `position` from the in-memory model, never the on-disk slot
+    /// or the free list. `Block::delete` (`crate::btrieve`, the same crate,
+    /// so `pub(crate)` already reaches it) is the only caller and always
+    /// pairs this with `pages::delete_record` -- disk first, then this --
+    /// so the two never drift apart. Calling this alone, from outside that
+    /// pairing, would take `position` out of [`Self::positions`] while the
+    /// slot on disk is still live: `Layout::next_slot`'s
+    /// free-list-then-existing-gap search does not consult the free list on
+    /// disk either, so nothing would stop `next_slot` handing that same
+    /// still-live position back as `Slot::Existing` and a later insert
+    /// overwriting it.
     ///
     /// # Errors
     ///
