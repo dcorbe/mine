@@ -42,6 +42,11 @@
 //! and every routine that used to read `machine.read_cstr`/`resolve`/`write`
 //! now reads through [`Call::mem`] instead.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
@@ -89,6 +94,7 @@ pub fn btutsw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btutsw`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btutsw_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btutsw(&mut super::call(machine), host).map(Into::into)
 }
@@ -108,6 +114,7 @@ pub fn btumil<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btumil`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btumil_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btumil(&mut super::call(machine), host).map(Into::into)
 }
@@ -126,6 +133,7 @@ pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuech`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuech_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuech(&mut super::call(machine), host).map(Into::into)
 }
@@ -145,6 +153,7 @@ pub fn btulok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btulok`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btulok_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btulok(&mut super::call(machine), host).map(Into::into)
 }
@@ -164,6 +173,7 @@ pub fn btuoes<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuoes`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuoes_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuoes(&mut super::call(machine), host).map(Into::into)
 }
@@ -183,6 +193,7 @@ pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btutrg`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btutrg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btutrg(&mut super::call(machine), host).map(Into::into)
 }
@@ -225,6 +236,7 @@ pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuxnf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuxnf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuxnf(&mut super::call(machine), host).map(Into::into)
 }
@@ -273,6 +285,7 @@ pub fn btuhpk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuhpk`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuhpk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuhpk(&mut super::call(machine), host).map(Into::into)
 }
@@ -300,6 +313,7 @@ pub fn btupbc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btupbc`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btupbc_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btupbc(&mut super::call(machine), host).map(Into::into)
 }
@@ -328,6 +342,7 @@ pub fn btucpc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btucpc`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btucpc_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btucpc(&mut super::call(machine), host).map(Into::into)
 }
@@ -353,6 +368,7 @@ pub fn btuclo<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuclo`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuclo_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuclo(&mut super::call(machine), host).map(Into::into)
 }
@@ -380,6 +396,7 @@ pub fn btucli<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btucli`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btucli_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btucli(&mut super::call(machine), host).map(Into::into)
 }
@@ -398,6 +415,7 @@ pub fn btuinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuinj`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuinj_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuinj(&mut super::call(machine), host).map(Into::into)
 }
@@ -426,6 +444,7 @@ pub fn btuibw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuibw`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuibw_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuibw(&mut super::call(machine), host).map(Into::into)
 }
@@ -451,6 +470,7 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuxmt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuxmt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuxmt(&mut super::call(machine), host).map(Into::into)
 }
@@ -478,6 +498,7 @@ pub fn btuxct<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuxct`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuxct_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuxct(&mut super::call(machine), host).map(Into::into)
 }
@@ -514,6 +535,7 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`btuica`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn btuica_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     btuica(&mut super::call(machine), host).map(Into::into)
 }

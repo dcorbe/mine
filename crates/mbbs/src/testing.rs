@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 use crate::Host;
-use crate::shims::{Shim, ShimError};
+use crate::abi::{self, Call, Wg16};
+use crate::shims::{ShimError, Wg16Shim};
 
 pub struct Fixture {
     pub machine: Machine,
@@ -181,7 +182,7 @@ impl Fixture {
     }
 
     /// Push `args` and run `shim` over them.
-    pub fn invoke(&mut self, shim: Shim, args: &[u16]) -> Result<Ret, ShimError> {
+    pub fn invoke(&mut self, shim: Wg16Shim, args: &[u16]) -> Result<Ret, ShimError> {
         self.call(args);
         shim(&mut self.machine, &mut self.host)
     }
@@ -189,12 +190,31 @@ impl Fixture {
     /// Push `args`, set the registers, and run `shim` over both.
     pub fn invoke_with(
         &mut self,
-        shim: Shim,
+        shim: Wg16Shim,
         args: &[u16],
         regs: [u16; 4],
     ) -> Result<Ret, ShimError> {
         self.call_with(args, regs);
         shim(&mut self.machine, &mut self.host)
+    }
+
+    /// Push `args` and run a raw [`Shim<Wg16>`](crate::shims::Shim) over
+    /// them -- the shape [`entry`](crate::shims::entry) hands back now that
+    /// [`crate::shims::Shim`] is generic, rather than [`Wg16Shim`]'s bare
+    /// `&mut Machine`. Only two of this crate's own tests need it (both in
+    /// `shims::mod`, which reach a routine through `entry` by name rather
+    /// than by calling it directly, the way every other test in this crate
+    /// does) -- everywhere else keeps calling [`Fixture::invoke`] with a
+    /// `_wg16` bridge, which is cheaper to write and does not need this.
+    pub fn invoke_call(
+        &mut self,
+        shim: crate::shims::Shim<Wg16>,
+        args: &[u16],
+    ) -> Result<abi::Ret<Wg16>, ShimError> {
+        self.call(args);
+        let frame = self.machine.arg_frame().to_vec();
+        let mut call = Call::<Wg16>::new(&mut self.machine, &frame);
+        shim(&mut call, &mut self.host)
     }
 
     /// A far pointer, as the two argument words it arrives in.

@@ -25,6 +25,11 @@
 //! unblocked it, in the `shims/text.rs`+`fsd.rs` and `shims/gsbl.rs`+
 //! `screen.rs` commits that followed this one.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
@@ -63,6 +68,7 @@ pub fn uacoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// The dispatch-table entry for [`uacoff`]: builds a [`Call<Wg16>`] over the
 /// outstanding call's frame and converts its `abi::Ret<Wg16>` back into
 /// `mbbs16::Ret`. See `shims::call`'s own doc comment.
+#[cfg(test)]
 pub fn uacoff_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     uacoff(&mut super::call(machine), host).map(Into::into)
 }
@@ -115,6 +121,7 @@ pub fn curusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`curusr`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn curusr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     curusr(&mut super::call(machine), host).map(Into::into)
 }
@@ -166,6 +173,7 @@ pub fn getin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`getin`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn getin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     getin(&mut super::call(machine), host).map(Into::into)
 }
@@ -263,6 +271,7 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`haskey`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn haskey_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     haskey(&mut super::call(machine), host).map(Into::into)
 }
@@ -319,6 +328,7 @@ pub fn begin_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
 
 /// The dispatch-table entry for [`begin_polling`]. See `shims::call`'s own
 /// doc comment.
+#[cfg(test)]
 pub fn begin_polling_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     begin_polling(&mut super::call(machine), host).map(Into::into)
 }
@@ -347,6 +357,7 @@ pub fn stop_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 
 /// The dispatch-table entry for [`stop_polling`]. See `shims::call`'s own
 /// doc comment.
+#[cfg(test)]
 pub fn stop_polling_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     stop_polling(&mut super::call(machine), host).map(Into::into)
 }

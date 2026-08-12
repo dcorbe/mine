@@ -318,7 +318,7 @@ mod tests {
     use crate::testing::Fixture;
 
     /// Push a dividend and a divisor the way the module does, and run `shim`.
-    fn div(shim: crate::shims::Shim, dividend: u32, divisor: u32) -> Result<Ret, ShimError> {
+    fn div(shim: crate::shims::Wg16Shim, dividend: u32, divisor: u32) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         let args = [
             dividend as u16,
@@ -386,7 +386,7 @@ mod tests {
     }
 
     /// Set `DX:AX` and `CX:BX` the way a module does, and run `shim`.
-    fn regs(shim: crate::shims::Shim, dxax: u32, cxbx: u32) -> Result<Ret, ShimError> {
+    fn regs(shim: crate::shims::Wg16Shim, dxax: u32, cxbx: u32) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         let regs = [
             dxax as u16,         // AX
@@ -432,7 +432,7 @@ mod tests {
     }
 
     /// Set `DX:AX` and a shift count in `CL`, and run `shim`.
-    fn shift(shim: crate::shims::Shim, value: u32, count: u8) -> Result<Ret, ShimError> {
+    fn shift(shim: crate::shims::Wg16Shim, value: u32, count: u8) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         // CH is deliberately not zero: no call site sets it, so a shim that read
         // CX rather than CL would shift by an enormous number.

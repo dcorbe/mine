@@ -331,6 +331,7 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// The dispatch-table entry for [`fsdroom`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdroom_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdroom(&mut super::call(machine), host).map(Into::into)
 }
@@ -440,6 +441,7 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdapr`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdapr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdapr(&mut super::call(machine), host).map(Into::into)
 }
@@ -550,6 +552,7 @@ pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdnan`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdnan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdnan(&mut super::call(machine), host).map(Into::into)
 }
@@ -683,6 +686,7 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdord`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdord_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdord(&mut super::call(machine), host).map(Into::into)
 }
@@ -752,6 +756,7 @@ pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`fsdxan`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdxan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdxan(&mut super::call(machine), host).map(Into::into)
 }
@@ -802,6 +807,7 @@ pub fn fsdrft<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdrft`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdrft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdrft(&mut super::call(machine), host).map(Into::into)
 }
@@ -938,6 +944,7 @@ pub fn fsdbkg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdbkg`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdbkg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdbkg(&mut super::call(machine), host).map(Into::into)
 }
@@ -991,12 +998,6 @@ pub fn vfyadn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     Ok(abi::Ret::Int(A::Int::from(vc as u16)))
-}
-
-/// The dispatch-table entry for [`vfyadn`]. See `shims::call`'s own doc
-/// comment.
-pub fn vfyadn_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    vfyadn(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `fsdcon()`, `FSDBBS.C:91-101`. Turn on the channel settings an FSD session
@@ -1267,6 +1268,7 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fsdego`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fsdego_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fsdego(&mut super::call(machine), host).map(Into::into)
 }

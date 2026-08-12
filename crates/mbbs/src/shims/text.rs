@@ -15,7 +15,12 @@
 //! place in the host that can consume the `ESC[[ansi|ascii]` construct before
 //! any of it reaches `prfbuf`, the GSBL, or the wire.
 
-use mbbs16::{Machine, Ret};
+use mbbs16::Machine;
+// `Ret` is now named only by this file's `#[cfg(test)]` `_wg16` bridges --
+// production code reaches every routine here through its generic
+// `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own `call` doc comment.
+#[cfg(test)]
+use mbbs16::Ret;
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
@@ -52,6 +57,7 @@ pub fn spr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
 }
 
 /// The dispatch-table entry for [`spr`]. See `shims::call`'s own doc comment.
+#[cfg(test)]
 pub fn spr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     spr(&mut super::call(machine), host).map(Into::into)
 }
@@ -120,6 +126,7 @@ pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`l2as`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn l2as_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     l2as(&mut super::call(machine), host).map(Into::into)
 }
@@ -144,6 +151,7 @@ pub fn sprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`sprintf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn sprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     sprintf(&mut super::call(machine), host).map(Into::into)
 }
@@ -177,6 +185,7 @@ pub fn vsprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`vsprintf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn vsprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     vsprintf(&mut super::call(machine), host).map(Into::into)
 }
@@ -198,6 +207,7 @@ pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
 }
 
 /// The dispatch-table entry for [`prf`]. See `shims::call`'s own doc comment.
+#[cfg(test)]
 pub fn prf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     prf(&mut super::call(machine), host).map(Into::into)
 }
@@ -452,6 +462,7 @@ pub fn clrprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), Sh
 
 /// The dispatch-table entry for [`clrprf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn clrprf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     clrprf(&mut super::call(machine), host).map(Into::into)
 }
@@ -485,6 +496,7 @@ pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`stzcpy`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn stzcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     stzcpy(&mut super::call(machine), host).map(Into::into)
 }
@@ -504,6 +516,7 @@ pub fn strcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strcpy`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strcpy(&mut super::call(machine), host).map(Into::into)
 }
@@ -519,6 +532,7 @@ pub fn strlen<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strlen`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strlen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strlen(&mut super::call(machine), host).map(Into::into)
 }
@@ -542,6 +556,7 @@ pub fn rmvwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`rmvwht`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rmvwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rmvwht(&mut super::call(machine), host).map(Into::into)
 }
@@ -562,6 +577,7 @@ pub fn skpwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`skpwht`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn skpwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     skpwht(&mut super::call(machine), host).map(Into::into)
 }
@@ -578,6 +594,7 @@ pub fn skpwrd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`skpwrd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn skpwrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     skpwrd(&mut super::call(machine), host).map(Into::into)
 }
@@ -597,6 +614,7 @@ pub fn depad<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>,
 
 /// The dispatch-table entry for [`depad`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn depad_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     depad(&mut super::call(machine), host).map(Into::into)
 }
@@ -775,6 +793,7 @@ pub fn parsin_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), Sh
 
 /// The dispatch-table entry for [`parsin`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn parsin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     parsin(&mut super::call(machine), host).map(Into::into)
 }
@@ -871,6 +890,7 @@ pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`rstrin`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rstrin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rstrin(&mut super::call(machine), host).map(Into::into)
 }
@@ -915,6 +935,7 @@ pub fn atol<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
 
 /// The dispatch-table entry for [`atol`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn atol_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     atol(&mut super::call(machine), host).map(Into::into)
 }
@@ -939,6 +960,7 @@ pub fn sameas<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`sameas`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn sameas_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     sameas(&mut super::call(machine), host).map(Into::into)
 }
@@ -959,6 +981,7 @@ pub fn sameto<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`sameto`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn sameto_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     sameto(&mut super::call(machine), host).map(Into::into)
 }
@@ -979,6 +1002,7 @@ pub fn samein<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`samein`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn samein_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     samein(&mut super::call(machine), host).map(Into::into)
 }
@@ -998,6 +1022,7 @@ pub fn lastwd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`lastwd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn lastwd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     lastwd(&mut super::call(machine), host).map(Into::into)
 }
@@ -1045,6 +1070,7 @@ pub fn sortstgs<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`sortstgs`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn sortstgs_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     sortstgs(&mut super::call(machine), host).map(Into::into)
 }
@@ -1111,6 +1137,7 @@ pub fn strtok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`strtok`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strtok_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strtok(&mut super::call(machine), host).map(Into::into)
 }
@@ -1140,6 +1167,7 @@ pub fn strchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strchr`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strchr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strchr(&mut super::call(machine), host).map(Into::into)
 }
@@ -1177,6 +1205,7 @@ pub fn strstr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strstr`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strstr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strstr(&mut super::call(machine), host).map(Into::into)
 }
@@ -1203,6 +1232,7 @@ pub fn strcat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strcat`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strcat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strcat(&mut super::call(machine), host).map(Into::into)
 }
@@ -1238,6 +1268,7 @@ pub fn strncat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`strncat`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strncat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strncat(&mut super::call(machine), host).map(Into::into)
 }
@@ -1293,6 +1324,7 @@ pub fn strncpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`strncpy`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strncpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strncpy(&mut super::call(machine), host).map(Into::into)
 }
@@ -1316,6 +1348,7 @@ pub fn strcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`strcmp`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn strcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     strcmp(&mut super::call(machine), host).map(Into::into)
 }
@@ -1338,6 +1371,7 @@ pub fn toupper<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`toupper`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn toupper_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     toupper(&mut super::call(machine), host).map(Into::into)
 }
@@ -1351,6 +1385,7 @@ pub fn tolower<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`tolower`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn tolower_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     tolower(&mut super::call(machine), host).map(Into::into)
 }

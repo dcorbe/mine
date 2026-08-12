@@ -132,6 +132,11 @@
 //! implementation would start from -- recording it now is what makes that
 //! later work additive instead of a rewrite.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
@@ -209,6 +214,7 @@ pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`rstrxf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rstrxf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rstrxf(&mut super::call(machine), host).map(Into::into)
 }

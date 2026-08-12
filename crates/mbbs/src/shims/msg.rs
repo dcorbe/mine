@@ -21,6 +21,11 @@
 //! same rule the rest of the crate is under. It is a deliberate difference from
 //! the real host, and the only one in this file.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 
 // `FarPtr` is named by exactly one item now -- the `#[cfg(test)]` [`message`]
@@ -91,6 +96,7 @@ pub fn opnmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`opnmsg`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn opnmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     opnmsg(&mut super::call(machine), host).map(Into::into)
 }
@@ -126,6 +132,7 @@ pub fn clsmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`clsmsg`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn clsmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     clsmsg(&mut super::call(machine), host).map(Into::into)
 }
@@ -154,6 +161,7 @@ pub fn setmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`setmbk`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn setmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     setmbk(&mut super::call(machine), host).map(Into::into)
 }
@@ -170,6 +178,7 @@ pub fn rstmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`rstmbk`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rstmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rstmbk(&mut super::call(machine), host).map(Into::into)
 }
@@ -217,6 +226,7 @@ pub fn stgopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`stgopt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn stgopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     stgopt(&mut super::call(machine), host).map(Into::into)
 }
@@ -252,6 +262,7 @@ pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`numopt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn numopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     numopt(&mut super::call(machine), host).map(Into::into)
 }
@@ -280,6 +291,7 @@ pub fn ynopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`ynopt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn ynopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     ynopt(&mut super::call(machine), host).map(Into::into)
 }
@@ -301,6 +313,7 @@ pub fn chropt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`chropt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn chropt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     chropt(&mut super::call(machine), host).map(Into::into)
 }
@@ -361,6 +374,7 @@ pub fn tokopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`tokopt`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn tokopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     tokopt(&mut super::call(machine), host).map(Into::into)
 }
@@ -386,6 +400,7 @@ pub fn prfmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`prfmsg`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn prfmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     prfmsg(&mut super::call(machine), host).map(Into::into)
 }

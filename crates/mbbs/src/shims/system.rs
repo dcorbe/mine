@@ -37,6 +37,11 @@
 //! already made and for the same reason -- see `Registration::dispatch`'s
 //! own doc comment.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
@@ -91,6 +96,7 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
 }
 
 /// The dispatch-table entry for [`now`]. See `shims::call`'s own doc comment.
+#[cfg(test)]
 pub fn now_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     now(&mut super::call(machine), host).map(Into::into)
 }
@@ -118,6 +124,7 @@ pub fn today<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>,
 
 /// The dispatch-table entry for [`today`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn today_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     today(&mut super::call(machine), host).map(Into::into)
 }
@@ -155,6 +162,7 @@ pub fn time<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
 
 /// The dispatch-table entry for [`time`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn time_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     time(&mut super::call(machine), host).map(Into::into)
 }
@@ -239,6 +247,7 @@ pub fn nctime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`nctime`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn nctime_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     nctime(&mut super::call(machine), host).map(Into::into)
 }
@@ -284,6 +293,7 @@ pub fn ncdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`ncdate`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn ncdate_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     ncdate(&mut super::call(machine), host).map(Into::into)
 }
@@ -356,6 +366,7 @@ pub fn cofdat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`cofdat`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn cofdat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     cofdat(&mut super::call(machine), host).map(Into::into)
 }
@@ -448,6 +459,7 @@ pub fn ncedat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`ncedat`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn ncedat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     ncedat(&mut super::call(machine), host).map(Into::into)
 }
@@ -468,6 +480,7 @@ pub fn srand<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`srand`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn srand_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     srand(&mut super::call(machine), host).map(Into::into)
 }
@@ -494,6 +507,7 @@ pub fn genrdn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`genrdn`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn genrdn_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     genrdn(&mut super::call(machine), host).map(Into::into)
 }
@@ -542,6 +556,7 @@ pub fn lngrnd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`lngrnd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn lngrnd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     lngrnd(&mut super::call(machine), host).map(Into::into)
 }
@@ -604,12 +619,6 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
-/// The dispatch-table entry for [`access`]. See `shims::call`'s own doc
-/// comment.
-pub fn access_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    access(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `CHAR *gmdnam(CHAR *mdfnam)` -- `GCOMM.H:954-956` -- a module's name, out
 /// of its `.MDF`.
 ///
@@ -648,6 +657,7 @@ pub fn gmdnam<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`gmdnam`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn gmdnam_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     gmdnam(&mut super::call(machine), host).map(Into::into)
 }
@@ -681,6 +691,7 @@ pub fn shocst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`shocst`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn shocst_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     shocst(&mut super::call(machine), host).map(Into::into)
 }
@@ -732,6 +743,7 @@ pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`rtkick`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rtkick_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rtkick(&mut super::call(machine), host).map(Into::into)
 }
@@ -757,6 +769,7 @@ pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`dclvda`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn dclvda_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     dclvda(&mut super::call(machine), host).map(Into::into)
 }
@@ -811,6 +824,7 @@ pub fn register_module<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result
 
 /// The dispatch-table entry for [`register_module`]. See `shims::call`'s own
 /// doc comment.
+#[cfg(test)]
 pub fn register_module_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     register_module(&mut super::call(machine), host).map(Into::into)
 }
@@ -897,6 +911,7 @@ pub fn register_agent<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<
 
 /// The dispatch-table entry for [`register_agent`]. See `shims::call`'s own
 /// doc comment.
+#[cfg(test)]
 pub fn register_agent_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     register_agent(&mut super::call(machine), host).map(Into::into)
 }
@@ -965,6 +980,7 @@ pub fn register_textvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Resul
 
 /// The dispatch-table entry for [`register_textvar`]. See `shims::call`'s
 /// own doc comment.
+#[cfg(test)]
 pub fn register_textvar_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     register_textvar(&mut super::call(machine), host).map(Into::into)
 }
@@ -991,6 +1007,7 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`catastro`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn catastro_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     catastro(&mut super::call(machine), host).map(Into::into)
 }

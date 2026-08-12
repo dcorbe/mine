@@ -57,6 +57,7 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`alcmem`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn alcmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     alcmem(&mut super::call(machine), host).map(Into::into)
 }
@@ -87,6 +88,7 @@ pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`alczer`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn alczer_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     alczer(&mut super::call(machine), host).map(Into::into)
 }
@@ -105,6 +107,7 @@ pub fn galfree<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// The dispatch-table entry for [`galfree`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn galfree_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     galfree(&mut super::call(machine), host).map(Into::into)
 }
@@ -126,6 +129,7 @@ pub fn farcoreleft<A: Abi>(
 
 /// The dispatch-table entry for [`farcoreleft`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn farcoreleft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     farcoreleft(&mut super::call(machine), host).map(Into::into)
 }
@@ -208,6 +212,7 @@ pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`setmem`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn setmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     setmem(&mut super::call(machine), host).map(Into::into)
 }
@@ -235,6 +240,7 @@ pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`movmem`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn movmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     movmem(&mut super::call(machine), host).map(Into::into)
 }
@@ -260,6 +266,7 @@ pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`memcpy`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn memcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     memcpy(&mut super::call(machine), host).map(Into::into)
 }
@@ -293,6 +300,7 @@ pub fn memcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
 /// The dispatch-table entry for [`memcmp`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn memcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     memcmp(&mut super::call(machine), host).map(Into::into)
 }

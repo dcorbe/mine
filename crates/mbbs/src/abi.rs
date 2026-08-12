@@ -233,6 +233,53 @@ pub trait Abi {
     /// its ordinary pointers already use -- there being nothing else it
     /// could mean once "near" and "far" collapse to the same address space.
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr;
+
+    /// A routine that answers only for this `Abi`, when the shared table
+    /// (`crate::shims::entry`) has nothing generic to offer.
+    ///
+    /// **The second door**, named in
+    /// `docs/plans/2026-08-11-abi-abstraction-implementation.md`'s "`Shim<A>`
+    /// as specified is unreachable, and the table needs a second door": most
+    /// of `crate::shims`'s routines are `fn<A: Abi>(&mut Call<A>, &mut
+    /// Host<A>) -> Result<Ret<A>, ShimError>` and live in one shared table,
+    /// keyed only by DLL and symbol name. Twenty-seven are not, for two
+    /// different reasons:
+    ///
+    /// - Ten are genuinely 16-bit by design and have no meaning under any
+    ///   other `Abi` at all: `shims::runtime`'s eight Borland callee-cleaned
+    ///   helpers (`WGSERVER.DEF`'s `#ifdef GCDOS` block; 32-bit Worldgroup is
+    ///   uniformly cdecl and needs none of them) and `shims::memory`'s
+    ///   `alctile`/`ptrtile` (segment tiling; a flat address space has
+    ///   nothing to tile).
+    /// - Seventeen are `shims::btrieve`'s Btrieve family, which *could* mean
+    ///   something under another `Abi` -- but the engine behind them
+    ///   (`crate::btrieve::Btrieve`) is concrete, keyed by `mbbs16::FarPtr`
+    ///   and `mbbs16::Machine`, and generifying it is separate, larger work
+    ///   this crate has not done yet. Not an ABI difference the way the ten
+    ///   above are -- a coverage gap this door also has to hold open until
+    ///   that work lands.
+    ///
+    /// Default `None`: an `Abi` with nothing to add here (`Wg32`, today)
+    /// writes no code at all. `Wg16`'s override
+    /// (`crates/mbbs/src/abi.rs`'s own `impl Abi for Wg16`) delegates to
+    /// [`crate::shims::wg16_native`], which is where the actual table of
+    /// twenty-seven lives -- kept in `shims::mod` alongside the shared table
+    /// and `ABSOLUTES`/`GLOBALS`, rather than here, so this trait states only
+    /// that the door exists and not what is behind it.
+    ///
+    /// A symbol this returns `None` for is not necessarily unimplemented --
+    /// `crate::shims::entry` still has `ABSOLUTES` and `GLOBALS` to check, and
+    /// only answers [`crate::shims::Entry::Unimplemented`] once every door has
+    /// been asked. That is already how this host reports a truly
+    /// unimplemented symbol; an `Abi` simply not carrying a routine walks the
+    /// same, already-tested path.
+    fn native(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)>
+    where
+        Self: Sized,
+    {
+        let _ = (dll, symbol);
+        None
+    }
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -519,6 +566,14 @@ impl Abi for Wg16 {
             selector: cpu.data_selector(),
         }
     }
+
+    /// The second door, opened: `Wg16` is the one `Abi` with routines behind
+    /// it. See [`Abi::native`]'s own doc comment for what the twenty-seven
+    /// are and why they are here rather than in the shared table; the table
+    /// itself lives in `shims::mod`, not this file.
+    fn native(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)> {
+        crate::shims::wg16_native(dll, symbol)
+    }
 }
 
 impl From<Ret<Wg16>> for mbbs16::Ret {
@@ -538,6 +593,24 @@ impl From<Ret<Wg16>> for mbbs16::Ret {
             Ret::Int(v) => mbbs16::Ret::U16(v),
             Ret::Long(v) => mbbs16::Ret::U32(v),
             Ret::Ptr(v) => mbbs16::Ret::Far(v),
+        }
+    }
+}
+
+impl From<mbbs16::Ret> for Ret<Wg16> {
+    /// The reverse of the conversion above -- needed once `Wg16::native`
+    /// (see this module's `Abi::native`) has to hand a routine that still
+    /// answers in `mbbs16::Ret` (the ten permanently-16-bit helpers behind
+    /// `Wg16`'s door: `runtime.rs`'s `f_*@` family and `memory.rs`'s
+    /// `alctile`/`ptrtile`) back to a caller expecting `Ret<Wg16>`, the same
+    /// type every other routine behind `entry` answers in. Same variant
+    /// mapping as the forward direction, read backwards.
+    fn from(ret: mbbs16::Ret) -> Self {
+        match ret {
+            mbbs16::Ret::Void => Ret::Void,
+            mbbs16::Ret::U16(v) => Ret::Int(v),
+            mbbs16::Ret::U32(v) => Ret::Long(v),
+            mbbs16::Ret::Far(v) => Ret::Ptr(v),
         }
     }
 }
@@ -852,5 +925,34 @@ mod tests {
             mbbs16::Ret::Far(ptr),
             "offset (AX) and selector (DX) must land unswapped"
         );
+    }
+
+    /// The reverse direction: `Ret<A>` has no `PartialEq` (see this module's
+    /// own doc comment on why `Debug`/`Clone`/`Copy` are hand-written rather
+    /// than derived), so this destructures each variant instead of comparing
+    /// whole values -- same discrimination the forward test above uses
+    /// (distinct high and low halves), read backwards.
+    #[test]
+    fn mbbs16_ret_converts_to_ret_wg16_for_all_four_variants() {
+        assert!(matches!(Ret::<Wg16>::from(mbbs16::Ret::Void), Ret::Void));
+
+        let Ret::Int(v) = Ret::<Wg16>::from(mbbs16::Ret::U16(0x1234)) else {
+            panic!("U16 must convert to Int");
+        };
+        assert_eq!(v, 0x1234);
+
+        let Ret::Long(v) = Ret::<Wg16>::from(mbbs16::Ret::U32(0x1234_5678)) else {
+            panic!("U32 must convert to Long");
+        };
+        assert_eq!(v, 0x1234_5678);
+
+        let ptr = FarPtr {
+            offset: 0x5678,
+            selector: 0x1234,
+        };
+        let Ret::Ptr(v) = Ret::<Wg16>::from(mbbs16::Ret::Far(ptr)) else {
+            panic!("Far must convert to Ptr");
+        };
+        assert_eq!(v, ptr, "offset (AX) and selector (DX) must land unswapped");
     }
 }

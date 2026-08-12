@@ -232,7 +232,9 @@ mod tests {
         // count belongs. This is the join, and it is the assertion that would
         // have failed.
         let name = Exports::wg101().name(DOSCALLS, 135).expect("135 is named");
-        let crate::shims::Entry::Absolute(shift) = crate::shims::entry(DOSCALLS, name) else {
+        let crate::shims::Entry::Absolute(shift) =
+            crate::shims::entry::<crate::abi::Wg16>(DOSCALLS, name)
+        else {
             panic!("{DOSCALLS}.{name} must reach the loader as a constant");
         };
         assert_eq!(1u16 << shift, mbbs16::SELECTOR_STEP);

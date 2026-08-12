@@ -67,6 +67,11 @@
 //! these by name rather than by ordinal, calls `otstcrd(x,amt,1)` and
 //! `odedcrd(x,amt,1,0)`, and branches on `== 0` as the failure.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 
 use super::ShimError;
@@ -113,6 +118,7 @@ pub fn otstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// The dispatch-table entry for [`otstcrd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn otstcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     otstcrd(&mut super::call(machine), host).map(Into::into)
 }
@@ -147,6 +153,7 @@ pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// The dispatch-table entry for [`odedcrd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn odedcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     odedcrd(&mut super::call(machine), host).map(Into::into)
 }

@@ -2991,7 +2991,7 @@ impl Host<Wg16> {
                 None => (String::new(), format!("thunk #{index}"), None),
             };
 
-            let (shim, cleans) = match shims::entry(&from, &symbol) {
+            let (shim, cleans) = match shims::entry::<Wg16>(&from, &symbol) {
                 Entry::Routine(shim, cleans) => (shim, cleans),
                 other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
                     let kind = match other {
@@ -3052,8 +3052,17 @@ impl Host<Wg16> {
             if self.trace {
                 eprintln!("{:4} {symbol}", self.calls);
             }
-            match shim(machine, self) {
+            // `shims::entry`'s `Shim<Wg16>` takes a `Call<Wg16>`, not a bare
+            // `&mut Machine` -- this is the one place that gap is bridged now
+            // that `routines` names generic cores directly rather than 111
+            // individual `_wg16` siblings; see `shims::mod`'s own `call` doc
+            // comment. `shims::call` itself, not a second copy of it: this is
+            // now that helper's one production caller, the 128 `_wg16`
+            // bridges that used to be all of them having gone `#[cfg(test)]`.
+            let mut call = shims::call(machine);
+            match shim(&mut call, self) {
                 Ok(ret) => {
+                    let ret: Ret = ret.into();
                     exit = match cleans {
                         shims::Cleans::Caller => machine.resume(ret)?,
                         shims::Cleans::Callee(bytes) => machine.resume_cleaning(ret, bytes)?,
@@ -3122,7 +3131,7 @@ impl Host<Wg16> {
         let mut missing = Vec::new();
         for ((from, symbol), reach) in addressed_as_data(image, file) {
             let name = self.symbol_name(&from, &symbol);
-            let why = match shims::entry(&from, &name) {
+            let why = match shims::entry::<Wg16>(&from, &name) {
                 // A constant has no memory to be too small, and a routine whose
                 // address is taken in pieces is a routine -- the thunk's
                 // address is the right thing to write.
@@ -3244,7 +3253,7 @@ impl ImportResolver for Resolver<'_> {
             Symbol::Ordinal(n) => self.exports.name(module, *n)?.to_owned(),
         };
 
-        match shims::entry(module, &name) {
+        match shims::entry::<Wg16>(module, &name) {
             // A datum is addressed, never called, so the host's own memory goes
             // into the fixup and nothing is ever dispatched for it.
             Entry::Datum => Some(Import::Data(self.globals.address(&name)?)),

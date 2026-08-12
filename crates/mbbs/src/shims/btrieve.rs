@@ -134,7 +134,12 @@
 //! key value and record-pointer type throughout, because the engine behind
 //! it still is one.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::FarPtr;
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]` `_wg16`
+// bridges -- production code reaches every routine here through `Call<Wg16>`/
+// `Host<Wg16>` instead, per this file's own module doc comment.
+#[cfg(test)]
+use mbbs16::{Machine, Ret};
 
 use crate::Host;
 use crate::abi::{self, Call, Wg16};
@@ -172,6 +177,7 @@ pub fn omdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`omdbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn omdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     omdbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -274,6 +280,7 @@ pub fn opnbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`opnbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn opnbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     opnbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -300,6 +307,7 @@ pub fn setbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`setbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn setbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     setbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -325,6 +333,7 @@ pub fn rstbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`rstbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn rstbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     rstbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -367,6 +376,7 @@ pub fn cntrbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`cntrbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn cntrbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     cntrbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -406,6 +416,7 @@ pub fn invbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`invbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn invbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     invbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -437,6 +448,7 @@ pub fn delbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`delbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn delbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     delbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -522,6 +534,7 @@ pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`dinsbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn dinsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     dinsbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -663,6 +676,7 @@ pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`dupdbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn dupdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     dupdbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -753,6 +767,7 @@ pub fn clsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`clsbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn clsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     clsbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -940,6 +955,7 @@ pub fn qrybtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`qrybtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn qrybtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     qrybtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -987,6 +1003,7 @@ pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`qnpbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn qnpbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     qnpbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -1055,6 +1072,7 @@ pub fn obtbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`obtbtvl`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn obtbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     obtbtvl(&mut super::call(machine), host).map(Into::into)
 }
@@ -1170,6 +1188,7 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`stpbtvl`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn stpbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     stpbtvl(&mut super::call(machine), host).map(Into::into)
 }
@@ -1207,6 +1226,7 @@ pub fn absbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`absbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn absbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     absbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -1257,6 +1277,7 @@ pub fn aabbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
 /// The dispatch-table entry for [`aabbtv`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn aabbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     aabbtv(&mut super::call(machine), host).map(Into::into)
 }
@@ -1320,6 +1341,7 @@ pub fn gabbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`gabbtvl`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn gabbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     gabbtvl(&mut super::call(machine), host).map(Into::into)
 }

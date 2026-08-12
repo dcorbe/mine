@@ -43,6 +43,11 @@
 //! answer; a file that is there and will not open is a refusal, because the
 //! module can act on the first and has no way to find out about the second.
 
+// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
+// `_wg16` bridges -- production code reaches every routine here through
+// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
+// `call` doc comment.
+#[cfg(test)]
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
@@ -133,6 +138,7 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`fopen`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fopen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fopen(&mut super::call(machine), host).map(Into::into)
 }
@@ -157,6 +163,7 @@ pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fclose`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fclose_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fclose(&mut super::call(machine), host).map(Into::into)
 }
@@ -209,6 +216,7 @@ pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`fgets`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fgets_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fgets(&mut super::call(machine), host).map(Into::into)
 }
@@ -265,6 +273,7 @@ pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
 /// The dispatch-table entry for [`fread`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fread_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fread(&mut super::call(machine), host).map(Into::into)
 }
@@ -300,6 +309,7 @@ pub fn fprintf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
 /// The dispatch-table entry for [`fprintf`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fprintf(&mut super::call(machine), host).map(Into::into)
 }
@@ -331,6 +341,7 @@ pub fn fflush<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`fflush`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn fflush_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     fflush(&mut super::call(machine), host).map(Into::into)
 }
@@ -368,6 +379,7 @@ pub fn unlink<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`unlink`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn unlink_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     unlink(&mut super::call(machine), host).map(Into::into)
 }
@@ -434,6 +446,7 @@ pub fn getdtd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`getdtd`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn getdtd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     getdtd(&mut super::call(machine), host).map(Into::into)
 }
@@ -544,6 +557,7 @@ pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// The dispatch-table entry for [`cntdir`]. See `shims::call`'s own doc
 /// comment.
+#[cfg(test)]
 pub fn cntdir_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     cntdir(&mut super::call(machine), host).map(Into::into)
 }
