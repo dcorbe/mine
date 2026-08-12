@@ -66,3 +66,7 @@ wccmdact.ini
 
 # Build artifact of tools/btrieve-oracle/build.sh
 tools/btrieve-oracle/btrvprobe.exe
+
+# Build artifact of tools/btrieve-oracle/crtprobe.c -- built by hand, see
+# that file's own header comment.
+tools/btrieve-oracle/crtprobe.exe
