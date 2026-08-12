@@ -38,6 +38,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, Wg16};
 use crate::arena::Arena;
@@ -212,7 +213,7 @@ struct Stream<A: Abi = Wg16> {
     ended: bool,
 }
 
-impl Stream {
+impl<A: Abi> Stream<A> {
     /// The `flags` word the module should see.
     ///
     /// Both direction bits for an update stream, which is `_F_RDWR` --
@@ -338,16 +339,38 @@ impl Stream {
 
 /// The streams that are open, and every cookie ever issued.
 ///
-/// # Generic type, `Wg16`-concrete body
+/// # Generic core, `Wg16`-facade names
 ///
 /// `Stream::cookie` and `retired`'s addresses are typed `A::Ptr` rather than
-/// `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely `Streams<A>` --
-/// but every method stays in `impl Streams<Wg16>` below, using `&mut Machine`
-/// exactly as before. `A` defaults to [`Wg16`] so every existing caller keeps
-/// naming this type as plain `Streams`. Not `#[derive(Default)]`: the derive
-/// macro bounds `A: Default` on the generated impl, which the bare marker
-/// struct `Wg16` does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>`
-/// for the same problem and fix.
+/// `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely `Streams<A>`.
+/// Every method that never touched a `Machine` -- `close`, `name`,
+/// `modified`, `write`, `len`, `is_empty`, and the private `find`/`readable`/
+/// `free_fd` -- moves onto `impl<A: Abi> Streams<A>` outright, `cookie`
+/// widened from `FarPtr` to `A::Ptr`. That widening is invisible at every
+/// existing call site: a shim always reaches these through `Host<Wg16>`'s
+/// concrete `streams: Streams<Wg16>` field (`crates/mbbs/src/shims/mod.rs`'s
+/// `Shim = fn(&mut Machine, &mut Host)`, where `Host` defaults `A = Wg16`),
+/// so `self` already pins `A::Ptr` to `FarPtr` before a caller's argument is
+/// even type-checked.
+///
+/// `open`, `line`, `read` and the private `sync` do touch memory, so going
+/// generic changes their signature (`&mut A::Mem` in place of `&mut
+/// Machine`) -- a real break for shim call sites built against the old
+/// ones. `open`/`line`/`read` keep their name and `&mut Machine` signature on
+/// a `Wg16` facade (delegating into the generic core through
+/// [`Machine::mem_mut`], the same shape `Globals::write` and
+/// `TextVars::push` use), and the generic core gets new names --
+/// `open_mem`/`line_mem`/`read_mem` -- naming the parameter that is actually
+/// new, the convention `Globals::word_mem`/`write_mem` and
+/// `TextVars::push_mem`/`get_mem` set. `sync` is private and has no shim call
+/// site to preserve, so it simply takes `&mut A::Mem` outright with no facade
+/// at all.
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
+/// as plain `Streams`. Not `#[derive(Default)]`: the derive macro bounds
+/// `A: Default` on the generated impl, which the bare marker struct `Wg16`
+/// does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same
+/// problem and fix.
 pub struct Streams<A: Abi = Wg16> {
     /// Where the `FILE` structs live. Deliberately **not** the module heap: a
     /// Borland `FILE` belongs to the runtime's own static `_streams[]` and the
@@ -375,20 +398,24 @@ impl<A: Abi> Default for Streams<A> {
     }
 }
 
-impl Streams<Wg16> {
-    /// Open `path` and give the module a `FILE *` to name it by.
+impl<A: Abi> Streams<A> {
+    /// Open `path` and give the module a `FILE *` to name it by, against
+    /// memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Streams::open`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
     ///
     /// # Errors
     ///
     /// If the mode asks for something this host does not do, if the file will
     /// not open, or if there is no descriptor left.
-    pub fn open(
+    pub fn open_mem(
         &mut self,
-        machine: &mut Machine,
+        mem: &mut A::Mem,
         name: &str,
         path: &Path,
         mode: Mode,
-    ) -> Result<FarPtr, String> {
+    ) -> Result<A::Ptr, String> {
         let fd = self.free_fd().ok_or_else(|| {
             format!(
                 "{name}: all {} descriptors are in use",
@@ -429,7 +456,7 @@ impl Streams<Wg16> {
 
         let cookie = self
             .arena
-            .reserve(machine.mem_mut(), FILE_SIZE)
+            .reserve(mem, FILE_SIZE)
             .map_err(|e| format!("{name}: {e}"))?;
 
         let stream = Stream {
@@ -448,8 +475,8 @@ impl Streams<Wg16> {
         let at = usize::from(FLAGS);
         image[at..at + 2].copy_from_slice(&stream.flags().to_le_bytes());
         image[usize::from(FD)] = fd;
-        machine
-            .write(cookie, &image)
+        cookie
+            .write(mem, &image)
             .map_err(|e| format!("{name}: {e}"))?;
 
         self.open.push(stream);
@@ -465,10 +492,14 @@ impl Streams<Wg16> {
     /// validated against, and the descriptor is only ever read out of a `FILE`
     /// the module has open in front of it.
     ///
+    /// Never touched a `Machine`, so this is generic outright -- see the
+    /// struct's own doc comment for why `cookie: A::Ptr` costs nothing at any
+    /// existing call site.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open stream.
-    pub fn close(&mut self, cookie: FarPtr) -> Result<(), String> {
+    pub fn close(&mut self, cookie: A::Ptr) -> Result<(), String> {
         let at = self.find(cookie)?;
         let stream = self.open.remove(at);
         self.retired.push((cookie, stream.name));
@@ -477,10 +508,12 @@ impl Streams<Wg16> {
 
     /// What a stream was opened as.
     ///
+    /// Generic outright, for the same reason `close` is.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open stream.
-    pub fn name(&self, cookie: FarPtr) -> Result<&str, String> {
+    pub fn name(&self, cookie: A::Ptr) -> Result<&str, String> {
         Ok(&self.open[self.find(cookie)?].name)
     }
 
@@ -494,6 +527,8 @@ impl Streams<Wg16> {
     /// Taken from the open handle, not from the path, which is what DOS's
     /// `AH=57h` does: it takes a handle and cannot be fooled by a rename
     /// between the `fopen` and the ask.
+    ///
+    /// Generic outright: never touched a `Machine` or a pointer of any kind.
     ///
     /// # Errors
     ///
@@ -519,25 +554,29 @@ impl Streams<Wg16> {
             .map_err(|_| format!("{} was written before 1970", stream.name))
     }
 
-    /// A line, or `None` if the stream ended before one could start.
+    /// A line, or `None` if the stream ended before one could start, against
+    /// memory directly rather than a whole `Machine`.
     ///
     /// `None` is `fgets` returning `NULL`, which is an answer.
+    ///
+    /// The generic core [`Streams::line`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
     ///
     /// # Errors
     ///
     /// If `cookie` names no open stream, if it is not open for reading, or if
     /// the read fails.
-    pub fn line(
+    pub fn line_mem(
         &mut self,
-        machine: &mut Machine,
-        cookie: FarPtr,
+        mem: &mut A::Mem,
+        cookie: A::Ptr,
         max: usize,
     ) -> Result<Option<Vec<u8>>, String> {
         let at = self.readable(cookie)?;
         let line = self.open[at]
             .line(max)
             .map_err(|e| format!("{}: {e}", self.open[at].name))?;
-        self.sync(machine, at)?;
+        self.sync(mem, at)?;
 
         // `FGETS.C`: `if (EOF == c && P == s) return NULL`. Nothing read *and*
         // the stream is over -- a zero-length answer from a stream that is still
@@ -545,33 +584,41 @@ impl Streams<Wg16> {
         Ok((!line.is_empty() || !self.open[at].ended).then_some(line))
     }
 
-    /// Up to `want` bytes. A short answer means the file ended.
+    /// Up to `want` bytes. A short answer means the file ended, against
+    /// memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Streams::read`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
     ///
     /// # Errors
     ///
     /// If `cookie` names no open stream, if it is not open for reading, or if
     /// the read fails.
-    pub fn read(
+    pub fn read_mem(
         &mut self,
-        machine: &mut Machine,
-        cookie: FarPtr,
+        mem: &mut A::Mem,
+        cookie: A::Ptr,
         want: usize,
     ) -> Result<Vec<u8>, String> {
         let at = self.readable(cookie)?;
         let bytes = self.open[at]
             .read(want)
             .map_err(|e| format!("{}: {e}", self.open[at].name))?;
-        self.sync(machine, at)?;
+        self.sync(mem, at)?;
         Ok(bytes)
     }
 
     /// Put `bytes` on the end of a stream.
     ///
+    /// Never touched a `Machine`: the write lands in the host's own file
+    /// handle ([`Stream::write`]), not in module memory, so this is generic
+    /// outright.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open stream, if it is not open for writing, or if
     /// the write fails.
-    pub fn write(&mut self, cookie: FarPtr, bytes: &[u8]) -> Result<(), String> {
+    pub fn write(&mut self, cookie: A::Ptr, bytes: &[u8]) -> Result<(), String> {
         let at = self.find(cookie)?;
         let stream = &mut self.open[at];
         if !stream.mode.writable() {
@@ -593,7 +640,7 @@ impl Streams<Wg16> {
     }
 
     /// Where the stream `cookie` names is, or why it names none.
-    fn find(&self, cookie: FarPtr) -> Result<usize, String> {
+    fn find(&self, cookie: A::Ptr) -> Result<usize, String> {
         if let Some(at) = self.open.iter().position(|s| s.cookie == cookie) {
             return Ok(at);
         }
@@ -613,7 +660,7 @@ impl Streams<Wg16> {
     /// this is not one check: an update stream **is** readable as far as its
     /// mode and its `flags` word go, and there is still no defined moment at
     /// which reading it would mean anything.
-    fn readable(&self, cookie: FarPtr) -> Result<usize, String> {
+    fn readable(&self, cookie: A::Ptr) -> Result<usize, String> {
         let at = self.find(cookie)?;
         let stream = &self.open[at];
         if !stream.mode.readable() {
@@ -639,17 +686,76 @@ impl Streams<Wg16> {
     }
 
     /// Put the stream's `flags` back where the module reads it.
-    fn sync(&mut self, machine: &mut Machine, at: usize) -> Result<(), String> {
+    ///
+    /// Private, with no shim call site to preserve, so this takes `&mut
+    /// A::Mem` outright rather than needing a `Wg16` facade of its own --
+    /// unlike `open`/`line`/`read`, which are public and do need one.
+    fn sync(&mut self, mem: &mut A::Mem, at: usize) -> Result<(), String> {
         let stream = &self.open[at];
-        let field = Wg16::ptr_offset(stream.cookie, FLAGS);
-        machine
-            .write(field, &stream.flags().to_le_bytes())
+        let field = A::ptr_offset(stream.cookie, FLAGS);
+        field
+            .write(mem, &stream.flags().to_le_bytes())
             .map_err(|e| format!("{}: {e}", stream.name))
     }
 
     /// The lowest descriptor no open stream is using.
     fn free_fd(&self) -> Option<u8> {
         (FIRST_FD..=u8::MAX).find(|fd| !self.open.iter().any(|s| s.fd == *fd))
+    }
+}
+
+impl Streams<Wg16> {
+    /// Open `path` and give the module a `FILE *` to name it by.
+    ///
+    /// Reborrows into [`Streams::open_mem`] through [`Machine::mem_mut`] --
+    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
+    ///
+    /// # Errors
+    ///
+    /// If the mode asks for something this host does not do, if the file will
+    /// not open, or if there is no descriptor left.
+    pub fn open(
+        &mut self,
+        machine: &mut Machine,
+        name: &str,
+        path: &Path,
+        mode: Mode,
+    ) -> Result<FarPtr, String> {
+        self.open_mem(machine.mem_mut(), name, path, mode)
+    }
+
+    /// A line, or `None` if the stream ended before one could start.
+    ///
+    /// Reborrows into [`Streams::line_mem`] through [`Machine::mem_mut`].
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream, if it is not open for reading, or if
+    /// the read fails.
+    pub fn line(
+        &mut self,
+        machine: &mut Machine,
+        cookie: FarPtr,
+        max: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.line_mem(machine.mem_mut(), cookie, max)
+    }
+
+    /// Up to `want` bytes. A short answer means the file ended.
+    ///
+    /// Reborrows into [`Streams::read_mem`] through [`Machine::mem_mut`].
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream, if it is not open for reading, or if
+    /// the read fails.
+    pub fn read(
+        &mut self,
+        machine: &mut Machine,
+        cookie: FarPtr,
+        want: usize,
+    ) -> Result<Vec<u8>, String> {
+        self.read_mem(machine.mem_mut(), cookie, want)
     }
 }
 
