@@ -556,7 +556,7 @@ impl Gsbl {
     /// `i16::MAX`, so both terms are below 32,767 and the sum is below
     /// `u16::MAX`. That cap is three units of headroom away from being
     /// load-bearing, and it lives in another module -- hence this sentence.
-    fn peek(&self) -> Option<u16> {
+    pub(crate) fn peek(&self) -> Option<u16> {
         let count = self.terms.count();
         (0..count)
             .map(|step| (self.next + step) % count)

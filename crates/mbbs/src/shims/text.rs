@@ -202,6 +202,13 @@ pub fn vsprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
 pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let fmat = call.ptr();
     let (text, _) = format_call(call, fmat)?;
+    // `MBBS_TRACE_SHIMS`: the text the module composed, before `outprf`
+    // decides whether it is ever transmitted. A module that formats a message
+    // and never sends it is otherwise indistinguishable from one that never
+    // had anything to say -- which is exactly what a wedged move looks like.
+    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+        eprintln!("mbbs-trace: PRF {:?}", String::from_utf8_lossy(&text));
+    }
     append_mem(call.mem(), host, &text)?;
     Ok(abi::Ret::Void)
 }

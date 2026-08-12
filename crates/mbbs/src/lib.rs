@@ -630,6 +630,11 @@ pub struct Host<A: Abi = Wg16> {
     /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
     /// [`Host::prcrtk`]. See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick<A>>,
+    /// `lstunm` -- "last user-number returned by `btuscn()`"
+    /// (`MAJORBBS.C:325`). Only the `syscyc` test in [`Host::cycle`] reads it.
+    /// Starts at 0, as the original's uninitialised global does, so the very
+    /// first pass fires the vector.
+    lstunm: i16,
 
     /// Poll dispatches left in this burst.
     ///
@@ -1677,6 +1682,7 @@ impl Host<Wg16> {
             notes: Vec::new(),
             noted: HashSet::new(),
             kicks: Vec::new(),
+            lstunm: 0,
             polls_left: 0,
             forms: HashMap::new(),
             fsdscb: vec![None; usize::from(terms.count())],
@@ -2431,6 +2437,12 @@ impl Host<Wg16> {
 
         for kick in due {
             *fired += 1;
+            // `MBBS_TRACE_SHIMS`: name each kick as it fires. A module whose
+            // timers are dead and one whose timers run but do nothing look
+            // identical from outside; this tells them apart.
+            if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+                eprintln!("mbbs-trace: KICK-FIRE dstrou={:?}", kick.dstrou);
+            }
             match self.run(machine, module, kick.dstrou, &[], None)? {
                 Outcome::Stopped(poison) => return Ok(Some(poison)),
                 Outcome::Returned { .. } => {}
@@ -2448,9 +2460,12 @@ impl Host<Wg16> {
     ///
     /// ```text
     /// scan() -> a channel with a status
-    ///   status 3 (CRSTG)  -> curusr(chan), getin(), then entry 1 (sttrou)
+    ///   curusr(chan), then write the `status` global -- BOTH unconditional,
+    ///   as `MAJORBBS.C:152` is (see the comment at the write itself for the
+    ///   stale-value bug that writing it only on the non-CRSTG path caused)
+    ///   status 3 (CRSTG)  -> getin(), then entry 1 (sttrou)
     ///   status 4 (INBLK)
-    ///      or 5 (OUTMT)   -> curusr(chan), write the `status` global, entry 2 (stsrou)
+    ///      or 5 (OUTMT)   -> entry 2 (stsrou)
     ///   anything else     -> a note, and no call
     /// ```
     ///
@@ -2728,6 +2743,51 @@ impl Host<Wg16> {
         while iterations < max {
             iterations += 1;
 
+            // `MAJORBBS.C:419-424`, the one part of the main loop this host
+            // used to decline:
+            //
+            //
+            // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
+            // `prctask()`)" -- the pointer a module chains its own real-time
+            // engine onto at init. Declining it was not a scoping saving: it
+            // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
+            // (export 106) is the ONLY writer of the module's fast-tick gate;
+            // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
+            // so with the vector uncalled the gate was set twice at init and
+            // never again -- monsters never moved, and the per-player movement
+            // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
+            // decrements, never counted down. Measured: calling this is what
+            // makes "You hear movement to the north" appear at all.
+            //
+            // `peek` rather than `scan` because the vector fires on the scan's
+            // *answer*, before the channel is serviced, and `scan` advances the
+            // rotation; `peek` is the same query without the side effect.
+            // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
+            // for every channel number -- so an idle pass fires it too, as the
+            // original's does.
+            //
+            // `prctask` -- the vector's documented tail -- is still not here.
+            // Nothing this host loads registers a task, so there is no chain to
+            // run; a module that did would need it, and would find this comment.
+            let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
+            if newunm <= self.lstunm {
+                let vector = self.globals().pointer(machine, "syscyc")?;
+                if vector != FarPtr::NULL {
+                    match self.run(machine, module, vector, &[], None)? {
+                        Outcome::Stopped(poison) => {
+                            return Ok(Cycles {
+                                iterations,
+                                dispatched,
+                                // `None`: the vector belongs to no channel.
+                                ended: Ended::Stopped(poison, None),
+                            });
+                        }
+                        Outcome::Returned { .. } => dispatched += 1,
+                    }
+                }
+            }
+            self.lstunm = newunm;
+
             // No `pending()` guard here, and deliberately. `Host::poll`'s first
             // act is the same scan, and it returns `Ok(None)` before touching
             // the module or the machine when that scan finds nothing -- so a
@@ -2992,7 +3052,26 @@ impl Host<Wg16> {
             };
 
             let (shim, cleans) = match shims::entry::<Wg16>(&from, &symbol) {
-                Entry::Routine(shim, cleans) => (shim, cleans),
+                Entry::Routine(shim, cleans) => {
+                    // `MBBS_TRACE_SHIMS`: name every shim the module reaches.
+                    //
+                    // This exists because the in-Realm wedge (2026-08-12) was
+                    // invisible to every other instrument. Diffing one working
+                    // command's dispatch sequence against a failing one's is
+                    // what localised it: `look` ran
+                    // `toupper x4 -> prf x35 -> btutsw -> btuxmt x5`, while a
+                    // move ran `toupper -> prf -> f_ludiv@ x5 -> btuech ->
+                    // rstmbk x3` and never transmitted. Nothing else in this
+                    // host could have shown that.
+                    //
+                    // Costs one `var_os` per dispatch when off. Read with the
+                    // `KICK-FIRE` line in `prcrtk` and the `PRF` line in
+                    // `shims::text::prf`, which share the same variable.
+                    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+                        eprintln!("mbbs-trace: chan={chan:?} {from}!{symbol}");
+                    }
+                    (shim, cleans)
+                }
                 other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
                     let kind = match other {
                         Entry::Datum => survey::Kind::Datum,
@@ -5027,6 +5106,44 @@ mod tests {
             assert_eq!(f.host.clock().epoch(), Ok(1_135_952_405));
         }
         assert_eq!(f.host.clock_reads(), 100, "counted even though it did not move");
+    }
+
+    /// `MAJORBBS.C:419-424` fires the `syscyc` vector whenever the channel
+    /// scan does not advance. This host declined it for most of its life, and
+    /// that single omission froze MajorMUD's entire real-time engine: its
+    /// `_MAJORMUD_SYSCYC` is the only writer of the fast-tick gate that
+    /// `_BACKGROUND_FAST` tests and clears, so with the vector uncalled the
+    /// gate was set at init and never again -- monsters never moved and no
+    /// player's movement delay ever counted down. See `cycle`'s own comment.
+    ///
+    /// The null case is asserted first and is not a formality: a `cycle` that
+    /// called through a null vector would jump to whatever lives at 0:0.
+    #[test]
+    fn cycle_fires_the_syscyc_vector_when_the_scan_does_not_advance() {
+        let (mut f, module, rou) = polling_fixture();
+
+        let quiet = f.host.cycle(&mut f.machine, &module, 4).expect("ran");
+        assert_eq!(
+            quiet.dispatched, 0,
+            "with syscyc null there is nothing to call, and nothing is called"
+        );
+
+        // Install a vector, as a module's init routine does.
+        let mut bytes = [0u8; 4];
+        bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+        f.host
+            .globals()
+            .write(&mut f.machine, "syscyc", &bytes)
+            .expect("syscyc is a placed global");
+
+        let turned = f.host.cycle(&mut f.machine, &module, 4).expect("ran");
+        assert!(
+            turned.dispatched >= 1,
+            "an installed syscyc vector is called once the scan stops advancing; \
+             dispatched was {}",
+            turned.dispatched
+        );
     }
 
     #[test]
