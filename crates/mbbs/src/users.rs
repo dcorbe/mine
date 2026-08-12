@@ -44,6 +44,7 @@
 use std::io;
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
 use crate::ShimError;
 use crate::abi::{Abi, Wg16};
@@ -225,18 +226,34 @@ impl Connection {
 /// # Generic type, split method surface
 ///
 /// The four table-head fields and `vda`'s address are typed `A::Ptr` rather
-/// than `FarPtr`, so this is genuinely `Users<A>`. Unlike the other five
-/// subsystems, part of the method surface is *not* Wg16-only: [`Users::nth`]
-/// and the accessors built on it ([`slot`](Users::slot), [`extra`](Users::extra),
+/// than `FarPtr`, so this is genuinely `Users<A>`. [`Users::nth`] and the
+/// accessors built on it ([`slot`](Users::slot), [`extra`](Users::extra),
 /// [`account`](Users::account), [`vda`](Users::vda), plus [`head`](Users::head),
-/// [`channels`](Users::channels), [`terms`](Users::terms) and the keyring
-/// accessors) touch no `Machine` at all -- they are pure pointer arithmetic
-/// and bookkeeping over fields this struct already owns -- so they live in
-/// `impl<A: Abi> Users<A>` and are real for any ABI. Everything that reads or
-/// writes module memory (`new`, `alcvda`, `polrou`/`set_polrou`, `state`/
-/// `set_state`, `substt`/`set_substt`) stays in `impl Users<Wg16>`, taking
-/// `&mut Machine`/`&mut Heap` exactly as before. `A` defaults to [`Wg16`] so
-/// every existing caller keeps naming this type as plain `Users`.
+/// [`channels`](Users::channels), [`terms`](Users::terms), the keyring
+/// accessors, and the private `state_at`/`substt_at`/`polrou_at`) touch no
+/// `Machine` at all -- they are pure pointer arithmetic and bookkeeping over
+/// fields this struct already owns -- so they live in `impl<A: Abi> Users<A>`
+/// and are real for any ABI.
+///
+/// `alcvda`, `polrou`/`set_polrou` and `state`/`set_state`/`substt`/
+/// `set_substt` do read or write module memory, so going generic changes
+/// their signature (`&mut A::Mem`/`&A::Mem` and `&mut Heap<A>` in place of
+/// `&mut Machine`/`&mut Heap`) -- a real break for shim call sites built
+/// against the old ones. So each keeps its name and `Wg16` signature
+/// (delegating into the generic core through [`Machine::mem`]/
+/// [`Machine::mem_mut`], the same shape `Globals`/`TextVars`/`Streams`/
+/// `Messages` use), and the generic core gets a new name per method --
+/// `alcvda_mem`, `polrou_mem`/`set_polrou_mem`, `state_mem`/`set_state_mem`,
+/// `substt_mem`/`set_substt_mem` -- the same `_mem` convention.
+///
+/// `new` stays `impl Users<Wg16>`-only outright: it is not in this task's
+/// scope (see the top-level task list), and unlike the six methods above it
+/// has no generic-core/`Wg16`-facade split to make -- there is exactly one
+/// caller, `Host::load`, which is itself `Wg16`-only 16-bit loading
+/// machinery.
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
+/// as plain `Users`.
 pub struct Users<A: Abi = Wg16> {
     /// How many channels there are: `nterms`, and the only thing that mints a
     /// [`Chan`] for these tables. The same value
@@ -379,6 +396,168 @@ impl<A: Abi> Users<A> {
             });
         A::ptr_offset(base, offset)
     }
+
+    /// `&user[unum].state`.
+    fn state_at(&self, unum: Chan) -> A::Ptr {
+        A::ptr_offset(self.slot(unum), user::STATE)
+    }
+
+    /// `&user[unum].substt`.
+    fn substt_at(&self, unum: Chan) -> A::Ptr {
+        A::ptr_offset(self.slot(unum), user::SUBSTT)
+    }
+
+    /// `&user[unum].polrou`.
+    fn polrou_at(&self, unum: Chan) -> A::Ptr {
+        A::ptr_offset(self.slot(unum), user::POLROU)
+    }
+
+    /// `user[unum].polrou` -- the channel's polling routine, or `None` for
+    /// NULL, against memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::polrou`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    /// Null is checked on the raw bytes rather than through an ABI-specific
+    /// `NULL` constant, the same way [`TextVars::get_mem`](crate::textvar::TextVars::get_mem)
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment.
+    pub fn polrou_mem(&self, mem: &A::Mem, unum: Chan) -> Result<Option<A::Ptr>, ShimError> {
+        let bytes = self
+            .polrou_at(unum)
+            .resolve(mem, A::PTR_WIDTH)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let is_null = bytes.iter().all(|b| *b == 0);
+        let rou = A::ptr_from_bytes(bytes);
+        Ok((!is_null).then_some(rou))
+    }
+
+    /// Install or clear channel `unum`'s polling routine, against memory
+    /// directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::set_polrou`]'s `Wg16` facade delegates
+    /// into -- see the struct's own doc comment for why the two need
+    /// different names.
+    ///
+    /// # Errors
+    ///
+    /// If the write runs off the segment.
+    pub fn set_polrou_mem(
+        &mut self,
+        mem: &mut A::Mem,
+        unum: Chan,
+        rou: Option<A::Ptr>,
+    ) -> Result<(), ShimError> {
+        let bytes = match rou {
+            Some(ptr) => A::ptr_to_bytes(ptr),
+            None => vec![0u8; A::PTR_WIDTH],
+        };
+        self.polrou_at(unum)
+            .write(mem, &bytes)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `user[unum].state` -- which registered module this channel is in,
+    /// against memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::state`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment.
+    pub fn state_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
+        let bytes = self
+            .state_at(unum)
+            .resolve(mem, 2)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Put channel `unum` in state `state`, against memory directly rather
+    /// than a whole `Machine`.
+    ///
+    /// The generic core [`Users::set_state`]'s `Wg16` facade delegates
+    /// into -- see the struct's own doc comment for why the two need
+    /// different names.
+    ///
+    /// # Errors
+    ///
+    /// If the write runs off the segment.
+    pub fn set_state_mem(&mut self, mem: &mut A::Mem, unum: Chan, state: u16) -> Result<(), ShimError> {
+        self.state_at(unum)
+            .write(mem, &state.to_le_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `user[unum].substt` -- the registered module's own substate, against
+    /// memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::substt`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment.
+    pub fn substt_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
+        let bytes = self
+            .substt_at(unum)
+            .resolve(mem, 2)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Put channel `unum` in substate `substt`, against memory directly
+    /// rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::set_substt`]'s `Wg16` facade delegates
+    /// into -- see the struct's own doc comment for why the two need
+    /// different names.
+    ///
+    /// # Errors
+    ///
+    /// If the write runs off the segment.
+    pub fn set_substt_mem(
+        &mut self,
+        mem: &mut A::Mem,
+        unum: Chan,
+        substt: u16,
+    ) -> Result<(), ShimError> {
+        self.substt_at(unum)
+            .write(mem, &substt.to_le_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Allocate `size` bytes of volatile data area per channel, against
+    /// memory directly rather than a whole `Machine`.
+    ///
+    /// The generic core [`Users::alcvda`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room.
+    pub fn alcvda_mem(
+        &mut self,
+        mem: &mut A::Mem,
+        heap: &mut crate::Heap<A>,
+        size: u16,
+    ) -> io::Result<()> {
+        let count = self.terms.count();
+        let bytes = size
+            .checked_mul(count)
+            .ok_or_else(|| io::Error::other(format!("{count} channels of {size} bytes")))?;
+        let at = heap
+            .reserve(mem, bytes)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.vda = Some((at, size));
+        Ok(())
+    }
 }
 
 impl Users<Wg16> {
@@ -475,6 +654,9 @@ impl Users<Wg16> {
     /// area before writing it read whatever was there, and it reads the same
     /// here.
     ///
+    /// Reborrows into [`Users::alcvda_mem`] through [`Machine::mem_mut`] --
+    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
+    ///
     /// # Errors
     ///
     /// If the heap has no room.
@@ -484,13 +666,7 @@ impl Users<Wg16> {
         heap: &mut crate::Heap,
         size: u16,
     ) -> io::Result<()> {
-        let count = self.terms.count();
-        let bytes = size
-            .checked_mul(count)
-            .ok_or_else(|| io::Error::other(format!("{count} channels of {size} bytes")))?;
-        let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
-        self.vda = Some((at, size));
-        Ok(())
+        self.alcvda_mem(machine.mem_mut(), heap, size)
     }
 
     /// `user[unum].polrou` -- the channel's polling routine, or `None` for
@@ -501,16 +677,18 @@ impl Users<Wg16> {
     /// that the routine may have called `stop_polling` on itself while it ran,
     /// and a remembered copy would not have noticed.
     ///
+    /// Reborrows into [`Users::polrou_mem`] through [`Machine::mem`].
+    ///
     /// # Errors
     ///
     /// If the read runs off the segment.
     pub fn polrou(&self, machine: &Machine, unum: Chan) -> Result<Option<FarPtr>, ShimError> {
-        let bytes = machine.resolve(self.polrou_at(unum), 4)?;
-        let rou = FarPtr::from_bytes(bytes.try_into().expect("4 bytes"));
-        Ok((rou != FarPtr::NULL).then_some(rou))
+        self.polrou_mem(machine.mem(), unum)
     }
 
     /// Install or clear channel `unum`'s polling routine.
+    ///
+    /// Reborrows into [`Users::set_polrou_mem`] through [`Machine::mem_mut`].
     ///
     /// # Errors
     ///
@@ -521,8 +699,7 @@ impl Users<Wg16> {
         unum: Chan,
         rou: Option<FarPtr>,
     ) -> Result<(), ShimError> {
-        machine.write(self.polrou_at(unum), &rou.unwrap_or(FarPtr::NULL).to_bytes())?;
-        Ok(())
+        self.set_polrou_mem(machine.mem_mut(), unum, rou)
     }
 
     /// `user[unum].state` -- which registered module this channel is in.
@@ -536,12 +713,13 @@ impl Users<Wg16> {
     /// [`polrou`](Self::polrou) is: module code changes it between dispatches,
     /// and that is the point of it.
     ///
+    /// Reborrows into [`Users::state_mem`] through [`Machine::mem`].
+    ///
     /// # Errors
     ///
     /// If the read runs off the segment.
     pub fn state(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        let bytes = machine.resolve(self.state_at(unum), 2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.state_mem(machine.mem(), unum)
     }
 
     /// Put channel `unum` in state `state`.
@@ -552,6 +730,8 @@ impl Users<Wg16> {
     /// routine, rather than the module, has to move a channel into a
     /// registered state.
     ///
+    /// Reborrows into [`Users::set_state_mem`] through [`Machine::mem_mut`].
+    ///
     /// # Errors
     ///
     /// If the write runs off the segment.
@@ -561,23 +741,18 @@ impl Users<Wg16> {
         unum: Chan,
         state: u16,
     ) -> Result<(), ShimError> {
-        machine.write(self.state_at(unum), &state.to_le_bytes())?;
-        Ok(())
-    }
-
-    /// `&user[unum].state`.
-    fn state_at(&self, unum: Chan) -> FarPtr {
-        Wg16::ptr_offset(self.slot(unum), user::STATE)
+        self.set_state_mem(machine.mem_mut(), unum, state)
     }
 
     /// `user[unum].substt` -- the registered module's own substate.
+    ///
+    /// Reborrows into [`Users::substt_mem`] through [`Machine::mem`].
     ///
     /// # Errors
     ///
     /// If the read runs off the segment.
     pub fn substt(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        let bytes = machine.resolve(self.substt_at(unum), 2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.substt_mem(machine.mem(), unum)
     }
 
     /// Put channel `unum` in substate `substt`.
@@ -585,6 +760,8 @@ impl Users<Wg16> {
     /// `fsdego` (`shims/fsd.rs`) is this crate's one host-side writer
     /// (`FSDBBS.C:211`'s `usrptr->substt=ENTERING`) -- everywhere else this
     /// field moves, a module wrote it.
+    ///
+    /// Reborrows into [`Users::set_substt_mem`] through [`Machine::mem_mut`].
     ///
     /// # Errors
     ///
@@ -595,18 +772,7 @@ impl Users<Wg16> {
         unum: Chan,
         substt: u16,
     ) -> Result<(), ShimError> {
-        machine.write(self.substt_at(unum), &substt.to_le_bytes())?;
-        Ok(())
-    }
-
-    /// `&user[unum].substt`.
-    fn substt_at(&self, unum: Chan) -> FarPtr {
-        Wg16::ptr_offset(self.slot(unum), user::SUBSTT)
-    }
-
-    /// `&user[unum].polrou`.
-    fn polrou_at(&self, unum: Chan) -> FarPtr {
-        Wg16::ptr_offset(self.slot(unum), user::POLROU)
+        self.set_substt_mem(machine.mem_mut(), unum, substt)
     }
 }
 
