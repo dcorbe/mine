@@ -1321,18 +1321,42 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         .ordered_len(key)
         .ok_or_else(|| ShimError::Failed(format!("{who} on {name} by key {key}, which it has not")))?;
 
-    // Where the file is now, in this key's order. A cursor left by a step, or
-    // by a query on a different key, is translated through the record's place
-    // rather than reused as an index -- the two orders have nothing to do with
-    // each other.
-    let here = match cursor {
-        Cursor::Ordered { key: had, at } if had == key => Some(at),
-        Cursor::Ordered { key: had, at } => records
-            .ordered(had, at)
-            .and_then(|r| records.find_physical(r.position))
-            .and_then(|physical| records.place_in(key, physical)),
-        Cursor::Physical { at } => records.place_in(key, at),
-        Cursor::Nowhere => None,
+    // Where the file is now, in this key's order -- and **only** `Next` and
+    // `Previous` may ask, because they are the only two operations whose
+    // answer depends on where the file already is. A `Get Equal` does not
+    // care what the cursor holds, so it must not be refused for holding the
+    // wrong sort of cursor.
+    //
+    // **A cursor from another key, or from a step, is refused rather than
+    // translated.** An earlier version translated one through
+    // `Records::place_in` on the reasoning that the two orders describe the
+    // same records. Genuine Btrieve 6.15 does not do that, measured in
+    // `crates/mbbs/tests/btrieve.rs::position_ops_oracle_scenarios`:
+    //
+    //   - `S6` -- `Get Equal` on key 0, then `Get Next` on key 1: status 7,
+    //     "different key number". Not an answer in key 1's order.
+    //   - `S4`/`S4b` -- `Step First`, then `Get Next` on *either* key:
+    //     status 8. A step establishes no key context at all.
+    //
+    // Both are error statuses rather than the 4/9 this layer turns into a
+    // zero, so both stop the module, which is what `PLBTVSTF.C` does with a
+    // status it has no mapping for. Translating produced a *plausible*
+    // record instead, which is the worse failure: the module cannot tell it
+    // asked a question the original would have refused.
+    let here: Result<Option<usize>, String> = match cursor {
+        Cursor::Ordered { key: had, at } if had == key => Ok(Some(at)),
+        Cursor::Ordered { key: had, .. } => Err(format!(
+            "{who} asked {name} for the next record in key {key}'s order, but \
+             the file is positioned in key {had}'s. Real Btrieve refuses this \
+             with status 7, \"different key number\", rather than translating \
+             between the two orders -- measured, S6"
+        )),
+        Cursor::Physical { .. } => Err(format!(
+            "{who} asked {name} for the next record in key {key}'s order, but \
+             the file was positioned by a step, which establishes no key at \
+             all. Real Btrieve refuses this with status 8 -- measured, S4"
+        )),
+        Cursor::Nowhere => Ok(None),
     };
 
     let found = match op {
@@ -1360,23 +1384,27 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
             at.checked_sub(1)
         }
         Op::Less => records.seek(&definitions, key, &wanted).checked_sub(1),
-        Op::Next => match here {
+        Op::Next => match here.map_err(ShimError::Failed)? {
             Some(at) => Some(at + 1).filter(|at| *at < count),
-            None => {
-                return Err(ShimError::Failed(format!(
-                    "{who} asked {name} for the next record and nothing has \
-                     positioned it, so there is no record to be next to"
-                )));
-            }
+            // **An unpositioned `Get Next` is not an error -- it answers.**
+            // `S1` measured genuine Btrieve returning status 0 and the
+            // *first* record for a `Get Next` on a freshly opened file that
+            // nothing has positioned: it behaves as `Get Lowest`.
+            //
+            // This used to refuse, which stopped the module. That is the
+            // most damaging shape a divergence can take here -- the other
+            // two in this function make the host more permissive than the
+            // original and merely lose a refusal, where this one invented a
+            // fatal error in a case the original answered normally.
+            None => (count > 0).then_some(0),
         },
-        Op::Previous => match here {
+        Op::Previous => match here.map_err(ShimError::Failed)? {
             Some(at) => at.checked_sub(1),
-            None => {
-                return Err(ShimError::Failed(format!(
-                    "{who} asked {name} for the previous record and nothing has \
-                     positioned it"
-                )));
-            }
+            // `S1c`: the mirror of `S1` is *not* symmetric. An unpositioned
+            // `Get Previous` measured status 9, "end of file" -- which this
+            // layer turns into a zero, an answer meaning "no such record",
+            // rather than into a refusal.
+            None => None,
         },
     };
 
@@ -2266,15 +2294,163 @@ mod tests {
         assert_eq!(names, ["alpha", "beta", "gamma"]);
     }
 
+    /// **This test used to assert the opposite, and the opposite was wrong.**
+    ///
+    /// Its reasoning was that "the record after nowhere" is not a record and
+    /// that returning the first one would be answering a different question.
+    /// That is a good argument and it is not what genuine Btrieve 6.15 does.
+    /// `crates/mbbs/tests/btrieve.rs::position_ops_oracle_scenarios` `S1`
+    /// measured a `Get Next` on a freshly opened, never-positioned file
+    /// returning **status 0 and the first record** -- it behaves as
+    /// `Get Lowest`.
+    ///
+    /// The old behaviour was the most damaging kind of divergence available
+    /// here: a host error, which stops the module, in a case where the
+    /// original answered normally. A module that opens a file and steps
+    /// straight into `qnxbtv` was killed by this host and served by the real
+    /// one.
+    ///
+    /// `S1c` measured the mirror case and it is **not** symmetric: an
+    /// unpositioned `Get Previous` gives status 9, which this layer turns
+    /// into a zero -- "no such record", an answer -- rather than a refusal.
     #[test]
-    fn a_next_with_nothing_to_be_next_to_refuses() {
-        // Btrieve would have answered with whatever its position block happened
-        // to hold. There is no honest answer: "the record after nowhere" is not
-        // a record, and returning the first one would be a different question's
-        // answer.
+    fn an_unpositioned_next_answers_with_the_lowest_record() {
+        // What the record *is* is a property of the fixture, so this asks the
+        // question that actually matters instead of naming a record: does an
+        // unpositioned Get Next land where an explicit Get Lowest lands?
+        // Hard-coding the answer here would pass just as well if `Next`
+        // returned some other record for some other reason.
+        let lowest = {
+            let mut f = Fixture::new();
+            let block = open(&mut f, "SAMPLE.DAT", 64);
+            let into = buffer(&f, block);
+            assert!(acquire(&mut f, None, 0, 12), "an explicit Get Lowest");
+            f.machine.resolve(into, 64).expect("readable").to_vec()
+        };
+
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+        assert_eq!(
+            f.invoke(qnpbtv, &[56]).expect("answers"),
+            Ret::U16(1),
+            "S1: an unpositioned Get Next answers rather than refusing"
+        );
+        assert_eq!(
+            f.machine.resolve(into, 64).expect("readable"),
+            &lowest[..],
+            "and it answers with the same record an explicit Get Lowest gives"
+        );
+    }
+
+    /// `absbtv` on a never-positioned file is the one refusal of the three
+    /// that the oracle **confirms**: `S1b` measured real Btrieve answering
+    /// status 8, "invalid positioning", for a `Get Position` on a freshly
+    /// opened file. So this one stays a refusal.
+    ///
+    /// The step in the middle is deliberately left as it was and is **not**
+    /// claimed to be oracle-confirmed. `S1d` recorded a `Step Next` on a
+    /// nominally unpositioned file answering with status 0, which would make
+    /// this refusal wrong too -- but that scenario ran on a position block
+    /// that earlier scenarios in the same handle had already moved, so what
+    /// it measured may be "step from where S1 left the file" rather than
+    /// "step from nowhere". Answering that needs a scenario with its own
+    /// fresh handle, which has not been run. Recorded rather than acted on,
+    /// because changing a refusal on an ambiguous measurement is exactly the
+    /// mistake the other three fixes were correcting.
+    /// `S6`: a `Get Equal` in one key's order followed by a `Get Next` in
+    /// another's is refused by real Btrieve with status 7, "different key
+    /// number". This host used to translate between the two orders through
+    /// `Records::place_in` and answer.
+    ///
+    /// Needs a file with two keys, which `SAMPLE.DAT` is not -- it has
+    /// exactly one. So the fixture is built by this crate's own
+    /// [`crate::btrieve::create`], the Btrieve `Create` this task added, with
+    /// the two keys deliberately ordering the same three records
+    /// *oppositely*: key 0 ascending 1,2,3 is key 1 descending 3,2,1. That
+    /// way a translation would not merely be unmeasured, it would land on a
+    /// visibly different record, so this test fails loudly rather than
+    /// coincidentally passing.
+    #[test]
+    fn a_next_in_another_keys_order_refuses_rather_than_translating() {
+        use crate::btrieve::{FileSpec, KeySpec, SegmentSpec, create};
+
+        let int = |offset: u16| SegmentSpec {
+            offset,
+            length: 2,
+            kind: 0x01,
+            descending: false,
+        };
+        let key = |offset: u16| KeySpec {
+            segments: vec![int(offset)],
+            duplicates: false,
+            modifiable: false,
+        };
+
+        let dir = crate::testing::scratch("btv-shim-crosskey");
+        create(
+            &dir.join("TWOKEY.DAT"),
+            &FileSpec {
+                record_length: 8,
+                page_size: 512,
+                keys: vec![key(0), key(2)],
+            },
+        )
+        .expect("creates a two-key file");
+
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "TWOKEY.DAT", 8);
+
+        for (first, second) in [(1u16, 3u16), (2, 2), (3, 1)] {
+            let mut record = [0u8; 8];
+            record[0..2].copy_from_slice(&first.to_le_bytes());
+            record[2..4].copy_from_slice(&second.to_le_bytes());
+            let at = f.bytes(&record, false);
+            f.invoke(dinsbtv, &Fixture::far(at)).expect("inserts");
+        }
+
+        assert!(
+            acquire(&mut f, Some(2), 0, 5),
+            "positioned by key 0, on the record whose key 0 is 2"
+        );
+        assert!(
+            f.invoke(
+                obtbtvl,
+                &[0, 0, 0, 0, 1, 6, 0],
+            )
+            .is_err(),
+            "S6: a Get Next in key 1's order is refused, not translated"
+        );
+    }
+
+    /// `S4`/`S4b`: a step establishes no key context, so a `Get Next`
+    /// afterwards is refused by real Btrieve with status 8 -- on *either*
+    /// key of the two-key fixture the oracle scenario used, which is what
+    /// rules out "it just means a different key".
+    ///
+    /// This host used to translate the physical position into key order
+    /// through `Records::place_in` and answer. That produced a *plausible*
+    /// record, which is worse than a refusal: nothing downstream can tell
+    /// that the question was one the original would not have answered.
+    #[test]
+    fn a_next_after_a_step_refuses_rather_than_translating_the_position() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(qnpbtv, &[56]).is_err());
+
+        assert!(
+            f.invoke(stpbtvl, &[0, 0, 33, 0]).is_ok(),
+            "step to the first record in physical order"
+        );
+        assert!(
+            f.invoke(qnpbtv, &[56]).is_err(),
+            "S4: and a Get Next afterwards is refused, not translated"
+        );
+    }
+
+    #[test]
+    fn a_step_or_a_position_with_nothing_to_be_next_to_refuses() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
         assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
         assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
     }
