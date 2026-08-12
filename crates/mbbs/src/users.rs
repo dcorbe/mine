@@ -46,6 +46,7 @@ use std::io;
 use mbbs16::{FarPtr, Machine};
 
 use crate::ShimError;
+use crate::abi::{Abi, Wg16};
 use crate::chan::{Chan, Terms};
 
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
@@ -220,24 +221,40 @@ impl Connection {
 /// because two of the three heads -- `extusr` and `uablok` -- are not globals
 /// the module can address: `WCCMMUD.DLL` imports neither, and reaches the
 /// account block only through `uacoff`.
-pub struct Users {
+///
+/// # Generic type, split method surface
+///
+/// The four table-head fields and `vda`'s address are typed `A::Ptr` rather
+/// than `FarPtr`, so this is genuinely `Users<A>`. Unlike the other five
+/// subsystems, part of the method surface is *not* Wg16-only: [`Users::nth`]
+/// and the accessors built on it ([`slot`](Users::slot), [`extra`](Users::extra),
+/// [`account`](Users::account), [`vda`](Users::vda), plus [`head`](Users::head),
+/// [`channels`](Users::channels), [`terms`](Users::terms) and the keyring
+/// accessors) touch no `Machine` at all -- they are pure pointer arithmetic
+/// and bookkeeping over fields this struct already owns -- so they live in
+/// `impl<A: Abi> Users<A>` and are real for any ABI. Everything that reads or
+/// writes module memory (`new`, `alcvda`, `polrou`/`set_polrou`, `state`/
+/// `set_state`, `substt`/`set_substt`) stays in `impl Users<Wg16>`, taking
+/// `&mut Machine`/`&mut Heap` exactly as before. `A` defaults to [`Wg16`] so
+/// every existing caller keeps naming this type as plain `Users`.
+pub struct Users<A: Abi = Wg16> {
     /// How many channels there are: `nterms`, and the only thing that mints a
     /// [`Chan`] for these tables. The same value
     /// [`Gsbl`](crate::gsbl::Gsbl) was built from -- see [`crate::chan`].
     terms: Terms,
     /// `struct user *user` -- the head of the array the module indexes itself.
-    users: FarPtr,
+    users: A::Ptr,
     /// `struct extusr *extusr`.
-    extra: FarPtr,
+    extra: A::Ptr,
     /// `uablok`, `ACCOUNT.C:30` -- the account records, one per channel.
-    accounts: FarPtr,
+    accounts: A::Ptr,
     /// `int *channel` -- and this one points [`SENTINELS`] words *into* its own
     /// allocation, exactly as `MAJORBBS.C:741-743` left it.
-    channels: FarPtr,
+    channels: A::Ptr,
     /// `vdahdl`, `MAJORBBS.C:1373` -- one volatile data area per channel, and
     /// how big each is. `None` until `alcvda`, which cannot run until every
     /// module's `dclvda` has been counted.
-    vda: Option<(FarPtr, u16)>,
+    vda: Option<(A::Ptr, u16)>,
     /// `usrptr->keys` -- what each channel is allowed to do.
     ///
     /// The fourth per-channel table, and the only one that does not live in
@@ -259,7 +276,112 @@ pub struct Users {
 /// `[-2]` and `[-3]` are reads rather than accidents.
 const SENTINELS: u16 = 3;
 
-impl Users {
+impl<A: Abi> Users<A> {
+    /// How many channels there are -- and the only thing that names one.
+    pub fn terms(&self) -> Terms {
+        self.terms
+    }
+
+    /// The head of `user[]`, which is what the `user` global holds.
+    pub fn head(&self) -> A::Ptr {
+        self.users
+    }
+
+    /// The head of `channel[]`, which is three words *into* its allocation.
+    pub fn channels(&self) -> A::Ptr {
+        self.channels
+    }
+
+    /// `&user[unum]`.
+    pub fn slot(&self, unum: Chan) -> A::Ptr {
+        self.nth(self.users, USER, unum)
+    }
+
+    /// `&extusr[unum]`.
+    pub fn extra(&self, unum: Chan) -> A::Ptr {
+        self.nth(self.extra, EXTUSR, unum)
+    }
+
+    /// `uacoff(unum)` -- the channel's account record.
+    pub fn account(&self, unum: Chan) -> A::Ptr {
+        self.nth(self.accounts, USRACC, unum)
+    }
+
+    /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if
+    /// [`Users::alcvda`] has not run.
+    ///
+    /// `MAJORBBS.C:1380`. Null before `alcvda` is the answer the real host's
+    /// `vdaoff` gave too, because `vdahdl` was still null: every module's
+    /// `dclvda` has to be counted before the size is known.
+    ///
+    /// That is now the *only* thing a `None` here means. It used to mean either
+    /// that or "no such channel", and a caller could not tell which.
+    pub fn vda(&self, unum: Chan) -> Option<A::Ptr> {
+        let (base, size) = self.vda?;
+        Some(self.nth(base, size, unum))
+    }
+
+    /// What channel `unum` is allowed to do, or `None` if it never logged on.
+    ///
+    /// As with [`Users::vda`], the `None` now carries one meaning instead of
+    /// two.
+    pub fn keys(&self, unum: Chan) -> Option<&crate::KeySet> {
+        self.keys[unum.index()].as_ref()
+    }
+
+    /// Give channel `unum` a keyring. What `loadkeys()` did at logon.
+    pub fn set_keys(&mut self, unum: Chan, keys: crate::KeySet) {
+        self.keys[unum.index()] = Some(keys);
+    }
+
+    /// Drop this channel's keyring entirely.
+    ///
+    /// `freekey()`, as `dftrst` calls it (`MAJORBBS.C:3492-3494`, guarded by
+    /// `if (usrptr->keys != NULL)`). **Not the same as an empty
+    /// [`KeySet`](crate::KeySet)**: the original tests the pointer for null, so
+    /// "no keyring" and "a keyring holding nothing" are different states -- see
+    /// the field's own documentation -- and this produces the first.
+    pub fn clear_keys(&mut self, unum: Chan) {
+        self.keys[unum.index()] = None;
+    }
+
+    /// The `unum`th slot of a table of `each`-byte entries.
+    ///
+    /// `MAJORBBS.C:4293`'s `if (0 <= uno && uno < nterms)` used to live here,
+    /// restated once per table. It lives in [`Terms::chan`] now, and a [`Chan`]
+    /// is what is left of having asked it.
+    ///
+    /// The final add -- base plus `each * unum` -- goes through
+    /// [`Abi::ptr_offset`] rather than a hand-built `FarPtr`, which is what
+    /// makes this method, and every accessor built on it, real for any `A`
+    /// rather than only `Wg16`. The `checked_mul` above it stays: it is what
+    /// turns an out-of-range `unum` into the named panic below rather than a
+    /// wrapped offset, and [`Abi::ptr_offset`] carries no such check of its
+    /// own. A second overflow check on the add itself (`base`'s own offset
+    /// plus that product) was dropped rather than pushed through the trait:
+    /// [`Users::new`] already proved `each * terms.count()` bytes fit in one
+    /// region before handing out `base`, so for any `unum` this `Chan` can
+    /// name, the add cannot leave that region either.
+    ///
+    /// # Panics
+    ///
+    /// If the slot does not fit in the segment. Unreachable for a `Chan` of
+    /// this `Users`' own [`Terms`]: [`Users::new`] allocated `each * terms`
+    /// bytes at `base` and that allocation succeeded, so every offset below it
+    /// is addressable. A panic here means `unum` came from a larger `Terms`
+    /// than the one that sized these tables.
+    fn nth(&self, base: A::Ptr, each: u16, unum: Chan) -> A::Ptr {
+        let offset = u16::try_from(unum.index())
+            .ok()
+            .and_then(|unum| each.checked_mul(unum))
+            .unwrap_or_else(|| {
+                panic!("channel {unum} is past the end of a table of {each}-byte slots")
+            });
+        A::ptr_offset(base, offset)
+    }
+}
+
+impl Users<Wg16> {
     /// Allocate `terms` channels' worth of everything, zeroed.
     ///
     /// `alczer` and not `alcmem`, at `MAJORBBS.C:735-736`, and `ACCOUNT.C:112`
@@ -307,18 +429,12 @@ impl Users {
             .write(base, &vec![0xffu8; usize::from(words)])
             .map_err(io::Error::other)?;
         for (index, value) in [-3i16, -2, -1].into_iter().enumerate() {
-            let at = FarPtr {
-                offset: base.offset + index as u16 * 2,
-                selector: base.selector,
-            };
+            let at = Wg16::ptr_offset(base, index as u16 * 2);
             machine
                 .write(at, &value.to_le_bytes())
                 .map_err(io::Error::other)?;
         }
-        let channels = FarPtr {
-            offset: base.offset + SENTINELS * 2,
-            selector: base.selector,
-        };
+        let channels = Wg16::ptr_offset(base, SENTINELS * 2);
 
         // `MAJORBBS.C:878` -- `channel[usrnum]=0` with `usrnum` still zero,
         // the local console. Reached only when no hardware channel groups are
@@ -375,74 +491,6 @@ impl Users {
         let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
         self.vda = Some((at, size));
         Ok(())
-    }
-
-    /// How many channels there are -- and the only thing that names one.
-    pub fn terms(&self) -> Terms {
-        self.terms
-    }
-
-    /// The head of `user[]`, which is what the `user` global holds.
-    pub fn head(&self) -> FarPtr {
-        self.users
-    }
-
-    /// The head of `channel[]`, which is three words *into* its allocation.
-    pub fn channels(&self) -> FarPtr {
-        self.channels
-    }
-
-    /// `&user[unum]`.
-    pub fn slot(&self, unum: Chan) -> FarPtr {
-        self.nth(self.users, USER, unum)
-    }
-
-    /// `&extusr[unum]`.
-    pub fn extra(&self, unum: Chan) -> FarPtr {
-        self.nth(self.extra, EXTUSR, unum)
-    }
-
-    /// `uacoff(unum)` -- the channel's account record.
-    pub fn account(&self, unum: Chan) -> FarPtr {
-        self.nth(self.accounts, USRACC, unum)
-    }
-
-    /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if
-    /// [`Users::alcvda`] has not run.
-    ///
-    /// `MAJORBBS.C:1380`. Null before `alcvda` is the answer the real host's
-    /// `vdaoff` gave too, because `vdahdl` was still null: every module's
-    /// `dclvda` has to be counted before the size is known.
-    ///
-    /// That is now the *only* thing a `None` here means. It used to mean either
-    /// that or "no such channel", and a caller could not tell which.
-    pub fn vda(&self, unum: Chan) -> Option<FarPtr> {
-        let (base, size) = self.vda?;
-        Some(self.nth(base, size, unum))
-    }
-
-    /// What channel `unum` is allowed to do, or `None` if it never logged on.
-    ///
-    /// As with [`Users::vda`], the `None` now carries one meaning instead of
-    /// two.
-    pub fn keys(&self, unum: Chan) -> Option<&crate::KeySet> {
-        self.keys[unum.index()].as_ref()
-    }
-
-    /// Give channel `unum` a keyring. What `loadkeys()` did at logon.
-    pub fn set_keys(&mut self, unum: Chan, keys: crate::KeySet) {
-        self.keys[unum.index()] = Some(keys);
-    }
-
-    /// Drop this channel's keyring entirely.
-    ///
-    /// `freekey()`, as `dftrst` calls it (`MAJORBBS.C:3492-3494`, guarded by
-    /// `if (usrptr->keys != NULL)`). **Not the same as an empty
-    /// [`KeySet`](crate::KeySet)**: the original tests the pointer for null, so
-    /// "no keyring" and "a keyring holding nothing" are different states -- see
-    /// the field's own documentation -- and this produces the first.
-    pub fn clear_keys(&mut self, unum: Chan) {
-        self.keys[unum.index()] = None;
     }
 
     /// `user[unum].polrou` -- the channel's polling routine, or `None` for
@@ -519,11 +567,7 @@ impl Users {
 
     /// `&user[unum].state`.
     fn state_at(&self, unum: Chan) -> FarPtr {
-        let slot = self.slot(unum);
-        FarPtr {
-            offset: slot.offset + user::STATE,
-            selector: slot.selector,
-        }
+        Wg16::ptr_offset(self.slot(unum), user::STATE)
     }
 
     /// `user[unum].substt` -- the registered module's own substate.
@@ -557,47 +601,12 @@ impl Users {
 
     /// `&user[unum].substt`.
     fn substt_at(&self, unum: Chan) -> FarPtr {
-        let slot = self.slot(unum);
-        FarPtr {
-            offset: slot.offset + user::SUBSTT,
-            selector: slot.selector,
-        }
+        Wg16::ptr_offset(self.slot(unum), user::SUBSTT)
     }
 
     /// `&user[unum].polrou`.
     fn polrou_at(&self, unum: Chan) -> FarPtr {
-        let slot = self.slot(unum);
-        FarPtr {
-            offset: slot.offset + user::POLROU,
-            selector: slot.selector,
-        }
-    }
-
-    /// The `unum`th slot of a table of `each`-byte entries.
-    ///
-    /// `MAJORBBS.C:4293`'s `if (0 <= uno && uno < nterms)` used to live here,
-    /// restated once per table. It lives in [`Terms::chan`] now, and a [`Chan`]
-    /// is what is left of having asked it.
-    ///
-    /// # Panics
-    ///
-    /// If the slot does not fit in the segment. Unreachable for a `Chan` of
-    /// this `Users`' own [`Terms`]: [`Users::new`] allocated `each * terms`
-    /// bytes at `base` and that allocation succeeded, so every offset below it
-    /// is addressable. A panic here means `unum` came from a larger `Terms`
-    /// than the one that sized these tables.
-    fn nth(&self, base: FarPtr, each: u16, unum: Chan) -> FarPtr {
-        let offset = u16::try_from(unum.index())
-            .ok()
-            .and_then(|unum| each.checked_mul(unum))
-            .and_then(|into| base.offset.checked_add(into))
-            .unwrap_or_else(|| {
-                panic!("channel {unum} is past the end of a table of {each}-byte slots")
-            });
-        FarPtr {
-            offset,
-            selector: base.selector,
-        }
+        Wg16::ptr_offset(self.slot(unum), user::POLROU)
     }
 }
 
