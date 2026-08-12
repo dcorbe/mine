@@ -62,7 +62,9 @@ fn on_channel<T>(
 
 /// `int btutsw(int chan, int width)` -- output word-wrap width. Zero disables.
 pub fn btutsw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, width) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let width = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).width = width;
     }) {
@@ -74,7 +76,9 @@ pub fn btutsw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btumil(int chan, int maxinl)` -- maximum input line length. Zero
 /// disables the limit.
 pub fn btumil(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, maxinl) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let maxinl = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).maxinl = maxinl;
     }) {
@@ -85,7 +89,9 @@ pub fn btumil(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
 /// `int btuech(int chan, int onoff)` -- echo input back to the terminal.
 pub fn btuech(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let onoff = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).echo = onoff != 0;
     }) {
@@ -97,7 +103,9 @@ pub fn btuech(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btulok(int chan, int onoff)` -- input lockout: arriving bytes are
 /// discarded while locked.
 pub fn btulok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let onoff = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).locked = onoff != 0;
     }) {
@@ -109,7 +117,9 @@ pub fn btulok(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btuoes(int chan, int onoff)` -- raise status 5 when the output buffer
 /// empties.
 pub fn btuoes(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, onoff) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let onoff = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).oes = onoff != 0;
     }) {
@@ -121,7 +131,9 @@ pub fn btuoes(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `int btutrg(int chan, int nbyt)` -- byte-count input trigger. Zero is ASCII
 /// mode; non-zero switches to binary mode and sets the block size.
 pub fn btutrg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, nbyt) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let nbyt = args.int();
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).trigger = nbyt;
     }) {
@@ -142,14 +154,17 @@ pub fn btutrg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `cnt` and the pause message are recorded so they are not lost, and
 /// pagination is a driver problem (Batch C of this plan), not a GSBL one.
 pub fn btuxnf(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, xon, xoff) = (
-        machine.arg_u16(0) as i16,
-        machine.arg_u16(1),
-        machine.arg_u16(2) as i16,
-    );
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let xon = args.int();
+    let xoff = args.int() as i16;
+    // The two page-mode arguments are read only when xoff says to expect
+    // them -- see this function's own doc comment. The cursor reads them in
+    // frame order regardless of which branch runs, same as `arg_u16(3)`/
+    // `arg_far(4)` did: the reads that happen, happen sequentially.
     let page = if xoff < 0 {
-        let cnt = machine.arg_u16(3);
-        let stg = machine.arg_far(4);
+        let cnt = args.int();
+        let stg = args.ptr();
         Some((cnt, machine.read_cstr(stg)?.to_vec()))
     } else {
         None
@@ -195,7 +210,8 @@ pub(crate) fn apply_xnf(
 /// never read: see [`crate::gsbl::Channel::pause_handler_installed`] for why
 /// a `bool` is the whole of what this host records.
 pub fn btuhpk(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
     Ok(match on_channel(host, chan, apply_hpk) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -215,7 +231,9 @@ pub(crate) fn apply_hpk(g: &mut Gsbl, chan: Chan) {
 /// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
 /// applies here unchanged.
 pub fn btupbc(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, pausch) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as u8);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let pausch = args.int() as u8;
     Ok(match on_channel(host, chan, |g, chan| apply_pbc(g, chan, pausch)) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -236,7 +254,9 @@ pub(crate) fn apply_pbc(g: &mut Gsbl, chan: Chan, pausch: u8) {
 /// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
 /// applies here unchanged.
 pub fn btucpc(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, cpchar) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as u8);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let cpchar = args.int() as u8;
     Ok(match on_channel(host, chan, |g, chan| apply_cpc(g, chan, cpchar)) {
         Some(()) => Ret::U16(0),
         None => Ret::U16(OUT_OF_RANGE),
@@ -251,7 +271,8 @@ pub(crate) fn apply_cpc(g: &mut Gsbl, chan: Chan, cpchar: u8) {
 
 /// `int btuclo(int chan)` -- throw away output that has not gone out yet.
 pub fn btuclo(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
     Ok(match on_channel(host, chan, |g, chan| {
         let c = g.channel_mut(chan);
         c.output.clear();
@@ -271,7 +292,8 @@ pub fn btuclo(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// bug to fix; a "helpful" implementation that also drained `status` would
 /// diverge from every real board.
 pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
     Ok(match on_channel(host, chan, |g, chan| {
         let c = g.channel_mut(chan);
         c.input.clear();
@@ -285,7 +307,9 @@ pub fn btucli(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
 /// `int btuinj(int chan, int status)` -- inject a status code into the FIFO.
 pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, status) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as i16);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let status = args.int() as i16;
     Ok(match on_channel(host, chan, |g, chan| {
         g.inject(chan, status);
     }) {
@@ -306,7 +330,8 @@ pub fn btuinj(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// without their terminator. Only matters if the module compares the count
 /// against a length it computed itself -- it does not.
 pub fn btuibw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
     };
@@ -322,8 +347,9 @@ pub fn btuibw(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `prf` into `prfbuf` and calls `btuxmt(chan, prfbuf)` itself, through
 /// `_TELL_USER` at 677 sites.
 pub fn btuxmt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
-    let at = machine.arg_far(1);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let at = args.ptr();
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
     };
@@ -339,8 +365,10 @@ pub fn btuxmt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// data. None of the ASCII output features apply -- the guide is explicit that
 /// word wrap and XON/XOFF "are not in effect when you use btuxct()".
 pub fn btuxct(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (chan, nbyt) = (machine.arg_u16(0) as i16, machine.arg_u16(1));
-    let at = machine.arg_far(2);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let nbyt = args.int();
+    let at = args.ptr();
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
     };
@@ -360,9 +388,10 @@ pub fn btuxct(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// without mutating anything, so if it succeeds, the write after the drain
 /// cannot fail.
 pub fn btuica(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let chan = machine.arg_u16(0) as i16;
-    let at = machine.arg_far(1);
-    let max = machine.arg_u16(3);
+    let mut args = super::args(machine);
+    let chan = args.int() as i16;
+    let at = args.ptr();
+    let max = args.int();
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(Ret::U16(OUT_OF_RANGE));
     };
