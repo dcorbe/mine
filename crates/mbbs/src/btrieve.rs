@@ -30,6 +30,7 @@
 
 mod create;
 pub mod keys;
+mod ops;
 pub mod pages;
 pub mod records;
 mod variable;
@@ -42,6 +43,7 @@ use mbbs16::{FarPtr, Machine};
 
 pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
+pub use ops::{Delivery, Op, OpError, Step};
 pub use records::{Record, Records};
 
 /// How much of the first page this host reads.
