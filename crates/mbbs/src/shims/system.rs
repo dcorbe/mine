@@ -3,36 +3,41 @@
 //! Everything here that reads the world reads it through [`Host`], so a test
 //! can point it at a directory of its own.
 //!
-//! # Generic core, three holdouts
+//! # Generic core, all nineteen now
 //!
-//! Sixteen of these nineteen routines are generic now:
+//! Every routine here is generic:
 //! `fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`, the
 //! same shape `shims::user`/`shims::text` already established. `shocst` and
 //! `catastro` route their varargs through [`crate::fmt::format_call`], which
 //! needed no word-index parameter the way the old `Args::Call { first: N }`
 //! did -- see `fmt`'s own doc comment.
 //!
-//! **`register_module`, `register_agent` and `rtkick` did not convert.**
-//! Each builds a [`Registration`], [`Agent`] or [`Kick`] -- all three plain,
-//! non-generic structs holding `FarPtr` fields -- and pushes it into
-//! `Host<A>`'s own `modules`/`agents`/`kicks` fields, which are `Vec<Registration>`,
-//! `Vec<Agent>`, `Vec<Kick>` **regardless of `A`**, not `Vec<Registration<A>>`.
-//! That is not an oversight this file can fix: `4d5bab4` ("Host over the ABI
-//! rather than the machine") generified every other `Host` field this way
-//! and *named* the ones it moved onto `A::Ptr` in its own commit message --
-//! `spr`, `l2as`, `mdf`, `empty`, `strtok`, `fsdscb`, `fsdtmp`, `fsd_ascii`,
-//! `fsd_scratch`, plus `DateBuffers` and `FsdSession` -- and did not name
-//! these three, which is a deliberate boundary, not a gap this task
-//! happened to find. Making `Registration`/`Agent`/`Kick` generic would also
-//! genericise [`Registration::dispatch`], which `Host::poll`'s `state_entry`/
-//! `fsd_dispatch` call directly and which is `&Machine`-shaped throughout --
-//! a change to `Host::poll` itself, comparable in size to `crate::fsd`'s own
-//! deferred follow-up (see `shims::fsd`'s doc comment on `fsdego`/`vfyadn`),
-//! and out of this task's scope. All three keep their original
-//! `fn(&mut Machine, &mut Host) -> Result<Ret, ShimError>` shape and
-//! unchanged `ROUTINES` entries.
+//! **`register_module`, `register_agent` and `rtkick` were the last three.**
+//! Each builds a [`Registration`], [`Agent`] or [`Kick`], which used to be
+//! plain, non-generic structs holding `FarPtr` fields directly -- pushed into
+//! `Host<A>`'s own `modules`/`agents`/`kicks` fields, which held
+//! `Vec<Registration>`/`Vec<Agent>`/`Vec<Kick>` **regardless of `A`**, not
+//! `Vec<Registration<A>>`. `4d5bab4` ("Host over the ABI rather than the
+//! machine") generified every other `Host` field this way and *named* the
+//! ones it moved onto `A::Ptr` in its own commit message -- `spr`, `l2as`,
+//! `mdf`, `empty`, `strtok`, `fsdscb`, `fsdtmp`, `fsd_ascii`, `fsd_scratch`,
+//! plus `DateBuffers` and `FsdSession` -- and deliberately did not name
+//! these three, because making them generic also genericises
+//! [`Registration::dispatch`], which `Host::poll`'s `state_entry`/
+//! `fsd_dispatch` call directly. That conversion is now done: `Kick<A>`,
+//! `Registration<A>` and `Agent<A>` (each defaulting to `Wg16`, the
+//! technique `Users<A>`, `Globals<A>` and the rest of this crate's
+//! subsystems already established) hold `A::Ptr` instead of `FarPtr`, and
+//! `Registration::dispatch` takes `&A::Mem` instead of `&Machine` -- every
+//! call site in `impl Host<Wg16>` reborrows one out of the `Machine` it
+//! already has (`Machine::mem`), so the change does not reach `Host::poll`'s
+//! own signature or its dispatch *logic*, only the one line that reads an
+//! entry point. `dispatch`'s null test moves from `FarPtr::selector != 0` to
+//! "every byte zero" ([`Abi::ptr_to_bytes`]), the same substitution [`time`]
+//! already made and for the same reason -- see `Registration::dispatch`'s
+//! own doc comment.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
 use crate::{DateBuffers, Host};
@@ -693,16 +698,24 @@ pub fn shocst_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 ///
 /// If `delay` is negative, which no caller can mean and a misread argument
 /// list would produce.
-pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let delay = args.int();
-    let dstrou = args.ptr();
+///
+/// Generic: the negativity test widens `call.int()` to `u32` via
+/// `Abi::Int`'s own `Into<u32>` bound and then reads bit 15, the same
+/// narrowing [`genrdn`]'s own conversion already established for an `INT`
+/// argument this crate's own logic treats as 16 bits wide regardless of the
+/// calling ABI's native `int` size -- `Kick::delay` is a countdown this
+/// host keeps, not a value handed back to the module, so there is no wire
+/// width to preserve past this point.
+pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let delay = Into::<u32>::into(call.int());
+    let dstrou = call.ptr();
     if delay & 0x8000 != 0 {
         return Err(ShimError::Failed(format!(
             "rtkick: a negative delay ({} seconds)",
             delay as i16
         )));
     }
+    let delay = delay as u16;
     if delay == 0 {
         // `RTKICK.C:50`'s free-slot marker is `countr == 0`, and `:65` skips any
         // entry holding it -- so the original writes this kick into a slot that
@@ -711,10 +724,16 @@ pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         host.note(format!(
             "rtkick: a zero delay for {dstrou:?}, which RTKICK.C would never fire"
         ));
-        return Ok(Ret::Void);
+        return Ok(abi::Ret::Void);
     }
     host.kicks.push(Kick { delay, dstrou });
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rtkick`]. See `shims::call`'s own doc
+/// comment.
+pub fn rtkick_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rtkick(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID dclvda(INT size)` -- `MAJORBBS.H:771` -- declare how much volatile
@@ -758,14 +777,19 @@ pub fn dclvda_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// not exist yet. And it fills a null `stsrou` with the host's own `dfsthn` --
 /// pointless here, because a null `stsrou` simply means the host has no status
 /// routine to call, which is what it would mean either way.
-pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let block = args.ptr();
+///
+/// Generic: `block.resolve` replaces `Machine::resolve`, the same
+/// substitution [`register_textvar`]'s own read makes, and `host.register`
+/// now takes `A::Ptr` rather than `FarPtr`.
+pub fn register_module<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = call.ptr();
 
     // `descrp` is a fixed-width field, so the string inside it is read bounded
     // rather than scanned: a module whose description fills all 25 bytes has no
     // terminator, and scanning would run into `lonrou`.
-    let bytes = machine.resolve(block, usize::from(MNMSIZ))?;
+    let bytes = block
+        .resolve(call.mem(), usize::from(MNMSIZ))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     let description = String::from_utf8_lossy(&bytes[..end]).into_owned();
 
@@ -782,7 +806,13 @@ pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, Sh
         )));
     }
 
-    Ok(Ret::U16(host.register(description, block)))
+    Ok(abi::Ret::Int(A::Int::from(host.register(description, block))))
+}
+
+/// The dispatch-table entry for [`register_module`]. See `shims::call`'s own
+/// doc comment.
+pub fn register_module_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    register_module(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID register_agent(struct agent *agdptr)` -- `GCSPSRV.H:141` -- take a
@@ -816,10 +846,19 @@ pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, Sh
 /// second is this host's own refusal and not the original's: an agent with no
 /// name can never be addressed by a client, so no caller can mean it, and a
 /// misread argument list is what would produce one.
-pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let block = args.ptr();
-    let bytes = machine.resolve(block, usize::from(AGENT_SIZE))?;
+///
+/// Generic: each vector is `A::PTR_WIDTH` bytes wide, not a hardcoded 4 --
+/// the stride [`write_parse`](crate::shims::text)'s own `margv`/`margn` walk
+/// already established for a packed array of pointers. The null test is
+/// every byte of the decoded pointer being zero, the same reading
+/// [`Registration::dispatch`]'s own doc comment gives -- which for this
+/// four-byte `A::Ptr` is exactly the "both words zero" the real routine's
+/// `or` tests, so the two agree on every value either can produce.
+pub fn register_agent<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = call.ptr();
+    let bytes = block
+        .resolve(call.mem(), usize::from(AGENT_SIZE))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // `appid` is a fixed-width field, so the name inside it is read bounded
     // rather than scanned -- an agent whose name fills all nine bytes has no
@@ -833,17 +872,16 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
         ));
     }
 
-    // A vector is null when **both** its words are zero. The real routine tests
-    // it as `mov ax,[es:bx+9]; or ax,[es:bx+0xb]`, and the difference matters:
-    // offset zero is a perfectly good address, and `seg 26:0x0000` of
-    // `WCCMMUD.DLL` is the very routine that makes this call.
+    // A vector is null when **every** byte of it is zero -- see the doc
+    // comment above for why that agrees with the real routine's `or` of its
+    // two words. Offset zero is a perfectly good address, and `seg 26:0x0000`
+    // of `WCCMMUD.DLL` is the very routine that makes this call, so only an
+    // all-zero pointer is refused.
     let vector = |n: usize| {
-        let at = usize::from(AIDSIZ) + n * 4;
-        let ptr = FarPtr {
-            offset: u16::from_le_bytes([bytes[at], bytes[at + 1]]),
-            selector: u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]),
-        };
-        (ptr.offset != 0 || ptr.selector != 0).then_some(ptr)
+        let at = usize::from(AIDSIZ) + n * A::PTR_WIDTH;
+        let ptr = A::ptr_from_bytes(&bytes[at..at + A::PTR_WIDTH]);
+        let is_null = A::ptr_to_bytes(ptr).iter().all(|&b| b == 0);
+        (!is_null).then_some(ptr)
     };
     let agent = Agent {
         appid,
@@ -854,7 +892,13 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
     };
 
     host.agents.push(agent);
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`register_agent`]. See `shims::call`'s own
+/// doc comment.
+pub fn register_agent_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    register_agent(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `INT register_textvar(CHAR *name, CHAR *(*varrou)())` -- `MAJORBBS.H:767`
@@ -963,8 +1007,19 @@ pub fn catastro_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shim
 /// live, decremented by one every elapsed second inside
 /// [`crate::Host::prcrtk`], which [`crate::Host::cycle`] calls on that
 /// schedule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Kick {
+///
+/// Generic over `A: Abi` since `dstrou` is a module pointer -- `FarPtr` for
+/// `Wg16`, and something else for a future 32-bit ABI. Not derived: the
+/// derive macro would generate an `A: Trait` bound, which is wrong here
+/// (`Kick<A>`'s fields are `u16` and `A::Ptr`, never `A` itself) -- see
+/// `crate::abi::Ret`'s own doc comment for the fuller account of why this
+/// crate hand-writes these instead of deriving them. `Clone`/`Copy`/`PartialEq`/
+/// `Eq` all typecheck unconditionally for any `A: Abi`, with no `where`
+/// clause needed, because `Abi::Ptr` already requires `Copy + Eq` in the
+/// trait itself; `Debug` needs `A::Ptr: Debug` spelled out because
+/// `mbbs_ptr::ModulePtr`'s own `Debug` supertrait is not visible to the
+/// compiler without it being named at the impl site.
+pub struct Kick<A: Abi = Wg16> {
     /// Seconds yet to go, counted down one per elapsed second by
     /// [`crate::Host::prcrtk`]. Never `0`: `rtkick` refuses to record a
     /// zero-delay kick, because `RTKICK.C` would never have fired it.
@@ -972,8 +1027,36 @@ pub struct Kick {
 
     /// The module routine to call. Far, and into the module's own code -- the
     /// one MajorMUD registers is an `INTERNALREF` to its NE segment 6.
-    pub dstrou: FarPtr,
+    pub dstrou: A::Ptr,
 }
+
+impl<A: Abi> std::fmt::Debug for Kick<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kick")
+            .field("delay", &self.delay)
+            .field("dstrou", &self.dstrou)
+            .finish()
+    }
+}
+
+impl<A: Abi> Clone for Kick<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for Kick<A> {}
+
+impl<A: Abi> PartialEq for Kick<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.delay == other.delay && self.dstrou == other.dstrou
+    }
+}
+
+impl<A: Abi> Eq for Kick<A> {}
 
 /// A module that has been taken online, or a host-native handler occupying a
 /// `state` slot the same way one would.
@@ -982,8 +1065,10 @@ pub struct Kick {
 /// whether `module[n]` is a loaded NE module or `inifsd()` registering
 /// FSDBBS as one -- both are just an entry in the table. This enum is that
 /// indifference, made explicit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Registration {
+///
+/// Generic over `A: Abi`, and hand-written rather than derived -- see
+/// [`Kick`]'s own doc comment for why.
+pub enum Registration<A: Abi = Wg16> {
     /// A module that has been taken online.
     Module {
         /// The name from `descrp`, which is the key its records are kept
@@ -993,7 +1078,7 @@ pub enum Registration {
         /// The module's own `struct module`, in its own memory. Every entry
         /// point the host will ever call is read back through here rather
         /// than copied, because the module may change them.
-        block: FarPtr,
+        block: A::Ptr,
     },
 
     /// A handler implemented by this host rather than by module code.
@@ -1002,8 +1087,54 @@ pub enum Registration {
     Native(Native),
 }
 
+impl<A: Abi> std::fmt::Debug for Registration<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Module { description, block } => f
+                .debug_struct("Module")
+                .field("description", description)
+                .field("block", block)
+                .finish(),
+            Self::Native(native) => f.debug_tuple("Native").field(native).finish(),
+        }
+    }
+}
+
+impl<A: Abi> Clone for Registration<A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Module { description, block } => Self::Module {
+                description: description.clone(),
+                block: *block,
+            },
+            Self::Native(native) => Self::Native(*native),
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for Registration<A> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Module { description: d1, block: b1 },
+                Self::Module { description: d2, block: b2 },
+            ) => d1 == d2 && b1 == b2,
+            (Self::Native(n1), Self::Native(n2)) => n1 == n2,
+            _ => false,
+        }
+    }
+}
+
+impl<A: Abi> Eq for Registration<A> {}
+
 /// A host-native handler occupying a `state` slot. One variant today; a
 /// second module (MajorMUD Plus) would add a second.
+///
+/// Not generic -- a native handler has no module pointer of its own to vary
+/// by ABI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Native {
     /// The full-screen data entry engine, `FSDBBS.C`'s `inifsd()` registers.
@@ -1023,23 +1154,64 @@ pub enum Native {
 /// here, because this host has nothing to dispatch and a `None` says which
 /// vector the module actually supplied. Whoever builds the dispatcher owes
 /// those four defaults, and the table above is what they are.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Agent {
+///
+/// Generic over `A: Abi`, and hand-written rather than derived -- see
+/// [`Kick`]'s own doc comment for why.
+pub struct Agent<A: Abi = Wg16> {
     /// The name a client addresses this agent by. MajorMUD's is `WCCMMUD`.
     pub appid: String,
 
     /// Deliver a dynapak to the agent, or `None` -- which rejects the request.
-    pub read: Option<FarPtr>,
+    pub read: Option<A::Ptr>,
 
     /// Take a dynapak from the agent, or `None` -- which rejects the request.
-    pub write: Option<FarPtr>,
+    pub write: Option<A::Ptr>,
 
     /// A transfer finished, or `None` -- which does nothing.
-    pub xferdone: Option<FarPtr>,
+    pub xferdone: Option<A::Ptr>,
 
     /// A transfer was abandoned, or `None` -- which does nothing.
-    pub abort: Option<FarPtr>,
+    pub abort: Option<A::Ptr>,
 }
+
+impl<A: Abi> std::fmt::Debug for Agent<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Agent")
+            .field("appid", &self.appid)
+            .field("read", &self.read)
+            .field("write", &self.write)
+            .field("xferdone", &self.xferdone)
+            .field("abort", &self.abort)
+            .finish()
+    }
+}
+
+impl<A: Abi> Clone for Agent<A> {
+    fn clone(&self) -> Self {
+        Self {
+            appid: self.appid.clone(),
+            read: self.read,
+            write: self.write,
+            xferdone: self.xferdone,
+            abort: self.abort,
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for Agent<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.appid == other.appid
+            && self.read == other.read
+            && self.write == other.write
+            && self.xferdone == other.xferdone
+            && self.abort == other.abort
+    }
+}
+
+impl<A: Abi> Eq for Agent<A> {}
 
 /// What [`Registration::dispatch`] found at a channel's state: a module's
 /// far pointer (which may be null, meaning the module supplies no handler
@@ -1049,16 +1221,50 @@ pub struct Agent {
 /// and its old `entry` method already had: a test outside this crate (an
 /// integration test under `tests/`) reads a registered module's entry points
 /// back the same way `Host::state_entry` does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Dispatch {
+///
+/// Generic over `A: Abi`, and hand-written rather than derived -- see
+/// [`Kick`]'s own doc comment for why.
+pub enum Dispatch<A: Abi = Wg16> {
     /// A module's far pointer for this entry, or `None` if it left the entry
     /// null.
-    Module(Option<FarPtr>),
+    Module(Option<A::Ptr>),
     /// A host-native handler, run directly rather than through a far call.
     Native(Native),
 }
 
-impl Registration {
+impl<A: Abi> std::fmt::Debug for Dispatch<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Module(ptr) => f.debug_tuple("Module").field(ptr).finish(),
+            Self::Native(native) => f.debug_tuple("Native").field(native).finish(),
+        }
+    }
+}
+
+impl<A: Abi> Clone for Dispatch<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for Dispatch<A> {}
+
+impl<A: Abi> PartialEq for Dispatch<A> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Module(p1), Self::Module(p2)) => p1 == p2,
+            (Self::Native(n1), Self::Native(n2)) => n1 == n2,
+            _ => false,
+        }
+    }
+}
+
+impl<A: Abi> Eq for Dispatch<A> {}
+
+impl<A: Abi> Registration<A> {
     /// Where one of the nine entry points is, or which native handler runs
     /// instead.
     ///
@@ -1070,22 +1276,28 @@ impl Registration {
     /// Read every time a [`Registration::Module`]'s pointer is wanted. That
     /// is the whole reason the block address is kept instead of a copy.
     ///
+    /// Takes `&A::Mem` rather than `&Machine`: reading an entry point is a
+    /// memory read, not a call, and every caller in `impl Host<Wg16>` already
+    /// has a `Machine` to reborrow one out of (`Machine::mem`). The null test
+    /// is every byte of the decoded pointer being zero
+    /// ([`Abi::ptr_to_bytes`]), not `FarPtr::selector != 0` as the original
+    /// wrote it -- the same substitution [`time`]'s own doc comment makes,
+    /// for the same reason: `A::Ptr` is opaque to a generic caller, and the
+    /// two tests agree on every value this crate's own tests exercise.
+    ///
     /// # Errors
     ///
     /// If a `Module`'s block no longer names memory the module owns.
-    pub fn dispatch(&self, machine: &Machine, n: usize) -> Result<Dispatch, ShimError> {
+    pub fn dispatch(&self, mem: &A::Mem, n: usize) -> Result<Dispatch<A>, ShimError> {
         match self {
             Self::Module { block, .. } => {
-                let at = FarPtr {
-                    offset: block.offset + MNMSIZ + (n as u16) * 4,
-                    selector: block.selector,
-                };
-                let bytes = machine.resolve(at, 4)?;
-                let ptr = FarPtr {
-                    offset: u16::from_le_bytes([bytes[0], bytes[1]]),
-                    selector: u16::from_le_bytes([bytes[2], bytes[3]]),
-                };
-                Ok(Dispatch::Module((ptr.selector != 0).then_some(ptr)))
+                let at = A::ptr_offset(*block, MNMSIZ + (n as u16) * A::PTR_WIDTH as u16);
+                let bytes = at
+                    .resolve(mem, A::PTR_WIDTH)
+                    .map_err(|e| ShimError::Failed(e.to_string()))?;
+                let ptr = A::ptr_from_bytes(bytes);
+                let is_null = A::ptr_to_bytes(ptr).iter().all(|&b| b == 0);
+                Ok(Dispatch::Module((!is_null).then_some(ptr)))
             }
             Self::Native(native) => Ok(Dispatch::Native(*native)),
         }
@@ -1096,6 +1308,7 @@ impl Registration {
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+    use mbbs16::FarPtr;
 
     /// A `struct module` in module memory: 25 bytes of name, then nine far
     /// pointers.
@@ -1299,7 +1512,7 @@ mod tests {
         let block = module_block(&mut f, "MajorMUD", &entries);
 
         assert_eq!(
-            f.invoke(register_module, &Fixture::far(block)).expect("ok"),
+            f.invoke(register_module_wg16, &Fixture::far(block)).expect("ok"),
             Ret::U16(want),
             "a module registers into the next free slot, past the FSD's own"
         );
@@ -1311,7 +1524,7 @@ mod tests {
 
         for (n, expect) in entries.iter().enumerate() {
             assert_eq!(
-                registered.dispatch(&f.machine, n).expect("readable"),
+                registered.dispatch(f.machine.mem(), n).expect("readable"),
                 Dispatch::Module(Some(*expect))
             );
         }
@@ -1325,11 +1538,11 @@ mod tests {
         let mut f = Fixture::new();
         let want = f.host.modules().len();
         let block = module_block(&mut f, "MajorMUD", &[]);
-        f.invoke(register_module, &Fixture::far(block)).expect("ok");
+        f.invoke(register_module_wg16, &Fixture::far(block)).expect("ok");
 
         assert_eq!(
             f.host.modules()[want]
-                .dispatch(&f.machine, 1)
+                .dispatch(f.machine.mem(), 1)
                 .expect("readable"),
             Dispatch::Module(None),
             "a null entry point is no entry point"
@@ -1347,7 +1560,7 @@ mod tests {
 
         assert_eq!(
             f.host.modules()[want]
-                .dispatch(&f.machine, 1)
+                .dispatch(f.machine.mem(), 1)
                 .expect("readable"),
             Dispatch::Module(Some(sttrou)),
             "read back, not remembered"
@@ -1361,11 +1574,11 @@ mod tests {
         // from.
         let mut f = Fixture::new();
         let short = module_block(&mut f, "AB", &[]);
-        assert!(f.invoke(register_module, &Fixture::far(short)).is_err());
+        assert!(f.invoke(register_module_wg16, &Fixture::far(short)).is_err());
 
         let mut f = Fixture::new();
         let full = module_block(&mut f, "0123456789012345678901234", &[]);
-        assert!(f.invoke(register_module, &Fixture::far(full)).is_err());
+        assert!(f.invoke(register_module_wg16, &Fixture::far(full)).is_err());
     }
 
     #[test]
@@ -1515,7 +1728,7 @@ mod tests {
         };
 
         let args = [1, dstrou.offset, dstrou.selector];
-        assert!(matches!(f.invoke(rtkick, &args), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rtkick_wg16, &args), Ok(Ret::Void)));
 
         assert_eq!(f.host.kicks(), [Kick { delay: 1, dstrou }]);
     }
@@ -1536,9 +1749,9 @@ mod tests {
             selector: 0x0067,
         };
 
-        f.invoke(rtkick, &[5, first.offset, first.selector])
+        f.invoke(rtkick_wg16, &[5, first.offset, first.selector])
             .expect("first");
-        f.invoke(rtkick, &[5, second.offset, second.selector])
+        f.invoke(rtkick_wg16, &[5, second.offset, second.selector])
             .expect("second");
 
         assert_eq!(
@@ -1565,7 +1778,7 @@ mod tests {
         let mut f = Fixture::new();
 
         let e = f
-            .invoke(rtkick, &[0xffff, 0x0a21, 0x0067])
+            .invoke(rtkick_wg16, &[0xffff, 0x0a21, 0x0067])
             .expect_err("refused");
         assert!(format!("{e}").contains("negative delay"), "{e}");
         assert!(f.host.kicks().is_empty());
@@ -1582,7 +1795,7 @@ mod tests {
         let mut f = Fixture::new();
         let dstrou = f.machine.code_ptr(0);
         assert!(matches!(
-            f.invoke(rtkick, &[0, dstrou.offset, dstrou.selector]),
+            f.invoke(rtkick_wg16, &[0, dstrou.offset, dstrou.selector]),
             Ok(Ret::Void)
         ));
         assert!(f.host.kicks().is_empty(), "RTKICK.C would never fire it");
@@ -1608,7 +1821,7 @@ mod tests {
         let block = agent_block(&mut f, "WCCMMUD", &vectors);
 
         assert_eq!(
-            f.invoke(register_agent, &Fixture::far(block))
+            f.invoke(register_agent_wg16, &Fixture::far(block))
                 .expect("registered"),
             Ret::Void,
             "register_agent returns nothing"
@@ -1634,7 +1847,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "WCCMMUD", &[read]);
-        f.invoke(register_agent, &Fixture::far(block))
+        f.invoke(register_agent_wg16, &Fixture::far(block))
             .expect("registered");
 
         let at = FarPtr {
@@ -1659,7 +1872,7 @@ mod tests {
         // `Agent`.
         let mut f = Fixture::new();
         let block = agent_block(&mut f, "SILENT", &[]);
-        f.invoke(register_agent, &Fixture::far(block))
+        f.invoke(register_agent_wg16, &Fixture::far(block))
             .expect("registered");
 
         let agent = &f.host.agents()[0];
@@ -1681,7 +1894,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "WCCMMUD", &[start]);
-        f.invoke(register_agent, &Fixture::far(block))
+        f.invoke(register_agent_wg16, &Fixture::far(block))
             .expect("registered");
 
         assert_eq!(f.host.agents()[0].read, Some(start));
@@ -1698,7 +1911,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "ABCDEFGHI", &[read]);
-        f.invoke(register_agent, &Fixture::far(block))
+        f.invoke(register_agent_wg16, &Fixture::far(block))
             .expect("registered");
 
         assert_eq!(f.host.agents()[0].appid, "ABCDEFGHI");
@@ -1899,7 +2112,7 @@ mod tests {
         let block = agent_block(&mut f, "", &[]);
 
         let e = f
-            .invoke(register_agent, &Fixture::far(block))
+            .invoke(register_agent_wg16, &Fixture::far(block))
             .expect_err("refused");
         assert!(format!("{e}").contains("no appid"), "{e}");
         assert!(f.host.agents().is_empty());

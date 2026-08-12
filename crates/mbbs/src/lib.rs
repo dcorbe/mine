@@ -574,11 +574,11 @@ pub struct Host<A: Abi = Wg16> {
     /// Every module that has come online, in registration order. A module's
     /// number is its index here, which is what `register_module` returns and
     /// what the module passes back.
-    modules: Vec<Registration>,
+    modules: Vec<Registration<A>>,
 
     /// Every client/server agent that has come online, in registration order.
     /// Unlike [`Host::modules`] these are *copies* -- see [`Agent`].
-    pub(crate) agents: Vec<Agent>,
+    pub(crate) agents: Vec<Agent<A>>,
 
     /// The text variables the module has registered. Unlike [`Host::agents`]
     /// these live in memory the module can reach -- see [`TextVars`].
@@ -629,7 +629,7 @@ pub struct Host<A: Abi = Wg16> {
     /// Every callback `rtkick` has been asked to run later, in the order it
     /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
     /// [`Host::prcrtk`]. See [`Host::kicks`].
-    pub(crate) kicks: Vec<Kick>,
+    pub(crate) kicks: Vec<Kick<A>>,
 
     /// Poll dispatches left in this burst.
     ///
@@ -959,7 +959,7 @@ impl<A: Abi> Host<A> {
         &self.audit
     }
 
-    pub fn modules(&self) -> &[Registration] {
+    pub fn modules(&self) -> &[Registration<A>] {
         &self.modules
     }
 
@@ -967,7 +967,7 @@ impl<A: Abi> Host<A> {
     /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
     /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
     /// and neither wants to mistake the FSD's native slot for it.
-    fn first_module(&self) -> Option<&Registration> {
+    fn first_module(&self) -> Option<&Registration<A>> {
         self.modules
             .iter()
             .find(|r| matches!(r, Registration::Module { .. }))
@@ -1029,7 +1029,7 @@ impl<A: Abi> Host<A> {
     /// this host has no way to be talking to. So this is the record of what a
     /// client/server layer would call into, in the same sense that
     /// [`Host::kicks`] is a record of what a main loop would owe.
-    pub fn agents(&self) -> &[Agent] {
+    pub fn agents(&self) -> &[Agent<A>] {
         &self.agents
     }
 
@@ -1057,7 +1057,7 @@ impl<A: Abi> Host<A> {
     /// MajorMUD registers two during initialisation -- a one-second heartbeat
     /// into its own segment 6, and a second one-second callback into segment
     /// 10, which is the last thing it does before it asks for a random number.
-    pub fn kicks(&self) -> &[Kick] {
+    pub fn kicks(&self) -> &[Kick<A>] {
         &self.kicks
     }
 
@@ -1317,7 +1317,7 @@ impl<A: Abi> Host<A> {
     }
 
     /// Take a module online, and give it its number.
-    fn register(&mut self, description: String, block: FarPtr) -> u16 {
+    fn register(&mut self, description: String, block: A::Ptr) -> u16 {
         self.modules.push(Registration::Module { description, block });
         (self.modules.len() - 1) as u16
     }
@@ -1729,7 +1729,7 @@ impl Host<Wg16> {
                  never given, or a registration this host owes has not happened"
             )));
         };
-        Ok(registered.dispatch(machine, n))
+        Ok(registered.dispatch(machine.mem(), n))
     }
 
     /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
@@ -2109,7 +2109,7 @@ impl Host<Wg16> {
             let registered = self.first_module().ok_or_else(|| {
                 io::Error::other("no module has registered, so there is nothing to enter")
             })?;
-            match registered.dispatch(machine, 0) {
+            match registered.dispatch(machine.mem(), 0) {
                 Ok(Dispatch::Module(rou)) => Ok(rou),
                 // `first_module` never answers `Native`, but the match stays
                 // exhaustive and the fallback stays correct if that changes.
@@ -2291,7 +2291,7 @@ impl Host<Wg16> {
                         "no module has registered, so there is nothing to disconnect from",
                     )
                 })?;
-                match registered.dispatch(machine, vector.entry()) {
+                match registered.dispatch(machine.mem(), vector.entry()) {
                     Ok(Dispatch::Module(rou)) => Ok(rou),
                     Ok(Dispatch::Native(_)) => Ok(None),
                     Err(e) => Err(e),
@@ -3794,7 +3794,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
             .expect("registered");
 
         f.host.gsbl_mut().push_input(console, b"look\r");
@@ -3823,7 +3823,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
             .expect("registered");
 
         f.host.gsbl_mut().push_input(console, b"look\r");
@@ -3867,7 +3867,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
             .expect("registered");
 
         let outcome = f
@@ -3897,7 +3897,7 @@ mod tests {
         }
         let block = f.bytes(&bytes, false);
         let ret = f
-            .invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
             .expect("registered");
         match ret {
             Ret::U16(n) => n,
@@ -3938,7 +3938,7 @@ mod tests {
         }
         let block = f.bytes(&bytes, false);
         let ret = f
-            .invoke(crate::shims::system::register_module, &Fixture::far(block))
+            .invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
             .expect("registered");
         match ret {
             Ret::U16(n) => n,

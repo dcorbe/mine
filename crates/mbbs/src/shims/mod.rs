@@ -260,13 +260,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "unlink", stream::unlink_wg16, Cleans::Caller),
     (MAJORBBS, "getdtd", stream::getdtd_wg16, Cleans::Caller),
     (MAJORBBS, "cntdir", stream::cntdir_wg16, Cleans::Caller),
-    // The clock, the audit trail, and coming online. `_wg16`: sixteen of
-    // these nineteen are generic now (see `shims::system`'s own doc
-    // comment); `register_module`, `register_agent` and `rtkick` stay
-    // concrete, all three blocked on `Registration`/`Agent`/`Kick` being
-    // plain `FarPtr`-typed structs `Host<A>`'s own fields hold regardless of
-    // `A` -- see `shims::system`'s doc comment for why that boundary is
-    // deliberate, not a gap this task happened to find.
+    // The clock, the audit trail, and coming online. `_wg16`: all nineteen
+    // are generic now (see `shims::system`'s own doc comment);
+    // `register_module`, `register_agent` and `rtkick` were the last three,
+    // unblocked once `Registration`/`Agent`/`Kick` went generic over `A`.
     (MAJORBBS, "access", system::access_wg16, Cleans::Caller),
     (MAJORBBS, "now", system::now_wg16, Cleans::Caller),
     (MAJORBBS, "nctime", system::nctime_wg16, Cleans::Caller),
@@ -283,7 +280,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "lngrnd", system::lngrnd_wg16, Cleans::Caller),
     (MAJORBBS, "gmdnam", system::gmdnam_wg16, Cleans::Caller),
     (MAJORBBS, "shocst", system::shocst_wg16, Cleans::Caller),
-    (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
+    (MAJORBBS, "rtkick", system::rtkick_wg16, Cleans::Caller),
     // `_wg16`: these five are converted to the generic `Call<A>`/`Host<A>`
     // shape (see `shims::user`'s own doc comment); the table entry is the
     // monomorphised bridge, not the shim itself. `getin` is the sixth,
@@ -307,13 +304,13 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (
         MAJORBBS,
         "register_module",
-        system::register_module,
+        system::register_module_wg16,
         Cleans::Caller,
     ),
     (
         MAJORBBS,
         "register_agent",
-        system::register_agent,
+        system::register_agent_wg16,
         Cleans::Caller,
     ),
     (
