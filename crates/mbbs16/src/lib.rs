@@ -82,6 +82,21 @@
 //! on the contents of a register at a mode transition can be masked this way,
 //! and only the other profile shows it.
 
+// The header above says "on x86-64 Linux" in prose; this makes the compiler say
+// it. Every entry into module code here goes through x86 segmentation --
+// `modify_ldt(2)` writes the descriptors and a far call enters them -- and no
+// other architecture has the syscall, the descriptor tables, or the 16-bit
+// instruction set for any of it to be ported to.
+//
+// This does not silence the rest of the failure, it names the cause of it.
+// `cargo check --target aarch64-unknown-linux-gnu -p mbbs16 -p mbbs32` reports
+// 37 errors: 27 are `libc` constants that exist only on x86 (`MAP_32BIT`,
+// `REG_CSGSFS`, `SYS_arch_prctl`), 4 are `att_syntax` blocks rejected outright,
+// 2 are missing `ucontext` fields -- and every one of them describes a symptom.
+// Without these two lines nothing in the output says the crate is x86-only.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("mbbs16 runs 16-bit x86 in LDT segments (modify_ldt): x86_64 only");
+
 mod asm;
 mod farptr;
 mod fault;

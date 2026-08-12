@@ -44,6 +44,14 @@
 //! `cargo test -p mbbs32 --release` are not the same check -- see the sibling
 //! crate's note for the measurement behind that.
 
+// As in `mbbs16` -- see the longer note there -- but for a different mechanism:
+// entry is a far jump to `__USER32_CS` (`0x23`) rather than to an LDT selector,
+// and `FS` is set through `arch_prctl`. Both are facilities the kernel offers
+// only on x86, so the crate cannot build anywhere else and should say so
+// itself.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!("mbbs32 enters 32-bit code via __USER32_CS: x86_64 only");
+
 mod asm;
 mod fault;
 pub mod flatptr;
