@@ -144,7 +144,16 @@ pub(crate) fn ldt_index(selector: u16) -> Result<u16, FarPtrError> {
 }
 
 impl mbbs_ptr::ModulePtr for FarPtr {
-    type Memory = crate::Machine;
+    // `Segments`, not `Machine`: this is a module's *memory*, and `Machine`
+    // owns strictly more than that (thunk table, fault recovery, the call
+    // frame). Binding to the wider type would force anything generic over
+    // `ModulePtr` -- `crates/mbbs`'s upcoming `Abi::Mem` among them -- to be
+    // handed a whole `Machine` just to resolve one pointer, which is the
+    // exact coupling Task 1 (`Segments`) exists to break. `resolve`,
+    // `read_cstr` and `write` are identical methods on both types today
+    // (`Machine`'s are a delegating facade over these same ones on
+    // `Segments`), so this costs nothing to change.
+    type Memory = crate::Segments;
     type Error = FarPtrError;
 
     fn resolve<'m>(&self, memory: &'m Self::Memory, len: usize) -> Result<&'m [u8], Self::Error> {

@@ -440,6 +440,7 @@ version = "0.1.0"
 dependencies = [
  "btrieve-engine",
  "libc",
+ "mbbs-ptr",
  "mbbs16",
 ]
 

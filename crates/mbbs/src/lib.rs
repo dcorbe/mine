@@ -20,6 +20,7 @@
 //! return an error the module can interpret. It stops the module, naming the
 //! symbol -- see [`Poison::Unimplemented`](mbbs16::Poison::Unimplemented).
 
+pub mod abi;
 mod arena;
 pub mod btrieve;
 pub mod chan;
