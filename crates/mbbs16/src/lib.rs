@@ -87,19 +87,20 @@ mod farptr;
 mod fault;
 mod ne;
 mod seg;
+mod segments;
 mod watchdog;
 
 use std::io;
 use std::time::Duration;
 
 use asm::{Ctx, mbbs16_enter, trampoline};
-use farptr::ldt_index;
 pub use farptr::{FarPtr, FarPtrError};
 pub use ne::{
     EntryPoint, Import, ImportResolver, ImportSite, Module, NeError, NeImage, Relocation,
     SegmentEntry, Source, Symbol, Target,
 };
 use seg::Segment;
+pub use segments::Segments;
 use watchdog::Watched;
 
 /// Size of a module's code and stack segments. 64 KiB is the most a 16-bit
@@ -288,20 +289,11 @@ impl Ret {
 /// One module's 16-bit world: its code, its stack, and the state needed to
 /// re-enter it where it left off.
 pub struct Machine {
-    /// Every segment this module owns, in no particular order. Lookup is by
-    /// selector, because that is the only thing a far pointer carries -- and a
-    /// loaded NE image appends 82 more of them here, so an index would be a
-    /// second way of naming a segment that the module itself cannot use.
-    pub(crate) segments: Vec<Segment>,
-
-    /// The scratch code segment [`Machine::load_code`] fills. Unused once an NE
-    /// image is loaded, which brings 34 code segments of its own.
-    code: u16,
-    stack: u16,
-
-    /// The segment `DS` is loaded from: the scratch one until an NE image is
-    /// loaded, and that image's `DGROUP` afterwards.
-    pub(crate) data: u16,
+    /// This module's address space: every segment it owns, plus the code,
+    /// stack and data selectors execution needs to name them. See
+    /// [`Segments`] for why this is a separate type rather than fields here --
+    /// `mbbs32` already draws the same line between its `Machine` and `Image`.
+    mem: Segments,
 
     /// The thunk table and the trampoline. The host's, and no module's.
     bridge: u16,
@@ -414,10 +406,7 @@ impl Machine {
         let (data_sel, bridge_sel) = (data.selector(), bridge.selector());
 
         Ok(Self {
-            segments: vec![code, stack, data, bridge],
-            code: code_sel,
-            stack: stack_sel,
-            data: data_sel,
+            mem: Segments::new(vec![code, stack, data, bridge], code_sel, stack_sel, data_sel),
             bridge: bridge_sel,
             ctx: Watched::new()?,
             frame_sp: None,
@@ -520,17 +509,11 @@ impl Machine {
     ///
     /// If `len` is zero or larger than a 16-bit segment can address, or if the
     /// mapping or its descriptor cannot be made.
+    ///
+    /// Delegates to [`Segments::alloc_segment`]; kept on `Machine` so the shim
+    /// layer compiles unchanged until the `Abi` conversion reaches it.
     pub fn alloc_segment(&mut self, len: usize) -> io::Result<u16> {
-        if len == 0 || len > SEGMENT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("a 16-bit segment is 1..={SEGMENT_BYTES} bytes, not {len}"),
-            ));
-        }
-        let segment = Segment::new(len, false)?;
-        let selector = segment.selector();
-        self.segments.push(segment);
-        Ok(selector)
+        self.mem.alloc_segment(len)
     }
 
     /// One region of `qty * size` bytes, described by `qty` consecutive LDT
@@ -553,14 +536,11 @@ impl Machine {
     ///
     /// If `qty` or `size` is zero, if the region cannot be mapped, or if the
     /// LDT has no run of `qty` free entries.
+    ///
+    /// Delegates to [`Segments::alloc_tiled`]; kept on `Machine` so the shim
+    /// layer compiles unchanged until the `Abi` conversion reaches it.
     pub fn alloc_tiled(&mut self, qty: u16, size: u16) -> io::Result<FarPtr> {
-        let tiles = Segment::tiled(qty, size)?;
-        let selector = tiles[0].selector();
-        self.segments.extend(tiles);
-        Ok(FarPtr {
-            offset: 0,
-            selector,
-        })
+        self.mem.alloc_tiled(qty, size)
     }
 
     /// Place a raw image at offset 0 of the scratch code segment.
@@ -569,8 +549,9 @@ impl Machine {
     /// shares that segment with it. For a real module, see
     /// [`Machine::load_ne`].
     pub fn load_code(&mut self, image: &[u8]) -> io::Result<()> {
-        let code = self.code;
-        self.segment_mut(code)
+        let code = self.mem.code_selector();
+        self.mem
+            .segment_mut(code)
             .expect("the scratch code segment is this machine's own")
             .write(0, image)
     }
@@ -580,7 +561,7 @@ impl Machine {
     pub fn code_ptr(&self, offset: u16) -> FarPtr {
         FarPtr {
             offset,
-            selector: self.code,
+            selector: self.mem.code_selector(),
         }
     }
 
@@ -616,7 +597,7 @@ impl Machine {
 
         // A far jump into a segment we do not own would leave 16-bit mode with
         // no way back. Better an error here than a fault there.
-        self.segment(entry.selector)?;
+        self.mem.segment(entry.selector)?;
 
         if let Some(poison) = &self.poisoned {
             return Err(io::Error::other(format!(
@@ -643,8 +624,9 @@ impl Machine {
             .chain(args.iter().copied())
             .collect();
 
-        let stack_sel = self.stack;
+        let stack_sel = self.mem.stack_selector();
         let stack = self
+            .mem
             .segment_mut(stack_sel)
             .expect("the stack segment is this machine's own");
         for (i, word) in frame.iter().enumerate() {
@@ -663,7 +645,7 @@ impl Machine {
 
         // A module starts with DS naming its own data segment. After that it is
         // whatever the module last had, since DS is callee-saved.
-        self.ctx.out_ds = u64::from(self.data);
+        self.ctx.out_ds = u64::from(self.mem.data);
 
         self.ctx.arm(self.budget)?;
         self.run(entry, sp, Ret::Void)
@@ -715,11 +697,11 @@ impl Machine {
         // segments calls out from any of them, so this is read back rather than
         // assumed -- but it must still be a segment we own.
         let at = FarPtr {
-            offset: self.stack().read_u16(usize::from(sp)),
-            selector: self.stack().read_u16(usize::from(sp) + 2),
+            offset: self.mem.stack().read_u16(usize::from(sp)),
+            selector: self.mem.stack().read_u16(usize::from(sp) + 2),
         };
         debug_assert!(
-            self.segment(at.selector).is_ok(),
+            self.mem.segment(at.selector).is_ok(),
             "call frame names a segment that is not this machine's"
         );
 
@@ -748,7 +730,7 @@ impl Machine {
         let sp = self
             .frame_sp
             .expect("arg_u16() with no outstanding call to read from");
-        self.stack().read_u16(usize::from(sp) + 4 + n * 2)
+        self.mem.stack().read_u16(usize::from(sp) + 4 + n * 2)
     }
 
     /// Read the `n`th and `n + 1`th argument words as one 32-bit value, low
@@ -768,47 +750,36 @@ impl Machine {
     }
 
     /// Selector of the scratch code segment [`Machine::load_code`] fills.
+    ///
+    /// Delegates to [`Segments::code_selector`]; kept on `Machine` so the shim
+    /// layer compiles unchanged until the `Abi` conversion reaches it. Not
+    /// listed among the memory methods in the design doc's file list, but
+    /// `code` moved with the rest of [`Segments`], so this has to move with it
+    /// to stay callable.
     pub fn code_selector(&self) -> u16 {
-        self.code
+        self.mem.code_selector()
     }
 
     /// Selector of the module's stack segment.
     ///
     /// Worth having separately from the code one: under `DS != SS` a module
     /// hands out pointers to its own locals, and this is the segment they name.
+    ///
+    /// Delegates to [`Segments::stack_selector`]; kept on `Machine` so the
+    /// shim layer compiles unchanged until the `Abi` conversion reaches it.
     pub fn stack_selector(&self) -> u16 {
-        self.stack
+        self.mem.stack_selector()
     }
 
     /// Selector of the module's data segment: its `DGROUP`.
     ///
     /// The scratch one until [`Machine::load_ne`] replaces it with the loaded
     /// module's own.
+    ///
+    /// Delegates to [`Segments::data_selector`]; kept on `Machine` so the shim
+    /// layer compiles unchanged until the `Abi` conversion reaches it.
     pub fn data_selector(&self) -> u16 {
-        self.data
-    }
-
-    fn stack(&self) -> &Segment {
-        self.segment(self.stack)
-            .expect("the stack segment is this machine's own")
-    }
-
-    /// Find the segment a selector names.
-    fn segment(&self, selector: u16) -> Result<&Segment, FarPtrError> {
-        let index = ldt_index(selector)?;
-        self.segments
-            .iter()
-            .find(|s| s.entry() == u32::from(index))
-            .ok_or(FarPtrError::NoSuchSegment { selector })
-    }
-
-    /// Find the segment a selector names, to write to.
-    fn segment_mut(&mut self, selector: u16) -> Result<&mut Segment, FarPtrError> {
-        let index = ldt_index(selector)?;
-        self.segments
-            .iter_mut()
-            .find(|s| s.entry() == u32::from(index))
-            .ok_or(FarPtrError::NoSuchSegment { selector })
+        self.mem.data_selector()
     }
 
     /// Borrow `len` bytes of module memory through a far pointer.
@@ -823,22 +794,11 @@ impl Machine {
     /// If the selector names nothing of this module's, or the access would run
     /// past the end of what it names. Both are things a module can do, so
     /// neither is a panic.
+    ///
+    /// Delegates to [`Segments::resolve`]; kept on `Machine` so the shim layer
+    /// compiles unchanged until the `Abi` conversion reaches it.
     pub fn resolve(&self, ptr: FarPtr, len: usize) -> Result<&[u8], FarPtrError> {
-        let segment = self.segment(ptr.selector)?;
-        let start = usize::from(ptr.offset);
-        let end = start.checked_add(len).ok_or(FarPtrError::OutOfBounds {
-            ptr,
-            len,
-            limit: segment.len(),
-        })?;
-        if end > segment.len() {
-            return Err(FarPtrError::OutOfBounds {
-                ptr,
-                len,
-                limit: segment.len(),
-            });
-        }
-        Ok(segment.slice(start, len))
+        self.mem.resolve(ptr, len)
     }
 
     /// Read a NUL-terminated string through a far pointer, without the NUL.
@@ -850,25 +810,11 @@ impl Machine {
     /// # Errors
     ///
     /// As [`Machine::resolve`], plus [`FarPtrError::Unterminated`].
+    ///
+    /// Delegates to [`Segments::read_cstr`]; kept on `Machine` so the shim
+    /// layer compiles unchanged until the `Abi` conversion reaches it.
     pub fn read_cstr(&self, ptr: FarPtr) -> Result<&[u8], FarPtrError> {
-        let limit = self.segment(ptr.selector)?.len();
-        let start = usize::from(ptr.offset);
-
-        // Everything from the pointer to the end of its segment is the most a
-        // string could possibly be. Going through `resolve` rather than
-        // reaching for the segment directly keeps one bounds check and one
-        // lookup in the crate, instead of two that can drift apart.
-        let avail = limit
-            .checked_sub(start)
-            .filter(|n| *n > 0)
-            .ok_or(FarPtrError::OutOfBounds { ptr, len: 1, limit })?;
-        let tail = self.resolve(ptr, avail)?;
-
-        let n = tail
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or(FarPtrError::Unterminated { ptr })?;
-        Ok(&tail[..n])
+        self.mem.read_cstr(ptr)
     }
 
     /// Write into module memory through a far pointer.
@@ -880,13 +826,11 @@ impl Machine {
     /// # Errors
     ///
     /// As [`Machine::resolve`].
+    ///
+    /// Delegates to [`Segments::write`]; kept on `Machine` so the shim layer
+    /// compiles unchanged until the `Abi` conversion reaches it.
     pub fn write(&mut self, ptr: FarPtr, bytes: &[u8]) -> Result<(), FarPtrError> {
-        // Resolve first so the bounds check and the error are shared.
-        self.resolve(ptr, bytes.len())?;
-        self.segment_mut(ptr.selector)?
-            .write(usize::from(ptr.offset), bytes)
-            .expect("bounds already checked by resolve");
-        Ok(())
+        self.mem.write(ptr, bytes)
     }
 
     /// Read the `n`th argument of the outstanding call as a far pointer.
@@ -1000,7 +944,7 @@ impl Machine {
 
         self.ctx.target_offset = u32::from(at.offset);
         self.ctx.target_selector = at.selector;
-        self.ctx.ss16 = self.stack;
+        self.ctx.ss16 = self.mem.stack_selector();
         self.ctx.sp = u64::from(sp);
         self.ctx.ax = u64::from(ax);
         self.ctx.dx = u64::from(dx);
@@ -1056,7 +1000,8 @@ impl Machine {
         }
 
         debug_assert_eq!(
-            self.ctx.out_ss as u16, self.stack,
+            self.ctx.out_ss as u16,
+            self.mem.stack_selector(),
             "came back on a stack that is not the module's"
         );
 
@@ -1092,8 +1037,8 @@ impl Machine {
                 "the module called out at SP={out_sp:#06x}, so its stack has underflowed"
             ))
         })?;
-        self.call_cx = self.stack().read_u16(usize::from(out_sp));
-        self.call_ax = self.stack().read_u16(usize::from(out_sp) + 2);
+        self.call_cx = self.mem.stack().read_u16(usize::from(out_sp));
+        self.call_ax = self.mem.stack().read_u16(usize::from(out_sp) + 2);
         self.frame_sp = Some(frame);
 
         Ok(Exit::Call {

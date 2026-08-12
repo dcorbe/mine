@@ -888,7 +888,7 @@ impl Machine {
         // tail is BSS, and leaving it as whatever was there before would be a
         // module reading uninitialised globals that looked initialised.
         let mut selectors = Vec::with_capacity(image.segments.len());
-        let first = self.segments.len();
+        let first = self.mem.segments.len();
         for (i, entry) in image.segments.iter().enumerate() {
             let mut segment =
                 Segment::new(entry.alloc, !entry.is_data()).map_err(|e| NeError::Mapping {
@@ -899,7 +899,7 @@ impl Machine {
                 .write(0, &file[entry.file.clone()])
                 .expect("the segment is at least as large as its file data");
             selectors.push(segment.selector());
-            self.segments.push(segment);
+            self.mem.segments.push(segment);
         }
 
         let mut thunks = Thunks::new();
@@ -959,7 +959,7 @@ impl Machine {
                     Target::OsFixup { .. } => continue,
                 };
 
-                apply(&mut self.segments[first + i], (i + 1) as u16, reloc, value)?;
+                apply(&mut self.mem.segments[first + i], (i + 1) as u16, reloc, value)?;
                 applied += 1;
             }
         }
@@ -969,7 +969,7 @@ impl Machine {
             .ok_or(NeError::NoAutoData {
                 segment: image.autodata,
             })?;
-        self.data = autodata;
+        self.mem.data = autodata;
 
         Ok(Module {
             selectors,
