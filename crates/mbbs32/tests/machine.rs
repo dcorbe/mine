@@ -412,3 +412,117 @@ fn resume_with_ret_void_clears_eax_and_edx() {
         "Ret::Void did not clear both EAX and EDX"
     );
 }
+
+/// Assemble code that pushes `args` right to left (`push imm32` is `0x68` +
+/// the 4-byte little-endian immediate) and then `call`s `target` -- the
+/// module-side mirror of what a module does just before an import call,
+/// which is what [`Machine::arg_u32`] actually reads back. Distinct from
+/// `Machine::call`'s own `args` (which build the *entry* frame, not an
+/// outstanding call's), so this exists only in this test file.
+fn push_args_and_call(args: &[u32], entry: u32, target: u32) -> Vec<u8> {
+    let mut code = Vec::new();
+    for &arg in args.iter().rev() {
+        code.push(0x68); // push imm32
+        code.extend_from_slice(&arg.to_le_bytes());
+    }
+    code.push(0xe8); // call rel32
+    let call_site_end = entry + code.len() as u32 + 4;
+    let rel = target.wrapping_sub(call_site_end);
+    code.extend_from_slice(&rel.to_le_bytes());
+    code
+}
+
+/// `arg_u32` must return the argument at index `n`, not merely *an* argument
+/// -- proven with four distinct, non-adjacent sentinels (not `1, 2, 3, 4`, so
+/// an off-by-one lands on a value that is obviously wrong rather than
+/// coincidentally plausible) read back in scrambled order (2, 0, 3, 1) so a
+/// stateful or positional bug would show. `docs/plans/2026-08-12-btrieve-finish.md`
+/// (arg_u32 hardening task): `arg_u32` shipped with zero test coverage, and
+/// `docs/wgnt-init-trace.md`'s entire argument column depends on it being
+/// correct, not merely present.
+///
+/// cdecl pushes right to left, so the *last* `push` before the `call` is
+/// argument 0 -- nearest the frame. A reversed implementation (one that
+/// read argument `n` from where argument `3 - n` actually sits) would still
+/// return *some* valid-looking word for every index; it would fail this test
+/// specifically because `arg_u32(0)` would come back `0xDDDD_3333` (argument
+/// 3's sentinel) instead of `0xAAAA_0000`, and every other assertion below
+/// would likewise pair the wrong sentinel with the wrong index.
+#[test]
+fn arg_u32_reads_each_argument_at_its_own_index_in_order() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(21);
+
+    const ARG0: u32 = 0xAAAA_0000;
+    const ARG1: u32 = 0xBBBB_1111;
+    const ARG2: u32 = 0xCCCC_2222;
+    const ARG3: u32 = 0xDDDD_3333;
+
+    let (mut mapping, entry) = code_at(&[]);
+    let code = push_args_and_call(&[ARG0, ARG1, ARG2, ARG3], entry, target);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 21 });
+
+    // Scrambled read order: 2, 0, 3, 1. A positional/stateful bug (e.g. an
+    // implementation that only works for ascending reads, or that caches the
+    // previous `n`) would show up here even if a simple ascending scan
+    // happened to pass.
+    assert_eq!(machine.arg_u32(2), ARG2, "argument 2 (read first) was wrong");
+    assert_eq!(machine.arg_u32(0), ARG0, "argument 0 (read second) was wrong");
+    assert_eq!(machine.arg_u32(3), ARG3, "argument 3 (read third) was wrong");
+    assert_eq!(machine.arg_u32(1), ARG1, "argument 1 (read fourth) was wrong");
+}
+
+/// Argument 0 specifically, isolated from the others -- the `+4` skip of the
+/// near return address `Machine::call` (and the module's own `call`
+/// instruction) pushed is the most likely off-by-one, and a single-argument
+/// call makes it the only thing being measured: mutating the `+ 4` to `+ 0`
+/// would make this read the return address itself (the thunk's own entry, a
+/// completely different value from the sentinel), and mutating it to `+ 8`
+/// would read one word past the end of a one-argument frame -- effectively
+/// the previous test's `push_args_and_call` overhead slot -- either way
+/// nowhere near `SENTINEL`.
+#[test]
+fn arg_u32_reads_argument_zero_immediately_above_the_return_address() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(23);
+
+    const SENTINEL: u32 = 0xE5CA_7E00;
+
+    let (mut mapping, entry) = code_at(&[]);
+    let code = push_args_and_call(&[SENTINEL], entry, target);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 23 });
+
+    assert_eq!(machine.arg_u32(0), SENTINEL);
+}
+
+/// `arg_u32`'s internal arithmetic must be checked, not merely `debug_assert`-
+/// shaped: `n * 4` has no natural ceiling on a caller-supplied `n`, and on a
+/// release build an unchecked multiply wraps silently rather than panicking
+/// -- a wrapped offset can land back inside the stack slice, where `.get()`
+/// succeeds and hands back the wrong bytes with no panic at all.
+/// `docs/plans/2026-08-12-btrieve-finish.md` (arg_u32 hardening task, Part 2).
+///
+/// `usize::MAX` makes `n * 4` overflow `usize` on both 32- and 64-bit targets
+/// (there is no value of `n` that would NOT overflow at this size), so this
+/// does not depend on target pointer width to bite.
+#[test]
+#[should_panic(expected = "argument index overflows a byte offset")]
+fn arg_u32_panics_rather_than_wrapping_on_an_overflowing_index() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(25);
+
+    let (mut mapping, entry) = code_at(&[]);
+    let code = push_args_and_call(&[0x1234_5678], entry, target);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 25 });
+
+    let _ = machine.arg_u32(usize::MAX);
+}

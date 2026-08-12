@@ -520,17 +520,40 @@ impl Machine {
     ///
     /// # Panics
     ///
-    /// If the module is not stopped at a call.
+    /// If the module is not stopped at a call, or if `n` (or the offset it
+    /// produces) does not fit within this machine's own stack -- every step
+    /// is checked, mirroring [`Machine::resume`]'s own `checked_sub` above
+    /// and for the same reason: a corrupted `frame_sp`, or a caller-supplied
+    /// `n` far larger than any real argument list, must not silently wrap
+    /// into an offset that `.get()` then accepts and reads garbage back for.
     pub fn arg_u32(&self, n: usize) -> u32 {
         let sp = self
             .frame_sp
             .expect("arg_u32() with no outstanding call to read from");
         let limit = self.tib.stack_limit();
-        let off = (sp - limit) as usize + 4 + n * 4;
+        let frame_off = sp.checked_sub(limit).expect(
+            "arg_u32(): the remembered call frame is below this machine's own stack",
+        ) as usize;
+        // The 4-byte near return address the module's own `call` pushed,
+        // stepped over the same way `resume`'s own `off` does -- argument 0
+        // sits immediately above it. `n * 4` is the one multiplication in
+        // this file with no natural ceiling on `n` (a caller can pass
+        // anything), so it gets its own `checked_mul` rather than folding
+        // into the addition below and losing which operation overflowed.
+        let arg_bytes = n
+            .checked_mul(4)
+            .expect("arg_u32(): argument index overflows a byte offset");
+        let off = 4usize
+            .checked_add(arg_bytes)
+            .and_then(|past_ret| frame_off.checked_add(past_ret))
+            .expect("arg_u32(): argument offset overflows this machine's own stack");
+        let end = off
+            .checked_add(4)
+            .expect("arg_u32(): argument slot overflows this machine's own stack");
         let bytes = self
             .tib
             .stack()
-            .get(off..off + 4)
+            .get(off..end)
             .expect("arg_u32(): argument slot runs past this machine's own stack");
         u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
     }
