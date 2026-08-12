@@ -1414,6 +1414,53 @@ impl<A: Abi> Host<A> {
         Ok(())
     }
 
+    /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
+    /// `char *margv[0]`, against memory directly rather than a whole
+    /// `Machine`.
+    ///
+    /// The generic core [`Host::get_input`]'s `Wg16` facade delegates into --
+    /// same split, same reason as [`Host::class_mem`]/[`Host::point_curusr_mem`].
+    /// This is what unblocks `shims::user::getin` (Task 5's one file this
+    /// task finishes): [`shims::text::parsin_mem`] was the last piece of the
+    /// sequence still `Wg16`-only, and it converted in the text.rs/fsd.rs
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// If `input`, `margv` or `margn` are not placed, or a write runs off a
+    /// segment.
+    pub(crate) fn get_input_mem(&mut self, mem: &mut A::Mem, chan: Chan) -> Result<A::Ptr, ShimError> {
+        // R16: resolve everything that can fail before touching the channel.
+        // See `Host::get_input`'s own doc comment for why this ordering
+        // matters -- unchanged by the move onto `A::Mem`.
+        let input = self
+            .globals()
+            .address("input")
+            .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+        let size = usize::from(
+            self.globals()
+                .size("input")
+                .expect("input is placed, its address just resolved"),
+        );
+
+        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
+        let take = line.len().min(size - 1);
+        let mut bytes = line[..take].to_vec();
+        bytes.push(0);
+        input.write(mem, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        shims::text::parsin_mem(mem, self)?;
+
+        let margv = self
+            .globals()
+            .address("margv")
+            .expect("margv is placed, or parsin above would already have failed");
+        let bytes = margv
+            .resolve(mem, A::PTR_WIDTH)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(A::ptr_from_bytes(bytes))
+    }
+
     /// The C name of an imported symbol, or something that identifies it when
     /// the host has no name for it.
     fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
@@ -1762,6 +1809,10 @@ impl Host<Wg16> {
     /// [`Host::poll`] (Task 9) needs the identical sequence and must not have
     /// to fake a call frame to reach it.
     ///
+    /// The `Wg16` facade [`Host::get_input_mem`] delegates into. Kept under
+    /// this name and `&mut Machine` signature: [`Host::poll`] calls it
+    /// directly, with no argument frame to build a `Call<Wg16>` from.
+    ///
     /// # Errors
     ///
     /// If `input`, `margv` or `margn` are not placed, or a write runs off a
@@ -1771,37 +1822,7 @@ impl Host<Wg16> {
         machine: &mut Machine,
         chan: Chan,
     ) -> Result<FarPtr, ShimError> {
-        // R16: resolve everything that can fail before touching the channel.
-        // `take_line` pops the ready queue -- if the line were taken first and
-        // `input` then turned out not to be placed, the user's line would be
-        // gone with nothing to retry. `input` not being placed cannot happen
-        // in practice (`Globals::new` places it unconditionally), but the
-        // ordering is what makes that true by construction rather than by
-        // coincidence of what `Globals::new` currently does.
-        let input = self
-            .globals()
-            .address("input")
-            .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
-        let size = usize::from(
-            self.globals()
-                .size("input")
-                .expect("input is placed, its address just resolved"),
-        );
-
-        let line = self.gsbl_mut().take_line(chan).unwrap_or_default();
-        let take = line.len().min(size - 1);
-        let mut bytes = line[..take].to_vec();
-        bytes.push(0);
-        machine.write(input, &bytes)?;
-
-        shims::text::parsin_mem(machine.mem_mut(), self)?;
-
-        let margv = self
-            .globals()
-            .address("margv")
-            .expect("margv is placed, or parsin above would already have failed");
-        let bytes = machine.resolve(margv, 4)?;
-        Ok(FarPtr::from_bytes(bytes.try_into().expect("4 bytes")))
+        self.get_input_mem(machine.mem_mut(), chan)
     }
 
     /// Point the four globals that name "the current channel" -- `usrnum`,

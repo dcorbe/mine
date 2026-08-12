@@ -191,20 +191,20 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "strtok", text::strtok_wg16, Cleans::Caller),
     (MAJORBBS, "lastwd", text::lastwd_wg16, Cleans::Caller),
     (MAJORBBS, "sortstgs", text::sortstgs_wg16, Cleans::Caller),
-    // Message files, and the options in them. `_wg16`: eight of these ten are
-    // generic now (see `shims::msg`'s own doc comment); `stgopt` and `prfmsg`
-    // stay concrete, each blocked on a `shims::text` routine that has not
-    // converted yet.
+    // Message files, and the options in them. `_wg16`: all ten are generic
+    // now (see `shims::msg`'s own doc comment) -- `stgopt` and `prfmsg` were
+    // the last two, unblocked once `shims::text::write_cstr`/`append`
+    // converted.
     (MAJORBBS, "opnmsg", msg::opnmsg_wg16, Cleans::Caller),
     (MAJORBBS, "clsmsg", msg::clsmsg_wg16, Cleans::Caller),
     (MAJORBBS, "setmbk", msg::setmbk_wg16, Cleans::Caller),
     (MAJORBBS, "rstmbk", msg::rstmbk_wg16, Cleans::Caller),
-    (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller),
+    (MAJORBBS, "stgopt", msg::stgopt_wg16, Cleans::Caller),
     (MAJORBBS, "numopt", msg::numopt_wg16, Cleans::Caller),
     (MAJORBBS, "ynopt", msg::ynopt_wg16, Cleans::Caller),
     (MAJORBBS, "chropt", msg::chropt_wg16, Cleans::Caller),
     (MAJORBBS, "tokopt", msg::tokopt_wg16, Cleans::Caller),
-    (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller),
+    (MAJORBBS, "prfmsg", msg::prfmsg_wg16, Cleans::Caller),
     // Memory the module owns, and the leaves that move bytes about.
     (MAJORBBS, "alcmem", memory::alcmem_wg16, Cleans::Caller),
     (MAJORBBS, "alczer", memory::alczer_wg16, Cleans::Caller),
@@ -286,8 +286,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
     // `_wg16`: these five are converted to the generic `Call<A>`/`Host<A>`
     // shape (see `shims::user`'s own doc comment); the table entry is the
-    // monomorphised bridge, not the shim itself. `getin` is the one sixth
-    // routine that stays as it was -- see its doc comment for why.
+    // monomorphised bridge, not the shim itself. `getin` is the sixth,
+    // unblocked once `shims::text::parsin`/`Host::get_input` went generic.
     (MAJORBBS, "begin_polling", user::begin_polling_wg16, Cleans::Caller),
     (MAJORBBS, "stop_polling", user::stop_polling_wg16, Cleans::Caller),
     // `_wg16`: seven of these nine are generic now (see `shims::fsd`'s own
@@ -332,7 +332,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // slot it names.
     (MAJORBBS, "curusr", user::curusr_wg16, Cleans::Caller),
     (MAJORBBS, "uacoff", user::uacoff_wg16, Cleans::Caller),
-    (MAJORBBS, "getin", user::getin, Cleans::Caller),
+    (MAJORBBS, "getin", user::getin_wg16, Cleans::Caller),
     (MAJORBBS, "haskey", user::haskey_wg16, Cleans::Caller),
     // Billing, which this host does not do. Both answer yes; `shims::credits`
     // is where that decision is written down. `Cleans::Caller` is measured --

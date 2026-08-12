@@ -26,7 +26,7 @@ use mbbs_ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
-use crate::fmt::{Args, format};
+use crate::fmt::format_call;
 use crate::msg::{MsgFile, value};
 use crate::shims::{ShimError, text};
 
@@ -186,27 +186,32 @@ pub fn rstmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// these in globals that live for the run -- so this leaks by design, exactly
 /// as the real one did.
 ///
-/// # Did not go generic (Task 5)
-///
-/// [`text::write_cstr`] takes `&mut Machine`, not `&mut A::Mem` -- `text.rs`
-/// is a different file, out of this task's scope (the next one, taken
-/// together with `fsd.rs`). [`Heap::reserve`](crate::heap::Heap::reserve) is
-/// already generic, so the *allocation* half of this routine is not what
-/// blocks it -- only the write into the block that follows.
-pub fn stgopt(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let msgnum = args.int();
-    let at = message(machine, host, msgnum)?;
-    let text = machine.read_cstr(at)?.to_vec();
+/// Generic: [`text::write_cstr_mem`] is what [`text::write_cstr`]'s `Wg16`
+/// facade delegates into now that `text.rs` has converted; [`message_mem`]
+/// replaces [`message`] and [`Heap::reserve`](crate::heap::Heap::reserve)
+/// (already generic) replaces `Heap::alloc`'s `Wg16` facade.
+pub fn stgopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msgnum = Into::<u32>::into(call.int()) as u16;
+    let at = message_mem(call.mem(), host, msgnum)?;
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     let size = u16::try_from(text.len() + 1)
         .map_err(|_| ShimError::Failed(format!("a {}-byte message", text.len())))?;
     let out = host
         .heap
-        .alloc(machine, size)
+        .reserve(call.mem(), size)
         .map_err(|e| ShimError::Failed(format!("stgopt: {e}")))?;
-    text::write_cstr(machine, out, &text, size)?;
-    Ok(Ret::Far(out))
+    text::write_cstr_mem::<A>(call.mem(), out, &text, size)?;
+    Ok(abi::Ret::Ptr(out))
+}
+
+/// The dispatch-table entry for [`stgopt`]. See `shims::call`'s own doc
+/// comment.
+pub fn stgopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    stgopt(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int numopt(int msgnum,int floor,int ceiling)`.
@@ -359,25 +364,23 @@ pub fn tokopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// from the module. The arguments start at word 1, because `msg` is an `int`
 /// and not the far pointer `prf`'s first argument is.
 ///
-/// # Did not go generic (Task 5)
-///
-/// Only half unblocked: [`crate::fmt::format_call`] removes the *formatting*
-/// blocker this routine used to have -- once `msgnum` is read with
-/// `call.int()`, `call`'s position already marks where the varargs begin, so
-/// `format_call(call, template)` could replace `format(machine, at,
-/// Args::Call { first: 1 })` outright. What still blocks it is
-/// [`text::append`], which takes `&mut Machine` and reaches
-/// `channel_ansi`/`normalize_newlines`/`Host::current_channel` -- all
-/// `text.rs`-private or `Wg16`-only, out of this task's scope (the next one,
-/// taken together with `fsd.rs`, which touches `text.rs` and could unblock
-/// this then).
-pub fn prfmsg(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let msgnum = args.int();
-    let at = message(machine, host, msgnum)?;
-    let (text, _) = format(machine, at, Args::Call { first: 1 })?;
-    text::append(machine, host, &text)?;
-    Ok(Ret::Void)
+/// Generic: [`crate::fmt::format_call`] replaces `format`/`Args::Call { first:
+/// 1 }` -- once `msgnum` is read with `call.int()`, `call`'s position already
+/// marks where the varargs begin, matching `shocst`'s own substitution
+/// (`shims::system`). [`text::append_mem`] is what [`text::append`]'s `Wg16`
+/// facade delegates into now that `text.rs` has converted.
+pub fn prfmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msgnum = Into::<u32>::into(call.int()) as u16;
+    let at = message_mem(call.mem(), host, msgnum)?;
+    let (text, _) = format_call(call, at)?;
+    text::append_mem(call.mem(), host, &text)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`prfmsg`]. See `shims::call`'s own doc
+/// comment.
+pub fn prfmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    prfmsg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// What `curmbk` holds, read back out of module memory every time.
@@ -410,17 +413,16 @@ pub(crate) fn message_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Resul
 
 /// The `Wg16` facade [`message_mem`] delegates into -- kept under its
 /// original name and signature: `shims::fsd`'s tests call this directly
-/// (not through `Fixture::invoke`), and [`stgopt`]/[`prfmsg`] still call it
-/// as `(&Machine, &Host, u16)`.
+/// (not through `Fixture::invoke`). [`stgopt`]/[`prfmsg`] call [`message_mem`]
+/// directly now that both are generic.
 pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
     message_mem(machine.mem(), host, n)
 }
 
 /// The text of message `n` of the current block.
 ///
-/// Generic core (Task 5); see the `Wg16` facade [`stgopt`]/[`prfmsg`] still
-/// need -- there is none by this exact old name, because nothing outside this
-/// file called the old `read` directly (unlike [`message`]).
+/// Generic core (Task 5). No `Wg16` facade by this exact old name -- nothing
+/// outside this file called the old `read` directly (unlike [`message`]).
 fn read_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Result<Vec<u8>, ShimError> {
     let at = message_mem(mem, host, n)?;
     at.read_cstr(mem)
@@ -548,7 +550,7 @@ mod tests {
     fn stgopt_returns_the_whole_message() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
+        let Ret::Far(at) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
             panic!("stgopt returns a pointer");
         };
         assert_eq!(f.read(at), "DEMO");
@@ -562,7 +564,7 @@ mod tests {
         // initialisation.
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
+        let Ret::Far(at) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
             panic!("stgopt returns a pointer")
         };
         assert_eq!(f.read(at), "DEMO");
@@ -581,11 +583,11 @@ mod tests {
         // there: nothing the host does later writes over a live heap block.
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(first) = f.invoke(stgopt, &[1]).expect("read") else {
+        let Ret::Far(first) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
             panic!("stgopt returns a pointer")
         };
 
-        f.invoke(stgopt, &[2]).expect("another option");
+        f.invoke(stgopt_wg16, &[2]).expect("another option");
         let other = f.text("OTHER.MSG");
         f.invoke(opnmsg_wg16, &Fixture::far(other)).expect("another file");
         let template = f.text("noise %d");
@@ -675,8 +677,8 @@ mod tests {
         opened(&mut f);
 
         // Message 8 is `<%d>`.
-        f.invoke(prfmsg, &[8, 1]).expect("first");
-        f.invoke(prfmsg, &[8, 2]).expect("second");
+        f.invoke(prfmsg_wg16, &[8, 1]).expect("first");
+        f.invoke(prfmsg_wg16, &[8, 2]).expect("second");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "<1><2>");
@@ -694,14 +696,14 @@ mod tests {
     fn an_option_past_the_end_of_the_file_refuses() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let e = f.invoke(stgopt, &[9999]).expect_err("no such message");
+        let e = f.invoke(stgopt_wg16, &[9999]).expect_err("no such message");
         assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
     }
 
     #[test]
     fn reading_an_option_with_no_block_set_refuses() {
         let mut f = Fixture::new();
-        assert!(f.invoke(stgopt, &[0]).is_err(), "nothing is current");
+        assert!(f.invoke(stgopt_wg16, &[0]).is_err(), "nothing is current");
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //!
 //! # Task 5: the template file for `Call`-shaped shims
 //!
-//! Five of these six routines are now generic:
+//! All six routines are generic now:
 //! `fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`, taking
 //! their arguments through [`Call`] rather than [`super::args`]'s bare
 //! `Cursor`, and touching module memory through [`Call::mem`] rather than a
@@ -20,8 +20,10 @@
 //! "target shape"), and gets a `_wg16`-suffixed sibling that bridges it into
 //! the (still concrete) [`super::Shim`] the dispatch table wants -- see
 //! `shims::call`'s own doc comment for why the table itself does not go
-//! generic in this task, and [`getin`]'s doc comment for the one routine that
-//! stayed behind.
+//! generic in this task. [`getin`] was the one holdout, when this file first
+//! converted -- see its own doc comment for what it was blocked on and what
+//! unblocked it, in the `shims/text.rs`+`fsd.rs` and `shims/gsbl.rs`+
+//! `screen.rs` commits that followed this one.
 
 use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
@@ -132,35 +134,40 @@ pub fn curusr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// [`Host::poll`](crate::Host::poll) needs it too and this is the one call
 /// site among the two that has an argument stack to read from at all.
 ///
-/// # The one shim in this file that did not go generic
+/// Generic (unblocked by `shims/text.rs` and `crate::fsd.rs` converting):
+/// [`Host::get_input`](crate::Host::get_input) was the last piece of
+/// `paccin(); parsin();` still `Wg16`-only, because it called
+/// `shims::text::parsin(machine, self)` -- `parsin` itself is generic now
+/// (see `shims::text`'s own doc comment), and `Host::get_input_mem` is the
+/// `_mem` core that calls `parsin_mem` directly. Reads no argument of its
+/// own -- like [`shims::text::clrprf`]/[`parsin`] this still takes a
+/// `Call<A>`, not a bare `Cursor`, matching every other converted shim in
+/// this file, but unlike those two, `getin` is reached **only** through
+/// module dispatch (its one `ROUTINES` entry) and never as an internal
+/// helper with no call frame -- see this crate's own `entry` table -- so
+/// there is no `arg_frame()` panic to guard against here the way there was
+/// for `clrprf`/`parsin`.
 ///
-/// [`Host::get_input`](crate::Host::get_input) calls
-/// `shims::text::parsin(machine, self)` -- `shims/text.rs` is a different
-/// file, out of this task's scope (ten more files follow this one, in order,
-/// and the point of doing them one at a time is that a shim's own file is
-/// touched and nothing else's). `parsin` still takes `&mut Machine` and
-/// returns `mbbs16::Ret` directly, so `get_input` cannot be generified
-/// without it, and `getin` cannot be generified without `get_input`. This is
-/// exactly the kind of finding the task exists to surface rather than paper
-/// over: attempting `fn getin<A: Abi>(call: &mut Call<A>, host: &mut
-/// Host<A>)` and forwarding to `host.get_input(call.cpu, chan)` fails with
-/// `expected &mut Machine, found &mut A::Cpu` -- `A::Cpu` is opaque outside
-/// the `Abi` trait, and nothing binds it to `Machine` for an arbitrary `A`.
-/// `getin` keeps its Task-4 shape (a bare `Cursor`, not `Call` -- it reads no
-/// arguments, so there was nothing to convert either way) and its own
-/// `ROUTINES` entry unchanged.
-pub fn getin(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+/// [`shims::text::clrprf`]: crate::shims::text::clrprf
+/// [`parsin`]: crate::shims::text::parsin
+pub fn getin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let usrnum = host
         .globals()
-        .word(machine, "usrnum")
+        .word_mem(call.mem(), "usrnum")
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
     let chan = host
         .users()
         .terms()
         .chan(usrnum)
         .ok_or_else(|| ShimError::Failed(format!("getin: usrnum {usrnum} names no channel")))?;
-    let margv0 = host.get_input(machine, chan)?;
-    Ok(Ret::Far(margv0))
+    let margv0 = host.get_input_mem(call.mem(), chan)?;
+    Ok(abi::Ret::Ptr(margv0))
+}
+
+/// The dispatch-table entry for [`getin`]. See `shims::call`'s own doc
+/// comment.
+pub fn getin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    getin(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int haskey(char *lock)` -- does the current user hold the key to this lock?
@@ -450,7 +457,7 @@ mod tests {
         f.invoke(curusr_wg16, &[0]).expect("channel 0");
         f.host.gsbl_mut().push_input(console, b"get all gold\r");
 
-        let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
+        let Ret::Far(margv0) = f.invoke(getin_wg16, &[]).expect("ok") else {
             panic!("getin returns char *margv[0]");
         };
 
@@ -474,7 +481,7 @@ mod tests {
         let mut f = Fixture::new();
         f.invoke(curusr_wg16, &[0]).expect("channel 0");
 
-        let Ret::Far(margv0) = f.invoke(getin, &[]).expect("ok") else {
+        let Ret::Far(margv0) = f.invoke(getin_wg16, &[]).expect("ok") else {
             panic!("getin returns char *margv[0]");
         };
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);

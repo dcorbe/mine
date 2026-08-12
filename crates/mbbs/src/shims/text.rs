@@ -15,11 +15,11 @@
 //! place in the host that can consume the `ESC[[ansi|ascii]` construct before
 //! any of it reaches `prfbuf`, the GSBL, or the wire.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
-use crate::abi::{self, Abi, Call, Wg16};
+use crate::abi::{self, Abi, Call};
 use crate::fmt::{Spec, format_call, integer};
 use crate::shims::ShimError;
 
@@ -236,9 +236,9 @@ pub fn prf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError
 /// established for a computed pointer.
 ///
 /// Kept under its original name and `&mut Machine` signature as a `Wg16`
-/// facade: `shims::msg::prfmsg` and `shims::fsd` both call this directly (not
-/// through `Fixture::invoke`), and neither converts in this task -- see
-/// `shims::msg::prfmsg`'s own doc comment for why.
+/// facade: `shims::fsd` calls this directly (not through `Fixture::invoke`),
+/// and does not convert in this task. `shims::msg::prfmsg` used to as well --
+/// it calls [`append_mem`] directly now that it is generic.
 pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
     append_mem(machine.mem_mut(), host, text)
 }
@@ -1429,7 +1429,9 @@ fn is_null<A: Abi>(ptr: A::Ptr) -> bool {
 /// Write `text` and its terminator at `at`, refusing to exceed `capacity`,
 /// against memory directly rather than a whole `Machine`.
 ///
-/// The `Wg16` facade [`write_cstr`] delegates into.
+/// No `Wg16` facade under a `write_cstr` name: `shims::msg` (`stgopt`) and
+/// `shims::system` were its last two `&mut Machine`-taking callers, and both
+/// call this directly now that they are generic.
 pub fn write_cstr_mem<A: Abi>(
     mem: &mut A::Mem,
     at: A::Ptr,
@@ -1448,17 +1450,12 @@ pub fn write_cstr_mem<A: Abi>(
     Ok(())
 }
 
-/// Kept under its original name and `&mut Machine` signature: `shims::msg`
-/// (`stgopt`) and `shims::system` still call this directly, and neither
-/// converts in this task.
-pub fn write_cstr(machine: &mut Machine, at: FarPtr, text: &[u8], capacity: u16) -> Result<(), ShimError> {
-    write_cstr_mem::<Wg16>(machine.mem_mut(), at, text, capacity)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
+    use mbbs16::FarPtr;
 
     #[test]
     fn lastwd_answers_a_pointer_into_the_callers_own_string() {
@@ -2485,7 +2482,7 @@ mod tests {
         // `SAMPLE.MSG`'s `FMT` is message 8 -- see
         // `prfmsg_appends_to_the_print_buffer_the_way_prf_does` in
         // `shims/msg.rs`.
-        f.invoke(crate::shims::msg::prfmsg, &[1]).expect("prfmsg");
+        f.invoke(crate::shims::msg::prfmsg_wg16, &[1]).expect("prfmsg");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");

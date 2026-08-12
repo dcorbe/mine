@@ -54,10 +54,9 @@
 //! comment on why `fmt.rs` alone was worth doing first regardless: every one
 //! of those six routines was blocked on this file, and now none of them are.
 
-use mbbs16::{FarPtr, Machine};
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Call, Wg16};
+use crate::abi::{Abi, Call};
 use crate::shims::ShimError;
 
 /// One `%...` conversion, as parsed.
@@ -517,133 +516,41 @@ fn pad(out: &mut Vec<u8>, text: &[u8], spec: &Spec) {
     }
 }
 
-// ---- The `Wg16` compatibility facade ------------------------------------
-//
-// Everything below exists for six call sites this task does not touch:
-// `msg::prfmsg`, `text::spr`/`sprintf`/`vsprintf`/`prf`, `system::shocst`/
-// `catastro`, and `stream::fprintf` if it stays unconverted. Each already
-// holds a whole `&mut Machine` and constructs `Args::Call { first: N }` or
-// `Args::List { at }` -- the word-indexed shape this crate used before
-// `Call<A>` existed -- so `Args` and `format` keep exactly that shape rather
-// than moving onto `Vararg`, which no caller outside this file ever
-// constructs.
-
-/// Where a `Wg16` caller's printf walk reads its arguments from.
-///
-/// Not generic. Task 2 made this type generic in anticipation of a walk that
-/// would stay `Wg16`-concrete indefinitely (see git history); now that
-/// [`format_call`]/[`format_va_list`] are the generic entry points and
-/// nothing constructs an `Args<A>` for any `A` but `Wg16`, carrying the type
-/// parameter bought nothing and cost a reader having to notice it was never
-/// instantiated any other way. `first`/`at` are unchanged from before: `first`
-/// is a **word** index (not `Call`'s byte position) because every one of
-/// this facade's six remaining callers already computed a word count against
-/// `Machine::arg_u16`, and changing that unit would be a needless second
-/// change bundled into this one.
-#[derive(Debug, Clone, Copy)]
-pub enum Args {
-    /// The outstanding call's own stack, from argument word `first` on.
-    ///
-    /// `first` counts argument *words* and not arguments, because a far
-    /// `char *` is two of them and a near one is not.
-    Call { first: usize },
-
-    /// A `va_list`: consecutive words from a far pointer into module memory.
-    List { at: FarPtr },
-}
-
-/// Format `template` with the arguments `args` names, for a caller that
-/// still holds a whole `&mut Machine`.
-///
-/// `Args::Call` builds a [`Call<Wg16>`] over the outstanding call's frame --
-/// the same one [`crate::shims::call`] builds for a converted shim -- and
-/// skips `first` argument words before handing it to [`format_call`].
-/// `first` is a word count; `Wg16`'s [`Call::int`] always advances by one
-/// word ([`Abi::INT_WIDTH`] is 2), so skipping `first` of them advances the
-/// position by exactly the `first * 2` bytes the old word-indexed reader
-/// used to start from -- the value read each time is discarded, which is
-/// safe because nothing about *decoding* a fixed argument can fail; only
-/// resolving a pointer through it can, and nothing here does that.
-///
-/// **`Args::List` builds its `Call<Wg16>` over an empty frame, deliberately,
-/// and never touches `Machine::arg_frame`.** A `va_list` walk reads
-/// exclusively through [`Call::mem`], never through [`Call::int`]/
-/// [`Call::ptr`]/[`Call::long`] -- see [`Vararg::List`]'s own doc comment --
-/// so no bytes from an outstanding call are ever needed. That is not just
-/// cheaper: `Machine::arg_frame` panics unless the module is stopped at a
-/// call, and a `va_list` is exactly the case that should not require one --
-/// it is what makes a `va_list` format usable from a routine whose own frame
-/// holds something else, or from no outstanding call at all (see this
-/// module's tests, which format a `va_list` with no [`crate::testing::Fixture::call`]
-/// beforehand).
-///
-/// # A necessary widening from the signature this replaces
-///
-/// The function this facade stood in for took `&Machine`, because nothing in
-/// it ever wrote to module memory. Building a [`Call<Wg16>`] needs
-/// `&mut Machine` regardless -- [`Call::new`] takes `cpu: &'a mut A::Cpu` so
-/// that [`Call::mem`] can reborrow it, and there is no narrower handle to
-/// build one from (see `crates/mbbs/src/abi.rs`'s "`Call` holds one handle,
-/// not two"). Every one of this facade's six call sites already holds
-/// `&mut Machine` -- none of them ever had only `&Machine` to give it -- so
-/// widening the parameter breaks no caller; it only stops discarding
-/// mutability those callers were never short of.
-///
-/// # Errors
-///
-/// As [`format_call`]/[`format_va_list`].
-///
-/// # Panics
-///
-/// If `args` is [`Args::Call`] and the module is not stopped at a call,
-/// since that is where those arguments are. [`Args::List`] does not need a
-/// frame at all, per above.
-pub fn format(
-    machine: &mut Machine,
-    template: FarPtr,
-    args: Args,
-) -> Result<(Vec<u8>, usize), ShimError> {
-    match args {
-        Args::Call { first } => {
-            let frame = machine.arg_frame().to_vec();
-            let mut call = Call::<Wg16>::new(machine, &frame);
-            for _ in 0..first {
-                call.int();
-            }
-            format_call(&mut call, template)
-        }
-        Args::List { at } => {
-            let mut call = Call::<Wg16>::new(machine, &[]);
-            format_va_list(&mut call, template, at)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
+    use mbbs16::FarPtr;
 
     /// A [`Call<Wg16>`] over the outstanding call's frame -- the same two
-    /// lines [`format`] and `crate::shims::call` both build, repeated here so
-    /// this module's tests need no dependency on `crate::shims`.
+    /// lines `crate::shims::call` builds, repeated here so this module's
+    /// tests need no dependency on `crate::shims`.
     fn call(f: &mut Fixture) -> Call<'_, Wg16> {
         let frame = f.machine.arg_frame().to_vec();
         Call::new(&mut f.machine, &frame)
     }
 
-    /// One case: a format string, the argument words, and what should come out.
+    /// One case: a format string, the argument words, and what should come
+    /// out -- through [`format_call`] directly. Was, until `Args`/`format`
+    /// (the word-indexed `Wg16` compatibility facade) were deleted: their
+    /// last non-test callers converted in `shims::system`/`shims::msg`, and
+    /// this helper's own `Args::Call { first: 0 }` was doing nothing
+    /// `format_call` does not already do for a `Call` positioned at the
+    /// start of its frame -- see [`walk`], which already exercised the same
+    /// generic entry point and is now what this delegates to.
     fn check(template: &str, args: &[u16], expect: &str) {
         let mut f = Fixture::new();
         let at = f.text(template);
         f.call(args);
-        let (bytes, _) = format(&mut f.machine, at, Args::Call { first: 0 }).expect("formatted");
-        assert_eq!(String::from_utf8_lossy(&bytes), expect, "{template:?}");
+        let (rendered, _) = walk(&mut f, at);
+        assert_eq!(rendered, expect, "{template:?}");
     }
 
-    /// The rendering, and the bytes the walk stopped at -- through
-    /// [`format_call`] directly, proving the generic entry point (not just
-    /// the `Wg16` facade over it) produces the same thing.
+    /// The rendering, and the bytes the walk stopped at, through
+    /// [`format_call`] -- the generic entry point every converted shim
+    /// (`shims::text::spr`/`sprintf`/`prf`, `shims::msg::prfmsg`,
+    /// `shims::system::shocst`/`catastro`, ...) now calls directly.
     fn walk(f: &mut Fixture, template: FarPtr) -> (String, usize) {
         let mut call = call(f);
         let (bytes, next) = format_call(&mut call, template).expect("formatted");
@@ -796,7 +703,8 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%f");
         f.call(&[0, 0, 0, 0]);
-        assert!(format(&mut f.machine, template, Args::Call { first: 0 }).is_err());
+        let mut c = call(&mut f);
+        assert!(format_call(&mut c, template).is_err());
     }
 
     #[test]
@@ -804,7 +712,8 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("all done %");
         f.call(&[]);
-        assert!(format(&mut f.machine, template, Args::Call { first: 0 }).is_err());
+        let mut c = call(&mut f);
+        assert!(format_call(&mut c, template).is_err());
     }
 
     #[test]
@@ -850,14 +759,17 @@ mod tests {
         let template = f.text("%s|%ld|%c|%05d");
         let args = words(&mut f);
         f.call(&args);
-        let framed = format(&mut f.machine, template, Args::Call { first: 0 }).expect("formatted");
+        let mut c = call(&mut f);
+        let framed = format_call(&mut c, template).expect("formatted");
 
         let mut g = Fixture::new();
         let template = g.text("%s|%ld|%c|%05d");
         let args = words(&mut g);
         let list = g.words(&args);
-        let listed =
-            format(&mut g.machine, template, Args::List { at: list }).expect("formatted");
+        // Not `call(&mut g)`: a `va_list` walk needs no outstanding frame --
+        // see `a_va_list_reads_the_words_a_frame_walk_would`'s own comment.
+        let mut c = Call::<Wg16>::new(&mut g.machine, &[]);
+        let listed = format_va_list(&mut c, template, list).expect("formatted");
 
         assert_eq!(framed, listed);
         assert_eq!(String::from_utf8_lossy(&framed.0), "gold|100000|x|00042");
@@ -871,7 +783,8 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%d");
         let at = FarPtr::NULL;
-        assert!(format(&mut f.machine, template, Args::List { at }).is_err());
+        let mut c = Call::<Wg16>::new(&mut f.machine, &[]);
+        assert!(format_va_list(&mut c, template, at).is_err());
     }
 
     #[test]
@@ -889,7 +802,8 @@ mod tests {
         };
         f.machine.write(at, &7u16.to_le_bytes()).expect("fits");
 
-        assert!(format(&mut f.machine, template, Args::List { at }).is_err());
+        let mut c = Call::<Wg16>::new(&mut f.machine, &[]);
+        assert!(format_va_list(&mut c, template, at).is_err());
     }
 
     /// [`format_call`], exercised directly with no `Wg16` `Args` in sight --
