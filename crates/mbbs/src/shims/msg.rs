@@ -21,7 +21,14 @@
 //! same rule the rest of the crate is under. It is a deliberate difference from
 //! the real host, and the only one in this file.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::{Machine, Ret};
+
+// `FarPtr` is named by exactly one item now -- the `#[cfg(test)]` [`message`]
+// facade below -- so the import follows it rather than sitting unused in a
+// release build. The `_wg16` siblings deal in `Machine` and `Ret` and never
+// spell a pointer type: that is the conversion working.
+#[cfg(test)]
+use mbbs16::FarPtr;
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
@@ -411,10 +418,17 @@ pub(crate) fn message_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Resul
     host.messages.text(block, n).map_err(ShimError::Failed)
 }
 
-/// The `Wg16` facade [`message_mem`] delegates into -- kept under its
-/// original name and signature: `shims::fsd`'s tests call this directly
-/// (not through `Fixture::invoke`). [`stgopt`]/[`prfmsg`] call [`message_mem`]
-/// directly now that both are generic.
+/// The `Wg16` facade over [`message_mem`], kept under its original name and
+/// signature because `shims::fsd`'s tests call it directly rather than through
+/// `Fixture::invoke`.
+///
+/// `#[cfg(test)]` because that is now its whole audience. [`stgopt`] and
+/// [`prfmsg`] were its only production callers and both went generic, so in a
+/// non-test build it is dead — and saying so with `cfg` is the honest form of
+/// that, where an `allow(dead_code)` would have hidden it. If a production
+/// caller ever comes back, this attribute is what will stop it compiling and
+/// make someone decide deliberately.
+#[cfg(test)]
 pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
     message_mem(machine.mem(), host, n)
 }
