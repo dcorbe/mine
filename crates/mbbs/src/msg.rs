@@ -39,6 +39,7 @@ use std::fmt;
 use std::io;
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, Wg16};
 use crate::arena::Arena;
@@ -352,16 +353,29 @@ struct Block<A: Abi = Wg16> {
 /// the same rule `prfptr` is under, and for the same reason. What is here is
 /// the stack of blocks to restore, which the module cannot see and has no way
 /// to change.
-/// # Generic type, `Wg16`-concrete body
+/// # Generic core, `Wg16`-facade names
 ///
 /// `Block::cookie`/`text` and `saved`'s addresses are typed `A::Ptr` rather
 /// than `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely
-/// `Messages<A>` -- but every method stays in `impl Messages<Wg16>` below,
-/// using `&mut Machine` exactly as before. `A` defaults to [`Wg16`] so every
-/// existing caller keeps naming this type as plain `Messages`. Not
-/// `#[derive(Default)]`: the derive macro bounds `A: Default` on the
-/// generated impl, which the bare marker struct `Wg16` does not satisfy --
-/// see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
+/// `Messages<A>`. Every method that never touched a `Machine` -- `close`,
+/// `push`, `pop`, `text`, `name`, `len`, `is_empty`, and the private `find`
+/// -- moves onto `impl<A: Abi> Messages<A>` outright, `FarPtr` widened to
+/// `A::Ptr` wherever one appears. That widening is invisible at every
+/// existing call site, the same reasoning `Streams`' doc comment gives: a
+/// shim always reaches `Messages` through `Host<Wg16>`'s concrete field, so
+/// `self` already pins `A::Ptr` to `FarPtr` before an argument is even
+/// type-checked.
+///
+/// `open` does touch memory, so it keeps its name and `&mut Machine`
+/// signature on a `Wg16` facade (reborrowing into the generic core through
+/// [`Machine::mem_mut`]), and the generic core gets a new name -- `open_mem`
+/// -- the convention `Globals`/`TextVars`/`Streams` all set.
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
+/// as plain `Messages`. Not `#[derive(Default)]`: the derive macro bounds
+/// `A: Default` on the generated impl, which the bare marker struct `Wg16`
+/// does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same
+/// problem and fix.
 pub struct Messages<A: Abi = Wg16> {
     arena: Arena<A>,
     open: Vec<Block<A>>,
@@ -380,8 +394,9 @@ impl<A: Abi> Default for Messages<A> {
     }
 }
 
-impl Messages<Wg16> {
-    /// Open a message file, and give the module something to name it by.
+impl<A: Abi> Messages<A> {
+    /// Open a message file, and give the module something to name it by,
+    /// against memory directly rather than a whole `Machine`.
     ///
     /// The cookie is backed by a real, zeroed, `msgblk`-shaped region rather
     /// than an invented number. `MSGUTL.H` says the struct is used "for some
@@ -391,31 +406,35 @@ impl Messages<Wg16> {
     /// because writing zero where the truth is free is the habit this crate
     /// exists to avoid.
     ///
+    /// The generic core [`Messages::open`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
     /// # Errors
     ///
     /// If the arena cannot be extended.
-    pub fn open(
+    pub fn open_mem(
         &mut self,
-        machine: &mut Machine,
+        mem: &mut A::Mem,
         name: &str,
         file: &MsgFile,
-    ) -> io::Result<FarPtr> {
+    ) -> io::Result<A::Ptr> {
         let mut text = Vec::with_capacity(file.len());
         for message in file.messages() {
-            text.push(self.arena.intern(machine.mem_mut(), message)?);
+            text.push(self.arena.intern(mem, message)?);
         }
 
-        let cookie = self.arena.reserve(machine.mem_mut(), MSGBLK)?;
+        let cookie = self.arena.reserve(mem, MSGBLK)?;
         let count = u16::try_from(file.len()).map_err(|_| {
             io::Error::other(format!("{name} has {} messages, which is more \
                 than a 16-bit msgcnt holds", file.len()))
         })?;
 
         // `lngcnt` and `msgcnt` are the last two `int`s of the struct.
-        let tail = Wg16::ptr_offset(cookie, (MSGBLK - 4) as u16);
+        let tail = A::ptr_offset(cookie, (MSGBLK - 4) as u16);
         let mut fields = 1u16.to_le_bytes().to_vec();
         fields.extend_from_slice(&count.to_le_bytes());
-        machine.write(tail, &fields).map_err(io::Error::other)?;
+        tail.write(mem, &fields)
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         self.open.push(Block {
             name: name.to_owned(),
@@ -430,13 +449,17 @@ impl Messages<Wg16> {
     /// The text stays interned -- see [`Arena`] -- so this only forgets the
     /// block, which is what makes a later use of the cookie a refusal.
     ///
+    /// Never touched a `Machine`, so this is generic outright -- see the
+    /// struct's own doc comment for why `A::Ptr` costs nothing at any
+    /// existing call site.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open block, or names one that is still set: closing
     /// the current block would leave `curmbk` pointing at something the host
     /// has forgotten, and every option read after it would be a refusal naming
     /// the wrong thing.
-    pub fn close(&mut self, current: FarPtr, cookie: FarPtr) -> Result<(), String> {
+    pub fn close(&mut self, current: A::Ptr, cookie: A::Ptr) -> Result<(), String> {
         let at = self.find(cookie)?;
         if cookie == current || self.saved.contains(&cookie) {
             return Err(format!(
@@ -449,18 +472,22 @@ impl Messages<Wg16> {
     }
 
     /// Remember what was current, so `rstmbk` can put it back.
-    pub fn push(&mut self, previous: FarPtr) {
+    ///
+    /// Generic outright, for the same reason `close` is.
+    pub fn push(&mut self, previous: A::Ptr) {
         self.saved.push(previous);
     }
 
     /// What was current before the last unmatched `setmbk`.
+    ///
+    /// Generic outright, for the same reason `close` is.
     ///
     /// # Errors
     ///
     /// If nothing was saved. The alternative is guessing at a value for
     /// `curmbk`, and every option read afterwards would come from whichever
     /// block that guess named.
-    pub fn pop(&mut self) -> Result<FarPtr, String> {
+    pub fn pop(&mut self) -> Result<A::Ptr, String> {
         self.saved
             .pop()
             .ok_or_else(|| "rstmbk with no setmbk to undo".to_owned())
@@ -468,10 +495,12 @@ impl Messages<Wg16> {
 
     /// Where message `n` of the block named by `cookie` was interned.
     ///
+    /// Generic outright, for the same reason `close` is.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open block, or the block has no message `n`.
-    pub fn text(&self, cookie: FarPtr, n: u16) -> Result<FarPtr, String> {
+    pub fn text(&self, cookie: A::Ptr, n: u16) -> Result<A::Ptr, String> {
         let block = &self.open[self.find(cookie)?];
         block.text.get(usize::from(n)).copied().ok_or_else(|| {
             format!(
@@ -484,10 +513,12 @@ impl Messages<Wg16> {
 
     /// What a block was opened as.
     ///
+    /// Generic outright, for the same reason `close` is.
+    ///
     /// # Errors
     ///
     /// If `cookie` names no open block.
-    pub fn name(&self, cookie: FarPtr) -> Result<&str, String> {
+    pub fn name(&self, cookie: A::Ptr) -> Result<&str, String> {
         Ok(&self.open[self.find(cookie)?].name)
     }
 
@@ -501,11 +532,30 @@ impl Messages<Wg16> {
         self.open.is_empty()
     }
 
-    fn find(&self, cookie: FarPtr) -> Result<usize, String> {
+    fn find(&self, cookie: A::Ptr) -> Result<usize, String> {
         self.open
             .iter()
             .position(|b| b.cookie == cookie)
             .ok_or_else(|| format!("{cookie:?} is not an open message block"))
+    }
+}
+
+impl Messages<Wg16> {
+    /// Open a message file, and give the module something to name it by.
+    ///
+    /// Reborrows into [`Messages::open_mem`] through [`Machine::mem_mut`] --
+    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
+    ///
+    /// # Errors
+    ///
+    /// If the arena cannot be extended.
+    pub fn open(
+        &mut self,
+        machine: &mut Machine,
+        name: &str,
+        file: &MsgFile,
+    ) -> io::Result<FarPtr> {
+        self.open_mem(machine.mem_mut(), name, file)
     }
 }
 
