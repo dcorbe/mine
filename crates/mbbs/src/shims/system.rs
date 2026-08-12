@@ -30,9 +30,17 @@ const AGENT_SIZE: u16 = AIDSIZ + 4 * 4;
 /// of the `.MDF` before the name is picked out of it.
 const MDF_LINE: u16 = 40;
 
-/// `int now(void)` -- the time of day, packed as DOS packs it.
+/// `USHORT now(VOID)` -- `DNTAPI.H:205-206` -- the time of day, packed as
+/// DOS packs it.
 ///
-/// `DOSFACE.H:73`. Hours in bits 15..11, minutes in 10..5, and *two-second*
+/// **Correction, found converting this file to a cursor
+/// (docs/plans/2026-08-11-abi-abstraction-implementation.md's Task 4-5):**
+/// this and its neighbours below were long cited to `DOSFACE.H`, which does
+/// not exist anywhere in `re/wg33src/INC`'s 125 headers -- not even under a
+/// different name; grepping for it repo-wide finds nothing. The real
+/// declaration is `DNTAPI.H`'s, which also declares `today`, `ncdate`,
+/// `nctime`, `ncedat`, `cofdat` and the `moname` table below, all corrected
+/// in this diff. Hours in bits 15..11, minutes in 10..5, and *two-second*
 /// units in 4..0, because five bits will not hold sixty.
 ///
 /// # Errors
@@ -43,7 +51,8 @@ pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(t.dos_time()))
 }
 
-/// `int today(void)` -- the date, packed as DOS packs it.
+/// `USHORT today(VOID)` -- `DNTAPI.H:199-200` -- the date, packed as DOS
+/// packs it.
 ///
 /// Years since 1980 in bits 15..9, month in 8..5, day in 4..0.
 ///
@@ -63,6 +72,9 @@ pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 
 /// `long time(long *tloc)` -- seconds since 1970, and stored if asked.
 ///
+/// No vendor prototype: Borland's own runtime, re-exported by `MAJORBBS.DLL`
+/// like `access` below, with no Galacticomm header redeclaring it.
+///
 /// # Errors
 ///
 /// If the host's clock cannot say, or `tloc` names memory the module does not
@@ -70,9 +82,10 @@ pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 pub fn time(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
     let seconds = host.clock().epoch().map_err(ShimError::Failed)?;
 
+    let mut args = super::args(machine);
+    let tloc = args.ptr();
     // A null pointer is how C spells "do not store it", and is the ordinary
     // case rather than an error.
-    let tloc = machine.arg_far(0);
     if tloc.selector != 0 {
         machine.write(tloc, &seconds.to_le_bytes())?;
     }
@@ -123,12 +136,13 @@ fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimEr
     Ok(all)
 }
 
-/// `char *nctime(int time)` -- a DOS-packed time as `HH:MM:SS`.
+/// `const CHAR *nctime(USHORT time)` -- `DNTAPI.H:216-218` -- a DOS-packed
+/// time as `HH:MM:SS`.
 ///
-/// No C source survives for this one. Transcribed from
-/// `MAJORBBS-wg101.EXE seg 33:0x0c56`, which is
+/// No C source (the `.C`, as opposed to the header) survives for this one.
+/// Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c56`, which is
 /// `sprintf(buf, "%02d:%02d:%02d", (t>>11)&0x1f, (t>>5)&0x3f, (t<<1)&0x3e)`
-/// and hands back the buffer. Declared at `DOSFACE.H:75`.
+/// and hands back the buffer.
 ///
 /// **The low five bits are two-second units and are doubled, not masked** --
 /// five bits will not hold 59, so an odd second cannot be represented at all
@@ -141,7 +155,8 @@ fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimEr
 ///
 /// If the module's heap cannot give the buffer its first time through.
 pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let packed = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let packed = args.int();
     let at = buffers(machine, host)?.time;
     let text = format!(
         "{:02}:{:02}:{:02}",
@@ -153,10 +168,11 @@ pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
-/// `char *ncdate(int date)` -- a DOS-packed date as `MM/DD/YY`.
+/// `const CHAR *ncdate(USHORT date)` -- `DNTAPI.H:208-210` -- a DOS-packed
+/// date as `MM/DD/YY`.
 ///
-/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c02`;
-/// declared at `DOSFACE.H:74`.
+/// No C source (the `.C`) survives. Transcribed from
+/// `MAJORBBS-wg101.EXE seg 33:0x0c02`.
 ///
 /// **Date zero is not a date, and the original says so** by returning a
 /// separate empty string at `DS:0x82` *without touching its buffer* -- so a
@@ -172,7 +188,8 @@ pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// If the module's heap cannot give the buffer its first time through.
 pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let packed = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let packed = args.int();
     let all = buffers(machine, host)?;
 
     // `or cx,cx / jnz` at `seg 33:0x0c10`, and the branch it does not take
@@ -199,12 +216,13 @@ pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// starts and how long it is.
 const CUMULATIVE_DAYS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
 
-/// `int cofdat(int date)` -- a DOS-packed date as a day count, so that two
-/// dates can be subtracted to find how many days apart they are.
+/// `USHORT cofdat(USHORT date)` -- `DNTAPI.H:276-278` -- a DOS-packed date
+/// as a day count, so that two dates can be subtracted to find how many days
+/// apart they are.
 ///
-/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0e9e`
-/// (ordinal 134, twelve call sites); the fields unpack exactly as [`ncdate`]'s
-/// do:
+/// No C source (the `.C`) survives. Transcribed from
+/// `MAJORBBS-wg101.EXE seg 33:0x0e9e` (ordinal 134, twelve call sites); the
+/// fields unpack exactly as [`ncdate`]'s do:
 ///
 /// ```text
 /// year  = (date >> 9) & 0x7f      years since 1980
@@ -241,7 +259,8 @@ const CUMULATIVE_DAYS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 2
 /// meter after this commit is not this shim breaking -- it is this shim never
 /// running.
 pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let packed = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let packed = args.int();
     let year = i64::from((packed >> 9) & 0x7f);
     let month = usize::from((packed >> 5) & 0xf);
     let day = i64::from(packed & 0x1f);
@@ -256,11 +275,12 @@ pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     Ok(Ret::U16(days as u16))
 }
 
-/// `moname[][4]`, `DOSFACE.H:71` -- sixteen four-byte entries, measured at
-/// **NE segment 88** of `MAJORBBS-wg101.EXE` (file offset `0xc9a00`), DGROUP
-/// offset `0x00`. Segment 88 is this module's real DGROUP: it is what the
-/// relocation on the `mov ax,0xffff` at `seg 33:0x0c9f` (immediately before
-/// the `mov ds,ax` that `ncedat` runs before indexing this table) targets.
+/// `EXPWGSV(CHAR) moname[16][4]` -- `DNTAPI.H:195` -- sixteen four-byte
+/// entries, measured at **NE segment 88** of `MAJORBBS-wg101.EXE` (file
+/// offset `0xc9a00`), DGROUP offset `0x00`. Segment 88 is this module's real
+/// DGROUP: it is what the relocation on the `mov ax,0xffff` at
+/// `seg 33:0x0c9f` (immediately before the `mov ds,ax` that `ncedat` runs
+/// before indexing this table) targets.
 ///
 /// The measured bytes:
 ///
@@ -277,12 +297,12 @@ const MONAME: [&str; 16] = [
     "XXX", "XXX", "XXX",
 ];
 
-/// `char *ncedat(int date)` -- a DOS-packed date as `DD-MON-YY`, e.g.
-/// `07-AUG-26`.
+/// `const CHAR *ncedat(USHORT date)` -- `DNTAPI.H:220-222` -- a DOS-packed
+/// date as `DD-MON-YY`, e.g. `07-AUG-26`.
 ///
-/// No C source survives. Transcribed from `MAJORBBS-wg101.EXE seg 33:0x0c98`
-/// (ordinal 429, seven call sites); the fields unpack exactly as [`cofdat`]'s
-/// do. The call it builds is
+/// No C source (the `.C`) survives. Transcribed from
+/// `MAJORBBS-wg101.EXE seg 33:0x0c98` (ordinal 429, seven call sites); the
+/// fields unpack exactly as [`cofdat`]'s do. The call it builds is
 /// `spr(buf, "%02d-%s-%02d", day, moname[month], (year + 0x7bc) % 100)` --
 /// `0x7bc` is 1980, and the format string (`DGROUP:0xa1`) is the same static
 /// [`ncdate`] and [`nctime`] already measured.
@@ -325,7 +345,8 @@ const MONAME: [&str; 16] = [
 /// meter after this commit is not this shim breaking -- it is this shim never
 /// running.
 pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let packed = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let packed = args.int();
     let all = buffers(machine, host)?;
 
     let month = usize::from((packed >> 5) & 0xf);
@@ -343,15 +364,20 @@ pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 
 /// `void srand(unsigned seed)`.
 ///
+/// No vendor prototype: Borland's own runtime, re-exported by `MAJORBBS.DLL`,
+/// with no Galacticomm header redeclaring it.
+///
 /// MajorMUD calls this once, six calls into initialisation, with the low word
 /// of `time()` -- so the seed is the wall clock and no two runs of the real host
 /// agreed either. See [`mbbs::random`](crate::random).
 pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    host.random = Random::new(machine.arg_u16(0));
+    let mut args = super::args(machine);
+    host.random = Random::new(args.int());
     Ok(Ret::Void)
 }
 
-/// `int genrdn(int min, int max)` -- a random number in `[min, max)`.
+/// `INT genrdn(INT min, INT max)` -- `BBSUTILS.H:69` -- a random number in
+/// `[min, max)`.
 ///
 /// The upper bound is exclusive and the routine's own comment says so. See
 /// [`between`](crate::random::between), which is the ported algorithm; this is
@@ -362,15 +388,17 @@ pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// If the generator stops generating. See
 /// [`Runaway`](crate::random::Runaway).
 pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (min, max) = (machine.arg_u16(0) as i16, machine.arg_u16(1) as i16);
+    let mut args = super::args(machine);
+    let (min, max) = (args.int() as i16, args.int() as i16);
     host.random
         .genrdn(min, max)
         .map(|n| Ret::U16(n as u16))
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
-/// `long lngrnd(long min, long max)` -- [`genrdn`] in `long` arithmetic.
-/// `BBSUTILS.C:76-93`, and ordinal 390 of the genuine host.
+/// `LONG lngrnd(LONG min, LONG max)` -- `BBSUTILS.H:70` -- [`genrdn`] in
+/// `long` arithmetic. `BBSUTILS.C:76-93`, and ordinal 390 of the genuine
+/// host.
 ///
 /// The upper bound is exclusive, as it is for [`genrdn`]. See
 /// [`between_long`](crate::random::between_long), which is the ported
@@ -378,10 +406,14 @@ pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// # Two words each, and which two
 ///
-/// `arg_u16` is indexed in **words**, so a pair of `long`s is `arg_u32(0)` and
-/// `arg_u32(2)` -- not `(0)` and `(1)`, which is [`genrdn`]'s spacing and would
-/// read `min`'s high half as `max`'s low one. Worth stating because the two
-/// shims sit next to each other and differ only here.
+/// Before this shim read its arguments through a cursor, `arg_u16` was
+/// indexed in **words**, so a pair of `long`s was `arg_u32(0)` and
+/// `arg_u32(2)` -- not `(0)` and `(1)`, which is [`genrdn`]'s spacing and
+/// would have read `min`'s high half as `max`'s low one. `Cursor::long`
+/// removes that footgun by construction: it always advances by exactly one
+/// `long`'s width, so `args.long()` twice in a row cannot land on the wrong
+/// half the way a hand-picked word offset could. Kept here as the reason the
+/// two shims, sitting next to each other, differ in more than name.
 ///
 /// # Why this was missing for so long, and what it cost
 ///
@@ -398,7 +430,8 @@ pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// If the generator stops generating. See
 /// [`Runaway`](crate::random::Runaway).
 pub fn lngrnd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let (min, max) = (machine.arg_u32(0) as i32, machine.arg_u32(2) as i32);
+    let mut args = super::args(machine);
+    let (min, max) = (args.long() as i32, args.long() as i32);
     host.random
         .lngrnd(min, max)
         .map(|n| Ret::U32(n as u32))
@@ -423,8 +456,10 @@ pub fn lngrnd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// no `WCCVACN.VIR` to install one from and no working board has the file, so
 /// -1 is both the true answer and the one that lets the module continue.
 pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let named = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
-    let mode = machine.arg_u16(2);
+    let mut args = super::args(machine);
+    let path = args.ptr();
+    let mode = args.int();
+    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
 
     // A path this host will not look in is not a file that is missing -- it is
     // a question it cannot answer, and answering "no" would tell the module the
@@ -451,7 +486,8 @@ pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::U16(0))
 }
 
-/// `char *gmdnam(char *mdfnam)` -- a module's name, out of its `.MDF`.
+/// `CHAR *gmdnam(CHAR *mdfnam)` -- `GCOMM.H:954-956` -- a module's name, out
+/// of its `.MDF`.
 ///
 /// The real one (`MAJORBBS.C:1137`) opens the file, finds the line beginning
 /// `Module Name:`, unpads it and returns a pointer past the label into its own
@@ -461,7 +497,9 @@ pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// A file it cannot open is `catastro` in the original. Here it stops the
 /// module with the path, which is the same outcome and says more.
 pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let name = machine.read_cstr(machine.arg_far(0))?.to_vec();
+    let mut args = super::args(machine);
+    let mdfnam = args.ptr();
+    let name = machine.read_cstr(mdfnam)?.to_vec();
     let name = String::from_utf8_lossy(&name).into_owned();
 
     let path = host
@@ -482,15 +520,22 @@ pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Far(at))
 }
 
-/// `void shocst(char *tex1, char *tex2, ...)` -- one line of audit trail.
+/// `VOID shocst(const CHAR *brief, const CHAR *detail, ...)` --
+/// `MAJORBBS.H:1083-1087` -- one line of audit trail.
 ///
 /// Two strings then printf arguments, as every call site has it:
 /// `shocst("C/S FILE PAGE FILE MISSING","%s %s",mnutmp2.pagnam,fpath)`
 /// (`BBSMAINM.C:498`). The real host writes it to the audit-trail Btrieve file
 /// and the console; this keeps it, and [`Host::audit`] is where it can be read.
+/// `Args::Call { first: 4 }` stays a literal word index into the frame -- the
+/// varargs it walks are not named arguments the cursor reads, as `prfmsg`'s
+/// equivalent stayed literal when `shims/msg.rs` converted (eeda7b3).
 pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let headline = machine.read_cstr(machine.arg_far(0))?.to_vec();
-    let (detail, _) = format(machine, machine.arg_far(2), Args::Call { first: 4 })?;
+    let mut args = super::args(machine);
+    let brief = args.ptr();
+    let template = args.ptr();
+    let headline = machine.read_cstr(brief)?.to_vec();
+    let (detail, _) = format(machine, template, Args::Call { first: 4 })?;
     host.audit.push(format!(
         "{}: {}",
         String::from_utf8_lossy(&headline),
@@ -499,7 +544,8 @@ pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
-/// `void rtkick(int delay, void (*dstrou)())` -- run this later.
+/// `VOID rtkick(INT delay, VOID (*dstrou)())` -- `GCOMM.H:228-231` -- run
+/// this later.
 ///
 /// The host remembers it and **nothing runs it**, because running it needs a
 /// main loop and a clock that this host does not have. That is a debt rather
@@ -512,14 +558,15 @@ pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// If `delay` is negative, which no caller can mean and a misread argument
 /// list would produce.
 pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let delay = machine.arg_u16(0);
+    let mut args = super::args(machine);
+    let delay = args.int();
+    let dstrou = args.ptr();
     if delay & 0x8000 != 0 {
         return Err(ShimError::Failed(format!(
             "rtkick: a negative delay ({} seconds)",
             delay as i16
         )));
     }
-    let dstrou = machine.arg_far(1);
     if delay == 0 {
         // `RTKICK.C:50`'s free-slot marker is `countr == 0`, and `:65` skips any
         // entry holding it -- so the original writes this kick into a slot that
@@ -534,13 +581,14 @@ pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
-/// `void dclvda(int size)` -- declare how much volatile data area this module
-/// needs.
+/// `VOID dclvda(INT size)` -- `MAJORBBS.H:771` -- declare how much volatile
+/// data area this module needs.
 ///
 /// `MAJORBBS.C:1157`, in full: `if (size > vdasiz) vdasiz=size`. The largest
 /// declaration wins, because every module shares one area per channel.
 pub fn dclvda(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let size = machine.arg_u16(0) as i16;
+    let mut args = super::args(machine);
+    let size = args.int() as i16;
     let current = host
         .globals()
         .word(machine, "vdasiz")
@@ -553,9 +601,12 @@ pub fn dclvda(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     Ok(Ret::Void)
 }
 
-/// `int register_module(struct module *mod)` -- take a module online.
+/// `INT register_module(struct module *mod)` -- `MAJORBBS.H:769` -- take a
+/// module online.
 ///
-/// `MAJORBBS.H:241`: 25 bytes of description, then nine far pointers, which are
+/// `struct module` itself is `MAJORBBS.H:301-312` (corrected here -- long
+/// cited as `:241`, which is a run of `#define`d sub-state codes, not the
+/// struct): 25 bytes of description, then nine far pointers, which are
 /// every entry point the host will ever call back into. **The pointer is kept,
 /// not the contents.** The real host stores `mod` itself
 /// (`MAJORBBS.C:1327`, `module[nmods]=mod`) and the module is free to change
@@ -567,7 +618,8 @@ pub fn dclvda(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// pointless here, because a null `stsrou` simply means the host has no status
 /// routine to call, which is what it would mean either way.
 pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let block = args.ptr();
 
     // `descrp` is a fixed-width field, so the string inside it is read bounded
     // rather than scanned: a module whose description fills all 25 bytes has no
@@ -592,8 +644,8 @@ pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, Sh
     Ok(Ret::U16(host.register(description, block)))
 }
 
-/// `void register_agent(struct agent *agdptr)` -- take a client/server agent
-/// online.
+/// `VOID register_agent(struct agent *agdptr)` -- `GCSPSRV.H:141` -- take a
+/// client/server agent online.
 ///
 /// An *agent* is a module's server-side handler for a Worldgroup client, and
 /// its `appid` is the name a client addresses it by (`GCSPSRV.H:21`). MajorMUD
@@ -624,7 +676,8 @@ pub fn register_module(machine: &mut Machine, host: &mut Host) -> Result<Ret, Sh
 /// name can never be addressed by a client, so no caller can mean it, and a
 /// misread argument list is what would produce one.
 pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = machine.arg_far(0);
+    let mut args = super::args(machine);
+    let block = args.ptr();
     let bytes = machine.resolve(block, usize::from(AGENT_SIZE))?;
 
     // `appid` is a fixed-width field, so the name inside it is read bounded
@@ -663,8 +716,8 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
     Ok(Ret::Void)
 }
 
-/// `int register_textvar(char *name, char *(*varrou)())` -- register a text
-/// variable.
+/// `INT register_textvar(CHAR *name, CHAR *(*varrou)())` -- `MAJORBBS.H:767`
+/// -- register a text variable.
 ///
 /// `MAJORBBS.C:1279`, and this one has surviving source -- unlike
 /// [`register_agent`], which had to be transcribed. It is checked against the
@@ -698,8 +751,10 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
 /// match one, and carried instead by the realistic cause being a misread
 /// argument list.
 pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let name = String::from_utf8_lossy(machine.read_cstr(machine.arg_far(0))?).into_owned();
-    let varrou = machine.arg_far(2);
+    let mut args = super::args(machine);
+    let name_ptr = args.ptr();
+    let varrou = args.ptr();
+    let name = String::from_utf8_lossy(machine.read_cstr(name_ptr)?).into_owned();
 
     let mut table = std::mem::take(&mut host.textvars);
     let pushed = table.push(machine, &mut host.heap, &name, varrou);
@@ -716,13 +771,19 @@ pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, S
     Ok(Ret::U16(n))
 }
 
-/// `void catastro(char *fmat, ...)` -- the module has given up.
+/// `VOID catastro(CHAR *string, ...)` -- `GCOMM.H:287-290` -- the module has
+/// given up.
 ///
 /// Stops it, deliberately. `catastro` is a module saying it cannot continue,
 /// and a host that formatted the message and returned would be resuming code
-/// that has already decided it is in an impossible state.
+/// that has already decided it is in an impossible state. `Args::Call { first:
+/// 2 }` stays a literal word index into the frame, the same as `shocst`'s and
+/// `prfmsg`'s (`shims/msg.rs`, `eeda7b3`) -- the varargs it walks are not
+/// named arguments the cursor reads.
 pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let (text, _) = format(machine, machine.arg_far(0), Args::Call { first: 2 })?;
+    let mut args = super::args(machine);
+    let template = args.ptr();
+    let (text, _) = format(machine, template, Args::Call { first: 2 })?;
     Err(ShimError::Failed(format!(
         "catastro: {}",
         String::from_utf8_lossy(&text)
