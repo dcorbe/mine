@@ -260,23 +260,29 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "unlink", stream::unlink_wg16, Cleans::Caller),
     (MAJORBBS, "getdtd", stream::getdtd_wg16, Cleans::Caller),
     (MAJORBBS, "cntdir", stream::cntdir_wg16, Cleans::Caller),
-    // The clock, the audit trail, and coming online.
-    (MAJORBBS, "access", system::access, Cleans::Caller),
-    (MAJORBBS, "now", system::now, Cleans::Caller),
-    (MAJORBBS, "nctime", system::nctime, Cleans::Caller),
-    (MAJORBBS, "ncdate", system::ncdate, Cleans::Caller),
-    (MAJORBBS, "cofdat", system::cofdat, Cleans::Caller),
-    (MAJORBBS, "ncedat", system::ncedat, Cleans::Caller),
-    (MAJORBBS, "today", system::today, Cleans::Caller),
-    (MAJORBBS, "time", system::time, Cleans::Caller),
-    (MAJORBBS, "srand", system::srand, Cleans::Caller),
-    (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller),
+    // The clock, the audit trail, and coming online. `_wg16`: sixteen of
+    // these nineteen are generic now (see `shims::system`'s own doc
+    // comment); `register_module`, `register_agent` and `rtkick` stay
+    // concrete, all three blocked on `Registration`/`Agent`/`Kick` being
+    // plain `FarPtr`-typed structs `Host<A>`'s own fields hold regardless of
+    // `A` -- see `shims::system`'s doc comment for why that boundary is
+    // deliberate, not a gap this task happened to find.
+    (MAJORBBS, "access", system::access_wg16, Cleans::Caller),
+    (MAJORBBS, "now", system::now_wg16, Cleans::Caller),
+    (MAJORBBS, "nctime", system::nctime_wg16, Cleans::Caller),
+    (MAJORBBS, "ncdate", system::ncdate_wg16, Cleans::Caller),
+    (MAJORBBS, "cofdat", system::cofdat_wg16, Cleans::Caller),
+    (MAJORBBS, "ncedat", system::ncedat_wg16, Cleans::Caller),
+    (MAJORBBS, "today", system::today_wg16, Cleans::Caller),
+    (MAJORBBS, "time", system::time_wg16, Cleans::Caller),
+    (MAJORBBS, "srand", system::srand_wg16, Cleans::Caller),
+    (MAJORBBS, "genrdn", system::genrdn_wg16, Cleans::Caller),
     // Caller-cleaned, read off the host rather than assumed from its
     // neighbours: lngrnd ends in a bare `retf` (segment 13, offset 0x167) with
     // no immediate, so the module pops its own eight bytes of arguments.
-    (MAJORBBS, "lngrnd", system::lngrnd, Cleans::Caller),
-    (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
-    (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
+    (MAJORBBS, "lngrnd", system::lngrnd_wg16, Cleans::Caller),
+    (MAJORBBS, "gmdnam", system::gmdnam_wg16, Cleans::Caller),
+    (MAJORBBS, "shocst", system::shocst_wg16, Cleans::Caller),
     (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
     // `_wg16`: these five are converted to the generic `Call<A>`/`Host<A>`
     // shape (see `shims::user`'s own doc comment); the table entry is the
@@ -297,7 +303,7 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "fsdbkg", fsd::fsdbkg_wg16, Cleans::Caller),
     (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
     (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
-    (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
+    (MAJORBBS, "dclvda", system::dclvda_wg16, Cleans::Caller),
     (
         MAJORBBS,
         "register_module",
@@ -313,10 +319,10 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (
         MAJORBBS,
         "register_textvar",
-        system::register_textvar,
+        system::register_textvar_wg16,
         Cleans::Caller,
     ),
-    (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
+    (MAJORBBS, "catastro", system::catastro_wg16, Cleans::Caller),
     // "Restore screen-length to usracc setting" -- `MAJORBBS.C:3776` (wg1),
     // one import, one call site. See `shims::screen`'s own doc comment for
     // what it does, what it does not, and where its one caller actually

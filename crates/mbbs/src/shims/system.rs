@@ -2,14 +2,45 @@
 //!
 //! Everything here that reads the world reads it through [`Host`], so a test
 //! can point it at a directory of its own.
+//!
+//! # Generic core, three holdouts
+//!
+//! Sixteen of these nineteen routines are generic now:
+//! `fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`, the
+//! same shape `shims::user`/`shims::text` already established. `shocst` and
+//! `catastro` route their varargs through [`crate::fmt::format_call`], which
+//! needed no word-index parameter the way the old `Args::Call { first: N }`
+//! did -- see `fmt`'s own doc comment.
+//!
+//! **`register_module`, `register_agent` and `rtkick` did not convert.**
+//! Each builds a [`Registration`], [`Agent`] or [`Kick`] -- all three plain,
+//! non-generic structs holding `FarPtr` fields -- and pushes it into
+//! `Host<A>`'s own `modules`/`agents`/`kicks` fields, which are `Vec<Registration>`,
+//! `Vec<Agent>`, `Vec<Kick>` **regardless of `A`**, not `Vec<Registration<A>>`.
+//! That is not an oversight this file can fix: `4d5bab4` ("Host over the ABI
+//! rather than the machine") generified every other `Host` field this way
+//! and *named* the ones it moved onto `A::Ptr` in its own commit message --
+//! `spr`, `l2as`, `mdf`, `empty`, `strtok`, `fsdscb`, `fsdtmp`, `fsd_ascii`,
+//! `fsd_scratch`, plus `DateBuffers` and `FsdSession` -- and did not name
+//! these three, which is a deliberate boundary, not a gap this task
+//! happened to find. Making `Registration`/`Agent`/`Kick` generic would also
+//! genericise [`Registration::dispatch`], which `Host::poll`'s `state_entry`/
+//! `fsd_dispatch` call directly and which is `&Machine`-shaped throughout --
+//! a change to `Host::poll` itself, comparable in size to `crate::fsd`'s own
+//! deferred follow-up (see `shims::fsd`'s doc comment on `fsdego`/`vfyadn`),
+//! and out of this task's scope. All three keep their original
+//! `fn(&mut Machine, &mut Host) -> Result<Ret, ShimError>` shape and
+//! unchanged `ROUTINES` entries.
 
 use mbbs16::{FarPtr, Machine, Ret};
+use mbbs_ptr::ModulePtr;
 
 use crate::{DateBuffers, Host};
-use crate::fmt::{Args, format};
+use crate::abi::{self, Abi, Call, Wg16};
+use crate::fmt::format_call;
 use crate::random::Random;
 use crate::shims::{NO, ShimError};
-use crate::shims::text::write_cstr;
+use crate::shims::text::write_cstr_mem;
 
 /// `MAJORBBS.H:37` -- maximum size for module names, terminator included.
 const MNMSIZ: u16 = 25;
@@ -46,9 +77,17 @@ const MDF_LINE: u16 = 40;
 /// # Errors
 ///
 /// If the host's clock cannot say what time it is.
-pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic: reads no argument of its own, and [`Host::clock`] is not
+/// `A`-dependent at all.
+pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let t = host.clock().civil().map_err(ShimError::Failed)?;
-    Ok(Ret::U16(t.dos_time()))
+    Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
+}
+
+/// The dispatch-table entry for [`now`]. See `shims::call`'s own doc comment.
+pub fn now_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    now(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `USHORT today(VOID)` -- `DNTAPI.H:199-200` -- the date, packed as DOS
@@ -62,12 +101,20 @@ pub fn now(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 /// seven bits will not hold. The old shim clamped with `.max(0)`, which turned
 /// 1970 into 1980 -- a date that is wrong rather than absent, and the one
 /// outcome this crate exists to avoid.
-pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic: reads no argument of its own, matching [`now`].
+pub fn today<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let t = host.clock().civil().map_err(ShimError::Failed)?;
     let packed = t
         .dos_date()
         .map_err(|why| ShimError::Failed(format!("today: {why}")))?;
-    Ok(Ret::U16(packed))
+    Ok(abi::Ret::Int(A::Int::from(packed)))
+}
+
+/// The dispatch-table entry for [`today`]. See `shims::call`'s own doc
+/// comment.
+pub fn today_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    today(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long time(long *tloc)` -- seconds since 1970, and stored if asked.
@@ -79,17 +126,32 @@ pub fn today(_: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// If the host's clock cannot say, or `tloc` names memory the module does not
 /// own.
-pub fn time(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+///
+/// Generic: the null test is every byte of `tloc` being zero
+/// ([`Abi::ptr_to_bytes`]), the same reading `shims::user::begin_polling`
+/// and `shims::msg::tokopt` already established for a null routine/list
+/// pointer -- not `FarPtr::selector != 0` as the original word-indexed shim
+/// wrote it, which `A::Ptr` is opaque to. The two agree on every value this
+/// crate's own tests exercise (`tloc` is either a real allocation or exactly
+/// `[0, 0]`), and the byte test is the one every other converted shim in
+/// this crate already uses for "is this pointer null".
+pub fn time<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let seconds = host.clock().epoch().map_err(ShimError::Failed)?;
+    let tloc = call.ptr();
 
-    let mut args = super::args(machine);
-    let tloc = args.ptr();
     // A null pointer is how C spells "do not store it", and is the ordinary
     // case rather than an error.
-    if tloc.selector != 0 {
-        machine.write(tloc, &seconds.to_le_bytes())?;
+    if !A::ptr_to_bytes(tloc).iter().all(|&b| b == 0) {
+        tloc.write(call.mem(), &seconds.to_le_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    Ok(Ret::U32(seconds))
+    Ok(abi::Ret::Long(seconds))
+}
+
+/// The dispatch-table entry for [`time`]. See `shims::call`'s own doc
+/// comment.
+pub fn time_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    time(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Bytes of the three date statics, measured from their spacing in
@@ -109,22 +171,25 @@ const EDAT_LEN: u16 = 10;
 /// # Errors
 ///
 /// If the module's heap cannot give up four small blocks.
-fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimError> {
+///
+/// Generic: [`Heap::reserve`](crate::heap::Heap::reserve) is the core
+/// [`Heap::alloc`](crate::heap::Heap::alloc)'s `Wg16` facade delegates into,
+/// and [`write_cstr_mem`] is `write_cstr`'s. `DateBuffers<A>` was already
+/// generic (`4d5bab4`), so nothing about the struct itself needed to move.
+fn buffers_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<DateBuffers<A>, ShimError> {
     if let Some(already) = host.datebuf {
         return Ok(already);
     }
 
-    // Not a closure over both: `alloc` needs the machine mutably and so does
-    // the `write_cstr` below it.
-    let date = host.heap.alloc(machine, DATE_LEN).map_err(ShimError::Failed)?;
-    let time = host.heap.alloc(machine, TIME_LEN).map_err(ShimError::Failed)?;
-    let edat = host.heap.alloc(machine, EDAT_LEN).map_err(ShimError::Failed)?;
-    let empty = host.heap.alloc(machine, 1).map_err(ShimError::Failed)?;
+    let date = host.heap.reserve(mem, DATE_LEN).map_err(ShimError::Failed)?;
+    let time = host.heap.reserve(mem, TIME_LEN).map_err(ShimError::Failed)?;
+    let edat = host.heap.reserve(mem, EDAT_LEN).map_err(ShimError::Failed)?;
+    let empty = host.heap.reserve(mem, 1).map_err(ShimError::Failed)?;
     // Written explicitly rather than trusted to the heap's zero-fill -- see
     // `Host::empty` (`lib.rs:212`) for the sibling that gets the same
     // treatment eagerly, in `Host::new`, because it has to exist before this
     // one would ever be allocated.
-    write_cstr(machine, empty, b"", 1)?;
+    write_cstr_mem::<A>(mem, empty, b"", 1)?;
 
     let all = DateBuffers {
         date,
@@ -154,18 +219,23 @@ fn buffers(machine: &mut Machine, host: &mut Host) -> Result<DateBuffers, ShimEr
 /// # Errors
 ///
 /// If the module's heap cannot give the buffer its first time through.
-pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let packed = args.int();
-    let at = buffers(machine, host)?.time;
+pub fn nctime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let packed = Into::<u32>::into(call.int()) as u16;
+    let at = buffers_mem(call.mem(), host)?.time;
     let text = format!(
         "{:02}:{:02}:{:02}",
         (packed >> 11) & 0x1f,
         (packed >> 5) & 0x3f,
         (packed << 1) & 0x3e,
     );
-    write_cstr(machine, at, text.as_bytes(), TIME_LEN)?;
-    Ok(Ret::Far(at))
+    write_cstr_mem::<A>(call.mem(), at, text.as_bytes(), TIME_LEN)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`nctime`]. See `shims::call`'s own doc
+/// comment.
+pub fn nctime_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    nctime(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `const CHAR *ncdate(USHORT date)` -- `DNTAPI.H:208-210` -- a DOS-packed
@@ -187,15 +257,14 @@ pub fn nctime(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// # Errors
 ///
 /// If the module's heap cannot give the buffer its first time through.
-pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let packed = args.int();
-    let all = buffers(machine, host)?;
+pub fn ncdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let packed = Into::<u32>::into(call.int()) as u16;
+    let all = buffers_mem(call.mem(), host)?;
 
     // `or cx,cx / jnz` at `seg 33:0x0c10`, and the branch it does not take
     // writes nothing at all.
     if packed == 0 {
-        return Ok(Ret::Far(all.empty));
+        return Ok(abi::Ret::Ptr(all.empty));
     }
 
     let text = format!(
@@ -204,8 +273,14 @@ pub fn ncdate(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         packed & 0x1f,
         (((packed >> 9) & 0x7f) + 1980) % 100,
     );
-    write_cstr(machine, all.date, text.as_bytes(), DATE_LEN)?;
-    Ok(Ret::Far(all.date))
+    write_cstr_mem::<A>(call.mem(), all.date, text.as_bytes(), DATE_LEN)?;
+    Ok(abi::Ret::Ptr(all.date))
+}
+
+/// The dispatch-table entry for [`ncdate`]. See `shims::call`'s own doc
+/// comment.
+pub fn ncdate_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    ncdate(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Days before each month in a non-leap year, measured -- not reasoned out --
@@ -258,9 +333,8 @@ const CUMULATIVE_DAYS: [u16; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 2
 /// Its callers are the polling routines, which nothing here drives yet. A flat
 /// meter after this commit is not this shim breaking -- it is this shim never
 /// running.
-pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let packed = args.int();
+pub fn cofdat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let packed = Into::<u32>::into(call.int()) as u16;
     let year = i64::from((packed >> 9) & 0x7f);
     let month = usize::from((packed >> 5) & 0xf);
     let day = i64::from(packed & 0x1f);
@@ -272,7 +346,13 @@ pub fn cofdat(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
     let leap_this_year = i64::from(month > 2 && year % 4 == 0);
 
     let days = year * 365 + leap_before + i64::from(cumulative) + leap_this_year + day - 1;
-    Ok(Ret::U16(days as u16))
+    Ok(abi::Ret::Int(A::Int::from(days as u16)))
+}
+
+/// The dispatch-table entry for [`cofdat`]. See `shims::call`'s own doc
+/// comment.
+pub fn cofdat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    cofdat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `EXPWGSV(CHAR) moname[16][4]` -- `DNTAPI.H:195` -- sixteen four-byte
@@ -344,10 +424,9 @@ const MONAME: [&str; 16] = [
 /// Its callers are the polling routines, which nothing here drives yet. A flat
 /// meter after this commit is not this shim breaking -- it is this shim never
 /// running.
-pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let packed = args.int();
-    let all = buffers(machine, host)?;
+pub fn ncedat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let packed = Into::<u32>::into(call.int()) as u16;
+    let all = buffers_mem(call.mem(), host)?;
 
     let month = usize::from((packed >> 5) & 0xf);
     let name = MONAME[month];
@@ -358,8 +437,14 @@ pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         name,
         (((packed >> 9) & 0x7f) + 1980) % 100,
     );
-    write_cstr(machine, all.edat, text.as_bytes(), EDAT_LEN)?;
-    Ok(Ret::Far(all.edat))
+    write_cstr_mem::<A>(call.mem(), all.edat, text.as_bytes(), EDAT_LEN)?;
+    Ok(abi::Ret::Ptr(all.edat))
+}
+
+/// The dispatch-table entry for [`ncedat`]. See `shims::call`'s own doc
+/// comment.
+pub fn ncedat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    ncedat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void srand(unsigned seed)`.
@@ -370,10 +455,16 @@ pub fn ncedat(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// MajorMUD calls this once, six calls into initialisation, with the low word
 /// of `time()` -- so the seed is the wall clock and no two runs of the real host
 /// agreed either. See [`mbbs::random`](crate::random).
-pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    host.random = Random::new(args.int());
-    Ok(Ret::Void)
+pub fn srand<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let seed = Into::<u32>::into(call.int()) as u16;
+    host.random = Random::new(seed);
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`srand`]. See `shims::call`'s own doc
+/// comment.
+pub fn srand_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    srand(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `INT genrdn(INT min, INT max)` -- `BBSUTILS.H:69` -- a random number in
@@ -387,13 +478,19 @@ pub fn srand(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
 ///
 /// If the generator stops generating. See
 /// [`Runaway`](crate::random::Runaway).
-pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let (min, max) = (args.int() as i16, args.int() as i16);
+pub fn genrdn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let min = Into::<u32>::into(call.int()) as i16;
+    let max = Into::<u32>::into(call.int()) as i16;
     host.random
         .genrdn(min, max)
-        .map(|n| Ret::U16(n as u16))
+        .map(|n| abi::Ret::Int(A::Int::from(n as u16)))
         .map_err(|e| ShimError::Failed(e.to_string()))
+}
+
+/// The dispatch-table entry for [`genrdn`]. See `shims::call`'s own doc
+/// comment.
+pub fn genrdn_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    genrdn(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `LONG lngrnd(LONG min, LONG max)` -- `BBSUTILS.H:70` -- [`genrdn`] in
@@ -429,13 +526,19 @@ pub fn genrdn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// If the generator stops generating. See
 /// [`Runaway`](crate::random::Runaway).
-pub fn lngrnd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let (min, max) = (args.long() as i32, args.long() as i32);
+pub fn lngrnd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let min = call.long() as i32;
+    let max = call.long() as i32;
     host.random
         .lngrnd(min, max)
-        .map(|n| Ret::U32(n as u32))
+        .map(|n| abi::Ret::Long(n as u32))
         .map_err(|e| ShimError::Failed(e.to_string()))
+}
+
+/// The dispatch-table entry for [`lngrnd`]. See `shims::call`'s own doc
+/// comment.
+pub fn lngrnd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    lngrnd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int access(char *path, int amode)` -- is this file there, and may I use it?
@@ -455,21 +558,31 @@ pub fn lngrnd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `access(".\WCCVACN.DAT", 0)`, is told -1, and **does not open it**. There is
 /// no `WCCVACN.VIR` to install one from and no working board has the file, so
 /// -1 is both the true answer and the one that lets the module continue.
-pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let path = args.ptr();
-    let mode = args.int();
-    let named = String::from_utf8_lossy(machine.read_cstr(path)?).into_owned();
+pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let path = call.ptr();
+    let mode = Into::<u32>::into(call.int()) as u16;
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
 
     // A path this host will not look in is not a file that is missing -- it is
     // a question it cannot answer, and answering "no" would tell the module the
     // file is absent when nobody looked.
-    let name = Host::dos_name(&named).map_err(ShimError::Failed)?;
+    //
+    // `Host::<Wg16>::dos_name`, not `Host::<A>::dos_name`: `dos_name` has no
+    // `self` and no `A`-mentioning parameter, so it lives in `impl
+    // Host<Wg16>` rather than the generic block (`rustc` cannot infer which
+    // `Abi` a bare `impl<A: Abi> Host<A>` copy would mean, with nothing in
+    // its signature to pin `A`) -- the same reading `shims::stream::fopen`/
+    // `unlink` already established for the identical call.
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
     let Some(path) = host.find(name) else {
-        return Ok(Ret::U16(NO));
+        return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
     let Ok(metadata) = std::fs::metadata(&path) else {
-        return Ok(Ret::U16(NO));
+        return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
 
     // Bit 1 is write and bit 2 is read. Nothing else is defined, and a mode
@@ -481,9 +594,15 @@ pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     }
     if mode & 2 != 0 && metadata.permissions().readonly() {
-        return Ok(Ret::U16(NO));
+        return Ok(abi::Ret::Int(A::Int::from(NO)));
     }
-    Ok(Ret::U16(0))
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// The dispatch-table entry for [`access`]. See `shims::call`'s own doc
+/// comment.
+pub fn access_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    access(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `CHAR *gmdnam(CHAR *mdfnam)` -- `GCOMM.H:954-956` -- a module's name, out
@@ -496,10 +615,12 @@ pub fn access(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// A file it cannot open is `catastro` in the original. Here it stops the
 /// module with the path, which is the same outcome and says more.
-pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let mdfnam = args.ptr();
-    let name = machine.read_cstr(mdfnam)?.to_vec();
+pub fn gmdnam<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mdfnam = call.ptr();
+    let name = mdfnam
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let name = String::from_utf8_lossy(&name).into_owned();
 
     let path = host
@@ -516,8 +637,14 @@ pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         .ok_or_else(|| ShimError::Failed(format!("gmdnam: no module name in {name}")))?;
 
     let at = host.mdf_buffer();
-    write_cstr(machine, at, module.as_bytes(), MDF_LINE)?;
-    Ok(Ret::Far(at))
+    write_cstr_mem::<A>(call.mem(), at, module.as_bytes(), MDF_LINE)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// The dispatch-table entry for [`gmdnam`]. See `shims::call`'s own doc
+/// comment.
+pub fn gmdnam_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    gmdnam(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID shocst(const CHAR *brief, const CHAR *detail, ...)` --
@@ -527,21 +654,30 @@ pub fn gmdnam(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `shocst("C/S FILE PAGE FILE MISSING","%s %s",mnutmp2.pagnam,fpath)`
 /// (`BBSMAINM.C:498`). The real host writes it to the audit-trail Btrieve file
 /// and the console; this keeps it, and [`Host::audit`] is where it can be read.
-/// `Args::Call { first: 4 }` stays a literal word index into the frame -- the
-/// varargs it walks are not named arguments the cursor reads, as `prfmsg`'s
-/// equivalent stayed literal when `shims/msg.rs` converted (eeda7b3).
-pub fn shocst(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let brief = args.ptr();
-    let template = args.ptr();
-    let headline = machine.read_cstr(brief)?.to_vec();
-    let (detail, _) = format(machine, template, Args::Call { first: 4 })?;
+///
+/// Generic: [`crate::fmt::format_call`] replaces `format`/`Args::Call { first:
+/// 4 }` -- `brief` and `template` are `call.ptr()`, and by the time both are
+/// read, `call`'s position already marks where the varargs begin.
+pub fn shocst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let brief = call.ptr();
+    let template = call.ptr();
+    let headline = brief
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let (detail, _) = format_call(call, template)?;
     host.audit.push(format!(
         "{}: {}",
         String::from_utf8_lossy(&headline),
         String::from_utf8_lossy(&detail)
     ));
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`shocst`]. See `shims::call`'s own doc
+/// comment.
+pub fn shocst_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    shocst(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID rtkick(INT delay, VOID (*dstrou)())` -- `GCOMM.H:228-231` -- run
@@ -586,19 +722,24 @@ pub fn rtkick(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// `MAJORBBS.C:1157`, in full: `if (size > vdasiz) vdasiz=size`. The largest
 /// declaration wins, because every module shares one area per channel.
-pub fn dclvda(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let size = args.int() as i16;
+pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let size = Into::<u32>::into(call.int()) as i16;
     let current = host
         .globals()
-        .word(machine, "vdasiz")
+        .word_mem(call.mem(), "vdasiz")
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
     if size > current {
         host.globals()
-            .write(machine, "vdasiz", &size.to_le_bytes())
+            .write_mem(call.mem(), "vdasiz", &size.to_le_bytes())
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`dclvda`]. See `shims::call`'s own doc
+/// comment.
+pub fn dclvda_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    dclvda(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `INT register_module(struct module *mod)` -- `MAJORBBS.H:769` -- take a
@@ -750,14 +891,21 @@ pub fn register_agent(machine: &mut Machine, host: &mut Host) -> Result<Ret, Shi
 /// original's -- weaker than the agent's, since `findtvar("")` could genuinely
 /// match one, and carried instead by the realistic cause being a misread
 /// argument list.
-pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let name_ptr = args.ptr();
-    let varrou = args.ptr();
-    let name = String::from_utf8_lossy(machine.read_cstr(name_ptr)?).into_owned();
+///
+/// Generic: [`TextVars::push_mem`](crate::textvar::TextVars::push_mem) is
+/// what `push`'s `Wg16` facade already delegated into.
+pub fn register_textvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let name_ptr = call.ptr();
+    let varrou = call.ptr();
+    let name = String::from_utf8_lossy(
+        name_ptr
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
 
     let mut table = std::mem::take(&mut host.textvars);
-    let pushed = table.push(machine, &mut host.heap, &name, varrou);
+    let pushed = table.push_mem(call.mem(), &mut host.heap, &name, varrou);
     host.textvars = table;
     let n = pushed?;
 
@@ -765,10 +913,16 @@ pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, S
     // table and left the global null would have registered nothing.
     let at = host.textvars.at().expect("a row was just added");
     host.globals()
-        .write(machine, "txtvars", &at.to_bytes())
+        .write_mem(call.mem(), "txtvars", &A::ptr_to_bytes(at))
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    Ok(Ret::U16(n))
+    Ok(abi::Ret::Int(A::Int::from(n)))
+}
+
+/// The dispatch-table entry for [`register_textvar`]. See `shims::call`'s
+/// own doc comment.
+pub fn register_textvar_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    register_textvar(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID catastro(CHAR *string, ...)` -- `GCOMM.H:287-290` -- the module has
@@ -776,18 +930,25 @@ pub fn register_textvar(machine: &mut Machine, host: &mut Host) -> Result<Ret, S
 ///
 /// Stops it, deliberately. `catastro` is a module saying it cannot continue,
 /// and a host that formatted the message and returned would be resuming code
-/// that has already decided it is in an impossible state. `Args::Call { first:
-/// 2 }` stays a literal word index into the frame, the same as `shocst`'s and
-/// `prfmsg`'s (`shims/msg.rs`, `eeda7b3`) -- the varargs it walks are not
-/// named arguments the cursor reads.
-pub fn catastro(machine: &mut Machine, _: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let template = args.ptr();
-    let (text, _) = format(machine, template, Args::Call { first: 2 })?;
+/// that has already decided it is in an impossible state.
+///
+/// Generic: [`crate::fmt::format_call`] replaces `format`/`Args::Call { first:
+/// 2 }`, the same substitution [`shocst`] makes -- `template` is `call.ptr()`,
+/// and by the time it is read, `call`'s position already marks where the
+/// varargs begin.
+pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let template = call.ptr();
+    let (text, _) = format_call(call, template)?;
     Err(ShimError::Failed(format!(
         "catastro: {}",
         String::from_utf8_lossy(&text)
     )))
+}
+
+/// The dispatch-table entry for [`catastro`]. See `shims::call`'s own doc
+/// comment.
+pub fn catastro_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    catastro(&mut super::call(machine), host).map(Into::into)
 }
 
 /// A module routine the host has been asked to run later.
@@ -964,7 +1125,7 @@ mod tests {
     fn now_and_today_are_packed_the_way_dos_packs_them() {
         let mut f = Fixture::new();
 
-        let Ret::U16(time) = f.invoke(now, &[]).expect("now") else {
+        let Ret::U16(time) = f.invoke(now_wg16, &[]).expect("now") else {
             panic!("now returns an int");
         };
         let (hour, minute, second) = (time >> 11, (time >> 5) & 0x3f, (time & 0x1f) * 2);
@@ -972,7 +1133,7 @@ mod tests {
         assert!(minute < 60, "{minute}");
         assert!(second < 60, "{second}");
 
-        let Ret::U16(date) = f.invoke(today, &[]).expect("today") else {
+        let Ret::U16(date) = f.invoke(today_wg16, &[]).expect("today") else {
             panic!("today returns an int");
         };
         let (year, month, day) = (1980 + (date >> 9), (date >> 5) & 0x0f, date & 0x1f);
@@ -993,9 +1154,9 @@ mod tests {
         let mut f = Fixture::new();
         f.host.set_clock(crate::Clock::pinned(BUILD));
 
-        assert_eq!(f.invoke(today, &[]).expect("today"), Ret::U16(13214));
-        assert_eq!(f.invoke(now, &[]).expect("now"), Ret::U16(29314));
-        assert_eq!(f.invoke(time, &[0, 0]).expect("time"), Ret::U32(BUILD));
+        assert_eq!(f.invoke(today_wg16, &[]).expect("today"), Ret::U16(13214));
+        assert_eq!(f.invoke(now_wg16, &[]).expect("now"), Ret::U16(29314));
+        assert_eq!(f.invoke(time_wg16, &[0, 0]).expect("time"), Ret::U32(BUILD));
     }
 
     #[test]
@@ -1007,12 +1168,12 @@ mod tests {
         let mut f = Fixture::new();
         f.host.set_clock(crate::Clock::pinned(BUILD));
 
-        let Ret::U32(seconds) = f.invoke(time, &[0, 0]).expect("time") else {
+        let Ret::U32(seconds) = f.invoke(time_wg16, &[0, 0]).expect("time") else {
             panic!("time returns a long");
         };
         let civil = crate::Clock::pinned(seconds).civil().expect("in range");
 
-        let Ret::U16(date) = f.invoke(today, &[]).expect("today") else {
+        let Ret::U16(date) = f.invoke(today_wg16, &[]).expect("today") else {
             panic!("today returns an int");
         };
         assert_eq!(u32::from(date >> 9) + 1980, civil.year as u32);
@@ -1034,13 +1195,13 @@ mod tests {
         let mut f = Fixture::new();
 
         f.host.set_clock(crate::Clock::pinned(0));
-        let e = f.invoke(today, &[]).expect_err("1970 is not a DOS year");
+        let e = f.invoke(today_wg16, &[]).expect_err("1970 is not a DOS year");
         assert!(format!("{e}").contains("1970"), "{e}");
 
         // The last second a `u32` can hold is still inside the range, so the
         // ceiling stays a refusal nothing trips over.
         f.host.set_clock(crate::Clock::pinned(u32::MAX));
-        assert!(f.invoke(today, &[]).is_ok(), "2106 is a DOS year");
+        assert!(f.invoke(today_wg16, &[]).is_ok(), "2106 is a DOS year");
     }
 
     #[test]
@@ -1048,14 +1209,14 @@ mod tests {
         let mut f = Fixture::new();
         let tloc = f.buffer(4);
 
-        let Ret::U32(seconds) = f.invoke(time, &Fixture::far(tloc)).expect("time") else {
+        let Ret::U32(seconds) = f.invoke(time_wg16, &Fixture::far(tloc)).expect("time") else {
             panic!("time returns a long");
         };
         let stored = f.machine.resolve(tloc, 4).expect("in bounds");
         assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), seconds);
 
         // A null pointer means "do not store it", which is the ordinary call.
-        assert!(f.invoke(time, &[0, 0]).is_ok());
+        assert!(f.invoke(time_wg16, &[0, 0]).is_ok());
     }
 
     #[test]
@@ -1063,15 +1224,15 @@ mod tests {
         let mut f = Fixture::new();
         let vdasiz = |f: &Fixture| f.host.globals().word(&f.machine, "vdasiz").expect("vdasiz");
 
-        f.invoke(dclvda, &[512]).expect("declared");
+        f.invoke(dclvda_wg16, &[512]).expect("declared");
         assert_eq!(vdasiz(&f), 512);
 
         // Every module shares one volatile data area per channel, so a smaller
         // declaration must not shrink it.
-        f.invoke(dclvda, &[128]).expect("declared");
+        f.invoke(dclvda_wg16, &[128]).expect("declared");
         assert_eq!(vdasiz(&f), 512);
 
-        f.invoke(dclvda, &[1024]).expect("declared");
+        f.invoke(dclvda_wg16, &[1024]).expect("declared");
         assert_eq!(vdasiz(&f), 1024);
     }
 
@@ -1079,7 +1240,7 @@ mod tests {
     fn gmdnam_returns_the_name_after_the_label() {
         let mut f = Fixture::new();
         let name = f.text("SAMPLE.MDF");
-        let Ret::Far(at) = f.invoke(gmdnam, &Fixture::far(name)).expect("read") else {
+        let Ret::Far(at) = f.invoke(gmdnam_wg16, &Fixture::far(name)).expect("read") else {
             panic!("gmdnam returns a pointer");
         };
         assert_eq!(f.read(at), "Sample Module");
@@ -1091,14 +1252,14 @@ mod tests {
         // filesystem underneath is not as forgiving as DOS was.
         let mut f = Fixture::new();
         let name = f.text("sample.mdf");
-        assert!(f.invoke(gmdnam, &Fixture::far(name)).is_ok());
+        assert!(f.invoke(gmdnam_wg16, &Fixture::far(name)).is_ok());
     }
 
     #[test]
     fn gmdnam_stops_the_module_rather_than_inventing_a_name() {
         let mut f = Fixture::new();
         let name = f.text("NOSUCH.MDF");
-        assert!(f.invoke(gmdnam, &Fixture::far(name)).is_err());
+        assert!(f.invoke(gmdnam_wg16, &Fixture::far(name)).is_err());
     }
 
     #[test]
@@ -1116,7 +1277,7 @@ mod tests {
             who.selector,
             3,
         ];
-        f.invoke(shocst, &args).expect("recorded");
+        f.invoke(shocst_wg16, &args).expect("recorded");
         assert_eq!(f.host.audit(), ["MODULE ONLINE: rangerdan on channel 3"]);
     }
 
@@ -1212,7 +1373,7 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("BAD LIBRARY FILE DATA POINTER (%d)");
         let failed = f
-            .invoke(catastro, &[template.offset, template.selector, 7])
+            .invoke(catastro_wg16, &[template.offset, template.selector, 7])
             .expect_err("catastro never returns");
         assert!(
             failed
@@ -1227,14 +1388,14 @@ mod tests {
         // What `srand` is *for*. The seed was stored and unused from step 7
         // until now; this is the first test that can see it do anything.
         let mut f = Fixture::new();
-        f.invoke(srand, &[0x1234]).expect("seeded");
+        f.invoke(srand_wg16, &[0x1234]).expect("seeded");
         let first: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
 
-        f.invoke(srand, &[0x1234]).expect("seeded again");
+        f.invoke(srand_wg16, &[0x1234]).expect("seeded again");
         let again: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
         assert_eq!(first, again);
 
-        f.invoke(srand, &[0x1235]).expect("a different seed");
+        f.invoke(srand_wg16, &[0x1235]).expect("a different seed");
         let other: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
         assert_ne!(first, other);
     }
@@ -1244,9 +1405,9 @@ mod tests {
         // Measured: the two calls initialisation makes are both
         // `genrdn(0, 343)`, so this is that call, a thousand times over.
         let mut f = Fixture::new();
-        f.invoke(srand, &[40615]).expect("seeded");
+        f.invoke(srand_wg16, &[40615]).expect("seeded");
         for _ in 0..1000 {
-            let Ret::U16(n) = f.invoke(genrdn, &[0, 343]).expect("a number") else {
+            let Ret::U16(n) = f.invoke(genrdn_wg16, &[0, 343]).expect("a number") else {
                 panic!("genrdn returns an int");
             };
             assert!(n < 343, "{n} is outside 0..343");
@@ -1258,9 +1419,9 @@ mod tests {
         // A shim that read its arguments and returned one of them would pass
         // the bounds check above.
         let mut f = Fixture::new();
-        f.invoke(srand, &[40615]).expect("seeded");
+        f.invoke(srand_wg16, &[40615]).expect("seeded");
         let drawn: std::collections::HashSet<u16> = (0..100)
-            .map(|_| match f.invoke(genrdn, &[0, 343]).expect("a number") {
+            .map(|_| match f.invoke(genrdn_wg16, &[0, 343]).expect("a number") {
                 Ret::U16(n) => n,
                 other => panic!("genrdn returns an int, not {other:?}"),
             })
@@ -1289,10 +1450,10 @@ mod tests {
         // spacing, min becomes word 0 (1) and max word 1 (2), so the answer is
         // 1 -- outside the asserted range by five orders of magnitude.
         let mut f = Fixture::new();
-        f.invoke(srand, &[40615]).expect("seeded");
+        f.invoke(srand_wg16, &[40615]).expect("seeded");
         for _ in 0..500 {
             let Ret::U32(n) = f
-                .invoke(lngrnd, &[0x0001, 0x0002, 0x0000, 0x0003])
+                .invoke(lngrnd_wg16, &[0x0001, 0x0002, 0x0000, 0x0003])
                 .expect("a number")
             else {
                 panic!("lngrnd returns a long");
@@ -1311,10 +1472,10 @@ mod tests {
         // that the modulo cannot bite. The observable property of the
         // generator, through the shim rather than the pure function.
         let mut f = Fixture::new();
-        f.invoke(srand, &[40615]).expect("seeded");
+        f.invoke(srand_wg16, &[40615]).expect("seeded");
         for _ in 0..2000 {
             // min = 0, max = 0x0003_0000 = 196608.
-            let Ret::U32(n) = f.invoke(lngrnd, &[0, 0, 0, 3]).expect("a number") else {
+            let Ret::U32(n) = f.invoke(lngrnd_wg16, &[0, 0, 0, 3]).expect("a number") else {
                 panic!("lngrnd returns a long");
             };
             assert!(
@@ -1329,11 +1490,11 @@ mod tests {
         // 100000 is past what one rand() can produce, so the loop is the only
         // way to satisfy it -- and the answer still has to land under max.
         let mut f = Fixture::new();
-        f.invoke(srand, &[40615]).expect("seeded");
+        f.invoke(srand_wg16, &[40615]).expect("seeded");
         for _ in 0..500 {
             // min = 100000 = 0x0001_86A0, max = 1000000 = 0x000F_4240.
             let Ret::U32(n) = f
-                .invoke(lngrnd, &[0x86A0, 0x0001, 0x4240, 0x000F])
+                .invoke(lngrnd_wg16, &[0x86A0, 0x0001, 0x4240, 0x000F])
                 .expect("a number")
             else {
                 panic!("lngrnd returns a long");
@@ -1560,7 +1721,7 @@ mod tests {
 
         let args = [name.offset, name.selector, varrou.offset, varrou.selector];
         assert_eq!(
-            f.invoke(register_textvar, &args).expect("registered"),
+            f.invoke(register_textvar_wg16, &args).expect("registered"),
             Ret::U16(0),
             "the first text variable is number zero"
         );
@@ -1603,7 +1764,7 @@ mod tests {
 
         assert_eq!(
             f.invoke(
-                register_textvar,
+                register_textvar_wg16,
                 &[first.offset, first.selector, a.offset, a.selector]
             )
             .expect("registered"),
@@ -1611,7 +1772,7 @@ mod tests {
         );
         assert_eq!(
             f.invoke(
-                register_textvar,
+                register_textvar_wg16,
                 &[second.offset, second.selector, b.offset, b.selector]
             )
             .expect("registered"),
@@ -1666,7 +1827,7 @@ mod tests {
         };
 
         f.invoke(
-            register_textvar,
+            register_textvar_wg16,
             &[name.offset, name.selector, varrou.offset, varrou.selector],
         )
         .expect("registered");
@@ -1690,7 +1851,7 @@ mod tests {
         let mut f = Fixture::new();
         let name = f.text("MUDCHARINFO");
 
-        f.invoke(register_textvar, &[name.offset, name.selector, 0, 0])
+        f.invoke(register_textvar_wg16, &[name.offset, name.selector, 0, 0])
             .expect("registered");
 
         let row = f
@@ -1714,7 +1875,7 @@ mod tests {
         let name = f.text("");
 
         let e = f
-            .invoke(register_textvar, &[name.offset, name.selector, 0x1e, 0x67])
+            .invoke(register_textvar_wg16, &[name.offset, name.selector, 0x1e, 0x67])
             .expect_err("refused");
         assert!(format!("{e}").contains("no name"), "{e}");
         assert!(f.host.textvars().is_empty());
@@ -1752,7 +1913,7 @@ mod tests {
         // `sar 0x5 / and 0x3f`, and `add ax,ax / and 0x3e`.
         let packed = (13 << 11) | (45 << 5) | 15;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(nctime, &[packed]).expect("nctime") else {
+        let Ret::Far(at) = f.invoke(nctime_wg16, &[packed]).expect("nctime") else {
             panic!("nctime returns a far pointer");
         };
         assert_eq!(f.read(at), "13:45:30");
@@ -1764,7 +1925,7 @@ mod tests {
         // instructions. Five bits will not hold 59, so what is stored is half
         // the seconds and an odd second cannot be represented at all.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(nctime, &[(23 << 11) | (59 << 5) | 29]).expect("nctime")
+        let Ret::Far(at) = f.invoke(nctime_wg16, &[(23 << 11) | (59 << 5) | 29]).expect("nctime")
         else {
             panic!("far pointer");
         };
@@ -1778,13 +1939,13 @@ mod tests {
         // host must not be quietly kinder about it than the thing it
         // reproduces.
         let mut f = Fixture::new();
-        let Ret::Far(first) = f.invoke(nctime, &[(1 << 11) | (2 << 5) | 1]).expect("nctime")
+        let Ret::Far(first) = f.invoke(nctime_wg16, &[(1 << 11) | (2 << 5) | 1]).expect("nctime")
         else {
             panic!("far pointer");
         };
         assert_eq!(f.read(first), "01:02:02");
 
-        let Ret::Far(second) = f.invoke(nctime, &[0]).expect("nctime") else {
+        let Ret::Far(second) = f.invoke(nctime_wg16, &[0]).expect("nctime") else {
             panic!("far pointer");
         };
         assert_eq!(first, second, "one buffer, not two");
@@ -1796,7 +1957,7 @@ mod tests {
         // 2026-08-05, packed the way `today` packs it.
         let packed = ((2026 - 1980) << 9) | (8 << 5) | 5;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
+        let Ret::Far(at) = f.invoke(ncdate_wg16, &[packed]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "08/05/26");
@@ -1809,11 +1970,11 @@ mod tests {
         // is still standing afterwards, which a shim formatting "00/00/00"
         // would have destroyed.
         let mut f = Fixture::new();
-        let Ret::Far(real) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        let Ret::Far(real) = f.invoke(ncdate_wg16, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
         else {
             panic!("far pointer");
         };
-        let Ret::Far(none) = f.invoke(ncdate, &[0]).expect("ncdate") else {
+        let Ret::Far(none) = f.invoke(ncdate_wg16, &[0]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_ne!(none, real, "the empty string is not the buffer");
@@ -1828,7 +1989,7 @@ mod tests {
         // 2007. That is the original's limitation, reproduced.
         let packed = (127 << 9) | (12 << 5) | 31;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
+        let Ret::Far(at) = f.invoke(ncdate_wg16, &[packed]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "12/31/07");
@@ -1840,11 +2001,11 @@ mod tests {
         // module may hold an ncdate result across an nctime call, so sharing
         // one block here would corrupt it in a way nothing else would catch.
         let mut f = Fixture::new();
-        let Ret::Far(date) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        let Ret::Far(date) = f.invoke(ncdate_wg16, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
         else {
             panic!("far pointer");
         };
-        let Ret::Far(time) = f.invoke(nctime, &[(13 << 11) | (45 << 5) | 15]).expect("nctime")
+        let Ret::Far(time) = f.invoke(nctime_wg16, &[(13 << 11) | (45 << 5) | 15]).expect("nctime")
         else {
             panic!("far pointer");
         };
@@ -1859,11 +2020,11 @@ mod tests {
         // 366, not 365. Hand-computable, and the first place `(year+3)/4`
         // could be off by one and still leave every formatted date correct.
         let mut f = Fixture::new();
-        let Ret::U16(d1980) = f.invoke(cofdat, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1980) = f.invoke(cofdat_wg16, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1981) = f.invoke(cofdat_wg16, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -1873,11 +2034,11 @@ mod tests {
     #[test]
     fn cofdat_of_two_new_years_that_do_not_cross_a_leap_day_is_365() {
         let mut f = Fixture::new();
-        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1981) = f.invoke(cofdat_wg16, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(d1982) = f.invoke(cofdat, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1982) = f.invoke(cofdat_wg16, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -1888,11 +2049,11 @@ mod tests {
     fn cofdat_of_28_feb_and_1_mar_in_a_leap_year_is_2() {
         // Year 20 is 2000 -- divisible by 4, so 29 Feb falls between them.
         let mut f = Fixture::new();
-        let Ret::U16(feb28) = f.invoke(cofdat, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
+        let Ret::U16(feb28) = f.invoke(cofdat_wg16, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(mar1) = f.invoke(cofdat, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
+        let Ret::U16(mar1) = f.invoke(cofdat_wg16, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -1913,7 +2074,7 @@ mod tests {
         // tests use, formatted `07-Aug-26`. `datetime.date(2026, 8, 7) -
         // datetime.date(1980, 1, 1)` is 17,020 days.
         let mut f = Fixture::new();
-        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
+        let Ret::U16(days) = f.invoke(cofdat_wg16, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -1926,7 +2087,7 @@ mod tests {
         // exercises month 12, or anything past March. `datetime.date(2026,
         // 12, 31) - datetime.date(1980, 1, 1)` is 17,166 days.
         let mut f = Fixture::new();
-        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
+        let Ret::U16(days) = f.invoke(cofdat_wg16, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -1941,7 +2102,7 @@ mod tests {
         // refuses instead.
         let mut f = Fixture::new();
         let e = f
-            .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
+            .invoke(cofdat_wg16, &[(0 << 9) | (13 << 5) | 1])
             .expect_err("refused");
         assert!(format!("{e}").contains("13"), "{e}");
     }
@@ -1953,7 +2114,7 @@ mod tests {
         // 88, DGROUP:0x00, of `MAJORBBS-wg101.EXE`.
         let packed = (46 << 9) | (8 << 5) | 7;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "07-AUG-26");
@@ -1963,7 +2124,7 @@ mod tests {
     fn ncedat_wraps_the_year_at_a_century() {
         let packed = (127 << 9) | (12 << 5) | 31;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "31-DEC-07");
@@ -1975,7 +2136,7 @@ mod tests {
         // measured slot -- the `"000"` sentinel -- not one array element
         // before the table. `ncedat(0)` unpacks to day 0, month 0, year 80.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat, &[0]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat_wg16, &[0]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "00-000-80");
@@ -1987,7 +2148,7 @@ mod tests {
         // too, `"XXX"` each -- table shape, not an out-of-bounds read.
         let packed = (0 << 9) | (13 << 5) | 1;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "01-XXX-80");
@@ -1997,7 +2158,7 @@ mod tests {
     fn ncedat_writes_over_what_the_last_call_left() {
         let mut f = Fixture::new();
         let Ret::Far(first) = f
-            .invoke(ncedat, &[(46 << 9) | (8 << 5) | 7])
+            .invoke(ncedat_wg16, &[(46 << 9) | (8 << 5) | 7])
             .expect("ncedat")
         else {
             panic!("far pointer");
@@ -2005,7 +2166,7 @@ mod tests {
         assert_eq!(f.read(first), "07-AUG-26");
 
         let Ret::Far(second) = f
-            .invoke(ncedat, &[(20 << 9) | (3 << 5) | 1])
+            .invoke(ncedat_wg16, &[(20 << 9) | (3 << 5) | 1])
             .expect("ncedat")
         else {
             panic!("far pointer");

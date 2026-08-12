@@ -973,7 +973,7 @@ mod tests {
         // hands the FSD both at once and they must not be the same bytes.
         let mut f = crate::testing::Fixture::new();
         let console = f.console();
-        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.invoke(crate::shims::system::dclvda_wg16, &[512]).expect("declared");
         f.host.alcvda(&mut f.machine).expect("allocated");
 
         let g = f.host.globals();
@@ -1025,7 +1025,7 @@ mod tests {
     #[test]
     fn finishing_initialisation_allocates_what_dclvda_asked_for() {
         let mut f = crate::testing::Fixture::new();
-        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.invoke(crate::shims::system::dclvda_wg16, &[512]).expect("declared");
         f.host.finish_init(&mut f.machine).expect("finished");
 
         let g = f.host.globals();

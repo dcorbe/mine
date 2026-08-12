@@ -406,7 +406,7 @@ mod tests {
             mbbs16::FarPtr::NULL
         );
 
-        f.invoke(crate::shims::system::dclvda, &[256]).expect("declared");
+        f.invoke(crate::shims::system::dclvda_wg16, &[256]).expect("declared");
         f.host.alcvda(&mut f.machine).expect("allocated");
         f.invoke(curusr_wg16, &[0]).expect("channel 0 again");
         assert_eq!(
