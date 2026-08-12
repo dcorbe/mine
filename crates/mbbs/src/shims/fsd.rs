@@ -959,40 +959,44 @@ pub fn fsdbkg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 ///
 /// If no session has been prepared, or `fldno` is not a field of it.
 ///
-/// # Did not go generic (Task 5)
-///
-/// [`fsd::vfyadn`] -- the entry-engine routine this shim is a thin wrapper
-/// over -- takes `&mut Scb`, i.e. `&mut Scb<Wg16>`: `crate::fsd` (the
-/// 10,900-line compiler and entry engine, `crates/mbbs/src/fsd.rs`) is a
-/// different file from `crates/mbbs/src/shims/fsd.rs`, out of this task's
-/// scope. [`fsdego`], below, is blocked the same way, by `fsd::fsdlin`/
-/// `fsd::fsdent`. Genericising `crate::fsd` itself -- every one of its ~30
-/// `&Scb`/`&mut Scb`-taking functions, the whole entry engine -- is
-/// comparable in size to this task by itself and is not attempted here;
-/// [`fsd::Scb`] itself *is* generic now (this commit), which is what makes
-/// that a later task's job rather than a redesign.
-pub fn vfyadn(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+/// Generic (Task 5's follow-up): [`fsd::vfyadn`] itself now takes
+/// `&mut Scb<A>` -- `crate::fsd`'s ~30 `&Scb`/`&mut Scb`-taking functions
+/// went generic in one mechanical pass, since none of them ever touches a
+/// `Machine` (see that file's module doc comment, "No `Machine` here on
+/// purpose") -- so this shim needed only its own signature and reads
+/// converted, the same shape [`fsdxan`] already established.
+pub fn vfyadn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int vfyadn(int fldno, char *answer)` -- FSD.H:584-587.
-    let mut args = super::args(machine);
-    let fldno = args.int();
-    let answer = args.ptr();
-    let answer = machine.read_cstr(answer)?.to_vec();
+    let fldno = Into::<u32>::into(call.int()) as u16;
+    let answer = call.ptr();
+    let answer = answer
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
-    let (mut block, at) = prepared(machine, host, "vfyadn")?;
-    let record = field_record(machine, &block, fldno, "vfyadn")?;
+    let (mut block, at) = prepared_mem(call.mem(), host, "vfyadn")?;
+    let record = field_record_mem(call.mem(), &block, fldno, "vfyadn")?;
     let field = u8::try_from(fldno).map_err(|_| {
         ShimError::Failed(format!("vfyadn: field {fldno} does not fit fsdscb->entfld's byte"))
     })?;
     let ansoff = answer_offset(&record);
-    let current = machine
-        .read_cstr(offset::<Wg16>(block.newans(), usize::from(ansoff))?)?
+    let current = offset::<A>(block.newans(), usize::from(ansoff))?
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
     let numtpl = block.numtpl();
     let vc = fsd::vfyadn(&mut block, field, numtpl, &answer, &current);
-    machine.write(at, block.as_bytes())?;
+    at.write(call.mem(), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    Ok(Ret::U16(vc as u16))
+    Ok(abi::Ret::Int(A::Int::from(vc as u16)))
+}
+
+/// The dispatch-table entry for [`vfyadn`]. See `shims::call`'s own doc
+/// comment.
+pub fn vfyadn_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    vfyadn(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `fsdcon()`, `FSDBBS.C:91-101`. Turn on the channel settings an FSD session
@@ -1184,23 +1188,21 @@ fn live_form(machine: &Machine, block: &fsd::Scb, form: &fsd::Form) -> Result<fs
 /// If no session has been prepared (`fsdroom`/`fsdapr` first), or the
 /// recorded `amode` is `1`.
 ///
-/// # Did not go generic (Task 5)
-///
-/// [`fsd::fsdlin`] and [`fsd::fsdent`] both take `&mut Scb`, i.e.
-/// `&mut Scb<Wg16>` -- see [`vfyadn`]'s own doc comment for why
-/// (`crate::fsd` is a different, much larger file, out of this task's
-/// scope) and what would need to change to lift it.
-pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+/// Generic (Task 5's follow-up): [`fsd::fsdlin`] and [`fsd::fsdent`] both
+/// take `&mut Scb<A>` now -- see [`vfyadn`]'s own doc comment for how
+/// `crate::fsd` got there. What is left `Wg16`-specific here is nothing of
+/// `crate::fsd`'s; it is [`Users::set_state_mem`]/[`Users::set_substt_mem`],
+/// already generic, and [`crate::shims::text::append_mem`], likewise.
+pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `void fsdego(int (*fldvfy)(int fldno, char *answer), void (*whndun)(short save))`
     // -- FSDBBS.H:262-267. Both are far pointers to module code (4 bytes
     // each, `Cursor::ptr()`) -- this shim only stores them, so their own
     // callback signatures don't matter to how they're read.
-    let mut args = super::args(machine);
-    let fldvfy = args.ptr();
-    let whndun = args.ptr();
-    let chan = host.current_channel(machine)?;
+    let fldvfy = call.ptr();
+    let whndun = call.ptr();
+    let chan = host.current_channel_mem(call.mem())?;
 
-    let (mut block, at) = prepared(machine, host, "fsdego")?;
+    let (mut block, at) = prepared_mem(call.mem(), host, "fsdego")?;
     let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
             "fsdego: no template on record for this channel; FSDBBS.H:245 has fsdroom() first"
@@ -1214,10 +1216,14 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
         )));
     };
 
-    let form = live_form(machine, &block, &form)?;
-    let spec = machine.read_cstr(block.fldspc())?.to_vec();
-    let template = fsd_template(machine, host, mbk, msgno, amode)?;
-    let answers = answer_string::<Wg16>(machine.mem(), block.newans())?;
+    let form = live_form_mem(call.mem(), &block, &form)?;
+    let spec = block
+        .fldspc()
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let template = fsd_template_mem(call.mem(), host, mbk, msgno, amode)?;
+    let answers = answer_string::<A>(call.mem(), block.newans())?;
 
     block.set_fldvfy(fldvfy);
     // `FSDBBS.C:205-212`: the amode fork. `fsdent(0)` for a full-screen
@@ -1226,23 +1232,24 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     // (`FSDBBS.C:227`).
     let full_screen = amode == 1;
     let output = if full_screen {
-        let installed = read_answers(machine, &block)?;
+        let installed = read_answers_mem(call.mem(), &block)?;
         fsd::fsdent(&form, &installed, &mut block, 0)
     } else {
         fsd::fsdlin(&form, &spec, &template, &mut block, &answers)
     };
-    machine.write(at, block.as_bytes())?;
+    at.write(call.mem(), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     host
         .users
-        .set_state(machine, chan, host.fsd_state() as u16)
+        .set_state_mem(call.mem(), chan, host.fsd_state() as u16)
         .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
     host
         .users
-        .set_substt(machine, chan, ENTERING)
+        .set_substt_mem(call.mem(), chan, ENTERING)
         .map_err(|e| ShimError::Failed(format!("fsdego: {e}")))?;
     host.fsd_sessions[chan.index()] = Some(crate::FsdSession {
-        whndun: (whndun != FarPtr::NULL).then_some(whndun),
+        whndun: (!is_null::<A>(whndun)).then_some(whndun),
         save: false,
         full_screen,
     });
@@ -1253,9 +1260,15 @@ pub fn fsdego(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     host.fsd_ain[chan.index()].ainbeg();
 
     fsdcon(host, chan);
-    crate::shims::text::append(machine, host, &output)?;
+    crate::shims::text::append_mem(call.mem(), host, &output)?;
 
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`fsdego`]. See `shims::call`'s own doc
+/// comment.
+pub fn fsdego_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    fsdego(&mut super::call(machine), host).map(Into::into)
 }
 
 /// This channel's -- rather, this host's -- scratch buffer for
@@ -3065,7 +3078,8 @@ mod tests {
         let template = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
         let template = f.machine.read_cstr(template).expect("text").to_vec();
         let form = f.host.forms()[&(0, 0)].clone();
-        let mut expected_scb = fsd::Scb::from_bytes(&[0u8; fsd::FSDSCB as usize]).expect("zeroed");
+        let mut expected_scb =
+            fsd::Scb::<Wg16>::from_bytes(&[0u8; fsd::FSDSCB as usize]).expect("zeroed");
         let expected = fsd::fsdlin(&form, b"NAME", &template, &mut expected_scb, b"NAME=Kaimon\0\0");
 
         let fldvfy = FarPtr {
@@ -3085,7 +3099,7 @@ mod tests {
 
         assert!(matches!(
             f.invoke(
-                fsdego,
+                fsdego_wg16,
                 &[fldvfy.offset, fldvfy.selector, whndun.offset, whndun.selector],
             ),
             Ok(Ret::Void)
@@ -3144,7 +3158,7 @@ mod tests {
              live module record does"
         );
 
-        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
 
         assert_eq!(
             block(&f).crsfld(),
@@ -3158,7 +3172,7 @@ mod tests {
     fn fsdego_before_any_session_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
+        let e = f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
@@ -3177,7 +3191,7 @@ mod tests {
         // amode 1 recorded, but only the amode-0 form was ever compiled.
         f.host.fsdtmp[chan.index()] = Some((mbk, msgno, 1));
 
-        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
+        let e = f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect_err("refused");
         assert!(format!("{e}").contains("no such form"), "{e}");
 
         // And refusing did not half-mutate anything on the way there.
@@ -3994,7 +4008,7 @@ mod tests {
         let chan = f.console();
 
         assert!(matches!(
-            f.invoke(fsdego, &[0, 0, 0, 0]),
+            f.invoke(fsdego_wg16, &[0, 0, 0, 0]),
             Ok(Ret::Void)
         ));
         // `fsdego` prompted field 0 into the print buffer; that is not this
@@ -4053,7 +4067,7 @@ mod tests {
 
         assert!(matches!(
             f.invoke(
-                fsdego,
+                fsdego_wg16,
                 &[0, 0, whndun.offset, whndun.selector],
             ),
             Ok(Ret::Void)
@@ -4103,7 +4117,7 @@ mod tests {
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b");
@@ -4147,7 +4161,7 @@ mod tests {
         let _ = session(&mut f, "NAME RANK", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b[B");
@@ -4188,7 +4202,7 @@ mod tests {
         let _ = session(&mut f, "NAME RANK", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         // From FSDNPT -- the state `fsdlin` leaves a fresh session in.
@@ -4426,7 +4440,7 @@ mod tests {
         let chan = f.console();
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
-        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
 
         let scb = block(&f);
         assert_eq!(scb.state(), fsd::state::FSDAPT, "cursor-browse mode");
@@ -4465,7 +4479,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
-        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
 
         let session = f.host.fsd_sessions[chan.index()].as_ref().expect("a session");
         assert!(!session.full_screen);
@@ -4488,7 +4502,7 @@ mod tests {
         };
         f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
             .expect("painted");
-        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
         let _ = f.host.gsbl_mut().drain_output(chan);
         chan
     }
@@ -4547,7 +4561,7 @@ mod tests {
         };
         f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
             .expect("painted");
-        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
         outprf(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");
         let painted = f.host.gsbl_mut().drain_output(chan);
         assert!(!painted.is_empty(), "the initial paint must have reached the channel");
@@ -4662,7 +4676,7 @@ mod tests {
         let module = f.minimal_module();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
-        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
         let _ = f.host.gsbl_mut().drain_output(chan);
         assert!(
             f.host.gsbl_mut().channel_mut(chan).status.is_empty(),

@@ -1976,7 +1976,7 @@ fn dspans(field: &Field, punctuation: &[u8], answer: &[u8], justfy: i16) -> (Vec
 /// embedded-punctuation cursor. Not modeled: nothing this crate ports before
 /// Task 6 ever reads `ftmptr`, the way [`defntr`]'s own doc comment explains
 /// `altptr`'s identical gap.
-pub fn shoabf(form: &Form, scb: &Scb, justfy: i16) -> Vec<u8> {
+pub fn shoabf<A: Abi>(form: &Form, scb: &Scb<A>, justfy: i16) -> Vec<u8> {
     shoabf_fmtend(form, scb, justfy).0
 }
 
@@ -1986,7 +1986,7 @@ pub fn shoabf(form: &Form, scb: &Scb, justfy: i16) -> Vec<u8> {
 /// offset `altntr` subtracts from `xwidth` to work out how far left to walk
 /// the cursor afterwards (`FSD.C:1421`). Only the ANSI path needs it, which is
 /// why [`shoabf`] itself still throws it away.
-fn shoabf_fmtend(form: &Form, scb: &Scb, justfy: i16) -> (Vec<u8>, i16) {
+fn shoabf_fmtend<A: Abi>(form: &Form, scb: &Scb<A>, justfy: i16) -> (Vec<u8>, i16) {
     let field = &form.fields[usize::from(scb.crsfld())];
     dspans(field, &form.punctuation, scb.ansbuf(), justfy)
 }
@@ -2094,7 +2094,7 @@ pub fn shofld(
 ///
 /// Draws with `fsdscb->crsatr` and `justfy == 1`.
 #[must_use]
-pub fn cursat(form: &Form, answers: &Answers, scb: &mut Scb, fldi: u8) -> Vec<u8> {
+pub fn cursat<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>, fldi: u8) -> Vec<u8> {
     scb.set_crsfld(fldi);
     scb.set_shffld(fldi);
     shofld(form, answers, usize::from(fldi), scb.crsatr(), 1)
@@ -2169,7 +2169,7 @@ pub fn fsddsp(form: &Form, answers: &Answers, template: &[u8]) -> Vec<u8> {
 /// `fldptr > fsdscb->flddat` in the original is a pointer comparison; since
 /// `fldptr == flddat + crsfld`, it is true exactly when `crsfld > 0`, which
 /// is the test this uses.
-pub fn pmtfld(form: &Form, template: &[u8], scb: &Scb) -> Vec<u8> {
+pub fn pmtfld<A: Abi>(form: &Form, template: &[u8], scb: &Scb<A>) -> Vec<u8> {
     let crsfld = usize::from(scb.crsfld());
     let field = &form.fields[crsfld];
     let mut out = Vec::new();
@@ -2221,7 +2221,7 @@ pub fn pmtfld(form: &Form, template: &[u8], scb: &Scb) -> Vec<u8> {
 /// `flddat` fresh rather than trusting a host-side copy -- `fsdord` never
 /// changes a `NAME=`, only what follows it, so a name lookup finds
 /// whatever `fsdord` most recently put there.
-pub fn defntr(form: &Form, spec: &[u8], scb: &mut Scb, answers: &[u8]) {
+pub fn defntr<A: Abi>(form: &Form, spec: &[u8], scb: &mut Scb<A>, answers: &[u8]) {
     let crsfld = usize::from(scb.crsfld());
     let field = &form.fields[crsfld];
     let name = name_of(spec, field);
@@ -2239,7 +2239,7 @@ pub fn defntr(form: &Form, spec: &[u8], scb: &mut Scb, answers: &[u8]) {
 /// `fsdscb->ansptr=fsdscb->anslen`, between `defntr()` and `shoabf(0)` in
 /// the original, is not reproduced -- both are the scb-level fields
 /// [`defntr`]'s own doc comment already declines to model.
-pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers: &[u8]) -> Vec<u8> {
+pub fn fsdlin<A: Abi>(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb<A>, answers: &[u8]) -> Vec<u8> {
     scb.set_flags(0);
     // `movfld(0,1,0)`: a real field number as the last-resort, not the `-1`
     // sentinel -- see `move_field`'s own doc comment for which of its six
@@ -2289,7 +2289,7 @@ pub fn fsdlin(form: &Form, spec: &[u8], template: &[u8], scb: &mut Scb, answers:
 /// model, so it takes the initialiser. That is the same reasoning [`fsdlin`]'s
 /// own call site uses to arrive at `false`.
 #[must_use]
-pub fn fsdent(form: &Form, answers: &Answers, scb: &mut Scb, inifld: i32) -> Vec<u8> {
+pub fn fsdent<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>, inifld: i32) -> Vec<u8> {
     scb.set_flags(entry_flags::FSDANS);
     let resort = usize::try_from(inifld).ok();
     let fldn = move_field(form, inifld, 1, resort, true).unwrap_or(0);
@@ -2325,7 +2325,7 @@ pub fn fsdent(form: &Form, answers: &Answers, scb: &mut Scb, inifld: i32) -> Vec
 /// on one field would survive into the next field's fresh entry, and
 /// [`hdlalt`]'s own space-cycling branch reads `altptr` before anything else
 /// this port ports has a chance to reset it.
-pub fn entprp(scb: &mut Scb) {
+pub fn entprp<A: Abi>(scb: &mut Scb<A>) {
     scb.set_ansbuf(b"");
     // `fsdscb->ansptr=0`, FSD.C:781. `anslen=0` on the line above it is what
     // blanking `ansbuf` already says; the cursor is its own member -- see
@@ -2353,7 +2353,7 @@ pub fn entprp(scb: &mut Scb) {
 /// `compile(, Ascn::Line)` built. It is ported anyway, faithfully, because that is what
 /// `FSD.C` does and because the loop is not dead against a `Form` built by
 /// hand -- which is exactly how this file's own tests exercise it.
-pub fn skppnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn skppnc<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
     if let Some(mbpoff) = field.punctuation_at {
@@ -2387,7 +2387,7 @@ pub fn skppnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// template's own terminator -- the pre-increment `while ((c=*++ftmptr)...)`
 /// at `FSD.C:1309-1311`, the same forward-walk idiom [`addprt`]'s own doc
 /// comment already names.
-pub fn skcpnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn skcpnc<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
     let ansptr = usize::from(scb.ansptr());
@@ -2436,7 +2436,7 @@ pub fn skcpnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// anything, and `fsdscb->ansptr=fsdscb->anslen` (this port's
 /// `scb.set_ansptr(scb.ansbuf().len())`) always runs, even when `k` was 0
 /// and [`ansmov`] silently dropped the move.
-pub fn skepnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn skepnc<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let anslen = scb.ansbuf().len() as i16;
     let k: i16 = if field.punctuation_at.is_some() {
@@ -2504,7 +2504,7 @@ pub fn skepnc(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// sits below every real heap address -- the subtraction is done as `i32`
 /// and clamped at zero to reproduce the same "erase nothing" outcome by
 /// construction rather than by coincidence of address space.
-pub fn unentr(form: &Form, scb: &Scb) -> Vec<u8> {
+pub fn unentr<A: Abi>(form: &Form, scb: &Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let n = if let Some(mbpoff) = field.punctuation_at {
         (i32::from(scb.ftmptr()) - i32::from(mbpoff)).max(0) as usize
@@ -2569,7 +2569,7 @@ pub fn unentr(form: &Form, scb: &Scb) -> Vec<u8> {
 /// (rather than re-reading `scb.crsfld()`, which [`cursat`] just moved) says
 /// the same thing without relying on a mutation [`cursat`] performed a line
 /// above.
-fn hopfld(form: &Form, answers: &Answers, scb: &mut Scb, fldn: i32, finc: i32) -> Vec<u8> {
+fn hopfld<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>, fldn: i32, finc: i32) -> Vec<u8> {
     let mut out = Vec::new();
     let Some(fldi) = move_field(form, fldn, finc, None, true) else {
         return out;
@@ -2619,7 +2619,7 @@ fn hopfld(form: &Form, answers: &Answers, scb: &mut Scb, fldn: i32, finc: i32) -
 /// `if`/`else` and the `skppnc()` call in the original, is not reproduced:
 /// both are the scb-level fields this module derives from `ansbuf` itself
 /// rather than storing (see [`entprp`]'s doc comment).
-pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn bgnter<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = if scb.flags() & entry_flags::FSDANS == 0 {
         unentr(form, scb)
@@ -2673,7 +2673,7 @@ pub fn bgnter(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// and the two are the same thing, which is why Stage 4 could substitute
 /// `ansbuf().len()` for `ansptr` and why ANSI mode cannot -- see
 /// [`scb::ANSPTR`].
-pub fn addprt(form: &Form, scb: &mut Scb, c: u8) -> Vec<u8> {
+pub fn addprt<A: Abi>(form: &Form, scb: &mut Scb<A>, c: u8) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
     let ansptr = usize::from(scb.ansptr());
@@ -2749,7 +2749,7 @@ pub fn addprt(form: &Form, scb: &mut Scb, c: u8) -> Vec<u8> {
 /// real call sites (`FSD.C:1858`, `:1861`) invoke `hdlnbs();` as a bare
 /// statement. This port has nothing to hand the value to and does not
 /// invent a use for it.
-pub fn hdlnbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn hdlnbs<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     scb.set_ansptr(scb.ansptr() - 1);
     let mut out = Vec::new();
@@ -2814,7 +2814,7 @@ pub enum Hdlprt {
 /// `FSD.C:1566`). `false` means a MULTICHOICE field's own committed choice,
 /// or a `#`/`$` field's, is not undone by a bare backspace; `altptr` is left
 /// alone.
-pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
+pub fn bstalt<A: Abi>(field: &Field, scb: &mut Scb<A>) -> bool {
     if scb.altptr().is_some() {
         if field.flags & flags::MULTICHOICE != 0 || field.kind != b'?' {
             return false;
@@ -2860,7 +2860,7 @@ pub fn bstalt(field: &Field, scb: &mut Scb) -> bool {
 /// cursor at the end of the answer, so dropping the last byte and stepping
 /// `ansptr` back are the same movement. (ANSI mode's backspace is `hdlnbs`
 /// plus `dprest`, which can act mid-field; it is not this function.)
-pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
+pub fn hdlcbs<A: Abi>(form: &Form, scb: &mut Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let mut out = Vec::new();
     if scb.ansptr() > 0 && bstalt(field, scb) {
@@ -2949,7 +2949,7 @@ pub fn hdlcbs(form: &Form, scb: &mut Scb) -> Vec<u8> {
 /// only that a byte lives there -- and this backs the cursor up one column
 /// and overwrites that stray `*` with a real space, so deleting a character
 /// from a password field does not leave a ghost asterisk behind.
-pub fn dprest(form: &Form, scb: &Scb) -> Vec<u8> {
+pub fn dprest<A: Abi>(form: &Form, scb: &Scb<A>) -> Vec<u8> {
     let field = &form.fields[usize::from(scb.crsfld())];
     let ansbuf = scb.ansbuf();
     let n = ansbuf.len();
@@ -3067,7 +3067,7 @@ fn next_alternate(spec: &[u8], field: &Field, at: u16) -> Option<u16> {
 /// so by the time this function would test it, the answer is already known.
 /// Calling [`shoabf`] with `justfy=0` unconditionally is that assertion's
 /// consequence made explicit rather than a second, redundant check.
-fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
+fn altntr<A: Abi>(form: &Form, scb: &mut Scb<A>, at: u16, spelling: &[u8]) -> Vec<u8> {
     scb.set_altptr(Some(at));
     let mut out = bgnter(form, scb);
     scb.set_ansbuf(spelling);
@@ -3126,7 +3126,7 @@ fn altntr(form: &Form, scb: &mut Scb, at: u16, spelling: &[u8]) -> Vec<u8> {
 /// A space that is neither (not MULTICHOICE, or `FSDQOT` already set) falls
 /// through both branches to [`Hdlprt::Ignore`], matching the original's own
 /// fall-through to its final `return(0);`.
-pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
+pub fn hdlalt<A: Abi>(form: &Form, spec: &[u8], scb: &mut Scb<A>, c: u8) -> (Hdlprt, Vec<u8>) {
     let field = &form.fields[usize::from(scb.crsfld())];
     if field.flags & flags::ALTERNATES == 0 {
         return (Hdlprt::Ignore, Vec::new());
@@ -3250,7 +3250,7 @@ pub fn hdlalt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
 /// crate's acceptance test; it is real regardless, reachable through this
 /// port's own `hdlalt`/`hdlprt` on any `#`/`$` ALT= field a specification
 /// could name.)
-pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8>) {
+pub fn hdlprt<A: Abi>(form: &Form, spec: &[u8], scb: &mut Scb<A>, c: u8) -> (Hdlprt, Vec<u8>) {
     let field = &form.fields[usize::from(scb.crsfld())];
     match field.kind {
         b'Y' | b'?' => {
@@ -3340,7 +3340,7 @@ pub fn hdlprt(form: &Form, spec: &[u8], scb: &mut Scb, c: u8) -> (Hdlprt, Vec<u8
 ///
 /// The cursor-goto for the field it moved to, on the ANSI path, and nothing
 /// at all off it.
-pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) -> Vec<u8> {
+pub fn xitfld<A: Abi>(form: &Form, scb: &mut Scb<A>, finc: i32) -> Vec<u8> {
     let mut out = Vec::new();
     scb.set_entfld(scb.crsfld());
     let wrap = scb.flags() & entry_flags::FSDANS != 0;
@@ -3476,7 +3476,7 @@ pub fn xitfld(form: &Form, scb: &mut Scb, finc: i32) -> Vec<u8> {
 /// public dispatcher this is a private arm of: by the time this runs,
 /// `fsdinc` has already confirmed `scb.state()` is `FSDNPT` or `FSDNEN`.
 /// Ctrl-L does *not* panic -- see above.
-fn fsdinc_line(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
+fn fsdinc_line<A: Abi>(form: &Form, spec: &[u8], scb: &mut Scb<A>, key: i16) -> Vec<u8> {
     let mut out = Vec::new();
 
     // Falls through to FSDNEN's own switch below, with `state` left at
@@ -3635,7 +3635,7 @@ fn fsdinc_line(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
 ///   comment on why this stays a no-op rather than a panic.
 /// - Anything else (an unrecognised special key, `>= 256`) does nothing,
 ///   matching the C's own `default:` guard failing silently.
-fn fsdinc_apt(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i16) -> Vec<u8> {
+fn fsdinc_apt<A: Abi>(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb<A>, key: i16) -> Vec<u8> {
     let mut out = Vec::new();
     match key {
         ain::CRSRUP | ain::BAKTAB | 0x15 => {
@@ -3859,7 +3859,7 @@ fn fsdinc_apt(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i
 /// `fsdqdp()` sets a redisplay flag this host has no reader for. See
 /// [`fsdinc_line`]'s own doc comment for the full reasoning; it applies
 /// here unchanged.
-fn fsdinc_aen(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
+fn fsdinc_aen<A: Abi>(form: &Form, spec: &[u8], scb: &mut Scb<A>, key: i16) -> Vec<u8> {
     let mut out = Vec::new();
     match key {
         ain::CRSRUP | ain::BAKTAB | 0x15 => {
@@ -4112,7 +4112,7 @@ fn fsdinc_aen(form: &Form, spec: &[u8], scb: &mut Scb, key: i16) -> Vec<u8> {
 /// `fsdprc` catching up) are dropped per the design doc's "Dropped" list
 /// and are never valid here. Ctrl-L does *not* panic -- see
 /// [`fsdinc_line`]'s own doc comment.
-pub fn fsdinc(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb, key: i16) -> Vec<u8> {
+pub fn fsdinc<A: Abi>(form: &Form, spec: &[u8], answers: &Answers, scb: &mut Scb<A>, key: i16) -> Vec<u8> {
     assert!(
         matches!(
             scb.state(),
@@ -5072,7 +5072,7 @@ pub mod verify {
 /// nowhere to keep (`announce`'s own doc comment already treats `fsdemg`
 /// this way); [`verify::VFYCHK`] is returned regardless of whether a real
 /// session would have had a message to go with it.
-pub fn vfyadn(scb: &mut Scb, entfld: u8, numtpl: u16, answer: &[u8], current: &[u8]) -> i16 {
+pub fn vfyadn<A: Abi>(scb: &mut Scb<A>, entfld: u8, numtpl: u16, answer: &[u8], current: &[u8]) -> i16 {
     const TAB: u16 = 9;
     const ESC: u16 = 0x1b;
 
@@ -5240,7 +5240,7 @@ fn alarm(beep: bool) -> Vec<u8> {
 /// template width.** `FSD.C:1079-1081`: `if (strlen(fsdemg) > hlplen)
 /// fsdemg[hlplen]='\0';` -- a message longer than the help area is cut, not
 /// wrapped or refused.
-fn announce(form: &Form, scb: &mut Scb, message: &[u8], beep: bool) -> Vec<u8> {
+fn announce<A: Abi>(form: &Form, scb: &mut Scb<A>, message: &[u8], beep: bool) -> Vec<u8> {
     if scb.flags() & entry_flags::FSDANS != 0 {
         let hlplen = usize::from(scb.hlplen());
         if hlplen > 0 {
@@ -5268,7 +5268,7 @@ fn announce(form: &Form, scb: &mut Scb, message: &[u8], beep: bool) -> Vec<u8> {
 /// `Machine`/`Host` territory no pure function can reach, the same gap
 /// [`xitfld`]'s own doc comment already names for its own dropped
 /// `fsdnfy()` call.
-fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
+fn xitfsd<A: Abi>(scb: &mut Scb<A>, exit_state: u8) -> Vec<u8> {
     scb.set_state(exit_state);
     b"\r\n".to_vec()
 }
@@ -5402,11 +5402,11 @@ fn xitfsd(scb: &mut Scb, exit_state: u8) -> Vec<u8> {
 ///
 /// If `move_field` somehow answers a field outside `[0, numtpl)` despite
 /// the invariant the "no wraparound" section above argues for.
-pub fn fsdprc(
+pub fn fsdprc<A: Abi>(
     form: &Form,
     spec: &[u8],
     template: &[u8],
-    scb: &mut Scb,
+    scb: &mut Scb<A>,
     answers: &mut Answers,
     vc: i16,
     bufptr: &[u8],
@@ -5642,7 +5642,7 @@ pub fn fsdprc(
 /// falls through having already cleared both flags and done nothing else,
 /// exactly matching the C's own no-`default:` fallthrough rather than
 /// refusing a state this function has no particular argument against.
-pub fn fsdqoe(form: &Form, answers: &Answers, scb: &mut Scb) -> Vec<u8> {
+pub fn fsdqoe<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>) -> Vec<u8> {
     scb.set_flags(scb.flags() & !entry_flags::FSDQOT);
     let mut out = Vec::new();
     if scb.flags() & entry_flags::FSDSHN != 0 {
