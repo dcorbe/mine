@@ -71,6 +71,7 @@ use mbbs16::{Machine, Ret};
 
 use super::ShimError;
 use crate::Host;
+use crate::abi::{self, Abi, Call};
 
 /// The answer both routines give: yes.
 ///
@@ -96,16 +97,24 @@ const YES: u16 = 1;
 /// value this host can check, so it is the only thing standing between a
 /// mis-declared `Cleans` -- or an argument read at the wrong stack word -- and
 /// a shim that cheerfully answers yes forever to a question it misread.
-pub fn otstcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let unum = args.int() as i16;
-    let _amt = args.long();
-    let _real = args.int() as i16;
+///
+/// Generic (Task 5): no memory is touched, so this is the plain
+/// `Call<A>`/`Host<A>` shape with nothing to reborrow.
+pub fn otstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let _amt = call.long();
+    let _real = call.int();
     host.users()
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("otstcrd({unum}): there is no such channel")))?;
-    Ok(Ret::U16(YES))
+    Ok(abi::Ret::Int(A::Int::from(YES)))
+}
+
+/// The dispatch-table entry for [`otstcrd`]. See `shims::call`'s own doc
+/// comment.
+pub fn otstcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    otstcrd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int odedcrd(int unum, long amt, int real, int asmuch)` -- take `amt`
@@ -122,17 +131,24 @@ pub fn otstcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// # Errors
 ///
 /// If `unum` names no channel; see [`otstcrd`].
-pub fn odedcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let unum = args.int() as i16;
-    let _amt = args.long() as i32;
-    let _real = args.int() as i16;
-    let _asmuch = args.int() as i16;
+///
+/// Generic (Task 5): same shape as [`otstcrd`].
+pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let _amt = call.long();
+    let _real = call.int();
+    let _asmuch = call.int();
     host.users()
         .terms()
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("odedcrd({unum}): there is no such channel")))?;
-    Ok(Ret::U16(YES))
+    Ok(abi::Ret::Int(A::Int::from(YES)))
+}
+
+/// The dispatch-table entry for [`odedcrd`]. See `shims::call`'s own doc
+/// comment.
+pub fn odedcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    odedcrd(&mut super::call(machine), host).map(Into::into)
 }
 
 #[cfg(test)]
@@ -147,13 +163,13 @@ mod tests {
         let mut f = Fixture::new();
         // otstcrd(0, 500, real=0) -- a `long` is two words, low half first.
         assert_eq!(
-            f.invoke(otstcrd, &[0, 500, 0, 0]).expect("otstcrd"),
+            f.invoke(otstcrd_wg16, &[0, 500, 0, 0]).expect("otstcrd"),
             Ret::U16(1),
             "otstcrd must be non-zero or the module refuses to let the player in"
         );
         // odedcrd(0, 500, real=1, asmuch=1)
         assert_eq!(
-            f.invoke(odedcrd, &[0, 500, 0, 1, 1]).expect("odedcrd"),
+            f.invoke(odedcrd_wg16, &[0, 500, 0, 1, 1]).expect("odedcrd"),
             Ret::U16(1),
             "odedcrd's zero is what ejects a player mid-game"
         );
@@ -174,13 +190,13 @@ mod tests {
         for (low, high) in amounts {
             for real in [0, 1] {
                 assert_eq!(
-                    f.invoke(otstcrd, &[0, low, high, real]).expect("otstcrd"),
+                    f.invoke(otstcrd_wg16, &[0, low, high, real]).expect("otstcrd"),
                     Ret::U16(1),
                     "otstcrd({low:#x}:{high:#x}, real={real})"
                 );
                 for asmuch in [0, 1] {
                     assert_eq!(
-                        f.invoke(odedcrd, &[0, low, high, real, asmuch])
+                        f.invoke(odedcrd_wg16, &[0, low, high, real, asmuch])
                             .expect("odedcrd"),
                         Ret::U16(1),
                         "odedcrd({low:#x}:{high:#x}, real={real}, asmuch={asmuch})"
@@ -200,9 +216,9 @@ mod tests {
     fn a_channel_that_does_not_exist_stops_the_module() {
         let mut f = Fixture::new();
         let past = f.host.users().terms().count();
-        assert!(f.invoke(otstcrd, &[past, 500, 0, 0]).is_err());
-        assert!(f.invoke(odedcrd, &[past, 500, 0, 1, 1]).is_err());
-        assert!(f.invoke(otstcrd, &[-1i16 as u16, 500, 0, 0]).is_err());
-        assert!(f.invoke(odedcrd, &[-1i16 as u16, 500, 0, 1, 1]).is_err());
+        assert!(f.invoke(otstcrd_wg16, &[past, 500, 0, 0]).is_err());
+        assert!(f.invoke(odedcrd_wg16, &[past, 500, 0, 1, 1]).is_err());
+        assert!(f.invoke(otstcrd_wg16, &[-1i16 as u16, 500, 0, 0]).is_err());
+        assert!(f.invoke(odedcrd_wg16, &[-1i16 as u16, 500, 0, 1, 1]).is_err());
     }
 }

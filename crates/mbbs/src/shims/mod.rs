@@ -314,8 +314,8 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     // `re/ne_arity.py` reads `add sp,8` after all three `otstcrd` sites and
     // `add sp,0Ah` after all three `odedcrd` sites, matching `USRACC.H`'s
     // `(int, long, int)` and `(int, long, int, int)` exactly.
-    (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller),
-    (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller),
+    (MAJORBBS, "otstcrd", credits::otstcrd_wg16, Cleans::Caller),
+    (MAJORBBS, "odedcrd", credits::odedcrd_wg16, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real one
     // did. These four pop their own arguments -- see `runtime`.
     (
