@@ -225,28 +225,31 @@ const ROUTINES: &[(&str, &str, Shim, Cleans)] = &[
     (MAJORBBS, "memcpy", memory::memcpy_wg16, Cleans::Caller),
     (MAJORBBS, "memcmp", memory::memcmp_wg16, Cleans::Caller),
     // Btrieve: opening a module's data files, and which one is current.
-    (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
-    (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),
-    (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller),
-    (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller),
-    (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller),
+    // `_wg16`: all seventeen take a `Call<Wg16>` now (see `shims::btrieve`'s
+    // own doc comment for why they stop there rather than going on to
+    // `fn foo<A: Abi>` -- the engine behind them is concrete).
+    (MAJORBBS, "omdbtv", btrieve::omdbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "opnbtv", btrieve::opnbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "setbtv", btrieve::setbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "rstbtv", btrieve::rstbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "cntrbtv", btrieve::cntrbtv_wg16, Cleans::Caller),
     // Btrieve: reading records.
-    (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller),
-    (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller),
-    (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller),
-    (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller),
-    (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
-    (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
-    (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
+    (MAJORBBS, "qrybtv", btrieve::qrybtv_wg16, Cleans::Caller),
+    (MAJORBBS, "qnpbtv", btrieve::qnpbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "obtbtvl", btrieve::obtbtvl_wg16, Cleans::Caller),
+    (MAJORBBS, "stpbtvl", btrieve::stpbtvl_wg16, Cleans::Caller),
+    (MAJORBBS, "absbtv", btrieve::absbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "aabbtv", btrieve::aabbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "gabbtvl", btrieve::gabbtvl_wg16, Cleans::Caller),
     // Btrieve: the write family. `dinsbtv` and `dupdbtv` write; `invbtv` and
     // `delbtv` reproduce what `PLBTVSTF.C` did with no file current, and
     // refuse when there is one; `clsbtv` flushes the index and gives four
     // allocations back.
-    (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
-    (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
-    (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
-    (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
-    (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
+    (MAJORBBS, "dinsbtv", btrieve::dinsbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "dupdbtv", btrieve::dupdbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "invbtv", btrieve::invbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "delbtv", btrieve::delbtv_wg16, Cleans::Caller),
+    (MAJORBBS, "clsbtv", btrieve::clsbtv_wg16, Cleans::Caller),
     // Streams: the module's own files, read and written. All nine are
     // generic now -- `fprintf` converted once `crate::fmt::format_call`
     // existed for it to route through (see `shims::stream::fprintf`'s own

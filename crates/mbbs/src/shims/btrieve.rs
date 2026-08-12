@@ -96,10 +96,48 @@
 //! [`restore`](crate::btrieve::Btrieve::restore) -- the original's answer there
 //! is not a lie, it is a documented limit, and reproducing it is what keeps a
 //! module that was working as designed working.
+//!
+//! # Task 5: `Call<Wg16>`, not `Call<A>`
+//!
+//! Every routine below now takes a [`Call<Wg16>`] rather than a raw
+//! `&mut Machine`, matching the shape the rest of the shim layer converted
+//! to. **It stops there rather than going on to `fn foo<A: Abi>(...)`.**
+//! `Host<A>::btrieve` is `crate::btrieve::Btrieve` -- concrete, not
+//! `Btrieve<A>` -- keyed throughout by `mbbs16::FarPtr` and, for `open`/
+//! `close`, taking a real `&mut mbbs16::Machine` directly
+//! (`crates/mbbs/src/btrieve.rs`'s own doc comment: "stays concrete: it is
+//! out of scope here"). A generic body would need to hand that engine an
+//! `A::Ptr` and an `&mut A::Cpu` for an arbitrary `A`, and there is no
+//! generic way to turn either into the `FarPtr`/`Machine` the engine
+//! actually wants -- `Wg32`'s pointer is a flat `u32`, not a segment:offset,
+//! and `Wg32Cpu` holds an `mbbs32::Machine`, not an `mbbs16::Machine`. So
+//! genuine `A`-genericity here is blocked on generifying the Btrieve engine
+//! itself, which is a separate, larger piece of work this task does not do.
+//!
+//! What this conversion buys anyway: arguments are read through
+//! [`Call::ptr`]/[`Call::int`]/[`Call::long`] instead of a word-indexed
+//! `arg_far`/`arg_u16`, and memory is reached through [`Call::mem`]
+//! (`mbbs16::Segments`, the same type `Machine`'s own facade delegates to)
+//! rather than a bare `&mut Machine` -- everywhere except the two calls that
+//! must reach the concrete engine (`opnbtv`'s `btrieve.open`, `clsbtv`'s
+//! `btrieve.close`), which take `call.cpu` -- `Call`'s public field, typed
+//! `&mut mbbs16::Machine` because `Wg16::Cpu = mbbs16::Machine` -- directly.
+//! Each routine keeps its C name for this Wg16-concrete core and gets a
+//! `_wg16`-suffixed sibling built from `shims::call(machine)`, the same
+//! bridge convention every generic-shaped file already uses (see
+//! `shims::mod`'s `call` doc comment); the only difference is that here the
+//! core itself, not just the bridge, is pinned to one `Abi`.
+//!
+//! `crates/mbbs/tests/no_direct_farptr.rs`'s `ALLOWED` list keeps this file
+//! (and `crates/mbbs/src/btrieve.rs`) regardless of this conversion, for
+//! exactly the reason above: `FarPtr` is still this file's block identity,
+//! key value and record-pointer type throughout, because the engine behind
+//! it still is one.
 
 use mbbs16::{FarPtr, Machine, Ret};
 
 use crate::Host;
+use crate::abi::{self, Call, Wg16};
 use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
 
@@ -121,16 +159,21 @@ const MODES: [i16; 5] = [0, -1, -2, -3, -4];
 /// given and passed it to Btrieve as an open flag; here it would be a number
 /// kept and never used, which is the shape of a value that turns out to have
 /// meant something.
-pub fn omdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let mode = args.int() as i16;
+pub fn omdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let mode = call.int() as i16;
     if !MODES.contains(&mode) {
         return Err(ShimError::Failed(format!(
             "omdbtv({mode}), which is none of the five modes BTVSTF.H defines"
         )));
     }
     host.btrieve.set_mode(mode);
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`omdbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn omdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    omdbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `BTVFILE *opnbtv(char *filnam, int maxlen)` -- open a Btrieve file.
@@ -160,11 +203,10 @@ pub fn omdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// have fallen off the bottom before the module has finished opening them. The
 /// real host did that too, and a host that had refused on overflow instead
 /// would have stopped MajorMUD at its eleventh data file.
-pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let filnam = args.ptr();
-    let maxlen = args.int();
-    let named = String::from_utf8_lossy(machine.read_cstr(filnam)?).into_owned();
+pub fn opnbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let filnam = call.ptr();
+    let maxlen = call.int();
+    let named = String::from_utf8_lossy(call.mem().read_cstr(filnam)?).into_owned();
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
 
     let path = host.btrieve_file(&name).map_err(ShimError::Failed)?;
@@ -218,16 +260,22 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     let block = {
         let Host { btrieve, heap, .. } = host;
         btrieve
-            .open(machine, heap, &name, &path, geometry, maxlen)
+            .open(call.cpu, heap, &name, &path, geometry, maxlen)
             .map_err(|e| ShimError::Failed(format!("opnbtv({name}): {e}")))?
     };
 
     // `bb = the new block` and *then* `setbtv(bb)`, in that order, because that
     // is the order `PLBTVSTF.C:145` and `:167` do it in and the order is the
     // whole of the difference: it is what makes the open push itself.
-    set_current(machine, host, block)?;
-    push(machine, host, block)?;
-    Ok(Ret::Far(block))
+    set_current(call, host, block)?;
+    push(call, host, block)?;
+    Ok(abi::Ret::Ptr(block))
+}
+
+/// The dispatch-table entry for [`opnbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn opnbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    opnbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void setbtv(struct btvblk *bbptr)` -- work on this file until told
@@ -241,14 +289,19 @@ pub fn opnbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// checks for it everywhere. A pointer that is neither null nor a file this
 /// host opened is refused: the real host would have handed it to Btrieve as a
 /// position block and read 128 bytes of whatever it was.
-pub fn setbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let block = args.ptr();
+pub fn setbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let block = call.ptr();
     if block != Btrieve::null() {
         host.btrieve.block(block).map_err(ShimError::Failed)?;
     }
-    push(machine, host, block)?;
-    Ok(Ret::Void)
+    push(call, host, block)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`setbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn setbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    setbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void rstbtv(void)` -- go back to the file that was current before.
@@ -256,7 +309,7 @@ pub fn setbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// Underflow is not an error here, which is the one place this crate follows
 /// the original rather than refusing. See
 /// [`Btrieve::restore`](crate::btrieve::Btrieve::restore) for why.
-pub fn rstbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn rstbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     let (restored, empty) = host.btrieve.restore();
     if empty {
         host.note(
@@ -266,8 +319,14 @@ pub fn rstbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
                 .to_owned(),
         );
     }
-    set_current(machine, host, restored)?;
-    Ok(Ret::Void)
+    set_current(call, host, restored)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`rstbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn rstbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    rstbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long cntrbtv(void)` -- how many records the current file holds.
@@ -293,8 +352,8 @@ pub fn rstbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// TSR holding a position**; it reads the file itself, so "which file" comes
 /// from `bb` and from nowhere else. With none current the question has no
 /// referent, and 0 would be a count of a file this host cannot name.
-pub fn cntrbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let block = positioned(machine, host, "cntrbtv")?.ok_or_else(|| {
+pub fn cntrbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let block = positioned(call, host, "cntrbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "cntrbtv with no Btrieve file current -- PLBTVSTF.C:681 would have \
              counted whatever file Btrieve was last positioned on, and this \
@@ -303,7 +362,13 @@ pub fn cntrbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         )
     })?;
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    Ok(Ret::U32(file.geometry().records))
+    Ok(abi::Ret::Long(file.geometry().records))
+}
+
+/// The dispatch-table entry for [`cntrbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn cntrbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    cntrbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void invbtv(void *recptr, int length)` -- insert a new record.
@@ -327,16 +392,22 @@ pub fn cntrbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// a Btrieve file. That is a refusal, and it is the refusal the whole design
 /// exists for: a module told its insert worked and then finding the character
 /// gone is the failure nothing else catches.
-pub fn invbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let Some(block) = positioned(machine, host, "invbtv")? else {
+pub fn invbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let Some(block) = positioned(call, host, "invbtv")? else {
         note_no_file(host, "invbtv");
-        return Ok(Ret::Void);
+        return Ok(abi::Ret::Void);
     };
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     Err(ShimError::Failed(format!(
         "invbtv into {}, and nothing in this host writes to a Btrieve file",
         file.name()
     )))
+}
+
+/// The dispatch-table entry for [`invbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn invbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    invbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void delbtv(void)` -- delete the record the file is positioned on.
@@ -352,16 +423,22 @@ pub fn invbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// Answers nothing with no file current, refuses with one, for exactly the
 /// reasons in [`invbtv`].
-pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let Some(block) = positioned(machine, host, "delbtv")? else {
+pub fn delbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let Some(block) = positioned(call, host, "delbtv")? else {
         note_no_file(host, "delbtv");
-        return Ok(Ret::Void);
+        return Ok(abi::Ret::Void);
     };
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     Err(ShimError::Failed(format!(
         "delbtv from {}, and nothing in this host writes to a Btrieve file",
         file.name()
     )))
+}
+
+/// The dispatch-table entry for [`delbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn delbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    delbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int dinsbtv(void *recptr)` -- insert a new record into the current file.
@@ -395,10 +472,9 @@ pub fn delbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// re-derives the same answer Btrieve's TSR would have: it has no TSR to ask,
 /// so it asks whether a record with this value is already in that key's
 /// order.
-pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let recptr = args.ptr();
-    let block = positioned(machine, host, "dinsbtv")?.ok_or_else(|| {
+pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let recptr = call.ptr();
+    let block = positioned(call, host, "dinsbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "dinsbtv with no Btrieve file current -- PLBTVSTF.C:598 has no \
              guard and reads bb->reclen before checking anything, so the \
@@ -413,12 +489,12 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         true => file.data(),
         false => recptr,
     };
-    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+    let bytes = call.mem().resolve(recptr, usize::from(length))?.to_vec();
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
         note_duplicate_key(host, "dinsbtv", &name, key, &value);
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -441,7 +517,13 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     };
     file.seek_to(cursor);
 
-    Ok(Ret::U16(1))
+    Ok(abi::Ret::Int(1))
+}
+
+/// The dispatch-table entry for [`dinsbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn dinsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    dinsbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int dupdbtv(void *recptr)` -- update the record the file is positioned
@@ -509,10 +591,9 @@ pub fn dinsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// search result wearing the clothes of a fact. The corrected shape: name
 /// the tool and what it found (or didn't), rather than asserting the thing
 /// itself.
-pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let recptr = args.ptr();
-    let block = positioned(machine, host, "dupdbtv")?.ok_or_else(|| {
+pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let recptr = call.ptr();
+    let block = positioned(call, host, "dupdbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "dupdbtv with no Btrieve file current -- PLBTVSTF.C:550 has no \
              guard and reads bb->reclen before checking anything, so the \
@@ -538,12 +619,12 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         true => file.data(),
         false => recptr,
     };
-    let bytes = machine.resolve(recptr, usize::from(length))?.to_vec();
+    let bytes = call.mem().resolve(recptr, usize::from(length))?.to_vec();
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
         note_duplicate_key(host, "dupdbtv", &name, key, &value);
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -577,7 +658,13 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         file.seek_to(cursor);
     }
 
-    Ok(Ret::U16(1))
+    Ok(abi::Ret::Int(1))
+}
+
+/// The dispatch-table entry for [`dupdbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn dupdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    dupdbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
@@ -650,19 +737,24 @@ pub fn dupdbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// all four came off the module's heap in [`opnbtv`], and all four go back
 /// here rather than leaking a tiled descriptor per close, which would fail a
 /// long-running board rather than this one.
-pub fn clsbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let bbp = args.ptr();
+pub fn clsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let bbp = call.ptr();
 
     // Unconditional, and before anything below decides whether there is a
     // file to close -- see this routine's doc comment.
-    set_current(machine, host, bbp)?;
+    set_current(call, host, bbp)?;
 
     let Host { btrieve, heap, .. } = host;
     btrieve
-        .close(machine, heap, bbp)
+        .close(call.cpu, heap, bbp)
         .map_err(|e| ShimError::Failed(format!("clsbtv: {e}")))?;
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`clsbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn clsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    clsbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Whether `bytes` collides with an existing record on a key that does not
@@ -810,18 +902,17 @@ impl Op {
 /// **With no file current it is the same zero**, per the guard at
 /// `PLBTVSTF.C:262`. That indistinguishability is the point: a module could
 /// never tell "no such record" from "no such file" and none was written to.
-pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn qrybtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     // The guard is the first thing `PLBTVSTF.C:262` does -- before the key, the
     // key number or the option are looked at -- so it is the first thing here.
-    let Some(block) = positioned(machine, host, "qrybtv")? else {
+    let Some(block) = positioned(call, host, "qrybtv")? else {
         note_no_file(host, "qrybtv");
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     };
 
-    let mut args = super::args(machine);
-    let value = args.ptr();
-    let keynum = args.int() as i16;
-    let opt = args.int() as i16;
+    let value = call.ptr();
+    let keynum = call.int() as i16;
+    let opt = call.int() as i16;
 
     // `qrybtv` takes the *get key* codes, fifty above the acquire family's.
     let op = Op::of(opt - 50).ok_or_else(|| {
@@ -829,8 +920,8 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             "qrybtv with option {opt}, which is none of the nine BTVSTF.H's q-macros produce"
         ))
     })?;
-    Ok(Ret::U16(u16::from(locate(
-        machine,
+    Ok(abi::Ret::Int(u16::from(locate(
+        call,
         host,
         Request {
             who: "qrybtv",
@@ -847,6 +938,12 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     )?)))
 }
 
+/// The dispatch-table entry for [`qrybtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn qrybtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    qrybtv(&mut super::call(machine), host).map(Into::into)
+}
+
 /// `int qnpbtv(int getopt)` -- step in key order, *and* read the record.
 ///
 /// Despite living with the query family, this one fetches: `PLBTVSTF.C:296`
@@ -856,16 +953,15 @@ pub fn qrybtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 ///
 /// The pattern the two make together is what MajorMUD uses them for: `qeqbtv`
 /// to find where a group of records starts, then `qnxbtv` along it.
-pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     // `PLBTVSTF.C:287`, and it has to be before `bb->data` is read for the same
     // reason the C puts it there: there is no `bb->data` to read.
-    let Some(block) = positioned(machine, host, "qnpbtv")? else {
+    let Some(block) = positioned(call, host, "qnpbtv")? else {
         note_no_file(host, "qnpbtv");
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     };
 
-    let mut args = super::args(machine);
-    let opt = args.int() as i16;
+    let opt = call.int() as i16;
     let op = Op::of(opt - 50).ok_or_else(|| {
         ShimError::Failed(format!("qnpbtv with option {opt}, which is not a get operation"))
     })?;
@@ -873,8 +969,8 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
     // `bb->lastkn`: which key the last positioning used. Passed as -1 so that
     // `locate` reads it back rather than changing it, exactly as the C does.
     let into = data_buffer(host, block)?;
-    Ok(Ret::U16(u16::from(locate(
-        machine,
+    Ok(abi::Ret::Int(u16::from(locate(
+        call,
         host,
         Request {
             who: "qnpbtv",
@@ -887,6 +983,12 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             lock: 0,
         },
     )?)))
+}
+
+/// The dispatch-table entry for [`qnpbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn qnpbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    qnpbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int obtbtvl(void *recptr, void *key, int keynum, int obtopt, int loktyp)`
@@ -912,21 +1014,20 @@ pub fn qnpbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// the one initialisation actually reaches. Call 128 of `_INIT__WCCMMUD` is an
 /// `obtbtvl` after a `setbtv(NULL)`, and it is entitled to be told there is no
 /// record rather than stopped.
-pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn obtbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     // `:357` guards, and only then does `:360` default `recptr` to `bb->data`.
     // The order is the whole of it: `bb->data` cannot be read from a null `bb`,
     // so a guard placed after that default never runs.
-    let Some(block) = positioned(machine, host, "obtbtvl")? else {
+    let Some(block) = positioned(call, host, "obtbtvl")? else {
         note_no_file(host, "obtbtvl");
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     };
 
-    let mut args = super::args(machine);
-    let into = args.ptr();
-    let value = args.ptr();
-    let keynum = args.int() as i16;
-    let opt = args.int() as i16;
-    let lock = args.int() as i16;
+    let into = call.ptr();
+    let value = call.ptr();
+    let keynum = call.int() as i16;
+    let opt = call.int() as i16;
+    let lock = call.int() as i16;
 
     let op = Op::of(opt).ok_or_else(|| {
         ShimError::Failed(format!(
@@ -937,8 +1038,8 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         true => data_buffer(host, block)?,
         false => into,
     };
-    Ok(Ret::U16(u16::from(locate(
-        machine,
+    Ok(abi::Ret::Int(u16::from(locate(
+        call,
         host,
         Request {
             who: "obtbtvl",
@@ -950,6 +1051,12 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
             lock,
         },
     )?)))
+}
+
+/// The dispatch-table entry for [`obtbtvl`]. See `shims::call`'s own doc
+/// comment.
+pub fn obtbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    obtbtvl(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int stpbtvl(void *recptr, int stpopt, int loktyp)` -- walk the file in the
@@ -971,10 +1078,10 @@ pub fn obtbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// Two dereferences before anything is checked. A real board that stepped with
 /// no file current took the fault there, so there is no answer to reproduce and
 /// refusing is the honest translation of what happened.
-pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     // Before `recptr` is defaulted, so that the refusal names `stpbtvl` rather
     // than coming out of a `bb->data` lookup on a null block.
-    let block = positioned(machine, host, "stpbtvl")?.ok_or_else(|| {
+    let block = positioned(call, host, "stpbtvl")?.ok_or_else(|| {
         ShimError::Failed(
             "stpbtvl with no Btrieve file current -- PLBTVSTF.C:509 has no \
              guard for that and dereferences bb twice, so the real host faulted \
@@ -983,10 +1090,9 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         )
     })?;
 
-    let mut args = super::args(machine);
-    let into = args.ptr();
-    let opt = args.int() as i16;
-    let lock = args.int() as i16;
+    let into = call.ptr();
+    let opt = call.int() as i16;
+    let lock = call.int() as i16;
 
     let into = match into == Btrieve::null() {
         true => data_buffer(host, block)?,
@@ -1000,10 +1106,10 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     let at = match (opt, file.cursor()) {
         (33, _) => 0,
         (34, _) if count > 0 => count - 1,
-        (34, _) => return Ok(Ret::U16(0)),
+        (34, _) => return Ok(abi::Ret::Int(0)),
         (24, Cursor::Physical { at }) => at + 1,
         (35, Cursor::Physical { at }) if at > 0 => at - 1,
-        (35, Cursor::Physical { .. }) => return Ok(Ret::U16(0)),
+        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(0)),
         // Stepping from a keyed position. **Correction, found driving
         // character creation's real duplicate-name check against
         // `WCCMMUD.DLL` (Task 12):** an earlier version of this arm treated
@@ -1036,7 +1142,7 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
             match opt {
                 24 => physical + 1,
                 _ if physical > 0 => physical - 1,
-                _ => return Ok(Ret::U16(0)),
+                _ => return Ok(abi::Ret::Int(0)),
             }
         }
         (24 | 35, Cursor::Nowhere) => {
@@ -1054,12 +1160,18 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
     };
 
     if at >= count {
-        return Ok(Ret::U16(0));
+        return Ok(abi::Ret::Int(0));
     }
     file.seek_to(Cursor::Physical { at });
     take_lock(host, block, lock)?;
-    deliver(machine, host, block, into)?;
-    Ok(Ret::U16(1))
+    deliver(call, host, block, into)?;
+    Ok(abi::Ret::Int(1))
+}
+
+/// The dispatch-table entry for [`stpbtvl`]. See `shims::call`'s own doc
+/// comment.
+pub fn stpbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    stpbtvl(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long absbtv(void)` -- where the current record is in the file.
@@ -1078,10 +1190,10 @@ pub fn stpbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// `catastro`, so there was never a zero to reproduce there. Zero is also a
 /// real file offset in the sense that matters -- the module hands it straight
 /// back to `gabbtvl` -- and answering it would name the file control record.
-pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let Some(block) = positioned(machine, host, "absbtv")? else {
+pub fn absbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let Some(block) = positioned(call, host, "absbtv")? else {
         note_no_file(host, "absbtv");
-        return Ok(Ret::U32(0));
+        return Ok(abi::Ret::Long(0));
     };
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let record = file.current().ok_or_else(|| {
@@ -1090,7 +1202,13 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             file.name()
         ))
     })?;
-    Ok(Ret::U32(record.position))
+    Ok(abi::Ret::Long(record.position))
+}
+
+/// The dispatch-table entry for [`absbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn absbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    absbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int aabbtv(void *recptr, long abspos, int keynum)` -- acquire the record at
@@ -1119,13 +1237,12 @@ pub fn absbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
 /// `keynum`'s order from wherever the position landed.
 ///
 /// With no file current it answers 0, per the guard at `:476`.
-pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let into = args.ptr();
-    let position = args.long();
-    let keynum = args.int() as i16;
-    Ok(Ret::U16(u16::from(absolute(
-        machine,
+pub fn aabbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let into = call.ptr();
+    let position = call.long();
+    let keynum = call.int() as i16;
+    Ok(abi::Ret::Int(u16::from(absolute(
+        call,
         host,
         Position {
             who: "aabbtv",
@@ -1136,6 +1253,12 @@ pub fn aabbtv(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> 
             keynum,
         },
     )?)))
+}
+
+/// The dispatch-table entry for [`aabbtv`]. See `shims::call`'s own doc
+/// comment.
+pub fn aabbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    aabbtv(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The lock type `aabbtv` has instead of an argument.
@@ -1175,14 +1298,13 @@ const UNLOCKED: i16 = 0;
 /// no-file-current guard, exactly as before this file read its arguments
 /// through a cursor. See `absolute`'s own doc comment for why that guard,
 /// then lock, then everything else ordering is load-bearing and was kept.
-pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let mut args = super::args(machine);
-    let into = args.ptr();
-    let position = args.long();
-    let keynum = args.int() as i16;
-    let lock = args.int() as i16;
+pub fn gabbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let into = call.ptr();
+    let position = call.long();
+    let keynum = call.int() as i16;
+    let lock = call.int() as i16;
     absolute(
-        machine,
+        call,
         host,
         Position {
             who: "gabbtvl",
@@ -1193,7 +1315,13 @@ pub fn gabbtvl(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
             keynum,
         },
     )?;
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
+}
+
+/// The dispatch-table entry for [`gabbtvl`]. See `shims::call`'s own doc
+/// comment.
+pub fn gabbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+    gabbtvl(&mut super::call(machine), host).map(Into::into)
 }
 
 /// What `aabbtv` and `gabbtvl` supply to [`absolute`], bundled into one type
@@ -1240,7 +1368,7 @@ struct Position {
 /// function to read the same bytes again off a cursor that has moved on.
 /// `aabbtv` now reads its own three the same way, so both callers share one
 /// shape instead of one reading through `absolute` and the other around it.
-fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<bool, ShimError> {
+fn absolute(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Position) -> Result<bool, ShimError> {
     let Position {
         who,
         fatal,
@@ -1255,7 +1383,7 @@ fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<boo
     // original returned before it looked at anything, including `lock`, so
     // `take_lock` runs later -- only once a record has actually been found
     // (below) -- not here.
-    let Some(block) = positioned(machine, host, who)? else {
+    let Some(block) = positioned(call, host, who)? else {
         note_no_file(host, who);
         return Ok(false);
     };
@@ -1288,7 +1416,7 @@ fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<boo
             ),
         );
     }
-    let key = key_number(machine, host, block, keynum)?;
+    let key = key_number(call, host, block, keynum)?;
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -1312,8 +1440,8 @@ fn absolute(machine: &mut Machine, host: &mut Host, req: Position) -> Result<boo
     take_lock(host, block, lock)?;
 
     // `:484` passes `bb->keyseg`, so Btrieve left the found record's key there.
-    answer_with_key(machine, host, block, key)?;
-    deliver(machine, host, block, into)?;
+    answer_with_key(call, host, block, key)?;
+    deliver(call, host, block, into)?;
     Ok(true)
 }
 
@@ -1351,7 +1479,7 @@ struct Request<'a> {
 /// Position the file a [`Request`] names, and hand back the record if asked.
 ///
 /// Returns whether a record was found.
-fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, ShimError> {
+fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<bool, ShimError> {
     let Request {
         who,
         block,
@@ -1362,7 +1490,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
         lock,
     } = req;
     load(host, block)?;
-    let key = key_number(machine, host, block, keynum)?;
+    let key = key_number(call, host, block, keynum)?;
 
     // `PLBTVSTF.C:266` -- the module's key value is copied into `bb->key`
     // before anything else, and that is where it is read from afterwards. So a
@@ -1397,13 +1525,13 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
             );
         }
         let length = key_length(host, block, key)?;
-        let bytes = machine.resolve(value, usize::from(length))?.to_vec();
+        let bytes = call.mem().resolve(value, usize::from(length))?.to_vec();
         let buffer = host
             .btrieve
             .block(block)
             .map_err(ShimError::Failed)?
             .key();
-        machine.write(buffer, &bytes)?;
+        call.mem().write(buffer, &bytes)?;
     }
 
     let wanted = match op.wants_value() {
@@ -1415,7 +1543,7 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
                 .block(block)
                 .map_err(ShimError::Failed)?
                 .key();
-            machine.resolve(buffer, usize::from(length))?.to_vec()
+            call.mem().resolve(buffer, usize::from(length))?.to_vec()
         }
     };
 
@@ -1522,10 +1650,10 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
     };
     file.seek_to(Cursor::Ordered { key, at });
     take_lock(host, block, lock)?;
-    answer_with_key(machine, host, block, key)?;
+    answer_with_key(call, host, block, key)?;
 
     if let Some(into) = into {
-        deliver(machine, host, block, into)?;
+        deliver(call, host, block, into)?;
     }
     Ok(true)
 }
@@ -1544,8 +1672,8 @@ fn locate(machine: &mut Machine, host: &mut Host, req: Request) -> Result<bool, 
 /// Shared rather than written twice: the absolute-position family had it
 /// missing for exactly as long as this was inline in [`locate`].
 fn answer_with_key(
-    machine: &mut Machine,
-    host: &mut Host,
+    call: &mut Call<Wg16>,
+    host: &mut Host<Wg16>,
     block: FarPtr,
     key: u16,
 ) -> Result<(), ShimError> {
@@ -1565,7 +1693,7 @@ fn answer_with_key(
         // record body it compares is right.
         .extract(&file.keyed(&record.bytes));
     let buffer = file.key();
-    machine.write(buffer, &bytes)?;
+    call.mem().write(buffer, &bytes)?;
     Ok(())
 }
 
@@ -1585,8 +1713,8 @@ fn answer_with_key(
 /// before the copy runs, where this truncates silently. `opnbtv` already notes
 /// the mismatch that would make it live.
 fn deliver(
-    machine: &mut Machine,
-    host: &mut Host,
+    call: &mut Call<Wg16>,
+    host: &mut Host<Wg16>,
     block: FarPtr,
     into: FarPtr,
 ) -> Result<(), ShimError> {
@@ -1596,7 +1724,7 @@ fn deliver(
         .ok_or_else(|| ShimError::Failed(format!("{} is not positioned", file.name())))?;
     let take = usize::from(file.maxlen()).min(record.bytes.len());
     let bytes = record.bytes[..take].to_vec();
-    machine.write(into, &bytes)?;
+    call.mem().write(into, &bytes)?;
     Ok(())
 }
 
@@ -1606,8 +1734,8 @@ fn deliver(
 /// other means "this one, and remember it". `lastkn` is a field of the block in
 /// module memory, so it is read and written there rather than kept here.
 fn key_number(
-    machine: &mut Machine,
-    host: &Host,
+    call: &mut Call<Wg16>,
+    host: &Host<Wg16>,
     block: FarPtr,
     keynum: i16,
 ) -> Result<u16, ShimError> {
@@ -1616,7 +1744,7 @@ fn key_number(
         selector: block.selector,
     };
     if keynum < 0 {
-        let bytes = machine.resolve(at, 2)?;
+        let bytes = call.mem().resolve(at, 2)?;
         return Ok(u16::from_le_bytes([bytes[0], bytes[1]]));
     }
 
@@ -1628,7 +1756,7 @@ fn key_number(
             file.name()
         )));
     }
-    machine.write(at, &(keynum as u16).to_le_bytes())?;
+    call.mem().write(at, &(keynum as u16).to_le_bytes())?;
     Ok(keynum as u16)
 }
 
@@ -1688,8 +1816,8 @@ fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
 ///
 /// A pointer that is neither null nor a file this host opened *is* a refusal,
 /// which is [`setbtv`]'s contract and unrelated to the null case.
-fn positioned(machine: &Machine, host: &Host, who: &str) -> Result<Option<FarPtr>, ShimError> {
-    let block = current(machine, host)?;
+fn positioned(call: &mut Call<Wg16>, host: &Host<Wg16>, who: &str) -> Result<Option<FarPtr>, ShimError> {
+    let block = current(call, host)?;
     if block == Btrieve::null() {
         return Ok(None);
     }
@@ -1778,27 +1906,27 @@ fn take_lock(host: &mut Host, block: FarPtr, lock: i16) -> Result<(), ShimError>
 }
 
 /// Push what is current and make `block` current, as `setbtv` does.
-fn push(machine: &mut Machine, host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
-    let previous = current(machine, host)?;
+fn push(call: &mut Call<Wg16>, host: &mut Host<Wg16>, block: FarPtr) -> Result<(), ShimError> {
+    let previous = current(call, host)?;
     if let Some(dropped) = host.btrieve.set(previous) {
         host.note(format!(
             "the setbtv stack is ten deep and overflowed, so {dropped} fell off \
              the bottom -- exactly as it would have on the real host"
         ));
     }
-    set_current(machine, host, block)
+    set_current(call, host, block)
 }
 
 /// What `bb` holds, read back out of module memory every time.
-fn current(machine: &Machine, host: &Host) -> Result<FarPtr, ShimError> {
+fn current(call: &mut Call<Wg16>, host: &Host<Wg16>) -> Result<FarPtr, ShimError> {
     host.globals()
-        .pointer(machine, "bb")
+        .pointer_mem(call.mem(), "bb")
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
-fn set_current(machine: &mut Machine, host: &Host, block: FarPtr) -> Result<(), ShimError> {
+fn set_current(call: &mut Call<Wg16>, host: &Host<Wg16>, block: FarPtr) -> Result<(), ShimError> {
     host.globals()
-        .write(machine, "bb", &block.to_bytes())
+        .write_mem(call.mem(), "bb", &block.to_bytes())
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
@@ -1811,7 +1939,7 @@ mod tests {
     fn open(f: &mut Fixture, name: &str, maxlen: u16) -> FarPtr {
         let at = f.text(name);
         let Ret::Far(block) = f
-            .invoke(opnbtv, &[at.offset, at.selector, maxlen])
+            .invoke(opnbtv_wg16, &[at.offset, at.selector, maxlen])
             .expect("opens")
         else {
             panic!("opnbtv returns a pointer");
@@ -1873,9 +2001,9 @@ mod tests {
         let second = open(&mut f, "OTHER.DAT", 32);
         assert_ne!(first, second, "two files are two blocks");
 
-        f.invoke(rstbtv, &[]).expect("restores");
+        f.invoke(rstbtv_wg16, &[]).expect("restores");
         assert_eq!(bb(&f), second, "the file it had just opened");
-        f.invoke(rstbtv, &[]).expect("restores");
+        f.invoke(rstbtv_wg16, &[]).expect("restores");
         assert_eq!(bb(&f), first, "and now the one before it");
     }
 
@@ -1885,9 +2013,9 @@ mod tests {
         let first = open(&mut f, "SAMPLE.DAT", 64);
         let second = open(&mut f, "OTHER.DAT", 32);
 
-        f.invoke(setbtv, &Fixture::far(first)).expect("set");
+        f.invoke(setbtv_wg16, &Fixture::far(first)).expect("set");
         assert_eq!(bb(&f), first);
-        f.invoke(rstbtv, &[]).expect("restored");
+        f.invoke(rstbtv_wg16, &[]).expect("restored");
         assert_eq!(bb(&f), second);
     }
 
@@ -1899,7 +2027,7 @@ mod tests {
             offset: 0x40,
             selector: f.host.globals().selector(),
         };
-        assert!(f.invoke(setbtv, &Fixture::far(nonsense)).is_err());
+        assert!(f.invoke(setbtv_wg16, &Fixture::far(nonsense)).is_err());
         assert_eq!(bb(&f), before, "and left bb where it was");
     }
 
@@ -1914,7 +2042,7 @@ mod tests {
 
         // Eleven pushes on top of what the two opens already pushed.
         for _ in 0..11 {
-            f.invoke(setbtv, &Fixture::far(other)).expect("set");
+            f.invoke(setbtv_wg16, &Fixture::far(other)).expect("set");
         }
         assert!(
             f.host.notes().iter().any(|n| n.contains("fell off")),
@@ -1924,7 +2052,7 @@ mod tests {
 
         // Unwinding the whole stack never reaches the first file again.
         for _ in 0..10 {
-            f.invoke(rstbtv, &[]).expect("restores");
+            f.invoke(rstbtv_wg16, &[]).expect("restores");
         }
         assert_ne!(bb(&f), first, "the outermost entry is gone for good");
     }
@@ -1936,7 +2064,7 @@ mod tests {
         // `bb == NULL` at the top of every routine, so null is the answer the
         // module was written to expect.
         let mut f = Fixture::new();
-        f.invoke(rstbtv, &[]).expect("not an error");
+        f.invoke(rstbtv_wg16, &[]).expect("not an error");
         assert_eq!(bb(&f), Btrieve::null());
         assert!(
             f.host.notes().iter().any(|n| n.contains("rstbtv")),
@@ -1944,7 +2072,7 @@ mod tests {
         );
 
         // And what null costs: nothing can be counted.
-        assert!(f.invoke(cntrbtv, &[]).is_err());
+        assert!(f.invoke(cntrbtv_wg16, &[]).is_err());
     }
 
     #[test]
@@ -1954,9 +2082,9 @@ mod tests {
         open(&mut f, "OTHER.DAT", 32);
 
         // `OTHER.DAT` has three records and `SAMPLE.DAT` seven.
-        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(3));
-        f.invoke(setbtv, &Fixture::far(sample)).expect("set");
-        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+        assert_eq!(f.invoke(cntrbtv_wg16, &[]).expect("counts"), Ret::U32(3));
+        f.invoke(setbtv_wg16, &Fixture::far(sample)).expect("set");
+        assert_eq!(f.invoke(cntrbtv_wg16, &[]).expect("counts"), Ret::U32(7));
     }
 
     #[test]
@@ -1965,7 +2093,7 @@ mod tests {
         // zero is the right answer rather than a parse that went wrong.
         let mut f = Fixture::new();
         open(&mut f, "EMPTY.DAT", 64);
-        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(0));
+        assert_eq!(f.invoke(cntrbtv_wg16, &[]).expect("counts"), Ret::U32(0));
     }
 
     #[test]
@@ -1975,7 +2103,7 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text("SAMPLE.MSG");
         let e = f
-            .invoke(opnbtv, &[at.offset, at.selector, 64])
+            .invoke(opnbtv_wg16, &[at.offset, at.selector, 64])
             .expect_err("a .MSG is not a Btrieve file");
         assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
     }
@@ -1985,7 +2113,7 @@ mod tests {
         let mut f = Fixture::new();
         let at = f.text("NOSUCH.DAT");
         let e = f
-            .invoke(opnbtv, &[at.offset, at.selector, 64])
+            .invoke(opnbtv_wg16, &[at.offset, at.selector, 64])
             .expect_err("no file");
         assert!(e.to_string().contains("NOSUCH.DAT"), "{e}");
         assert!(e.to_string().contains("NOSUCH.VIR"), "{e}");
@@ -1997,11 +2125,11 @@ mod tests {
         // `.\NAME.DAT`.
         let mut f = Fixture::new();
         let here = f.text(".\\SAMPLE.DAT");
-        assert!(f.invoke(opnbtv, &[here.offset, here.selector, 64]).is_ok());
+        assert!(f.invoke(opnbtv_wg16, &[here.offset, here.selector, 64]).is_ok());
 
         let elsewhere = f.text("D:\\MUD\\SAMPLE.DAT");
         let e = f
-            .invoke(opnbtv, &[elsewhere.offset, elsewhere.selector, 64])
+            .invoke(opnbtv_wg16, &[elsewhere.offset, elsewhere.selector, 64])
             .expect_err("that is not this host's directory");
         assert!(e.to_string().contains("D:\\MUD\\SAMPLE.DAT"), "{e}");
     }
@@ -2075,10 +2203,10 @@ mod tests {
         let mut f = Fixture::new();
         assert_eq!(f.host.btrieve().mode(), 0, "PRIMBV until told otherwise");
 
-        f.invoke(omdbtv, &[(-2i16) as u16]).expect("RONLBV");
+        f.invoke(omdbtv_wg16, &[(-2i16) as u16]).expect("RONLBV");
         assert_eq!(f.host.btrieve().mode(), -2);
 
-        assert!(f.invoke(omdbtv, &[7]).is_err(), "7 is not a mode");
+        assert!(f.invoke(omdbtv_wg16, &[7]).is_err(), "7 is not a mode");
         assert_eq!(f.host.btrieve().mode(), -2, "and it did not take");
     }
     /// The two-byte key of the record a read left in a buffer.
@@ -2089,7 +2217,7 @@ mod tests {
 
     /// `qrybtv` with no key value: the lowest, highest, next or previous.
     fn query(f: &mut Fixture, keynum: i16, opt: i16) -> bool {
-        f.invoke(qrybtv, &[0, 0, keynum as u16, opt as u16])
+        f.invoke(qrybtv_wg16, &[0, 0, keynum as u16, opt as u16])
             .expect("queries")
             == Ret::U16(1)
     }
@@ -2101,7 +2229,7 @@ mod tests {
             None => Btrieve::null(),
         };
         f.invoke(
-            obtbtvl,
+            obtbtvl_wg16,
             &[0, 0, value.offset, value.selector, keynum as u16, opt as u16, 0],
         )
         .expect("acquires")
@@ -2233,9 +2361,9 @@ mod tests {
         assert!(!acquire(&mut f, None, -1, 6), "and then the end");
 
         let mut stepped = vec![];
-        assert_eq!(f.invoke(stpbtvl, &[0, 0, 33, 0]).expect("step first"), Ret::U16(1));
+        assert_eq!(f.invoke(stpbtvl_wg16, &[0, 0, 33, 0]).expect("step first"), Ret::U16(1));
         stepped.push(got(&f, into));
-        while f.invoke(stpbtvl, &[0, 0, 24, 0]).expect("step next") == Ret::U16(1) {
+        while f.invoke(stpbtvl_wg16, &[0, 0, 24, 0]).expect("step next") == Ret::U16(1) {
             stepped.push(got(&f, into));
         }
         assert_eq!(stepped, [4, 1, 7, 2, 6, 3, 5], "the order the pages hold");
@@ -2290,10 +2418,10 @@ mod tests {
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let into = buffer(&f, block);
 
-        assert!(f.invoke(qrybtv, &[0, 0, 0, 62]).expect("lowest") == Ret::U16(1));
+        assert!(f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("lowest") == Ret::U16(1));
         assert_eq!(got(&f, into), 0, "a query reads no record");
 
-        assert_eq!(f.invoke(qnpbtv, &[56]).expect("next"), Ret::U16(1));
+        assert_eq!(f.invoke(qnpbtv_wg16, &[56]).expect("next"), Ret::U16(1));
         assert_eq!(got(&f, into), 2, "and the step after it does");
     }
 
@@ -2320,14 +2448,14 @@ mod tests {
         let into = buffer(&f, block);
 
         assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
 
         assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
         assert_eq!(got(&f, into), 1);
 
-        f.invoke(gabbtvl, &[0, 0, position as u16, (position >> 16) as u16, 0, 0])
+        f.invoke(gabbtvl_wg16, &[0, 0, position as u16, (position >> 16) as u16, 0, 0])
             .expect("back to where it was");
         assert_eq!(got(&f, into), 6);
 
@@ -2345,10 +2473,10 @@ mod tests {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
         assert_eq!(
-            f.invoke(aabbtv, &[0, 0, 7, 0, 0]).expect("answers"),
+            f.invoke(aabbtv_wg16, &[0, 0, 7, 0, 0]).expect("answers"),
             Ret::U16(0)
         );
-        assert!(f.invoke(gabbtvl, &[0, 0, 7, 0, 0, 0]).is_err());
+        assert!(f.invoke(gabbtvl_wg16, &[0, 0, 7, 0, 0, 0]).is_err());
     }
 
     #[test]
@@ -2372,13 +2500,13 @@ mod tests {
         let into = buffer(&f, block);
 
         assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
         assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
 
         assert_eq!(
-            f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
+            f.invoke(aabbtv_wg16, &[0, 0, position as u16, (position >> 16) as u16, 0])
                 .expect("five argument words are all there are"),
             Ret::U16(1)
         );
@@ -2397,7 +2525,7 @@ mod tests {
         let key = f.host.btrieve().block(block).expect("open").key();
 
         assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
 
@@ -2405,13 +2533,13 @@ mod tests {
         assert!(acquire(&mut f, None, 0, 12), "lowest");
         assert_eq!(got(&f, key), 1);
 
-        f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
+        f.invoke(aabbtv_wg16, &[0, 0, position as u16, (position >> 16) as u16, 0])
             .expect("back to where it was");
         assert_eq!(got(&f, key), 6, "aabbtv answers with the key it landed on");
 
         assert!(acquire(&mut f, None, 0, 12), "lowest again");
         f.invoke(
-            gabbtvl,
+            gabbtvl_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, 0, 0],
         )
         .expect("and gabbtvl too");
@@ -2473,7 +2601,7 @@ mod tests {
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let into = buffer(&f, block);
         assert_eq!(
-            f.invoke(qnpbtv, &[56]).expect("answers"),
+            f.invoke(qnpbtv_wg16, &[56]).expect("answers"),
             Ret::U16(1),
             "S1: an unpositioned Get Next answers rather than refusing"
         );
@@ -2506,7 +2634,7 @@ mod tests {
             "positioned by key 0, on the record whose key 0 is 2"
         );
         assert!(
-            f.invoke(obtbtvl, &[0, 0, 0, 0, 1, 6, 0]).is_err(),
+            f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 1, 6, 0]).is_err(),
             "S6: a Get Next in key 1's order is refused, not translated"
         );
     }
@@ -2553,7 +2681,7 @@ mod tests {
             record[0..2].copy_from_slice(&first.to_le_bytes());
             record[2..4].copy_from_slice(&second.to_le_bytes());
             let at = f.bytes(&record, false);
-            f.invoke(dinsbtv, &Fixture::far(at)).expect("inserts");
+            f.invoke(dinsbtv_wg16, &Fixture::far(at)).expect("inserts");
         }
 
         (f, block)
@@ -2594,20 +2722,20 @@ mod tests {
             acquire(&mut f, Some(2), 0, 5),
             "learn where the record whose key 0 is 2 lives, through key 0"
         );
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("has a position") else {
             panic!("absbtv answers with a position");
         };
 
         // The same record, but reached through key ONE -- so the cursor this
         // leaves behind is key 1's, not the key 0 the acquire above used.
         f.invoke(
-            gabbtvl,
+            gabbtvl_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
         )
         .expect("get direct, establishing key 1");
 
         assert_eq!(
-            f.invoke(qnpbtv, &[56]).expect("answers"),
+            f.invoke(qnpbtv_wg16, &[56]).expect("answers"),
             Ret::U16(1),
             "a Get Next on the key gabbtvl established is not a cross-key ask"
         );
@@ -2628,18 +2756,18 @@ mod tests {
         let (mut f, _) = two_key_file("btv-shim-direct-cross");
 
         assert!(acquire(&mut f, Some(2), 0, 5), "learn where (2,2) lives");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("has a position") else {
             panic!("absbtv answers with a position");
         };
 
         f.invoke(
-            gabbtvl,
+            gabbtvl_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, 1, 0],
         )
         .expect("get direct, establishing key 1");
 
         assert!(
-            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 6, 0]).is_err(),
+            f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 6, 0]).is_err(),
             "S6: a Get Next in key 0's order, from a key 1 position, refuses"
         );
     }
@@ -2659,11 +2787,11 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 64);
 
         assert!(
-            f.invoke(stpbtvl, &[0, 0, 33, 0]).is_ok(),
+            f.invoke(stpbtvl_wg16, &[0, 0, 33, 0]).is_ok(),
             "step to the first record in physical order"
         );
         assert!(
-            f.invoke(qnpbtv, &[56]).is_err(),
+            f.invoke(qnpbtv_wg16, &[56]).is_err(),
             "S4: and a Get Next afterwards is refused, not translated"
         );
     }
@@ -2687,8 +2815,8 @@ mod tests {
     fn a_step_or_a_position_with_nothing_to_be_next_to_refuses() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(stpbtvl, &[0, 0, 24, 0]).is_err());
-        assert!(f.invoke(absbtv, &[]).is_err(), "and nowhere has no position");
+        assert!(f.invoke(stpbtvl_wg16, &[0, 0, 24, 0]).is_err());
+        assert!(f.invoke(absbtv_wg16, &[]).is_err(), "and nowhere has no position");
     }
 
     #[test]
@@ -2726,14 +2854,14 @@ mod tests {
         let into = buffer(&f, block);
 
         assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6, so lastkn is 0");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
         assert!(acquire(&mut f, None, 0, 12), "somewhere else entirely");
 
         let minus_one = -1i16 as u16;
         f.invoke(
-            aabbtv,
+            aabbtv_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, minus_one],
         )
         .expect("a negative key number reads lastkn");
@@ -2755,7 +2883,7 @@ mod tests {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
         let e = f
-            .invoke(qrybtv, &[0, 0, 3, 62])
+            .invoke(qrybtv_wg16, &[0, 0, 3, 62])
             .expect_err("SAMPLE.DAT has one key");
         assert!(e.to_string().contains("key 3"), "{e}");
     }
@@ -2764,9 +2892,9 @@ mod tests {
     fn an_option_no_macro_produces_is_refused() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        assert!(f.invoke(qrybtv, &[0, 0, 0, 5]).is_err(), "5 is an acquire code");
-        assert!(f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 62, 0]).is_err(), "62 is a query code");
-        assert!(f.invoke(stpbtvl, &[0, 0, 99, 0]).is_err());
+        assert!(f.invoke(qrybtv_wg16, &[0, 0, 0, 5]).is_err(), "5 is an acquire code");
+        assert!(f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 62, 0]).is_err(), "62 is a query code");
+        assert!(f.invoke(stpbtvl_wg16, &[0, 0, 99, 0]).is_err());
     }
 
     /// **Replaces `a_lock_this_host_cannot_take_is_refused_rather_than_
@@ -2791,7 +2919,7 @@ mod tests {
         let mut f = Fixture::new();
         let block = open(&mut f, "SAMPLE.DAT", 64);
 
-        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
+        f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 12, 100])
             .expect("Lowest, single lock with wait -- both are real Btrieve values");
 
         assert_eq!(
@@ -2850,12 +2978,12 @@ mod tests {
             acquire(&mut f, Some(2), 0, 5),
             "find the record whose key 0 is 2, to get a real position to lock"
         );
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("has a position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("has a position") else {
             panic!("absbtv answers with a position");
         };
 
         f.invoke(
-            gabbtvl,
+            gabbtvl_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, 1, 3],
         )
         .expect("get direct, then take the lock");
@@ -2886,7 +3014,7 @@ mod tests {
     fn qrybtv_with_no_file_current_answers_nothing_found() {
         let mut f = nothing_current();
         assert_eq!(
-            f.invoke(qrybtv, &[0, 0, 0, 62]).expect("answers"),
+            f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("answers"),
             Ret::U16(0)
         );
     }
@@ -2896,7 +3024,7 @@ mod tests {
         // And in particular does not fail looking for `bb->data` to read into,
         // which is a null block away.
         let mut f = nothing_current();
-        assert_eq!(f.invoke(qnpbtv, &[56]).expect("answers"), Ret::U16(0));
+        assert_eq!(f.invoke(qnpbtv_wg16, &[56]).expect("answers"), Ret::U16(0));
     }
 
     #[test]
@@ -2906,7 +3034,7 @@ mod tests {
         // the guard has to come before `recptr` is defaulted to `bb->data`.
         let mut f = nothing_current();
         assert_eq!(
-            f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]).expect("answers"),
+            f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 12, 0]).expect("answers"),
             Ret::U16(0)
         );
     }
@@ -2916,7 +3044,7 @@ mod tests {
         // Five argument words, per `BTVSTF.H:155`.
         let mut f = nothing_current();
         assert_eq!(
-            f.invoke(aabbtv, &[0, 0, 7, 0, 0]).expect("answers"),
+            f.invoke(aabbtv_wg16, &[0, 0, 7, 0, 0]).expect("answers"),
             Ret::U16(0)
         );
     }
@@ -2927,7 +3055,7 @@ mod tests {
         // the answer occupies `DX:AX` and not just `AX`. A `Ret::U16(0)` here
         // would pass a test that only compared the low half.
         let mut f = nothing_current();
-        assert_eq!(f.invoke(absbtv, &[]).expect("answers"), Ret::U32(0));
+        assert_eq!(f.invoke(absbtv_wg16, &[]).expect("answers"), Ret::U32(0));
     }
 
     /// `lock` is word 5 and `keynum` is word 4, and nothing else here tells
@@ -2970,12 +3098,12 @@ mod tests {
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let into = buffer(&f, block);
         assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
-        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(position) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
 
         f.invoke(
-            gabbtvl,
+            gabbtvl_wg16,
             &[0, 0, position as u16, (position >> 16) as u16, 0, 3],
         )
         .expect("get direct, then take the lock");
@@ -3007,7 +3135,7 @@ mod tests {
         let into = f.bytes(&[0xAA; 8], false);
         assert_eq!(
             f.invoke(
-                gabbtvl,
+                gabbtvl_wg16,
                 &[into.offset, into.selector, 0, 0, 0, 0]
             )
             .expect("answers"),
@@ -3029,12 +3157,12 @@ mod tests {
         // perfectly good file and every call site tests for it.
         let mut f = Fixture::new();
         open(&mut f, "EMPTY.DAT", 64);
-        let not_found = f.invoke(qrybtv, &[0, 0, 0, 62]).expect("empty file");
+        let not_found = f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("empty file");
 
-        f.invoke(rstbtv, &[]).expect("restores");
-        f.invoke(rstbtv, &[]).expect("and past the bottom");
+        f.invoke(rstbtv_wg16, &[]).expect("restores");
+        f.invoke(rstbtv_wg16, &[]).expect("and past the bottom");
         assert_eq!(bb(&f), Btrieve::null(), "nothing current now");
-        let no_file = f.invoke(qrybtv, &[0, 0, 0, 62]).expect("no file");
+        let no_file = f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("no file");
 
         assert_eq!(not_found, no_file, "the module cannot tell them apart");
     }
@@ -3045,12 +3173,12 @@ mod tests {
         // `bb` twice before checking anything, so the real host faulted and
         // there is no answer to reproduce.
         let mut f = nothing_current();
-        let e = f.invoke(stpbtvl, &[0, 0, 33, 0]).expect_err("no file");
+        let e = f.invoke(stpbtvl_wg16, &[0, 0, 33, 0]).expect_err("no file");
         assert!(e.to_string().contains("stpbtvl"), "{e}");
 
         // With a null `recptr` too, which is the path that used to refuse from
         // inside a `bb->data` lookup and so named the block rather than itself.
-        let e = f.invoke(stpbtvl, &[0, 0, 24, 0]).expect_err("no file");
+        let e = f.invoke(stpbtvl_wg16, &[0, 0, 24, 0]).expect_err("no file");
         assert!(e.to_string().contains("stpbtvl"), "{e}");
     }
 
@@ -3061,7 +3189,7 @@ mod tests {
         // such position, so there is nothing to count rather than nothing to
         // dereference.
         let mut f = nothing_current();
-        let e = f.invoke(cntrbtv, &[]).expect_err("no file");
+        let e = f.invoke(cntrbtv_wg16, &[]).expect_err("no file");
         assert!(e.to_string().contains("cntrbtv"), "{e}");
     }
 
@@ -3071,7 +3199,7 @@ mod tests {
         // function: with no file current the real host inserted nothing and
         // returned. Call 130 of `_INIT__WCCMMUD` is exactly this.
         let mut f = nothing_current();
-        assert_eq!(f.invoke(invbtv, &[0, 0, 64]).expect("answers"), Ret::Void);
+        assert_eq!(f.invoke(invbtv_wg16, &[0, 0, 64]).expect("answers"), Ret::Void);
         assert!(
             f.host.notes().iter().any(|n| n.contains("invbtv")),
             "and it is recorded: {:?}",
@@ -3088,7 +3216,7 @@ mod tests {
         // whole crate is shaped around.
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        let e = f.invoke(invbtv, &[0, 0, 64]).expect_err("nothing here writes");
+        let e = f.invoke(invbtv_wg16, &[0, 0, 64]).expect_err("nothing here writes");
         assert!(e.to_string().contains("invbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }
@@ -3097,7 +3225,7 @@ mod tests {
     fn delbtv_with_no_file_current_deletes_nothing_and_says_so() {
         // `PLBTVSTF.C:623`, the same guard again.
         let mut f = nothing_current();
-        assert_eq!(f.invoke(delbtv, &[]).expect("answers"), Ret::Void);
+        assert_eq!(f.invoke(delbtv_wg16, &[]).expect("answers"), Ret::Void);
         assert!(
             f.host.notes().iter().any(|n| n.contains("delbtv")),
             "and it is recorded: {:?}",
@@ -3109,7 +3237,7 @@ mod tests {
     fn delbtv_with_a_file_current_refuses_and_names_the_file() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        let e = f.invoke(delbtv, &[]).expect_err("nothing here writes");
+        let e = f.invoke(delbtv_wg16, &[]).expect_err("nothing here writes");
         assert!(e.to_string().contains("delbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }
@@ -3138,7 +3266,7 @@ mod tests {
         let recptr = f.bytes(&sample_record(99, "Zorro"), false);
 
         assert_eq!(
-            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+            f.invoke(dinsbtv_wg16, &Fixture::far(recptr)).expect("inserts"),
             Ret::U16(1)
         );
 
@@ -3169,12 +3297,12 @@ mod tests {
         let recptr = f.bytes(&sample_record(5, "Imposter"), false);
 
         assert_eq!(
-            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            f.invoke(dinsbtv_wg16, &Fixture::far(recptr)).expect("answers"),
             Ret::U16(0),
             "key 5 already belongs to Troll"
         );
         assert_eq!(
-            f.invoke(cntrbtv, &[]).expect("counts"),
+            f.invoke(cntrbtv_wg16, &[]).expect("counts"),
             Ret::U32(7),
             "and nothing was written"
         );
@@ -3195,7 +3323,7 @@ mod tests {
         let recptr = f.bytes(&sample_record(5, "Imposter"), false);
 
         assert_eq!(
-            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("answers"),
+            f.invoke(dinsbtv_wg16, &Fixture::far(recptr)).expect("answers"),
             Ret::U16(0),
             "key 5 already belongs to Troll"
         );
@@ -3227,7 +3355,7 @@ mod tests {
         let recptr = f.bytes(&sample_record(6, "Imposter"), false);
 
         assert_eq!(
-            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            f.invoke(dupdbtv_wg16, &Fixture::far(recptr)).expect("answers"),
             Ret::U16(0),
             "key 6 already belongs to Elf"
         );
@@ -3263,10 +3391,10 @@ mod tests {
 
             let recptr = f.bytes(&sample_record(key as i16, "Newcomer"), false);
             assert_eq!(
-                f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+                f.invoke(dinsbtv_wg16, &Fixture::far(recptr)).expect("inserts"),
                 Ret::U16(1)
             );
-            let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+            let Ret::U32(after) = f.invoke(absbtv_wg16, &[]).expect("position") else {
                 panic!("absbtv returns a long");
             };
 
@@ -3280,7 +3408,7 @@ mod tests {
                 acquire(&mut g, Some(key), 0, 5),
                 "the record dinsbtv just inserted, found by its own key"
             );
-            let Ret::U32(expected) = g.invoke(absbtv, &[]).expect("position") else {
+            let Ret::U32(expected) = g.invoke(absbtv_wg16, &[]).expect("position") else {
                 panic!("absbtv returns a long");
             };
 
@@ -3300,7 +3428,7 @@ mod tests {
         // honestly reached, and a different shape from `invbtv`/`delbtv`,
         // which answer quietly with no file current.
         let mut f = nothing_current();
-        let e = f.invoke(dinsbtv, &[0, 0]).expect_err("no file current");
+        let e = f.invoke(dinsbtv_wg16, &[0, 0]).expect_err("no file current");
         assert!(e.to_string().contains("dinsbtv"), "{e}");
     }
 
@@ -3316,18 +3444,18 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 64);
 
         assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
-        let Ret::U32(before) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(before) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
 
         let recptr = f.bytes(&sample_record(5, "TROLLX"), false);
         assert_eq!(
-            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            f.invoke(dupdbtv_wg16, &Fixture::far(recptr)).expect("updates"),
             Ret::U16(1)
         );
 
         // An update is in place: `absbtv` answers the same before and after.
-        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(after) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
         assert_eq!(before, after, "opcode 3 rewrites the record in place");
@@ -3346,7 +3474,7 @@ mod tests {
             }),
             "TROLLX"
         );
-        assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+        assert_eq!(g.invoke(cntrbtv_wg16, &[]).expect("counts"), Ret::U32(7));
     }
 
     /// Critical: `Cursor::Ordered { key, at }` is an ordinal into a key's
@@ -3369,7 +3497,7 @@ mod tests {
         open(&mut f, "SAMPLE.DAT", 64);
 
         assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
-        let Ret::U32(troll) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(troll) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
 
@@ -3377,11 +3505,11 @@ mod tests {
         // moves from the middle of key order to the very end.
         let recptr = f.bytes(&sample_record(8, "TrollX"), false);
         assert_eq!(
-            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("updates"),
+            f.invoke(dupdbtv_wg16, &Fixture::far(recptr)).expect("updates"),
             Ret::U16(1)
         );
 
-        let Ret::U32(after) = f.invoke(absbtv, &[]).expect("position") else {
+        let Ret::U32(after) = f.invoke(absbtv_wg16, &[]).expect("position") else {
             panic!("absbtv returns a long");
         };
         assert_eq!(
@@ -3406,7 +3534,7 @@ mod tests {
         let recptr = f.bytes(&sample_record(6, "Imposter"), false);
 
         assert_eq!(
-            f.invoke(dupdbtv, &Fixture::far(recptr)).expect("answers"),
+            f.invoke(dupdbtv_wg16, &Fixture::far(recptr)).expect("answers"),
             Ret::U16(0),
             "key 6 already belongs to Elf"
         );
@@ -3420,7 +3548,7 @@ mod tests {
             }),
             "Troll"
         );
-        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+        assert_eq!(f.invoke(cntrbtv_wg16, &[]).expect("counts"), Ret::U32(7));
     }
 
     #[test]
@@ -3434,7 +3562,7 @@ mod tests {
         let recptr = f.bytes(&sample_record(1, "Nobody"), false);
 
         let e = f
-            .invoke(dupdbtv, &Fixture::far(recptr))
+            .invoke(dupdbtv_wg16, &Fixture::far(recptr))
             .expect_err("nothing has positioned the file");
         assert!(e.to_string().contains("dupdbtv"), "{e}");
     }
@@ -3443,7 +3571,7 @@ mod tests {
     fn dupdbtv_with_no_file_current_stops_the_module() {
         // `PLBTVSTF.C:550` has the same no-guard shape as `dinsbtv`.
         let mut f = nothing_current();
-        let e = f.invoke(dupdbtv, &[0, 0]).expect_err("no file current");
+        let e = f.invoke(dupdbtv_wg16, &[0, 0]).expect_err("no file current");
         assert!(e.to_string().contains("dupdbtv"), "{e}");
     }
 
@@ -3475,7 +3603,7 @@ mod tests {
         assert!(f.host.heap.block(filnam).is_some(), "the name is allocated");
         assert!(f.host.heap.block(block).is_some(), "the block itself is allocated");
 
-        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+        f.invoke(clsbtv_wg16, &Fixture::far(block)).expect("closes");
 
         assert!(
             f.host.btrieve.files().iter().all(|b| b.block() != block),
@@ -3499,12 +3627,12 @@ mod tests {
         let mut f = Fixture::rooted(dir);
         let block = open(&mut f, "SAMPLE.DAT", 64);
 
-        f.invoke(clsbtv, &Fixture::far(block)).expect("closes");
+        f.invoke(clsbtv_wg16, &Fixture::far(block)).expect("closes");
         // A second close of the same pointer: `filnam` is already null, so
         // `PLBTVSTF.C:637`'s guard is false and nothing runs -- in
         // particular nothing tries to free what the first close already
         // gave back, which would be a double free if it did.
-        f.invoke(clsbtv, &Fixture::far(block))
+        f.invoke(clsbtv_wg16, &Fixture::far(block))
             .expect("a no-op, not an error");
         assert_eq!(
             bb(&f),
@@ -3529,7 +3657,7 @@ mod tests {
 
         let mut f = Fixture::rooted(dir);
         let other = open(&mut f, "OTHER.DAT", 32);
-        f.invoke(clsbtv, &Fixture::far(other)).expect("closes");
+        f.invoke(clsbtv_wg16, &Fixture::far(other)).expect("closes");
 
         let after = std::fs::read(&path).expect("read after");
         assert_eq!(before, after, "a clean close never touches the file");
@@ -3543,7 +3671,7 @@ mod tests {
         let mut f = nothing_current();
         for _ in 0..50 {
             assert_eq!(
-                f.invoke(qrybtv, &[0, 0, 0, 62]).expect("answers"),
+                f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("answers"),
                 Ret::U16(0)
             );
         }
@@ -3556,7 +3684,7 @@ mod tests {
         assert_eq!(noted.len(), 1, "{:?}", f.host.notes());
 
         // Per routine, not per host: a second routine has its own to say.
-        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]).expect("answers");
+        f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 12, 0]).expect("answers");
         assert!(
             f.host.notes().iter().any(|n| n.contains("obtbtvl")),
             "{:?}",
@@ -3584,10 +3712,10 @@ mod tests {
 
         for who in ["qrybtv", "obtbtvl", "absbtv", "cntrbtv"] {
             let e = match who {
-                "qrybtv" => f.invoke(qrybtv, &[0, 0, 0, 62]),
-                "obtbtvl" => f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 0]),
-                "absbtv" => f.invoke(absbtv, &[]),
-                _ => f.invoke(cntrbtv, &[]),
+                "qrybtv" => f.invoke(qrybtv_wg16, &[0, 0, 0, 62]),
+                "obtbtvl" => f.invoke(obtbtvl_wg16, &[0, 0, 0, 0, 0, 12, 0]),
+                "absbtv" => f.invoke(absbtv_wg16, &[]),
+                _ => f.invoke(cntrbtv_wg16, &[]),
             }
             .expect_err("{who} on a block that was never opened");
             assert!(e.to_string().contains(who), "{who}: {e}");
