@@ -30,6 +30,7 @@
 
 use mbbs16::{FarPtr, Machine};
 
+use crate::abi::{Abi, Wg16};
 use crate::heap::Heap;
 use crate::shims::ShimError;
 use crate::shims::text::write_cstr;
@@ -57,16 +58,45 @@ pub struct TextVar {
 }
 
 /// Every text variable that has been registered, in module memory.
-#[derive(Debug, Default)]
-pub struct TextVars {
+///
+/// # Generic type, `Wg16`-concrete body
+///
+/// `at` is typed `A::Ptr` rather than `FarPtr` so this struct is genuinely
+/// `TextVars<A>` -- but every method stays in `impl TextVars<Wg16>` below,
+/// using `&mut Machine`/`&mut Heap` exactly as before: [`Heap`] itself
+/// defaults to `Heap<Wg16>` and nothing here has a reason to take a
+/// different one yet. `A` defaults to [`Wg16`] so every existing caller
+/// keeps naming this type as plain `TextVars`. Not `#[derive(Debug,
+/// Default)]`: the derive macros bound `A: Debug`/`A: Default` on the impl,
+/// which `Wg16` (a bare marker struct) does not satisfy -- see
+/// `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
+pub struct TextVars<A: Abi = Wg16> {
     /// Where the table is, or `None` before the first registration.
-    at: Option<FarPtr>,
+    at: Option<A::Ptr>,
 
     /// How many rows it has.
     count: u16,
 }
 
-impl TextVars {
+impl<A: Abi> Default for TextVars<A> {
+    fn default() -> Self {
+        Self { at: None, count: 0 }
+    }
+}
+
+impl<A: Abi> std::fmt::Debug for TextVars<A>
+where
+    A::Ptr: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextVars")
+            .field("at", &self.at)
+            .field("count", &self.count)
+            .finish()
+    }
+}
+
+impl TextVars<Wg16> {
     /// How many text variables are registered.
     pub fn len(&self) -> u16 {
         self.count
@@ -141,10 +171,7 @@ impl TextVars {
                 .map_err(|e| ShimError::Failed(format!("register_textvar: {e}")))?;
         }
 
-        let row = FarPtr {
-            offset: grown.offset + self.count * TEXTVAR_SIZE,
-            selector: grown.selector,
-        };
+        let row = Wg16::ptr_offset(grown, self.count * TEXTVAR_SIZE);
 
         // `stzcpy`, not `strncpy`: at most fifteen characters and always a
         // terminator. A name that fills the field is truncated rather than left
@@ -153,13 +180,7 @@ impl TextVars {
         let take = text.len().min(usize::from(TVRSIZ) - 1);
         write_cstr(machine, row, &text[..take], TVRSIZ)?;
 
-        machine.write(
-            FarPtr {
-                offset: row.offset + TVRSIZ,
-                ..row
-            },
-            &varrou.to_bytes(),
-        )?;
+        machine.write(Wg16::ptr_offset(row, TVRSIZ), &varrou.to_bytes())?;
 
         self.at = Some(grown);
         self.count += 1;
@@ -178,10 +199,7 @@ impl TextVars {
         let (Some(at), true) = (self.at, n < self.count) else {
             return Ok(None);
         };
-        let row = FarPtr {
-            offset: at.offset + n * TEXTVAR_SIZE,
-            selector: at.selector,
-        };
+        let row = Wg16::ptr_offset(at, n * TEXTVAR_SIZE);
         let bytes = machine.resolve(row, usize::from(TEXTVAR_SIZE))?;
 
         // `name` is a fixed-width field, so it is read bounded rather than
