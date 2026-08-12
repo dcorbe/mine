@@ -97,9 +97,10 @@ const YES: u16 = 1;
 /// mis-declared `Cleans` -- or an argument read at the wrong stack word -- and
 /// a shim that cheerfully answers yes forever to a question it misread.
 pub fn otstcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let unum = machine.arg_u16(0) as i16;
-    let _amt = machine.arg_u32(1);
-    let _real = machine.arg_u16(3) as i16;
+    let mut args = super::args(machine);
+    let unum = args.int() as i16;
+    let _amt = args.long();
+    let _real = args.int() as i16;
     host.users()
         .terms()
         .chan(unum)
@@ -122,10 +123,11 @@ pub fn otstcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 ///
 /// If `unum` names no channel; see [`otstcrd`].
 pub fn odedcrd(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    let unum = machine.arg_u16(0) as i16;
-    let _amt = machine.arg_u32(1) as i32;
-    let _real = machine.arg_u16(3) as i16;
-    let _asmuch = machine.arg_u16(4) as i16;
+    let mut args = super::args(machine);
+    let unum = args.int() as i16;
+    let _amt = args.long() as i32;
+    let _real = args.int() as i16;
+    let _asmuch = args.int() as i16;
     host.users()
         .terms()
         .chan(unum)
