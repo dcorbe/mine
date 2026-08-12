@@ -174,6 +174,40 @@ impl fmt::Display for BtvError {
 
 impl std::error::Error for BtvError {}
 
+/// Why [`Btrieve::begin`], [`Btrieve::end`] or [`Btrieve::abort`] refused.
+///
+/// Measured against genuine Btrieve 6.15 under Wine
+/// (`tools/btrieve-oracle/xactprobe.c`), not designed from the vendor
+/// header's `ASSERT`s alone: a nested `dfaBegTrans` is refused (status 37,
+/// not silently accepted or stacked -- `nested: inner begin status=37`), and
+/// `dfaEndTrans`/`dfaAbtTrans` with no transaction active are refused with
+/// the same status the engine gives a *second* `dfaAbtTrans` right after a
+/// first one that already closed the transaction (`end_no_begin: status=39`,
+/// `abort_no_begin: status=39`, `nested: second abort status=39`) -- three
+/// different routes to "no transaction is open" landing on one status is
+/// itself the measurement, not a name read off a manual. This host does not
+/// reproduce Btrieve's numeric status codes at the engine layer (Task 7's
+/// marshalling does that); the two variants below are what `dfaBegTrans` and
+/// `dfaEndTrans`/`dfaAbtTrans` each need to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionError {
+    /// [`Btrieve::begin`] while a transaction was already open.
+    AlreadyActive,
+    /// [`Btrieve::end`] or [`Btrieve::abort`] with none open.
+    NoneActive,
+}
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyActive => write!(f, "a transaction is already open"),
+            Self::NoneActive => write!(f, "no transaction is open"),
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {}
+
 impl Geometry {
     /// Read a file's geometry from its first page.
     ///
@@ -557,6 +591,60 @@ pub struct Block {
     /// `clsbtv` calls `reindex` exactly when this is true so that a file
     /// leaving this host's reach never leaves with a stale index behind it.
     dirty: bool,
+
+    /// Whether a transaction [`Btrieve::begin`] started is still open and
+    /// covers this block.
+    ///
+    /// Set on every currently-open block by [`Btrieve::begin`] and on every
+    /// block opened while one is in progress by [`Btrieve::open`], cleared by
+    /// [`Btrieve::end`] and [`Btrieve::abort`]. `Block::insert`/`Block::update`
+    /// read this rather than taking a parameter, because `dinsbtv`/`dupdbtv`
+    /// call them directly (`shims/btrieve.rs:455,579`) and that call site is
+    /// frozen for this task -- see this module's top-of-file note. A `bool`
+    /// here is what lets the transaction reach a write it cannot be told
+    /// about through its own argument list.
+    txn_active: bool,
+
+    /// This block's pre-image for the transaction in progress, if a write
+    /// has reached it since [`Self::txn_active`] went true.
+    ///
+    /// `None` until the *first* write inside the transaction -- capturing one
+    /// for every open block at `begin` would mean reading every file the
+    /// module happens to have open, most of which a transaction never
+    /// touches, and the largest MajorMUD ships is 77 MB. Captured just once:
+    /// [`Self::insert`] and [`Self::update`] only take it if it is still
+    /// `None`, so a second write to the same block in the same transaction
+    /// leaves the *pre-transaction* image standing, not the first write's
+    /// result.
+    pre_image: Option<PreImage>,
+}
+
+/// One block's state as it was the moment a transaction first wrote to it --
+/// enough to put both the disk and the in-memory model back exactly where
+/// they were on [`Btrieve::abort`].
+///
+/// Genuine Pervasive Btrieve keeps this as a page-level pre-image file
+/// (`docs/plans/2026-08-12-btrieve-finish.md` Task 6, and `DFAAPI.C`'s
+/// `PRIMBV`/"normal pre-image `dfaMode()`" -- see `at::` in this file's
+/// module doc comment). This host keeps the whole file's bytes instead of
+/// only the pages a write touched: `Block::insert`/`Block::update` write
+/// through several places (a data page, and on `insert` sometimes the
+/// allocation table) and re-deriving exactly which bytes moved would have to
+/// track every one of them precisely, where "the file as it was" cannot be
+/// wrong by construction. The cost is one extra copy of the file, taken
+/// once per transaction per block actually written -- not per write, and not
+/// for a block a transaction never touches.
+#[derive(Debug)]
+struct PreImage {
+    /// The file's bytes before this transaction's first write to it.
+    bytes: Vec<u8>,
+    /// The in-memory model at the same instant, so a restore does not need a
+    /// re-read to agree with the bytes it just wrote back.
+    records: Option<Records>,
+    /// The block's record/page counts at the same instant.
+    geometry: Geometry,
+    /// Whether the block was dirty at the same instant.
+    dirty: bool,
 }
 
 /// Make `bytes` exactly `reclen` long: padded with zero if shorter, cut off
@@ -636,6 +724,40 @@ impl Block {
                 ),
             });
         }
+        Ok(())
+    }
+
+    /// If a transaction covers this block and has not yet written to it,
+    /// capture its pre-image. A no-op otherwise -- both when no transaction
+    /// is active ([`Self::txn_active`] false) and when this transaction has
+    /// already captured one, so every call site can call this unconditionally
+    /// right before it is about to change the file.
+    ///
+    /// **Called at the last point before a write, not at the top of
+    /// `insert`/`update`.** Both callers reach this only after every refusal
+    /// ahead of them (`writable`, the variable-length checks, the length and
+    /// position checks) has already passed, so a call that returns `Err`
+    /// never captures one -- there is nothing to roll back for a write that
+    /// never happened, and capturing anyway would cost a full read of the
+    /// file for every refused call, not just every real write.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read back for the snapshot.
+    fn capture_for_journal(&mut self) -> Result<(), BtvError> {
+        if !self.txn_active || self.pre_image.is_some() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&self.path).map_err(|e| BtvError {
+            file: self.name.clone(),
+            why: format!("{}: reading a transaction pre-image: {e}", self.path.display()),
+        })?;
+        self.pre_image = Some(PreImage {
+            bytes,
+            records: self.records.clone(),
+            geometry: self.geometry,
+            dirty: self.dirty,
+        });
         Ok(())
     }
 
@@ -794,6 +916,11 @@ impl Block {
         })?;
         let slot = layout.next_slot(&positions, free, &data);
 
+        // The last point before this write actually changes anything -- see
+        // `Self::capture_for_journal`'s doc comment for why it is taken here
+        // rather than at the top of the function.
+        self.capture_for_journal()?;
+
         pages::write_record(&self.path, layout, slot, &bytes, count).map_err(|why| BtvError {
             file: name.clone(),
             why,
@@ -875,6 +1002,7 @@ impl Block {
                     .find_physical(position)
                     .is_some();
                 if known {
+                    self.capture_for_journal()?;
                     return match self.rewrite_variable(position, bytes) {
                         Ok(()) => {
                             self.records
@@ -931,6 +1059,7 @@ impl Block {
             physical: self.geometry.physical,
             pages: self.geometry.pages,
         };
+        self.capture_for_journal()?;
         pages::write_record(&self.path, layout, pages::Slot::Existing(position), bytes, count)
             .map_err(|why| BtvError {
                 file: name.clone(),
@@ -1264,6 +1393,21 @@ pub struct Btrieve {
     /// `bbomode`: the mode the next `opnbtv` opens in. `PRIMBV`, which is zero,
     /// until `omdbtv` says otherwise.
     mode: i16,
+
+    /// Whether a transaction begun by [`Self::begin`] is in progress.
+    ///
+    /// Btrieve ops 19/20/21 (`dfaBegTrans`/`dfaEndTrans`/`dfaAbtTrans`) take
+    /// no file argument at all -- `DFAAPI.C:206,214,222` calls
+    /// `btvu(19+loktyp,NULL,NULL,0,0)`, `btvu(21,NULL,NULL,0,0)` and
+    /// `btvu(20,NULL,NULL,0,0)` -- so the transaction is a property of the
+    /// whole session, not of any one [`Block`], and belongs on `Btrieve`
+    /// rather than on a `Block`. Each `Block` additionally carries its own
+    /// `txn_active`/`pre_image` (see [`Block`]'s doc comments) because the
+    /// frozen shim call sites reach a block's `insert`/`update` directly, with
+    /// no way to pass this flag through -- this field is what tells
+    /// [`Self::begin`]/[`Self::open`] to set that per-block flag, and
+    /// [`Self::end`]/[`Self::abort`] to clear it everywhere.
+    transaction: bool,
 }
 
 impl Default for Btrieve {
@@ -1277,6 +1421,7 @@ impl Default for Btrieve {
             open: Vec::new(),
             stack: [FarPtr::NULL; BBSTSZ],
             mode: 0,
+            transaction: false,
         }
     }
 }
@@ -1373,6 +1518,13 @@ impl Btrieve {
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
+            // A file opened while a transaction is in progress is covered by
+            // it too -- `dfaBegTrans` has no per-file scope (see this
+            // module's `Btrieve::begin` doc comment), so a module that opens
+            // a new file mid-transaction and writes to it gets that write
+            // rolled back on abort the same as one opened before `begin`.
+            txn_active: self.transaction,
+            pre_image: None,
         });
         Ok(block)
     }
@@ -1441,6 +1593,142 @@ impl Btrieve {
     /// Set the mode the next `opnbtv` will use, as `omdbtv` does.
     pub fn set_mode(&mut self, mode: i16) {
         self.mode = mode;
+    }
+
+    /// Begin a transaction, as `dfaBegTrans` (Btrieve op `19+loktyp`) does.
+    ///
+    /// `loktyp` (`WAITBV`/`NOWTBV`, `DFAAPI.H:36-37`) is not a parameter
+    /// here: measured against the real engine with a single client
+    /// (`tools/btrieve-oracle/xactprobe.c`'s `loktyp` scenario), `begin` then
+    /// `end` with each value in turn gave `status=0` both times, with no
+    /// observable difference -- unsurprising, since a wait-or-not bias only
+    /// has anything to wait *for* when a second client is holding a
+    /// conflicting lock, and this host is single-process and
+    /// single-threaded by construction. Task 7's marshalling can take the
+    /// argument and drop it, with this comment as the record of why.
+    ///
+    /// Every write made through [`Block::insert`]/[`Block::update`] after
+    /// this call, on any file open now or opened later while it is still in
+    /// progress, is covered: [`Self::abort`] can undo it, [`Self::end`]
+    /// keeps it. Writes already made **before** this call are not covered --
+    /// there is nothing before `begin` for a pre-image to be *of*.
+    ///
+    /// # Errors
+    ///
+    /// [`TransactionError::AlreadyActive`] if a transaction is already open.
+    /// Measured, not assumed: `xactprobe`'s `nested` scenario opens one,
+    /// begins a second without ending the first, and the real engine
+    /// refuses it (`nested: inner begin status=37`) rather than accepting it
+    /// silently or stacking it -- the first transaction's own single
+    /// `abort` closes it (`nested: abort status=0`), and a *second* abort
+    /// right after finds nothing open (`nested: second abort status=39`,
+    /// the same status [`Self::end`]/[`Self::abort`] give with no `begin` at
+    /// all). So Btrieve transactions do not nest, and this does not either.
+    pub fn begin(&mut self) -> Result<(), TransactionError> {
+        if self.transaction {
+            return Err(TransactionError::AlreadyActive);
+        }
+        self.transaction = true;
+        for block in &mut self.open {
+            block.txn_active = true;
+            block.pre_image = None;
+        }
+        Ok(())
+    }
+
+    /// End a transaction, as `dfaEndTrans` (Btrieve op 20) does: keep every
+    /// write made since [`Self::begin`], and discard the pre-images that
+    /// would have undone them.
+    ///
+    /// **Writes are already visible before this is called.** Measured
+    /// (`xactprobe`'s `visibility` scenario): a `GET_EQUAL` for a record
+    /// inserted earlier in the same transaction found it, tag and all,
+    /// before `dfaEndTrans` was ever reached (`get-inside-txn status=0 (OK)
+    /// tag=aa`), and it was still there after a close and reopen
+    /// (`get-after-close-reopen status=0 (OK) tag=aa`). So this host's
+    /// `Block::insert`/`Block::update` already write straight through, live,
+    /// the same as the real engine -- there is no buffered write for `end`
+    /// to flush. All it does is stop tracking pre-images, which matches: a
+    /// failing op inside a transaction does not implicitly end or abort it
+    /// either (`xactprobe`'s `fail_inside`: a duplicate-key insert returned
+    /// status 5, and every op after it -- including the eventual `end` --
+    /// still succeeded, and both the surviving insert and the one after the
+    /// failure were there on reopen).
+    ///
+    /// # Errors
+    ///
+    /// [`TransactionError::NoneActive`] if no transaction is open. Measured:
+    /// `xactprobe`'s `end_no_begin` scenario calls `dfaEndTrans` on a freshly
+    /// opened file with no `dfaBegTrans` first, and the real engine refuses
+    /// it (`end_no_begin: status=39`) rather than treating it as a no-op.
+    pub fn end(&mut self) -> Result<(), TransactionError> {
+        if !self.transaction {
+            return Err(TransactionError::NoneActive);
+        }
+        self.transaction = false;
+        for block in &mut self.open {
+            block.txn_active = false;
+            block.pre_image = None;
+        }
+        Ok(())
+    }
+
+    /// Abort a transaction, as `dfaAbtTrans` (Btrieve op 21) does: undo
+    /// every write made since [`Self::begin`], on every file that has one.
+    ///
+    /// Measured against the real engine (`xactprobe`'s `abort_insert`,
+    /// `abort_update` and `abort_delete` scenarios), an insert, an update and
+    /// a delete made inside a transaction are all rolled back by abort, both
+    /// within the same session (`get-after-abort-same-session`) and after a
+    /// close and reopen (`get-after-close-reopen`) -- so this restores the
+    /// file to disk, not only the in-memory model.
+    ///
+    /// A block with no [`Block::pre_image`] (nothing was written to it this
+    /// transaction) is untouched -- there is nothing to undo, and reading it
+    /// back off disk to overwrite it with itself would be pointless I/O for
+    /// every file a module merely holds open. A block whose pre-image
+    /// belongs to a file that has since been closed cannot be restored --
+    /// [`Self::close`] refuses to close a block with one outstanding rather
+    /// than let this silently happen; see its doc comment.
+    ///
+    /// # Errors
+    ///
+    /// [`TransactionError::NoneActive`] if no transaction is open. Measured
+    /// the same way [`Self::end`]'s is: `xactprobe`'s `abort_no_begin`
+    /// scenario gives `abort_no_begin: status=39`, the same status as
+    /// `end_no_begin` and as a second `dfaAbtTrans` right after a first one
+    /// already closed the transaction.
+    ///
+    /// If a pre-image cannot be written back to disk, the block it belongs to
+    /// is left with that pre-image still attached rather than half-restored
+    /// -- a later retry can still find it -- and every other block's restore
+    /// still runs; one file's disk error should not strand every other
+    /// file's rollback.
+    pub fn abort(&mut self) -> Result<(), TransactionError> {
+        if !self.transaction {
+            return Err(TransactionError::NoneActive);
+        }
+        self.transaction = false;
+        for block in &mut self.open {
+            block.txn_active = false;
+            let Some(pre) = block.pre_image.take() else {
+                continue;
+            };
+            if std::fs::write(&block.path, &pre.bytes).is_err() {
+                // Restoring the model without the disk write succeeding
+                // would make the two disagree in a way a fresh read could
+                // not even detect, since the next read of this file would
+                // see the *unrestored* disk bytes. Leave both, and the
+                // pre-image, exactly as they were so nothing here claims a
+                // rollback that did not happen.
+                block.pre_image = Some(pre);
+                continue;
+            }
+            block.records = pre.records;
+            block.geometry = pre.geometry;
+            block.dirty = pre.dirty;
+        }
+        Ok(())
     }
 
     /// The block a module's pointer names.
@@ -1517,7 +1805,25 @@ impl Btrieve {
     /// point the whole design rests on, and a file going out of this host's
     /// reach with an index that disagrees with its data is exactly what
     /// `reindex` exists to prevent. Or if any of the four allocations cannot
-    /// be freed.
+    /// be freed. Or if the block has an outstanding transaction pre-image --
+    /// see the note below.
+    ///
+    /// # A block with an outstanding pre-image refuses to close
+    ///
+    /// [`Btrieve::abort`] restores a block from its [`Block::pre_image`],
+    /// which lives on the `Block` and leaves with it if the block is
+    /// removed from [`Self::open`] here. Closing a block a transaction has
+    /// already written to would make that write unreachable to a later
+    /// `abort` -- the write stays on disk and in whatever the module did
+    /// with the closed handle, and the transaction's own guarantee (measured
+    /// against the real engine: an aborted insert, update or delete does not
+    /// survive, even across a close and reopen -- see [`Btrieve::abort`]'s
+    /// doc comment) silently stops applying to this one file. This case is
+    /// not in `xactprobe`'s scenarios -- closing a file mid-transaction was
+    /// never run against the real engine -- so rather than guess what real
+    /// Btrieve does with it, this refuses it outright: a compile-time-checked
+    /// `Result` a caller must handle, not a rollback guarantee that quietly
+    /// stops holding for one file and nothing says so.
     pub fn close(
         &mut self,
         machine: &mut Machine,
@@ -1542,6 +1848,15 @@ impl Btrieve {
             file: name.clone(),
             why,
         };
+
+        if self.open[index].pre_image.is_some() {
+            return Err(fail(
+                "has been written to inside a transaction that has not yet ended or \
+                 aborted -- closing it now would take its rollback out of a later abort's \
+                 reach, so this refuses rather than let that happen silently"
+                    .to_owned(),
+            ));
+        }
 
         let filnam_at = FarPtr {
             offset: at.offset + field::FILNAM,
@@ -1955,6 +2270,8 @@ mod tests {
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
+            txn_active: false,
+            pre_image: None,
         }
     }
 
@@ -2411,6 +2728,8 @@ mod tests {
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
+            txn_active: false,
+            pre_image: None,
         }
     }
 
@@ -2654,6 +2973,8 @@ mod tests {
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
+            txn_active: false,
+            pre_image: None,
         }
     }
 
@@ -3143,6 +3464,8 @@ mod tests {
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
+            txn_active: false,
+            pre_image: None,
         }
     }
 
@@ -3479,5 +3802,381 @@ mod tests {
         bytes[at::VARIABLE_MARK] = 0xff;
         mark_first_half_live(&mut bytes);
         assert!(read("V6ROOM.DAT", &bytes).expect("six is enough").variable);
+    }
+
+    // Task 6: transactions. Ops 19/20/21 (`dfaBegTrans`/`dfaEndTrans`/
+    // `dfaAbtTrans`) as ABI-independent `Btrieve` methods -- semantics only,
+    // no shim registration (that is Task 7's marshalling, blocked on the
+    // `abi` branch's `Abi` trait landing on `main`). Every behaviour here was
+    // measured against genuine Btrieve 6.15 first with
+    // `tools/btrieve-oracle/xactprobe.c`; see `Btrieve::begin`/`end`/`abort`'s
+    // doc comments for the raw probe output each test is reproducing.
+
+    /// A `Btrieve` over a set of already-open blocks, built directly rather
+    /// than through [`Btrieve::open`] -- these tests are about the
+    /// transaction bookkeeping in [`Btrieve::begin`]/[`Btrieve::end`]/
+    /// [`Btrieve::abort`], not about opening a file, and every field here is
+    /// visible to `mod tests` as a descendant of the module that declares
+    /// them private.
+    fn btrieve_with(open: Vec<Block>) -> Btrieve {
+        Btrieve {
+            open,
+            stack: [FarPtr::NULL; BBSTSZ],
+            mode: 0,
+            transaction: false,
+        }
+    }
+
+    #[test]
+    fn beginning_a_transaction_when_one_is_already_open_is_refused() {
+        let mut btrieve = btrieve_with(vec![]);
+        btrieve.begin().expect("the first begin opens one");
+        let e = btrieve.begin().expect_err("nested begin is refused, not stacked");
+        assert_eq!(e, TransactionError::AlreadyActive);
+    }
+
+    #[test]
+    fn ending_a_transaction_with_none_open_is_refused() {
+        let mut btrieve = btrieve_with(vec![]);
+        let e = btrieve.end().expect_err("nothing was begun");
+        assert_eq!(e, TransactionError::NoneActive);
+    }
+
+    #[test]
+    fn aborting_a_transaction_with_none_open_is_refused() {
+        let mut btrieve = btrieve_with(vec![]);
+        let e = btrieve.abort().expect_err("nothing was begun");
+        assert_eq!(e, TransactionError::NoneActive);
+    }
+
+    /// Reproduces `xactprobe`'s `nested` scenario past its first `abort`:
+    /// `nested: abort status=0 (OK)` then `nested: second abort status=39
+    /// (?)` -- the same status `end_no_begin`/`abort_no_begin` give with no
+    /// `begin` at all. One `abort` closes the transaction completely; there
+    /// is no outer transaction left standing for a second `abort` to find.
+    #[test]
+    fn a_second_abort_right_after_the_first_finds_nothing_open() {
+        let mut btrieve = btrieve_with(vec![]);
+        btrieve.begin().expect("begin");
+        btrieve.abort().expect("first abort closes it");
+        let e = btrieve.abort().expect_err("nothing is open a second time");
+        assert_eq!(e, TransactionError::NoneActive);
+    }
+
+    #[test]
+    fn begin_marks_every_currently_open_block_as_covered() {
+        let dir = crate::testing::scratch("txn-begin-marks-open-blocks");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+
+        assert!(!btrieve.open[0].txn_active, "not covered before begin");
+        btrieve.begin().expect("begin");
+        assert!(btrieve.open[0].txn_active, "covered the moment begin returns");
+    }
+
+    /// `Btrieve::open` (the real one, not the test helper `block()`) is where
+    /// a file that did not exist yet when `begin` ran picks up coverage --
+    /// exercised through the genuine method, with a real `Machine` and
+    /// `Heap`, because that propagation lives in `open` itself and a
+    /// hand-built `Block` pushed straight into `open` (as `open_indexed`
+    /// does for other tests here) would skip the code path this test is for.
+    #[test]
+    fn a_file_opened_after_begin_is_covered_too() {
+        let mut machine = Machine::new().expect("a 16-bit machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let mut btrieve = Btrieve::default();
+
+        btrieve.begin().expect("begin before anything is open");
+
+        // `SAMPLE.DAT`: a real, committed fixture with a genuine key
+        // definition (`crates/mbbs/tests/data/SAMPLE.DAT`, what
+        // `shims::btrieve`'s own `opnbtv` tests open) -- unlike this file's
+        // hand-built `seed`/`seed_indexed` fixtures, which only ever back a
+        // hand-rolled `Geometry`/`Key` and have no real key bytes at `0x110`
+        // for `keys::parse` to read. This is the first test in this module to
+        // drive the real `Btrieve::open`, so it needs a fixture that survives
+        // both `Geometry::read` and `keys::parse`, not just one.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/SAMPLE.DAT");
+        let geometry = Geometry::read("SAMPLE.DAT", &path).expect("reads");
+        let at = btrieve
+            .open(&mut machine, &mut heap, "SAMPLE.DAT", &path, geometry, 64)
+            .expect("opens");
+
+        assert!(
+            btrieve.block(at).expect("open").txn_active,
+            "a file opened mid-transaction is covered by it, matching real \
+             Btrieve: dfaBegTrans has no per-file scope"
+        );
+    }
+
+    /// Reproduces `xactprobe`'s `visibility` scenario: `insert status=0
+    /// (OK)`, then `get-inside-txn status=0 (OK) tag=aa` -- the write is
+    /// visible to a read on the same client before `end`, because this
+    /// host's `insert` already writes straight through rather than buffering
+    /// until commit.
+    #[test]
+    fn an_insert_made_after_begin_is_visible_before_end() {
+        let dir = crate::testing::scratch("txn-insert-visible-before-end");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+        btrieve.begin().expect("begin");
+
+        let position = btrieve.open[0].insert(&record(1)).expect("insert");
+
+        let seen = btrieve.open[0]
+            .records()
+            .expect("reads")
+            .find_physical(position)
+            .is_some();
+        assert!(seen, "visible before end, same as the real engine");
+    }
+
+    /// Reproduces `xactprobe`'s `abort_insert` scenario: after `abort`, a
+    /// `GET_EQUAL` for the inserted key found nothing, both
+    /// `get-after-abort-same-session` and `get-after-close-reopen` -- so this
+    /// checks both the in-memory model (no re-read) and a fresh read off
+    /// disk (cache dropped), the same distinction
+    /// `a_block_that_writes_is_readable_after_its_cache_is_dropped` draws for
+    /// an ordinary insert.
+    #[test]
+    fn abort_undoes_an_insert_both_in_memory_and_on_disk() {
+        let dir = crate::testing::scratch("txn-abort-undoes-insert");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path.clone())]);
+        // A record from before the transaction, so this test can also see
+        // that abort does not touch it -- see the companion test below for
+        // the write made *after* begin being the only one undone.
+        let baseline = btrieve.open[0].insert(&record(1)).expect("baseline insert");
+
+        btrieve.begin().expect("begin");
+        let inserted = btrieve.open[0].insert(&record(2)).expect("insert inside the transaction");
+        assert!(
+            btrieve.open[0].records().expect("reads").find_physical(inserted).is_some(),
+            "visible before abort"
+        );
+
+        btrieve.abort().expect("abort");
+
+        assert!(!btrieve.open[0].txn_active, "the block is no longer covered");
+        assert!(btrieve.open[0].pre_image.is_none(), "the pre-image is discarded, not kept");
+        assert_eq!(btrieve.open[0].geometry.records, 1, "the count reverts too");
+
+        let model = btrieve.open[0].records().expect("in-memory model after abort");
+        assert!(model.find_physical(baseline).is_some(), "the baseline survives");
+        assert!(model.find_physical(inserted).is_none(), "the transaction's insert does not");
+
+        // And a fresh read off disk, cache dropped, agrees with the model --
+        // the rollback reached the file, not only the `Records` cache.
+        btrieve.open[0].records = None;
+        let reread = btrieve.open[0].records().expect("a fresh read from disk");
+        assert_eq!(reread.len(), 1, "disk has only the baseline record");
+        assert!(reread.find_physical(baseline).is_some());
+    }
+
+    /// Reproduces `xactprobe`'s `abort_update` scenario: `get-inside-txn`
+    /// showed the new tag (`22`), and after `abort`,
+    /// `get-after-abort-same-session` and `get-after-close-reopen` both
+    /// showed the old one (`11`) again.
+    #[test]
+    fn abort_undoes_an_update_both_in_memory_and_on_disk() {
+        let dir = crate::testing::scratch("txn-abort-undoes-update");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+        let position = btrieve.open[0].insert(&record(1)).expect("baseline insert");
+
+        btrieve.begin().expect("begin");
+        btrieve.open[0].update(position, &record(9)).expect("update inside the transaction");
+        assert_eq!(
+            btrieve.open[0]
+                .records()
+                .expect("reads")
+                .find_physical(position)
+                .and_then(|at| btrieve.open[0].records.as_ref().expect("loaded").physical(at))
+                .expect("still there")
+                .bytes[0],
+            9,
+            "the new value is visible before abort"
+        );
+
+        btrieve.abort().expect("abort");
+
+        btrieve.open[0].records = None;
+        let reread = btrieve.open[0].records().expect("a fresh read from disk");
+        assert_eq!(
+            reread
+                .find_physical(position)
+                .and_then(|at| reread.physical(at))
+                .expect("still there")
+                .bytes[0],
+            1,
+            "the pre-transaction value, not the update, survives on disk"
+        );
+    }
+
+    /// The variable-length in-place rewrite path
+    /// ([`Block::update`]'s `has_body`/`known` branch, which reaches
+    /// [`Block::rewrite_variable`] instead of the fixed-length write below
+    /// it) is a **second, separate** call to `capture_for_journal` --
+    /// `update`'s doc comment on why variable-length files take a different
+    /// path than fixed-length ones applies here too. A mutation that removed
+    /// only this call site (leaving the fixed-length one intact) passed
+    /// every other test in this module, including
+    /// [`abort_undoes_an_update_both_in_memory_and_on_disk`], because that
+    /// test's block is fixed-length and never reaches this branch. This test
+    /// is what closes that gap: same fixture and position as
+    /// [`update_rewrites_a_matching_variable_length_fragment_in_place`], now
+    /// inside a transaction that gets aborted instead of kept.
+    #[test]
+    fn abort_undoes_a_variable_length_in_place_rewrite() {
+        let dir = crate::testing::scratch("txn-abort-undoes-variable-rewrite");
+        let path = seed_variable(&dir);
+        let mut btrieve = btrieve_with(vec![block_variable(path.clone())]);
+
+        let original = btrieve.open[0]
+            .records()
+            .expect("reads")
+            .find_physical(70)
+            .and_then(|at| btrieve.open[0].records.as_ref().expect("loaded").physical(at))
+            .expect("the fixture's one record")
+            .bytes
+            .clone();
+
+        btrieve.begin().expect("begin");
+        let mut new_value = vec![0u8; 8];
+        new_value[..2].copy_from_slice(&9u16.to_le_bytes());
+        new_value.extend((100..120u8).collect::<Vec<u8>>());
+        btrieve.open[0]
+            .update(70, &new_value)
+            .expect("an equal-length rewrite is handled");
+        assert_ne!(
+            btrieve.open[0]
+                .records()
+                .expect("reads")
+                .find_physical(70)
+                .and_then(|at| btrieve.open[0].records.as_ref().expect("loaded").physical(at))
+                .expect("still there")
+                .bytes,
+            original,
+            "the rewrite is visible before abort"
+        );
+
+        btrieve.abort().expect("abort");
+
+        let model = btrieve.open[0].records().expect("in-memory model after abort");
+        let restored = model.find_physical(70).and_then(|at| model.physical(at)).expect("still there");
+        assert_eq!(restored.bytes, original, "the in-memory model reverts to the original fragment");
+
+        btrieve.open[0].records = None;
+        let reread = btrieve.open[0].records().expect("a fresh read from disk");
+        let reread_record = reread.find_physical(70).and_then(|at| reread.physical(at)).expect("still there");
+        assert_eq!(reread_record.bytes, original, "and so does a fresh read off disk");
+    }
+
+    /// Reproduces `xactprobe`'s `fail_inside` scenario indirectly: `end`
+    /// keeps the write rather than rolling it back, matching real Btrieve
+    /// where every op after a failed one (including the eventual `end`)
+    /// still succeeded and both records were there on reopen. This host has
+    /// no buffered-write path for `end` to flush -- see [`Btrieve::end`]'s
+    /// doc comment -- so what `end` actually has to get right is *not*
+    /// undoing anything, and discarding the now-useless pre-image.
+    #[test]
+    fn ending_a_transaction_keeps_the_write_and_discards_the_pre_image() {
+        let dir = crate::testing::scratch("txn-end-keeps-write");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+
+        btrieve.begin().expect("begin");
+        let inserted = btrieve.open[0].insert(&record(1)).expect("insert");
+        assert!(btrieve.open[0].pre_image.is_some(), "captured on the first write");
+
+        btrieve.end().expect("end");
+
+        assert!(!btrieve.open[0].txn_active, "no longer covered");
+        assert!(btrieve.open[0].pre_image.is_none(), "the pre-image is discarded");
+
+        btrieve.open[0].records = None;
+        let reread = btrieve.open[0].records().expect("a fresh read from disk");
+        assert!(reread.find_physical(inserted).is_some(), "the write survives end");
+    }
+
+    /// Scope check: a write made **before** `begin` is not what a later
+    /// `abort` undoes -- there is no pre-image of it to restore, because
+    /// [`Block::capture_for_journal`] only ever runs once `txn_active` is
+    /// true. Without this, a test that only ever inserts *after* begin
+    /// cannot tell "abort undoes this transaction's writes" from "abort
+    /// undoes every write this block has ever seen" -- see this test's
+    /// mutation-table entry.
+    #[test]
+    fn a_write_before_begin_is_untouched_by_a_later_abort() {
+        let dir = crate::testing::scratch("txn-write-before-begin-survives-abort");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+        let before = btrieve.open[0].insert(&record(1)).expect("before begin");
+
+        btrieve.begin().expect("begin");
+        btrieve.abort().expect("abort with nothing written since begin");
+
+        let model = btrieve.open[0].records().expect("reads");
+        assert!(model.find_physical(before).is_some(), "a pre-begin write survives an abort");
+    }
+
+    /// The pre-image is captured **once**, at the first write since `begin`
+    /// -- not refreshed on every write. If it were refreshed, the second
+    /// write's "before" state (which already includes the first write) would
+    /// be what abort restores to, and the first write inside the transaction
+    /// would survive an abort that is supposed to undo the whole
+    /// transaction. Both inserts made after `begin` must be gone after
+    /// `abort`, not just the second.
+    #[test]
+    fn a_second_write_in_the_same_transaction_does_not_reset_the_pre_image() {
+        let dir = crate::testing::scratch("txn-second-write-keeps-first-pre-image");
+        let path = seed(&dir);
+        let mut btrieve = btrieve_with(vec![block(path)]);
+
+        btrieve.begin().expect("begin");
+        let first = btrieve.open[0].insert(&record(1)).expect("first insert this transaction");
+        let second = btrieve.open[0].insert(&record(2)).expect("second insert this transaction");
+
+        btrieve.abort().expect("abort");
+
+        let model = btrieve.open[0].records().expect("reads");
+        assert!(model.find_physical(first).is_none(), "the first write is undone too");
+        assert!(model.find_physical(second).is_none(), "and the second");
+        assert_eq!(model.len(), 0, "back to nothing, the state before begin");
+    }
+
+    /// [`Btrieve::close`]'s new refusal: closing a block a transaction has
+    /// already written to would take its rollback out of a later abort's
+    /// reach (see `close`'s doc comment), so this refuses rather than let
+    /// that happen silently.
+    #[test]
+    fn closing_a_block_with_an_outstanding_pre_image_is_refused() {
+        let mut machine = Machine::new().expect("a 16-bit machine");
+        let mut heap = crate::Heap::new(crate::Config::default());
+        let mut btrieve = Btrieve::default();
+
+        let path = seed_indexed(&crate::testing::scratch("txn-close-refuses-outstanding-pre-image"));
+        let at = open_indexed(&mut machine, &mut heap, &mut btrieve, path);
+
+        btrieve.begin().expect("begin");
+        btrieve
+            .block_mut(at)
+            .expect("open")
+            .insert(&record(1))
+            .expect("insert, which captures a pre-image");
+
+        let e = btrieve
+            .close(&mut machine, &mut heap, at)
+            .expect_err("a write from this transaction has nowhere to go on abort otherwise");
+        assert!(e.why.contains("transaction"), "{e}");
+
+        // Still open, and still covered -- the refusal did not half-close it.
+        assert!(btrieve.block(at).is_ok(), "still open after the refusal");
+        btrieve.abort().expect("abort still works after the refused close");
+        let model = btrieve.block(at).expect("still open").loaded();
+        assert!(
+            model.is_none_or(|records| records.is_empty()),
+            "the insert this test never got to keep was rolled back"
+        );
     }
 }

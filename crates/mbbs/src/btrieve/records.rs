@@ -69,7 +69,13 @@ pub struct Record {
 }
 
 /// Every record in a file, in physical order, with an index per key.
-#[derive(Debug)]
+///
+/// `Clone`: Task 6's transaction journal keeps a whole copy of this as a
+/// pre-image, taken the first time a write inside a transaction reaches a
+/// block and restored verbatim on abort -- see `btrieve.rs`'s `PreImage`.
+/// Every field here is itself `Clone` (two levels of `Vec`, at most), so this
+/// is a derive, not new logic to get wrong.
+#[derive(Debug, Clone)]
 pub struct Records {
     /// Physical order: the order `stpbtvl` walks.
     records: Vec<Record>,
