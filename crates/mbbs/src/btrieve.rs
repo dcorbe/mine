@@ -28,6 +28,7 @@
 //! FCR, verified against all eighteen files MajorMUD ships by
 //! `crates/mbbs/tests/btrieve.rs`.
 
+mod create;
 pub mod keys;
 pub mod pages;
 pub mod records;
@@ -39,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use mbbs16::{FarPtr, Machine};
 
+pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
 pub use records::{Record, Records};
 

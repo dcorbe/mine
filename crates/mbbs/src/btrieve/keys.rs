@@ -122,7 +122,14 @@ pub enum Kind {
 impl Kind {
     /// The ordering a Btrieve data type implies, or `None` for one this host
     /// has no ordering for.
-    fn of(code: u8) -> Option<Self> {
+    ///
+    /// `pub(crate)` rather than private: [`create`](super::create) calls this
+    /// to refuse writing a key of a type this reader could not make sense of
+    /// afterward. Writing a value `parse` cannot read back is exactly the
+    /// silent-corruption shape this module's own doc comment warns against,
+    /// so the writer and the reader share one answer to "is this type
+    /// readable" rather than keeping two lists that could drift apart.
+    pub(crate) fn of(code: u8) -> Option<Self> {
         match code {
             0x00 | 0x0a | 0x0b | 0x20 => Some(Self::Text),
             0x01 | 0x0f => Some(Self::Signed),

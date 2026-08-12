@@ -75,3 +75,7 @@ tools/btrieve-oracle/xactprobe.exe
 
 # Build artifact of tools/btrieve-oracle/delprobe.c (Block::delete's oracle probe)
 tools/btrieve-oracle/delprobe.exe
+
+# Build artifact of tools/btrieve-oracle/crtprobe.c -- built by hand, see
+# that file's own header comment.
+tools/btrieve-oracle/crtprobe.exe
