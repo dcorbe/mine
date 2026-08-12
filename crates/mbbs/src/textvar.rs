@@ -29,11 +29,11 @@
 //! own `register_textvar` uses throughout.
 
 use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, Wg16};
 use crate::heap::Heap;
 use crate::shims::ShimError;
-use crate::shims::text::write_cstr;
 
 /// `MAJORBBS.H:33` -- maximum size of a text variable name, terminator
 /// included.
@@ -43,8 +43,15 @@ pub const TVRSIZ: u16 = 16;
 pub const TEXTVAR_SIZE: u16 = TVRSIZ + 4;
 
 /// One registered text variable, read back out of the table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TextVar {
+///
+/// Generic over `A` because [`TextVars::get_mem`] hands one back with
+/// `varrou: Option<A::Ptr>`. Not `#[derive(Debug, Clone, PartialEq, Eq)]`:
+/// the derive macros would bound the generated impls on `A: Trait` rather
+/// than `A::Ptr: Trait` -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the
+/// same problem and fix. `A::Ptr` already carries every one of these bounds
+/// through `mbbs_ptr::ModulePtr`'s own supertraits, so no extra `where`
+/// clause is needed on the hand-written impls below.
+pub struct TextVar<A: Abi = Wg16> {
     /// The name a message refers to it by. MajorMUD's is `MUDCHARINFO`.
     pub name: String,
 
@@ -54,22 +61,56 @@ pub struct TextVar {
     /// module tests `varrou` before calling it -- `mov ax,[es:bx+0x10]` then
     /// `or ax,[es:bx+0x12]` at `seg 23:0x22f5` -- so a null one is a row that
     /// produces nothing, not a row that is wrong.
-    pub varrou: Option<FarPtr>,
+    pub varrou: Option<A::Ptr>,
+}
+
+impl<A: Abi> Clone for TextVar<A> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            varrou: self.varrou,
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for TextVar<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.varrou == other.varrou
+    }
+}
+
+impl<A: Abi> Eq for TextVar<A> {}
+
+impl<A: Abi> std::fmt::Debug for TextVar<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextVar")
+            .field("name", &self.name)
+            .field("varrou", &self.varrou)
+            .finish()
+    }
 }
 
 /// Every text variable that has been registered, in module memory.
 ///
-/// # Generic type, `Wg16`-concrete body
+/// # Generic core, `Wg16`-facade names
 ///
 /// `at` is typed `A::Ptr` rather than `FarPtr` so this struct is genuinely
-/// `TextVars<A>` -- but every method stays in `impl TextVars<Wg16>` below,
-/// using `&mut Machine`/`&mut Heap` exactly as before: [`Heap`] itself
-/// defaults to `Heap<Wg16>` and nothing here has a reason to take a
-/// different one yet. `A` defaults to [`Wg16`] so every existing caller
-/// keeps naming this type as plain `TextVars`. Not `#[derive(Debug,
-/// Default)]`: the derive macros bound `A: Debug`/`A: Default` on the impl,
-/// which `Wg16` (a bare marker struct) does not satisfy -- see
-/// `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same problem and fix.
+/// `TextVars<A>`. `len`/`is_empty`/`at` never touched a `Machine` and move
+/// onto `impl<A: Abi> TextVars<A>` outright. `push`/`get` do read and write
+/// module memory, so going generic changes their signature (`&mut A::Mem`/
+/// `&A::Mem` and `&mut Heap<A>` in place of `&mut Machine`/`&mut Heap`) --
+/// a real break for shim call sites built against the old ones. So both keep
+/// their name and `Wg16` signature (delegating into the generic core through
+/// [`Machine::mem`]/[`Machine::mem_mut`], the same shape `Globals::word`/
+/// `Globals::write` use), and the generic core gets new names --
+/// `push_mem`/`get_mem` -- naming the parameter that is actually new, the
+/// same convention `Globals::word_mem`/`Globals::write_mem` set.
+///
+/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
+/// as plain `TextVars`. Not `#[derive(Debug, Default)]`: the derive macros
+/// bound `A: Debug`/`A: Default` on the impl, which `Wg16` (a bare marker
+/// struct) does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for
+/// the same problem and fix.
 pub struct TextVars<A: Abi = Wg16> {
     /// Where the table is, or `None` before the first registration.
     at: Option<A::Ptr>,
@@ -96,7 +137,7 @@ where
     }
 }
 
-impl TextVars<Wg16> {
+impl<A: Abi> TextVars<A> {
     /// How many text variables are registered.
     pub fn len(&self) -> u16 {
         self.count
@@ -108,11 +149,12 @@ impl TextVars<Wg16> {
     }
 
     /// Where the table is, which is what belongs in the `txtvars` global.
-    pub fn at(&self) -> Option<FarPtr> {
+    pub fn at(&self) -> Option<A::Ptr> {
         self.at
     }
 
-    /// Add a row, growing the table by one record.
+    /// Add a row, growing the table by one record, against memory directly
+    /// rather than a whole `Machine`.
     ///
     /// Returns the new row's index, which is what `register_textvar` hands the
     /// module back.
@@ -124,16 +166,22 @@ impl TextVars<Wg16> {
     /// on every access -- `les bx,[es:txtvars]` -- so a table that moves is a
     /// table it follows.
     ///
+    /// The generic core [`TextVars::push`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    /// Errors come back as [`ShimError::Failed`] rather than
+    /// [`ShimError::BadPointer`] here: that variant carries `mbbs16`'s own
+    /// `FarPtrError`, which a generic `A::Ptr::Error` is not.
+    ///
     /// # Errors
     ///
     /// If the name is empty, if the table would outgrow a segment, or if the
     /// heap has no room.
-    pub fn push(
+    pub fn push_mem(
         &mut self,
-        machine: &mut Machine,
-        heap: &mut Heap,
+        mem: &mut A::Mem,
+        heap: &mut Heap<A>,
         name: &str,
-        varrou: FarPtr,
+        varrou: A::Ptr,
     ) -> Result<u16, ShimError> {
         if name.is_empty() {
             return Err(ShimError::Failed(
@@ -153,7 +201,7 @@ impl TextVars<Wg16> {
         })?;
 
         let grown = heap
-            .alloc(machine, size)
+            .reserve(mem, size)
             .map_err(|e| ShimError::Failed(format!("register_textvar: {e}")))?;
 
         // Zeroed before anything is written into it. The original left whatever
@@ -161,46 +209,65 @@ impl TextVars<Wg16> {
         // correct reader stops at the terminator either way, and a table whose
         // bytes are a function of what was registered is worth more than that
         // fidelity.
-        machine.write(grown, &vec![0u8; usize::from(size)])?;
+        grown
+            .write(mem, &vec![0u8; usize::from(size)])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
 
         if let Some(old) = self.at {
             let kept = usize::from(self.count) * usize::from(TEXTVAR_SIZE);
-            let bytes = machine.resolve(old, kept)?.to_vec();
-            machine.write(grown, &bytes)?;
+            let bytes = old
+                .resolve(mem, kept)
+                .map_err(|e| ShimError::Failed(e.to_string()))?
+                .to_vec();
+            grown
+                .write(mem, &bytes)
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
             heap.free(old)
                 .map_err(|e| ShimError::Failed(format!("register_textvar: {e}")))?;
         }
 
-        let row = Wg16::ptr_offset(grown, self.count * TEXTVAR_SIZE);
+        let row = A::ptr_offset(grown, self.count * TEXTVAR_SIZE);
 
         // `stzcpy`, not `strncpy`: at most fifteen characters and always a
         // terminator. A name that fills the field is truncated rather than left
-        // running into `varrou`.
+        // running into `varrou`. Written directly rather than through
+        // `shims::text::write_cstr` -- that helper takes `&mut Machine`, which
+        // this method deliberately does not have.
         let text = name.as_bytes();
         let take = text.len().min(usize::from(TVRSIZ) - 1);
-        write_cstr(machine, row, &text[..take], TVRSIZ)?;
+        let mut named = text[..take].to_vec();
+        named.push(0);
+        row.write(mem, &named).map_err(|e| ShimError::Failed(e.to_string()))?;
 
-        machine.write(Wg16::ptr_offset(row, TVRSIZ), &varrou.to_bytes())?;
+        A::ptr_offset(row, TVRSIZ)
+            .write(mem, &A::ptr_to_bytes(varrou))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
 
         self.at = Some(grown);
         self.count += 1;
         Ok(self.count - 1)
     }
 
-    /// Row `n`, read out of module memory, or `None` if there is no such row.
+    /// Row `n`, read out of module memory, or `None` if there is no such row,
+    /// against memory directly rather than a whole `Machine`.
     ///
     /// Read back every time rather than remembered. The table is memory the
     /// module can reach and change, so what it holds now is the answer.
     ///
+    /// The generic core [`TextVars::get`]'s `Wg16` facade delegates into --
+    /// see the struct's own doc comment for why the two need different names.
+    ///
     /// # Errors
     ///
     /// If the table no longer names memory that can be read.
-    pub fn get(&self, machine: &Machine, n: u16) -> Result<Option<TextVar>, ShimError> {
+    pub fn get_mem(&self, mem: &A::Mem, n: u16) -> Result<Option<TextVar<A>>, ShimError> {
         let (Some(at), true) = (self.at, n < self.count) else {
             return Ok(None);
         };
-        let row = Wg16::ptr_offset(at, n * TEXTVAR_SIZE);
-        let bytes = machine.resolve(row, usize::from(TEXTVAR_SIZE))?;
+        let row = A::ptr_offset(at, n * TEXTVAR_SIZE);
+        let bytes = row
+            .resolve(mem, usize::from(TEXTVAR_SIZE))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
 
         // `name` is a fixed-width field, so it is read bounded rather than
         // scanned -- though unlike an agent's `appid` a name here always has a
@@ -209,15 +276,52 @@ impl TextVars<Wg16> {
         let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
         let name = String::from_utf8_lossy(&field[..end]).into_owned();
 
-        let at = usize::from(TVRSIZ);
-        let varrou = FarPtr {
-            offset: u16::from_le_bytes([bytes[at], bytes[at + 1]]),
-            selector: u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]),
-        };
+        // Null is checked on the raw bytes, before decoding: `A::Ptr` has no
+        // generic notion of "null" to ask about after the fact, but "every
+        // byte of the pointer field is zero" is the same test for any ABI
+        // this crate has met, and it is what `FarPtr`'s own
+        // `offset != 0 || selector != 0` check reduces to.
+        let ptr_bytes = &bytes[usize::from(TVRSIZ)..usize::from(TEXTVAR_SIZE)];
+        let varrou = A::ptr_from_bytes(ptr_bytes);
+        let is_null = ptr_bytes.iter().all(|b| *b == 0);
+
         Ok(Some(TextVar {
             name,
-            varrou: (varrou.offset != 0 || varrou.selector != 0).then_some(varrou),
+            varrou: (!is_null).then_some(varrou),
         }))
+    }
+}
+
+impl TextVars<Wg16> {
+    /// Add a row, growing the table by one record.
+    ///
+    /// Reborrows into [`TextVars::push_mem`] through [`Machine::mem_mut`] --
+    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
+    ///
+    /// # Errors
+    ///
+    /// If the name is empty, if the table would outgrow a segment, or if the
+    /// heap has no room.
+    pub fn push(
+        &mut self,
+        machine: &mut Machine,
+        heap: &mut Heap,
+        name: &str,
+        varrou: FarPtr,
+    ) -> Result<u16, ShimError> {
+        self.push_mem(machine.mem_mut(), heap, name, varrou)
+    }
+
+    /// Row `n`, read out of module memory, or `None` if there is no such row.
+    ///
+    /// Reborrows into [`TextVars::get_mem`] through [`Machine::mem`] -- the
+    /// read-only counterpart to `push`'s [`Machine::mem_mut`] reborrow.
+    ///
+    /// # Errors
+    ///
+    /// If the table no longer names memory that can be read.
+    pub fn get(&self, machine: &Machine, n: u16) -> Result<Option<TextVar>, ShimError> {
+        self.get_mem(machine.mem(), n)
     }
 }
 
@@ -228,7 +332,11 @@ mod tests {
 
     #[test]
     fn an_empty_table_has_no_pointer_and_no_rows() {
-        let table = TextVars::default();
+        // `len`/`is_empty`/`at` moved onto `impl<A: Abi> TextVars<A>`, so
+        // nothing here pins `A` to `Wg16` the way calling `push`/`get` would
+        // -- unlike before this task, `TextVars`'s default type parameter no
+        // longer resolves from a Wg16-only method used later in the test.
+        let table: TextVars = TextVars::default();
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
         assert_eq!(table.at(), None);

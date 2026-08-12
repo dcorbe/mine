@@ -134,6 +134,17 @@ pub trait Abi {
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
 
+    /// Encode a pointer into exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
+    /// this ABI's own layout -- the inverse of [`Abi::ptr_from_bytes`].
+    ///
+    /// Nothing needed this direction until a generic caller had to embed a
+    /// pointer *inside* a struct it writes into module memory (`TextVars`'s
+    /// `varrou` field, `crates/mbbs/src/textvar.rs`) rather than only decode
+    /// one out of an argument frame -- reading a module's own arguments never
+    /// writes one back, which is why [`Cursor`]/[`Call`] only ever needed
+    /// [`Abi::ptr_from_bytes`].
+    fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8>;
+
     /// Decode a C `int` from exactly [`INT_WIDTH`](Abi::INT_WIDTH) bytes.
     fn int_from_bytes(bytes: &[u8]) -> Self::Int;
 
@@ -414,6 +425,10 @@ impl Abi for Wg16 {
         mbbs16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
     }
 
+    fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8> {
+        ptr.to_bytes().to_vec()
+    }
+
     fn int_from_bytes(bytes: &[u8]) -> Self::Int {
         u16::from_le_bytes(bytes.try_into().expect("INT_WIDTH bytes"))
     }
@@ -592,6 +607,10 @@ mod tests {
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)
+        }
+
+        fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8> {
+            Wg16::ptr_to_bytes(ptr)
         }
 
         fn int_from_bytes(bytes: &[u8]) -> Self::Int {
