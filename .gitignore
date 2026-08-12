@@ -83,3 +83,8 @@ tools/btrieve-oracle/crtprobe.exe
 # Build artifact of tools/btrieve-oracle/statprobe.c (Btrieve op 15/STAT's
 # oracle probe) -- built by hand, see that file's own header comment.
 tools/btrieve-oracle/statprobe.exe
+
+# Build artifact of tools/btrieve-oracle/seedprobe.c (Task 5's lock probe
+# seeds a fixture in ONE process: 24 sequential fresh wine processes wedge
+# the Microkernel, which sweep.sh's own header also warns about).
+tools/btrieve-oracle/seedprobe.exe

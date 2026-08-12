@@ -1629,6 +1629,40 @@ fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
 /// is the trap**: the day a second channel exists, every lock the module asked
 /// for will have been silently not taken, and what it protects is a character's
 /// inventory.
+///
+/// # This refusal is the answer to Task 5, not a placeholder for it
+///
+/// `docs/plans/2026-08-12-btrieve-finish.md` Task 5 asked whether to build
+/// lock support, and `docs/lock-oracle-answer.md` is the measurement that
+/// settled it. Two facts, both measured on 2026-08-12:
+///
+/// - **`WCCMMUD.DLL` never asks for a lock.** All **191** lock-capable call
+///   sites -- `obtbtvl` 112, `gabbtv`/`gabbtvl` 34, `stpbtvl` 45 -- push a
+///   literal zero for `loktyp`. Established twice by methods sharing no code:
+///   a backward push-run scan anchored on each site's own stack cleanup, and
+///   a hand disassembly of individual sites.
+/// - **Real lock contention *is* observable**, so the reason not to build
+///   bookkeeping is the call count and not an inability to test it. Two
+///   concurrent Btrieve clients under Wine genuinely block each other
+///   (status 84, and a "wait" variant that really waits).
+///
+/// So this refuses, and `docs/lock-oracle-answer.md` carries the semantics a
+/// future implementer would need -- including two traps that would bite a
+/// naive design: single and multiple lock modes **cannot be mixed in one
+/// session** (status 93), and a wait-lock taken inside the session's own
+/// transaction **deadlocks against it**.
+///
+/// # Do not quietly turn this into `Ok(())`
+///
+/// Four tests depend on this refusal, and only two of them are about locks.
+/// `a_lock_this_host_cannot_take_is_refused_rather_than_ignored` pins
+/// `obtbtvl`'s lock word by value, and
+/// `gabbtvl_takes_its_lock_from_word_five_by_value` pins `gabbtvl`'s word 5
+/// the same way. The other two are the `gabbtvl` key-path tests, which catch
+/// a lock read from the wrong word only *because* the resulting non-zero
+/// value is refused here -- a pin that exists as a side effect and vanishes
+/// with the mechanism it rides on. A change that accepts locks must
+/// re-establish all of them on some other observable first.
 fn unlocked(who: &str, lock: i16) -> Result<(), ShimError> {
     if lock == 0 {
         return Ok(());
@@ -2638,6 +2672,48 @@ mod tests {
             .invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100])
             .expect_err("SLWTBV is a single record lock with wait");
         assert!(e.to_string().contains("100"), "{e}");
+    }
+
+    /// `gabbtvl` reads its lock from **word 5**, and this proves it by value
+    /// rather than by the call merely failing.
+    ///
+    /// The frame deliberately carries `keynum = 1` in word 4 and `loktyp = 3`
+    /// in word 5, two *different* non-zero values, and the assertion names
+    /// the 3. Reading word 4 instead would refuse "lock type 1" and fail
+    /// here; passing zeros in both -- which is what every other `gabbtvl`
+    /// test in this file did before `ae4d479` -- could not tell the two words
+    /// apart at all.
+    ///
+    /// **Why this exists separately from the `gabbtvl` key-path tests.**
+    /// Those two also catch a lock read from word 4, but only *transitively*:
+    /// they pass `keynum = 1`, so the misread lock becomes 1, and
+    /// [`unlocked`] refuses it. That mechanism disappears the moment locks
+    /// stop being refused, and it would take the pin with it while both tests
+    /// carried on passing. This one asserts the value directly, so it depends
+    /// on the refusal's *message* rather than on the refusal being the only
+    /// possible outcome -- and if a future change makes locks succeed, the
+    /// repair instruction is to re-pin word 5 on whatever observable replaces
+    /// the message (the recorded lock type for the position, say), keeping
+    /// "word 5, by value" even though the mechanism changes.
+    ///
+    /// The `abi` session has an equivalent test on its own branch
+    /// (`c6e1e17`). Deliberately named differently so the two merge as two
+    /// tests rather than as a conflict; both pin the same word and neither is
+    /// redundant until someone decides so on purpose.
+    #[test]
+    fn gabbtvl_takes_its_lock_from_word_five_by_value() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        let e = f
+            .invoke(gabbtvl, &[0, 0, 0, 0, 1, 3])
+            .expect_err("a lock this host cannot give is a refusal");
+
+        let text = e.to_string();
+        assert!(
+            text.contains("lock type 3"),
+            "word 5 is the lock; reading word 4 would have said \"lock type 1\": {text}"
+        );
     }
 
     // # With no Btrieve file current
