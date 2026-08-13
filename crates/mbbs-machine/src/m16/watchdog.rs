@@ -119,9 +119,12 @@ impl Watched {
         let mut sev: libc::sigevent = unsafe { std::mem::zeroed() };
         sev.sigev_notify = libc::SIGEV_THREAD_ID;
         sev.sigev_signo = signo();
-        sev.sigev_value = libc::sigval {
-            sival_ptr: target.cast(),
-        };
+        // Tagged with this ABI's registered slot, not a bare cast -- m32's
+        // watchdog now shares this same signal number (`crate::fault`'s
+        // module doc comment), so the payload has to say whose `Ctx` it
+        // names. See `crate::m16::fault::recover_watchdog`, the other half
+        // of this contract.
+        sev.sigev_value = crate::fault::tag(target, crate::m16::fault::owner());
         // SAFETY: gettid has no preconditions.
         sev.sigev_notify_thread_id = unsafe { libc::gettid() };
 

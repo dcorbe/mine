@@ -77,11 +77,28 @@
 //! lives. `a_faulting_module_leaves_the_hosts_thread_locals_working` below is
 //! the test that checks this rather than trusts it.
 //!
+//! # The watchdog rides the same arbiter, asynchronously
+//!
+//! Task 16 lands `crate::m32::watchdog`: a per-machine CPU-time timer, the
+//! flat-ABI mirror of `crate::m16::watchdog`. Its signal is asynchronous --
+//! it can land anywhere, not only at the instruction that provoked it -- so
+//! it cannot be dispatched by a `CS` claim the way [`is_user32_cs`] decides
+//! a fault. It rides `crate::fault`'s registry as its own
+//! [`crate::fault::AsyncClaim`] instead, and shares the exact real-time
+//! signal `crate::m16::watchdog` already claims (`crate::fault`'s module doc
+//! comment, "Two signal classes"), so [`recover_watchdog`] cannot assume
+//! every delivery is this ABI's: it untags the payload against [`owner`],
+//! this ABI's own registered slot, before treating anything as an
+//! `m32::asm::Ctx`. See `crate::m32::watchdog`'s own module doc comment for
+//! the timer half.
+//!
 //! [raw]: crate::m32::asm
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::m32::asm::Ctx;
+use crate::m32::watchdog;
 
 /// `UC_STRICT_RESTORE_SS` from `<asm/ucontext.h>`, which libc does not
 /// re-export. `compat32_fault.c` set this unconditionally even though it
@@ -93,8 +110,27 @@ const UC_STRICT_RESTORE_SS: libc::c_ulong = 0x4;
 
 static INSTALL: std::sync::Once = std::sync::Once::new();
 
+/// This ABI's slot index in the shared arbiter's registry -- see
+/// `crate::m16::fault::OWNER`'s own doc comment, which this mirrors
+/// exactly.
+static OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// This ABI's registered slot in the shared arbiter, for tagging a new
+/// watchdog's `sigval` -- see [`crate::fault::tag`].
+///
+/// # Panics
+///
+/// If called before [`arm`] has run at least once in this process. Every
+/// [`crate::m32::Machine::new`] calls `arm` before building a
+/// [`watchdog::Watched`], so this only fires if that ordering is broken.
+pub(crate) fn owner() -> usize {
+    let owner = OWNER.load(Ordering::Relaxed);
+    assert_ne!(owner, usize::MAX, "m32::fault::owner() read before arm() registered");
+    owner
+}
+
 /// Make module faults survivable on this thread, and register this ABI's
-/// claim with the shared arbiter.
+/// claim -- and its watchdog's -- with the shared arbiter.
 ///
 /// Registers the process-wide claim on first call only, and arms this
 /// thread's alternate signal stack every time -- the claim is shared across
@@ -110,8 +146,12 @@ pub(crate) fn arm(host_cs: u16) -> io::Result<()> {
                 claims: is_user32_cs,
                 recover,
             },
-            None, // this crate has no watchdog of its own to register.
-        );
+            Some(crate::fault::AsyncClaim {
+                signo: watchdog::signo(),
+                recover: recover_watchdog,
+            }),
+        )
+        .map(|i| OWNER.store(i, Ordering::Relaxed));
     });
     result
 }
@@ -161,9 +201,101 @@ unsafe fn recover(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16) {
     // possible.
     let ctx32 = gregs[libc::REG_R14 as usize] as *mut Ctx;
 
+    // SAFETY: `ctx32`, `gregs` and `packed` all come from this same fault;
+    // `ctx32` is the live `Ctx` this excursion was entered with.
+    unsafe { rewrite(uc, packed, ctx32, signo, host_cs) };
+}
+
+/// Handle one delivery of the watchdog's timer, whether or not it concerns
+/// this excursion. The 32-bit mirror of `crate::m16::fault::recover_watchdog`
+/// -- see that function's own doc comment for the shape; the only
+/// substantive difference is `crate::m32::fault`'s one-register-lighter
+/// rewrite (no `SS`, no `DS` reload -- see this module's doc comment).
+///
+/// # Safety
+///
+/// See [`crate::fault::AsyncRecoverFn`]. Reached for *every* delivery of
+/// [`watchdog::signo`], regardless of what was executing -- unlike
+/// [`recover`], no CS claim has been checked yet, and (now that `m16`'s
+/// watchdog shares this same signal number) not even the ABI is known
+/// until [`owner`] says so.
+unsafe fn recover_watchdog(
+    signo: libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx: *mut libc::c_void,
+    host_cs: u16,
+) {
+    // SAFETY: the kernel hands a real `ucontext_t` to an SA_SIGINFO handler.
+    let uc = unsafe { &mut *ctx.cast::<libc::ucontext_t>() };
+    let gregs = &mut uc.uc_mcontext.gregs;
+    let packed = gregs[libc::REG_CSGSFS as usize] as u64;
+    let faulting_cs = (packed >> CS_SHIFT) as u16;
+
+    // R14 holds the `Ctx` passed to `mbbs32_enter_raw`. Meaningful only once
+    // we know 32-bit code was actually interrupted -- see below.
+    let ctx32 = gregs[libc::REG_R14 as usize] as *mut Ctx;
+
+    // The timer carries the (tagged) address of the context it watches --
+    // see this module's own doc comment, "The watchdog rides the same
+    // arbiter, asynchronously".
+    //
+    // SAFETY: `info` is non-null for an SA_SIGINFO handler, and a
+    // POSIX-timer signal carries the `sigev_value` given to `timer_create`,
+    // which is `crate::fault::tag`'s output over a `Ctx` the owning
+    // `Watched` keeps alive for as long as the timer exists.
+    let sival_ptr = unsafe { (*info).si_value().sival_ptr };
+    // SAFETY: `Watched::new` built this `sigval` with `crate::fault::tag`
+    // over a `Ctx`, which is the same `T` named here.
+    let Some(watched) = (unsafe { crate::fault::untag::<Ctx>(sival_ptr, owner()) }) else {
+        // Tagged for a different ABI's slot -- not an error, just not ours.
+        return;
+    };
+
+    // Whose module is executing right now -- if anyone's -- decides only
+    // *how* to stop it, not whether the budget is gone. It is gone either
+    // way, so record that first and unconditionally.
+    //
+    // SAFETY: as above. Volatile because the host reads this field outside
+    // any excursion and must not have the read optimised away.
+    unsafe { std::ptr::write_volatile(&raw mut (*watched).expired, 1) };
+
+    if faulting_cs == host_cs || !std::ptr::eq(ctx32, watched) {
+        // Either nothing is in 32-bit mode, or someone else is. Leave it to
+        // the host, which checks the flag just set before it resumes the
+        // module and refuses. See `crate::m16::fault::recover_watchdog`'s
+        // own comment on this branch -- identical reasoning.
+        return;
+    }
+
+    // SAFETY: `ctx32`, `gregs` and `packed` all come from this same
+    // delivery; `ctx32 == watched`, just proven above, and `watched` is a
+    // live `Ctx` for as long as its `Watched` exists.
+    unsafe { rewrite(uc, packed, ctx32, signo, host_cs) };
+}
+
+/// The context rewrite shared by a synchronous fault and a watchdog tick
+/// that has decided to act: point `sigreturn` back at host code, exactly as
+/// the trampoline would have on an ordinary return. Mirrors
+/// `crate::m16::fault::rewrite`, minus the `SS`/`DS` handling this ABI
+/// never needs (see the module doc comment).
+///
+/// # Safety
+///
+/// `ctx32` must be a live, dereferenceable `*mut Ctx` -- the excursion's own
+/// context, still owned by its caller's stack frame (or, for the watchdog,
+/// by the `Watched` that armed the timer).
+unsafe fn rewrite(
+    uc: &mut libc::ucontext_t,
+    packed: u64,
+    ctx32: *mut Ctx,
+    signo: libc::c_int,
+    host_cs: u16,
+) {
+    let gregs = &mut uc.uc_mcontext.gregs;
+
     // SAFETY: `ctx32` is the live `Ctx` this excursion was entered with, and
     // it outlives the call (owned by the caller's stack frame for the
-    // duration of `enter`).
+    // duration of `enter`, or by the `Watched` that armed the timer).
     unsafe {
         (*ctx32).out_signo = signo as u64;
         // Where it stopped, taken before the rewrite below destroys it. A

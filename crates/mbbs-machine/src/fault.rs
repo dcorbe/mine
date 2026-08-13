@@ -28,9 +28,11 @@
 //! the path a module fault actually takes. A `Vec<Claim>` would allocate to
 //! grow; a `Mutex` could already be held by the very thread the signal
 //! interrupted, which is an instant deadlock. So the registry is a fixed
-//! array of slots, each two `AtomicUsize`s (a claim function pointer and a
-//! recovery function pointer), published with `Release` and read with
-//! `Acquire` so the handler never sees a half-written slot -- and if it does
+//! array of slots -- a claim predicate and a recovery function pointer for
+//! the synchronous fault signals, plus (for a slot whose ABI has a
+//! watchdog) a signal number and a second recovery pointer for its async
+//! signal -- published with `Release` and read with `Acquire` so the
+//! handler never sees a half-written slot -- and if it does
 //! catch one still being written (the claim word not yet stored), it treats
 //! that slot as "not yet claiming anything" rather than guessing, which is
 //! the same bias toward dying over misclaiming that motivated this module.
@@ -44,17 +46,31 @@
 //! instruction that caused it, so the faulting `CS` is meaningful and a claim
 //! predicate over it is exactly the right question to ask.
 //!
-//! `m16` also rides a watchdog timer signal over this same handler (see
-//! `crate::m16::watchdog`), and that signal is **asynchronous** -- it can land
-//! anywhere, including in host code that has nothing to do with any module,
-//! or while a *different* module's excursion is in progress. A CS claim
-//! cannot express "this concerns me" for a signal like that; only the
-//! timer's own payload (the context address it was told to watch, carried in
-//! `siginfo_t`) can. So the registry has a second, single-slot mechanism for
-//! at most one such signal: whichever ABI owns it is handed every delivery
-//! unconditionally, `CS` never enters into it, and that ABI's own recovery
-//! function decides for itself whether there is anything to rewrite. See
-//! [`AsyncClaim`].
+//! `m16` and `m32` each also ride a watchdog timer signal over this same
+//! handler (see `crate::m16::watchdog`, `crate::m32::watchdog`), and that
+//! signal is **asynchronous** -- it can land anywhere, including in host
+//! code that has nothing to do with any module, or while a *different*
+//! module's excursion is in progress. A CS claim cannot express "this
+//! concerns me" for a signal like that; only the timer's own payload (the
+//! context address it was told to watch, carried in `siginfo_t`) can.
+//!
+//! **Both watchdogs share the same real-time signal** -- `SIGRTMIN()`,
+//! computed independently by each ABI's own `watchdog::signo`, rather than
+//! each minting its own. Real-time signals are a scarce, process-wide
+//! resource, and there is no reason to spend a second one on a mechanism
+//! that already has a payload to disambiguate with. So a delivery of that
+//! signal is **offered to every registered async claim whose signal number
+//! matches** -- today that is all of them, since they agree -- and each
+//! one's own recovery function decides, from the payload alone, whether
+//! this particular delivery is its own. See [`AsyncClaim`] and [`tag`]/
+//! [`untag`] for how a recovery function makes that determination safely:
+//! `sival_ptr` is not, on its own, enough to say *which ABI's* `Ctx` it
+//! addresses, so each ABI's timer folds its own registration slot into the
+//! low bits of the address it hands `timer_create`, and each recovery
+//! function checks that tag before treating the rest of the value as its
+//! own `Ctx` type. A tag mismatch is treated exactly like a CS claim that
+//! answers no: not mine, touch nothing, let the delivery pass through
+//! unclaimed by this slot.
 //!
 //! # What is deliberately NOT shared
 //!
@@ -132,24 +148,31 @@ pub(crate) struct FaultClaim {
     pub(crate) recover: RecoverFn,
 }
 
-/// One ABI's registration for an asynchronous signal that must reach it
-/// unconditionally, bypassing the CS-claim dispatch entirely.
+/// One ABI's registration for an asynchronous signal, bypassing the
+/// CS-claim dispatch entirely: every delivery of `signo` reaches `recover`,
+/// whatever `CS` happens to be, and `recover` decides for itself (from the
+/// payload -- see [`tag`]/[`untag`]) whether a given delivery is its own.
 ///
-/// At most one of these is ever active: only `m16`'s watchdog needs it
-/// today (see the module doc comment's "Two signal classes" section), and
-/// [`register`] keeps whichever registers first if it were ever called
-/// twice with different signal numbers -- which nothing in this workspace
-/// does.
+/// More than one of these can be active at once now -- both `m16` and
+/// `m32`'s watchdogs register one, and today both choose the *same*
+/// `signo` (see the module doc comment). [`register`] returns the slot
+/// index this claim landed in, which the caller must fold into every
+/// `sigval` it hands `timer_create` from then on (via [`tag`]) so that
+/// [`untag`] can tell its own deliveries apart from another ABI's.
 pub(crate) struct AsyncClaim {
     /// The signal number this ABI's timer raises.
     pub(crate) signo: libc::c_int,
-    /// Handle every delivery, unconditionally.
+    /// Handle every delivery whose payload names this ABI's own `Ctx`.
     pub(crate) recover: AsyncRecoverFn,
 }
 
 struct Slot {
     claims: AtomicUsize,
     recover: AtomicUsize,
+    /// `0` means this slot has no asynchronous claim. Real signal numbers
+    /// are always positive, so `0` is a safe sentinel.
+    async_signo: AtomicI32,
+    async_recover: AtomicUsize,
 }
 
 impl Slot {
@@ -157,6 +180,8 @@ impl Slot {
         Self {
             claims: AtomicUsize::new(0),
             recover: AtomicUsize::new(0),
+            async_signo: AtomicI32::new(0),
+            async_recover: AtomicUsize::new(0),
         }
     }
 }
@@ -169,15 +194,67 @@ static SLOTS: [Slot; MAX_CLAIMS] = [
 ];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// Bits of an async claim's `sigval.sival_ptr` reserved to say which
+/// registration slot -- and therefore which ABI -- owns the `Ctx` it
+/// names. Two bits cover every index [`MAX_CLAIMS`] can hand out. Every
+/// `Ctx` an ABI in this crate boxes for a watchdog carries a `u32`- or
+/// wider-aligned field, so a live heap address always has at least this
+/// many low bits free to borrow.
+const ASYNC_TAG_BITS: u32 = 2;
+const ASYNC_TAG_MASK: usize = (1 << ASYNC_TAG_BITS) - 1;
+
+/// Build the `sigval` an async timer should carry: `ctx`'s address, tagged
+/// with `owner` -- the slot index [`register`] returned for this ABI's
+/// registration -- so [`untag`] can tell whose payload a delivery names.
+///
+/// # Panics
+///
+/// If `owner` does not fit [`ASYNC_TAG_MASK`], or `ctx`'s address is not
+/// aligned enough to carry the tag. Both are construction-time programmer
+/// errors -- neither can be provoked by a module -- so this runs as an
+/// ordinary `assert!`, not a `debug_assert!`: a silently mistagged context
+/// is exactly the kind of bug this crate exists to make loud.
+pub(crate) fn tag<T>(ctx: *mut T, owner: usize) -> libc::sigval {
+    assert!(
+        owner <= ASYNC_TAG_MASK,
+        "owner slot {owner} does not fit the async tag"
+    );
+    assert_eq!(
+        ctx as usize & ASYNC_TAG_MASK,
+        0,
+        "Ctx is not aligned enough to carry the async ownership tag"
+    );
+    libc::sigval {
+        sival_ptr: ((ctx as usize) | owner) as *mut libc::c_void,
+    }
+}
+
+/// The inverse of [`tag`]: given a delivery's raw `sival_ptr` and `owner`
+/// (this ABI's own registered slot index), the untagged `Ctx` address if
+/// `owner` matches the tag, or `None` if this delivery names some other
+/// ABI's context -- the positive claim an async recovery function makes
+/// over its own payload, mirroring [`ClaimFn`]'s positive claim over `CS`.
+/// Never guess by ruling the other ABI out; a tag mismatch means "not
+/// mine," full stop.
+///
+/// # Safety
+///
+/// The caller must supply the same `T` [`tag`] was built with for this
+/// exact `sival_ptr` -- this function has no way to check that itself.
+pub(crate) unsafe fn untag<T>(sival_ptr: *mut libc::c_void, owner: usize) -> Option<*mut T> {
+    let raw = sival_ptr as usize;
+    if raw & ASYNC_TAG_MASK == owner {
+        Some((raw & !ASYNC_TAG_MASK) as *mut T)
+    } else {
+        None
+    }
+}
+
 /// The 64-bit code selector host code runs under, recorded when the first
 /// ABI registers. Every ABI in this process reads the same value at
 /// startup (Linux's `__USER_CS`), so it does not matter which registration
 /// wins the race to store it.
 static HOST_CS: AtomicU16 = AtomicU16::new(0);
-
-/// The one asynchronous signal registered, if any. `0` means none.
-static ASYNC_SIGNO: AtomicI32 = AtomicI32::new(0);
-static ASYNC_RECOVER: AtomicUsize = AtomicUsize::new(0);
 
 /// Guards the *first* `sigaction` install for [`FAULT_SIGNALS`]. Not a guard
 /// on registration itself -- see [`register`]'s doc comment for why it
@@ -255,11 +332,18 @@ pub(crate) fn install_altstack() -> io::Result<()> {
 ///
 /// If [`MAX_CLAIMS`] ABIs have already registered, or if any underlying
 /// `sigaction` call fails.
+///
+/// # Returns
+///
+/// The slot index this registration landed in. A caller that also passed
+/// `async_claim` must fold this into every `sigval` it builds afterward
+/// (via [`tag`]) -- see the module doc comment's "Two signal classes"
+/// section.
 pub(crate) fn register(
     host_cs: u16,
     claim: FaultClaim,
     async_claim: Option<AsyncClaim>,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     // Whichever registration gets here first wins; every ABI in this process
     // reads the same value, so it does not matter which.
     HOST_CS.store(host_cs, Ordering::Relaxed);
@@ -281,18 +365,25 @@ pub(crate) fn register(
     result?;
 
     if let Some(a) = async_claim {
-        register_async(a)?;
+        register_async(i, a)?;
     }
-    Ok(())
+    Ok(i)
 }
 
-fn register_async(claim: AsyncClaim) -> io::Result<()> {
-    ASYNC_RECOVER.store(claim.recover as usize, Ordering::Relaxed);
-    ASYNC_SIGNO.store(claim.signo, Ordering::Release);
-    install_with_async(claim.signo)
+fn register_async(i: usize, claim: AsyncClaim) -> io::Result<()> {
+    // Recovery first (Relaxed), signo with Release -- same pairing as the
+    // fault claim above, and for the same reason: the handler's Acquire
+    // load of `async_signo` must see a fully-written `async_recover`
+    // alongside it. No signal of `claim.signo` can be delivered before
+    // `install_async_signal` below runs, so there is no window in which a
+    // partially-published slot could be observed as claiming a signal it
+    // is not yet ready to service.
+    SLOTS[i].async_recover.store(claim.recover as usize, Ordering::Relaxed);
+    SLOTS[i].async_signo.store(claim.signo, Ordering::Release);
+    install_async_signal(claim.signo)
 }
 
-fn install_with_async(async_signo: libc::c_int) -> io::Result<()> {
+fn install_async_signal(async_signo: libc::c_int) -> io::Result<()> {
     let mut action = fresh_action();
     // SAFETY: emptying a freshly zeroed set, then blocking one signal in it.
     unsafe {
@@ -345,29 +436,42 @@ fn fresh_action() -> libc::sigaction {
 /// long before any signal can be delivered on the signals it installs.)
 extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     let host_cs = HOST_CS.load(Ordering::Relaxed);
+    let n = NEXT.load(Ordering::Acquire).min(MAX_CLAIMS);
 
-    let async_signo = ASYNC_SIGNO.load(Ordering::Acquire);
-    if async_signo != 0 && signo == async_signo {
-        let recover = ASYNC_RECOVER.load(Ordering::Relaxed);
-        if recover != 0 {
-            // SAFETY: `recover` was stored before `ASYNC_SIGNO` in
-            // `register_async`, and observed here only after the Acquire
-            // load above saw the Release-published signal number, so the
-            // function pointer is valid. The kernel guarantees `info` and
-            // `ctx` for an SA_SIGINFO handler.
-            let f: AsyncRecoverFn = unsafe { std::mem::transmute(recover) };
-            unsafe { f(signo, info, ctx, host_cs) };
+    // Offer this delivery to every slot whose async signal matches. Today
+    // that is every registered slot with a watchdog at all -- both ABIs
+    // choose the same `signo` -- so more than one recovery function can run
+    // for a single delivery, and each decides for itself (via `untag`,
+    // inside its own `recover`) whether the payload is really its own. A
+    // tag mismatch there is a fast, harmless no-op, so trying every match
+    // costs nothing a single dispatch would not have.
+    let mut delivered_async = false;
+    for slot in &SLOTS[..n] {
+        let async_signo = slot.async_signo.load(Ordering::Acquire);
+        if async_signo != 0 && async_signo == signo {
+            delivered_async = true;
+            let recover = slot.async_recover.load(Ordering::Relaxed);
+            if recover != 0 {
+                // SAFETY: `recover` was stored before `async_signo` in
+                // `register_async`, and observed here only after the
+                // Acquire load above saw the Release-published signal
+                // number, so the function pointer is valid. The kernel
+                // guarantees `info` and `ctx` for an SA_SIGINFO handler.
+                let f: AsyncRecoverFn = unsafe { std::mem::transmute(recover) };
+                unsafe { f(signo, info, ctx, host_cs) };
+            }
         }
+    }
+    if delivered_async {
         return;
     }
 
     // SAFETY: the kernel hands a real `ucontext_t` to an SA_SIGINFO handler
-    // for every signal `install_fault_signals`/`install_with_async` install.
+    // for every signal `install_fault_signals`/`install_async_signal` install.
     let uc = unsafe { &*ctx.cast::<libc::ucontext_t>() };
     let packed = uc.uc_mcontext.gregs[libc::REG_CSGSFS as usize] as u64;
     let faulting_cs = (packed >> CS_SHIFT) as u16;
 
-    let n = NEXT.load(Ordering::Acquire).min(MAX_CLAIMS);
     for slot in &SLOTS[..n] {
         let claims_addr = slot.claims.load(Ordering::Acquire);
         if claims_addr == 0 {

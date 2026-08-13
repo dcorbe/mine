@@ -227,13 +227,10 @@ impl Abi for Wg32 {
         cpu.machine.arg_frame()
     }
 
-    /// Direct delegation -- `mbbs_machine::m32::Machine::poison` (Task 6)
-    /// mirrors `mbbs_machine::m16::Machine::poison` with one deliberate
-    /// divergence, documented at the method itself, not invented here: it
-    /// does not disarm a watchdog, because this machine has none yet (the
-    /// 32-bit watchdog is Task 16, unlanded). Nothing about that changes what
-    /// this arm needs to do -- forward the reason and the `io::Result`
-    /// straight through.
+    /// Direct delegation -- `mbbs_machine::m32::Machine::poison` mirrors
+    /// `mbbs_machine::m16::Machine::poison` exactly since Task 16 landed the
+    /// 32-bit watchdog, disarm included. Forward the reason and the
+    /// `io::Result` straight through.
     fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
         cpu.machine.poison(why)
     }
@@ -374,14 +371,16 @@ impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
 }
 
 /// [`mbbs_machine::m32::Exit`] converted to [`Exit<Wg32>`] -- the same
-/// `Fault` collapse `abi/wg16.rs`'s `convert_exit` documents; `Wg32` has no
-/// `Timeout` variant of its own yet (Task 16 adds the 32-bit watchdog).
+/// `Fault`/`Timeout` collapse `abi/wg16.rs`'s `convert_exit` documents.
+/// `Wg32` gained a real `Timeout` variant with Task 16's 32-bit watchdog;
+/// both it and `Fault` fold into [`Exit::Stopped`] here, exactly as
+/// `abi/wg16.rs`'s `Fault { .. } | Timeout { .. }` arm does.
 /// The 32-bit half of the check `abi/wg16.rs`'s namesake documents at
 /// length: [`Exit::Stopped`] is only honest if [`Abi::poisoned`] can still
 /// say why, and that rests on the machine poisoning itself before it hands
-/// back a terminal `Exit`. Here that is `m32::Machine::call`'s
-/// `get_or_insert` on the fault path. Convention, not construction -- so it
-/// is checked, not asserted in prose.
+/// back a terminal `Exit`. Here that is `m32::Machine::terminate`'s
+/// `get_or_insert` on both the fault and timeout paths. Convention, not
+/// construction -- so it is checked, not asserted in prose.
 fn debug_assert_attributable(exit: &Exit<Wg32>, machine: &mbbs_machine::m32::Machine) {
     debug_assert!(
         !matches!(exit, Exit::Stopped) || machine.poisoned().is_some(),
@@ -395,7 +394,9 @@ fn convert_exit(exit: mbbs_machine::m32::Exit) -> Exit<Wg32> {
     match exit {
         mbbs_machine::m32::Exit::Call { index } => Exit::Call { index },
         mbbs_machine::m32::Exit::Returned { eax, edx } => Exit::Returned { lo: eax, hi: edx },
-        mbbs_machine::m32::Exit::Fault { .. } => Exit::Stopped,
+        mbbs_machine::m32::Exit::Fault { .. } | mbbs_machine::m32::Exit::Timeout { .. } => {
+            Exit::Stopped
+        }
     }
 }
 

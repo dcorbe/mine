@@ -60,10 +60,12 @@ mod map;
 mod mem;
 mod pe;
 mod tib;
+mod watchdog;
 
 use std::io;
+use std::time::Duration;
 
-use asm::{Ctx, USER32_CS, current_cs, trampoline};
+use asm::{USER32_CS, current_cs, trampoline};
 pub use flatptr::{Flat32Ptr, Flat32PtrError};
 pub use image::{AbsoluteImport, Image, Import32, ImportResolver};
 pub use map::Mapping;
@@ -71,6 +73,7 @@ pub use mem::Memory;
 pub use crate::module::{ImportSite, Symbol};
 pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section};
 use tib::{DEFAULT_STACK_LEN, Tib};
+use watchdog::Watched;
 
 /// Where the thunk table sits within the **bridge** mapping, which holds
 /// nothing else before it.
@@ -119,6 +122,11 @@ const RETURN_THUNK_SLOT: u16 = MAX_THUNKS;
 const KIND_CALL: u32 = 0;
 const KIND_RETURN: u32 = 1;
 
+/// CPU time one entry point gets before the watchdog stops it. Mirrors
+/// `crate::m16::DEFAULT_BUDGET` exactly -- see that constant's own doc
+/// comment for the reasoning. Adjust per module with [`Machine::set_budget`].
+const DEFAULT_BUDGET: Duration = Duration::from_secs(5);
+
 /// Why 32-bit execution stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -139,6 +147,12 @@ pub enum Exit {
     /// value the CPU pushed already is the number a disassembly of the
     /// mapped image is annotated with.
     Fault { signo: i32, eip: u32 },
+
+    /// The module used its whole CPU budget without returning. Nothing is
+    /// resumable, and the machine is [`Machine::poisoned`]. Mirrors
+    /// `crate::m16::Exit::Timeout`; `eip` is a linear address for the same
+    /// reason [`Exit::Fault`]'s is.
+    Timeout { eip: u32 },
 }
 
 /// Why a machine will not be entered again. See [`Machine::poisoned`].
@@ -159,6 +173,9 @@ pub enum Poison {
     /// It faulted. See [`Exit::Fault`].
     Fault { signo: i32, eip: u32 },
 
+    /// It overran its budget. See [`Exit::Timeout`].
+    Timeout { eip: u32 },
+
     /// It called an import the host has no implementation for.
     Unimplemented { module: String, symbol: String },
 }
@@ -168,6 +185,9 @@ impl std::fmt::Display for Poison {
         match self {
             Self::Fault { signo, eip } => {
                 write!(f, "module faulted with signal {signo} at {eip:#010x}")
+            }
+            Self::Timeout { eip } => {
+                write!(f, "module timed out at {eip:#010x}")
             }
             Self::Unimplemented { module, symbol } => {
                 write!(f, "{module}.{symbol} is not implemented")
@@ -270,8 +290,12 @@ pub struct Machine {
     /// entry; see `tib.rs`.
     tib: Tib,
 
-    /// The state the assembly is entered through.
-    ctx: Ctx,
+    /// The state the assembly is entered through, together with the
+    /// CPU-time timer that stops a module which will not stop itself. One
+    /// object because the timer holds the context's address; see
+    /// [`watchdog::Watched`]. Armed for the whole of a [`Machine::call`],
+    /// shim servicing included -- mirrors `crate::m16::Machine::ctx` exactly.
+    ctx: Watched,
 
     /// `ESP` (a linear address) when the module last called out, or `None`
     /// before its first call and after it has returned. The frame the
@@ -287,8 +311,12 @@ pub struct Machine {
     /// already names this address directly.
     frame_sp: Option<u32>,
 
-    /// Set once this machine has faulted, and never cleared. A poisoned
-    /// machine refuses to be entered again.
+    /// How much CPU time one entry point may have. Mirrors
+    /// `crate::m16::Machine::budget`.
+    budget: Duration,
+
+    /// Set once this machine has faulted or overrun, and never cleared. A
+    /// poisoned machine refuses to be entered again.
     poisoned: Option<Poison>,
 }
 
@@ -366,10 +394,29 @@ impl Machine {
         Ok(Self {
             bridge,
             tib,
-            ctx: Ctx::default(),
+            ctx: Watched::new()?,
             frame_sp: None,
+            budget: DEFAULT_BUDGET,
             poisoned: None,
         })
+    }
+
+    /// How much CPU time one entry point may have. See [`Machine::set_budget`].
+    pub fn budget(&self) -> Duration {
+        self.budget
+    }
+
+    /// Change the CPU budget an entry point gets, for calls made from now on.
+    /// Mirrors `crate::m16::Machine::set_budget` exactly.
+    ///
+    /// # Panics
+    ///
+    /// If `budget` is zero, which would mean "no time at all" but is how
+    /// `timer_settime` spells "no limit". Nothing good comes of guessing which
+    /// was meant.
+    pub fn set_budget(&mut self, budget: Duration) {
+        assert!(!budget.is_zero(), "a zero watchdog budget is not a budget");
+        self.budget = budget;
     }
 
     /// Why this machine will not run again, if it will not.
@@ -379,36 +426,32 @@ impl Machine {
 
     /// Refuse this module from now on, for a reason the host reached itself.
     ///
-    /// Mirrors `crate::m16::Machine::poison`: the call frame is forgotten and
-    /// every later [`call`](Machine::call)/[`resume`](Machine::resume) fails
-    /// naming the reason. The first reason wins -- a module poisoned for one
-    /// thing that then trips over another is still poisoned for the first,
-    /// which is the one that is true. See `crate::m16::Machine::poison`'s own
-    /// doc comment for why a host-reached reason (e.g. an unimplemented
-    /// import) is worth having at all, alongside the fault path that already
-    /// poisons through `Machine::run`'s `Exit::Fault` arm.
+    /// Mirrors `crate::m16::Machine::poison` exactly, watchdog disarm
+    /// included: the call frame is forgotten, the watchdog timer is
+    /// stopped, and every later [`call`](Machine::call)/
+    /// [`resume`](Machine::resume) fails naming the reason. The first
+    /// reason wins -- a module poisoned for one thing that then trips over
+    /// another is still poisoned for the first, which is the one that is
+    /// true. See `crate::m16::Machine::poison`'s own doc comment for why a
+    /// host-reached reason (e.g. an unimplemented import) is worth having
+    /// at all, alongside the fault and timeout paths that already poison
+    /// through `Machine::run`'s own terminal arms.
     ///
-    /// **One deliberate divergence from `crate::m16::Machine::poison`:** that
-    /// method also disarms its machine's watchdog timer (`self.ctx.disarm()`).
-    /// This machine has no watchdog to disarm -- `crate::m32::asm::Ctx` carries
-    /// no timer state, because the 32-bit watchdog is Task 16's job
-    /// (`docs/plans/2026-08-12-abi-border-implementation.md`), not yet landed.
-    /// There is nothing armed here for a poisoned machine to leave running, so
-    /// skipping that step is not a shortcut around a real hazard, only the
-    /// absence of one. `io::Result` stays on the signature regardless, for
-    /// parity with `mbbs::abi::Abi::poison` -- a different crate, so this is
-    /// deliberately not an intra-doc link; `mbbs-machine` does not depend on
-    /// `mbbs` and rustdoc cannot resolve it from here -- and so Task 16's
-    /// watchdog can grow a fallible disarm later without changing callers.
+    /// **This method used to skip the disarm.** Until Task 16
+    /// (`docs/plans/2026-08-12-abi-border-implementation.md`) landed the
+    /// 32-bit watchdog, `crate::m32::asm::Ctx` carried no timer state at
+    /// all, so there was nothing here for a poisoned machine to leave
+    /// running. That gap is closed now: this machine has a watchdog exactly
+    /// like `crate::m16::Machine`'s, and this method disarms it exactly the
+    /// same way.
     ///
     /// # Errors
     ///
-    /// Never, today -- see the divergence above. Kept fallible for the same
-    /// reason the signature is, not because this body can fail.
+    /// If the watchdog timer cannot be disarmed.
     pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
         self.poisoned.get_or_insert(reason);
         self.frame_sp = None;
-        Ok(())
+        self.ctx.disarm()
     }
 
     /// The linear address of the outstanding call's near return address --
@@ -530,6 +573,13 @@ impl Machine {
         self.ctx.out_edi = 0;
         self.ctx.out_ebp = 0;
 
+        // The watchdog is armed here and stays armed until the module
+        // reaches a terminal exit, so the budget covers the whole entry
+        // point -- every crossing, and all the time the host spends
+        // servicing imports in between. Mirrors
+        // `crate::m16::Machine::call`'s own arm exactly; see that method's
+        // doc comment for why arming per crossing instead would be wrong.
+        self.ctx.arm(self.budget)?;
         self.run(entry, sp, Ret::Void)
     }
 
@@ -598,6 +648,19 @@ impl Machine {
             );
             u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
         };
+
+        // This is where an overrun spent on host code is caught -- mirrors
+        // `crate::m16::Machine::resume_cleaning`'s own check exactly. A
+        // watchdog tick that arrives while the host is servicing an import
+        // proves the budget is gone just as surely as one that interrupts
+        // 32-bit code, and there is no sense re-entering a module whose
+        // time is up in order to stop it a moment later.
+        if self.ctx.expired() {
+            // Report where it would have resumed -- the instruction after
+            // the module's own `call`, which is the honest answer to
+            // "where did it stop" for a module parked at an import call.
+            return self.terminate(Exit::Timeout { eip: at });
+        }
 
         // Step over the 4 bytes just read, exactly as the module's own `ret`
         // would when the call it made returns normally: `ESP` ends up where
@@ -766,18 +829,28 @@ impl Machine {
         // stack and TIB mappings are likewise live for as long as `self`,
         // and `fault::arm` was called in `new`, so a fault this call takes
         // is recoverable rather than fatal.
-        unsafe { asm::enter(&mut self.ctx) };
+        unsafe { asm::enter(self.ctx.as_ptr()) };
 
         if self.ctx.out_signo != 0 {
             let signo = self.ctx.out_signo as i32;
             let eip = self.ctx.out_eip;
-            self.poisoned.get_or_insert(Poison::Fault { signo, eip });
-            self.frame_sp = None;
-            return Ok(Exit::Fault { signo, eip });
+            // Which signal it was is the whole distinction -- everything
+            // else (the recovery, the poisoning, the lost state) is
+            // identical. Mirrors `crate::m16::Machine::run`'s own dispatch.
+            return if signo == watchdog::signo() {
+                self.terminate(Exit::Timeout { eip })
+            } else {
+                self.terminate(Exit::Fault { signo, eip })
+            };
         }
 
         if self.ctx.out_ecx == KIND_RETURN {
             self.frame_sp = None;
+            // The entry point is over, so its budget is too. Leaving the
+            // timer armed would charge the next call for this one's
+            // leftovers -- mirrors `crate::m16::Machine::run`'s own disarm
+            // on `Exit::Returned`.
+            self.ctx.disarm()?;
             return Ok(Exit::Returned {
                 eax: self.ctx.out_eax,
                 edx: self.ctx.out_edx,
@@ -788,5 +861,22 @@ impl Machine {
         Ok(Exit::Call {
             index: self.ctx.out_eax as u16,
         })
+    }
+
+    /// Stop for good: disarm the watchdog, poison the machine and forget the
+    /// call frame. Mirrors `crate::m16::Machine::terminate` exactly.
+    ///
+    /// Forgetting the frame matters as much as the rest. A module that died
+    /// or was stopped mid-call has nothing meaningful left on its stack, and
+    /// `arg_u32` and friends would otherwise happily report the leftovers.
+    fn terminate(&mut self, exit: Exit) -> io::Result<Exit> {
+        self.poisoned.get_or_insert(match exit {
+            Exit::Fault { signo, eip } => Poison::Fault { signo, eip },
+            Exit::Timeout { eip } => Poison::Timeout { eip },
+            other => unreachable!("{other:?} is not a terminal exit"),
+        });
+        self.frame_sp = None;
+        self.ctx.disarm()?;
+        Ok(exit)
     }
 }

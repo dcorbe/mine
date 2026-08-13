@@ -174,6 +174,19 @@ pub(crate) struct Ctx {
     /// above.
     pub out_esp: u32,
 
+    /// Nonzero once a watchdog tick has been recorded against this module,
+    /// whether or not it was in 32-bit mode at the time. The assembly never
+    /// touches it: the signal handler sets it and
+    /// [`crate::m32::watchdog::Watched::arm`] clears it, so it survives the
+    /// crossings in between and outlives the excursion a tick may have
+    /// interrupted. Mirrors `crate::m16::asm::Ctx::expired` exactly, one
+    /// register narrower to match the rest of this struct.
+    ///
+    /// Separate from `out_signo` because that one is cleared before every
+    /// entry, and a tick that arrives while the host is servicing an import
+    /// must not be wiped out by the next crossing it triggers.
+    pub expired: u32,
+
     /// The signal that stopped the module, or `0` if the crossing ended by
     /// reaching the trampoline normally. Set only by `crate::fault::handler`
     /// -- never by the assembly above, which has no branch that touches it --

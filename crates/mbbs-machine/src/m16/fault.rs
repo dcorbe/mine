@@ -66,11 +66,22 @@
 //!
 //! So the watchdog signal is registered with the arbiter as its own
 //! [`crate::fault::AsyncClaim`], not folded into the CS-claim dispatch: every
-//! delivery reaches [`recover_watchdog`] unconditionally, `CS` never enters
-//! into whether it is "ours" to look at. See [`crate::m16::watchdog`] for the
-//! timer half.
+//! delivery reaches [`recover_watchdog`] regardless of `CS`. `CS` never
+//! decides *whether* it is dispatched -- only, once inside, whether it is
+//! worth rewriting anything (see below).
+//!
+//! `m32` rides the very same real-time signal for its own watchdog now
+//! (`crate::fault`'s module doc comment, "Two signal classes"), so
+//! `recover_watchdog` cannot assume every delivery is this ABI's: it first
+//! untags the payload with [`crate::fault::untag`] against [`owner`], this
+//! ABI's own registered slot, and returns immediately on a mismatch --
+//! exactly the positive-claim discipline [`is_ldt_selector`] applies to
+//! `CS`, just made over the timer's payload instead. Only past that check
+//! is `sival_ptr` known to name an `m16::asm::Ctx` at all. See
+//! [`crate::m16::watchdog`] for the timer half.
 
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::m16::asm::Ctx;
 use crate::m16::watchdog;
@@ -81,6 +92,28 @@ use crate::m16::watchdog;
 const UC_STRICT_RESTORE_SS: libc::c_ulong = 0x4;
 
 static INSTALL: std::sync::Once = std::sync::Once::new();
+
+/// This ABI's slot index in the shared arbiter's registry, set once by
+/// [`arm`] and read by every [`crate::m16::watchdog::Watched`] this process
+/// ever builds. `usize::MAX` until then, which is never a real slot index
+/// ([`crate::fault::register`]'s `MAX_CLAIMS` is far smaller) -- reading it
+/// before `arm` has run is a caller bug, not a value this module will ever
+/// hand out.
+static OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// This ABI's registered slot in the shared arbiter, for tagging a new
+/// watchdog's `sigval` -- see [`crate::fault::tag`].
+///
+/// # Panics
+///
+/// If called before [`arm`] has run at least once in this process. Every
+/// [`crate::m16::Machine::new`] calls `arm` before building a
+/// [`watchdog::Watched`], so this only fires if that ordering is broken.
+pub(crate) fn owner() -> usize {
+    let owner = OWNER.load(Ordering::Relaxed);
+    assert_ne!(owner, usize::MAX, "m16::fault::owner() read before arm() registered");
+    owner
+}
 
 /// Make module faults survivable on this thread, and register this ABI's
 /// claim with the shared arbiter.
@@ -104,7 +137,8 @@ pub(crate) fn arm(host_cs: u16) -> io::Result<()> {
                 signo: watchdog::signo(),
                 recover: recover_watchdog,
             }),
-        );
+        )
+        .map(|i| OWNER.store(i, Ordering::Relaxed));
     });
     result
 }
@@ -180,15 +214,24 @@ unsafe fn recover_watchdog(
     // know 16-bit code was actually interrupted -- see below.
     let ctx16 = gregs[libc::REG_R14 as usize] as *mut Ctx;
 
-    // The timer carries the address of the context it watches, which is the
-    // only thing here that is meaningful no matter where the tick landed.
-    // `R14` is not: it names an excursion, and there may not be one.
+    // The timer carries the (tagged) address of the context it watches,
+    // which is the only thing here that is meaningful no matter where the
+    // tick landed. `R14` is not: it names an excursion, and there may not
+    // be one.
     //
     // SAFETY: `info` is non-null for an SA_SIGINFO handler, and a
     // POSIX-timer signal carries the `sigev_value` given to `timer_create`,
-    // which is a `Ctx` the owning `Watched` keeps alive for as long as the
-    // timer exists.
-    let watched = unsafe { (*info).si_value().sival_ptr }.cast::<Ctx>();
+    // which is `crate::fault::tag`'s output over a `Ctx` the owning
+    // `Watched` keeps alive for as long as the timer exists.
+    let sival_ptr = unsafe { (*info).si_value().sival_ptr };
+    // SAFETY: `Watched::new` built this `sigval` with `crate::fault::tag`
+    // over a `Ctx`, which is the same `T` named here.
+    let Some(watched) = (unsafe { crate::fault::untag::<Ctx>(sival_ptr, owner()) }) else {
+        // Tagged for a different ABI's slot -- both watchdogs share this
+        // real-time signal now (see `crate::fault`'s module doc comment),
+        // so this tick is not an error, just not ours. Touch nothing.
+        return;
+    };
 
     // Whose module is executing right now -- if anyone's -- decides only
     // *how* to stop it, not whether the budget is gone. It is gone either
