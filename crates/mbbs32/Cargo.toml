@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 libc = "0.2"
 mbbs-ptr = { path = "../mbbs-ptr" }
+mbbs-ldt = { path = "../mbbs-ldt" }
 
 [dev-dependencies]
 libc = "0.2"

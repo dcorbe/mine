@@ -1,15 +1,15 @@
 //! Segments: memory below 4 GiB, and the LDT descriptors that name it.
+//!
+//! Entry numbers themselves come from `mbbs-ldt`, not a bitmap private to
+//! this crate -- see that crate's module comment for why a second, from
+//! scratch allocator (which is what used to live here) is not merely
+//! duplication but a real bug the moment another ABI shares the process.
 
 use std::io;
 use std::rc::Rc;
-use std::sync::{Mutex, PoisonError};
 
 /// `modify_ldt(2)` function code for writing an entry.
 const LDT_WRITE: i32 = 1;
-
-/// How many entries an LDT has. One module load takes 82 of them, so this is
-/// not a limit only a pathological caller could reach.
-const LDT_ENTRIES: u32 = 8192;
 
 /// Segment contents, as `struct user_desc` encodes it.
 const CONTENTS_DATA: u32 = 0;
@@ -32,70 +32,15 @@ const F_READ_EXEC_ONLY: u32 = 1 << 3;
 const F_SEG_NOT_PRESENT: u32 = 1 << 5;
 const F_USEABLE: u32 = 1 << 6;
 
-/// `u64`s needed to give every LDT entry a bit.
-const WORDS: usize = LDT_ENTRIES as usize / 64;
-
-/// Which LDT entries are spoken for.
-///
-/// A bitmap rather than a counter and a free list, because **a tiled region
-/// needs its descriptors to be adjacent** and neither of those can promise it.
-/// `alctile` hands the module one far pointer and the module computes the rest
-/// itself by stepping the selector, so if entry `n + 1` belongs to something
-/// else the module writes through it and nothing reports anything.
-///
-/// A bump allocator *happens* to hand out consecutive entries, which is worse
-/// than not doing so: it holds until the first free and then quietly stops.
-///
-/// One kilobyte, and a process has exactly one LDT -- so this is process-wide
-/// even though a `Machine` feels local.
-static IN_USE: Mutex<[u64; WORDS]> = Mutex::new([0; WORDS]);
-
-fn in_use() -> std::sync::MutexGuard<'static, [u64; WORDS]> {
-    // Nothing inside the critical section can panic in a way that matters, and
-    // failing an allocation because an unrelated thread died is worse than
-    // carrying on with a table that is merely correct.
-    IN_USE.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn taken(bits: &[u64; WORDS], entry: u32) -> bool {
-    bits[entry as usize / 64] & (1 << (entry % 64)) != 0
-}
-
-/// Reserve `count` adjacent entries and return the first.
-///
-/// First fit, lowest first, so a freed slot is handed out again before a fresh
-/// one -- the LDT is a fixed 8,192 entries and a module load takes 82, so
-/// loading and unloading the same module a hundred times would otherwise run
-/// the table out.
+/// Reserve `count` adjacent entries and return the first. Delegates to
+/// `mbbs-ldt`'s process-wide free list -- see this file's module comment.
 fn take_ldt_run(count: u32) -> io::Result<u32> {
-    let mut bits = in_use();
-    let mut run = 0;
-    for entry in 0..LDT_ENTRIES {
-        if taken(&bits, entry) {
-            run = 0;
-            continue;
-        }
-        run += 1;
-        if run == count {
-            let start = entry + 1 - count;
-            for e in start..start + count {
-                bits[e as usize / 64] |= 1 << (e % 64);
-            }
-            return Ok(start);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::OutOfMemory,
-        format!("no run of {count} free entries in the LDT's {LDT_ENTRIES}"),
-    ))
+    mbbs_ldt::take_run(count)
 }
 
 /// Hand `count` entries starting at `start` back.
 fn give_ldt_run(start: u32, count: u32) {
-    let mut bits = in_use();
-    for e in start..start + count {
-        bits[e as usize / 64] &= !(1 << (e % 64));
-    }
+    mbbs_ldt::give_run(start, count);
 }
 
 /// Write `desc` into the LDT.
@@ -402,6 +347,7 @@ impl Drop for Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
 
     /// The LDT is process-wide, and so is the free list. These tests assert on
     /// *which* slot comes back, so they cannot run beside each other.

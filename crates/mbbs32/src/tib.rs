@@ -28,36 +28,33 @@
 //! descriptor per [`Tib`] is the entire LDT footprint this crate has -- against
 //! 3,576 for a single 16-bit MajorMUD instance in `crates/mbbs16`.
 //!
-//! # This crate's own LDT allocator, deliberately not shared with `mbbs16`'s
+//! # The LDT entry number comes from `mbbs-ldt`, not a private allocator
 //!
-//! `crates/mbbs16/src/seg.rs` already has a proven one-shot/tiled LDT
-//! allocator, but it is private to that crate and this one needs neither
-//! tiling nor its 82-descriptors-per-load scale -- one [`Tib`] is one entry.
-//! The allocator below is a from-scratch, much smaller mirror of the same
-//! shape (`modify_ldt`, a process-wide free bitmap, `seg_32bit` set instead of
-//! clear). **It draws entry numbers from a separate free list than
-//! `mbbs16::seg`'s**, because the LDT itself is a single process-wide kernel
-//! table and Rust has no way to share one crate's private static with
-//! another. A process that loads both a 16-bit and a 32-bit module at once
-//! could have `mbbs16` and `mbbs32` each believe entry *N* is theirs and hand
-//! it out independently -- silently overwriting each other's descriptor. This
-//! is the same "no 16/32 interop yet" gap the design doc names for the fault
-//! handler; nothing here resolves it for the LDT, and nothing through this
-//! crate's current scope (Task 17 and earlier) needs it resolved, because
-//! nothing runs both ABIs in one process yet. Worth fixing before that day
-//! arrives, most simply by putting one allocator behind a single crate both
-//! sides depend on.
+//! This crate needs neither `mbbs16::seg`'s tiling nor its 82-descriptors-
+//! per-load scale -- one [`Tib`] is one entry -- but the entry *number* still
+//! has to come from a free list every ABI in the process shares, because the
+//! LDT itself is one 8,192-entry kernel table regardless of how many crates
+//! carve descriptors out of it. An earlier version of this file drew from a
+//! bitmap private to this crate instead, on the theory that nothing yet ran
+//! both ABIs in one process -- and said so, in so many words, right here.
+//! That day arrived building `crates/mbbs-fault`: a test that constructed an
+//! `mbbs16::Machine` and then an `mbbs32::Machine` found this crate's
+//! `Tib::new` silently reserve the same entry 0 the 16-bit machine's code
+//! segment already owned, overwrite its descriptor, and fault the very first
+//! far jump into the module before it ran a single instruction. No amount of
+//! fault-handler arbitration could have caught that: the module's memory was
+//! gone before anything reached a signal at all. See `mbbs-ldt`'s module
+//! comment for the shared free list this crate now draws from instead, and
+//! what stayed here: `modify_ldt`'s bitfield encoding and everything about
+//! what a *reserved* entry's descriptor contains (`seg_32bit` set, unlike
+//! `mbbs16::seg::describe`'s data segments).
 
 use std::io;
-use std::sync::{Mutex, PoisonError};
 
 use crate::map::Mapping;
 
 /// `modify_ldt(2)` function code for writing an entry.
 const LDT_WRITE: i32 = 1;
-
-/// How many entries an LDT has. Same kernel-wide limit `mbbs16::seg` uses.
-const LDT_ENTRIES: u32 = 8192;
 
 /// `struct user_desc`, with the kernel's bitfield word spelled out -- the same
 /// layout `crates/mbbs16/src/seg.rs::UserDesc` documents.
@@ -80,40 +77,15 @@ const CONTENTS_SHIFT: u32 = 1;
 const F_SEG_NOT_PRESENT: u32 = 1 << 5;
 const F_USEABLE: u32 = 1 << 6;
 
-/// `u64`s needed to give every LDT entry a bit.
-const WORDS: usize = LDT_ENTRIES as usize / 64;
-
-/// This crate's own free list -- see the module doc comment for why it is not
-/// `mbbs16::seg`'s.
-static IN_USE: Mutex<[u64; WORDS]> = Mutex::new([0; WORDS]);
-
-fn in_use() -> std::sync::MutexGuard<'static, [u64; WORDS]> {
-    IN_USE.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn taken(bits: &[u64; WORDS], entry: u32) -> bool {
-    bits[entry as usize / 64] & (1 << (entry % 64)) != 0
-}
-
-/// Reserve one free LDT entry, lowest first.
+/// Reserve one free LDT entry, from `mbbs-ldt`'s process-wide free list --
+/// see this file's module comment.
 fn take_one() -> io::Result<u32> {
-    let mut bits = in_use();
-    for entry in 0..LDT_ENTRIES {
-        if !taken(&bits, entry) {
-            bits[entry as usize / 64] |= 1 << (entry % 64);
-            return Ok(entry);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::OutOfMemory,
-        format!("no free entry in this crate's {LDT_ENTRIES}-entry LDT free list"),
-    ))
+    mbbs_ldt::take_run(1)
 }
 
 /// Hand one entry back.
 fn give_one(entry: u32) {
-    let mut bits = in_use();
-    bits[entry as usize / 64] &= !(1 << (entry % 64));
+    mbbs_ldt::give_run(entry, 1);
 }
 
 /// Write `desc` into the LDT.
