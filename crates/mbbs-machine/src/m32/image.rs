@@ -11,8 +11,10 @@
 //! bytes, and nothing through this task exercises it.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 
+use crate::m32::flatptr::Flat32Ptr;
 use crate::m32::map::Mapping;
 use crate::m32::pe::{PeError, PeImage, Symbol};
 use crate::module::ImportSite;
@@ -252,21 +254,40 @@ impl Image {
     /// Returns every distinct symbol that was given an index, in that same
     /// index order, so a later task can tell one thunk from the next without
     /// re-walking `image.imports` itself.
+    ///
+    /// # Errors
+    ///
+    /// [`AbsoluteImport`] if `resolver` answers [`Import32::Absolute`] for
+    /// any site -- see that type's own doc comment for why a PE import site
+    /// can never honour one. No bytes are written for the site that
+    /// triggered the refusal, but sites walked before it (in
+    /// `image.imports`'s own order) have already had their IAT slots
+    /// written -- the same "the caller must treat the whole load as failed"
+    /// contract every other refusal in this loader carries, not a promise
+    /// that this method itself leaves the mapping untouched.
     pub fn bind_imports(
         &mut self,
         image: &PeImage,
-        resolver: &dyn ImportResolver,
-    ) -> Vec<ImportSite> {
+        resolver: &dyn ImportResolver<Flat32Ptr>,
+    ) -> Result<Vec<ImportSite>, AbsoluteImport> {
         let mut cache: HashMap<(&str, &Symbol), u32> = HashMap::new();
         let mut thunks: Vec<ImportSite> = Vec::new();
 
         let dst = self.mapping.as_mut_slice();
         for import in &image.imports {
             let key = (import.library.as_str(), &import.symbol);
-            let value = *cache.entry(key).or_insert_with(|| {
+            let value = if let Some(&v) = cache.get(&key) {
+                v
+            } else {
                 let answer = resolver.resolve(&import.library, &import.symbol);
-                match answer {
-                    Some(Import32::Data(addr)) => addr,
+                let v = match answer {
+                    Some(Import32::Data(addr)) => addr.0,
+                    Some(Import32::Absolute(_)) => {
+                        return Err(AbsoluteImport {
+                            module: import.library.clone(),
+                            symbol: import.symbol.clone(),
+                        });
+                    }
                     other => {
                         // `other` is `Some(Import32::Routine)` or `None`;
                         // both get a thunk, see the doc comment above.
@@ -278,8 +299,10 @@ impl Image {
                         });
                         index as u32
                     }
-                }
-            });
+                };
+                cache.insert(key, v);
+                v
+            };
 
             let rva = import.iat_rva as usize;
             // In-bounds by construction: `PeImage::parse` refuses (as
@@ -291,7 +314,7 @@ impl Image {
             dst[rva..rva + 4].copy_from_slice(&value.to_le_bytes());
         }
 
-        thunks
+        Ok(thunks)
     }
 
     /// After [`Image::bind_imports`], overwrite every IAT slot it gave a
@@ -338,35 +361,59 @@ impl Image {
 
 /// How a host answers "what is `WGSERVER.EXE:_prfmsg`?".
 ///
-/// Two arms, not the sibling 16-bit loader's three: a flat 32-bit ABI has no
-/// segment:offset far pointers to carry, and nothing measured in
-/// `wccmmud.dll`'s 210 imports needs [`Import`](crate::m32::Import)-by-constant
-/// (the 16-bit loader's `Absolute` arm, for `DOSCALLS.135`'s shift count) --
-/// a fixup here writes a whole address-sized slot, never patches an
-/// instruction's immediate field.
-pub trait ImportResolver {
-    /// `None` for a symbol the host does not implement. The loader still
-    /// gives it a thunk, so that calling it is a diagnosable event rather
-    /// than a jump into nothing.
-    fn resolve(&self, library: &str, symbol: &Symbol) -> Option<Import32>;
+/// Re-exported rather than declared here -- see
+/// [`crate::module::ImportResolver`] for the shared trait, and this crate's
+/// `m16::ne` for the identical re-export on the 16-bit side. A real host has
+/// a table, keyed by version; tests and examples in this crate use a closure
+/// throughout, via the blanket impl `crate::module::ImportResolver` already
+/// carries.
+pub use crate::module::ImportResolver;
+
+/// What a host answers "what is `WGSERVER.EXE:_prfmsg`?" with, in this
+/// format's own pointer type.
+///
+/// A type alias onto the shared vocabulary, not a format-local enum --
+/// `crate::m16::ne::Import` is the identical alias for the 16-bit side. Used
+/// to be a two-variant enum of its own (`Routine`, `Data(u32)`); reconciled
+/// onto [`crate::module::Import`] once the third variant, `Absolute`,
+/// needed a single place to be refused rather than two loaders each
+/// inventing their own answer -- see [`AbsoluteImport`]'s own doc comment.
+pub type Import32 = crate::module::Import<Flat32Ptr>;
+
+/// A resolver answered [`Import32::Absolute`] for a symbol a PE import site
+/// asked to bind, and [`Image::bind_imports`] refused rather than binding it.
+///
+/// Only NE relocations can honour `Absolute`: an NE fixup can patch *part*
+/// of an address into an instruction's own immediate field
+/// (`m16::ne`'s module doc comment, `DOSCALLS.135`'s huge-shift constant),
+/// while a PE fixup always writes a whole address-sized IAT slot and never
+/// an instruction's immediate -- see [`Image::bind_imports`]'s own doc
+/// comment. So a PE loader asked to bind one means either the resolver
+/// answered for the wrong ABI, or a symbol the host's own table marks
+/// `Absolute` reached a PE import site at all -- both are host bugs, and
+/// both deserve to stop the load loudly rather than be coerced into
+/// something that merely compiles (writing the raw constant into the IAT
+/// slot would compile and be wrong: nothing would ever call through it, and
+/// nothing would ever read it back as the constant it is).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsoluteImport {
+    pub module: String,
+    pub symbol: Symbol,
 }
 
-impl<F: Fn(&str, &Symbol) -> Option<Import32>> ImportResolver for F {
-    fn resolve(&self, library: &str, symbol: &Symbol) -> Option<Import32> {
-        self(library, symbol)
+impl fmt::Display for AbsoluteImport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{} resolved to Import::Absolute, which a PE import site cannot bind \
+             (a PE fixup writes a whole address-sized IAT slot, never an instruction's \
+             immediate field)",
+            self.module, self.symbol
+        )
     }
 }
 
-/// What a host answers `ImportResolver::resolve` with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Import32 {
-    /// A host routine. Gets a thunk; calling it comes back as `Exit::Call`
-    /// (a later increment -- see `Image::bind_imports`'s doc comment).
-    Routine,
-    /// A host global the module addresses directly. This address goes
-    /// straight into the IAT slot, and the host is never told it was read.
-    Data(u32),
-}
+impl std::error::Error for AbsoluteImport {}
 
 #[cfg(test)]
 mod read_write_tests {
@@ -474,5 +521,47 @@ mod read_write_tests {
 
         assert!(image.write_at(SIZE_OF_IMAGE, &[0]).is_err());
         assert!(image.write_at(SIZE_OF_IMAGE - 1, &[0, 0]).is_err());
+    }
+
+    /// The `Absolute` decision, enforced: a resolver answering
+    /// [`Import32::Absolute`] for a PE import site must make
+    /// [`Image::bind_imports`] refuse loudly, not silently bind the
+    /// constant as if it were an address. See [`AbsoluteImport`]'s own doc
+    /// comment for why only NE relocations can ever honour that answer.
+    ///
+    /// The IAT slot assertion is the mutation this test exists to catch: a
+    /// `bind_imports` that matched `Import32::Absolute` under the same
+    /// catch-all arm as `Routine`/`None` would still compile, still return
+    /// `Ok(..)`, and would write a *thunk index* into the slot -- wrong, but
+    /// silently wrong, exactly the failure mode `AbsoluteImport` exists to
+    /// turn into a loud one instead.
+    #[test]
+    fn bind_imports_refuses_an_absolute_answer_rather_than_silently_binding_it() {
+        let file = minimal_with_one_section();
+        let mut pe = PeImage::parse(&file).expect("fixture parses");
+        // rva 0x1000 is the CODE section's own start -- inside the mapped
+        // image, so a wrongly-written slot would be observable rather than
+        // merely out of bounds.
+        pe.imports.push(crate::m32::pe::Import {
+            library: "MAJORBBS".to_owned(),
+            symbol: Symbol::Name("doscalls_135".to_owned()),
+            iat_rva: 0x1000,
+        });
+        let mut image = Image::load(&file, &pe).expect("fixture loads");
+
+        let resolver = |_library: &str, _symbol: &Symbol| -> Option<Import32> { Some(Import32::Absolute(9)) };
+        let err = image
+            .bind_imports(&pe, &resolver)
+            .expect_err("Import::Absolute must be refused, not bound");
+        assert_eq!(err.module, "MAJORBBS");
+        assert_eq!(err.symbol, Symbol::Name("doscalls_135".to_owned()));
+
+        // Not a silent skip either: the IAT slot is still the zero bytes the
+        // fresh mapping started with, not a thunk index or the raw constant.
+        assert_eq!(
+            image.read_at(0x1000, 4).unwrap(),
+            &[0, 0, 0, 0],
+            "a refused bind must not have written anything into the IAT slot"
+        );
     }
 }

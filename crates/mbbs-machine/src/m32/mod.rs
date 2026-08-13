@@ -65,7 +65,7 @@ use std::io;
 
 use asm::{Ctx, USER32_CS, current_cs, trampoline};
 pub use flatptr::{Flat32Ptr, Flat32PtrError};
-pub use image::{Image, Import32, ImportResolver};
+pub use image::{AbsoluteImport, Image, Import32, ImportResolver};
 pub use map::Mapping;
 pub use mem::Memory;
 pub use crate::module::{ImportSite, Symbol};
@@ -209,6 +209,49 @@ impl Ret {
             Self::U32(v) => (v, 0),
             Self::U64(v) => (v as u32, (v >> 32) as u32),
         }
+    }
+}
+
+/// A module in memory: what sits behind each thunk, and where its entry
+/// point is.
+///
+/// The 32-bit sibling of `crate::m16::ne::Module`, much smaller. A PE
+/// image's own mapping -- sections, relocations, the IAT -- lives in
+/// [`Memory`]/[`Image`] once loaded, not here: `crate::abi::Abi::Mem`
+/// (`Wg32::Mem`, in `crates/mbbs` -- a different crate, so this is
+/// deliberately not an intra-doc link; `mbbs-machine` does not depend on
+/// `mbbs` and rustdoc cannot resolve it from here) owns that, since
+/// `Abi::mem` needs somewhere to reborrow it from `Cpu` regardless of
+/// whether a module has been loaded yet -- see
+/// `crates/mbbs/src/abi/wg32.rs`'s own module doc comment ("Collision 2").
+/// This only needs to carry what `crate::abi::Abi::import`/
+/// `crate::abi::Abi::caller` read: the bound import table, in thunk-index
+/// order, and the entry point's linear address.
+#[derive(Debug, Clone)]
+pub struct Module {
+    entry: u32,
+    imports: Vec<crate::module::ImportSite>,
+}
+
+impl Module {
+    pub fn new(entry: u32, imports: Vec<crate::module::ImportSite>) -> Self {
+        Self { entry, imports }
+    }
+
+    /// The linear address `DllMain`/the module's own entry point sits at.
+    pub fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    /// What thunk `index` stands for, as [`Exit::Call`] reports it. Mirrors
+    /// `crate::m16::ne::Module::import`.
+    pub fn import(&self, index: u16) -> Option<&crate::module::ImportSite> {
+        self.imports.get(usize::from(index))
+    }
+
+    /// Every import the module has, in thunk-index order.
+    pub fn imports(&self) -> &[crate::module::ImportSite] {
+        &self.imports
     }
 }
 
