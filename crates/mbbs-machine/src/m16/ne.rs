@@ -42,6 +42,7 @@ use std::io;
 
 use crate::m16::seg::Segment;
 use crate::m16::{FarPtr, MAX_THUNKS, Machine};
+pub use crate::module::{ImportSite, Symbol};
 
 /// A 16-bit segment's size when the field holding it reads zero. Both `length`
 /// and `minalloc` spell 64 KiB this way, since the field is a word and 64 KiB
@@ -316,23 +317,6 @@ pub enum Target {
     /// (`FIERQQ`/`FIDRQQ`/`FIWRQQ`), and none of the FSD or screen-library code
     /// touches them.
     OsFixup { kind: u16 },
-}
-
-/// How an imported symbol is named. Ordinals are the usual case by a very wide
-/// margin: `WCCMMUD.DLL` has 22,370 of them and exactly one import by name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Symbol {
-    Ordinal(u16),
-    Name(String),
-}
-
-impl fmt::Display for Symbol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Ordinal(n) => write!(f, "{n}"),
-            Self::Name(s) => write!(f, "{s}"),
-        }
-    }
 }
 
 /// One fixup.
@@ -707,23 +691,6 @@ pub trait ImportResolver {
 impl<F: Fn(&str, &Symbol) -> Option<Import>> ImportResolver for F {
     fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import> {
         self(module, symbol)
-    }
-}
-
-/// An imported symbol that was given a thunk, and what the host said about it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportSite {
-    pub module: String,
-    pub symbol: Symbol,
-    /// False when the host had no answer. The thunk exists anyway, so that a
-    /// module reaching an unimplemented import announces which one rather than
-    /// far-calling into nothing.
-    pub resolved: bool,
-}
-
-impl fmt::Display for ImportSite {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.module, self.symbol)
     }
 }
 

@@ -15,6 +15,7 @@ use std::io;
 
 use crate::m32::map::Mapping;
 use crate::m32::pe::{PeError, PeImage, Symbol};
+use crate::module::ImportSite;
 
 /// A [`PeImage`], mapped: one [`Mapping`] of `size_of_image` bytes, with each
 /// section's raw bytes copied into place at its `rva`.
@@ -255,9 +256,9 @@ impl Image {
         &mut self,
         image: &PeImage,
         resolver: &dyn ImportResolver,
-    ) -> Vec<ThunkSite> {
+    ) -> Vec<ImportSite> {
         let mut cache: HashMap<(&str, &Symbol), u32> = HashMap::new();
-        let mut thunks: Vec<ThunkSite> = Vec::new();
+        let mut thunks: Vec<ImportSite> = Vec::new();
 
         let dst = self.mapping.as_mut_slice();
         for import in &image.imports {
@@ -270,8 +271,8 @@ impl Image {
                         // `other` is `Some(Import32::Routine)` or `None`;
                         // both get a thunk, see the doc comment above.
                         let index = thunks.len();
-                        thunks.push(ThunkSite {
-                            library: import.library.clone(),
+                        thunks.push(ImportSite {
+                            module: import.library.clone(),
                             symbol: import.symbol.clone(),
                             resolved: matches!(other, Some(Import32::Routine)),
                         });
@@ -313,13 +314,13 @@ impl Image {
     pub fn patch_thunk_addresses(
         &mut self,
         image: &PeImage,
-        thunks: &[ThunkSite],
+        thunks: &[ImportSite],
         thunk_addr: impl Fn(u32) -> u32,
     ) {
         let index_of: HashMap<(&str, &Symbol), u32> = thunks
             .iter()
             .enumerate()
-            .map(|(i, t)| ((t.library.as_str(), &t.symbol), i as u32))
+            .map(|(i, t)| ((t.module.as_str(), &t.symbol), i as u32))
             .collect();
 
         let dst = self.mapping.as_mut_slice();
@@ -365,21 +366,6 @@ pub enum Import32 {
     /// A host global the module addresses directly. This address goes
     /// straight into the IAT slot, and the host is never told it was read.
     Data(u32),
-}
-
-/// One symbol [`Image::bind_imports`] gave a thunk index rather than a real
-/// address -- every site in `image.imports` naming this exact
-/// `(library, symbol)` pair got the same index, in the order these appear in
-/// the `Vec` [`Image::bind_imports`] returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ThunkSite {
-    pub library: String,
-    pub symbol: Symbol,
-    /// `false` when `ImportResolver::resolve` answered `None` -- the host
-    /// does not implement this symbol at all. The site still gets a thunk
-    /// index (see [`Image::bind_imports`]'s doc comment for why), so this is
-    /// the only place that distinction survives.
-    pub resolved: bool,
 }
 
 #[cfg(test)]

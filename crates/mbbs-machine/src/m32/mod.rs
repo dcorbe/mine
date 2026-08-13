@@ -65,10 +65,11 @@ use std::io;
 
 use asm::{Ctx, USER32_CS, current_cs, trampoline};
 pub use flatptr::{Flat32Ptr, Flat32PtrError};
-pub use image::{Image, Import32, ImportResolver, ThunkSite};
+pub use image::{Image, Import32, ImportResolver};
 pub use map::Mapping;
 pub use mem::Memory;
-pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section, Symbol};
+pub use crate::module::{ImportSite, Symbol};
+pub use pe::{Export, ExportAddress, Import, PeError, PeImage, Relocation, Section};
 use tib::{DEFAULT_STACK_LEN, Tib};
 
 /// Where the thunk table sits within the **bridge** mapping, which holds
@@ -122,7 +123,7 @@ const KIND_RETURN: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     /// The module called an import thunk. `index` names which one --
-    /// look it up in the `Vec<ThunkSite>` [`Image::bind_imports`] returned.
+    /// look it up in the `Vec<ImportSite>` [`Image::bind_imports`] returned.
     Call { index: u16 },
 
     /// The module returned from the entry point it was called at, via an

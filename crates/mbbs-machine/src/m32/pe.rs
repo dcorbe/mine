@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+pub use crate::module::Symbol;
+
 /// Why a module could not be read.
 ///
 /// Every variant is something a *file* can be, not something the host can do
@@ -349,15 +351,6 @@ const DIR_IMPORT: usize = 1;
 /// but the format allows either per entry, and other Worldgroup modules in
 /// the Task 9 corpus use it.
 const IMPORT_BY_ORDINAL: u32 = 0x8000_0000;
-
-/// How a module names something it wants from another DLL.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Symbol {
-    /// The ordinary case here, and the only one `wccmmud.dll` uses.
-    Name(String),
-    /// Present in the format, and in other Worldgroup modules.
-    Ordinal(u16),
-}
 
 /// One symbol a module imports, and where its address must be written.
 #[derive(Debug, Clone, PartialEq, Eq)]

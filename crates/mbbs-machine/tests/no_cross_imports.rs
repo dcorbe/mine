@@ -1,7 +1,10 @@
 //! m16 and m32 lost their crate boundary in Task 1; this is the fence
-//! that replaces it. `fault` and `ldt` are the only sanctioned shared
-//! modules -- see the design's §1 ("What the merge costs, and the guard
-//! for it").
+//! that replaces it. `fault`, `ldt` and `module` are the only sanctioned
+//! shared modules -- see the design's §1 ("What the merge costs, and the
+//! guard for it") for `fault`/`ldt`, and Task 8 for `module` (the
+//! format-neutral `Symbol`/`ImportSite` vocabulary, which joined them for
+//! the identical reason: it sits beside `m16/` and `m32/`, not inside
+//! either).
 //!
 //! # Recursion
 //!
@@ -71,21 +74,25 @@
 //! That compiles, gives `m16` a real dependency on an `m32` type, and the
 //! directory scan reports green -- because `m16` never writes the string
 //! `crate::m32` anywhere. `fault` and `ldt` are the two modules the design
-//! sanctions as shared (§1), which is exactly what makes a re-export
-//! through them look legitimate to a reader *and* invisible to a fence
-//! that only watches the machines.
+//! originally sanctioned as shared (§1), which is exactly what makes a
+//! re-export through them look legitimate to a reader *and* invisible to a
+//! fence that only watches the machines. `module.rs` (Task 8, the
+//! format-neutral `Symbol`/`ImportSite` vocabulary) joined them as a third
+//! door: it sits beside `m16/` and `m32/` for the same reason `fault.rs`
+//! and `ldt.rs` do, so it gets the same fence, not a pass.
 //!
-//! They are the only two doors between the machines, so the invariant that
-//! closes the path is the strongest and simplest one available: **a bridge
-//! that never names either side cannot carry anything across it.** Neither
-//! `fault.rs` nor `ldt.rs` may mention `m16` or `m32` in code at all --
-//! not via `crate::`, not via `super::`, not braced, not renamed. Today
-//! both mention them only in prose, so the invariant holds as written.
+//! They are the only three doors between the machines, so the invariant
+//! that closes the path is the strongest and simplest one available: **a
+//! bridge that never names either side cannot carry anything across it.**
+//! None of `fault.rs`, `ldt.rs`, or `module.rs` may mention `m16` or `m32`
+//! in code at all -- not via `crate::`, not via `super::`, not braced, not
+//! renamed. Today all three mention them only in prose (doc comments), so
+//! the invariant holds as written.
 //!
 //! The needle there is the bare substring, not a path spelling, and that
 //! is deliberate: it costs a loud, easily-diagnosed failure if someone
-//! ever names an identifier containing `m16`/`m32` in those two files, and
-//! it buys immunity to every spelling -- including the braced and
+//! ever names an identifier containing `m16`/`m32` in one of these files,
+//! and it buys immunity to every spelling -- including the braced and
 //! whitespace forms the directory scan gives up on. Same trade as the
 //! flatness assertion above: force a human decision rather than let
 //! coverage quietly shrink.
@@ -161,21 +168,26 @@ fn the_two_machines_do_not_import_each_other() {
 }
 
 /// The other half of the fence. See the module comment's "laundering hole"
-/// section: watching only the machines leaves `fault`/`ldt` free to
+/// section: watching only the machines leaves `fault`/`ldt`/`module` free to
 /// re-export one machine's types for the other to pick up, which compiles,
 /// reads as legitimate, and was demonstrated to pass the scan above.
 #[test]
 fn the_shared_modules_name_neither_machine() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let shared = [root.join("fault.rs"), root.join("ldt.rs")];
+    let shared = [
+        root.join("fault.rs"),
+        root.join("ldt.rs"),
+        root.join("module.rs"),
+    ];
 
     let leaks = offending_in_files(&shared, &["m16", "m32"]);
 
     assert!(
         leaks.is_empty(),
         "a shared module names a machine in code, which is the laundering \
-         path the module comment describes -- `fault` and `ldt` are the only \
-         doors between m16 and m32, so they must not name either side:\n{}",
+         path the module comment describes -- `fault`, `ldt` and `module` are \
+         the only doors between m16 and m32, so they must not name either \
+         side:\n{}",
         leaks.join("\n")
     );
 }
