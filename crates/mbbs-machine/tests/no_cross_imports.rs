@@ -43,6 +43,52 @@
 //! likely to type by accident, and covering it would mean normalizing
 //! whitespace before every needle check for a case with no real-world
 //! instance.
+//!
+//! One more known false-negative, in a different class from the spelling
+//! ones above: the comment stripper cuts at the first `//` on the line
+//! regardless of whether it sits inside a string literal, so
+//! `let u = "http://x"; use crate::m32::Y;` would have its real `use`
+//! silently dropped from the scanned text. No such line exists here (every
+//! `://` in `m16`/`m32` is a URL in a doc comment, already invisible
+//! because the line *starts* with `//`), and one statement per line is the
+//! house style, so this is recorded rather than fixed. Block comments are
+//! not stripped either; that direction can only produce false *positives*
+//! (commented-out code tripping the guard), which fail loudly and safely.
+//!
+//! # The laundering hole, and why the shared modules are checked too
+//!
+//! The needles above only ever scan files *inside* `m16/` and `m32/`. That
+//! is not sufficient, and the gap is not theoretical -- it was built and
+//! demonstrated against the first version of this test:
+//!
+//! ```ignore
+//! // src/ldt.rs
+//! pub(crate) use crate::m32::Poison as LaunderedPoison;
+//! // src/m16/mod.rs
+//! pub(crate) fn probe(p: crate::ldt::LaunderedPoison) -> String { .. }
+//! ```
+//!
+//! That compiles, gives `m16` a real dependency on an `m32` type, and the
+//! directory scan reports green -- because `m16` never writes the string
+//! `crate::m32` anywhere. `fault` and `ldt` are the two modules the design
+//! sanctions as shared (§1), which is exactly what makes a re-export
+//! through them look legitimate to a reader *and* invisible to a fence
+//! that only watches the machines.
+//!
+//! They are the only two doors between the machines, so the invariant that
+//! closes the path is the strongest and simplest one available: **a bridge
+//! that never names either side cannot carry anything across it.** Neither
+//! `fault.rs` nor `ldt.rs` may mention `m16` or `m32` in code at all --
+//! not via `crate::`, not via `super::`, not braced, not renamed. Today
+//! both mention them only in prose, so the invariant holds as written.
+//!
+//! The needle there is the bare substring, not a path spelling, and that
+//! is deliberate: it costs a loud, easily-diagnosed failure if someone
+//! ever names an identifier containing `m16`/`m32` in those two files, and
+//! it buys immunity to every spelling -- including the braced and
+//! whitespace forms the directory scan gives up on. Same trade as the
+//! flatness assertion above: force a human decision rather than let
+//! coverage quietly shrink.
 
 use std::fs;
 use std::path::Path;
@@ -77,6 +123,24 @@ fn offending(dir: &Path, needles: &[&str]) -> Vec<String> {
     hits
 }
 
+/// The same scan as [`offending`], over an explicit list of files rather
+/// than a directory. Used for the shared modules, which sit beside `m16/`
+/// and `m32/` rather than inside them -- pointing [`offending`] at `src/`
+/// itself would trip its own flatness assertion on those two directories.
+fn offending_in_files(files: &[std::path::PathBuf], needles: &[&str]) -> Vec<String> {
+    let mut hits = Vec::new();
+    for path in files {
+        let text = fs::read_to_string(path).expect("source is UTF-8");
+        for (i, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if needles.iter().any(|n| code.contains(n)) {
+                hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+            }
+        }
+    }
+    hits
+}
+
 #[test]
 fn the_two_machines_do_not_import_each_other() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -93,5 +157,25 @@ fn the_two_machines_do_not_import_each_other() {
         m32_uses_m16.is_empty(),
         "m32 reaches into m16:\n{}",
         m32_uses_m16.join("\n")
+    );
+}
+
+/// The other half of the fence. See the module comment's "laundering hole"
+/// section: watching only the machines leaves `fault`/`ldt` free to
+/// re-export one machine's types for the other to pick up, which compiles,
+/// reads as legitimate, and was demonstrated to pass the scan above.
+#[test]
+fn the_shared_modules_name_neither_machine() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let shared = [root.join("fault.rs"), root.join("ldt.rs")];
+
+    let leaks = offending_in_files(&shared, &["m16", "m32"]);
+
+    assert!(
+        leaks.is_empty(),
+        "a shared module names a machine in code, which is the laundering \
+         path the module comment describes -- `fault` and `ldt` are the only \
+         doors between m16 and m32, so they must not name either side:\n{}",
+        leaks.join("\n")
     );
 }
