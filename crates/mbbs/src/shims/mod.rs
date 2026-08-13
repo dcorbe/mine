@@ -16,28 +16,19 @@ pub mod user;
 use mbbs16::Machine;
 
 use crate::Host;
-use crate::abi::{self, Abi, Call, Cursor, Wg16};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
 use crate::globals::GLOBALS;
 
-/// A cursor over the outstanding call's argument frame, decoded for [`Wg16`].
-///
-/// One helper rather than `Cursor::new(machine.arg_frame())` written out at
-/// every shim's first line, because every converted shim needs the identical
-/// two calls and the crate has only one 16-bit `Abi` to name.
-///
-/// Takes `&Machine`, not `&mut Machine`: argument reads are immutable
-/// (`Machine::arg_u16`/`arg_far` always were), and the returned `Cursor`
-/// borrows `machine` for as long as it lives. The plan's own hoisting rule --
-/// read every argument at the top of the function, before any other use of
-/// `machine` -- is what ends that borrow before a shim goes on to call
-/// `&mut Machine` methods; see `crates/mbbs/src/abi.rs`'s module doc for why
-/// that is enough for Task 4, and the implementation plan's Task 5 note for
-/// why it stops being enough once `Call` holds `mem: &mut A::Mem` alongside
-/// a `Cursor` for a whole shim body.
-pub(crate) fn args(machine: &Machine) -> Cursor<'_, Wg16> {
-    Cursor::new(machine.arg_frame())
-}
+// `args(machine) -> Cursor<'_, Wg16>` used to live here: a bare `Cursor` over
+// the argument frame, with no `Call` and so no way to reach memory. It was
+// Task 4's shape, when a shim still took `&mut Machine` and read its
+// arguments separately from touching the module's memory.
+//
+// Its last two callers were `shims::memory`'s `alctile` and `ptrtile`, and
+// they went when those two became `Shim<Wg16>` like everything else. `Call`
+// subsumes it -- `Call::ptr`/`int`/`long` walk the same frame in the same
+// order, and `Call::mem` is the part a bare `Cursor` could never provide.
 
 /// A [`Call<Wg16>`] over the outstanding call's argument frame.
 ///
@@ -53,9 +44,10 @@ pub(crate) fn args(machine: &Machine) -> Cursor<'_, Wg16> {
 /// the bridges are deleted.
 ///
 /// Computes the frame before taking `machine` mutably -- the same ordering
-/// [`Call::new`]'s own doc comment describes, and why this takes
-/// `&mut Machine` rather than composing with [`args`] above, which only
-/// borrows `machine` immutably.
+/// [`Call::new`]'s own doc comment describes, and the reason this copies the
+/// frame out rather than borrowing it: `Call` needs `machine` mutably for
+/// [`Call::mem`], so a `Cursor` still borrowing it immutably would be a
+/// second live borrow of the same object.
 pub(crate) fn call(machine: &mut Machine) -> Call<'_, Wg16> {
     let frame = machine.arg_frame().to_vec();
     Call::new(machine, &frame)
