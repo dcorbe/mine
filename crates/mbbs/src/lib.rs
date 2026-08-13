@@ -470,14 +470,23 @@ pub struct Query {
 /// `messages`, `streams`, ...), the notes/audit/keys-asked logs, the module
 /// filesystem helpers, and `next_spr_buffer`/`next_l2as_buffer`/`mdf_buffer`/
 /// `empty_string`, which now build their pointers through [`Abi::ptr_offset`]
-/// instead of a hand-built `FarPtr`. A handful of those
-/// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`)
-/// read or build [`Registration`]/[`Agent`]/[`Kick`], which are concrete
-/// `FarPtr`-typed structs with no `Abi` parameter of their own -- moving
-/// their *accessors* here costs nothing (the fields they read are not
-/// parameterized by `A` either), but the module dispatch table itself will
-/// not serve a 32-bit module until those three types grow one too. Not this
-/// task's scope; see the doc comment on `impl<A: Abi> Host<A>` below.
+/// instead of a hand-built `FarPtr`. That includes
+/// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`),
+/// which read or build [`Registration`]/[`Agent`]/[`Kick`] -- all three of
+/// which *are* parameterised, as `Registration<A: Abi = Wg16>` and its two
+/// siblings, so these accessors are generic in substance and not merely by
+/// position.
+///
+/// An earlier revision of this comment said the opposite -- that the three
+/// were "concrete `FarPtr`-typed structs with no `Abi` parameter of their
+/// own", and that "the module dispatch table itself will not serve a 32-bit
+/// module until those three types grow one too". They grew one; the comment
+/// was not updated with them, and it outlived the fact by long enough to be
+/// quoted back as a live blocker. The `= Wg16` *default* on each is what
+/// makes the staleness hard to see: a bare `Kick` in a signature still reads
+/// as concrete and still compiles, because the default silently supplies
+/// `Wg16` -- so genericity here has to be confirmed at the declaration, never
+/// inferred from a use site.
 ///
 /// Everything that reads or writes module memory -- every method taking
 /// `&mut Machine`/`&Machine`, plus [`Host::check_globals`] (no `Machine`
@@ -925,13 +934,19 @@ impl<A: Abi> Default for FsdSession<A> {
 /// field accessors, pointer arithmetic through [`Abi::ptr_offset`],
 /// bookkeeping vectors and maps -- and never needs a `Machine`. See the
 /// struct's own doc comment ("Split method surface, like `Users`") for
-/// which methods that includes and the one caveat: a few of them
+/// which methods that includes. The few that read or build
+/// [`Registration`]/[`Agent`]/[`Kick`]
 /// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`)
-/// read or build [`Registration`]/[`Agent`]/[`Kick`], concrete `FarPtr`-typed
-/// structs that are not themselves generic over `A` -- living here costs
-/// nothing today (the fields are not parameterized either) but does not by
-/// itself make the module dispatch table serve a second ABI; that is those
-/// types' own conversion, not attempted here.
+/// belong here on the same terms as the rest: those three types carry their
+/// own `A` (`Registration<A: Abi = Wg16>` and siblings), so the pointers they
+/// hold are `A::Ptr`, not `FarPtr`.
+///
+/// This comment used to claim they were "concrete `FarPtr`-typed structs that
+/// are not themselves generic over `A`" and that their presence "does not by
+/// itself make the module dispatch table serve a second ABI". Both halves
+/// were true when written and neither survived the conversion that
+/// parameterised them. See the struct's own doc comment for why the `= Wg16`
+/// default made that easy to miss.
 impl<A: Abi> Host<A> {
     /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
     /// every `Entry::Unimplemented` call site it reaches from now on,

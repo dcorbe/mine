@@ -319,10 +319,13 @@ pub const NTERMS: u16 = 1;
 ///
 /// `base` and `prf` are typed `A::Ptr` rather than `FarPtr` so this struct is
 /// genuinely `Globals<A>`. [`Globals::new`] and the MajorBBS-specific readers
-/// (`pointer`, `long`, `selector`, `prf_buffer`) stay `impl Globals<Wg16>`-only,
-/// using `&Machine`/`&mut Machine` exactly as before -- construction and 32-bit
-/// widths are a later task's concern. `address` and `size` moved onto
-/// `impl<A: Abi> Globals<A>` outright: neither ever touched a `Machine`, so
+/// (`pointer`, `long`, `selector`) stay `impl Globals<Wg16>`-only, using
+/// `&Machine`/`&mut Machine` exactly as before -- construction and 32-bit
+/// widths are a later task's concern. `selector` stays for a stronger reason
+/// than the others: it returns `base.selector`, and a flat 32-bit pointer has
+/// no selector to return, so it is 16-bit in substance and not merely by
+/// signature. `address`, `size` and `prf_buffer` moved onto
+/// `impl<A: Abi> Globals<A>` outright: none ever touched a `Machine`, so
 /// generalising them changed nothing a caller can observe (`A` defaults to
 /// [`Wg16`], so `Globals::address` still returns `Option<FarPtr>` at every
 /// existing call site).
@@ -350,6 +353,17 @@ pub struct Globals<A: Abi = Wg16> {
 }
 
 impl<A: Abi> Globals<A> {
+    /// Where the print buffer starts.
+    ///
+    /// Generic outright, for the same reason [`Globals::address`] is: it
+    /// never touched a `Machine`. It returns the `prf` field verbatim, and
+    /// that field has been `A::Ptr` since this struct was parameterised --
+    /// so the `FarPtr` in its old signature was pinning the *return type* of
+    /// an already-generic value, and nothing else.
+    pub fn prf_buffer(&self) -> A::Ptr {
+        self.prf
+    }
+
     /// Where a global lives, or `None` for a name the host does not place.
     ///
     /// Generic outright: this never touched a `Machine`, only the offsets
@@ -503,11 +517,6 @@ impl Globals<Wg16> {
     /// The segment the globals live in.
     pub fn selector(&self) -> u16 {
         self.base.selector
-    }
-
-    /// Where the print buffer starts.
-    pub fn prf_buffer(&self) -> FarPtr {
-        self.prf
     }
 
     /// Overwrite a global.
