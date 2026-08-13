@@ -37,16 +37,21 @@
 //! no flat-memory counterpart) and `testing.rs` (the fixture builder). A
 //! fourth left in the very next commit: the seventeen `btv*` shims went
 //! `fn foo<A: Abi>(...)` once `Host<A>::btrieve`'s own elided parameter (see
-//! `lib.rs`'s history) stopped pinning the engine behind them to `Wg16`. So
-//! the live conversion backlog is **four files**.
+//! `lib.rs`'s history) stopped pinning the engine behind them to `Wg16`. A
+//! fifth, `shims/fsd.rs`, left in Task 12 of
+//! `docs/plans/2026-08-12-abi-border-implementation.md`: the FSD session
+//! engine (`fsd_cycle`, `fsdprc`, `goback` and their helpers) went generic
+//! over `A`, which is what let [`crate::Host::fsd_dispatch`] itself go
+//! generic and retire the `Abi::native_dispatch` bridge Task 11 had added to
+//! reach it. So the live conversion backlog is **three files**.
 //!
 //! # The one that is not like the others
 //!
-//! `lib.rs` is `impl Host<Wg16>`'s execution driver, and it is not blocked on
-//! a facade or a leaf the way the other four are. It is blocked on the `Abi`
-//! trait, which abstracts *memory and pointers* and has no notion of
-//! *execution* -- there is no `resume`, no `call`. Every other entry here is
-//! an afternoon's mechanical work. This one is a design question first.
+//! `lib.rs`'s entry no longer names an execution-vocabulary gap -- `Abi`
+//! grew `call`/`resume` in Task 5, and by Task 12 `impl Host<Wg16>` holds
+//! only `dos_name` (no `Self` to be generic over) and `new` (Task 13's own
+//! `.selector` arithmetic). What is left is exactly those two, not a design
+//! question.
 //!
 //! # Rules
 //!
@@ -89,15 +94,11 @@ const ALLOWED: &[&str] = &[
     // signature: it returns `base.selector`, and a flat pointer has none.
     // `selector` will still be here when the other three are gone.
     "globals.rs",
-    // `fsdego`/`vfyadn`, each blocked on a dependency `shims::mod`'s
-    // `ROUTINES` table documents beside its own entry.
-    "shims/fsd.rs",
-    // The big one, and the real remaining boundary: `impl Host<Wg16>`'s
-    // execution driver -- `run`, `poll`, `cycle`, `load`, `stop` and the rest
-    // of the 26 methods that take a `&mut Machine`. These are NOT blocked on
-    // a facade or a leaf; they are blocked on the `Abi` trait itself, which
-    // abstracts memory and pointers but has no notion of EXECUTION (no
-    // `resume`, no `call`). Nothing here converts until that is designed.
+    // What is left of `impl Host<Wg16>` after Tasks 9-12 (§4's four
+    // dissolution clusters, minus `new`): `dos_name` (no `Self`, so a bare
+    // `impl<A: Abi> Host<A>` copy cannot infer which ABI a caller means --
+    // see that method's own doc comment) and `new` (Task 13's `.selector`
+    // arithmetic). Two methods, not twenty-six.
     "lib.rs",
 ];
 

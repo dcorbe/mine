@@ -97,7 +97,7 @@ pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
-use mbbs_machine::m16::{FarPtr, Machine, Module, NeImage, Poison, Relocation, Source, Symbol, Target};
+use mbbs_machine::m16::{FarPtr, Machine, Module, NeImage, Relocation, Source, Symbol, Target};
 
 // `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
 // own 64 KiB allocation goes through the `Abi` trait's allocator now, same as
@@ -2229,13 +2229,15 @@ impl<A: Abi> Host<A> {
     /// `Outcome`, so `poll` keeps that shape and this carries the extra fact
     /// out through the one caller that has a use for it.
     ///
-    /// The `Dispatch::Native` arm no longer names `Native::Fsd` (or calls
-    /// `Host::fsd_dispatch`) directly -- that stays genuinely `Wg16`-only
-    /// (`FSDBBS.C`'s session engine is `FarPtr` throughout, see
-    /// `shims/fsd.rs`), so it is reached through [`Abi::native_dispatch`]
-    /// instead, the same "second door" shape [`Abi::native`] already opens
-    /// for shim routines. `Wg16`'s implementation still delegates straight
-    /// to `Host::fsd_dispatch`, unchanged.
+    /// The `Dispatch::Native` arm calls [`Host::fsd_dispatch`] directly,
+    /// generically, since Task 12 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: `shims/fsd.rs`'s
+    /// session engine went generic in that task (`fsd_cycle`, `fsdprc`,
+    /// `goback` and their `FarPtr`-typed helpers all took `A::Cpu`/`A::Ptr`
+    /// instead), which retired the `Abi::native_dispatch` bridge Task 11 had
+    /// added to reach this arm while `fsd_dispatch` was still `Wg16`-only.
+    /// `Native::Fsd` is the only [`shims::system::Native`] variant, so this
+    /// match has nothing else to route.
     fn poll_with_chan(
         &mut self,
         machine: &mut A::Cpu,
@@ -2356,14 +2358,15 @@ impl<A: Abi> Host<A> {
             // genuinely for -- `inifsd()` registers the FSD so that a
             // channel's `state` can name it exactly the way one names a
             // module, and `sttrou`/`stsrou` are the entry points it exists to
-            // answer. `Abi::native_dispatch` carries that; every other call
-            // site in this file treats `Native` as a hook a module left null
-            // instead, because none of them are input dispatch.
+            // answer. [`Host::fsd_dispatch`] carries that, generically, since
+            // Task 12; every other call site in this file treats `Native` as
+            // a hook a module left null instead, because none of them are
+            // input dispatch.
             let entry = self.state_entry(machine, chan, entry_index)?;
             let entry = match entry {
                 Ok(Dispatch::Module(entry)) => Ok(entry),
-                Ok(Dispatch::Native(native)) => {
-                    A::native_dispatch(self, machine, module, chan, native, entry_index)
+                Ok(Dispatch::Native(_native)) => {
+                    self.fsd_dispatch(machine, module, chan, entry_index)
                 }
                 Err(e) => Err(e),
             };
@@ -2625,6 +2628,684 @@ impl<A: Abi> Host<A> {
             ended: Ended::Bound { next_kick },
         })
     }
+
+    /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
+    /// dispatch: entry `n` of the FSD's own native slot, run directly
+    /// instead of through a far call.
+    ///
+    /// Entry 2 is `stsrou`, the only one `FSDBBS.C`'s own `fsdmod` ever gave
+    /// a body -- `fsdsts`, folded here into
+    /// [`shims::fsd::fsd_cycle`]. Entry 1 (`sttrou`, reached on `CRSTG`)
+    /// is never real: raw mode means `CRSTG` cannot fire while a session is
+    /// under way (the design doc's "Input" section), so a `CRSTG` reaching
+    /// this slot at all means the channel is in the FSD's `state` without a
+    /// live session -- the same shape as a module that left the entry point
+    /// null, noted rather than refused so [`Host::poll`]'s own "no entry
+    /// registered" fallback handles it exactly as it would a module's own
+    /// null pointer.
+    ///
+    /// Always answers "no far pointer to call": the FSD's own work, when
+    /// there is any, happens right here rather than through a far call --
+    /// that is the whole point of a *native* registration.
+    ///
+    /// Generic since Task 12 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`:
+    /// [`shims::fsd::fsd_cycle`] and everything under it went generic in the
+    /// same task, which is what lets `Host::poll_with_chan` call this
+    /// directly instead of through `Abi::native_dispatch` -- see that
+    /// former trait method's own doc comment (deleted alongside this move)
+    /// for the bridge this retires.
+    ///
+    /// # Errors
+    ///
+    /// If [`shims::fsd::fsd_cycle`] does -- in particular, if this channel's
+    /// state names the FSD's own slot but `fsdego` never ran for it, which
+    /// is a bug in whatever set that state rather than a condition to
+    /// silently ignore.
+    fn fsd_dispatch(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        n: usize,
+    ) -> Result<Option<A::Ptr>, ShimError> {
+        if n != 2 {
+            self.note(format!(
+                "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
+                 which has no handler wired up yet"
+            ));
+            return Ok(None);
+        }
+
+        shims::fsd::fsd_cycle(machine, self, module, chan)?;
+        Ok(None)
+    }
+
+    /// `user[unum].usrcls` -- what kind of channel this is.
+    ///
+    /// Zero for every channel this host makes, which is neither `ONLINE` nor
+    /// `BBSPRV`. Read rather than assumed because `low_haskey` branches on it.
+    ///
+    /// Generic since Task 12: a thin facade over the already-generic
+    /// [`Host::class_mem`], reached through [`Abi::mem_ref`] rather than
+    /// [`Abi::mem`] -- this never writes, so it never needs `&mut A::Cpu`.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off a segment.
+    pub fn class(&self, machine: &A::Cpu, unum: Chan) -> Result<u16, ShimError> {
+        self.class_mem(A::mem_ref(machine), unum)
+    }
+
+    /// Point the four globals that name "the current channel" -- `usrnum`,
+    /// `usrptr`, `usaptr` and `vdaptr` -- at `uno`.
+    ///
+    /// `MAJORBBS.C:4290`'s `curusr`, minus the range check: every caller here
+    /// already knows `uno` is a channel that exists, for a different reason
+    /// each. [`shims::user::curusr`] checked it itself, because an
+    /// out-of-range `uno` there is the documented silent no-op
+    /// (`MAJORBBS.C:4293`) and not a failure. [`Host::connect_state`] gets
+    /// its answer from [`Users::account`] failing first. Factored out so
+    /// both call one piece of code rather than keep two that can drift.
+    ///
+    /// Generic since Task 12: a thin facade over the already-generic
+    /// [`Host::point_curusr_mem`].
+    ///
+    /// # Errors
+    ///
+    /// If a write runs off a segment.
+    pub(crate) fn point_curusr(&mut self, machine: &mut A::Cpu, uno: Chan) -> Result<(), ShimError> {
+        self.point_curusr_mem(A::mem(machine), uno)
+    }
+
+    /// Plant a connecting user's account record and channel state, and make
+    /// the channel current.
+    ///
+    /// Writes what a real board's `loadup()` would have read out of
+    /// `bbsusr.dat` -- this host has no accounts and none are being grown
+    /// here; see [`users::Connection`]. `usrcls`, `state` and `substt` are
+    /// all written as zero: that is already what a freshly allocated slot
+    /// reads as (`Users::new`'s `alczer` zeroed it), and it is what
+    /// [`Host::connect`] (Task 8) then hands to the module's own `lonrou` to
+    /// set for real. Written anyway, rather than left to the allocator's
+    /// zero, so the state a connecting channel is in is something this
+    /// function visibly does and not an accident of history.
+    ///
+    /// Generic since Task 12 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: the five raw
+    /// `FarPtr { offset, selector }` literals this carried become
+    /// [`Abi::ptr_offset`] calls from `account`/`slot`, and the five direct
+    /// `machine.write` calls become `ModulePtr::write` against
+    /// [`Abi::mem`] -- this had no generic `_mem` core to delegate into the
+    /// way `class`/`point_curusr` do, so this is the conversion itself, not
+    /// a facade over one.
+    ///
+    /// # Errors
+    ///
+    /// If `chan` names no channel, or a write runs off a segment.
+    pub fn connect_state(
+        &mut self,
+        machine: &mut A::Cpu,
+        chan: Chan,
+        who: &users::Connection,
+    ) -> Result<(), ShimError> {
+        // The module reads `vdatmp` before it draws, so a channel connected to
+        // a host that never allocated one fails silently much later and
+        // somewhere else. See [`Host::finish_init`].
+        if !self.inited {
+            return Err(ShimError::Failed(
+                "connect: this host has not run finish_init, so no channel has a \
+                 volatile data area yet"
+                    .to_owned(),
+            ));
+        }
+        let account = self.users().account(chan);
+        let slot = self.users().slot(chan);
+
+        // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
+        // the header's own comment says so -- so at most 29 characters fit
+        // and byte 29 must stay a NUL; `psword` starts immediately after
+        // `userid` in the record, at 30, and a longer name is truncated
+        // rather than overrunning it.
+        //
+        // The whole field is zeroed before the name is written in, not just
+        // the bytes the name occupies. `connect_state` can run again on a
+        // channel that already held a user -- Task 8/9's driver reuses
+        // channels rather than allocating a fresh one per connection -- and
+        // writing only `take` bytes would leave the tail of a longer, earlier
+        // name sitting past the new one. `userid` is what `obtbtvl` keys the
+        // character lookup on (`WCCMMUD_named.c:9847`), so that tail is not
+        // cosmetic: "dan" over "rangerdan" reads back as "dangerdan" and the
+        // module finds a stranger's character.
+        //
+        // Only `userid` is reset here, not the account's other 308 bytes.
+        // Whether a reused channel should clear the whole record was an open
+        // question; it is not open any more. `dftrst` clears all of it, and
+        // [`Host::rstchn`] is where that happens -- at startup over every
+        // channel and at the tail of every disconnect, so a channel arriving
+        // here has already been emptied by whoever left it.
+        const UIDSIZ: usize = 30;
+        let userid = who.userid.as_bytes();
+        let take = userid.len().min(UIDSIZ - 1);
+        let mut field = [0u8; UIDSIZ];
+        field[..take].copy_from_slice(&userid[..take]);
+        let at = A::ptr_offset(account, users::usracc::USERID as u16);
+        at.write(A::mem(machine), &field)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        let at = A::ptr_offset(account, users::usracc::ANSIFL as u16);
+        at.write(A::mem(machine), &[u8::from(who.ansi)])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        let at = A::ptr_offset(account, users::usracc::SCNWID as u16);
+        at.write(A::mem(machine), &[who.width])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        let at = A::ptr_offset(account, users::usracc::SCNFSE as u16);
+        at.write(A::mem(machine), &[who.height])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        for (field, value) in [
+            (users::user::USRCLS, 0u16),
+            (users::user::STATE, 0u16),
+            (users::user::SUBSTT, 0u16),
+        ] {
+            let at = A::ptr_offset(slot, field);
+            at.write(A::mem(machine), &value.to_le_bytes())
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+        }
+
+        // `loadkeys()`, `LOCKNKEY.C:88`. On a real board this read `bbsk.dat`
+        // and a `&CLASS` keyring record; here the keys arrived with the
+        // connection, because whatever authenticated the user is what knows
+        // them. Set unconditionally, so a channel reused by a second user does
+        // not inherit the first one's access.
+        self.users.set_keys(chan, who.keys.clone());
+
+        // A channel that already held a user may still hold that user's polling
+        // routine, and `polrou` is a pointer into module code installed for
+        // *them*. Cleared for the same reason `userid` above is zeroed whole:
+        // this function runs again on a reused channel.
+        self.users.set_polrou_mem(A::mem(machine), chan, None)?;
+
+        // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
+        // byte is at offset 0x14. Read-modify-write on that one bit: the rest
+        // of the byte is the module's, `WCCMMUD.DLL` sets and tests masks 2, 4
+        // and 0x10 in it, and `connect_state` runs again on a channel that
+        // already held a user. A whole-field store would clear the module's
+        // bits out from under it.
+        //
+        // Host-private in practice -- the module never tests 0x40 -- but the
+        // bit is real and `user.flags` should not lie about it.
+        const MASTER: u8 = 0x40;
+        let at = A::ptr_offset(slot, users::user::FLAGS);
+        let was = at
+            .resolve(A::mem_ref(machine), 1)
+            .map_err(|e| ShimError::Failed(e.to_string()))?[0];
+        let now = if who.keys.is_master() {
+            was | MASTER
+        } else {
+            was & !MASTER
+        };
+        at.write(A::mem(machine), &[now])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+        self.point_curusr(machine, chan)
+    }
+
+    /// Completely reset a channel: `rstchn`, via its default handler `dftrst`.
+    ///
+    ///
+    /// `MAJORBBS.C:3487-3500`. Everything after those five lines is hardware:
+    /// `rcdbaud`, `lincst`, `bturst` and the `switch` over its return code
+    /// exist to bring a *modem* channel back up, and this host has no channel
+    /// hardware to reset. `mnuusr` is zeroed there too and is not here: it
+    /// belongs to the menuing subsystem, whose `muusrs` table this host does
+    /// not have and whose absence is deliberate. `gcsprst` is the
+    /// client/server reset, which this host has nothing to reset.
+    ///
+    /// # Why this is one routine and not two
+    ///
+    /// The original calls this from two places that look unrelated: startup
+    /// (`:908-911`, over every channel, right after `alcvda`) and the tail of
+    /// both disconnect paths. That is not a coincidence -- it is what makes "a
+    /// channel nobody has used" and "a channel just freed" the same state.
+    /// [`Host::connect_state`] used to note that whether a reused channel
+    /// should clear its whole record was an open question; it is not open, it
+    /// is answered here.
+    ///
+    /// # What this does NOT clear, and where that is done instead
+    ///
+    /// The volatile data area. `dftrst` does not clear it either -- the
+    /// original zeroes it on the way *in*, at `MAJORBBS.C:4000`, the line
+    /// before `cyclon` calls a module's `lonrou`. [`Host::connect`] is where
+    /// that line lives here, so the guarantee is "a channel a module is handed
+    /// has a zeroed VDA", not "`rstchn` leaves nothing at all". An earlier
+    /// version of this comment claimed the latter and said "the answer is all
+    /// of it", which was false for 1,961 bytes per channel.
+    ///
+    /// At one channel none of this is observable, because no second user ever
+    /// arrives to inherit the first one's bytes.
+    ///
+    /// Generic since Task 12: the three `machine.write` calls become
+    /// `ModulePtr::write` against [`Abi::mem`].
+    ///
+    /// # Errors
+    ///
+    /// If a write runs off a segment.
+    pub fn rstchn(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
+        self.users.clear_keys(chan);
+        for (at, len) in [
+            (self.users.slot(chan), users::USER),
+            (self.users.extra(chan), users::EXTUSR),
+            (self.users.account(chan), users::USRACC),
+        ] {
+            at.write(A::mem(machine), &vec![0u8; usize::from(len)])
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+        }
+        // `bturst(usrnum)`, `MAJORBBS.C:3503` -- the last thing `dftrst` does
+        // that this host has anything to do. Without it the three `setmem`s
+        // above clear the module's view of the channel while GSBL's view keeps
+        // the previous player's buffers and terminal settings.
+        self.gsbl.reset(chan);
+        Ok(())
+    }
+
+    /// Put a channel into the module's state machine and let the module know.
+    ///
+    /// `connect_state` writes what a real board's `loadup()` would have read
+    /// out of `bbsusr.dat`; `lonrou` is the module's own logon hook, which
+    /// `MAJORBBS.C:558`'s `lonstf()` called for every registered module. Only
+    /// one module is registered here, so this calls the one.
+    ///
+    /// Returns `None` if the module supplies no `lonrou` -- the real host
+    /// never called one either, so there is no [`Outcome`] to report for a
+    /// call that never happened.
+    ///
+    /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
+    /// poisons the machine and comes back as `Outcome::Stopped`, the same
+    /// policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
+    /// Generic since Task 12.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered. (A malformed `chan`, a write running off
+    /// a segment, or the module being unenterable all poison the machine and
+    /// come back as `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
+    pub fn connect(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        who: &users::Connection,
+    ) -> io::Result<Option<Outcome<A>>> {
+        if let Err(e) = self.connect_state(machine, chan, who) {
+            return self.shim_stop(machine, "connect_state", e).map(Some);
+        }
+
+        // `Registration::dispatch` borrows `self.modules()` immutably, and
+        // `self.run` needs `self` mutably right after -- so the pointer is
+        // read out here and the borrow ends before `run` is ever reached.
+        //
+        // The first *module* registration, and not the channel's state, on
+        // purpose. `cyclon` calls `if ((rouptr = module[i]->lonrou) != NULL)`
+        // over an `i`: a logon is announced to every registered module, not
+        // dispatched to one. This host makes the first iteration only, which
+        // is the whole loop while one real module is registered -- and now
+        // that `Host::finish_init` registers the FSD's native slot ahead of
+        // any module, `first_module` (not `modules().first()`) is what keeps
+        // that "one module" reading correct: a `Native` registration has no
+        // `lonrou` to announce (`FSDBBS.C` supplies no module-shaped logon
+        // hook) and skipping past it is not the same thing as counting it as
+        // the sole module. A **second real module** is still owed the rest
+        // of `cyclon`'s loop; that debt is unaffected by this change.
+        let lonrou = {
+            let registered = self.first_module().ok_or_else(|| {
+                io::Error::other("no module has registered, so there is nothing to enter")
+            })?;
+            match registered.dispatch(A::mem(machine), 0) {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                // `first_module` never answers `Native`, but the match stays
+                // exhaustive and the fallback stays correct if that changes.
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let lonrou = match lonrou {
+            Ok(lonrou) => lonrou,
+            Err(e) => return self.shim_stop(machine, "lonrou lookup", e).map(Some),
+        };
+        let Some(lonrou) = lonrou else {
+            // R24: a null `lonrou` is legal -- the real host checked
+            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
+            // and it means no call happened, not that one returned zero.
+            // `None` says that honestly; a fabricated `Returned { ax: 0,
+            // dx: 0 }` would claim a call this host never made.
+            return Ok(None);
+        };
+        // `MAJORBBS.C:4000` -- `setmem(vdaptr,vdasiz,0)`, the line before
+        // `cyclon` calls a module's `lonrou`. The volatile data area is the one
+        // per-channel block `rstchn` does *not* clear, because `dftrst` does not
+        // clear it either: the original zeroes it on the way *in* rather than on
+        // the way out, and this is that line.
+        //
+        // Found by a mutation that stayed green across all 786 tests -- pointing
+        // `vdaptr` at channel 0 for every dispatch. That is invisible today
+        // because MajorMUD leaves the area zero on the returning-player path,
+        // which is exactly the argument that made `btuxmt`'s channel argument
+        // unfalsifiable at one channel. This branch exists because that argument
+        // was wrong once already.
+        if let Some(vda) = self.users.vda(chan) {
+            let size = self.globals.word_mem(A::mem_ref(machine), "vdasiz")?;
+            if let Err(e) = vda.write(A::mem(machine), &vec![0u8; usize::from(size)]) {
+                return self
+                    .shim_stop(machine, "clearing the volatile data area", ShimError::Failed(e.to_string()))
+                    .map(Some);
+            }
+        }
+
+        self.run(machine, module, lonrou, &[], Some(chan)).map(Some)
+    }
+
+    /// Lost carrier: hand the channel to the module's `huprou`, then reset it.
+    ///
+    /// `loscar()` -> `aschup()` -> `rstchn()`, `MAJORBBS.C:4562-4605` and
+    /// `:4607-4637`. This is what a closed socket raises, and `aschup` is the
+    /// only caller of the `huprou` sweep in the entire host -- a graceful
+    /// logoff does not pass through here. See [`Vector`].
+    ///
+    /// MajorMUD's `_LJNGAME_HUPROU` (`re/exports/WCCMMUD_named.c:12646`) is the
+    /// substantial one: `_GET_PLAYER`, `_CLEAR_FORGET_LIST` and `_SAVE_PLAYER`
+    /// unconditionally, and then -- gated on `user[usrnum].substt >= 0x82`, in
+    /// the Realm -- it works the room, dropping carried items and announcing
+    /// the departure through `_TELL_GAME`, whose loop is bounded by `nterms`.
+    /// It is a `void` routine, so its [`Outcome::Returned`] words are whatever
+    /// it happened to leave behind rather than an answer.
+    ///
+    /// Returns `None` if the module supplies no `huprou`. **The reset happens
+    /// either way** -- `loscar` reaches `rstchn` at `:4593` whether or not
+    /// `aschup` found a routine to call.
+    ///
+    /// Generic since Task 12.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered.
+    pub fn hangup(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+    ) -> io::Result<Option<Outcome<A>>> {
+        self.disconnect(machine, module, chan, Vector::Hangup)
+    }
+
+    /// Graceful logoff: hand the channel to the module's `lofrou`, then reset
+    /// it.
+    ///
+    /// `bgnlof`/`nxtlof`, `MAJORBBS.C:4054-4105`. The original's sweep walks
+    /// every registered module and falls back to `go2mnu(JSTRET)` -- the
+    /// menuing system, which is out of scope here. With one module the sweep's
+    /// loop body never runs at all (`:4076` skips `i == lofstt`, and `lofstt` is the
+    /// only module there is), so it collapses to the self-call at `:4100-4101`
+    /// and `go2mnu` never arises.
+    ///
+    /// That self-call is `if ((*lofrou)() != 1) go2mnu(JSTRET);`, so **`1` is
+    /// the only value the original distinguishes for a one-module host**: it
+    /// means "I am not finished", and the channel stays in the module's logoff
+    /// state for another pass. This host has no logoff state to stay in, so a
+    /// `1` is refused with a named stop rather than discarded -- a silent
+    /// discard would leave the module believing a multi-pass dialogue is in
+    /// progress.
+    ///
+    /// **Only `1`.** `-1` -- the sweep's "abandon and return to the menu" at
+    /// `:4087-4089` -- is *not* refused, because that branch is inside the loop
+    /// this host never reaches. Against `:4100`'s `!= 1`, the values `0`, `-1`
+    /// and `42` are one answer: finished, go to the menu. "Go to the menu" for
+    /// a headless host collapses to "the logoff is over", which is exactly the
+    /// [`rstchn`](Self::rstchn) that follows. Refusing `-1` as well would be
+    /// this host inventing a distinction the original does not draw at the only
+    /// line it reaches. See
+    /// `a_lofrou_that_abandons_the_sweep_is_taken_at_its_word_like_any_non_one`.
+    ///
+    /// MajorMUD's own `_LJNGAME_LOFROU` (`re/exports/WCCMMUD_named.c:12628`)
+    /// returns 0, which is exactly why the refusal has to exist rather than be
+    /// assumed unreachable.
+    ///
+    /// Returns `None` if the module supplies no `lofrou`. As with
+    /// [`Host::hangup`], the reset happens either way.
+    ///
+    /// Generic since Task 12.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered.
+    pub fn logoff(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+    ) -> io::Result<Option<Outcome<A>>> {
+        self.disconnect(machine, module, chan, Vector::Logoff)
+    }
+
+    /// What [`Host::hangup`] and [`Host::logoff`] have in common: point the
+    /// channel, call its vector if the module supplied one, then reset it.
+    ///
+    /// The order is the contract. The routine runs **first**, while the channel
+    /// still holds the departing player -- `_LJNGAME_HUPROU` opens with
+    /// `_GET_PLAYER(usrnum)` and goes on to `_SAVE_PLAYER`, and a `rstchn` that
+    /// ran before it would hand the module a zeroed record to save. The reset
+    /// runs **last, and unconditionally**: a null vector means no call
+    /// happened, not that the channel stays occupied, and `loscar` reaches
+    /// `rstchn` either way.
+    ///
+    /// R21: a `ShimError` out of `point_curusr` or the entry lookup poisons the
+    /// machine and comes back as [`Outcome::Stopped`], matching
+    /// [`Host::connect`].
+    ///
+    /// Generic since Task 12: the `Poison::Unimplemented` literal this built
+    /// for the refused `lofrou` retry becomes [`Abi::unimplemented`].
+    fn disconnect(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+        vector: Vector,
+    ) -> io::Result<Option<Outcome<A>>> {
+        if let Err(e) = self.point_curusr(machine, chan) {
+            return self.shim_stop(machine, "point_curusr", e).map(Some);
+        }
+
+        // `Registration::dispatch` borrows `self.modules()` immutably and
+        // `self.run` needs `self` mutably right after, so the pointer is read
+        // out here and the borrow ends before `run` is ever reached -- the same
+        // discipline `Host::connect` follows.
+        //
+        // The two vectors are not reached the same way, and this is the one
+        // place that difference is visible:
+        //
+        // - `bgnlof` tests `module[usrptr->state]->lofrou == NULL` -- keyed on
+        //   the channel's state, like `sttrou`.
+        // - `aschup` tests `(rouptr=module[i]->huprou) != NULL` -- an `i`, a
+        //   loop over *every* registered module. This host makes the first
+        //   iteration and no more, which is exactly right while one real
+        //   module is registered and is owed a loop the day a second one is.
+        //   It is the first *module* and not the channel's state
+        //   deliberately: a hangup is news for every module, not just the
+        //   one holding the channel -- `first_module`, not `modules().first()`,
+        //   because the FSD's native slot registers ahead of any module now
+        //   and has no `huprou` to be news to.
+        //
+        // Neither vector has a native-handler shape: `FSDBBS.C` supplies no
+        // `lofrou` or `huprou`, so a `Dispatch::Native` answer here is the
+        // same "no call happened" as a module that left the pointer null --
+        // unlike `poll`'s `sttrou`/`stsrou` dispatch, which is the FSD's own
+        // reason to exist as a state at all.
+        let rou = match vector {
+            Vector::Logoff => match self.state_entry(machine, chan, vector.entry())? {
+                Ok(Dispatch::Module(rou)) => Ok(rou),
+                Ok(Dispatch::Native(_)) => Ok(None),
+                Err(e) => Err(e),
+            },
+            Vector::Hangup => {
+                let registered = self.first_module().ok_or_else(|| {
+                    io::Error::other(
+                        "no module has registered, so there is nothing to disconnect from",
+                    )
+                })?;
+                match registered.dispatch(A::mem(machine), vector.entry()) {
+                    Ok(Dispatch::Module(rou)) => Ok(rou),
+                    Ok(Dispatch::Native(_)) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+        let rou = match rou {
+            Ok(rou) => rou,
+            Err(e) => {
+                let where_ = format!("{} lookup", vector.name());
+                return self.shim_stop(machine, &where_, e).map(Some);
+            }
+        };
+
+        // R24: a null vector is legal -- `aschup` tests
+        // `(rouptr=module[i]->huprou) != NULL` (`:4623`) and `bgnlof` tests
+        // `module[usrptr->state]->lofrou == NULL` -- and it means no call
+        // happened, not that one returned zero.
+        let outcome = match rou {
+            Some(rou) => Some(self.run(machine, module, rou, &[], Some(chan))?),
+            None => None,
+        };
+
+        // `nxtlof`'s protocol; see [`Host::logoff`] for why a non-zero return
+        // is refused rather than discarded. `huprou` is `void` and has no
+        // protocol, so its words are not read.
+        let outcome = match (vector, outcome) {
+            (Vector::Logoff, Some(Outcome::Returned { lo: ax, .. })) if ax == 1 => {
+                Some(self.stop(
+                    machine,
+                    A::unimplemented(
+                        "mbbs".to_owned(),
+                        format!(
+                            "lofrou returned {}, asking to be called again, and this \
+                             host has no second logoff pass to give it \
+                             (MAJORBBS.C:4100)",
+                            ax as i16
+                        ),
+                    ),
+                )?)
+            }
+            (_, outcome) => outcome,
+        };
+
+        if let Err(e) = self.rstchn(machine, chan) {
+            return self.shim_stop(machine, "rstchn", e).map(Some);
+        }
+        Ok(outcome)
+    }
+
+    /// `void alcvda(void)` -- give every channel its volatile data area.
+    ///
+    /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init
+    /// routine has run, because `dclvda` is what decides the size and it is
+    /// still being called until then. Not part of [`Host::new`] for that
+    /// reason: a host that allocated at construction would size the area off a
+    /// `vdasiz` of zero and every `vdaptr` the module read would be null.
+    ///
+    ///
+    /// `vdaptr` is left pointing at channel 0, matching `vdarea=vdaoff(0)` at
+    /// `:1374`; `curusr` is what re-points it per channel afterwards. `vdatmp`
+    /// is a block of its own and not a slot, because `fsdapr` is handed both at
+    /// once and they must not be the same bytes.
+    ///
+    /// Doing nothing when `vdasiz` is zero is the original's own `if`, and it
+    /// is load-bearing here: this heap refuses an allocation of nothing.
+    ///
+    /// Generic since Task 12: [`Heap::reserve`] rather than the `Wg16`-only
+    /// [`Heap::alloc`] facade -- `heap.rs` itself is Task 13's, but its
+    /// generic core already existed for this to call.
+    ///
+    /// # Errors
+    ///
+    /// If the heap has no room.
+    pub fn alcvda(&mut self, machine: &mut A::Cpu) -> io::Result<()> {
+        let size = self.globals.word_mem(A::mem_ref(machine), "vdasiz")?;
+        if size == 0 {
+            return Ok(());
+        }
+        self.users
+            .alcvda_mem(A::mem(machine), &mut self.heap, size)?;
+        let console = self
+            .users
+            .terms()
+            .chan(0)
+            .expect("every host has a channel zero");
+        let area = self.users.vda(console).expect("just allocated");
+        let temp = self
+            .heap
+            .reserve(A::mem(machine), size)
+            .map_err(io::Error::other)?;
+        self.globals
+            .write_mem(A::mem(machine), "vdaptr", &A::ptr_to_bytes(area))?;
+        self.globals
+            .write_mem(A::mem(machine), "vdatmp", &A::ptr_to_bytes(temp))?;
+        Ok(())
+    }
+
+    /// Every module has initialised: finish the host's own setup.
+    ///
+    /// `MAJORBBS.C:896`. The real host runs `inimod()` over every module and
+    /// then, on the next line, `alcvda()` -- in that order and not the other,
+    /// because `dclvda` is still accumulating `vdasiz` while modules
+    /// initialise. A host that allocated in [`Host::new`] would size every
+    /// volatile data area off a `vdasiz` of zero.
+    ///
+    /// # Why this is a step the caller must take, and why forgetting it is refused
+    ///
+    /// [`Host::alcvda`] was correct, complete and tested for weeks while
+    /// **nothing in the crate called it** -- every caller was a test. Nothing
+    /// failed. `vdasiz` reached 1,961 from `WCCMMUD.DLL`'s own `dclvda` and
+    /// `vdaptr`/`vdatmp` stayed null, and the module noticed long before this
+    /// host did: `_EDIT_CHARACTER_STATS` tests `vdatmp` before it draws
+    /// anything and returns silently when it is null. Character creation took
+    /// the player's answer, computed the whole character, resolved its title,
+    /// and stopped without printing a byte or advancing its substate.
+    ///
+    /// That cost days to find, because a *global* the module reads is invisible
+    /// to a host-call trace -- the signature is "every routine it reaches is
+    /// implemented and it still does nothing". So this host refuses to
+    /// [`connect`](Self::connect) a channel until this has run, which turns the
+    /// whole class of mistake into an error message naming the step.
+    ///
+    /// Idempotent, and doing nothing when no module declared a size is
+    /// `alcvda`'s own `if (vdasiz != 0)`.
+    ///
+    /// Generic since Task 12.
+    ///
+    /// # Errors
+    ///
+    /// If the volatile data areas cannot be allocated.
+    pub fn finish_init(&mut self, machine: &mut A::Cpu) -> io::Result<()> {
+        self.alcvda(machine)?;
+        // `MAJORBBS.C:908-911`, the next thing the real host does after
+        // `alcvda()`: reset every channel. See [`Host::rstchn`] for why startup
+        // and disconnect share one routine. The order is `:896` then `:908` and
+        // not the other way about.
+        for chan in self.users.terms().all() {
+            self.rstchn(machine, chan)
+                .map_err(|e| io::Error::other(format!("rstchn({chan}): {e}")))?;
+        }
+        // `inifsd()` registers FSDBBS as an ordinary module during startup;
+        // this is that registration. It must happen before `inited` is set,
+        // so nothing can reach a channel's `state` before the FSD's slot
+        // exists to be named.
+        self.fsd_state = Some(self.register_native(Native::Fsd));
+        self.inited = true;
+        Ok(())
+    }
 }
 
 /// Everything that reads or writes module memory, plus [`Host::dos_name`]
@@ -2844,649 +3525,6 @@ impl Host<Wg16> {
             inited: false,
             survey: None,
         })
-    }
-
-    /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
-    /// dispatch: entry `n` of the FSD's own native slot, run directly
-    /// instead of through a far call.
-    ///
-    /// Entry 2 is `stsrou`, the only one `FSDBBS.C`'s own `fsdmod` ever gave
-    /// a body -- `fsdsts`, folded here into
-    /// [`shims::fsd::fsd_cycle`]. Entry 1 (`sttrou`, reached on `CRSTG`)
-    /// is never real: raw mode means `CRSTG` cannot fire while a session is
-    /// under way (the design doc's "Input" section), so a `CRSTG` reaching
-    /// this slot at all means the channel is in the FSD's `state` without a
-    /// live session -- the same shape as a module that left the entry point
-    /// null, noted rather than refused so [`Host::poll`]'s own "no entry
-    /// registered" fallback handles it exactly as it would a module's own
-    /// null pointer.
-    ///
-    /// Always answers "no far pointer to call": the FSD's own work, when
-    /// there is any, happens right here rather than through a far call --
-    /// that is the whole point of a *native* registration.
-    ///
-    /// # Errors
-    ///
-    /// If [`shims::fsd::fsd_cycle`] does -- in particular, if this channel's
-    /// state names the FSD's own slot but `fsdego` never ran for it, which
-    /// is a bug in whatever set that state rather than a condition to
-    /// silently ignore.
-    fn fsd_dispatch(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-        n: usize,
-    ) -> Result<Option<FarPtr>, ShimError> {
-        if n != 2 {
-            self.note(format!(
-                "fsd_dispatch: channel {chan} entry {n} reached the FSD's native slot, \
-                 which has no handler wired up yet"
-            ));
-            return Ok(None);
-        }
-
-        shims::fsd::fsd_cycle(machine, self, module, chan)?;
-        Ok(None)
-    }
-
-    /// `user[unum].usrcls` -- what kind of channel this is.
-    ///
-    /// Zero for every channel this host makes, which is neither `ONLINE` nor
-    /// `BBSPRV`. Read rather than assumed because `low_haskey` branches on it.
-    ///
-    /// # Errors
-    ///
-    /// If the read runs off a segment.
-    ///
-    /// Reborrows into [`Host::class_mem`] through [`Machine::mem`].
-    pub fn class(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        self.class_mem(machine.mem(), unum)
-    }
-
-    /// Point the four globals that name "the current channel" -- `usrnum`,
-    /// `usrptr`, `usaptr` and `vdaptr` -- at `uno`.
-    ///
-    /// `MAJORBBS.C:4290`'s `curusr`, minus the range check: every caller here
-    /// already knows `uno` is a channel that exists, for a different reason
-    /// each. [`shims::user::curusr`] checked it itself, because an
-    /// out-of-range `uno` there is the documented silent no-op
-    /// (`MAJORBBS.C:4293`) and not a failure. [`Host::connect_state`] gets
-    /// its answer from [`Users::account`] failing first. Factored out so
-    /// both call one piece of code rather than keep two that can drift.
-    ///
-    /// # Errors
-    ///
-    /// If a write runs off a segment.
-    ///
-    /// Reborrows into [`Host::point_curusr_mem`] through [`Machine::mem_mut`].
-    pub(crate) fn point_curusr(&mut self, machine: &mut Machine, uno: Chan) -> Result<(), ShimError> {
-        self.point_curusr_mem(machine.mem_mut(), uno)
-    }
-
-    /// Plant a connecting user's account record and channel state, and make
-    /// the channel current.
-    ///
-    /// Writes what a real board's `loadup()` would have read out of
-    /// `bbsusr.dat` -- this host has no accounts and none are being grown
-    /// here; see [`users::Connection`]. `usrcls`, `state` and `substt` are
-    /// all written as zero: that is already what a freshly allocated slot
-    /// reads as (`Users::new`'s `alczer` zeroed it), and it is what
-    /// [`Host::connect`] (Task 8) then hands to the module's own `lonrou` to
-    /// set for real. Written anyway, rather than left to the allocator's
-    /// zero, so the state a connecting channel is in is something this
-    /// function visibly does and not an accident of history.
-    ///
-    /// # Errors
-    ///
-    /// If `chan` names no channel, or a write runs off a segment.
-    pub fn connect_state(
-        &mut self,
-        machine: &mut Machine,
-        chan: Chan,
-        who: &users::Connection,
-    ) -> Result<(), ShimError> {
-        // The module reads `vdatmp` before it draws, so a channel connected to
-        // a host that never allocated one fails silently much later and
-        // somewhere else. See [`Host::finish_init`].
-        if !self.inited {
-            return Err(ShimError::Failed(
-                "connect: this host has not run finish_init, so no channel has a \
-                 volatile data area yet"
-                    .to_owned(),
-            ));
-        }
-        let account = self.users().account(chan);
-        let slot = self.users().slot(chan);
-
-        // `UIDSIZ` (`UStructs.h:10`) is 30 *including the trailing zero* --
-        // the header's own comment says so -- so at most 29 characters fit
-        // and byte 29 must stay a NUL; `psword` starts immediately after
-        // `userid` in the record, at 30, and a longer name is truncated
-        // rather than overrunning it.
-        //
-        // The whole field is zeroed before the name is written in, not just
-        // the bytes the name occupies. `connect_state` can run again on a
-        // channel that already held a user -- Task 8/9's driver reuses
-        // channels rather than allocating a fresh one per connection -- and
-        // writing only `take` bytes would leave the tail of a longer, earlier
-        // name sitting past the new one. `userid` is what `obtbtvl` keys the
-        // character lookup on (`WCCMMUD_named.c:9847`), so that tail is not
-        // cosmetic: "dan" over "rangerdan" reads back as "dangerdan" and the
-        // module finds a stranger's character.
-        //
-        // Only `userid` is reset here, not the account's other 308 bytes.
-        // Whether a reused channel should clear the whole record was an open
-        // question; it is not open any more. `dftrst` clears all of it, and
-        // [`Host::rstchn`] is where that happens -- at startup over every
-        // channel and at the tail of every disconnect, so a channel arriving
-        // here has already been emptied by whoever left it.
-        const UIDSIZ: usize = 30;
-        let userid = who.userid.as_bytes();
-        let take = userid.len().min(UIDSIZ - 1);
-        let mut field = [0u8; UIDSIZ];
-        field[..take].copy_from_slice(&userid[..take]);
-        let at = FarPtr {
-            offset: account.offset + users::usracc::USERID as u16,
-            selector: account.selector,
-        };
-        machine.write(at, &field)?;
-
-        let at = FarPtr {
-            offset: account.offset + users::usracc::ANSIFL as u16,
-            selector: account.selector,
-        };
-        machine.write(at, &[u8::from(who.ansi)])?;
-
-        let at = FarPtr {
-            offset: account.offset + users::usracc::SCNWID as u16,
-            selector: account.selector,
-        };
-        machine.write(at, &[who.width])?;
-
-        let at = FarPtr {
-            offset: account.offset + users::usracc::SCNFSE as u16,
-            selector: account.selector,
-        };
-        machine.write(at, &[who.height])?;
-
-        for (field, value) in [
-            (users::user::USRCLS, 0u16),
-            (users::user::STATE, 0u16),
-            (users::user::SUBSTT, 0u16),
-        ] {
-            let at = FarPtr {
-                offset: slot.offset + field,
-                selector: slot.selector,
-            };
-            machine.write(at, &value.to_le_bytes())?;
-        }
-
-        // `loadkeys()`, `LOCKNKEY.C:88`. On a real board this read `bbsk.dat`
-        // and a `&CLASS` keyring record; here the keys arrived with the
-        // connection, because whatever authenticated the user is what knows
-        // them. Set unconditionally, so a channel reused by a second user does
-        // not inherit the first one's access.
-        self.users.set_keys(chan, who.keys.clone());
-
-        // A channel that already held a user may still hold that user's polling
-        // routine, and `polrou` is a pointer into module code installed for
-        // *them*. Cleared for the same reason `userid` above is zeroed whole:
-        // this function runs again on a reused channel.
-        self.users.set_polrou_mem(machine.mem_mut(), chan, None)?;
-
-        // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
-        // byte is at offset 0x14. Read-modify-write on that one bit: the rest
-        // of the byte is the module's, `WCCMMUD.DLL` sets and tests masks 2, 4
-        // and 0x10 in it, and `connect_state` runs again on a channel that
-        // already held a user. A whole-field store would clear the module's
-        // bits out from under it.
-        //
-        // Host-private in practice -- the module never tests 0x40 -- but the
-        // bit is real and `user.flags` should not lie about it.
-        const MASTER: u8 = 0x40;
-        let at = FarPtr {
-            offset: slot.offset + users::user::FLAGS,
-            selector: slot.selector,
-        };
-        let was = machine.resolve(at, 1)?[0];
-        let now = if who.keys.is_master() {
-            was | MASTER
-        } else {
-            was & !MASTER
-        };
-        machine.write(at, &[now])?;
-
-        self.point_curusr(machine, chan)
-    }
-
-    /// Completely reset a channel: `rstchn`, via its default handler `dftrst`.
-    ///
-    ///
-    /// `MAJORBBS.C:3487-3500`. Everything after those five lines is hardware:
-    /// `rcdbaud`, `lincst`, `bturst` and the `switch` over its return code
-    /// exist to bring a *modem* channel back up, and this host has no channel
-    /// hardware to reset. `mnuusr` is zeroed there too and is not here: it
-    /// belongs to the menuing subsystem, whose `muusrs` table this host does
-    /// not have and whose absence is deliberate. `gcsprst` is the
-    /// client/server reset, which this host has nothing to reset.
-    ///
-    /// # Why this is one routine and not two
-    ///
-    /// The original calls this from two places that look unrelated: startup
-    /// (`:908-911`, over every channel, right after `alcvda`) and the tail of
-    /// both disconnect paths. That is not a coincidence -- it is what makes "a
-    /// channel nobody has used" and "a channel just freed" the same state.
-    /// [`Host::connect_state`] used to note that whether a reused channel
-    /// should clear its whole record was an open question; it is not open, it
-    /// is answered here.
-    ///
-    /// # What this does NOT clear, and where that is done instead
-    ///
-    /// The volatile data area. `dftrst` does not clear it either -- the
-    /// original zeroes it on the way *in*, at `MAJORBBS.C:4000`, the line
-    /// before `cyclon` calls a module's `lonrou`. [`Host::connect`] is where
-    /// that line lives here, so the guarantee is "a channel a module is handed
-    /// has a zeroed VDA", not "`rstchn` leaves nothing at all". An earlier
-    /// version of this comment claimed the latter and said "the answer is all
-    /// of it", which was false for 1,961 bytes per channel.
-    ///
-    /// At one channel none of this is observable, because no second user ever
-    /// arrives to inherit the first one's bytes.
-    ///
-    /// # Errors
-    ///
-    /// If a write runs off a segment.
-    pub fn rstchn(&mut self, machine: &mut Machine, chan: Chan) -> Result<(), ShimError> {
-        self.users.clear_keys(chan);
-        for (at, len) in [
-            (self.users.slot(chan), users::USER),
-            (self.users.extra(chan), users::EXTUSR),
-            (self.users.account(chan), users::USRACC),
-        ] {
-            machine.write(at, &vec![0u8; usize::from(len)])?;
-        }
-        // `bturst(usrnum)`, `MAJORBBS.C:3503` -- the last thing `dftrst` does
-        // that this host has anything to do. Without it the three `setmem`s
-        // above clear the module's view of the channel while GSBL's view keeps
-        // the previous player's buffers and terminal settings.
-        self.gsbl.reset(chan);
-        Ok(())
-    }
-
-    /// Put a channel into the module's state machine and let the module know.
-    ///
-    /// `connect_state` writes what a real board's `loadup()` would have read
-    /// out of `bbsusr.dat`; `lonrou` is the module's own logon hook, which
-    /// `MAJORBBS.C:558`'s `lonstf()` called for every registered module. Only
-    /// one module is registered here, so this calls the one.
-    ///
-    /// Returns `None` if the module supplies no `lonrou` -- the real host
-    /// never called one either, so there is no [`Outcome`] to report for a
-    /// call that never happened.
-    ///
-    /// R21: a `ShimError` out of `connect_state` or the `lonrou` lookup
-    /// poisons the machine and comes back as `Outcome::Stopped`, the same
-    /// policy [`Host::run`] applies to a `ShimError` from a shim it
-    /// dispatched. See `shim_stop`.
-    ///
-    /// # Errors
-    ///
-    /// If no module has registered. (A malformed `chan`, a write running off
-    /// a segment, or the module being unenterable all poison the machine and
-    /// come back as `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
-    pub fn connect(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-        who: &users::Connection,
-    ) -> io::Result<Option<Outcome<Wg16>>> {
-        if let Err(e) = self.connect_state(machine, chan, who) {
-            return self.shim_stop(machine, "connect_state", e).map(Some);
-        }
-
-        // `Registration::dispatch` borrows `self.modules()` immutably, and
-        // `self.run` needs `self` mutably right after -- so the pointer is
-        // read out here and the borrow ends before `run` is ever reached.
-        //
-        // The first *module* registration, and not the channel's state, on
-        // purpose. `cyclon` calls `if ((rouptr = module[i]->lonrou) != NULL)`
-        // over an `i`: a logon is announced to every registered module, not
-        // dispatched to one. This host makes the first iteration only, which
-        // is the whole loop while one real module is registered -- and now
-        // that `Host::finish_init` registers the FSD's native slot ahead of
-        // any module, `first_module` (not `modules().first()`) is what keeps
-        // that "one module" reading correct: a `Native` registration has no
-        // `lonrou` to announce (`FSDBBS.C` supplies no module-shaped logon
-        // hook) and skipping past it is not the same thing as counting it as
-        // the sole module. A **second real module** is still owed the rest
-        // of `cyclon`'s loop; that debt is unaffected by this change.
-        let lonrou = {
-            let registered = self.first_module().ok_or_else(|| {
-                io::Error::other("no module has registered, so there is nothing to enter")
-            })?;
-            match registered.dispatch(machine.mem(), 0) {
-                Ok(Dispatch::Module(rou)) => Ok(rou),
-                // `first_module` never answers `Native`, but the match stays
-                // exhaustive and the fallback stays correct if that changes.
-                Ok(Dispatch::Native(_)) => Ok(None),
-                Err(e) => Err(e),
-            }
-        };
-        let lonrou = match lonrou {
-            Ok(lonrou) => lonrou,
-            Err(e) => return self.shim_stop(machine, "lonrou lookup", e).map(Some),
-        };
-        let Some(lonrou) = lonrou else {
-            // R24: a null `lonrou` is legal -- the real host checked
-            // `if ((rouptr = module[i]->lonrou) != NULL)` before calling --
-            // and it means no call happened, not that one returned zero.
-            // `None` says that honestly; a fabricated `Returned { ax: 0,
-            // dx: 0 }` would claim a call this host never made.
-            return Ok(None);
-        };
-        // `MAJORBBS.C:4000` -- `setmem(vdaptr,vdasiz,0)`, the line before
-        // `cyclon` calls a module's `lonrou`. The volatile data area is the one
-        // per-channel block `rstchn` does *not* clear, because `dftrst` does not
-        // clear it either: the original zeroes it on the way *in* rather than on
-        // the way out, and this is that line.
-        //
-        // Found by a mutation that stayed green across all 786 tests -- pointing
-        // `vdaptr` at channel 0 for every dispatch. That is invisible today
-        // because MajorMUD leaves the area zero on the returning-player path,
-        // which is exactly the argument that made `btuxmt`'s channel argument
-        // unfalsifiable at one channel. This branch exists because that argument
-        // was wrong once already.
-        if let Some(vda) = self.users.vda(chan) {
-            let size = self.globals.word(machine, "vdasiz")?;
-            if let Err(e) = machine.write(vda, &vec![0u8; usize::from(size)]) {
-                return self.shim_stop(machine, "clearing the volatile data area", e.into()).map(Some);
-            }
-        }
-
-        self.run(machine, module, lonrou, &[], Some(chan)).map(Some)
-    }
-
-    /// Lost carrier: hand the channel to the module's `huprou`, then reset it.
-    ///
-    /// `loscar()` -> `aschup()` -> `rstchn()`, `MAJORBBS.C:4562-4605` and
-    /// `:4607-4637`. This is what a closed socket raises, and `aschup` is the
-    /// only caller of the `huprou` sweep in the entire host -- a graceful
-    /// logoff does not pass through here. See [`Vector`].
-    ///
-    /// MajorMUD's `_LJNGAME_HUPROU` (`re/exports/WCCMMUD_named.c:12646`) is the
-    /// substantial one: `_GET_PLAYER`, `_CLEAR_FORGET_LIST` and `_SAVE_PLAYER`
-    /// unconditionally, and then -- gated on `user[usrnum].substt >= 0x82`, in
-    /// the Realm -- it works the room, dropping carried items and announcing
-    /// the departure through `_TELL_GAME`, whose loop is bounded by `nterms`.
-    /// It is a `void` routine, so its [`Outcome::Returned`] words are whatever
-    /// it happened to leave behind rather than an answer.
-    ///
-    /// Returns `None` if the module supplies no `huprou`. **The reset happens
-    /// either way** -- `loscar` reaches `rstchn` at `:4593` whether or not
-    /// `aschup` found a routine to call.
-    ///
-    /// # Errors
-    ///
-    /// If no module has registered.
-    pub fn hangup(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-    ) -> io::Result<Option<Outcome<Wg16>>> {
-        self.disconnect(machine, module, chan, Vector::Hangup)
-    }
-
-    /// Graceful logoff: hand the channel to the module's `lofrou`, then reset
-    /// it.
-    ///
-    /// `bgnlof`/`nxtlof`, `MAJORBBS.C:4054-4105`. The original's sweep walks
-    /// every registered module and falls back to `go2mnu(JSTRET)` -- the
-    /// menuing system, which is out of scope here. With one module the sweep's
-    /// loop body never runs at all (`:4076` skips `i == lofstt`, and `lofstt` is the
-    /// only module there is), so it collapses to the self-call at `:4100-4101`
-    /// and `go2mnu` never arises.
-    ///
-    /// That self-call is `if ((*lofrou)() != 1) go2mnu(JSTRET);`, so **`1` is
-    /// the only value the original distinguishes for a one-module host**: it
-    /// means "I am not finished", and the channel stays in the module's logoff
-    /// state for another pass. This host has no logoff state to stay in, so a
-    /// `1` is refused with a named stop rather than discarded -- a silent
-    /// discard would leave the module believing a multi-pass dialogue is in
-    /// progress.
-    ///
-    /// **Only `1`.** `-1` -- the sweep's "abandon and return to the menu" at
-    /// `:4087-4089` -- is *not* refused, because that branch is inside the loop
-    /// this host never reaches. Against `:4100`'s `!= 1`, the values `0`, `-1`
-    /// and `42` are one answer: finished, go to the menu. "Go to the menu" for
-    /// a headless host collapses to "the logoff is over", which is exactly the
-    /// [`rstchn`](Self::rstchn) that follows. Refusing `-1` as well would be
-    /// this host inventing a distinction the original does not draw at the only
-    /// line it reaches. See
-    /// `a_lofrou_that_abandons_the_sweep_is_taken_at_its_word_like_any_non_one`.
-    ///
-    /// MajorMUD's own `_LJNGAME_LOFROU` (`re/exports/WCCMMUD_named.c:12628`)
-    /// returns 0, which is exactly why the refusal has to exist rather than be
-    /// assumed unreachable.
-    ///
-    /// Returns `None` if the module supplies no `lofrou`. As with
-    /// [`Host::hangup`], the reset happens either way.
-    ///
-    /// # Errors
-    ///
-    /// If no module has registered.
-    pub fn logoff(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-    ) -> io::Result<Option<Outcome<Wg16>>> {
-        self.disconnect(machine, module, chan, Vector::Logoff)
-    }
-
-    /// What [`Host::hangup`] and [`Host::logoff`] have in common: point the
-    /// channel, call its vector if the module supplied one, then reset it.
-    ///
-    /// The order is the contract. The routine runs **first**, while the channel
-    /// still holds the departing player -- `_LJNGAME_HUPROU` opens with
-    /// `_GET_PLAYER(usrnum)` and goes on to `_SAVE_PLAYER`, and a `rstchn` that
-    /// ran before it would hand the module a zeroed record to save. The reset
-    /// runs **last, and unconditionally**: a null vector means no call
-    /// happened, not that the channel stays occupied, and `loscar` reaches
-    /// `rstchn` either way.
-    ///
-    /// R21: a `ShimError` out of `point_curusr` or the entry lookup poisons the
-    /// machine and comes back as [`Outcome::Stopped`], matching
-    /// [`Host::connect`].
-    fn disconnect(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-        vector: Vector,
-    ) -> io::Result<Option<Outcome<Wg16>>> {
-        if let Err(e) = self.point_curusr(machine, chan) {
-            return self.shim_stop(machine, "point_curusr", e).map(Some);
-        }
-
-        // `Registration::dispatch` borrows `self.modules()` immutably and
-        // `self.run` needs `self` mutably right after, so the pointer is read
-        // out here and the borrow ends before `run` is ever reached -- the same
-        // discipline `Host::connect` follows.
-        //
-        // The two vectors are not reached the same way, and this is the one
-        // place that difference is visible:
-        //
-        // - `bgnlof` tests `module[usrptr->state]->lofrou == NULL` -- keyed on
-        //   the channel's state, like `sttrou`.
-        // - `aschup` tests `(rouptr=module[i]->huprou) != NULL` -- an `i`, a
-        //   loop over *every* registered module. This host makes the first
-        //   iteration and no more, which is exactly right while one real
-        //   module is registered and is owed a loop the day a second one is.
-        //   It is the first *module* and not the channel's state
-        //   deliberately: a hangup is news for every module, not just the
-        //   one holding the channel -- `first_module`, not `modules().first()`,
-        //   because the FSD's native slot registers ahead of any module now
-        //   and has no `huprou` to be news to.
-        //
-        // Neither vector has a native-handler shape: `FSDBBS.C` supplies no
-        // `lofrou` or `huprou`, so a `Dispatch::Native` answer here is the
-        // same "no call happened" as a module that left the pointer null --
-        // unlike `poll`'s `sttrou`/`stsrou` dispatch, which is the FSD's own
-        // reason to exist as a state at all.
-        let rou = match vector {
-            Vector::Logoff => match self.state_entry(machine, chan, vector.entry())? {
-                Ok(Dispatch::Module(rou)) => Ok(rou),
-                Ok(Dispatch::Native(_)) => Ok(None),
-                Err(e) => Err(e),
-            },
-            Vector::Hangup => {
-                let registered = self.first_module().ok_or_else(|| {
-                    io::Error::other(
-                        "no module has registered, so there is nothing to disconnect from",
-                    )
-                })?;
-                match registered.dispatch(machine.mem(), vector.entry()) {
-                    Ok(Dispatch::Module(rou)) => Ok(rou),
-                    Ok(Dispatch::Native(_)) => Ok(None),
-                    Err(e) => Err(e),
-                }
-            }
-        };
-        let rou = match rou {
-            Ok(rou) => rou,
-            Err(e) => {
-                let where_ = format!("{} lookup", vector.name());
-                return self.shim_stop(machine, &where_, e).map(Some);
-            }
-        };
-
-        // R24: a null vector is legal -- `aschup` tests
-        // `(rouptr=module[i]->huprou) != NULL` (`:4623`) and `bgnlof` tests
-        // `module[usrptr->state]->lofrou == NULL` -- and it means no call
-        // happened, not that one returned zero.
-        let outcome = match rou {
-            Some(rou) => Some(self.run(machine, module, rou, &[], Some(chan))?),
-            None => None,
-        };
-
-        // `nxtlof`'s protocol; see [`Host::logoff`] for why a non-zero return
-        // is refused rather than discarded. `huprou` is `void` and has no
-        // protocol, so its words are not read.
-        let outcome = match (vector, outcome) {
-            (Vector::Logoff, Some(Outcome::Returned { lo: ax, .. })) if ax == 1 => {
-                Some(self.stop(
-                    machine,
-                    Poison::Unimplemented {
-                        module: "mbbs".to_owned(),
-                        symbol: format!(
-                            "lofrou returned {}, asking to be called again, and this \
-                             host has no second logoff pass to give it \
-                             (MAJORBBS.C:4100)",
-                            ax as i16
-                        ),
-                    },
-                )?)
-            }
-            (_, outcome) => outcome,
-        };
-
-        if let Err(e) = self.rstchn(machine, chan) {
-            return self.shim_stop(machine, "rstchn", e).map(Some);
-        }
-        Ok(outcome)
-    }
-
-
-    /// `void alcvda(void)` -- give every channel its volatile data area.
-    ///
-    /// `MAJORBBS.C:1370`, called from `:896` *after* every module's init
-    /// routine has run, because `dclvda` is what decides the size and it is
-    /// still being called until then. Not part of [`Host::new`] for that
-    /// reason: a host that allocated at construction would size the area off a
-    /// `vdasiz` of zero and every `vdaptr` the module read would be null.
-    ///
-    ///
-    /// `vdaptr` is left pointing at channel 0, matching `vdarea=vdaoff(0)` at
-    /// `:1374`; `curusr` is what re-points it per channel afterwards. `vdatmp`
-    /// is a block of its own and not a slot, because `fsdapr` is handed both at
-    /// once and they must not be the same bytes.
-    ///
-    /// Doing nothing when `vdasiz` is zero is the original's own `if`, and it
-    /// is load-bearing here: this heap refuses an allocation of nothing.
-    ///
-    /// # Errors
-    ///
-    /// If the heap has no room.
-    /// Every module has initialised: finish the host's own setup.
-    ///
-    /// `MAJORBBS.C:896`. The real host runs `inimod()` over every module and
-    /// then, on the next line, `alcvda()` -- in that order and not the other,
-    /// because `dclvda` is still accumulating `vdasiz` while modules
-    /// initialise. A host that allocated in [`Host::new`] would size every
-    /// volatile data area off a `vdasiz` of zero.
-    ///
-    /// # Why this is a step the caller must take, and why forgetting it is refused
-    ///
-    /// [`Host::alcvda`] was correct, complete and tested for weeks while
-    /// **nothing in the crate called it** -- every caller was a test. Nothing
-    /// failed. `vdasiz` reached 1,961 from `WCCMMUD.DLL`'s own `dclvda` and
-    /// `vdaptr`/`vdatmp` stayed null, and the module noticed long before this
-    /// host did: `_EDIT_CHARACTER_STATS` tests `vdatmp` before it draws
-    /// anything and returns silently when it is null. Character creation took
-    /// the player's answer, computed the whole character, resolved its title,
-    /// and stopped without printing a byte or advancing its substate.
-    ///
-    /// That cost days to find, because a *global* the module reads is invisible
-    /// to a host-call trace -- the signature is "every routine it reaches is
-    /// implemented and it still does nothing". So this host refuses to
-    /// [`connect`](Self::connect) a channel until this has run, which turns the
-    /// whole class of mistake into an error message naming the step.
-    ///
-    /// Idempotent, and doing nothing when no module declared a size is
-    /// `alcvda`'s own `if (vdasiz != 0)`.
-    ///
-    /// # Errors
-    ///
-    /// If the volatile data areas cannot be allocated.
-    pub fn finish_init(&mut self, machine: &mut Machine) -> io::Result<()> {
-        self.alcvda(machine)?;
-        // `MAJORBBS.C:908-911`, the next thing the real host does after
-        // `alcvda()`: reset every channel. See [`Host::rstchn`] for why startup
-        // and disconnect share one routine. The order is `:896` then `:908` and
-        // not the other way about.
-        for chan in self.users.terms().all() {
-            self.rstchn(machine, chan)
-                .map_err(|e| io::Error::other(format!("rstchn({chan}): {e}")))?;
-        }
-        // `inifsd()` registers FSDBBS as an ordinary module during startup;
-        // this is that registration. It must happen before `inited` is set,
-        // so nothing can reach a channel's `state` before the FSD's slot
-        // exists to be named.
-        self.fsd_state = Some(self.register_native(Native::Fsd));
-        self.inited = true;
-        Ok(())
-    }
-
-    pub fn alcvda(&mut self, machine: &mut Machine) -> io::Result<()> {
-        let size = self.globals.word(machine, "vdasiz")?;
-        if size == 0 {
-            return Ok(());
-        }
-        self.users
-            .alcvda_mem(machine.mem_mut(), &mut self.heap, size)?;
-        let console = self
-            .users
-            .terms()
-            .chan(0)
-            .expect("every host has a channel zero");
-        let area = self.users.vda(console).expect("just allocated");
-        let temp = self.heap.alloc(machine, size).map_err(io::Error::other)?;
-        self.globals.write(machine, "vdaptr", &area.to_bytes())?;
-        self.globals.write(machine, "vdatmp", &temp.to_bytes())?;
-        Ok(())
     }
 }
 

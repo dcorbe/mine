@@ -157,6 +157,12 @@ impl Abi for Wg32 {
         &mut cpu.mem
     }
 
+    /// `&cpu.mem`, `mem`'s shared-borrow sibling. See [`Abi::mem_ref`]'s own
+    /// doc comment.
+    fn mem_ref(cpu: &Self::Cpu) -> &Self::Mem {
+        &cpu.mem
+    }
+
     /// The module's own loaded image, at its own base -- there is no
     /// near/far distinction left to collapse once every pointer is already
     /// flat, so "the module's own data segment" and "an ordinary pointer

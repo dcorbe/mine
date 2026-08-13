@@ -45,10 +45,9 @@
 //! `btuchi`'s whole family collapses to here -- see [`fsdcon`]'s own doc
 //! comment.
 
-use mbbs_machine::m16::{FarPtr, Machine, Module, Ret};
 use mbbs_machine::ptr::ModulePtr;
 
-use crate::abi::{self, Abi, Call, ModuleMem, Wg16};
+use crate::abi::{self, Abi, Call, ModuleMem};
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
 use crate::shims::{NO, ShimError};
@@ -106,9 +105,8 @@ fn control_block<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: Chan) -> Re
 /// Read the session control block out of module memory, against memory
 /// directly rather than a whole `Machine`.
 ///
-/// The `Wg16` facade [`read_block`] delegates into -- [`fsdprc`],
-/// `fsd_drain_edge` and `goback` (three routines this task does not convert)
-/// all call the facade directly, and so do this file's own tests.
+/// [`read_block`] reaches this through a `Cpu` -- [`fsdprc`], `fsd_drain_edge`
+/// and `fsd_cycle` call that facade, and so do this file's own tests.
 fn read_block_mem<A: Abi>(mem: &A::Mem, at: A::Ptr) -> Result<fsd::Scb<A>, ShimError> {
     let bytes = at
         .resolve(mem, usize::from(fsd::FSDSCB))
@@ -116,10 +114,13 @@ fn read_block_mem<A: Abi>(mem: &A::Mem, at: A::Ptr) -> Result<fsd::Scb<A>, ShimE
     fsd::Scb::from_bytes(bytes).map_err(|e| ShimError::Failed(e.to_string()))
 }
 
-/// The `Wg16` facade [`read_block_mem`] delegates into. See that function's
-/// own doc comment for who still calls this by name.
-fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb<Wg16>, ShimError> {
-    read_block_mem::<Wg16>(machine.mem(), at)
+/// [`read_block_mem`] reached through a `Cpu` rather than bare `A::Mem` --
+/// what [`fsdprc`], `fsd_drain_edge` and `fsd_cycle` call, all of which hold
+/// `&mut A::Cpu` rather than `&A::Mem` directly. Generic since Task 12 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`, via
+/// [`Abi::mem_ref`]: a shared borrow, so this needs no `&mut`.
+fn read_block<A: Abi>(machine: &A::Cpu, at: A::Ptr) -> Result<fsd::Scb<A>, ShimError> {
+    read_block_mem::<A>(A::mem_ref(machine), at)
 }
 
 /// A pointer `by` bytes past `base`, refusing rather than wrapping.
@@ -440,8 +441,8 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `newans`, which is the same test the real host's own `fsdchi` makes at
 /// `FSDBBS.C:340` before touching anything.
 ///
-/// Generic core (Task 5); see [`prepared`] for the `Wg16` facade, which
-/// [`fsdprc`] (a different, unconverted routine) still calls.
+/// Generic core (Task 5); see [`prepared`] for the `Cpu`-taking facade
+/// [`fsdprc`] calls.
 fn prepared_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, who: &str) -> Result<(fsd::Scb<A>, A::Ptr), ShimError> {
     let chan = host.current_channel_mem(mem)?;
     let at = host.fsdscb[chan.index()].ok_or_else(|| {
@@ -459,9 +460,9 @@ fn prepared_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, who: &str) -> Result<(fsd:
     Ok((block, at))
 }
 
-/// The `Wg16` facade [`prepared_mem`] delegates into.
-fn prepared(machine: &Machine, host: &Host<Wg16>, who: &str) -> Result<(fsd::Scb<Wg16>, FarPtr), ShimError> {
-    prepared_mem(machine.mem(), host, who)
+/// [`prepared_mem`] reached through a `Cpu`. Generic since Task 12.
+fn prepared<A: Abi>(machine: &A::Cpu, host: &Host<A>, who: &str) -> Result<(fsd::Scb<A>, A::Ptr), ShimError> {
+    prepared_mem(A::mem_ref(machine), host, who)
 }
 
 /// One `struct fsdfld` out of the field array, bounds-checked, against
@@ -471,8 +472,8 @@ fn prepared(machine: &Machine, host: &Host<Wg16>, who: &str) -> Result<(fsd::Scb
 /// a field number outside it reads whatever follows the array and calls it an
 /// answer.
 ///
-/// The `Wg16` facade [`field_record`] delegates into -- [`fsdprc`] (a
-/// different, unconverted routine) still calls it directly.
+/// The `Cpu`-taking facade [`field_record`] delegates into -- [`fsdprc`]
+/// still calls it directly.
 fn field_record_mem<A: Abi>(
     mem: &A::Mem,
     block: &fsd::Scb<A>,
@@ -494,14 +495,14 @@ fn field_record_mem<A: Abi>(
     Ok(out)
 }
 
-/// The `Wg16` facade [`field_record_mem`] delegates into.
-fn field_record(
-    machine: &Machine,
-    block: &fsd::Scb<Wg16>,
+/// [`field_record_mem`] reached through a `Cpu`. Generic since Task 12.
+fn field_record<A: Abi>(
+    machine: &A::Cpu,
+    block: &fsd::Scb<A>,
     field: u16,
     who: &str,
 ) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
-    field_record_mem(machine.mem(), block, field, who)
+    field_record_mem(A::mem_ref(machine), block, field, who)
 }
 
 /// Where a field's answer starts, out of its record.
@@ -1010,9 +1011,8 @@ const ENTERING: u16 = 1;
 /// on the wrong bytes. [`getasc`](crate::msg::getasc) inserts a byte per line
 /// break, so the two forms disagree from the first one onward.
 ///
-/// Generic core (Task 5); see the `Wg16` facade [`fsd_template`] below,
-/// which [`fsdprc`] (a different, unconverted routine) still calls under
-/// that exact name.
+/// Generic core (Task 5); see the `Cpu`-taking facade [`fsd_template`]
+/// below, which [`fsdprc`] still calls under that exact name.
 fn fsd_template_mem<A: Abi>(
     mem: &A::Mem,
     host: &Host<A>,
@@ -1032,9 +1032,9 @@ fn fsd_template_mem<A: Abi>(
     })
 }
 
-/// The `Wg16` facade [`fsd_template_mem`] delegates into.
-fn fsd_template(machine: &Machine, host: &Host<Wg16>, block: FarPtr, number: u16, amode: i16) -> Result<Vec<u8>, ShimError> {
-    fsd_template_mem(machine.mem(), host, block, number, amode)
+/// [`fsd_template_mem`] reached through a `Cpu`. Generic since Task 12.
+fn fsd_template<A: Abi>(machine: &A::Cpu, host: &Host<A>, block: A::Ptr, number: u16, amode: i16) -> Result<Vec<u8>, ShimError> {
+    fsd_template_mem(A::mem_ref(machine), host, block, number, amode)
 }
 
 /// Which of `fsdppc`'s two scanning modes an `amode` asks for.
@@ -1077,9 +1077,9 @@ const EURMSK: i16 = 0x7F;
 /// `flddat[]` anywhere in this crate's own measurements), so `flags` is the
 /// only one refreshed.
 ///
-/// Generic core (Task 5); see the `Wg16` facade [`live_form`] below, which
-/// [`fsdprc`], `fsd_drain_edge` and `goback` (routines this task does not
-/// convert) still call under that exact name.
+/// Generic core (Task 5); see the `Cpu`-taking facade [`live_form`] below,
+/// which [`fsdprc`], `fsd_cycle` and `fsd_drain_edge` still call under that
+/// exact name.
 fn live_form_mem<A: Abi>(
     mem: &A::Mem,
     block: &fsd::Scb<A>,
@@ -1093,9 +1093,9 @@ fn live_form_mem<A: Abi>(
     Ok(form)
 }
 
-/// The `Wg16` facade [`live_form_mem`] delegates into.
-fn live_form(machine: &Machine, block: &fsd::Scb<Wg16>, form: &fsd::Form) -> Result<fsd::Form, ShimError> {
-    live_form_mem(machine.mem(), block, form)
+/// [`live_form_mem`] reached through a `Cpu`. Generic since Task 12.
+fn live_form<A: Abi>(machine: &A::Cpu, block: &fsd::Scb<A>, form: &fsd::Form) -> Result<fsd::Form, ShimError> {
+    live_form_mem(A::mem_ref(machine), block, form)
 }
 
 /// `void fsdego(int (*fldvfy)(int,char*), void (*whndun)(int))` -- hand the
@@ -1221,14 +1221,13 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// [`fsd::candidate_answer`], allocating it on first use. See
 /// [`crate::Host::fsd_scratch`]'s own doc comment for why one segment,
 /// not one per channel, is the right shape here.
-fn fsd_scratch(machine: &mut Machine, host: &mut Host<Wg16>) -> Result<FarPtr, ShimError> {
+fn fsd_scratch<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>) -> Result<A::Ptr, ShimError> {
     match host.fsd_scratch {
         Some(at) => Ok(at),
         None => {
             // `ModuleMem::alloc_region`, not `Machine::alloc_segment`
             // directly -- see `control_block`'s identical comment above.
-            let at = machine
-                .mem_mut()
+            let at = A::mem(machine)
                 .alloc_region(usize::from(fsd::ANSLEN) + 1)
                 .map_err(|e| {
                     ShimError::Failed(format!("fsdprc: no room for a scratch buffer: {e}"))
@@ -1246,9 +1245,9 @@ fn fsd_scratch(machine: &mut Machine, host: &mut Host<Wg16>) -> Result<FarPtr, S
 /// explains why a field's mutable members are read live, and `ansoff`/
 /// `anslen` are exactly the members `fsdord` itself already writes.
 ///
-/// Generic core (Task 5); see the `Wg16` facade [`read_answers`] below,
-/// which [`fsdprc`], `fsd_drain_edge` and `goback` (routines this task does
-/// not convert) still call under that exact name.
+/// Generic core (Task 5); see the `Cpu`-taking facade [`read_answers`]
+/// below, which [`fsdprc`], `fsd_cycle` and `fsd_drain_edge` still call
+/// under that exact name.
 fn read_answers_mem<A: Abi>(mem: &A::Mem, block: &fsd::Scb<A>) -> Result<fsd::Answers, ShimError> {
     let text = answer_string::<A>(mem, block.newans())?;
     let mut offsets = Vec::with_capacity(usize::from(block.numfld()));
@@ -1263,9 +1262,9 @@ fn read_answers_mem<A: Abi>(mem: &A::Mem, block: &fsd::Scb<A>) -> Result<fsd::An
     })
 }
 
-/// The `Wg16` facade [`read_answers_mem`] delegates into.
-fn read_answers(machine: &Machine, block: &fsd::Scb<Wg16>) -> Result<fsd::Answers, ShimError> {
-    read_answers_mem(machine.mem(), block)
+/// [`read_answers_mem`] reached through a `Cpu`. Generic since Task 12.
+fn read_answers<A: Abi>(machine: &A::Cpu, block: &fsd::Scb<A>) -> Result<fsd::Answers, ShimError> {
+    read_answers_mem(A::mem_ref(machine), block)
 }
 
 /// `fsdprc()`'s `FSDBUF` arm, wired through `Machine`. `FSD.C:1124-1233`.
@@ -1314,12 +1313,12 @@ fn read_answers(machine: &Machine, block: &fsd::Scb<Wg16>) -> Result<fsd::Answer
 /// `Host::run` services) -- the machine is already poisoned with the real
 /// reason by the time that happens (`Machine::poison`'s "the first reason
 /// wins"), so this only has to name the fact, not invent a better one.
-pub(crate) fn fsdprc(
-    machine: &mut Machine,
-    host: &mut Host<Wg16>,
-    module: &Module,
+pub(crate) fn fsdprc<A: Abi>(
+    machine: &mut A::Cpu,
+    host: &mut Host<A>,
+    module: &A::Module,
     chan: Chan,
-) -> Result<Ret, ShimError> {
+) -> Result<abi::Ret<A>, ShimError> {
     let (block, at) = prepared(machine, host, "fsdprc")?;
     let Some((mbk, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(
@@ -1333,7 +1332,11 @@ pub(crate) fn fsdprc(
         )));
     };
     let form = live_form(machine, &block, &form)?;
-    let spec = machine.read_cstr(block.fldspc())?.to_vec();
+    let spec = block
+        .fldspc()
+        .read_cstr(A::mem_ref(machine))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let template = fsd_template(machine, host, mbk, msgno, amode)?;
 
     let entfld = block.entfld();
@@ -1343,14 +1346,17 @@ pub(crate) fn fsdprc(
     let scratch = fsd_scratch(machine, host)?;
     let mut scratch_bytes = candidate;
     scratch_bytes.push(0);
-    machine.write(scratch, &scratch_bytes)?;
+    scratch
+        .write(A::mem(machine), &scratch_bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     let vc = if block.flags() & fsd::entry_flags::FSDIGA != 0 {
         let mut cleared = block.clone();
         cleared.set_flags(cleared.flags() & !fsd::entry_flags::FSDIGA);
-        machine.write(at, cleared.as_bytes())?;
+        at.write(A::mem(machine), cleared.as_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
         fsd::verify::VFYDEF
-    } else if block.fldvfy() != FarPtr::NULL {
+    } else if !is_null::<A>(block.fldvfy()) {
         let fldvfy = block.fldvfy();
         // The borrow on `block` ends here: everything after this point
         // re-reads fresh from `Machine`, per the callback discipline
@@ -1360,7 +1366,10 @@ pub(crate) fn fsdprc(
                 machine,
                 module,
                 fldvfy,
-                &[crate::abi::Arg::Int(u16::from(entfld)), crate::abi::Arg::Ptr(scratch)],
+                &[
+                    crate::abi::Arg::Int(A::Int::from(u16::from(entfld))),
+                    crate::abi::Arg::Ptr(scratch),
+                ],
                 Some(chan),
             )
             .map_err(|e| ShimError::Failed(format!("fsdprc: fldvfy call failed: {e}")))?;
@@ -1377,8 +1386,11 @@ pub(crate) fn fsdprc(
     };
 
     // Re-read everything the callback (if any ran) could have touched.
-    let mut block = read_block(machine, at)?;
-    let bufptr = machine.read_cstr(scratch)?.to_vec();
+    let mut block = read_block::<A>(machine, at)?;
+    let bufptr = scratch
+        .read_cstr(A::mem_ref(machine))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     let mut answers = read_answers(machine, &block)?;
 
     let (output, changed) = fsd::fsdprc(
@@ -1406,11 +1418,17 @@ pub(crate) fn fsdprc(
         if i == u16::from(entfld) && changed {
             record[fsd::fld::FLAGS] |= fsd::flags::CHANGED;
         }
-        machine.write(offset::<Wg16>(block.flddat(), field_at(i))?, &record)?;
+        offset::<A>(block.flddat(), field_at(i))?
+            .write(A::mem(machine), &record)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
-    machine.write(block.newans(), &answers.text)?;
+    block
+        .newans()
+        .write(A::mem(machine), &answers.text)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     block.set_allans(answers.allans);
-    machine.write(at, block.as_bytes())?;
+    at.write(A::mem(machine), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     // Propagate the outcome into `Host::fsd_sessions`, right while
     // `block.state()` is known-fresh (re-read from `Machine` above, per
@@ -1428,7 +1446,7 @@ pub(crate) fn fsdprc(
         }
     }
 
-    crate::shims::text::append(machine, host, &output)?;
+    crate::shims::text::append_mem(A::mem(machine), host, &output)?;
 
     // The session is over. `goback()` (Task 11) is what the real
     // `fsdsts()` reaches from here -- but only after one more poll pass
@@ -1446,7 +1464,7 @@ pub(crate) fn fsdprc(
         return goback(machine, host, module, chan);
     }
 
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
 }
 
 /// `outprf(int chan)`, declared at `GCOMM.H:447` with no body anywhere in
@@ -1462,24 +1480,30 @@ pub(crate) fn fsdprc(
 /// simply `powprf` without it. Transmit whatever `prf`/`append` have queued
 /// since the last flush, then clear the buffer the way [`crate::shims::text::clrprf`]
 /// (`clrprf()`) already does.
-fn outprf(machine: &mut Machine, host: &mut Host<Wg16>, chan: Chan) -> Result<(), ShimError> {
+fn outprf<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> Result<(), ShimError> {
     let start = host
         .globals()
-        .pointer(machine, "prfbuf")
+        .pointer_mem(A::mem_ref(machine), "prfbuf")
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let text = machine.read_cstr(start)?.to_vec();
+    let text = start
+        .read_cstr(A::mem_ref(machine))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
     host.gsbl_mut().transmit(chan, &text);
-    crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
+    crate::shims::text::clrprf_mem(A::mem(machine), host)?;
     Ok(())
 }
 
 /// `usaptr->scnwid`, read directly out of the account record rather than
 /// cached anywhere -- the same reason [`Host::current_channel`] reads
 /// `usrnum` fresh on every call instead of remembering it.
-fn account_scnwid(machine: &Machine, host: &Host<Wg16>, chan: Chan) -> Result<u16, ShimError> {
+fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Result<u16, ShimError> {
     let account = host.users.account(chan);
-    let at = offset::<Wg16>(account, crate::users::usracc::SCNWID)?;
-    Ok(u16::from(machine.resolve(at, 1)?[0]))
+    let at = offset::<A>(account, crate::users::usracc::SCNWID)?;
+    let byte = at
+        .resolve(A::mem_ref(machine), 1)
+        .map_err(|e| ShimError::Failed(e.to_string()))?[0];
+    Ok(u16::from(byte))
 }
 
 /// `void goback(void)` -- end the entry session and hand the channel back.
@@ -1590,19 +1614,19 @@ fn account_scnwid(machine: &Machine, host: &Host<Wg16>, chan: Chan) -> Result<u1
 /// If the channel has no session to close, or `whndun` stops the machine
 /// anywhere in the call tree `Host::run` services -- see `fsdprc`'s own
 /// doc comment on why the machine is already correctly poisoned by then.
-pub(crate) fn goback(
-    machine: &mut Machine,
-    host: &mut Host<Wg16>,
-    module: &Module,
+pub(crate) fn goback<A: Abi>(
+    machine: &mut A::Cpu,
+    host: &mut Host<A>,
+    module: &A::Module,
     chan: Chan,
-) -> Result<Ret, ShimError> {
+) -> Result<abi::Ret<A>, ShimError> {
     let session = host.fsd_sessions[chan.index()].take().ok_or_else(|| {
         ShimError::Failed(format!("goback: channel {chan} has no session to close"))
     })?;
 
     let scnwid = account_scnwid(machine, host, chan)?;
     fsdcof(host, chan, scnwid);
-    crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
+    crate::shims::text::clrprf_mem(A::mem(machine), host)?;
 
     // `if (fsdusr->flags&FBFULL) { prf("\x1B[%d;1f",min(ANSILN,fsdscb->maxy+1)); }`
     // -- FSDBBS.C:227-229. See this function's own doc comment, "The FBFULL
@@ -1626,13 +1650,13 @@ pub(crate) fn goback(
         // hide it anyway, but the addition itself must not panic or silently
         // wrap first).
         let row = u16::from(form.max_y).saturating_add(1).min(fsd::ANSILN);
-        crate::shims::text::append(machine, host, format!("\x1b[{row};1f").as_bytes())?;
+        crate::shims::text::append_mem(A::mem(machine), host, format!("\x1b[{row};1f").as_bytes())?;
     }
 
     // `prf("\x1B[0;1;32m"); outprf(usrnum);` -- FSDBBS.C:231-232. See this
     // function's own doc comment on why the colour reset is ported
     // unconditionally.
-    crate::shims::text::append(machine, host, b"\x1b[0;1;32m")?;
+    crate::shims::text::append_mem(A::mem(machine), host, b"\x1b[0;1;32m")?;
     outprf(machine, host, chan)?;
     // `prf("");` -- FSDBBS.C:233. No text of its own; its only effect is
     // making sure `prfptr` is back at `prfbuf`'s own start before whatever
@@ -1640,7 +1664,7 @@ pub(crate) fn goback(
     // does (it moves `prfptr` by zero bytes, from wherever `clrprf` above
     // already put it -- a genuine no-op, kept because the original has one
     // and a caller diffing this against the C should find nothing missing).
-    crate::shims::text::append(machine, host, b"")?;
+    crate::shims::text::append_mem(A::mem(machine), host, b"")?;
 
     match session.whndun {
         Some(whndun) => {
@@ -1649,7 +1673,7 @@ pub(crate) fn goback(
                     machine,
                     module,
                     whndun,
-                    &[crate::abi::Arg::Int(u16::from(session.save))],
+                    &[crate::abi::Arg::Int(A::Int::from(u16::from(session.save)))],
                     Some(chan),
                 )
                 .map_err(|e| ShimError::Failed(format!("goback: whndun call failed: {e}")))?;
@@ -1671,7 +1695,7 @@ pub(crate) fn goback(
     }
 
     outprf(machine, host, chan)?;
-    Ok(Ret::Void)
+    Ok(abi::Ret::Void)
 }
 
 /// The FSD's own `CYCLE` dispatch -- `fsdsts()`'s `ENTERING` case
@@ -1737,10 +1761,10 @@ pub(crate) fn goback(
 /// condition to paper over -- or if anything [`fsd::fsdinc`]/[`fsdprc`]
 /// themselves need turns out missing (the same errors `fsdprc` and its
 /// neighbours already raise).
-pub(crate) fn fsd_cycle(
-    machine: &mut Machine,
-    host: &mut Host<Wg16>,
-    module: &Module,
+pub(crate) fn fsd_cycle<A: Abi>(
+    machine: &mut A::Cpu,
+    host: &mut Host<A>,
+    module: &A::Module,
     chan: Chan,
 ) -> Result<(), ShimError> {
     let at = host.fsdscb[chan.index()].ok_or_else(|| {
@@ -1762,7 +1786,7 @@ pub(crate) fn fsd_cycle(
     // body.
     let status = host
         .globals()
-        .word(machine, "status")
+        .word_mem(A::mem_ref(machine), "status")
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     if status == crate::gsbl::Gsbl::OUTMT as u16 {
         return fsd_drain_edge(machine, host, at, chan);
@@ -1790,7 +1814,7 @@ pub(crate) fn fsd_cycle(
         }
         let key = if key < 256 { key & EURMSK } else { key };
 
-        let mut block = read_block(machine, at)?;
+        let mut block = read_block::<A>(machine, at)?;
         let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
             return Err(ShimError::Failed(format!(
                 "fsd_cycle: channel {chan} recorded no template -- fsdego's own invariant has \
@@ -1804,7 +1828,11 @@ pub(crate) fn fsd_cycle(
             )));
         };
         let form = live_form(machine, &block, &form)?;
-        let spec = machine.read_cstr(block.fldspc())?.to_vec();
+        let spec = block
+            .fldspc()
+            .read_cstr(A::mem_ref(machine))
+            .map_err(|e| ShimError::Failed(e.to_string()))?
+            .to_vec();
         // `fsdinc`'s `FSDAPT` arm needs the installed answer string --
         // `hopfld`'s repaint and the Ctrl-F/DEL per-field-width guards read
         // a field's *stored* answer, not the in-session `ansbuf` -- the same
@@ -1812,7 +1840,8 @@ pub(crate) fn fsd_cycle(
         let answers = read_answers(machine, &block)?;
 
         pending.extend(fsd::fsdinc(&form, &spec, &answers, &mut block, key));
-        machine.write(at, block.as_bytes())?;
+        at.write(A::mem(machine), block.as_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
 
         if block.state() == fsd::state::FSDBUF {
             if !pending.is_empty() {
@@ -1823,8 +1852,8 @@ pub(crate) fn fsd_cycle(
             // `clrprf(); prf("");` -- FSDBBS.C:279-280, immediately before
             // fsdprc(), so its own composed output starts from an empty
             // print buffer regardless of anything already flushed above.
-            crate::shims::text::clrprf_mem(machine.mem_mut(), host)?;
-            crate::shims::text::append(machine, host, b"")?;
+            crate::shims::text::clrprf_mem(A::mem(machine), host)?;
+            crate::shims::text::append_mem(A::mem(machine), host, b"")?;
 
             fsdprc(machine, host, module, chan)?;
 
@@ -1921,10 +1950,10 @@ pub(crate) fn fsd_cycle(
 /// inconsistency [`fsd_cycle`]'s own errors already guard against, reached
 /// here instead because `fsd_cycle` checks `Host::fsdscb`/`fsd_sessions`
 /// before ever reading `status`.
-fn fsd_drain_edge(
-    machine: &mut Machine,
-    host: &mut Host<Wg16>,
-    at: FarPtr,
+fn fsd_drain_edge<A: Abi>(
+    machine: &mut A::Cpu,
+    host: &mut Host<A>,
+    at: A::Ptr,
     chan: Chan,
 ) -> Result<(), ShimError> {
     // `btulok(usrnum,0)` -- FSDBBS.C:266. See this function's own doc
@@ -1936,7 +1965,7 @@ fn fsd_drain_edge(
     if !host.gsbl_mut().channel_mut(chan).oes {
         return Ok(());
     }
-    let block = read_block(machine, at)?;
+    let block = read_block::<A>(machine, at)?;
     let Some((_, msgno, amode)) = host.fsdtmp[chan.index()] else {
         return Err(ShimError::Failed(format!(
             "fsd_drain_edge: channel {chan} recorded no template -- fsdego's own invariant has \
@@ -1954,7 +1983,8 @@ fn fsd_drain_edge(
 
     let mut block = block;
     let out = fsd::fsdqoe(&form, &answers, &mut block);
-    machine.write(at, block.as_bytes())?;
+    at.write(A::mem(machine), block.as_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     if !out.is_empty() {
         host.gsbl_mut().transmit(chan, &out);
@@ -1966,8 +1996,9 @@ fn fsd_drain_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
-    use mbbs_machine::m16::FarPtr;
+    use mbbs_machine::m16::{FarPtr, Module, Ret};
 
     /// Point `usrnum` at the fixture's own console.
     ///
@@ -2769,7 +2800,7 @@ mod tests {
             .expect("placed");
         assert_ne!(at, FarPtr::NULL);
 
-        let block = read_block(&f.machine, at).expect("readable");
+        let block = read_block::<Wg16>(&f.machine, at).expect("readable");
         assert_eq!(block.numfld(), 2);
         assert_eq!(
             block.fldspc(),
@@ -3638,7 +3669,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcof turned raw off");
@@ -3679,7 +3710,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         let recorded = f.machine.resolve(marker, 2).expect("in range");
@@ -3704,7 +3735,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         assert_eq!(
@@ -3743,7 +3774,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
@@ -3778,7 +3809,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
@@ -3806,7 +3837,7 @@ mod tests {
 
         assert!(matches!(
             goback(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         let sent = String::from_utf8_lossy(&f.host.gsbl_mut().drain_output(chan)).into_owned();
@@ -3910,7 +3941,7 @@ mod tests {
 
         assert!(matches!(
             crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan),
-            Ok(Ret::Void)
+            Ok(abi::Ret::Void)
         ));
 
         assert!(

@@ -72,6 +72,12 @@ impl Abi for Wg16 {
         cpu.mem_mut()
     }
 
+    /// `Machine::mem`, `mem_mut`'s shared-borrow sibling. See
+    /// [`Abi::mem_ref`]'s own doc comment.
+    fn mem_ref(cpu: &Self::Cpu) -> &Self::Mem {
+        cpu.mem()
+    }
+
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
         mbbs_machine::m16::FarPtr {
             offset: 0,
@@ -175,23 +181,6 @@ impl Abi for Wg16 {
     /// "seg NN:offset" shape this answers in.
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
         crate::caller(cpu, module)
-    }
-
-    /// The one native registration this host has ever had: `FSDBBS.C`'s
-    /// full-screen data entry engine. Delegates straight to
-    /// `Host::fsd_dispatch`, which stays `Wg16`-only -- see
-    /// [`Abi::native_dispatch`]'s own doc comment for why.
-    fn native_dispatch(
-        host: &mut crate::Host<Wg16>,
-        cpu: &mut Self::Cpu,
-        module: &Self::Module,
-        chan: crate::Chan,
-        native: crate::shims::system::Native,
-        n: usize,
-    ) -> Result<Option<Self::Ptr>, crate::ShimError> {
-        match native {
-            crate::shims::system::Native::Fsd => host.fsd_dispatch(cpu, module, chan, n),
-        }
     }
 }
 
