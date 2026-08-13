@@ -49,9 +49,11 @@ use crate::abi::{Abi, ModuleMem};
 /// met so far.
 const SEGMENT: usize = 64 * 1024;
 
-/// `A` defaults to [`Wg16`] so every existing caller -- all of which predate
-/// this generic parameter -- keeps naming this type as plain `Arena`. See the
-/// module doc comment ("Generic over the ABI, concrete at every call site").
+/// `A` carries no default. It was `= Wg16`, which let callers -- all of which
+/// predate this generic parameter -- keep naming the type as plain `Arena`;
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md` struck it,
+/// so each spells its ABI. See the module doc comment ("Generic over the ABI,
+/// concrete at every call site").
 pub(crate) struct Arena<A: Abi> {
     /// Each region and how much of it is spoken for.
     segments: Vec<(A::Ptr, usize)>,

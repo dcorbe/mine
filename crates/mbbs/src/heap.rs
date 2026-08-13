@@ -46,8 +46,10 @@
 //! that: LDT tile chaining is `Wg16`-only forever (its 32-bit counterpart is
 //! `alcblok`/`ptrblok`, an unrelated mechanism, out of scope here).
 //!
-//! `A` defaults to [`Wg16`](crate::abi::Wg16), so every existing caller keeps
-//! naming this type as plain `Heap`.
+//! `A` carries no default. It was `= Wg16`, which let every caller name this
+//! type as plain `Heap`; Task 3 of
+//! `docs/plans/2026-08-12-abi-border-implementation.md` struck that default
+//! along with every other in this crate, so each caller spells its ABI.
 
 use std::collections::HashMap;
 
@@ -115,9 +117,8 @@ struct Block {
 
 /// The module's heap and its tiled regions.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
-/// as plain `Heap` -- see this module's doc comment ("Generic core, 16-bit-only
-/// skin").
+/// `A` carries no default; every caller spells its ABI -- see this module's
+/// doc comment ("Generic core, 16-bit-only skin").
 pub struct Heap<A: Abi> {
     config: Config,
     regions: Vec<Arena<A>>,

@@ -336,9 +336,11 @@ impl std::fmt::Display for MissingGlobal {
 /// three separate statics and a module may hold an `ncdate` result across an
 /// `nctime` call.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type as
-/// plain `DateBuffers` -- see [`Host`]'s own doc comment for why that default
-/// is what keeps `crates/mbbs/src/shims/system.rs` compiling untouched. Not
+/// `A` carries no default. It was `= Wg16` until Task 3 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md` struck every
+/// declaration-site default in this crate: a default reads as generic at the
+/// use site while pinning one ABI, and nothing warns. Every caller now spells
+/// its ABI -- see [`Host`]'s own doc comment. Not
 /// `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`: the derive macros bound `A:
 /// Trait` on the impl, which is wrong here -- `Wg16` itself implements none of
 /// these, only `A::Ptr` does (`Abi::Ptr: mbbs_ptr::ModulePtr + Copy + Eq +
@@ -449,10 +451,12 @@ pub struct Query {
 
 /// One MajorBBS host.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller -- every field access
-/// and method call in this file, every `&mut Host` in `crates/mbbs/src/shims/`,
-/// `crates/mbbs-server`, and every test -- keeps naming this type as plain
-/// `Host` and keeps compiling unchanged. See `docs/plans/2026-08-11-abi-
+/// `A` carries no default. It was `= Wg16`, which let every caller -- every
+/// field access and method call in this file, every `&mut Host` in
+/// `crates/mbbs/src/shims/`, `crates/mbbs-server`, and every test -- name this
+/// type as plain `Host` and keep compiling unchanged. Task 3 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md` removed it, so each of
+/// those now spells `Host<Wg16>`. See `docs/plans/2026-08-11-abi-
 /// abstraction-implementation.md`'s "Tasks 5 and 6 are in the wrong order,
 /// and `Host` is missing from both": `Host` owns [`Heap`], [`Globals`],
 /// [`TextVars`], [`msg::Messages`], [`stream::Streams`] and [`Users`], each
@@ -882,7 +886,8 @@ enum PollTarget {
 /// The two things about an FSD session no module can see. See
 /// [`Host::fsd_sessions`].
 ///
-/// `A` defaults to [`Wg16`] for the same reason [`DateBuffers`] does. Not
+/// `A` carries no default, for the same reason [`DateBuffers`] carries
+/// none. Not
 /// `#[derive(Debug, Clone, Default)]`: same trap, same fix -- see
 /// `DateBuffers`'s own doc comment. `Default` in particular would bound `A:
 /// Default`, which `Wg16` does not implement and does not need to: every

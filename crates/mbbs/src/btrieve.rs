@@ -553,9 +553,10 @@ pub enum Cursor {
 ///
 /// `block`/`data`/`key` are `A::Ptr` rather than `mbbs16::FarPtr` -- they are
 /// module-memory addresses the host handed a module, and the module's own
-/// ABI decides their shape. `A` defaults to [`Wg16`] so every existing caller
-/// keeps naming this type as plain `Block`, the same convention
-/// [`crate::heap::Heap`] and [`crate::msg::Messages`] already use. Every
+/// ABI decides their shape. `A` carries no default; every caller spells its
+/// ABI, the same convention [`crate::heap::Heap`] and
+/// [`crate::msg::Messages`] follow since Task 3 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`. Every
 /// method that never resolved a pointer against module memory -- `query`,
 /// `get`, `step`, `insert`, `update`, `delete`, `reindex`, and the getters
 /// below -- has no `A`-dependent behaviour and lives on `impl<A: Abi>
@@ -1525,13 +1526,19 @@ impl<A: Abi> Block<A> {
 ///
 /// `open: Vec<Block<A>>` and `stack: [A::Ptr; BBSTSZ]` -- every pointer this
 /// type keeps is a module address, and the module's own ABI decides its
-/// shape. `A` defaults to [`Wg16`], the same convention every other generic
-/// type in this crate uses, so every existing caller keeps naming this type
-/// as plain `Btrieve`. `crate::lib::Host<A>::btrieve` still names it without
-/// `<A>` (bare `btrieve::Btrieve`, i.e. `Btrieve<Wg16>` through that default)
-/// -- widening it to `Btrieve<A>` is the one remaining step, and it is in
-/// `crates/mbbs/src/lib.rs`, a file this task does not own; see this crate's
-/// own worklog for the exact edit.
+/// shape. `A` carries no default; every caller spells its ABI, the same
+/// convention every other generic type in this crate follows.
+///
+/// This paragraph used to say that `Host<A>::btrieve` "still names it without
+/// `<A>` ... widening it to `Btrieve<A>` is the one remaining step". Both
+/// halves are done and have been for a while: commit 42d212e made the field
+/// `btrieve::Btrieve<A>` -- the elision had been silently pinning the whole
+/// subsystem to one ABI, which is the bug that comment was describing as
+/// future work -- and Task 3 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md` removed the `= Wg16`
+/// default that made the elision compile. Left in place rather than deleted
+/// because a comment that outlived its fact by long enough to be quoted back
+/// as a live blocker is the failure this crate keeps paying for.
 pub struct Btrieve<A: Abi> {
     open: Vec<Block<A>>,
 

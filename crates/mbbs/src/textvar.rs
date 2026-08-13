@@ -105,8 +105,9 @@ impl<A: Abi> std::fmt::Debug for TextVar<A> {
 /// `push_mem`/`get_mem` -- naming the parameter that is actually new, the
 /// same convention `Globals::word_mem`/`Globals::write_mem` set.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
-/// as plain `TextVars`. Not `#[derive(Debug, Default)]`: the derive macros
+/// `A` carries no default; every caller spells its ABI. It was `= Wg16` until
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md`.
+/// Not `#[derive(Debug, Default)]`: the derive macros
 /// bound `A: Debug`/`A: Default` on the impl, which `Wg16` (a bare marker
 /// struct) does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for
 /// the same problem and fix.

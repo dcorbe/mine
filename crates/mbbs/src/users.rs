@@ -251,8 +251,8 @@ impl Connection {
 /// caller, `Host::load`, which is itself `Wg16`-only 16-bit loading
 /// machinery.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
-/// as plain `Users`.
+/// `A` carries no default; every caller spells its ABI. It was `= Wg16` until
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md`.
 pub struct Users<A: Abi> {
     /// How many channels there are: `nterms`, and the only thing that mints a
     /// [`Chan`] for these tables. The same value

@@ -363,8 +363,9 @@ impl<A: Abi> Stream<A> {
 /// is churn against every call site for no behaviour, so it stays. Read it as
 /// naming the parameter, not as implying a facade.
 ///
-/// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
-/// as plain `Streams`. Not `#[derive(Default)]`: the derive macro bounds
+/// `A` carries no default; every caller spells its ABI. It was `= Wg16` until
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md`.
+/// Not `#[derive(Default)]`: the derive macro bounds
 /// `A: Default` on the generated impl, which the bare marker struct `Wg16`
 /// does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same
 /// problem and fix.
