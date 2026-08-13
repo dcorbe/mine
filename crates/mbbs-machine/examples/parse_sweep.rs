@@ -17,7 +17,7 @@
 //! individually rather than dismissing as noise.
 //!
 //! ```text
-//! python3 build_the_list.py | cargo run -q -p mbbs32 --release --example parse_sweep
+//! python3 build_the_list.py | cargo run -q -p mbbs-machine --release --example parse_sweep
 //! ```
 
 use std::collections::BTreeMap;

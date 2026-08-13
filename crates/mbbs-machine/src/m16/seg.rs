@@ -1,7 +1,7 @@
 //! Segments: memory below 4 GiB, and the LDT descriptors that name it.
 //!
-//! Entry numbers themselves come from `mbbs-ldt`, not a bitmap private to
-//! this crate -- see that crate's module comment for why a second, from
+//! Entry numbers themselves come from [`crate::ldt`], not a bitmap private
+//! to this module -- see that module's own comment for why a second, from
 //! scratch allocator (which is what used to live here) is not merely
 //! duplication but a real bug the moment another ABI shares the process.
 
@@ -33,7 +33,7 @@ const F_SEG_NOT_PRESENT: u32 = 1 << 5;
 const F_USEABLE: u32 = 1 << 6;
 
 /// Reserve `count` adjacent entries and return the first. Delegates to
-/// `mbbs-ldt`'s process-wide free list -- see this file's module comment.
+/// [`crate::ldt`]'s process-wide free list -- see this file's module comment.
 fn take_ldt_run(count: u32) -> io::Result<u32> {
     crate::ldt::take_run(count)
 }

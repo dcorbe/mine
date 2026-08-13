@@ -11,7 +11,7 @@
 //! Installing `mbbs16`'s old handler instead broke the same thing in
 //! reverse.
 //!
-//! `crates/mbbs-fault` is the fix this crate now registers with instead of
+//! [`crate::fault`] is the fix this module now registers with instead of
 //! installing its own handler: every ABI gets a *positive* claim over the
 //! faulting `CS` -- [`is_user32_cs`] here -- rather than deciding by ruling
 //! the host out, and the shared handler tries each ABI's claim in turn.
@@ -39,7 +39,7 @@
 //! <https://github.com/dcorbe/x86-compat16> and inherited here unchanged --
 //! see `crates/mbbs-machine/src/m16/fault.rs`'s module comment for the fuller account,
 //! including why the stack's *address* (as opposed to `SA_ONSTACK` itself)
-//! turned out not to matter. `crates/mbbs-fault` owns the one alternate
+//! turned out not to matter. [`crate::fault`] owns the one alternate
 //! stack this thread gets; both ABIs share it.
 //!
 //! # The FS_BASE hazard, and why this file does not need to fix it
@@ -50,8 +50,8 @@
 //! TIB address at the instant a fault is taken, not the host's. [`recover`]
 //! touches no `thread_local`, does no allocation, and calls no library
 //! function at all -- not even `libc::sigaction`, unlike the standalone
-//! handler this crate used to install, because giving up a claimed fault
-//! back to `SIG_DFL` is now `crates/mbbs-fault`'s job, reached only once
+//! handler this module used to install, because giving up a claimed fault
+//! back to `SIG_DFL` is now [`crate::fault`]'s job, reached only once
 //! nobody's claim matched, which never happens while `FS_BASE` is wrong --
 //! so nothing here depends on `FS_BASE` being correct while it runs.
 //!
@@ -139,7 +139,7 @@ const KEEP_EVERYTHING_BUT_CS: u64 = 0xffff_ffff_ffff_0000;
 ///
 /// Async-signal-safe: it edits the interrupted context in place and returns.
 /// No allocation, no locks, and -- on this path, always, now that giving a
-/// fault back up to `SIG_DFL` belongs to `crates/mbbs-fault` -- no library
+/// fault back up to `SIG_DFL` belongs to [`crate::fault`] -- no library
 /// call either; see the module doc comment's "FS_BASE hazard" section for
 /// why that specifically matters here.
 ///

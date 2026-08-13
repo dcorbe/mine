@@ -24,8 +24,8 @@
 //! silently take the first ABI's handler away, and worse: `mbbs32`'s old
 //! handler decided a fault was "ours" by checking `CS != host_cs`, which is
 //! true for a 16-bit fault too, so it would have read `R14` as the wrong
-//! `Ctx` type and corrupted the process. See `crates/mbbs-fault` for the
-//! shared arbiter this crate now registers with instead of installing its
+//! `Ctx` type and corrupted the process. See [`crate::fault`] for the
+//! shared arbiter this module now registers with instead of installing its
 //! own handler: it claims a fault only when [`is_ldt_selector`] answers yes,
 //! never by ruling out the host.
 //!
@@ -42,9 +42,9 @@
 //! nothing, and compat16 now carries a three-arm test that settles it --
 //! killed with no alternate stack, fine with one at any address.
 //!
-//! So the rule is `SA_ONSTACK`, not the address. `mbbs_fault`'s shared
+//! So the rule is `SA_ONSTACK`, not the address. [`crate::fault`]'s shared
 //! `install_altstack` keeps `MAP_32BIT` anyway, for the same reason this
-//! crate always did: it costs nothing and rules out a whole class of
+//! module always did: it costs nothing and rules out a whole class of
 //! surprise for free.
 //!
 //! # Synchronous and asynchronous are not the same signal

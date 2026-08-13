@@ -1,6 +1,6 @@
 //! Running 32-bit Worldgroup modules on x86-64 Linux, natively.
 //!
-//! The 32-bit sibling of [`mbbs16`](../mbbs16/index.html). Same idea -- a module
+//! The 32-bit sibling of [`crate::m16`]. Same idea -- a module
 //! is a coroutine that runs until it wants something from the host -- against a
 //! different container (PE32 rather than NE) and a different ABI (flat 32-bit
 //! cdecl rather than Borland's 16-bit huge model).

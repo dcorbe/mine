@@ -28,7 +28,7 @@
 //! descriptor per [`Tib`] is the entire LDT footprint this module has -- against
 //! 3,576 for a single 16-bit MajorMUD instance in `crate::m16`.
 //!
-//! # The LDT entry number comes from `mbbs-ldt`, not a private allocator
+//! # The LDT entry number comes from [`crate::ldt`], not a private allocator
 //!
 //! This module needs neither `crate::m16::seg`'s tiling nor its 82-descriptors-
 //! per-load scale -- one [`Tib`] is one entry -- but the entry *number* still
@@ -77,7 +77,7 @@ const CONTENTS_SHIFT: u32 = 1;
 const F_SEG_NOT_PRESENT: u32 = 1 << 5;
 const F_USEABLE: u32 = 1 << 6;
 
-/// Reserve one free LDT entry, from `mbbs-ldt`'s process-wide free list --
+/// Reserve one free LDT entry, from [`crate::ldt`]'s process-wide free list --
 /// see this file's module comment.
 fn take_one() -> io::Result<u32> {
     crate::ldt::take_run(1)
