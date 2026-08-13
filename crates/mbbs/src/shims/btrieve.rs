@@ -97,54 +97,130 @@
 //! is not a lie, it is a documented limit, and reproducing it is what keeps a
 //! module that was working as designed working.
 //!
-//! # Task 5: `Call<Wg16>`, not `Call<A>`
+//! # Generic (`fn foo<A: Abi>(...)`), as of this task
 //!
-//! Every routine below now takes a [`Call<Wg16>`] rather than a raw
-//! `&mut Machine`, matching the shape the rest of the shim layer converted
-//! to. **It stops there rather than going on to `fn foo<A: Abi>(...)`.**
-//! `Host<A>::btrieve` is `crate::btrieve::Btrieve` -- concrete, not
-//! `Btrieve<A>` -- keyed throughout by `mbbs16::FarPtr` and, for `open`/
-//! `close`, taking a real `&mut mbbs16::Machine` directly
-//! (`crates/mbbs/src/btrieve.rs`'s own doc comment: "stays concrete: it is
-//! out of scope here"). A generic body would need to hand that engine an
-//! `A::Ptr` and an `&mut A::Cpu` for an arbitrary `A`, and there is no
-//! generic way to turn either into the `FarPtr`/`Machine` the engine
-//! actually wants -- `Wg32`'s pointer is a flat `u32`, not a segment:offset,
-//! and `Wg32Cpu` holds an `mbbs32::Machine`, not an `mbbs16::Machine`. So
-//! genuine `A`-genericity here is blocked on generifying the Btrieve engine
-//! itself, which is a separate, larger piece of work this task does not do.
-//!
-//! What this conversion buys anyway: arguments are read through
-//! [`Call::ptr`]/[`Call::int`]/[`Call::long`] instead of a word-indexed
-//! `arg_far`/`arg_u16`, and memory is reached through [`Call::mem`]
-//! (`mbbs16::Segments`, the same type `Machine`'s own facade delegates to)
-//! rather than a bare `&mut Machine` -- everywhere except the two calls that
-//! must reach the concrete engine (`opnbtv`'s `btrieve.open`, `clsbtv`'s
-//! `btrieve.close`), which take `call.cpu` -- `Call`'s public field, typed
-//! `&mut mbbs16::Machine` because `Wg16::Cpu = mbbs16::Machine` -- directly.
-//! Each routine keeps its C name for this Wg16-concrete core and gets a
+//! Every routine below takes [`Call<A>`]/[`Host<A>`] rather than a raw
+//! `&mut Machine`, and each keeps its C name for the generic core plus a
 //! `_wg16`-suffixed sibling built from `shims::call(machine)`, the same
-//! bridge convention every generic-shaped file already uses (see
-//! `shims::mod`'s `call` doc comment); the only difference is that here the
-//! core itself, not just the bridge, is pinned to one `Abi`.
+//! bridge convention every other generic-shaped file in this crate uses (see
+//! `shims::mod`'s `call` doc comment) -- kept, not deleted, because
+//! `crate::testing::Fixture::invoke` drives a real `mbbs16::Machine` and so
+//! can only ever run one ABI's routine, and every one of this file's own
+//! tests still calls a `_wg16` bridge by name.
 //!
-//! `crates/mbbs/tests/no_direct_farptr.rs`'s `ALLOWED` list keeps this file
-//! (and `crates/mbbs/src/btrieve.rs`) regardless of this conversion, for
-//! exactly the reason above: `FarPtr` is still this file's block identity,
-//! key value and record-pointer type throughout, because the engine behind
-//! it still is one.
+//! This file stopped one commit short of generic for exactly as long as
+//! [`Host<A>::btrieve`](crate::Host::btrieve) elided its own `A` --
+//! `crates/mbbs/src/lib.rs` declared the field bare `btrieve::Btrieve`
+//! rather than `btrieve::Btrieve<A>`, and a bare struct name in a *type*
+//! position takes its default (`Wg16`) unconditionally, independent of the
+//! `Host<A>` it sits inside. So `host.btrieve` was `Btrieve<Wg16>` inside
+//! *any* `Host<A>`, and `call.ptr()`'s `A::Ptr` had no way to reach it --
+//! not a limitation of the engine, which [`crate::btrieve::Btrieve`] and
+//! [`crate::btrieve::Block`] had already made properly generic over `A`.
+//! Once that one field grew its parameter, every routine below converted
+//! the same way the rest of this crate's shim layer already had:
+//!
+//! - Arguments are read through [`Call::ptr`]/[`Call::int`]/[`Call::long`]
+//!   instead of a word-indexed `arg_far`/`arg_u16`.
+//! - Memory is reached through [`Call::mem`] (`&mut A::Mem`) and pointers
+//!   resolve/write/read a C string through [`mbbs_ptr::ModulePtr`]'s own
+//!   methods (`ptr.resolve(mem, len)`, not `mem.resolve(ptr, len)` -- the
+//!   inherent `Segments` methods this file called directly before are
+//!   `Wg16`-only and do not exist on a generic `A::Mem`).
+//! - `opnbtv`'s `btrieve.open`/`clsbtv`'s `btrieve.close` take `call.mem()`
+//!   rather than the `call.cpu`/`&mut mbbs16::Machine` this file used to
+//!   reach them with -- `crate::btrieve::Btrieve::open`/`close` themselves
+//!   now take `mem: &mut A::Mem`, not a whole machine.
+//! - `Position`/`Request`, the two structs [`absolute`]/[`locate`] bundle
+//!   their many parameters into, both grew an `A: Abi` parameter of their
+//!   own -- every module-address field on either (`into`, `block`, `value`)
+//!   is `A::Ptr`.
+//! - Two width conversions, not one: [`i16_arg`] is the reinterpreting cast
+//!   `call.int() as i16` used to be, for every argument `BTVSTF.H` declares
+//!   plain `int` (`omdbtv`'s `mode`, `qrybtv`'s `keynum`/`qryopt`, `qnpbtv`'s
+//!   `getopt`, `obtbtvl`'s `keynum`/`obtopt`/`loktyp`, `stpbtvl`'s
+//!   `stpopt`/`loktyp`, `aabbtv`'s `keynum`, `gabbtvl`'s `keynum`/`loktyp`)
+//!   -- `A::Int` is not a primitive `rustc` will cast, so the cast now goes
+//!   through `u32` first (`Into<u32>`, then `as i16`), which is bit-for-bit
+//!   the same reinterpretation `u16 as i16` already was on every value
+//!   `Wg16` can produce. [`u16_arg`] is `opnbtv`'s `maxlen` alone: read with
+//!   no cast at all before this file went generic (`Call<Wg16>::int()`
+//!   already returned `u16`), and it becomes
+//!   [`crate::btrieve::Btrieve::open`]'s own `maxlen: u16` -- a Btrieve wire
+//!   width, not an ABI one -- so this refuses rather than truncates a value
+//!   that does not fit, instead of reinterpreting one that always does.
+//!
+//! `crates/mbbs/tests/no_direct_farptr.rs`'s `ALLOWED` list no longer names
+//! this file: every `FarPtr`/`Machine` mention left is inside
+//! `#[cfg(test)] mod tests` or a `_wg16` bridge, which that test's own
+//! scanner does not count.
 
-use mbbs16::FarPtr;
-// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]` `_wg16`
-// bridges -- production code reaches every routine here through `Call<Wg16>`/
-// `Host<Wg16>` instead, per this file's own module doc comment.
+// `FarPtr`/`Machine`/`Ret`/`Wg16` are now named only by this file's own
+// `#[cfg(test)] mod tests` and its `_wg16` bridges -- production code
+// reaches every routine here through the generic `Call<A>`/`Host<A>`
+// instead, per this file's own module doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use crate::abi::Wg16;
+#[cfg(test)]
+use mbbs16::{FarPtr, Machine, Ret};
+
+use mbbs_ptr::ModulePtr;
 
 use crate::Host;
-use crate::abi::{self, Call, Wg16};
+use crate::abi::{self, Abi, Call};
 use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
+
+/// Read the next argument as a 16-bit signed `int`, [`Abi`]-generic.
+///
+/// Every argument this file reads this way -- `omdbtv`'s `mode`, `qrybtv`'s
+/// `keynum`/`qryopt`, `qnpbtv`'s `getopt`, `obtbtvl`'s `keynum`/`obtopt`/
+/// `loktyp`, `stpbtvl`'s `stpopt`/`loktyp`, `aabbtv`'s `keynum`, `gabbtvl`'s
+/// `keynum`/`loktyp` -- is declared plain `int` in `BTVSTF.H`, never
+/// `unsigned`/`UINT`, so every one of these was already `as i16` before this
+/// file went generic; this is that same reinterpreting cast, done once.
+///
+/// `A::Int` is `u16` for `Wg16` and `u32` for `Wg32` -- [`Abi::Int`]'s own
+/// doc comment -- so a bare `as i16` stopped compiling the moment the read
+/// went generic (`A::Int` is an associated type, not a primitive `rustc`
+/// will cast). Going through `u32` first is not a width change: `Into<u32>`
+/// zero-extends `Wg16`'s `u16`, and `as i16` then truncates to the low 16
+/// bits and reinterprets them as signed -- bit-for-bit the same answer
+/// `u16 as i16` gave before, for every value `Wg16` can produce. `Wg32`'s
+/// `u32` truncates to the same low 16 bits before reinterpreting, which is
+/// the only generic reading of "the low 16 bits of this argument, signed"
+/// available without a wider `mode`/`keynum`/`loktyp` this wire protocol has
+/// never had, on any `Abi` this crate has met so far.
+fn i16_arg<A: Abi>(v: A::Int) -> i16 {
+    let wide: u32 = v.into();
+    wide as i16
+}
+
+/// Read the next argument as an unsigned 16-bit `int`, refusing rather than
+/// truncating if it does not fit.
+///
+/// `opnbtv`'s `maxlen` is the one argument this file reads this way:
+/// `BTVSTF.H` declares `BTVFILE *opnbtv(char *filnam, int maxlen)`, but
+/// `PLBTVSTF.C:150` (`bb->reclen=maxlen`) and every comparison against it
+/// treat it as unsigned throughout, and it flows straight into
+/// [`crate::btrieve::Btrieve::open`]'s own `maxlen: u16` -- a Btrieve wire
+/// width, not an ABI one: `RECLEN` is two bytes in a `struct btvblk`
+/// regardless of which `Abi` opened the file. Before this file went
+/// generic, `Call<Wg16>::int()` already returned `u16` and this argument was
+/// used with no cast at all -- so this is that same unsigned read, done
+/// generically. Unlike [`i16_arg`], a value that does not fit in 16 bits is
+/// refused rather than reinterpreted: silently truncating a module's own
+/// declared record length would size its record buffer wrong without
+/// telling anyone.
+///
+/// # Errors
+///
+/// If the widened value does not fit in a `u16`.
+fn u16_arg<A: Abi>(v: A::Int, who: &str) -> Result<u16, ShimError> {
+    let wide: u32 = v.into();
+    u16::try_from(wide)
+        .map_err(|_| ShimError::Failed(format!("{who}: {wide}, which does not fit in 16 bits")))
+}
 
 /// The five modes `BTVSTF.H:41-45` defines for `omdbtv`.
 ///
@@ -164,8 +240,8 @@ const MODES: [i16; 5] = [0, -1, -2, -3, -4];
 /// given and passed it to Btrieve as an open flag; here it would be a number
 /// kept and never used, which is the shape of a value that turns out to have
 /// meant something.
-pub fn omdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
-    let mode = call.int() as i16;
+pub fn omdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mode = i16_arg::<A>(call.int());
     if !MODES.contains(&mode) {
         return Err(ShimError::Failed(format!(
             "omdbtv({mode}), which is none of the five modes BTVSTF.H defines"
@@ -209,10 +285,10 @@ pub fn omdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// have fallen off the bottom before the module has finished opening them. The
 /// real host did that too, and a host that had refused on overflow instead
 /// would have stopped MajorMUD at its eleventh data file.
-pub fn opnbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn opnbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let filnam = call.ptr();
-    let maxlen = call.int();
-    let named = String::from_utf8_lossy(call.mem().read_cstr(filnam)?).into_owned();
+    let maxlen = u16_arg::<A>(call.int(), "opnbtv")?;
+    let named = String::from_utf8_lossy(filnam.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?).into_owned();
     let name = Host::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
 
     let path = host.btrieve_file(&name).map_err(ShimError::Failed)?;
@@ -296,9 +372,9 @@ pub fn opnbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// checks for it everywhere. A pointer that is neither null nor a file this
 /// host opened is refused: the real host would have handed it to Btrieve as a
 /// position block and read 128 bytes of whatever it was.
-pub fn setbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn setbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = call.ptr();
-    if block != Btrieve::<Wg16>::null() {
+    if block != Btrieve::<A>::null() {
         host.btrieve.block(block).map_err(ShimError::Failed)?;
     }
     push(call, host, block)?;
@@ -317,7 +393,7 @@ pub fn setbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// Underflow is not an error here, which is the one place this crate follows
 /// the original rather than refusing. See
 /// [`Btrieve::restore`](crate::btrieve::Btrieve::restore) for why.
-pub fn rstbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn rstbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let (restored, empty) = host.btrieve.restore();
     if empty {
         host.note(
@@ -361,7 +437,7 @@ pub fn rstbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// TSR holding a position**; it reads the file itself, so "which file" comes
 /// from `bb` and from nowhere else. With none current the question has no
 /// referent, and 0 would be a count of a file this host cannot name.
-pub fn cntrbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn cntrbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = positioned(call, host, "cntrbtv")?.ok_or_else(|| {
         ShimError::Failed(
             "cntrbtv with no Btrieve file current -- PLBTVSTF.C:681 would have \
@@ -402,7 +478,7 @@ pub fn cntrbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// a Btrieve file. That is a refusal, and it is the refusal the whole design
 /// exists for: a module told its insert worked and then finding the character
 /// gone is the failure nothing else catches.
-pub fn invbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn invbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = positioned(call, host, "invbtv")? else {
         note_no_file(host, "invbtv");
         return Ok(abi::Ret::Void);
@@ -434,7 +510,7 @@ pub fn invbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 ///
 /// Answers nothing with no file current, refuses with one, for exactly the
 /// reasons in [`invbtv`].
-pub fn delbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn delbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = positioned(call, host, "delbtv")? else {
         note_no_file(host, "delbtv");
         return Ok(abi::Ret::Void);
@@ -484,7 +560,7 @@ pub fn delbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// re-derives the same answer Btrieve's TSR would have: it has no TSR to ask,
 /// so it asks whether a record with this value is already in that key's
 /// order.
-pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn dinsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
     let block = positioned(call, host, "dinsbtv")?.ok_or_else(|| {
         ShimError::Failed(
@@ -497,16 +573,19 @@ pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<Wg16>::null() {
+    let recptr = match recptr == Btrieve::<A>::null() {
         true => file.data(),
         false => recptr,
     };
-    let bytes = call.mem().resolve(recptr, usize::from(length))?.to_vec();
+    let bytes = recptr
+        .resolve(call.mem(), usize::from(length))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, None)? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
         note_duplicate_key(host, "dinsbtv", &name, key, &value);
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -529,7 +608,7 @@ pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     };
     file.seek_to(cursor);
 
-    Ok(abi::Ret::Int(1))
+    Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
 /// The dispatch-table entry for [`dinsbtv`]. See `shims::call`'s own doc
@@ -604,7 +683,7 @@ pub fn dinsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// search result wearing the clothes of a fact. The corrected shape: name
 /// the tool and what it found (or didn't), rather than asserting the thing
 /// itself.
-pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
     let block = positioned(call, host, "dupdbtv")?.ok_or_else(|| {
         ShimError::Failed(
@@ -628,16 +707,19 @@ pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
         })?
         .position;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<Wg16>::null() {
+    let recptr = match recptr == Btrieve::<A>::null() {
         true => file.data(),
         false => recptr,
     };
-    let bytes = call.mem().resolve(recptr, usize::from(length))?.to_vec();
+    let bytes = recptr
+        .resolve(call.mem(), usize::from(length))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
 
     if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
         let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
         note_duplicate_key(host, "dupdbtv", &name, key, &value);
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
 
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
@@ -671,7 +753,7 @@ pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
         file.seek_to(cursor);
     }
 
-    Ok(abi::Ret::Int(1))
+    Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
 /// The dispatch-table entry for [`dupdbtv`]. See `shims::call`'s own doc
@@ -751,7 +833,7 @@ pub fn dupdbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// all four came off the module's heap in [`opnbtv`], and all four go back
 /// here rather than leaking a tiled descriptor per close, which would fail a
 /// long-running board rather than this one.
-pub fn clsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn clsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let bbp = call.ptr();
 
     // Unconditional, and before anything below decides whether there is a
@@ -789,9 +871,9 @@ pub fn clsbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 ///
 /// The caller is the one who notes it -- see [`note_duplicate_key`] -- because
 /// only the caller knows whether this is an insert or an update.
-fn duplicate_key(
-    host: &mut Host,
-    block: FarPtr,
+fn duplicate_key<A: Abi>(
+    host: &mut Host<A>,
+    block: A::Ptr,
     bytes: &[u8],
     exclude: Option<u32>,
 ) -> Result<Option<(u16, Vec<u8>)>, ShimError> {
@@ -832,7 +914,7 @@ fn duplicate_key(
 /// is printed as raw bytes, the same `{:02x?}` this crate already uses for a
 /// file-control-record mismatch in [`crate::btrieve::Btrieve::open`], because
 /// a key can be text, a number, or several segments of both.
-fn note_duplicate_key(host: &mut Host, who: &str, name: &str, key: u16, value: &[u8]) {
+fn note_duplicate_key<A: Abi>(host: &mut Host<A>, who: &str, name: &str, key: u16, value: &[u8]) {
     host.note(format!(
         "{who} on {name} refused a record: key {key} already holds {value:02x?}, \
          and that key does not permit duplicates -- this call answers 0 rather \
@@ -917,17 +999,17 @@ impl Op {
 /// **With no file current it is the same zero**, per the guard at
 /// `PLBTVSTF.C:262`. That indistinguishability is the point: a module could
 /// never tell "no such record" from "no such file" and none was written to.
-pub fn qrybtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn qrybtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // The guard is the first thing `PLBTVSTF.C:262` does -- before the key, the
     // key number or the option are looked at -- so it is the first thing here.
     let Some(block) = positioned(call, host, "qrybtv")? else {
         note_no_file(host, "qrybtv");
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     };
 
     let value = call.ptr();
-    let keynum = call.int() as i16;
-    let opt = call.int() as i16;
+    let keynum = i16_arg::<A>(call.int());
+    let opt = i16_arg::<A>(call.int());
 
     // `qrybtv` takes the *get key* codes, fifty above the acquire family's.
     let op = Op::of(opt - 50).ok_or_else(|| {
@@ -935,7 +1017,7 @@ pub fn qrybtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
             "qrybtv with option {opt}, which is none of the nine BTVSTF.H's q-macros produce"
         ))
     })?;
-    Ok(abi::Ret::Int(u16::from(locate(
+    Ok(abi::Ret::Int(A::Int::from(u16::from(locate(
         call,
         host,
         Request {
@@ -950,7 +1032,7 @@ pub fn qrybtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
             // nothing to lock. See `ops.rs`'s "Locking" doc section.
             lock: 0,
         },
-    )?)))
+    )?))))
 }
 
 /// The dispatch-table entry for [`qrybtv`]. See `shims::call`'s own doc
@@ -969,15 +1051,15 @@ pub fn qrybtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 ///
 /// The pattern the two make together is what MajorMUD uses them for: `qeqbtv`
 /// to find where a group of records starts, then `qnxbtv` along it.
-pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn qnpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `PLBTVSTF.C:287`, and it has to be before `bb->data` is read for the same
     // reason the C puts it there: there is no `bb->data` to read.
     let Some(block) = positioned(call, host, "qnpbtv")? else {
         note_no_file(host, "qnpbtv");
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     };
 
-    let opt = call.int() as i16;
+    let opt = i16_arg::<A>(call.int());
     let op = Op::of(opt - 50).ok_or_else(|| {
         ShimError::Failed(format!("qnpbtv with option {opt}, which is not a get operation"))
     })?;
@@ -985,7 +1067,7 @@ pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
     // `bb->lastkn`: which key the last positioning used. Passed as -1 so that
     // `locate` reads it back rather than changing it, exactly as the C does.
     let into = data_buffer(host, block)?;
-    Ok(abi::Ret::Int(u16::from(locate(
+    Ok(abi::Ret::Int(A::Int::from(u16::from(locate(
         call,
         host,
         Request {
@@ -993,12 +1075,12 @@ pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
             block,
             op,
             keynum: -1,
-            value: Btrieve::<Wg16>::null(),
+            value: Btrieve::<A>::null(),
             into: Some(into),
             // `int qnpbtv(int getopt)` -- one argument, no `loktyp`.
             lock: 0,
         },
-    )?)))
+    )?))))
 }
 
 /// The dispatch-table entry for [`qnpbtv`]. See `shims::call`'s own doc
@@ -1031,31 +1113,31 @@ pub fn qnpbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// the one initialisation actually reaches. Call 128 of `_INIT__WCCMMUD` is an
 /// `obtbtvl` after a `setbtv(NULL)`, and it is entitled to be told there is no
 /// record rather than stopped.
-pub fn obtbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn obtbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `:357` guards, and only then does `:360` default `recptr` to `bb->data`.
     // The order is the whole of it: `bb->data` cannot be read from a null `bb`,
     // so a guard placed after that default never runs.
     let Some(block) = positioned(call, host, "obtbtvl")? else {
         note_no_file(host, "obtbtvl");
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     };
 
     let into = call.ptr();
     let value = call.ptr();
-    let keynum = call.int() as i16;
-    let opt = call.int() as i16;
-    let lock = call.int() as i16;
+    let keynum = i16_arg::<A>(call.int());
+    let opt = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
 
     let op = Op::of(opt).ok_or_else(|| {
         ShimError::Failed(format!(
             "obtbtvl with option {opt}, which is none of the nine BTVSTF.H's a-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<Wg16>::null() {
+    let into = match into == Btrieve::<A>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
-    Ok(abi::Ret::Int(u16::from(locate(
+    Ok(abi::Ret::Int(A::Int::from(u16::from(locate(
         call,
         host,
         Request {
@@ -1067,7 +1149,7 @@ pub fn obtbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
             into: Some(into),
             lock,
         },
-    )?)))
+    )?))))
 }
 
 /// The dispatch-table entry for [`obtbtvl`]. See `shims::call`'s own doc
@@ -1096,7 +1178,7 @@ pub fn obtbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// Two dereferences before anything is checked. A real board that stepped with
 /// no file current took the fault there, so there is no answer to reproduce and
 /// refusing is the honest translation of what happened.
-pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn stpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // Before `recptr` is defaulted, so that the refusal names `stpbtvl` rather
     // than coming out of a `bb->data` lookup on a null block.
     let block = positioned(call, host, "stpbtvl")?.ok_or_else(|| {
@@ -1109,10 +1191,10 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     })?;
 
     let into = call.ptr();
-    let opt = call.int() as i16;
-    let lock = call.int() as i16;
+    let opt = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
 
-    let into = match into == Btrieve::<Wg16>::null() {
+    let into = match into == Btrieve::<A>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1124,10 +1206,10 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     let at = match (opt, file.cursor()) {
         (33, _) => 0,
         (34, _) if count > 0 => count - 1,
-        (34, _) => return Ok(abi::Ret::Int(0)),
+        (34, _) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
         (24, Cursor::Physical { at }) => at + 1,
         (35, Cursor::Physical { at }) if at > 0 => at - 1,
-        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(0)),
+        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
         // Stepping from a keyed position. **Correction, found driving
         // character creation's real duplicate-name check against
         // `WCCMMUD.DLL` (Task 12):** an earlier version of this arm treated
@@ -1160,7 +1242,7 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
             match opt {
                 24 => physical + 1,
                 _ if physical > 0 => physical - 1,
-                _ => return Ok(abi::Ret::Int(0)),
+                _ => return Ok(abi::Ret::Int(A::Int::from(0u16))),
             }
         }
         (24 | 35, Cursor::Nowhere) => {
@@ -1178,12 +1260,12 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     };
 
     if at >= count {
-        return Ok(abi::Ret::Int(0));
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
     file.seek_to(Cursor::Physical { at });
     take_lock(host, block, lock)?;
     deliver(call, host, block, into)?;
-    Ok(abi::Ret::Int(1))
+    Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
 /// The dispatch-table entry for [`stpbtvl`]. See `shims::call`'s own doc
@@ -1209,7 +1291,7 @@ pub fn stpbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// `catastro`, so there was never a zero to reproduce there. Zero is also a
 /// real file offset in the sense that matters -- the module hands it straight
 /// back to `gabbtvl` -- and answering it would name the file control record.
-pub fn absbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn absbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = positioned(call, host, "absbtv")? else {
         note_no_file(host, "absbtv");
         return Ok(abi::Ret::Long(0));
@@ -1257,11 +1339,11 @@ pub fn absbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// `keynum`'s order from wherever the position landed.
 ///
 /// With no file current it answers 0, per the guard at `:476`.
-pub fn aabbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn aabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let into = call.ptr();
     let position = call.long();
-    let keynum = call.int() as i16;
-    Ok(abi::Ret::Int(u16::from(absolute(
+    let keynum = i16_arg::<A>(call.int());
+    Ok(abi::Ret::Int(A::Int::from(u16::from(absolute(
         call,
         host,
         Position {
@@ -1272,7 +1354,7 @@ pub fn aabbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
             position,
             keynum,
         },
-    )?)))
+    )?))))
 }
 
 /// The dispatch-table entry for [`aabbtv`]. See `shims::call`'s own doc
@@ -1319,11 +1401,11 @@ const UNLOCKED: i16 = 0;
 /// no-file-current guard, exactly as before this file read its arguments
 /// through a cursor. See `absolute`'s own doc comment for why that guard,
 /// then lock, then everything else ordering is load-bearing and was kept.
-pub fn gabbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn gabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let into = call.ptr();
     let position = call.long();
-    let keynum = call.int() as i16;
-    let lock = call.int() as i16;
+    let keynum = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
     absolute(
         call,
         host,
@@ -1350,7 +1432,7 @@ pub fn gabbtvl_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimE
 /// rather than passed as six more parameters -- clippy already has an opinion
 /// about `absolute` at seven, and the file already has a precedent for this
 /// shape in [`Request`], below.
-struct Position {
+struct Position<A: Abi> {
     /// The routine asking, for anything it has to refuse or note by name.
     who: &'static str,
 
@@ -1364,7 +1446,7 @@ struct Position {
     lock: i16,
 
     /// Where the record goes, or the module's null for `bb->data`.
-    into: FarPtr,
+    into: A::Ptr,
 
     /// The file position to acquire -- Btrieve's Get Position number, what
     /// [`absbtv`] hands back.
@@ -1390,7 +1472,7 @@ struct Position {
 /// function to read the same bytes again off a cursor that has moved on.
 /// `aabbtv` now reads its own three the same way, so both callers share one
 /// shape instead of one reading through `absolute` and the other around it.
-fn absolute(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Position) -> Result<bool, ShimError> {
+fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Position<A>) -> Result<bool, ShimError> {
     let Position {
         who,
         fatal,
@@ -1410,7 +1492,7 @@ fn absolute(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Position) -> Resu
         return Ok(false);
     };
 
-    let into = match into == Btrieve::<Wg16>::null() {
+    let into = match into == Btrieve::<A>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1472,14 +1554,14 @@ fn absolute(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Position) -> Resu
 ///
 /// The query, acquire and key families differ in exactly these fields and in
 /// nothing else, which is what makes [`locate`] one routine.
-struct Request<'a> {
+struct Request<'a, A: Abi> {
     /// The routine asking, for anything it has to refuse by name.
     who: &'a str,
 
     /// The file. The caller's rather than read from `bb` here, because the
     /// caller has already had to decide what a null `bb` means to it -- see
     /// [`positioned`].
-    block: FarPtr,
+    block: A::Ptr,
 
     /// What to find.
     op: Op,
@@ -1488,10 +1570,10 @@ struct Request<'a> {
     keynum: i16,
 
     /// The module's key value, or null for an operation that needs none.
-    value: FarPtr,
+    value: A::Ptr,
 
     /// Where the record goes, or `None` for a query, which reads none.
-    into: Option<FarPtr>,
+    into: Option<A::Ptr>,
 
     /// The lock type to take once a record is found, or `0` for none --
     /// `0` for `qrybtv`/`qnpbtv`, which have no `loktyp` at either layer.
@@ -1501,7 +1583,7 @@ struct Request<'a> {
 /// Position the file a [`Request`] names, and hand back the record if asked.
 ///
 /// Returns whether a record was found.
-fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<bool, ShimError> {
+fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Request<'_, A>) -> Result<bool, ShimError> {
     let Request {
         who,
         block,
@@ -1518,7 +1600,7 @@ fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<
     // before anything else, and that is where it is read from afterwards. So a
     // module may pass the buffer it was given last time and mean "the same key
     // again", which only works if the copy really happens.
-    if value != Btrieve::<Wg16>::null() {
+    if value != Btrieve::<A>::null() {
         // **The original measured this copy with the key number as passed**,
         // before `:268` resolved a negative one to `bb->lastkn`:
         //
@@ -1547,13 +1629,18 @@ fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<
             );
         }
         let length = key_length(host, block, key)?;
-        let bytes = call.mem().resolve(value, usize::from(length))?.to_vec();
+        let bytes = value
+            .resolve(call.mem(), usize::from(length))
+            .map_err(|e| ShimError::Failed(e.to_string()))?
+            .to_vec();
         let buffer = host
             .btrieve
             .block(block)
             .map_err(ShimError::Failed)?
             .key();
-        call.mem().write(buffer, &bytes)?;
+        buffer
+        .write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
 
     let wanted = match op.wants_value() {
@@ -1565,7 +1652,10 @@ fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<
                 .block(block)
                 .map_err(ShimError::Failed)?
                 .key();
-            call.mem().resolve(buffer, usize::from(length))?.to_vec()
+            buffer
+                .resolve(call.mem(), usize::from(length))
+                .map_err(|e| ShimError::Failed(e.to_string()))?
+                .to_vec()
         }
     };
 
@@ -1693,10 +1783,10 @@ fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<
 ///
 /// Shared rather than written twice: the absolute-position family had it
 /// missing for exactly as long as this was inline in [`locate`].
-fn answer_with_key(
-    call: &mut Call<Wg16>,
-    host: &mut Host<Wg16>,
-    block: FarPtr,
+fn answer_with_key<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    block: A::Ptr,
     key: u16,
 ) -> Result<(), ShimError> {
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
@@ -1715,7 +1805,9 @@ fn answer_with_key(
         // record body it compares is right.
         .extract(&file.keyed(&record.bytes));
     let buffer = file.key();
-    call.mem().write(buffer, &bytes)?;
+    buffer
+        .write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
 }
 
@@ -1734,11 +1826,11 @@ fn answer_with_key(
 /// status 22 and `posbtverr` (`:746`) truncates with a NUL at `bb->reclen-1`
 /// before the copy runs, where this truncates silently. `opnbtv` already notes
 /// the mismatch that would make it live.
-fn deliver(
-    call: &mut Call<Wg16>,
-    host: &mut Host<Wg16>,
-    block: FarPtr,
-    into: FarPtr,
+fn deliver<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    block: A::Ptr,
+    into: A::Ptr,
 ) -> Result<(), ShimError> {
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let record = file
@@ -1746,7 +1838,8 @@ fn deliver(
         .ok_or_else(|| ShimError::Failed(format!("{} is not positioned", file.name())))?;
     let take = usize::from(file.maxlen()).min(record.bytes.len());
     let bytes = record.bytes[..take].to_vec();
-    call.mem().write(into, &bytes)?;
+    into.write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(())
 }
 
@@ -1755,18 +1848,15 @@ fn deliver(
 /// `PLBTVSTF.C:268`: a negative key number means "the one last used", and any
 /// other means "this one, and remember it". `lastkn` is a field of the block in
 /// module memory, so it is read and written there rather than kept here.
-fn key_number(
-    call: &mut Call<Wg16>,
-    host: &Host<Wg16>,
-    block: FarPtr,
+fn key_number<A: Abi>(
+    call: &mut Call<A>,
+    host: &Host<A>,
+    block: A::Ptr,
     keynum: i16,
 ) -> Result<u16, ShimError> {
-    let at = FarPtr {
-        offset: block.offset + LASTKN,
-        selector: block.selector,
-    };
+    let at = A::ptr_offset(block, LASTKN);
     if keynum < 0 {
-        let bytes = call.mem().resolve(at, 2)?;
+        let bytes = at.resolve(call.mem(), 2).map_err(|e| ShimError::Failed(e.to_string()))?;
         return Ok(u16::from_le_bytes([bytes[0], bytes[1]]));
     }
 
@@ -1778,7 +1868,8 @@ fn key_number(
             file.name()
         )));
     }
-    call.mem().write(at, &(keynum as u16).to_le_bytes())?;
+    at.write(call.mem(), &(keynum as u16).to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(keynum as u16)
 }
 
@@ -1786,7 +1877,7 @@ fn key_number(
 const LASTKN: u16 = 142;
 
 /// How many bytes of the module's buffer are a key value.
-fn key_length(host: &Host, block: FarPtr, key: u16) -> Result<u16, ShimError> {
+fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Result<u16, ShimError> {
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     file.keys()
         .get(usize::from(key))
@@ -1804,7 +1895,7 @@ fn key_length(host: &Host, block: FarPtr, key: u16) -> Result<u16, ShimError> {
 /// against the file's own index pages -- see
 /// [`Records::ties`](crate::btrieve::Records::ties) -- so it is counted and
 /// reported rather than left silent.
-fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
+fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     if file.loaded().is_some() {
         return Ok(());
@@ -1838,9 +1929,9 @@ fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
 ///
 /// A pointer that is neither null nor a file this host opened *is* a refusal,
 /// which is [`setbtv`]'s contract and unrelated to the null case.
-fn positioned(call: &mut Call<Wg16>, host: &Host<Wg16>, who: &str) -> Result<Option<FarPtr>, ShimError> {
+fn positioned<A: Abi>(call: &mut Call<A>, host: &Host<A>, who: &str) -> Result<Option<A::Ptr>, ShimError> {
     let block = current(call, host)?;
-    if block == Btrieve::<Wg16>::null() {
+    if block == Btrieve::<A>::null() {
         return Ok(None);
     }
     host.btrieve
@@ -1858,7 +1949,7 @@ fn positioned(call: &mut Call<Wg16>, host: &Host<Wg16>, who: &str) -> Result<Opt
 ///
 /// Once per routine. `obtbtvl` inside a loop would otherwise fill
 /// [`Host::notes`](crate::Host::notes) with thousands of identical lines.
-fn note_no_file(host: &mut Host, who: &str) {
+fn note_no_file<A: Abi>(host: &mut Host<A>, who: &str) {
     host.note_once(
         who,
         format!(
@@ -1870,7 +1961,7 @@ fn note_no_file(host: &mut Host, who: &str) {
 }
 
 /// Where `bb->data` points, for a file the caller has already established.
-fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
+fn data_buffer<A: Abi>(host: &Host<A>, block: A::Ptr) -> Result<A::Ptr, ShimError> {
     Ok(host
         .btrieve
         .block(block)
@@ -1923,12 +2014,12 @@ fn data_buffer(host: &Host, block: FarPtr) -> Result<FarPtr, ShimError> {
 /// discrimination by value, checked the hard way (mutate the shim to read
 /// the adjacent word, confirm the test fails) -- see each test's own doc
 /// comment.
-fn take_lock(host: &mut Host, block: FarPtr, lock: i16) -> Result<(), ShimError> {
+fn take_lock<A: Abi>(host: &mut Host<A>, block: A::Ptr, lock: i16) -> Result<(), ShimError> {
     host.btrieve.take_lock(block, lock).map_err(ShimError::Failed)
 }
 
 /// Push what is current and make `block` current, as `setbtv` does.
-fn push(call: &mut Call<Wg16>, host: &mut Host<Wg16>, block: FarPtr) -> Result<(), ShimError> {
+fn push<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     let previous = current(call, host)?;
     if let Some(dropped) = host.btrieve.set(previous) {
         host.note(format!(
@@ -1940,15 +2031,15 @@ fn push(call: &mut Call<Wg16>, host: &mut Host<Wg16>, block: FarPtr) -> Result<(
 }
 
 /// What `bb` holds, read back out of module memory every time.
-fn current(call: &mut Call<Wg16>, host: &Host<Wg16>) -> Result<FarPtr, ShimError> {
+fn current<A: Abi>(call: &mut Call<A>, host: &Host<A>) -> Result<A::Ptr, ShimError> {
     host.globals()
         .pointer_mem(call.mem(), "bb")
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
-fn set_current(call: &mut Call<Wg16>, host: &Host<Wg16>, block: FarPtr) -> Result<(), ShimError> {
+fn set_current<A: Abi>(call: &mut Call<A>, host: &Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     host.globals()
-        .write_mem(call.mem(), "bb", &block.to_bytes())
+        .write_mem(call.mem(), "bb", &A::ptr_to_bytes(block))
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 

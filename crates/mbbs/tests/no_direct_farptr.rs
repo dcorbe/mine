@@ -32,10 +32,13 @@
 //! `Wg16` facades (deleted -- every caller had already moved to the generic
 //! `_mem` core), `Users::new`, and the Btrieve engine going `Btrieve<A>`.
 //!
-//! Three of the eight that remain are permanent and are marked as such in
-//! `ALLOWED`: `abi.rs` (where the type is declared), `shims/memory.rs`
-//! (segment tiling, no flat-memory counterpart) and `testing.rs` (the
-//! fixture builder). So the live conversion backlog is **five files**.
+//! Three of those eight are permanent and are marked as such in `ALLOWED`:
+//! `abi.rs` (where the type is declared), `shims/memory.rs` (segment tiling,
+//! no flat-memory counterpart) and `testing.rs` (the fixture builder). A
+//! fourth left in the very next commit: the seventeen `btv*` shims went
+//! `fn foo<A: Abi>(...)` once `Host<A>::btrieve`'s own elided parameter (see
+//! `lib.rs`'s history) stopped pinning the engine behind them to `Wg16`. So
+//! the live conversion backlog is **four files**.
 //!
 //! # The one that is not like the others
 //!
@@ -87,11 +90,6 @@ const ALLOWED: &[&str] = &[
     // `fsdego`/`vfyadn`, each blocked on a dependency `shims::mod`'s
     // `ROUTINES` table documents beside its own entry.
     "shims/fsd.rs",
-    // The seventeen `btv*` shims. The ENGINE behind them is generic now
-    // (`Btrieve<A>`, which is why `btrieve.rs` and `btrieve/ops.rs` left this
-    // list), but the shims themselves are still `Call<Wg16>`. They are the
-    // last block that can move from `WG16_ROUTINES` into `routines<A>()`.
-    "shims/btrieve.rs",
     // The big one, and the real remaining boundary: `impl Host<Wg16>`'s
     // execution driver -- `run`, `poll`, `cycle`, `load`, `stop` and the rest
     // of the 26 methods that take a `&mut Machine`. These are NOT blocked on
