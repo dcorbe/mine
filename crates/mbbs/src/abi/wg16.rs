@@ -114,7 +114,9 @@ impl Abi for Wg16 {
                 }
             }
         }
-        Ok(convert_exit(cpu.call(entry, &words)?))
+        let exit = convert_exit(cpu.call(entry, &words)?);
+        debug_assert_attributable(&exit, cpu);
+        Ok(exit)
     }
 
     /// `Cleans::Caller` is `Machine::resume`; `Cleans::Callee(bytes)` is
@@ -124,11 +126,13 @@ impl Abi for Wg16 {
     /// [`Abi::native`]).
     fn resume(cpu: &mut Self::Cpu, ret: Ret<Self>, cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
         let ret16: mbbs_machine::m16::Ret = ret.into();
-        let exit = match cleans {
+        let raw = match cleans {
             crate::shims::Cleans::Caller => cpu.resume(ret16)?,
             crate::shims::Cleans::Callee(bytes) => cpu.resume_cleaning(ret16, bytes)?,
         };
-        Ok(convert_exit(exit))
+        let exit = convert_exit(raw);
+        debug_assert_attributable(&exit, cpu);
+        Ok(exit)
     }
 
     fn arg_frame(cpu: &Self::Cpu) -> &[u8] {
@@ -152,6 +156,27 @@ impl Abi for Wg16 {
 /// collapse to `Stopped` (see `Exit`'s own doc comment); the machine has
 /// already stored the poison behind [`Machine::poisoned`](mbbs_machine::m16::Machine::poisoned)
 /// either way.
+/// [`Exit::Stopped`] promises the caller can find out *why* by reading
+/// [`Abi::poisoned`] -- that is the whole justification for collapsing
+/// `Fault` and `Timeout` into one variant (design §2).
+///
+/// It holds today because `m16::Machine::terminate` sets `poisoned` before
+/// returning either terminal `Exit`. But that is a **machine-side
+/// convention, not a structural guarantee**: nothing in `Exit`'s type stops
+/// a future terminal variant from being added that skips the poisoning
+/// step, and if one were, `Stopped` would silently become unattributable
+/// and the collapse would start losing information. Prose in the design doc
+/// does not prevent that; this does, in debug builds and the whole test
+/// suite.
+fn debug_assert_attributable(exit: &Exit<Wg16>, cpu: &mbbs_machine::m16::Machine) {
+    debug_assert!(
+        !matches!(exit, Exit::Stopped) || cpu.poisoned().is_some(),
+        "Exit::Stopped with no poison stored: the machine has stopped and \
+         cannot say why, so Abi::poisoned cannot recover what the collapse \
+         of Fault/Timeout into Stopped discarded"
+    );
+}
+
 fn convert_exit(exit: mbbs_machine::m16::Exit) -> Exit<Wg16> {
     match exit {
         mbbs_machine::m16::Exit::Call { index } => Exit::Call { index },

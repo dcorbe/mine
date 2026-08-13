@@ -183,7 +183,9 @@ impl Abi for Wg32 {
                 Arg::Ptr(p) => p.0,
             })
             .collect();
-        Ok(convert_exit(cpu.machine.call(entry.0, &dwords)?))
+        let exit = convert_exit(cpu.machine.call(entry.0, &dwords)?);
+        debug_assert_attributable(&exit, &cpu.machine);
+        Ok(exit)
     }
 
     /// `Wg32` has no callee-cleaned routines -- 32-bit Worldgroup is
@@ -202,7 +204,9 @@ impl Abi for Wg32 {
             ),
             crate::shims::Cleans::Caller => {
                 let ret32: mbbs_machine::m32::Ret = ret.into();
-                Ok(convert_exit(cpu.machine.resume(ret32)?))
+                let exit = convert_exit(cpu.machine.resume(ret32)?);
+                debug_assert_attributable(&exit, &cpu.machine);
+                Ok(exit)
             }
         }
     }
@@ -257,6 +261,21 @@ impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
 /// [`mbbs_machine::m32::Exit`] converted to [`Exit<Wg32>`] -- the same
 /// `Fault` collapse `abi/wg16.rs`'s `convert_exit` documents; `Wg32` has no
 /// `Timeout` variant of its own yet (Task 16 adds the 32-bit watchdog).
+/// The 32-bit half of the check `abi/wg16.rs`'s namesake documents at
+/// length: [`Exit::Stopped`] is only honest if [`Abi::poisoned`] can still
+/// say why, and that rests on the machine poisoning itself before it hands
+/// back a terminal `Exit`. Here that is `m32::Machine::call`'s
+/// `get_or_insert` on the fault path. Convention, not construction -- so it
+/// is checked, not asserted in prose.
+fn debug_assert_attributable(exit: &Exit<Wg32>, machine: &mbbs_machine::m32::Machine) {
+    debug_assert!(
+        !matches!(exit, Exit::Stopped) || machine.poisoned().is_some(),
+        "Exit::Stopped with no poison stored: the machine has stopped and \
+         cannot say why, so Abi::poisoned cannot recover what the collapse \
+         of Fault into Stopped discarded"
+    );
+}
+
 fn convert_exit(exit: mbbs_machine::m32::Exit) -> Exit<Wg32> {
     match exit {
         mbbs_machine::m32::Exit::Call { index } => Exit::Call { index },
