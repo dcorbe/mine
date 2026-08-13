@@ -56,19 +56,30 @@
 //! machine, and identifies a connection process-wide as *(which `serve`
 //! call's `host_tx` it holds, `Chan`)*, not `Chan` alone: two machines can
 //! both have a channel zero, and only the first half of that pair says
-//! which one a given `Chan` means. Nothing in this crate builds that pairing
-//! into a first-class type yet -- today's `main.rs` only ever calls `serve`
-//! once -- because nothing yet needs to route one already-open connection
-//! between two machines; a connect-time selector choosing *which* machine's
-//! `serve` a fresh connection's first byte belongs to is design doc §4
-//! point 4's named next step (`docs/plans/2026-08-12-abi-border-implementation.md`
-//! Task 22).
+//! which one a given `Chan` means.
+//!
+//! **That pairing is [`Routed`], and it is built.**
+//! `crate::pool::MachineId` is the first half -- whoever calls `serve`
+//! assigns one per machine (`main.rs` today, one call, always the same id);
+//! `Pool::take` hands back the pair, never a bare `Chan`, and every message
+//! this task exchanges with the host thread (`In::Connect`'s reply,
+//! `In::Input`/`In::Disconnect`'s `chan` field) carries the pair too -- see
+//! `crate::msg`'s module doc. A connection's identity for its whole life,
+//! from [`handle`]'s `reply_rx.await` onward, is therefore already the
+//! process-wide key, not a value that only happens to be unique because
+//! nothing multiplexes it yet. What is *not* built, on purpose: a machine
+//! registry, or a connect-time selector choosing *which* machine's `serve` a
+//! fresh connection's first byte belongs to -- today's `main.rs` still only
+//! ever calls `serve` once, so every `Routed` this process ever mints shares
+//! one `MachineId`, and nothing here needs to look one up. That selector is
+//! design doc §4 point 4's named next step
+//! (`docs/plans/2026-08-12-abi-border-implementation.md` Task 22).
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc as std_mpsc;
 
-use mbbs::{Chan, Connection};
+use mbbs::Connection;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -78,6 +89,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::host::{self, Boot};
 use crate::iac::Filter;
 use crate::msg::{In, Out};
+use crate::pool::Routed;
 use crate::termcompat::Stack;
 
 const IAC: u8 = 255;
@@ -269,8 +281,10 @@ async fn handle(
         return Ok(());
     }
 
-    let chan = match reply_rx.await {
-        Ok(Some(chan)) => chan,
+    // This connection's process-wide identity for the rest of its life --
+    // see the module doc's "That pairing is `Routed`, and it is built."
+    let routed = match reply_rx.await {
+        Ok(Some(routed)) => routed,
         Ok(None) => {
             writer.write_all(b"All lines are busy.\r\n").await?;
             return Ok(());
@@ -289,11 +303,13 @@ async fn handle(
     // Bytes that arrived pipelined behind the user ID's terminator (the same
     // TCP segment carried more than one line) must not be dropped just
     // because they showed up before a channel existed to receive them.
-    if !leftover.is_empty() && host_tx.send(In::Input { chan, bytes: leftover }).is_err() {
+    if !leftover.is_empty()
+        && host_tx.send(In::Input { chan: routed, bytes: leftover }).is_err()
+    {
         return Ok(());
     }
 
-    pump(reader, writer, host_tx, chan, out_rx, stack).await
+    pump(reader, writer, host_tx, routed, out_rx, stack).await
 }
 
 /// The tiny line editor behind the user ID prompt.
@@ -423,7 +439,7 @@ async fn pump(
     mut reader: OwnedReadHalf,
     mut writer: OwnedWriteHalf,
     host_tx: std_mpsc::Sender<In>,
-    chan: Chan,
+    routed: Routed,
     mut out_rx: mpsc::Receiver<Out>,
     stack: fn() -> Stack,
 ) -> io::Result<()> {
@@ -444,7 +460,7 @@ async fn pump(
                         // promptly rather than waiting for a flush that may
                         // never come (a channel with nothing queued is never
                         // visited by `host::flush` at all).
-                        let _ = host_tx.send(In::Disconnect { chan });
+                        let _ = host_tx.send(In::Disconnect { chan: routed });
                         return Ok(());
                     }
                 }
@@ -459,7 +475,7 @@ async fn pump(
             },
             result = reader.read(&mut buf) => match result {
                 Ok(0) | Err(_) => {
-                    let _ = host_tx.send(In::Disconnect { chan });
+                    let _ = host_tx.send(In::Disconnect { chan: routed });
                     return Ok(());
                 }
                 Ok(n) => {
@@ -468,7 +484,9 @@ async fn pump(
                     // the module doc.
                     let bytes = filter.feed(&buf[..n]);
                     let bytes = termcompat.inbound(&bytes);
-                    if !bytes.is_empty() && host_tx.send(In::Input { chan, bytes }).is_err() {
+                    if !bytes.is_empty()
+                        && host_tx.send(In::Input { chan: routed, bytes }).is_err()
+                    {
                         // The host thread is gone. Nobody will ever read
                         // another `Input` or send another `Out` -- there is
                         // nothing left for this task to do.
@@ -503,6 +521,7 @@ mod tests {
 
         let root = mbbs::testing::scratch("mbbs-server-conn-dead-host");
         let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
+            machine: crate::pool::MachineId(0),
             build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             module: PathBuf::from("/nonexistent/NOPE.DLL"),
@@ -677,8 +696,9 @@ mod tests {
         let (host_tx, _host_rx) = std_mpsc::channel::<In>();
         let (out_tx, out_rx) = mpsc::channel::<Out>(4);
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+        let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
 
-        let pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
+        let pump_task = tokio::spawn(pump(reader, writer, host_tx, routed, out_rx, Stack::modern));
 
         let cp437_bytes: Vec<u8> = vec![0xC9, 0xCD, 0xCD, 0xBB, 0x82, 0xBA];
         out_tx
@@ -738,8 +758,9 @@ mod tests {
         let (host_tx, host_rx) = std_mpsc::channel::<In>();
         let (_out_tx, out_rx) = mpsc::channel::<Out>(4);
         let chan = mbbs::Terms::new(1).chan(0).expect("channel zero of one");
+        let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
 
-        let _pump_task = tokio::spawn(pump(reader, writer, host_tx, chan, out_rx, Stack::modern));
+        let _pump_task = tokio::spawn(pump(reader, writer, host_tx, routed, out_rx, Stack::modern));
 
         // U+00A0 (non-breaking space) as UTF-8, then a plain 'X'. Neither
         // byte is telnet's real IAC (255) -- the filter must let both
@@ -827,7 +848,8 @@ mod tests {
                 if let In::Connect { out, reply, .. } = msg {
                     let chan = terms.chan(next).expect("channel in range");
                     next += 1;
-                    let _ = reply.send(Some(chan));
+                    let routed = crate::pool::Routed { machine: crate::pool::MachineId(0), chan };
+                    let _ = reply.send(Some(routed));
                     // blocking_send: this is a plain std::thread, not a
                     // tokio task, so there is no async context to violate.
                     let _ = out.blocking_send(Out::Bytes(host_chunk.clone()));
@@ -914,6 +936,7 @@ mod tests {
 
         let root = mbbs::testing::scratch("mbbs-server-conn-multi-listen");
         let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
+            machine: crate::pool::MachineId(0),
             build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             module: PathBuf::from("/nonexistent/NOPE.DLL"),

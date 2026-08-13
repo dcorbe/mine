@@ -64,12 +64,18 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
 use crate::msg::{In, Out};
-use crate::pool::Pool;
+use crate::pool::{MachineId, Pool};
 
 /// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
 /// here and cannot be: it is `!Send`, and the thread builds its own -- see
 /// [`Boot::build`].
 pub struct Boot<A: Abi> {
+    /// This machine's process-wide id -- see `crate::pool`'s module doc.
+    /// Assigned by whoever builds this `Boot` (`main.rs` today, always the
+    /// same id, since only one machine boots); [`life`] hands it straight to
+    /// [`Pool::new`], so every `Chan` this machine's `Pool` takes comes back
+    /// tagged with it.
+    pub machine: MachineId,
     /// Build a fresh `A::Cpu`, called on the host thread itself, once per
     /// life (see the module doc's "Surviving a module stop").
     ///
@@ -437,7 +443,7 @@ fn life<A: Abi>(
     eprintln!("mbbs-server: module booted, serving {} channel(s)", boot.terms.count());
 
     let terms = boot.terms;
-    let mut pool = Pool::new(terms);
+    let mut pool = Pool::new(boot.machine, terms);
     let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
     let mut wait = Wait::Now;
 
@@ -618,20 +624,20 @@ fn apply<A: Abi>(
 ) -> io::Result<()> {
     match msg {
         In::Connect { who, out, reply } => {
-            let Some(chan) = pool.take() else {
+            let Some(routed) = pool.take() else {
                 // All lines busy. Whoever is waiting on `reply` is the only
                 // audience -- if they are already gone (the connection task
                 // died before we got here) there is nobody left to tell.
                 let _ = reply.send(None);
                 return Ok(());
             };
-            host.connect(machine, module, chan, &who)?;
-            conns[chan.index()] = Some(out);
-            let _ = reply.send(Some(chan));
+            host.connect(machine, module, routed.chan, &who)?;
+            conns[routed.chan.index()] = Some(out);
+            let _ = reply.send(Some(routed));
             Ok(())
         }
-        In::Input { chan, bytes } => {
-            if conns[chan.index()].is_none() {
+        In::Input { chan: routed, bytes } => {
+            if conns[routed.chan.index()].is_none() {
                 // Nobody is connected on this channel in this life. Either
                 // this is a duplicate arriving after `flush` already hung
                 // this same connection up (Path 1: the sender closed and a
@@ -646,11 +652,11 @@ fn apply<A: Abi>(
                 // in someone else's session -- so they are dropped instead.
                 return Ok(());
             }
-            host.gsbl_mut().push_input(chan, &bytes);
+            host.gsbl_mut().push_input(routed.chan, &bytes);
             Ok(())
         }
-        In::Disconnect { chan } => {
-            if conns[chan.index()].is_none() {
+        In::Disconnect { chan: routed } => {
+            if conns[routed.chan.index()].is_none() {
                 // Already disconnected in this life -- see the matching
                 // comment on `In::Input` above for the two ways this
                 // arrives. Running `Host::hangup` here would run the
@@ -662,9 +668,9 @@ fn apply<A: Abi>(
                 // what keeps it from running in the first place.
                 return Ok(());
             }
-            host.hangup(machine, module, chan)?;
-            pool.give_back(chan);
-            conns[chan.index()] = None;
+            host.hangup(machine, module, routed.chan)?;
+            pool.give_back(routed);
+            conns[routed.chan.index()] = None;
             Ok(())
         }
         // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
@@ -702,7 +708,13 @@ fn flush<A: Abi>(
             // a socket that will not drain is indistinguishable from one
             // that is gone. This is already the lost-carrier path.
             host.hangup(machine, module, chan)?;
-            pool.give_back(chan);
+            // `chan` here is a bare `Chan` from `terms.all()`, not a
+            // `Routed` that arrived on the wire -- `Pool::key` is the
+            // caller-trusts-itself pairing for exactly that case (this
+            // pool's own sweep of its own channels), as opposed to
+            // `Pool::give_back`'s guarded acceptance of a `Routed` handed in
+            // from outside. See `pool.rs`'s doc on both.
+            pool.give_back(pool.key(chan));
             conns[chan.index()] = None;
             eprintln!("mbbs-server: channel {chan} dropped (could not send output), hung up");
         }
@@ -737,7 +749,7 @@ mod tests {
     use tokio::sync::mpsc::Sender;
     use tokio::sync::oneshot;
 
-    use crate::pool::Pool;
+    use crate::pool::{MachineId, Pool};
 
     use super::{Woke, collapse, wake};
     use crate::msg::{In, Out};
@@ -843,12 +855,12 @@ mod tests {
     #[tokio::test]
     async fn a_connect_against_an_empty_pool_replies_none() {
         let terms = Terms::new(1);
-        let mut pool = Pool::new(terms);
+        let mut pool = Pool::new(MachineId(0), terms);
         let taken = pool.take().expect("the only channel");
 
         // Reproduce exactly the branch `apply` takes on `pool.take() ==
         // None`, since `apply` itself needs a live `Host`.
-        let (reply_tx, reply_rx) = oneshot::channel::<Option<mbbs::Chan>>();
+        let (reply_tx, reply_rx) = oneshot::channel::<Option<crate::pool::Routed>>();
         match pool.take() {
             Some(_) => panic!("the pool had one channel and it is already out"),
             None => {
@@ -871,7 +883,7 @@ mod tests {
     #[test]
     fn a_disconnect_returns_its_channel_to_the_pool() {
         let terms = Terms::new(2);
-        let mut pool = Pool::new(terms);
+        let mut pool = Pool::new(MachineId(0), terms);
         let a = pool.take().expect("first");
         let _b = pool.take().expect("second");
         assert!(pool.take().is_none(), "both lines busy");
@@ -911,7 +923,8 @@ mod tests {
         let module = fixture.minimal_module();
         let chan = fixture.console();
 
-        let mut pool = Pool::new(terms);
+        let mut pool = Pool::new(MachineId(0), terms);
+        let routed = pool.key(chan);
         let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
 
         let result = super::apply(
@@ -920,7 +933,7 @@ mod tests {
             &module,
             &mut pool,
             &mut conns,
-            In::Disconnect { chan },
+            In::Disconnect { chan: routed },
         );
 
         assert!(
@@ -931,7 +944,7 @@ mod tests {
         );
         assert_eq!(
             pool.take(),
-            Some(chan),
+            Some(routed),
             "the channel must still be free exactly once"
         );
         assert!(
@@ -962,7 +975,8 @@ mod tests {
         let module = fixture.minimal_module();
         let chan = fixture.console();
 
-        let mut pool = Pool::new(terms);
+        let mut pool = Pool::new(MachineId(0), terms);
+        let routed = pool.key(chan);
         let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
 
         let result = super::apply(
@@ -971,7 +985,7 @@ mod tests {
             &module,
             &mut pool,
             &mut conns,
-            In::Input { chan, bytes: b"EVIL\r".to_vec() },
+            In::Input { chan: routed, bytes: b"EVIL\r".to_vec() },
         );
 
         assert!(result.is_ok(), "{result:?}");

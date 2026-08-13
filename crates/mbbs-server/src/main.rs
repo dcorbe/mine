@@ -8,6 +8,7 @@ use mbbs::Terms;
 use mbbs::abi::Wg16;
 use mbbs_server::conn::{self, Listener, default_keys};
 use mbbs_server::host::Boot;
+use mbbs_server::pool::MachineId;
 use mbbs_server::termcompat::Stack;
 
 const DEFAULT_MODULE: &str = "re/WCCMMUD.DLL";
@@ -209,10 +210,19 @@ async fn main() -> ExitCode {
     // thread (`Boot::build`, called from `host::life` -- never here, since
     // `A::Cpu` is `!Send` and can never cross into this `async fn`). A board
     // that also serves a 32-bit module (LunatiX, design doc §4a) would call
-    // `conn::serve::<Wg32>` a second time, with its own `Boot`; wiring a
-    // connect-time selector between the two is Task 22's, not this one's --
-    // see `conn.rs`'s own module doc, "One `serve` call is one machine".
+    // `conn::serve::<Wg32>` a second time, with its own `Boot` and its own
+    // `MachineId` (below) -- wiring a connect-time selector between the two
+    // is Task 22's, not this one's -- see `conn.rs`'s own module doc, "One
+    // `serve` call is one machine".
+    //
+    // `MachineId(0)` is arbitrary -- there is exactly one machine, so any id
+    // would do -- but it is a real assignment, not a placeholder: every
+    // `Chan` this board's `Pool` hands out is tagged with it (`pool.rs`), and
+    // that tag is what a future second `serve` call's own `MachineId` would
+    // need to differ from for the two boards' channel zeros to stay
+    // distinguishable. See `mbbs_server::pool`'s module doc.
     let boot: Boot<Wg16> = Boot {
+        machine: MachineId(0),
         build: Box::new(mbbs_machine::m16::Machine::new),
         root: cli.root.clone(),
         module: cli.module.clone(),

@@ -1,22 +1,29 @@
 //! What crosses the boundary between the async edge and the host thread.
 
-use mbbs::{Chan, Connection};
+use mbbs::Connection;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::pool::Routed;
 
 /// Into the host thread. One queue for every connection, because the host
 /// thread has to be able to block on exactly one thing.
+///
+/// `chan` fields carry [`Routed`], not a bare `mbbs::Chan` -- see
+/// `crate::pool`'s module doc. Today every `Routed` in a running process
+/// shares the same `MachineId` (only one machine boots), but the type is the
+/// process-wide connection identity regardless.
 pub enum In {
     Connect {
         who: Connection,
         out: mpsc::Sender<Out>,
-        reply: oneshot::Sender<Option<Chan>>,
+        reply: oneshot::Sender<Option<Routed>>,
     },
     Input {
-        chan: Chan,
+        chan: Routed,
         bytes: Vec<u8>,
     },
     Disconnect {
-        chan: Chan,
+        chan: Routed,
     },
     /// A deadline the driver itself asked for has passed -- see
     /// `crate::alarm`. Carries nothing: the timer task never learns *why* it
