@@ -3769,6 +3769,110 @@ mod tests {
     }
 
     #[test]
+    fn the_four_host_buffers_cannot_drift_into_each_other_unnoticed() {
+        // `Host::new` (~line 1170) carves `spr`, `mdf`, `empty` and `l2as` out
+        // of one allocated region, back to back:
+        //
+        //   spr   [0, spr_bytes)                  spr_bytes = SPR_BYTES * SPR_BUFFERS
+        //   mdf   [spr_bytes, spr_bytes + 64)      64 -- `gmdnam`'s line, headroom over MDF_LINE(40)
+        //   empty [spr_bytes + 64, spr_bytes + 65) one NUL byte
+        //   l2as  [spr_bytes + 65, spr_bytes + 65 + l2as_bytes)
+        //
+        // and `alloc_region` is asked for exactly `spr_bytes + 64 + 1 +
+        // l2as_bytes` -- so these four add up to the *whole* allocation, with
+        // no padding anywhere between any of them. That was measured, not
+        // assumed: shifting any one of the four offsets in `Host::new` by a
+        // single byte passed every test in the repository (1448 lib/target
+        // tests plus all 19 `--ignored` module tests). Every existing
+        // `spr`/`l2as` test compares buffers against *each other* (rotation,
+        // distinctness) or writes strings short enough that a shifted buffer
+        // never reaches its true edge, so none of them can see a boundary
+        // move.
+        //
+        // This test fills each region to its own *full declared length* with
+        // a byte no other region uses, then reads every region back. A
+        // one-byte shift in any offset means a full-length write into the
+        // shifted region reaches one byte into its neighbour, and the
+        // neighbour's own read-back shows the intruder's byte instead of its
+        // own.
+        //
+        // Fill order is deliberately the *reverse* of address order: `l2as`,
+        // then `mdf`, then `spr`. Every mutation this test is built to catch
+        // shifts a region *forward*, spilling into whatever follows it in
+        // memory -- so that following region's fill has to already be in
+        // place, or its own later, correctly-placed fill would simply
+        // overwrite the spillover and hide it. Filling high-to-low guarantees
+        // each region is written only after everything above it already holds
+        // its own pattern, so a forward spill is always the last write to
+        // land and survives to the read-back below.
+        //
+        // `empty` is never written by this test -- `Host::new` writes its one
+        // NUL byte during construction and nothing should touch it again.
+        // Reading it back is the check for a shifted `mdf`: if `mdf`'s offset
+        // moves forward by one, `mdf`'s full-length fill reaches exactly the
+        // byte `empty` occupies (`spr_bytes + 64`, unaffected by `mdf`'s own
+        // mutation), and the read-back no longer sees the NUL `Host::new` put
+        // there. It also catches `empty`'s own offset moving forward by one:
+        // `spr_bytes + 64 + 1` is `l2as`'s true first byte, so a shifted
+        // `empty` field points at whatever `l2as`'s own fill wrote, not the
+        // NUL `Host::new` wrote to the wrong place.
+        let mut machine = Machine::new().expect("16-bit machine");
+        let host =
+            Host::<Wg16>::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
+
+        let spr_len =
+            usize::from(crate::shims::text::SPR_BYTES) * crate::shims::text::SPR_BUFFERS;
+        // Not a named constant anywhere -- it is `Host::new`'s own literal
+        // (the gap between `mdf`'s offset and `empty`'s), reproduced here
+        // rather than guessed.
+        let mdf_len = 64usize;
+        let l2as_len =
+            usize::from(crate::shims::text::L2AS_BYTES) * crate::shims::text::L2AS_BUFFERS;
+
+        const L2AS_PATTERN: u8 = 0xC3;
+        const MDF_PATTERN: u8 = 0xB4;
+        const SPR_PATTERN: u8 = 0xA1;
+
+        machine
+            .write(host.l2as, &vec![L2AS_PATTERN; l2as_len])
+            .expect("l2as's full declared length fits in the allocated region");
+        machine
+            .write(host.mdf, &vec![MDF_PATTERN; mdf_len])
+            .expect("mdf's full declared length fits in the allocated region");
+        machine
+            .write(host.spr, &vec![SPR_PATTERN; spr_len])
+            .expect("spr's full declared length fits in the allocated region");
+
+        let spr_read = machine.resolve(host.spr, spr_len).expect("read spr");
+        assert!(
+            spr_read.iter().all(|&b| b == SPR_PATTERN),
+            "spr's own region was not entirely its own pattern: {spr_read:?}"
+        );
+
+        let mdf_read = machine.resolve(host.mdf, mdf_len).expect("read mdf");
+        assert!(
+            mdf_read.iter().all(|&b| b == MDF_PATTERN),
+            "mdf's own region was not entirely its own pattern -- a neighbour's \
+             buffer overlaps it: {mdf_read:?}"
+        );
+
+        let l2as_read = machine.resolve(host.l2as, l2as_len).expect("read l2as");
+        assert!(
+            l2as_read.iter().all(|&b| b == L2AS_PATTERN),
+            "l2as's own region was not entirely its own pattern -- a neighbour's \
+             buffer overlaps it: {l2as_read:?}"
+        );
+
+        let empty_read = machine.resolve(host.empty, 1).expect("read empty");
+        assert_eq!(
+            empty_read,
+            &[0u8],
+            "empty no longer holds the NUL byte Host::new wrote -- its offset, \
+             or mdf's, has drifted into a neighbour"
+        );
+    }
+
+    #[test]
     fn every_global_that_names_the_current_channel_follows_the_channel() {
         // `point_curusr` writes four globals, and until this test three of them
         // were pinned and one was not. Pointing `vdaptr` at channel 0's area for
