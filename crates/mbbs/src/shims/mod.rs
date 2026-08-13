@@ -340,6 +340,29 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // int)` and `(int, long, int, int)` exactly.
         (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller),
         (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller),
+        // Btrieve. Seventeen routines, and the last block to reach this table
+        // -- they sat in `WG16_ROUTINES` from the day it was created until
+        // the engine behind them became `Btrieve<A>` and `Host<A>`'s own
+        // `btrieve` field stopped eliding its parameter. Neither the shims
+        // nor the engine were ever 16-bit in substance; a defaulted type
+        // parameter on one struct field was holding all seventeen here.
+        (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
+        (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),
+        (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller),
+        (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller),
+        (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller),
+        (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller),
+        (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller),
+        (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller),
+        (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller),
+        (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
+        (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
+        (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
+        (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
+        (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
+        (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
+        (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
+        (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
         // The GSBL terminal layer. Fourteen routines, seventy-seven call
         // sites, none of them reached by initialisation, plus three more
         // (`btuhpk`/`btupbc`/`btucpc`) registered even though `WCCMMUD.DLL`
@@ -376,26 +399,6 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
 /// -- every entry is already `Shim<Wg16>`, so there is no per-instantiation
 /// table to build.
 const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
-    // Btrieve: already `Shim<Wg16>`-shaped (see `shims::btrieve`'s own doc
-    // comment on why they stop there), so these are the core functions
-    // themselves -- no adapter needed, unlike the ten below.
-    (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
-    (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),
-    (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller),
-    (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller),
-    (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller),
-    (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller),
-    (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller),
-    (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller),
-    (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller),
-    (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
-    (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
-    (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
-    (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
-    (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
-    (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
-    (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
-    (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
     // Segment tiling: no flat-memory counterpart. Never given a `Call`-taking
     // body (see `shims::memory`'s own doc comment on `alctile`), so these are
     // non-capturing closures adapting `Wg16Shim` into `Shim<Wg16>` -- a
