@@ -259,7 +259,7 @@ impl Fixture {
 /// segment, no imports, no exports beyond its own name. See
 /// [`Fixture::minimal_module`].
 ///
-/// Built by hand rather than borrowed from `mbbs16/tests/ne.rs`'s builder,
+/// Built by hand rather than borrowed from `crates/mbbs-machine/tests/ne.rs`'s builder,
 /// which is private to that crate's own test binary and cannot be imported
 /// from here. The field offsets are the NE header's, the same ones
 /// `NeImage::parse` reads them back from.

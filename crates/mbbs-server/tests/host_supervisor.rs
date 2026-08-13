@@ -3,7 +3,7 @@
 //! `re/WCCMMUD.DLL` is not used here on purpose. Reaching a real wall in it
 //! (`l2as` via a monster kill, say) needs a live character and a live
 //! monster; this file needs a *deterministic* one, on demand, from a module
-//! built byte by byte -- the same technique `mbbs16/tests/ne.rs` uses for the
+//! built byte by byte -- the same technique `crates/mbbs-machine/tests/ne.rs` uses for the
 //! NE loader itself, applied one layer up. See `builder` below.
 //!
 //! ```text
@@ -76,19 +76,19 @@ async fn read_until_closed(stream: &mut TcpStream, acc: &mut Vec<u8>, budget: Du
 }
 
 /// A synthetic NE module, built byte by byte -- deliberately not borrowed
-/// from `mbbs16/tests/ne.rs`'s own builder, which is private to that crate's
+/// from `crates/mbbs-machine/tests/ne.rs`'s own builder, which is private to that crate's
 /// test binary and cannot be imported from here (the same situation
 /// `mbbs::testing::minimal_module_bytes`'s doc comment already describes).
 /// This is a smaller, single-purpose version: just enough NE format to
 /// register with the host and, on cue, run `HLT` -- a privileged
 /// instruction that raises `SIGSEGV` inside the sandboxed segment
-/// (`crates/mbbs16/tests/fault.rs` pins the same trick) -- which is what
+/// (`crates/mbbs-machine/tests/fault.rs` pins the same trick) -- which is what
 /// gives every test in this file a *deterministic* module stop instead of
 /// one that depends on a live board and a monster kill.
 mod builder {
     /// Logical sector alignment, as a shift count. Small, so a two-segment
     /// module is a few hundred bytes rather than a few thousand -- the same
-    /// choice `mbbs16/tests/ne.rs` makes and for the same reason.
+    /// choice `crates/mbbs-machine/tests/ne.rs` makes and for the same reason.
     const ALIGN: u16 = 4;
     const SECTOR: usize = 1 << ALIGN;
 
@@ -148,7 +148,7 @@ mod builder {
     /// `MAJORBBS.<name>` (module reference 1, the only one this module
     /// imports). Every relocation here is `IMPORTNAME`/`FAR_ADDR`, a single
     /// non-additive link (the placeholder `0xFFFF` is `CHAIN_END`) -- the
-    /// same shape `mbbs16/tests/ne.rs`'s `IMPORTNAME` case pins.
+    /// same shape `crates/mbbs-machine/tests/ne.rs`'s `IMPORTNAME` case pins.
     fn call_far_import(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>, name_offset: u16) {
         code.push(0x9A);
         let site = code.len() as u16;
@@ -414,7 +414,7 @@ mod builder {
     }
 
     /// Assemble `ne` into the bytes [`mbbs_machine::m16::Machine::load_ne`] (through
-    /// [`mbbs::Host::load`]) accepts. Modelled on `mbbs16/tests/ne.rs`'s
+    /// [`mbbs::Host::load`]) accepts. Modelled on `crates/mbbs-machine/tests/ne.rs`'s
     /// `Ne::finish`; trimmed to this file's one shape -- exactly two
     /// segments (code, then data when non-empty), at most one imported
     /// module ("MAJORBBS"), and exactly one entry point at ordinal 1.

@@ -21,7 +21,7 @@
 use mbbs_machine::m16::Exit;
 
 /// A module that executes `HLT` -- privileged, so `#GP`, arriving as SIGSEGV.
-/// Byte-for-byte `crates/mbbs16/tests/fault.rs`'s own fixture.
+/// Byte-for-byte `crates/mbbs-machine/tests/fault.rs`'s own fixture.
 fn suicidal() -> Vec<u8> {
     vec![
         0xb8, 0x34, 0x12, // mov $0x1234, %ax

@@ -10,7 +10,7 @@
 //! # A shim that lies is worse than one that refuses
 //!
 //! This is the rule the whole crate is shaped around, and it is measured rather
-//! than asserted. `crates/mbbs16/tests/trace_init.rs` drives MajorMUD's
+//! than asserted. `crates/mbbs-machine/tests/trace_init.rs` drives MajorMUD's
 //! initialisation with a host that answers zero to everything. It reaches 201
 //! calls and then takes SIGSEGV *inside module code*, because `alczer` was told
 //! it returned a null pointer at call 183 and the module dereferenced it
@@ -5586,7 +5586,7 @@ mod tests {
 
         // sttrou (index 1): a privileged instruction, HLT, which raises
         // SIGSEGV inside the sandboxed segment the same way
-        // `crates/mbbs16/tests/fault.rs` pins for `Machine` directly.
+        // `crates/mbbs-machine/tests/fault.rs` pins for `Machine` directly.
         let sttrou = f.machine.code_ptr(0);
         let state = register_module_with(&mut f, &[(1, sttrou)]);
         // Loaded *after* `register_module_with` -- see `connected_with`'s own
@@ -5872,7 +5872,7 @@ mod tests {
     /// name are both facts `Host::run` reads off the module's *own*
     /// `ImportSite` (`module.import(index)`), which is only ever populated
     /// by `mbbs_machine::m16::Machine::load_ne` actually resolving a real relocation --
-    /// see `crates/mbbs16/src/ne.rs`'s `map_ne`. `dll` is deliberately never
+    /// see `crates/mbbs-machine/src/m16/ne.rs`'s `map_ne`. `dll` is deliberately never
     /// `"MAJORBBS"`/`"GALGSBL"`/`"DOSCALLS"`, so `shims::entry` always
     /// answers `Entry::Unimplemented` for it and the loader gives it a real
     /// thunk (a `Datum`/`Absolute` classification resolves straight to an

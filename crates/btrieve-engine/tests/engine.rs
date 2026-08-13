@@ -4,7 +4,7 @@
 //! `WCCSPELS.VIR` -- reading it here by a third, independent path.
 //!
 //! Skips, loudly, when `tmp/WCCSPELS.VIR` is absent or `wine` is not on
-//! PATH, following the house pattern in `crates/mbbs16/tests/wccmmud.rs`.
+//! PATH, following the house pattern in `crates/mbbs-machine/tests/m16_wccmmud.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

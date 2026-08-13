@@ -15,7 +15,7 @@
 //! Precedent already exists in this crate for keeping the two apart:
 //! `Machine`'s `tib` owns its own stack [`Mapping`], entirely separate from
 //! whatever `Image` a caller happens to be executing against (`Machine`
-//! does not own an `Image` at all -- see `lib.rs`'s `Machine::call` doc
+//! does not own an `Image` at all -- see `mod.rs`'s `Machine::call` doc
 //! comment). `Memory` is that same shape applied to the *other* side of the
 //! crate: one struct owning the module's `Image` and a second `Mapping` for
 //! host-allocated regions, so a pointer into either resolves the same way.

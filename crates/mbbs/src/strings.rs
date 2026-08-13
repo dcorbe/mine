@@ -18,7 +18,7 @@
 //!
 //! [`all_digits`] and [`strcmpi`] came in for the FSD's field checks, and both
 //! are cheap leaves with one string argument, so they were measured instead of
-//! disassembled: `cargo run -p mbbs16 --example alldgs` and `--example
+//! disassembled: `cargo run -p mbbs-machine --example alldgs` and `--example
 //! stricmp` call the genuine host's own copies over probe sets chosen to
 //! separate every plausible implementation from every other one. The doc
 //! comment on each says which probes decided what. A measurement is worth more
@@ -143,7 +143,7 @@ pub fn strcmp(a: &[u8], b: &[u8]) -> i16 {
 /// `int strcmpi(char *s1,char *s2)` -- [`strcmp`] with the case folded away.
 ///
 /// Borland's `strcmpi` is its `stricmp`, ordinal 576, `seg 1:0x47f1`. This one
-/// was measured rather than disassembled: `cargo run -p mbbs16 --example
+/// was measured rather than disassembled: `cargo run -p mbbs-machine --example
 /// stricmp` calls the genuine host's copy over the pairs that distinguish every
 /// plausible implementation from every other one.
 ///
@@ -187,7 +187,7 @@ pub fn strcmpi(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// `int alldgs(char *string)` -- is every character a decimal digit?
 ///
 /// `GCOMM.H:345` declares it and no recovered `.C` file defines it, so this is
-/// measured from the genuine host at `46:0` by `cargo run -p mbbs16 --example
+/// measured from the genuine host at `46:0` by `cargo run -p mbbs-machine --example
 /// alldgs` rather than inferred.
 ///
 /// **The empty string answers true**, and that is the part that matters:
@@ -399,7 +399,7 @@ mod tests {
     }
 
     /// `alldgs`, `GCOMM.H:345`. Measured from the genuine host, not inferred:
-    /// `cargo run -p mbbs16 --example alldgs` prints every line asserted here.
+    /// `cargo run -p mbbs-machine --example alldgs` prints every line asserted here.
     ///
     /// The empty string is the one that matters. `chktyp` (`FSD.C:874`) tests a
     /// `#` field with a bare `alldgs(bufptr)` and a `$` field with
@@ -465,7 +465,7 @@ mod tests {
 
     /// **It folds up, not down**, and the six bytes between `'Z'` and `'a'` are
     /// what make that observable. Measured by
-    /// `cargo run -p mbbs16 --example stricmp`.
+    /// `cargo run -p mbbs-machine --example stricmp`.
     ///
     /// `'_'` is 0x5f. Folding up, it is compared against `'A'` = 0x41 and is
     /// *greater*; folding down it would be compared against `'a'` = 0x61 and be

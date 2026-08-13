@@ -38,7 +38,7 @@
 //!
 //! A [`Poison::Fault`](mbbs_machine::m16::Poison::Fault) or
 //! [`Poison::Timeout`](mbbs_machine::m16::Poison::Timeout) is never continued past
-//! either, and cannot be: `crates/mbbs16/src/lib.rs`'s own doc on
+//! either, and cannot be: `crates/mbbs-machine/src/m16/mod.rs`'s own doc on
 //! [`Machine::poisoned`](mbbs_machine::m16::Machine::poisoned) says why -- the module
 //! faulted or wedged with its globals mid-update, the call frame is
 //! deliberately forgotten, and there is no resume point to fabricate a

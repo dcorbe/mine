@@ -25,12 +25,12 @@
 //! #2) -- was unreachable without widening `Image` itself into an
 //! allocator, which both that correction and this task's own brief reject:
 //! `Image` is a fixed-size mapping made once at load, and staying that way
-//! is deliberate (`crates/mbbs32/src/image.rs`'s own module doc comment).
+//! is deliberate (`crates/mbbs-machine/src/m32/image.rs`'s own module doc comment).
 //!
 //! Neither horn is acceptable, so the actual fix reaches one file this
-//! task's brief did not originally name: `crates/mbbs32/src/flatptr.rs`'s
+//! task's brief did not originally name: `crates/mbbs-machine/src/m32/flatptr.rs`'s
 //! `ModulePtr` impl now answers `type Memory = mbbs_machine::m32::Memory`, a new type
-//! (`crates/mbbs32/src/mem.rs`) that owns the loaded `Image` *and* a second
+//! (`crates/mbbs-machine/src/m32/mem.rs`) that owns the loaded `Image` *and* a second
 //! `Mapping` for host-allocated regions -- exactly the `tib`-owns-its-own-
 //! stack-mapping precedent the design cites, just written down where the
 //! trait bound could actually see it. `Image` itself is untouched: still a
@@ -46,7 +46,7 @@
 //! reborrow, not a second field (see `Call`'s "holds one handle, not two").
 //! For `Wg16` that works because `mbbs_machine::m16::Machine` owns its `Segments`
 //! outright. `mbbs_machine::m32::Machine` does not own an `Image` "unlike
-//! `mbbs_machine::m16::Machine`... **deliberately**" (`crates/mbbs32/src/lib.rs`,
+//! `mbbs_machine::m16::Machine`... **deliberately**" (`crates/mbbs-machine/src/m32/mod.rs`,
 //! `Machine`'s own doc comment) -- so there is no `&mut Self::Mem` inside a
 //! bare `mbbs_machine::m32::Machine` for `Abi::mem` to reborrow. `type Cpu =
 //! mbbs_machine::m32::Machine` compiles as a bare assignment, but `fn mem` cannot then
@@ -274,9 +274,9 @@ impl ModuleMem for mbbs_machine::m32::Memory {
 // deliberately. Any test that builds a real `Wg32Cpu` must build a real
 // `mbbs_machine::m32::Machine`, and `mbbs_machine::m32::Machine::new` unconditionally calls
 // `mbbs_machine::m32::fault::arm`, which registers this ABI's fault claim with
-// `crates/mbbs-fault`'s shared arbiter. Registering no longer steals another
+// `crates/mbbs-machine/src/fault.rs`'s shared arbiter. Registering no longer steals another
 // ABI's recovery the way installing a standalone handler used to -- see
-// `crates/mbbs-fault`'s module doc comment -- but `cargo test -p mbbs --lib`
+// `crates/mbbs-machine/src/fault.rs`'s module doc comment -- but `cargo test -p mbbs --lib`
 // still runs every unit test, 16-bit and 32-bit, as threads of ONE process,
 // sharing the one per-thread alternate signal stack and the one process-wide
 // claim registry. A `Wg32Cpu`-building test has no reason to entangle that
@@ -292,7 +292,7 @@ impl ModuleMem for mbbs_machine::m32::Memory {
 // all failed, every one of them an `mbbs16` fault-recovery test running
 // *after* this file's test had already clobbered the process's SIGSEGV
 // handler with `mbbs32`'s standalone one. That specific failure mode is
-// exactly what `crates/mbbs-fault` now fixes -- see
+// exactly what `crates/mbbs-machine/src/fault.rs` now fixes -- see
 // `crates/mbbs/tests/fault_16_after_32.rs`, `fault_16_alone.rs` and
 // `fault_32_after_16.rs` -- but the isolation below is worth keeping on its
 // own merits regardless.

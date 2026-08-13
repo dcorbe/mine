@@ -13,7 +13,7 @@
 use mbbs_machine::m32::{Exit, Mapping};
 
 /// `mov eax, [0]` -- an ordinary, unprefixed dereference of address zero.
-/// Byte-for-byte `crates/mbbs32/src/fault.rs`'s own `null_deref_code` fixture,
+/// Byte-for-byte `crates/mbbs-machine/src/m32/fault.rs`'s own `null_deref_code` fixture,
 /// minus the `ljmp` back to a trampoline: `mbbs_machine::m32::Machine::call` already
 /// builds a proper cdecl return frame on the module's own stack, and this
 /// code is never meant to reach it.

@@ -28,7 +28,7 @@
 //! Reviewing that before anything was built on it found a second, independent
 //! problem that would have survived splitting `Cpu` from `Mem` anyway: a real
 //! 16-bit argument frame lives in the *stack segment* (`Machine::arg_u16`,
-//! `crates/mbbs16/src/lib.rs:729`, reads
+//! `crates/mbbs-machine/src/m16/mod.rs:747`, reads
 //! `self.mem.stack().read_u16(sp + 4 + n * 2)`), so a `Cursor` that borrows
 //! its bytes out of `A::Mem` holds a *shared* borrow of `Mem` for as long as
 //! it lives -- and `Call` needs `mem: &mut A::Mem` at the same time, for the
@@ -60,7 +60,7 @@
 //! An earlier version of this module gave `Call` both `cpu: &'a mut A::Cpu`
 //! and `mem: &'a mut A::Mem` as fields, following the design's Part 1
 //! sketch. That does not compile for `Wg16`: `Machine` owns its `Segments`
-//! as a private field (`crates/mbbs16/src/lib.rs:296`), and Task 1
+//! as a private field (`crates/mbbs-machine/src/m16/mod.rs:311`), and Task 1
 //! deliberately kept it that way, adding only a *delegating* facade so
 //! `crates/mbbs`'s existing `&mut Machine` call sites kept compiling --
 //! never an independent `&mut Segments`. So `cpu` and `mem` sourced from one
@@ -85,8 +85,8 @@
 //! extracting an `Exec` type from `Machine`.
 //!
 //! This module's tests now build a real `Call<Wg16>` from a live
-//! `mbbs_machine::m16::Machine` (`the_cursor_and_a_real_machine_agree_on_stzcpys_frame`
-//! below), not only the `FixtureAbi` used to test byte arithmetic cheaply.
+//! `mbbs_machine::m16::Machine` (`call_reads_a_real_machines_frame_for_stzcpy`
+//! in `abi/wg16.rs`), not only the `FixtureAbi` used to test byte arithmetic cheaply.
 //! The fixture tests stay, for the same reason `Cursor`'s do -- they need no
 //! `Machine` at all -- but they no longer stand in for the one path that
 //! matters: whether `Call<Wg16>` can be built from a machine actually

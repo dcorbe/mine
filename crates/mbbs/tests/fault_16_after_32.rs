@@ -21,7 +21,7 @@
 
 use mbbs_machine::m16::Exit;
 
-/// Byte-for-byte the control's fixture, and `crates/mbbs16/tests/fault.rs`'s.
+/// Byte-for-byte the control's fixture, and `crates/mbbs-machine/tests/fault.rs`'s.
 fn suicidal() -> Vec<u8> {
     vec![
         0xb8, 0x34, 0x12, // mov $0x1234, %ax

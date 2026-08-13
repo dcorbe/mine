@@ -3,12 +3,12 @@
 //! **Why this is not `crates/mbbs/src/abi/wg32.rs`'s own `#[cfg(test)] mod
 //! tests`, unlike every sibling `Abi` file.** A real `Wg32Cpu` needs a real
 //! `mbbs_machine::m32::Machine`, and `mbbs_machine::m32::Machine::new` unconditionally registers
-//! with `crates/mbbs-fault`'s shared arbiter. Registering is no longer
+//! with `crates/mbbs-machine/src/fault.rs`'s shared arbiter. Registering is no longer
 //! destructive to another ABI's recovery -- see below, that is the whole
 //! point of the arbiter -- but `cargo test -p mbbs --lib` still runs every
 //! 16-bit and 32-bit unit test as threads of ONE process, sharing the one
 //! per-thread alternate signal stack and the one process-wide claim
-//! registry `crates/mbbs-fault` owns. Nothing about that is unsafe by
+//! registry `crates/mbbs-machine/src/fault.rs` owns. Nothing about that is unsafe by
 //! itself, but it is still global state a `Wg32Cpu`-building test has no
 //! reason to entangle with `abi/wg32.rs`'s otherwise-pure unit tests, so it
 //! stays here, in its own process, on the same reasoning as always.
@@ -20,7 +20,7 @@
 //! file's `Wg32Cpu` had already clobbered the process's SIGSEGV handler
 //! before they ran. That was `mbbs_machine::m32::fault`'s own standalone handler
 //! stealing the disposition `mbbs_machine::m16::fault`'s handler needed, exactly the
-//! bug `crates/mbbs-fault` now exists to fix -- but `cargo test`'s own
+//! bug `crates/mbbs-machine/src/fault.rs` now exists to fix -- but `cargo test`'s own
 //! process model is still the right isolation for *this* file regardless:
 //! each file under `tests/` is a separate binary, hence a separate process,
 //! so nothing here needs to depend on the arbiter behaving correctly to stay
@@ -29,7 +29,7 @@
 //! **This no longer describes a production limitation.** A host serving both
 //! a 16-bit and a 32-bit module from one process now can: `mbbs_machine::m16::fault` and
 //! `mbbs_machine::m32::fault` each register a *positive* claim over the faulting `CS`
-//! with `crates/mbbs-fault`'s shared arbiter instead of installing a
+//! with `crates/mbbs-machine/src/fault.rs`'s shared arbiter instead of installing a
 //! standalone handler, so the second `Machine::new` (whichever ABI is
 //! second) no longer steals the first ABI's recovery. See
 //! `crates/mbbs/tests/fault_16_after_32.rs`, `fault_16_alone.rs` and
