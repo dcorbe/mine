@@ -235,8 +235,20 @@ impl Vector {
 /// Descriptive: this is the host's state, not an instruction. [`Ended::wait`]
 /// turns it into one, in a single place, so that the socket driver and the
 /// tests cannot come to disagree about what a given state means.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ended {
+///
+/// `A` carries no default, added by Task 11 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`: the plan's
+/// "Corrections, measured during execution" section named `Ended` alongside
+/// `Outcome`/`Vector`/`Wait` as parameterless, but Task 10 only needed to add
+/// the parameter to `Outcome` -- neither `run`/`stop`/`shim_stop` nor any
+/// `Vector` use site ever built an `Ended`. [`Host::cycle`] is the first
+/// method that does, and it is this task's, so the parameter lands here.
+/// `Vector` and `Wait` stay bare: neither carries a `Poison`.
+///
+/// Not `#[derive(..)]`, for the same reason [`Outcome<A>`] is not: the
+/// derive macro's generated bound is `A: Trait`, and only `A::Poison` varies
+/// with `A` here, not `A` itself.
+pub enum Ended<A: Abi> {
     /// No status queued and no timer outstanding: nothing can happen until the
     /// transport delivers something. A driver blocks here.
     Idle,
@@ -284,8 +296,54 @@ pub enum Ended {
     /// came from [`Host::prcrtk`]'s kick sweep rather than [`Host::poll`]: a
     /// timer callback has no channel to name (see [`crate::Kick`]'s own
     /// doc), and that is an honest fact rather than a gap to paper over.
-    Stopped(Poison, Option<Chan>),
+    Stopped(A::Poison, Option<Chan>),
 }
+
+impl<A: Abi> Clone for Ended<A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Idle => Self::Idle,
+            Self::Waiting { next_kick, polls_cut } => Self::Waiting {
+                next_kick: *next_kick,
+                polls_cut: *polls_cut,
+            },
+            Self::Bound { next_kick } => Self::Bound { next_kick: *next_kick },
+            Self::Stopped(poison, chan) => Self::Stopped(poison.clone(), *chan),
+        }
+    }
+}
+
+impl<A: Abi> std::fmt::Debug for Ended<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::Waiting { next_kick, polls_cut } => f
+                .debug_struct("Waiting")
+                .field("next_kick", next_kick)
+                .field("polls_cut", polls_cut)
+                .finish(),
+            Self::Bound { next_kick } => f.debug_struct("Bound").field("next_kick", next_kick).finish(),
+            Self::Stopped(poison, chan) => f.debug_tuple("Stopped").field(poison).field(chan).finish(),
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for Ended<A> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Idle, Self::Idle) => true,
+            (
+                Self::Waiting { next_kick, polls_cut },
+                Self::Waiting { next_kick: nk2, polls_cut: pc2 },
+            ) => next_kick == nk2 && polls_cut == pc2,
+            (Self::Bound { next_kick }, Self::Bound { next_kick: nk2 }) => next_kick == nk2,
+            (Self::Stopped(poison, chan), Self::Stopped(poison2, chan2)) => poison == poison2 && chan == chan2,
+            _ => false,
+        }
+    }
+}
+
+impl<A: Abi> Eq for Ended<A> where A::Poison: Eq {}
 
 /// What a driver should do about an [`Ended`].
 ///
@@ -303,7 +361,7 @@ pub enum Wait {
     Stop,
 }
 
-impl Ended {
+impl<A: Abi> Ended<A> {
     /// What a driver should do about this state.
     #[must_use]
     pub fn wait(&self) -> Wait {
@@ -317,8 +375,11 @@ impl Ended {
 }
 
 /// What one [`Host::cycle`] run did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cycles {
+///
+/// `A` carries no default -- see [`Ended`]'s own doc comment. Not
+/// `#[derive(..)]`, for the same reason: only `A::Poison`, buried inside
+/// `Ended<A>`, varies with `A`.
+pub struct Cycles<A: Abi> {
     /// Passes made, at most `max`. The host's own share of
     /// [`Host::clock_reads`], since each pass reads the clock once.
     pub iterations: usize,
@@ -328,8 +389,36 @@ pub struct Cycles {
     pub dispatched: usize,
 
     /// Why it stopped.
-    pub ended: Ended,
+    pub ended: Ended<A>,
 }
+
+impl<A: Abi> Clone for Cycles<A> {
+    fn clone(&self) -> Self {
+        Self {
+            iterations: self.iterations,
+            dispatched: self.dispatched,
+            ended: self.ended.clone(),
+        }
+    }
+}
+
+impl<A: Abi> std::fmt::Debug for Cycles<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cycles")
+            .field("iterations", &self.iterations)
+            .field("dispatched", &self.dispatched)
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
+impl<A: Abi> PartialEq for Cycles<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.iterations == other.iterations && self.dispatched == other.dispatched && self.ended == other.ended
+    }
+}
+
+impl<A: Abi> Eq for Cycles<A> where A::Poison: Eq {}
 
 /// A global the module addresses that the host cannot place.
 ///
@@ -1890,6 +1979,652 @@ impl<A: Abi> Host<A> {
         };
         self.stop(machine, A::unimplemented("mbbs".to_owned(), symbol))
     }
+
+    /// Entry `n` of the module channel `chan`'s `state` names -- or, if
+    /// `state` names a host-native registration, the native handler itself.
+    ///
+    /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`: a channel's
+    /// `state` **is** an index into the module table, and `register_module`
+    /// returning that index is the whole handshake. This host had dispatched to
+    /// `modules().first()` instead, which is the same thing only while exactly
+    /// one module is registered -- and `inifsd()` registers FSDBBS as an
+    /// ordinary module, so the FSD is a second one.
+    ///
+    /// A `state` naming a slot nobody registered stops with a reason. Falling
+    /// back to module 0 would send another module's keystrokes to MajorMUD and
+    /// look, from the outside, like a module that ignored its input.
+    ///
+    /// The two layers of `Result` are not decoration: the outer is "this host
+    /// cannot go on", the inner is a [`ShimError`] the caller turns into
+    /// [`Outcome::Stopped`] through [`Host::shim_stop`], and only the caller
+    /// knows which of its own step names to attach.
+    ///
+    /// Moved here (Task 11 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`) ahead of the
+    /// rest of its own cluster (`connect`/`connect_state`/... -- Task 12):
+    /// [`Host::poll_with_chan`] calls this directly, and its own body is
+    /// already `A`-generic in substance -- it never touches anything but
+    /// [`Users::state_mem`] and [`Registration::dispatch`], both already
+    /// generic. `machine` widens from `&Machine` to `&mut A::Cpu` because
+    /// [`Abi::mem`] is the only way to reach `A::Mem` generically and it
+    /// takes `&mut Self::Cpu` even to read -- see that trait method's own
+    /// doc comment.
+    ///
+    /// # Errors
+    ///
+    /// If `state` names no registered module.
+    fn state_entry(
+        &self,
+        machine: &mut A::Cpu,
+        chan: Chan,
+        n: usize,
+    ) -> io::Result<Result<Dispatch<A>, ShimError>> {
+        let state = match self.users.state_mem(A::mem(machine), chan) {
+            Ok(state) => state,
+            Err(e) => return Ok(Err(e)),
+        };
+        let Some(registered) = self.modules().get(usize::from(state)) else {
+            let count = self.modules().len();
+            return Err(io::Error::other(format!(
+                "channel {chan} is in state {state} and {count} module(s) are registered, \
+                 so there is no module to enter: either a module wrote a state it was \
+                 never given, or a registration this host owes has not happened"
+            )));
+        };
+        Ok(registered.dispatch(A::mem(machine), n))
+    }
+
+    /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
+    /// `char *margv[0]`.
+    ///
+    /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
+    ///
+    ///
+    /// `paccin` is `inplen=btuinp(usrnum,input)` followed by `paccit()` --
+    /// the modem monitor and the profanity check, both BBS-shaped and out of
+    /// scope. This host's `paccin` is `btuinp` and nothing else: take the
+    /// channel's completed line (an empty one if none is ready, which is
+    /// exactly the byte string an empty line already is) and write it,
+    /// NUL-terminated, into `input`. `btuinp` is not itself a shim --
+    /// `WCCMMUD.DLL` imports it only on the 32-bit side -- so it has no
+    /// argument stack to read; what it does is folded in here.
+    ///
+    /// Shared rather than inlined into the `getin` shim because
+    /// [`Host::poll`] needs the identical sequence and must not have to fake
+    /// a call frame to reach it.
+    ///
+    /// The generic core [`Host::get_input_mem`] delegates into -- see
+    /// `Host::class_mem`'s own doc comment for why the split exists. Moved
+    /// here (Task 11 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`): the plan's
+    /// four dissolution clusters never name it, but its own doc comment
+    /// (before this move) said it is a shared helper for `Host::poll`, which
+    /// is this cluster.
+    ///
+    /// # Errors
+    ///
+    /// If `input`, `margv` or `margn` are not placed, or a write runs off a
+    /// segment.
+    pub(crate) fn get_input(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<A::Ptr, ShimError> {
+        self.get_input_mem(A::mem(machine), chan)
+    }
+
+    /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
+    ///
+    ///
+    /// The routine takes no arguments and its return value is discarded, as
+    /// `(*usrptr->polrou)()` discards it. `poll` has already pointed `curusr`
+    /// and written `status`, so it runs with `usrnum`, `usrptr`, `usaptr` and
+    /// `vdaptr` correct.
+    ///
+    /// `polrou` is read again after the call rather than remembered: a routine
+    /// that called `stop_polling` on itself must not be re-armed, and that is
+    /// the *only* thing the second read is for.
+    ///
+    /// Returns `None` when the channel is not polling -- a status left over
+    /// from a `begin_polling` the module has since undone. No call happened, so
+    /// there is no [`Outcome`] to report and R24 forbids inventing one.
+    fn dopoll(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        chan: Chan,
+    ) -> io::Result<Option<Outcome<A>>> {
+        let rou = match self.users.polrou_mem(A::mem(machine), chan) {
+            Ok(Some(rou)) => rou,
+            Ok(None) => return Ok(None),
+            Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+        };
+
+        self.inpolr = Some(chan);
+        let outcome = self.run(machine, module, rou, &[], Some(chan));
+        // Cleared before the `?`, so a machine that malfunctioned does not leave
+        // `inpolr` naming a channel that is no longer running anything. The
+        // original does the same from the `longjmp` landings at
+        // `MAJORBBS.C:2488` and `:4150`.
+        self.inpolr = None;
+        let outcome = outcome?;
+
+        // One dispatch, one token. Saturating because the budget may already
+        // be zero: when it runs out, up to `nterms` injections are still
+        // queued, and those are dispatched rather than dropped -- a status the
+        // host queued is one it owes the module.
+        self.polls_left = self.polls_left.saturating_sub(1);
+
+        // `MAJORBBS.C:3258` re-injects unconditionally, because the original
+        // owned the machine and had nothing else to do with the turn. The
+        // re-read of `polrou` below is its check and is kept exactly: a
+        // routine that zeroed its own `polrou` must not be re-armed.
+        //
+        // The budget is the addition. Without it this chain never breaks,
+        // `pending()` is permanently true, and `cycle` can never tell a driver
+        // it is safe to sleep.
+        if self.polls_left > 0 && matches!(outcome, Outcome::Returned { .. }) {
+            match self.users.polrou_mem(A::mem(machine), chan) {
+                Ok(Some(_)) => {
+                    self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
+                }
+                Ok(None) => {}
+                Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
+            }
+        }
+        Ok(Some(outcome))
+    }
+
+    /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
+    ///
+    ///
+    /// Called once per elapsed second, never once per pass -- see
+    /// [`Host::cycle`].
+    ///
+    /// Every due entry is taken out of the table *before* any of them runs.
+    /// `GALMJD.C:1106` re-arms `mjdrtk` from inside `mjdrtk`, so a callback
+    /// pushes onto the list being walked; draining first puts the re-armed kick
+    /// in the next round, which is where the original's free-slot scan puts it
+    /// too.
+    ///
+    /// `fired` is added to rather than assigned, so a caller can accumulate
+    /// across the rounds of one catch-up.
+    ///
+    /// Returns the poison if a callback stopped the machine, and `None`
+    /// otherwise. A callback's return value is discarded, as `prcrtk` discards
+    /// it.
+    fn prcrtk(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        let mut due = Vec::new();
+        self.kicks.retain_mut(|kick| {
+            // `rtkick` refuses a zero delay, so no live entry can underflow.
+            kick.delay -= 1;
+            if kick.delay == 0 {
+                due.push(*kick);
+                false
+            } else {
+                true
+            }
+        });
+
+        for kick in due {
+            *fired += 1;
+            // `MBBS_TRACE_SHIMS`: name each kick as it fires. A module whose
+            // timers are dead and one whose timers run but do nothing look
+            // identical from outside; this tells them apart.
+            if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+                eprintln!("mbbs-trace: KICK-FIRE dstrou={:?}", kick.dstrou);
+            }
+            match self.run(machine, module, kick.dstrou, &[], None)? {
+                Outcome::Stopped(poison) => return Ok(Some(poison)),
+                Outcome::Returned { .. } => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// Service one channel that has something to report.
+    ///
+    /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
+    /// out -- the `usrptr->class` switch, `RING`/`CMDOK`, `rstchn`, `dwopr`,
+    /// `prcrtk` and `hdlinp`'s fallback to `module00` are all MajorBBS and not
+    /// the module, and none of them are here:
+    ///
+    /// ```text
+    /// scan() -> a channel with a status
+    ///   curusr(chan), then write the `status` global -- BOTH unconditional,
+    ///   as `MAJORBBS.C:152` is (see the comment at the write itself for the
+    ///   stale-value bug that writing it only on the non-CRSTG path caused)
+    ///   status 3 (CRSTG)  -> getin(), then entry 1 (sttrou)
+    ///   status 4 (INBLK)
+    ///      or 5 (OUTMT)   -> entry 2 (stsrou)
+    ///   anything else     -> a note, and no call
+    /// ```
+    ///
+    /// Returns `None` if no channel has a status waiting, if the one that
+    /// did raised a status nothing here dispatches, or if the module
+    /// supplies no entry point for the one that would have been called --
+    /// none of those is a module call, so there is no [`Outcome`] to report.
+    ///
+    /// R21: a `ShimError` out of `point_curusr`, `get_input` or the entry
+    /// lookup poisons the machine and comes back as `Outcome::Stopped`, the
+    /// same policy [`Host::run`] applies to a `ShimError` from a shim it
+    /// dispatched. See `shim_stop`.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered. (A write running off a segment, or the
+    /// module being unenterable, poisons the machine and comes back as
+    /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
+    pub fn poll(&mut self, machine: &mut A::Cpu, module: &A::Module) -> io::Result<Option<Outcome<A>>> {
+        Ok(self.poll_with_chan(machine, module)?.map(|(outcome, _chan)| outcome))
+    }
+
+    /// [`Host::poll`], plus the channel an [`Outcome`] belongs to.
+    ///
+    /// Private: the only caller that needs the channel is [`Host::cycle`],
+    /// which wants it to name who a stop happened to in [`Ended::Stopped`].
+    /// Every external caller of `poll` (`crates/mbbs/tests/wccmmud.rs` and
+    /// `ifansi_oracle.rs`, dozens of call sites) only ever wanted the
+    /// `Outcome`, so `poll` keeps that shape and this carries the extra fact
+    /// out through the one caller that has a use for it.
+    ///
+    /// The `Dispatch::Native` arm no longer names `Native::Fsd` (or calls
+    /// `Host::fsd_dispatch`) directly -- that stays genuinely `Wg16`-only
+    /// (`FSDBBS.C`'s session engine is `FarPtr` throughout, see
+    /// `shims/fsd.rs`), so it is reached through [`Abi::native_dispatch`]
+    /// instead, the same "second door" shape [`Abi::native`] already opens
+    /// for shim routines. `Wg16`'s implementation still delegates straight
+    /// to `Host::fsd_dispatch`, unchanged.
+    fn poll_with_chan(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+    ) -> io::Result<Option<(Outcome<A>, Chan)>> {
+        // R23: a status this host does not dispatch (`OVRFLW`, say) is not
+        // the same fact as "nothing queued" -- looping past it here, rather
+        // than answering `Ok(None)` for it, keeps that distinction from
+        // leaking into the return value. A driver written
+        // `while host.poll(..)?.is_some() {}` would otherwise stop dead on
+        // one undispatched status with a `CRSTG` still queued behind it.
+        // Every iteration consumes exactly one status, so this cannot
+        // legitimately run more times than there were statuses queued. The
+        // bound is not for the legitimate case.
+        //
+        // Both `continue` arms below allocate a note, and the status queue is
+        // deliberately unbounded (see `gsbl::Channel::status`). So an edit that
+        // stops consuming turns this loop into something that eats the machine
+        // instead of failing a test -- which is not hypothetical: a mutation
+        // that peeked instead of popping reached 4.7 GB resident and the global
+        // OOM killer took the session down with it. A host bug should cost a
+        // red test, not the box.
+        const SPINS: usize = 1024;
+        let mut spins = 0usize;
+
+        loop {
+            spins += 1;
+            if spins > SPINS {
+                return Err(io::Error::other(format!(
+                    "poll went round {SPINS} times without dispatching to the module: \
+                     a status is being read but not consumed"
+                )));
+            }
+
+            let Some(chan) = self.gsbl_mut().scan() else {
+                return Ok(None);
+            };
+
+            // Popped before either entry point is called, not after -- a
+            // `sttrou` that re-enters through `hdlinp` must not see its own
+            // status still queued.
+            let status = self
+                .gsbl_mut()
+                .next_status(chan)
+                .expect("scan just found a channel with one");
+
+            let dispatch = match status {
+                gsbl::Gsbl::CRSTG => PollTarget::Entry(1),
+                // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
+                // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
+                // `ABOREQ` and `OUTMT`, and lets everything else fall to
+                // `default: (*(module[usrptr->state]->stsrou))()`. `CYCLE`
+                // (`MAJORBBS.H:236`) is in "everything else", which is what
+                // makes `fsdnfy()` work at all -- it injects 240 at itself
+                // expecting `stsrou` to run.
+                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => PollTarget::Entry(2),
+                gsbl::Gsbl::POLSTS => PollTarget::Poll,
+                other => {
+                    self.note(format!(
+                        "poll: channel {chan} raised status {other}, which nothing here dispatches"
+                    ));
+                    continue;
+                }
+            };
+
+            // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
+            // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
+            // every dispatch -- `:157` is the `usrptr->class` switch this host
+            // deliberately does not have. `vdaptr` is not named there at all;
+            // `point_curusr` sets it because the real host's own `curusr`
+            // (`MAJORBBS.C:4290`) does. Calls the generic core
+            // [`Host::point_curusr_mem`] directly rather than the `Wg16`
+            // facade [`Host::point_curusr`] -- that facade stays concrete
+            // (Task 12), and there is no reason for generic code to route
+            // through it when the core it delegates to is already generic.
+            if let Err(e) = self.point_curusr_mem(A::mem(machine), chan) {
+                return self
+                    .shim_stop(machine, "point_curusr", e)
+                    .map(|outcome| Some((outcome, chan)));
+            }
+
+            // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
+            // only the `!= 3` guard on `shomal()` (the operator console, out of
+            // scope) is conditional. `status` is a placed global
+            // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
+            // at 2 sites); writing it only on the non-CRSTG path left the
+            // module reading a stale value on the CRSTG path -- zero on a
+            // fresh host, or a leftover `OUTMT` from an earlier poll.
+            self.globals()
+                .write_mem(A::mem(machine), "status", &status.to_le_bytes())?;
+
+            let entry_index = match dispatch {
+                // A polling routine is not an entry point and has no index. The
+                // arm diverges either way, so the `match` still yields the index
+                // the `Entry` arm carries.
+                PollTarget::Poll => match self.dopoll(machine, module, chan)? {
+                    Some(outcome) => return Ok(Some((outcome, chan))),
+                    None => continue,
+                },
+                PollTarget::Entry(index) => index,
+            };
+
+            if status == gsbl::Gsbl::CRSTG
+                && let Err(e) = self.get_input(machine, chan)
+            {
+                return self
+                    .shim_stop(machine, "get_input", e)
+                    .map(|outcome| Some((outcome, chan)));
+            }
+
+            // `MAJORBBS.C:2703` keys both of these on the channel's own state:
+            // `sttrou` through `(*(module[usrptr->state]->sttrou))()` and
+            // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
+            // is read out here and the borrow ends before `self.run` needs
+            // `self` mutably.
+            //
+            // This is the one dispatch site a `Native` registration is
+            // genuinely for -- `inifsd()` registers the FSD so that a
+            // channel's `state` can name it exactly the way one names a
+            // module, and `sttrou`/`stsrou` are the entry points it exists to
+            // answer. `Abi::native_dispatch` carries that; every other call
+            // site in this file treats `Native` as a hook a module left null
+            // instead, because none of them are input dispatch.
+            let entry = self.state_entry(machine, chan, entry_index)?;
+            let entry = match entry {
+                Ok(Dispatch::Module(entry)) => Ok(entry),
+                Ok(Dispatch::Native(native)) => {
+                    A::native_dispatch(self, machine, module, chan, native, entry_index)
+                }
+                Err(e) => Err(e),
+            };
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return self
+                        .shim_stop(machine, "entry lookup", e)
+                        .map(|outcome| Some((outcome, chan)));
+                }
+            };
+            let Some(entry) = entry else {
+                // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
+                // the input", which the module never answered here -- a
+                // fabricated `Returned { ax: 0, dx: 0 }` would claim a call
+                // that never happened. On the CRSTG path `get_input` above
+                // has already taken the line, so a module with no `sttrou`
+                // silently drops every command; not implementing
+                // `module00`'s fallback is in scope, dropping the line
+                // without a word about it is not.
+                self.note(format!(
+                    "poll: channel {chan} has no entry {entry_index} registered; \
+                     status {status} was serviced with no module call"
+                ));
+                continue;
+            };
+            return self
+                .run(machine, module, entry, &[], Some(chan))
+                .map(|outcome| Some((outcome, chan)));
+        }
+    }
+
+    /// Grant `n` poll dispatches and arm every channel that polls.
+    ///
+    /// The analogue of `begin_polling`'s initial injection (`MAJORBBS.C:1183`).
+    /// [`Host::dopoll`] carries the chain from there, re-arming after each
+    /// call until the budget runs out; this is what starts it again.
+    ///
+    /// **It must arm, not merely count.** A budget that only gated the re-arm
+    /// would break the chain with nothing to restart it, and the channel would
+    /// be polled never again.
+    ///
+    /// A driver calls this once per wake. `n` has a floor -- enough dispatches
+    /// to drain a round of whatever the module amortises across its polling
+    /// routine -- and no ceiling worth worrying about: once a round is drained
+    /// the module's own pending-work counter is zero and every further poll
+    /// falls through. Overshooting buys no-ops. Undershooting is graceful.
+    ///
+    /// **`n` is the driver's whole sleep policy, so pick it knowingly.** The
+    /// chain re-arms until the budget runs out, so a polling channel spends
+    /// exactly what it is given: measured against MajorMUD, one wake per
+    /// second consumed all of 32, 128 and 512, and the host thread's pass
+    /// count came back as `n + 1` each time. `n` is therefore very nearly
+    /// "poll dispatches per second" on a board whose wakes are kick-driven,
+    /// and it is also, to within one, the host thread's idle CPU cost.
+    /// [`Ended::Waiting`]'s `polls_cut` does NOT tell a driver whether `n` was
+    /// large enough -- see its own doc for why not.
+    ///
+    /// `machine` widens from `&Machine` to `&mut A::Cpu` -- the same reason
+    /// `state_entry`'s own signature does: [`Abi::mem`] takes `&mut
+    /// Self::Cpu` even to read.
+    ///
+    /// # Errors
+    ///
+    /// If a channel's `polrou` cannot be read out of the machine.
+    pub fn refill_polls(&mut self, machine: &mut A::Cpu, n: usize) -> io::Result<()> {
+        self.polls_left = n;
+        if n == 0 {
+            return Ok(());
+        }
+        for chan in self.users.terms().all() {
+            // Already armed: either `dopoll` re-injected before the budget ran
+            // out, or the last burst hit `cycle`'s pass bound with statuses
+            // still queued. Injecting again would add a dispatch per wake.
+            if self.gsbl.polling_armed(chan) {
+                continue;
+            }
+            match self.users.polrou_mem(A::mem(machine), chan) {
+                Ok(Some(_)) => self.gsbl.inject(chan, gsbl::Gsbl::POLSTS),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "refill_polls: reading polrou for channel {chan}: {e:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn the main loop until something says stop.
+    ///
+    /// `MAJORBBS.C:417-480`, minus everything this host has already declined --
+    /// `syscyc`/`prctask` (`:423`), `chncyc` (`:474`), `shomal`, and the
+    /// `usrptr->class` switch. What is left is: service one status if any, then
+    /// catch the tick counter up to the clock, running [`Host::prcrtk`] once per
+    /// elapsed second.
+    ///
+    /// **`max` bounds passes, not dispatches.** A bound on dispatches would
+    /// make a module that stopped polling to wait on a timer return zero work
+    /// forever.
+    ///
+    /// It returns as soon as nothing is queued, rather than spinning until a
+    /// timer comes due. The caller advances time by sleeping and calling back;
+    /// [`Ended::wait`] says how long. The old loop turned here because the
+    /// original's did, and the original's did because it owned the machine.
+    ///
+    /// This never sleeps. One thread owns the machine, so a sleep here would
+    /// be a sleep the socket cannot interrupt; the caller owns all blocking and
+    /// [`Ended`] carries what it needs to decide.
+    ///
+    /// # Errors
+    ///
+    /// If no module has registered, or the machine malfunctions. A module that
+    /// stops is [`Ended::Stopped`], not an error.
+    pub fn cycle(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        max: usize,
+    ) -> io::Result<Cycles<A>> {
+        let mut iterations = 0;
+        let mut dispatched = 0;
+
+        while iterations < max {
+            iterations += 1;
+
+            // `MAJORBBS.C:419-424`, the one part of the main loop this host
+            // used to decline:
+            //
+            //
+            // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
+            // `prctask()`)" -- the pointer a module chains its own real-time
+            // engine onto at init. Declining it was not a scoping saving: it
+            // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
+            // (export 106) is the ONLY writer of the module's fast-tick gate;
+            // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
+            // so with the vector uncalled the gate was set twice at init and
+            // never again -- monsters never moved, and the per-player movement
+            // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
+            // decrements, never counted down. Measured: calling this is what
+            // makes "You hear movement to the north" appear at all.
+            //
+            // `peek` rather than `scan` because the vector fires on the scan's
+            // *answer*, before the channel is serviced, and `scan` advances the
+            // rotation; `peek` is the same query without the side effect.
+            // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
+            // for every channel number -- so an idle pass fires it too, as the
+            // original's does.
+            //
+            // `prctask` -- the vector's documented tail -- is still not here.
+            // Nothing this host loads registers a task, so there is no chain to
+            // run; a module that did would need it, and would find this comment.
+            let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
+            if newunm <= self.lstunm {
+                let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
+                if vector != A::null_ptr() {
+                    match self.run(machine, module, vector, &[], None)? {
+                        Outcome::Stopped(poison) => {
+                            return Ok(Cycles {
+                                iterations,
+                                dispatched,
+                                // `None`: the vector belongs to no channel.
+                                ended: Ended::Stopped(poison, None),
+                            });
+                        }
+                        Outcome::Returned { .. } => dispatched += 1,
+                    }
+                }
+            }
+            self.lstunm = newunm;
+
+            // No `pending()` guard here, and deliberately. `Host::poll`'s first
+            // act is the same scan, and it returns `Ok(None)` before touching
+            // the module or the machine when that scan finds nothing -- so a
+            // guard testing the identical predicate could only agree with it.
+            // It was written as one, and review found that mutating the guard
+            // away left all 739 tests passing, which is what unobservable looks
+            // like.
+            match self.poll_with_chan(machine, module)? {
+                Some((Outcome::Stopped(poison), chan)) => {
+                    return Ok(Cycles {
+                        iterations,
+                        dispatched,
+                        ended: Ended::Stopped(poison, Some(chan)),
+                    });
+                }
+                Some((Outcome::Returned { .. }, _chan)) => dispatched += 1,
+                // A status that dispatched nothing: a stale `POLSTS`, or an
+                // entry point the module never registered. `poll` has
+                // consumed it either way.
+                None => {}
+            }
+
+            // `MAJORBBS.C:476`, with two changes the original did not need.
+            // `get_or_insert` is the first pass syncing rather than catching up
+            // from 1970, and `<` is where the original had `!=`: `ticker` could
+            // only wrap, a system clock can be set backwards, and `!=` would
+            // then run about four billion rounds firing timers on every one.
+            let now = self.clock().epoch().map_err(io::Error::other)?;
+            let mut last = *self.tcklst.get_or_insert(now);
+            if now < last {
+                self.note(format!(
+                    "cycle: the clock went backwards, {last} to {now}; resyncing without firing"
+                ));
+                last = now;
+            }
+            let mut rounds = 0;
+            while last < now {
+                last += 1;
+                rounds += 1;
+                if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
+                    // Written back before the early return: the rounds already
+                    // run must not run again on the next `cycle`.
+                    self.tcklst = Some(last);
+                    return Ok(Cycles {
+                        iterations,
+                        dispatched,
+                        // `None`: a kick fired this, and `Kick` carries only
+                        // `delay` and `dstrou` -- no channel exists to name.
+                        // See `Ended::Stopped`'s own doc.
+                        ended: Ended::Stopped(poison, None),
+                    });
+                }
+            }
+            self.tcklst = Some(last);
+            if rounds > 1 {
+                self.note(format!(
+                    "cycle: {rounds} seconds of timers in one pass -- the host stalled"
+                ));
+            }
+
+            // Nothing queued. Whether a timer is outstanding decides which
+            // kind of nothing this is, but either way the loop has no reason
+            // to turn again: `prcrtk` cannot fire before the next whole
+            // second, and no other source of work exists -- the 16-bit world
+            // only advances when this host dispatches into it. Spinning here
+            // was the whole of the old busy-wait.
+            if !self.gsbl().pending() {
+                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    ended: match next_kick {
+                        Some(next_kick) => Ended::Waiting {
+                            next_kick,
+                            polls_cut: self.polls_left == 0,
+                        },
+                        None => Ended::Idle,
+                    },
+                });
+            }
+        }
+
+        let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
+        Ok(Cycles {
+            iterations,
+            dispatched,
+            ended: Ended::Bound { next_kick },
+        })
+    }
 }
 
 /// Everything that reads or writes module memory, plus [`Host::dos_name`]
@@ -2111,50 +2846,6 @@ impl Host<Wg16> {
         })
     }
 
-    /// Every module that has registered, in the order they did.
-    /// Entry `n` of the module channel `chan`'s `state` names -- or, if
-    /// `state` names a host-native registration, the native handler itself.
-    ///
-    /// `MAJORBBS.C:2703` is `(*(module[usrptr->state]->sttrou))()`: a channel's
-    /// `state` **is** an index into the module table, and `register_module`
-    /// returning that index is the whole handshake. This host had dispatched to
-    /// `modules().first()` instead, which is the same thing only while exactly
-    /// one module is registered -- and `inifsd()` registers FSDBBS as an
-    /// ordinary module, so the FSD is a second one.
-    ///
-    /// A `state` naming a slot nobody registered stops with a reason. Falling
-    /// back to module 0 would send another module's keystrokes to MajorMUD and
-    /// look, from the outside, like a module that ignored its input.
-    ///
-    /// The two layers of `Result` are not decoration: the outer is "this host
-    /// cannot go on", the inner is a [`ShimError`] the caller turns into
-    /// [`Outcome::Stopped`] through [`Host::shim_stop`], and only the caller
-    /// knows which of its own step names to attach.
-    ///
-    /// # Errors
-    ///
-    /// If `state` names no registered module.
-    fn state_entry(
-        &self,
-        machine: &Machine,
-        chan: Chan,
-        n: usize,
-    ) -> io::Result<Result<Dispatch<Wg16>, ShimError>> {
-        let state = match self.users.state_mem(machine.mem(), chan) {
-            Ok(state) => state,
-            Err(e) => return Ok(Err(e)),
-        };
-        let Some(registered) = self.modules().get(usize::from(state)) else {
-            let count = self.modules().len();
-            return Err(io::Error::other(format!(
-                "channel {chan} is in state {state} and {count} module(s) are registered, \
-                 so there is no module to enter: either a module wrote a state it was \
-                 never given, or a registration this host owes has not happened"
-            )));
-        };
-        Ok(registered.dispatch(machine.mem(), n))
-    }
-
     /// `Dispatch::Native`'s side of [`Host::poll`]'s `sttrou`/`stsrou`
     /// dispatch: entry `n` of the FSD's own native slot, run directly
     /// instead of through a far call.
@@ -2211,41 +2902,6 @@ impl Host<Wg16> {
     /// Reborrows into [`Host::class_mem`] through [`Machine::mem`].
     pub fn class(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
         self.class_mem(machine.mem(), unum)
-    }
-
-    /// `paccin()` then `parsin()`, and the far pointer `getin()` hands back:
-    /// `char *margv[0]`.
-    ///
-    /// `archive/galacticomm/extract/wg20/galdsrc/SRC/MAJORBBS.C:3368`:
-    ///
-    ///
-    /// `paccin` is `inplen=btuinp(usrnum,input)` followed by `paccit()` --
-    /// the modem monitor and the profanity check, both BBS-shaped and out of
-    /// scope. This host's `paccin` is `btuinp` and nothing else: take the
-    /// channel's completed line (an empty one if none is ready, which is
-    /// exactly the byte string an empty line already is) and write it,
-    /// NUL-terminated, into `input`. `btuinp` is not itself a shim --
-    /// `WCCMMUD.DLL` imports it only on the 32-bit side -- so it has no
-    /// argument stack to read; what it does is folded in here.
-    ///
-    /// Shared rather than inlined into the `getin` shim because
-    /// [`Host::poll`] (Task 9) needs the identical sequence and must not have
-    /// to fake a call frame to reach it.
-    ///
-    /// The `Wg16` facade [`Host::get_input_mem`] delegates into. Kept under
-    /// this name and `&mut Machine` signature: [`Host::poll`] calls it
-    /// directly, with no argument frame to build a `Call<Wg16>` from.
-    ///
-    /// # Errors
-    ///
-    /// If `input`, `margv` or `margn` are not placed, or a write runs off a
-    /// segment.
-    pub(crate) fn get_input(
-        &mut self,
-        machine: &mut Machine,
-        chan: Chan,
-    ) -> Result<FarPtr, ShimError> {
-        self.get_input_mem(machine.mem_mut(), chan)
     }
 
     /// Point the four globals that name "the current channel" -- `usrnum`,
@@ -2743,546 +3399,6 @@ impl Host<Wg16> {
         Ok(outcome)
     }
 
-    /// `dopoll()` -- call a channel's polling routine now. `MAJORBBS.C:3258`.
-    ///
-    ///
-    /// The routine takes no arguments and its return value is discarded, as
-    /// `(*usrptr->polrou)()` discards it. `poll` has already pointed `curusr`
-    /// and written `status`, so it runs with `usrnum`, `usrptr`, `usaptr` and
-    /// `vdaptr` correct.
-    ///
-    /// `polrou` is read again after the call rather than remembered: a routine
-    /// that called `stop_polling` on itself must not be re-armed, and that is
-    /// the *only* thing the second read is for.
-    ///
-    /// Returns `None` when the channel is not polling -- a status left over
-    /// from a `begin_polling` the module has since undone. No call happened, so
-    /// there is no [`Outcome`] to report and R24 forbids inventing one.
-    fn dopoll(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        chan: Chan,
-    ) -> io::Result<Option<Outcome<Wg16>>> {
-        let rou = match self.users.polrou_mem(machine.mem(), chan) {
-            Ok(Some(rou)) => rou,
-            Ok(None) => return Ok(None),
-            Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
-        };
-
-        self.inpolr = Some(chan);
-        let outcome = self.run(machine, module, rou, &[], Some(chan));
-        // Cleared before the `?`, so a machine that malfunctioned does not leave
-        // `inpolr` naming a channel that is no longer running anything. The
-        // original does the same from the `longjmp` landings at
-        // `MAJORBBS.C:2488` and `:4150`.
-        self.inpolr = None;
-        let outcome = outcome?;
-
-        // One dispatch, one token. Saturating because the budget may already
-        // be zero: when it runs out, up to `nterms` injections are still
-        // queued, and those are dispatched rather than dropped -- a status the
-        // host queued is one it owes the module.
-        self.polls_left = self.polls_left.saturating_sub(1);
-
-        // `MAJORBBS.C:3258` re-injects unconditionally, because the original
-        // owned the machine and had nothing else to do with the turn. The
-        // re-read of `polrou` below is its check and is kept exactly: a
-        // routine that zeroed its own `polrou` must not be re-armed.
-        //
-        // The budget is the addition. Without it this chain never breaks,
-        // `pending()` is permanently true, and `cycle` can never tell a driver
-        // it is safe to sleep.
-        if self.polls_left > 0 && matches!(outcome, Outcome::Returned { .. }) {
-            match self.users.polrou_mem(machine.mem(), chan) {
-                Ok(Some(_)) => {
-                    self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
-                }
-                Ok(None) => {}
-                Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
-            }
-        }
-        Ok(Some(outcome))
-    }
-
-    /// `prcrtk()` -- one second's worth of the kicktable. `RTKICK.C:59`:
-    ///
-    ///
-    /// Called once per elapsed second, never once per pass -- see
-    /// [`Host::cycle`].
-    ///
-    /// Every due entry is taken out of the table *before* any of them runs.
-    /// `GALMJD.C:1106` re-arms `mjdrtk` from inside `mjdrtk`, so a callback
-    /// pushes onto the list being walked; draining first puts the re-armed kick
-    /// in the next round, which is where the original's free-slot scan puts it
-    /// too.
-    ///
-    /// `fired` is added to rather than assigned, so a caller can accumulate
-    /// across the rounds of one catch-up.
-    ///
-    /// Returns the poison if a callback stopped the machine, and `None`
-    /// otherwise. A callback's return value is discarded, as `prcrtk` discards
-    /// it.
-    fn prcrtk(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        fired: &mut usize,
-    ) -> io::Result<Option<Poison>> {
-        let mut due = Vec::new();
-        self.kicks.retain_mut(|kick| {
-            // `rtkick` refuses a zero delay, so no live entry can underflow.
-            kick.delay -= 1;
-            if kick.delay == 0 {
-                due.push(*kick);
-                false
-            } else {
-                true
-            }
-        });
-
-        for kick in due {
-            *fired += 1;
-            // `MBBS_TRACE_SHIMS`: name each kick as it fires. A module whose
-            // timers are dead and one whose timers run but do nothing look
-            // identical from outside; this tells them apart.
-            if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
-                eprintln!("mbbs-trace: KICK-FIRE dstrou={:?}", kick.dstrou);
-            }
-            match self.run(machine, module, kick.dstrou, &[], None)? {
-                Outcome::Stopped(poison) => return Ok(Some(poison)),
-                Outcome::Returned { .. } => {}
-            }
-        }
-        Ok(None)
-    }
-
-    /// Service one channel that has something to report.
-    ///
-    /// `MAJORBBS.C:169`'s loop, with everything bulletin-board-shaped taken
-    /// out -- the `usrptr->class` switch, `RING`/`CMDOK`, `rstchn`, `dwopr`,
-    /// `prcrtk` and `hdlinp`'s fallback to `module00` are all MajorBBS and not
-    /// the module, and none of them are here:
-    ///
-    /// ```text
-    /// scan() -> a channel with a status
-    ///   curusr(chan), then write the `status` global -- BOTH unconditional,
-    ///   as `MAJORBBS.C:152` is (see the comment at the write itself for the
-    ///   stale-value bug that writing it only on the non-CRSTG path caused)
-    ///   status 3 (CRSTG)  -> getin(), then entry 1 (sttrou)
-    ///   status 4 (INBLK)
-    ///      or 5 (OUTMT)   -> entry 2 (stsrou)
-    ///   anything else     -> a note, and no call
-    /// ```
-    ///
-    /// Returns `None` if no channel has a status waiting, if the one that
-    /// did raised a status nothing here dispatches, or if the module
-    /// supplies no entry point for the one that would have been called --
-    /// none of those is a module call, so there is no [`Outcome`] to report.
-    ///
-    /// R21: a `ShimError` out of `point_curusr`, `get_input` or the entry
-    /// lookup poisons the machine and comes back as `Outcome::Stopped`, the
-    /// same policy [`Host::run`] applies to a `ShimError` from a shim it
-    /// dispatched. See `shim_stop`.
-    ///
-    /// # Errors
-    ///
-    /// If no module has registered. (A write running off a segment, or the
-    /// module being unenterable, poisons the machine and comes back as
-    /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
-    pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome<Wg16>>> {
-        Ok(self.poll_with_chan(machine, module)?.map(|(outcome, _chan)| outcome))
-    }
-
-    /// [`Host::poll`], plus the channel an [`Outcome`] belongs to.
-    ///
-    /// Private: the only caller that needs the channel is [`Host::cycle`],
-    /// which wants it to name who a stop happened to in [`Ended::Stopped`].
-    /// Every external caller of `poll` (`crates/mbbs/tests/wccmmud.rs` and
-    /// `ifansi_oracle.rs`, dozens of call sites) only ever wanted the
-    /// `Outcome`, so `poll` keeps that shape and this carries the extra fact
-    /// out through the one caller that has a use for it.
-    fn poll_with_chan(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-    ) -> io::Result<Option<(Outcome<Wg16>, Chan)>> {
-        // R23: a status this host does not dispatch (`OVRFLW`, say) is not
-        // the same fact as "nothing queued" -- looping past it here, rather
-        // than answering `Ok(None)` for it, keeps that distinction from
-        // leaking into the return value. A driver written
-        // `while host.poll(..)?.is_some() {}` would otherwise stop dead on
-        // one undispatched status with a `CRSTG` still queued behind it.
-        // Every iteration consumes exactly one status, so this cannot
-        // legitimately run more times than there were statuses queued. The
-        // bound is not for the legitimate case.
-        //
-        // Both `continue` arms below allocate a note, and the status queue is
-        // deliberately unbounded (see `gsbl::Channel::status`). So an edit that
-        // stops consuming turns this loop into something that eats the machine
-        // instead of failing a test -- which is not hypothetical: a mutation
-        // that peeked instead of popping reached 4.7 GB resident and the global
-        // OOM killer took the session down with it. A host bug should cost a
-        // red test, not the box.
-        const SPINS: usize = 1024;
-        let mut spins = 0usize;
-
-        loop {
-            spins += 1;
-            if spins > SPINS {
-                return Err(io::Error::other(format!(
-                    "poll went round {SPINS} times without dispatching to the module: \
-                     a status is being read but not consumed"
-                )));
-            }
-
-            let Some(chan) = self.gsbl_mut().scan() else {
-                return Ok(None);
-            };
-
-            // Popped before either entry point is called, not after -- a
-            // `sttrou` that re-enters through `hdlinp` must not see its own
-            // status still queued.
-            let status = self
-                .gsbl_mut()
-                .next_status(chan)
-                .expect("scan just found a channel with one");
-
-            let dispatch = match status {
-                gsbl::Gsbl::CRSTG => PollTarget::Entry(1),
-                // `susing()` (`MAJORBBS.C:2478`) names `POLSTS`, `SPXTRM`,
-                // `SPXWDG`, `RING`, `LOST2C`, `LOST25`, `CRSTG`, `OBFCLR`,
-                // `ABOREQ` and `OUTMT`, and lets everything else fall to
-                // `default: (*(module[usrptr->state]->stsrou))()`. `CYCLE`
-                // (`MAJORBBS.H:236`) is in "everything else", which is what
-                // makes `fsdnfy()` work at all -- it injects 240 at itself
-                // expecting `stsrou` to run.
-                gsbl::Gsbl::INBLK | gsbl::Gsbl::OUTMT | gsbl::Gsbl::CYCLE => PollTarget::Entry(2),
-                gsbl::Gsbl::POLSTS => PollTarget::Poll,
-                other => {
-                    self.note(format!(
-                        "poll: channel {chan} raised status {other}, which nothing here dispatches"
-                    ));
-                    continue;
-                }
-            };
-
-            // The module reads `usrnum` at 2,570 sites and `usrptr` at 255;
-            // `MAJORBBS.C:154-155` points both, and `usaptr` with them, before
-            // every dispatch -- `:157` is the `usrptr->class` switch this host
-            // deliberately does not have. `vdaptr` is not named there at all;
-            // `point_curusr` sets it because the real host's own `curusr`
-            // (`MAJORBBS.C:4290`) does.
-            if let Err(e) = self.point_curusr(machine, chan) {
-                return self
-                    .shim_stop(machine, "point_curusr", e)
-                    .map(|outcome| Some((outcome, chan)));
-            }
-
-            // `MAJORBBS.C:152`: `status=btusts(usrnum)` is unconditional --
-            // only the `!= 3` guard on `shomal()` (the operator console, out of
-            // scope) is conditional. `status` is a placed global
-            // (`globals.rs:107`) that `stsrou` reads (`WCCMMUD.DLL` imports it
-            // at 2 sites); writing it only on the non-CRSTG path left the
-            // module reading a stale value on the CRSTG path -- zero on a
-            // fresh host, or a leftover `OUTMT` from an earlier poll.
-            self.globals()
-                .write(machine, "status", &status.to_le_bytes())?;
-
-            let entry_index = match dispatch {
-                // A polling routine is not an entry point and has no index. The
-                // arm diverges either way, so the `match` still yields the index
-                // the `Entry` arm carries.
-                PollTarget::Poll => match self.dopoll(machine, module, chan)? {
-                    Some(outcome) => return Ok(Some((outcome, chan))),
-                    None => continue,
-                },
-                PollTarget::Entry(index) => index,
-            };
-
-            if status == gsbl::Gsbl::CRSTG
-                && let Err(e) = self.get_input(machine, chan)
-            {
-                return self
-                    .shim_stop(machine, "get_input", e)
-                    .map(|outcome| Some((outcome, chan)));
-            }
-
-            // `MAJORBBS.C:2703` keys both of these on the channel's own state:
-            // `sttrou` through `(*(module[usrptr->state]->sttrou))()` and
-            // `stsrou` beside it. Same borrow trap as `connect` -- the pointer
-            // is read out here and the borrow ends before `self.run` needs
-            // `self` mutably.
-            //
-            // This is the one dispatch site a `Native` registration is
-            // genuinely for -- `inifsd()` registers the FSD so that a
-            // channel's `state` can name it exactly the way one names a
-            // module, and `sttrou`/`stsrou` are the entry points it exists to
-            // answer. `fsd_dispatch` carries that; every other call site in
-            // this file treats `Native` as a hook a module left null instead,
-            // because none of them are input dispatch.
-            let entry = self.state_entry(machine, chan, entry_index)?;
-            let entry = match entry {
-                Ok(Dispatch::Module(entry)) => Ok(entry),
-                Ok(Dispatch::Native(Native::Fsd)) => {
-                    self.fsd_dispatch(machine, module, chan, entry_index)
-                }
-                Err(e) => Err(e),
-            };
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    return self
-                        .shim_stop(machine, "entry lookup", e)
-                        .map(|outcome| Some((outcome, chan)));
-                }
-            };
-            let Some(entry) = entry else {
-                // R24: `sttrou`'s `ax` is TRUE/FALSE for "did you consume
-                // the input", which the module never answered here -- a
-                // fabricated `Returned { ax: 0, dx: 0 }` would claim a call
-                // that never happened. On the CRSTG path `get_input` above
-                // has already taken the line, so a module with no `sttrou`
-                // silently drops every command; not implementing
-                // `module00`'s fallback is in scope, dropping the line
-                // without a word about it is not.
-                self.note(format!(
-                    "poll: channel {chan} has no entry {entry_index} registered; \
-                     status {status} was serviced with no module call"
-                ));
-                continue;
-            };
-            return self
-                .run(machine, module, entry, &[], Some(chan))
-                .map(|outcome| Some((outcome, chan)));
-        }
-    }
-
-    /// Grant `n` poll dispatches and arm every channel that polls.
-    ///
-    /// The analogue of `begin_polling`'s initial injection (`MAJORBBS.C:1183`).
-    /// [`Host::dopoll`] carries the chain from there, re-arming after each
-    /// call until the budget runs out; this is what starts it again.
-    ///
-    /// **It must arm, not merely count.** A budget that only gated the re-arm
-    /// would break the chain with nothing to restart it, and the channel would
-    /// be polled never again.
-    ///
-    /// A driver calls this once per wake. `n` has a floor -- enough dispatches
-    /// to drain a round of whatever the module amortises across its polling
-    /// routine -- and no ceiling worth worrying about: once a round is drained
-    /// the module's own pending-work counter is zero and every further poll
-    /// falls through. Overshooting buys no-ops. Undershooting is graceful.
-    ///
-    /// **`n` is the driver's whole sleep policy, so pick it knowingly.** The
-    /// chain re-arms until the budget runs out, so a polling channel spends
-    /// exactly what it is given: measured against MajorMUD, one wake per
-    /// second consumed all of 32, 128 and 512, and the host thread's pass
-    /// count came back as `n + 1` each time. `n` is therefore very nearly
-    /// "poll dispatches per second" on a board whose wakes are kick-driven,
-    /// and it is also, to within one, the host thread's idle CPU cost.
-    /// [`Ended::Waiting`]'s `polls_cut` does NOT tell a driver whether `n` was
-    /// large enough -- see its own doc for why not.
-    ///
-    /// # Errors
-    ///
-    /// If a channel's `polrou` cannot be read out of the machine.
-    pub fn refill_polls(&mut self, machine: &Machine, n: usize) -> io::Result<()> {
-        self.polls_left = n;
-        if n == 0 {
-            return Ok(());
-        }
-        for chan in self.users.terms().all() {
-            // Already armed: either `dopoll` re-injected before the budget ran
-            // out, or the last burst hit `cycle`'s pass bound with statuses
-            // still queued. Injecting again would add a dispatch per wake.
-            if self.gsbl.polling_armed(chan) {
-                continue;
-            }
-            match self.users.polrou_mem(machine.mem(), chan) {
-                Ok(Some(_)) => self.gsbl.inject(chan, gsbl::Gsbl::POLSTS),
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "refill_polls: reading polrou for channel {chan}: {e:?}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Turn the main loop until something says stop.
-    ///
-    /// `MAJORBBS.C:417-480`, minus everything this host has already declined --
-    /// `syscyc`/`prctask` (`:423`), `chncyc` (`:474`), `shomal`, and the
-    /// `usrptr->class` switch. What is left is: service one status if any, then
-    /// catch the tick counter up to the clock, running [`Host::prcrtk`] once per
-    /// elapsed second.
-    ///
-    /// **`max` bounds passes, not dispatches.** A bound on dispatches would
-    /// make a module that stopped polling to wait on a timer return zero work
-    /// forever.
-    ///
-    /// It returns as soon as nothing is queued, rather than spinning until a
-    /// timer comes due. The caller advances time by sleeping and calling back;
-    /// [`Ended::wait`] says how long. The old loop turned here because the
-    /// original's did, and the original's did because it owned the machine.
-    ///
-    /// This never sleeps. One thread owns the `Machine`, so a sleep here would
-    /// be a sleep the socket cannot interrupt; the caller owns all blocking and
-    /// [`Ended`] carries what it needs to decide.
-    ///
-    /// # Errors
-    ///
-    /// If no module has registered, or the machine malfunctions. A module that
-    /// stops is [`Ended::Stopped`], not an error.
-    pub fn cycle(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        max: usize,
-    ) -> io::Result<Cycles> {
-        let mut iterations = 0;
-        let mut dispatched = 0;
-
-        while iterations < max {
-            iterations += 1;
-
-            // `MAJORBBS.C:419-424`, the one part of the main loop this host
-            // used to decline:
-            //
-            //
-            // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
-            // `prctask()`)" -- the pointer a module chains its own real-time
-            // engine onto at init. Declining it was not a scoping saving: it
-            // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
-            // (export 106) is the ONLY writer of the module's fast-tick gate;
-            // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
-            // so with the vector uncalled the gate was set twice at init and
-            // never again -- monsters never moved, and the per-player movement
-            // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
-            // decrements, never counted down. Measured: calling this is what
-            // makes "You hear movement to the north" appear at all.
-            //
-            // `peek` rather than `scan` because the vector fires on the scan's
-            // *answer*, before the channel is serviced, and `scan` advances the
-            // rotation; `peek` is the same query without the side effect.
-            // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
-            // for every channel number -- so an idle pass fires it too, as the
-            // original's does.
-            //
-            // `prctask` -- the vector's documented tail -- is still not here.
-            // Nothing this host loads registers a task, so there is no chain to
-            // run; a module that did would need it, and would find this comment.
-            let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
-            if newunm <= self.lstunm {
-                let vector = self.globals().pointer(machine, "syscyc")?;
-                if vector != FarPtr::NULL {
-                    match self.run(machine, module, vector, &[], None)? {
-                        Outcome::Stopped(poison) => {
-                            return Ok(Cycles {
-                                iterations,
-                                dispatched,
-                                // `None`: the vector belongs to no channel.
-                                ended: Ended::Stopped(poison, None),
-                            });
-                        }
-                        Outcome::Returned { .. } => dispatched += 1,
-                    }
-                }
-            }
-            self.lstunm = newunm;
-
-            // No `pending()` guard here, and deliberately. `Host::poll`'s first
-            // act is the same scan, and it returns `Ok(None)` before touching
-            // the module or the machine when that scan finds nothing -- so a
-            // guard testing the identical predicate could only agree with it.
-            // It was written as one, and review found that mutating the guard
-            // away left all 739 tests passing, which is what unobservable looks
-            // like.
-            match self.poll_with_chan(machine, module)? {
-                Some((Outcome::Stopped(poison), chan)) => {
-                    return Ok(Cycles {
-                        iterations,
-                        dispatched,
-                        ended: Ended::Stopped(poison, Some(chan)),
-                    });
-                }
-                Some((Outcome::Returned { .. }, _chan)) => dispatched += 1,
-                // A status that dispatched nothing: a stale `POLSTS`, or an
-                // entry point the module never registered. `poll` has
-                // consumed it either way.
-                None => {}
-            }
-
-            // `MAJORBBS.C:476`, with two changes the original did not need.
-            // `get_or_insert` is the first pass syncing rather than catching up
-            // from 1970, and `<` is where the original had `!=`: `ticker` could
-            // only wrap, a system clock can be set backwards, and `!=` would
-            // then run about four billion rounds firing timers on every one.
-            let now = self.clock().epoch().map_err(io::Error::other)?;
-            let mut last = *self.tcklst.get_or_insert(now);
-            if now < last {
-                self.note(format!(
-                    "cycle: the clock went backwards, {last} to {now}; resyncing without firing"
-                ));
-                last = now;
-            }
-            let mut rounds = 0;
-            while last < now {
-                last += 1;
-                rounds += 1;
-                if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
-                    // Written back before the early return: the rounds already
-                    // run must not run again on the next `cycle`.
-                    self.tcklst = Some(last);
-                    return Ok(Cycles {
-                        iterations,
-                        dispatched,
-                        // `None`: a kick fired this, and `Kick` carries only
-                        // `delay` and `dstrou` -- no channel exists to name.
-                        // See `Ended::Stopped`'s own doc.
-                        ended: Ended::Stopped(poison, None),
-                    });
-                }
-            }
-            self.tcklst = Some(last);
-            if rounds > 1 {
-                self.note(format!(
-                    "cycle: {rounds} seconds of timers in one pass -- the host stalled"
-                ));
-            }
-
-            // Nothing queued. Whether a timer is outstanding decides which
-            // kind of nothing this is, but either way the loop has no reason
-            // to turn again: `prcrtk` cannot fire before the next whole
-            // second, and no other source of work exists -- the 16-bit world
-            // only advances when this host dispatches into it. Spinning here
-            // was the whole of the old busy-wait.
-            if !self.gsbl().pending() {
-                let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-                return Ok(Cycles {
-                    iterations,
-                    dispatched,
-                    ended: match next_kick {
-                        Some(next_kick) => Ended::Waiting {
-                            next_kick,
-                            polls_cut: self.polls_left == 0,
-                        },
-                        None => Ended::Idle,
-                    },
-                });
-            }
-        }
-
-        let next_kick = self.kicks.iter().map(|kick| kick.delay).min();
-        Ok(Cycles {
-            iterations,
-            dispatched,
-            ended: Ended::Bound { next_kick },
-        })
-    }
 
     /// `void alcvda(void)` -- give every channel its volatile data area.
     ///
@@ -4360,7 +4476,7 @@ mod tests {
         set_state(&mut f, console, native);
         assert_eq!(
             f.host
-                .state_entry(&f.machine, console, 1)
+                .state_entry(&mut f.machine, console, 1)
                 .expect("readable")
                 .expect("no ShimError"),
             Dispatch::Native(Native::Fsd),
@@ -4368,7 +4484,7 @@ mod tests {
         set_state(&mut f, console, module_state);
         assert_eq!(
             f.host
-                .state_entry(&f.machine, console, 1)
+                .state_entry(&mut f.machine, console, 1)
                 .expect("readable")
                 .expect("no ShimError"),
             Dispatch::Module(Some(sttrou)),
@@ -5199,7 +5315,7 @@ mod tests {
             .users
             .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
-        f.host.refill_polls(&f.machine, 2).expect("armed");
+        f.host.refill_polls(&mut f.machine, 2).expect("armed");
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -5263,7 +5379,7 @@ mod tests {
         // inside it never runs. Deleting that read outright then passed all
         // 781 lib tests and all 17 real-module tests -- the budget silently
         // defanged the one test that protects it.
-        f.host.refill_polls(&f.machine, 4).expect("armed");
+        f.host.refill_polls(&mut f.machine, 4).expect("armed");
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
 
@@ -5427,7 +5543,7 @@ mod tests {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-        f.host.refill_polls(&f.machine, 1_000).expect("armed");
+        f.host.refill_polls(&mut f.machine, 1_000).expect("armed");
 
         let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
 
@@ -5459,7 +5575,7 @@ mod tests {
         let console = f.console();
         f.host.set_clock(Clock::pinned(1_135_952_405));
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
-        f.host.refill_polls(&f.machine, 1_000).expect("armed");
+        f.host.refill_polls(&mut f.machine, 1_000).expect("armed");
         f.host.kicks.push(Kick { delay: 300, dstrou: rou });
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
         f.host.kicks.push(Kick { delay: 45, dstrou: rou });
@@ -5567,7 +5683,7 @@ mod tests {
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
-        f.host.refill_polls(&f.machine, 5).expect("armed");
+        f.host.refill_polls(&mut f.machine, 5).expect("armed");
         let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
 
         assert_eq!(cycles.dispatched, 5, "the budget, not the pass bound");
@@ -5591,11 +5707,11 @@ mod tests {
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
-        f.host.refill_polls(&f.machine, 3).expect("armed");
+        f.host.refill_polls(&mut f.machine, 3).expect("armed");
         let first = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
         assert_eq!(first.dispatched, 3);
 
-        f.host.refill_polls(&f.machine, 3).expect("armed again");
+        f.host.refill_polls(&mut f.machine, 3).expect("armed again");
         let second = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
         assert_eq!(second.dispatched, 3, "the second burst polls too");
     }
@@ -5610,11 +5726,11 @@ mod tests {
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
-        f.host.refill_polls(&f.machine, 100).expect("armed");
+        f.host.refill_polls(&mut f.machine, 100).expect("armed");
         // One pass: dispatches one poll, and `dopoll` re-arms because budget
         // remains. So a status is queued when the refill below runs.
         let _ = f.host.cycle(&mut f.machine, &module, 1).expect("cycled");
-        f.host.refill_polls(&f.machine, 100).expect("refilled while armed");
+        f.host.refill_polls(&mut f.machine, 100).expect("refilled while armed");
 
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(gsbl::Gsbl::POLSTS));
         assert_eq!(
@@ -5655,7 +5771,7 @@ mod tests {
                 .expect("a polling channel");
         }
 
-        f.host.refill_polls(&f.machine, 100).expect("armed");
+        f.host.refill_polls(&mut f.machine, 100).expect("armed");
 
         assert!(f.host.gsbl().polling_armed(zero), "channel 0 polls, so it is armed");
         assert!(
@@ -5698,7 +5814,7 @@ mod tests {
         let console = f.console();
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
-        f.host.refill_polls(&f.machine, 0).expect("granted nothing");
+        f.host.refill_polls(&mut f.machine, 0).expect("granted nothing");
 
         assert!(
             !f.host.gsbl().polling_armed(console),
@@ -5717,13 +5833,13 @@ mod tests {
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
-        f.host.refill_polls(&f.machine, 2).expect("armed");
+        f.host.refill_polls(&mut f.machine, 2).expect("armed");
         let cut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
         assert_eq!(cut.ended, Ended::Waiting { next_kick: 60, polls_cut: true });
 
         // Nothing polling: the budget is untouched, so nothing was cut.
         f.host.users.set_polrou_mem(f.machine.mem_mut(), console, None).expect("channel 0");
-        f.host.refill_polls(&f.machine, 2).expect("nothing to arm");
+        f.host.refill_polls(&mut f.machine, 2).expect("nothing to arm");
         let uncut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
         assert_eq!(uncut.ended, Ended::Waiting { next_kick: 60, polls_cut: false });
     }
@@ -5733,17 +5849,18 @@ mod tests {
     #[test]
     fn ended_tells_a_driver_what_to_wait_on() {
         use crate::Wait;
-        assert_eq!(Ended::Idle.wait(), Wait::Blocked);
+        use crate::abi::Wg16;
+        assert_eq!(Ended::<Wg16>::Idle.wait(), Wait::Blocked);
         assert_eq!(
-            Ended::Waiting { next_kick: 1, polls_cut: false }.wait(),
+            Ended::<Wg16>::Waiting { next_kick: 1, polls_cut: false }.wait(),
             Wait::Until(1)
         );
         assert_eq!(
-            Ended::Waiting { next_kick: 60, polls_cut: true }.wait(),
+            Ended::<Wg16>::Waiting { next_kick: 60, polls_cut: true }.wait(),
             Wait::Until(60)
         );
-        assert_eq!(Ended::Bound { next_kick: None }.wait(), Wait::Now);
-        assert_eq!(Ended::Bound { next_kick: Some(3) }.wait(), Wait::Now);
+        assert_eq!(Ended::<Wg16>::Bound { next_kick: None }.wait(), Wait::Now);
+        assert_eq!(Ended::<Wg16>::Bound { next_kick: Some(3) }.wait(), Wait::Now);
 
         // The arm a driver reaches once and never returns from. Left out of
         // the first draft of this test, and review found it by mutating
@@ -5751,7 +5868,7 @@ mod tests {
         // green -- a driver that blocked forever on a stopped module instead
         // of shutting down, with nothing to say so.
         assert_eq!(
-            Ended::Stopped(mbbs_machine::m16::Poison::Timeout { cs: 0, ip: 0 }, None).wait(),
+            Ended::<Wg16>::Stopped(mbbs_machine::m16::Poison::Timeout { cs: 0, ip: 0 }, None).wait(),
             Wait::Stop
         );
     }
@@ -6333,7 +6450,7 @@ mod tests {
             .users
             .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
-        f.host.refill_polls(&f.machine, 1).expect("armed");
+        f.host.refill_polls(&mut f.machine, 1).expect("armed");
 
         let inventory = survey_inventory();
         f.host.enable_survey(inventory.clone());

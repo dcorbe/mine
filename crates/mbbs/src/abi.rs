@@ -435,6 +435,45 @@ pub trait Abi {
     /// offset for a future `Wg32` implementation, once `Wg32::Module`
     /// carries enough to answer it (design §3).
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
+
+    /// Run a [`crate::shims::system::Registration::Native`] entry's own
+    /// handler -- a host-implemented module slot, not a far call -- when
+    /// [`crate::Host::poll`]'s state lookup names one.
+    ///
+    /// The mirror of [`Abi::native`] for module *registrations* the host
+    /// supplies itself rather than routines an imported module calls:
+    /// `crate::shims::system::Native::Fsd` is the only variant today,
+    /// registered by `Host::finish_init`'s native FSD wiring, and it is
+    /// genuinely, permanently 16-bit -- `FSDBBS.C`'s session engine
+    /// (`crate::shims::fsd`) is `FarPtr` from top to bottom, the same reason
+    /// [`Abi::native`]'s ten routines never move into the shared table.
+    ///
+    /// Default: no native handler, because an `Abi` with no native
+    /// registration has nothing to dispatch -- `Wg32` writes no override, the
+    /// same way it writes none for [`Abi::native`]. Overridden only by
+    /// `Wg16`, which delegates to `Host::fsd_dispatch`.
+    ///
+    /// # Errors
+    ///
+    /// The default errors unconditionally, naming the variant, since reaching
+    /// it at all means a `Registration::Native` this ABI cannot have produced
+    /// somehow got dispatched anyway -- a bug in the host, not the module.
+    fn native_dispatch(
+        host: &mut crate::Host<Self>,
+        cpu: &mut Self::Cpu,
+        module: &Self::Module,
+        chan: crate::Chan,
+        native: crate::shims::system::Native,
+        n: usize,
+    ) -> Result<Option<Self::Ptr>, crate::ShimError>
+    where
+        Self: Sized,
+    {
+        let _ = (host, cpu, module, chan, n);
+        Err(crate::ShimError::Failed(format!(
+            "{native:?} has no native dispatch handler under this ABI"
+        )))
+    }
 }
 
 /// Memory a module can address, and the host's ability to hand it more.

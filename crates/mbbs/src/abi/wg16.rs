@@ -176,6 +176,23 @@ impl Abi for Wg16 {
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
         crate::caller(cpu, module)
     }
+
+    /// The one native registration this host has ever had: `FSDBBS.C`'s
+    /// full-screen data entry engine. Delegates straight to
+    /// `Host::fsd_dispatch`, which stays `Wg16`-only -- see
+    /// [`Abi::native_dispatch`]'s own doc comment for why.
+    fn native_dispatch(
+        host: &mut crate::Host<Wg16>,
+        cpu: &mut Self::Cpu,
+        module: &Self::Module,
+        chan: crate::Chan,
+        native: crate::shims::system::Native,
+        n: usize,
+    ) -> Result<Option<Self::Ptr>, crate::ShimError> {
+        match native {
+            crate::shims::system::Native::Fsd => host.fsd_dispatch(cpu, module, chan, n),
+        }
+    }
 }
 
 /// [`mbbs_machine::m16::Exit`] converted to [`Exit<Wg16>`] -- `Fault`/`Timeout`

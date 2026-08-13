@@ -358,7 +358,7 @@ fn life(
         }
 
         // 3. Arm every polling channel and grant this wake's budget.
-        host.refill_polls(&machine, boot.polls_per_wake)?;
+        host.refill_polls(&mut machine, boot.polls_per_wake)?;
 
         // 4. Turn the world.
         let cycles = host.cycle(&mut machine, &module, boot.passes)?;
