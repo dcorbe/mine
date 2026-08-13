@@ -1811,7 +1811,10 @@ impl<A: Abi> Host<A> {
         let vda = self.users().vda(uno);
 
         self.globals()
-            .write_mem(mem, "usrnum", &uno.number().to_le_bytes())
+            // `usrnum` is an `int`, so the whole of it is rewritten -- see
+            // `Globals::write_int_mem`. A two-byte write on top of the
+            // all-ones seed would have left `0xFFFF0000` under `Wg32`.
+            .write_int_mem(mem, "usrnum", uno.number() as i32 as u32)
             .map_err(|e| ShimError::Failed(format!("point_curusr: {e}")))?;
         self.globals()
             .write_mem(mem, "usrptr", &A::ptr_to_bytes(slot))
@@ -2524,7 +2527,9 @@ impl<A: Abi> Host<A> {
             // module reading a stale value on the CRSTG path -- zero on a
             // fresh host, or a leftover `OUTMT` from an earlier poll.
             self.globals()
-                .write_mem(A::mem(machine), "status", &status.to_le_bytes())?;
+                // `status` is an `i16` here and an `int` there: sign-extended to 32
+                // bits first, so a negative one is still negative at either width.
+                .write_int_mem(A::mem(machine), "status", status as i32 as u32)?;
 
             let entry_index = match dispatch {
                 // A polling routine is not an entry point and has no index. The

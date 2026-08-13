@@ -516,8 +516,8 @@ pub fn skpwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     let text = cp
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let n = crate::strings::skpwht(text) as u16;
-    Ok(abi::Ret::Ptr(at::<A>(cp, n)))
+    let n = crate::strings::skpwht(text);
+    Ok(abi::Ret::Ptr(at::<A>(cp, n)?))
 }
 
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
@@ -526,8 +526,8 @@ pub fn skpwrd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     let text = cp
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let n = crate::strings::skpwrd(text) as u16;
-    Ok(abi::Ret::Ptr(at::<A>(cp, n)))
+    let n = crate::strings::skpwrd(text);
+    Ok(abi::Ret::Ptr(at::<A>(cp, n)?))
 }
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
@@ -752,14 +752,14 @@ fn write_parse<A: Abi>(
     }
 
     for (n, &offset) in margv_ends.iter().enumerate() {
-        let word = at::<A>(input, offset);
-        let slot = at::<A>(margv, n as u16 * A::PTR_WIDTH as u16);
+        let word = at::<A>(input, usize::from(offset))?;
+        let slot = at::<A>(margv, n * A::PTR_WIDTH)?;
         slot.write(mem, &A::ptr_to_bytes(word))
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
     for (n, &offset) in margn_ends.iter().enumerate() {
-        let end = at::<A>(input, offset);
-        let slot = at::<A>(margn, n as u16 * A::PTR_WIDTH as u16);
+        let end = at::<A>(input, usize::from(offset))?;
+        let slot = at::<A>(margn, n * A::PTR_WIDTH)?;
         slot.write(mem, &A::ptr_to_bytes(end))
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
@@ -792,7 +792,7 @@ pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .ok_or_else(|| ShimError::Failed("margn is not placed".into()))?;
 
     for i in 0..(margc - 1).max(0) as u16 {
-        let slot = at::<A>(margn, i * A::PTR_WIDTH as u16);
+        let slot = at::<A>(margn, usize::from(i) * A::PTR_WIDTH)?;
         // `resolve` is how this crate reads raw bytes out of module memory --
         // `read_cstr` is for strings and there is no buffer-filling `read`.
         let bytes = slot
@@ -898,8 +898,8 @@ pub fn lastwd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     let text = s
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let n = crate::strings::lastwd(text) as u16;
-    Ok(abi::Ret::Ptr(at::<A>(s, n)))
+    let n = crate::strings::lastwd(text);
+    Ok(abi::Ret::Ptr(at::<A>(s, n)?))
 }
 
 /// `void sortstgs(char *stgs[],int num)` -- sort an array of `char *` in place.
@@ -984,21 +984,21 @@ pub fn strtok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let Some(start) = rest.iter().position(|b| !delims.contains(b)) else {
         // Nothing but delimiters. The cursor ends on the terminator, so every
         // later call answers NULL too.
-        host.strtok = at::<A>(cursor, rest.len() as u16);
+        host.strtok = at::<A>(cursor, rest.len())?;
         return Ok(abi::Ret::Ptr(null_ptr::<A>()));
     };
     let token_len = rest[start..].len();
     let ends_at = rest[start..].iter().position(|b| delims.contains(b));
 
-    let token = at::<A>(cursor, start as u16);
+    let token = at::<A>(cursor, start)?;
     match ends_at {
         Some(n) => {
-            let end = at::<A>(token, n as u16);
+            let end = at::<A>(token, n)?;
             end.write(call.mem(), &[0])
                 .map_err(|e| ShimError::Failed(e.to_string()))?;
-            host.strtok = at::<A>(end, 1);
+            host.strtok = at::<A>(end, 1)?;
         }
-        None => host.strtok = at::<A>(token, token_len as u16),
+        None => host.strtok = at::<A>(token, token_len)?,
     }
     Ok(abi::Ret::Ptr(token))
 }
@@ -1018,12 +1018,12 @@ pub fn strchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
     if want == 0 {
-        return Ok(abi::Ret::Ptr(at::<A>(s, text.len() as u16)));
+        return Ok(abi::Ret::Ptr(at::<A>(s, text.len())?));
     }
-    Ok(match text.iter().position(|&b| b == want) {
-        Some(i) => abi::Ret::Ptr(at::<A>(s, i as u16)),
-        None => abi::Ret::Ptr(null_ptr::<A>()),
-    })
+    match text.iter().position(|&b| b == want) {
+        Some(i) => Ok(abi::Ret::Ptr(at::<A>(s, i)?)),
+        None => Ok(abi::Ret::Ptr(null_ptr::<A>())),
+    }
 }
 
 /// `char *strstr(char *hay,char *needle)`.
@@ -1051,10 +1051,10 @@ pub fn strstr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         return Ok(abi::Ret::Ptr(null_ptr::<A>()));
     }
     let found = (0..=text.len() - needle.len()).find(|&i| text[i..].starts_with(&needle));
-    Ok(match found {
-        Some(i) => abi::Ret::Ptr(at::<A>(hay, i as u16)),
-        None => abi::Ret::Ptr(null_ptr::<A>()),
-    })
+    match found {
+        Some(i) => Ok(abi::Ret::Ptr(at::<A>(hay, i)?)),
+        None => Ok(abi::Ret::Ptr(null_ptr::<A>())),
+    }
 }
 
 /// `char *strcat(char *dst,char *src)`.
@@ -1068,12 +1068,12 @@ pub fn strcat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     let end = dst
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
-        .len() as u16;
+        .len();
     let text = src
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
-    fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
+    fill::<A>(call.mem(), at::<A>(dst, end)?, &text)?;
     Ok(abi::Ret::Ptr(dst))
 }
 
@@ -1099,12 +1099,12 @@ pub fn strncat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     let end = dst
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
-        .len() as u16;
+        .len();
     let text = src
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     let text = text[..text.len().min(max)].to_vec();
-    fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
+    fill::<A>(call.mem(), at::<A>(dst, end)?, &text)?;
     Ok(abi::Ret::Ptr(dst))
 }
 
@@ -1258,19 +1258,43 @@ fn fill<A: Abi>(mem: &mut A::Mem, at: A::Ptr, text: &[u8]) -> Result<(), ShimErr
 
 /// A pointer `n` bytes into the string `ptr` names.
 ///
-/// The one piece of arithmetic every routine here that answers a `char *` does,
-/// and the reason it does not need checking: **`ptr.offset + n` never passes
-/// the terminator of a string that has already been read**. A successful
-/// [`Machine::read_cstr`] puts that terminator inside the segment, a segment is
-/// at most 64 KiB, and so the sum is at most `0xffff`. That covers `n` taken
-/// from a string's length and equally the
-/// `at(end, 1)` in [`strtok`], where `end` is a delimiter -- strictly before
-/// the terminator, so one past it still is not past.
+/// The one piece of arithmetic every routine here that answers a `char *`
+/// does. An earlier version of this comment argued it away as never needing
+/// a check: "`ptr.offset + n` never passes the terminator of a string that
+/// has already been read... a segment is at most 64 KiB, and so the sum is
+/// at most `0xffff`". That is true, but it is a **`Wg16` fact, not an `Abi`
+/// one** -- it is [`crate::abi::Wg16`]'s own segment that tops out at 64 KiB,
+/// not the notion of a module's address space in general.
+/// [`crate::abi::Wg32`] is a flat 32-bit space with no such ceiling: a
+/// `Wg32` string of 64 KiB or more is entirely legal, and every call site
+/// here builds `n` from a length or a scan position measured against the
+/// string actually read (`text.len()`, `rest.len()`, `position(...)`, and so
+/// on) -- there is nothing about *that* arithmetic that stays under
+/// `0xffff` just because it once did under `Wg16`. Capping `n` at `u16`
+/// before it reached [`Abi::ptr_offset`], the way this function used to,
+/// would silently wrap such a length round to a small one, and the wrapped
+/// pointer would still *resolve* -- landing somewhere plausible and wrong
+/// inside the module's own memory, with nothing to catch it.
+///
+/// So this is checked: [`Abi::ptr_checked_add`] refuses whatever this ABI's
+/// own pointer cannot represent (`Wg16`'s `u16` offset overflowing; a future
+/// ABI's own bound overflowing) instead of wrapping it, and this function
+/// turns that refusal into a [`ShimError`] naming the byte count that would
+/// not fit, rather than propagating a silent wraparound to the module.
 ///
 /// The selector is the caller's own. Rebuilding it from anywhere else would
 /// hand the module an address into the wrong segment.
-fn at<A: Abi>(ptr: A::Ptr, n: u16) -> A::Ptr {
-    A::ptr_offset(ptr, n)
+///
+/// # Errors
+///
+/// If `ptr` plus `n` bytes would leave the address space this ABI's own
+/// pointer can name.
+fn at<A: Abi>(ptr: A::Ptr, n: usize) -> Result<A::Ptr, ShimError> {
+    A::ptr_checked_add(ptr, n).ok_or_else(|| {
+        ShimError::Failed(format!(
+            "{n} bytes past this pointer overflows the address space this ABI's own pointer can name"
+        ))
+    })
 }
 
 /// The null pointer, in this ABI's own representation.
@@ -1360,6 +1384,55 @@ mod tests {
         // disassembly shows -- and stays so at both widths.
         assert_eq!(fold::<Wg16>(0x161, crate::strings::toupper), u32::from(b'A'));
         assert_eq!(fold::<Wg32>(0x161, crate::strings::toupper), u32::from(b'A'));
+    }
+
+    /// `at`'s own offset used to be `u16`, capped at exactly the width
+    /// [`crate::abi::Wg16`]'s segment allows -- correct for `Wg16`, but a
+    /// silent wraparound for [`crate::abi::Wg32`], whose flat address space
+    /// has no 64 KiB ceiling to cap `n` at. `0x1_0000` (65536) is the
+    /// smallest offset that demonstrates the difference: as a `u16` it
+    /// wraps to `0`, so the old, unchecked `at` would have answered the
+    /// *same pointer it started from* -- wrong, and not even a byte away
+    /// from where it should be, let alone caught.
+    ///
+    /// Tested on `at` directly, over bare `A::Ptr` values, for the reason
+    /// [`eof_survives_case_folding_at_both_int_widths`] gives for testing
+    /// `fold` the same way: a real `Wg32` `Call`/`Machine` cannot be built
+    /// inside this crate's `--lib` tests.
+    #[test]
+    fn at_refuses_an_offset_wg16_cannot_name_but_wg32_accepts_it() {
+        use crate::abi::Wg32;
+
+        let base16 = FarPtr {
+            offset: 0,
+            selector: 0x38,
+        };
+        assert!(
+            at::<Wg16>(base16, 0x1_0000).is_err(),
+            "a Wg16 segment is at most 64 KiB; there is no offset in it \
+             65536 bytes from the start"
+        );
+
+        let base32 = mbbs_machine::m32::Flat32Ptr(0);
+        let moved = at::<Wg32>(base32, 0x1_0000).expect("Wg32 has no 64 KiB ceiling to refuse this at");
+        assert_eq!(
+            moved,
+            mbbs_machine::m32::Flat32Ptr(0x1_0000),
+            "moved the full 65536 bytes, not wrapped back to the start"
+        );
+
+        // The boundary itself: exactly 64 KiB into a Wg16 segment is still
+        // one byte past the last one it can name (offsets 0..=0xffff), so
+        // this refuses too, one below where the case above starts.
+        assert!(at::<Wg16>(base16, 0x1_0001).is_err());
+        // But the very last in-range offset succeeds.
+        assert_eq!(
+            at::<Wg16>(base16, 0xffff).expect("the last offset in range"),
+            FarPtr {
+                offset: 0xffff,
+                selector: 0x38
+            }
+        );
     }
 
     #[test]
@@ -1589,7 +1662,7 @@ mod tests {
         assert_eq!(
             f.invoke(strchr, &[s.offset, s.selector, u16::from(b'n')])
                 .expect("ok"),
-            Ret::Far(at::<Wg16>(s, 3))
+            Ret::Far(at::<Wg16>(s, 3).expect("within the segment"))
         );
         assert_eq!(
             f.invoke(strchr, &[s.offset, s.selector, u16::from(b'z')])
@@ -1608,12 +1681,12 @@ mod tests {
         let s = f.text("abc");
         assert_eq!(
             f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
-            Ret::Far(at::<Wg16>(s, 3))
+            Ret::Far(at::<Wg16>(s, 3).expect("within the segment"))
         );
         assert_eq!(
             f.invoke(strchr, &[s.offset, s.selector, 0xff62])
                 .expect("ok"),
-            Ret::Far(at::<Wg16>(s, 1)),
+            Ret::Far(at::<Wg16>(s, 1).expect("within the segment")),
             "0xff62 is searched for as 'b'"
         );
     }
@@ -1629,7 +1702,7 @@ mod tests {
 
         assert_eq!(
             f.invoke(strstr, &pair(hay, needle)).expect("ok"),
-            Ret::Far(at::<Wg16>(hay, 3))
+            Ret::Far(at::<Wg16>(hay, 3).expect("within the segment"))
         );
         assert_eq!(
             f.invoke(strstr, &pair(hay, empty)).expect("ok"),

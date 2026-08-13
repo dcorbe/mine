@@ -678,7 +678,7 @@ pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))? as i16;
     if size > current {
         host.globals()
-            .write_mem(call.mem(), "vdasiz", &size.to_le_bytes())
+            .write_int_mem(call.mem(), "vdasiz", size as u32)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
     Ok(abi::Ret::Void)
@@ -704,6 +704,60 @@ pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// Generic: `block.resolve` replaces `Machine::resolve`, the same
 /// substitution [`register_textvar`]'s own read makes, and `host.register`
 /// now takes `A::Ptr` rather than `FarPtr`.
+/// `void globalcmd(int (*rouptr)())` -- install a global command handler.
+///
+/// `MAJORBBS.C:1114`, transcribed:
+///
+///
+/// A global command is one the host offers on every channel regardless of
+/// which module has it -- the real host walks `globs[]` before handing a
+/// line to the module that owns the session. This registers into the
+/// module's own memory rather than a Rust-side list, because `nglobs` and
+/// `globs` are host globals the module can read and write itself (see
+/// `crate::globals`'s module doc on why a second copy is the bug it exists
+/// to prevent).
+///
+/// # The overflow is a refusal, not a truncation
+///
+/// The real host calls `catastro`, which takes the whole system down. This
+/// host stops the module instead and names the limit -- the same trade every
+/// `ShimError::Failed` here makes. What it must not do is silently drop the
+/// fifty-first handler, which would leave the module believing a command is
+/// installed that no line will ever reach.
+pub fn globalcmd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let routine = call.ptr();
+
+    let n = host
+        .globals()
+        .word_mem(call.mem(), "nglobs")
+        .map_err(|e| ShimError::Failed(format!("globalcmd: {e}")))?;
+    if n >= crate::globals::GLBMAX {
+        return Err(ShimError::Failed(format!(
+            "globalcmd: TOO MANY GLOBAL COMMAND HANDLERS ({n} of {})",
+            crate::globals::GLBMAX
+        )));
+    }
+
+    // `globs[nglobs] = rouptr`, addressed through the table rather than a
+    // hand-built pointer: the slot stride is `A::PTR_WIDTH`, which is 4 under
+    // both ABIs, but saying so through the constant keeps the arithmetic
+    // honest if that ever stops being true.
+    let base = host
+        .globals()
+        .address("globs")
+        .ok_or_else(|| ShimError::Failed("globalcmd: globs is not placed".to_owned()))?;
+    let slot = A::ptr_offset(base, n * A::PTR_WIDTH as u16);
+    slot.write(call.mem(), &A::ptr_to_bytes(routine))
+        .map_err(|e| ShimError::Failed(format!("globalcmd: {e}")))?;
+
+    // `nglobs++`, at `A`'s own int width -- see `Globals::write_int_mem`.
+    host.globals()
+        .write_int_mem(call.mem(), "nglobs", u32::from(n) + 1)
+        .map_err(|e| ShimError::Failed(format!("globalcmd: {e}")))?;
+
+    Ok(abi::Ret::Void)
+}
+
 pub fn register_module<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = call.ptr();
 

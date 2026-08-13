@@ -300,6 +300,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
         (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
         (MAJORBBS, "register_module", system::register_module, Cleans::Caller),
+        (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller),
         (MAJORBBS, "register_agent", system::register_agent, Cleans::Caller),
         (
             MAJORBBS,
@@ -468,14 +469,38 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// handled: `exports::c_name` strips it before a symbol name ever reaches
 /// this function, uniformly for both container formats.
 ///
-/// This stays a single, named alias -- not a general suffix-stripping rule
-/// -- until real data asks for a second one (design doc's "Known edges,
-/// named now": `GALGSBL`'s and `cw3220mt`'s own 32-bit import names are
-/// still unmeasured against this table). Case-insensitive because PE import
+/// # The second alias: `cw3220mt.DLL`
+///
+/// Real data asked, and this is what it said. `LUNATIX.DLL` imports 37
+/// symbols from `cw3220mt.DLL` -- Borland C++ 5.x's 32-bit runtime -- and
+/// seventeen of them are C library routines this table already serves:
+/// `strcpy`, `fopen`, `sprintf`, `toupper` and the rest. They are in the
+/// `MAJORBBS` table for a historical reason, not an arbitrary one: 16-bit
+/// modules got their C library *from* `MAJORBBS.DLL`, which re-exported
+/// Borland's 16-bit runtime. Worldgroup NT links the same routines from
+/// Borland's own DLL instead. Same functions, same prototypes, different
+/// file -- which is exactly the shape `WGSERVER.EXE` already had.
+///
+/// The twenty that are not served stay unserved: aliasing maps a library
+/// name, it does not invent entries, so `cw3220mt.DLL!_ftol` is
+/// [`Entry::Unimplemented`] before and after. `crates/mbbs/tests/lunatix.rs`
+/// pins exactly which, and this alias shrank that list by seventeen.
+///
+/// **The widths behind it had to be fixed first.** Every one of those
+/// seventeen was written and tested only against `Wg16`, and six of them
+/// read a C `int` through `as u16`/`as i16` -- `Wg16`'s width hard-coded.
+/// Aliasing before fixing them would have routed a 32-bit module into
+/// `toupper` that cannot return `EOF` and `fread` that silently short-reads.
+/// See those routines' own doc comments.
+///
+/// Still a list of named aliases, not a general suffix-stripping rule:
+/// `GALGSBL.dll` is deliberately absent, because its seven `btu*` imports
+/// are genuinely unserved rather than served under another name, and an
+/// alias would only move where they fail. Case-insensitive because PE import
 /// directory names are conventionally upper-cased but nothing in the format
 /// requires it.
 fn canonical_dll(dll: &str) -> &str {
-    if dll.eq_ignore_ascii_case("WGSERVER.EXE") {
+    if dll.eq_ignore_ascii_case("WGSERVER.EXE") || dll.eq_ignore_ascii_case("cw3220mt.DLL") {
         MAJORBBS
     } else {
         dll

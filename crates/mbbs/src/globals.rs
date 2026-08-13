@@ -41,7 +41,7 @@ use crate::abi::{Abi, ModuleMem};
 /// `MAJORBBS.H:23` -- input buffer size for each channel.
 const INPSIZ: u16 = 256;
 /// `MAJORBBS.H:398` -- max number of global command handlers.
-const GLBMAX: u16 = 50;
+pub(crate) const GLBMAX: u16 = 50;
 /// `FSD.H:243` -- maximum length of a help field, which sizes `fsdemg`.
 const MAXHLP: u16 = 80;
 /// `TFSCAN.H:14` -- max characters per line, plus the NUL.
@@ -480,6 +480,39 @@ impl<A: Abi> Globals<A> {
             )));
         }
         at.write(mem, bytes).map_err(|e| io::Error::other(e.to_string()))
+    }
+
+    /// Overwrite a global declared `int`, at `A`'s own int width.
+    ///
+    /// # Why `write_mem` is not enough for these
+    ///
+    /// [`write_mem`](Globals::write_mem) writes the bytes it is handed and
+    /// leaves the rest of the global alone -- correct for a `char[]` being
+    /// filled in piecewise, and wrong for a scalar. Under `Wg16` an `int` is
+    /// two bytes and every caller handed it exactly two, so the distinction
+    /// never came up. Under `Wg32` an `int` is four, and a two-byte write
+    /// leaves the top half *whatever it was before*.
+    ///
+    /// That is not hypothetical. `Globals::new` seeds `usrnum` to all-ones
+    /// (`-1`, MAJORBBS.C:882); the first two-byte write of channel `0` on top
+    /// of it would leave `0xFFFF0000`, which is neither `0` nor `-1` and
+    /// which no reader could recognise as wrong.
+    ///
+    /// `value` is taken as `u32` and narrowed, so a caller with a negative
+    /// number passes it already sign-extended to 32 bits (`x as u32` on an
+    /// `i32`) and gets the right bytes at either width -- the same reason
+    /// [`Abi::int_from_u32`] exists rather than a `From<u16>`.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn write_int_mem(&self, mem: &mut A::Mem, name: &str, value: u32) -> io::Result<()> {
+        debug_assert_eq!(
+            self.size(name),
+            Some(A::INT_WIDTH as u16),
+            "{name} is not an int global",
+        );
+        self.write_mem(mem, name, &A::int_to_bytes(A::int_from_u32(value)))
     }
 
     /// Read a global as a pointer, against memory directly rather than a
