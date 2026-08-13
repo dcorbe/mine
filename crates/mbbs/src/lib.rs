@@ -286,11 +286,11 @@ pub enum Ended<A: Abi> {
     /// other direction: `false` means the module ran out of work before the
     /// budget ran out, which is the only cheap evidence that the budget is
     /// more than enough.
-    Waiting { next_kick: u16, polls_cut: bool },
+    Waiting { next_kick: u32, polls_cut: bool },
 
     /// `max` passes were made and there is still work queued. A driver calls
     /// straight back.
-    Bound { next_kick: Option<u16> },
+    Bound { next_kick: Option<u32> },
 
     /// The module stopped, on the pass it stopped on.
     ///
@@ -357,7 +357,7 @@ pub enum Wait {
     /// Block until the transport delivers something.
     Blocked,
     /// Sleep at most this many whole seconds, waking early on input.
-    Until(u16),
+    Until(u32),
     /// Call `cycle` again now.
     Now,
     /// The module stopped. Shut the host down.

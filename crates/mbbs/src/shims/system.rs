@@ -627,22 +627,30 @@ pub fn shocst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// list would produce.
 ///
 /// Generic: the negativity test widens `call.int()` to `u32` via
-/// `Abi::Int`'s own `Into<u32>` bound and then reads bit 15, the same
-/// narrowing [`genrdn`]'s own conversion already established for an `INT`
-/// argument this crate's own logic treats as 16 bits wide regardless of the
-/// calling ABI's native `int` size -- `Kick::delay` is a countdown this
-/// host keeps, not a value handed back to the module, so there is no wire
-/// width to preserve past this point.
+/// `Abi::Int`'s own `Into<u32>` bound, then reads the *actual* sign bit of a
+/// caller's `int` -- bit `A::INT_WIDTH * 8 - 1`, bit 15 under `Wg16` and bit
+/// 31 under `Wg32` -- rather than a bare `0x8000` literal. That literal
+/// happens to equal `Wg16`'s sign bit, but under `Wg32` an `int` is four
+/// bytes: `0x8000` is an ordinary positive value's bit 15, and a genuinely
+/// negative 32-bit delay like `0x8000_0000` has bit 15 *clear*, so the old
+/// test let it straight through. `Kick::delay` then keeps the value whole
+/// (`u32`, not `u16`) -- Task 17 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`: `rtkick(86400)`
+/// (one day, which LunatiX ships daily events for) has low 16 bits
+/// `0x5180`, whose own bit 15 is clear, so it passed the old sign test too
+/// and then `as u16` truncated it to `86400 mod 65536 == 20864` seconds --
+/// silently, with no error at all.
 pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let delay = Into::<u32>::into(call.int());
+    let raw: u32 = call.int().into();
     let dstrou = call.ptr();
-    if delay & 0x8000 != 0 {
+    let sign_bit = 1u32 << (A::INT_WIDTH * 8 - 1);
+    if raw & sign_bit != 0 {
         return Err(ShimError::Failed(format!(
-            "rtkick: a negative delay ({} seconds)",
-            delay as i16
+            "rtkick: a negative delay ({raw:#x} under a {}-byte int)",
+            A::INT_WIDTH
         )));
     }
-    let delay = delay as u16;
+    let delay = raw; // u32 end to end; no truncation
     if delay == 0 {
         // `RTKICK.C:50`'s free-slot marker is `countr == 0`, and `:65` skips any
         // entry holding it -- so the original writes this kick into a slot that
@@ -902,7 +910,7 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 /// Generic over `A: Abi` since `dstrou` is a module pointer -- `FarPtr` for
 /// `Wg16`, and something else for a future 32-bit ABI. Not derived: the
 /// derive macro would generate an `A: Trait` bound, which is wrong here
-/// (`Kick<A>`'s fields are `u16` and `A::Ptr`, never `A` itself) -- see
+/// (`Kick<A>`'s fields are `u32` and `A::Ptr`, never `A` itself) -- see
 /// `crate::abi::Ret`'s own doc comment for the fuller account of why this
 /// crate hand-writes these instead of deriving them. `Clone`/`Copy`/`PartialEq`/
 /// `Eq` all typecheck unconditionally for any `A: Abi`, with no `where`
@@ -910,11 +918,16 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 /// trait itself; `Debug` needs `A::Ptr: Debug` spelled out because
 /// `mbbs_machine::ptr::ModulePtr`'s own `Debug` supertrait is not visible to the
 /// compiler without it being named at the impl site.
+///
+/// `delay` is `u32`, not `u16` -- Task 17 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`: `Wg16`'s `int` is
+/// two bytes and every 16-bit kick fits regardless, but a `Wg32` module's
+/// `int` is four, and `rtkick(86400)` (one day) does not fit in `u16`.
 pub struct Kick<A: Abi> {
     /// Seconds yet to go, counted down one per elapsed second by
     /// [`crate::Host::prcrtk`]. Never `0`: `rtkick` refuses to record a
     /// zero-delay kick, because `RTKICK.C` would never have fired it.
-    pub delay: u16,
+    pub delay: u32,
 
     /// The module routine to call. Far, and into the module's own code -- the
     /// one MajorMUD registers is an `INTERNALREF` to its NE segment 6.
