@@ -16,9 +16,18 @@
 //!
 //! `Abi::Ptr` is bound `mbbs_machine::ptr::ModulePtr<Memory = Self::Mem>`. Before this
 //! file existed, `mbbs_machine::m32::Flat32Ptr`'s only `ModulePtr` impl
-//! (`crates/mbbs32/src/flatptr.rs`) answered `type Memory = mbbs_machine::m32::Image`
-//! -- and `mbbs-ptr`'s own doc comment said as much: "concretely ...
-//! `mbbs_machine::m32::Image` for `Flat32Ptr`". So `type Mem = Image` was the only
+//! (then `crates/mbbs32/src/flatptr.rs`, today
+//! `crates/mbbs-machine/src/m32/flatptr.rs`) answered
+//! `type Memory = mbbs_machine::m32::Image` -- and `mbbs-ptr`'s own doc
+//! comment said as much: "concretely ... `mbbs_machine::m32::Image` for
+//! `Flat32Ptr`".
+//!
+//! **Both quotes are historical and neither file still says it.**
+//! `m32/flatptr.rs:54` now answers `type Memory = Memory`, and `ptr.rs` now
+//! says "the module's loaded `Image` plus the host's own allocation arena,
+//! not `Image` alone" -- which is this section's own conclusion, landed. The
+//! citations are kept because they are what forced the decision below, not
+//! because they describe the tree you are reading. So `type Mem = Image` was the only
 //! choice that would satisfy the bound at all, and everything else this
 //! design says about a 32-bit `Mem` -- "Image plus its allocator", "a 32-bit
 //! allocator gets its own `Mapping`" (design doc, Part 3 and its correction

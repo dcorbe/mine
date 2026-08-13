@@ -1,19 +1,28 @@
-//! The question `crates/mbbs32/src/fault.rs` names and declines to answer:
-//! can a 16-bit module still be recovered from a fault once a 32-bit machine
+//! Can a 16-bit module still be recovered from a fault once a 32-bit machine
 //! exists in the same process?
 //!
-//! Both machine crates install a process-wide handler for the same four
-//! signals (SIGSEGV/SIGILL/SIGBUS/SIGFPE) through their own `static INSTALL:
-//! Once`. There is one disposition per process. Whichever constructs second
-//! wins, and nothing arbitrates between them -- `mbbs32/src/fault.rs` says
-//! "Running both ABIs in one process needs a single arbiter... deliberately
-//! NOT built here."
+//! This constructs the 16-bit machine FIRST, then a 32-bit machine, holds the
+//! latter alive, and then faults the 16-bit module.
 //!
-//! So this constructs the 16-bit machine FIRST, then a 32-bit machine, holds
-//! the latter alive, and then faults the 16-bit module. If recovery still
-//! works, the two handlers are compatible by luck or by design and the
-//! arbiter is unnecessary. If it does not, this is the red test the arbiter
-//! has to turn green.
+//! # It was written red, and the arbiter turned it green
+//!
+//! When this test went in, `m16` and `m32` were separate crates and each
+//! installed its own process-wide handler for the same four signals
+//! (SIGSEGV/SIGILL/SIGBUS/SIGFPE) through its own `static INSTALL: Once`.
+//! There is one disposition per process, so whichever machine constructed
+//! second simply won, and nothing arbitrated between them -- the 32-bit
+//! fault module said so itself, naming the problem and declining to solve
+//! it: "Running both ABIs in one process needs a single arbiter...
+//! deliberately NOT built here."
+//!
+//! `8c61335` built it. There is now one handler, in
+//! `crates/mbbs-machine/src/fault.rs`, and each ABI claims a fault
+//! *positively* -- `is_ldt_selector` here, `is_user32_cs` for the 32-bit
+//! side -- rather than by ruling the host out, which is the only thing that
+//! can work once there are two claimants. So this is no longer an open
+//! question with a red test attached: it is the regression guard that the
+//! arbiter keeps holding, and `fault_32_after_16.rs` is the same guard
+//! pointed the other way.
 //!
 //! Its own binary, and hence its own process: see `fault_16_alone.rs`'s module
 //! comment for why sharing one with the control makes both results
