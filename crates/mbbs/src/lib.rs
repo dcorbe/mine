@@ -18,7 +18,7 @@
 //!
 //! So an import the host cannot service does not return zero and does not
 //! return an error the module can interpret. It stops the module, naming the
-//! symbol -- see [`Poison::Unimplemented`](mbbs16::Poison::Unimplemented).
+//! symbol -- see [`Poison::Unimplemented`](mbbs_machine::m16::Poison::Unimplemented).
 
 /// The vocabulary for serving more than one ABI: [`abi::Abi`], [`abi::Cursor`]
 /// and the single implementation [`abi::Wg16`].
@@ -97,7 +97,7 @@ pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
-use mbbs16::{
+use mbbs_machine::m16::{
     Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Ret,
     Source, Symbol, Target,
 };
@@ -112,7 +112,7 @@ use crate::abi::{Abi, ModuleMem, Wg16};
 // `Host::point_curusr_mem` are this file's first two generic-core methods
 // that touch a pointer's own memory access rather than only `Globals`'/
 // `Users`'/`Heap`'s already-generic surface.
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 /// How a module entry point ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,7 +343,7 @@ impl std::fmt::Display for MissingGlobal {
 /// its ABI -- see [`Host`]'s own doc comment. Not
 /// `#[derive(Debug, Clone, Copy, PartialEq, Eq)]`: the derive macros bound `A:
 /// Trait` on the impl, which is wrong here -- `Wg16` itself implements none of
-/// these, only `A::Ptr` does (`Abi::Ptr: mbbs_ptr::ModulePtr + Copy + Eq +
+/// these, only `A::Ptr` does (`Abi::Ptr: mbbs_machine::ptr::ModulePtr + Copy + Eq +
 /// Hash`, and `ModulePtr` itself requires `Debug`). See `abi.rs`'s `Ret<A>`
 /// for the same trap hit and fixed the same way.
 pub(crate) struct DateBuffers<A: Abi> {
@@ -405,7 +405,7 @@ impl<A: Abi> Eq for DateBuffers<A> where A::Ptr: Eq {}
 #[derive(Debug)]
 pub enum LoadError {
     /// The file is not a module this loader can map. See
-    /// [`NeError`](mbbs16::NeError).
+    /// [`NeError`](mbbs_machine::m16::NeError).
     Image(io::Error),
 
     /// The module addresses host globals the host cannot honestly provide.
@@ -497,7 +497,7 @@ pub struct Query {
 ///
 /// Everything that reads or writes module memory -- every method taking
 /// `&mut Machine`/`&Machine`, plus [`Host::check_globals`] (no `Machine`
-/// parameter, but built entirely around `mbbs16::NeImage`, the 16-bit NE
+/// parameter, but built entirely around `mbbs_machine::m16::NeImage`, the 16-bit NE
 /// format `Host::load` parses) -- stays in `impl Host<Wg16>`.
 ///
 /// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
@@ -1531,7 +1531,7 @@ impl<A: Abi> Host<A> {
 
 /// Everything that reads or writes module memory, plus
 /// [`Host::check_globals`] (no `Machine` parameter, but built around
-/// `mbbs16::NeImage`, which `Host::load` parses -- 16-bit-format-specific
+/// `mbbs_machine::m16::NeImage`, which `Host::load` parses -- 16-bit-format-specific
 /// by construction, same as `Host::load` itself) and [`Host::dos_name`] (no
 /// `Machine` parameter and no use of `Self` at all -- it stays here purely
 /// because it has no `self`: every call site names it as `Host::dos_name(...)`,
@@ -3394,7 +3394,7 @@ mod tests {
         Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Registration, Terms, gsbl, testing,
         users,
     };
-    use mbbs16::{FarPtr, Machine, Poison, Ret};
+    use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
 
     #[test]
     fn a_host_is_built_with_as_many_channels_as_it_is_asked_for() {
@@ -4567,7 +4567,7 @@ mod tests {
     /// second would overwrite them.
     fn connected_with(
         build: impl FnOnce(&Fixture) -> Vec<(usize, Vec<u8>)>,
-    ) -> (Fixture, mbbs16::Module, crate::Chan) {
+    ) -> (Fixture, mbbs_machine::m16::Module, crate::Chan) {
         let mut f = Fixture::new();
         let module = f.minimal_module();
         let console = f.console();
@@ -4953,7 +4953,7 @@ mod tests {
     fn connecting_clears_a_polling_routine_the_last_user_left_behind() {
         let mut f = crate::testing::Fixture::new();
         let console = f.console();
-        let stale = mbbs16::FarPtr {
+        let stale = mbbs_machine::m16::FarPtr {
             offset: 0x2184,
             selector: 0x1010,
         };
@@ -4980,7 +4980,7 @@ mod tests {
     /// A polling routine is a `void (*)(void)`, so the smallest real one is a
     /// single `retf`. `load_code` puts it somewhere the machine will execute
     /// and `code_ptr` addresses it.
-    fn polling_fixture() -> (crate::testing::Fixture, mbbs16::Module, FarPtr) {
+    fn polling_fixture() -> (crate::testing::Fixture, mbbs_machine::m16::Module, FarPtr) {
         let mut f = crate::testing::Fixture::new();
         let module = f.minimal_module();
         f.machine.load_code(&[0xcb]).expect("a retf fits");
@@ -4994,7 +4994,7 @@ mod tests {
     /// means -- and at one channel "every channel" and "channel zero" are the
     /// same set, so nothing built on it can tell a per-channel sweep from a
     /// sweep that stops after the first.
-    fn polling_fixture_with(count: u16) -> (crate::testing::Fixture, mbbs16::Module, FarPtr) {
+    fn polling_fixture_with(count: u16) -> (crate::testing::Fixture, mbbs_machine::m16::Module, FarPtr) {
         let mut f = crate::testing::Fixture::rooted_with_terms(testing::data(), Terms::new(count));
         let module = f.minimal_module();
         f.machine.load_code(&[0xcb]).expect("a retf fits");
@@ -5562,7 +5562,7 @@ mod tests {
         // green -- a driver that blocked forever on a stopped module instead
         // of shutting down, with nothing to say so.
         assert_eq!(
-            Ended::Stopped(mbbs16::Poison::Timeout { cs: 0, ip: 0 }, None).wait(),
+            Ended::Stopped(mbbs_machine::m16::Poison::Timeout { cs: 0, ip: 0 }, None).wait(),
             Wait::Stop
         );
     }
@@ -5605,7 +5605,7 @@ mod tests {
 
         let cycles = f.host.cycle(&mut f.machine, &module, 4).expect("cycle runs");
         match cycles.ended {
-            Ended::Stopped(mbbs16::Poison::Fault { .. }, Some(chan)) => {
+            Ended::Stopped(mbbs_machine::m16::Poison::Fault { .. }, Some(chan)) => {
                 assert_eq!(
                     chan, console,
                     "the stop must name the channel actually being serviced"
@@ -5871,7 +5871,7 @@ mod tests {
     /// `lcall_thunks`' "unnamed thunk" trick: an ordinal and an `@`-suffixed
     /// name are both facts `Host::run` reads off the module's *own*
     /// `ImportSite` (`module.import(index)`), which is only ever populated
-    /// by `mbbs16::Machine::load_ne` actually resolving a real relocation --
+    /// by `mbbs_machine::m16::Machine::load_ne` actually resolving a real relocation --
     /// see `crates/mbbs16/src/ne.rs`'s `map_ne`. `dll` is deliberately never
     /// `"MAJORBBS"`/`"GALGSBL"`/`"DOSCALLS"`, so `shims::entry` always
     /// answers `Entry::Unimplemented` for it and the loader gives it a real
@@ -5882,8 +5882,8 @@ mod tests {
     /// crate's loader is concerned, that combination cannot be produced by
     /// loading any module, only by `Inventory::record`'s own unit tests
     /// exercising the bookkeeping directly).
-    fn module_with_one_import(dll: &str, symbol: &mbbs16::Symbol) -> Vec<u8> {
-        use mbbs16::Symbol;
+    fn module_with_one_import(dll: &str, symbol: &mbbs_machine::m16::Symbol) -> Vec<u8> {
+        use mbbs_machine::m16::Symbol;
 
         const ALIGN: u16 = 4;
         const SECTOR: usize = 1 << ALIGN;
@@ -5947,7 +5947,7 @@ mod tests {
         // The one segment's data: 4 bytes, holding one relocation site
         // (`SRC_FAR_ADDR`, 4 bytes, additive) at offset 0. Nothing ever
         // executes or reads this segment's bytes -- the only thing this
-        // relocation is for is making `mbbs16::ne::map_ne` resolve this
+        // relocation is for is making `mbbs_machine::m16::ne::map_ne` resolve this
         // import and assign it a thunk, which is what makes
         // `Module::import(0)` answer `Some`.
         //
@@ -6006,7 +6006,7 @@ mod tests {
     #[test]
     fn survey_mode_records_the_ordinal_of_a_genuinely_imported_unimplemented_symbol() {
         let mut f = Fixture::new();
-        let bytes = module_with_one_import("TESTDLL", &mbbs16::Symbol::Ordinal(42));
+        let bytes = module_with_one_import("TESTDLL", &mbbs_machine::m16::Symbol::Ordinal(42));
         let module = f.host.load(&mut f.machine, &bytes).expect("loads");
 
         // Thunk index 0: the module's one and only import, and the first
@@ -6042,7 +6042,7 @@ mod tests {
         let mut f = Fixture::new();
         let bytes = module_with_one_import(
             "TESTDLL",
-            &mbbs16::Symbol::Name("f_lxdiv@_not_a_real_routine".to_owned()),
+            &mbbs_machine::m16::Symbol::Name("f_lxdiv@_not_a_real_routine".to_owned()),
         );
         let module = f.host.load(&mut f.machine, &bytes).expect("loads");
         let entry = lcall_thunks(&mut f.machine, &[0]);

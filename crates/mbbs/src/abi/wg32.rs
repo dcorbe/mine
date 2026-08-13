@@ -14,11 +14,11 @@
 //!
 //! # Collision 1: `Abi::Ptr`'s bound forced `Abi::Mem`'s shape
 //!
-//! `Abi::Ptr` is bound `mbbs_ptr::ModulePtr<Memory = Self::Mem>`. Before this
-//! file existed, `mbbs32::Flat32Ptr`'s only `ModulePtr` impl
-//! (`crates/mbbs32/src/flatptr.rs`) answered `type Memory = mbbs32::Image`
+//! `Abi::Ptr` is bound `mbbs_machine::ptr::ModulePtr<Memory = Self::Mem>`. Before this
+//! file existed, `mbbs_machine::m32::Flat32Ptr`'s only `ModulePtr` impl
+//! (`crates/mbbs32/src/flatptr.rs`) answered `type Memory = mbbs_machine::m32::Image`
 //! -- and `mbbs-ptr`'s own doc comment said as much: "concretely ...
-//! `mbbs32::Image` for `Flat32Ptr`". So `type Mem = Image` was the only
+//! `mbbs_machine::m32::Image` for `Flat32Ptr`". So `type Mem = Image` was the only
 //! choice that would satisfy the bound at all, and everything else this
 //! design says about a 32-bit `Mem` -- "Image plus its allocator", "a 32-bit
 //! allocator gets its own `Mapping`" (design doc, Part 3 and its correction
@@ -29,7 +29,7 @@
 //!
 //! Neither horn is acceptable, so the actual fix reaches one file this
 //! task's brief did not originally name: `crates/mbbs32/src/flatptr.rs`'s
-//! `ModulePtr` impl now answers `type Memory = mbbs32::Memory`, a new type
+//! `ModulePtr` impl now answers `type Memory = mbbs_machine::m32::Memory`, a new type
 //! (`crates/mbbs32/src/mem.rs`) that owns the loaded `Image` *and* a second
 //! `Mapping` for host-allocated regions -- exactly the `tib`-owns-its-own-
 //! stack-mapping precedent the design cites, just written down where the
@@ -40,16 +40,16 @@
 //! the one file that had baked in the older answer before a second `Abi`
 //! existed to test it against.
 //!
-//! # Collision 2: `Abi::Cpu` cannot be bare `mbbs32::Machine`
+//! # Collision 2: `Abi::Cpu` cannot be bare `mbbs_machine::m32::Machine`
 //!
 //! `Abi::mem` is `fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem` -- a
 //! reborrow, not a second field (see `Call`'s "holds one handle, not two").
-//! For `Wg16` that works because `mbbs16::Machine` owns its `Segments`
-//! outright. `mbbs32::Machine` does not own an `Image` "unlike
-//! `mbbs16::Machine`... **deliberately**" (`crates/mbbs32/src/lib.rs`,
+//! For `Wg16` that works because `mbbs_machine::m16::Machine` owns its `Segments`
+//! outright. `mbbs_machine::m32::Machine` does not own an `Image` "unlike
+//! `mbbs_machine::m16::Machine`... **deliberately**" (`crates/mbbs32/src/lib.rs`,
 //! `Machine`'s own doc comment) -- so there is no `&mut Self::Mem` inside a
-//! bare `mbbs32::Machine` for `Abi::mem` to reborrow. `type Cpu =
-//! mbbs32::Machine` compiles as a bare assignment, but `fn mem` cannot then
+//! bare `mbbs_machine::m32::Machine` for `Abi::mem` to reborrow. `type Cpu =
+//! mbbs_machine::m32::Machine` compiles as a bare assignment, but `fn mem` cannot then
 //! be implemented for it at all: there is nothing in a `Machine` to return
 //! `&mut`.
 //!
@@ -58,13 +58,13 @@
 //! host builds holding a `Machine` and its `Image`"
 //! (`docs/plans/2026-08-11-abi-abstraction-implementation.md`, "Tasks 5 and
 //! 6 are in the wrong order"). `Wg32::Cpu` is that struct, not bare
-//! `mbbs32::Machine`.
+//! `mbbs_machine::m32::Machine`.
 
 use super::{Abi, ModuleMem};
 
 /// Execution plus memory, bundled because `Abi::mem` needs somewhere to
-/// reborrow `&mut mbbs32::Memory` out of `&mut Self::Cpu`, and a bare
-/// `mbbs32::Machine` has nowhere to keep one -- see this module's doc
+/// reborrow `&mut mbbs_machine::m32::Memory` out of `&mut Self::Cpu`, and a bare
+/// `mbbs_machine::m32::Machine` has nowhere to keep one -- see this module's doc
 /// comment ("Collision 2").
 ///
 /// Public fields, not a constructor-only opaque struct: this is a bundle a
@@ -73,12 +73,12 @@ use super::{Abi, ModuleMem};
 /// image) -- there is no invariant between them for a constructor to
 /// enforce beyond "both exist".
 pub struct Wg32Cpu {
-    pub machine: mbbs32::Machine,
-    pub mem: mbbs32::Memory,
+    pub machine: mbbs_machine::m32::Machine,
+    pub mem: mbbs_machine::m32::Memory,
 }
 
 impl Wg32Cpu {
-    pub fn new(machine: mbbs32::Machine, mem: mbbs32::Memory) -> Self {
+    pub fn new(machine: mbbs_machine::m32::Machine, mem: mbbs_machine::m32::Memory) -> Self {
         Self { machine, mem }
     }
 }
@@ -89,8 +89,8 @@ impl Wg32Cpu {
 pub struct Wg32;
 
 impl Abi for Wg32 {
-    type Ptr = mbbs32::Flat32Ptr;
-    type Mem = mbbs32::Memory;
+    type Ptr = mbbs_machine::m32::Flat32Ptr;
+    type Mem = mbbs_machine::m32::Memory;
     type Cpu = Wg32Cpu;
 
     /// `u32`, not `u16` -- the single number this whole abstraction exists
@@ -104,7 +104,7 @@ impl Abi for Wg32 {
     const LONG_WIDTH: usize = 4;
 
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
-        mbbs32::Flat32Ptr(u32::from_le_bytes(
+        mbbs_machine::m32::Flat32Ptr(u32::from_le_bytes(
             bytes.try_into().expect("PTR_WIDTH bytes"),
         ))
     }
@@ -129,19 +129,19 @@ impl Abi for Wg32 {
     /// realistic overflow for a checked version to catch that a debug build's
     /// own overflow panic would not already catch first.
     fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr {
-        mbbs32::Flat32Ptr(base.0 + u32::from(delta))
+        mbbs_machine::m32::Flat32Ptr(base.0 + u32::from(delta))
     }
 
     fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr> {
         let by = u32::try_from(by).ok()?;
-        base.0.checked_add(by).map(mbbs32::Flat32Ptr)
+        base.0.checked_add(by).map(mbbs_machine::m32::Flat32Ptr)
     }
 
     /// Flat address `0` -- there is no `seg:off` pair to be zero in both
     /// halves of, only the one address space every other `Wg32` pointer
     /// already names. See [`Abi::null_ptr`]'s own doc comment.
     fn null_ptr() -> Self::Ptr {
-        mbbs32::Flat32Ptr(0)
+        mbbs_machine::m32::Flat32Ptr(0)
     }
 
     fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem {
@@ -154,18 +154,18 @@ impl Abi for Wg32 {
     /// into it" are the same address. See [`Abi::data_ptr`]'s own doc
     /// comment.
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
-        mbbs32::Flat32Ptr(cpu.mem.image().base())
+        mbbs_machine::m32::Flat32Ptr(cpu.mem.image().base())
     }
 }
 
-/// `mbbs32::Memory`'s host-allocation half, named through the trait
+/// `mbbs_machine::m32::Memory`'s host-allocation half, named through the trait
 /// `crates/mbbs`'s generic `Heap`/`Arena`/`Globals` already grow through.
-/// Thin delegation on purpose -- `mbbs32::Memory::alloc` (not named
+/// Thin delegation on purpose -- `mbbs_machine::m32::Memory::alloc` (not named
 /// `alloc_region` itself, so this impl body calls it rather than
 /// recursing) already is the bump allocator; this is only the seam that
 /// lets `A::Mem::alloc_region` reach it generically.
-impl ModuleMem for mbbs32::Memory {
-    type Ptr = mbbs32::Flat32Ptr;
+impl ModuleMem for mbbs_machine::m32::Memory {
+    type Ptr = mbbs_machine::m32::Flat32Ptr;
 
     fn alloc_region(&mut self, bytes: usize) -> std::io::Result<Self::Ptr> {
         self.alloc(bytes)
@@ -174,8 +174,8 @@ impl ModuleMem for mbbs32::Memory {
 
 // No `#[cfg(test)] mod tests` here, unlike every sibling `Abi` file --
 // deliberately. Any test that builds a real `Wg32Cpu` must build a real
-// `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally calls
-// `mbbs32::fault::arm`, which registers this ABI's fault claim with
+// `mbbs_machine::m32::Machine`, and `mbbs_machine::m32::Machine::new` unconditionally calls
+// `mbbs_machine::m32::fault::arm`, which registers this ABI's fault claim with
 // `crates/mbbs-fault`'s shared arbiter. Registering no longer steals another
 // ABI's recovery the way installing a standalone handler used to -- see
 // `crates/mbbs-fault`'s module doc comment -- but `cargo test -p mbbs --lib`

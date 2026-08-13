@@ -5679,7 +5679,7 @@ pub fn fsdqoe<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>) -> Vec<u
 mod tests {
     use super::*;
     use crate::abi::Wg16;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// The maximum this host's 4,096-byte output buffer allows. See the
     /// `fsdroom` shim for where it comes from; a unit test just needs a number

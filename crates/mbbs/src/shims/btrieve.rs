@@ -104,7 +104,7 @@
 //! `_wg16`-suffixed sibling built from `shims::call(machine)`, the same
 //! bridge convention every other generic-shaped file in this crate uses (see
 //! `shims::mod`'s `call` doc comment) -- kept, not deleted, because
-//! `crate::testing::Fixture::invoke` drives a real `mbbs16::Machine` and so
+//! `crate::testing::Fixture::invoke` drives a real `mbbs_machine::m16::Machine` and so
 //! can only ever run one ABI's routine, and every one of this file's own
 //! tests still calls a `_wg16` bridge by name.
 //!
@@ -123,12 +123,12 @@
 //! - Arguments are read through [`Call::ptr`]/[`Call::int`]/[`Call::long`]
 //!   instead of a word-indexed `arg_far`/`arg_u16`.
 //! - Memory is reached through [`Call::mem`] (`&mut A::Mem`) and pointers
-//!   resolve/write/read a C string through [`mbbs_ptr::ModulePtr`]'s own
+//!   resolve/write/read a C string through [`mbbs_machine::ptr::ModulePtr`]'s own
 //!   methods (`ptr.resolve(mem, len)`, not `mem.resolve(ptr, len)` -- the
 //!   inherent `Segments` methods this file called directly before are
 //!   `Wg16`-only and do not exist on a generic `A::Mem`).
 //! - `opnbtv`'s `btrieve.open`/`clsbtv`'s `btrieve.close` take `call.mem()`
-//!   rather than the `call.cpu`/`&mut mbbs16::Machine` this file used to
+//!   rather than the `call.cpu`/`&mut mbbs_machine::m16::Machine` this file used to
 //!   reach them with -- `crate::btrieve::Btrieve::open`/`close` themselves
 //!   now take `mem: &mut A::Mem`, not a whole machine.
 //! - `Position`/`Request`, the two structs [`absolute`]/[`locate`] bundle
@@ -162,9 +162,9 @@
 #[cfg(test)]
 use crate::abi::Wg16;
 #[cfg(test)]
-use mbbs16::{FarPtr, Ret};
+use mbbs_machine::m16::{FarPtr, Ret};
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};

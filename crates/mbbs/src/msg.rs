@@ -38,7 +38,7 @@
 use std::fmt;
 use std::io;
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::Abi;
 use crate::arena::Arena;
@@ -365,7 +365,7 @@ struct Block<A: Abi> {
 /// facade named `open`, keeping the original `&mut Machine` signature, until
 /// the shim layer took `Call<A>` and every caller reached `A::Mem` directly
 /// through `Call::mem`. That left the facade with no callers while still
-/// pulling `mbbs16::FarPtr`/`Machine` into this file, so it was deleted --
+/// pulling `mbbs_machine::m16::FarPtr`/`Machine` into this file, so it was deleted --
 /// see `Streams`' own doc comment, which records the same deletion and why
 /// the `_mem` suffix now outlives the distinction it was coined for.
 ///

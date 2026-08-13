@@ -281,7 +281,7 @@ mod builder {
     ///
     /// Every other test in this file reaches its stop through
     /// `Poison::Fault` -- that is the shape every test up to this one
-    /// shares, and `mbbs16::Machine::poison` does not care which `Poison`
+    /// shares, and `mbbs_machine::m16::Machine::poison` does not care which `Poison`
     /// variant it is handed (see `host.rs`'s module doc: "All three `Poison`
     /// variants poison identically"), so this exists to check that claim
     /// rather than assume it: a real board's actual walls (`l2as`, the
@@ -413,7 +413,7 @@ mod builder {
         entry_offset: u16,
     }
 
-    /// Assemble `ne` into the bytes [`mbbs16::Machine::load_ne`] (through
+    /// Assemble `ne` into the bytes [`mbbs_machine::m16::Machine::load_ne`] (through
     /// [`mbbs::Host::load`]) accepts. Modelled on `mbbs16/tests/ne.rs`'s
     /// `Ne::finish`; trimmed to this file's one shape -- exactly two
     /// segments (code, then data when non-empty), at most one imported
@@ -792,7 +792,7 @@ async fn a_module_that_crash_loops_makes_the_supervisor_give_up() {
 /// to survive -- see `docs/plans/2026-08-11-survivability-and-the-reachable-
 /// surface.md`) are `Unimplemented`, never `Fault`: a mutation that special-
 /// cased `Poison::Fault` in `host.rs`'s `life`/`run` (instead of treating
-/// every `Poison` identically, as `mbbs16::Machine::poison` itself does)
+/// every `Poison` identically, as `mbbs_machine::m16::Machine::poison` itself does)
 /// would pass every other test in this file and only be caught here.
 #[tokio::test]
 async fn the_board_serves_again_after_an_unimplemented_symbol_stop() {

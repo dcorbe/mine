@@ -15,13 +15,13 @@
 //! place in the host that can consume the `ESC[[ansi|ascii]` construct before
 //! any of it reaches `prfbuf`, the GSBL, or the wire.
 
-use mbbs16::Machine;
+use mbbs_machine::m16::Machine;
 // `Ret` is now named only by this file's `#[cfg(test)]` `_wg16` bridges --
 // production code reaches every routine here through its generic
 // `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own `call` doc comment.
 #[cfg(test)]
-use mbbs16::Ret;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::Ret;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
@@ -1289,7 +1289,7 @@ mod tests {
     use super::*;
     use crate::abi::Wg16;
     use crate::testing::Fixture;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     #[test]
     fn lastwd_answers_a_pointer_into_the_callers_own_string() {
@@ -2680,7 +2680,7 @@ mod tests {
         // Two separators, at offsets 4 and 7.
         let ends = [line.offset + 4, line.offset + 7];
         for (i, off) in ends.iter().enumerate() {
-            let slot = mbbs16::FarPtr {
+            let slot = mbbs_machine::m16::FarPtr {
                 offset: margn.offset + (i as u16) * 4,
                 selector: margn.selector,
             };
@@ -2715,7 +2715,7 @@ mod tests {
     }
 
     /// A far pointer, read out of module memory at `at`.
-    fn read_ptr(machine: &mbbs16::Machine, at: FarPtr) -> FarPtr {
+    fn read_ptr(machine: &mbbs_machine::m16::Machine, at: FarPtr) -> FarPtr {
         let bytes = machine.resolve(at, 4).expect("readable");
         FarPtr::from_bytes(bytes.try_into().expect("4 bytes"))
     }

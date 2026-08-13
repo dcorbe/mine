@@ -9,8 +9,8 @@
 //! This module adds the vocabulary: `Abi`, `Cursor`, `Call`, `Ret<A>`, and
 //! `Wg16` as the sole implementation. Nothing in `crates/mbbs` reads a
 //! shim's arguments through any of it yet -- shims still take
-//! `&mut mbbs16::Machine`, still call `arg_far`/`arg_u16`, and still return
-//! `mbbs16::Ret` directly (`crates/mbbs/src/shims/mod.rs:55`). That
+//! `&mut mbbs_machine::m16::Machine`, still call `arg_far`/`arg_u16`, and still return
+//! `mbbs_machine::m16::Ret` directly (`crates/mbbs/src/shims/mod.rs:55`). That
 //! conversion is a later task. See
 //! `docs/plans/2026-08-11-abi-abstraction-design.md` (Parts 1 and 2) and
 //! `docs/plans/2026-08-11-abi-abstraction-implementation.md` (Tasks 2 and 5).
@@ -18,7 +18,7 @@
 //! # Why `Call` owns its frame
 //!
 //! Task 2's version of this comment left `Call` unbuilt, reasoning that
-//! `mbbs16::Machine` owning its `Segments` outright made `cpu: &mut A::Cpu`
+//! `mbbs_machine::m16::Machine` owning its `Segments` outright made `cpu: &mut A::Cpu`
 //! and `mem: &mut A::Mem` two mutable borrows of one object for `Wg16`.
 //! Reviewing that before anything was built on it found a second, independent
 //! problem that would have survived splitting `Cpu` from `Mem` anyway: a real
@@ -69,7 +69,7 @@
 //! demand. A reborrow is legal where a second stored borrow was not, because
 //! it does not outlive the single call that produces it; nothing holds two
 //! `'a`-long borrows of the same object anymore. `Wg16`'s implementation is
-//! `mbbs16::Machine::mem_mut`, the one deliberate exception to Task 1's
+//! `mbbs_machine::m16::Machine::mem_mut`, the one deliberate exception to Task 1's
 //! "delegate a method, never expose the field" rule -- see that method's own
 //! doc comment for why generic access needs the field itself. `Wg32`'s `Cpu`
 //! will not own its `Mem` the same way `Wg16`'s does, and both still answer
@@ -80,7 +80,7 @@
 //! extracting an `Exec` type from `Machine`.
 //!
 //! This module's tests now build a real `Call<Wg16>` from a live
-//! `mbbs16::Machine` (`the_cursor_and_a_real_machine_agree_on_stzcpys_frame`
+//! `mbbs_machine::m16::Machine` (`the_cursor_and_a_real_machine_agree_on_stzcpys_frame`
 //! below), not only the `FixtureAbi` used to test byte arithmetic cheaply.
 //! The fixture tests stay, for the same reason `Cursor`'s do -- they need no
 //! `Machine` at all -- but they no longer stand in for the one path that
@@ -105,7 +105,7 @@ pub trait Abi {
     ///
     /// The cost is that an `Abi` may not pair one ABI's pointer with another's
     /// memory -- which is the property being bought, not a limitation.
-    type Ptr: mbbs_ptr::ModulePtr<Memory = Self::Mem> + Copy + Eq + std::hash::Hash;
+    type Ptr: mbbs_machine::ptr::ModulePtr<Memory = Self::Mem> + Copy + Eq + std::hash::Hash;
 
     /// What a pointer resolves against. `Segments` for 16-bit; `Image` plus
     /// its allocator for 32-bit. Never the executing machine -- `mbbs32`'s
@@ -212,7 +212,7 @@ pub trait Abi {
     /// stack (`FarPtr::NULL` before this task) and to answer `goodptr`-style
     /// null checks (`bb == NULL`, `bb->filnam == NULL`) generically -- see
     /// `crate::btrieve::Btrieve::null`'s own doc comment. `Wg16`'s is
-    /// `mbbs16::FarPtr::NULL`, a `seg:off` of `0:0`; `Wg32`'s is a flat
+    /// `mbbs_machine::m16::FarPtr::NULL`, a `seg:off` of `0:0`; `Wg32`'s is a flat
     /// address of `0`, the ordinary meaning of a null pointer once "near" and
     /// "far" collapse to one address space -- the same collapse
     /// [`Abi::data_ptr`]'s own doc comment describes.
@@ -221,8 +221,8 @@ pub trait Abi {
     /// Reach this ABI's memory through its execution handle.
     ///
     /// A reborrow, not a second field: see the module doc comment ("`Call`
-    /// holds one handle, not two"). `Wg16`'s `Cpu` (`mbbs16::Machine`) owns
-    /// its `Mem` (`mbbs16::Segments`) outright, so `cpu: &mut Cpu` and
+    /// holds one handle, not two"). `Wg16`'s `Cpu` (`mbbs_machine::m16::Machine`) owns
+    /// its `Mem` (`mbbs_machine::m16::Segments`) outright, so `cpu: &mut Cpu` and
     /// `mem: &mut Mem` sourced independently from one live module are two
     /// mutable borrows of the same object -- it does not compile. `Wg32`'s
     /// `Cpu` will not own its `Mem` the same way, and both still answer this
@@ -265,8 +265,8 @@ pub trait Abi {
     ///   nothing to tile).
     /// - Seventeen are `shims::btrieve`'s Btrieve family, which *could* mean
     ///   something under another `Abi` -- but the engine behind them
-    ///   (`crate::btrieve::Btrieve`) is concrete, keyed by `mbbs16::FarPtr`
-    ///   and `mbbs16::Machine`, and generifying it is separate, larger work
+    ///   (`crate::btrieve::Btrieve`) is concrete, keyed by `mbbs_machine::m16::FarPtr`
+    ///   and `mbbs_machine::m16::Machine`, and generifying it is separate, larger work
     ///   this crate has not done yet. Not an ABI difference the way the ten
     ///   above are -- a coverage gap this door also has to hold open until
     ///   that work lands.
@@ -451,21 +451,21 @@ impl<'a, A: Abi> Call<'a, A> {
 /// What a host call hands back to the module, generic over the ABI's width
 /// and pointer representation.
 ///
-/// Mirrors `mbbs16::Ret` with the two ABI-dependent shapes generalised:
+/// Mirrors `mbbs_machine::m16::Ret` with the two ABI-dependent shapes generalised:
 /// `Far(FarPtr)` becomes `Ptr(A::Ptr)` and `U16(u16)` becomes `Int(A::Int)`.
 /// `Void` and the 32-bit `Long` do not vary -- a `long` is
 /// [`Abi::LONG_WIDTH`] bytes in every ABI this crate has met so far (4, in
 /// both), so there is nothing for an ABI to name here the way `PTR_WIDTH` and
 /// `INT_WIDTH` do for the other two.
 ///
-/// `mbbs16::Ret` itself is unchanged and stays that way -- it is what
+/// `mbbs_machine::m16::Ret` itself is unchanged and stays that way -- it is what
 /// `Machine::resume` takes, and this crate does not get to add a generic
 /// parameter to a type `mbbs16` owns. So the 16-bit boundary is a conversion,
-/// not a shared type: see `impl From<Ret<Wg16>> for mbbs16::Ret` below.
+/// not a shared type: see `impl From<Ret<Wg16>> for mbbs_machine::m16::Ret` below.
 ///
 /// *Where* the value lands is deliberately not this type's business, the same
-/// way it was not `mbbs16::Ret`'s: 16-bit Worldgroup returns a pointer in
-/// `DX:AX` (`mbbs16::Ret::Far`'s own doc comment); 32-bit Worldgroup returns
+/// way it was not `mbbs_machine::m16::Ret`'s: 16-bit Worldgroup returns a pointer in
+/// `DX:AX` (`mbbs_machine::m16::Ret::Far`'s own doc comment); 32-bit Worldgroup returns
 /// one in `EAX` alone. Each `Abi` implementation's own conversion decides
 /// that placement.
 pub enum Ret<A: Abi> {
@@ -522,9 +522,9 @@ where
 pub struct Wg16;
 
 impl Abi for Wg16 {
-    type Ptr = mbbs16::FarPtr;
-    type Mem = mbbs16::Segments;
-    type Cpu = mbbs16::Machine;
+    type Ptr = mbbs_machine::m16::FarPtr;
+    type Mem = mbbs_machine::m16::Segments;
+    type Cpu = mbbs_machine::m16::Machine;
     type Int = u16;
 
     const PTR_WIDTH: usize = 4;
@@ -532,7 +532,7 @@ impl Abi for Wg16 {
     const LONG_WIDTH: usize = 4;
 
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
-        mbbs16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
+        mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
     }
 
     fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8> {
@@ -548,7 +548,7 @@ impl Abi for Wg16 {
     }
 
     fn ptr_offset(base: Self::Ptr, delta: u16) -> Self::Ptr {
-        mbbs16::FarPtr {
+        mbbs_machine::m16::FarPtr {
             offset: base.offset + delta,
             selector: base.selector,
         }
@@ -557,14 +557,14 @@ impl Abi for Wg16 {
     fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr> {
         let by = u16::try_from(by).ok()?;
         let offset = base.offset.checked_add(by)?;
-        Some(mbbs16::FarPtr {
+        Some(mbbs_machine::m16::FarPtr {
             offset,
             selector: base.selector,
         })
     }
 
     fn null_ptr() -> Self::Ptr {
-        mbbs16::FarPtr::NULL
+        mbbs_machine::m16::FarPtr::NULL
     }
 
     /// `Machine::mem_mut` is the one deliberate exception Task 1's facade
@@ -577,7 +577,7 @@ impl Abi for Wg16 {
     }
 
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
-        mbbs16::FarPtr {
+        mbbs_machine::m16::FarPtr {
             offset: 0,
             selector: cpu.data_selector(),
         }
@@ -592,9 +592,9 @@ impl Abi for Wg16 {
     }
 }
 
-impl From<Ret<Wg16>> for mbbs16::Ret {
+impl From<Ret<Wg16>> for mbbs_machine::m16::Ret {
     /// The 16-bit boundary conversion this module's doc comment names:
-    /// `Machine::resume` still takes `mbbs16::Ret`, unchanged, so this is
+    /// `Machine::resume` still takes `mbbs_machine::m16::Ret`, unchanged, so this is
     /// where a `Ret<Wg16>` a converted shim hands back becomes it.
     ///
     /// `Ptr` maps to `Far` and `Int` maps to `U16` with no repacking --
@@ -605,34 +605,34 @@ impl From<Ret<Wg16>> for mbbs16::Ret {
     /// type checker; the mutation test below is aimed at exactly that.
     fn from(ret: Ret<Wg16>) -> Self {
         match ret {
-            Ret::Void => mbbs16::Ret::Void,
-            Ret::Int(v) => mbbs16::Ret::U16(v),
-            Ret::Long(v) => mbbs16::Ret::U32(v),
-            Ret::Ptr(v) => mbbs16::Ret::Far(v),
+            Ret::Void => mbbs_machine::m16::Ret::Void,
+            Ret::Int(v) => mbbs_machine::m16::Ret::U16(v),
+            Ret::Long(v) => mbbs_machine::m16::Ret::U32(v),
+            Ret::Ptr(v) => mbbs_machine::m16::Ret::Far(v),
         }
     }
 }
 
-impl From<mbbs16::Ret> for Ret<Wg16> {
+impl From<mbbs_machine::m16::Ret> for Ret<Wg16> {
     /// The reverse of the conversion above -- needed once `Wg16::native`
     /// (see this module's `Abi::native`) has to hand a routine that still
-    /// answers in `mbbs16::Ret` (the ten permanently-16-bit helpers behind
+    /// answers in `mbbs_machine::m16::Ret` (the ten permanently-16-bit helpers behind
     /// `Wg16`'s door: `runtime.rs`'s `f_*@` family and `memory.rs`'s
     /// `alctile`/`ptrtile`) back to a caller expecting `Ret<Wg16>`, the same
     /// type every other routine behind `entry` answers in. Same variant
     /// mapping as the forward direction, read backwards.
-    fn from(ret: mbbs16::Ret) -> Self {
+    fn from(ret: mbbs_machine::m16::Ret) -> Self {
         match ret {
-            mbbs16::Ret::Void => Ret::Void,
-            mbbs16::Ret::U16(v) => Ret::Int(v),
-            mbbs16::Ret::U32(v) => Ret::Long(v),
-            mbbs16::Ret::Far(v) => Ret::Ptr(v),
+            mbbs_machine::m16::Ret::Void => Ret::Void,
+            mbbs_machine::m16::Ret::U16(v) => Ret::Int(v),
+            mbbs_machine::m16::Ret::U32(v) => Ret::Long(v),
+            mbbs_machine::m16::Ret::Far(v) => Ret::Ptr(v),
         }
     }
 }
 
-impl ModuleMem for mbbs16::Segments {
-    type Ptr = mbbs16::FarPtr;
+impl ModuleMem for mbbs_machine::m16::Segments {
+    type Ptr = mbbs_machine::m16::FarPtr;
 
     /// One LDT segment, exactly as `Heap::grow` already gets its backing
     /// store today (`crates/mbbs/src/heap.rs:162`) -- this is that call site
@@ -642,7 +642,7 @@ impl ModuleMem for mbbs16::Segments {
     /// caller's job, not this one's, per the trait's own doc comment.
     fn alloc_region(&mut self, bytes: usize) -> std::io::Result<Self::Ptr> {
         let selector = self.alloc_segment(bytes)?;
-        Ok(mbbs16::FarPtr {
+        Ok(mbbs_machine::m16::FarPtr {
             offset: 0,
             selector,
         })
@@ -652,7 +652,7 @@ impl ModuleMem for mbbs16::Segments {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// A cursor over a byte array, with no `Machine`, no `Segments`, no
     /// thunk table -- see this module's doc comment for why a cursor can be
@@ -744,7 +744,7 @@ mod tests {
     impl Abi for FixtureAbi {
         type Ptr = FarPtr;
 
-        /// `mbbs16::Segments`, not a stub, and not because this fixture ever
+        /// `mbbs_machine::m16::Segments`, not a stub, and not because this fixture ever
         /// touches memory -- it does not. `Abi::Ptr` is bound
         /// `ModulePtr<Memory = Self::Mem>`, so an ABI whose `Ptr` is `FarPtr`
         /// has no choice: `FarPtr` resolves against `Segments` and nothing
@@ -753,7 +753,7 @@ mod tests {
         /// invent its own memory type while borrowing a real pointer type.
         /// Cheap here, because `Cpu` is still `()` and the reads under test
         /// never leave the frame.
-        type Mem = mbbs16::Segments;
+        type Mem = mbbs_machine::m16::Segments;
         type Cpu = ();
         type Int = u16;
 
@@ -872,7 +872,7 @@ mod tests {
     }
 
     /// The proof this task exists for: `Call<Wg16>` built from a *live*
-    /// `mbbs16::Machine` -- not `FixtureAbi`'s trivial `Cpu`/`Mem` -- reading
+    /// `mbbs_machine::m16::Machine` -- not `FixtureAbi`'s trivial `Cpu`/`Mem` -- reading
     /// a real argument frame `Fixture::call` pushed with genuine 16-bit code
     /// and a genuine `lcall`. See the module doc comment ("`Call` holds one
     /// handle, not two") for why this was previously impossible to write at
@@ -921,14 +921,14 @@ mod tests {
     /// swapped -- would be caught rather than accidentally agreeing.
     #[test]
     fn ret_wg16_converts_to_mbbs16_ret_for_all_four_variants() {
-        assert_eq!(mbbs16::Ret::from(Ret::<Wg16>::Void), mbbs16::Ret::Void);
+        assert_eq!(mbbs_machine::m16::Ret::from(Ret::<Wg16>::Void), mbbs_machine::m16::Ret::Void);
         assert_eq!(
-            mbbs16::Ret::from(Ret::<Wg16>::Int(0x1234)),
-            mbbs16::Ret::U16(0x1234)
+            mbbs_machine::m16::Ret::from(Ret::<Wg16>::Int(0x1234)),
+            mbbs_machine::m16::Ret::U16(0x1234)
         );
         assert_eq!(
-            mbbs16::Ret::from(Ret::<Wg16>::Long(0x1234_5678)),
-            mbbs16::Ret::U32(0x1234_5678)
+            mbbs_machine::m16::Ret::from(Ret::<Wg16>::Long(0x1234_5678)),
+            mbbs_machine::m16::Ret::U32(0x1234_5678)
         );
 
         // `Ret::Far`'s own doc comment: "segment in DX, offset in AX" --
@@ -941,8 +941,8 @@ mod tests {
             selector: 0x1234,
         };
         assert_eq!(
-            mbbs16::Ret::from(Ret::<Wg16>::Ptr(ptr)),
-            mbbs16::Ret::Far(ptr),
+            mbbs_machine::m16::Ret::from(Ret::<Wg16>::Ptr(ptr)),
+            mbbs_machine::m16::Ret::Far(ptr),
             "offset (AX) and selector (DX) must land unswapped"
         );
     }
@@ -954,14 +954,14 @@ mod tests {
     /// (distinct high and low halves), read backwards.
     #[test]
     fn mbbs16_ret_converts_to_ret_wg16_for_all_four_variants() {
-        assert!(matches!(Ret::<Wg16>::from(mbbs16::Ret::Void), Ret::Void));
+        assert!(matches!(Ret::<Wg16>::from(mbbs_machine::m16::Ret::Void), Ret::Void));
 
-        let Ret::Int(v) = Ret::<Wg16>::from(mbbs16::Ret::U16(0x1234)) else {
+        let Ret::Int(v) = Ret::<Wg16>::from(mbbs_machine::m16::Ret::U16(0x1234)) else {
             panic!("U16 must convert to Int");
         };
         assert_eq!(v, 0x1234);
 
-        let Ret::Long(v) = Ret::<Wg16>::from(mbbs16::Ret::U32(0x1234_5678)) else {
+        let Ret::Long(v) = Ret::<Wg16>::from(mbbs_machine::m16::Ret::U32(0x1234_5678)) else {
             panic!("U32 must convert to Long");
         };
         assert_eq!(v, 0x1234_5678);
@@ -970,7 +970,7 @@ mod tests {
             offset: 0x5678,
             selector: 0x1234,
         };
-        let Ret::Ptr(v) = Ret::<Wg16>::from(mbbs16::Ret::Far(ptr)) else {
+        let Ret::Ptr(v) = Ret::<Wg16>::from(mbbs_machine::m16::Ret::Far(ptr)) else {
             panic!("Far must convert to Ptr");
         };
         assert_eq!(v, ptr, "offset (AX) and selector (DX) must land unswapped");

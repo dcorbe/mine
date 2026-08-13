@@ -45,8 +45,8 @@
 //! `btuchi`'s whole family collapses to here -- see [`fsdcon`]'s own doc
 //! comment.
 
-use mbbs16::{FarPtr, Machine, Module, Ret};
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::{FarPtr, Machine, Module, Ret};
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::{self, Abi, Call, ModuleMem, Wg16};
 use crate::fsd::{self, MBPMAX};
@@ -1961,7 +1961,7 @@ fn fsd_drain_edge(
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// Point `usrnum` at the fixture's own console.
     ///
@@ -2259,7 +2259,7 @@ mod tests {
             .expect_err("refused");
         // `ShimError::BadPointer` before Task 5: `fsdapr` read this pointer
         // through `machine.read_cstr(at)?`, and `?` converted the
-        // `FarPtrError` through `impl From<mbbs16::FarPtrError> for
+        // `FarPtrError` through `impl From<mbbs_machine::m16::FarPtrError> for
         // ShimError`. The generic `answer_string<A>` cannot: `A::Ptr`'s own
         // `Error` type has no such `From` for an arbitrary `A` (only
         // `Wg16`'s `FarPtrError` does), so it reports the same fact as

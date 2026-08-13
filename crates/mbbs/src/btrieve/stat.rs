@@ -224,8 +224,8 @@ pub struct StatKey {
 }
 
 /// A file's STAT reply, before it is serialised to Btrieve's wire bytes.
-/// Plain data -- no [`super::super::mbbs16::Machine`], no
-/// [`super::super::mbbs16::FarPtr`] -- so both ABIs' `dfaStat`/`dfaStatus`
+/// Plain data -- no [`super::super::mbbs_machine::m16::Machine`], no
+/// [`super::super::mbbs_machine::m16::FarPtr`] -- so both ABIs' `dfaStat`/`dfaStatus`
 /// marshalling can build on the same reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stat {

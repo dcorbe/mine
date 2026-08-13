@@ -4,7 +4,7 @@
 //!
 //! # This produces wrong behaviour. It exists for enumeration only.
 //!
-//! [`Machine::poison`](mbbs16::Machine::poison)'s own doc says the whole
+//! [`Machine::poison`](mbbs_machine::m16::Machine::poison)'s own doc says the whole
 //! reason it exists: "Returning zero instead is the bug this method is here
 //! to prevent." Survey mode is [`Host::run`](crate::Host::run) deliberately
 //! doing that bug, under a flag, on purpose -- fabricating a return
@@ -36,10 +36,10 @@
 //! survey still surfaces the host's own modelling bugs, but they always
 //! still stop the module, survey mode or not.
 //!
-//! A [`Poison::Fault`](mbbs16::Poison::Fault) or
-//! [`Poison::Timeout`](mbbs16::Poison::Timeout) is never continued past
+//! A [`Poison::Fault`](mbbs_machine::m16::Poison::Fault) or
+//! [`Poison::Timeout`](mbbs_machine::m16::Poison::Timeout) is never continued past
 //! either, and cannot be: `crates/mbbs16/src/lib.rs`'s own doc on
-//! [`Machine::poisoned`](mbbs16::Machine::poisoned) says why -- the module
+//! [`Machine::poisoned`](mbbs_machine::m16::Machine::poisoned) says why -- the module
 //! faulted or wedged with its globals mid-update, the call frame is
 //! deliberately forgotten, and there is no resume point to fabricate a
 //! return into even if this crate wanted to. Those never reach this module

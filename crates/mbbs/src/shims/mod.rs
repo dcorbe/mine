@@ -13,7 +13,7 @@ pub mod system;
 pub mod text;
 pub mod user;
 
-use mbbs16::Machine;
+use mbbs_machine::m16::Machine;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
@@ -79,7 +79,7 @@ pub(crate) const NO: u16 = -1i16 as u16;
 /// to `Wg16`) now live behind [`Abi::native`] instead of in [`routines`].
 pub type Shim<A> = fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>;
 
-// `Wg16Shim` -- a bare `fn(&mut Machine, &mut Host) -> Result<mbbs16::Ret,
+// `Wg16Shim` -- a bare `fn(&mut Machine, &mut Host) -> Result<mbbs_machine::m16::Ret,
 // ShimError>`, Wg16-concrete with no `Call` at all -- used to live here, and
 // is deleted.
 //
@@ -126,7 +126,7 @@ pub enum Cleans {
 pub enum ShimError {
     /// The module handed the host a pointer naming nothing, or a range leaving
     /// its segment.
-    BadPointer(mbbs16::FarPtrError),
+    BadPointer(mbbs_machine::m16::FarPtrError),
 
     /// The host could not do it: a file that would not open, a value that would
     /// not fit.
@@ -142,8 +142,8 @@ impl std::fmt::Display for ShimError {
     }
 }
 
-impl From<mbbs16::FarPtrError> for ShimError {
-    fn from(e: mbbs16::FarPtrError) -> Self {
+impl From<mbbs_machine::m16::FarPtrError> for ShimError {
+    fn from(e: mbbs_machine::m16::FarPtrError) -> Self {
         Self::BadPointer(e)
     }
 }
@@ -386,9 +386,9 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
     // Segment tiling: no flat-memory counterpart. Never given a `Call`-taking
     // body (see `shims::memory`'s own doc comment on `alctile`), so these are
     // non-capturing closures adapting `Wg16Shim` into `Shim<Wg16>` -- a
-    // reborrow of `call.cpu` (`Call<Wg16>::cpu` is `&mut mbbs16::Machine`,
-    // since `Wg16::Cpu = mbbs16::Machine`) and the reverse `Ret` conversion
-    // `impl From<mbbs16::Ret> for abi::Ret<Wg16>` supplies.
+    // reborrow of `call.cpu` (`Call<Wg16>::cpu` is `&mut mbbs_machine::m16::Machine`,
+    // since `Wg16::Cpu = mbbs_machine::m16::Machine`) and the reverse `Ret` conversion
+    // `impl From<mbbs_machine::m16::Ret> for abi::Ret<Wg16>` supplies.
     (MAJORBBS, "alctile", memory::alctile, Cleans::Caller),
     (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real
@@ -428,13 +428,13 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 /// `mov $x, %cx` that is followed by a `shl`, which is Borland's huge-pointer
 /// normalisation and is what identifies it.
 ///
-/// [`SELECTOR_STEP`](mbbs16::SELECTOR_STEP) is the answer, expressed as the
+/// [`SELECTOR_STEP`](mbbs_machine::m16::SELECTOR_STEP) is the answer, expressed as the
 /// shift the module wants: consecutive LDT entries are eight apart, so a count
 /// of chunks becomes a selector delta by shifting left three.
 ///
 /// **This is only true once a huge object's chunks occupy consecutive LDT
 /// entries**, which was an open question when the constant went in and is no
-/// longer: [`alloc_tiled`](mbbs16::Machine::alloc_tiled) reserves a region's
+/// longer: [`alloc_tiled`](mbbs_machine::m16::Machine::alloc_tiled) reserves a region's
 /// descriptors as one run, and `memory::ptrtile` is tested against exactly this
 /// arithmetic. The module computes tile addresses both ways and they agree.
 ///
@@ -446,7 +446,7 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 const ABSOLUTES: &[(&str, &str, u16)] = &[(
     DOSCALLS,
     "doshugeshift",
-    mbbs16::SELECTOR_STEP.ilog2() as u16,
+    mbbs_machine::m16::SELECTOR_STEP.ilog2() as u16,
 )];
 
 /// What the host knows about a symbol, for `A`.
@@ -634,7 +634,7 @@ mod tests {
             .point_curusr(&mut f.machine, console)
             .expect("channel 0 is current");
         let account = f.host.users().account(console);
-        let at = mbbs16::FarPtr {
+        let at = mbbs_machine::m16::FarPtr {
             offset: account.offset + crate::users::usracc::SCNBRK as u16,
             selector: account.selector,
         };
@@ -689,7 +689,7 @@ mod tests {
         };
         assert_eq!(
             1u16 << shift,
-            mbbs16::SELECTOR_STEP,
+            mbbs_machine::m16::SELECTOR_STEP,
             "shifting by this must land on the next selector"
         );
     }

@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::io;
 
-use mbbs16::{FarPtr, Machine};
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::{FarPtr, Machine};
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::{Abi, ModuleMem, Wg16};
 

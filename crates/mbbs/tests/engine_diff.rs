@@ -29,7 +29,7 @@ use btrieve_engine::{Engine, Request};
 use mbbs::abi::Wg16;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};
-use mbbs16::Machine;
+use mbbs_machine::m16::Machine;
 
 const B_OPEN: u16 = 0;
 const B_CLOSE: u16 = 1;

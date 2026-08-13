@@ -19,7 +19,7 @@
 //! comment for why sharing one with the control makes both results
 //! meaningless.
 
-use mbbs16::Exit;
+use mbbs_machine::m16::Exit;
 
 /// Byte-for-byte the control's fixture, and `crates/mbbs16/tests/fault.rs`'s.
 fn suicidal() -> Vec<u8> {
@@ -31,13 +31,13 @@ fn suicidal() -> Vec<u8> {
 
 #[test]
 fn a_16_bit_fault_is_recovered_after_mbbs32_has_also_armed() {
-    let mut machine = mbbs16::Machine::new().expect("a 16-bit machine");
+    let mut machine = mbbs_machine::m16::Machine::new().expect("a 16-bit machine");
     machine.load_code(&suicidal()).expect("module fits");
     let entry = machine.code_ptr(0);
 
     // The clobber, held alive across the fault below exactly as a host serving
     // both widths from one process would hold it.
-    let _thirty_two = mbbs32::Machine::new().expect("a 32-bit machine");
+    let _thirty_two = mbbs_machine::m32::Machine::new().expect("a 32-bit machine");
 
     match machine.call(entry, &[]).expect("recovered, not fatal") {
         Exit::Fault { signo, .. } => assert_eq!(signo, libc::SIGSEGV),

@@ -31,7 +31,7 @@
 //! sizes kept host-side keyed by the pointer -- is written once, over
 //! `A: Abi`, and grows a region at a time through
 //! [`ModuleMem::alloc_region`](crate::abi::ModuleMem::alloc_region) rather
-//! than `mbbs16::Machine::alloc_segment` directly: see [`Heap::reserve`].
+//! than `mbbs_machine::m16::Machine::alloc_segment` directly: see [`Heap::reserve`].
 //!
 //! What does **not** move onto that generic core is `alcmem`/`galfree`'s
 //! actual public surface, or `alctile`. Every shim call site --
@@ -106,7 +106,7 @@ struct Arena<A: Abi> {
 /// Kept host-side rather than reconstructed from the pointer, because a
 /// generic `A::Ptr` cannot be decomposed back into "which region" and "how
 /// far into it" the way a `FarPtr`'s `selector`/`offset` could be read
-/// directly -- `mbbs_ptr::ModulePtr` has no such operation, deliberately (see
+/// directly -- `mbbs_machine::ptr::ModulePtr` has no such operation, deliberately (see
 /// its own doc comment). Recording the decomposition at allocation time, once,
 /// is simpler than adding one.
 struct Block {
@@ -327,7 +327,7 @@ impl Heap<Wg16> {
     /// # Errors
     ///
     /// If `size` is zero, or the heap has no room and may not grow.
-    pub fn alloc(&mut self, machine: &mut mbbs16::Machine, size: u16) -> Result<mbbs16::FarPtr, String> {
+    pub fn alloc(&mut self, machine: &mut mbbs_machine::m16::Machine, size: u16) -> Result<mbbs_machine::m16::FarPtr, String> {
         self.reserve(machine.mem_mut(), size)
     }
 
@@ -341,10 +341,10 @@ impl Heap<Wg16> {
     /// If the region cannot be mapped or the LDT has no run that long.
     pub fn alloc_tiled(
         &mut self,
-        machine: &mut mbbs16::Machine,
+        machine: &mut mbbs_machine::m16::Machine,
         qty: u16,
         size: u16,
-    ) -> Result<mbbs16::FarPtr, String> {
+    ) -> Result<mbbs_machine::m16::FarPtr, String> {
         let at = machine.alloc_tiled(qty, size).map_err(|e| e.to_string())?;
         self.tiles.push(Region {
             selector: at.selector,
@@ -358,7 +358,7 @@ impl Heap<Wg16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mbbs16::{FarPtr, Machine};
+    use mbbs_machine::m16::{FarPtr, Machine};
 
     fn heap() -> (Machine, Heap<Wg16>) {
         (

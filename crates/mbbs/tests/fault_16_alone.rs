@@ -4,7 +4,7 @@
 //! Its own test binary -- hence its own process, hence its own signal
 //! disposition -- for the reason `crates/mbbs/tests/wg32_abi.rs` documents at
 //! length: `cargo test` runs the tests within one binary as THREADS of one
-//! process, and a `mbbs32::Machine::new` anywhere in that binary rearms the
+//! process, and a `mbbs_machine::m32::Machine::new` anywhere in that binary rearms the
 //! process's SIGSEGV handler for every thread in it, whichever test happens to
 //! be faulting at the time.
 //!
@@ -18,7 +18,7 @@
 //! If this test fails, `mbbs16`'s own fault recovery is broken and the
 //! sibling's result should not be read at all.
 
-use mbbs16::Exit;
+use mbbs_machine::m16::Exit;
 
 /// A module that executes `HLT` -- privileged, so `#GP`, arriving as SIGSEGV.
 /// Byte-for-byte `crates/mbbs16/tests/fault.rs`'s own fixture.
@@ -31,7 +31,7 @@ fn suicidal() -> Vec<u8> {
 
 #[test]
 fn a_16_bit_fault_is_recovered_when_only_mbbs16_has_armed() {
-    let mut machine = mbbs16::Machine::new().expect("a 16-bit machine");
+    let mut machine = mbbs_machine::m16::Machine::new().expect("a 16-bit machine");
     machine.load_code(&suicidal()).expect("module fits");
     let entry = machine.code_ptr(0);
 

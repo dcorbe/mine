@@ -37,7 +37,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::Abi;
 use crate::arena::Arena;
@@ -355,7 +355,7 @@ impl<A: Abi> Stream<A> {
 /// are gone: once the shim layer took `Call<A>`, every call site had an
 /// `A::Mem` of its own via `Call::mem` and went straight to the `_mem` core,
 /// which left all three facades with **zero callers** while still forcing
-/// `mbbs16::FarPtr` and `mbbs16::Machine` into this file's imports. Deleting
+/// `mbbs_machine::m16::FarPtr` and `mbbs_machine::m16::Machine` into this file's imports. Deleting
 /// them is what took `stream.rs` off `no_direct_farptr.rs`'s `ALLOWED` list.
 ///
 /// The `_mem` suffix is now vestigial -- there is no unsuffixed sibling left

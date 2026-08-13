@@ -2,11 +2,7 @@
 resolver = "2"
 members = [
     "crates/mbbs",
-    "crates/mbbs-ptr",
-    "crates/mbbs16",
-    "crates/mbbs32",
-    "crates/mbbs-ldt",
-    "crates/mbbs-fault",
+    "crates/mbbs-machine",
     "crates/btrieve-engine",
     "crates/mbbs-server",
     "crates/mud-core",

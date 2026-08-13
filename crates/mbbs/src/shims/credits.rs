@@ -72,7 +72,7 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::Ret;
+use mbbs_machine::m16::Ret;
 
 use super::ShimError;
 use crate::Host;

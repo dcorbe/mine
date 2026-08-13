@@ -28,7 +28,7 @@
 //! `varrou` at `+0x10`. Twenty bytes, which is the `imul ax,ax,0x14` the host's
 //! own `register_textvar` uses throughout.
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::Abi;
 use crate::heap::Heap;
@@ -48,7 +48,7 @@ pub const TEXTVAR_SIZE: u16 = TVRSIZ + 4;
 /// the derive macros would bound the generated impls on `A: Trait` rather
 /// than `A::Ptr: Trait` -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the
 /// same problem and fix. `A::Ptr` already carries every one of these bounds
-/// through `mbbs_ptr::ModulePtr`'s own supertraits, so no extra `where`
+/// through `mbbs_machine::ptr::ModulePtr`'s own supertraits, so no extra `where`
 /// clause is needed on the hand-written impls below.
 pub struct TextVar<A: Abi> {
     /// The name a message refers to it by. MajorMUD's is `MUDCHARINFO`.
@@ -299,7 +299,7 @@ mod tests {
     // file: production code here reaches memory through `A::Ptr` now, so a
     // file-level import would be an unused one in the non-test build and a
     // standing invitation to reintroduce the coupling above.
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     #[test]
     fn an_empty_table_has_no_pointer_and_no_rows() {

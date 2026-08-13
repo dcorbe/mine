@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 mbbs = { path = "../mbbs" }
-mbbs16 = { path = "../mbbs16" }
+mbbs-machine = { path = "../mbbs-machine" }
 mud-core = { path = "../mud-core" }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 

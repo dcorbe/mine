@@ -27,8 +27,8 @@
 //! differ, and a source and destination that differ -- a test written
 //! `setmem(p, 4, 4)` would pass either way.
 
-use mbbs16::FarPtr;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::FarPtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
@@ -62,7 +62,7 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// Generic (Task 5): same [`Heap::reserve`](crate::heap::Heap::reserve) core
 /// as [`alcmem`], and the zero-fill writes through
-/// [`mbbs_ptr::ModulePtr::write`] on [`Call::mem`] rather than
+/// [`mbbs_machine::ptr::ModulePtr::write`] on [`Call::mem`] rather than
 /// `Machine::write`.
 pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let size = Into::<u32>::into(call.int()) as u16;
@@ -111,7 +111,7 @@ pub fn farcoreleft<A: Abi>(
 /// `PLSTUFF.C`: `bigptr = MK_FP(pltile(qty*(long)size, 0, size, size), 0)`. One
 /// linear region, `qty` consecutive LDT descriptors across it, each a `size`
 /// window. The module walks between tiles itself, so every descriptor has to
-/// exist first -- see [`Machine::alloc_tiled`](mbbs16::Machine::alloc_tiled).
+/// exist first -- see [`Machine::alloc_tiled`](mbbs_machine::m16::Machine::alloc_tiled).
 pub fn alctile(
     call: &mut Call<Wg16>,
     host: &mut Host<Wg16>,
@@ -135,7 +135,7 @@ pub fn alctile(
 ///
 /// A far pointer is a 32-bit value with the selector in the high word, so
 /// `+ (index << 19)` is `+ index * 8` **on the selector** -- which is
-/// [`SELECTOR_STEP`](mbbs16::SELECTOR_STEP), and the same shift `DOSCALLS.135`
+/// [`SELECTOR_STEP`](mbbs_machine::m16::SELECTOR_STEP), and the same shift `DOSCALLS.135`
 /// hands the module to fold inline.
 ///
 /// The module computes this itself at most of the twelve call sites and only
@@ -162,7 +162,7 @@ pub fn ptrtile(
 
     Ok(abi::Ret::Ptr(FarPtr {
         offset: base.offset,
-        selector: base.selector + index * mbbs16::SELECTOR_STEP,
+        selector: base.selector + index * mbbs_machine::m16::SELECTOR_STEP,
     }))
 }
 
@@ -175,7 +175,7 @@ pub fn ptrtile(
 /// arguments the other way round.
 ///
 /// Generic (Task 5): the fill and the write go through [`Call::mem`] and
-/// [`mbbs_ptr::ModulePtr::write`] rather than a whole `&mut Machine`.
+/// [`mbbs_machine::ptr::ModulePtr::write`] rather than a whole `&mut Machine`.
 pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let at = call.ptr();
     let count = Into::<u32>::into(call.int()) as u16;
@@ -192,8 +192,8 @@ pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 ///
 /// **Source first**, which is the opposite of `memcpy` immediately below.
 ///
-/// Generic (Task 5): reads through [`mbbs_ptr::ModulePtr::resolve`] and
-/// writes through [`mbbs_ptr::ModulePtr::write`], both against [`Call::mem`].
+/// Generic (Task 5): reads through [`mbbs_machine::ptr::ModulePtr::resolve`] and
+/// writes through [`mbbs_machine::ptr::ModulePtr::write`], both against [`Call::mem`].
 pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let src = call.ptr();
     let dst = call.ptr();
@@ -229,7 +229,7 @@ pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// `int memcmp(const void *a, const void *b, size_t n)`. Borland's; no
 /// Galacticomm header redeclares it.
 ///
-/// Generic (Task 5): both reads go through [`mbbs_ptr::ModulePtr::resolve`]
+/// Generic (Task 5): both reads go through [`mbbs_machine::ptr::ModulePtr::resolve`]
 /// on [`Call::mem`]; the answer is built through [`Abi::Int`]'s `From<u16>`
 /// the same way [`shims::user::haskey`](crate::shims::user::haskey) builds
 /// its boolean answer.
@@ -258,7 +258,7 @@ mod tests {
     use super::*;
     // Wg16-only, and used by these fixtures alone -- the
     // production code above reaches memory through the ABI.
-    use mbbs16::Ret;
+    use mbbs_machine::m16::Ret;
     use crate::testing::Fixture;
 
     fn far(at: FarPtr) -> [u16; 2] {
@@ -368,7 +368,7 @@ mod tests {
             panic!("alctile returns a pointer")
         };
 
-        let shift = mbbs16::SELECTOR_STEP.ilog2();
+        let shift = mbbs_machine::m16::SELECTOR_STEP.ilog2();
         for index in 0..8u16 {
             let Ret::Far(asked) = f.invoke(ptrtile, &[base.offset, base.selector, index])
                 .expect("in range")

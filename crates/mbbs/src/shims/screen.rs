@@ -132,7 +132,7 @@
 //! implementation would start from -- recording it now is what makes that
 //! later work additive instead of a rewrite.
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use super::gsbl::{apply_cpc, apply_hpk, apply_pbc, apply_xnf};
@@ -210,7 +210,7 @@ pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// Point `usrnum` at the fixture's own console -- the same helper
     /// `crate::shims::fsd`'s tests use, for the same reason: `rstrxf` asks

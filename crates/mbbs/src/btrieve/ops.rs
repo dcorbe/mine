@@ -945,7 +945,7 @@ mod tests {
     use crate::abi::Wg16;
     use crate::btrieve::keys::{Kind, Segment};
     use crate::btrieve::{Geometry, Version, pages};
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
     use std::path::{Path, PathBuf};
 
     /// A file with six records over two keys, chosen so key 0's order and

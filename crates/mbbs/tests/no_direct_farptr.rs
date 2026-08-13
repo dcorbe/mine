@@ -1,4 +1,4 @@
-//! `FarPtr` is `mbbs16`'s pointer representation, and the whole point of the
+//! `FarPtr` is `m16`'s pointer representation, and the whole point of the
 //! `Abi` trait (`crates/mbbs/src/abi.rs`) is to keep it out of code meant to
 //! serve either width. Without a test, the next contributor reintroduces the
 //! coupling one shim at a time and nothing objects.
@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 /// sorted -- the test sorts both sides before comparing, so the order here is
 /// free to carry meaning. See this file's module comment before editing.
 const ALLOWED: &[&str] = &[
-    // Where the type is SUPPOSED to live: `Wg16::Ptr = mbbs16::FarPtr` is
+    // Where the type is SUPPOSED to live: `Wg16::Ptr = mbbs_machine::m16::FarPtr` is
     // declared here. Not a leak, and this entry never leaves.
     "abi.rs",
     // Irreducibly 16-bit, and staying. `alctile`/`ptrtile` are LDT segment
@@ -73,7 +73,7 @@ const ALLOWED: &[&str] = &[
     // still unimplemented. Same for `Heap::alloc_tiled` behind them.
     "shims/memory.rs",
     // The test fixture builder. Every fixture in this crate constructs a real
-    // `mbbs16::Machine`, so this names `FarPtr` by construction. It is
+    // `mbbs_machine::m16::Machine`, so this names `FarPtr` by construction. It is
     // Wg16-only on purpose and is not a conversion target.
     "testing.rs",
     // --- Genuinely still to convert, in rough order of difficulty ---
@@ -129,7 +129,7 @@ fn braces(line: &str) -> (isize, isize) {
 /// This file's own module comment has always said test code is not what the
 /// guard is for -- "it targets the shim layer's SHARED code, not the Wg16-only
 /// fixtures that exercise it" -- because every fixture in this crate builds a
-/// real `mbbs16::Machine` and so names `FarPtr` by construction. But the
+/// real `mbbs_machine::m16::Machine` and so names `FarPtr` by construction. But the
 /// allowlist is per FILE, so a file whose production code is fully converted
 /// stayed on the list anyway if its `#[cfg(test)]` module poked one address.
 ///

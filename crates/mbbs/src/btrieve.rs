@@ -40,7 +40,7 @@ pub(crate) mod v6;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::Abi;
 
@@ -551,7 +551,7 @@ pub enum Cursor {
 ///
 /// # Generic (over `A: Abi`), as of this task
 ///
-/// `block`/`data`/`key` are `A::Ptr` rather than `mbbs16::FarPtr` -- they are
+/// `block`/`data`/`key` are `A::Ptr` rather than `mbbs_machine::m16::FarPtr` -- they are
 /// module-memory addresses the host handed a module, and the module's own
 /// ABI decides their shape. `A` carries no default; every caller spells its
 /// ABI, the same convention [`crate::heap::Heap`] and
@@ -2124,7 +2124,7 @@ impl<A: Abi> Btrieve<A> {
 mod tests {
     use super::*;
     use crate::abi::Wg16;
-    use mbbs16::{FarPtr, Machine};
+    use mbbs_machine::m16::{FarPtr, Machine};
 
     /// A file control record with a page length, a record length and a count,
     /// and enough pages behind it to match.

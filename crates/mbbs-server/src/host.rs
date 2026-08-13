@@ -1,6 +1,6 @@
 //! The host thread: the only place `Machine::new` is ever called.
 //!
-//! `mbbs16::Machine` is `!Send` -- its segments are `Rc`s over `mmap`s, its
+//! `mbbs_machine::m16::Machine` is `!Send` -- its segments are `Rc`s over `mmap`s, its
 //! watchdog timer is bound with `SIGEV_THREAD_ID` to the `gettid()` of the
 //! thread that created it, and the fault handler's alternate stack is a
 //! `thread_local`. So the `Machine` is built *inside* this thread and never
@@ -21,9 +21,9 @@
 //!
 //! A module that faults, overruns its budget, or calls something this host
 //! does not implement poisons the `Machine` it is running on --
-//! [`mbbs16::Machine::call`] then refuses to enter that machine again, for
+//! [`mbbs_machine::m16::Machine::call`] then refuses to enter that machine again, for
 //! **every** channel, not just the one that tripped it, and
-//! [`mbbs16::Machine::poison`] deliberately forgets the call frame
+//! [`mbbs_machine::m16::Machine::poison`] deliberately forgets the call frame
 //! (`frame_sp = None`), so there is no resume point to salvage even if a
 //! host wanted one. "Hang up only the offending channel and keep going" is
 //! therefore not a safer, more surgical alternative to a restart -- it is
@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use mbbs::abi::Wg16;
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
-use mbbs16::{Machine, Module, Poison};
+use mbbs_machine::m16::{Machine, Module, Poison};
 use tokio::sync::mpsc::Sender;
 
 use crate::msg::{In, Out};

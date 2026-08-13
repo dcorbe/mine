@@ -52,7 +52,7 @@ use mbbs::abi::Wg16;
 use mbbs::btrieve::keys::Kind;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};
-use mbbs16::Machine;
+use mbbs_machine::m16::Machine;
 
 /// Every file MajorMUD ships that actually holds records, and how many.
 ///

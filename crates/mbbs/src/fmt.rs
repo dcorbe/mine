@@ -54,7 +54,7 @@
 //! comment on why `fmt.rs` alone was worth doing first regardless: every one
 //! of those six routines was blocked on this file, and now none of them are.
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::{Abi, Call};
 use crate::shims::ShimError;
@@ -521,7 +521,7 @@ mod tests {
     use super::*;
     use crate::abi::Wg16;
     use crate::testing::Fixture;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// A [`Call<Wg16>`] over the outstanding call's frame -- the same two
     /// lines `crate::shims::call` builds, repeated here so this module's
@@ -678,7 +678,7 @@ mod tests {
         // Lower case: `%p` now defers to `A::Ptr`'s own `Display` (see
         // `format`'s doc for why the generic walk cannot reconstruct
         // `FarPtr`'s fields by hand) rather than reimplementing the same
-        // `seg:off` rendering `mbbs16::FarPtr::fmt` already gives -- one
+        // `seg:off` rendering `mbbs_machine::m16::FarPtr::fmt` already gives -- one
         // place that decides how a pointer prints, not two that could
         // disagree. WCCMMUD.DLL's decompiled sources have no `%p` conversion
         // at all (`grep -c %p` over `WCCMMUD_named.c` is 0), so nothing

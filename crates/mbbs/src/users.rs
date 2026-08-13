@@ -43,7 +43,7 @@
 
 use std::io;
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::ShimError;
 use crate::abi::Abi;
@@ -734,7 +734,7 @@ mod tests {
         // table sized past `nterms` so that the arithmetic is tested even
         // though this host has one channel -- a stride bug would otherwise be
         // invisible until the day `nterms` moved.
-        let mut machine = mbbs16::Machine::new().expect("machine");
+        let mut machine = mbbs_machine::m16::Machine::new().expect("machine");
         let mut heap = crate::Heap::new(crate::Config::default());
         let terms = Terms::new(4);
         // Annotated because `Users::new` is generic now: this test reads
@@ -794,7 +794,7 @@ mod tests {
         let f = crate::testing::Fixture::new();
         let console = f.console();
         let head = f.host.globals().pointer(&f.machine, "user").expect("user");
-        assert_ne!(head, mbbs16::FarPtr::NULL, "the module dereferences this");
+        assert_ne!(head, mbbs_machine::m16::FarPtr::NULL, "the module dereferences this");
         assert_eq!(head, f.host.users().slot(console));
         assert_eq!(head, f.host.users().head());
     }
@@ -810,9 +810,9 @@ mod tests {
         // of the block and returns whatever the heap holds.
         let f = crate::testing::Fixture::new();
         let at = f.host.globals().pointer(&f.machine, "channel").expect("channel");
-        assert_ne!(at, mbbs16::FarPtr::NULL);
+        assert_ne!(at, mbbs_machine::m16::FarPtr::NULL);
         let word = |delta: i16| -> i16 {
-            let from = mbbs16::FarPtr {
+            let from = mbbs_machine::m16::FarPtr {
                 offset: at.offset.wrapping_add((delta * 2) as u16),
                 selector: at.selector,
             };
@@ -845,7 +845,7 @@ mod tests {
         let f = crate::testing::Fixture::new();
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            mbbs16::FarPtr::NULL
+            mbbs_machine::m16::FarPtr::NULL
         );
     }
 
@@ -862,8 +862,8 @@ mod tests {
         let g = f.host.globals();
         let area = g.pointer(&f.machine, "vdaptr").expect("vdaptr");
         let temp = g.pointer(&f.machine, "vdatmp").expect("vdatmp");
-        assert_ne!(area, mbbs16::FarPtr::NULL);
-        assert_ne!(temp, mbbs16::FarPtr::NULL);
+        assert_ne!(area, mbbs_machine::m16::FarPtr::NULL);
+        assert_ne!(temp, mbbs_machine::m16::FarPtr::NULL);
         assert_ne!(area, temp, "the area and the scratch copy are two blocks");
         assert_eq!(area, f.host.users().vda(console).expect("allocated"));
     }
@@ -881,7 +881,7 @@ mod tests {
     fn a_host_that_never_finished_initialising_refuses_to_connect() {
         // Deliberately NOT a `Fixture`: a fixture has finished starting up,
         // which is the whole point of this test's opposite.
-        let mut machine = mbbs16::Machine::new().expect("16-bit machine");
+        let mut machine = mbbs_machine::m16::Machine::new().expect("16-bit machine");
         let mut host = crate::Host::new(
             &mut machine,
             crate::testing::data(),
@@ -914,12 +914,12 @@ mod tests {
         let g = f.host.globals();
         assert_ne!(
             g.pointer(&f.machine, "vdatmp").expect("vdatmp"),
-            mbbs16::FarPtr::NULL,
+            mbbs_machine::m16::FarPtr::NULL,
             "vdatmp is the pointer MajorMUD gates character creation on"
         );
         assert_ne!(
             g.pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            mbbs16::FarPtr::NULL
+            mbbs_machine::m16::FarPtr::NULL
         );
     }
 
@@ -931,7 +931,7 @@ mod tests {
         f.host.alcvda(&mut f.machine).expect("nothing to do");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            mbbs16::FarPtr::NULL
+            mbbs_machine::m16::FarPtr::NULL
         );
     }
 
@@ -1132,7 +1132,7 @@ mod tests {
 
         // Whatever the module had set in the rest of the byte.
         let at = f.host.users().slot(console);
-        let flags = mbbs16::FarPtr {
+        let flags = mbbs_machine::m16::FarPtr {
             offset: at.offset + user::FLAGS,
             selector: at.selector,
         };
@@ -1152,7 +1152,7 @@ mod tests {
     fn polrou_round_trips_through_the_bytes_the_module_reads() {
         let mut f = crate::testing::Fixture::new();
         let console = f.console();
-        let rou = mbbs16::FarPtr {
+        let rou = mbbs_machine::m16::FarPtr {
             offset: 0x2184,
             selector: 0x1010,
         };
@@ -1183,7 +1183,7 @@ mod tests {
         // independent statement of `MAJORBBS.H:90`'s offset that makes a wrong
         // `POLROU` observable.
         let slot = f.host.users().slot(console);
-        let at = mbbs16::FarPtr {
+        let at = mbbs_machine::m16::FarPtr {
             offset: slot.offset + 0x24,
             selector: slot.selector,
         };
@@ -1233,7 +1233,7 @@ mod tests {
         // literal `0x24`: an address derived from the constant under test
         // could only prove the accessor agrees with itself.
         let slot = f.host.users().slot(console);
-        let at = mbbs16::FarPtr {
+        let at = mbbs_machine::m16::FarPtr {
             offset: slot.offset + 6,
             selector: slot.selector,
         };
@@ -1262,7 +1262,7 @@ mod tests {
         // The literal `+8`, for the reason `set_state_writes_where_the_
         // module_reads_state`'s own literal is.
         let slot = f.host.users().slot(console);
-        let at = mbbs16::FarPtr {
+        let at = mbbs_machine::m16::FarPtr {
             offset: slot.offset + 8,
             selector: slot.selector,
         };

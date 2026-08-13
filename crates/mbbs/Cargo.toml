@@ -7,9 +7,7 @@ publish.workspace = true
 
 [dependencies]
 libc = "0.2"
-mbbs16 = { path = "../mbbs16" }
-mbbs32 = { path = "../mbbs32" }
-mbbs-ptr = { path = "../mbbs-ptr" }
+mbbs-machine = { path = "../mbbs-machine" }
 
 [dev-dependencies]
 btrieve-engine = { path = "../btrieve-engine" }

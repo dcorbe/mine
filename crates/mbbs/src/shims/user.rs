@@ -30,8 +30,8 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::Ret;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::Ret;
+use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
@@ -378,7 +378,7 @@ mod tests {
         f.invoke(curusr, &[0]).expect("channel 0");
         assert_eq!(
             f.host.globals().pointer(&f.machine, "vdaptr").expect("vdaptr"),
-            mbbs16::FarPtr::NULL
+            mbbs_machine::m16::FarPtr::NULL
         );
 
         f.invoke(crate::shims::system::dclvda, &[256]).expect("declared");
@@ -453,7 +453,7 @@ mod tests {
             panic!("getin returns char *margv[0]");
         };
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
-        assert_ne!(margv0, mbbs16::FarPtr::NULL);
+        assert_ne!(margv0, mbbs_machine::m16::FarPtr::NULL);
         assert_eq!(f.machine.read_cstr(margv0).expect("readable"), b"");
     }
 
@@ -473,13 +473,13 @@ mod tests {
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(1));
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(1));
 
         let lock = f.text("WCCSYSOP");
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(0));
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(0));
     }
 
     #[test]
@@ -498,7 +498,7 @@ mod tests {
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(0), "not 1 -- the null check comes first");
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(0), "not 1 -- the null check comes first");
     }
 
     #[test]
@@ -532,7 +532,7 @@ mod tests {
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(0));
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(0));
     }
 
     #[test]
@@ -557,7 +557,7 @@ mod tests {
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(1));
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(1));
     }
 
     #[test]
@@ -580,7 +580,7 @@ mod tests {
         let got = f
             .invoke(super::haskey, &crate::testing::Fixture::far(lock))
             .expect("answered");
-        assert_eq!(got, mbbs16::Ret::U16(1), "matched case-insensitively");
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(1), "matched case-insensitively");
         assert_eq!(f.read(lock), "user", "and left the module's string alone");
     }
 

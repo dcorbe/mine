@@ -13,7 +13,7 @@
 //! # Generic over the ABI, concrete at every call site
 //!
 //! `Arena<A>` gets its backing regions from [`ModuleMem::alloc_region`]
-//! rather than `mbbs16::Machine::alloc_segment` directly, and builds
+//! rather than `mbbs_machine::m16::Machine::alloc_segment` directly, and builds
 //! placements inside one with [`Abi::ptr_offset`] rather than constructing a
 //! `FarPtr` by hand -- so the packing algorithm below (first-fit within the
 //! current region, a fresh region when nothing fits) is written once and
@@ -39,7 +39,7 @@
 
 use std::io;
 
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::{Abi, ModuleMem};
 
@@ -135,7 +135,7 @@ impl<A: Abi> Arena<A> {
 mod tests {
     use super::*;
     use crate::abi::Wg16;
-    use mbbs16::Machine;
+    use mbbs_machine::m16::Machine;
 
     fn machine() -> Machine {
         Machine::new().expect("machine")

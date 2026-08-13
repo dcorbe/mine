@@ -237,7 +237,7 @@ mod tests {
         else {
             panic!("{DOSCALLS}.{name} must reach the loader as a constant");
         };
-        assert_eq!(1u16 << shift, mbbs16::SELECTOR_STEP);
+        assert_eq!(1u16 << shift, mbbs_machine::m16::SELECTOR_STEP);
     }
 
     #[test]

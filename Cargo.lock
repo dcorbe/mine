@@ -440,25 +440,16 @@ version = "0.1.0"
 dependencies = [
  "btrieve-engine",
  "libc",
- "mbbs-ptr",
- "mbbs16",
- "mbbs32",
+ "mbbs-machine",
 ]
 
 [[package]]
-name = "mbbs-fault"
+name = "mbbs-machine"
 version = "0.1.0"
 dependencies = [
+ "btrieve-engine",
  "libc",
 ]
-
-[[package]]
-name = "mbbs-ldt"
-version = "0.1.0"
-
-[[package]]
-name = "mbbs-ptr"
-version = "0.1.0"
 
 [[package]]
 name = "mbbs-server"
@@ -466,30 +457,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mbbs",
- "mbbs16",
+ "mbbs-machine",
  "mud-core",
  "tokio",
-]
-
-[[package]]
-name = "mbbs16"
-version = "0.1.0"
-dependencies = [
- "btrieve-engine",
- "libc",
- "mbbs-fault",
- "mbbs-ldt",
- "mbbs-ptr",
-]
-
-[[package]]
-name = "mbbs32"
-version = "0.1.0"
-dependencies = [
- "libc",
- "mbbs-fault",
- "mbbs-ldt",
- "mbbs-ptr",
 ]
 
 [[package]]

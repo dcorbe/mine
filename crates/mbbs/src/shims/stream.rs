@@ -48,8 +48,8 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::Ret;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::Ret;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
@@ -166,7 +166,7 @@ pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// Generic (Task 5): [`Streams::line_mem`](crate::stream::Streams::line_mem)
 /// is already `impl<A: Abi> Streams<A>`, and the terminated line is written
-/// back through [`Call::mem`] and [`mbbs_ptr::ModulePtr::write`] rather than
+/// back through [`Call::mem`] and [`mbbs_machine::ptr::ModulePtr::write`] rather than
 /// `Machine::write`.
 pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *fgets(char *s, int n, FILE *f)` -- Borland's; no Galacticomm
@@ -215,7 +215,7 @@ pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 ///
 /// Generic (Task 5): [`Streams::read_mem`](crate::stream::Streams::read_mem)
 /// is already `impl<A: Abi> Streams<A>`, and the block is written back
-/// through [`Call::mem`] and [`mbbs_ptr::ModulePtr::write`].
+/// through [`Call::mem`] and [`mbbs_machine::ptr::ModulePtr::write`].
 pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- Borland's;
     // no Galacticomm header redeclares it.
@@ -502,7 +502,7 @@ pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     use crate::stream::FILE_SIZE;
     use crate::testing::{Fixture, scratch, scratch_with};

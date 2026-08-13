@@ -2,7 +2,7 @@
 //!
 //! **Why this is not `crates/mbbs/src/abi/wg32.rs`'s own `#[cfg(test)] mod
 //! tests`, unlike every sibling `Abi` file.** A real `Wg32Cpu` needs a real
-//! `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally registers
+//! `mbbs_machine::m32::Machine`, and `mbbs_machine::m32::Machine::new` unconditionally registers
 //! with `crates/mbbs-fault`'s shared arbiter. Registering is no longer
 //! destructive to another ABI's recovery -- see below, that is the whole
 //! point of the arbiter -- but `cargo test -p mbbs --lib` still runs every
@@ -18,8 +18,8 @@
 //! `1281 passed; 0 failed` to `1282 passed; 3 failed` -- three unrelated
 //! `mbbs16` fault-recovery tests broke, every one of them because this
 //! file's `Wg32Cpu` had already clobbered the process's SIGSEGV handler
-//! before they ran. That was `mbbs32::fault`'s own standalone handler
-//! stealing the disposition `mbbs16::fault`'s handler needed, exactly the
+//! before they ran. That was `mbbs_machine::m32::fault`'s own standalone handler
+//! stealing the disposition `mbbs_machine::m16::fault`'s handler needed, exactly the
 //! bug `crates/mbbs-fault` now exists to fix -- but `cargo test`'s own
 //! process model is still the right isolation for *this* file regardless:
 //! each file under `tests/` is a separate binary, hence a separate process,
@@ -27,8 +27,8 @@
 //! isolated from unrelated tests.
 //!
 //! **This no longer describes a production limitation.** A host serving both
-//! a 16-bit and a 32-bit module from one process now can: `mbbs16::fault` and
-//! `mbbs32::fault` each register a *positive* claim over the faulting `CS`
+//! a 16-bit and a 32-bit module from one process now can: `mbbs_machine::m16::fault` and
+//! `mbbs_machine::m32::fault` each register a *positive* claim over the faulting `CS`
 //! with `crates/mbbs-fault`'s shared arbiter instead of installing a
 //! standalone handler, so the second `Machine::new` (whichever ABI is
 //! second) no longer steals the first ABI's recovery. See
@@ -38,7 +38,7 @@
 
 use mbbs::abi::{Abi, Call, Cursor, ModuleMem, Wg16, Wg32, Wg32Cpu};
 
-/// Byte-for-byte the same fixture `mbbs32::flatptr`'s and `mbbs32::mem`'s own
+/// Byte-for-byte the same fixture `mbbs_machine::m32::flatptr`'s and `mbbs_machine::m32::mem`'s own
 /// test modules build -- duplicated per this crate family's own convention
 /// (see those modules' doc comments on `minimal_with_one_section`) rather
 /// than shared, since a private test fixture in one source file is not
@@ -74,19 +74,19 @@ fn minimal_with_one_section() -> Vec<u8> {
     v
 }
 
-/// A real `Wg32Cpu`: a genuine `mbbs32::Machine` (thunk table, TIB, fault
-/// recovery armed) bundled with a genuine `mbbs32::Memory` wrapping a loaded
+/// A real `Wg32Cpu`: a genuine `mbbs_machine::m32::Machine` (thunk table, TIB, fault
+/// recovery armed) bundled with a genuine `mbbs_machine::m32::Memory` wrapping a loaded
 /// (if inert) image. Nothing here is entered -- this task does not service a
-/// call end to end (that needs `mbbs32::Machine::resume`, unmerged; see the
+/// call end to end (that needs `mbbs_machine::m32::Machine::resume`, unmerged; see the
 /// design's Task 3 note) -- but `Call<Wg32>` must be buildable from the real
 /// thing, not only a fixture standing in for it, the same way `Call<Wg16>`'s
-/// own proof needed a live `mbbs16::Machine`.
+/// own proof needed a live `mbbs_machine::m16::Machine`.
 fn cpu() -> Wg32Cpu {
     let file = minimal_with_one_section();
-    let pe = mbbs32::PeImage::parse(&file).expect("fixture parses");
-    let image = mbbs32::Image::load(&file, &pe).expect("fixture loads");
-    let mem = mbbs32::Memory::new(image, 0x1000).expect("arena mapping");
-    let machine = mbbs32::Machine::new().expect("thunk table, TIB, fault recovery");
+    let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
+    let image = mbbs_machine::m32::Image::load(&file, &pe).expect("fixture loads");
+    let mem = mbbs_machine::m32::Memory::new(image, 0x1000).expect("arena mapping");
+    let machine = mbbs_machine::m32::Machine::new().expect("thunk table, TIB, fault recovery");
     Wg32Cpu::new(machine, mem)
 }
 
@@ -111,7 +111,7 @@ fn call_reads_a_ptr_int_int_frame_at_32_bit_offsets_not_16_bit_ones() {
 
     let mut cpu = cpu();
     let mut call = Call::<Wg32>::new(&mut cpu, &frame);
-    assert_eq!(call.ptr(), mbbs32::Flat32Ptr(0xAABB_CCDD), "bytes 0-4: the pointer");
+    assert_eq!(call.ptr(), mbbs_machine::m32::Flat32Ptr(0xAABB_CCDD), "bytes 0-4: the pointer");
     assert_eq!(
         call.int(),
         0x1111_2222,
@@ -161,10 +161,10 @@ fn call_mem_reborrows_the_same_memory_the_cpu_owns() {
 #[test]
 fn data_ptr_is_the_images_own_base() {
     let cpu = cpu();
-    assert_eq!(Wg32::data_ptr(&cpu), mbbs32::Flat32Ptr(cpu.mem.image().base()));
+    assert_eq!(Wg32::data_ptr(&cpu), mbbs_machine::m32::Flat32Ptr(cpu.mem.image().base()));
 }
 
-/// `ModuleMem::alloc_region` reaches `mbbs32::Memory`'s real allocator -- not
+/// `ModuleMem::alloc_region` reaches `mbbs_machine::m32::Memory`'s real allocator -- not
 /// a stub that always errors, and not a pointer into the image by mistake.
 /// The generic `Heap<A>`/`Arena<A>` core (`crates/mbbs/src/heap.rs`,
 /// `arena.rs`) calls exactly this method, so this is also the smallest

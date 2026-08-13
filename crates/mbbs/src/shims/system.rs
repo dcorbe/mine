@@ -42,8 +42,8 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::Ret;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::Ret;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::{DateBuffers, Host};
 use crate::abi::{self, Abi, Call, Wg16};
@@ -909,7 +909,7 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 /// `Eq` all typecheck unconditionally for any `A: Abi`, with no `where`
 /// clause needed, because `Abi::Ptr` already requires `Copy + Eq` in the
 /// trait itself; `Debug` needs `A::Ptr: Debug` spelled out because
-/// `mbbs_ptr::ModulePtr`'s own `Debug` supertrait is not visible to the
+/// `mbbs_machine::ptr::ModulePtr`'s own `Debug` supertrait is not visible to the
 /// compiler without it being named at the impl site.
 pub struct Kick<A: Abi> {
     /// Seconds yet to go, counted down one per elapsed second by
@@ -1200,7 +1200,7 @@ impl<A: Abi> Registration<A> {
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     /// A `struct module` in module memory: 25 bytes of name, then nine far
     /// pointers.
@@ -1836,7 +1836,7 @@ mod tests {
             .globals()
             .pointer(&f.machine, "txtvars")
             .expect("txtvars");
-        assert_ne!(published, mbbs16::FarPtr::NULL, "the global was filled in");
+        assert_ne!(published, mbbs_machine::m16::FarPtr::NULL, "the global was filled in");
         assert_eq!(published, f.host.textvars().at().expect("a table"));
 
         let row = f
@@ -1986,7 +1986,7 @@ mod tests {
                 .globals()
                 .pointer(&f.machine, "txtvars")
                 .expect("txtvars"),
-            mbbs16::FarPtr::NULL,
+            mbbs_machine::m16::FarPtr::NULL,
             "and nothing was published"
         );
     }

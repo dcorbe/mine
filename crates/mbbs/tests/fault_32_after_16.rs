@@ -10,11 +10,11 @@
 //! module comment for why sharing one with any sibling makes every result in
 //! it meaningless.
 
-use mbbs32::{Exit, Mapping};
+use mbbs_machine::m32::{Exit, Mapping};
 
 /// `mov eax, [0]` -- an ordinary, unprefixed dereference of address zero.
 /// Byte-for-byte `crates/mbbs32/src/fault.rs`'s own `null_deref_code` fixture,
-/// minus the `ljmp` back to a trampoline: `mbbs32::Machine::call` already
+/// minus the `ljmp` back to a trampoline: `mbbs_machine::m32::Machine::call` already
 /// builds a proper cdecl return frame on the module's own stack, and this
 /// code is never meant to reach it.
 fn null_deref() -> [u8; 5] {
@@ -27,13 +27,13 @@ fn a_32_bit_fault_is_recovered_after_mbbs16_has_also_armed() {
     // construction order from `fault_16_after_32.rs`, and the whole point of
     // this test: whichever ABI arms the process's signal disposition second
     // must not break recovery for the *other* one either.
-    let _sixteen = mbbs16::Machine::new().expect("a 16-bit machine");
+    let _sixteen = mbbs_machine::m16::Machine::new().expect("a 16-bit machine");
 
     let mut mapping = Mapping::new(4096).expect("a low mapping for the fault code");
     let entry = mapping.base() as usize as u32;
     mapping.as_mut_slice()[..5].copy_from_slice(&null_deref());
 
-    let mut machine = mbbs32::Machine::new().expect("a 32-bit machine");
+    let mut machine = mbbs_machine::m32::Machine::new().expect("a 32-bit machine");
 
     match machine.call(entry, &[]).expect("recovered, not fatal") {
         Exit::Fault { signo, eip } => {

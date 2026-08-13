@@ -26,15 +26,15 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use mbbs_machine::m16::{Machine, Ret};
 
 // `FarPtr` is named by exactly one item now -- the `#[cfg(test)]` [`message`]
 // facade below -- so the import follows it rather than sitting unused in a
 // release build. The `_wg16` siblings deal in `Machine` and `Ret` and never
 // spell a pointer type: that is the conversion working.
 #[cfg(test)]
-use mbbs16::FarPtr;
-use mbbs_ptr::ModulePtr;
+use mbbs_machine::m16::FarPtr;
+use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};

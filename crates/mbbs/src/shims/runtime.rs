@@ -37,7 +37,7 @@
 //! eight nullary routines -- it looks for the caller's stack adjustment and
 //! there is not one to find.
 //!
-//! The three register-only ones are why [`Machine::ax`](mbbs16::Machine::ax) and
+//! The three register-only ones are why [`Machine::ax`](mbbs_machine::m16::Machine::ax) and
 //! its siblings exist. An import thunk overwrites `AX` and `CX` to name itself,
 //! so it now saves them first.
 //!
@@ -51,7 +51,7 @@
 //! which asks `f_lumod@` for `x % 2000` four times with a different `x` each
 //! time.
 
-use mbbs16::Machine;
+use mbbs_machine::m16::Machine;
 
 use crate::Host;
 use crate::abi::{self, Call, Wg16};
@@ -321,12 +321,12 @@ fn overflow(name: &str, a: i32, b: i32) -> ShimError {
 
 #[cfg(test)]
 mod tests {
-    use mbbs16::FarPtr;
+    use mbbs_machine::m16::FarPtr;
 
     use super::*;
     // Wg16-only, and used by these fixtures alone -- the
     // production code above reaches memory through the ABI.
-    use mbbs16::Ret;
+    use mbbs_machine::m16::Ret;
     use crate::testing::Fixture;
 
     /// Push a dividend and a divisor the way the module does, and run `shim`.

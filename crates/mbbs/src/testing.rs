@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use mbbs16::{Exit, FarPtr, Machine, Ret};
+use mbbs_machine::m16::{Exit, FarPtr, Machine, Ret};
 
 use crate::Host;
 use crate::abi::{self, Call, Wg16};
@@ -191,7 +191,7 @@ impl Fixture {
     /// made adding one routine to the API surface cost two functions instead
     /// of one. The bridges are gone; this builds the `Call` itself.
     ///
-    /// Still returns `mbbs16::Ret` rather than [`abi::Ret<Wg16>`], via the
+    /// Still returns `mbbs_machine::m16::Ret` rather than [`abi::Ret<Wg16>`], via the
     /// `From` conversion between them. That is what let the bridges be
     /// deleted without touching a single assertion in those 594 tests: the
     /// call sites changed by exactly one thing, dropping `_wg16` from the
@@ -219,7 +219,7 @@ impl Fixture {
     }
 
     /// Push `args` and run a shim, answering in [`abi::Ret<Wg16>`] rather
-    /// than converting to `mbbs16::Ret` the way [`Fixture::invoke`] does.
+    /// than converting to `mbbs_machine::m16::Ret` the way [`Fixture::invoke`] does.
     ///
     /// The two tests that need it are in `shims::mod` and reach a routine
     /// through [`entry`](crate::shims::entry) by name rather than by calling
@@ -243,19 +243,19 @@ impl Fixture {
 
     /// Load [`minimal_module_bytes`] into this fixture's host.
     ///
-    /// `Host::connect` and `Host::poll` both take a `&mbbs16::Module`, whether
+    /// `Host::connect` and `Host::poll` both take a `&mbbs_machine::m16::Module`, whether
     /// or not the branch under test ever reads it, and `Host::load` is the
     /// only way to produce one -- there is no `Default`, no test constructor,
     /// nothing but real NE bytes in. A test of "no module has registered"
     /// still needs a module to *pass*, just not one that has registered.
-    pub fn minimal_module(&mut self) -> mbbs16::Module {
+    pub fn minimal_module(&mut self) -> mbbs_machine::m16::Module {
         self.host
             .load(&mut self.machine, &minimal_module_bytes())
             .expect("a minimal module loads")
     }
 }
 
-/// The smallest NE image [`mbbs16::Machine::load_ne`] accepts: one data
+/// The smallest NE image [`mbbs_machine::m16::Machine::load_ne`] accepts: one data
 /// segment, no imports, no exports beyond its own name. See
 /// [`Fixture::minimal_module`].
 ///
