@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 
 pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
@@ -561,7 +561,7 @@ pub enum Cursor {
 /// below -- has no `A`-dependent behaviour and lives on `impl<A: Abi>
 /// Block<A>` unchanged; only the three fields below and their own getters
 /// name `A::Ptr`.
-pub struct Block<A: Abi = Wg16> {
+pub struct Block<A: Abi> {
     /// This block's identity for [`ops::LockTable`] -- see [`ops::BlockId`]'s
     /// own doc comment for why it is not the module's `struct btvblk *`.
     id: ops::BlockId,
@@ -1532,7 +1532,7 @@ impl<A: Abi> Block<A> {
 /// -- widening it to `Btrieve<A>` is the one remaining step, and it is in
 /// `crates/mbbs/src/lib.rs`, a file this task does not own; see this crate's
 /// own worklog for the exact edit.
-pub struct Btrieve<A: Abi = Wg16> {
+pub struct Btrieve<A: Abi> {
     open: Vec<Block<A>>,
 
     /// `bbstk`: what `rstbtv` will restore, nearest first. Fixed at ten and
@@ -2116,6 +2116,7 @@ impl<A: Abi> Btrieve<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use mbbs16::{FarPtr, Machine};
 
     /// A file control record with a page length, a record length and a count,
@@ -2448,7 +2449,7 @@ mod tests {
     /// A `Block` over `seed`'s file, built directly rather than through
     /// `Btrieve::open` -- this test has no module and no heap, only the file
     /// and the geometry a real `opnbtv` would have read out of it.
-    fn block(path: PathBuf) -> Block {
+    fn block(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
             page: 64,
@@ -2909,7 +2910,7 @@ mod tests {
 
     /// A `Block` over [`seed_variable`]'s file, built directly the same way
     /// [`block`] is.
-    fn block_variable(path: PathBuf) -> Block {
+    fn block_variable(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
             page: 64,
@@ -3155,7 +3156,7 @@ mod tests {
     }
 
     /// A `Block` over `seed_indexed`'s file.
-    fn block_indexed(path: PathBuf) -> Block {
+    fn block_indexed(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
             page: 512,
@@ -3229,7 +3230,7 @@ mod tests {
     }
 
     /// A `Block` over [`seed_duplicated`]'s file.
-    fn block_duplicated(path: PathBuf) -> Block {
+    fn block_duplicated(path: PathBuf) -> Block<Wg16> {
         let mut block = block_indexed(path);
         block.name = "DUPLICATE.DAT".to_owned();
         block.geometry.physical = 24;
@@ -3266,7 +3267,7 @@ mod tests {
     /// Out of order on purpose, and deterministically so: odd keys ascending,
     /// then even. A builder that preserved insertion order rather than key
     /// order would pass against a file seeded in order.
-    fn block_with_many_records(dir: &Path, n: u16) -> Block {
+    fn block_with_many_records(dir: &Path, n: u16) -> Block<Wg16> {
         let path = seed_indexed(dir);
         let mut block = block_indexed(path);
         let odd = (1..=n).filter(|k| k % 2 == 1);
@@ -3637,7 +3638,7 @@ mod tests {
     /// A `Block` over `seed_two_keys_segmented_first`'s file: key 0 has two
     /// segments and `definition: 0`; key 1 has one segment, `number: 1` but
     /// `definition: 2`.
-    fn block_two_keys(path: PathBuf) -> Block {
+    fn block_two_keys(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
             page: 512,
@@ -3772,8 +3773,8 @@ mod tests {
     /// would hold.
     fn open_indexed(
         machine: &mut Machine,
-        heap: &mut crate::Heap,
-        btrieve: &mut Btrieve,
+        heap: &mut crate::Heap<Wg16>,
+        btrieve: &mut Btrieve<Wg16>,
         path: PathBuf,
     ) -> FarPtr {
         let mut block = block_indexed(path);
@@ -4227,7 +4228,7 @@ mod tests {
     /// [`Btrieve::abort`], not about opening a file, and every field here is
     /// visible to `mod tests` as a descendant of the module that declares
     /// them private.
-    fn btrieve_with(open: Vec<Block>) -> Btrieve {
+    fn btrieve_with(open: Vec<Block<Wg16>>) -> Btrieve<Wg16> {
         Btrieve {
             open,
             stack: [FarPtr::NULL; BBSTSZ],

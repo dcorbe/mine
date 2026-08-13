@@ -911,7 +911,7 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
 /// trait itself; `Debug` needs `A::Ptr: Debug` spelled out because
 /// `mbbs_ptr::ModulePtr`'s own `Debug` supertrait is not visible to the
 /// compiler without it being named at the impl site.
-pub struct Kick<A: Abi = Wg16> {
+pub struct Kick<A: Abi> {
     /// Seconds yet to go, counted down one per elapsed second by
     /// [`crate::Host::prcrtk`]. Never `0`: `rtkick` refuses to record a
     /// zero-delay kick, because `RTKICK.C` would never have fired it.
@@ -960,7 +960,7 @@ impl<A: Abi> Eq for Kick<A> {}
 ///
 /// Generic over `A: Abi`, and hand-written rather than derived -- see
 /// [`Kick`]'s own doc comment for why.
-pub enum Registration<A: Abi = Wg16> {
+pub enum Registration<A: Abi> {
     /// A module that has been taken online.
     Module {
         /// The name from `descrp`, which is the key its records are kept
@@ -1049,7 +1049,7 @@ pub enum Native {
 ///
 /// Generic over `A: Abi`, and hand-written rather than derived -- see
 /// [`Kick`]'s own doc comment for why.
-pub struct Agent<A: Abi = Wg16> {
+pub struct Agent<A: Abi> {
     /// The name a client addresses this agent by. MajorMUD's is `WCCMMUD`.
     pub appid: String,
 
@@ -1116,7 +1116,7 @@ impl<A: Abi> Eq for Agent<A> {}
 ///
 /// Generic over `A: Abi`, and hand-written rather than derived -- see
 /// [`Kick`]'s own doc comment for why.
-pub enum Dispatch<A: Abi = Wg16> {
+pub enum Dispatch<A: Abi> {
     /// A module's far pointer for this entry, or `None` if it left the entry
     /// null.
     Module(Option<A::Ptr>),

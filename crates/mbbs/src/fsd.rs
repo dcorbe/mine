@@ -47,7 +47,7 @@
 
 use std::fmt;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 
 pub mod ain;
 
@@ -526,7 +526,7 @@ impl Field {
 /// macro's generated bound is `A: Trait`, which `Wg16` (a bare marker with no
 /// derives of its own) does not satisfy, so `Clone`/`PartialEq`/`Eq`/`Debug`
 /// are written out by hand below instead.
-pub struct Scb<A: Abi = Wg16> {
+pub struct Scb<A: Abi> {
     bytes: [u8; FSDSCB as usize],
     abi: std::marker::PhantomData<A>,
 }
@@ -5678,6 +5678,7 @@ pub fn fsdqoe<A: Abi>(form: &Form, answers: &Answers, scb: &mut Scb<A>) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use mbbs16::FarPtr;
 
     /// The maximum this host's 4,096-byte output buffer allows. See the
@@ -6385,7 +6386,7 @@ mod tests {
     }
 
     /// A fresh, zeroed control block, the way `alczer` leaves one.
-    fn zeroed_scb() -> Scb {
+    fn zeroed_scb() -> Scb<Wg16> {
         Scb::from_bytes(&[0u8; FSDSCB as usize]).expect("exactly FSDSCB bytes")
     }
 
@@ -6399,7 +6400,7 @@ mod tests {
     /// engine cannot be in -- and before `ansptr` became a real member, it
     /// silently was that state. This is how a test says "the player has
     /// typed this much".
-    fn typed(scb: &mut Scb, text: &[u8]) {
+    fn typed(scb: &mut Scb<Wg16>, text: &[u8]) {
         scb.set_ansbuf(text);
         scb.set_ansptr(u8::try_from(text.len()).expect("a field is at most ANSLEN wide"));
     }
@@ -9481,7 +9482,7 @@ mod tests {
     /// the sentinel `in_template`, one past the end, for the last field),
     /// `state` is `FSDBUF`, and `xitkey` is whatever byte triggered the
     /// commit.
-    fn buffered_scb(entfld: u8, crsfld: u8, xitkey: u8) -> Scb {
+    fn buffered_scb(entfld: u8, crsfld: u8, xitkey: u8) -> Scb<Wg16> {
         let mut scb = zeroed_scb();
         scb.set_entfld(entfld);
         scb.set_crsfld(crsfld);

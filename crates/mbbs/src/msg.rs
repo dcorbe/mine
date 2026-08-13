@@ -40,7 +40,7 @@ use std::io;
 
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 use crate::arena::Arena;
 
 /// One `.MSG` file, as a numbered list of messages.
@@ -333,7 +333,7 @@ pub fn getasc(compact: &[u8]) -> Vec<u8> {
 const MSGBLK: usize = 5 * 4 + 2 + 3 * 4 + 2 + 2;
 
 /// One open message file.
-struct Block<A: Abi = Wg16> {
+struct Block<A: Abi> {
     /// What it was opened as, for error messages.
     name: String,
 
@@ -374,7 +374,7 @@ struct Block<A: Abi = Wg16> {
 /// `A: Default` on the generated impl, which the bare marker struct `Wg16`
 /// does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same
 /// problem and fix.
-pub struct Messages<A: Abi = Wg16> {
+pub struct Messages<A: Abi> {
     arena: Arena<A>,
     open: Vec<Block<A>>,
 

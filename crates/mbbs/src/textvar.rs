@@ -30,7 +30,7 @@
 
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 use crate::heap::Heap;
 use crate::shims::ShimError;
 
@@ -50,7 +50,7 @@ pub const TEXTVAR_SIZE: u16 = TVRSIZ + 4;
 /// same problem and fix. `A::Ptr` already carries every one of these bounds
 /// through `mbbs_ptr::ModulePtr`'s own supertraits, so no extra `where`
 /// clause is needed on the hand-written impls below.
-pub struct TextVar<A: Abi = Wg16> {
+pub struct TextVar<A: Abi> {
     /// The name a message refers to it by. MajorMUD's is `MUDCHARINFO`.
     pub name: String,
 
@@ -110,7 +110,7 @@ impl<A: Abi> std::fmt::Debug for TextVar<A> {
 /// bound `A: Debug`/`A: Default` on the impl, which `Wg16` (a bare marker
 /// struct) does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for
 /// the same problem and fix.
-pub struct TextVars<A: Abi = Wg16> {
+pub struct TextVars<A: Abi> {
     /// Where the table is, or `None` before the first registration.
     at: Option<A::Ptr>,
 
@@ -292,6 +292,7 @@ impl<A: Abi> TextVars<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
     // Wg16-only, and deliberately scoped to the fixtures rather than the
     // file: production code here reaches memory through `A::Ptr` now, so a
@@ -305,7 +306,7 @@ mod tests {
         // nothing here pins `A` to `Wg16` the way calling `push`/`get` would
         // -- unlike before this task, `TextVars`'s default type parameter no
         // longer resolves from a Wg16-only method used later in the test.
-        let table: TextVars = TextVars::default();
+        let table: TextVars<Wg16> = TextVars::default();
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
         assert_eq!(table.at(), None);

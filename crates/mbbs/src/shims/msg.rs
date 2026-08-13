@@ -38,6 +38,9 @@ use mbbs_ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
+// Named only by the same `#[cfg(test)]` `message` facade `FarPtr` above is.
+#[cfg(test)]
+use crate::abi::Wg16;
 use crate::fmt::format_call;
 use crate::msg::{MsgFile, value};
 use crate::shims::{ShimError, text};
@@ -374,7 +377,7 @@ pub(crate) fn message_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, n: u16) -> Resul
 /// caller ever comes back, this attribute is what will stop it compiling and
 /// make someone decide deliberately.
 #[cfg(test)]
-pub(crate) fn message(machine: &Machine, host: &Host, n: u16) -> Result<FarPtr, ShimError> {
+pub(crate) fn message(machine: &Machine, host: &Host<Wg16>, n: u16) -> Result<FarPtr, ShimError> {
     message_mem(machine.mem(), host, n)
 }
 

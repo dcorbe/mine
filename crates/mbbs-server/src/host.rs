@@ -47,6 +47,7 @@ use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mbbs::abi::Wg16;
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
 use mbbs16::{Machine, Module, Poison};
 use tokio::sync::mpsc::Sender;
@@ -272,7 +273,7 @@ fn collapse(notes: &[String]) -> Vec<String> {
 /// than borrowing is what keeps the same note from being reported on every
 /// turn of the driver loop, and is also what stops the list growing without
 /// bound -- see `Host::drain_notes`.
-fn report_notes(host: &mut Host) {
+fn report_notes(host: &mut Host<Wg16>) {
     for line in collapse(&host.drain_notes()) {
         eprintln!("mbbs-server: note: {line}");
     }
@@ -449,7 +450,7 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
 
 /// Apply one boundary message to the host.
 fn apply(
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     machine: &mut Machine,
     module: &Module,
     pool: &mut Pool,
@@ -513,7 +514,7 @@ fn apply(
 /// Send everything every channel queued, and hang up on anyone who cannot
 /// take it.
 fn flush(
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     machine: &mut Machine,
     module: &Module,
     pool: &mut Pool,

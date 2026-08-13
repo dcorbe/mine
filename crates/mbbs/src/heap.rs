@@ -118,7 +118,7 @@ struct Block {
 /// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
 /// as plain `Heap` -- see this module's doc comment ("Generic core, 16-bit-only
 /// skin").
-pub struct Heap<A: Abi = Wg16> {
+pub struct Heap<A: Abi> {
     config: Config,
     regions: Vec<Arena<A>>,
 
@@ -359,7 +359,7 @@ mod tests {
     use super::*;
     use mbbs16::{FarPtr, Machine};
 
-    fn heap() -> (Machine, Heap) {
+    fn heap() -> (Machine, Heap<Wg16>) {
         (
             Machine::new().expect("machine"),
             Heap::new(Config::default()),

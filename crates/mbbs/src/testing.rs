@@ -15,7 +15,7 @@ use crate::shims::ShimError;
 
 pub struct Fixture {
     pub machine: Machine,
-    pub host: Host,
+    pub host: Host<Wg16>,
     scratch: u16,
     next: u16,
 }

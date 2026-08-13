@@ -41,7 +41,7 @@ use std::io;
 
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, ModuleMem, Wg16};
+use crate::abi::{Abi, ModuleMem};
 
 /// Bytes in one of the arena's regions. One 16-bit segment is as much as a
 /// 16-bit offset can address; other ABIs may allow more, but nothing this
@@ -52,7 +52,7 @@ const SEGMENT: usize = 64 * 1024;
 /// `A` defaults to [`Wg16`] so every existing caller -- all of which predate
 /// this generic parameter -- keeps naming this type as plain `Arena`. See the
 /// module doc comment ("Generic over the ABI, concrete at every call site").
-pub(crate) struct Arena<A: Abi = Wg16> {
+pub(crate) struct Arena<A: Abi> {
     /// Each region and how much of it is spoken for.
     segments: Vec<(A::Ptr, usize)>,
 }
@@ -132,6 +132,7 @@ impl<A: Abi> Arena<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use mbbs16::Machine;
 
     fn machine() -> Machine {

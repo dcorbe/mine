@@ -942,6 +942,7 @@ impl<A: Abi> Block<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::btrieve::keys::{Kind, Segment};
     use crate::btrieve::{Geometry, Version, pages};
     use mbbs16::FarPtr;
@@ -1005,7 +1006,7 @@ mod tests {
     /// `Btrieve::open` -- no module and no heap, only the file and the
     /// geometry a real `opnbtv` would have read out of it. Mirrors
     /// `btrieve.rs`'s own `tests::block`.
-    fn block(path: PathBuf) -> Block {
+    fn block(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
             page: 512,
@@ -1065,7 +1066,7 @@ mod tests {
     /// scratch` clears and recreates the directory it names, and this
     /// crate's tests run in parallel, so two tests sharing a name would
     /// each see the other rewrite `OPS.DAT` out from under it mid-read.
-    fn fixture(name: &str) -> Block {
+    fn fixture(name: &str) -> Block<Wg16> {
         block(seed(&crate::testing::scratch(&format!("ops-{name}"))))
     }
 

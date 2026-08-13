@@ -46,7 +46,7 @@ use std::io;
 use mbbs_ptr::ModulePtr;
 
 use crate::ShimError;
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 use crate::chan::{Chan, Terms};
 
 /// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
@@ -253,7 +253,7 @@ impl Connection {
 ///
 /// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
 /// as plain `Users`.
-pub struct Users<A: Abi = Wg16> {
+pub struct Users<A: Abi> {
     /// How many channels there are: `nterms`, and the only thing that mints a
     /// [`Chan`] for these tables. The same value
     /// [`Gsbl`](crate::gsbl::Gsbl) was built from -- see [`crate::chan`].
@@ -656,6 +656,7 @@ impl<A: Abi> Users<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
 
     #[test]
     fn a_user_slot_is_the_forty_one_bytes_the_module_strides_by() {

@@ -24,7 +24,7 @@ use mbbs16::Ret;
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
-use crate::abi::{self, Abi, Call};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::fmt::{Spec, format_call, integer};
 use crate::shims::ShimError;
 
@@ -223,7 +223,7 @@ pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
 /// facade: `shims::fsd` calls this directly (not through `Fixture::invoke`),
 /// and does not convert in this task. `shims::msg::prfmsg` used to as well --
 /// it calls [`append_mem`] directly now that it is generic.
-pub fn append(machine: &mut Machine, host: &mut Host, text: &[u8]) -> Result<(), ShimError> {
+pub fn append(machine: &mut Machine, host: &mut Host<Wg16>, text: &[u8]) -> Result<(), ShimError> {
     append_mem(machine.mem_mut(), host, text)
 }
 

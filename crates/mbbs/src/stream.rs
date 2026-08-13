@@ -39,7 +39,7 @@ use std::path::Path;
 
 use mbbs_ptr::ModulePtr;
 
-use crate::abi::{Abi, Wg16};
+use crate::abi::Abi;
 use crate::arena::Arena;
 
 /// Bytes of Borland's `FILE`, as `INCLUDE/STDIO.H:104-114` declares it: two
@@ -193,7 +193,7 @@ enum Io {
 }
 
 /// One open stream.
-struct Stream<A: Abi = Wg16> {
+struct Stream<A: Abi> {
     /// What the module called it, in the module's own spelling.
     name: String,
 
@@ -368,7 +368,7 @@ impl<A: Abi> Stream<A> {
 /// `A: Default` on the generated impl, which the bare marker struct `Wg16`
 /// does not satisfy -- see `crates/mbbs/src/abi.rs`'s `Ret<A>` for the same
 /// problem and fix.
-pub struct Streams<A: Abi = Wg16> {
+pub struct Streams<A: Abi> {
     /// Where the `FILE` structs live. Deliberately **not** the module heap: a
     /// Borland `FILE` belongs to the runtime's own static `_streams[]` and the
     /// module never allocates or frees one, and putting them on the heap would

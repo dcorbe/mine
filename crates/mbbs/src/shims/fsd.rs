@@ -118,7 +118,7 @@ fn read_block_mem<A: Abi>(mem: &A::Mem, at: A::Ptr) -> Result<fsd::Scb<A>, ShimE
 
 /// The `Wg16` facade [`read_block_mem`] delegates into. See that function's
 /// own doc comment for who still calls this by name.
-fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb, ShimError> {
+fn read_block(machine: &Machine, at: FarPtr) -> Result<fsd::Scb<Wg16>, ShimError> {
     read_block_mem::<Wg16>(machine.mem(), at)
 }
 
@@ -460,7 +460,7 @@ fn prepared_mem<A: Abi>(mem: &A::Mem, host: &Host<A>, who: &str) -> Result<(fsd:
 }
 
 /// The `Wg16` facade [`prepared_mem`] delegates into.
-fn prepared(machine: &Machine, host: &Host, who: &str) -> Result<(fsd::Scb, FarPtr), ShimError> {
+fn prepared(machine: &Machine, host: &Host<Wg16>, who: &str) -> Result<(fsd::Scb<Wg16>, FarPtr), ShimError> {
     prepared_mem(machine.mem(), host, who)
 }
 
@@ -497,7 +497,7 @@ fn field_record_mem<A: Abi>(
 /// The `Wg16` facade [`field_record_mem`] delegates into.
 fn field_record(
     machine: &Machine,
-    block: &fsd::Scb,
+    block: &fsd::Scb<Wg16>,
     field: u16,
     who: &str,
 ) -> Result<[u8; fsd::FSDFLD as usize], ShimError> {
@@ -1033,7 +1033,7 @@ fn fsd_template_mem<A: Abi>(
 }
 
 /// The `Wg16` facade [`fsd_template_mem`] delegates into.
-fn fsd_template(machine: &Machine, host: &Host, block: FarPtr, number: u16, amode: i16) -> Result<Vec<u8>, ShimError> {
+fn fsd_template(machine: &Machine, host: &Host<Wg16>, block: FarPtr, number: u16, amode: i16) -> Result<Vec<u8>, ShimError> {
     fsd_template_mem(machine.mem(), host, block, number, amode)
 }
 
@@ -1094,7 +1094,7 @@ fn live_form_mem<A: Abi>(
 }
 
 /// The `Wg16` facade [`live_form_mem`] delegates into.
-fn live_form(machine: &Machine, block: &fsd::Scb, form: &fsd::Form) -> Result<fsd::Form, ShimError> {
+fn live_form(machine: &Machine, block: &fsd::Scb<Wg16>, form: &fsd::Form) -> Result<fsd::Form, ShimError> {
     live_form_mem(machine.mem(), block, form)
 }
 
@@ -1221,7 +1221,7 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// [`fsd::candidate_answer`], allocating it on first use. See
 /// [`crate::Host::fsd_scratch`]'s own doc comment for why one segment,
 /// not one per channel, is the right shape here.
-fn fsd_scratch(machine: &mut Machine, host: &mut Host) -> Result<FarPtr, ShimError> {
+fn fsd_scratch(machine: &mut Machine, host: &mut Host<Wg16>) -> Result<FarPtr, ShimError> {
     match host.fsd_scratch {
         Some(at) => Ok(at),
         None => {
@@ -1264,7 +1264,7 @@ fn read_answers_mem<A: Abi>(mem: &A::Mem, block: &fsd::Scb<A>) -> Result<fsd::An
 }
 
 /// The `Wg16` facade [`read_answers_mem`] delegates into.
-fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, ShimError> {
+fn read_answers(machine: &Machine, block: &fsd::Scb<Wg16>) -> Result<fsd::Answers, ShimError> {
     read_answers_mem(machine.mem(), block)
 }
 
@@ -1316,7 +1316,7 @@ fn read_answers(machine: &Machine, block: &fsd::Scb) -> Result<fsd::Answers, Shi
 /// wins"), so this only has to name the fact, not invent a better one.
 pub(crate) fn fsdprc(
     machine: &mut Machine,
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     module: &Module,
     chan: Chan,
 ) -> Result<Ret, ShimError> {
@@ -1462,7 +1462,7 @@ pub(crate) fn fsdprc(
 /// simply `powprf` without it. Transmit whatever `prf`/`append` have queued
 /// since the last flush, then clear the buffer the way [`crate::shims::text::clrprf`]
 /// (`clrprf()`) already does.
-fn outprf(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<(), ShimError> {
+fn outprf(machine: &mut Machine, host: &mut Host<Wg16>, chan: Chan) -> Result<(), ShimError> {
     let start = host
         .globals()
         .pointer(machine, "prfbuf")
@@ -1476,7 +1476,7 @@ fn outprf(machine: &mut Machine, host: &mut Host, chan: Chan) -> Result<(), Shim
 /// `usaptr->scnwid`, read directly out of the account record rather than
 /// cached anywhere -- the same reason [`Host::current_channel`] reads
 /// `usrnum` fresh on every call instead of remembering it.
-fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, ShimError> {
+fn account_scnwid(machine: &Machine, host: &Host<Wg16>, chan: Chan) -> Result<u16, ShimError> {
     let account = host.users.account(chan);
     let at = offset::<Wg16>(account, crate::users::usracc::SCNWID)?;
     Ok(u16::from(machine.resolve(at, 1)?[0]))
@@ -1592,7 +1592,7 @@ fn account_scnwid(machine: &Machine, host: &Host, chan: Chan) -> Result<u16, Shi
 /// doc comment on why the machine is already correctly poisoned by then.
 pub(crate) fn goback(
     machine: &mut Machine,
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     module: &Module,
     chan: Chan,
 ) -> Result<Ret, ShimError> {
@@ -1733,7 +1733,7 @@ pub(crate) fn goback(
 /// neighbours already raise).
 pub(crate) fn fsd_cycle(
     machine: &mut Machine,
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     module: &Module,
     chan: Chan,
 ) -> Result<(), ShimError> {
@@ -1917,7 +1917,7 @@ pub(crate) fn fsd_cycle(
 /// before ever reading `status`.
 fn fsd_drain_edge(
     machine: &mut Machine,
-    host: &mut Host,
+    host: &mut Host<Wg16>,
     at: FarPtr,
     chan: Chan,
 ) -> Result<(), ShimError> {
@@ -2079,7 +2079,7 @@ mod tests {
     }
 
     /// The session control block, as it stands.
-    fn block(f: &Fixture) -> crate::fsd::Scb {
+    fn block(f: &Fixture) -> crate::fsd::Scb<Wg16> {
         let at = f
             .host
             .globals()

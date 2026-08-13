@@ -343,7 +343,7 @@ pub const NTERMS: u16 = 1;
 /// `prfbuf`'s own small one), so unlike `Heap`/`Arena` there is no
 /// growable-pool algorithm to share -- the only thing generic access buys
 /// here is a caller that has `A::Mem` but not a whole `A::Cpu`/`Machine`.
-pub struct Globals<A: Abi = Wg16> {
+pub struct Globals<A: Abi> {
     base: A::Ptr,
     offsets: HashMap<&'static str, u16>,
     sizes: HashMap<&'static str, u16>,

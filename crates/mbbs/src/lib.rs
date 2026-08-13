@@ -344,7 +344,7 @@ impl std::fmt::Display for MissingGlobal {
 /// these, only `A::Ptr` does (`Abi::Ptr: mbbs_ptr::ModulePtr + Copy + Eq +
 /// Hash`, and `ModulePtr` itself requires `Debug`). See `abi.rs`'s `Ret<A>`
 /// for the same trap hit and fixed the same way.
-pub(crate) struct DateBuffers<A: Abi = Wg16> {
+pub(crate) struct DateBuffers<A: Abi> {
     /// 9 bytes: `MM/DD/YY` and its terminator.
     pub(crate) date: A::Ptr,
 
@@ -473,7 +473,7 @@ pub struct Query {
 /// instead of a hand-built `FarPtr`. That includes
 /// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`),
 /// which read or build [`Registration`]/[`Agent`]/[`Kick`] -- all three of
-/// which *are* parameterised, as `Registration<A: Abi = Wg16>` and its two
+/// which *are* parameterised, as `Registration<A: Abi>` and its two
 /// siblings, so these accessors are generic in substance and not merely by
 /// position.
 ///
@@ -482,11 +482,14 @@ pub struct Query {
 /// own", and that "the module dispatch table itself will not serve a 32-bit
 /// module until those three types grow one too". They grew one; the comment
 /// was not updated with them, and it outlived the fact by long enough to be
-/// quoted back as a live blocker. The `= Wg16` *default* on each is what
-/// makes the staleness hard to see: a bare `Kick` in a signature still reads
-/// as concrete and still compiles, because the default silently supplies
-/// `Wg16` -- so genericity here has to be confirmed at the declaration, never
-/// inferred from a use site.
+/// quoted back as a live blocker. The `= Wg16` *default* each carried until
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md` was what
+/// made the staleness hard to see: a bare `Kick` in a signature still read as
+/// concrete and still compiled, because the default silently supplied
+/// `Wg16` -- so genericity here had to be confirmed at the declaration, never
+/// inferred from a use site. Task 3 removed the default; a bare `Kick` no
+/// longer compiles at all, so the compiler now names every site that still
+/// needs `<Wg16>` spelled out, and this exact staleness cannot hide again.
 ///
 /// Everything that reads or writes module memory -- every method taking
 /// `&mut Machine`/`&Machine`, plus [`Host::check_globals`] (no `Machine`
@@ -495,7 +498,7 @@ pub struct Query {
 ///
 /// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
 /// session owned that file, and the field elided its parameter to say so.
-pub struct Host<A: Abi = Wg16> {
+pub struct Host<A: Abi> {
     exports: &'static Exports,
     globals: Globals<A>,
 
@@ -600,20 +603,25 @@ pub struct Host<A: Abi = Wg16> {
     /// The Btrieve files that are open, and the stack of which is current.
     /// Which one *is* current is `bb`, for the same reason.
     ///
-    /// **Write the `<A>`.** A bare `Btrieve` here is not "generic, parameter
-    /// inferred from the enclosing `Host<A>`" -- in a type-annotation
-    /// position the `= Wg16` default applies unconditionally, so the field
-    /// would be `Btrieve<Wg16>` inside `Host<Wg32>` just as much as inside
-    /// `Host<Wg16>`. It compiles, it reads as generic, and it silently pins
-    /// the whole Btrieve subsystem to one ABI.
+    /// **Write the `<A>`.** A bare `Btrieve` here used not to be "generic,
+    /// parameter inferred from the enclosing `Host<A>`" -- in a
+    /// type-annotation position the field's `= Wg16` default applied
+    /// unconditionally, so it would have been `Btrieve<Wg16>` inside
+    /// `Host<Wg32>` just as much as inside `Host<Wg16>`. It compiled, it read
+    /// as generic, and it silently pinned the whole Btrieve subsystem to one
+    /// ABI.
     ///
     /// That elision is what blocked the seventeen `btv*` shims from taking a
     /// `Call<A>` long after the engine behind them became `Btrieve<A>`: a
     /// generic shim's `call.ptr()` is `A::Ptr`, `Btrieve<Wg16>::block` wants
-    /// `FarPtr`, and the compiler reports a type mismatch for *every* `A`
-    /// rather than only for `Wg32`. The error points at the shim, so it
-    /// reads as the shim being unconvertible; the cause was one missing
-    /// parameter here.
+    /// `FarPtr`, and the compiler reported a type mismatch for *every* `A`
+    /// rather than only for `Wg32`. The error pointed at the shim, so it
+    /// read as the shim being unconvertible; the cause was one missing
+    /// parameter here. Task 3 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md` removed the
+    /// `= Wg16` default from `Btrieve` (and every other declaration that had
+    /// one): a bare `Btrieve` is now a hard `E0107` at every call site, not a
+    /// silent pin, so this exact mistake can no longer compile.
     pub(crate) btrieve: btrieve::Btrieve<A>,
 
     /// The terminal channels. See [`gsbl`].
@@ -880,7 +888,7 @@ enum PollTarget {
 /// Default`, which `Wg16` does not implement and does not need to: every
 /// field here defaults on its own (`bool` and `Option<A::Ptr>` both do,
 /// regardless of what `A::Ptr` is).
-pub(crate) struct FsdSession<A: Abi = Wg16> {
+pub(crate) struct FsdSession<A: Abi> {
     /// Whether `fsdego` started this session with `fsdent` rather than
     /// `fsdlin` -- the original's `fsdusr->flags & FBFULL` (`FSDBBS.C:207`,
     /// `:211`). `goback` reads it to decide whether to park the cursor below
@@ -946,15 +954,17 @@ impl<A: Abi> Default for FsdSession<A> {
 /// [`Registration`]/[`Agent`]/[`Kick`]
 /// (`modules`/`first_module`/`register`/`register_native`/`agents`/`kicks`)
 /// belong here on the same terms as the rest: those three types carry their
-/// own `A` (`Registration<A: Abi = Wg16>` and siblings), so the pointers they
+/// own `A` (`Registration<A: Abi>` and siblings), so the pointers they
 /// hold are `A::Ptr`, not `FarPtr`.
 ///
 /// This comment used to claim they were "concrete `FarPtr`-typed structs that
 /// are not themselves generic over `A`" and that their presence "does not by
 /// itself make the module dispatch table serve a second ABI". Both halves
 /// were true when written and neither survived the conversion that
-/// parameterised them. See the struct's own doc comment for why the `= Wg16`
-/// default made that easy to miss.
+/// parameterised them. See the struct's own doc comment for why the
+/// `= Wg16` default each carried made that easy to miss, and why, since
+/// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md` removed
+/// it, a bare `Registration`/`Agent`/`Kick` no longer compiles at all.
 impl<A: Abi> Host<A> {
     /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
     /// every `Entry::Unimplemented` call site it reaches from now on,
@@ -1756,7 +1766,7 @@ impl Host<Wg16> {
         machine: &Machine,
         chan: Chan,
         n: usize,
-    ) -> io::Result<Result<Dispatch, ShimError>> {
+    ) -> io::Result<Result<Dispatch<Wg16>, ShimError>> {
         let state = match self.users.state_mem(machine.mem(), chan) {
             Ok(state) => state,
             Err(e) => return Ok(Err(e)),
@@ -3346,7 +3356,7 @@ fn addend(reloc: &Relocation, segment: &[u8]) -> i16 {
 /// Answers "what is `MAJORBBS.474`?" for the loader.
 struct Resolver<'a> {
     exports: &'static Exports,
-    globals: &'a Globals,
+    globals: &'a Globals<Wg16>,
 }
 
 impl ImportResolver for Resolver<'_> {
