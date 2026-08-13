@@ -55,6 +55,25 @@ impl Memory {
         &mut self.image
     }
 
+    /// Swap in a freshly loaded `image`, in place -- `self.arena` and
+    /// `self.arena_used` are untouched.
+    ///
+    /// This is the operation a host reloading a module needs:
+    /// [`Memory::alloc`] pointers the host is already holding resolve
+    /// against `arena`, never `image`, so replacing only the field that
+    /// changes on a reload is what keeps them valid. Assigning a whole new
+    /// `Memory` in their place (`*self = Memory::new(image, ..)`) would
+    /// drop the old `arena` `Mapping` -- and `Mapping::drop` really does
+    /// `munmap` it (`crate::m32::map`) -- so every pointer `alloc` had
+    /// already handed out would resolve against memory the kernel has
+    /// since taken back. The old `image`'s `Mapping` is still dropped here,
+    /// by the ordinary assignment below; that is correct and intended --
+    /// the previous image is not addressable once a new one has taken its
+    /// place -- it is only the arena this method is careful to leave alone.
+    pub fn replace_image(&mut self, image: crate::m32::Image) {
+        self.image = image;
+    }
+
     fn arena_base(&self) -> u32 {
         // Same non-lossy cast `Image::base` relies on: `Mapping::new` only
         // ever returns a base below 4 GiB (`MAP_32BIT`), so this narrows
@@ -276,5 +295,37 @@ mod tests {
         let nowhere = mem.image().base().max(mem.arena_base()) + 0x10_0000;
         assert!(mem.read_at(nowhere, 1).is_none());
         assert!(mem.write_at(nowhere, &[0]).is_none());
+    }
+
+    /// `replace_image` must leave the arena -- and a pointer already
+    /// allocated out of it -- exactly as they were. This is the property
+    /// `crates/mbbs/src/abi/wg32.rs`'s `Wg32::load` now depends on: without
+    /// it, reloading a module would drop the old arena `Mapping` and every
+    /// host-owned buffer's pointer would resolve against memory the kernel
+    /// has already taken back.
+    #[test]
+    fn replace_image_leaves_the_arena_and_its_pointers_untouched() {
+        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+        let ptr = mem.alloc(4).expect("fits");
+        mem.write_at(ptr.0, &[9, 8, 7, 6]).expect("just allocated");
+
+        let second = load();
+        let second_base = second.base();
+        mem.replace_image(second);
+
+        assert_eq!(mem.image().base(), second_base, "the image really did change");
+        assert_eq!(
+            mem.read_at(ptr.0, 4).expect("the arena pointer must still resolve"),
+            &[9, 8, 7, 6],
+            "replacing the image must not disturb bytes already in the arena"
+        );
+
+        // The arena is still open for business at the address the first
+        // allocation ended -- `arena_used` was not reset, so a second
+        // `alloc` continues exactly where the first left off rather than
+        // starting over (which would happen for free if `replace_image`
+        // secretly rebuilt the whole `Memory`).
+        let second_ptr = mem.alloc(4).expect("the arena is still there to allocate from");
+        assert_eq!(second_ptr.0, ptr.0 + 4, "arena_used must not have reset");
     }
 }

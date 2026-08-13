@@ -78,20 +78,20 @@
 //! (the API this task's brief requires exercising, since `crate::Resolver`
 //! is private and only `Host::load` can build one) never sees it at all.
 //!
-//! # The load-order hazard this file's harness works around
+//! # The load-order hazard this file first exposed, now fixed
 //!
 //! `mbbs-server/src/host.rs`'s `life()` builds `Host::<Wg16>::new` and
 //! *then* calls `host.load` -- safe for `Wg16` because `Wg16::load`
 //! *mutates* the `Segments` a `Machine::new` scratch build already carries
 //! (`abi/wg32.rs`'s own doc comment: "`Machine::load_ne` appends"), so a
-//! `Host::new`-built buffer pointer stays valid after `load`. `Wg32::load`
-//! does not: it *replaces* `cpu.mem` wholesale with a freshly mapped
-//! `Memory` (that same doc comment: "cpu.mem is replaced, not grown"),
-//! dropping the old one -- and `Mapping::drop` really does `munmap` the old
-//! arena (`crates/mbbs-machine/src/m32/map.rs`). A `Host<Wg32>` built the
-//! naive way and then loaded therefore carries buffer pointers (`self.l2as`
-//! among them) computed against memory that no longer exists by the time
-//! any shim tries to use them.
+//! `Host::new`-built buffer pointer stays valid after `load`. Building
+//! `Host<Wg32>` the same way used to be unsafe: an earlier `Wg32::load`
+//! *replaced* `cpu.mem` wholesale with a freshly mapped `Memory`, dropping
+//! the old one -- and `Mapping::drop` really does `munmap` the old arena
+//! (`crates/mbbs-machine/src/m32/map.rs`). A `Host<Wg32>` built the naive
+//! way and then loaded carried buffer pointers (`self.l2as` among them)
+//! computed against memory that no longer existed by the time any shim
+//! tried to use them.
 //!
 //! Measured, not theorised: an earlier version of this harness built
 //! `Host::new` against a placeholder `Memory` and then called `host.load`,
@@ -103,26 +103,30 @@
 //! segfault (`Flat32Ptr::write` bounds-checks against the live `Memory`'s
 //! own mapped ranges rather than dereferencing a raw address -- see
 //! `flatptr.rs`), but a real, silent failure of every host-owned buffer the
-//! moment a real module gets loaded through the ordinary API.
+//! moment a real module got loaded through the ordinary API.
 //!
-//! **This is a genuine gap in `Host<Wg32>`'s construction contract, not a
-//! test-harness bug.** `Globals<Wg32>`/`Heap<Wg32>` placement surviving a
-//! real load is exactly the work design §4a defers to Task 22's survey.
-//! Task 15's brief is the synthetic round trip, not that placement work, so
-//! [`load_module_and_host`] below works around the hazard rather than
-//! fixing it: it builds a *first*, throwaway `Host<Wg32>` purely to reach
-//! `Host::load` (and, through it, the real private `Resolver<Wg32>` --
-//! there is no other way to reach that resolver from outside the crate),
-//! discards it the instant `load` returns, and builds a *second* `Host<Wg32>`
-//! against the now-final, now-stable `cpu.mem` for [`Host::run`] to
-//! actually dispatch through. `Host::run`'s own dispatch loop -- the thing
-//! actually under test here -- is untouched by this; only the harness's
-//! construction order differs from `host.rs`'s. Task 22 owes the real fix
-//! (either `Wg32::load` growing the existing arena in place, or
-//! `mbbs-server` rebuilding `Host` after `load` the way this harness does),
-//! and this comment is the measurement that motivates it.
+//! **That was a genuine gap in `Host<Wg32>`'s construction contract, not a
+//! test-harness bug**, and Task 15's brief -- the synthetic round trip, not
+//! a fix to `Wg32::load` -- was not the place to close it: at the time,
+//! [`load_module_and_host`] below worked around the hazard rather than
+//! fixing it, building a *first*, throwaway `Host<Wg32>` purely to reach
+//! `Host::load` (and, through it, the real private `Resolver<Wg32>`),
+//! discarding it the instant `load` returned, and building a *second*
+//! `Host<Wg32>` against the now-final, now-stable `cpu.mem`.
+//!
+//! **The fix has since landed.** `Wg32::load` now calls
+//! [`mbbs_machine::m32::Memory::replace_image`], which swaps in the freshly
+//! loaded `Image` while leaving `cpu.mem`'s arena -- and every pointer
+//! already carved out of it -- untouched (see that method's own doc
+//! comment, and `Abi::load`'s own doc comment in `crates/mbbs/src/abi.rs`,
+//! which now states the invariant this closes generally: loading a module
+//! must never invalidate a pointer `ModuleMem::alloc_region` already
+//! returned). [`load_module_and_host`] below builds exactly one
+//! `Host<Wg32>`, the same order `host.rs` always used for `Wg16` and the
+//! order that used to be unsafe here -- the workaround is gone because the
+//! gap it worked around is closed, not merely papered over again.
 
-use mbbs::abi::{Arg, Wg32, Wg32Cpu};
+use mbbs::abi::{Arg, ModuleMem, Wg32, Wg32Cpu};
 use mbbs::{Host, Outcome, Terms};
 use mbbs_machine::m32::{Flat32Ptr, Image, Machine, Memory, PeImage};
 use mbbs_machine::ptr::ModulePtr;
@@ -285,17 +289,16 @@ fn machine_and_placeholder() -> Wg32Cpu {
     Wg32Cpu::new(machine, mem)
 }
 
-/// Load `file` into `cpu` through the real `Host::load` -- see this file's
-/// own module doc comment, "The load-order hazard this file's harness
-/// works around", for why this needs two `Host::new` calls rather than one.
-/// One channel: nothing here drives a connection.
+/// Build one `Host<Wg32>` and load `file` into it through the real
+/// `Host::load` -- the same order `mbbs-server/src/host.rs` always used for
+/// `Wg16`, and the order that used to be unsafe for `Wg32` before
+/// `Wg32::load` was fixed to preserve `cpu.mem`'s arena (see this file's own
+/// module doc comment, "The load-order hazard this file first exposed, now
+/// fixed"). One channel: nothing here drives a connection.
 fn load_module_and_host(cpu: &mut Wg32Cpu, file: &[u8]) -> (mbbs_machine::m32::Module, Host<Wg32>) {
-    let mut scratch = Host::<Wg32>::new(cpu, mbbs::testing::data(), Terms::new(1))
+    let mut host = Host::<Wg32>::new(cpu, mbbs::testing::data(), Terms::new(1))
         .expect("host builds against the placeholder memory");
-    let module = scratch.load(cpu, file).expect("the synthetic module loads and binds");
-
-    let host = Host::<Wg32>::new(cpu, mbbs::testing::data(), Terms::new(1))
-        .expect("host builds against the module's own final memory");
+    let module = host.load(cpu, file).expect("the synthetic module loads and binds");
     (module, host)
 }
 
@@ -462,4 +465,43 @@ fn host_run_encodes_entry_args_in_order_through_arg() {
         panic!("expected Outcome::Returned, got {outcome:?}");
     };
     assert_eq!(lo, 77, "the first Arg minus the second, in the order they were given");
+}
+
+/// The regression this file's whole "load-order hazard" module doc section
+/// is about: a pointer allocated out of `cpu.mem`'s arena *before* a module
+/// is loaded must still resolve to the same bytes *after*. This is exactly
+/// the shape `Host::new`'s own `spr`/`mdf`/`l2as`/`empty` buffers take --
+/// carved out of the arena at `Host::new` time, then read and written by
+/// shims for the rest of the host's life, load included.
+///
+/// Before `Wg32::load` was fixed to call `Memory::replace_image` instead of
+/// rebuilding `cpu.mem` wholesale, this failed with
+/// `Flat32PtrError::OutOfBounds`: the pattern below was written into the
+/// *old* arena, and `Wg32::load` had since `munmap`'d it out from under the
+/// pointer. See `Memory::replace_image`'s own doc comment
+/// (`crates/mbbs-machine/src/m32/mem.rs`) and `Abi::load`'s own doc comment
+/// (`crates/mbbs/src/abi.rs`) for the invariant this now upholds generally,
+/// not just for this one buffer.
+#[test]
+fn loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds() {
+    let mut cpu = machine_and_placeholder();
+    let mut host = Host::<Wg32>::new(&mut cpu, mbbs::testing::data(), Terms::new(1))
+        .expect("host builds against the placeholder memory");
+
+    // A host-owned buffer, allocated straight out of the arena before any
+    // module is loaded -- deliberately not through `Host::new`'s own
+    // buffers, so this proves the general `ModuleMem::alloc_region`
+    // contract rather than one specific field surviving by luck.
+    let ptr = ModuleMem::alloc_region(&mut cpu.mem, 4).expect("4 bytes fit the placeholder arena");
+    let pattern = *b"ABCD";
+    ptr.write(&mut cpu.mem, &pattern).expect("the arena just handed this pointer back");
+
+    let file = module_with_code(&[0xC3]); // ret -- nothing here needs to run
+    host.load(&mut cpu, &file).expect("a module loads after the buffer was allocated");
+
+    let got = ptr.resolve(&cpu.mem, 4).expect(
+        "loading a module must not invalidate a pointer ModuleMem::alloc_region already \
+         returned -- see Memory::replace_image's own doc comment",
+    );
+    assert_eq!(got, pattern, "the pointer's bytes must survive the load unchanged");
 }

@@ -611,4 +611,38 @@ mod tests {
             other => panic!("expected Some(Fault{{..}}), got {other:?}"),
         }
     }
+
+    /// The `Wg16` half of `Abi::load`'s own invariant ("loading a module
+    /// must not invalidate a pointer `ModuleMem::alloc_region` has already
+    /// returned"), and the matched sibling of
+    /// `crates/mbbs/tests/wg32_round_trip.rs`'s
+    /// `loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds`.
+    ///
+    /// This side of the pair was never broken -- `Machine::load_ne` appends
+    /// a fresh segment to `Segments` rather than replacing it, so nothing
+    /// already allocated ever moves -- but it had never been *proven*
+    /// either. Without this test, only the `Wg32` half of the invariant
+    /// `abi.rs`'s doc comment states would have a regression test, which is
+    /// exactly the kind of one-sided coverage that lets the two `Abi`
+    /// implementations drift apart again the next time either one changes
+    /// how it loads.
+    #[test]
+    fn loading_a_module_does_not_invalidate_a_pointer_the_host_already_holds() {
+        let mut f = crate::testing::Fixture::new();
+
+        // A host-owned buffer, allocated straight out of `Segments` before
+        // any module is loaded -- the same shape `Host::new`'s own
+        // `spr`/`mdf`/`l2as`/`empty` buffers take.
+        let ptr = ModuleMem::alloc_region(f.machine.mem_mut(), 4).expect("4 bytes fit");
+        let pattern = *b"ABCD";
+        f.machine.write(ptr, &pattern).expect("just allocated");
+
+        f.minimal_module();
+
+        let got = f.machine.resolve(ptr, 4).expect(
+            "loading a module must not invalidate a pointer ModuleMem::alloc_region \
+             already returned",
+        );
+        assert_eq!(got, pattern, "the pointer's bytes must survive the load unchanged");
+    }
 }

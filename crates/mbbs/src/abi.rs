@@ -429,6 +429,28 @@ pub trait Abi {
     /// load, exactly as it always has, but the check is no longer a
     /// separate pass over the whole image before this one runs.
     ///
+    /// **Loading a module must not invalidate a pointer
+    /// [`ModuleMem::alloc_region`] has already returned.** `Self::Mem` is
+    /// the module's own memory *and* the host's allocation arena together
+    /// (see [`ModuleMem`]'s own doc comment); a caller may build `Self::Cpu`,
+    /// carve host-owned regions out of that arena with `alloc_region` --
+    /// `Host::new`'s own buffers are the ordinary case -- and only then call
+    /// this method to load or reload the module those buffers will be read
+    /// and written alongside. This method may replace, relocate or discard
+    /// anything that belongs to the *module* (the image it just parsed), but
+    /// the arena, and every pointer already handed out of it, must still
+    /// resolve to the same bytes once this method returns `Ok`. `Wg16::load`
+    /// gets this for free: `Machine::load_ne` *appends* a fresh segment to
+    /// the `Segments` a scratch `Machine::new` already carries, so nothing
+    /// already allocated ever moves. `Wg32::load` has to earn it instead --
+    /// see that implementation's own doc comment, and
+    /// [`mbbs_machine::m32::Memory::replace_image`], for how: only the
+    /// image is ever replaced, never the arena. This was not always true of
+    /// `Wg32::load` (`crates/mbbs/tests/wg32_round_trip.rs`'s module doc
+    /// comment records the bug this invariant now rules out by
+    /// construction, and this trait method's own doc comment previously
+    /// said nothing about it at all).
+    ///
     /// # Errors
     ///
     /// If `file` is not a well-formed module for this ABI. The

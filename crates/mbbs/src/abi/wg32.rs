@@ -264,20 +264,42 @@ impl Abi for Wg32 {
     /// identical note). Task 9 left this reconciliation to this task because
     /// this is the file that owns the real PE arm.
     ///
-    /// **`cpu.mem` is replaced, not grown.** Unlike `Wg16::load`, which
-    /// mutates the `Segments` a `Machine::new` scratch build already carries
-    /// (`Machine::load_ne` appends), `mbbs_machine::m32::Memory` has no
-    /// "swap in a freshly loaded image" operation short of building a new
-    /// one -- `Memory::new` is the only way to pair an `Image` with a fresh
-    /// allocation arena (`mem.rs`'s own module doc comment, "why not fold
-    /// this into `Image`"). So this method builds the whole `Image` first,
-    /// against `file` alone, and only once loading, relocating, binding and
-    /// patching have all succeeded does it commit -- assigning the result to
-    /// `cpu.mem` (a public field, per [`Wg32Cpu`]'s own doc comment) in the
-    /// same motion that returns `Ok`. `cpu.machine` is never rebuilt: its
-    /// thunk table, fault-recovery arming and TID binding all predate this
-    /// call and must survive it, which is exactly why `cpu.machine.thunk_addr`
-    /// is read from but `cpu.machine` itself is never reassigned.
+    /// **Only the image is replaced -- the arena is not.** `cpu.mem`'s
+    /// arena is the host's own allocation, not the module's: every pointer
+    /// [`ModuleMem::alloc_region`] has ever handed out (`Host::new`'s
+    /// `spr`/`mdf`/`l2as`/`empty` buffers among them) resolves against it,
+    /// and loading a module has no business freeing memory it does not own
+    /// -- see [`Abi::load`]'s own doc comment, which states that as the
+    /// border's general contract, not a `Wg32`-specific courtesy. This
+    /// method upholds it through
+    /// [`mbbs_machine::m32::Memory::replace_image`], which swaps in a
+    /// freshly loaded `Image` while leaving `cpu.mem`'s arena -- and every
+    /// pointer already carved from it -- exactly as they were; see that
+    /// method's own doc comment for why an outright `cpu.mem = Memory::new(image,
+    /// ..)` cannot do the same (it drops the old arena `Mapping`, and
+    /// `Mapping::drop` really does `munmap` it).
+    ///
+    /// **This was not always true.** An earlier version of this method did
+    /// exactly that -- replaced `cpu.mem` wholesale -- and it was a real,
+    /// measured bug, not a theoretical one:
+    /// `crates/mbbs/tests/wg32_round_trip.rs`'s module doc comment records
+    /// the failure it produced (a host-owned buffer pointer computed before
+    /// `load`, resolving as `Flat32PtrError::OutOfBounds` after it) and the
+    /// harness workaround Task 15 needed until this method was fixed to
+    /// call `replace_image` instead.
+    ///
+    /// Unlike `Wg16::load`, which mutates the `Segments` a `Machine::new`
+    /// scratch build already carries (`Machine::load_ne` appends), there is
+    /// no way to grow `mbbs_machine::m32::Image` itself in place -- it is a
+    /// fixed-size mapping made once at load (`mem.rs`'s own module doc
+    /// comment, "why not fold this into `Image`"). So this method builds
+    /// the whole `Image` first, against `file` alone, and only once
+    /// loading, relocating, binding and patching have all succeeded does it
+    /// commit -- calling `cpu.mem.replace_image` in the same motion that
+    /// returns `Ok`. `cpu.machine` is never rebuilt: its thunk table,
+    /// fault-recovery arming and TID binding all predate this call and must
+    /// survive it, which is exactly why `cpu.machine.thunk_addr` is read
+    /// from but `cpu.machine` itself is never reassigned.
     ///
     /// # Errors
     ///
@@ -307,12 +329,11 @@ impl Abi for Wg32 {
 
         let entry = image.base().wrapping_add(pe.entry_point);
 
-        // Every step above succeeded -- commit. `ARENA_LEN` is a generous
-        // placeholder headroom, not a measured requirement: nothing through
-        // this task allocates out of it (`Globals<Wg32>` placement is
-        // Task 13/22's job), so there is no real workload yet to size it
-        // against.
-        cpu.mem = mbbs_machine::m32::Memory::new(image, ARENA_LEN)?;
+        // Every step above succeeded -- commit. `replace_image` swaps in
+        // `image` without touching `cpu.mem`'s arena -- see this method's
+        // own doc comment ("Only the image is replaced -- the arena is
+        // not.").
+        cpu.mem.replace_image(image);
 
         Ok(mbbs_machine::m32::Module::new(entry, thunks))
     }
@@ -334,14 +355,6 @@ impl Abi for Wg32 {
         None
     }
 }
-
-/// Headroom `Wg32::load` reserves for host-allocated regions
-/// ([`mbbs_machine::m32::Memory::alloc`]) alongside the loaded image. 1 MiB:
-/// comfortably more than any 16-bit segment could ever hold (`SEGMENT_BYTES`,
-/// 64 KiB) and nothing through this task allocates out of it at all --
-/// `Globals<Wg32>` placement is Task 13/22's job, which is what actually
-/// measures this number instead of guessing it.
-const ARENA_LEN: usize = 1 << 20;
 
 /// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so
 /// a pointer comes back in `EAX` exactly as an `int` does. `Ret::Long` maps
