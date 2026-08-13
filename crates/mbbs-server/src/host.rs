@@ -127,7 +127,7 @@ fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
             Ok(msg) => Woke::Message(msg),
             Err(_) => Woke::Gone,
         },
-        Wait::Until(secs) => match rx.recv_timeout(Duration::from_secs(secs.into())) {
+        Wait::Until(d) => match rx.recv_timeout(d) {
             Ok(msg) => Woke::Message(msg),
             Err(RecvTimeoutError::Timeout) => Woke::Nothing,
             Err(RecvTimeoutError::Disconnected) => Woke::Gone,
@@ -635,7 +635,7 @@ mod tests {
     /// finds it, because a socket test never drops its senders.
     #[test]
     fn every_wait_stops_once_the_senders_are_gone() {
-        for wait in [Wait::Blocked, Wait::Until(60), Wait::Now, Wait::Stop] {
+        for wait in [Wait::Blocked, Wait::Until(Duration::from_secs(60)), Wait::Now, Wait::Stop] {
             let (tx, rx) = std::sync::mpsc::channel::<In>();
             drop(tx);
             assert!(
@@ -652,7 +652,7 @@ mod tests {
     fn an_idle_wake_is_nothing_rather_than_gone() {
         let (tx, rx) = std::sync::mpsc::channel::<In>();
         assert!(matches!(wake(Wait::Now, &rx), Woke::Nothing));
-        assert!(matches!(wake(Wait::Until(1), &rx), Woke::Nothing));
+        assert!(matches!(wake(Wait::Until(Duration::from_secs(1)), &rx), Woke::Nothing));
         drop(tx);
     }
 

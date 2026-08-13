@@ -356,8 +356,17 @@ impl<A: Abi> Eq for Ended<A> where A::Poison: Eq {}
 pub enum Wait {
     /// Block until the transport delivers something.
     Blocked,
-    /// Sleep at most this many whole seconds, waking early on input.
-    Until(u32),
+    /// Sleep at most this long, waking early on input.
+    ///
+    /// `Duration`, not a whole-second count -- Task 18 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: the vendor
+    /// semantic ([`Ended::Waiting`]'s `next_kick`, which decrements on
+    /// elapsed *whole* seconds) is unchanged, but the type a driver sleeps on
+    /// should not force sub-second pacing through a seconds-shaped hole.
+    /// [`Ended::wait`] is the one place that converts -- every value built
+    /// here today is still a whole number of seconds, in value, until a
+    /// caller has a reason to ask for less.
+    Until(std::time::Duration),
     /// Call `cycle` again now.
     Now,
     /// The module stopped. Shut the host down.
@@ -370,7 +379,9 @@ impl<A: Abi> Ended<A> {
     pub fn wait(&self) -> Wait {
         match self {
             Ended::Idle => Wait::Blocked,
-            Ended::Waiting { next_kick, .. } => Wait::Until(*next_kick),
+            Ended::Waiting { next_kick, .. } => {
+                Wait::Until(std::time::Duration::from_secs(u64::from(*next_kick)))
+            }
             Ended::Bound { .. } => Wait::Now,
             Ended::Stopped(..) => Wait::Stop,
         }
@@ -5962,11 +5973,11 @@ mod tests {
         assert_eq!(Ended::<Wg16>::Idle.wait(), Wait::Blocked);
         assert_eq!(
             Ended::<Wg16>::Waiting { next_kick: 1, polls_cut: false }.wait(),
-            Wait::Until(1)
+            Wait::Until(std::time::Duration::from_secs(1))
         );
         assert_eq!(
             Ended::<Wg16>::Waiting { next_kick: 60, polls_cut: true }.wait(),
-            Wait::Until(60)
+            Wait::Until(std::time::Duration::from_secs(60))
         );
         assert_eq!(Ended::<Wg16>::Bound { next_kick: None }.wait(), Wait::Now);
         assert_eq!(Ended::<Wg16>::Bound { next_kick: Some(3) }.wait(), Wait::Now);
