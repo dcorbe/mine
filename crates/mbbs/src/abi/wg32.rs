@@ -60,7 +60,7 @@
 //! 6 are in the wrong order"). `Wg32::Cpu` is that struct, not bare
 //! `mbbs_machine::m32::Machine`.
 
-use super::{Abi, ModuleMem};
+use super::{Abi, Arg, Exit, ModuleMem, Ret};
 
 /// Execution plus memory, bundled because `Abi::mem` needs somewhere to
 /// reborrow `&mut mbbs_machine::m32::Memory` out of `&mut Self::Cpu`, and a bare
@@ -155,6 +155,104 @@ impl Abi for Wg32 {
     /// comment.
     fn data_ptr(cpu: &Self::Cpu) -> Self::Ptr {
         mbbs_machine::m32::Flat32Ptr(cpu.mem.image().base())
+    }
+
+    type Poison = mbbs_machine::m32::Poison;
+
+    /// Encode `args` into the dwords `mbbs_machine::m32::Machine::call` takes,
+    /// then delegate. One dword each, whatever the variant: `Wg32`'s
+    /// `PTR_WIDTH`/`INT_WIDTH`/`LONG_WIDTH` all agree at 4, unlike `Wg16`'s
+    /// `INT_WIDTH` of 2 -- see `abi.rs`'s own module doc comment ("Only
+    /// `INT_WIDTH` ... discriminates") and design §6, which is exactly what
+    /// `wg32_abi.rs`'s differential test (Task 6) checks for.
+    fn call(cpu: &mut Self::Cpu, entry: Self::Ptr, args: &[Arg<Self>]) -> std::io::Result<Exit<Self>> {
+        let dwords: Vec<u32> = args
+            .iter()
+            .map(|arg| match arg {
+                Arg::Int(v) => *v,
+                Arg::Long(v) => *v,
+                Arg::Ptr(p) => p.0,
+            })
+            .collect();
+        Ok(convert_exit(cpu.machine.call(entry.0, &dwords)?))
+    }
+
+    /// `Wg32` has no callee-cleaned routines -- 32-bit Worldgroup is
+    /// uniformly cdecl (`WGSERVER.DEF`'s `#ifdef GCDOS` block only; see this
+    /// module's own doc comment and design §2). `Cleans::Callee` reaching
+    /// this arm therefore names a bug in the host's own shim table -- some
+    /// entry wrongly marked callee-cleaned under this ABI -- not a case to
+    /// guess an answer for. This panic is permanent, not a stub awaiting
+    /// Task 6: there is no future implementation of it to write.
+    fn resume(cpu: &mut Self::Cpu, ret: Ret<Self>, cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
+        match cleans {
+            crate::shims::Cleans::Callee(bytes) => panic!(
+                "Wg32::resume asked to clean {bytes} callee-side bytes -- 32-bit \
+                 Worldgroup is uniformly cdecl, so a Cleans::Callee row reaching \
+                 this ABI is a bug in the host's shim table, not something to guess at"
+            ),
+            crate::shims::Cleans::Caller => {
+                let ret32: mbbs_machine::m32::Ret = ret.into();
+                Ok(convert_exit(cpu.machine.resume(ret32)?))
+            }
+        }
+    }
+
+    /// **Stub awaiting Task 6.** `mbbs_machine::m32::Machine` has no
+    /// `arg_frame` yet -- Task 6's Step 1 adds it, mirroring
+    /// `mbbs_machine::m16::Machine::arg_frame`. Nothing in this task calls
+    /// this arm; no test exercises it.
+    fn arg_frame(_cpu: &Self::Cpu) -> &[u8] {
+        todo!(
+            "Task 6: mbbs_machine::m32::Machine::arg_frame does not exist yet -- \
+             see docs/plans/2026-08-12-abi-border-implementation.md"
+        )
+    }
+
+    /// **Stub awaiting Task 6.** `mbbs_machine::m32::Machine` has no poison
+    /// *setter* -- only the fault path sets its `poisoned` field today.
+    /// Nothing in this task calls this arm; no test exercises it.
+    fn poison(_cpu: &mut Self::Cpu, _why: Self::Poison) -> std::io::Result<()> {
+        todo!(
+            "Task 6: mbbs_machine::m32::Machine has no poison() setter yet -- \
+             see docs/plans/2026-08-12-abi-border-implementation.md"
+        )
+    }
+
+    fn poisoned(cpu: &Self::Cpu) -> Option<Self::Poison> {
+        cpu.machine.poisoned().cloned()
+    }
+
+    fn unimplemented(module: String, symbol: String) -> Self::Poison {
+        mbbs_machine::m32::Poison::Unimplemented { module, symbol }
+    }
+}
+
+/// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so
+/// a pointer comes back in `EAX` exactly as an `int` does. `Ret::Long` maps
+/// the same way as `Ret::Int`: both are [`Abi::LONG_WIDTH`]/[`Abi::INT_WIDTH`]
+/// bytes wide (4, agreeing under `Wg32`), so there is no wider `U64` case to
+/// reach here -- see `Ret`'s own doc comment ("`Void` and the 32-bit `Long`
+/// do not vary").
+impl From<Ret<Wg32>> for mbbs_machine::m32::Ret {
+    fn from(ret: Ret<Wg32>) -> Self {
+        match ret {
+            Ret::Void => mbbs_machine::m32::Ret::Void,
+            Ret::Int(v) => mbbs_machine::m32::Ret::U32(v),
+            Ret::Long(v) => mbbs_machine::m32::Ret::U32(v),
+            Ret::Ptr(p) => mbbs_machine::m32::Ret::U32(p.0),
+        }
+    }
+}
+
+/// [`mbbs_machine::m32::Exit`] converted to [`Exit<Wg32>`] -- the same
+/// `Fault` collapse `abi/wg16.rs`'s `convert_exit` documents; `Wg32` has no
+/// `Timeout` variant of its own yet (Task 16 adds the 32-bit watchdog).
+fn convert_exit(exit: mbbs_machine::m32::Exit) -> Exit<Wg32> {
+    match exit {
+        mbbs_machine::m32::Exit::Call { index } => Exit::Call { index },
+        mbbs_machine::m32::Exit::Returned { eax, edx } => Exit::Returned { lo: eax, hi: edx },
+        mbbs_machine::m32::Exit::Fault { .. } => Exit::Stopped,
     }
 }
 

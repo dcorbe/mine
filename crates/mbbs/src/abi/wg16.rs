@@ -10,7 +10,7 @@
 //! Self::Mem>`, `Abi::mem` as a reborrow rather than a second field), so
 //! nothing here changed to accommodate them.
 
-use super::{Abi, ModuleMem, Ret};
+use super::{Abi, Arg, Exit, ModuleMem, Ret};
 
 /// The ABI Galacticomm's 16-bit modules were compiled for: Borland huge
 /// model, `seg:off` pointers, cdecl with ten callee-cleaned exceptions (see
@@ -85,6 +85,81 @@ impl Abi for Wg16 {
     /// in `shims::mod`, not this file.
     fn native(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)> {
         crate::shims::wg16_native(dll, symbol)
+    }
+
+    type Poison = mbbs_machine::m16::Poison;
+
+    /// Encode `args` into the words `mbbs_machine::m16::Machine::call` takes,
+    /// then delegate.
+    ///
+    /// The order is the load-bearing detail: `Arg::Ptr` becomes offset word
+    /// then selector word, matching [`Abi::ptr_to_bytes`] (`FarPtr::to_bytes`)
+    /// and `testing::Fixture::far`, and proven here (not merely stated) by
+    /// `arg_ptr_lands_offset_then_selector_in_a_genuine_relayed_frame` below,
+    /// which round-trips through a real `lcall`, not a byte array agreeing
+    /// with itself. `Arg::Long` splits low word first, high word second --
+    /// the same order [`Ret::Long`]'s own conversion (below) reads back.
+    fn call(cpu: &mut Self::Cpu, entry: Self::Ptr, args: &[Arg<Self>]) -> std::io::Result<Exit<Self>> {
+        let mut words = Vec::with_capacity(args.len() * 2);
+        for arg in args {
+            match arg {
+                Arg::Int(v) => words.push(*v),
+                Arg::Long(v) => {
+                    words.push(*v as u16);
+                    words.push((*v >> 16) as u16);
+                }
+                Arg::Ptr(p) => {
+                    words.push(p.offset);
+                    words.push(p.selector);
+                }
+            }
+        }
+        Ok(convert_exit(cpu.call(entry, &words)?))
+    }
+
+    /// `Cleans::Caller` is `Machine::resume`; `Cleans::Callee(bytes)` is
+    /// `Machine::resume_cleaning` -- the fold this trait method's own doc
+    /// comment describes, with `Wg16` the one `Abi` that actually has
+    /// callee-cleaned rows to serve (`shims::runtime`'s `f_*@` family, behind
+    /// [`Abi::native`]).
+    fn resume(cpu: &mut Self::Cpu, ret: Ret<Self>, cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
+        let ret16: mbbs_machine::m16::Ret = ret.into();
+        let exit = match cleans {
+            crate::shims::Cleans::Caller => cpu.resume(ret16)?,
+            crate::shims::Cleans::Callee(bytes) => cpu.resume_cleaning(ret16, bytes)?,
+        };
+        Ok(convert_exit(exit))
+    }
+
+    fn arg_frame(cpu: &Self::Cpu) -> &[u8] {
+        cpu.arg_frame()
+    }
+
+    fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
+        cpu.poison(why)
+    }
+
+    fn poisoned(cpu: &Self::Cpu) -> Option<Self::Poison> {
+        cpu.poisoned().cloned()
+    }
+
+    fn unimplemented(module: String, symbol: String) -> Self::Poison {
+        mbbs_machine::m16::Poison::Unimplemented { module, symbol }
+    }
+}
+
+/// [`mbbs_machine::m16::Exit`] converted to [`Exit<Wg16>`] -- `Fault`/`Timeout`
+/// collapse to `Stopped` (see `Exit`'s own doc comment); the machine has
+/// already stored the poison behind [`Machine::poisoned`](mbbs_machine::m16::Machine::poisoned)
+/// either way.
+fn convert_exit(exit: mbbs_machine::m16::Exit) -> Exit<Wg16> {
+    match exit {
+        mbbs_machine::m16::Exit::Call { index } => Exit::Call { index },
+        mbbs_machine::m16::Exit::Returned { ax, dx } => Exit::Returned {
+            lo: u32::from(ax),
+            hi: u32::from(dx),
+        },
+        mbbs_machine::m16::Exit::Fault { .. } | mbbs_machine::m16::Exit::Timeout { .. } => Exit::Stopped,
     }
 }
 
@@ -254,5 +329,109 @@ mod tests {
             panic!("Far must convert to Ptr");
         };
         assert_eq!(v, ptr, "offset (AX) and selector (DX) must land unswapped");
+    }
+
+    /// `Abi::call`'s [`Arg::Ptr`] encode order, proven against a genuine
+    /// `lcall` frame rather than a byte array agreeing with itself (design
+    /// §6). The entry `Wg16::call` is pointed at does not read its own
+    /// arguments and stop there -- it relays them, through real
+    /// `push`/`lcall` instructions, into a *second* genuine far call, whose
+    /// frame is then read the same way every other test in this crate reads
+    /// one: [`mbbs_machine::m16::Machine::arg_frame`].
+    ///
+    /// Borland's far-function prologue (`push bp; mov bp, sp`) puts the
+    /// first argument word at `bp+6` and the second at `bp+8` --
+    /// `crates/mbbs-machine/tests/entry.rs`'s own `SUBTRACT_ENTRY` documents
+    /// the identical layout. The relay pushes `bp+8` first and `bp+6` last,
+    /// mirroring `testing::Fixture::call_with`'s `.rev()` (last-declared-arg-
+    /// pushed-first) so the two words land in the new frame in the same
+    /// order they arrived in the old one.
+    #[test]
+    fn arg_ptr_lands_offset_then_selector_in_a_genuine_relayed_frame() {
+        fn relay_two_words(thunk: FarPtr) -> Vec<u8> {
+            let mut code = vec![
+                0x55, // push bp
+                0x89, 0xe5, // mov bp, sp
+                0x8b, 0x46, 0x08, // mov ax, [bp+8]   (word 1, the 2nd arg)
+                0x50, // push ax
+                0x8b, 0x46, 0x06, // mov ax, [bp+6]   (word 0, the 1st arg)
+                0x50, // push ax
+                0x9a, // lcall $cs, $thunk
+            ];
+            code.extend_from_slice(&thunk.to_bytes());
+            code
+        }
+
+        let mut machine = mbbs_machine::m16::Machine::new().expect("16-bit machine");
+        let thunk = machine.thunk_address(0);
+        machine.load_code(&relay_two_words(thunk)).expect("module fits");
+        let entry = machine.code_ptr(0);
+
+        let ptr = FarPtr {
+            offset: 0x1000,
+            selector: 0x0038,
+        };
+        let exit = Wg16::call(&mut machine, entry, &[Arg::Ptr(ptr)]).expect("called");
+        assert!(
+            matches!(exit, Exit::Call { index: 0 }),
+            "the relay reached thunk 0, got {exit:?}"
+        );
+
+        assert_eq!(
+            &machine.arg_frame()[0..4],
+            ptr.to_bytes().as_slice(),
+            "the relayed frame is offset then selector, exactly what Arg::Ptr pushed"
+        );
+    }
+
+    /// [`Exit::Returned`]'s `lo`/`hi` mapping: `AX` becomes `lo`, `DX`
+    /// becomes `hi`. Distinct halves (`0x1234`, `0x5678`), same
+    /// discrimination `ret_wg16_converts_to_mbbs16_ret_for_all_four_variants`
+    /// above uses, so a swap cannot pass by agreeing with itself.
+    #[test]
+    fn returned_maps_ax_to_lo_and_dx_to_hi() {
+        // `crates/mbbs-machine/tests/entry.rs`'s `LONG_ENTRY`, byte for byte:
+        //  0: b8 34 12   mov $0x1234, %ax
+        //  3: ba 78 56   mov $0x5678, %dx
+        //  6: cb         lret
+        let code = vec![0xb8, 0x34, 0x12, 0xba, 0x78, 0x56, 0xcb];
+        let mut machine = mbbs_machine::m16::Machine::new().expect("16-bit machine");
+        machine.load_code(&code).expect("module fits");
+        let entry = machine.code_ptr(0);
+
+        match Wg16::call(&mut machine, entry, &[]).expect("called") {
+            Exit::Returned { lo, hi } => {
+                assert_eq!(lo, 0x1234, "AX becomes lo");
+                assert_eq!(hi, 0x5678, "DX becomes hi");
+            }
+            other => panic!("expected Exit::Returned, got {other:?}"),
+        }
+    }
+
+    /// A faulting entry stops as [`Exit::Stopped`], with the reason readable
+    /// through [`Abi::poisoned`] afterward -- the collapse `Exit`'s own doc
+    /// comment describes ("every caller's next move is identical: read
+    /// `Abi::poisoned`").
+    #[test]
+    fn a_fault_stops_as_exit_stopped_and_poisons_the_machine() {
+        // Byte-for-byte `suicidal()` from `crates/mbbs/tests/fault_16_alone.rs`:
+        // privileged HLT, so #GP, arriving as SIGSEGV.
+        let code = vec![
+            0xb8, 0x34, 0x12, // mov $0x1234, %ax
+            0xf4, // hlt
+        ];
+        let mut machine = mbbs_machine::m16::Machine::new().expect("16-bit machine");
+        machine.load_code(&code).expect("module fits");
+        let entry = machine.code_ptr(0);
+
+        match Wg16::call(&mut machine, entry, &[]).expect("recovered, not fatal") {
+            Exit::Stopped => {}
+            other => panic!("expected Exit::Stopped, got {other:?}"),
+        }
+
+        match Wg16::poisoned(&machine) {
+            Some(mbbs_machine::m16::Poison::Fault { .. }) => {}
+            other => panic!("expected Some(Fault{{..}}), got {other:?}"),
+        }
     }
 }

@@ -298,6 +298,73 @@ pub trait Abi {
         let _ = (dll, symbol);
         None
     }
+
+    /// Why this ABI's machine refuses to run again -- `mbbs_machine::m16::Poison`
+    /// for `Wg16`, `mbbs_machine::m32::Poison` for `Wg32`.
+    ///
+    /// Bound the same way [`crate::shims::ShimError`]'s callers need: cloned out
+    /// of the machine by [`Abi::poisoned`] (which borrows `Cpu`, so the answer
+    /// cannot itself borrow), formatted for the host's own stop message, and
+    /// compared in tests. The machine keeps owning the real enum -- an ABI
+    /// answers with it, never redefines it -- see design §2.
+    type Poison: Clone + std::fmt::Debug + std::fmt::Display + PartialEq;
+
+    /// Call a module entry point with `args`, the way the real host does.
+    ///
+    /// `args` are in declaration order, encoded into this ABI's own frame
+    /// shape by the implementation -- see [`Arg`]'s own doc comment for what
+    /// that means per-ABI. Delegates straight to this ABI's machine (`Wg16`
+    /// to `mbbs_machine::m16::Machine::call`, `Wg32` to
+    /// `mbbs_machine::m32::Machine::call`), converting the machine's own
+    /// `Exit` into [`Exit<Self>`] on the way out.
+    fn call(cpu: &mut Self::Cpu, entry: Self::Ptr, args: &[Arg<Self>]) -> std::io::Result<Exit<Self>>
+    where
+        Self: Sized;
+
+    /// Continue a module past the [`Exit::Call`] it stopped at, handing back
+    /// `ret` and popping `cleans`' worth of arguments first if this ABI's
+    /// calling convention requires the *callee* to.
+    ///
+    /// Folds `mbbs_machine::m16::Machine::resume_cleaning` in rather than adding a
+    /// second trait method for it: `Cleans::Caller` is `machine.resume(ret)`,
+    /// `Cleans::Callee(bytes)` is `machine.resume_cleaning(ret, bytes)`. `Wg32`
+    /// has no callee-cleaned routines at all (32-bit Worldgroup is uniformly
+    /// cdecl) -- its `Cleans::Callee` arm panics naming the host-table bug a
+    /// callee-clean row reaching it would be. See design §2.
+    fn resume(cpu: &mut Self::Cpu, ret: Ret<Self>, cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>>
+    where
+        Self: Sized;
+
+    /// The outstanding call's raw argument frame -- what [`Cursor`]/[`Call`]
+    /// read. Direct delegation to the machine's own `arg_frame`.
+    fn arg_frame(cpu: &Self::Cpu) -> &[u8];
+
+    /// Mark this ABI's machine as refusing to run again, and say why.
+    ///
+    /// The generic `Host::stop` needs this to record a host-side judgement
+    /// (an unimplemented import, most often -- see [`Abi::unimplemented`])
+    /// that never came from the machine's own `Exit`, the same way
+    /// `mbbs_machine::m16::Machine::poison` already lets `Host::run` do today.
+    fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()>;
+
+    /// Why this ABI's machine will not be entered again, if it will not.
+    ///
+    /// Clones out of the machine's own `Option<&Poison>` -- borrowing `cpu`
+    /// only for the call, not for as long as the answer lives, which is what
+    /// lets a caller hold the result past the point it stops borrowing `cpu`
+    /// (`Host::run`'s own stop path does exactly that).
+    fn poisoned(cpu: &Self::Cpu) -> Option<Self::Poison>;
+
+    /// Build the poison that says a module called an import this host has no
+    /// implementation for.
+    ///
+    /// The one constructor a generic `Host::stop` needs for the case with no
+    /// `Exit` behind it at all: the host recognised the call landed at a
+    /// thunk, looked the symbol up, and found nothing. Every `Poison` this
+    /// crate's machines carry has an `Unimplemented { module, symbol }`
+    /// variant with the same wording -- see `mbbs_machine::m16::Poison::Unimplemented`
+    /// and its `mbbs_machine::m32` mirror.
+    fn unimplemented(module: String, symbol: String) -> Self::Poison;
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -519,6 +586,84 @@ where
     }
 }
 
+/// An outbound argument, in this ABI's own frame encoding -- the mirror of
+/// [`Call`]'s inbound reads, and what [`Abi::call`] takes.
+///
+/// `Ptr` is [`Abi::PTR_WIDTH`] bytes laid out the same way
+/// [`Abi::ptr_to_bytes`] would: two words, offset then selector, under
+/// `Wg16`; one dword, the flat address, under `Wg32`. `Long` is a plain
+/// `u32` rather than `A::Long` because no `Abi` implementation has ever
+/// needed a `long` wider than that (see [`Abi::LONG_WIDTH`]'s own doc
+/// comment) -- there is nothing per-ABI left for this variant to carry.
+pub enum Arg<A: Abi> {
+    /// A C `int`, `A::INT_WIDTH` bytes.
+    Int(A::Int),
+    /// A C `long`, always four bytes.
+    Long(u32),
+    /// A pointer, in this ABI's own representation.
+    Ptr(A::Ptr),
+}
+
+/// How an excursion into module code came back, with everything ABI-specific
+/// already converted out.
+///
+/// `Fault` and `Timeout` collapse to `Stopped` because every caller's next
+/// move is identical: read [`Abi::poisoned`]. The per-ABI location shapes
+/// (`cs:ip` vs `eip`) stay in each machine's own `Exit`/`Poison` and never
+/// cross this border -- see design §2.
+pub enum Exit<A: Abi> {
+    /// The module reached host thunk `index` (`u16` in both machines).
+    Call { index: u16 },
+
+    /// The module returned. `lo` is `AX`/`EAX` zero-extended, `hi` is
+    /// `DX`/`EDX`; each `Abi` implementation's own conversion documents the
+    /// mapping (`Ret`'s own doc comment covers the direction back in).
+    Returned { lo: u32, hi: u32 },
+
+    /// Terminal. The poison is already stored machine-side -- see
+    /// [`Abi::poisoned`].
+    Stopped,
+
+    /// Not a variant. `Exit<A>` names no field of `A`'s own -- every real
+    /// variant above is the same shape in both ABIs -- so without this the
+    /// type parameter would be unused and the compiler would refuse to
+    /// accept it (E0392). Keeping `Exit` parameterised anyway is deliberate:
+    /// `Outcome<A>`/`Vector<A>` (Task 10) wrap it and want the parameter
+    /// there, not bolted on later. `Infallible` makes this uninhabitable, so
+    /// no match arm anywhere ever needs to produce one; only construct it by
+    /// matching `Infallible`'s own zero variants, which is to say: never.
+    #[doc(hidden)]
+    _Phantom(std::convert::Infallible, std::marker::PhantomData<A>),
+}
+
+// Hand-written, not `#[derive(..)]`, for the same reason `Ret<A>`'s impls
+// above are: the derive macro's generated bound is `A: Trait`, which is both
+// wrong (every field here is `u16`/`u32`/`Infallible`/`PhantomData<A>`, none
+// of which need `A` itself to implement anything) and, for `Wg16`/`Wg32`
+// (unit structs implementing nothing but `Abi`), simply unsatisfiable.
+impl<A: Abi> Clone for Exit<A> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<A: Abi> Copy for Exit<A> {}
+
+impl<A: Abi> std::fmt::Debug for Exit<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Call { index } => f.debug_struct("Call").field("index", index).finish(),
+            Self::Returned { lo, hi } => f.debug_struct("Returned").field("lo", lo).field("hi", hi).finish(),
+            Self::Stopped => write!(f, "Stopped"),
+            // `_Phantom` holds an `Infallible`, which has no values -- this
+            // arm can never run, and matching on the `Infallible` (rather
+            // than writing `unreachable!()`) is what lets the compiler prove
+            // that rather than trust a comment saying so.
+            Self::_Phantom(never, _) => match *never {},
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +819,39 @@ mod tests {
             // to name, which is fine because `Call`'s frame-read tests below
             // never format a near pointer.
             unreachable!("Call's read tests never call Abi::data_ptr")
+        }
+
+        // `Cpu = ()` cannot execute anything, so none of the six methods
+        // Task 5 added has a real implementation to give -- same reasoning
+        // as `mem`/`data_ptr`/`ptr_offset`/`ptr_checked_add` above, repeated
+        // six more times rather than left implicit: `Call`'s frame-read
+        // tests build a `Call<FixtureAbi>` directly from a byte slice and
+        // never call [`Machine::call`](mbbs_machine::m16::Machine::call) or
+        // anything downstream of it.
+        type Poison = mbbs_machine::m16::Poison;
+
+        fn call(_cpu: &mut Self::Cpu, _entry: Self::Ptr, _args: &[Arg<Self>]) -> std::io::Result<Exit<Self>> {
+            unreachable!("Call's read tests never call Abi::call")
+        }
+
+        fn resume(_cpu: &mut Self::Cpu, _ret: Ret<Self>, _cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
+            unreachable!("Call's read tests never call Abi::resume")
+        }
+
+        fn arg_frame(_cpu: &Self::Cpu) -> &[u8] {
+            unreachable!("Call's read tests never call Abi::arg_frame")
+        }
+
+        fn poison(_cpu: &mut Self::Cpu, _why: Self::Poison) -> std::io::Result<()> {
+            unreachable!("Call's read tests never call Abi::poison")
+        }
+
+        fn poisoned(_cpu: &Self::Cpu) -> Option<Self::Poison> {
+            unreachable!("Call's read tests never call Abi::poisoned")
+        }
+
+        fn unimplemented(_module: String, _symbol: String) -> Self::Poison {
+            unreachable!("Call's read tests never call Abi::unimplemented")
         }
     }
 

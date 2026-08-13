@@ -142,13 +142,24 @@ pub enum Exit {
 
 /// Why a machine will not be entered again. See [`Machine::poisoned`].
 ///
-/// The one variant here mirrors the one terminal [`Exit`], kept separately
-/// (as `crate::m16::Poison` is) so a host that has discarded the `Exit` can still
-/// say what happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The first variant mirrors the one terminal [`Exit`], kept separately (as
+/// `crate::m16::Poison` is) so a host that has discarded the `Exit` can still
+/// say what happened. `Unimplemented` mirrors `crate::m16::Poison`'s own
+/// variant of the same name -- the host's own judgement, reached while
+/// servicing a call, that a module asked for an import this host does not
+/// implement; there is no `Exit` behind it at all. See
+/// `crate::abi::Abi::unimplemented`.
+///
+/// Not `Copy`, unlike `crate::m16::Poison`: `Unimplemented`'s `String` fields
+/// cannot be. Every use here already goes through `Clone` or a reference, so
+/// nothing chases this beyond the derive line itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Poison {
     /// It faulted. See [`Exit::Fault`].
     Fault { signo: i32, eip: u32 },
+
+    /// It called an import the host has no implementation for.
+    Unimplemented { module: String, symbol: String },
 }
 
 impl std::fmt::Display for Poison {
@@ -156,6 +167,9 @@ impl std::fmt::Display for Poison {
         match self {
             Self::Fault { signo, eip } => {
                 write!(f, "module faulted with signal {signo} at {eip:#010x}")
+            }
+            Self::Unimplemented { module, symbol } => {
+                write!(f, "{module}.{symbol} is not implemented")
             }
         }
     }
