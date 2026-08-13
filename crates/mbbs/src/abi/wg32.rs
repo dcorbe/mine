@@ -175,31 +175,33 @@ impl ModuleMem for mbbs32::Memory {
 // No `#[cfg(test)] mod tests` here, unlike every sibling `Abi` file --
 // deliberately. Any test that builds a real `Wg32Cpu` must build a real
 // `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally calls
-// `mbbs32::fault::arm`, which installs this process's SIGSEGV/SIGILL/
-// SIGBUS/SIGFPE handlers. `crates/mbbs32/src/fault.rs`'s own module doc
-// comment says why that is not safe to do here: "This handler and mbbs16's
-// cannot both be installed... There is exactly one SIGSEGV disposition per
-// process." `cargo test -p mbbs --lib` runs every unit test -- 16-bit and
-// now 32-bit -- in ONE process, so a `Wg32Cpu`-building test in *this* file
-// would install `mbbs32`'s handler over top of whatever `mbbs16`'s own
-// tests need armed, and never restore it.
+// `mbbs32::fault::arm`, which registers this ABI's fault claim with
+// `crates/mbbs-fault`'s shared arbiter. Registering no longer steals another
+// ABI's recovery the way installing a standalone handler used to -- see
+// `crates/mbbs-fault`'s module doc comment -- but `cargo test -p mbbs --lib`
+// still runs every unit test, 16-bit and 32-bit, as threads of ONE process,
+// sharing the one per-thread alternate signal stack and the one process-wide
+// claim registry. A `Wg32Cpu`-building test has no reason to entangle that
+// shared, process-global state with this file's otherwise-pure unit tests,
+// so it stays out.
 //
-// This was not theoretical: an earlier version of this file built a real
-// `Wg32Cpu` right here and `cargo test -p mbbs --lib` went from 1281/0 to
-// 1282/3 -- `tests::survey_mode_still_stops_on_a_fault_reached_after_a_continued_call`,
+// This was not theoretical before the arbiter existed: an earlier version of
+// this file built a real `Wg32Cpu` right here and `cargo test -p mbbs --lib`
+// went from 1281/0 to 1282/3 --
+// `tests::survey_mode_still_stops_on_a_fault_reached_after_a_continued_call`,
 // `tests::cycle_names_the_channel_a_poll_sourced_stop_happened_on`, and
 // `shims::fsd::tests::a_module_that_dies_inside_whndun_stops_the_host_cleanly`
 // all failed, every one of them an `mbbs16` fault-recovery test running
 // *after* this file's test had already clobbered the process's SIGSEGV
-// handler. See this task's report for what that means for production, not
-// only for tests: nothing in either crate yet arbitrates one process running
-// both ABIs at once (`fault.rs`'s own words: "Running both ABIs in one
-// process needs a single arbiter dispatching three ways on the faulting
-// CS... deliberately NOT built here").
+// handler with `mbbs32`'s standalone one. That specific failure mode is
+// exactly what `crates/mbbs-fault` now fixes -- see
+// `crates/mbbs/tests/fault_16_after_32.rs`, `fault_16_alone.rs` and
+// `fault_32_after_16.rs` -- but the isolation below is worth keeping on its
+// own merits regardless.
 //
 // The tests that need a real `Wg32Cpu` -- `Call<Wg32>`'s offset-divergence
 // proof among them -- live in `crates/mbbs/tests/wg32_abi.rs` instead: a
-// separate `cargo test` integration binary is a separate OS process, with
-// its own independent signal disposition table, so arming `mbbs32`'s
-// handler there cannot reach any `mbbs16` test no matter how `cargo test`
-// schedules the two binaries.
+// separate `cargo test` integration binary is a separate OS process, so
+// nothing built there needs to depend on the arbiter's correctness to stay
+// isolated from this file's own tests, no matter how `cargo test` schedules
+// the two binaries.

@@ -2,38 +2,39 @@
 //!
 //! **Why this is not `crates/mbbs/src/abi/wg32.rs`'s own `#[cfg(test)] mod
 //! tests`, unlike every sibling `Abi` file.** A real `Wg32Cpu` needs a real
-//! `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally arms
-//! `mbbs32`'s SIGSEGV/SIGILL/SIGBUS/SIGFPE handler
-//! (`crates/mbbs32/src/fault.rs`). That module's own doc comment says why
-//! that cannot share a process with `mbbs16`'s: "There is exactly one
-//! SIGSEGV disposition per process... Installing this one instead breaks
-//! the same thing in reverse." `cargo test -p mbbs --lib` runs every 16-bit
-//! and 32-bit unit test in ONE process, so a `Wg32Cpu`-building test placed
-//! there would install `mbbs32`'s handler over whatever `mbbs16`'s own fault
-//! tests need armed -- and never restore it, because nothing in either crate
-//! arbitrates one process running both ABIs yet (`fault.rs` again: "Running
-//! both ABIs in one process needs a single arbiter... deliberately NOT
-//! built here").
+//! `mbbs32::Machine`, and `mbbs32::Machine::new` unconditionally registers
+//! with `crates/mbbs-fault`'s shared arbiter. Registering is no longer
+//! destructive to another ABI's recovery -- see below, that is the whole
+//! point of the arbiter -- but `cargo test -p mbbs --lib` still runs every
+//! 16-bit and 32-bit unit test as threads of ONE process, sharing the one
+//! per-thread alternate signal stack and the one process-wide claim
+//! registry `crates/mbbs-fault` owns. Nothing about that is unsafe by
+//! itself, but it is still global state a `Wg32Cpu`-building test has no
+//! reason to entangle with `abi/wg32.rs`'s otherwise-pure unit tests, so it
+//! stays here, in its own process, on the same reasoning as always.
 //!
 //! Measured, not assumed: an earlier version of this file's test lived in
 //! `abi/wg32.rs` instead, and `cargo test -p mbbs --lib` went from
 //! `1281 passed; 0 failed` to `1282 passed; 3 failed` -- three unrelated
 //! `mbbs16` fault-recovery tests broke, every one of them because this
 //! file's `Wg32Cpu` had already clobbered the process's SIGSEGV handler
-//! before they ran. `cargo test`'s own process model is the fix: each file
-//! under `tests/` is a separate binary, hence a separate process, with its
-//! own independent signal disposition table -- so arming `mbbs32`'s handler
-//! here cannot reach any `mbbs16` test, in this binary or any other, no
-//! matter how `cargo test` schedules them relative to each other.
+//! before they ran. That was `mbbs32::fault`'s own standalone handler
+//! stealing the disposition `mbbs16::fault`'s handler needed, exactly the
+//! bug `crates/mbbs-fault` now exists to fix -- but `cargo test`'s own
+//! process model is still the right isolation for *this* file regardless:
+//! each file under `tests/` is a separate binary, hence a separate process,
+//! so nothing here needs to depend on the arbiter behaving correctly to stay
+//! isolated from unrelated tests.
 //!
-//! This is not merely a test-suite inconvenience. It means a *production*
-//! host that wants to serve both a 16-bit and a 32-bit module from the same
-//! process cannot safely do so yet: the second `Machine::new` (whichever ABI
-//! is second) silently steals the fault handler the first ABI's modules
-//! depend on to survive a crash rather than take the whole process down.
-//! See this task's report for the specific fix `fault.rs` already names --
-//! one arbiter dispatching on the faulting `CS` -- and why it is out of this
-//! task's scope.
+//! **This no longer describes a production limitation.** A host serving both
+//! a 16-bit and a 32-bit module from one process now can: `mbbs16::fault` and
+//! `mbbs32::fault` each register a *positive* claim over the faulting `CS`
+//! with `crates/mbbs-fault`'s shared arbiter instead of installing a
+//! standalone handler, so the second `Machine::new` (whichever ABI is
+//! second) no longer steals the first ABI's recovery. See
+//! `crates/mbbs/tests/fault_16_after_32.rs`, `fault_16_alone.rs` and
+//! `fault_32_after_16.rs` for the constructions this now proves recover
+//! correctly in both orders.
 
 use mbbs::abi::{Abi, Call, Cursor, ModuleMem, Wg16, Wg32, Wg32Cpu};
 
