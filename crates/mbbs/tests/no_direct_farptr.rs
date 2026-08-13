@@ -23,44 +23,37 @@
 //!
 //! # The list, as of 2026-08-13
 //!
-//! It went from 26 files to 8 in one pass. Most of that was not conversion
-//! work at all -- it was this test learning to measure what it always said it
-//! measured. Eight of the eighteen files that left had *zero* production
-//! mentions and were on the list purely for their fixtures; two more were on
-//! it for doc comments explaining a conversion that had already happened.
-//! The genuine removals were `Streams`'/`Messages`'/`TextVars`'/`Users`' dead
-//! `Wg16` facades (deleted -- every caller had already moved to the generic
-//! `_mem` core), `Users::new`, and the Btrieve engine going `Btrieve<A>`.
-//!
-//! Three of those eight are permanent and are marked as such in `ALLOWED`:
-//! `abi/wg16.rs` (where the type is declared, once `abi.rs` split it out --
-//! see below), `shims/memory.rs` (segment tiling, no flat-memory
-//! counterpart) and `testing.rs` (the fixture builder). A fourth left in the
-//! very next commit: the seventeen `btv*` shims went `fn foo<A: Abi>(...)`
+//! It went from 26 files to 3, across two implementation plans. Most of that
+//! was not conversion work at all -- it was this test learning to measure
+//! what it always said it measured (see the git history for the pass that
+//! found eight files with *zero* production mentions, on the list purely for
+//! their fixtures, and two more on it for doc comments explaining a
+//! conversion that had already happened). The genuine removals: `Streams`'/
+//! `Messages`'/`TextVars`'/`Users`' dead `Wg16` facades, `Users::new`, the
+//! Btrieve engine going `Btrieve<A>`, the seventeen `btv*` shims following it
 //! once `Host<A>::btrieve`'s own elided parameter (see `lib.rs`'s history)
-//! stopped pinning the engine behind them to `Wg16`. A fifth, `shims/fsd.rs`,
-//! left in Task 12 of `docs/plans/2026-08-12-abi-border-implementation.md`:
-//! the FSD session engine (`fsd_cycle`, `fsdprc`, `goback` and their
-//! helpers) went generic over `A`, which is what let
+//! stopped pinning the engine behind them to `Wg16`, `shims/fsd.rs` in Task
+//! 12 of `docs/plans/2026-08-12-abi-border-implementation.md` (the FSD
+//! session engine going generic over `A`, which is what let
 //! [`crate::Host::fsd_dispatch`] itself go generic and retire the
-//! `Abi::native_dispatch` bridge Task 11 had added to reach it. Two more,
-//! `heap.rs` and `globals.rs`, left in Task 13: `Host::new`'s `.selector`
-//! arithmetic became `A::ptr_offset` from one `alloc_region` base, which is
-//! what let `Globals::new` go generic too, and `Heap::alloc` -- by then
-//! called only by tests, every production call site having already moved
-//! onto `Heap::reserve` -- was deleted outright rather than converted. So the
-//! live conversion backlog is **one file**.
+//! `Abi::native_dispatch` bridge Task 11 had added to reach it), `heap.rs`
+//! and `globals.rs` in Task 13 (`Host::new`'s `.selector` arithmetic became
+//! `A::ptr_offset` from one `alloc_region` base, which is what let
+//! `Globals::new` go generic too, and `Heap::alloc` -- by then called only by
+//! tests, every production call site having already moved onto
+//! `Heap::reserve` -- was deleted outright rather than converted), and
+//! `lib.rs` itself in Task 14: `Host::dos_name` (pure string logic, no `Self`
+//! to be generic over) followed `Host::new` onto `impl<A: Abi> Host<A>`, and
+//! the free function `caller` (`Wg16`'s own `Abi::caller` arm) moved to
+//! `abi/wg16.rs` -- the question it answers, a live call frame's return
+//! address decoded against the one loaded NE image, names
+//! `mbbs_machine::m16::Machine`/`Module` concretely by its nature, so it was
+//! never a conversion candidate, only misplaced. `impl Host<Wg16>` is
+//! deleted; there is no method-cluster dissolution left to do.
 //!
-//! # The one that is not like the others
-//!
-//! `lib.rs`'s entry no longer names an execution-vocabulary gap -- `Abi`
-//! grew `call`/`resume` in Task 5, `Host::new` moved onto `impl<A: Abi>
-//! Host<A>` in Task 13, and what is left is [`crate::Host::dos_name`] (no
-//! `Self` to be generic over) and the free function `crate::caller` (`Wg16`'s
-//! own `Abi::caller` arm, concrete over `mbbs_machine::m16::Machine` and
-//! `Module` by the nature of the question it answers -- see its own doc
-//! comment). One method and one free function, not twenty-six. Task 14 moves
-//! both and deletes `impl Host<Wg16>` for good.
+//! What remains is the three permanent entries below, and each is marked
+//! with its own reason at its own line -- see those comments, not this one,
+//! for why each stays.
 //!
 //! # Rules
 //!
@@ -81,27 +74,30 @@ const ALLOWED: &[&str] = &[
     // Where the type is SUPPOSED to live: `Wg16::Ptr = mbbs_machine::m16::FarPtr` is
     // declared here, in `Wg16`'s own `impl Abi` (`abi.rs` split this out
     // once `abi/wg32.rs` existed beside it -- see that commit). Not a leak,
-    // and this entry never leaves.
+    // and this entry never leaves. Permanent.
     "abi/wg16.rs",
     // Irreducibly 16-bit, and staying. `alctile`/`ptrtile` are LDT segment
     // tiling, which has no flat-memory counterpart at all -- the 32-bit
     // equivalents `alcblok`/`ptrblok` are different routines, among the 56
-    // still unimplemented. Same for `Heap::alloc_tiled` behind them.
+    // still unimplemented. `Heap::alloc_tiled` moved here in Task 13 of
+    // `docs/plans/2026-08-12-abi-border-implementation.md`, beside `alctile`,
+    // its one production caller. Permanent.
     "shims/memory.rs",
     // The test fixture builder. Every fixture in this crate constructs a real
-    // `mbbs_machine::m16::Machine`, so this names `FarPtr` by construction. It is
-    // Wg16-only on purpose and is not a conversion target.
-    "testing.rs",
-    // --- Genuinely still to convert ---
+    // `mbbs_machine::m16::Machine`, so this names `FarPtr` by construction.
     //
-    // What is left of `impl Host<Wg16>` after Tasks 9-13 (§4's four
-    // dissolution clusters): `dos_name` (no `Self`, so a bare `impl<A: Abi>
-    // Host<A>` copy cannot infer which ABI a caller means -- see that
-    // method's own doc comment) and the free function `caller` (`Wg16`'s
-    // `Abi::caller` arm, concrete over `mbbs_machine::m16::Machine`/`Module`
-    // -- see `crate::caller`'s own doc comment). One method and one free
-    // function, not twenty-six.
-    "lib.rs",
+    // Wg16-only ON PURPOSE, but that purpose is a DECISION made for this
+    // plan's scope, not a law like the two entries above -- unlike
+    // `alctile`/`ptrtile`, a generic fixture builder is not structurally
+    // impossible, only not what Task 15 does. Task 15's Wg32 fixtures land
+    // in `tests/wg32_abi.rs` (a separate file, its own harness pieces) rather
+    // than folding into this one, which means two parallel fixture builders
+    // where a single `Fixture<A>` could in principle serve both -- accepted
+    // for this plan's scope, not required by anything about `FarPtr` or
+    // `Wg16`. Revisit if a third ABI ever needs a third builder in a third
+    // place; that would be the point to ask whether one generic builder pays
+    // for itself.
+    "testing.rs",
 ];
 
 fn is_ident_byte(b: u8) -> bool {

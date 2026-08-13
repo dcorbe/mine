@@ -97,15 +97,17 @@ pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
-use mbbs_machine::m16::{FarPtr, Machine, Module, NeImage, Relocation, Source, Symbol, Target};
+use mbbs_machine::m16::{NeImage, Relocation, Source, Symbol, Target};
 
 // `ModuleMem` for `A::mem(cpu).alloc_region(..)` in `Host::new` below --
 // generic since Task 13 of
 // `docs/plans/2026-08-12-abi-border-implementation.md`, the same allocator
 // `Heap`/`Arena`/`Globals` already went through. `Abi` itself is what
-// `Host<A>` is generic over; `Wg16` is still named explicitly wherever a
-// generic type needs pinning to the one ABI that exists.
-use crate::abi::{Abi, ModuleMem, Wg16};
+// `Host<A>` is generic over; nothing in this file's production code names
+// `Wg16` any more (Task 14 moved the last two things that did, `dos_name`
+// and the free function `caller`, off it) -- the test module imports it
+// itself, where a concrete machine still has to be built.
+use crate::abi::{Abi, ModuleMem};
 // `ModulePtr` for `A::Ptr::resolve`/`write` below -- `Host::class_mem` and
 // `Host::point_curusr_mem` are this file's first two generic-core methods
 // that touch a pointer's own memory access rather than only `Globals`'/
@@ -657,13 +659,18 @@ pub struct Query {
 /// longer compiles at all, so the compiler now names every site that still
 /// needs `<Wg16>` spelled out, and this exact staleness cannot hide again.
 ///
-/// Everything that reads or writes module memory -- every method taking
-/// `&mut Machine`/`&Machine` -- stays in `impl Host<Wg16>`. `Host::load`
-/// itself moved to `impl<A: Abi> Host<A>` in Task 9
-/// (`docs/plans/2026-08-12-abi-border-implementation.md`); its own
-/// NE-specific mechanism (`check_globals`'s old refusal, now folded into
-/// `Resolver::resolve`) is private module-level machinery, not a method on
-/// `Host` at all -- see `Host::load`'s own doc comment.
+/// `impl Host<Wg16>` itself is gone as of Task 14 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`: every method that
+/// used to live there for touching module memory (`&mut Machine`/`&Machine`)
+/// moved onto `impl<A: Abi> Host<A>` across Tasks 9-13, generic on the
+/// memory access itself (`Abi::mem`/`Abi::mem_ref`) rather than on the
+/// parameter's concrete type, and the two survivors with no ABI-dependent
+/// behaviour at all (`Host::new`, `Host::dos_name`) followed them once
+/// nothing else forced the block to exist. `Host::load` -- and the
+/// NE-specific mechanism `check_globals` used to be, now folded into
+/// `Resolver::resolve` -- moved out in Task 9; its own NE-specific mechanism
+/// is private module-level machinery, not a method on `Host` at all -- see
+/// `Host::load`'s own doc comment.
 ///
 /// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
 /// session owned that file, and the field elided its parameter to say so.
@@ -1005,34 +1012,6 @@ pub struct Host<A: Abi> {
     survey: Option<survey::Shared>,
 }
 
-/// Where in the module the call being refused came from, as a place you can
-/// look up in a disassembly.
-///
-/// When a shim runs, the top of the module's stack is the far return address of
-/// the `9A` far call that got there: `frame_sp+0` is the offset, `+2` the
-/// selector. A `9A` call is five bytes, so the instruction itself begins five
-/// before the address it would have returned to.
-///
-/// Reported as an **NE segment**, not a selector. The selector is whatever the
-/// loader happened to hand out this run; the segment is a fact about the file,
-/// and it is what `re/ne_arity.py` and every disassembler speak.
-///
-/// `None` rather than a guess whenever the answer would be misleading: no
-/// outstanding call, a stack that will not resolve, or a selector this module
-/// does not own. A wrong address costs more than no address -- it sends someone
-/// to a real instruction that had nothing to do with it.
-fn caller(machine: &Machine, module: &Module) -> Option<String> {
-    let frame = FarPtr {
-        offset: machine.frame_sp()?,
-        selector: machine.stack_selector(),
-    };
-    let bytes = machine.resolve(frame, 4).ok()?;
-    let offset = u16::from_le_bytes([bytes[0], bytes[1]]);
-    let selector = u16::from_le_bytes([bytes[2], bytes[3]]);
-    let segment = module.segment_at(selector)?;
-    Some(format!("seg {segment}:{:#06x}", offset.wrapping_sub(5)))
-}
-
 /// What `poll` does with a status.
 ///
 /// Two shapes, not one index: `CRSTG`, `INBLK` and `OUTMT` reach an entry point
@@ -1298,6 +1277,48 @@ impl<A: Abi> Host<A> {
             inited: false,
             survey: None,
         })
+    }
+
+    /// The file a module named, with the directory it is allowed to name
+    /// stripped off.
+    ///
+    /// A module builds its filenames from `DATADIR`, an option in its `.MSG`.
+    /// MajorMUD's is empty, so what `spr` produces is `.\WCCITEMS.DAT` -- the
+    /// module's own directory, which is [`Host::root`] and is where this host
+    /// looks anyway. That prefix is accepted and removed.
+    ///
+    /// **Any other directory is refused rather than stripped.** A module
+    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
+    /// the file of the same name from somewhere else would be the exact failure
+    /// this crate exists to avoid -- with the added charm that a board with two
+    /// installs would silently play the wrong one.
+    ///
+    /// # No `Machine`, and no `self`, and generic anyway
+    ///
+    /// This is pure string logic with nothing ABI-dependent in it -- the last
+    /// method `impl Host<Wg16>` held, moved here in Task 14 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`, which is what let
+    /// that block be deleted outright. Every call site that used to read
+    /// `Host::dos_name(...)` and infer `Wg16` because it was the only impl now
+    /// spells `Host::<Wg16>::dos_name(...)` (or `Host::<A>::dos_name(...)`
+    /// inside a generic shim, e.g. `shims::btrieve::opnbtv`) -- `rustc` cannot
+    /// infer which `Abi` a bare `impl<A: Abi> Host<A>` copy means from a
+    /// signature that mentions neither `Self` nor `A`.
+    ///
+    /// # Errors
+    ///
+    /// If the name has a directory component other than `.\`.
+    pub fn dos_name(named: &str) -> Result<&str, String> {
+        let bare = named
+            .strip_prefix(".\\")
+            .or_else(|| named.strip_prefix("./"))
+            .unwrap_or(named);
+        if bare.contains(['\\', '/', ':']) {
+            return Err(format!(
+                "{named} names a directory; this host only opens a module's own"
+            ));
+        }
+        Ok(bare)
     }
 
     /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
@@ -3470,59 +3491,6 @@ impl<A: Abi> Host<A> {
         self.fsd_state = Some(self.register_native(Native::Fsd));
         self.inited = true;
         Ok(())
-    }
-}
-
-/// What is left of `impl Host<Wg16>` after Tasks 9-13 (§4's four dissolution
-/// clusters of `docs/plans/2026-08-12-abi-border-design.md`) is one method:
-/// [`Host::dos_name`], which has no `Machine` parameter and no use of `Self`
-/// at all. It stays here purely because it has no `self`: every call site
-/// names it as `Host::dos_name(...)`, and with no argument or return type
-/// mentioning `A`, `rustc` cannot infer which `Abi` a bare `impl<A: Abi>
-/// Host<A>` copy would mean, only reporting "type annotations needed" --
-/// moving it into the generic block would force every one of those call
-/// sites to spell out `Host::<Wg16>::dos_name(...)` for a function that has
-/// no ABI-dependent behaviour to abstract over. Task 14 deletes this block
-/// and moves `dos_name` itself onto `impl<A: Abi> Host<A>`, accepting that
-/// spelling everywhere, once nothing else forces the block to exist.
-///
-/// `Host::new` was the other survivor, through Task 12; Task 13 moved it
-/// onto `impl<A: Abi> Host<A>` (its `.selector` arithmetic became
-/// `A::ptr_offset` from one `alloc_region` base -- see that method's own doc
-/// comment). `Host::load` -- and the NE-specific mechanism `check_globals`
-/// used to be, now folded into `Resolver::resolve` -- moved out in Task 9:
-/// loading crosses the `Abi` trait now, so the wrapper is `impl<A: Abi>
-/// Host<A>` and only the format-specific arm (`Abi::load`'s `Wg16`
-/// implementation, `crates/mbbs/src/abi/wg16.rs`) is concrete.
-impl Host<Wg16> {
-    /// The file a module named, with the directory it is allowed to name
-    /// stripped off.
-    ///
-    /// A module builds its filenames from `DATADIR`, an option in its `.MSG`.
-    /// MajorMUD's is empty, so what `spr` produces is `.\WCCITEMS.DAT` -- the
-    /// module's own directory, which is [`Host::root`] and is where this host
-    /// looks anyway. That prefix is accepted and removed.
-    ///
-    /// **Any other directory is refused rather than stripped.** A module
-    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
-    /// the file of the same name from somewhere else would be the exact failure
-    /// this crate exists to avoid -- with the added charm that a board with two
-    /// installs would silently play the wrong one.
-    ///
-    /// # Errors
-    ///
-    /// If the name has a directory component other than `.\`.
-    pub fn dos_name(named: &str) -> Result<&str, String> {
-        let bare = named
-            .strip_prefix(".\\")
-            .or_else(|| named.strip_prefix("./"))
-            .unwrap_or(named);
-        if bare.contains(['\\', '/', ':']) {
-            return Err(format!(
-                "{named} names a directory; this host only opens a module's own"
-            ));
-        }
-        Ok(bare)
     }
 }
 

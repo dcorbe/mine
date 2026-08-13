@@ -179,12 +179,46 @@ impl Abi for Wg16 {
         module.import(index)
     }
 
-    /// Delegates to the free function this crate had before `Abi` grew a
-    /// loading surface -- see `crate::caller`'s own doc comment for the
-    /// "seg NN:offset" shape this answers in.
+    /// Delegates to `caller16` below (private, so not doc-linked from here)
+    /// -- the free function this crate had as `crate::caller` in `lib.rs`
+    /// before `Abi` grew a loading surface. See `caller16`'s own doc comment
+    /// for the "seg NN:offset" shape this answers in. Moved here in Task 14
+    /// of `docs/plans/2026-08-12-abi-border-implementation.md`: it names
+    /// `mbbs_machine::m16::Machine`/`Module` concretely, by the nature of
+    /// the question it answers (a live call frame's return address, decoded
+    /// against the one loaded NE image), so it belongs on the `Wg16` side of
+    /// the border rather than in `lib.rs`.
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
-        crate::caller(cpu, module)
+        caller16(cpu, module)
     }
+}
+
+/// Where in the module the call being refused came from, as a place you can
+/// look up in a disassembly.
+///
+/// When a shim runs, the top of the module's stack is the far return address of
+/// the `9A` far call that got there: `frame_sp+0` is the offset, `+2` the
+/// selector. A `9A` call is five bytes, so the instruction itself begins five
+/// before the address it would have returned to.
+///
+/// Reported as an **NE segment**, not a selector. The selector is whatever the
+/// loader happened to hand out this run; the segment is a fact about the file,
+/// and it is what `re/ne_arity.py` and every disassembler speak.
+///
+/// `None` rather than a guess whenever the answer would be misleading: no
+/// outstanding call, a stack that will not resolve, or a selector this module
+/// does not own. A wrong address costs more than no address -- it sends someone
+/// to a real instruction that had nothing to do with it.
+fn caller16(machine: &mbbs_machine::m16::Machine, module: &mbbs_machine::m16::Module) -> Option<String> {
+    let frame = mbbs_machine::m16::FarPtr {
+        offset: machine.frame_sp()?,
+        selector: machine.stack_selector(),
+    };
+    let bytes = machine.resolve(frame, 4).ok()?;
+    let offset = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let selector = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let segment = module.segment_at(selector)?;
+    Some(format!("seg {segment}:{:#06x}", offset.wrapping_sub(5)))
 }
 
 /// [`mbbs_machine::m16::Exit`] converted to [`Exit<Wg16>`] -- `Fault`/`Timeout`
