@@ -644,55 +644,30 @@ fn collect_names(
     }
 }
 
-/// What an imported symbol resolves to.
+/// What an imported symbol resolves to, in this format's own pointer type.
 ///
 /// The distinction is not a convenience. A routine is reached by far call, so
 /// the host can put a thunk in its place and be told when it is used. A datum
 /// is reached by `mov`, and the host is never told anything -- so the address a
 /// data import resolves to must be memory the host genuinely owns and can read
-/// back later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Import {
-    /// A host routine. It gets a thunk, and calling it comes back as
-    /// [`Exit::Call`](crate::m16::Exit::Call).
-    Routine,
+/// back later. An absolute needs no memory at all -- see
+/// [`crate::module::Import`]'s own doc comment for the third arm, and for why
+/// this is a type alias onto shared vocabulary now rather than a type local
+/// to this format: `m32::image::Import32` used to be this enum's own
+/// two-variant cousin, and the two are reconciled there, not here --
+/// `docs/plans/2026-08-12-abi-border-design.md` §3.
+pub type Import = crate::module::Import<FarPtr>;
 
-    /// A host global the module addresses directly.
-    Data(FarPtr),
-
-    /// A constant. The export has no address at all: its "offset" *is* the
-    /// value, and the fixup writes it into an instruction's immediate field.
-    ///
-    /// `WCCMMUD.DLL` needs exactly one of these. `DOSCALLS.135` is the huge
-    /// shift -- how far to shift a 64 KiB count to get a selector increment --
-    /// and thirteen sites resolve it into `mov $x, %cx` immediately before a
-    /// `shl`. Given a thunk's offset instead, the module shifts by whatever
-    /// slot the thunk happened to land in.
-    ///
-    /// Only an OFFSET or LOBYTE fixup can carry one, because a SEGMENT or
-    /// FAR_ADDR site wants a selector and a constant has none. Anything else is
-    /// [`NeError::AbsoluteNeedsAnAddress`].
-    Absolute(u16),
-}
-
-/// How a host answers "what is `MAJORBBS.474`?".
+/// How a host answers "what is `MAJORBBS.474`?", for this format's own
+/// pointer type.
 ///
-/// Implemented for any suitable closure, which is what tests want; a real host
-/// will have a table, keyed by host version. Ordinals move between versions
-/// (996 in MBBS 6.25, 1210 in WG 1.01, 1233 in WG 2.0), so resolving against
-/// the wrong one produces plausible wrong bindings rather than errors.
-pub trait ImportResolver {
-    /// `None` for a symbol the host does not implement. The loader still gives
-    /// it a thunk, so that calling it is a diagnosable event rather than a far
-    /// call into nothing.
-    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import>;
-}
-
-impl<F: Fn(&str, &Symbol) -> Option<Import>> ImportResolver for F {
-    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import> {
-        self(module, symbol)
-    }
-}
+/// Re-exported rather than declared here: see [`crate::module::ImportResolver`]
+/// for the shared trait (implemented for any suitable closure, which is what
+/// tests and examples in this crate use throughout). A real host has a
+/// table, keyed by host version -- ordinals move between versions (996 in
+/// MBBS 6.25, 1210 in WG 1.01, 1233 in WG 2.0), so resolving against the
+/// wrong one produces plausible wrong bindings rather than errors.
+pub use crate::module::ImportResolver;
 
 /// A module in memory: which selector each of its segments got, what its
 /// exports are, and what sits behind each thunk.
@@ -834,7 +809,7 @@ impl Machine {
     /// loader refuses (a moveable segment), or if a segment cannot be mapped. An
     /// OSFIXUP relocation is not one of these: it is carried, not applied, and
     /// costs the load nothing (see [`Target::OsFixup`]).
-    pub fn load_ne(&mut self, file: &[u8], imports: &dyn ImportResolver) -> io::Result<Module> {
+    pub fn load_ne(&mut self, file: &[u8], imports: &dyn ImportResolver<FarPtr>) -> io::Result<Module> {
         let image = NeImage::parse(file)?;
         self.map_ne(&image, file, imports).map_err(io::Error::from)
     }
@@ -844,7 +819,7 @@ impl Machine {
         &mut self,
         image: &NeImage,
         file: &[u8],
-        imports: &dyn ImportResolver,
+        imports: &dyn ImportResolver<FarPtr>,
     ) -> Result<Module, NeError> {
         // Allocate first, so that every relocation has every selector it could
         // possibly name. A forward reference between segments is the ordinary

@@ -365,6 +365,76 @@ pub trait Abi {
     /// variant with the same wording -- see `mbbs_machine::m16::Poison::Unimplemented`
     /// and its `mbbs_machine::m32` mirror.
     fn unimplemented(module: String, symbol: String) -> Self::Poison;
+
+    /// A module loaded for this ABI: what selector or section each of its
+    /// pieces got, and what sits behind each thunk.
+    ///
+    /// `mbbs_machine::m16::Module` for `Wg16` (already existed before this
+    /// trait grew a loading surface at all -- see `crate::abi::wg16`).
+    /// `Wg32`'s own is Task 10's to build
+    /// (`docs/plans/2026-08-12-abi-border-implementation.md`); until then
+    /// `Wg32`'s answer is a placeholder no code calls, guarded by a `load`
+    /// that refuses to run rather than fabricate one -- see [`Abi::load`]'s
+    /// own `Wg32` implementation.
+    type Module;
+
+    /// Parse and map `file` into this ABI's own memory, resolving every
+    /// import through `resolve`.
+    ///
+    /// **Format mechanics stay inside this method; only policy crosses
+    /// `resolve`.** `resolve` answers "what does the host know about
+    /// `module.symbol`" -- a thunk, a datum's address, or (`Wg16` only) an
+    /// absolute constant, see [`mbbs_machine::module::Import`]'s own doc
+    /// comment for why that third arm cannot exist under any other ABI. How
+    /// an import site gets patched -- an NE relocation chain's fixup kinds,
+    /// a PE image's whole-slot IAT writes -- never surfaces through
+    /// `resolve` at all; it is exactly the machinery `mbbs_machine::m16::ne`
+    /// and `mbbs_machine::m32::image` already own, unrelated between the two,
+    /// and this method's implementation for `Self` is what calls into it. See
+    /// `docs/plans/2026-08-12-abi-border-design.md` §3.
+    ///
+    /// **The `MissingGlobal` refusal folds into this walk.** `Host::load`
+    /// (the generic wrapper that calls this) builds `resolve` so that every
+    /// symbol this method asks it about which the module *addresses as
+    /// data* (a fixup shape only NE relocations can express -- see
+    /// `crate::addressed_as_data`'s own doc comment) and which the host
+    /// cannot honestly place gets recorded, not merely answered `None`.
+    /// After this method returns, `Host::load` drains those records into
+    /// [`crate::LoadError::Globals`] if any exist -- so a `Wg16` module
+    /// that addresses an unplaced or too-small global still refuses to
+    /// load, exactly as it always has, but the check is no longer a
+    /// separate pass over the whole image before this one runs.
+    ///
+    /// # Errors
+    ///
+    /// If `file` is not a well-formed module for this ABI. The
+    /// `MissingGlobal` refusal above is reported by the caller, not by this
+    /// method -- see `crate::LoadError`'s own doc comment.
+    fn load(
+        cpu: &mut Self::Cpu,
+        file: &[u8],
+        resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
+    ) -> Result<Self::Module, crate::LoadError>
+    where
+        Self: Sized;
+
+    /// What thunk `index` stands for, as this ABI's own `Exit::Call` reports
+    /// it -- the only way an unimplemented import is named rather than
+    /// merely numbered. Direct delegation to the module's own lookup
+    /// (`mbbs_machine::m16::Module::import` for `Wg16`).
+    fn import(module: &Self::Module, index: u16) -> Option<&mbbs_machine::module::ImportSite>;
+
+    /// Where in the module the call being refused came from, as a place a
+    /// disassembly names -- best-effort diagnostics for `Host::run`'s own
+    /// stop message, never load-bearing for anything this crate decides.
+    ///
+    /// `None` whenever the answer would mislead rather than help: no
+    /// outstanding call, a stack that will not resolve, a selector or
+    /// section the module does not own. Segment:offset for `Wg16`
+    /// (delegates to the free function this crate already had); section and
+    /// offset for a future `Wg32` implementation, once `Wg32::Module`
+    /// carries enough to answer it (design §3).
+    fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -852,6 +922,26 @@ mod tests {
 
         fn unimplemented(_module: String, _symbol: String) -> Self::Poison {
             unreachable!("Call's read tests never call Abi::unimplemented")
+        }
+
+        // Same reasoning as `mem`/`data_ptr`/`call`/`resume` above: `Call`'s
+        // frame-read tests never load a module at all.
+        type Module = ();
+
+        fn load(
+            _cpu: &mut Self::Cpu,
+            _file: &[u8],
+            _resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
+        ) -> Result<Self::Module, crate::LoadError> {
+            unreachable!("Call's read tests never call Abi::load")
+        }
+
+        fn import(_module: &Self::Module, _index: u16) -> Option<&mbbs_machine::module::ImportSite> {
+            unreachable!("Call's read tests never call Abi::import")
+        }
+
+        fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
+            unreachable!("Call's read tests never call Abi::caller")
         }
     }
 

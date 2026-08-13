@@ -239,6 +239,46 @@ impl Abi for Wg32 {
     fn unimplemented(module: String, symbol: String) -> Self::Poison {
         mbbs_machine::m32::Poison::Unimplemented { module, symbol }
     }
+
+    /// `()`, temporarily: Task 10 builds the real PE-backed `Module` (the
+    /// demo's `pe::PeImage` parse, `Memory::load`, `relocate`, `bind_imports`
+    /// and `patch_thunk_addresses`, composed into one struct carrying the
+    /// import table). Nothing calls [`Abi::load`], [`Abi::import`] or
+    /// [`Abi::caller`] for `Wg32` yet -- see their own bodies below -- so
+    /// there is nothing this placeholder needs to hold.
+    type Module = ();
+
+    /// Not implemented. Task 10 is the real arm (see [`Wg32::Module`]'s own
+    /// doc comment for what it composes); this trait method exists now only
+    /// so `Abi` compiles with two implementations, per Task 9's brief. A
+    /// panic here is honest where `Ok(())` would not be: nothing has
+    /// actually mapped `file` or resolved a single import, so claiming
+    /// success would be the exact "shim that lies" this crate's own module
+    /// doc comment refuses to be.
+    fn load(
+        _cpu: &mut Self::Cpu,
+        _file: &[u8],
+        _resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
+    ) -> Result<Self::Module, crate::LoadError> {
+        unimplemented!(
+            "Wg32::load is Task 10's arm; nothing calls this yet (see \
+             docs/plans/2026-08-12-abi-border-implementation.md, Task 10)"
+        )
+    }
+
+    /// `None`, always: [`Wg32::Module`] is `()` until Task 10, so there is no
+    /// import table to look `index` up in.
+    fn import(_module: &Self::Module, _index: u16) -> Option<&mbbs_machine::module::ImportSite> {
+        None
+    }
+
+    /// `None`, always, for the same reason as [`Abi::import`] above -- a
+    /// `()` module carries no section table to resolve a return address
+    /// against. Not a stub awaiting a smarter answer under the *current*
+    /// `Module`; a real answer needs Task 10's real one.
+    fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
+        None
+    }
 }
 
 /// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so

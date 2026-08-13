@@ -98,8 +98,7 @@ pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
 use mbbs_machine::m16::{
-    Exit, FarPtr, Import, ImportResolver, Machine, Module, NeImage, Poison, Relocation, Ret,
-    Source, Symbol, Target,
+    Exit, FarPtr, Machine, Module, NeImage, Poison, Relocation, Ret, Source, Symbol, Target,
 };
 
 // `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
@@ -496,9 +495,12 @@ pub struct Query {
 /// needs `<Wg16>` spelled out, and this exact staleness cannot hide again.
 ///
 /// Everything that reads or writes module memory -- every method taking
-/// `&mut Machine`/`&Machine`, plus [`Host::check_globals`] (no `Machine`
-/// parameter, but built entirely around `mbbs_machine::m16::NeImage`, the 16-bit NE
-/// format `Host::load` parses) -- stays in `impl Host<Wg16>`.
+/// `&mut Machine`/`&Machine` -- stays in `impl Host<Wg16>`. `Host::load`
+/// itself moved to `impl<A: Abi> Host<A>` in Task 9
+/// (`docs/plans/2026-08-12-abi-border-implementation.md`); its own
+/// NE-specific mechanism (`check_globals`'s old refusal, now folded into
+/// `Resolver::resolve`) is private module-level machinery, not a method on
+/// `Host` at all -- see `Host::load`'s own doc comment.
 ///
 /// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
 /// session owned that file, and the field elided its parameter to say so.
@@ -1518,28 +1520,101 @@ impl<A: Abi> Host<A> {
     /// The C name of an imported symbol, or something that identifies it when
     /// the host has no name for it.
     fn symbol_name(&self, from: &str, symbol: &Symbol) -> String {
-        match symbol {
-            Symbol::Name(name) => exports::c_name(name).into_string(),
-            Symbol::Ordinal(n) => self
-                .exports
-                .name(from, *n)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("#{n}")),
+        symbol_name(self.exports, from, symbol)
+    }
+
+    /// Parse and map `file`, resolving every import against this host's own
+    /// tables, and refuse to load a module that addresses a global this
+    /// host cannot honestly place.
+    ///
+    /// Format mechanics belong to [`Abi::load`], not here -- this is the
+    /// thin wrapper design §3 describes: build the one `Resolver` this
+    /// load will use (host policy: this host's export table and placed
+    /// globals), hand it to `A::load`, then decide what the walk found.
+    ///
+    /// **Refusal is checked after the walk, not before it,** which is a
+    /// real behaviour change from the `Wg16`-only `Host::load` this
+    /// replaces: that method ran what is now `Resolver`'s own
+    /// miss-detection as a wholly separate pass over the image *before*
+    /// calling `Machine::load_ne` at all, so a refused load left the
+    /// machine untouched. Folding the check into the one resolver walk
+    /// (Task 9's own brief) means the walk -- and therefore every fixup it
+    /// applies -- runs to completion before this method ever inspects
+    /// `resolver`'s recorded misses, so a `Wg16` module that is ultimately
+    /// refused has still had `cpu` written to: segments allocated, thunks
+    /// assigned, relocations applied. No test today depends on the old
+    /// "untouched on refusal" behaviour (`LoadError::Globals` has no
+    /// synthetic fixture test, only the real-`WCCMMUD.DLL` one, which finds
+    /// zero misses) -- but a caller that gets `Err(LoadError::Globals(_))`
+    /// back must still treat `cpu` as no longer usable for a fresh load of
+    /// anything else, exactly as it always should have for any other
+    /// `LoadError`.
+    ///
+    /// The `reach` classification `Resolver` uses to decide *which* misses
+    /// matter (see `addressed_as_data`'s own doc comment) is NE
+    /// relocation mechanism -- meaningless for any other container format,
+    /// and this task's own brief forbids inventing a PE equivalent (there is
+    /// no signal in a PE import table that could answer "how far does this
+    /// fixup reach"; every PE import site is a full-width IAT write, see
+    /// `mbbs_machine::m32::image::Image::bind_imports`'s own doc comment).
+    /// So this classification is attempted against whatever bytes `file`
+    /// holds, without asking which `A` is loading them: a non-NE file (a PE
+    /// image loaded through `Wg32`, once Task 10 builds that arm) simply
+    /// fails to parse here and contributes an empty `reach`, which is
+    /// exactly what makes [`Why::TooSmall`] unreachable under `Wg32` "by
+    /// construction" -- there is no code path anywhere in this crate that
+    /// could build one without a non-empty `reach`, and `reach` is never
+    /// non-empty for a file that is not NE. This is a temporary seam, not a
+    /// permanent design point: if a second format ever grows its own
+    /// "addressed as data" signal, this is where it would need to split by
+    /// `A` -- nothing about today's single-format reality requires that
+    /// split yet.
+    ///
+    /// # Errors
+    ///
+    /// If `file` is not a well-formed module for `A`, or the module
+    /// addresses a global this host cannot honestly provide -- see
+    /// [`LoadError`].
+    pub fn load(&mut self, cpu: &mut A::Cpu, file: &[u8]) -> Result<A::Module, LoadError> {
+        let reach = NeImage::parse(file)
+            .map(|image| addressed_as_data(&image, file))
+            .unwrap_or_default();
+
+        let resolver = Resolver {
+            exports: self.exports,
+            globals: &self.globals,
+            reach,
+            missing: std::cell::RefCell::new(Vec::new()),
+        };
+
+        let module = A::load(cpu, file, &resolver)?;
+
+        let mut missing = resolver.missing.into_inner();
+        if missing.is_empty() {
+            Ok(module)
+        } else {
+            missing.sort_by(|a, b| (&a.module, &a.symbol).cmp(&(&b.module, &b.symbol)));
+            Err(LoadError::Globals(missing))
         }
     }
 }
 
-/// Everything that reads or writes module memory, plus
-/// [`Host::check_globals`] (no `Machine` parameter, but built around
-/// `mbbs_machine::m16::NeImage`, which `Host::load` parses -- 16-bit-format-specific
-/// by construction, same as `Host::load` itself) and [`Host::dos_name`] (no
-/// `Machine` parameter and no use of `Self` at all -- it stays here purely
-/// because it has no `self`: every call site names it as `Host::dos_name(...)`,
-/// and with no argument or return type mentioning `A`, `rustc` cannot infer
-/// which `Abi` a bare `impl<A: Abi> Host<A>` copy would mean, only reporting
-/// "type annotations needed" -- moving it into the generic block would force
-/// every one of those call sites to spell out `Host::<Wg16>::dos_name(...)`
-/// for a function that has no ABI-dependent behaviour to abstract over).
+/// Everything that reads or writes module memory, plus [`Host::dos_name`]
+/// (no `Machine` parameter and no use of `Self` at all -- it stays here
+/// purely because it has no `self`: every call site names it as
+/// `Host::dos_name(...)`, and with no argument or return type mentioning
+/// `A`, `rustc` cannot infer which `Abi` a bare `impl<A: Abi> Host<A>` copy
+/// would mean, only reporting "type annotations needed" -- moving it into
+/// the generic block would force every one of those call sites to spell out
+/// `Host::<Wg16>::dos_name(...)` for a function that has no ABI-dependent
+/// behaviour to abstract over).
+///
+/// `Host::load` -- and the NE-specific mechanism `check_globals` used to be,
+/// now folded into `Resolver::resolve` -- moved out of this block in Task 9
+/// (`docs/plans/2026-08-12-abi-border-implementation.md`): loading crosses
+/// the `Abi` trait now, so the wrapper is `impl<A: Abi> Host<A>` and only
+/// the format-specific arm (`Abi::load`'s `Wg16` implementation,
+/// `crates/mbbs/src/abi/wg16.rs`) is concrete.
 impl Host<Wg16> {
     /// The file a module named, with the directory it is allowed to name
     /// stripped off.
@@ -3005,32 +3080,6 @@ impl Host<Wg16> {
         Ok(())
     }
 
-    /// Load a module, binding its imports to this host.
-    ///
-    /// The globals the module addresses are checked *before* anything is
-    /// mapped, because the failure they would otherwise produce is silent: a
-    /// datum the host does not place gets a thunk, and a module reading a
-    /// thunk as a variable reads executable bytes and carries on.
-    ///
-    /// # Errors
-    ///
-    /// If the file is not a well-formed NE module, or the module addresses a
-    /// global the host cannot provide.
-    pub fn load(&mut self, machine: &mut Machine, file: &[u8]) -> Result<Module, LoadError> {
-        let image = NeImage::parse(file).map_err(io::Error::from)?;
-
-        let missing = self.check_globals(&image, file);
-        if !missing.is_empty() {
-            return Err(LoadError::Globals(missing));
-        }
-
-        let resolver = Resolver {
-            exports: self.exports,
-            globals: &self.globals,
-        };
-        Ok(machine.load_ne(file, &resolver)?)
-    }
-
     /// Call a module entry point, servicing its imports until it stops.
     ///
     /// `chan` names which channel this call is being made on -- purely for
@@ -3246,38 +3295,6 @@ impl Host<Wg16> {
             },
         )
     }
-
-    /// Every global the module addresses that the host cannot honestly place.
-    fn check_globals(&self, image: &NeImage, file: &[u8]) -> Vec<MissingGlobal> {
-        let mut missing = Vec::new();
-        for ((from, symbol), reach) in addressed_as_data(image, file) {
-            let name = self.symbol_name(&from, &symbol);
-            let why = match shims::entry::<Wg16>(&from, &name) {
-                // A constant has no memory to be too small, and a routine whose
-                // address is taken in pieces is a routine -- the thunk's
-                // address is the right thing to write.
-                Entry::Absolute(_) | Entry::Routine(..) => continue,
-                Entry::Unimplemented => Why::NotPlaced,
-                Entry::Datum => {
-                    let size = self.globals.size(&name).expect("a datum is placed");
-                    if reach.max < i32::from(size) {
-                        continue;
-                    }
-                    Why::TooSmall {
-                        addend: reach.max as i16,
-                        size,
-                    }
-                }
-            };
-            missing.push(MissingGlobal {
-                module: from,
-                symbol: name,
-                why,
-            });
-        }
-        missing.sort_by(|a, b| (&a.module, &a.symbol).cmp(&(&b.module, &b.symbol)));
-        missing
-    }
 }
 
 /// How far into a symbol the module's fixups reach.
@@ -3361,25 +3378,117 @@ fn addend(reloc: &Relocation, segment: &[u8]) -> i16 {
     }
 }
 
-/// Answers "what is `MAJORBBS.474`?" for the loader.
-struct Resolver<'a> {
-    exports: &'static Exports,
-    globals: &'a Globals<Wg16>,
+/// The C name of an imported symbol, or something that identifies it when
+/// `exports` has no name for it (`"#42"` for an ordinal no table names).
+///
+/// A free function rather than only [`Host::symbol_name`] because
+/// [`Resolver`] needs the identical computation and is not a `Host` --
+/// see [`Resolver::resolve`]'s own doc comment for why the two used to
+/// disagree (one gave up early on an unnamed ordinal, the other always
+/// produced a display string) and why the fold requires them to agree.
+fn symbol_name(exports: &Exports, from: &str, symbol: &Symbol) -> String {
+    match symbol {
+        Symbol::Name(name) => exports::c_name(name).into_string(),
+        Symbol::Ordinal(n) => exports
+            .name(from, *n)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("#{n}")),
+    }
 }
 
-impl ImportResolver for Resolver<'_> {
-    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import> {
-        let name = match symbol {
-            Symbol::Name(name) => exports::c_name(name).into_string(),
-            Symbol::Ordinal(n) => self.exports.name(module, *n)?.to_owned(),
-        };
+/// Answers "what is `MAJORBBS.474`?" for the loader -- and, folded in, what
+/// used to be [`Host`]'s own separate `check_globals` pass.
+///
+/// Generic over `A` since Task 9 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`, but only ever built
+/// for `Wg16` today: `Wg32::load` is Task 10's arm, unwritten. Nothing about
+/// this type assumes `Wg16` -- see [`Import`]/`Host::load`'s own doc
+/// comments for the one arm (`reach`) that is NE-specific mechanism reused
+/// generically rather than NE-specific *policy*.
+struct Resolver<'a, A: Abi> {
+    exports: &'static Exports,
+    globals: &'a Globals<A>,
 
-        match shims::entry::<Wg16>(module, &name) {
+    /// How far into each data-addressed symbol this module's own
+    /// relocations reach -- see [`addressed_as_data`]'s own doc comment.
+    /// Always empty for anything that does not parse as an NE image (a PE
+    /// image, today): there is no equivalent question a PE import table can
+    /// answer, and `Host::load` builds this without knowing which ABI it is
+    /// building it for -- see that method's own doc comment.
+    reach: HashMap<(String, Symbol), Reach>,
+
+    /// [`MissingGlobal`]s found during the walk, recorded here instead of
+    /// through a second pass over the whole image -- this is the fold
+    /// itself. `RefCell` because [`mbbs_machine::module::ImportResolver::resolve`]
+    /// takes `&self` (shared with every other symbol this walk resolves,
+    /// including ones cached and never re-asked -- see
+    /// `mbbs_machine::m16::ne::Machine::map_ne`'s own doc comment on why a
+    /// resolver is asked once per distinct symbol, not once per site).
+    missing: std::cell::RefCell<Vec<MissingGlobal>>,
+}
+
+impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
+    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<mbbs_machine::module::Import<A::Ptr>> {
+        // One name computation, reused for both the miss check below and
+        // the value this method returns -- `Resolver::resolve` used to
+        // compute its own (via a fallible `self.exports.name(..)?`, which
+        // gave up on an unnamed ordinal before ever asking `shims::entry`
+        // about it), and `Host::check_globals` computed a second, always-
+        // succeeding one (`Host::symbol_name`'s own `"#{n}"` fallback) for
+        // display. Folding the two walks into one forces them onto the same
+        // name, and the always-succeeding one is the right one to keep:
+        // `shims::entry(module, "#42")` answers `Entry::Unimplemented` for
+        // an ordinal no export table names, exactly as the fallible version
+        // did by giving up early -- so the resolved *value* is identical
+        // either way, and the miss-detection side gets a real symbol string
+        // to report instead of silently skipping an ordinal it cannot name.
+        let name = symbol_name(self.exports, module, symbol);
+        let entry = shims::entry::<A>(module, &name);
+
+        // The fold: `Host::check_globals` used to walk `addressed_as_data`'s
+        // whole map as a separate pass before any fixup was written. Here
+        // it is the same check, run inline for whichever symbol this call
+        // is already resolving -- only for a symbol this module's own
+        // relocations address *as data* (`reach.get` answers at all only
+        // for those; see `Reach`/`addressed_as_data`'s own doc comments).
+        // `Why::TooSmall` can only ever be built here: nothing else in this
+        // crate ever constructs a `Reach` to build one from, and `reach` is
+        // unconditionally empty for a format that is not NE (see
+        // `Host::load`'s own doc comment) -- which is what makes it
+        // unreachable under `Wg32` by construction, not merely unexercised.
+        if let Some(reach) = self.reach.get(&(module.to_owned(), symbol.clone())) {
+            match entry {
+                // A constant has no memory to be too small, and a routine
+                // whose address is taken in pieces is a routine -- the
+                // thunk's address is the right thing to write.
+                Entry::Absolute(_) | Entry::Routine(..) => {}
+                Entry::Unimplemented => self.missing.borrow_mut().push(MissingGlobal {
+                    module: module.to_owned(),
+                    symbol: name.clone(),
+                    why: Why::NotPlaced,
+                }),
+                Entry::Datum => {
+                    let size = self.globals.size(&name).expect("a datum is placed");
+                    if reach.max >= i32::from(size) {
+                        self.missing.borrow_mut().push(MissingGlobal {
+                            module: module.to_owned(),
+                            symbol: name.clone(),
+                            why: Why::TooSmall {
+                                addend: reach.max as i16,
+                                size,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+
+        match entry {
             // A datum is addressed, never called, so the host's own memory goes
             // into the fixup and nothing is ever dispatched for it.
-            Entry::Datum => Some(Import::Data(self.globals.address(&name)?)),
-            Entry::Absolute(value) => Some(Import::Absolute(value)),
-            Entry::Routine(..) => Some(Import::Routine),
+            Entry::Datum => Some(mbbs_machine::module::Import::Data(self.globals.address(&name)?)),
+            Entry::Absolute(value) => Some(mbbs_machine::module::Import::Absolute(value)),
+            Entry::Routine(..) => Some(mbbs_machine::module::Import::Routine),
 
             // The loader gives it a thunk anyway. That is what makes calling it
             // an event the host is told about rather than a far call into

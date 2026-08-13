@@ -72,6 +72,73 @@ impl fmt::Display for ImportSite {
     }
 }
 
+/// What a host answers "what is `<module>.<symbol>`?" with, in this format's
+/// own address representation.
+///
+/// `Ptr` is a raw address type (`m16::FarPtr`, `m32::Flat32Ptr`'s inner
+/// `u32`), not `crate` -- neither `m16` nor `m32` -- so this stays reachable
+/// from both without either depending on the other (`tests/no_cross_imports.rs`
+/// fences that). The host-level policy that decides *which* `Import` a
+/// symbol resolves to is one level up, in `crates/mbbs`'s `Resolver<A>` --
+/// this only names the shape the answer takes once decided.
+///
+/// **`Absolute` has no PE counterpart, and a PE resolver must refuse one
+/// rather than silently drop it or bind it as data.** An NE fixup can patch
+/// *part* of an address into an instruction's own immediate field
+/// (`DOSCALLS.135`'s huge-shift constant, 13 fixup sites in `WCCMMUD.DLL` --
+/// see `m16::ne`'s own module doc comment); a PE fixup always writes a
+/// whole address-sized IAT slot and never an instruction's immediate (see
+/// `m32::image::Image::bind_imports`'s own doc comment, "every import site
+/// is a full-width IAT write"). So a PE-format resolver being asked to bind
+/// an `Absolute` means either the resolver answered for the wrong ABI, or a
+/// symbol the host's own table marks `Absolute` reached a PE import site at
+/// all -- both are host bugs, not something a loader can route around, and
+/// both deserve to stop the load rather than be coerced into something that
+/// merely compiles.
+///
+/// This variant is carried in the one shared enum, rather than splitting
+/// `Import` into a 3-variant NE version and a 2-variant PE version, because
+/// the *decision* "what does this symbol mean" (`Entry::Absolute` in
+/// `crates/mbbs`'s shim table) is host policy that does not know which
+/// container format is asking -- see `Resolver<A>::resolve`'s own doc
+/// comment. Splitting the enum would only move the same refusal one level
+/// up, into policy code that has even less business knowing about PE fixup
+/// mechanics than the PE loader itself does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Import<Ptr> {
+    /// A host routine. It gets a thunk, and calling it is reported as a
+    /// call to thunk `index` by whichever `Exit` this format's machine
+    /// answers.
+    Routine,
+
+    /// A host global the module addresses directly.
+    Data(Ptr),
+
+    /// A constant with no address at all -- see this enum's own doc
+    /// comment for why only NE can ever produce or consume one.
+    Absolute(u16),
+}
+
+/// How a host answers "what is `<module>.<symbol>`?", for either container
+/// format -- the loader that calls this never learns which. `Ptr` matches
+/// whichever `Import<Ptr>` the answer comes back as.
+///
+/// Implemented for any suitable closure, which is what tests and examples
+/// want; a real host has a table, keyed by version (see `crates/mbbs`'s
+/// `Resolver<A>`).
+pub trait ImportResolver<Ptr> {
+    /// `None` for a symbol the host does not implement. The loader still
+    /// gives it a thunk, so that calling it is a diagnosable event rather
+    /// than a call into nothing.
+    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import<Ptr>>;
+}
+
+impl<Ptr, F: Fn(&str, &Symbol) -> Option<Import<Ptr>>> ImportResolver<Ptr> for F {
+    fn resolve(&self, module: &str, symbol: &Symbol) -> Option<Import<Ptr>> {
+        self(module, symbol)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

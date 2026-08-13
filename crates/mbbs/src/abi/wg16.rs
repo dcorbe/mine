@@ -150,6 +150,32 @@ impl Abi for Wg16 {
     fn unimplemented(module: String, symbol: String) -> Self::Poison {
         mbbs_machine::m16::Poison::Unimplemented { module, symbol }
     }
+
+    type Module = mbbs_machine::m16::Module;
+
+    /// Direct delegation to `Machine::load_ne` -- the NE parse, segment
+    /// allocation and relocation walk this crate always had; `resolve`'s
+    /// own type already matches `Machine::load_ne`'s (both speak
+    /// [`mbbs_machine::module::ImportResolver<FarPtr>`]), so no adapter sits
+    /// between them.
+    fn load(
+        cpu: &mut Self::Cpu,
+        file: &[u8],
+        resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
+    ) -> Result<Self::Module, crate::LoadError> {
+        Ok(cpu.load_ne(file, resolve)?)
+    }
+
+    fn import(module: &Self::Module, index: u16) -> Option<&mbbs_machine::module::ImportSite> {
+        module.import(index)
+    }
+
+    /// Delegates to the free function this crate had before `Abi` grew a
+    /// loading surface -- see `crate::caller`'s own doc comment for the
+    /// "seg NN:offset" shape this answers in.
+    fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
+        crate::caller(cpu, module)
+    }
 }
 
 /// [`mbbs_machine::m16::Exit`] converted to [`Exit<Wg16>`] -- `Fault`/`Timeout`
