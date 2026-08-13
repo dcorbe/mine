@@ -452,6 +452,36 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
     mbbs_machine::m16::SELECTOR_STEP.ilog2() as u16,
 )];
 
+/// The library name a 32-bit PE import table names the game-host API by,
+/// mapped onto the name every table in this file already keys it as.
+///
+/// Measured (`docs/plans/2026-08-12-abi-border-implementation.md`, Task 15's
+/// unstated dependency, and confirmed here by the round-trip test this
+/// function exists for): 16-bit MajorBBS modules import the game API from a
+/// DLL/segment named `MAJORBBS` (`crate::exports::MAJORBBS`, and every entry
+/// in [`routines`]/[`WG16_ROUTINES`]), but Worldgroup NT's PE modules import
+/// the *identical* symbols from `WGSERVER.EXE` -- confirmed against the real
+/// DLL with `objdump -p` (`WGSERVER.EXE!_l2as`). The API renamed at the file
+/// level when Worldgroup moved off segmented DOS binaries; the dispatch
+/// table underneath did not, so one alias -- not a per-symbol rename -- is
+/// the whole gap. `_l2as`'s leading underscore is unrelated and already
+/// handled: `exports::c_name` strips it before a symbol name ever reaches
+/// this function, uniformly for both container formats.
+///
+/// This stays a single, named alias -- not a general suffix-stripping rule
+/// -- until real data asks for a second one (design doc's "Known edges,
+/// named now": `GALGSBL`'s and `cw3220mt`'s own 32-bit import names are
+/// still unmeasured against this table). Case-insensitive because PE import
+/// directory names are conventionally upper-cased but nothing in the format
+/// requires it.
+fn canonical_dll(dll: &str) -> &str {
+    if dll.eq_ignore_ascii_case("WGSERVER.EXE") {
+        MAJORBBS
+    } else {
+        dll
+    }
+}
+
 /// What the host knows about a symbol, for `A`.
 ///
 /// `symbol` is the C name when the export tables have one and `#<ordinal>` when
@@ -464,7 +494,13 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// is [`Entry::Unimplemented`], exactly as it always has been; an `Abi` whose
 /// `native` returns `None` for everything (`Wg32`, today) walks the same
 /// already-tested path a genuinely unimplemented symbol always has.
+///
+/// `dll` is canonicalised once, here, through [`canonical_dll`] -- the one
+/// choke point both of this crate's callers (`Resolver::resolve` at load
+/// time, `Host::run`'s dispatch loop at call time) already go through, so
+/// neither needs its own copy of the alias.
 pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
+    let dll = canonical_dll(dll);
     if let Some((_, _, shim, cleans)) = routines::<A>()
         .into_iter()
         .find(|(d, n, _, _)| *d == dll && *n == symbol)
@@ -548,6 +584,37 @@ mod tests {
         // other's memory.
         assert!(matches!(entry::<Wg16>(MAJORBBS, "bturno"), Entry::Unimplemented));
         assert!(matches!(entry::<Wg16>(GALGSBL, "usrnum"), Entry::Unimplemented));
+    }
+
+    /// Task 15's unstated dependency, settled: the real PE spells the
+    /// game-host library `WGSERVER.EXE` (confirmed by `objdump -p` against
+    /// the reference DLL) where every entry in [`routines`] keys it
+    /// `MAJORBBS`. Without [`canonical_dll`], `entry::<Wg32>("WGSERVER.EXE",
+    /// "l2as")` finds nothing at all -- not because `l2as` has no generic
+    /// core (it does, and `Wg16` already reaches it under its own DLL
+    /// name), but because the DLL name never matches. This is the
+    /// mutation-worthy assertion: delete `canonical_dll`'s call in `entry`
+    /// and this goes from `Routine` to `Unimplemented`.
+    #[test]
+    fn wgserver_exe_aliases_onto_majorbbs_for_wg32() {
+        assert!(matches!(
+            entry::<crate::abi::Wg32>("WGSERVER.EXE", "l2as"),
+            Entry::Routine(..)
+        ));
+        // Case-insensitively: PE import directory names are conventionally
+        // upper-cased, but nothing in the format requires it, and this
+        // crate's own resolver must not depend on a case the real DLL
+        // happens to use today.
+        assert!(matches!(
+            entry::<crate::abi::Wg32>("wgserver.exe", "l2as"),
+            Entry::Routine(..)
+        ));
+        // The alias is exactly one name -- it must not swallow an unrelated
+        // DLL that merely shares a suffix or a prefix.
+        assert!(matches!(
+            entry::<crate::abi::Wg32>("GALGSBL.DLL", "l2as"),
+            Entry::Unimplemented
+        ));
     }
 
     #[test]
