@@ -1609,7 +1609,7 @@ impl Host<Wg16> {
         // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
         // module allocates from. So the heap has to exist before they do.
         let mut heap = Heap::<Wg16>::new(Config::default());
-        let users = users::Users::new(machine, &mut heap, terms)?;
+        let users = users::Users::new(machine.mem_mut(), &mut heap, terms)?;
 
         // The three authorities, checked against each other once.
         //
@@ -1749,7 +1749,7 @@ impl Host<Wg16> {
         chan: Chan,
         n: usize,
     ) -> io::Result<Result<Dispatch, ShimError>> {
-        let state = match self.users.state(machine, chan) {
+        let state = match self.users.state_mem(machine.mem(), chan) {
             Ok(state) => state,
             Err(e) => return Ok(Err(e)),
         };
@@ -1986,7 +1986,7 @@ impl Host<Wg16> {
         // routine, and `polrou` is a pointer into module code installed for
         // *them*. Cleared for the same reason `userid` above is zeroed whole:
         // this function runs again on a reused channel.
-        self.users.set_polrou(machine, chan, None)?;
+        self.users.set_polrou_mem(machine.mem_mut(), chan, None)?;
 
         // `MASTER`, `MAJORBBS.H:206` -- bit 0x40 of `user.flags`, whose low
         // byte is at offset 0x14. Read-modify-write on that one bit: the rest
@@ -2373,7 +2373,7 @@ impl Host<Wg16> {
         module: &Module,
         chan: Chan,
     ) -> io::Result<Option<Outcome>> {
-        let rou = match self.users.polrou(machine, chan) {
+        let rou = match self.users.polrou_mem(machine.mem(), chan) {
             Ok(Some(rou)) => rou,
             Ok(None) => return Ok(None),
             Err(e) => return self.shim_stop(machine, "dopoll", e).map(Some),
@@ -2403,7 +2403,7 @@ impl Host<Wg16> {
         // `pending()` is permanently true, and `cycle` can never tell a driver
         // it is safe to sleep.
         if self.polls_left > 0 && matches!(outcome, Outcome::Returned { .. }) {
-            match self.users.polrou(machine, chan) {
+            match self.users.polrou_mem(machine.mem(), chan) {
                 Ok(Some(_)) => {
                     self.gsbl.inject(chan, gsbl::Gsbl::POLSTS);
                 }
@@ -2708,7 +2708,7 @@ impl Host<Wg16> {
             if self.gsbl.polling_armed(chan) {
                 continue;
             }
-            match self.users.polrou(machine, chan) {
+            match self.users.polrou_mem(machine.mem(), chan) {
                 Ok(Some(_)) => self.gsbl.inject(chan, gsbl::Gsbl::POLSTS),
                 Ok(None) => {}
                 Err(e) => {
@@ -2968,7 +2968,8 @@ impl Host<Wg16> {
         if size == 0 {
             return Ok(());
         }
-        self.users.alcvda(machine, &mut self.heap, size)?;
+        self.users
+            .alcvda_mem(machine.mem_mut(), &mut self.heap, size)?;
         let console = self
             .users
             .terms()
@@ -4936,7 +4937,7 @@ mod tests {
         };
         f.host
             .users
-            .set_polrou(&mut f.machine, console, Some(stale))
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(stale))
             .expect("channel 0");
 
         f.host
@@ -4948,7 +4949,7 @@ mod tests {
             .expect("connected");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             None,
             "the new user must not inherit the old user's poll routine"
         );
@@ -4985,7 +4986,7 @@ mod tests {
         let console = f.console();
         f.host
             .users
-            .set_polrou(&mut f.machine, console, Some(rou))
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
         f.host.refill_polls(&f.machine, 2).expect("armed");
 
@@ -5043,7 +5044,7 @@ mod tests {
 
         f.host
             .users
-            .set_polrou(&mut f.machine, console, Some(rou))
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
         // A budget, and it is what makes this test a test at all. `dopoll`'s
         // re-arm is gated `polls_left > 0 && ..`, so at the default budget of
@@ -5060,7 +5061,7 @@ mod tests {
             "got {outcome:?}"
         );
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             None,
             "the routine cleared it mid-call"
         );
@@ -5214,7 +5215,7 @@ mod tests {
     fn a_polling_channel_ticks_until_the_bound() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.refill_polls(&f.machine, 1_000).expect("armed");
 
         let cycles = f.host.cycle(&mut f.machine, &module, 20).expect("cycled");
@@ -5246,7 +5247,7 @@ mod tests {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
         f.host.set_clock(Clock::pinned(1_135_952_405));
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.refill_polls(&f.machine, 1_000).expect("armed");
         f.host.kicks.push(Kick { delay: 300, dstrou: rou });
         f.host.kicks.push(Kick { delay: 7, dstrou: rou });
@@ -5353,7 +5354,7 @@ mod tests {
     fn the_poll_budget_bounds_dispatches_and_leaves_nothing_queued() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&f.machine, 5).expect("armed");
         let cycles = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
@@ -5377,7 +5378,7 @@ mod tests {
     fn a_refill_arms_the_chain_again_after_the_budget_ran_out() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&f.machine, 3).expect("armed");
         let first = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
@@ -5396,7 +5397,7 @@ mod tests {
     fn a_refill_does_not_arm_a_channel_that_is_already_armed() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&f.machine, 100).expect("armed");
         // One pass: dispatches one poll, and `dopoll` re-arms because budget
@@ -5439,7 +5440,7 @@ mod tests {
         for chan in [zero, two] {
             f.host
                 .users
-                .set_polrou(&mut f.machine, chan, Some(rou))
+                .set_polrou_mem(f.machine.mem_mut(), chan, Some(rou))
                 .expect("a polling channel");
         }
 
@@ -5484,7 +5485,7 @@ mod tests {
     fn a_refill_of_zero_arms_nothing_and_dispatches_nothing() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
 
         f.host.refill_polls(&f.machine, 0).expect("granted nothing");
 
@@ -5501,7 +5502,7 @@ mod tests {
     fn polls_cut_says_the_budget_was_the_thing_that_stopped_it() {
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.kicks.push(Kick { delay: 60, dstrou: rou });
         f.host.set_clock(Clock::pinned(1_135_952_405));
 
@@ -5510,7 +5511,7 @@ mod tests {
         assert_eq!(cut.ended, Ended::Waiting { next_kick: 60, polls_cut: true });
 
         // Nothing polling: the budget is untouched, so nothing was cut.
-        f.host.users.set_polrou(&mut f.machine, console, None).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, None).expect("channel 0");
         f.host.refill_polls(&f.machine, 2).expect("nothing to arm");
         let uncut = f.host.cycle(&mut f.machine, &module, 1_000).expect("cycled");
         assert_eq!(uncut.ended, Ended::Waiting { next_kick: 60, polls_cut: false });
@@ -5658,7 +5659,7 @@ mod tests {
 
         let (mut f, module, rou) = polling_fixture();
         let console = f.console();
-        f.host.users.set_polrou(&mut f.machine, console, Some(rou)).expect("channel 0");
+        f.host.users.set_polrou_mem(f.machine.mem_mut(), console, Some(rou)).expect("channel 0");
         f.host.gsbl_mut().inject(console, gsbl::Gsbl::POLSTS);
         let at = std::time::Instant::now();
         let busy = f.host.cycle(&mut f.machine, &module, n).expect("cycled");
@@ -6119,7 +6120,7 @@ mod tests {
 
         f.host
             .users
-            .set_polrou(&mut f.machine, console, Some(rou))
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
         f.host.refill_polls(&f.machine, 1).expect("armed");
 

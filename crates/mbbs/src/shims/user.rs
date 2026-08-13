@@ -639,7 +639,7 @@ mod tests {
             .expect("installed");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             Some(rou)
         );
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::POLSTS));
@@ -660,7 +660,7 @@ mod tests {
             .expect("installed");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             Some(rou),
             "the routine is still installed"
         );
@@ -687,7 +687,7 @@ mod tests {
             .expect("replaced");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             Some(second),
             "the new routine replaces the old one"
         );
@@ -710,7 +710,7 @@ mod tests {
         f.invoke(stop_polling_wg16, &[0]).expect("stopped");
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             None
         );
         assert_eq!(f.host.gsbl_mut().next_status(console), None);

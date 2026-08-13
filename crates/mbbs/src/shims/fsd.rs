@@ -3097,7 +3097,7 @@ mod tests {
             !f.host.gsbl_mut().channel_mut(chan).raw,
             "not raw before fsdego"
         );
-        assert_eq!(f.host.users().state(&f.machine, chan).expect("read"), 0);
+        assert_eq!(f.host.users().state_mem(f.machine.mem(), chan).expect("read"), 0);
 
         assert!(matches!(
             f.invoke(
@@ -3108,12 +3108,12 @@ mod tests {
         ));
 
         assert_eq!(
-            f.host.users().state(&f.machine, chan).expect("read"),
+            f.host.users().state_mem(f.machine.mem(), chan).expect("read"),
             f.host.fsd_state() as u16,
             "usrptr->state = fsdstt"
         );
         assert_eq!(
-            f.host.users().substt(&f.machine, chan).expect("read"),
+            f.host.users().substt_mem(f.machine.mem(), chan).expect("read"),
             ENTERING,
             "usrptr->substt = ENTERING"
         );
@@ -3197,8 +3197,8 @@ mod tests {
         assert!(format!("{e}").contains("no such form"), "{e}");
 
         // And refusing did not half-mutate anything on the way there.
-        assert_eq!(f.host.users().state(&f.machine, chan).expect("read"), 0);
-        assert_eq!(f.host.users().substt(&f.machine, chan).expect("read"), 0);
+        assert_eq!(f.host.users().state_mem(f.machine.mem(), chan).expect("read"), 0);
+        assert_eq!(f.host.users().substt_mem(f.machine.mem(), chan).expect("read"), 0);
         assert!(f.host.fsd_sessions[chan.index()].is_none());
         assert!(!f.host.gsbl_mut().channel_mut(chan).raw, "fsdcon did not run");
     }

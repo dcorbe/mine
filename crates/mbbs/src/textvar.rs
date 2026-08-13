@@ -28,7 +28,6 @@
 //! `varrou` at `+0x10`. Twenty bytes, which is the `imul ax,ax,0x14` the host's
 //! own `register_textvar` uses throughout.
 
-use mbbs16::{FarPtr, Machine};
 use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, Wg16};
@@ -166,8 +165,7 @@ impl<A: Abi> TextVars<A> {
     /// on every access -- `les bx,[es:txtvars]` -- so a table that moves is a
     /// table it follows.
     ///
-    /// The generic core [`TextVars::push`]'s `Wg16` facade delegates into --
-    /// see the struct's own doc comment for why the two need different names.
+    /// The `_mem` suffix is vestigial -- see the struct's own doc comment.
     /// Errors come back as [`ShimError::Failed`] rather than
     /// [`ShimError::BadPointer`] here: that variant carries `mbbs16`'s own
     /// `FarPtrError`, which a generic `A::Ptr::Error` is not.
@@ -254,8 +252,7 @@ impl<A: Abi> TextVars<A> {
     /// Read back every time rather than remembered. The table is memory the
     /// module can reach and change, so what it holds now is the answer.
     ///
-    /// The generic core [`TextVars::get`]'s `Wg16` facade delegates into --
-    /// see the struct's own doc comment for why the two need different names.
+    /// The `_mem` suffix is vestigial -- see the struct's own doc comment.
     ///
     /// # Errors
     ///
@@ -292,43 +289,15 @@ impl<A: Abi> TextVars<A> {
     }
 }
 
-impl TextVars<Wg16> {
-    /// Add a row, growing the table by one record.
-    ///
-    /// Reborrows into [`TextVars::push_mem`] through [`Machine::mem_mut`] --
-    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
-    ///
-    /// # Errors
-    ///
-    /// If the name is empty, if the table would outgrow a segment, or if the
-    /// heap has no room.
-    pub fn push(
-        &mut self,
-        machine: &mut Machine,
-        heap: &mut Heap,
-        name: &str,
-        varrou: FarPtr,
-    ) -> Result<u16, ShimError> {
-        self.push_mem(machine.mem_mut(), heap, name, varrou)
-    }
-
-    /// Row `n`, read out of module memory, or `None` if there is no such row.
-    ///
-    /// Reborrows into [`TextVars::get_mem`] through [`Machine::mem`] -- the
-    /// read-only counterpart to `push`'s [`Machine::mem_mut`] reborrow.
-    ///
-    /// # Errors
-    ///
-    /// If the table no longer names memory that can be read.
-    pub fn get(&self, machine: &Machine, n: u16) -> Result<Option<TextVar>, ShimError> {
-        self.get_mem(machine.mem(), n)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+    // Wg16-only, and deliberately scoped to the fixtures rather than the
+    // file: production code here reaches memory through `A::Ptr` now, so a
+    // file-level import would be an unused one in the non-test build and a
+    // standing invitation to reintroduce the coupling above.
+    use mbbs16::FarPtr;
 
     #[test]
     fn an_empty_table_has_no_pointer_and_no_rows() {
@@ -355,12 +324,15 @@ mod tests {
         };
         let mut table = TextVars::default();
         let n = table
-            .push(&mut f.machine, &mut f.host.heap, "MUDCHARINFO", varrou)
+            .push_mem(f.machine.mem_mut(), &mut f.host.heap, "MUDCHARINFO", varrou)
             .expect("registered");
 
         assert_eq!(n, 0, "the first text variable is number zero");
         assert_eq!(table.len(), 1);
-        let row = table.get(&f.machine, 0).expect("readable").expect("a row");
+        let row = table
+            .get_mem(f.machine.mem(), 0)
+            .expect("readable")
+            .expect("a row");
         assert_eq!(row.name, "MUDCHARINFO");
         assert_eq!(row.varrou, Some(varrou));
     }

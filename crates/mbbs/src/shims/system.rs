@@ -1967,7 +1967,7 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get(&f.machine, 0)
+            .get_mem(f.machine.mem(), 0)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "MUDCHARINFO");
@@ -2021,7 +2021,7 @@ mod tests {
         let row0 = f
             .host
             .textvars()
-            .get(&f.machine, 0)
+            .get_mem(f.machine.mem(), 0)
             .expect("readable")
             .expect("a row");
         assert_eq!(row0.name, "MUDCHARINFO", "the first row came along");
@@ -2030,14 +2030,14 @@ mod tests {
         let row1 = f
             .host
             .textvars()
-            .get(&f.machine, 1)
+            .get_mem(f.machine.mem(), 1)
             .expect("readable")
             .expect("a row");
         assert_eq!(row1.name, "USERID");
         assert_eq!(row1.varrou, Some(b));
 
         assert_eq!(
-            f.host.textvars().get(&f.machine, 2).expect("readable"),
+            f.host.textvars().get_mem(f.machine.mem(), 2).expect("readable"),
             None,
             "and there is no third"
         );
@@ -2065,7 +2065,7 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get(&f.machine, 0)
+            .get_mem(f.machine.mem(), 0)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "ABCDEFGHIJKLMNO", "fifteen and a terminator");
@@ -2087,7 +2087,7 @@ mod tests {
         let row = f
             .host
             .textvars()
-            .get(&f.machine, 0)
+            .get_mem(f.machine.mem(), 0)
             .expect("readable")
             .expect("a row");
         assert_eq!(row.name, "MUDCHARINFO");

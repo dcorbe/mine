@@ -43,7 +43,6 @@
 
 use std::io;
 
-use mbbs16::{FarPtr, Machine};
 use mbbs_ptr::ModulePtr;
 
 use crate::ShimError;
@@ -560,7 +559,7 @@ impl<A: Abi> Users<A> {
     }
 }
 
-impl Users<Wg16> {
+impl<A: Abi> Users<A> {
     /// Allocate `terms` channels' worth of everything, zeroed.
     ///
     /// `alczer` and not `alcmem`, at `MAJORBBS.C:735-736`, and `ACCOUNT.C:112`
@@ -568,19 +567,29 @@ impl Users<Wg16> {
     /// whose `state` came up as whatever the heap last held would be in some
     /// module the module never entered.
     ///
+    /// Takes `&mut A::Mem` rather than the `&mut Machine` it was written
+    /// with. Construction was left 16-bit on the reasoning `Globals`' doc
+    /// comment still gives -- "construction and 32-bit widths are a later
+    /// task's concern" -- but nothing here was ever 16-bit in substance: the
+    /// three allocations are [`Heap::reserve`], the fills are
+    /// [`ModulePtr::write`], and the sentinel arithmetic is
+    /// [`Abi::ptr_offset`]. All three had generic forms already, and the only
+    /// thing pinning this to `Wg16` was that it had not been asked.
+    ///
     /// # Errors
     ///
     /// If the heap has no room.
-    pub fn new(machine: &mut Machine, heap: &mut crate::Heap, terms: Terms) -> io::Result<Self> {
+    pub fn new(mem: &mut A::Mem, heap: &mut crate::Heap<A>, terms: Terms) -> io::Result<Self> {
         let count = terms.count();
-        let mut block = |each: u16| -> io::Result<FarPtr> {
+        let mut block = |each: u16| -> io::Result<A::Ptr> {
             let bytes = each
                 .checked_mul(count)
                 .ok_or_else(|| io::Error::other(format!("{count} channels of {each} bytes")))?;
-            let at = heap.alloc(machine, bytes).map_err(io::Error::other)?;
-            machine
-                .write(at, &vec![0u8; usize::from(bytes)])
-                .map_err(io::Error::other)?;
+            let at = heap
+                .reserve(mem, bytes)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            at.write(mem, &vec![0u8; usize::from(bytes)])
+                .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(at)
         };
         let users = block(USER)?;
@@ -603,17 +612,17 @@ impl Users<Wg16> {
             .checked_add(SENTINELS)
             .and_then(|words| words.checked_mul(2))
             .ok_or_else(|| io::Error::other(format!("{count} channels of channel[]")))?;
-        let base = heap.alloc(machine, words).map_err(io::Error::other)?;
-        machine
-            .write(base, &vec![0xffu8; usize::from(words)])
-            .map_err(io::Error::other)?;
+        let base = heap
+            .reserve(mem, words)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        base.write(mem, &vec![0xffu8; usize::from(words)])
+            .map_err(|e| io::Error::other(e.to_string()))?;
         for (index, value) in [-3i16, -2, -1].into_iter().enumerate() {
-            let at = Wg16::ptr_offset(base, index as u16 * 2);
-            machine
-                .write(at, &value.to_le_bytes())
-                .map_err(io::Error::other)?;
+            let at = A::ptr_offset(base, index as u16 * 2);
+            at.write(mem, &value.to_le_bytes())
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
-        let channels = Wg16::ptr_offset(base, SENTINELS * 2);
+        let channels = A::ptr_offset(base, SENTINELS * 2);
 
         // `MAJORBBS.C:878` -- `channel[usrnum]=0` with `usrnum` still zero,
         // the local console. Reached only when no hardware channel groups are
@@ -628,9 +637,9 @@ impl Users<Wg16> {
         // these in from configured channel groups, and this host has none to
         // read. Whoever gives this host real hardware or a real transport owes
         // the rest of the array.
-        machine
-            .write(channels, &0i16.to_le_bytes())
-            .map_err(io::Error::other)?;
+        channels
+            .write(mem, &0i16.to_le_bytes())
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         Ok(Self {
             terms,
@@ -641,138 +650,6 @@ impl Users<Wg16> {
             vda: None,
             keys: vec![None; usize::from(count)],
         })
-    }
-
-    /// Allocate `size` bytes of volatile data area per channel.
-    ///
-    /// `vdahdl=alcblok(nterms,vdasiz)`, `MAJORBBS.C:1373`. **Not zeroed**, and
-    /// that is deliberate: `alcblok` has no recovered source, but both of its
-    /// other callers initialise every slot themselves right afterwards --
-    /// `ACCOUNT.C:111-113` with a `setmem(...,0)` loop and `GALFILU.C:296` with
-    /// `nlibaxs=-1` -- which they would not do if the block came back clean.
-    /// `MAJORBBS.C:1373` does neither, so a module reading its volatile data
-    /// area before writing it read whatever was there, and it reads the same
-    /// here.
-    ///
-    /// Reborrows into [`Users::alcvda_mem`] through [`Machine::mem_mut`] --
-    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
-    ///
-    /// # Errors
-    ///
-    /// If the heap has no room.
-    pub fn alcvda(
-        &mut self,
-        machine: &mut Machine,
-        heap: &mut crate::Heap,
-        size: u16,
-    ) -> io::Result<()> {
-        self.alcvda_mem(machine.mem_mut(), heap, size)
-    }
-
-    /// `user[unum].polrou` -- the channel's polling routine, or `None` for
-    /// NULL.
-    ///
-    /// Read out of emulated memory every time rather than cached: the whole
-    /// point of the check `dopoll` makes after calling a polling routine is
-    /// that the routine may have called `stop_polling` on itself while it ran,
-    /// and a remembered copy would not have noticed.
-    ///
-    /// Reborrows into [`Users::polrou_mem`] through [`Machine::mem`].
-    ///
-    /// # Errors
-    ///
-    /// If the read runs off the segment.
-    pub fn polrou(&self, machine: &Machine, unum: Chan) -> Result<Option<FarPtr>, ShimError> {
-        self.polrou_mem(machine.mem(), unum)
-    }
-
-    /// Install or clear channel `unum`'s polling routine.
-    ///
-    /// Reborrows into [`Users::set_polrou_mem`] through [`Machine::mem_mut`].
-    ///
-    /// # Errors
-    ///
-    /// If the write runs off the segment.
-    pub fn set_polrou(
-        &mut self,
-        machine: &mut Machine,
-        unum: Chan,
-        rou: Option<FarPtr>,
-    ) -> Result<(), ShimError> {
-        self.set_polrou_mem(machine.mem_mut(), unum, rou)
-    }
-
-    /// `user[unum].state` -- which registered module this channel is in.
-    ///
-    /// The real host's whole dispatch is `(*(module[usrptr->state]->sttrou))()`
-    /// (`MAJORBBS.C:2703`), so this is the number that decides who gets a
-    /// keystroke. The module owns it: `register_module` hands back a number and
-    /// the module writes it here itself, at 14 sites in `WCCMMUD.DLL`.
-    ///
-    /// Read every time, never remembered, for the reason
-    /// [`polrou`](Self::polrou) is: module code changes it between dispatches,
-    /// and that is the point of it.
-    ///
-    /// Reborrows into [`Users::state_mem`] through [`Machine::mem`].
-    ///
-    /// # Errors
-    ///
-    /// If the read runs off the segment.
-    pub fn state(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        self.state_mem(machine.mem(), unum)
-    }
-
-    /// Put channel `unum` in state `state`.
-    ///
-    /// The module writes this field itself at 14 sites; this is the same
-    /// write made on the host's behalf, for `fsdego` (`shims/fsd.rs`,
-    /// `FSDBBS.C:210`'s `usrptr->state=fsdstt`) -- the one place a *host*
-    /// routine, rather than the module, has to move a channel into a
-    /// registered state.
-    ///
-    /// Reborrows into [`Users::set_state_mem`] through [`Machine::mem_mut`].
-    ///
-    /// # Errors
-    ///
-    /// If the write runs off the segment.
-    pub fn set_state(
-        &mut self,
-        machine: &mut Machine,
-        unum: Chan,
-        state: u16,
-    ) -> Result<(), ShimError> {
-        self.set_state_mem(machine.mem_mut(), unum, state)
-    }
-
-    /// `user[unum].substt` -- the registered module's own substate.
-    ///
-    /// Reborrows into [`Users::substt_mem`] through [`Machine::mem`].
-    ///
-    /// # Errors
-    ///
-    /// If the read runs off the segment.
-    pub fn substt(&self, machine: &Machine, unum: Chan) -> Result<u16, ShimError> {
-        self.substt_mem(machine.mem(), unum)
-    }
-
-    /// Put channel `unum` in substate `substt`.
-    ///
-    /// `fsdego` (`shims/fsd.rs`) is this crate's one host-side writer
-    /// (`FSDBBS.C:211`'s `usrptr->substt=ENTERING`) -- everywhere else this
-    /// field moves, a module wrote it.
-    ///
-    /// Reborrows into [`Users::set_substt_mem`] through [`Machine::mem_mut`].
-    ///
-    /// # Errors
-    ///
-    /// If the write runs off the segment.
-    pub fn set_substt(
-        &mut self,
-        machine: &mut Machine,
-        unum: Chan,
-        substt: u16,
-    ) -> Result<(), ShimError> {
-        self.set_substt_mem(machine.mem_mut(), unum, substt)
     }
 }
 
@@ -859,7 +736,12 @@ mod tests {
         let mut machine = mbbs16::Machine::new().expect("machine");
         let mut heap = crate::Heap::new(crate::Config::default());
         let terms = Terms::new(4);
-        let users = Users::new(&mut machine, &mut heap, terms).expect("four channels");
+        // Annotated because `Users::new` is generic now: this test reads
+        // `.offset` off the returned pointers, which only a `FarPtr` has, so
+        // the fixture has to say which ABI it means rather than leave `A` to
+        // inference that no longer has anything to work from.
+        let users: Users<Wg16> =
+            Users::new(machine.mem_mut(), &mut heap, terms).expect("four channels");
         let ch = |n| terms.chan(n).expect("one of the four");
         let at = |n| users.slot(ch(n)).offset;
         assert_eq!(at(1) - at(0), USER);
@@ -1275,17 +1157,17 @@ mod tests {
         };
 
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             None,
             "a fresh slot is NULL, because alczer zeroed it"
         );
 
         f.host
             .users
-            .set_polrou(&mut f.machine, console, Some(rou))
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
             .expect("channel 0");
         assert_eq!(
-            f.host.users().polrou(&f.machine, console).expect("channel 0"),
+            f.host.users().polrou_mem(f.machine.mem(), console).expect("channel 0"),
             Some(rou)
         );
 
@@ -1312,7 +1194,7 @@ mod tests {
 
         f.host
             .users
-            .set_polrou(&mut f.machine, console, None)
+            .set_polrou_mem(f.machine.mem_mut(), console, None)
             .expect("channel 0");
         assert_eq!(
             f.machine.resolve(at, 4).expect("in the slot"),
@@ -1337,13 +1219,13 @@ mod tests {
         let mut f = crate::testing::Fixture::new();
         let console = f.console();
 
-        assert_eq!(f.host.users().state(&f.machine, console).expect("read"), 0);
+        assert_eq!(f.host.users().state_mem(f.machine.mem(), console).expect("read"), 0);
 
         f.host
             .users
-            .set_state(&mut f.machine, console, 7)
+            .set_state_mem(f.machine.mem_mut(), console, 7)
             .expect("write");
-        assert_eq!(f.host.users().state(&f.machine, console).expect("read"), 7);
+        assert_eq!(f.host.users().state_mem(f.machine.mem(), console).expect("read"), 7);
 
         // The literal `+6`, not `user::STATE`, for the same reason
         // `polrou_round_trips_through_the_bytes_the_module_reads` uses a
@@ -1363,16 +1245,16 @@ mod tests {
         let console = f.console();
 
         assert_eq!(
-            f.host.users().substt(&f.machine, console).expect("read"),
+            f.host.users().substt_mem(f.machine.mem(), console).expect("read"),
             0
         );
 
         f.host
             .users
-            .set_substt(&mut f.machine, console, 1)
+            .set_substt_mem(f.machine.mem_mut(), console, 1)
             .expect("write");
         assert_eq!(
-            f.host.users().substt(&f.machine, console).expect("read"),
+            f.host.users().substt_mem(f.machine.mem(), console).expect("read"),
             1
         );
 

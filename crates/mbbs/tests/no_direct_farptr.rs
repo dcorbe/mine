@@ -13,77 +13,173 @@
 //! the conversion.
 //!
 //! Measured directly against the source below, not trusted from a prior run.
-//! As of this test's introduction (2026-08-12), three kinds of file account
-//! for the whole list:
 //!
-//! - **`abi.rs` itself** -- the 16-bit `Abi` implementation, where
-//!   `Wg16::Ptr = mbbs16::FarPtr` is declared. This is where the type is
-//!   *supposed* to live, not a leak to guard against.
-//! - **Facades not yet converted, or never going to be.** Tasks 4-6 moved
-//!   most shim bodies and the subsystems behind them onto `A::Ptr`, but each
-//!   left either a `_wg16`-suffixed dispatch-table bridge (the pattern
-//!   `shims::mod`'s `call` doc comment names) or a Wg16-concrete method
-//!   beside a generic core -- `Heap::alloc` beside `Heap::reserve`,
-//!   `Users::polrou`, and `Messages`'/`Streams`'/`TextVars`' own Wg16-typed
-//!   leaves -- plus routines the design says stay 16-bit forever:
-//!   `shims::memory`'s `alctile`/`ptrtile` (segment tiling has no
-//!   flat-memory counterpart), `shims::runtime`'s Borland helpers (the
-//!   `Cleans::Callee` family, 16-bit-only by the design's Part 2),
-//!   `shims::btrieve` and `crates/mbbs/src/btrieve.rs` (frozen for another
-//!   session's Btrieve-engine work -- do not touch either file to shrink
-//!   this list), and `shims::fsd`'s `fsdego`/`vfyadn`, `shims::user`'s
-//!   `getin`, `shims::system`'s
-//!   `register_module`/`register_agent`/`rtkick`, each blocked on a
-//!   dependency `shims::mod`'s `ROUTINES` table documents beside its own
-//!   entry.
-//! - **Test code.** Every fixture in this crate builds a real
-//!   `mbbs16::Machine` (`crates/mbbs/src/testing.rs`), so a `#[cfg(test)]`
-//!   module that pokes a known address or reads back a `Ret::Far` names
-//!   `FarPtr` directly even in a file whose production code no longer does.
-//!   That is not a gap this test is meant to close -- it targets the shim
-//!   layer's SHARED code, not the Wg16-only fixtures that exercise it.
+//! # What is measured
 //!
-//! Do not add a file to `ALLOWED` to make a new production use pass; convert
-//! that file's remaining concrete code, or -- if the mention is only in its
-//! test module -- confirm that first before touching `ALLOWED` at all.
+//! **Production code only.** Comment prose is stripped ([`code_only`]) and
+//! `#[cfg(test)]` items are stripped ([`strip_test_modules`]); each of those
+//! functions documents why at its own definition. Code inside a doctest fence
+//! survives both, because it is compiled and run.
+//!
+//! # The list, as of 2026-08-12
+//!
+//! It went from 26 files to 8 in one pass. Most of that was not conversion
+//! work at all -- it was this test learning to measure what it always said it
+//! measured. Eight of the eighteen files that left had *zero* production
+//! mentions and were on the list purely for their fixtures; two more were on
+//! it for doc comments explaining a conversion that had already happened.
+//! The genuine removals were `Streams`'/`Messages`'/`TextVars`'/`Users`' dead
+//! `Wg16` facades (deleted -- every caller had already moved to the generic
+//! `_mem` core), `Users::new`, and the Btrieve engine going `Btrieve<A>`.
+//!
+//! Three of the eight that remain are permanent and are marked as such in
+//! `ALLOWED`: `abi.rs` (where the type is declared), `shims/memory.rs`
+//! (segment tiling, no flat-memory counterpart) and `testing.rs` (the
+//! fixture builder). So the live conversion backlog is **five files**.
+//!
+//! # The one that is not like the others
+//!
+//! `lib.rs` is `impl Host<Wg16>`'s execution driver, and it is not blocked on
+//! a facade or a leaf the way the other four are. It is blocked on the `Abi`
+//! trait, which abstracts *memory and pointers* and has no notion of
+//! *execution* -- there is no `resume`, no `call`. Every other entry here is
+//! an afternoon's mechanical work. This one is a design question first.
+//!
+//! # Rules
+//!
+//! Do not add a file to `ALLOWED` to make a new production use pass, and do
+//! not reword a signature to slip past the scanner -- deleting a `FarPtr`
+//! type annotation and letting inference supply it removes the mention
+//! without removing an ounce of the coupling. Convert the code, and delete
+//! the file's entry in the same diff.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Files under `crates/mbbs/src`, relative to that directory, that may still
-/// name `FarPtr`. Sorted. See this file's module comment before editing.
+/// Files under `crates/mbbs/src`, relative to that directory, whose
+/// **production** code may still name `FarPtr`. Grouped by reason rather than
+/// sorted -- the test sorts both sides before comparing, so the order here is
+/// free to carry meaning. See this file's module comment before editing.
 const ALLOWED: &[&str] = &[
+    // Where the type is SUPPOSED to live: `Wg16::Ptr = mbbs16::FarPtr` is
+    // declared here. Not a leak, and this entry never leaves.
     "abi.rs",
-    "btrieve.rs",
-    // Arrived with the Btrieve locking work merged from `btrieve-finish`, and
-    // caught by this test on the merge rather than noticed by hand -- which is
-    // what it is for. They are engine files behind the seventeen `btv*` shims,
-    // which are the last unconverted block in `ROUTINES`, so they leave this
-    // list in the same commit those shims take a `Call<A>`.
-    "btrieve/ops.rs",
-    "fmt.rs",
-    "fsd.rs",
-    "globals.rs",
-    "heap.rs",
-    "lib.rs",
-    "shims/btrieve.rs",
-    "shims/fsd.rs",
+    // Irreducibly 16-bit, and staying. `alctile`/`ptrtile` are LDT segment
+    // tiling, which has no flat-memory counterpart at all -- the 32-bit
+    // equivalents `alcblok`/`ptrblok` are different routines, among the 56
+    // still unimplemented. Same for `Heap::alloc_tiled` behind them.
     "shims/memory.rs",
-    "shims/mod.rs",
-    "shims/msg.rs",
-    "shims/runtime.rs",
-    "shims/screen.rs",
-    "shims/stream.rs",
-    "shims/system.rs",
-    "shims/text.rs",
-    "shims/user.rs",
+    // The test fixture builder. Every fixture in this crate constructs a real
+    // `mbbs16::Machine`, so this names `FarPtr` by construction. It is
+    // Wg16-only on purpose and is not a conversion target.
     "testing.rs",
-    "textvar.rs",
-    "users.rs",
+    // --- Genuinely still to convert, in rough order of difficulty ---
+    //
+    // `Heap::alloc` -- a `&mut Machine` facade over the generic
+    // `Heap::reserve`. Unlike the four facades deleted alongside this commit,
+    // it still has live callers, so it goes when they move.
+    "heap.rs",
+    // `Globals::new`/`pointer`/`long` (construction and MajorBBS-specific
+    // readers) plus `selector`, which is 16-bit in SUBSTANCE rather than by
+    // signature: it returns `base.selector`, and a flat pointer has none.
+    // `selector` will still be here when the other three are gone.
+    "globals.rs",
+    // `fsdego`/`vfyadn`, each blocked on a dependency `shims::mod`'s
+    // `ROUTINES` table documents beside its own entry.
+    "shims/fsd.rs",
+    // The seventeen `btv*` shims. The ENGINE behind them is generic now
+    // (`Btrieve<A>`, which is why `btrieve.rs` and `btrieve/ops.rs` left this
+    // list), but the shims themselves are still `Call<Wg16>`. They are the
+    // last block that can move from `WG16_ROUTINES` into `routines<A>()`.
+    "shims/btrieve.rs",
+    // The big one, and the real remaining boundary: `impl Host<Wg16>`'s
+    // execution driver -- `run`, `poll`, `cycle`, `load`, `stop` and the rest
+    // of the 26 methods that take a `&mut Machine`. These are NOT blocked on
+    // a facade or a leaf; they are blocked on the `Abi` trait itself, which
+    // abstracts memory and pointers but has no notion of EXECUTION (no
+    // `resume`, no `call`). Nothing here converts until that is designed.
+    "lib.rs",
 ];
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `{` and `}` counts for one line of code, ignoring any inside a string.
+fn braces(line: &str) -> (isize, isize) {
+    let (mut open, mut close) = (0, 0);
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_str => i += 1,
+            b'"' => in_str = !in_str,
+            b'{' if !in_str => open += 1,
+            b'}' if !in_str => close += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (open, close)
+}
+
+/// `code` with every `#[cfg(test)]` item removed.
+///
+/// # Why
+///
+/// This file's own module comment has always said test code is not what the
+/// guard is for -- "it targets the shim layer's SHARED code, not the Wg16-only
+/// fixtures that exercise it" -- because every fixture in this crate builds a
+/// real `mbbs16::Machine` and so names `FarPtr` by construction. But the
+/// allowlist is per FILE, so a file whose production code is fully converted
+/// stayed on the list anyway if its `#[cfg(test)]` module poked one address.
+///
+/// That made `ALLOWED` mean "has production coupling, **or** has a 16-bit
+/// fixture", and the two were indistinguishable from the outside. Eight
+/// files were on the list with zero production mentions between them:
+/// `fmt.rs`, `shims/mod.rs`, `shims/msg.rs`, `shims/runtime.rs`,
+/// `shims/screen.rs`, `shims/stream.rs`, `shims/text.rs`, `shims/user.rs`.
+/// Reading the list, all eight looked like remaining work. None was.
+///
+/// **This removes no coupling.** It stops counting fixtures, so the list
+/// says what it always claimed to. The production count is the number that
+/// moves when a conversion lands, and it is unaffected by this function.
+///
+/// Brace-matched rather than truncated at the first `#[cfg(test)]`: an
+/// earlier draft cut the file there, which is right only because the test
+/// module conventionally comes last, and would silently drop production code
+/// the day one did not.
+fn strip_test_modules(code: &str) -> String {
+    let mut out = String::new();
+    let mut lines = code.lines();
+
+    while let Some(line) = lines.next() {
+        if !line.trim_start().starts_with("#[cfg(test)]") {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Skip the annotated item: find its opening brace, then run to the
+        // matching close. Anything before the first brace (a `mod tests`
+        // line, attributes) belongs to the item too.
+        let mut depth: isize = 0;
+        let mut started = false;
+        for l in lines.by_ref() {
+            let (open, close) = braces(l);
+            depth += open;
+            if open > 0 {
+                started = true;
+            }
+            depth -= close;
+            if started && depth <= 0 {
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 /// `text` with comment prose removed, so only code is left to search.
@@ -239,7 +335,7 @@ fn far_ptr_is_named_only_where_the_allowlist_says() {
         .filter(|p| {
             let text = fs::read_to_string(p)
                 .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-            names_far_ptr(&code_only(&text))
+            names_far_ptr(&strip_test_modules(&code_only(&text)))
         })
         .map(|p| {
             p.strip_prefix(root)
@@ -269,14 +365,26 @@ fn far_ptr_is_named_only_where_the_allowlist_says() {
 /// signature and a green test, so it gets its own tests rather than being
 /// trusted because the suite happened to stay green after it landed.
 ///
-/// Each case below was checked by mutation: the stripper was broken in the
-/// matching way (drop the fence branch, drop the block-comment branch, strip
-/// strings, treat `//` inside a string as a comment) and the case named here
-/// is the one that failed. A case no mutation can break is not a test, and
-/// two early drafts of this list had exactly that problem.
+/// Checked by mutation, not by observing the suite stay green. Five defects
+/// were introduced one at a time and every one was caught:
+///
+/// | mutation | caught by |
+/// |---|---|
+/// | fence branch disabled, so doctest code reads as prose | `code_inside_a_doctest_fence_is_still_code` |
+/// | block comments never entered | `prose_in_a_block_comment_is_not_code`, `a_block_comment_spanning_lines_stays_stripped` |
+/// | test module truncated at the first `#[cfg(test)]` rather than brace-matched | `production_code_after_a_test_module_still_counts` |
+/// | `braces` ignores string literals | `a_brace_inside_a_string_does_not_end_the_test_module_early` |
+/// | `code_only` never enters a string literal | `a_double_slash_inside_a_string_does_not_start_a_comment` |
+///
+/// One of those five appeared to survive on the first pass. The mutation was
+/// at fault, not the test: it broke only the `{` arm of `braces` while the
+/// fixture's string contains `}`, so nothing about the file's behaviour
+/// actually changed. A survivor is a claim about a test, and it has to be
+/// read as sceptically as the test itself -- the first question is whether
+/// the mutation did anything.
 #[cfg(test)]
 mod scanner {
-    use super::{code_only, names_far_ptr};
+    use super::{code_only, names_far_ptr, strip_test_modules};
 
     #[test]
     fn prose_in_a_doc_comment_is_not_code() {
@@ -343,6 +451,34 @@ mod scanner {
         // line, which silently swallows real code after it.
         let src = "let s = \"he said \\\"hi\\\"\"; let at: FarPtr = q;\n";
         assert!(names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn a_test_module_is_not_production_code() {
+        let src = "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    let at: FarPtr = q;\n}\n";
+        assert!(!names_far_ptr(&strip_test_modules(&code_only(src))));
+    }
+
+    #[test]
+    fn production_code_after_a_test_module_still_counts() {
+        // The reason this is brace-matched and not truncated at the first
+        // `#[cfg(test)]`. Truncation passes every other case here and loses
+        // exactly this one.
+        let src =
+            "#[cfg(test)]\nmod tests {\n    let x = 1;\n}\npub fn g(at: FarPtr) -> u16 { 0 }\n";
+        assert!(names_far_ptr(&strip_test_modules(&code_only(src))));
+    }
+
+    #[test]
+    fn a_nested_brace_does_not_end_the_test_module_early() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn a() { let at: FarPtr = q; }\n    fn b() {}\n}\n";
+        assert!(!names_far_ptr(&strip_test_modules(&code_only(src))));
+    }
+
+    #[test]
+    fn a_brace_inside_a_string_does_not_end_the_test_module_early() {
+        let src = "#[cfg(test)]\nmod tests {\n    let s = \"}\";\n    let at: FarPtr = q;\n}\n";
+        assert!(!names_far_ptr(&strip_test_modules(&code_only(src))));
     }
 
     #[test]
