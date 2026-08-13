@@ -1609,9 +1609,8 @@ impl<A: Abi> Btrieve<A> {
     /// Takes `mem: &mut A::Mem` rather than a whole machine -- the same
     /// generic-core shape [`crate::heap::Heap::reserve`] and
     /// [`crate::msg::Messages::open_mem`] already use. `heap` allocates
-    /// through [`Heap::reserve`](crate::heap::Heap::reserve), the generic
-    /// core behind [`Heap::alloc`](crate::heap::Heap::alloc)'s `Wg16` facade,
-    /// so this needs no facade of its own.
+    /// through [`Heap::reserve`](crate::heap::Heap::reserve) directly, so
+    /// this needs no `Wg16` facade of its own.
     ///
     /// # Errors
     ///
@@ -3786,18 +3785,18 @@ mod tests {
     ) -> FarPtr {
         let mut block = block_indexed(path);
 
-        let filnam = heap.alloc(machine, 12).expect("alloc filnam");
+        let filnam = heap.reserve(machine.mem_mut(), 12).expect("alloc filnam");
         machine.write(filnam, b"INDEXED.DAT\0").expect("write filnam");
 
-        let data = heap.alloc(machine, block.maxlen).expect("alloc data");
+        let data = heap.reserve(machine.mem_mut(), block.maxlen).expect("alloc data");
         machine
             .write(data, &vec![0u8; usize::from(block.maxlen)])
             .expect("write data");
 
-        let key = heap.alloc(machine, 3).expect("alloc key");
+        let key = heap.reserve(machine.mem_mut(), 3).expect("alloc key");
         machine.write(key, &[0u8; 3]).expect("write key");
 
-        let at = heap.alloc(machine, field::SIZE).expect("alloc block");
+        let at = heap.reserve(machine.mem_mut(), field::SIZE).expect("alloc block");
         let mut image = vec![0u8; usize::from(field::SIZE)];
         let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
             let start = usize::from(offset);
@@ -3872,8 +3871,8 @@ mod tests {
     /// module memory the first close already freed. [`crate::Heap::free`]
     /// never clears what it frees (see its own doc comment), so that read
     /// stayed reliably null only until something else allocated over the
-    /// same span -- reproduced here with eight `Heap::alloc(256)` calls, the
-    /// same shape `alcmem` makes, run after the first close. Before the fix
+    /// same span -- reproduced here with eight `Heap::reserve(.., 256)`
+    /// calls, the same shape `alcmem` makes, run after the first close. Before the fix
     /// the second close found garbage where `bb->filnam` used to be null,
     /// tried to look up a block already removed from [`Self::open`], and
     /// stopped the module with "is not an open Btrieve file" -- a module
@@ -3897,11 +3896,11 @@ mod tests {
         // The same shape of traffic `alcmem` makes, and enough of it to land
         // on the span the closed block's own `struct btvblk` used to occupy
         // -- and, critically, written into, the way a module actually uses
-        // memory it was just handed. `Heap::alloc` alone only reserves
+        // memory it was just handed. `Heap::reserve` alone only reserves
         // address space; it is the write that leaves non-null garbage where
         // `bb->filnam` used to read as null.
         for _ in 0..8 {
-            let block = heap.alloc(&mut machine, 256).expect("alcmem-shaped traffic");
+            let block = heap.reserve(machine.mem_mut(), 256).expect("alcmem-shaped traffic");
             machine
                 .write(block, &[0xaau8; 256])
                 .expect("a module writes into what it was just given");

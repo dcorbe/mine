@@ -43,9 +43,11 @@ use crate::shims::ShimError;
 /// later, where the fault named module code rather than the lie.
 ///
 /// Generic (Task 5): [`Heap::reserve`](crate::heap::Heap::reserve) is
-/// already `impl<A: Abi> Heap<A>` -- unlike [`Heap::alloc`](crate::heap::Heap::alloc),
-/// which is the `Wg16` facade this used to call, it takes `&mut A::Mem`
-/// straight from [`Call::mem`] rather than a whole `&mut Machine`.
+/// already `impl<A: Abi> Heap<A>` -- unlike the `Wg16`-only `alloc` facade
+/// this used to call (deleted in Task 13 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`, once nothing else
+/// called it), it takes `&mut A::Mem` straight from [`Call::mem`] rather
+/// than a whole `&mut Machine`.
 pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let size = Into::<u32>::into(call.int()) as u16;
     let at = host
@@ -128,6 +130,34 @@ pub fn alctile(
         .alloc_tiled(call.cpu, qty, size)
         .map_err(|e| ShimError::Failed(format!("alctile({qty}, {size}): {e}")))?;
     Ok(abi::Ret::Ptr(at))
+}
+
+/// [`Heap::alloc_tiled`](crate::heap::Heap::alloc_tiled)'s `Wg16` facade --
+/// `alctile`'s host half, kept beside its one production caller now that
+/// [`Heap`](crate::heap::Heap) itself is generic top to bottom (Task 13 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`; see that module's
+/// doc comment). No generic core to delegate into: LDT tile chaining
+/// (`Machine::alloc_tiled`) has no 32-bit counterpart -- `alcblok`/`ptrblok`
+/// are a different mechanism entirely, out of scope here, the same reason
+/// `alctile`/`ptrtile` above are concrete rather than `<A: Abi>`.
+impl crate::heap::Heap<Wg16> {
+    /// # Errors
+    ///
+    /// If the region cannot be mapped or the LDT has no run that long.
+    pub fn alloc_tiled(
+        &mut self,
+        machine: &mut mbbs_machine::m16::Machine,
+        qty: u16,
+        size: u16,
+    ) -> Result<mbbs_machine::m16::FarPtr, String> {
+        let at = machine.alloc_tiled(qty, size).map_err(|e| e.to_string())?;
+        self.push_tile(crate::heap::Region {
+            selector: at.selector,
+            qty,
+            size,
+        });
+        Ok(at)
+    }
 }
 
 /// `void *ptrtile(void *bigptr, int index)` -- the `index`th tile of a region.

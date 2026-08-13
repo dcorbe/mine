@@ -21,7 +21,7 @@
 //! functions documents why at its own definition. Code inside a doctest fence
 //! survives both, because it is compiled and run.
 //!
-//! # The list, as of 2026-08-12
+//! # The list, as of 2026-08-13
 //!
 //! It went from 26 files to 8 in one pass. Most of that was not conversion
 //! work at all -- it was this test learning to measure what it always said it
@@ -33,25 +33,34 @@
 //! `_mem` core), `Users::new`, and the Btrieve engine going `Btrieve<A>`.
 //!
 //! Three of those eight are permanent and are marked as such in `ALLOWED`:
-//! `abi.rs` (where the type is declared), `shims/memory.rs` (segment tiling,
-//! no flat-memory counterpart) and `testing.rs` (the fixture builder). A
-//! fourth left in the very next commit: the seventeen `btv*` shims went
-//! `fn foo<A: Abi>(...)` once `Host<A>::btrieve`'s own elided parameter (see
-//! `lib.rs`'s history) stopped pinning the engine behind them to `Wg16`. A
-//! fifth, `shims/fsd.rs`, left in Task 12 of
-//! `docs/plans/2026-08-12-abi-border-implementation.md`: the FSD session
-//! engine (`fsd_cycle`, `fsdprc`, `goback` and their helpers) went generic
-//! over `A`, which is what let [`crate::Host::fsd_dispatch`] itself go
-//! generic and retire the `Abi::native_dispatch` bridge Task 11 had added to
-//! reach it. So the live conversion backlog is **three files**.
+//! `abi/wg16.rs` (where the type is declared, once `abi.rs` split it out --
+//! see below), `shims/memory.rs` (segment tiling, no flat-memory
+//! counterpart) and `testing.rs` (the fixture builder). A fourth left in the
+//! very next commit: the seventeen `btv*` shims went `fn foo<A: Abi>(...)`
+//! once `Host<A>::btrieve`'s own elided parameter (see `lib.rs`'s history)
+//! stopped pinning the engine behind them to `Wg16`. A fifth, `shims/fsd.rs`,
+//! left in Task 12 of `docs/plans/2026-08-12-abi-border-implementation.md`:
+//! the FSD session engine (`fsd_cycle`, `fsdprc`, `goback` and their
+//! helpers) went generic over `A`, which is what let
+//! [`crate::Host::fsd_dispatch`] itself go generic and retire the
+//! `Abi::native_dispatch` bridge Task 11 had added to reach it. Two more,
+//! `heap.rs` and `globals.rs`, left in Task 13: `Host::new`'s `.selector`
+//! arithmetic became `A::ptr_offset` from one `alloc_region` base, which is
+//! what let `Globals::new` go generic too, and `Heap::alloc` -- by then
+//! called only by tests, every production call site having already moved
+//! onto `Heap::reserve` -- was deleted outright rather than converted. So the
+//! live conversion backlog is **one file**.
 //!
 //! # The one that is not like the others
 //!
 //! `lib.rs`'s entry no longer names an execution-vocabulary gap -- `Abi`
-//! grew `call`/`resume` in Task 5, and by Task 12 `impl Host<Wg16>` holds
-//! only `dos_name` (no `Self` to be generic over) and `new` (Task 13's own
-//! `.selector` arithmetic). What is left is exactly those two, not a design
-//! question.
+//! grew `call`/`resume` in Task 5, `Host::new` moved onto `impl<A: Abi>
+//! Host<A>` in Task 13, and what is left is [`crate::Host::dos_name`] (no
+//! `Self` to be generic over) and the free function `crate::caller` (`Wg16`'s
+//! own `Abi::caller` arm, concrete over `mbbs_machine::m16::Machine` and
+//! `Module` by the nature of the question it answers -- see its own doc
+//! comment). One method and one free function, not twenty-six. Task 14 moves
+//! both and deletes `impl Host<Wg16>` for good.
 //!
 //! # Rules
 //!
@@ -83,22 +92,15 @@ const ALLOWED: &[&str] = &[
     // `mbbs_machine::m16::Machine`, so this names `FarPtr` by construction. It is
     // Wg16-only on purpose and is not a conversion target.
     "testing.rs",
-    // --- Genuinely still to convert, in rough order of difficulty ---
+    // --- Genuinely still to convert ---
     //
-    // `Heap::alloc` -- a `&mut Machine` facade over the generic
-    // `Heap::reserve`. Unlike the four facades deleted alongside this commit,
-    // it still has live callers, so it goes when they move.
-    "heap.rs",
-    // `Globals::new`/`pointer`/`long` (construction and MajorBBS-specific
-    // readers) plus `selector`, which is 16-bit in SUBSTANCE rather than by
-    // signature: it returns `base.selector`, and a flat pointer has none.
-    // `selector` will still be here when the other three are gone.
-    "globals.rs",
-    // What is left of `impl Host<Wg16>` after Tasks 9-12 (§4's four
-    // dissolution clusters, minus `new`): `dos_name` (no `Self`, so a bare
-    // `impl<A: Abi> Host<A>` copy cannot infer which ABI a caller means --
-    // see that method's own doc comment) and `new` (Task 13's `.selector`
-    // arithmetic). Two methods, not twenty-six.
+    // What is left of `impl Host<Wg16>` after Tasks 9-13 (§4's four
+    // dissolution clusters): `dos_name` (no `Self`, so a bare `impl<A: Abi>
+    // Host<A>` copy cannot infer which ABI a caller means -- see that
+    // method's own doc comment) and the free function `caller` (`Wg16`'s
+    // `Abi::caller` arm, concrete over `mbbs_machine::m16::Machine`/`Module`
+    // -- see `crate::caller`'s own doc comment). One method and one free
+    // function, not twenty-six.
     "lib.rs",
 ];
 

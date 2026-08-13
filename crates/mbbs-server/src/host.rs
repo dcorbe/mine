@@ -299,7 +299,7 @@ fn life(
 ) -> io::Result<LifeEnd> {
     // 1. Build the machine HERE. It is !Send; it cannot be handed in.
     let mut machine = Machine::new()?;
-    let mut host = Host::new(&mut machine, boot.root.clone(), boot.terms)?;
+    let mut host = Host::<Wg16>::new(&mut machine, boot.root.clone(), boot.terms)?;
     // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
     // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
     // (and everything it owns) is rebuilt from scratch on every restart, and

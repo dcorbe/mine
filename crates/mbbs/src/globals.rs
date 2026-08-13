@@ -34,10 +34,9 @@
 use std::collections::HashMap;
 use std::io;
 
-use mbbs_machine::m16::{FarPtr, Machine};
 use mbbs_machine::ptr::ModulePtr;
 
-use crate::abi::{Abi, ModuleMem, Wg16};
+use crate::abi::{Abi, ModuleMem};
 
 /// `MAJORBBS.H:23` -- input buffer size for each channel.
 const INPSIZ: u16 = 256;
@@ -315,34 +314,28 @@ pub const NTERMS: u16 = 1;
 
 /// The host's globals, placed in a region the module can address.
 ///
-/// # Generic core, `Wg16`-facade names
+/// # Generic top to bottom, `Wg16`-facade names elsewhere
 ///
-/// `base` and `prf` are typed `A::Ptr` rather than `FarPtr` so this struct is
-/// genuinely `Globals<A>`. [`Globals::new`] and the MajorBBS-specific readers
-/// (`pointer`, `long`, `selector`) stay `impl Globals<Wg16>`-only, using
-/// `&Machine`/`&mut Machine` exactly as before -- construction and 32-bit
-/// widths are a later task's concern. `selector` stays for a stronger reason
-/// than the others: it returns `base.selector`, and a flat 32-bit pointer has
-/// no selector to return, so it is 16-bit in substance and not merely by
-/// signature. `address`, `size` and `prf_buffer` moved onto
-/// `impl<A: Abi> Globals<A>` outright: none ever touched a `Machine`, so
-/// generalising them changed nothing a caller can observe (`A` defaults to
-/// [`Wg16`], so `Globals::address` still returns `Option<FarPtr>` at every
-/// existing call site).
+/// `base` and `prf` are typed `A::Ptr`, so this struct is genuinely
+/// `Globals<A>` -- and since Task 13 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`, so is
+/// [`Globals::new`]: it reaches memory through [`Abi::mem`] and writes
+/// through the generic [`Globals::write_mem`] core below, the same as every
+/// other constructor in this crate. `address`, `size` and `prf_buffer` were
+/// generic outright before that, and stayed unchanged: none ever touched a
+/// `Machine`.
 ///
-/// `word` and `write` are different: their *bodies* read and write module
-/// memory, so going generic changes their signature from `&Machine`/
-/// `&mut Machine` to `&A::Mem`/`&mut A::Mem` -- a real break for the dozens of
-/// shim call sites built against the old ones. So both keep their original
-/// name and signature in `impl Globals<Wg16>` (delegating into the generic
-/// core below through [`Machine::mem`]/[`Machine::mem_mut`], the same
-/// reborrow-facade shape `Heap::alloc` uses over `Heap::reserve`), and the
-/// generic core gets new names -- `word_mem`/`write_mem` -- naming the
-/// parameter that is actually new: `A::Mem` in place of a whole `Machine`.
-/// Nothing here places more than two regions, ever (the globals block, and
-/// `prfbuf`'s own small one), so unlike `Heap`/`Arena` there is no
-/// growable-pool algorithm to share -- the only thing generic access buys
-/// here is a caller that has `A::Mem` but not a whole `A::Cpu`/`Machine`.
+/// What is genuinely `Wg16`-specific does not live in this file any more.
+/// [`Globals::word`]/[`Globals::write`] are `&Machine`/`&mut Machine`
+/// facades over [`Globals::word_mem`]/[`Globals::write_mem`] -- kept, under
+/// their original names and signatures, for the dozens of shim call sites
+/// built against them (the same reborrow-facade shape `Heap::alloc` used to
+/// give `Heap::reserve`) -- and [`Globals::selector`] returns `base.selector`,
+/// which is 16-bit in *substance* and not merely by signature: a flat 32-bit
+/// pointer has no selector to return. All three, plus `long`/`pointer`
+/// (the same `&Machine` shape), now live in `crates/mbbs/src/abi/wg16.rs`,
+/// beside the ABI they are specific to, rather than here -- this file names
+/// no ABI at all.
 pub struct Globals<A: Abi> {
     base: A::Ptr,
     offsets: HashMap<&'static str, u16>,
@@ -353,6 +346,17 @@ pub struct Globals<A: Abi> {
 }
 
 impl<A: Abi> Globals<A> {
+    /// The region every [`Globals::address`] offsets from.
+    ///
+    /// `pub(crate)`, not exposed at the crate boundary: the one caller that
+    /// needs the raw base rather than a named global's address is
+    /// [`Globals::selector`] in `abi/wg16.rs`, which is 16-bit in substance
+    /// and lives outside this module for exactly that reason -- see this
+    /// struct's own doc comment.
+    pub(crate) fn base(&self) -> A::Ptr {
+        self.base
+    }
+
     /// Where the print buffer starts.
     ///
     /// Generic outright, for the same reason [`Globals::address`] is: it
@@ -448,15 +452,21 @@ impl<A: Abi> Globals<A> {
             .map_err(|e| io::Error::other(e.to_string()))?;
         Ok(A::ptr_from_bytes(bytes))
     }
-}
 
-impl Globals<Wg16> {
     /// Place every global, and initialise the ones that are not zero.
+    ///
+    /// Generic since Task 13 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: `cpu: &mut
+    /// A::Cpu` reaches memory through [`Abi::mem`], the same reborrow every
+    /// other generic core in this crate uses, and every write below goes
+    /// through [`Globals::write_mem`] rather than the `Wg16` `write` facade
+    /// (`abi/wg16.rs`) -- that facade exists for the dozens of call sites
+    /// still built against `&mut Machine`, not for construction.
     ///
     /// # Errors
     ///
     /// If the regions cannot be mapped.
-    pub fn new(machine: &mut Machine, terms: crate::Terms) -> io::Result<Self> {
+    pub fn new(cpu: &mut A::Cpu, terms: crate::Terms) -> io::Result<Self> {
         let mut offsets = HashMap::with_capacity(GLOBALS.len());
         let mut sizes = HashMap::with_capacity(GLOBALS.len());
         let mut at = 0u16;
@@ -470,8 +480,9 @@ impl Globals<Wg16> {
             at += global.size;
         }
 
-        let base = machine.mem_mut().alloc_region(usize::from(at))?;
-        let prf = machine.mem_mut().alloc_region(usize::from(OUTBSZ))?;
+        let mem = A::mem(cpu);
+        let base = mem.alloc_region(usize::from(at))?;
+        let prf = mem.alloc_region(usize::from(OUTBSZ))?;
 
         let globals = Self {
             base,
@@ -483,9 +494,9 @@ impl Globals<Wg16> {
         // `prfbuf` and `prfptr` are `char *`, not the buffer -- GCOMM.H:449.
         // The module reads `prfbuf[0]` to ask whether anything is queued, so
         // they have to be real far pointers into real memory from the start.
-        globals.write(machine, "prfbuf", &prf.to_bytes())?;
-        globals.write(machine, "prfptr", &prf.to_bytes())?;
-        globals.write(machine, "_ctype", &ctype_table())?;
+        globals.write_mem(mem, "prfbuf", &A::ptr_to_bytes(prf))?;
+        globals.write_mem(mem, "prfptr", &A::ptr_to_bytes(prf))?;
+        globals.write_mem(mem, "_ctype", &ctype_table())?;
 
         // MAJORBBS.C:80-81 -- `int nterms=1, hichp1=1;`. Both were set before
         // any module's init ran, `:557` only ever adds configured groups to
@@ -503,78 +514,15 @@ impl Globals<Wg16> {
         // `terms` is passed in rather than read from `NTERMS` here, so that the
         // number the module sees and the number the host's tables are sized by
         // are the same value and not two reads of one constant.
-        globals.write(machine, "nterms", &terms.count().to_le_bytes())?;
-        globals.write(machine, "hichp1", &terms.count().to_le_bytes())?;
+        globals.write_mem(mem, "nterms", &terms.count().to_le_bytes())?;
+        globals.write_mem(mem, "hichp1", &terms.count().to_le_bytes())?;
 
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
         // is born with is a lie and not a placeholder.
-        globals.write(machine, "usrnum", &(-1i16).to_le_bytes())?;
+        globals.write_mem(mem, "usrnum", &(-1i16).to_le_bytes())?;
 
         Ok(globals)
-    }
-
-    /// The segment the globals live in.
-    pub fn selector(&self) -> u16 {
-        self.base.selector
-    }
-
-    /// Overwrite a global.
-    ///
-    /// Reborrows into [`Globals::write_mem`] through [`Machine::mem_mut`] --
-    /// the same facade shape `Heap::alloc` uses over `Heap::reserve` -- so the
-    /// bounds check and the actual write live in exactly one place.
-    ///
-    /// # Errors
-    ///
-    /// If `name` is not a global, or `bytes` is longer than it.
-    pub fn write(&self, machine: &mut Machine, name: &str, bytes: &[u8]) -> io::Result<()> {
-        self.write_mem(machine.mem_mut(), name, bytes)
-    }
-
-    /// Read a global as a word.
-    ///
-    /// Read rather than remembered. `margc` and `tfstate` are the host's
-    /// globals but the module's to change.
-    ///
-    /// Reborrows into [`Globals::word_mem`] through [`Machine::mem`] -- the
-    /// read-only counterpart to `write`'s [`Machine::mem_mut`] reborrow, added
-    /// alongside it for exactly this.
-    ///
-    /// # Errors
-    ///
-    /// If `name` is not a global.
-    pub fn word(&self, machine: &Machine, name: &str) -> io::Result<u16> {
-        self.word_mem(machine.mem(), name)
-    }
-
-    /// Read a global as a `long`.
-    ///
-    /// Signed, because C's `long` is: `numfils` and the rest are declared
-    /// `long` in `DSKUTL.H`, and a reader that widened them as unsigned would
-    /// report `4294967295` where the module would read `-1`.
-    ///
-    /// # Errors
-    ///
-    /// If `name` is not a global.
-    pub fn long(&self, machine: &Machine, name: &str) -> io::Result<i32> {
-        let at = self
-            .address(name)
-            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
-        let bytes = machine.resolve(at, 4).map_err(io::Error::other)?;
-        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    /// Read a global as a far pointer.
-    ///
-    /// Reborrows into [`Globals::pointer_mem`] through [`Machine::mem`] --
-    /// the same facade shape `word` uses over `word_mem`.
-    ///
-    /// # Errors
-    ///
-    /// If `name` is not a global.
-    pub fn pointer(&self, machine: &Machine, name: &str) -> io::Result<FarPtr> {
-        self.pointer_mem(machine.mem(), name)
     }
 }
 

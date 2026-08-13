@@ -10,7 +10,10 @@
 //! Self::Mem>`, `Abi::mem` as a reborrow rather than a second field), so
 //! nothing here changed to accommodate them.
 
+use std::io;
+
 use super::{Abi, Arg, Exit, ModuleMem, Ret};
+use crate::globals::Globals;
 
 /// The ABI Galacticomm's 16-bit modules were compiled for: Borland huge
 /// model, `seg:off` pointers, cdecl with ten callee-cleaned exceptions (see
@@ -274,6 +277,89 @@ impl ModuleMem for mbbs_machine::m16::Segments {
             offset: 0,
             selector,
         })
+    }
+}
+
+/// [`Globals`]'s `Wg16` facades: `&Machine`/`&mut Machine` shapes kept for
+/// the dozens of shim call sites still built against them, plus
+/// [`Globals::selector`], which no generic core could ever answer -- see
+/// `crates/mbbs/src/globals.rs`'s struct doc comment for why all four live
+/// here instead of there (Task 13 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md`).
+impl Globals<Wg16> {
+    /// The segment the globals live in.
+    ///
+    /// 16-bit in substance, not merely by signature: it projects
+    /// `base().selector`, and a flat 32-bit pointer has no selector to
+    /// project -- there is no `Globals<Wg32>` arm this could ever grow.
+    pub fn selector(&self) -> u16 {
+        self.base().selector
+    }
+
+    /// Overwrite a global.
+    ///
+    /// Reborrows into [`Globals::write_mem`] through `Machine::mem_mut` --
+    /// the same facade shape `Heap::alloc` used to give `Heap::reserve` --
+    /// so the bounds check and the actual write live in exactly one place.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global, or `bytes` is longer than it.
+    pub fn write(
+        &self,
+        machine: &mut mbbs_machine::m16::Machine,
+        name: &str,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.write_mem(machine.mem_mut(), name, bytes)
+    }
+
+    /// Read a global as a word.
+    ///
+    /// Read rather than remembered. `margc` and `tfstate` are the host's
+    /// globals but the module's to change.
+    ///
+    /// Reborrows into [`Globals::word_mem`] through `Machine::mem` -- the
+    /// read-only counterpart to `write`'s `Machine::mem_mut` reborrow.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn word(&self, machine: &mbbs_machine::m16::Machine, name: &str) -> io::Result<u16> {
+        self.word_mem(machine.mem(), name)
+    }
+
+    /// Read a global as a `long`.
+    ///
+    /// Signed, because C's `long` is: `numfils` and the rest are declared
+    /// `long` in `DSKUTL.H`, and a reader that widened them as unsigned would
+    /// report `4294967295` where the module would read `-1`.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn long(&self, machine: &mbbs_machine::m16::Machine, name: &str) -> io::Result<i32> {
+        let at = self
+            .address(name)
+            .ok_or_else(|| io::Error::other(format!("{name} is not a host global")))?;
+        let bytes = machine.resolve(at, 4).map_err(io::Error::other)?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Read a global as a far pointer.
+    ///
+    /// Reborrows into [`Globals::pointer_mem`] through `Machine::mem` -- the
+    /// same facade shape `word` uses over `word_mem`.
+    ///
+    /// # Errors
+    ///
+    /// If `name` is not a global.
+    pub fn pointer(
+        &self,
+        machine: &mbbs_machine::m16::Machine,
+        name: &str,
+    ) -> io::Result<mbbs_machine::m16::FarPtr> {
+        self.pointer_mem(machine.mem(), name)
     }
 }
 

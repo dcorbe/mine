@@ -165,8 +165,7 @@ const EDAT_LEN: u16 = 10;
 ///
 /// If the module's heap cannot give up four small blocks.
 ///
-/// Generic: [`Heap::reserve`](crate::heap::Heap::reserve) is the core
-/// [`Heap::alloc`](crate::heap::Heap::alloc)'s `Wg16` facade delegates into,
+/// Generic: calls [`Heap::reserve`](crate::heap::Heap::reserve) directly,
 /// and [`write_cstr_mem`] is `write_cstr`'s. `DateBuffers<A>` was already
 /// generic (`4d5bab4`), so nothing about the struct itself needed to move.
 fn buffers_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<DateBuffers<A>, ShimError> {

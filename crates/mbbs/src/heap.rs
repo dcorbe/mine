@@ -25,7 +25,7 @@
 //! host -- which would have shrugged and carried on corrupting itself -- and it
 //! is the intended one.
 //!
-//! # Generic core, 16-bit-only skin
+//! # Generic top to bottom
 //!
 //! The algorithm above -- first-fit across regions already mapped, block
 //! sizes kept host-side keyed by the pointer -- is written once, over
@@ -33,18 +33,23 @@
 //! [`ModuleMem::alloc_region`](crate::abi::ModuleMem::alloc_region) rather
 //! than `mbbs_machine::m16::Machine::alloc_segment` directly: see [`Heap::reserve`].
 //!
-//! What does **not** move onto that generic core is `alcmem`/`galfree`'s
-//! actual public surface, or `alctile`. Every shim call site --
-//! `shims/system.rs`, `users.rs`, `btrieve.rs`, and others -- was written
-//! against `Heap::alloc(&mut Machine, ..)`, and this task's job is to change
-//! what backs that call, not to touch the 114 shim bodies that make it.
-//! [`Heap::alloc`] and [`Heap::alloc_tiled`] stay `impl Heap<Wg16>`-only
-//! methods with their original `&mut Machine` signatures, each a one-line
-//! reborrow into the generic core (`machine.mem_mut()`) -- the same
-//! delegating-facade shape Task 1 gave `Machine` over `Segments`.
-//! `alloc_tiled` in particular has no generic core to delegate deeper than
-//! that: LDT tile chaining is `Wg16`-only forever (its 32-bit counterpart is
-//! `alcblok`/`ptrblok`, an unrelated mechanism, out of scope here).
+//! This file used to keep a `Wg16`-only facade over that core --
+//! `Heap::alloc(&mut Machine, ..)`, a one-line reborrow into
+//! [`Heap::reserve`] -- because every shim call site was written against it.
+//! By Task 13 of `docs/plans/2026-08-12-abi-border-implementation.md` every
+//! production call site had already moved onto `reserve` itself (`alcmem`,
+//! `alczer`, `Host::alcvda`, `TextVars::push_mem`, ...); `alloc`'s only
+//! remaining callers were this file's own tests and one `btrieve.rs` test
+//! helper, both of which call `reserve` directly now. So the facade is
+//! deleted rather than converted -- there was nothing left calling it.
+//!
+//! [`Heap::alloc_tiled`] is not here for a different reason: LDT tile
+//! chaining is `Wg16`-only forever (32-bit's `alcblok`/`ptrblok` are an
+//! unrelated mechanism, out of scope here), so unlike `alloc` it never had a
+//! generic core to converge onto. It moved to `crates/mbbs/src/shims/memory.rs`,
+//! beside `alctile`, its one production caller -- see `Heap::push_tile`
+//! (`pub(crate)`, so not linked from here) for the one piece of access it
+//! still needs from this module.
 //!
 //! `A` carries no default. It was `= Wg16`, which let every caller name this
 //! type as plain `Heap`; Task 3 of
@@ -53,7 +58,7 @@
 
 use std::collections::HashMap;
 
-use crate::abi::{Abi, ModuleMem, Wg16};
+use crate::abi::{Abi, ModuleMem};
 
 /// Bytes in one of the heap's regions, which is as much as one 16-bit segment
 /// can address. Kept as the shared growth policy for now because only `Wg16`
@@ -118,7 +123,7 @@ struct Block {
 /// The module's heap and its tiled regions.
 ///
 /// `A` carries no default; every caller spells its ABI -- see this module's
-/// doc comment ("Generic core, 16-bit-only skin").
+/// doc comment ("Generic top to bottom").
 pub struct Heap<A: Abi> {
     config: Config,
     regions: Vec<Arena<A>>,
@@ -191,9 +196,9 @@ impl<A: Abi> Heap<A> {
     /// Reserve `size` bytes, growing through
     /// [`ModuleMem::alloc_region`] if nothing already mapped has room.
     ///
-    /// The generic core `alcmem`/`alczer` both back, through
-    /// [`Heap::alloc`]'s `Wg16` facade -- see this module's doc comment for
-    /// why the facade exists and why shim call sites still say `alloc`.
+    /// The generic core `alcmem`/`alczer` both call directly -- see this
+    /// module's doc comment for the `Wg16` `alloc` facade this used to be
+    /// reached through, and why it is gone now.
     ///
     /// # Errors
     ///
@@ -284,6 +289,18 @@ impl<A: Abi> Heap<A> {
         &self.tiles
     }
 
+    /// Record a newly tiled region.
+    ///
+    /// `pub(crate)`, not the tiling operation itself: building a [`Region`]
+    /// needs the selector `mbbs_machine::m16::Machine::alloc_tiled` handed
+    /// back, which only `Wg16`'s own `alloc_tiled` (`shims/memory.rs`,
+    /// beside `alctile`, its one caller) can supply -- see this module's
+    /// doc comment. This is the one piece of `tiles`' privacy that caller
+    /// needs, so it gets a named method rather than a wider field.
+    pub(crate) fn push_tile(&mut self, region: Region) {
+        self.tiles.push(region);
+    }
+
     /// How many heap regions are mapped.
     pub fn segments(&self) -> usize {
         self.regions.len()
@@ -313,51 +330,10 @@ impl<A: Abi> Heap<A> {
     }
 }
 
-/// The `Wg16` facade: `alcmem`/`galfree`'s and `alctile`'s original public
-/// names and `&mut Machine` signatures, unchanged since before this task, so
-/// every shim call site keeps compiling. See this module's doc comment
-/// ("Generic core, 16-bit-only skin").
-impl Heap<Wg16> {
-    /// `alcmem`'s host half. A one-line reborrow into [`Heap::reserve`] --
-    /// see `crates/mbbs/src/abi.rs`'s "Call holds one handle, not two" for why
-    /// a reborrow through `Machine::mem_mut`, not a second stored borrow, is
-    /// what makes a generic core reachable from a `&mut Machine` call site at
-    /// all.
-    ///
-    /// # Errors
-    ///
-    /// If `size` is zero, or the heap has no room and may not grow.
-    pub fn alloc(&mut self, machine: &mut mbbs_machine::m16::Machine, size: u16) -> Result<mbbs_machine::m16::FarPtr, String> {
-        self.reserve(machine.mem_mut(), size)
-    }
-
-    /// `alctile`'s host half. Stays `Wg16`-only by construction: LDT tile
-    /// chaining (`Machine::alloc_tiled`) has no 32-bit counterpart --
-    /// `alcblok`/`ptrblok` are a different mechanism entirely, out of scope
-    /// here (see the implementation plan's Task 6).
-    ///
-    /// # Errors
-    ///
-    /// If the region cannot be mapped or the LDT has no run that long.
-    pub fn alloc_tiled(
-        &mut self,
-        machine: &mut mbbs_machine::m16::Machine,
-        qty: u16,
-        size: u16,
-    ) -> Result<mbbs_machine::m16::FarPtr, String> {
-        let at = machine.alloc_tiled(qty, size).map_err(|e| e.to_string())?;
-        self.tiles.push(Region {
-            selector: at.selector,
-            qty,
-            size,
-        });
-        Ok(at)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use mbbs_machine::m16::{FarPtr, Machine};
 
     fn heap() -> (Machine, Heap<Wg16>) {
@@ -370,8 +346,8 @@ mod tests {
     #[test]
     fn allocations_do_not_overlap() {
         let (mut m, mut h) = heap();
-        let a = h.alloc(&mut m, 100).expect("a");
-        let b = h.alloc(&mut m, 100).expect("b");
+        let a = h.reserve(m.mem_mut(), 100).expect("a");
+        let b = h.reserve(m.mem_mut(), 100).expect("b");
         assert_ne!(a, b);
         assert!(
             a.offset + 100 <= b.offset || b.offset + 100 <= a.offset,
@@ -382,9 +358,9 @@ mod tests {
     #[test]
     fn freed_space_is_reusable() {
         let (mut m, mut h) = heap();
-        let a = h.alloc(&mut m, 4096).expect("a");
+        let a = h.reserve(m.mem_mut(), 4096).expect("a");
         h.free(a).expect("freed");
-        let b = h.alloc(&mut m, 4096).expect("b");
+        let b = h.reserve(m.mem_mut(), 4096).expect("b");
         assert_eq!(a, b, "the same space should come back");
     }
 
@@ -394,14 +370,14 @@ mod tests {
         // larger than the biggest single block ever freed -- and nothing would
         // say why.
         let (mut m, mut h) = heap();
-        let a = h.alloc(&mut m, 20_000).expect("a");
-        let b = h.alloc(&mut m, 20_000).expect("b");
-        let c = h.alloc(&mut m, 20_000).expect("c");
+        let a = h.reserve(m.mem_mut(), 20_000).expect("a");
+        let b = h.reserve(m.mem_mut(), 20_000).expect("b");
+        let c = h.reserve(m.mem_mut(), 20_000).expect("c");
         h.free(b).expect("freed");
         h.free(a).expect("freed");
         h.free(c).expect("freed");
 
-        let big = h.alloc(&mut m, 60_000).expect("three merged into one");
+        let big = h.reserve(m.mem_mut(), 60_000).expect("three merged into one");
         assert_eq!(big, a);
         assert_eq!(h.segments(), 1, "and it did not need a second segment");
     }
@@ -409,7 +385,7 @@ mod tests {
     #[test]
     fn a_free_of_something_never_allocated_refuses() {
         let (mut m, mut h) = heap();
-        let a = h.alloc(&mut m, 64).expect("a");
+        let a = h.reserve(m.mem_mut(), 64).expect("a");
         let stray = FarPtr {
             offset: a.offset + 8,
             selector: a.selector,
@@ -420,7 +396,7 @@ mod tests {
     #[test]
     fn a_double_free_refuses_rather_than_corrupting_the_heap() {
         let (mut m, mut h) = heap();
-        let a = h.alloc(&mut m, 64).expect("a");
+        let a = h.reserve(m.mem_mut(), 64).expect("a");
         h.free(a).expect("first");
         assert!(h.free(a).is_err(), "the second is a module bug");
     }
@@ -428,8 +404,8 @@ mod tests {
     #[test]
     fn the_heap_crosses_a_segment_boundary() {
         let (mut m, mut h) = heap();
-        let first = h.alloc(&mut m, 40_000).expect("a");
-        let second = h.alloc(&mut m, 40_000).expect("b");
+        let first = h.reserve(m.mem_mut(), 40_000).expect("a");
+        let second = h.reserve(m.mem_mut(), 40_000).expect("b");
         assert_ne!(
             first.selector, second.selector,
             "two of these do not fit in one 64 KiB segment"
@@ -440,11 +416,11 @@ mod tests {
     #[test]
     fn a_heap_that_may_not_grow_refuses_and_says_how_much_is_left() {
         let mut m = Machine::new().expect("machine");
-        let mut h = Heap::new(Config {
+        let mut h = Heap::<Wg16>::new(Config {
             heap: SEGMENT as usize,
         });
-        h.alloc(&mut m, 40_000).expect("fits");
-        let e = h.alloc(&mut m, 40_000).expect_err("does not");
+        h.reserve(m.mem_mut(), 40_000).expect("fits");
+        let e = h.reserve(m.mem_mut(), 40_000).expect_err("does not");
         assert!(e.contains("left"), "{e}");
     }
 
@@ -456,7 +432,7 @@ mod tests {
         let capacity = Config::default().heap / SEGMENT as usize * SEGMENT as usize;
         assert_eq!(h.left(), capacity, "nothing reserved yet");
 
-        let a = h.alloc(&mut m, 1000).expect("a");
+        let a = h.reserve(m.mem_mut(), 1000).expect("a");
         assert_eq!(h.left(), capacity - 1000);
         h.free(a).expect("freed");
         assert_eq!(h.left(), capacity, "and it comes back");
@@ -466,21 +442,21 @@ mod tests {
     fn a_heap_never_promises_a_remainder_it_cannot_hand_out() {
         // Two segments' worth and a bit: the bit is not capacity.
         let mut m = Machine::new().expect("machine");
-        let mut h = Heap::new(Config {
+        let mut h = Heap::<Wg16>::new(Config {
             heap: 2 * SEGMENT as usize + 4096,
         });
         assert_eq!(h.left(), 2 * SEGMENT as usize);
 
-        h.alloc(&mut m, 40_000).expect("first segment");
-        h.alloc(&mut m, 40_000).expect("second segment");
+        h.reserve(m.mem_mut(), 40_000).expect("first segment");
+        h.reserve(m.mem_mut(), 40_000).expect("second segment");
         assert_eq!(h.segments(), 2);
-        assert!(h.alloc(&mut m, 40_000).is_err(), "there is no third");
+        assert!(h.reserve(m.mem_mut(), 40_000).is_err(), "there is no third");
     }
 
     #[test]
     fn a_zero_byte_allocation_refuses() {
         let (mut m, mut h) = heap();
-        assert!(h.alloc(&mut m, 0).is_err());
+        assert!(h.reserve(m.mem_mut(), 0).is_err());
     }
 
     #[test]

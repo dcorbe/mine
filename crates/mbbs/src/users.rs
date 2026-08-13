@@ -882,7 +882,7 @@ mod tests {
         // Deliberately NOT a `Fixture`: a fixture has finished starting up,
         // which is the whole point of this test's opposite.
         let mut machine = mbbs_machine::m16::Machine::new().expect("16-bit machine");
-        let mut host = crate::Host::new(
+        let mut host = crate::Host::<crate::abi::Wg16>::new(
             &mut machine,
             crate::testing::data(),
             Terms::new(crate::globals::NTERMS),

@@ -99,11 +99,12 @@ pub use users::{Connection, Users};
 
 use mbbs_machine::m16::{FarPtr, Machine, Module, NeImage, Relocation, Source, Symbol, Target};
 
-// `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
-// own 64 KiB allocation goes through the `Abi` trait's allocator now, same as
-// `Heap`/`Arena`/`Globals`. `Abi` itself is what `Host<A>` is now generic
-// over; `Wg16` is still named explicitly wherever a generic type needs
-// pinning to the one ABI that exists, including `impl Host<Wg16>` below.
+// `ModuleMem` for `A::mem(cpu).alloc_region(..)` in `Host::new` below --
+// generic since Task 13 of
+// `docs/plans/2026-08-12-abi-border-implementation.md`, the same allocator
+// `Heap`/`Arena`/`Globals` already went through. `Abi` itself is what
+// `Host<A>` is generic over; `Wg16` is still named explicitly wherever a
+// generic type needs pinning to the one ABI that exists.
 use crate::abi::{Abi, ModuleMem, Wg16};
 // `ModulePtr` for `A::Ptr::resolve`/`write` below -- `Host::class_mem` and
 // `Host::point_curusr_mem` are this file's first two generic-core methods
@@ -1135,6 +1136,170 @@ impl<A: Abi> Default for FsdSession<A> {
 /// Task 3 of `docs/plans/2026-08-12-abi-border-implementation.md` removed
 /// it, a bare `Registration`/`Agent`/`Kick` no longer compiles at all.
 impl<A: Abi> Host<A> {
+    /// Build a host over a machine, placing its globals in memory the module
+    /// will be able to address.
+    ///
+    /// `root` is the directory the module's own files live in, and `terms` is
+    /// how many channels it serves.
+    ///
+    /// **The count is an input because it was one in the original.**
+    /// `MAJORBBS.C:557` accumulates `nterms` per configured channel group --
+    /// `nterms+=numopt(msg+NUMBR1,1,256)`, whose `1` is the floor -- `:569`
+    /// catastros above 256, and `:845-866` walks the groups that result,
+    /// raising `hichp1` at `:861` and filling `channel[]` at `:862`. It was
+    /// never a constant the host chose for itself. [`NTERMS`](crate::NTERMS)
+    /// names the one-channel case -- `MAJORBBS.C:80`'s initialiser and
+    /// `GMEOFF.C:23`'s offline host, which is the shape every meter in this
+    /// crate was measured against.
+    ///
+    /// There is deliberately no two-argument form defaulting to one channel. A
+    /// caller who wanted four and got one would find out at the first
+    /// `Terms::chan(1)` that returned `None`, which is a long way from the
+    /// mistake; requiring the argument makes it a compile error instead.
+    ///
+    /// # Generic since Task 13
+    ///
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`'s Task 13. What
+    /// used to be a single `.selector` field access
+    /// (`machine.mem_mut().alloc_region(..)?.selector`) feeding four
+    /// `FarPtr { offset, selector }` literals and one `FarPtr::NULL` is now
+    /// one `A::mem(machine).alloc_region(..)?` call, whose result -- `base`,
+    /// an `A::Ptr` -- every offset is built from through [`Abi::ptr_offset`].
+    /// Under `Wg32` there is no selector to project at all: the base pointer
+    /// *is* the address, and `A::null_ptr()` answers `strtok`'s starting
+    /// value the way `FarPtr::NULL` used to.
+    ///
+    /// # Errors
+    ///
+    /// If the globals or the host's buffers cannot be mapped.
+    pub fn new(machine: &mut A::Cpu, root: impl Into<PathBuf>, terms: Terms) -> io::Result<Self> {
+        // Every table this host keys by channel is sized from this one binding:
+        // the `nterms` global the module reads, `Users`' four tables, and
+        // `Gsbl`'s channels. It is deliberately one parameter and not three
+        // reads of `globals::NTERMS` -- see `crate::chan` for what the three
+        // separate reads cost, and for the measurement that showed one of the
+        // two directions of disagreement was completely silent.
+        let globals = Globals::<A>::new(machine, terms)?;
+        let prf_end = OUTBSZ;
+
+        // One segment for everything the host hands a module a pointer into and
+        // then keeps: `spr`'s four buffers, `gmdnam`'s line, one NUL byte for
+        // `parsin`'s empty-line `margv[0]`, and `l2as`'s own small rotation
+        // (see `Host::l2as`'s doc comment for why that is a separate pool
+        // rather than more of `spr`'s). Separate from the globals so that a
+        // module overrunning one of these cannot reach `usrnum`.
+        let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
+        let l2as_bytes = shims::text::L2AS_BYTES as usize * shims::text::L2AS_BUFFERS;
+        // `ModuleMem::alloc_region` through `Abi::mem` -- every `A::ptr_offset`
+        // below is this same `base` at a chosen offset within it.
+        let base = A::mem(machine).alloc_region(spr_bytes + 64 + 1 + l2as_bytes)?;
+
+        // The per-channel tables come off the module heap, because the real
+        // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
+        // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
+        // module allocates from. So the heap has to exist before they do.
+        let mut heap = Heap::<A>::new(Config::default());
+        let users = users::Users::new(A::mem(machine), &mut heap, terms)?;
+
+        // The three authorities, checked against each other once.
+        //
+        // `Chan` makes a channel of one bound unusable against a table of
+        // another, but it does not by itself make a *construction* error
+        // visible: at `nterms == 1` nothing ever mints the channel-1 handle that
+        // would panic, so building `Gsbl` one channel longer than `Users` still
+        // passed all 688 tests. Measured, not assumed -- the same mutation was
+        // run before this line existed and after it, and only the second one
+        // went red. Without it the divergence waits for a real second channel
+        // and arrives as `point_curusr` refusing a channel `Gsbl::scan` just
+        // handed out, which reads as a module fault.
+        //
+        // `nterms` is read back out of module memory rather than compared to
+        // `terms`, because what the module bounds its own loops by is the word
+        // in the segment, not the value this function meant to write there.
+        let gsbl = gsbl::Gsbl::new(terms);
+        let nterms = globals
+            .word_mem(A::mem_ref(machine), "nterms")
+            .map_err(|e| io::Error::other(format!("nterms: {e}")))?;
+        assert_eq!(
+            (users.terms(), gsbl.terms(), nterms),
+            (terms, terms, terms.count()),
+            "the host's channel tables and the module's `nterms` disagree"
+        );
+
+        // `MAJORBBS.H:345` declares `struct user *user` -- the *head* of the
+        // array, not a slot. The module never asks the host for a channel's
+        // record; it loads this pointer and indexes off it itself, at 58 sites
+        // of `_user_625 + usrnum * 0x29`. So it has to be a real far pointer
+        // before the module's first access, and pointing it at channel 0 is
+        // pointing it at the array.
+        //
+        // `extusr` and `uablok` get no such line, because neither is a global
+        // this host places: `WCCMMUD.DLL` imports neither, and reaches an
+        // account record only by calling `uacoff`.
+        globals.write_mem(A::mem(machine), "user", &A::ptr_to_bytes(users.head()))?;
+        globals.write_mem(A::mem(machine), "channel", &A::ptr_to_bytes(users.channels()))?;
+
+        // R17: written explicitly rather than left to `alloc_segment`'s
+        // `mmap(MAP_ANONYMOUS)` zero-fill. `DateBuffers`'s own empty byte gets
+        // the identical write at `shims/system.rs:110` -- two facilities for
+        // one NUL because they cannot be the same one: this one must exist
+        // before the module's first instruction, and that one is allocated
+        // lazily off the heap the first time a date routine runs.
+        let empty = A::ptr_offset(base, spr_bytes as u16 + 64);
+        empty
+            .write(A::mem(machine), &[0])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        Ok(Self {
+            exports: Exports::wg101(),
+            globals,
+            root: root.into(),
+            spr: A::ptr_offset(base, 0),
+            spr_next: 0,
+            l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
+            l2as_next: 0,
+            strtok: A::null_ptr(),
+            datebuf: None,
+            mdf: A::ptr_offset(base, spr_bytes as u16),
+            empty,
+            prf_end,
+            random: Random::default(),
+            clock: Clock::system()?,
+            audit: Vec::new(),
+            modules: Vec::new(),
+            agents: Vec::new(),
+            textvars: TextVars::default(),
+            messages: msg::Messages::default(),
+            btrieve: btrieve::Btrieve::default(),
+            gsbl,
+            streams: stream::Streams::default(),
+            installed: Vec::new(),
+            notes: Vec::new(),
+            noted: HashSet::new(),
+            kicks: Vec::new(),
+            lstunm: 0,
+            polls_left: 0,
+            forms: HashMap::new(),
+            fsdscb: vec![None; usize::from(terms.count())],
+            fsdtmp: vec![None; usize::from(terms.count())],
+            fsd_state: None,
+            fsd_sessions: vec![None; usize::from(terms.count())],
+            fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
+            fsd_ascii: std::collections::HashMap::new(),
+            fsd_scratch: None,
+            heap,
+            users,
+            asked: Vec::new(),
+            inpolr: None,
+            tcklst: None,
+            calls: 0,
+            clock_reads: 0,
+            trace: std::env::var_os("MBBS_TRACE").is_some(),
+            inited: false,
+            survey: None,
+        })
+    }
+
     /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
     /// every `Entry::Unimplemented` call site it reaches from now on,
     /// recording each one into `inventory` instead of stopping the module.
@@ -3225,7 +3390,7 @@ impl<A: Abi> Host<A> {
     /// is load-bearing here: this heap refuses an allocation of nothing.
     ///
     /// Generic since Task 12: [`Heap::reserve`] rather than the `Wg16`-only
-    /// [`Heap::alloc`] facade -- `heap.rs` itself is Task 13's, but its
+    /// `Heap::alloc` facade Task 13 went on to delete outright -- its
     /// generic core already existed for this to call.
     ///
     /// # Errors
@@ -3308,22 +3473,27 @@ impl<A: Abi> Host<A> {
     }
 }
 
-/// Everything that reads or writes module memory, plus [`Host::dos_name`]
-/// (no `Machine` parameter and no use of `Self` at all -- it stays here
-/// purely because it has no `self`: every call site names it as
-/// `Host::dos_name(...)`, and with no argument or return type mentioning
-/// `A`, `rustc` cannot infer which `Abi` a bare `impl<A: Abi> Host<A>` copy
-/// would mean, only reporting "type annotations needed" -- moving it into
-/// the generic block would force every one of those call sites to spell out
-/// `Host::<Wg16>::dos_name(...)` for a function that has no ABI-dependent
-/// behaviour to abstract over).
+/// What is left of `impl Host<Wg16>` after Tasks 9-13 (§4's four dissolution
+/// clusters of `docs/plans/2026-08-12-abi-border-design.md`) is one method:
+/// [`Host::dos_name`], which has no `Machine` parameter and no use of `Self`
+/// at all. It stays here purely because it has no `self`: every call site
+/// names it as `Host::dos_name(...)`, and with no argument or return type
+/// mentioning `A`, `rustc` cannot infer which `Abi` a bare `impl<A: Abi>
+/// Host<A>` copy would mean, only reporting "type annotations needed" --
+/// moving it into the generic block would force every one of those call
+/// sites to spell out `Host::<Wg16>::dos_name(...)` for a function that has
+/// no ABI-dependent behaviour to abstract over. Task 14 deletes this block
+/// and moves `dos_name` itself onto `impl<A: Abi> Host<A>`, accepting that
+/// spelling everywhere, once nothing else forces the block to exist.
 ///
-/// `Host::load` -- and the NE-specific mechanism `check_globals` used to be,
-/// now folded into `Resolver::resolve` -- moved out of this block in Task 9
-/// (`docs/plans/2026-08-12-abi-border-implementation.md`): loading crosses
-/// the `Abi` trait now, so the wrapper is `impl<A: Abi> Host<A>` and only
-/// the format-specific arm (`Abi::load`'s `Wg16` implementation,
-/// `crates/mbbs/src/abi/wg16.rs`) is concrete.
+/// `Host::new` was the other survivor, through Task 12; Task 13 moved it
+/// onto `impl<A: Abi> Host<A>` (its `.selector` arithmetic became
+/// `A::ptr_offset` from one `alloc_region` base -- see that method's own doc
+/// comment). `Host::load` -- and the NE-specific mechanism `check_globals`
+/// used to be, now folded into `Resolver::resolve` -- moved out in Task 9:
+/// loading crosses the `Abi` trait now, so the wrapper is `impl<A: Abi>
+/// Host<A>` and only the format-specific arm (`Abi::load`'s `Wg16`
+/// implementation, `crates/mbbs/src/abi/wg16.rs`) is concrete.
 impl Host<Wg16> {
     /// The file a module named, with the directory it is allowed to name
     /// stripped off.
@@ -3353,178 +3523,6 @@ impl Host<Wg16> {
             ));
         }
         Ok(bare)
-    }
-
-    /// Build a host over a machine, placing its globals in memory the module
-    /// will be able to address.
-    ///
-    /// `root` is the directory the module's own files live in, and `terms` is
-    /// how many channels it serves.
-    ///
-    /// **The count is an input because it was one in the original.**
-    /// `MAJORBBS.C:557` accumulates `nterms` per configured channel group --
-    /// `nterms+=numopt(msg+NUMBR1,1,256)`, whose `1` is the floor -- `:569`
-    /// catastros above 256, and `:845-866` walks the groups that result,
-    /// raising `hichp1` at `:861` and filling `channel[]` at `:862`. It was
-    /// never a constant the host chose for itself. [`NTERMS`](crate::NTERMS)
-    /// names the one-channel case -- `MAJORBBS.C:80`'s initialiser and
-    /// `GMEOFF.C:23`'s offline host, which is the shape every meter in this
-    /// crate was measured against.
-    ///
-    /// There is deliberately no two-argument form defaulting to one channel. A
-    /// caller who wanted four and got one would find out at the first
-    /// `Terms::chan(1)` that returned `None`, which is a long way from the
-    /// mistake; requiring the argument makes it a compile error instead.
-    ///
-    /// # Errors
-    ///
-    /// If the globals or the host's buffers cannot be mapped.
-    pub fn new(
-        machine: &mut Machine,
-        root: impl Into<PathBuf>,
-        terms: Terms,
-    ) -> io::Result<Self> {
-        // Every table this host keys by channel is sized from this one binding:
-        // the `nterms` global the module reads, `Users`' four tables, and
-        // `Gsbl`'s channels. It is deliberately one parameter and not three
-        // reads of `globals::NTERMS` -- see `crate::chan` for what the three
-        // separate reads cost, and for the measurement that showed one of the
-        // two directions of disagreement was completely silent.
-        let globals = Globals::<Wg16>::new(machine, terms)?;
-        let prf_end = OUTBSZ;
-
-        // One segment for everything the host hands a module a pointer into and
-        // then keeps: `spr`'s four buffers, `gmdnam`'s line, one NUL byte for
-        // `parsin`'s empty-line `margv[0]`, and `l2as`'s own small rotation
-        // (see `Host::l2as`'s doc comment for why that is a separate pool
-        // rather than more of `spr`'s). Separate from the globals so that a
-        // module overrunning one of these cannot reach `usrnum`.
-        let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
-        let l2as_bytes = shims::text::L2AS_BYTES as usize * shims::text::L2AS_BUFFERS;
-        // `ModuleMem::alloc_region`, not `Machine::alloc_segment` directly --
-        // one of the 9 sites Task 6 moves onto the `Abi` trait's allocator.
-        // `Host` itself is not generic yet, so this is `Wg16` concretely: the
-        // region it returns is always `offset: 0`, and every FarPtr built
-        // below is this same `selector` at a chosen offset within it.
-        let selector = machine
-            .mem_mut()
-            .alloc_region(spr_bytes + 64 + 1 + l2as_bytes)?
-            .selector;
-
-        // The per-channel tables come off the module heap, because the real
-        // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
-        // `ACCOUNT.C:109` with `alcblok`, both of which are the same heap a
-        // module allocates from. So the heap has to exist before they do.
-        let mut heap = Heap::<Wg16>::new(Config::default());
-        let users = users::Users::new(machine.mem_mut(), &mut heap, terms)?;
-
-        // The three authorities, checked against each other once.
-        //
-        // `Chan` makes a channel of one bound unusable against a table of
-        // another, but it does not by itself make a *construction* error
-        // visible: at `nterms == 1` nothing ever mints the channel-1 handle that
-        // would panic, so building `Gsbl` one channel longer than `Users` still
-        // passed all 688 tests. Measured, not assumed -- the same mutation was
-        // run before this line existed and after it, and only the second one
-        // went red. Without it the divergence waits for a real second channel
-        // and arrives as `point_curusr` refusing a channel `Gsbl::scan` just
-        // handed out, which reads as a module fault.
-        //
-        // `nterms` is read back out of module memory rather than compared to
-        // `terms`, because what the module bounds its loops by is the word in
-        // the segment, not the value this function meant to write there.
-        let gsbl = gsbl::Gsbl::new(terms);
-        let nterms = globals
-            .word(machine, "nterms")
-            .map_err(|e| io::Error::other(format!("nterms: {e}")))?;
-        assert_eq!(
-            (users.terms(), gsbl.terms(), nterms),
-            (terms, terms, terms.count()),
-            "the host's channel tables and the module's `nterms` disagree"
-        );
-
-        // `MAJORBBS.H:345` declares `struct user *user` -- the *head* of the
-        // array, not a slot. The module never asks the host for a channel's
-        // record; it loads this pointer and indexes off it itself, at 58 sites
-        // of `_user_625 + usrnum * 0x29`. So it has to be a real far pointer
-        // before the module's first access, and pointing it at channel 0 is
-        // pointing it at the array.
-        //
-        // `extusr` and `uablok` get no such line, because neither is a global
-        // this host places: `WCCMMUD.DLL` imports neither, and reaches an
-        // account record only by calling `uacoff`.
-        globals.write(machine, "user", &users.head().to_bytes())?;
-        globals.write(machine, "channel", &users.channels().to_bytes())?;
-
-        // R17: written explicitly rather than left to `alloc_segment`'s
-        // `mmap(MAP_ANONYMOUS)` zero-fill. `DateBuffers`'s own empty byte gets
-        // the identical write at `shims/system.rs:110` -- two facilities for
-        // one NUL because they cannot be the same one: this one must exist
-        // before the module's first instruction, and that one is allocated
-        // lazily off the heap the first time a date routine runs.
-        let empty = FarPtr {
-            offset: spr_bytes as u16 + 64,
-            selector,
-        };
-        machine.write(empty, &[0])?;
-
-        Ok(Self {
-            exports: Exports::wg101(),
-            globals,
-            root: root.into(),
-            spr: FarPtr {
-                offset: 0,
-                selector,
-            },
-            spr_next: 0,
-            l2as: FarPtr {
-                offset: spr_bytes as u16 + 64 + 1,
-                selector,
-            },
-            l2as_next: 0,
-            strtok: FarPtr::NULL,
-            datebuf: None,
-            mdf: FarPtr {
-                offset: spr_bytes as u16,
-                selector,
-            },
-            empty,
-            prf_end,
-            random: Random::default(),
-            clock: Clock::system()?,
-            audit: Vec::new(),
-            modules: Vec::new(),
-            agents: Vec::new(),
-            textvars: TextVars::default(),
-            messages: msg::Messages::default(),
-            btrieve: btrieve::Btrieve::default(),
-            gsbl,
-            streams: stream::Streams::default(),
-            installed: Vec::new(),
-            notes: Vec::new(),
-            noted: HashSet::new(),
-            kicks: Vec::new(),
-            lstunm: 0,
-            polls_left: 0,
-            forms: HashMap::new(),
-            fsdscb: vec![None; usize::from(terms.count())],
-            fsdtmp: vec![None; usize::from(terms.count())],
-            fsd_state: None,
-            fsd_sessions: vec![None; usize::from(terms.count())],
-            fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
-            fsd_ascii: std::collections::HashMap::new(),
-            fsd_scratch: None,
-            heap,
-            users,
-            asked: Vec::new(),
-            inpolr: None,
-            tcklst: None,
-            calls: 0,
-            clock_reads: 0,
-            trace: std::env::var_os("MBBS_TRACE").is_some(),
-            inited: false,
-            survey: None,
-        })
     }
 }
 
@@ -3731,6 +3729,7 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
 
 #[cfg(test)]
 mod tests {
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{
@@ -3945,7 +3944,7 @@ mod tests {
         // after alcvda. A channel the host has never touched and a channel just
         // freed must be the same state, and this is what makes them so.
         let mut machine = Machine::new().expect("16-bit machine");
-        let mut host = Host::new(&mut machine, testing::data(), Terms::new(3)).expect("host");
+        let mut host = Host::<Wg16>::new(&mut machine, testing::data(), Terms::new(3)).expect("host");
 
         // Dirty a channel *before* finish_init, the way a heap that does not
         // zero would have left it.
@@ -3972,7 +3971,7 @@ mod tests {
         // the time anything could reach it -- `Host::fsd_state()` is how the
         // rest of the FSD subsystem finds that slot's number.
         let mut machine = Machine::new().expect("16-bit machine");
-        let mut host = Host::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
+        let mut host = Host::<Wg16>::new(&mut machine, testing::data(), Terms::new(1)).expect("host");
 
         host.finish_init(&mut machine).expect("finished starting up");
 
