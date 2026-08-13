@@ -51,12 +51,48 @@ const SIDSIZ: u16 = 5;
 /// `BBSUTILS.H:18` -- size of the ASCII rendition of a version.
 const VERSIZ: u16 = 9;
 
-/// A far pointer, as 16-bit C stores one: offset then selector.
+/// A far pointer, as 16-bit C stores one: offset then selector. Four bytes
+/// under both ABIs ([`Abi::PTR_WIDTH`]), so it needs no [`Width`] of its own.
 const PTR: u16 = 4;
-/// An `int`, which is 16 bits in every compiler that ever built one of these.
-const INT: u16 = 2;
-/// A `long`.
+/// A `long`. Four bytes under both ABIs ([`Abi::LONG_WIDTH`]).
 const LONG: u16 = 4;
+
+/// How wide a global is.
+///
+/// Almost every global in this table is the same size under both ABIs:
+/// `PTR_WIDTH` and `LONG_WIDTH` are 4 for `Wg16` and `Wg32` alike, and a
+/// `char buf[N]` is `N` bytes wherever it is compiled. `int` is the sole
+/// exception, and the sole reason this type exists -- 2 bytes for 16-bit
+/// Borland, 4 for 32-bit. See [`Abi::INT_WIDTH`], which this defers to
+/// rather than restating.
+///
+/// # Why this is not just a `u16`
+///
+/// It was, and that was a bug. A `const INT: u16 = 2` is *correct* for the
+/// only ABI that existed when the table was written, and silently wrong for
+/// the second: it placed `usrnum`, `margc`, `status` and twelve others two
+/// bytes apart in a 32-bit module's address space, so the module's own
+/// four-byte write to any of them ran into its neighbour. Nothing caught it,
+/// because nothing had ever asked the table what width it meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Width {
+    /// A C `int`: [`Abi::INT_WIDTH`] bytes.
+    Int,
+    /// A width both ABIs agree on, in bytes -- pointers, longs, arrays,
+    /// structs, and the two single-byte flags.
+    Bytes(u16),
+}
+
+impl Width {
+    /// This width in bytes, for `A`.
+    pub const fn bytes<A: Abi>(self) -> u16 {
+        match self {
+            // `INT_WIDTH` is 2 or 4; the cast cannot lose anything.
+            Self::Int => A::INT_WIDTH as u16,
+            Self::Bytes(n) => n,
+        }
+    }
+}
 
 /// `MAJORBBS.H:287` -- `struct sysvbl`, the system-variable Btrieve record.
 /// Its own `spare[]` field pads it to exactly this, so the number is the
@@ -68,15 +104,30 @@ const SYSVBL: u16 = 1300;
 pub struct Global {
     pub dll: &'static str,
     pub name: &'static str,
-    pub size: u16,
+    pub size: Width,
 }
 
-/// A `MAJORBBS` global.
+/// A `MAJORBBS` global of a width both ABIs agree on.
 const fn g(name: &'static str, size: u16) -> Global {
     Global {
         dll: crate::exports::MAJORBBS,
         name,
-        size,
+        size: Width::Bytes(size),
+    }
+}
+
+/// A `MAJORBBS` global declared `int`, and so [`Abi::INT_WIDTH`] bytes wide
+/// rather than a fixed number of them.
+///
+/// Spelled as its own constructor instead of `g(name, INT)` so that the
+/// fifteen declarations that follow the compiler's `int` are visibly a
+/// different kind of thing from the ones that do not -- the distinction the
+/// old `const INT: u16 = 2` erased at the point of use.
+const fn gi(name: &'static str) -> Global {
+    Global {
+        dll: crate::exports::MAJORBBS,
+        name,
+        size: Width::Int,
     }
 }
 
@@ -85,7 +136,7 @@ const fn s(name: &'static str, size: u16) -> Global {
     Global {
         dll: crate::exports::GALGSBL,
         name,
-        size,
+        size: Width::Bytes(size),
     }
 }
 
@@ -102,25 +153,25 @@ pub const GLOBALS: &[Global] = &[
     g("nxtcmd", PTR),
     // MAJORBBS.H:389 -- int margc, inplen, pfnlvl, pfceil, status, shortm,
     // numcat;
-    g("margc", INT),
-    g("inplen", INT),
-    g("pfnlvl", INT),
-    g("pfceil", INT),
-    g("status", INT),
-    g("shortm", INT),
-    g("numcat", INT),
+    gi("margc"),
+    gi("inplen"),
+    gi("pfnlvl"),
+    gi("pfceil"),
+    gi("status"),
+    gi("shortm"),
+    gi("numcat"),
     // MAJORBBS.H:339 -- int nterms, hichp1, usrnum, othusn, uisusn;
-    g("nterms", INT),
-    g("hichp1", INT),
-    g("usrnum", INT),
-    g("othusn", INT),
-    g("uisusn", INT),
+    gi("nterms"),
+    gi("hichp1"),
+    gi("usrnum"),
+    gi("othusn"),
+    gi("uisusn"),
     // MAJORBBS.H:345 -- struct user *user, *usrptr, *othusp;
     g("user", PTR),
     g("usrptr", PTR),
     g("othusp", PTR),
     // MAJORBBS.H:400 -- int nglobs, (*globs[GLBMAX])();
-    g("nglobs", INT),
+    gi("nglobs"),
     g("globs", GLBMAX * PTR),
     // GCOMM.H:449 -- char *prfbuf, *prfptr;
     g("prfbuf", PTR),
@@ -135,7 +186,7 @@ pub const GLOBALS: &[Global] = &[
     g("vdaptr", PTR),
     g("vdatmp", PTR),
     // MAJORBBS.H:440 -- int vdasiz;
-    g("vdasiz", INT),
+    gi("vdasiz"),
     // MAJORBBS.H:74 -- struct usracc *usaptr;
     g("usaptr", PTR),
     // MAJORBBS.H:156, :489 -- BTVFILE *accbb, *genbb;
@@ -162,7 +213,7 @@ pub const GLOBALS: &[Global] = &[
     // FSD.H:54 -- int (*bgnedt)(...);
     g("bgnedt", PTR),
     // TFSCAN.H:17 -- int tfstate; char *tfspst; char tfsbuf[MAXTFS];
-    g("tfstate", INT),
+    gi("tfstate"),
     g("tfspst", PTR),
     g("tfsbuf", MAXTFS),
     // GALACTH.H:33 -- char msysid[SIDSIZ];
@@ -471,13 +522,27 @@ impl<A: Abi> Globals<A> {
         let mut sizes = HashMap::with_capacity(GLOBALS.len());
         let mut at = 0u16;
         for global in GLOBALS {
+            // Every width resolved once, here, against `A` -- and stored
+            // resolved, so that `Globals::size` answers in bytes and no
+            // caller has to know `Width` exists. Only `Width::Int` actually
+            // varies; see that type's own doc comment.
+            let size = global.size.bytes::<A>();
+
             // Even addresses, as a 16-bit compiler would place them. The 286
             // does not care, but a layout that matches the one the header
             // describes is one fewer difference to reason about.
+            //
+            // Deliberately still 2 and not `A::INT_WIDTH`: alignment is the
+            // one part of this layout nothing reads. Each global is addressed
+            // through its own fixup, never as a field at a fixed offset in a
+            // struct, and x86 does not fault on an unaligned dword. Holding
+            // it at 2 keeps every `Wg16` offset byte-identical to what it was
+            // before widths became a per-ABI question, which is what makes
+            // the 16-bit half of this change provably a no-op.
             at = at.next_multiple_of(2);
             offsets.insert(global.name, at);
-            sizes.insert(global.name, global.size);
-            at += global.size;
+            sizes.insert(global.name, size);
+            at += size;
         }
 
         let mem = A::mem(cpu);
@@ -514,13 +579,27 @@ impl<A: Abi> Globals<A> {
         // `terms` is passed in rather than read from `NTERMS` here, so that the
         // number the module sees and the number the host's tables are sized by
         // are the same value and not two reads of one constant.
-        globals.write_mem(mem, "nterms", &terms.count().to_le_bytes())?;
-        globals.write_mem(mem, "hichp1", &terms.count().to_le_bytes())?;
+        //
+        // Written through `A::int_to_bytes`, not `to_le_bytes`: these are
+        // `int`s, and an `int` is not always two bytes. See that method's own
+        // doc comment.
+        globals.write_mem(mem, "nterms", &A::int_to_bytes(terms.count().into()))?;
+        globals.write_mem(mem, "hichp1", &A::int_to_bytes(terms.count().into()))?;
 
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
         // is born with is a lie and not a placeholder.
-        globals.write_mem(mem, "usrnum", &(-1i16).to_le_bytes())?;
+        // `-1` in `A::INT_WIDTH` bytes: `0xFFFF` under `Wg16`, `0xFFFFFFFF`
+        // under `Wg32`. Writing two bytes unconditionally left a 32-bit
+        // module reading `usrnum` as `65535` -- a perfectly plausible channel
+        // number -- instead of the "nobody" the real host means by it.
+        //
+        // All-ones rather than `A::int_to_bytes(A::Int::from(..))`: `A::Int`
+        // is built from a `u16` by *zero* extension, so `From<u16>` can only
+        // ever produce `65535` under `Wg32` -- the exact wrong answer this
+        // line exists to stop. Two's complement `-1` is every bit set at any
+        // width, and needs no extension rule to be right.
+        globals.write_mem(mem, "usrnum", &vec![0xFF; A::INT_WIDTH])?;
 
         Ok(globals)
     }
@@ -591,13 +670,95 @@ mod tests {
         assert_eq!(usrnum as i16, -1);
     }
 
+    /// The whole table, laid out the way [`Globals::new`] lays it out, for
+    /// `A`. Kept in step with that loop by hand -- there is no way to ask
+    /// `Globals` for a layout without a `Cpu` to place it in, and building a
+    /// `Wg32` one means building a real `m32::Machine`, which arms this
+    /// thread's fault recovery and so cannot happen inside `--lib`.
+    fn layout<A: Abi>() -> Vec<(&'static str, u16, u16)> {
+        let mut at = 0u16;
+        let mut placed = Vec::new();
+        for global in GLOBALS {
+            let size = global.size.bytes::<A>();
+            at = at.next_multiple_of(2);
+            placed.push((global.name, at, size));
+            at += size;
+        }
+        placed
+    }
+
     #[test]
     fn the_globals_fit_in_one_segment() {
-        let total: u32 = GLOBALS
+        // A `Wg16` question and only a `Wg16` question: 16-bit modules
+        // address these through one selector, and `Wg32`'s live in a flat
+        // arena with no 64 KiB anything. Checked for both anyway -- the
+        // 32-bit total is the same table 30 bytes wider (fifteen `int`s
+        // gaining two bytes each), so if it ever stopped fitting, the reason
+        // would be worth knowing before a flat-memory assumption hid it.
+        for (abi, total) in [
+            ("Wg16", layout::<crate::abi::Wg16>()),
+            ("Wg32", layout::<crate::abi::Wg32>()),
+        ]
+        .map(|(name, placed)| {
+            let last = placed.last().expect("the table is not empty");
+            (name, u32::from(last.1) + u32::from(last.2))
+        }) {
+            assert!(total < 64 * 1024, "{abi}: {total} bytes of globals");
+        }
+    }
+
+    /// The one number this whole `Width` distinction exists for.
+    ///
+    /// Fifteen globals are declared `int`. Under `Wg16` that is two bytes and
+    /// under `Wg32` it is four, so the 32-bit table is exactly 30 bytes
+    /// longer -- and, far more importantly, a 32-bit module's four-byte write
+    /// to `usrnum` lands entirely inside `usrnum`.
+    ///
+    /// Before this, `const INT: u16 = 2` made both columns 2 and the whole
+    /// table one length. Nothing failed, because nothing asked.
+    #[test]
+    fn an_int_global_is_two_bytes_under_wg16_and_four_under_wg32() {
+        let ints: Vec<&str> = GLOBALS
             .iter()
-            .map(|g| u32::from(g.size).next_multiple_of(2))
-            .sum();
-        assert!(total < 64 * 1024, "{total} bytes of globals");
+            .filter(|g| g.size == Width::Int)
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(ints.len(), 15, "the int globals: {ints:?}");
+        assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
+
+        for name in &ints {
+            let w16 = GLOBALS.iter().find(|g| &g.name == name).expect("found");
+            assert_eq!(w16.size.bytes::<crate::abi::Wg16>(), 2, "{name} under Wg16");
+            assert_eq!(w16.size.bytes::<crate::abi::Wg32>(), 4, "{name} under Wg32");
+        }
+
+        // Every other global is the same width under both, so the totals
+        // differ by exactly two bytes per `int` and nothing else.
+        let end = |placed: Vec<(&str, u16, u16)>| {
+            let last = *placed.last().expect("non-empty");
+            u32::from(last.1) + u32::from(last.2)
+        };
+        assert_eq!(
+            end(layout::<crate::abi::Wg32>()) - end(layout::<crate::abi::Wg16>()),
+            2 * ints.len() as u32,
+        );
+    }
+
+    /// The 16-bit half of the width change is a no-op, stated as a test
+    /// rather than as a claim in a comment: every `Wg16` offset is what it
+    /// was when the table held plain `u16` sizes.
+    ///
+    /// Anchored on three globals whose offsets other tests and the module's
+    /// own `0xfffe` addend already depend on, plus the table's total length.
+    #[test]
+    fn the_wg16_layout_is_unchanged_by_widths_becoming_per_abi() {
+        let placed = layout::<crate::abi::Wg16>();
+        let at = |name: &str| placed.iter().find(|p| p.0 == name).expect("placed").1;
+        assert_eq!(at("input"), 0);
+        assert_eq!(at("margv"), 256);
+        assert_eq!(at("margn"), 256 + 512);
+        let last = *placed.last().expect("non-empty");
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3415);
     }
 
     #[test]
@@ -614,17 +775,18 @@ mod tests {
         // The `0xfffe` addend on `margv` reaches the word before it. This is
         // the layout that makes that word the end of `input` rather than
         // whatever happened to be placed there.
-        let mut at = 0u16;
-        let mut placed = Vec::new();
-        for global in GLOBALS {
-            at = at.next_multiple_of(2);
-            placed.push((global.name, at, global.size));
-            at += global.size;
+        // Both ABIs: `input` and `margv` are `char[]` and `char*[]`, neither
+        // of which changes width, but everything placed before them would
+        // move the pair together if it did.
+        for placed in [
+            layout::<crate::abi::Wg16>(),
+            layout::<crate::abi::Wg32>(),
+        ] {
+            let input = placed.iter().find(|p| p.0 == "input").expect("input");
+            let margv = placed.iter().find(|p| p.0 == "margv").expect("margv");
+            assert_eq!(input.1 + input.2, margv.1, "margv must follow input");
+            assert!(margv.1 >= 2, "margv[-1] must be inside the segment");
         }
-        let input = placed.iter().find(|p| p.0 == "input").expect("input");
-        let margv = placed.iter().find(|p| p.0 == "margv").expect("margv");
-        assert_eq!(input.1 + input.2, margv.1, "margv must follow input");
-        assert!(margv.1 >= 2, "margv[-1] must be inside the segment");
     }
 
     #[test]

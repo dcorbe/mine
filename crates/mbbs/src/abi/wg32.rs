@@ -126,6 +126,14 @@ impl Abi for Wg32 {
         u32::from_le_bytes(bytes.try_into().expect("INT_WIDTH bytes"))
     }
 
+    fn int_from_u32(value: u32) -> Self::Int {
+        value
+    }
+
+    fn int_to_bytes(value: Self::Int) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+
     fn long_from_bytes(bytes: &[u8]) -> u32 {
         u32::from_le_bytes(bytes.try_into().expect("LONG_WIDTH bytes"))
     }

@@ -169,6 +169,36 @@ pub trait Abi {
     /// Decode a C `int` from exactly [`INT_WIDTH`](Abi::INT_WIDTH) bytes.
     fn int_from_bytes(bytes: &[u8]) -> Self::Int;
 
+    /// Narrow a `u32` to a C `int` for `A`, keeping the low
+    /// [`INT_WIDTH`](Abi::INT_WIDTH) bytes.
+    ///
+    /// The counterpart to `Self::Int: Into<u32>`, and the *only* way to build
+    /// an `A::Int` whose value does not fit in a `u16`.
+    ///
+    /// # Why `From<u16>` is not enough
+    ///
+    /// [`Self::Int`](Abi::Int) is bound `From<u16>`, which zero-extends. That
+    /// is correct for a count or a channel number and silently wrong for
+    /// anything negative: `A::Int::from(0xFFFFu16)` is `-1` under `Wg16` and
+    /// `65535` under `Wg32`, because the bits that carry the sign under a
+    /// 4-byte `int` were never there to extend. Every shim returning a C
+    /// sentinel -- `toupper(EOF)`, and anything else answering `-1` -- needs
+    /// the value to be all-ones at `A`'s own width, and `From<u16>` cannot
+    /// express that.
+    fn int_from_u32(value: u32) -> Self::Int;
+
+    /// Encode a C `int` as exactly [`INT_WIDTH`](Abi::INT_WIDTH) bytes,
+    /// little-endian.
+    ///
+    /// The inverse of [`int_from_bytes`](Abi::int_from_bytes), and the
+    /// counterpart to [`ptr_to_bytes`](Abi::ptr_to_bytes). Needed because a
+    /// host that *seeds* an `int` global -- `crate::globals::Globals::new`
+    /// writes `usrnum`, `nterms` and `hichp1` before any module runs -- has
+    /// to write the same number of bytes the module will read, and
+    /// `(-1i16).to_le_bytes()` is two of them regardless of `A`. Under
+    /// `Wg32` that left `usrnum` reading back as `65535` instead of `-1`.
+    fn int_to_bytes(value: Self::Int) -> Vec<u8>;
+
     /// Decode a C `long` from exactly [`LONG_WIDTH`](Abi::LONG_WIDTH) bytes.
     fn long_from_bytes(bytes: &[u8]) -> u32;
 
@@ -919,6 +949,14 @@ mod tests {
 
         fn ptr_to_bytes(ptr: Self::Ptr) -> Vec<u8> {
             Wg16::ptr_to_bytes(ptr)
+        }
+
+        fn int_from_u32(value: u32) -> Self::Int {
+            Wg16::int_from_u32(value)
+        }
+
+        fn int_to_bytes(value: Self::Int) -> Vec<u8> {
+            Wg16::int_to_bytes(value)
         }
 
         fn int_from_bytes(bytes: &[u8]) -> Self::Int {
