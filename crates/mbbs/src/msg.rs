@@ -38,7 +38,6 @@
 use std::fmt;
 use std::io;
 
-use mbbs16::{FarPtr, Machine};
 use mbbs_ptr::ModulePtr;
 
 use crate::abi::{Abi, Wg16};
@@ -353,23 +352,22 @@ struct Block<A: Abi = Wg16> {
 /// the same rule `prfptr` is under, and for the same reason. What is here is
 /// the stack of blocks to restore, which the module cannot see and has no way
 /// to change.
-/// # Generic core, `Wg16`-facade names
+/// # Generic throughout
 ///
 /// `Block::cookie`/`text` and `saved`'s addresses are typed `A::Ptr` rather
 /// than `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely
 /// `Messages<A>`. Every method that never touched a `Machine` -- `close`,
 /// `push`, `pop`, `text`, `name`, `len`, `is_empty`, and the private `find`
-/// -- moves onto `impl<A: Abi> Messages<A>` outright, `FarPtr` widened to
-/// `A::Ptr` wherever one appears. That widening is invisible at every
-/// existing call site, the same reasoning `Streams`' doc comment gives: a
-/// shim always reaches `Messages` through `Host<Wg16>`'s concrete field, so
-/// `self` already pins `A::Ptr` to `FarPtr` before an argument is even
-/// type-checked.
+/// -- lives on `impl<A: Abi> Messages<A>`, `FarPtr` widened to `A::Ptr`
+/// wherever one appears.
 ///
-/// `open` does touch memory, so it keeps its name and `&mut Machine`
-/// signature on a `Wg16` facade (reborrowing into the generic core through
-/// [`Machine::mem_mut`]), and the generic core gets a new name -- `open_mem`
-/// -- the convention `Globals`/`TextVars`/`Streams` all set.
+/// `open_mem` touches memory and takes `&mut A::Mem` for it. It had a `Wg16`
+/// facade named `open`, keeping the original `&mut Machine` signature, until
+/// the shim layer took `Call<A>` and every caller reached `A::Mem` directly
+/// through `Call::mem`. That left the facade with no callers while still
+/// pulling `mbbs16::FarPtr`/`Machine` into this file, so it was deleted --
+/// see `Streams`' own doc comment, which records the same deletion and why
+/// the `_mem` suffix now outlives the distinction it was coined for.
 ///
 /// `A` defaults to [`Wg16`] so every existing caller keeps naming this type
 /// as plain `Messages`. Not `#[derive(Default)]`: the derive macro bounds
@@ -406,8 +404,9 @@ impl<A: Abi> Messages<A> {
     /// because writing zero where the truth is free is the habit this crate
     /// exists to avoid.
     ///
-    /// The generic core [`Messages::open`]'s `Wg16` facade delegates into --
-    /// see the struct's own doc comment for why the two need different names.
+    /// Open a message file, and give the module something to name it by.
+    ///
+    /// The `_mem` suffix is vestigial -- see the struct's own doc comment.
     ///
     /// # Errors
     ///
@@ -537,25 +536,6 @@ impl<A: Abi> Messages<A> {
             .iter()
             .position(|b| b.cookie == cookie)
             .ok_or_else(|| format!("{cookie:?} is not an open message block"))
-    }
-}
-
-impl Messages<Wg16> {
-    /// Open a message file, and give the module something to name it by.
-    ///
-    /// Reborrows into [`Messages::open_mem`] through [`Machine::mem_mut`] --
-    /// the same facade shape `Globals::write` uses over `Globals::write_mem`.
-    ///
-    /// # Errors
-    ///
-    /// If the arena cannot be extended.
-    pub fn open(
-        &mut self,
-        machine: &mut Machine,
-        name: &str,
-        file: &MsgFile,
-    ) -> io::Result<FarPtr> {
-        self.open_mem(machine.mem_mut(), name, file)
     }
 }
 

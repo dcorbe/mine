@@ -54,7 +54,6 @@ use std::path::{Path, PathBuf};
 /// name `FarPtr`. Sorted. See this file's module comment before editing.
 const ALLOWED: &[&str] = &[
     "abi.rs",
-    "arena.rs",
     "btrieve.rs",
     // Arrived with the Btrieve locking work merged from `btrieve-finish`, and
     // caught by this test on the merge rather than noticed by hand -- which is
@@ -62,13 +61,11 @@ const ALLOWED: &[&str] = &[
     // which are the last unconverted block in `ROUTINES`, so they leave this
     // list in the same commit those shims take a `Call<A>`.
     "btrieve/ops.rs",
-    "btrieve/stat.rs",
     "fmt.rs",
     "fsd.rs",
     "globals.rs",
     "heap.rs",
     "lib.rs",
-    "msg.rs",
     "shims/btrieve.rs",
     "shims/fsd.rs",
     "shims/memory.rs",
@@ -80,7 +77,6 @@ const ALLOWED: &[&str] = &[
     "shims/system.rs",
     "shims/text.rs",
     "shims/user.rs",
-    "stream.rs",
     "testing.rs",
     "textvar.rs",
     "users.rs",
@@ -88,6 +84,114 @@ const ALLOWED: &[&str] = &[
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `text` with comment prose removed, so only code is left to search.
+///
+/// # Why this exists
+///
+/// The first version of this test scanned the raw file. That counts a doc
+/// comment *about* the conversion -- "`cookie` widened from `FarPtr` to
+/// `A::Ptr`" -- exactly the same as a `FarPtr` in a signature, and the two
+/// are opposites: the first documents that the coupling is gone, the second
+/// is the coupling. Under a raw scan, the clearest possible explanation of a
+/// finished conversion is what keeps its file on `ALLOWED` forever, so the
+/// list stops meaning "still coupled" and starts meaning "still coupled, or
+/// once was and said so". `stream.rs` and `msg.rs` hit this on the commit
+/// that deleted their last `FarPtr`-typed function: zero code mentions left,
+/// six prose ones.
+///
+/// The implementation plan's Task 7 anticipated this shape of problem and
+/// gave the rule -- "fix the scanner rather than the allowlist when it
+/// produces a false positive, which `72d6bfa` already had to do once". This
+/// is that fix.
+///
+/// # What is deliberately still scanned
+///
+/// Code inside a doc-comment fence (```` ``` ````) is kept, because a
+/// doctest is compiled and run -- it is code that happens to live in a
+/// comment, and a `FarPtr` there is a real use. 86 fences exist in this
+/// crate; none names `FarPtr` today, which is a fact worth keeping true
+/// rather than a reason to stop looking.
+///
+/// String literals are kept too. A `FarPtr` inside one is not coupling, but
+/// stripping strings would mean parsing them, and the conservative direction
+/// for a guard is to over-report: a false positive here is a visible test
+/// failure, a false negative is coupling nobody notices.
+fn code_only(text: &str) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut in_block = false;
+    let mut in_fence = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let doc = trimmed
+            .strip_prefix("///")
+            .or_else(|| trimmed.strip_prefix("//!"));
+
+        if let Some(body) = doc {
+            if body.trim_start().starts_with("```") {
+                // The fence marker itself is not code; the toggle is the point.
+                in_fence = !in_fence;
+                out.push(b'\n');
+                continue;
+            }
+            if in_fence {
+                out.extend_from_slice(body.as_bytes());
+                out.push(b'\n');
+                continue;
+            }
+            // Ordinary doc prose.
+            out.push(b'\n');
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut in_str = false;
+        while i < bytes.len() {
+            if in_block {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    in_block = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if in_str {
+                match bytes[i] {
+                    b'\\' => i += 2,
+                    b'"' => {
+                        in_str = false;
+                        out.push(b'"');
+                        i += 1;
+                    }
+                    b => {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_str = true;
+                out.push(b'"');
+                i += 1;
+            } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                break;
+            } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                in_block = true;
+                i += 2;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out.push(b'\n');
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether `text` names the bare identifier `FarPtr` -- not as a substring of
@@ -135,7 +239,7 @@ fn far_ptr_is_named_only_where_the_allowlist_says() {
         .filter(|p| {
             let text = fs::read_to_string(p)
                 .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
-            names_far_ptr(&text)
+            names_far_ptr(&code_only(&text))
         })
         .map(|p| {
             p.strip_prefix(root)
@@ -159,4 +263,92 @@ fn far_ptr_is_named_only_where_the_allowlist_says() {
          the left means a conversion already freed that file and ALLOWED \
          should shrink to match, in the same commit that freed it."
     );
+}
+
+/// [`code_only`] is now the thing standing between a real `FarPtr` in a
+/// signature and a green test, so it gets its own tests rather than being
+/// trusted because the suite happened to stay green after it landed.
+///
+/// Each case below was checked by mutation: the stripper was broken in the
+/// matching way (drop the fence branch, drop the block-comment branch, strip
+/// strings, treat `//` inside a string as a comment) and the case named here
+/// is the one that failed. A case no mutation can break is not a test, and
+/// two early drafts of this list had exactly that problem.
+#[cfg(test)]
+mod scanner {
+    use super::{code_only, names_far_ptr};
+
+    #[test]
+    fn prose_in_a_doc_comment_is_not_code() {
+        let src = "/// `cookie` widened from `FarPtr` to `A::Ptr`.\npub fn f() {}\n";
+        assert!(!names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn prose_in_a_line_comment_is_not_code() {
+        assert!(!names_far_ptr(&code_only("let x = 1; // was a FarPtr once\n")));
+    }
+
+    #[test]
+    fn prose_in_a_block_comment_is_not_code() {
+        assert!(!names_far_ptr(&code_only("/* FarPtr lived here */\nlet x = 1;\n")));
+    }
+
+    #[test]
+    fn a_block_comment_spanning_lines_stays_stripped() {
+        // The `in_block` flag has to survive the line boundary, or the second
+        // line is scanned as code and the whole file reports a false positive.
+        let src = "/*\n * FarPtr\n */\nlet x = 1;\n";
+        assert!(!names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn a_signature_is_code() {
+        assert!(names_far_ptr(&code_only("pub fn f(at: FarPtr) -> u16 { 0 }\n")));
+    }
+
+    #[test]
+    fn code_after_a_comment_on_the_same_line_survives() {
+        // Stripping from the wrong end -- or stripping the whole line once a
+        // `//` appears anywhere -- would lose this.
+        let src = "let a = 1; // note\nlet b: FarPtr = q;\n";
+        assert!(names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn code_inside_a_doctest_fence_is_still_code() {
+        // The one case that distinguishes this stripper from "delete every
+        // comment": a doctest is compiled and run.
+        let src = "/// ```\n/// let at: FarPtr = q;\n/// ```\npub fn f() {}\n";
+        assert!(names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn prose_after_a_closed_fence_is_prose_again() {
+        // If the fence toggle never flips back, everything below the first
+        // doctest in a file is scanned as code and prose starts counting.
+        let src = "/// ```\n/// let x = 1;\n/// ```\n/// and `FarPtr` is gone now\npub fn f() {}\n";
+        assert!(!names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn a_double_slash_inside_a_string_does_not_start_a_comment() {
+        let src = "let s = \"http://x\"; let at: FarPtr = q;\n";
+        assert!(names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_string_early() {
+        // Getting this wrong flips the in-string state for the rest of the
+        // line, which silently swallows real code after it.
+        let src = "let s = \"he said \\\"hi\\\"\"; let at: FarPtr = q;\n";
+        assert!(names_far_ptr(&code_only(src)));
+    }
+
+    #[test]
+    fn a_longer_identifier_is_not_a_match() {
+        // `names_far_ptr`'s own boundary rule, re-checked through the
+        // stripper so the two are known to compose.
+        assert!(!names_far_ptr(&code_only("fn f(e: FarPtrError) {}\n")));
+    }
 }
