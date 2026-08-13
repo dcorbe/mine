@@ -351,6 +351,14 @@ impl Abi for Wg32 {
     fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
         None
     }
+
+    /// Always `Some` -- `mbbs_machine::m32::Module::entry` is a bare `u32`
+    /// set unconditionally by [`Wg32::load`](Abi::load), never an
+    /// `Option`. See [`Abi::init_entry`]'s own doc comment for why that is
+    /// not the same claim as "every PE has a meaningful entry point".
+    fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
+        Some(mbbs_machine::m32::Flat32Ptr(module.entry()))
+    }
 }
 
 /// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so

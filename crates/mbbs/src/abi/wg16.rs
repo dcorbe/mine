@@ -191,6 +191,14 @@ impl Abi for Wg16 {
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
         caller16(cpu, module)
     }
+
+    /// Direct delegation to `mbbs_machine::m16::Module::entry(1)` --
+    /// "ordinal 1" is the vendor's own name for the init routine
+    /// (`MAJORBBS.C`'s `init_module`/`register_module` convention every NE
+    /// module this host loads follows).
+    fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
+        module.entry(1)
+    }
 }
 
 /// Where in the module the call being refused came from, as a place you can

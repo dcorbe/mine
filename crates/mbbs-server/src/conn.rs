@@ -34,16 +34,35 @@
 //! **One host thread, however many listeners.** [`serve`] can bind more than
 //! one address -- a modern port and a period port, or several of either --
 //! but every one of them feeds the *same* host thread through the same
-//! `host_tx`. `Machine` is `!Send` (see the crate doc): the thread that
+//! `host_tx`. `A::Cpu` is `!Send` (see the crate doc): the thread that
 //! builds it is the one and only owner of this board's channels, its loaded
 //! module, its Btrieve files, for the process's whole life. A listener that
-//! spawned its own host thread would spawn its own `Machine`, load the
+//! spawned its own host thread would spawn its own `A::Cpu`, load the
 //! module a second time, and mint a second set of channels no other
 //! listener's connections could ever reach -- two boards quietly sharing one
 //! `--root` on disk, not one board with two doors into it. So [`serve`]
 //! spawns the host thread exactly once, before it binds anything, and
 //! [`spawn_listener`] -- the per-address half -- only ever receives a clone
 //! of that one thread's sender.
+//!
+//! **One `serve` call is one machine.** [`serve`] is generic over
+//! [`mbbs::abi::Abi`] since Task 20 of
+//! `docs/plans/2026-08-12-abi-border-implementation.md`, and every `Chan` a
+//! machine hands out (`Pool::take`, inside `host::life`) is numbered from
+//! zero *within that machine* -- see `crates/mbbs-server/src/pool.rs`'s own
+//! module doc for why. A board that ever runs more than one machine at once
+//! (a 16-bit `Wg16` board and a 32-bit `Wg32` board, say -- design doc §4a's
+//! staged acceptance) therefore calls `serve` more than once, one call per
+//! machine, and identifies a connection process-wide as *(which `serve`
+//! call's `host_tx` it holds, `Chan`)*, not `Chan` alone: two machines can
+//! both have a channel zero, and only the first half of that pair says
+//! which one a given `Chan` means. Nothing in this crate builds that pairing
+//! into a first-class type yet -- today's `main.rs` only ever calls `serve`
+//! once -- because nothing yet needs to route one already-open connection
+//! between two machines; a connect-time selector choosing *which* machine's
+//! `serve` a fresh connection's first byte belongs to is design doc §4
+//! point 4's named next step (`docs/plans/2026-08-12-abi-border-implementation.md`
+//! Task 22).
 
 use std::io;
 use std::net::SocketAddr;
@@ -119,8 +138,8 @@ pub type Listener<'a> = (&'a str, fn() -> Stack);
 /// `main.rs`'s `std::future::pending`); a test that wants to see `run` react
 /// to every sender dropping drives it directly, with a channel of its own
 /// and no bell attached (`crates/mbbs-server/tests/host_supervisor.rs`).
-pub async fn serve(
-    boot: Boot,
+pub async fn serve<A: mbbs::abi::Abi + 'static>(
+    boot: Boot<A>,
     keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
@@ -128,13 +147,21 @@ pub async fn serve(
     let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(None);
     crate::alarm::spawn(deadline_rx, host_tx.clone());
 
-    // `Machine` is `!Send` (see the crate doc): this thread has to build its
-    // own, so all `run` gets handed in is `Boot` (paths, `Terms`, numbers --
-    // all `Send`), the receiving half of the channel every listener's
-    // sender feeds, and the sending half of the deadline watch the bell task
-    // above is now reading.
+    // `A::Cpu` is `!Send` (see the crate doc): this thread has to build its
+    // own, via `Boot::build`, so all `run` gets handed in is `Boot` (paths,
+    // `Terms`, numbers, and that closure -- all `Send`, see `Boot::build`'s
+    // own doc for why the closure being `Send` says nothing about the
+    // `A::Cpu` it produces), the receiving half of the channel every
+    // listener's sender feeds, and the sending half of the deadline watch
+    // the bell task above is now reading.
+    //
+    // `A: 'static` (this function's own bound) is what lets this closure --
+    // which owns `boot: Boot<A>` -- satisfy `std::thread::spawn`'s own
+    // `'static` bound; it says nothing about `A::Cpu`'s `Send`-ness either,
+    // since no value of that type is ever part of the closure's captured
+    // environment (see `Boot::build`'s own doc, and the module doc above).
     std::thread::spawn(move || {
-        if let Err(e) = host::run(boot, host_rx, deadline_tx) {
+        if let Err(e) = host::run::<A>(boot, host_rx, deadline_tx) {
             eprintln!("mbbs-server: host thread ended: {e}");
         }
     });
@@ -475,7 +502,8 @@ mod tests {
         use tokio::net::TcpStream;
 
         let root = mbbs::testing::scratch("mbbs-server-conn-dead-host");
-        let boot = super::Boot {
+        let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
+            build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             module: PathBuf::from("/nonexistent/NOPE.DLL"),
             terms: mbbs::Terms::new(1),
@@ -885,7 +913,8 @@ mod tests {
         use tokio::net::TcpStream;
 
         let root = mbbs::testing::scratch("mbbs-server-conn-multi-listen");
-        let boot = super::Boot {
+        let boot: super::Boot<mbbs::abi::Wg16> = super::Boot {
+            build: Box::new(mbbs_machine::m16::Machine::new),
             root,
             module: PathBuf::from("/nonexistent/NOPE.DLL"),
             terms: mbbs::Terms::new(1),

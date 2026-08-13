@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use mbbs::Terms;
+use mbbs::abi::Wg16;
 use mbbs_server::conn::{self, Listener, default_keys};
 use mbbs_server::host::Boot;
 use mbbs_server::termcompat::Stack;
@@ -201,7 +202,18 @@ async fn main() -> ExitCode {
         );
     }
 
-    let boot = Boot {
+    // This CLI boots exactly one machine, `Wg16` -- `re/WCCMMUD.DLL`'s own
+    // ABI. `conn::serve` is generic over `A: Abi` since Task 20 of
+    // `docs/plans/2026-08-12-abi-border-implementation.md`, and each call
+    // spawns its own dedicated thread that builds its own `A::Cpu` *on* that
+    // thread (`Boot::build`, called from `host::life` -- never here, since
+    // `A::Cpu` is `!Send` and can never cross into this `async fn`). A board
+    // that also serves a 32-bit module (LunatiX, design doc §4a) would call
+    // `conn::serve::<Wg32>` a second time, with its own `Boot`; wiring a
+    // connect-time selector between the two is Task 22's, not this one's --
+    // see `conn.rs`'s own module doc, "One `serve` call is one machine".
+    let boot: Boot<Wg16> = Boot {
+        build: Box::new(mbbs_machine::m16::Machine::new),
         root: cli.root.clone(),
         module: cli.module.clone(),
         terms,

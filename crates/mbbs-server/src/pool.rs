@@ -6,6 +6,15 @@
 //! given back on disconnect. A connection arriving when the pool is empty is
 //! refused rather than queued: the honest telnet translation of a modem that
 //! did not answer.
+//!
+//! **One `Pool` per machine, never shared.** `crates/mbbs-server/src/host.rs`'s
+//! `life` builds a fresh `Pool` every life, on the one thread that owns that
+//! life's `A::Cpu` -- see `crates/mbbs-server/src/conn.rs`'s module doc,
+//! "One `serve` call is one machine". A `Chan`'s value alone is therefore
+//! only meaningful *within* the machine that handed it out: two machines
+//! both number their channels from zero, and this module has no way to tell
+//! one machine's channel zero from another's -- that is a fact about
+//! whichever `Pool` a caller is holding, not something a `Chan` carries.
 
 use std::collections::VecDeque;
 

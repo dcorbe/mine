@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
+use mbbs::abi::Wg16;
 use mbbs::{Chan, Connection};
 use mbbs_server::conn::{self, default_keys};
 use mbbs_server::host::Boot;
@@ -599,8 +600,9 @@ fn module_file(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot {
+fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot<Wg16> {
     Boot {
+        build: Box::new(mbbs_machine::m16::Machine::new),
         root: mbbs::testing::scratch(root_name),
         module,
         terms: mbbs::Terms::new(terms),

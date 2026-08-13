@@ -1,11 +1,22 @@
-//! The host thread: the only place `Machine::new` is ever called.
+//! The host thread: the only place `A::Cpu` is ever built.
 //!
-//! `mbbs_machine::m16::Machine` is `!Send` -- its segments are `Rc`s over `mmap`s, its
-//! watchdog timer is bound with `SIGEV_THREAD_ID` to the `gettid()` of the
-//! thread that created it, and the fault handler's alternate stack is a
-//! `thread_local`. So the `Machine` is built *inside* this thread and never
-//! crosses into it: [`Boot`] carries everything that is `Send` -- paths,
-//! [`Terms`], numbers -- and [`run`] does the rest.
+//! Every `Abi`'s `Cpu` is `!Send` -- `mbbs_machine::m16::Machine`'s segments
+//! are `Rc`s over `mmap`s, its watchdog timer is bound with
+//! `SIGEV_THREAD_ID` to the `gettid()` of the thread that created it, and
+//! its fault handler's alternate stack is a `thread_local`; `Wg32Cpu`
+//! bundles `mbbs_machine::m32::Machine`, which carries the same three
+//! per-thread commitments. So an `A::Cpu` is built *inside* this thread and
+//! never crosses into it: [`Boot`] carries everything that is `Send` --
+//! paths, [`Terms`], numbers, and [`Boot::build`], the closure that builds
+//! this machine's own `A::Cpu` when called *on* this thread -- and [`run`]
+//! does the rest. Task 20 of
+//! `docs/plans/2026-08-12-abi-border-implementation.md` made this driver
+//! generic over `A`; design doc §4 point 2 is the invariant this file
+//! exists to uphold: one dedicated thread per machine, `!Send` never
+//! violated because nothing ever moves, and no `Send`/`Sync` bound added
+//! anywhere to get there -- `A::Cpu` is produced by calling
+//! [`Boot::build`] *inside* the spawned thread's own stack frame, never
+//! captured by the closure `std::thread::spawn` receives.
 //!
 //! [`Host::hangup`] is the answer to both a lost carrier and a client that
 //! cannot keep up with its own output: the driver does not distinguish them,
@@ -20,11 +31,11 @@
 //! # Surviving a module stop
 //!
 //! A module that faults, overruns its budget, or calls something this host
-//! does not implement poisons the `Machine` it is running on --
-//! [`mbbs_machine::m16::Machine::call`] then refuses to enter that machine again, for
+//! does not implement poisons the `A::Cpu` it is running on --
+//! `A::call` then refuses to enter that machine again, for
 //! **every** channel, not just the one that tripped it, and
-//! [`mbbs_machine::m16::Machine::poison`] deliberately forgets the call frame
-//! (`frame_sp = None`), so there is no resume point to salvage even if a
+//! each ABI's own `poison` deliberately forgets the call frame
+//! (`frame_sp = None`, for `mbbs_machine::m16::Machine`), so there is no resume point to salvage even if a
 //! host wanted one. "Hang up only the offending channel and keep going" is
 //! therefore not a safer, more surgical alternative to a restart -- it is
 //! not available at all: the very next dispatch on any *other* channel would
@@ -47,18 +58,39 @@ use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use mbbs::abi::Wg16;
+use mbbs::abi::Abi;
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
-use mbbs_machine::m16::{Machine, Module, Poison};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
 use crate::msg::{In, Out};
 use crate::pool::Pool;
 
-/// Everything the host thread needs, all of it `Send`. The `Machine` is not
-/// here and cannot be: it is `!Send`, and the thread builds its own.
-pub struct Boot {
+/// Everything the host thread needs, all of it `Send`. `A::Cpu` is not
+/// here and cannot be: it is `!Send`, and the thread builds its own -- see
+/// [`Boot::build`].
+pub struct Boot<A: Abi> {
+    /// Build a fresh `A::Cpu`, called on the host thread itself, once per
+    /// life (see the module doc's "Surviving a module stop").
+    ///
+    /// This is the seam Task 20 introduced to make [`run`]/[`life`] generic
+    /// over `A` at all: `mbbs_machine::m16::Machine::new()` takes no
+    /// arguments and needs nothing but this closure to call it, but a future
+    /// `Wg32` board's `Wg32Cpu` needs a placeholder `Memory` built from the
+    /// module's own file bytes first (`crates/mbbs/tests/wg32_round_trip.rs`'s
+    /// `machine_and_placeholder`) -- ABI-specific construction detail this
+    /// driver has no business knowing, and does not: whoever builds a `Boot`
+    /// supplies it. `Fn`, not `FnOnce`, because [`run`]'s restart loop calls
+    /// this once per life, not once per process.
+    ///
+    /// `Box<dyn Fn() -> io::Result<A::Cpu> + Send>` is `Send` on its own
+    /// terms -- the closure's captured *environment* must be `Send` to cross
+    /// into the spawned thread, which says nothing about whether `A::Cpu`,
+    /// the value it *produces*, is `Send`. It is not, and does not need to
+    /// be: the result of calling this lives only in this thread's own stack
+    /// frame from the moment it is built (see the module doc's second
+    /// paragraph).
+    pub build: Box<dyn Fn() -> io::Result<A::Cpu> + Send>,
     /// The board directory the module's own files live in.
     pub root: PathBuf,
     /// The module to load, e.g. `re/WCCMMUD.DLL`.
@@ -177,7 +209,7 @@ fn arm(wait: Wait, deadline: &watch::Sender<Option<Duration>>) {
 /// asked for.
 ///
 /// Separated from [`run`] so that it can be tested at all: `run` needs a
-/// booted `Machine`, and this needs only a channel.
+/// booted `A::Cpu`, and this needs only a channel.
 ///
 /// **The one blocking point.** `Wait::Blocked` and `Wait::Until` both reduce
 /// to the same bare `rx.recv()` -- design doc §7's "single spine": every
@@ -271,7 +303,7 @@ impl RestartPolicy {
 }
 
 /// How one life of the host thread ended.
-enum LifeEnd {
+enum LifeEnd<A: Abi> {
     /// Every `Sender<In>` is gone -- see [`Woke::Gone`]. The whole
     /// supervisor should stop, not just this life.
     Gone,
@@ -280,7 +312,7 @@ enum LifeEnd {
     /// `chan` is `None` when the stop came from [`Host::cycle`]'s kick
     /// sweep rather than a channel dispatch: a timer callback has no
     /// channel to name. See [`mbbs::Ended::Stopped`].
-    Stopped { poison: Poison, chan: Option<Chan> },
+    Stopped { poison: A::Poison, chan: Option<Chan> },
 }
 
 /// Names who a stop happened to, for [`run`]'s log line -- pulled out as its
@@ -341,7 +373,7 @@ fn collapse(notes: &[String]) -> Vec<String> {
 /// than borrowing is what keeps the same note from being reported on every
 /// turn of the driver loop, and is also what stops the list growing without
 /// bound -- see `Host::drain_notes`.
-fn report_notes(host: &mut Host<Wg16>) {
+fn report_notes<A: Abi>(host: &mut Host<A>) {
     for line in collapse(&host.drain_notes()) {
         eprintln!("mbbs-server: note: {line}");
     }
@@ -360,15 +392,16 @@ fn report_notes(host: &mut Host<Wg16>) {
 /// out of `apply`/`cycle`/`flush` (a host bug, not a module poisoning) still
 /// ends the whole supervisor -- restarting on an error this crate does not
 /// understand would hide it, not fix it.
-fn life(
-    boot: &Boot,
+fn life<A: Abi>(
+    boot: &Boot<A>,
     rx: &std::sync::mpsc::Receiver<In>,
     deadline: &watch::Sender<Option<Duration>>,
     survey: Option<&mbbs::survey::Shared>,
-) -> io::Result<LifeEnd> {
-    // 1. Build the machine HERE. It is !Send; it cannot be handed in.
-    let mut machine = Machine::new()?;
-    let mut host = Host::<Wg16>::new(&mut machine, boot.root.clone(), boot.terms)?;
+) -> io::Result<LifeEnd<A>> {
+    // 1. Build the machine HERE, via `Boot::build`. It is !Send; it cannot
+    //    be handed in.
+    let mut machine = (boot.build)()?;
+    let mut host = Host::<A>::new(&mut machine, boot.root.clone(), boot.terms)?;
     // Every life gets the SAME shared inventory `run` built -- see `Boot::survey`'s
     // own doc for why this cannot be a fresh `Inventory` per life: a `Host`
     // (and everything it owns) is rebuilt from scratch on every restart, and
@@ -379,8 +412,7 @@ fn life(
     }
     let file = std::fs::read(&boot.module)?;
     let module = host.load(&mut machine, &file).map_err(io::Error::other)?;
-    let entry = module
-        .entry(1)
+    let entry = A::init_entry(&module)
         .ok_or_else(|| io::Error::other("module has no ordinal 1 (the init routine)"))?;
     match host.run(&mut machine, &module, entry, &[], None)? {
         Outcome::Returned { .. } => {}
@@ -519,15 +551,15 @@ fn life(
 ///
 /// If a life's *boot* fails (see [`life`]), or the module stops more than
 /// [`RestartPolicy`] allows within [`RESTART_WINDOW`].
-pub fn run(
-    boot: Boot,
+pub fn run<A: Abi>(
+    boot: Boot<A>,
     rx: std::sync::mpsc::Receiver<In>,
     deadline: watch::Sender<Option<Duration>>,
 ) -> io::Result<()> {
     let mut policy = RestartPolicy::new();
 
     // Built ONCE, here -- not inside `life` -- and handed to every life by a
-    // shared `Rc<RefCell<_>>`. `life` rebuilds `Machine` and `Host` from
+    // shared `Rc<RefCell<_>>`. `life` rebuilds `A::Cpu` and `Host` from
     // scratch on every restart (see the module doc, "Surviving a module
     // stop"); an inventory owned by a life's own `Host` would be destroyed
     // with it, and a survey that lost everything at the first restart would
@@ -576,10 +608,10 @@ pub fn run(
 }
 
 /// Apply one boundary message to the host.
-fn apply(
-    host: &mut Host<Wg16>,
-    machine: &mut Machine,
-    module: &Module,
+fn apply<A: Abi>(
+    host: &mut Host<A>,
+    machine: &mut A::Cpu,
+    module: &A::Module,
     pool: &mut Pool,
     conns: &mut [Option<Sender<Out>>],
     msg: In,
@@ -644,10 +676,10 @@ fn apply(
 
 /// Send everything every channel queued, and hang up on anyone who cannot
 /// take it.
-fn flush(
-    host: &mut Host<Wg16>,
-    machine: &mut Machine,
-    module: &Module,
+fn flush<A: Abi>(
+    host: &mut Host<A>,
+    machine: &mut A::Cpu,
+    module: &A::Module,
     pool: &mut Pool,
     conns: &mut [Option<Sender<Out>>],
     terms: Terms,

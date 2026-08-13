@@ -481,6 +481,27 @@ pub trait Abi {
     /// offset for a future `Wg32` implementation, once `Wg32::Module`
     /// carries enough to answer it (design §3).
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
+
+    /// Where the module's init routine sits -- "ordinal 1" for `Wg16`, the
+    /// PE's sole entry point for `Wg32` (a PE has no ordinal table of its
+    /// own the way an NE segment's export table does; there is exactly one
+    /// entry, and it is the vendor's `ordinal 1` for every purpose a caller
+    /// of this method has). Added for `crates/mbbs-server/src/host.rs`'s
+    /// `life`, generic since Task 20 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: it used to
+    /// call `mbbs_machine::m16::Module::entry(1)` directly, which has no
+    /// `Wg32` analogue by that name or that signature.
+    ///
+    /// `None` if this ABI's module has no such entry. Only `Wg16` can
+    /// answer that honestly today: its NE export table may simply lack
+    /// ordinal 1, and `mbbs_machine::m16::Module::entry` already returns
+    /// `Option`. `Wg32`'s `Module` carries its PE entry point as a bare
+    /// `u32` set unconditionally at load (`abi/wg32.rs`'s `load`), so its
+    /// implementation always answers `Some` -- there is no loaded `Wg32`
+    /// module this method could report `None` for, not because the
+    /// question is meaningless for PE, only because nothing upstream of
+    /// this method has built a `Wg32::Module` that could lack one yet.
+    fn init_entry(module: &Self::Module) -> Option<Self::Ptr>;
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
@@ -993,6 +1014,10 @@ mod tests {
 
         fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
             unreachable!("Call's read tests never call Abi::caller")
+        }
+
+        fn init_entry(_module: &Self::Module) -> Option<Self::Ptr> {
+            unreachable!("Call's read tests never call Abi::init_entry")
         }
     }
 
