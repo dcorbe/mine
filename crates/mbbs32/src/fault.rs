@@ -1,17 +1,20 @@
 //! Surviving a module that faults.
 //!
-//! # This handler and mbbs16's cannot both be installed
+//! # Sharing the disposition with other ABIs
 //!
-//! There is exactly one SIGSEGV disposition per process. mbbs16's handler
-//! dispatches on two cases -- host CS, or "ours" -- so a 32-bit fault (CS 0x23)
-//! lands in its 16-bit branch and has SS rewritten from R13, which nothing on
-//! this path sets. Installing this one instead breaks the same thing in reverse.
+//! There is exactly one SIGSEGV/SIGILL/SIGBUS/SIGFPE disposition per process.
+//! This crate used to install its own handler, deciding a fault was "ours"
+//! whenever the faulting `CS` was not the host's -- which is also true of a
+//! 16-bit fault, so a process running both ABIs would have had this handler
+//! read a 16-bit excursion's `R14` as an `mbbs32::asm::Ctx*`, rewrite `SS`
+//! from an `R13` nothing on this path ever sets, and corrupt the process.
+//! Installing `mbbs16`'s old handler instead broke the same thing in
+//! reverse.
 //!
-//! Running both ABIs in one process needs a single arbiter dispatching three
-//! ways on the faulting CS. That is designed in
-//! `docs/plans/2026-08-08-mbbs32-design.md` and deliberately NOT built here:
-//! this increment runs 32-bit modules alone. Do not "fix" the duplication by
-//! making one crate call the other.
+//! `crates/mbbs-fault` is the fix this crate now registers with instead of
+//! installing its own handler: every ABI gets a *positive* claim over the
+//! faulting `CS` -- [`is_user32_cs`] here -- rather than deciding by ruling
+//! the host out, and the shared handler tries each ABI's claim in turn.
 //!
 //! # The recovery protocol, and why it is one register lighter than mbbs16's
 //!
@@ -36,18 +39,30 @@
 //! <https://github.com/dcorbe/x86-compat16> and inherited here unchanged --
 //! see `crates/mbbs16/src/fault.rs`'s module comment for the fuller account,
 //! including why the stack's *address* (as opposed to `SA_ONSTACK` itself)
-//! turned out not to matter.
+//! turned out not to matter. `crates/mbbs-fault` owns the one alternate
+//! stack this thread gets; both ABIs share it.
 //!
 //! # The FS_BASE hazard, and why this file does not need to fix it
 //!
 //! Task 15's `Tib` gives a module's `FS` a real LDT descriptor, which means
 //! `FS_BASE` -- the MSR long-mode addressing actually uses for `%fs`-relative
 //! access, including glibc's own thread-local storage -- is the **module's**
-//! TIB address at the instant a fault is taken, not the host's. This handler
-//! touches no `thread_local`, does no allocation, and calls `libc::sigaction`
-//! only on the branch that hands a *foreign* fault back to `SIG_DFL` (never
-//! reached by a module fault, so never reached while `FS_BASE` is wrong) --
+//! TIB address at the instant a fault is taken, not the host's. [`recover`]
+//! touches no `thread_local`, does no allocation, and calls no library
+//! function at all -- not even `libc::sigaction`, unlike the standalone
+//! handler this crate used to install, because giving up a claimed fault
+//! back to `SIG_DFL` is now `crates/mbbs-fault`'s job, reached only once
+//! nobody's claim matched, which never happens while `FS_BASE` is wrong --
 //! so nothing here depends on `FS_BASE` being correct while it runs.
+//!
+//! Measured the hard way while instrumenting this file to print the faulting
+//! `CS`: a single `libc::write` call inserted into this path was enough to
+//! crash the test process, because glibc's wrapper touches `%fs`-relative
+//! TLS to set `errno`, and `%fs` at that instant names the module's TIB, not
+//! the host's. A raw `syscall` instruction has no such problem. That
+//! instrumentation is gone; the failure it produced is recorded here because
+//! it is exactly the class of mistake this section warns against, caught in
+//! the act rather than merely asserted.
 //!
 //! The restoration itself already happens regardless: [`crate::asm::enter`]
 //! wraps every crossing in an unconditional `arch_prctl(ARCH_GET_FS)` /
@@ -64,21 +79,9 @@
 //!
 //! [raw]: crate::asm
 
-use std::cell::Cell;
 use std::io;
-use std::sync::Once;
-use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::asm::Ctx;
-
-/// Signals a module can raise by misbehaving. `SIGTRAP` is deliberately
-/// absent -- it belongs to debuggers, and a module executing `int3` is
-/// pathological rather than routine. Same list as `mbbs16::fault`; there is
-/// no watchdog signal to add to it here, because this crate has no watchdog
-/// yet (see `docs/plans/2026-08-08-mbbs32-design.md`, "The fault arbiter,
-/// and why it is shared" -- that is where one eventually lands, moved
-/// unchanged from `mbbs16`, not reimplemented per-crate).
-const FAULT_SIGNALS: [i32; 4] = [libc::SIGSEGV, libc::SIGILL, libc::SIGBUS, libc::SIGFPE];
 
 /// `UC_STRICT_RESTORE_SS` from `<asm/ucontext.h>`, which libc does not
 /// re-export. `compat32_fault.c` set this unconditionally even though it
@@ -88,97 +91,43 @@ const FAULT_SIGNALS: [i32; 4] = [libc::SIGSEGV, libc::SIGILL, libc::SIGBUS, libc
 /// nothing when `SS` is correct, which it always is here (never rewritten).
 const UC_STRICT_RESTORE_SS: libc::c_ulong = 0x4;
 
-/// Size of the alternate signal stack. A handler that only edits registers
-/// needs very little, but `SIGSTKSZ` worth costs nothing.
-const ALTSTACK_BYTES: usize = 64 * 1024;
+static INSTALL: std::sync::Once = std::sync::Once::new();
 
-/// The 64-bit code selector host code runs under, recorded when the handlers
-/// go in. The handler compares against it to decide whether a fault is a
-/// module's or someone else's, so it must be a plain value readable without
-/// allocation.
-static HOST_CS: AtomicU16 = AtomicU16::new(0);
-
-static INSTALL: Once = Once::new();
-
-thread_local! {
-    /// This thread's alternate signal stack, mapped once and kept.
-    static ALTSTACK: Cell<*mut libc::c_void> = const { Cell::new(std::ptr::null_mut()) };
-}
-
-/// Make module faults survivable on this thread.
+/// Make module faults survivable on this thread, and register this ABI's
+/// claim with the shared arbiter.
 ///
-/// Installs the process-wide handlers on first call, and this thread's
-/// alternate signal stack every time -- the handlers are shared, the stack is
-/// not.
+/// Registers the process-wide claim on first call only, and arms this
+/// thread's alternate signal stack every time -- the claim is shared across
+/// every thread once registered, the stack is not.
 pub(crate) fn arm(host_cs: u16) -> io::Result<()> {
-    install_altstack()?;
+    mbbs_fault::install_altstack()?;
 
     let mut result = Ok(());
     INSTALL.call_once(|| {
-        HOST_CS.store(host_cs, Ordering::Relaxed);
-        result = install_handlers();
+        result = mbbs_fault::register(
+            host_cs,
+            mbbs_fault::FaultClaim {
+                claims: is_user32_cs,
+                recover,
+            },
+            None, // this crate has no watchdog of its own to register.
+        );
     });
     result
 }
 
-fn install_altstack() -> io::Result<()> {
-    ALTSTACK.with(|slot| {
-        if slot.get().is_null() {
-            // SAFETY: an ordinary anonymous mapping. MAP_32BIT is not needed
-            // here -- unlike a module's own memory, nothing about this stack
-            // has to be a 32-bit-addressable quantity -- but it costs nothing
-            // and mbbs16 carries it for the same reason, so it is kept for
-            // consistency rather than dropped.
-            let base = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    ALTSTACK_BYTES,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            if base == libc::MAP_FAILED {
-                return Err(io::Error::last_os_error());
-            }
-            slot.set(base);
-        }
-
-        let stack = libc::stack_t {
-            ss_sp: slot.get(),
-            ss_size: ALTSTACK_BYTES,
-            ss_flags: 0,
-        };
-        // SAFETY: `stack` describes a live mapping owned by this thread for
-        // the rest of its life.
-        if unsafe { libc::sigaltstack(&stack, std::ptr::null_mut()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    })
-}
-
-fn install_handlers() -> io::Result<()> {
-    // SAFETY: zeroed sigaction is a valid starting point; every field used is
-    // set below.
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = handler as *const () as usize;
-    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
-    // SAFETY: emptying a freshly zeroed set.
-    unsafe { libc::sigemptyset(&mut action.sa_mask) };
-
-    for signo in FAULT_SIGNALS {
-        // SAFETY: `action` is fully initialised and outlives the call.
-        if unsafe { libc::sigaction(signo, &action, std::ptr::null_mut()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+/// This ABI's positive claim: 32-bit module code always runs under Linux's
+/// fixed `__USER32_CS` GDT selector, `0x23` -- there is no `modify_ldt` call
+/// for it, unlike `mbbs16`'s per-module LDT segments, so one constant is the
+/// whole test. Measured, not assumed: instrumenting the handler and driving
+/// this file's own tests below recorded `0x23` on every delivery, against a
+/// host `CS` of `0x33`.
+fn is_user32_cs(cs: u16) -> bool {
+    cs == crate::asm::USER32_CS
 }
 
 /// Bit position of `CS` inside the packed segment-register `greg`. `SS`'s
-/// counterpart (`mbbs16::fault::SS_SHIFT`) has no analogue here: `SS` is
+/// counterpart (`mbbs16::fault`'s `SS_SHIFT`) has no analogue here: `SS` is
 /// never rewritten, so nothing in this file ever shifts anything into it.
 const CS_SHIFT: u32 = 0;
 
@@ -188,34 +137,22 @@ const KEEP_EVERYTHING_BUT_CS: u64 = 0xffff_ffff_ffff_0000;
 
 /// Turn a module's fault into an ordinary return from [`crate::asm::enter`].
 ///
-/// Async-signal-safe: it reads one atomic, edits the context in place, and
-/// returns. No allocation, no locks, and -- on the path a module fault
-/// actually takes -- no library call either; see the module doc comment's
-/// "FS_BASE hazard" section for why that specifically matters here.
-extern "C" fn handler(signo: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+/// Async-signal-safe: it edits the interrupted context in place and returns.
+/// No allocation, no locks, and -- on this path, always, now that giving a
+/// fault back up to `SIG_DFL` belongs to `crates/mbbs-fault` -- no library
+/// call either; see the module doc comment's "FS_BASE hazard" section for
+/// why that specifically matters here.
+///
+/// # Safety
+///
+/// See [`mbbs_fault::RecoverFn`]. Called only after [`is_user32_cs`] has
+/// claimed the faulting `CS`, which is what makes reading `R14` as a
+/// `*mut Ctx` sound -- see the field below.
+unsafe fn recover(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16) {
     // SAFETY: the kernel hands a real `ucontext_t` to an SA_SIGINFO handler.
     let uc = unsafe { &mut *ctx.cast::<libc::ucontext_t>() };
     let gregs = &mut uc.uc_mcontext.gregs;
-
     let packed = gregs[libc::REG_CSGSFS as usize] as u64;
-    let faulting_cs = (packed >> CS_SHIFT) as u16;
-    let host_cs = HOST_CS.load(Ordering::Relaxed);
-
-    if faulting_cs == host_cs {
-        // Not a module fault -- host code, or something else entirely. Put
-        // the default disposition back and return, so the faulting
-        // instruction runs again and kills us the way it would have without
-        // us here. Quietly swallowing another subsystem's SIGSEGV would be
-        // much worse than dying.
-        //
-        // SAFETY: restoring the default disposition of a signal.
-        unsafe {
-            let mut dfl: libc::sigaction = std::mem::zeroed();
-            dfl.sa_sigaction = libc::SIG_DFL;
-            libc::sigaction(signo, &dfl, std::ptr::null_mut());
-        }
-        return;
-    }
 
     // 32-bit module code was interrupted, and it is ours to stop. R14 holds
     // the Ctx passed to mbbs32_enter_raw, which the caller keeps alive across
@@ -367,6 +304,7 @@ mod tests {
     /// a stand-in selector.
     #[test]
     fn a_faulting_module_leaves_the_hosts_thread_locals_working() {
+        use std::cell::Cell;
         thread_local! {
             static PROBE: Cell<u32> = const { Cell::new(0) };
         }

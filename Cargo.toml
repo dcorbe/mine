@@ -6,6 +6,7 @@ members = [
     "crates/mbbs16",
     "crates/mbbs32",
     "crates/mbbs-ldt",
+    "crates/mbbs-fault",
     "crates/btrieve-engine",
     "crates/mbbs-server",
     "crates/mud-core",
