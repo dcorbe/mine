@@ -341,6 +341,150 @@ pub fn minimal_module_bytes() -> Vec<u8> {
     out
 }
 
+/// [`minimal_module_bytes`], plus one import: `module.symbol`, addressed as
+/// data (`OFFSET`, not `FAR_ADDR`) from the one segment's own first two
+/// bytes, additively, with `addend` sitting at the site.
+///
+/// This is what `Resolver::resolve` (`crates/mbbs/src/lib.rs`) needs to be
+/// able to record a [`crate::MissingGlobal`] at all: `Host::load` builds
+/// its `reach` map (`addressed_as_data`) by walking exactly this shape of
+/// relocation, and only a symbol that map has an entry for is ever checked
+/// against `shims::entry` for `Why::NotPlaced`/`Why::TooSmall`. A `FAR_ADDR`
+/// fixup -- what taking a routine's address looks like -- is invisible to
+/// that map on purpose (see `addressed_as_data`'s own doc comment), which is
+/// why this builder uses `OFFSET` rather than the wider record.
+///
+/// `symbol` is written as an **imported name**, not an ordinal: a plain NE
+/// pstring (length byte, then bytes, no trailing ordinal word -- that suffix
+/// belongs only to the *exported*-name tables, `restab`/`nrtab`) appended to
+/// the imported-name table right after `module`'s own. The module reference
+/// table then gets its one entry, pointing at `module`'s offset in that same
+/// table, and the segment's relocation names it by `TGT_IMPORTNAME`.
+///
+/// `addend` is written little-endian at the relocation's site (segment
+/// offset 0) and is what `addend()` in `lib.rs` reads back to build `Reach`.
+/// Pass `0` for a plain "the host does not have this at all"
+/// ([`crate::Why::NotPlaced`]) fixture; pass something at or past a real
+/// global's placed size to build a [`crate::Why::TooSmall`] one instead (see
+/// `missing_globals.rs`'s `refused_when_a_datum_is_addressed_past_its_own_size`
+/// for the latter).
+pub fn module_bytes_importing(module: &str, symbol: &str, addend: i16) -> Vec<u8> {
+    const ALIGN: u16 = 4;
+    const SECTOR: usize = 1 << ALIGN;
+
+    // Relocation record constants -- `crates/mbbs-machine/src/m16/ne.rs`'s
+    // own, not exported from there, so restated here byte-for-byte against
+    // its `parse_relocation`.
+    const SRC_OFFSET: u8 = 5;
+    const TGT_IMPORTNAME: u8 = 2;
+    const TGT_ADDITIVE: u8 = 0x04;
+
+    fn pstring(name: &str, ordinal: u16) -> Vec<u8> {
+        let mut out = vec![name.len() as u8];
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&ordinal.to_le_bytes());
+        out
+    }
+
+    // A plain pstring, with no trailing ordinal -- what the module- and
+    // imported-name tables hold, as opposed to the exported-name tables
+    // `pstring` above serves.
+    fn plain_pstring(name: &str) -> Vec<u8> {
+        let mut out = vec![name.len() as u8];
+        out.extend_from_slice(name.as_bytes());
+        out
+    }
+
+    // The imported-name table: a leading empty string at offset 0 (the same
+    // convention `minimal_module_bytes`'s `impnames` uses, and the reason
+    // module-reference offsets are never 0), then `module`'s own name, then
+    // `symbol`'s.
+    let mut impnames = vec![0u8];
+    let module_at = impnames.len();
+    impnames.extend_from_slice(&plain_pstring(module));
+    let symbol_at = impnames.len();
+    impnames.extend_from_slice(&plain_pstring(symbol));
+
+    // The module's own name, then a terminator -- no exports.
+    let mut restab = pstring("TESTMOD", 0);
+    restab.push(0);
+
+    // A description, then a terminator.
+    let mut nrtab = pstring("a test module", 0);
+    nrtab.push(0);
+
+    // No entries at all: a bundle count of zero ends the table immediately.
+    let entrytab = vec![0u8];
+
+    let mut out = vec![0u8; 0x80];
+    out[0..2].copy_from_slice(b"MZ");
+    out[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+    out[0x40..0x42].copy_from_slice(b"NE");
+
+    // One segment row, filled in once its data is placed.
+    let segtab = 0x80;
+    out.resize(segtab + 8, 0);
+
+    // One module reference: the offset of its name in the imported-name
+    // table, relative to that table's own start.
+    let modtab = out.len();
+    out.extend_from_slice(&(module_at as u16).to_le_bytes());
+
+    let imptab = out.len();
+    out.extend_from_slice(&impnames);
+    let restab_at = out.len();
+    out.extend_from_slice(&restab);
+    let entrytab_at = out.len();
+    out.extend_from_slice(&entrytab);
+    let nrtab_at = out.len();
+    out.extend_from_slice(&nrtab);
+
+    // The one segment's data, on a sector boundary: `addend`, little-endian,
+    // at its first two bytes -- the relocation's site -- then padding, since
+    // `load_ne` maps the segment at its `minalloc`/file length either way.
+    while !out.len().is_multiple_of(SECTOR) {
+        out.push(0);
+    }
+    let sector = (out.len() / SECTOR) as u16;
+    let mut data = addend.to_le_bytes().to_vec();
+    data.resize(4, 0);
+    out.extend_from_slice(&data);
+
+    // The one relocation, immediately after the segment's raw data -- where
+    // `parse_segment` looks for it once `SEG_RELOCINFO` is set.
+    out.extend_from_slice(&1u16.to_le_bytes()); // relocation count
+    out.push(SRC_OFFSET);
+    out.push(TGT_IMPORTNAME | TGT_ADDITIVE);
+    out.extend_from_slice(&0u16.to_le_bytes()); // site: the segment's first word
+    out.extend_from_slice(&1u16.to_le_bytes()); // module reference index, 1-based
+    out.extend_from_slice(&(symbol_at as u16).to_le_bytes()); // imported name offset
+
+    out[segtab..segtab + 2].copy_from_slice(&sector.to_le_bytes());
+    out[segtab + 2..segtab + 4].copy_from_slice(&(data.len() as u16).to_le_bytes());
+    out[segtab + 4..segtab + 6].copy_from_slice(&0x0101u16.to_le_bytes()); // data segment, has relocations
+    out[segtab + 6..segtab + 8].copy_from_slice(&(data.len() as u16).to_le_bytes());
+
+    let w = |out: &mut Vec<u8>, at: usize, v: u16| {
+        out[0x40 + at..0x40 + at + 2].copy_from_slice(&v.to_le_bytes());
+    };
+    w(&mut out, 0x04, (entrytab_at - 0x40) as u16);
+    w(&mut out, 0x06, entrytab.len() as u16);
+    w(&mut out, 0x0c, 0x8001); // a single-data library
+    w(&mut out, 0x0e, 1); // autodata: the one segment
+    w(&mut out, 0x1c, 1); // segment count
+    w(&mut out, 0x1e, 1); // imported module count
+    w(&mut out, 0x20, nrtab.len() as u16);
+    w(&mut out, 0x22, (segtab - 0x40) as u16);
+    w(&mut out, 0x26, (restab_at - 0x40) as u16);
+    w(&mut out, 0x28, (modtab - 0x40) as u16);
+    w(&mut out, 0x2a, (imptab - 0x40) as u16);
+    w(&mut out, 0x32, ALIGN);
+    out[0x40 + 0x2c..0x40 + 0x30].copy_from_slice(&(nrtab_at as u32).to_le_bytes());
+    out[0x40 + 0x36] = 0x02;
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
