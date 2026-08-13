@@ -208,6 +208,9 @@ async fn main() -> ExitCode {
         polls_per_wake: cli.polls_per_wake,
         passes: cli.passes,
         clock_reads: None,
+        wake_age_ms: None,
+        dispatched_total: None,
+        calls_total: None,
         survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
     };
 

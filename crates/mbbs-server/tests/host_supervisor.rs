@@ -274,6 +274,66 @@ mod builder {
         finish(Ne { code, data: block, relocs, entry_offset })
     }
 
+    /// A module whose ordinal 1 (init) registers with the host and schedules
+    /// a `delay`-second kick that re-arms *itself* forever -- `retf`, not
+    /// `HLT`, at the `dstrou` end, so nothing ever stops this module the way
+    /// [`faults_one_second_after_boot`]'s sibling kick does.
+    ///
+    /// For `host.rs`'s wake-age meter (`Boot::wake_age_ms`): that meter is
+    /// only informative against a driver that is *supposed* to keep turning
+    /// -- a one-shot kick like `faults_one_second_after_boot`'s goes idle
+    /// (`Ended::Idle`, `Wait::Blocked`, no deadline armed at all) the moment
+    /// it fires, which would make the meter go stale whether the bell is
+    /// alive or dead. A perpetual kick keeps `Wait::Until` (and so the bell)
+    /// outstanding for as long as the module runs, which is what makes "the
+    /// meter goes stale specifically because the bell died, not because
+    /// there was nothing left to wait for" an honest comparison.
+    pub fn reschedules_forever(delay: u16) -> Vec<u8> {
+        // The dstrou stub goes first, at a known offset, so `entry`'s own
+        // `rtkick` call below can name it without a forward reference: it
+        // re-arms itself with the identical delay, then returns.
+        let mut code = Vec::new();
+        let mut relocs = Vec::new();
+        let dstrou_offset: u16 = 0;
+
+        mov_ax_own_segment(&mut code, &mut relocs, 1); // dstrou.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, dstrou_offset); // dstrou.offset -- itself
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, delay);
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("rtkick"));
+        add_sp(&mut code, 6);
+        retf(&mut code);
+
+        let entry_offset = code.len() as u16;
+
+        // register_module(&block) -- block lives at data segment offset 0.
+        mov_ax_own_segment(&mut code, &mut relocs, 2); // block.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, 0); // block.offset
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("register_module"));
+        add_sp(&mut code, 4); // one far-pointer argument
+
+        // rtkick(delay, dstrou = the re-arming stub above).
+        mov_ax_own_segment(&mut code, &mut relocs, 1); // dstrou.selector
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, dstrou_offset); // dstrou.offset
+        push_ax(&mut code);
+        mov_ax_imm(&mut code, delay);
+        push_ax(&mut code);
+        call_far_import(&mut code, &mut relocs, name_offset("rtkick"));
+        add_sp(&mut code, 6);
+
+        retf(&mut code);
+
+        let mut block = vec![0u8; 25 + 9 * 4];
+        block[..7].copy_from_slice(b"TESTMOD");
+
+        finish(Ne { code, data: block, relocs, entry_offset })
+    }
+
     /// The same shape as [`faults_one_second_after_boot`], but the kick's
     /// routine calls a symbol this host has no shim for
     /// (`shims::entry` falls through to `Entry::Unimplemented`) instead of
@@ -547,8 +607,48 @@ fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot {
         polls_per_wake: 8,
         passes: 32,
         clock_reads: None,
+        wake_age_ms: None,
+        dispatched_total: None,
+        calls_total: None,
         survey: None,
     }
+}
+
+/// A `watch` channel `host::run` can arm deadlines on, with nothing reading
+/// the other end. For the tests below that never need a kick to fire on its
+/// own -- every wake is driven by hand over the test's own raw `In` channel,
+/// or the module here has no kick at all -- see `host::run`'s own doc for
+/// why that degrades cleanly to `Wait::Blocked`'s behaviour (`arm`'s `send`
+/// finds no bell listening) rather than needing a real one wired up. A test
+/// whose module reschedules a kick and expects it to fire autonomously (this
+/// file has several, all built on `faults_one_second_after_boot` or
+/// `survey_then_faults_one_second_after_boot`) needs [`real_bell`] instead --
+/// without a real bell, `Wait::Until` never resolves and the kick never
+/// comes due.
+fn no_bell() -> tokio::sync::watch::Sender<Option<Duration>> {
+    tokio::sync::watch::channel(None).0
+}
+
+/// The real thing: spawns `mbbs_server::alarm`'s bell against `tx`'s own
+/// channel, and returns the `watch::Sender` half for `host::run` to arm
+/// deadlines on alongside the task's handle.
+///
+/// **The handle matters for exactly one test.** The bell holds its own clone
+/// of `tx`, which keeps the channel alive even after a test drops its own
+/// copy -- fine for every test that never checks whether `run` reaches
+/// `Woke::Gone` (this file leaves plenty of `host_thread` handles unawaited
+/// already), wrong for the one test that explicitly wants "every sender
+/// gone" to be reachable
+/// (`a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool`):
+/// that test must `.abort()` this handle -- and `.await` it afterward, so
+/// the task's own `tx` clone is actually dropped before the test drops its
+/// own -- before it can observe `Woke::Gone`. See that test for the pattern.
+fn real_bell(
+    tx: &std::sync::mpsc::Sender<In>,
+) -> (tokio::sync::watch::Sender<Option<Duration>>, tokio::task::JoinHandle<()>) {
+    let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(None);
+    let bell = mbbs_server::alarm::spawn(deadline_rx, tx.clone());
+    (deadline_tx, bell)
 }
 
 /// `In::Connect` over a raw `In`/`Out` channel, bypassing sockets and
@@ -648,7 +748,7 @@ async fn a_module_that_faults_during_boot_is_not_restarted() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx)),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, no_bell())),
     )
     .await
     .expect("boot failing must return promptly, not hang the host thread")
@@ -765,13 +865,16 @@ async fn a_module_that_crash_loops_makes_the_supervisor_give_up() {
     let boot = boot(module, "mbbs-server-host-supervisor-crashloop-root", 1);
 
     let (_tx, rx) = std::sync::mpsc::channel();
+    let (deadline, _bell) = real_bell(&_tx);
     // MAX_RESTARTS lives at 5 (see `host.rs`), each one about a second (the
     // kick's minimum delay) plus a fast synthetic-module reload: comfortably
     // inside this test's own timeout, and every real restart in between is
     // still exercised -- this is not a mocked policy, it is `run` itself.
+    // `real_bell`, not `no_bell`: the whole test depends on this module's
+    // kick coming due five times on its own, with nothing ever sent on `_tx`.
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx)),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline)),
     )
     .await
     .expect("the supervisor must give up well inside 30s, not hang")
@@ -783,6 +886,126 @@ async fn a_module_that_crash_loops_makes_the_supervisor_give_up() {
         text.contains("crash-looping") || text.contains("stopped"),
         "the error should say why the supervisor gave up: {text:?}"
     );
+}
+
+/// Task 19's headline mutation, re-derived: `crates/mbbs-server/tests/sleep.rs`
+/// documents (its own "Mutation 2's honest result") that forcing
+/// `Ended::Waiting`'s arm to answer `Wait::Blocked` instead of
+/// `Wait::Until(next_kick)` did NOT turn that test red -- with no other wake
+/// source in its measurement window, `clock_reads` reads ~0 either way, so a
+/// driver that stopped waking for timers looked identical to one sleeping
+/// correctly. Catching it, that section says, needs "a different test... one
+/// that asserts forward progress on a kick-driven event... within a bounded
+/// wall-clock window." This is that test.
+///
+/// `faults_one_second_after_boot`'s kick makes forward progress cheap to
+/// observe from outside without a real DLL: firing it halts the machine,
+/// `run` restarts, and five restarts inside sixty seconds is an `Err` this
+/// test can wait for -- with `tx` held alive (so a dropped sender can never
+/// masquerade as the bug by producing a clean `Woke::Gone`) and NEVER sent
+/// to. Under the real driver, the bell alone wakes it once a second and it
+/// reaches that `Err` in a handful of seconds. Under the mutation, nothing
+/// ever arms a deadline at all (`arm` sees `Wait::Blocked` and sends `None`
+/// -- see `arm`'s own doc), so `rx.recv()` blocks forever and `run` never
+/// returns; the `timeout` below is what turns that into a clean failure
+/// instead of a hang.
+///
+/// Run by hand with `Ended::wait`'s `Waiting` arm changed to return
+/// `Wait::Blocked` (mirroring `sleep.rs`'s own mutation), this test times
+/// out -- red, as intended. See this task's own report for the exact output.
+#[tokio::test]
+async fn a_kick_reaches_five_restarts_with_no_external_wake_ever_sent() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-kick-only-wake",
+        &builder::faults_one_second_after_boot(),
+    );
+    let boot = boot(module, "mbbs-server-host-supervisor-kick-only-wake-root", 1);
+
+    let (tx, rx) = std::sync::mpsc::channel::<In>();
+    let (deadline, _bell) = real_bell(&tx);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline)),
+    )
+    .await
+    .expect(
+        "a driver that genuinely wakes for its own timers reaches the five- \
+         restart crash-loop ceiling well inside 20s with nothing external \
+         ever sent; a driver that stopped waking for timers (the \
+         Wait::Blocked mutation sleep.rs documents as otherwise invisible) \
+         hangs here forever instead",
+    )
+    .expect("the host thread did not panic");
+
+    let err = result.expect_err("five restarts inside the window must give up");
+    assert!(
+        err.to_string().contains("stopped") || err.to_string().contains("crash-looping"),
+        "must be the crash-loop message, not some other error: {err}"
+    );
+
+    // `tx` is still alive and was never sent to -- explicit, not merely
+    // implied by scope, since a premature drop turning into `Woke::Gone`
+    // would be exactly the kind of "passes for the wrong reason" this test
+    // exists to rule out.
+    drop(tx);
+}
+
+/// The other half of design doc §7's frozen-world defence: the wake-age
+/// meter (`Boot::wake_age_ms`). Where the test above proves the *driver*
+/// still reaches a kick with no external wake, this proves the *meter*
+/// notices when it stops being able to -- stamped fresh every turn while a
+/// live bell keeps `reschedules_forever`'s perpetual kick coming due, and
+/// left stale, provably past the kick's own interval, once the bell is
+/// killed.
+#[tokio::test]
+async fn a_dead_bell_leaves_the_wake_age_meter_stale() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-wake-age",
+        &builder::reschedules_forever(1),
+    );
+    let wake_age = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut boot = boot(module, "mbbs-server-host-supervisor-wake-age-root", 1);
+    boot.wake_age_ms = Some(std::sync::Arc::clone(&wake_age));
+
+    let (tx, rx) = std::sync::mpsc::channel::<In>();
+    let (deadline, bell) = real_bell(&tx);
+    let _host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline));
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_millis() as u64
+    }
+    fn age_of(wake_age: &std::sync::atomic::AtomicU64) -> u64 {
+        now_ms().saturating_sub(wake_age.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    // Let a couple of live, bell-driven turns happen -- boot itself, plus at
+    // least one real kick firing.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let fresh = age_of(&wake_age);
+    assert!(
+        fresh < 1_500,
+        "with a live bell and a one-second kick, the driver must have turned \
+         within the last 1.5s; measured {fresh}ms stale"
+    );
+
+    // Kill the bell. Nothing else in this test ever sends on `tx`, so the
+    // driver's only remaining path back to `rx.recv()` returning was a real
+    // Alarm -- which will now never arrive again.
+    bell.abort();
+
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let stale = age_of(&wake_age);
+    assert!(
+        stale > 1_000,
+        "a dead bell must leave the driver's last turn more than one kick \
+         interval (1s) in the past; measured {stale}ms"
+    );
+
+    drop(tx);
 }
 
 /// The restart path works for `Poison::Unimplemented`, not only
@@ -845,7 +1068,7 @@ async fn a_duplicate_disconnect_after_a_send_failure_does_not_let_two_clients_sh
     let boot = boot(module, "mbbs-server-host-supervisor-duplicate-disconnect-root", 1);
 
     let (tx, rx) = std::sync::mpsc::channel::<In>();
-    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, no_bell()));
 
     // Connection A takes the only channel. Its output receiver is dropped
     // immediately -- `flush`'s next `try_send` to it will see `Closed`,
@@ -943,7 +1166,8 @@ async fn a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool() 
     let boot = boot(module, "mbbs-server-host-supervisor-stale-cross-life-root", 1);
 
     let (tx, rx) = std::sync::mpsc::channel::<In>();
-    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+    let (deadline, bell) = real_bell(&tx);
+    let host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline));
 
     // The first life: connect once to get a genuine Chan value from *this*
     // board -- with terms == 1 it can only ever be channel 0, but obtaining
@@ -991,6 +1215,13 @@ async fn a_stale_message_from_a_dead_life_does_not_corrupt_the_new_lifes_pool() 
     );
     drop(out_rx_b);
     drop(out_rx_c);
+
+    // The bell holds its own clone of `tx` (see `real_bell`'s doc) -- kill it
+    // and wait for it to actually finish unwinding before dropping this
+    // test's own `tx`, or that clone would keep the channel alive and
+    // `Woke::Gone` would never come.
+    bell.abort();
+    let _ = bell.await;
 
     drop(tx);
     let result = tokio::time::timeout(Duration::from_secs(5), host_thread)
@@ -1042,12 +1273,14 @@ async fn the_survey_inventory_survives_every_restart() {
     boot.survey = Some(survey_path.clone());
 
     let (_tx, rx) = std::sync::mpsc::channel();
+    let (deadline, _bell) = real_bell(&_tx);
     // Same budget `a_module_that_crash_loops_makes_the_supervisor_give_up`
     // uses for the identical reason: five restarts, a second's kick delay
-    // apiece, plus a fast synthetic-module reload each time.
+    // apiece, plus a fast synthetic-module reload each time. Real bell, same
+    // reason: nothing here ever sends on `_tx`.
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx)),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline)),
     )
     .await
     .expect("the supervisor must give up well inside 30s, not hang")
@@ -1101,7 +1334,8 @@ async fn the_survey_inventory_is_on_disk_long_before_any_clean_shutdown() {
     // fires -- this test's whole point is to look *without* a graceful
     // shutdown ever having happened.
     let (tx, rx) = std::sync::mpsc::channel();
-    let _host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx));
+    let (deadline, _bell) = real_bell(&tx);
+    let _host_thread = tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, deadline));
 
     // Past the kick's one-second delay, comfortably short of the restart
     // that follows it -- this reads the file mid-flight, not after `run`

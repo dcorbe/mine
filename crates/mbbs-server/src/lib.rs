@@ -10,6 +10,7 @@
 //!
 //! See `docs/plans/2026-08-08-tokio-transport-design.md`.
 
+pub mod alarm;
 pub mod conn;
 pub mod host;
 pub mod iac;

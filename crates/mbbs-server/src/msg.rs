@@ -18,6 +18,13 @@ pub enum In {
     Disconnect {
         chan: Chan,
     },
+    /// A deadline the driver itself asked for has passed -- see
+    /// `crate::alarm`. Carries nothing: the timer task never learns *why* it
+    /// was armed, only *when*, and `Host::cycle`'s own clock-anchored
+    /// catch-up (`tcklst`) is what decides whether anything was actually
+    /// due. A stale or duplicate `Alarm` is not a bug -- see `alarm`'s own
+    /// module doc for why this message is deliberately sloppy.
+    Alarm,
 }
 
 /// Out of the host thread, to one connection.

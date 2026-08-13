@@ -43,14 +43,15 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mbbs::abi::Wg16;
 use mbbs::{Chan, Ended, Host, Outcome, Terms, Wait};
 use mbbs_machine::m16::{Machine, Module, Poison};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 
 use crate::msg::{In, Out};
 use crate::pool::Pool;
@@ -80,6 +81,44 @@ pub struct Boot {
     /// synchronises against it.
     pub clock_reads: Option<Arc<AtomicU64>>,
 
+    /// Epoch milliseconds of the start of the driver's most recent loop
+    /// turn, stamped once per turn regardless of what that turn did -- the
+    /// **frozen-world detector**. See design doc
+    /// `docs/plans/2026-08-12-abi-border-design.md` §7.
+    ///
+    /// A driver that is genuinely waiting correctly still turns once per
+    /// kick, once per input burst, or once per stray bell: this can go stale
+    /// for at most one kick interval under correct operation. A driver that
+    /// has stopped waking for timers at all -- the regression
+    /// `crates/mbbs-server/tests/sleep.rs` documents as invisible to the
+    /// clock-reads meter alone, because a driver that never wakes also never
+    /// reads the clock -- leaves this stamp motionless indefinitely, which a
+    /// reader outside the thread (which owns the `!Send` `Machine` and so
+    /// cannot itself be probed) can detect by simply comparing this against
+    /// wall-clock time. Same `Ordering::Relaxed` convention as
+    /// [`Boot::clock_reads`]: a reader polls this on its own schedule.
+    pub wake_age_ms: Option<Arc<AtomicU64>>,
+
+    /// Running total of [`mbbs::Cycles::dispatched`] across every `cycle`
+    /// call this life has made, for a reader to sample alongside
+    /// [`Boot::calls_total`] and derive the **no-op ratio**: how many host
+    /// routine calls ([`Host::calls`]) each top-level dispatch actually
+    /// costs. Design doc §7: "a meter, not a control input" -- nothing in
+    /// this driver ever branches on it. `fetch_add`, not `store`, because
+    /// `Cycles::dispatched` itself resets to zero every `cycle` call rather
+    /// than accumulating the way `Host::clock_reads`/[`Host::calls`] do.
+    ///
+    /// [`Host::calls`]: mbbs::Host::calls
+    pub dispatched_total: Option<Arc<AtomicU64>>,
+
+    /// [`Host::calls`] itself, sampled the same way [`Boot::clock_reads`]
+    /// samples [`Host::clock_reads`] -- a running total, stored (not added)
+    /// after every `cycle` call. Paired with [`Boot::dispatched_total`] for
+    /// the no-op ratio; see that field's doc.
+    ///
+    /// [`Host::calls`]: mbbs::Host::calls
+    pub calls_total: Option<Arc<AtomicU64>>,
+
     /// Where to write a survey of every unimplemented symbol this board
     /// reaches, or `None` (the default, and the only setting safe for a
     /// board anyone plays on) to run the way this crate always has.
@@ -100,20 +139,54 @@ pub struct Boot {
 
 /// What one wake yielded.
 enum Woke {
-    /// A message arrived.
+    /// A message arrived -- including [`In::Alarm`], a deadline this driver
+    /// itself asked for coming due. There is no other way to learn that one
+    /// has: see [`wake`]'s own doc.
     Message(In),
-    /// Nothing arrived, which is expected: a kick came due, or there was
-    /// simply nothing to do yet.
+    /// Nothing arrived. Only possible under `Wait::Now`'s non-blocking peek
+    /// -- a burst still in progress that found nothing queued this instant.
     Nothing,
     /// Every `Sender<In>` is gone. The listener and every connection task
     /// have dropped theirs, so nobody can ever send again.
     Gone,
 }
 
-/// Block, sleep, or peek, according to what the last `cycle` asked for.
+/// Tell [`crate::alarm::spawn`]'s task what to wait for next, translating
+/// [`Wait`] into the one thing that task understands: a duration from now,
+/// or none at all.
+///
+/// `Wait::Now` disarms (`None`) rather than requesting a zero-length sleep --
+/// this turn is not going to block on `rx` at all (see [`wake`]'s `Now` arm),
+/// so a bell that fired anyway would just be one more stale one for the next
+/// turn to shrug off. A `send` failing means nobody is watching the
+/// `watch::Receiver` any more (the alarm task ended, or -- in a test that
+/// never wired one up at all -- there never was one); either way there is
+/// nothing this call could do about it, so the error is dropped rather than
+/// propagated. A driver with no working bell degrades to `Wait::Blocked`'s
+/// old failure mode (see the mutation `crates/mbbs-server/tests/host_supervisor.rs`
+/// re-derives for this task), not a panic.
+fn arm(wait: Wait, deadline: &watch::Sender<Option<Duration>>) {
+    let request = match wait {
+        Wait::Until(d) => Some(d),
+        Wait::Blocked | Wait::Now | Wait::Stop => None,
+    };
+    let _ = deadline.send(request);
+}
+
+/// Block, peek, or refuse to wait at all, according to what the last `cycle`
+/// asked for.
 ///
 /// Separated from [`run`] so that it can be tested at all: `run` needs a
 /// booted `Machine`, and this needs only a channel.
+///
+/// **The one blocking point.** `Wait::Blocked` and `Wait::Until` both reduce
+/// to the same bare `rx.recv()` -- design doc §7's "single spine": every
+/// source of a wake, including a deadline coming due, is now a message on
+/// this one channel ([`crate::msg::In::Alarm`], rendered by
+/// [`crate::alarm::spawn`]'s task from whatever [`arm`] most recently
+/// requested). There is no more `recv_timeout` here at all; `Wait::Until`'s
+/// distinction from `Wait::Blocked` lives entirely in what [`arm`] told the
+/// bell to ring for, not in this function.
 ///
 /// **`Gone` is the case worth having a name.** Once every sender is dropped,
 /// `recv` stops blocking and returns an error immediately, every time. A
@@ -123,14 +196,9 @@ enum Woke {
 /// the back door at shutdown.
 fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
     match wait {
-        Wait::Blocked => match rx.recv() {
+        Wait::Blocked | Wait::Until(_) => match rx.recv() {
             Ok(msg) => Woke::Message(msg),
             Err(_) => Woke::Gone,
-        },
-        Wait::Until(d) => match rx.recv_timeout(d) {
-            Ok(msg) => Woke::Message(msg),
-            Err(RecvTimeoutError::Timeout) => Woke::Nothing,
-            Err(RecvTimeoutError::Disconnected) => Woke::Gone,
         },
         Wait::Now => match rx.try_recv() {
             Ok(msg) => Woke::Message(msg),
@@ -295,6 +363,7 @@ fn report_notes(host: &mut Host<Wg16>) {
 fn life(
     boot: &Boot,
     rx: &std::sync::mpsc::Receiver<In>,
+    deadline: &watch::Sender<Option<Duration>>,
     survey: Option<&mbbs::survey::Shared>,
 ) -> io::Result<LifeEnd> {
     // 1. Build the machine HERE. It is !Send; it cannot be handed in.
@@ -341,6 +410,21 @@ fn life(
     let mut wait = Wait::Now;
 
     loop {
+        // 0. Tell the bell what to ring for -- see `arm`'s own doc -- then
+        //    stamp this turn's start. `Boot::wake_age_ms`'s whole value is
+        //    in being stamped unconditionally, every turn, before anything
+        //    below can early-return or fail: a turn that stamps only on
+        //    success could not tell "waiting correctly" from "stopped
+        //    turning at all", which is exactly the distinction this meter
+        //    exists to make.
+        arm(wait, deadline);
+        if let Some(age) = &boot.wake_age_ms {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            age.store(now_ms, Ordering::Relaxed);
+        }
+
         // 1. Sleep according to what the previous cycle told us to do.
         let first = match wake(wait, rx) {
             Woke::Message(msg) => Some(msg),
@@ -350,20 +434,49 @@ fn life(
 
         // 2. Drain every message available, not just the one that woke us --
         //    taking one per wake would make a ten-line paste cost ten wakes.
+        //    `In::Alarm` carries no work of its own (see its own doc) but
+        //    still has to pass through `apply` so a driver here behaves
+        //    exactly like `apply`'s other callers -- `saw_input` is what
+        //    tells step 3 apart from a bare bell.
+        let mut saw_input = false;
         for msg in first
             .into_iter()
             .chain(std::iter::from_fn(|| rx.try_recv().ok()))
         {
+            saw_input |= !matches!(msg, In::Alarm);
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
         }
 
-        // 3. Arm every polling channel and grant this wake's budget.
-        host.refill_polls(&mut machine, boot.polls_per_wake)?;
+        // 3. The pump as a derived clock (design doc §7): grant a fresh poll
+        //    budget only on a turn that had a reason to expect new work --
+        //    real input, or a `Wait::Until` deadline this same loop armed
+        //    for an outstanding kick. Never unconditionally: a turn reached
+        //    only by a stray `Alarm` while nothing was expected
+        //    (`Wait::Blocked` -- no kick was ever outstanding to ring for,
+        //    see `arm`) or by `Wait::Now`'s non-blocking peek (`Ended::Bound`
+        //    already has budget left over from the burst in progress, so
+        //    handing it a fresh one would just restart the countdown) is
+        //    left to run `cycle` on whatever `polls_left` already is --
+        //    ordinarily zero, which is exactly a `polling_armed` channel's
+        //    resting state between bursts. `syscyc` and `prcrtk`'s kick
+        //    sweep are unaffected either way: neither is gated on
+        //    `polls_left` (see `Host::cycle`), so they run regardless -- the
+        //    "free rider" design doc §7 names them.
+        let expected_kick = matches!(wait, Wait::Until(_));
+        if saw_input || expected_kick {
+            host.refill_polls(&mut machine, boot.polls_per_wake)?;
+        }
 
         // 4. Turn the world.
         let cycles = host.cycle(&mut machine, &module, boot.passes)?;
         if let Some(meter) = &boot.clock_reads {
             meter.store(host.clock_reads(), Ordering::Relaxed);
+        }
+        if let Some(meter) = &boot.dispatched_total {
+            meter.fetch_add(u64::try_from(cycles.dispatched).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+        if let Some(meter) = &boot.calls_total {
+            meter.store(host.calls(), Ordering::Relaxed);
         }
 
         // 5. Everything the channels queued goes out.
@@ -392,11 +505,25 @@ fn life(
 /// [`RestartPolicy`]'s bound. See the module doc for why a restart, rather
 /// than hanging up one channel, is the only safe response to a stop.
 ///
+/// `deadline` is the host thread's half of [`crate::alarm::spawn`]'s
+/// channel -- every [`arm`] call this thread ever makes goes through it. A
+/// caller that never spawned an alarm task (every test in this file that
+/// drives `run` directly rather than through [`crate::conn::serve`]) may
+/// still pass one built from a bare `tokio::sync::watch::channel(None)`: with
+/// no task reading the other end, `arm`'s `send` simply finds nobody home
+/// (see its own doc) and this thread falls back to `Wait::Blocked`'s and
+/// `Wait::Until`'s shared behaviour of blocking on `rx` alone -- correct for
+/// any test that drives every wake by hand over `rx` itself.
+///
 /// # Errors
 ///
 /// If a life's *boot* fails (see [`life`]), or the module stops more than
 /// [`RestartPolicy`] allows within [`RESTART_WINDOW`].
-pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
+pub fn run(
+    boot: Boot,
+    rx: std::sync::mpsc::Receiver<In>,
+    deadline: watch::Sender<Option<Duration>>,
+) -> io::Result<()> {
     let mut policy = RestartPolicy::new();
 
     // Built ONCE, here -- not inside `life` -- and handed to every life by a
@@ -416,7 +543,7 @@ pub fn run(boot: Boot, rx: std::sync::mpsc::Receiver<In>) -> io::Result<()> {
     };
 
     let result = loop {
-        match life(&boot, &rx, inventory.as_ref()) {
+        match life(&boot, &rx, &deadline, inventory.as_ref()) {
             Err(e) => break Err(e),
             Ok(LifeEnd::Gone) => break Ok(()),
             Ok(LifeEnd::Stopped { poison, chan }) => {
@@ -508,6 +635,10 @@ fn apply(
             conns[chan.index()] = None;
             Ok(())
         }
+        // Nothing to apply -- see `In::Alarm`'s own doc. It exists purely to
+        // unblock `wake`'s `rx.recv()`; `life`'s own loop is what reads it
+        // apart from the other variants (`saw_input`), not this function.
+        In::Alarm => Ok(()),
     }
 }
 
@@ -645,15 +776,33 @@ mod tests {
         }
     }
 
-    /// The two "nothing arrived" answers, which must NOT be `Gone` -- a
-    /// driver that shut down on an idle tick would end the board the first
-    /// second nobody typed.
+    /// `Wait::Now`'s non-blocking peek finding nothing queued is `Nothing`,
+    /// not `Gone` -- a driver that shut down on an empty peek would end the
+    /// board the first turn nobody had anything queued.
+    ///
+    /// `Wait::Until` no longer has a "nothing arrived" answer of its own: see
+    /// `wake`'s doc for why it now reduces to the same blocking `rx.recv()`
+    /// as `Wait::Blocked` -- a deadline coming due arrives as
+    /// [`In::Alarm`], a `Woke::Message`, not a timeout `wake` can see.
     #[test]
-    fn an_idle_wake_is_nothing_rather_than_gone() {
+    fn an_idle_peek_is_nothing_rather_than_gone() {
         let (tx, rx) = std::sync::mpsc::channel::<In>();
         assert!(matches!(wake(Wait::Now, &rx), Woke::Nothing));
-        assert!(matches!(wake(Wait::Until(Duration::from_secs(1)), &rx), Woke::Nothing));
         drop(tx);
+    }
+
+    /// `Wait::Until` blocks on the same channel `Wait::Blocked` does, and a
+    /// deadline coming due is indistinguishable from any other message at
+    /// this level -- it is [`In::Alarm`], delivered as `Woke::Message` like
+    /// any other `In`.
+    #[test]
+    fn wait_until_wakes_on_a_plain_alarm_message_like_any_other() {
+        let (tx, rx) = std::sync::mpsc::channel::<In>();
+        tx.send(In::Alarm).expect("the receiver is still alive");
+        assert!(matches!(
+            wake(Wait::Until(Duration::from_secs(1)), &rx),
+            Woke::Message(In::Alarm)
+        ));
     }
 
     /// `apply`'s `Connect` arm, stripped of the `Host`/`Module` it would

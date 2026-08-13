@@ -104,19 +104,37 @@ pub type Listener<'a> = (&'a str, fn() -> Stack);
 /// Does not block: every accept loop runs in its own spawned task. See the
 /// module doc for why the host thread is spawned exactly once, here, before
 /// any listener is bound.
+///
+/// **Also spawns the bell.** [`host::run`]'s driver has one blocking point
+/// (`rx.recv()`); everything that can wake it, including a deadline coming
+/// due, arrives as a message on `host_tx`'s channel. [`alarm::spawn`] is the
+/// task on this (async) side that turns "sleep this long" requests from the
+/// host thread into [`In::Alarm`] messages back on that same channel -- see
+/// its own module doc for why one more channel of its own would defeat the
+/// point. It is given its own clone of `host_tx`, which -- unlike every
+/// other clone here -- lives for the process's whole life rather than one
+/// connection's, so [`host::run`]'s `rx` never naturally observes every
+/// sender gone while this task is alive. That is fine for a real board (this
+/// process runs until something kills it, never by `rx` going quiet -- see
+/// `main.rs`'s `std::future::pending`); a test that wants to see `run` react
+/// to every sender dropping drives it directly, with a channel of its own
+/// and no bell attached (`crates/mbbs-server/tests/host_supervisor.rs`).
 pub async fn serve(
     boot: Boot,
     keys: Vec<String>,
     listeners: &[Listener<'_>],
 ) -> io::Result<Vec<SocketAddr>> {
     let (host_tx, host_rx) = std_mpsc::channel::<In>();
+    let (deadline_tx, deadline_rx) = tokio::sync::watch::channel(None);
+    crate::alarm::spawn(deadline_rx, host_tx.clone());
 
     // `Machine` is `!Send` (see the crate doc): this thread has to build its
     // own, so all `run` gets handed in is `Boot` (paths, `Terms`, numbers --
-    // all `Send`) and the receiving half of the channel every listener's
-    // sender feeds.
+    // all `Send`), the receiving half of the channel every listener's
+    // sender feeds, and the sending half of the deadline watch the bell task
+    // above is now reading.
     std::thread::spawn(move || {
-        if let Err(e) = host::run(boot, host_rx) {
+        if let Err(e) = host::run(boot, host_rx, deadline_tx) {
             eprintln!("mbbs-server: host thread ended: {e}");
         }
     });
@@ -464,6 +482,9 @@ mod tests {
             polls_per_wake: 1,
             passes: 1,
             clock_reads: None,
+            wake_age_ms: None,
+            dispatched_total: None,
+            calls_total: None,
             survey: None,
         };
 
@@ -871,6 +892,9 @@ mod tests {
             polls_per_wake: 1,
             passes: 1,
             clock_reads: None,
+            wake_age_ms: None,
+            dispatched_total: None,
+            calls_total: None,
             survey: None,
         };
 
