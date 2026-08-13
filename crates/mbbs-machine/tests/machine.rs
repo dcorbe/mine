@@ -526,3 +526,42 @@ fn arg_u32_panics_rather_than_wrapping_on_an_overflowing_index() {
 
     let _ = machine.arg_u32(usize::MAX);
 }
+
+/// `Machine::arg_frame()` (Task 6 of `docs/plans/2026-08-12-abi-border-implementation.md`):
+/// the whole argument frame, not one dword at a time. Its own doc comment
+/// says it starts with the same bytes `arg_u32(0)`, `arg_u32(1)`, ... would
+/// read individually -- proved here directly, against pushed dwords with
+/// distinct halves so a byte-order or offset mutation cannot pass by
+/// coincidentally agreeing with itself.
+///
+/// `crate::abi::wg32::Wg32::arg_frame` (in the `mbbs` crate) delegates
+/// straight to this method, so `Call<Wg32>::new` -- and every shim behind it
+/// -- is only as correct as this window is.
+#[test]
+fn arg_frame_starts_with_the_pushed_dwords_in_order() {
+    let mut machine = Machine::new().expect("a Machine");
+    let target = machine.thunk_addr(27);
+
+    const ARG0: u32 = 0x1111_2222;
+    const ARG1: u32 = 0x3333_4444;
+    const ARG2: u32 = 0x5555_6666;
+
+    let (mut mapping, entry) = code_at(&[]);
+    let code = push_args_and_call(&[ARG0, ARG1, ARG2], entry, target);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+    let exit = machine.call(entry, &[]).expect("reaches the import call");
+    assert_eq!(exit, Exit::Call { index: 27 });
+
+    let frame = machine.arg_frame();
+    assert!(frame.len() >= 12, "frame is at least the three pushed dwords");
+    assert_eq!(&frame[0..4], &ARG0.to_le_bytes(), "arg_frame()[0..4] must be argument 0");
+    assert_eq!(&frame[4..8], &ARG1.to_le_bytes(), "arg_frame()[4..8] must be argument 1");
+    assert_eq!(&frame[8..12], &ARG2.to_le_bytes(), "arg_frame()[8..12] must be argument 2");
+
+    // Cross-check against arg_u32 itself, so the two readers of the same
+    // frame cannot silently disagree with each other.
+    assert_eq!(&frame[0..4], machine.arg_u32(0).to_le_bytes().as_slice());
+    assert_eq!(&frame[4..8], machine.arg_u32(1).to_le_bytes().as_slice());
+    assert_eq!(&frame[8..12], machine.arg_u32(2).to_le_bytes().as_slice());
+}

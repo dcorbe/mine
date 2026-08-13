@@ -333,6 +333,38 @@ impl Machine {
         self.poisoned.as_ref()
     }
 
+    /// Refuse this module from now on, for a reason the host reached itself.
+    ///
+    /// Mirrors `crate::m16::Machine::poison`: the call frame is forgotten and
+    /// every later [`call`](Machine::call)/[`resume`](Machine::resume) fails
+    /// naming the reason. The first reason wins -- a module poisoned for one
+    /// thing that then trips over another is still poisoned for the first,
+    /// which is the one that is true. See `crate::m16::Machine::poison`'s own
+    /// doc comment for why a host-reached reason (e.g. an unimplemented
+    /// import) is worth having at all, alongside the fault path that already
+    /// poisons through [`Machine::run`]'s `Exit::Fault` arm.
+    ///
+    /// **One deliberate divergence from `crate::m16::Machine::poison`:** that
+    /// method also disarms its machine's watchdog timer (`self.ctx.disarm()`).
+    /// This machine has no watchdog to disarm -- `crate::m32::asm::Ctx` carries
+    /// no timer state, because the 32-bit watchdog is Task 16's job
+    /// (`docs/plans/2026-08-12-abi-border-implementation.md`), not yet landed.
+    /// There is nothing armed here for a poisoned machine to leave running, so
+    /// skipping that step is not a shortcut around a real hazard, only the
+    /// absence of one. `io::Result` stays on the signature regardless, for
+    /// parity with [`crate::abi::Abi::poison`] and so Task 16's watchdog can
+    /// grow a fallible disarm here later without changing callers.
+    ///
+    /// # Errors
+    ///
+    /// Never, today -- see the divergence above. Kept fallible for the same
+    /// reason the signature is, not because this body can fail.
+    pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
+        self.poisoned.get_or_insert(reason);
+        self.frame_sp = None;
+        Ok(())
+    }
+
     /// The linear address of the outstanding call's near return address --
     /// `None` before any call and after the module has returned. Mirrors
     /// `crate::m16::Machine::frame_sp`, which exists for the same reason: a
@@ -580,6 +612,61 @@ impl Machine {
             .get(off..end)
             .expect("arg_u32(): argument slot runs past this machine's own stack");
         u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
+    }
+
+    /// The bytes of the outstanding call's argument frame, starting right
+    /// after the 4-byte near return address [`Machine::call`] pushed beneath
+    /// the arguments, and running to the end of this machine's stack.
+    ///
+    /// Mirrors `crate::m16::Machine::arg_frame`: the same "widest slice that
+    /// is still honestly backed by real memory" answer, for the same reason
+    /// -- there is no arity here to size the window against, only the stack
+    /// itself as a bound. It is the window [`Machine::arg_u32`] already reads
+    /// one dword at a time, handed back whole; `crate::abi::Abi::arg_frame`'s
+    /// `Wg32` arm delegates straight here, the same way `Wg16`'s delegates to
+    /// `crate::m16::Machine::arg_frame`.
+    ///
+    /// Unlike `crate::m16::Machine::arg_frame`, there is no `THUNK_SAVES`-sized
+    /// register-save area between the return address and argument 0 to step
+    /// over -- [`Machine::frame_sp`]'s own doc comment says this machine's
+    /// call thunk pushes nothing of the module's before reaching the
+    /// trampoline, so only the 4-byte return address itself needs skipping,
+    /// the same `+ 4` [`Machine::arg_u32`] uses.
+    ///
+    /// Also unlike `crate::m16::Machine::arg_frame`, `self.tib.stack()` is
+    /// already an ordinary Rust slice rather than a `Segment` addressed
+    /// through a hand-rolled `slice(offset, len)`, so the bounds check below
+    /// is an ordinary `.get(start..)` -- no `checked_sub`-then-multiply
+    /// arithmetic feeds an `unsafe` `from_raw_parts` the way
+    /// `crate::m16::Machine::arg_frame`'s own doc comment warns a wrapped
+    /// length would. There is no equivalent hazard here for the same
+    /// `.get` to be checked twice against.
+    ///
+    /// # Panics
+    ///
+    /// If the module is not stopped at a call, or if the frame begins past
+    /// the end of the stack -- mirroring [`Machine::arg_u32`]'s own panics,
+    /// for the same reason: a corrupted `frame_sp` must fail loudly rather
+    /// than read garbage or silently wrap.
+    pub fn arg_frame(&self) -> &[u8] {
+        let sp = self
+            .frame_sp
+            .expect("arg_frame() with no outstanding call to read from");
+        let limit = self.tib.stack_limit();
+        let frame_off = sp.checked_sub(limit).expect(
+            "arg_frame(): the remembered call frame is below this machine's own stack",
+        ) as usize;
+        let start = frame_off
+            .checked_add(4)
+            .expect("arg_frame(): the argument frame start overflows this machine's own stack");
+        let stack = self.tib.stack();
+        stack.get(start..).unwrap_or_else(|| {
+            panic!(
+                "arg_frame(): the module called out at a frame starting at {start:#x}, \
+                 past the end of this machine's {} byte stack",
+                stack.len()
+            )
+        })
     }
 
     /// Cross into 32-bit mode and come back, handing the module `ret` in

@@ -36,7 +36,7 @@
 //! `fault_32_after_16.rs` for the constructions this now proves recover
 //! correctly in both orders.
 
-use mbbs::abi::{Abi, Call, Cursor, ModuleMem, Wg16, Wg32, Wg32Cpu};
+use mbbs::abi::{Abi, Arg, Call, Cursor, Exit, ModuleMem, Ret, Wg16, Wg32, Wg32Cpu};
 
 /// Byte-for-byte the same fixture `mbbs_machine::m32::flatptr`'s and `mbbs_machine::m32::mem`'s own
 /// test modules build -- duplicated per this crate family's own convention
@@ -74,13 +74,20 @@ fn minimal_with_one_section() -> Vec<u8> {
     v
 }
 
-/// A real `Wg32Cpu`: a genuine `mbbs_machine::m32::Machine` (thunk table, TIB, fault
-/// recovery armed) bundled with a genuine `mbbs_machine::m32::Memory` wrapping a loaded
-/// (if inert) image. Nothing here is entered -- this task does not service a
-/// call end to end (that needs `mbbs_machine::m32::Machine::resume`, unmerged; see the
-/// design's Task 3 note) -- but `Call<Wg32>` must be buildable from the real
-/// thing, not only a fixture standing in for it, the same way `Call<Wg16>`'s
-/// own proof needed a live `mbbs_machine::m16::Machine`.
+/// A real `Wg32Cpu`: a genuine `mbbs_machine::m32::Machine` (thunk table, TIB,
+/// fault recovery armed) bundled with a genuine `mbbs_machine::m32::Memory`
+/// wrapping a loaded (if inert) image.
+///
+/// **Task 6 update:** this file's own doc comment used to say "nothing here
+/// is entered" -- true when only `Call<Wg32>`'s frame-reading was proven
+/// (Task 5's `Cursor`/`Call` proof, below). It stopped being true once
+/// `mbbs_machine::m32::Machine::arg_frame` and `Machine::poison` landed and
+/// `abi/wg32.rs`'s two `todo!()`s retired: `call_round_trips_a_hand_assembled_immediate_return`,
+/// the `Cleans::Callee` panic test, and the `Arg` differential test below all
+/// genuinely cross into 32-bit code through `Wg32::call`/`Machine::call` and
+/// come back. This `cpu()` fixture is still not itself *executed against* --
+/// its `Memory`/`Image` stay inert -- but the `Wg32Cpu` it returns is now a
+/// real target for `Abi::call`, not merely `Call::new`'s frame-reading.
 fn cpu() -> Wg32Cpu {
     let file = minimal_with_one_section();
     let pe = mbbs_machine::m32::PeImage::parse(&file).expect("fixture parses");
@@ -179,4 +186,126 @@ fn alloc_region_reaches_the_real_arena() {
         ptr.0.wrapping_sub(cpu.mem.image().base()) >= SIZE_OF_IMAGE,
         "an allocated region must not land inside the image"
     );
+}
+
+/// Task 6, requirement 1: `Wg32::call` against real hand-assembled 32-bit
+/// code, round-tripped through a genuine crossing -- `Machine::new`'s thunk
+/// table and TIB, `asm::enter`, the lot -- not merely "the types check".
+///
+/// `mov eax, imm32 ; ret` (`B8 xx xx xx xx C3`) is the smallest program that
+/// proves both halves at once: the module actually ran (a `Ret` that never
+/// entered silicon could not produce `imm` from nothing), and `Exit::Returned`
+/// carries it back correctly (`lo` from `EAX`).
+#[test]
+fn call_round_trips_a_hand_assembled_immediate_return() {
+    let mut cpu = cpu();
+
+    const IMM: u32 = 0x1234_5678;
+    let mut mapping = mbbs_machine::m32::Mapping::new(4096).expect("a code mapping");
+    let mut code = vec![0xB8]; // mov eax, imm32
+    code.extend_from_slice(&IMM.to_le_bytes());
+    code.push(0xC3); // ret
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+    let entry = mbbs_machine::m32::Flat32Ptr(mapping.base() as usize as u32);
+
+    let exit = Wg32::call(&mut cpu, entry, &[]).expect("the call is recovered, not fatal");
+    match exit {
+        Exit::Returned { lo, hi } => {
+            assert_eq!(lo, IMM, "EAX must come back as lo, unmodified");
+            assert_eq!(hi, 0, "nothing set EDX; hi must be zero, not garbage");
+        }
+        other => panic!("expected Exit::Returned{{lo: {IMM:#x}, hi: 0}}, got {other:?}"),
+    }
+}
+
+/// Task 6, requirement 2: `Wg32::resume` given `Cleans::Callee` must panic,
+/// not guess -- see `abi/wg32.rs`'s own doc comment on that arm ("32-bit
+/// Worldgroup is uniformly cdecl, so a `Cleans::Callee` row reaching this ABI
+/// is a bug in the host's shim table"). This is a permanent behaviour, not a
+/// stub Task 6 was meant to retire (`abi/wg32.rs`'s module doc comment says
+/// so explicitly), so the test pins the *message*, not merely that a panic
+/// happened -- a panic with the wrong reason would be just as wrong as no
+/// panic at all.
+///
+/// No outstanding call is needed: the `match cleans { .. }` in `Wg32::resume`
+/// dispatches on `cleans` before it ever touches `cpu`, so `Cleans::Callee`
+/// panics immediately regardless of what state `cpu` is in.
+#[test]
+#[should_panic(expected = "32-bit Worldgroup is uniformly cdecl")]
+fn resume_with_cleans_callee_panics_because_wg32_has_no_callee_cleaned_routines() {
+    let mut cpu = cpu();
+    let _ = Wg32::resume(&mut cpu, Ret::<Wg32>::Void, mbbs::Cleans::Callee(2));
+}
+
+/// Task 6, requirement 3 -- **the one that matters** (design §6). Both `Abi`
+/// implementations agree `PTR_WIDTH == LONG_WIDTH == 4`; a ptr/long confusion
+/// in generic code is invisible to either. Only `INT_WIDTH` (2 under `Wg16`,
+/// 4 under `Wg32`) discriminates, and this is the differential test that
+/// proves it still does, end to end through `Arg` and `Abi::call` -- not a
+/// hand-built byte array agreeing with itself (that proof already exists,
+/// decode-only, in `call_reads_a_ptr_int_int_frame_at_32_bit_offsets_not_16_bit_ones`
+/// above; this one drives the SAME `Arg` list through a genuine crossing of
+/// BOTH machines and reads the result back through each one's own `Call<A>`).
+///
+/// The harness trick: `entry` is the machine's own thunk address, entered
+/// directly as if it *were* the module's entry point. `Machine::call` builds
+/// its frame (near/far return address, then `args`) and jumps straight to
+/// `entry` either way; when `entry` happens to be thunk code, the thunk sets
+/// its `Exit::Call` markers and reports back immediately, with `frame_sp`
+/// landing exactly where a real module's own call to that thunk would have
+/// left it (`arg_frame`'s own doc comment on both machines: only the
+/// near/far return address separates the two, and the thunk's own AX/CX save
+/// -- `crate::m16::mod.rs`'s `THUNK_SAVES` -- is exactly compensated by
+/// `frame_sp`'s own `+ THUNK_SAVES`). So this needs no hand-assembled relay
+/// code: the frame `arg_frame()` reads back afterward is genuinely the one
+/// `Wg16::call`/`Wg32::call` encoded from `args`, not a stand-in for it.
+#[test]
+fn the_same_arg_list_encodes_to_a_different_byte_length_under_each_abi() {
+    const A: u32 = 0x1111_2222;
+    const B: u32 = 0x3333_4444;
+
+    // Wg32: two Arg::Int -> two dwords, 8 bytes. B lands at byte 4.
+    let mut cpu = cpu();
+    let entry32 = mbbs_machine::m32::Flat32Ptr(cpu.machine.thunk_addr(3));
+    let exit32 = Wg32::call(&mut cpu, entry32, &[Arg::Int(A), Arg::Int(B)])
+        .expect("reaches the thunk directly");
+    assert!(
+        matches!(exit32, Exit::Call { index: 3 }),
+        "expected Exit::Call{{index: 3}}, got {exit32:?}"
+    );
+    let frame32 = Wg32::arg_frame(&cpu).to_vec();
+    let mut call32 = Call::<Wg32>::new(&mut cpu, &frame32);
+    assert_eq!(call32.int(), A, "Wg32's first Int");
+    assert_eq!(
+        call32.int(),
+        B,
+        "Wg32's second Int must start at byte 4 -- one whole dword in"
+    );
+
+    // Wg16: the same two values, truncated to Wg16::Int (u16) -- one word
+    // each, 4 bytes total. B lands at byte 2.
+    let mut machine16 = mbbs_machine::m16::Machine::new().expect("a 16-bit machine");
+    let entry16 = machine16.thunk_address(3);
+    let exit16 = Wg16::call(&mut machine16, entry16, &[Arg::Int(A as u16), Arg::Int(B as u16)])
+        .expect("reaches the thunk directly");
+    assert!(
+        matches!(exit16, Exit::Call { index: 3 }),
+        "expected Exit::Call{{index: 3}}, got {exit16:?}"
+    );
+    let frame16 = machine16.arg_frame().to_vec();
+    let mut call16 = Call::<Wg16>::new(&mut machine16, &frame16);
+    assert_eq!(call16.int(), A as u16, "Wg16's first Int");
+    assert_eq!(
+        call16.int(),
+        B as u16,
+        "Wg16's second Int must start at byte 2 -- one whole word in"
+    );
+
+    // The proof itself, stated as a byte offset rather than only as two
+    // passing assertions above: B's own bytes sit at a DIFFERENT position in
+    // each frame for the IDENTICAL two-element Arg list -- the same
+    // "same input, different byte length" divergence design §6 calls the
+    // founding falsifiability argument of this whole abstraction.
+    assert_eq!(&frame16[2..4], &(B as u16).to_le_bytes(), "Wg16: B's bytes at offset 2");
+    assert_eq!(&frame32[4..8], &B.to_le_bytes(), "Wg32: B's bytes at offset 4");
 }

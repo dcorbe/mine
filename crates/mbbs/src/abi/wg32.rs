@@ -211,25 +211,25 @@ impl Abi for Wg32 {
         }
     }
 
-    /// **Stub awaiting Task 6.** `mbbs_machine::m32::Machine` has no
-    /// `arg_frame` yet -- Task 6's Step 1 adds it, mirroring
-    /// `mbbs_machine::m16::Machine::arg_frame`. Nothing in this task calls
-    /// this arm; no test exercises it.
-    fn arg_frame(_cpu: &Self::Cpu) -> &[u8] {
-        todo!(
-            "Task 6: mbbs_machine::m32::Machine::arg_frame does not exist yet -- \
-             see docs/plans/2026-08-12-abi-border-implementation.md"
-        )
+    /// Direct delegation -- `mbbs_machine::m32::Machine::arg_frame` (Task 6)
+    /// already returns exactly the window `Call<Wg32>::new` needs: the bytes
+    /// starting right after the near return address, running to the end of
+    /// the module's stack. See that method's own doc comment for why there is
+    /// no `THUNK_SAVES`-sized register-save area to step over here, unlike
+    /// `Wg16`'s arm.
+    fn arg_frame(cpu: &Self::Cpu) -> &[u8] {
+        cpu.machine.arg_frame()
     }
 
-    /// **Stub awaiting Task 6.** `mbbs_machine::m32::Machine` has no poison
-    /// *setter* -- only the fault path sets its `poisoned` field today.
-    /// Nothing in this task calls this arm; no test exercises it.
-    fn poison(_cpu: &mut Self::Cpu, _why: Self::Poison) -> std::io::Result<()> {
-        todo!(
-            "Task 6: mbbs_machine::m32::Machine has no poison() setter yet -- \
-             see docs/plans/2026-08-12-abi-border-implementation.md"
-        )
+    /// Direct delegation -- `mbbs_machine::m32::Machine::poison` (Task 6)
+    /// mirrors `mbbs_machine::m16::Machine::poison` with one deliberate
+    /// divergence, documented at the method itself, not invented here: it
+    /// does not disarm a watchdog, because this machine has none yet (the
+    /// 32-bit watchdog is Task 16, unlanded). Nothing about that changes what
+    /// this arm needs to do -- forward the reason and the `io::Result`
+    /// straight through.
+    fn poison(cpu: &mut Self::Cpu, why: Self::Poison) -> std::io::Result<()> {
+        cpu.machine.poison(why)
     }
 
     fn poisoned(cpu: &Self::Cpu) -> Option<Self::Poison> {
