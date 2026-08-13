@@ -493,9 +493,8 @@ pub struct Query {
 /// parameter, but built entirely around `mbbs16::NeImage`, the 16-bit NE
 /// format `Host::load` parses) -- stays in `impl Host<Wg16>`.
 ///
-/// [`btrieve::Btrieve`] stays concrete: it is out of scope here (a concurrent
-/// session owns that file) and a generic struct is free to hold
-/// non-parameterized fields alongside parameterized ones.
+/// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
+/// session owned that file, and the field elided its parameter to say so.
 pub struct Host<A: Abi = Wg16> {
     exports: &'static Exports,
     globals: Globals<A>,
@@ -601,12 +600,21 @@ pub struct Host<A: Abi = Wg16> {
     /// The Btrieve files that are open, and the stack of which is current.
     /// Which one *is* current is `bb`, for the same reason.
     ///
-    /// Concrete, not `btrieve::Btrieve<A>` -- out of scope for this
-    /// conversion (a concurrent session owns `crates/mbbs/src/btrieve.rs` and
-    /// `crates/mbbs/src/btrieve/`). A generic struct holding a
-    /// non-parameterized field alongside parameterized ones is ordinary Rust;
-    /// nothing about `Host<A>` requires every field to depend on `A`.
-    pub(crate) btrieve: btrieve::Btrieve,
+    /// **Write the `<A>`.** A bare `Btrieve` here is not "generic, parameter
+    /// inferred from the enclosing `Host<A>`" -- in a type-annotation
+    /// position the `= Wg16` default applies unconditionally, so the field
+    /// would be `Btrieve<Wg16>` inside `Host<Wg32>` just as much as inside
+    /// `Host<Wg16>`. It compiles, it reads as generic, and it silently pins
+    /// the whole Btrieve subsystem to one ABI.
+    ///
+    /// That elision is what blocked the seventeen `btv*` shims from taking a
+    /// `Call<A>` long after the engine behind them became `Btrieve<A>`: a
+    /// generic shim's `call.ptr()` is `A::Ptr`, `Btrieve<Wg16>::block` wants
+    /// `FarPtr`, and the compiler reports a type mismatch for *every* `A`
+    /// rather than only for `Wg32`. The error points at the shim, so it
+    /// reads as the shim being unconvertible; the cause was one missing
+    /// parameter here.
+    pub(crate) btrieve: btrieve::Btrieve<A>,
 
     /// The terminal channels. See [`gsbl`].
     pub(crate) gsbl: gsbl::Gsbl,
@@ -1098,7 +1106,7 @@ impl<A: Abi> Host<A> {
     }
 
     /// The Btrieve files that are open.
-    pub fn btrieve(&self) -> &btrieve::Btrieve {
+    pub fn btrieve(&self) -> &btrieve::Btrieve<A> {
         &self.btrieve
     }
 
