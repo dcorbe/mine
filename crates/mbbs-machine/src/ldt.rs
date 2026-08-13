@@ -37,7 +37,7 @@ use std::sync::{Mutex, PoisonError};
 
 /// How many entries an LDT has. Fixed by the kernel, not a choice either ABI
 /// makes.
-pub const LDT_ENTRIES: u32 = 8192;
+pub(crate) const LDT_ENTRIES: u32 = 8192;
 
 /// `u64`s needed to give every LDT entry a bit.
 const WORDS: usize = LDT_ENTRIES as usize / 64;
@@ -67,7 +67,7 @@ fn taken(bits: &[u64; WORDS], entry: u32) -> bool {
 /// modules many times over would otherwise run the table out. `count == 1`
 /// is an ordinary single-entry reservation, exactly what `crate::m32::tib::Tib`
 /// needs; `m16` uses larger counts for a tiled region.
-pub fn take_run(count: u32) -> io::Result<u32> {
+pub(crate) fn take_run(count: u32) -> io::Result<u32> {
     let mut bits = in_use();
     let mut run = 0;
     for entry in 0..LDT_ENTRIES {
@@ -91,7 +91,7 @@ pub fn take_run(count: u32) -> io::Result<u32> {
 }
 
 /// Hand `count` entries starting at `start` back.
-pub fn give_run(start: u32, count: u32) {
+pub(crate) fn give_run(start: u32, count: u32) {
     let mut bits = in_use();
     for e in start..start + count {
         bits[e as usize / 64] &= !(1 << (e % 64));

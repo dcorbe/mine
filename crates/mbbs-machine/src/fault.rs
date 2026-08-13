@@ -96,7 +96,7 @@ const CS_SHIFT: u32 = 0;
 /// A claim predicate over a faulting `CS`, with no captures -- see the
 /// module doc comment for why the registry demands a plain function pointer
 /// rather than a closure.
-pub type ClaimFn = fn(faulting_cs: u16) -> bool;
+pub(crate) type ClaimFn = fn(faulting_cs: u16) -> bool;
 
 /// The context rewrite for a synchronous fault this ABI has just claimed.
 ///
@@ -108,7 +108,7 @@ pub type ClaimFn = fn(faulting_cs: u16) -> bool;
 /// other than the specific ones each ABI has already measured as safe on
 /// this path (see each ABI's own module comment for what those are and
 /// why).
-pub type RecoverFn = unsafe fn(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16);
+pub(crate) type RecoverFn = unsafe fn(signo: libc::c_int, ctx: *mut libc::c_void, host_cs: u16);
 
 /// The recovery for an asynchronous signal -- see [`AsyncClaim`].
 ///
@@ -118,18 +118,18 @@ pub type RecoverFn = unsafe fn(signo: libc::c_int, ctx: *mut libc::c_void, host_
 /// the registered signal, whatever `CS` happens to be at the time, so the
 /// function must decide for itself (from `info`, `ctx`, or both) whether
 /// there is anything to do.
-pub type AsyncRecoverFn =
+pub(crate) type AsyncRecoverFn =
     unsafe fn(signo: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void, host_cs: u16);
 
 /// One ABI's positive claim over the synchronous fault signals.
-pub struct FaultClaim {
+pub(crate) struct FaultClaim {
     /// Does this ABI's module code run under this `CS`? Measured, not
     /// assumed -- see each ABI's own claim function for how its value
     /// was obtained.
-    pub claims: ClaimFn,
+    pub(crate) claims: ClaimFn,
     /// Perform this ABI's context rewrite. Called only once `claims` has
     /// returned `true` for this exact fault.
-    pub recover: RecoverFn,
+    pub(crate) recover: RecoverFn,
 }
 
 /// One ABI's registration for an asynchronous signal that must reach it
@@ -140,11 +140,11 @@ pub struct FaultClaim {
 /// [`register`] keeps whichever registers first if it were ever called
 /// twice with different signal numbers -- which nothing in this workspace
 /// does.
-pub struct AsyncClaim {
+pub(crate) struct AsyncClaim {
     /// The signal number this ABI's timer raises.
-    pub signo: libc::c_int,
+    pub(crate) signo: libc::c_int,
     /// Handle every delivery, unconditionally.
-    pub recover: AsyncRecoverFn,
+    pub(crate) recover: AsyncRecoverFn,
 }
 
 struct Slot {
@@ -196,7 +196,7 @@ thread_local! {
 /// this runs on it. Idempotent per thread: a second call on the same thread
 /// finds its mapping already made and only reinstalls the `sigaltstack`
 /// pointer, which costs one syscall.
-pub fn install_altstack() -> io::Result<()> {
+pub(crate) fn install_altstack() -> io::Result<()> {
     ALTSTACK.with(|slot| {
         if slot.get().is_null() {
             // SAFETY: an ordinary anonymous mapping. MAP_32BIT does not
@@ -255,7 +255,7 @@ pub fn install_altstack() -> io::Result<()> {
 ///
 /// If [`MAX_CLAIMS`] ABIs have already registered, or if any underlying
 /// `sigaction` call fails.
-pub fn register(
+pub(crate) fn register(
     host_cs: u16,
     claim: FaultClaim,
     async_claim: Option<AsyncClaim>,
