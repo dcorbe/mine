@@ -72,7 +72,7 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use mbbs16::Ret;
 
 use super::ShimError;
 use crate::Host;
@@ -116,13 +116,6 @@ pub fn otstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(YES)))
 }
 
-/// The dispatch-table entry for [`otstcrd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn otstcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    otstcrd(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int odedcrd(int unum, long amt, int real, int asmuch)` -- take `amt`
 /// credits off this user. `ACCOUNT.C:429`.
 ///
@@ -151,13 +144,6 @@ pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(YES)))
 }
 
-/// The dispatch-table entry for [`odedcrd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn odedcrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    odedcrd(&mut super::call(machine), host).map(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,13 +156,13 @@ mod tests {
         let mut f = Fixture::new();
         // otstcrd(0, 500, real=0) -- a `long` is two words, low half first.
         assert_eq!(
-            f.invoke(otstcrd_wg16, &[0, 500, 0, 0]).expect("otstcrd"),
+            f.invoke(otstcrd, &[0, 500, 0, 0]).expect("otstcrd"),
             Ret::U16(1),
             "otstcrd must be non-zero or the module refuses to let the player in"
         );
         // odedcrd(0, 500, real=1, asmuch=1)
         assert_eq!(
-            f.invoke(odedcrd_wg16, &[0, 500, 0, 1, 1]).expect("odedcrd"),
+            f.invoke(odedcrd, &[0, 500, 0, 1, 1]).expect("odedcrd"),
             Ret::U16(1),
             "odedcrd's zero is what ejects a player mid-game"
         );
@@ -197,13 +183,13 @@ mod tests {
         for (low, high) in amounts {
             for real in [0, 1] {
                 assert_eq!(
-                    f.invoke(otstcrd_wg16, &[0, low, high, real]).expect("otstcrd"),
+                    f.invoke(otstcrd, &[0, low, high, real]).expect("otstcrd"),
                     Ret::U16(1),
                     "otstcrd({low:#x}:{high:#x}, real={real})"
                 );
                 for asmuch in [0, 1] {
                     assert_eq!(
-                        f.invoke(odedcrd_wg16, &[0, low, high, real, asmuch])
+                        f.invoke(odedcrd, &[0, low, high, real, asmuch])
                             .expect("odedcrd"),
                         Ret::U16(1),
                         "odedcrd({low:#x}:{high:#x}, real={real}, asmuch={asmuch})"
@@ -223,9 +209,9 @@ mod tests {
     fn a_channel_that_does_not_exist_stops_the_module() {
         let mut f = Fixture::new();
         let past = f.host.users().terms().count();
-        assert!(f.invoke(otstcrd_wg16, &[past, 500, 0, 0]).is_err());
-        assert!(f.invoke(odedcrd_wg16, &[past, 500, 0, 1, 1]).is_err());
-        assert!(f.invoke(otstcrd_wg16, &[-1i16 as u16, 500, 0, 0]).is_err());
-        assert!(f.invoke(odedcrd_wg16, &[-1i16 as u16, 500, 0, 1, 1]).is_err());
+        assert!(f.invoke(otstcrd, &[past, 500, 0, 0]).is_err());
+        assert!(f.invoke(odedcrd, &[past, 500, 0, 1, 1]).is_err());
+        assert!(f.invoke(otstcrd, &[-1i16 as u16, 500, 0, 0]).is_err());
+        assert!(f.invoke(odedcrd, &[-1i16 as u16, 500, 0, 1, 1]).is_err());
     }
 }

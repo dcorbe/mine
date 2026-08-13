@@ -13,7 +13,7 @@ pub mod system;
 pub mod text;
 pub mod user;
 
-use mbbs16::{Machine, Ret};
+use mbbs16::Machine;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Cursor, Wg16};
@@ -41,21 +41,16 @@ pub(crate) fn args(machine: &Machine) -> Cursor<'_, Wg16> {
 
 /// A [`Call<Wg16>`] over the outstanding call's argument frame.
 ///
-/// The `Wg16` half of bridging a shim written against the generic
-/// `fn<A: Abi>(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`
-/// shape into [`Wg16Shim`], the shape [`crate::testing::Fixture::invoke`]
-/// still wants -- see `shims::user`'s `uacoff_wg16` and its four siblings for
-/// the other half (converting the `abi::Ret<Wg16>` a generic shim hands back
-/// into `mbbs16::Ret`, which `Into::into` already does via `crate::abi`'s
-/// `impl From<abi::Ret<Wg16>> for mbbs16::Ret`).
+/// One caller: `lib.rs`'s dispatch loop, which holds a `&mut Machine` and
+/// needs the `Call<Wg16>` that [`Shim<Wg16>`](Shim) wants.
 ///
-/// These `_wg16` bridges are no longer what [`entry`] hands the dispatch
-/// loop -- [`routines`] now names the generic cores directly, and `lib.rs`'s
-/// own call site calls this very function to build its `Call<Wg16>` (see
-/// that loop's own comment). They stay, one per converted routine,
-/// because every shim file's own tests still call them by name through
-/// `Fixture::invoke`, which cannot take a generic `Shim<A>` without knowing
-/// which `A` to build -- see [`Wg16Shim`].
+/// It used to have 126 more. Every converted routine carried a `_wg16`
+/// bridge built from this function -- `foo(&mut super::call(machine), host)
+/// .map(Into::into)` -- for one reason: `crate::testing::Fixture::invoke`
+/// took a bare `fn(&mut Machine, &mut Host)` and so could not be handed a
+/// shim directly. That made every addition to the API surface cost two
+/// functions instead of one. `Fixture::invoke` builds its own `Call` now and
+/// the bridges are deleted.
 ///
 /// Computes the frame before taking `machine` mutably -- the same ordering
 /// [`Call::new`]'s own doc comment describes, and why this takes
@@ -92,23 +87,20 @@ pub(crate) const NO: u16 = -1i16 as u16;
 /// to `Wg16`) now live behind [`Abi::native`] instead of in [`routines`].
 pub type Shim<A> = fn(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>;
 
-/// The shape [`Shim<A>`] replaced: a bare `fn(&mut Machine, &mut Host) ->
-/// Result<mbbs16::Ret, ShimError>`, Wg16-concrete with no `Call` at all.
-///
-/// Kept under its own name, not deleted, for two things that still need it
-/// and are `Wg16`-only by nature rather than by omission:
-///
-/// - [`crate::testing::Fixture::invoke`]/`invoke_with`, which drive a real
-///   `mbbs16::Machine` and so can only ever run one ABI's routine. Every
-///   `_wg16` bridge across `crate::shims` -- and `Fixture::invoke_call` for
-///   a raw `Shim<Wg16>` extracted from [`entry`] -- share this one
-///   entrypoint.
-/// - [`wg16_native`]'s own table, for the two routines
-///   (`shims::runtime`'s eight and `shims::memory`'s `alctile`/`ptrtile`)
-///   that were never given a `Call`-taking body at all, because they have no
-///   meaning under any other `Abi` and converting them would have bought
-///   nothing -- see [`Abi::native`]'s own doc comment.
-pub(crate) type Wg16Shim = fn(&mut Machine, &mut Host) -> Result<Ret, ShimError>;
+// `Wg16Shim` -- a bare `fn(&mut Machine, &mut Host) -> Result<mbbs16::Ret,
+// ShimError>`, Wg16-concrete with no `Call` at all -- used to live here, and
+// is deleted.
+//
+// It survived this long on a distinction that does not hold up: that a
+// routine with no meaning under any other `Abi` therefore has no use for the
+// `Abi` types. Being 16-bit-only means a routine cannot be `Shim<A>` for an
+// arbitrary `A`, because `routines<A>()` must yield an entry for every `A`
+// and there is no `alctile` for a flat address space. It does not mean the
+// routine should take a raw `&mut Machine`. `Shim<Wg16>` is the trait at its
+// 16-bit instantiation, and that is what every routine in this crate is now,
+// including `shims::memory`'s tiling pair and `shims::runtime`'s eight
+// Borland helpers. They stay in [`WG16_ROUTINES`] -- that part was always
+// real -- but they no longer need ten adapter closures to get there.
 
 /// Who removes a routine's arguments from the module's stack.
 ///
@@ -405,74 +397,24 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
     // reborrow of `call.cpu` (`Call<Wg16>::cpu` is `&mut mbbs16::Machine`,
     // since `Wg16::Cpu = mbbs16::Machine`) and the reverse `Ret` conversion
     // `impl From<mbbs16::Ret> for abi::Ret<Wg16>` supplies.
-    (
-        MAJORBBS,
-        "alctile",
-        |call, host| memory::alctile(call.cpu, host).map(Into::into),
-        Cleans::Caller,
-    ),
-    (
-        MAJORBBS,
-        "ptrtile",
-        |call, host| memory::ptrtile(call.cpu, host).map(Into::into),
-        Cleans::Caller,
-    ),
+    (MAJORBBS, "alctile", memory::alctile, Cleans::Caller),
+    (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller),
     // The compiler's own runtime, which this host exports because the real
     // one did. Same adapter shape as the tiling pair above. These four pop
     // their own arguments -- see `runtime`.
-    (
-        MAJORBBS,
-        "f_ldiv@",
-        |call, host| runtime::f_ldiv(call.cpu, host).map(Into::into),
-        Cleans::Callee(runtime::OPERANDS),
-    ),
-    (
-        MAJORBBS,
-        "f_lmod@",
-        |call, host| runtime::f_lmod(call.cpu, host).map(Into::into),
-        Cleans::Callee(runtime::OPERANDS),
-    ),
-    (
-        MAJORBBS,
-        "f_ludiv@",
-        |call, host| runtime::f_ludiv(call.cpu, host).map(Into::into),
-        Cleans::Callee(runtime::OPERANDS),
-    ),
-    (
-        MAJORBBS,
-        "f_lumod@",
-        |call, host| runtime::f_lumod(call.cpu, host).map(Into::into),
-        Cleans::Callee(runtime::OPERANDS),
-    ),
+    (MAJORBBS, "f_ldiv@", runtime::f_ldiv, Cleans::Callee(runtime::OPERANDS)),
+    (MAJORBBS, "f_lmod@", runtime::f_lmod, Cleans::Callee(runtime::OPERANDS)),
+    (MAJORBBS, "f_ludiv@", runtime::f_ludiv, Cleans::Callee(runtime::OPERANDS)),
+    (MAJORBBS, "f_lumod@", runtime::f_lumod, Cleans::Callee(runtime::OPERANDS)),
     // The rest of that runtime, and it does not share one convention. These
     // three take their operands in registers and put nothing on the stack,
     // so there is nothing for either side to clean.
-    (
-        MAJORBBS,
-        "f_lxmul@",
-        |call, host| runtime::f_lxmul(call.cpu, host).map(Into::into),
-        Cleans::Caller,
-    ),
-    (
-        MAJORBBS,
-        "f_lxlsh@",
-        |call, host| runtime::f_lxlsh(call.cpu, host).map(Into::into),
-        Cleans::Caller,
-    ),
-    (
-        MAJORBBS,
-        "f_lxursh@",
-        |call, host| runtime::f_lxursh(call.cpu, host).map(Into::into),
-        Cleans::Caller,
-    ),
+    (MAJORBBS, "f_lxmul@", runtime::f_lxmul, Cleans::Caller),
+    (MAJORBBS, "f_lxlsh@", runtime::f_lxlsh, Cleans::Caller),
+    (MAJORBBS, "f_lxursh@", runtime::f_lxursh, Cleans::Caller),
     // And this one is a struct copy: two far pointers on the stack, which it
     // pops, and the length in `CX`.
-    (
-        MAJORBBS,
-        "f_scopy@",
-        |call, host| runtime::f_scopy(call.cpu, host).map(Into::into),
-        Cleans::Callee(runtime::POINTERS),
-    ),
+    (MAJORBBS, "f_scopy@", runtime::f_scopy, Cleans::Callee(runtime::POINTERS)),
 ];
 
 /// [`Abi::native`]'s `Wg16` half: a lookup into [`WG16_ROUTINES`], the table
@@ -639,7 +581,7 @@ mod tests {
 
     /// Every test in `shims::screen` and `shims::gsbl` calls `rstrxf`,
     /// `btuhpk`, `btupbc` and `btucpc` by their Rust name --
-    /// `f.invoke(btupbc_wg16, ...)`, `f.invoke(rstrxf_wg16, ...)` -- which is
+    /// `f.invoke(btupbc, ...)`, `f.invoke(rstrxf, ...)` -- which is
     /// not how a module (or, for `rstrxf`, this crate's own MAJORBBS import
     /// dispatch) reaches any routine. That path is `entry`, keyed by the DLL
     /// and the *string* [`routines`] was given -- and every one of those

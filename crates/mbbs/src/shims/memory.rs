@@ -27,11 +27,11 @@
 //! differ, and a source and destination that differ -- a test written
 //! `setmem(p, 4, 4)` would pass either way.
 
-use mbbs16::{FarPtr, Machine, Ret};
+use mbbs16::FarPtr;
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
-use crate::abi::{self, Abi, Call};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::shims::ShimError;
 
 /// `VOID *alcmem(UINT size)` -- `GCOMM.H:256-258` -- reserve memory the
@@ -53,13 +53,6 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .reserve(call.mem(), size)
         .map_err(|e| ShimError::Failed(format!("alcmem: {e}")))?;
     Ok(abi::Ret::Ptr(at))
-}
-
-/// The dispatch-table entry for [`alcmem`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn alcmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    alcmem(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID *alczer(UINT nbytes)` -- `GCOMM.H:274-276` -- reserve memory, zeroed.
@@ -86,13 +79,6 @@ pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
-/// The dispatch-table entry for [`alczer`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn alczer_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    alczer(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `VOID galfree(VOID *block)` -- `GCOMM.H:771-773` -- give memory back.
 ///
 /// Generic (Task 5): [`Heap::free`](crate::heap::Heap::free) never touched a
@@ -103,13 +89,6 @@ pub fn galfree<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         .free(at)
         .map_err(|e| ShimError::Failed(format!("galfree: {e}")))?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`galfree`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn galfree_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    galfree(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `LONG farcoreleft(VOID)` -- `GCOMM.H:147` -- how much memory is left.
@@ -127,33 +106,28 @@ pub fn farcoreleft<A: Abi>(
     Ok(abi::Ret::Long(u32::try_from(left).unwrap_or(u32::MAX)))
 }
 
-/// The dispatch-table entry for [`farcoreleft`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn farcoreleft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    farcoreleft(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void *alctile(int qty, int size)` -- one region of `qty` tiles.
 ///
 /// `PLSTUFF.C`: `bigptr = MK_FP(pltile(qty*(long)size, 0, size, size), 0)`. One
 /// linear region, `qty` consecutive LDT descriptors across it, each a `size`
 /// window. The module walks between tiles itself, so every descriptor has to
 /// exist first -- see [`Machine::alloc_tiled`](mbbs16::Machine::alloc_tiled).
-pub fn alctile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn alctile(
+    call: &mut Call<Wg16>,
+    host: &mut Host<Wg16>,
+) -> Result<abi::Ret<Wg16>, ShimError> {
     // No vendor prototype: `alctile` is not declared anywhere in
     // re/wg33src/INC's 125 headers. It is genuinely 16-bit-only -- segment
     // tiling has no flat-memory counterpart -- and the 32-bit module imports
     // `alcblok`/`ptrblok` instead, which are among the 56 unimplemented
     // symbols and out of scope here.
-    let mut args = super::args(machine);
-    let qty = args.int();
-    let size = args.int();
+    let qty = call.int();
+    let size = call.int();
     let at = host
         .heap
-        .alloc_tiled(machine, qty, size)
+        .alloc_tiled(call.cpu, qty, size)
         .map_err(|e| ShimError::Failed(format!("alctile({qty}, {size}): {e}")))?;
-    Ok(Ret::Far(at))
+    Ok(abi::Ret::Ptr(at))
 }
 
 /// `void *ptrtile(void *bigptr, int index)` -- the `index`th tile of a region.
@@ -168,11 +142,13 @@ pub fn alctile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
 /// calls through here at some, so this must agree with the arithmetic exactly.
 /// An index past the last tile is refused: without the region's shape the host
 /// would hand back a selector belonging to something else entirely.
-pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
+pub fn ptrtile(
+    call: &mut Call<Wg16>,
+    host: &mut Host<Wg16>,
+) -> Result<abi::Ret<Wg16>, ShimError> {
     // No vendor prototype either, for the same reason as `alctile` above.
-    let mut args = super::args(machine);
-    let base = args.ptr();
-    let index = args.int();
+    let base = call.ptr();
+    let index = call.int();
 
     let region = host.heap.region(base.selector).ok_or_else(|| {
         ShimError::Failed(format!("ptrtile: {base:?} is not a tiled region"))
@@ -184,7 +160,7 @@ pub fn ptrtile(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError>
         )));
     }
 
-    Ok(Ret::Far(FarPtr {
+    Ok(abi::Ret::Ptr(FarPtr {
         offset: base.offset,
         selector: base.selector + index * mbbs16::SELECTOR_STEP,
     }))
@@ -210,13 +186,6 @@ pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`setmem`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn setmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    setmem(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `VOID galmovmem(VOID *src, VOID *dst, USHORT nbytes)` -- `GCOMM.H:163-164`,
 /// behind `#define movmem(s,d,n) galmovmem(s,d,n)` (`:166`) -- copy,
 /// overlapping allowed.
@@ -238,13 +207,6 @@ pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`movmem`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn movmem_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    movmem(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void *memcpy(void *dst, const void *src, size_t n)` -- destination
 /// first. Borland's; no Galacticomm header redeclares it (see this file's
 /// commit message).
@@ -262,13 +224,6 @@ pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     dst.write(call.mem(), &bytes)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Ptr(dst))
-}
-
-/// The dispatch-table entry for [`memcpy`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn memcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    memcpy(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int memcmp(const void *a, const void *b, size_t n)`. Borland's; no
@@ -298,16 +253,12 @@ pub fn memcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Int(A::Int::from(answer as u16)))
 }
 
-/// The dispatch-table entry for [`memcmp`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn memcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    memcmp(&mut super::call(machine), host).map(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Wg16-only, and used by these fixtures alone -- the
+    // production code above reaches memory through the ABI.
+    use mbbs16::Ret;
     use crate::testing::Fixture;
 
     fn far(at: FarPtr) -> [u16; 2] {
@@ -317,16 +268,16 @@ mod tests {
     #[test]
     fn alcmem_hands_out_distinct_memory_that_galfree_takes_back() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem_wg16, &[256]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem, &[256]).expect("a") else {
             panic!("alcmem returns a pointer")
         };
-        let Ret::Far(b) = f.invoke(alcmem_wg16, &[256]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alcmem, &[256]).expect("b") else {
             panic!("alcmem returns a pointer")
         };
         assert_ne!(a, b);
 
-        f.invoke(galfree_wg16, &far(a)).expect("freed");
-        let Ret::Far(c) = f.invoke(alcmem_wg16, &[256]).expect("c") else {
+        f.invoke(galfree, &far(a)).expect("freed");
+        let Ret::Far(c) = f.invoke(alcmem, &[256]).expect("c") else {
             panic!("alcmem returns a pointer")
         };
         assert_eq!(a, c, "the freed space came back");
@@ -335,13 +286,13 @@ mod tests {
     #[test]
     fn alczer_is_zeroed_even_in_space_that_was_used() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem_wg16, &[64]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem, &[64]).expect("a") else {
             panic!("pointer")
         };
         f.machine.write(a, &[0xcc; 64]).expect("dirtied");
-        f.invoke(galfree_wg16, &far(a)).expect("freed");
+        f.invoke(galfree, &far(a)).expect("freed");
 
-        let Ret::Far(b) = f.invoke(alczer_wg16, &[64]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alczer, &[64]).expect("b") else {
             panic!("pointer")
         };
         assert_eq!(b, a, "the same space, so the test means something");
@@ -355,27 +306,27 @@ mod tests {
     #[test]
     fn galfree_of_something_never_allocated_refuses_by_name() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem_wg16, &[64]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem, &[64]).expect("a") else {
             panic!("pointer")
         };
         let stray = FarPtr {
             offset: a.offset + 8,
             selector: a.selector,
         };
-        let e = f.invoke(galfree_wg16, &far(stray)).expect_err("not a block");
+        let e = f.invoke(galfree, &far(stray)).expect_err("not a block");
         assert!(e.to_string().contains("galfree"), "{e}");
 
-        f.invoke(galfree_wg16, &far(a)).expect("this one is");
-        assert!(f.invoke(galfree_wg16, &far(a)).is_err(), "but not twice");
+        f.invoke(galfree, &far(a)).expect("this one is");
+        assert!(f.invoke(galfree, &far(a)).is_err(), "but not twice");
     }
 
     #[test]
     fn the_heap_crosses_a_segment_and_still_works_from_16_bit_code() {
         let mut f = Fixture::new();
-        let Ret::Far(a) = f.invoke(alcmem_wg16, &[40_000]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem, &[40_000]).expect("a") else {
             panic!("pointer")
         };
-        let Ret::Far(b) = f.invoke(alcmem_wg16, &[40_000]).expect("b") else {
+        let Ret::Far(b) = f.invoke(alcmem, &[40_000]).expect("b") else {
             panic!("pointer")
         };
         assert_ne!(a.selector, b.selector, "two of these need two segments");
@@ -388,19 +339,19 @@ mod tests {
     #[test]
     fn farcoreleft_falls_by_what_was_taken_and_rises_when_it_is_given_back() {
         let mut f = Fixture::new();
-        let Ret::U32(before) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
+        let Ret::U32(before) = f.invoke(farcoreleft, &[]).expect("asked") else {
             panic!("farcoreleft returns a long")
         };
-        let Ret::Far(a) = f.invoke(alcmem_wg16, &[1000]).expect("a") else {
+        let Ret::Far(a) = f.invoke(alcmem, &[1000]).expect("a") else {
             panic!("pointer")
         };
-        let Ret::U32(during) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
+        let Ret::U32(during) = f.invoke(farcoreleft, &[]).expect("asked") else {
             panic!("long")
         };
         assert_eq!(during, before - 1000);
 
-        f.invoke(galfree_wg16, &far(a)).expect("freed");
-        let Ret::U32(after) = f.invoke(farcoreleft_wg16, &[]).expect("asked") else {
+        f.invoke(galfree, &far(a)).expect("freed");
+        let Ret::U32(after) = f.invoke(farcoreleft, &[]).expect("asked") else {
             panic!("long")
         };
         assert_eq!(after, before);
@@ -480,7 +431,7 @@ mod tests {
         );
 
         // And a pointer that is not a region at all.
-        let heap = f.invoke(alcmem_wg16, &[64]).expect("a");
+        let heap = f.invoke(alcmem, &[64]).expect("a");
         let Ret::Far(heap) = heap else { panic!("pointer") };
         assert!(f.invoke(ptrtile, &[heap.offset, heap.selector, 0]).is_err());
     }
@@ -491,7 +442,7 @@ mod tests {
         // `setmem(p, 4, 4)` this test would pass either way round.
         let mut f = Fixture::new();
         let at = f.bytes(&[0xff; 16], false);
-        f.invoke(setmem_wg16, &[at.offset, at.selector, 4, 0x41])
+        f.invoke(setmem, &[at.offset, at.selector, 4, 0x41])
             .expect("filled");
         assert_eq!(
             f.machine.resolve(at, 6).expect("readable"),
@@ -505,7 +456,7 @@ mod tests {
         let mut f = Fixture::new();
         let src = f.bytes(b"source", false);
         let dst = f.bytes(b"DEST!!", false);
-        f.invoke(movmem_wg16, &[src.offset, src.selector, dst.offset, dst.selector, 6])
+        f.invoke(movmem, &[src.offset, src.selector, dst.offset, dst.selector, 6])
             .expect("moved");
         assert_eq!(
             f.machine.resolve(dst, 6).expect("readable"),
@@ -521,7 +472,7 @@ mod tests {
         let dst = f.bytes(b"DEST!!", false);
         let src = f.bytes(b"source", false);
         assert_eq!(
-            f.invoke(memcpy_wg16, &[dst.offset, dst.selector, src.offset, src.selector, 6])
+            f.invoke(memcpy, &[dst.offset, dst.selector, src.offset, src.selector, 6])
                 .expect("copied"),
             Ret::Far(dst)
         );
@@ -536,11 +487,11 @@ mod tests {
         let c = f.bytes(b"abc", false);
 
         let args = |x: FarPtr, y: FarPtr| [x.offset, x.selector, y.offset, y.selector, 3];
-        assert_eq!(f.invoke(memcmp_wg16, &args(a, c)).expect("same"), Ret::U16(0));
+        assert_eq!(f.invoke(memcmp, &args(a, c)).expect("same"), Ret::U16(0));
         assert_eq!(
-            f.invoke(memcmp_wg16, &args(a, b)).expect("less"),
+            f.invoke(memcmp, &args(a, b)).expect("less"),
             Ret::U16((-1i16) as u16)
         );
-        assert_eq!(f.invoke(memcmp_wg16, &args(b, a)).expect("more"), Ret::U16(1));
+        assert_eq!(f.invoke(memcmp, &args(b, a)).expect("more"), Ret::U16(1));
     }
 }

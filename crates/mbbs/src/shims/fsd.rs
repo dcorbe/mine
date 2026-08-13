@@ -329,13 +329,6 @@ pub fn fsdroom<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(size)))
 }
 
-/// The dispatch-table entry for [`fsdroom`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdroom_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdroom(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void fsdapr(char *sesbuf, int sbleng, char *answers)` -- lay the session
 /// out. `FSDBBS.C:157`.
 ///
@@ -437,13 +430,6 @@ pub fn fsdapr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // their own prf'ing *after* this, for exactly this reason.
     crate::shims::text::clrprf_mem(call.mem(), host)?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`fsdapr`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdapr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdapr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The session control block, once `fsdapr` has filled one in.
@@ -548,13 +534,6 @@ pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         block.newans(),
         usize::from(answer_offset(&record)),
     )?))
-}
-
-/// The dispatch-table entry for [`fsdnan`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdnan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdnan(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int fsdord(int fldi)` -- which `ALT=` value field `fldi` holds.
@@ -684,13 +663,6 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(index)))
 }
 
-/// The dispatch-table entry for [`fsdord`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdord_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdord(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *fsdxan(char *answer, char *name)` -- a field's value, by name.
 /// `FSD.C:2073`.
 ///
@@ -754,13 +726,6 @@ pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     }
 }
 
-/// The dispatch-table entry for [`fsdxan`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdxan_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdxan(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *fsdrft(void)` -- the template again. `FSDBBS.C:413`.
 ///
 /// The original is `setmbk(fsdusr->curmbk); getasc(tmpmsg); rstmbk()`, and the
@@ -803,13 +768,6 @@ pub fn fsdrft<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         ));
     };
     ascii_template(call, host, block, number, amode).map(abi::Ret::Ptr)
-}
-
-/// The dispatch-table entry for [`fsdrft`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdrft_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdrft(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The template as a pointer the module can hold, in whichever form this
@@ -940,13 +898,6 @@ pub fn fsdbkg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     crate::shims::text::append_mem(call.mem(), host, &drawn)?;
 
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`fsdbkg`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdbkg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdbkg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int vfyadn(int fldno, char *answer)` -- `FSD.C:2007-2053`. See
@@ -1264,13 +1215,6 @@ pub fn fsdego<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     crate::shims::text::append_mem(call.mem(), host, &output)?;
 
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`fsdego`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fsdego_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fsdego(&mut super::call(machine), host).map(Into::into)
 }
 
 /// This channel's -- rather, this host's -- scratch buffer for
@@ -2041,7 +1985,7 @@ mod tests {
         current(f);
         let name = f.text("SAMPLE.MSG");
         let block = f
-            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
             .expect("opened");
         match block {
             Ret::Far(at) => at,
@@ -2066,7 +2010,7 @@ mod tests {
             .expect("fits");
 
         let args = [0, spec.offset, spec.selector, 0];
-        assert!(matches!(f.invoke(fsdroom_wg16, &args), Ok(Ret::U16(n)) if n == expected));
+        assert!(matches!(f.invoke(fsdroom, &args), Ok(Ret::U16(n)) if n == expected));
 
         assert_eq!(f.host.forms().len(), 1, "{:?}", f.host.forms());
         let form = f.host.forms().get(&(0, 0)).expect("message 0, amode 0");
@@ -2084,7 +2028,7 @@ mod tests {
         current(f);
         let name = f.text("FSDFORM.MSG");
         let block = f
-            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
             .expect("opened");
         match block {
             Ret::Far(at) => at,
@@ -2115,14 +2059,13 @@ mod tests {
     ) -> (FarPtr, u16) {
         let _ = open_form(f);
         let spec = f.text(spec);
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[message, spec.offset, spec.selector, amode])
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[message, spec.offset, spec.selector, amode])
         else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(defaults, false);
-        f.invoke(
-            fsdapr_wg16,
+        f.invoke(fsdapr,
             &[
                 buffer.offset,
                 buffer.selector,
@@ -2241,14 +2184,13 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE TWO");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(b"\0", false);
         let e = f
-            .invoke(
-                fsdapr_wg16,
+            .invoke(fsdapr,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2271,8 +2213,7 @@ mod tests {
         let buffer = f.buffer(64);
         let defaults = f.bytes(b"\0", false);
         let e = f
-            .invoke(
-                fsdapr_wg16,
+            .invoke(fsdapr,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2293,7 +2234,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]) else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
@@ -2306,8 +2247,7 @@ mod tests {
         f.machine.write(junk, b"xxxxxxxx").expect("fills it");
 
         let e = f
-            .invoke(
-                fsdapr_wg16,
+            .invoke(fsdapr,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -2336,7 +2276,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open(&mut f);
         let text = f.text("something queued");
-        f.invoke(crate::shims::text::prf_wg16, &[text.offset, text.selector])
+        f.invoke(crate::shims::text::prf, &[text.offset, text.selector])
             .expect("printed");
         assert_eq!(f.read(f.host.globals().prf_buffer()), "something queued");
 
@@ -2362,12 +2302,12 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME RANK", b"RANK=MAJOR\0\0");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "MAJOR");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "", "no default, so blank");
@@ -2391,7 +2331,7 @@ mod tests {
         scb.set_newans(moved);
         f.machine.write(at, scb.as_bytes()).expect("written");
 
-        let Ok(Ret::Far(got)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(got)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(got), "COLONEL");
@@ -2404,9 +2344,9 @@ mod tests {
         // follows the array, returned as an answer.
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME RANK", b"\0");
-        let e = f.invoke(fsdnan_wg16, &[2]).expect_err("refused");
+        let e = f.invoke(fsdnan, &[2]).expect_err("refused");
         assert!(format!("{e}").contains("2 fields"), "{e}");
-        let e = f.invoke(fsdnan_wg16, &[0xffff]).expect_err("refused");
+        let e = f.invoke(fsdnan, &[0xffff]).expect_err("refused");
         assert!(format!("{e}").contains("2 fields"), "{e}");
     }
 
@@ -2429,9 +2369,9 @@ mod tests {
         f.machine.write(at, scb.as_bytes()).expect("written");
 
         // 3000 * 23 = 69000, which is not a u16.
-        let e = f.invoke(fsdnan_wg16, &[3000]).expect_err("refused");
+        let e = f.invoke(fsdnan, &[3000]).expect_err("refused");
         assert!(matches!(e, ShimError::Failed(_)), "{e}");
-        let e = f.invoke(fsdord_wg16, &[3000]).expect_err("refused");
+        let e = f.invoke(fsdord, &[3000]).expect_err("refused");
         assert!(matches!(e, ShimError::Failed(_)), "{e}");
     }
 
@@ -2439,15 +2379,15 @@ mod tests {
     fn fsdnan_before_a_session_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdnan_wg16, &[0]).expect_err("refused");
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
 
         // And after `fsdroom` but before `fsdapr`, when `newans` is still null.
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
-        let e = f.invoke(fsdnan_wg16, &[0]).expect_err("refused");
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdapr"), "{e}");
     }
 
@@ -2456,7 +2396,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Brown ALT=Red MULTICHOICE)";
         let _ = session(&mut f, spec, b"COLOUR=Brown\0\0");
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
     }
 
     #[test]
@@ -2466,7 +2406,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Red)";
         let _ = session(&mut f, spec, b"COLOUR=Green\0\0");
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
     }
 
     #[test]
@@ -2479,19 +2419,19 @@ mod tests {
         let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
         let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
 
-        let Ok(Ret::Far(before)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(before), "Fred");
         let was = block(&f).allans();
 
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Brown", "FSD.H:656");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Fred", "still readable, three bytes further on");
@@ -2510,19 +2450,19 @@ mod tests {
         let spec = "COLOUR(ALT=Black) NAME";
         let _ = session(&mut f, spec, b"COLOUR=B l a c k\0NAME=Fred\0\0");
 
-        let Ok(Ret::Far(before)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(before)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(before), "Fred");
         let was = block(&f).allans();
 
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(0))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(0))));
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Black");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "Fred", "four bytes closer, not further");
@@ -2539,7 +2479,7 @@ mod tests {
         let spec = "COLOUR(ALT=Black ALT=Brown) NAME";
         let _ = session(&mut f, spec, b"COLOUR=br\0NAME=Fred\0\0");
 
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
         let scb = block(&f);
         let record = f
             .machine
@@ -2553,13 +2493,13 @@ mod tests {
 
         // And a second call over the now-canonical answer is a no-op that
         // leaves everything where the first put it.
-        let Ok(Ret::Far(name)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(name)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         let allans = block(&f).allans();
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
         assert_eq!(block(&f).allans(), allans, "nothing moved the second time");
-        let Ok(Ret::Far(again)) = f.invoke(fsdnan_wg16, &[1]) else {
+        let Ok(Ret::Far(again)) = f.invoke(fsdnan, &[1]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(again, name);
@@ -2573,7 +2513,7 @@ mod tests {
         let mut f = Fixture::new();
         let spec = "COLOUR(ALT=Black ALT=Red)";
         let _ = session(&mut f, spec, b"COLOUR=Red\0\0");
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(1))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(1))));
 
         let scb = block(&f);
         let mut record = [0u8; crate::fsd::FSDFLD as usize];
@@ -2585,7 +2525,7 @@ mod tests {
         record[crate::fsd::fld::FLAGS] &= !crate::fsd::flags::ALTERNATES;
         f.machine.write(scb.flddat(), &record).expect("written");
 
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
         assert!(
             f.host.forms()[&(0, 0)].fields[0].flags & crate::fsd::flags::ALTERNATES != 0,
             "the host's own copy still says otherwise, which is the point"
@@ -2602,7 +2542,7 @@ mod tests {
         let long = "A".repeat(60);
         let spec = format!("C(ALT={long})");
         let _ = session_over(&mut f, 1, &spec, b"C=A\0\0");
-        let e = f.invoke(fsdord_wg16, &[0]).expect_err("refused");
+        let e = f.invoke(fsdord, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("does not fit"), "{e}");
     }
 
@@ -2610,14 +2550,14 @@ mod tests {
     fn fsdord_on_a_field_with_no_alternates_answers_minus_one() {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"NAME=Fred\0\0");
-        assert!(matches!(f.invoke(fsdord_wg16, &[0]), Ok(Ret::U16(NO))));
+        assert!(matches!(f.invoke(fsdord, &[0]), Ok(Ret::U16(NO))));
     }
 
     #[test]
     fn fsdord_outside_the_form_stops_the_module() {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
-        let e = f.invoke(fsdord_wg16, &[1]).expect_err("refused");
+        let e = f.invoke(fsdord, &[1]).expect_err("refused");
         assert!(format!("{e}").contains("1 fields"), "{e}");
     }
 
@@ -2626,8 +2566,7 @@ mod tests {
         let mut f = Fixture::new();
         let answers = f.bytes(b"NAME=Fred\0RANK=MAJOR\0\0", false);
         let name = f.text("RANK");
-        let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan_wg16,
+        let Ok(Ret::Far(at)) = f.invoke(fsdxan,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2643,8 +2582,7 @@ mod tests {
         let mut f = Fixture::new();
         let answers = f.bytes(b"NAME=Fred\0\0", false);
         let name = f.text("RANK");
-        let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan_wg16,
+        let Ok(Ret::Far(at)) = f.invoke(fsdxan,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2667,8 +2605,7 @@ mod tests {
         assert!(f.host.forms().is_empty());
         let answers = f.bytes(b"A=1\0\0", false);
         let name = f.text("A");
-        let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan_wg16,
+        let Ok(Ret::Far(at)) = f.invoke(fsdxan,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2681,8 +2618,7 @@ mod tests {
         let mut f = Fixture::new();
         let answers = f.bytes(b"NAMEX=1\0NAME=2\0\0", false);
         let name = f.text("NAME");
-        let Ok(Ret::Far(at)) = f.invoke(
-            fsdxan_wg16,
+        let Ok(Ret::Far(at)) = f.invoke(fsdxan,
             &[answers.offset, answers.selector, name.offset, name.selector],
         ) else {
             panic!("fsdxan refused")
@@ -2703,8 +2639,7 @@ mod tests {
         f.machine.write(junk, b"xxxxxxxx").expect("fills it");
         let name = f.text("A");
         let e = f
-            .invoke(
-                fsdxan_wg16,
+            .invoke(fsdxan,
                 &[junk.offset, junk.selector, name.offset, name.selector],
             )
             .expect_err("refused");
@@ -2723,7 +2658,7 @@ mod tests {
     /// `getasc`'s expansion, which lives in a buffer of the host's
     /// (`FSDBBS.C:137`, and see [`ascii_template`]).
     fn fsdrft_text(f: &mut Fixture) -> Vec<u8> {
-        let Ok(Ret::Far(at)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
         f.machine.read_cstr(at).expect("addressable").to_vec()
@@ -2734,7 +2669,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 0).expect("message");
@@ -2752,14 +2687,14 @@ mod tests {
         let mut f = Fixture::new();
         let form = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let other = f.text("SAMPLE.MSG");
-        let Ok(Ret::Far(block)) = f.invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(other)) else {
+        let Ok(Ret::Far(block)) = f.invoke(crate::shims::msg::opnmsg, &Fixture::far(other)) else {
             panic!("opnmsg refused")
         };
-        f.invoke(crate::shims::msg::setmbk_wg16, &Fixture::far(block))
+        f.invoke(crate::shims::msg::setmbk, &Fixture::far(block))
             .expect("current");
 
         let expected = f
@@ -2782,9 +2717,9 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
-        f.invoke(fsdroom_wg16, &[1, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[1, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let expected = crate::shims::msg::message(&f.machine, &f.host, 1).expect("message");
@@ -2796,7 +2731,7 @@ mod tests {
     fn fsdrft_before_any_fsdroom_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdrft_wg16, &[]).expect_err("refused");
+        let e = f.invoke(fsdrft, &[]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
@@ -2818,7 +2753,7 @@ mod tests {
             "null until a form has been sized"
         );
 
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
 
         let at = f
@@ -2849,14 +2784,14 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open(&mut f);
         let spec = f.text("ONE");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
         let first = f
             .host
             .globals()
             .pointer(&f.machine, "fsdscb")
             .expect("placed");
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect("sized");
         let second = f
             .host
@@ -2888,14 +2823,13 @@ mod tests {
             .expect("channel 0 is current");
         let _ = open_form(&mut f);
         let spec_a = f.text("NAME");
-        let Ok(Ret::U16(size_a)) = f.invoke(fsdroom_wg16, &[0, spec_a.offset, spec_a.selector, 0])
+        let Ok(Ret::U16(size_a)) = f.invoke(fsdroom, &[0, spec_a.offset, spec_a.selector, 0])
         else {
             panic!("fsdroom (channel A) refused");
         };
         let buffer_a = f.buffer(size_a);
         let defaults_a = f.bytes(b"NAME=Alice\0\0", false);
-        f.invoke(
-            fsdapr_wg16,
+        f.invoke(fsdapr,
             &[
                 buffer_a.offset,
                 buffer_a.selector,
@@ -2912,14 +2846,13 @@ mod tests {
             .point_curusr(&mut f.machine, b)
             .expect("channel 1 is current");
         let spec_b = f.text("PHONE");
-        let Ok(Ret::U16(size_b)) = f.invoke(fsdroom_wg16, &[1, spec_b.offset, spec_b.selector, 0])
+        let Ok(Ret::U16(size_b)) = f.invoke(fsdroom, &[1, spec_b.offset, spec_b.selector, 0])
         else {
             panic!("fsdroom (channel B) refused");
         };
         let buffer_b = f.buffer(size_b);
         let defaults_b = f.bytes(b"PHONE=5551234\0\0", false);
-        f.invoke(
-            fsdapr_wg16,
+        f.invoke(fsdapr,
             &[
                 buffer_b.offset,
                 buffer_b.selector,
@@ -2936,7 +2869,7 @@ mod tests {
         f.host
             .point_curusr(&mut f.machine, a)
             .expect("channel 0 is current again");
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan (channel A) refused");
         };
         assert_eq!(
@@ -2958,7 +2891,7 @@ mod tests {
         let _ = open(&mut f);
         let spec = f.text("ONE");
 
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 1]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
             panic!("fsdroom(amode=1) refused")
         };
         assert!(size > 0);
@@ -2979,7 +2912,7 @@ mod tests {
         let spec = f.text("ONE");
 
         let e = f
-            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 7])
+            .invoke(fsdroom, &[0, spec.offset, spec.selector, 7])
             .expect_err("refused");
         assert!(format!("{e}").contains("neither entry"), "{e}");
     }
@@ -2993,7 +2926,7 @@ mod tests {
         let spec = f.text("A_VERY_LONG_NAME_INDEED");
 
         let e = f
-            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+            .invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
             .expect_err("refused");
         assert!(format!("{e}").contains("too long"), "{e}");
         assert!(f.host.forms().is_empty());
@@ -3100,8 +3033,7 @@ mod tests {
         assert_eq!(f.host.users().state_mem(f.machine.mem(), chan).expect("read"), 0);
 
         assert!(matches!(
-            f.invoke(
-                fsdego_wg16,
+            f.invoke(fsdego,
                 &[fldvfy.offset, fldvfy.selector, whndun.offset, whndun.selector],
             ),
             Ok(Ret::Void)
@@ -3160,7 +3092,7 @@ mod tests {
              live module record does"
         );
 
-        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
 
         assert_eq!(
             block(&f).crsfld(),
@@ -3174,7 +3106,7 @@ mod tests {
     fn fsdego_before_any_session_stops_the_module() {
         let mut f = Fixture::new();
         current(&mut f);
-        let e = f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect_err("refused");
+        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdroom"), "{e}");
     }
 
@@ -3193,7 +3125,7 @@ mod tests {
         // amode 1 recorded, but only the amode-0 form was ever compiled.
         f.host.fsdtmp[chan.index()] = Some((mbk, msgno, 1));
 
-        let e = f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect_err("refused");
+        let e = f.invoke(fsdego, &[0, 0, 0, 0]).expect_err("refused");
         assert!(format!("{e}").contains("no such form"), "{e}");
 
         // And refusing did not half-mutate anything on the way there.
@@ -3305,7 +3237,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "hello", "the callback's own answer, stored verbatim");
@@ -3352,7 +3284,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "", "VFYREJ -- nothing stored");
@@ -3411,7 +3343,7 @@ mod tests {
             fsd::state::FSDSAV,
             "left exactly as the callback set it, not overwritten back to FSDNPT"
         );
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "done", "VFYOK still stored the answer");
@@ -3616,7 +3548,7 @@ mod tests {
 
         crate::shims::fsd::fsdprc(&mut f.machine, &mut f.host, &module, chan).expect("processed");
 
-        let Ok(Ret::Far(at)) = f.invoke(fsdnan_wg16, &[0]) else {
+        let Ok(Ret::Far(at)) = f.invoke(fsdnan, &[0]) else {
             panic!("fsdnan refused")
         };
         assert_eq!(f.read(at), "3", "accepted by fsdprc's own local chktyp/chkmin/chkmax");
@@ -4010,7 +3942,7 @@ mod tests {
         let chan = f.console();
 
         assert!(matches!(
-            f.invoke(fsdego_wg16, &[0, 0, 0, 0]),
+            f.invoke(fsdego, &[0, 0, 0, 0]),
             Ok(Ret::Void)
         ));
         // `fsdego` prompted field 0 into the print buffer; that is not this
@@ -4068,8 +4000,7 @@ mod tests {
         let whndun = stub_recording_save(&mut f, 0x100, marker);
 
         assert!(matches!(
-            f.invoke(
-                fsdego_wg16,
+            f.invoke(fsdego,
                 &[0, 0, whndun.offset, whndun.selector],
             ),
             Ok(Ret::Void)
@@ -4119,7 +4050,7 @@ mod tests {
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b");
@@ -4163,7 +4094,7 @@ mod tests {
         let _ = session(&mut f, "NAME RANK", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         queue(&mut f, chan, b"Kaimon\x1b[B");
@@ -4204,7 +4135,7 @@ mod tests {
         let _ = session(&mut f, "NAME RANK", b"\0");
         let chan = f.console();
 
-        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
         // From FSDNPT -- the state `fsdlin` leaves a fresh session in.
@@ -4255,11 +4186,11 @@ mod tests {
         let _ = session(&mut f, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0");
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
         assert!(matches!(
-            f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]),
+            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
             Ok(Ret::Void)
         ));
 
@@ -4322,11 +4253,11 @@ mod tests {
 
         // Now the real thing: fsdbkg's btutsw(usrnum,0).
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
         assert!(matches!(
-            f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]),
+            f.invoke(fsdbkg, &[templt.offset, templt.selector]),
             Ok(Ret::Void)
         ));
         assert_eq!(
@@ -4356,10 +4287,10 @@ mod tests {
         assert!(!f.host.gsbl_mut().channel_mut(chan).locked);
         assert!(!f.host.gsbl_mut().channel_mut(chan).oes);
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector]).expect("painted");
+        f.invoke(fsdbkg, &[templt.offset, templt.selector]).expect("painted");
 
         assert!(f.host.gsbl_mut().channel_mut(chan).locked, "btulok");
         assert!(f.host.gsbl_mut().channel_mut(chan).oes, "btuoes");
@@ -4375,7 +4306,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
 
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
         let returned = f.machine.read_cstr(templt).expect("addressable").to_vec();
@@ -4390,7 +4321,7 @@ mod tests {
 
         // And it is stable: the module holds this pointer across calls, so a
         // second fsdrft must not hand out a different buffer.
-        let Ok(Ret::Far(again)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(again)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
         assert_eq!(templt, again, "the expansion is cached, not rebuilt");
@@ -4406,7 +4337,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
-        let Ok(Ret::U16(size)) = f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 1]) else {
+        let Ok(Ret::U16(size)) = f.invoke(fsdroom, &[0, spec.offset, spec.selector, 1]) else {
             panic!("fsdroom(amode=1) refused")
         };
         assert!(size > 0);
@@ -4414,7 +4345,7 @@ mod tests {
         // And the two forms of one message coexist, because Host::forms is
         // keyed by (message, amode) -- the ANSI one carries cursor gotos and
         // the line one does not.
-        f.invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 0]).expect("sized");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0]).expect("sized");
         let ansi = f.host.forms()[&(0, 1)].clone();
         let line = f.host.forms()[&(0, 0)].clone();
         assert!(!ansi.fields[0].ansgto.is_empty(), "the ANSI form has gotos");
@@ -4427,7 +4358,7 @@ mod tests {
         let _ = open_form(&mut f);
         let spec = f.text("NAME");
         let e = f
-            .invoke(fsdroom_wg16, &[0, spec.offset, spec.selector, 7])
+            .invoke(fsdroom, &[0, spec.offset, spec.selector, 7])
             .expect_err("refused");
         assert!(format!("{e}").contains("neither entry"), "{e}");
     }
@@ -4442,7 +4373,7 @@ mod tests {
         let chan = f.console();
         crate::shims::text::clrprf_mem(f.machine.mem_mut(), &mut f.host).expect("cleared");
 
-        assert!(matches!(f.invoke(fsdego_wg16, &[0, 0, 0, 0]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdego, &[0, 0, 0, 0]), Ok(Ret::Void)));
 
         let scb = block(&f);
         assert_eq!(scb.state(), fsd::state::FSDAPT, "cursor-browse mode");
@@ -4481,7 +4412,7 @@ mod tests {
         let mut f = Fixture::new();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
-        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
 
         let session = f.host.fsd_sessions[chan.index()].as_ref().expect("a session");
         assert!(!session.full_screen);
@@ -4499,12 +4430,12 @@ mod tests {
     fn ansi_session(f: &mut Fixture, spec: &str, defaults: &[u8]) -> Chan {
         let _ = session_amode(f, 0, spec, defaults, 1);
         let chan = f.console();
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
+        f.invoke(fsdbkg, &[templt.offset, templt.selector])
             .expect("painted");
-        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
         let _ = f.host.gsbl_mut().drain_output(chan);
         chan
     }
@@ -4558,12 +4489,12 @@ mod tests {
         let module = f.minimal_module();
         let _ = session_amode(&mut f, 0, "NAME RANK", b"NAME=Kai\0RANK=Cpl\0\0", 1);
         let chan = f.console();
-        let Ok(Ret::Far(templt)) = f.invoke(fsdrft_wg16, &[]) else {
+        let Ok(Ret::Far(templt)) = f.invoke(fsdrft, &[]) else {
             panic!("fsdrft refused")
         };
-        f.invoke(fsdbkg_wg16, &[templt.offset, templt.selector])
+        f.invoke(fsdbkg, &[templt.offset, templt.selector])
             .expect("painted");
-        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
         outprf(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");
         let painted = f.host.gsbl_mut().drain_output(chan);
         assert!(!painted.is_empty(), "the initial paint must have reached the channel");
@@ -4678,7 +4609,7 @@ mod tests {
         let module = f.minimal_module();
         let _ = session(&mut f, "NAME", b"\0");
         let chan = f.console();
-        f.invoke(fsdego_wg16, &[0, 0, 0, 0]).expect("started");
+        f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
         let _ = f.host.gsbl_mut().drain_output(chan);
         assert!(
             f.host.gsbl_mut().channel_mut(chan).status.is_empty(),

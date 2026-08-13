@@ -132,12 +132,6 @@
 //! implementation would start from -- recording it now is what makes that
 //! later work additive instead of a rewrite.
 
-// `Machine`/`Ret` are now named only by this file's `#[cfg(test)]`
-// `_wg16` bridges -- production code reaches every routine here through
-// its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
-// `call` doc comment.
-#[cfg(test)]
-use mbbs16::{Machine, Ret};
 use mbbs_ptr::ModulePtr;
 
 use super::ShimError;
@@ -212,13 +206,6 @@ pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`rstrxf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn rstrxf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    rstrxf(&mut super::call(machine), host).map(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +239,7 @@ mod tests {
         let chan = current(&mut f);
         write_scnbrk(&mut f, chan, 24);
 
-        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
 
         let c = f.host.gsbl().channel(chan);
         assert_eq!((c.xon, c.xoff), (0, 0xed), "0, -19 as btuxnf would store it");
@@ -272,7 +259,7 @@ mod tests {
         let chan = current(&mut f);
         // scnbrk left at its default -- no write_scnbrk call.
 
-        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
 
         let c = f.host.gsbl().channel(chan);
         assert_eq!(c.page_lines, 0xfffe, "-2 as the u16 btuxnf's cnt would hold");
@@ -290,7 +277,7 @@ mod tests {
         let chan = current(&mut f);
         write_scnbrk(&mut f, chan, -5);
 
-        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
 
         assert_eq!(
             f.host.gsbl().channel(chan).page_lines,
@@ -308,7 +295,7 @@ mod tests {
             .expect("channel 1 is current");
         write_scnbrk(&mut f, one, 10);
 
-        f.invoke(rstrxf_wg16, &[]).expect("rstrxf does not stop the machine");
+        f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
 
         let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
         assert_eq!(

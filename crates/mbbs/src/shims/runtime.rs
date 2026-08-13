@@ -51,9 +51,10 @@
 //! which asks `f_lumod@` for `x % 2000` four times with a different `x` each
 //! time.
 
-use mbbs16::{Machine, Ret};
+use mbbs16::Machine;
 
 use crate::Host;
+use crate::abi::{self, Call, Wg16};
 use crate::shims::ShimError;
 
 /// How many bytes of argument these helpers pop. Two `long`s.
@@ -81,14 +82,15 @@ fn by_zero(name: &str, dividend: u32) -> ShimError {
 ///
 /// If the divisor is zero, or if the result does not fit in a `long` -- which
 /// happens for exactly one pair of operands. `idiv` faults on both.
-pub fn f_ldiv(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_ldiv(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let (dividend, divisor) = operands(machine);
     let (a, b) = (dividend as i32, divisor as i32);
     if b == 0 {
         return Err(by_zero("f_ldiv@", dividend));
     }
     a.checked_div(b)
-        .map(|v| Ret::U32(v as u32))
+        .map(|v| abi::Ret::Long(v as u32))
         .ok_or_else(|| overflow("f_ldiv@", a, b))
 }
 
@@ -100,14 +102,15 @@ pub fn f_ldiv(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError>
 /// # Errors
 ///
 /// As [`f_ldiv`].
-pub fn f_lmod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_lmod(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let (dividend, divisor) = operands(machine);
     let (a, b) = (dividend as i32, divisor as i32);
     if b == 0 {
         return Err(by_zero("f_lmod@", dividend));
     }
     a.checked_rem(b)
-        .map(|v| Ret::U32(v as u32))
+        .map(|v| abi::Ret::Long(v as u32))
         .ok_or_else(|| overflow("f_lmod@", a, b))
 }
 
@@ -116,10 +119,11 @@ pub fn f_lmod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError>
 /// # Errors
 ///
 /// If the divisor is zero. Unsigned division cannot overflow.
-pub fn f_ludiv(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_ludiv(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let (dividend, divisor) = operands(machine);
     match dividend.checked_div(divisor) {
-        Some(v) => Ok(Ret::U32(v)),
+        Some(v) => Ok(abi::Ret::Long(v)),
         None => Err(by_zero("f_ludiv@", dividend)),
     }
 }
@@ -132,10 +136,11 @@ pub fn f_ludiv(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
 /// # Errors
 ///
 /// If the divisor is zero. Unsigned remainder cannot overflow.
-pub fn f_lumod(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_lumod(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let (dividend, divisor) = operands(machine);
     match dividend.checked_rem(divisor) {
-        Some(v) => Ok(Ret::U32(v)),
+        Some(v) => Ok(abi::Ret::Long(v)),
         None => Err(by_zero("f_lumod@", dividend)),
     }
 }
@@ -173,9 +178,10 @@ fn dxax(machine: &Machine) -> u32 {
 /// # Errors
 ///
 /// None. Multiplication modulo 2^32 is total.
-pub fn f_lxmul(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_lxmul(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let cxbx = u32::from(machine.bx()) | (u32::from(machine.cx()) << 16);
-    Ok(Ret::U32(dxax(machine).wrapping_mul(cxbx)))
+    Ok(abi::Ret::Long(dxax(machine).wrapping_mul(cxbx)))
 }
 
 /// The shift count a module passed, which is `CL` and never `CX`.
@@ -210,9 +216,10 @@ fn count(name: &str, machine: &Machine) -> Result<u32, ShimError> {
 /// `shl ax,1 / rcl dx,1` loop answers zero, and a 286 masking `CL` to five bits
 /// answers `value << (n & 31)`. Picking one would be a guess that reads as an
 /// answer.
-pub fn f_lxlsh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_lxlsh(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let by = count("f_lxlsh@", machine)?;
-    Ok(Ret::U32(dxax(machine) << by))
+    Ok(abi::Ret::Long(dxax(machine) << by))
 }
 
 /// `unsigned long F_LXURSH@(void)` -- `DX:AX` shifted right by `CL`, logically.
@@ -226,9 +233,10 @@ pub fn f_lxlsh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
 /// # Errors
 ///
 /// As [`f_lxlsh`].
-pub fn f_lxursh(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_lxursh(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let by = count("f_lxursh@", machine)?;
-    Ok(Ret::U32(dxax(machine) >> by))
+    Ok(abi::Ret::Long(dxax(machine) >> by))
 }
 
 /// How many bytes of argument `f_scopy@` pops. Two far pointers.
@@ -283,7 +291,8 @@ pub const POINTERS: u16 = 8;
 /// one. Overlap is judged on the selectors being equal, which is the same
 /// question as the segments being the same one only because every selector this
 /// host hands out carries the same low three bits.
-pub fn f_scopy(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError> {
+pub fn f_scopy(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
     let source = machine.arg_far(0);
     let dest = machine.arg_far(2);
     let len = usize::from(machine.cx());
@@ -300,7 +309,7 @@ pub fn f_scopy(machine: &mut Machine, _host: &mut Host) -> Result<Ret, ShimError
     let bytes = machine.resolve(source, len)?.to_vec();
     machine.write(dest, &bytes)?;
 
-    Ok(Ret::U32(dxax(machine)))
+    Ok(abi::Ret::Long(dxax(machine)))
 }
 
 /// The single signed pair that has no answer: `i32::MIN / -1`.
@@ -315,10 +324,13 @@ mod tests {
     use mbbs16::FarPtr;
 
     use super::*;
+    // Wg16-only, and used by these fixtures alone -- the
+    // production code above reaches memory through the ABI.
+    use mbbs16::Ret;
     use crate::testing::Fixture;
 
     /// Push a dividend and a divisor the way the module does, and run `shim`.
-    fn div(shim: crate::shims::Wg16Shim, dividend: u32, divisor: u32) -> Result<Ret, ShimError> {
+    fn div(shim: crate::shims::Shim<Wg16>, dividend: u32, divisor: u32) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         let args = [
             dividend as u16,
@@ -386,7 +398,7 @@ mod tests {
     }
 
     /// Set `DX:AX` and `CX:BX` the way a module does, and run `shim`.
-    fn regs(shim: crate::shims::Wg16Shim, dxax: u32, cxbx: u32) -> Result<Ret, ShimError> {
+    fn regs(shim: crate::shims::Shim<Wg16>, dxax: u32, cxbx: u32) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         let regs = [
             dxax as u16,         // AX
@@ -432,7 +444,7 @@ mod tests {
     }
 
     /// Set `DX:AX` and a shift count in `CL`, and run `shim`.
-    fn shift(shim: crate::shims::Wg16Shim, value: u32, count: u8) -> Result<Ret, ShimError> {
+    fn shift(shim: crate::shims::Shim<Wg16>, value: u32, count: u8) -> Result<Ret, ShimError> {
         let mut f = Fixture::new();
         // CH is deliberately not zero: no call site sets it, so a shim that read
         // CX rather than CL would shift by an enormous number.

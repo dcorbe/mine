@@ -48,7 +48,7 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use mbbs16::Ret;
 use mbbs_ptr::ModulePtr;
 
 use crate::Host;
@@ -136,13 +136,6 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     Ok(abi::Ret::Ptr(cookie))
 }
 
-/// The dispatch-table entry for [`fopen`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fopen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fopen(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int fclose(FILE *f)` -- close a stream.
 ///
 /// Zero, always: the failure `fclose` reports with `EOF` is one this host would
@@ -159,13 +152,6 @@ pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .close(cookie)
         .map_err(|e| ShimError::Failed(format!("fclose: {e}")))?;
     Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// The dispatch-table entry for [`fclose`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fclose_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fclose(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *fgets(char *s, int n, FILE *f)` -- a line, or `NULL` at the end.
@@ -212,13 +198,6 @@ pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         .write(call.mem(), &line)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Ptr(buffer))
-}
-
-/// The dispatch-table entry for [`fgets`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fgets_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fgets(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- a block.
@@ -271,13 +250,6 @@ pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     )))
 }
 
-/// The dispatch-table entry for [`fread`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fread_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fread(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
 /// with a destination.
 ///
@@ -307,13 +279,6 @@ pub fn fprintf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
 }
 
-/// The dispatch-table entry for [`fprintf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fprintf(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int fflush(FILE *f)` -- push what is buffered.
 ///
 /// **Honest as a no-op, and only because nothing here buffers.** C's `fflush`
@@ -337,13 +302,6 @@ pub fn fflush<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .name(cookie)
         .map_err(|e| ShimError::Failed(format!("fflush: {e}")))?;
     Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// The dispatch-table entry for [`fflush`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn fflush_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    fflush(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int unlink(const char *path)` -- remove a file.
@@ -375,13 +333,6 @@ pub fn unlink<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     std::fs::remove_file(&path)
         .map_err(|e| ShimError::Failed(format!("unlink({named}): {e}")))?;
     Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// The dispatch-table entry for [`unlink`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn unlink_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    unlink(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long getdtd(int fhdl)` -- when a file was last written, DOS-packed.
@@ -442,13 +393,6 @@ pub fn getdtd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Long(
         (u32::from(date) << 16) | u32::from(civil.dos_time()),
     ))
-}
-
-/// The dispatch-table entry for [`getdtd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn getdtd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    getdtd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID cntdir(const CHAR *path)` -- count the files and bytes a spec names.
@@ -555,13 +499,6 @@ pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`cntdir`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn cntdir_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    cntdir(&mut super::call(machine), host).map(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,8 +533,7 @@ mod tests {
     fn open(f: &mut Fixture, name: &str, mode: &str) -> Result<Ret, ShimError> {
         let path = f.text(name);
         let how = f.text(mode);
-        f.invoke(
-            fopen_wg16,
+        f.invoke(fopen,
             &[path.offset, path.selector, how.offset, how.selector],
         )
     }
@@ -611,7 +547,7 @@ mod tests {
     fn gets(f: &mut Fixture, fp: FarPtr, n: u16) -> Option<String> {
         let buffer = f.bytes(&vec![0xff; usize::from(n) + 8], false);
         let ret = f
-            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
+            .invoke(fgets, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
             .expect("fgets");
         match ret {
             Ret::Far(FarPtr {
@@ -677,7 +613,7 @@ mod tests {
         );
         assert_eq!(gets(&mut f, fp, 64), None, "NULL is how the module finds the end");
 
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
     }
 
     #[test]
@@ -745,7 +681,7 @@ mod tests {
         let fp = opened(&mut f, "LINES.TXT", "rt");
         let buffer = f.buffer(8);
         let e = f
-            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
+            .invoke(fgets, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
             .expect_err("a refusal");
         assert!(e.to_string().contains("n of 0"), "{e}");
     }
@@ -760,8 +696,7 @@ mod tests {
         let want = 200u16;
         let buffer = f.bytes(&vec![0xff; usize::from(want)], false);
         let got = word(
-            f.invoke(
-                fread_wg16,
+            f.invoke(fread,
                 &[
                     buffer.offset,
                     buffer.selector,
@@ -801,8 +736,7 @@ mod tests {
             let fp = opened(&mut f, "LINES.TXT", mode);
             let buffer = f.buffer(200);
             word(
-                f.invoke(
-                    fread_wg16,
+                f.invoke(fread,
                     &[buffer.offset, buffer.selector, 1, 200, fp.offset, fp.selector],
                 )
                 .expect("fread"),
@@ -821,8 +755,7 @@ mod tests {
         let fp = opened(&mut f, "LINES.TXT", "rb");
         let buffer = f.buffer(64);
         let e = f
-            .invoke(
-                fread_wg16,
+            .invoke(fread,
                 &[buffer.offset, buffer.selector, 256, 256, fp.offset, fp.selector],
             )
             .expect_err("a refusal");
@@ -878,12 +811,11 @@ mod tests {
         );
 
         let template = f.text("a\nb\n");
-        f.invoke(
-            fprintf_wg16,
+        f.invoke(fprintf,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
         // Truncated rather than appended to -- the base letter is still `w` --
         // and still a text stream, because a bare `w+` takes `_fmode`'s
@@ -921,18 +853,18 @@ mod tests {
     fn a_handle_used_after_closing_is_refused_by_name() {
         let mut f = Fixture::new();
         let fp = opened(&mut f, "LINES.TXT", "rt");
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
         let buffer = f.buffer(64);
         let e = f
-            .invoke(fgets_wg16, &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector])
+            .invoke(fgets, &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector])
             .expect_err("a refusal");
         assert!(
             e.to_string().contains("LINES.TXT was closed"),
             "the address is retired, so the refusal can name the file: {e}"
         );
 
-        let e = f.invoke(fclose_wg16, &Fixture::far(fp)).expect_err("a refusal");
+        let e = f.invoke(fclose, &Fixture::far(fp)).expect_err("a refusal");
         assert!(e.to_string().contains("LINES.TXT was closed"), "{e}");
     }
 
@@ -940,7 +872,7 @@ mod tests {
     fn a_handle_this_host_never_issued_is_refused() {
         let mut f = Fixture::new();
         let invented = f.buffer(FILE_SIZE as u16);
-        let e = f.invoke(fclose_wg16, &Fixture::far(invented)).expect_err("a refusal");
+        let e = f.invoke(fclose, &Fixture::far(invented)).expect_err("a refusal");
         assert!(e.to_string().contains("not a stream this host opened"), "{e}");
     }
 
@@ -964,8 +896,7 @@ mod tests {
 
         let buffer = f.buffer(64);
         let e = f
-            .invoke(
-                fgets_wg16,
+            .invoke(fgets,
                 &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector],
             )
             .expect_err("a refusal");
@@ -999,8 +930,7 @@ mod tests {
         let template = f.text("%s has %d gold\n");
         let who = f.text("rangerdan");
         let wrote = word(
-            f.invoke(
-                fprintf_wg16,
+            f.invoke(fprintf,
                 &[
                     fp.offset,
                     fp.selector,
@@ -1013,7 +943,7 @@ mod tests {
             )
             .expect("fprintf"),
         );
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
         let on_disk = std::fs::read(root.join("OUT.LOG")).expect("the log");
         assert_eq!(on_disk, b"rangerdan has 1234 gold\n");
@@ -1034,13 +964,12 @@ mod tests {
             let fp = opened(&mut f, name, mode);
             let template = f.text("a\nb\n");
             let wrote = word(
-                f.invoke(
-                    fprintf_wg16,
+                f.invoke(fprintf,
                     &[fp.offset, fp.selector, template.offset, template.selector],
                 )
                 .expect("fprintf"),
             );
-            f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+            f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
             assert_eq!(std::fs::read(root.join(name)).expect(name), expected, "{name}");
             // "A write to a text file does not count generated carriage
@@ -1058,12 +987,11 @@ mod tests {
         let mut f = Fixture::rooted(root.clone());
         let fp = opened(&mut f, "wccmmud.log", "at");
         let template = f.text("second\n");
-        f.invoke(
-            fprintf_wg16,
+        f.invoke(fprintf,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
         assert_eq!(
             std::fs::read(root.join("WCCMMUD.LOG")).expect("the log"),
@@ -1082,8 +1010,7 @@ mod tests {
         let fp = opened(&mut f, "LINES.TXT", "rt");
         let template = f.text("no");
         let e = f
-            .invoke(
-                fprintf_wg16,
+            .invoke(fprintf,
                 &[fp.offset, fp.selector, template.offset, template.selector],
             )
             .expect_err("a refusal");
@@ -1095,10 +1022,10 @@ mod tests {
         let root = scratch("stream-flush");
         let mut f = Fixture::rooted(root);
         let fp = opened(&mut f, "OUT.LOG", "wt");
-        assert_eq!(word(f.invoke(fflush_wg16, &Fixture::far(fp)).expect("fflush")), 0);
+        assert_eq!(word(f.invoke(fflush, &Fixture::far(fp)).expect("fflush")), 0);
 
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
-        let e = f.invoke(fflush_wg16, &Fixture::far(fp)).expect_err("a refusal");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        let e = f.invoke(fflush, &Fixture::far(fp)).expect_err("a refusal");
         assert!(e.to_string().contains("OUT.LOG was closed"), "{e}");
     }
 
@@ -1110,21 +1037,21 @@ mod tests {
         let mut f = Fixture::rooted(root.clone());
 
         let named = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
         assert!(!root.join("LINES.TXT").exists());
 
         // -1 for a file that is not there is the truth, and `_INIT__WCCMMUD`
         // reads it as one -- its single `unlink` is guarded by an `access` that
         // has already said the same thing.
         let again = f.text("LINES.TXT");
-        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(again)).expect("unlink")), NO);
+        assert_eq!(word(f.invoke(unlink, &Fixture::far(again)).expect("unlink")), NO);
     }
 
     #[test]
     fn unlink_outside_the_modules_own_directory_is_refused() {
         let mut f = Fixture::rooted(scratch("stream-unlink-path"));
         let named = f.text("D:\\LOGS\\MUD.LOG");
-        let e = f.invoke(unlink_wg16, &Fixture::far(named)).expect_err("a refusal");
+        let e = f.invoke(unlink, &Fixture::far(named)).expect_err("a refusal");
         assert!(e.to_string().contains("names a directory"), "{e}");
     }
 
@@ -1140,12 +1067,11 @@ mod tests {
 
         let fp = opened(&mut f, "WCCRECOV.FLG", "w");
         let template = f.text("MajorMUD Recovery required\n");
-        f.invoke(
-            fprintf_wg16,
+        f.invoke(fprintf,
             &[fp.offset, fp.selector, template.offset, template.selector],
         )
         .expect("fprintf");
-        f.invoke(fclose_wg16, &Fixture::far(fp)).expect("fclose");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
 
         assert_eq!(
             std::fs::read(root.join("WCCRECOV.FLG")).expect("the flag"),
@@ -1154,7 +1080,7 @@ mod tests {
         );
 
         let named = f.text("WCCRECOV.FLG");
-        assert_eq!(word(f.invoke(unlink_wg16, &Fixture::far(named)).expect("unlink")), 0);
+        assert_eq!(word(f.invoke(unlink, &Fixture::far(named)).expect("unlink")), 0);
         assert!(!root.join("WCCRECOV.FLG").exists());
     }
 
@@ -1169,7 +1095,7 @@ mod tests {
         let _fp = opened(&mut f, "LINES.TXT", "r");
 
         let Ret::U32(packed) = f
-            .invoke(getdtd_wg16, &[u16::from(crate::stream::FIRST_FD)])
+            .invoke(getdtd, &[u16::from(crate::stream::FIRST_FD)])
             .expect("getdtd")
         else {
             panic!("getdtd returns a long");
@@ -1209,7 +1135,7 @@ mod tests {
         // behind, so a stale handle came back as a date. There is nothing to
         // report here but the absence.
         let mut f = Fixture::new();
-        let e = f.invoke(getdtd_wg16, &[99]).expect_err("refused");
+        let e = f.invoke(getdtd, &[99]).expect_err("refused");
         assert!(format!("{e}").contains("no open stream"), "{e}");
     }
 
@@ -1219,7 +1145,7 @@ mod tests {
         let at = f.text(spec);
         let args = Fixture::far(at);
         assert!(matches!(
-            f.invoke(cntdir_wg16, &args).expect("cntdir"),
+            f.invoke(cntdir, &args).expect("cntdir"),
             Ret::Void
         ));
         let read = |name| f.host.globals().long(&f.machine, name).expect(name);
@@ -1298,7 +1224,7 @@ mod tests {
         for spec in ["D:\\MUD\\*.DAT", "SUBDIR\\*.*", "*"] {
             let at = f.text(spec);
             let args = Fixture::far(at);
-            assert!(f.invoke(cntdir_wg16, &args).is_err(), "{spec}");
+            assert!(f.invoke(cntdir, &args).is_err(), "{spec}");
         }
     }
 }

@@ -47,7 +47,7 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use mbbs16::Ret;
 use mbbs_ptr::ModulePtr;
 
 use super::ShimError;
@@ -92,13 +92,6 @@ pub fn btutsw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btutsw`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btutsw_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btutsw(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btumil(int chan, int maxinl)` -- maximum input line length. Zero
 /// disables the limit.
 pub fn btumil<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
@@ -112,13 +105,6 @@ pub fn btumil<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btumil`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btumil_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btumil(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btuech(int chan, int onoff)` -- echo input back to the terminal.
 pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
@@ -129,13 +115,6 @@ pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btuech`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuech_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuech(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btulok(int chan, int onoff)` -- input lockout: arriving bytes are
@@ -151,13 +130,6 @@ pub fn btulok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btulok`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btulok_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btulok(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btuoes(int chan, int onoff)` -- raise status 5 when the output buffer
 /// empties.
 pub fn btuoes<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
@@ -171,13 +143,6 @@ pub fn btuoes<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btuoes`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuoes_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuoes(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btutrg(int chan, int nbyt)` -- byte-count input trigger. Zero is ASCII
 /// mode; non-zero switches to binary mode and sets the block size.
 pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
@@ -189,13 +154,6 @@ pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btutrg`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btutrg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btutrg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btuxnf(int chan, int xon, int xoff, ...)` -- the XON and XOFF
@@ -232,13 +190,6 @@ pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btuxnf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuxnf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuxnf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The mutation [`btuxnf`] performs, apart from reading the module's stack --
@@ -283,13 +234,6 @@ pub fn btuhpk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btuhpk`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuhpk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuhpk(&mut super::call(machine), host).map(Into::into)
-}
-
 /// The mutation [`btuhpk`] performs. See [`apply_xnf`] for why this is
 /// factored out.
 pub(crate) fn apply_hpk(g: &mut Gsbl, chan: Chan) {
@@ -309,13 +253,6 @@ pub fn btupbc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btupbc`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btupbc_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btupbc(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The mutation [`btupbc`] performs. See [`apply_xnf`] for why this is
@@ -340,13 +277,6 @@ pub fn btucpc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btucpc`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btucpc_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btucpc(&mut super::call(machine), host).map(Into::into)
-}
-
 /// The mutation [`btucpc`] performs. See [`apply_xnf`] for why this is
 /// factored out.
 pub(crate) fn apply_cpc(g: &mut Gsbl, chan: Chan, cpchar: u8) {
@@ -364,13 +294,6 @@ pub fn btuclo<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btuclo`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuclo_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuclo(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btucli(int chan)` -- throw away input that has not been taken yet.
@@ -394,13 +317,6 @@ pub fn btucli<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// The dispatch-table entry for [`btucli`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btucli_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btucli(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btuinj(int chan, int status)` -- inject a status code into the FIFO.
 pub fn btuinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
@@ -411,13 +327,6 @@ pub fn btuinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
     })
-}
-
-/// The dispatch-table entry for [`btuinj`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuinj_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuinj(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btuibw(int chan)` -- input bytes waiting.
@@ -442,13 +351,6 @@ pub fn btuibw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(waiting as u16)))
 }
 
-/// The dispatch-table entry for [`btuibw`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuibw_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuibw(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int btuxmt(int chan, char *datstg)` -- transmit an ASCIIZ string.
 ///
 /// This is MajorMUD's whole output path. It has no `outprf`: it formats with
@@ -466,13 +368,6 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .to_vec();
     host.gsbl_mut().transmit(chan, &text);
     Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// The dispatch-table entry for [`btuxmt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuxmt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuxmt(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btuxct(int chan, int nbyt, const char *datstg)` -- transmit `nbyt`
@@ -494,13 +389,6 @@ pub fn btuxct<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .to_vec();
     host.gsbl_mut().transmit_raw(chan, &data);
     Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// The dispatch-table entry for [`btuxct`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuxct_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuxct(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int btuica(int chan, char *rdbptr, int max)` -- take up to `max` bytes of
@@ -533,13 +421,6 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(take as u16)))
 }
 
-/// The dispatch-table entry for [`btuica`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn btuica_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    btuica(&mut super::call(machine), host).map(Into::into)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,19 +433,19 @@ mod tests {
         let mut f = Fixture::new();
         let past = f.host.gsbl().terms().count();
         for (name, ret) in [
-            ("btutsw", f.invoke(btutsw_wg16, &[past, 80])),
-            ("btumil", f.invoke(btumil_wg16, &[past, 40])),
-            ("btuech", f.invoke(btuech_wg16, &[past, 1])),
-            ("btulok", f.invoke(btulok_wg16, &[past, 1])),
-            ("btuoes", f.invoke(btuoes_wg16, &[past, 1])),
-            ("btutrg", f.invoke(btutrg_wg16, &[past, 4])),
-            ("btuinj", f.invoke(btuinj_wg16, &[past, 3])),
-            ("btuclo", f.invoke(btuclo_wg16, &[past])),
-            ("btucli", f.invoke(btucli_wg16, &[past])),
-            ("btuibw", f.invoke(btuibw_wg16, &[past])),
-            ("btuhpk", f.invoke(btuhpk_wg16, &[past, 0, 0])),
-            ("btupbc", f.invoke(btupbc_wg16, &[past, 20])),
-            ("btucpc", f.invoke(btucpc_wg16, &[past, 19])),
+            ("btutsw", f.invoke(btutsw, &[past, 80])),
+            ("btumil", f.invoke(btumil, &[past, 40])),
+            ("btuech", f.invoke(btuech, &[past, 1])),
+            ("btulok", f.invoke(btulok, &[past, 1])),
+            ("btuoes", f.invoke(btuoes, &[past, 1])),
+            ("btutrg", f.invoke(btutrg, &[past, 4])),
+            ("btuinj", f.invoke(btuinj, &[past, 3])),
+            ("btuclo", f.invoke(btuclo, &[past])),
+            ("btucli", f.invoke(btucli, &[past])),
+            ("btuibw", f.invoke(btuibw, &[past])),
+            ("btuhpk", f.invoke(btuhpk, &[past, 0, 0])),
+            ("btupbc", f.invoke(btupbc, &[past, 20])),
+            ("btucpc", f.invoke(btucpc, &[past, 19])),
         ] {
             assert_eq!(
                 ret.expect(name),
@@ -578,9 +459,9 @@ mod tests {
     fn btuxmt_transmits_and_btutsw_is_what_wraps_it() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(btutsw_wg16, &[0, 10]).expect("width set");
+        f.invoke(btutsw, &[0, 10]).expect("width set");
         let text = f.text("the quick brown fox");
-        f.invoke(btuxmt_wg16, &[0, text.offset, text.selector])
+        f.invoke(btuxmt, &[0, text.offset, text.selector])
             .expect("transmitted");
         assert_eq!(
             f.host.gsbl_mut().drain_output(console),
@@ -617,7 +498,7 @@ mod tests {
             .expect("channel 2 is current");
 
         let text = f.text("Kaimon just entered the Realm.");
-        f.invoke(btuxmt_wg16, &[1, text.offset, text.selector])
+        f.invoke(btuxmt, &[1, text.offset, text.selector])
             .expect("transmitted");
 
         assert_eq!(
@@ -642,7 +523,7 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let data = f.bytes(&[b'a', 0, b'b'], false);
-        f.invoke(btuxct_wg16, &[0, 3, data.offset, data.selector])
+        f.invoke(btuxct, &[0, 3, data.offset, data.selector])
             .expect("transmitted");
         assert_eq!(f.host.gsbl_mut().drain_output(console), vec![b'a', 0, b'b']);
     }
@@ -653,9 +534,9 @@ mod tests {
         let console = f.console();
         f.host.gsbl_mut().channel_mut(console).trigger = 99;
         f.host.gsbl_mut().push_input(console, b"abcd");
-        assert_eq!(f.invoke(btuibw_wg16, &[0]).expect("counted"), Ret::U16(4));
-        f.invoke(btucli_wg16, &[0]).expect("cleared");
-        assert_eq!(f.invoke(btuibw_wg16, &[0]).expect("counted"), Ret::U16(0));
+        assert_eq!(f.invoke(btuibw, &[0]).expect("counted"), Ret::U16(4));
+        f.invoke(btucli, &[0]).expect("cleared");
+        assert_eq!(f.invoke(btuibw, &[0]).expect("counted"), Ret::U16(0));
     }
 
     /// Raw mode's bytes are ordinary input as far as these three are
@@ -685,14 +566,14 @@ mod tests {
         f.host.gsbl_mut().push_input(console, b"a\x1b[A\n");
 
         assert_eq!(
-            f.invoke(btuibw_wg16, &[0]).expect("counted"),
+            f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(5),
             "all five keystrokes are waiting, ESC and LF included"
         );
 
         let buf = f.buffer(16);
         let ret = f
-            .invoke(btuica_wg16, &[0, buf.offset, buf.selector, 3])
+            .invoke(btuica, &[0, buf.offset, buf.selector, 3])
             .expect("copied");
         assert_eq!(ret, Ret::U16(3));
         assert_eq!(
@@ -701,14 +582,14 @@ mod tests {
             "in arrival order, uncooked"
         );
         assert_eq!(
-            f.invoke(btuibw_wg16, &[0]).expect("counted"),
+            f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(2),
             "and what the FSD did not take is still waiting to be asked for"
         );
 
-        f.invoke(btucli_wg16, &[0]).expect("cleared");
+        f.invoke(btucli, &[0]).expect("cleared");
         assert_eq!(
-            f.invoke(btuibw_wg16, &[0]).expect("counted"),
+            f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(0),
             "btucli reaches raw bytes -- it is how fsdcon drops type-ahead"
         );
@@ -719,9 +600,9 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let text = f.text("wasted");
-        f.invoke(btuxmt_wg16, &[0, text.offset, text.selector])
+        f.invoke(btuxmt, &[0, text.offset, text.selector])
             .expect("transmitted");
-        f.invoke(btuclo_wg16, &[0]).expect("cleared");
+        f.invoke(btuclo, &[0]).expect("cleared");
         assert!(f.host.gsbl_mut().drain_output(console).is_empty());
     }
 
@@ -729,7 +610,7 @@ mod tests {
     fn btuinj_puts_a_status_where_the_host_will_find_it() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(btuinj_wg16, &[0, 3]).expect("injected");
+        f.invoke(btuinj, &[0, 3]).expect("injected");
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(3));
     }
 
@@ -741,7 +622,7 @@ mod tests {
         f.host.gsbl_mut().push_input(console, b"abcdef");
         let buf = f.buffer(16);
         let ret = f
-            .invoke(btuica_wg16, &[0, buf.offset, buf.selector, 4])
+            .invoke(btuica, &[0, buf.offset, buf.selector, 4])
             .expect("copied");
         assert_eq!(ret, Ret::U16(4), "the count copied, not the count waiting");
         assert_eq!(
@@ -750,7 +631,7 @@ mod tests {
             "and only four bytes landed"
         );
         assert_eq!(
-            f.invoke(btuibw_wg16, &[0]).expect("counted"),
+            f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(2),
             "what was copied is consumed"
         );
@@ -768,10 +649,10 @@ mod tests {
         let console = f.console();
         f.host.gsbl_mut().channel_mut(console).trigger = 99;
         f.host.gsbl_mut().push_input(console, b"abcd");
-        let ret = f.invoke(btuica_wg16, &[0, 0, 0xdead, 4]);
+        let ret = f.invoke(btuica, &[0, 0, 0xdead, 4]);
         assert!(ret.is_err(), "a destination that resolves to nothing must fail");
         assert_eq!(
-            f.invoke(btuibw_wg16, &[0]).expect("counted"),
+            f.invoke(btuibw, &[0]).expect("counted"),
             Ret::U16(4),
             "nothing was drained -- the bytes are still there to ask for again"
         );
@@ -787,7 +668,7 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         let msg = f.text("Hit any key to continue...");
-        f.invoke(btuxnf_wg16, &[0, 0, 0xffed, 22, msg.offset, msg.selector])
+        f.invoke(btuxnf, &[0, 0, 0xffed, 22, msg.offset, msg.selector])
             .expect("ok");
         let c = f.host.gsbl().channel(console);
         assert_eq!(c.xoff, 0xed, "the low byte still lands, negative or not");
@@ -802,7 +683,7 @@ mod tests {
     fn btuxnf_with_a_positive_xoff_records_no_page_parameters() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(btuxnf_wg16, &[0, 0, 19]).expect("ok");
+        f.invoke(btuxnf, &[0, 0, 19]).expect("ok");
         let c = f.host.gsbl().channel(console);
         assert_eq!(c.page_lines, 0);
         assert_eq!(c.page_message, None);
@@ -816,7 +697,7 @@ mod tests {
             !f.host.gsbl().channel(console).pause_handler_installed,
             "nothing installed one yet"
         );
-        f.invoke(btuhpk_wg16, &[0, 0x1234, 0x5678]).expect("ok");
+        f.invoke(btuhpk, &[0, 0x1234, 0x5678]).expect("ok");
         assert!(f.host.gsbl().channel(console).pause_handler_installed);
     }
 
@@ -824,8 +705,8 @@ mod tests {
     fn btupbc_and_btucpc_record_their_characters() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(btupbc_wg16, &[0, 20]).expect("ok");
-        f.invoke(btucpc_wg16, &[0, 19]).expect("ok");
+        f.invoke(btupbc, &[0, 20]).expect("ok");
+        f.invoke(btucpc, &[0, 19]).expect("ok");
         let c = f.host.gsbl().channel(console);
         assert_eq!(c.pause_char, 20, "Control-T, the guide's own example");
         assert_eq!(c.clear_pause_char, 19, "Control-S, the guide's own example");
@@ -835,13 +716,13 @@ mod tests {
     fn the_settings_reach_the_channel() {
         let mut f = Fixture::new();
         let console = f.console();
-        f.invoke(btutsw_wg16, &[0, 80]).expect("ok");
-        f.invoke(btumil_wg16, &[0, 40]).expect("ok");
-        f.invoke(btuech_wg16, &[0, 0]).expect("ok");
-        f.invoke(btulok_wg16, &[0, 1]).expect("ok");
-        f.invoke(btuoes_wg16, &[0, 1]).expect("ok");
-        f.invoke(btutrg_wg16, &[0, 8]).expect("ok");
-        f.invoke(btuxnf_wg16, &[0, 17, 19]).expect("ok");
+        f.invoke(btutsw, &[0, 80]).expect("ok");
+        f.invoke(btumil, &[0, 40]).expect("ok");
+        f.invoke(btuech, &[0, 0]).expect("ok");
+        f.invoke(btulok, &[0, 1]).expect("ok");
+        f.invoke(btuoes, &[0, 1]).expect("ok");
+        f.invoke(btutrg, &[0, 8]).expect("ok");
+        f.invoke(btuxnf, &[0, 17, 19]).expect("ok");
 
         let c = f.host.gsbl().channel(console);
         assert_eq!(c.width, 80);
@@ -860,7 +741,7 @@ mod tests {
         let mut f = Fixture::new();
         let console = f.console();
         f.host.gsbl_mut().push_input(console, b"look\r");
-        f.invoke(btucli_wg16, &[0]).expect("cleared");
+        f.invoke(btucli, &[0]).expect("cleared");
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::CRSTG));
         assert_eq!(f.host.gsbl_mut().take_line(console), None);
     }

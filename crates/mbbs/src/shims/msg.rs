@@ -94,13 +94,6 @@ pub fn opnmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(cookie))
 }
 
-/// The dispatch-table entry for [`opnmsg`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn opnmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    opnmsg(&mut super::call(machine), host).map(Into::into)
-}
-
 /// The file to read for the message file a module named.
 ///
 /// `opnmsg(char *mcvfil)` names the **compiled** file, and means it: MajorMUD's
@@ -130,13 +123,6 @@ pub fn clsmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`clsmsg`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn clsmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    clsmsg(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void setmbk(FILE *mb)` -- read options from this file until told otherwise.
 ///
 /// `curmbk` is written in module memory, not remembered here. What is
@@ -159,13 +145,6 @@ pub fn setmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`setmbk`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn setmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    setmbk(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void rstmbk(void)` -- go back to the message file that was current before.
 ///
 /// Generic (Task 5): [`Messages::pop`](crate::msg::Messages::pop) never
@@ -174,13 +153,6 @@ pub fn rstmbk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let previous = host.messages.pop().map_err(ShimError::Failed)?;
     set_current_mem(call.mem(), host, previous)?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`rstmbk`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn rstmbk_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    rstmbk(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *stgopt(int msgnum)` -- a message's text, whole.
@@ -224,13 +196,6 @@ pub fn stgopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(out))
 }
 
-/// The dispatch-table entry for [`stgopt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn stgopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    stgopt(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int numopt(int msgnum,int floor,int ceiling)`.
 ///
 /// The bounds are the module's own, and real: `ACCOUNT.C:117` asks for
@@ -260,13 +225,6 @@ pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(parsed as i16 as u16)))
 }
 
-/// The dispatch-table entry for [`numopt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn numopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    numopt(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int ynopt(int msgnum)`.
 ///
 /// Across the 91 recovered `.MSG` files every one of the 267 `B` options ends
@@ -289,13 +247,6 @@ pub fn ynopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     }
 }
 
-/// The dispatch-table entry for [`ynopt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn ynopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    ynopt(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int chropt(int msgnum)` -- an option that is one character.
 ///
 /// Generic (Task 5): [`read_mem`]/[`option_mem`] read module memory.
@@ -309,13 +260,6 @@ pub fn chropt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             option_mem(call.mem(), host, number)?
         ))),
     }
-}
-
-/// The dispatch-table entry for [`chropt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn chropt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    chropt(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int tokopt(int msgnum, char *tok, ..., NULL)` -- which of these the option
@@ -372,13 +316,6 @@ pub fn tokopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     }
 }
 
-/// The dispatch-table entry for [`tokopt`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn tokopt_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    tokopt(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void prfmsg(int msg,...)` -- append a message to the channel's output.
 ///
 /// `prf` with the template coming from the current message block instead of
@@ -396,13 +333,6 @@ pub fn prfmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let (text, _) = format_call(call, at)?;
     text::append_mem(call.mem(), host, &text)?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`prfmsg`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn prfmsg_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    prfmsg(&mut super::call(machine), host).map(Into::into)
 }
 
 /// What `curmbk` holds, read back out of module memory every time.
@@ -484,7 +414,7 @@ mod tests {
     /// Open a file, which also makes it current.
     fn open(f: &mut Fixture, name: &str) -> FarPtr {
         let at = f.text(name);
-        let Ret::Far(cookie) = f.invoke(opnmsg_wg16, &Fixture::far(at)).expect("opens") else {
+        let Ret::Far(cookie) = f.invoke(opnmsg, &Fixture::far(at)).expect("opens") else {
             panic!("opnmsg returns a pointer");
         };
         cookie
@@ -508,7 +438,7 @@ mod tests {
         let mut f = Fixture::new();
         let name = f.text("sample.msg");
         assert!(matches!(
-            f.invoke(opnmsg_wg16, &Fixture::far(name)).expect("opens"),
+            f.invoke(opnmsg, &Fixture::far(name)).expect("opens"),
             Ret::Far(_)
         ));
     }
@@ -517,7 +447,7 @@ mod tests {
     fn opnmsg_names_a_file_it_cannot_find() {
         let mut f = Fixture::new();
         let name = f.text("NOSUCH.MSG");
-        let e = f.invoke(opnmsg_wg16, &Fixture::far(name)).expect_err("no file");
+        let e = f.invoke(opnmsg, &Fixture::far(name)).expect_err("no file");
         assert!(e.to_string().contains("NOSUCH.MSG"), "{e}");
     }
 
@@ -537,9 +467,9 @@ mod tests {
         assert_ne!(first, second, "two files are two blocks");
         assert_eq!(curmbk(&f), second);
 
-        f.invoke(rstmbk_wg16, &[]).expect("back to the first");
+        f.invoke(rstmbk, &[]).expect("back to the first");
         assert_eq!(curmbk(&f), first);
-        f.invoke(rstmbk_wg16, &[]).expect("back to none");
+        f.invoke(rstmbk, &[]).expect("back to none");
         assert_eq!(curmbk(&f), nothing);
     }
 
@@ -549,9 +479,9 @@ mod tests {
         let first = opened(&mut f);
         let second = open(&mut f, "OTHER.MSG");
 
-        f.invoke(setmbk_wg16, &Fixture::far(first)).expect("set");
+        f.invoke(setmbk, &Fixture::far(first)).expect("set");
         assert_eq!(curmbk(&f), first);
-        f.invoke(rstmbk_wg16, &[]).expect("restored");
+        f.invoke(rstmbk, &[]).expect("restored");
         assert_eq!(curmbk(&f), second, "back to what opening OTHER made current");
     }
 
@@ -563,7 +493,7 @@ mod tests {
             offset: 0x40,
             selector: f.host.globals().selector(),
         };
-        assert!(f.invoke(setmbk_wg16, &Fixture::far(nonsense)).is_err());
+        assert!(f.invoke(setmbk, &Fixture::far(nonsense)).is_err());
         assert_eq!(curmbk(&f), before, "and left curmbk where it was");
     }
 
@@ -572,14 +502,14 @@ mod tests {
         // Rather than leaving `curmbk` at whatever seemed likely -- after which
         // every option read would come from that guess.
         let mut f = Fixture::new();
-        assert!(f.invoke(rstmbk_wg16, &[]).is_err());
+        assert!(f.invoke(rstmbk, &[]).is_err());
     }
 
     #[test]
     fn stgopt_returns_the_whole_message() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(at) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
+        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
             panic!("stgopt returns a pointer");
         };
         assert_eq!(f.read(at), "DEMO");
@@ -593,7 +523,7 @@ mod tests {
         // initialisation.
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(at) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
+        let Ret::Far(at) = f.invoke(stgopt, &[1]).expect("read") else {
             panic!("stgopt returns a pointer")
         };
         assert_eq!(f.read(at), "DEMO");
@@ -602,7 +532,7 @@ mod tests {
             Some(5),
             "four characters and a terminator, from the module's heap"
         );
-        f.invoke(crate::shims::memory::galfree_wg16, &Fixture::far(at))
+        f.invoke(crate::shims::memory::galfree, &Fixture::far(at))
             .expect("the module owns it");
     }
 
@@ -612,15 +542,15 @@ mod tests {
         // there: nothing the host does later writes over a live heap block.
         let mut f = Fixture::new();
         opened(&mut f);
-        let Ret::Far(first) = f.invoke(stgopt_wg16, &[1]).expect("read") else {
+        let Ret::Far(first) = f.invoke(stgopt, &[1]).expect("read") else {
             panic!("stgopt returns a pointer")
         };
 
-        f.invoke(stgopt_wg16, &[2]).expect("another option");
+        f.invoke(stgopt, &[2]).expect("another option");
         let other = f.text("OTHER.MSG");
-        f.invoke(opnmsg_wg16, &Fixture::far(other)).expect("another file");
+        f.invoke(opnmsg, &Fixture::far(other)).expect("another file");
         let template = f.text("noise %d");
-        f.invoke(text::prf_wg16, &[template.offset, template.selector, 7])
+        f.invoke(text::prf, &[template.offset, template.selector, 7])
             .expect("some output");
 
         assert_eq!(f.read(first), "DEMO", "the first pointer still reads");
@@ -630,14 +560,14 @@ mod tests {
     fn numopt_reads_the_number_off_the_end_of_the_prompt() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert_eq!(f.invoke(numopt_wg16, &[2, 0, 32767]).expect("read"), Ret::U16(60));
+        assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
     }
 
     #[test]
     fn numopt_outside_its_bounds_refuses_and_names_the_message() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let e = f.invoke(numopt_wg16, &[2, 0, 50]).expect_err("60 is over 50");
+        let e = f.invoke(numopt, &[2, 0, 50]).expect_err("60 is over 50");
         assert!(e.to_string().contains("60"), "{e}");
         assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
     }
@@ -650,7 +580,7 @@ mod tests {
         opened(&mut f);
         let floor = (-32767i16) as u16;
         assert_eq!(
-            f.invoke(numopt_wg16, &[5, floor, 32767]).expect("read"),
+            f.invoke(numopt, &[5, floor, 32767]).expect("read"),
             Ret::U16((-5i16) as u16)
         );
     }
@@ -659,10 +589,10 @@ mod tests {
     fn ynopt_and_chropt() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert_eq!(f.invoke(ynopt_wg16, &[3]).expect("read"), Ret::U16(1));
-        assert_eq!(f.invoke(ynopt_wg16, &[4]).expect("read"), Ret::U16(0));
+        assert_eq!(f.invoke(ynopt, &[3]).expect("read"), Ret::U16(1));
+        assert_eq!(f.invoke(ynopt, &[4]).expect("read"), Ret::U16(0));
         assert_eq!(
-            f.invoke(chropt_wg16, &[6]).expect("read"),
+            f.invoke(chropt, &[6]).expect("read"),
             Ret::U16(u16::from(b'='))
         );
     }
@@ -671,7 +601,7 @@ mod tests {
     fn ynopt_on_something_that_is_neither_refuses() {
         let mut f = Fixture::new();
         opened(&mut f);
-        assert!(f.invoke(ynopt_wg16, &[1]).is_err(), "DEMO is not yes or no");
+        assert!(f.invoke(ynopt, &[1]).is_err(), "DEMO is not yes or no");
     }
 
     #[test]
@@ -694,10 +624,10 @@ mod tests {
             0,
             0,
         ];
-        assert_eq!(f.invoke(tokopt_wg16, &args).expect("matched"), Ret::U16(3));
+        assert_eq!(f.invoke(tokopt, &args).expect("matched"), Ret::U16(3));
 
         let short = [7, high.offset, high.selector, medium.offset, medium.selector, 0, 0];
-        assert!(f.invoke(tokopt_wg16, &short).is_err(), "NONE is in neither");
+        assert!(f.invoke(tokopt, &short).is_err(), "NONE is in neither");
     }
 
     #[test]
@@ -706,8 +636,8 @@ mod tests {
         opened(&mut f);
 
         // Message 8 is `<%d>`.
-        f.invoke(prfmsg_wg16, &[8, 1]).expect("first");
-        f.invoke(prfmsg_wg16, &[8, 2]).expect("second");
+        f.invoke(prfmsg, &[8, 1]).expect("first");
+        f.invoke(prfmsg, &[8, 2]).expect("second");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "<1><2>");
@@ -725,14 +655,14 @@ mod tests {
     fn an_option_past_the_end_of_the_file_refuses() {
         let mut f = Fixture::new();
         opened(&mut f);
-        let e = f.invoke(stgopt_wg16, &[9999]).expect_err("no such message");
+        let e = f.invoke(stgopt, &[9999]).expect_err("no such message");
         assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
     }
 
     #[test]
     fn reading_an_option_with_no_block_set_refuses() {
         let mut f = Fixture::new();
-        assert!(f.invoke(stgopt_wg16, &[0]).is_err(), "nothing is current");
+        assert!(f.invoke(stgopt, &[0]).is_err(), "nothing is current");
     }
 
     #[test]
@@ -745,15 +675,15 @@ mod tests {
         // to. Forgetting either leaves `curmbk` naming a block the host has no
         // record of, and every option read after that is a refusal about the
         // wrong thing.
-        assert!(f.invoke(clsmsg_wg16, &Fixture::far(second)).is_err());
-        assert!(f.invoke(clsmsg_wg16, &Fixture::far(first)).is_err());
+        assert!(f.invoke(clsmsg, &Fixture::far(second)).is_err());
+        assert!(f.invoke(clsmsg, &Fixture::far(first)).is_err());
 
-        f.invoke(rstmbk_wg16, &[]).expect("back to the first");
-        f.invoke(rstmbk_wg16, &[]).expect("back to none");
+        f.invoke(rstmbk, &[]).expect("back to the first");
+        f.invoke(rstmbk, &[]).expect("back to none");
 
-        f.invoke(clsmsg_wg16, &Fixture::far(second)).expect("no longer in use");
+        f.invoke(clsmsg, &Fixture::far(second)).expect("no longer in use");
         assert!(
-            f.invoke(setmbk_wg16, &Fixture::far(second)).is_err(),
+            f.invoke(setmbk, &Fixture::far(second)).is_err(),
             "a closed block is not one to set"
         );
     }

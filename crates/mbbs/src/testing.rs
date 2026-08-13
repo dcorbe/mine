@@ -11,7 +11,7 @@ use mbbs16::{Exit, FarPtr, Machine, Ret};
 
 use crate::Host;
 use crate::abi::{self, Call, Wg16};
-use crate::shims::{ShimError, Wg16Shim};
+use crate::shims::ShimError;
 
 pub struct Fixture {
     pub machine: Machine,
@@ -182,30 +182,49 @@ impl Fixture {
     }
 
     /// Push `args` and run `shim` over them.
-    pub fn invoke(&mut self, shim: Wg16Shim, args: &[u16]) -> Result<Ret, ShimError> {
+    ///
+    /// Takes a [`Shim<Wg16>`](crate::shims::Shim) -- the shape every routine
+    /// in this crate actually has. It used to take `Wg16Shim`, the bare
+    /// `fn(&mut Machine, &mut Host)` shape, which meant every shim needed a
+    /// `_wg16` bridge written beside it for no reason except to be callable
+    /// here. That was 128 bridge functions serving 594 call sites, and it
+    /// made adding one routine to the API surface cost two functions instead
+    /// of one. The bridges are gone; this builds the `Call` itself.
+    ///
+    /// Still returns `mbbs16::Ret` rather than [`abi::Ret<Wg16>`], via the
+    /// `From` conversion between them. That is what let the bridges be
+    /// deleted without touching a single assertion in those 594 tests: the
+    /// call sites changed by exactly one thing, dropping `_wg16` from the
+    /// symbol.
+    pub fn invoke(&mut self, shim: crate::shims::Shim<Wg16>, args: &[u16]) -> Result<Ret, ShimError> {
         self.call(args);
-        shim(&mut self.machine, &mut self.host)
+        let frame = self.machine.arg_frame().to_vec();
+        let mut call = Call::<Wg16>::new(&mut self.machine, &frame);
+        shim(&mut call, &mut self.host).map(Into::into)
     }
 
     /// Push `args`, set the registers, and run `shim` over both.
+    ///
+    /// See [`Fixture::invoke`] for why this takes a `Shim<Wg16>`.
     pub fn invoke_with(
         &mut self,
-        shim: Wg16Shim,
+        shim: crate::shims::Shim<Wg16>,
         args: &[u16],
         regs: [u16; 4],
     ) -> Result<Ret, ShimError> {
         self.call_with(args, regs);
-        shim(&mut self.machine, &mut self.host)
+        let frame = self.machine.arg_frame().to_vec();
+        let mut call = Call::<Wg16>::new(&mut self.machine, &frame);
+        shim(&mut call, &mut self.host).map(Into::into)
     }
 
-    /// Push `args` and run a raw [`Shim<Wg16>`](crate::shims::Shim) over
-    /// them -- the shape [`entry`](crate::shims::entry) hands back now that
-    /// [`crate::shims::Shim`] is generic, rather than [`Wg16Shim`]'s bare
-    /// `&mut Machine`. Only two of this crate's own tests need it (both in
-    /// `shims::mod`, which reach a routine through `entry` by name rather
-    /// than by calling it directly, the way every other test in this crate
-    /// does) -- everywhere else keeps calling [`Fixture::invoke`] with a
-    /// `_wg16` bridge, which is cheaper to write and does not need this.
+    /// Push `args` and run a shim, answering in [`abi::Ret<Wg16>`] rather
+    /// than converting to `mbbs16::Ret` the way [`Fixture::invoke`] does.
+    ///
+    /// The two tests that need it are in `shims::mod` and reach a routine
+    /// through [`entry`](crate::shims::entry) by name rather than by calling
+    /// it directly, so they are checking the table's own wiring and want the
+    /// return value in the type the table deals in.
     pub fn invoke_call(
         &mut self,
         shim: crate::shims::Shim<Wg16>,

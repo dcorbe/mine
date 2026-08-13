@@ -56,12 +56,6 @@ pub fn spr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Ptr(at))
 }
 
-/// The dispatch-table entry for [`spr`]. See `shims::call`'s own doc comment.
-#[cfg(test)]
-pub fn spr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    spr(&mut super::call(machine), host).map(Into::into)
-}
-
 /// Bytes in one of `l2as`'s rotating buffers.
 ///
 /// A signed 32-bit decimal is at most 11 characters -- `i32::MIN` prints
@@ -124,13 +118,6 @@ pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
     Ok(abi::Ret::Ptr(at))
 }
 
-/// The dispatch-table entry for [`l2as`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn l2as_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    l2as(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int sprintf(char *buf, char *fmat, ...)` -- format into the caller's
 /// buffer, and return how many bytes that took.
 ///
@@ -147,13 +134,6 @@ pub fn sprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     let (text, _) = format_call(call, template)?;
     fill::<A>(call.mem(), buffer, &text)?;
     Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
-}
-
-/// The dispatch-table entry for [`sprintf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn sprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    sprintf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int vsprintf(char *buf, const char *fmat, va_list ap)` -- format into the
@@ -183,13 +163,6 @@ pub fn vsprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
     Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
 }
 
-/// The dispatch-table entry for [`vsprintf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn vsprintf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    vsprintf(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void prf(char *fmat, ...)` -- append to the channel's output.
 ///
 /// `prfbuf` and `prfptr` are `char *` globals, not the buffer (`GCOMM.H:449`).
@@ -211,12 +184,6 @@ pub fn prf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>
     }
     append_mem(call.mem(), host, &text)?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`prf`]. See `shims::call`'s own doc comment.
-#[cfg(test)]
-pub fn prf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    prf(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Put `text` where `prfptr` points, and move `prfptr` past it.
@@ -467,13 +434,6 @@ pub fn clrprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), Sh
     Ok(())
 }
 
-/// The dispatch-table entry for [`clrprf`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn clrprf_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    clrprf(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *stzcpy(char *dst, char *src, unsigned num)` -- copy, bounded,
 /// always terminated.
 ///
@@ -501,13 +461,6 @@ pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Ptr(dst))
 }
 
-/// The dispatch-table entry for [`stzcpy`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn stzcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    stzcpy(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *strcpy(char *dst, char *src)`.
 pub fn strcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dst = call.ptr();
@@ -521,13 +474,6 @@ pub fn strcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Ptr(dst))
 }
 
-/// The dispatch-table entry for [`strcpy`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strcpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strcpy(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `unsigned strlen(char *s)`.
 pub fn strlen<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let s = call.ptr();
@@ -535,13 +481,6 @@ pub fn strlen<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
-}
-
-/// The dispatch-table entry for [`strlen`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strlen_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strlen(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void rmvwht(char *string)` -- remove every whitespace character, in place.
@@ -561,13 +500,6 @@ pub fn rmvwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`rmvwht`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn rmvwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    rmvwht(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *skpwht(char *cp)` -- past the leading spaces.
 ///
 /// The answer is a pointer *into* the caller's own buffer, so the selector is
@@ -582,13 +514,6 @@ pub fn skpwht<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Ptr(at::<A>(cp, n)))
 }
 
-/// The dispatch-table entry for [`skpwht`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn skpwht_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    skpwht(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *skpwrd(char *cp)` -- past this word, to the space that ends it.
 pub fn skpwrd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let cp = call.ptr();
@@ -597,13 +522,6 @@ pub fn skpwrd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     let n = crate::strings::skpwrd(text) as u16;
     Ok(abi::Ret::Ptr(at::<A>(cp, n)))
-}
-
-/// The dispatch-table entry for [`skpwrd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn skpwrd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    skpwrd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int depad(char *cp)` -- strip trailing whitespace, answer how much went.
@@ -617,13 +535,6 @@ pub fn depad<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>,
     let capacity = text.len() as u16 + 1;
     write_cstr_mem::<A>(call.mem(), at, &text[..kept], capacity)?;
     Ok(abi::Ret::Int(A::Int::from(removed)))
-}
-
-/// The dispatch-table entry for [`depad`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn depad_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    depad(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void parsin(void)` -- parse `input` into `margv[]`.
@@ -798,13 +709,6 @@ pub fn parsin_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), Sh
     )
 }
 
-/// The dispatch-table entry for [`parsin`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn parsin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    parsin(&mut super::call(machine), host).map(Into::into)
-}
-
 /// The tail every exit of [`parsin`] shares: write the (possibly modified)
 /// input buffer back, then `margc`, `inplen`, `margv[]` and `margn[]`.
 ///
@@ -895,13 +799,6 @@ pub fn rstrin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`rstrin`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn rstrin_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    rstrin(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `long atol(char *s)`.
 ///
 /// Leading whitespace, an optional sign, then digits until something that is
@@ -940,13 +837,6 @@ pub fn atol<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
     Ok(abi::Ret::Long(value as u32))
 }
 
-/// The dispatch-table entry for [`atol`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn atol_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    atol(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int sameas(char *stg1,char *stg2)` -- equal, ignoring case.
 ///
 /// **1 is equal**, which is the opposite of [`strcmp`] and the reason this
@@ -965,13 +855,6 @@ pub fn sameas<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::sameas(&a, b)))))
 }
 
-/// The dispatch-table entry for [`sameas`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn sameas_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    sameas(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int sameto(char *shorts,char *longs)` -- a prefix test, short one first.
 pub fn sameto<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let shorts_ptr = call.ptr();
@@ -984,13 +867,6 @@ pub fn sameto<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::sameto(&shorts, longs)))))
-}
-
-/// The dispatch-table entry for [`sameto`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn sameto_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    sameto(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int samein(char *shorts,char *longs)` -- a substring test, short one first.
@@ -1007,13 +883,6 @@ pub fn samein<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Int(A::Int::from(u16::from(crate::strings::samein(&shorts, longs)))))
 }
 
-/// The dispatch-table entry for [`samein`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn samein_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    samein(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *lastwd(char *string)` -- the last word, in the caller's own buffer.
 ///
 /// See [`strings::lastwd`](crate::strings::lastwd). It writes nothing, and the
@@ -1025,13 +894,6 @@ pub fn lastwd<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     let n = crate::strings::lastwd(text) as u16;
     Ok(abi::Ret::Ptr(at::<A>(s, n)))
-}
-
-/// The dispatch-table entry for [`lastwd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn lastwd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    lastwd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `void sortstgs(char *stgs[],int num)` -- sort an array of `char *` in place.
@@ -1073,13 +935,6 @@ pub fn sortstgs<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
         .collect();
     array.write(call.mem(), &out).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`sortstgs`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn sortstgs_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    sortstgs(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strtok(char *s,char *delim)` -- the next token, destructively.
@@ -1142,13 +997,6 @@ pub fn strtok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(token))
 }
 
-/// The dispatch-table entry for [`strtok`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strtok_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strtok(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *strchr(char *s,int c)`.
 ///
 /// Ordinal 572, `seg 1:0xcf62`. Two things the prototype hides. `c` arrives as
@@ -1170,13 +1018,6 @@ pub fn strchr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         Some(i) => abi::Ret::Ptr(at::<A>(s, i as u16)),
         None => abi::Ret::Ptr(null_ptr::<A>()),
     })
-}
-
-/// The dispatch-table entry for [`strchr`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strchr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strchr(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strstr(char *hay,char *needle)`.
@@ -1210,13 +1051,6 @@ pub fn strstr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     })
 }
 
-/// The dispatch-table entry for [`strstr`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strstr_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strstr(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `char *strcat(char *dst,char *src)`.
 ///
 /// Ordinal 571, `seg 1:0x26d0`. How much room `dst` has, only the caller knows,
@@ -1235,13 +1069,6 @@ pub fn strcat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .to_vec();
     fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
     Ok(abi::Ret::Ptr(dst))
-}
-
-/// The dispatch-table entry for [`strcat`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strcat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strcat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strncat(char *dst,char *src,int maxlen)`.
@@ -1271,13 +1098,6 @@ pub fn strncat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     let text = text[..text.len().min(max)].to_vec();
     fill::<A>(call.mem(), at::<A>(dst, end), &text)?;
     Ok(abi::Ret::Ptr(dst))
-}
-
-/// The dispatch-table entry for [`strncat`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strncat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strncat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `char *strncpy(char *dst,char *src,unsigned n)`.
@@ -1329,13 +1149,6 @@ pub fn strncpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     Ok(abi::Ret::Ptr(dst))
 }
 
-/// The dispatch-table entry for [`strncpy`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strncpy_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strncpy(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int strcmp(char *s1,char *s2)` -- **0 is equal**, unlike [`sameas`].
 ///
 /// See [`strings::strcmp`](crate::strings::strcmp): the result is the unsigned
@@ -1351,13 +1164,6 @@ pub fn strcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Int(A::Int::from(crate::strings::strcmp(&a, b) as u16)))
-}
-
-/// The dispatch-table entry for [`strcmp`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn strcmp_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    strcmp(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int toupper(int c)`.
@@ -1376,25 +1182,11 @@ pub fn toupper<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::toupper))))
 }
 
-/// The dispatch-table entry for [`toupper`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn toupper_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    toupper(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
 /// `sameto` and `samein` fold with.
 pub fn tolower<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let c = Into::<u32>::into(call.int()) as u16;
     Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::tolower))))
-}
-
-/// The dispatch-table entry for [`tolower`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn tolower_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    tolower(&mut super::call(machine), host).map(Into::into)
 }
 
 /// The `int` wrapper both case-folding routines share: EOF through untouched,
@@ -1503,7 +1295,7 @@ mod tests {
     fn lastwd_answers_a_pointer_into_the_callers_own_string() {
         let mut f = Fixture::new();
         let s = f.text("SHORT MESSAGES LONG");
-        let Ret::Far(p) = f.invoke(lastwd_wg16, &Fixture::far(s)).expect("ok") else {
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
             panic!("lastwd returns char *");
         };
         assert_eq!(p.selector, s.selector);
@@ -1515,7 +1307,7 @@ mod tests {
     fn lastwd_leaves_the_trailing_padding_where_it_found_it() {
         let mut f = Fixture::new();
         let s = f.text("go north  ");
-        let Ret::Far(p) = f.invoke(lastwd_wg16, &Fixture::far(s)).expect("ok") else {
+        let Ret::Far(p) = f.invoke(lastwd, &Fixture::far(s)).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(p), "north  ", "skipped, not stripped");
@@ -1537,7 +1329,7 @@ mod tests {
         ]);
 
         assert!(matches!(
-            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 3]),
+            f.invoke(sortstgs, &[array.offset, array.selector, 3]),
             Ok(Ret::Void)
         ));
         let bytes = f.machine.resolve(array, 12).expect("readable").to_vec();
@@ -1559,7 +1351,7 @@ mod tests {
         // error here -- the real one never dereferences it either.
         let mut f = Fixture::new();
         for num in [0u16, 1, (-4i16) as u16] {
-            assert!(matches!(f.invoke(sortstgs_wg16, &[0, 0, num]), Ok(Ret::Void)));
+            assert!(matches!(f.invoke(sortstgs, &[0, 0, num]), Ok(Ret::Void)));
         }
     }
 
@@ -1572,7 +1364,7 @@ mod tests {
         let one = f.text("only");
         let array = f.words(&[one.offset, one.selector, 0, 0]);
         assert!(
-            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 2])
+            f.invoke(sortstgs, &[array.offset, array.selector, 2])
                 .is_err()
         );
     }
@@ -1585,7 +1377,7 @@ mod tests {
         // Two pointers named, one present, and the rest of the segment is not
         // the module's to claim.
         assert!(
-            f.invoke(sortstgs_wg16, &[array.offset, array.selector, 900])
+            f.invoke(sortstgs, &[array.offset, array.selector, 900])
                 .is_err()
         );
     }
@@ -1601,27 +1393,27 @@ mod tests {
         let first = [line.offset, line.selector, delim.offset, delim.selector];
         let again = [0, 0, delim.offset, delim.selector];
 
-        let Ret::Far(one) = f.invoke(strtok_wg16, &first).expect("ok") else {
+        let Ret::Far(one) = f.invoke(strtok, &first).expect("ok") else {
             panic!("strtok returns char *");
         };
         assert_eq!(f.read(one), "go");
 
-        let Ret::Far(two) = f.invoke(strtok_wg16, &again).expect("ok") else {
+        let Ret::Far(two) = f.invoke(strtok, &again).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(two), "north", "a run of two spaces is one gap");
 
-        let Ret::Far(three) = f.invoke(strtok_wg16, &again).expect("ok") else {
+        let Ret::Far(three) = f.invoke(strtok, &again).expect("ok") else {
             panic!("char *")
         };
         assert_eq!(f.read(three), "now");
 
         assert_eq!(
-            f.invoke(strtok_wg16, &again).expect("ok"),
+            f.invoke(strtok, &again).expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
         assert_eq!(
-            f.invoke(strtok_wg16, &again).expect("ok"),
+            f.invoke(strtok, &again).expect("ok"),
             Ret::Far(FarPtr::NULL),
             "and it stays exhausted"
         );
@@ -1636,8 +1428,7 @@ mod tests {
         let line = f.text("a,b");
         let delim = f.text(",");
 
-        f.invoke(
-            strtok_wg16,
+        f.invoke(strtok,
             &[line.offset, line.selector, delim.offset, delim.selector],
         )
         .expect("ok");
@@ -1654,8 +1445,7 @@ mod tests {
         let line = f.text(",,,");
         let delim = f.text(",");
         assert_eq!(
-            f.invoke(
-                strtok_wg16,
+            f.invoke(strtok,
                 &[line.offset, line.selector, delim.offset, delim.selector]
             )
             .expect("ok"),
@@ -1670,14 +1460,12 @@ mod tests {
         let second = f.text("c d");
         let delim = f.text(" ");
 
-        f.invoke(
-            strtok_wg16,
+        f.invoke(strtok,
             &[first.offset, first.selector, delim.offset, delim.selector],
         )
         .expect("ok");
         let Ret::Far(p) = f
-            .invoke(
-                strtok_wg16,
+            .invoke(strtok,
                 &[second.offset, second.selector, delim.offset, delim.selector],
             )
             .expect("ok")
@@ -1695,8 +1483,7 @@ mod tests {
         let line = f.text("go north");
         let empty = f.text("");
         let Ret::Far(p) = f
-            .invoke(
-                strtok_wg16,
+            .invoke(strtok,
                 &[line.offset, line.selector, empty.offset, empty.selector],
             )
             .expect("ok")
@@ -1705,7 +1492,7 @@ mod tests {
         };
         assert_eq!(f.read(p), "go north");
         assert_eq!(
-            f.invoke(strtok_wg16, &[0, 0, empty.offset, empty.selector])
+            f.invoke(strtok, &[0, 0, empty.offset, empty.selector])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL),
             "and then there is no more"
@@ -1719,7 +1506,7 @@ mod tests {
         let mut f = Fixture::new();
         let delim = f.text(" ");
         assert!(
-            f.invoke(strtok_wg16, &[0, 0, delim.offset, delim.selector])
+            f.invoke(strtok, &[0, 0, delim.offset, delim.selector])
                 .is_err()
         );
     }
@@ -1729,12 +1516,12 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("go north");
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'n')])
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'n')])
                 .expect("ok"),
             Ret::Far(at::<Wg16>(s, 3))
         );
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'z')])
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'z')])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL),
             "absent is NULL, not the terminator"
@@ -1749,11 +1536,11 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("abc");
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, 0]).expect("ok"),
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
             Ret::Far(at::<Wg16>(s, 3))
         );
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, 0xff62])
+            f.invoke(strchr, &[s.offset, s.selector, 0xff62])
                 .expect("ok"),
             Ret::Far(at::<Wg16>(s, 1)),
             "0xff62 is searched for as 'b'"
@@ -1770,20 +1557,20 @@ mod tests {
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
 
         assert_eq!(
-            f.invoke(strstr_wg16, &pair(hay, needle)).expect("ok"),
+            f.invoke(strstr, &pair(hay, needle)).expect("ok"),
             Ret::Far(at::<Wg16>(hay, 3))
         );
         assert_eq!(
-            f.invoke(strstr_wg16, &pair(hay, empty)).expect("ok"),
+            f.invoke(strstr, &pair(hay, empty)).expect("ok"),
             Ret::Far(hay),
             "the routine's first test is on the needle"
         );
         assert_eq!(
-            f.invoke(strstr_wg16, &pair(hay, missing)).expect("ok"),
+            f.invoke(strstr, &pair(hay, missing)).expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
         assert_eq!(
-            f.invoke(strstr_wg16, &pair(needle, hay)).expect("ok"),
+            f.invoke(strstr, &pair(needle, hay)).expect("ok"),
             Ret::Far(FarPtr::NULL),
             "a needle longer than the haystack"
         );
@@ -1797,7 +1584,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector];
-        assert_eq!(f.invoke(strcat_wg16, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strcat, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.read(dst), "go north");
     }
 
@@ -1810,7 +1597,7 @@ mod tests {
         let src = f.text("abcdefgh");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
 
-        assert_eq!(f.invoke(strncpy_wg16, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(
             f.machine.resolve(dst, 8).expect("readable"),
             b"abcd####",
@@ -1825,7 +1612,7 @@ mod tests {
         let src = f.text("ab");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 6];
 
-        f.invoke(strncpy_wg16, &args).expect("ok");
+        f.invoke(strncpy, &args).expect("ok");
         assert_eq!(
             f.machine.resolve(dst, 8).expect("readable"),
             b"ab\0\0\0\0##",
@@ -1853,7 +1640,7 @@ mod tests {
         f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
-        assert_eq!(f.invoke(strncpy_wg16, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncpy, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.machine.resolve(dst, 8).expect("readable"), b"xxxx####");
     }
 
@@ -1864,7 +1651,7 @@ mod tests {
         // early on a `num` of zero.
         let mut f = Fixture::new();
         assert_eq!(
-            f.invoke(strncpy_wg16, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
+            f.invoke(strncpy, &[0, 0, 0, 0, 0]).expect("wrote nothing"),
             Ret::Far(FarPtr::NULL)
         );
     }
@@ -1883,8 +1670,7 @@ mod tests {
         };
         f.machine.write(src, &[b'x'; 6]).expect("fits exactly");
         assert!(
-            f.invoke(
-                strncpy_wg16,
+            f.invoke(strncpy,
                 &[dst.offset, dst.selector, src.offset, src.selector, 32]
             )
             .is_err()
@@ -1899,7 +1685,7 @@ mod tests {
         let src = f.text("northwards");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
-        assert_eq!(f.invoke(strncat_wg16, &args).expect("ok"), Ret::Far(dst));
+        assert_eq!(f.invoke(strncat, &args).expect("ok"), Ret::Far(dst));
         assert_eq!(f.read(dst), "go north", "five of the source, then a NUL");
     }
 
@@ -1914,7 +1700,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0x8000];
-        f.invoke(strncat_wg16, &args).expect("ok");
+        f.invoke(strncat, &args).expect("ok");
         assert_eq!(f.read(dst), "go north", "0x8000 is 32,768, not -32,768");
     }
 
@@ -1929,7 +1715,7 @@ mod tests {
         let src = f.text("north");
 
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
-        f.invoke(strncat_wg16, &args).expect("ok");
+        f.invoke(strncat, &args).expect("ok");
         assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"go \0##");
     }
 
@@ -1938,12 +1724,12 @@ mod tests {
         let mut f = Fixture::new();
         let s = f.text("");
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, 0]).expect("ok"),
+            f.invoke(strchr, &[s.offset, s.selector, 0]).expect("ok"),
             Ret::Far(s),
             "the terminator is at offset zero"
         );
         assert_eq!(
-            f.invoke(strchr_wg16, &[s.offset, s.selector, u16::from(b'a')])
+            f.invoke(strchr, &[s.offset, s.selector, u16::from(b'a')])
                 .expect("ok"),
             Ret::Far(FarPtr::NULL)
         );
@@ -1964,8 +1750,7 @@ mod tests {
         f.machine.write(near_end, b"go\0").expect("still inside");
 
         assert!(
-            f.invoke(
-                strncpy_wg16,
+            f.invoke(strncpy,
                 &[
                     near_end.offset,
                     near_end.selector,
@@ -1978,16 +1763,14 @@ mod tests {
             "100 bytes at 4090 leaves a 4096-byte segment"
         );
         assert!(
-            f.invoke(
-                strcat_wg16,
+            f.invoke(strcat,
                 &[near_end.offset, near_end.selector, src.offset, src.selector]
             )
             .is_err(),
             "and so does `go` plus `overlong`"
         );
         assert!(
-            f.invoke(
-                strncat_wg16,
+            f.invoke(strncat,
                 &[
                     near_end.offset,
                     near_end.selector,
@@ -2010,16 +1793,16 @@ mod tests {
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
 
         assert_eq!(
-            f.invoke(strcmp_wg16, &pair(short, long)).expect("ok"),
+            f.invoke(strcmp, &pair(short, long)).expect("ok"),
             Ret::U16((-121i16) as u16),
             "the terminator against 'y'"
         );
         assert_eq!(
-            f.invoke(strcmp_wg16, &pair(long, short)).expect("ok"),
+            f.invoke(strcmp, &pair(long, short)).expect("ok"),
             Ret::U16(121)
         );
         assert_eq!(
-            f.invoke(strcmp_wg16, &pair(short, same)).expect("ok"),
+            f.invoke(strcmp, &pair(short, same)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -2035,11 +1818,11 @@ mod tests {
 
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
         assert_eq!(
-            f.invoke(sameas_wg16, &pair(long, lower)).expect("ok"),
+            f.invoke(sameas, &pair(long, lower)).expect("ok"),
             Ret::U16(1)
         );
         assert_eq!(
-            f.invoke(sameas_wg16, &pair(long, longer)).expect("ok"),
+            f.invoke(sameas, &pair(long, longer)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -2053,22 +1836,22 @@ mod tests {
 
         let pair = |a: FarPtr, b: FarPtr| [a.offset, a.selector, b.offset, b.selector];
         assert_eq!(
-            f.invoke(sameto_wg16, &pair(long, longer)).expect("ok"),
+            f.invoke(sameto, &pair(long, longer)).expect("ok"),
             Ret::U16(1),
             "sameto(shorts, longs): `longer` begins with `long`"
         );
         assert_eq!(
-            f.invoke(sameto_wg16, &pair(longer, long)).expect("ok"),
+            f.invoke(sameto, &pair(longer, long)).expect("ok"),
             Ret::U16(0),
             "and not the other way round"
         );
         assert_eq!(
-            f.invoke(samein_wg16, &pair(ong, longer)).expect("ok"),
+            f.invoke(samein, &pair(ong, longer)).expect("ok"),
             Ret::U16(1),
             "samein(shorts, longs): `ONG` is inside `longer`"
         );
         assert_eq!(
-            f.invoke(samein_wg16, &pair(longer, ong)).expect("ok"),
+            f.invoke(samein, &pair(longer, ong)).expect("ok"),
             Ret::U16(0)
         );
     }
@@ -2077,7 +1860,11 @@ mod tests {
     fn the_same_family_refuses_a_pointer_naming_nothing() {
         let mut f = Fixture::new();
         let s = f.text("x");
-        for shim in [sameas_wg16, sameto_wg16, samein_wg16] {
+        for shim in [
+            sameas as crate::shims::Shim<Wg16>,
+            sameto,
+            samein,
+        ] {
             assert!(f.invoke(shim, &[s.offset, s.selector, 0, 0]).is_err());
             assert!(f.invoke(shim, &[0, 0, s.offset, s.selector]).is_err());
         }
@@ -2092,10 +1879,10 @@ mod tests {
             (u16::from(b'7'), u16::from(b'7')),
             (0, 0),
         ] {
-            assert_eq!(f.invoke(toupper_wg16, &[input]).expect("folded"), Ret::U16(want));
+            assert_eq!(f.invoke(toupper, &[input]).expect("folded"), Ret::U16(want));
         }
         assert_eq!(
-            f.invoke(tolower_wg16, &[u16::from(b'Z')]).expect("folded"),
+            f.invoke(tolower, &[u16::from(b'Z')]).expect("folded"),
             Ret::U16(u16::from(b'z'))
         );
     }
@@ -2106,10 +1893,10 @@ mod tests {
         // one argument that survives as a full word. Every other `int` is cut
         // to its low byte: `toupper(0x161)` is `toupper('a')`.
         let mut f = Fixture::new();
-        assert_eq!(f.invoke(toupper_wg16, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
-        assert_eq!(f.invoke(tolower_wg16, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
-        assert_eq!(f.invoke(toupper_wg16, &[0x161]).expect("cut"), Ret::U16(0x41));
-        assert_eq!(f.invoke(tolower_wg16, &[0xff41]).expect("cut"), Ret::U16(0x61));
+        assert_eq!(f.invoke(toupper, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(tolower, &[0xffff]).expect("EOF"), Ret::U16(0xffff));
+        assert_eq!(f.invoke(toupper, &[0x161]).expect("cut"), Ret::U16(0x41));
+        assert_eq!(f.invoke(tolower, &[0xff41]).expect("cut"), Ret::U16(0x61));
     }
 
     #[test]
@@ -2150,7 +1937,7 @@ mod tests {
         // Five bytes of room means four characters and the NUL. `strncpy`
         // would put five characters and no NUL, which is the difference.
         let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
-        assert_eq!(f.invoke(stzcpy_wg16, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "Newh");
     }
 
@@ -2162,7 +1949,7 @@ mod tests {
         let dst = f.buffer(16);
         let src = f.text("hi");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
-        assert_eq!(f.invoke(stzcpy_wg16, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "hi");
     }
 
@@ -2172,7 +1959,7 @@ mod tests {
         let dst = f.bytes(b"keep", true);
         let src = f.text("overwrite me");
         let args = [dst.offset, dst.selector, src.offset, src.selector, 0];
-        f.invoke(stzcpy_wg16, &args).expect("copied nothing");
+        f.invoke(stzcpy, &args).expect("copied nothing");
         assert_eq!(f.read(dst), "keep", "not even a terminator fits in zero");
     }
 
@@ -2182,13 +1969,13 @@ mod tests {
         let dst = f.buffer(16);
         let src = f.text("kobold");
         let args = [dst.offset, dst.selector, src.offset, src.selector];
-        assert_eq!(f.invoke(strcpy_wg16, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(f.invoke(strcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "kobold");
 
         let mut f = Fixture::new();
         let at = f.text("kobold");
         assert_eq!(
-            f.invoke(strlen_wg16, &Fixture::far(at)).expect("ok"),
+            f.invoke(strlen, &Fixture::far(at)).expect("ok"),
             Ret::U16(6)
         );
     }
@@ -2206,7 +1993,7 @@ mod tests {
             let mut f = Fixture::new();
             let at = f.text(text);
             assert_eq!(
-                f.invoke(atol_wg16, &Fixture::far(at)).expect("parsed"),
+                f.invoke(atol, &Fixture::far(at)).expect("parsed"),
                 Ret::U32(expect as u32),
                 "{text:?}"
             );
@@ -2223,7 +2010,7 @@ mod tests {
         let mut seen = Vec::new();
         for n in 0..=SPR_BUFFERS {
             let args = [template.offset, template.selector, n as u16];
-            let Ret::Far(at) = f.invoke(spr_wg16, &args).expect("formatted") else {
+            let Ret::Far(at) = f.invoke(spr, &args).expect("formatted") else {
                 panic!("spr returns a pointer");
             };
             seen.push(at);
@@ -2249,7 +2036,7 @@ mod tests {
     #[test]
     fn l2as_renders_zero_as_a_bare_zero() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as_wg16, &long(0)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as, &long(0)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"0");
@@ -2258,7 +2045,7 @@ mod tests {
     #[test]
     fn l2as_prefixes_negative_values_with_a_minus() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as_wg16, &long(-42)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as, &long(-42)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-42");
@@ -2269,7 +2056,7 @@ mod tests {
         // >= 65536 is the one magnitude an `arg_u16` mistake gets wrong while
         // still passing on anything smaller.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as_wg16, &long(100_000)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as, &long(100_000)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"100000");
@@ -2280,7 +2067,7 @@ mod tests {
         // `i32::MIN`'s magnitude has no positive `i32` counterpart -- `-value`
         // overflows. `unsigned_abs` is the one way to get here without it.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as_wg16, &long(i32::MIN)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as, &long(i32::MIN)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-2147483648");
@@ -2289,7 +2076,7 @@ mod tests {
     #[test]
     fn l2as_renders_i32_max() {
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(l2as_wg16, &long(i32::MAX)).expect("formatted") else {
+        let Ret::Far(at) = f.invoke(l2as, &long(i32::MAX)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"2147483647");
@@ -2300,7 +2087,7 @@ mod tests {
         let mut f = Fixture::new();
         let mut seen = Vec::new();
         for n in 0..=L2AS_BUFFERS {
-            let Ret::Far(at) = f.invoke(l2as_wg16, &long(n as i32)).expect("formatted") else {
+            let Ret::Far(at) = f.invoke(l2as, &long(n as i32)).expect("formatted") else {
                 panic!("l2as returns a pointer");
             };
             seen.push(at);
@@ -2326,16 +2113,16 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("%d");
 
-        let Ret::Far(first) = f.invoke(l2as_wg16, &long(1)).expect("formatted") else {
+        let Ret::Far(first) = f.invoke(l2as, &long(1)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
 
         for n in 0..3u16 {
             let args = [template.offset, template.selector, n];
-            f.invoke(spr_wg16, &args).expect("formatted");
+            f.invoke(spr, &args).expect("formatted");
         }
 
-        let Ret::Far(second) = f.invoke(l2as_wg16, &long(2)).expect("formatted") else {
+        let Ret::Far(second) = f.invoke(l2as, &long(2)).expect("formatted") else {
             panic!("l2as returns a pointer");
         };
 
@@ -2363,7 +2150,7 @@ mod tests {
             text.selector,
             9,
         ];
-        assert_eq!(f.invoke(sprintf_wg16, &args).expect("ok"), Ret::U16(6));
+        assert_eq!(f.invoke(sprintf, &args).expect("ok"), Ret::U16(6));
         assert_eq!(f.read(dst), "gold/9");
     }
 
@@ -2372,15 +2159,15 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("<%d>");
 
-        f.invoke(prf_wg16, &[template.offset, template.selector, 1])
+        f.invoke(prf, &[template.offset, template.selector, 1])
             .expect("first");
-        f.invoke(prf_wg16, &[template.offset, template.selector, 2])
+        f.invoke(prf, &[template.offset, template.selector, 2])
             .expect("second");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "<1><2>", "the second call appends");
 
-        f.invoke(clrprf_wg16, &[]).expect("cleared");
+        f.invoke(clrprf, &[]).expect("cleared");
         assert_eq!(f.read(buffer), "");
         assert_eq!(
             f.host
@@ -2400,7 +2187,7 @@ mod tests {
         // show up as scrambled output much later.
         let mut f = Fixture::new();
         let template = f.text("%d");
-        f.invoke(prf_wg16, &[template.offset, template.selector, 1])
+        f.invoke(prf, &[template.offset, template.selector, 1])
             .expect("first");
 
         let buffer = f.host.globals().prf_buffer();
@@ -2413,7 +2200,7 @@ mod tests {
             .write(&mut f.machine, "prfptr", &moved.to_bytes())
             .expect("moved");
 
-        f.invoke(prf_wg16, &[template.offset, template.selector, 2])
+        f.invoke(prf, &[template.offset, template.selector, 2])
             .expect("second");
         assert_eq!(f.read(moved), "2", "prf wrote where prfptr now points");
         assert_eq!(f.read(buffer), "1", "and left the earlier text alone");
@@ -2427,8 +2214,7 @@ mod tests {
 
         // Twice over is more than the 4 KiB buffer holds. The real one would
         // simply write past it.
-        f.invoke(
-            prf_wg16,
+        f.invoke(prf,
             &[
                 template.offset,
                 template.selector,
@@ -2437,8 +2223,7 @@ mod tests {
             ],
         )
         .expect("the first fits");
-        let second = f.invoke(
-            prf_wg16,
+        let second = f.invoke(prf,
             &[
                 template.offset,
                 template.selector,
@@ -2448,8 +2233,7 @@ mod tests {
         );
         assert!(second.is_ok(), "two of these still fit");
 
-        let third = f.invoke(
-            prf_wg16,
+        let third = f.invoke(prf,
             &[
                 template.offset,
                 template.selector,
@@ -2475,7 +2259,7 @@ mod tests {
             .expect("connected");
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
@@ -2494,7 +2278,7 @@ mod tests {
             .expect("connected");
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "XTAIL");
@@ -2518,13 +2302,13 @@ mod tests {
             .expect("connected");
 
         let name = f.text("IFANSI.MSG");
-        f.invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
+        f.invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
             .expect("opened");
         // `IFMSG` is message 1: `LEVEL0` itself is message 0, exactly as
         // `SAMPLE.MSG`'s `FMT` is message 8 -- see
         // `prfmsg_appends_to_the_print_buffer_the_way_prf_does` in
         // `shims/msg.rs`.
-        f.invoke(crate::shims::msg::prfmsg_wg16, &[1]).expect("prfmsg");
+        f.invoke(crate::shims::msg::prfmsg, &[1]).expect("prfmsg");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
@@ -2541,7 +2325,7 @@ mod tests {
         // before now.
         let mut f = Fixture::new();
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf");
+        f.invoke(prf, &Fixture::far(template)).expect("prf");
 
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "\x1b[1;37mTAIL");
@@ -2570,15 +2354,15 @@ mod tests {
             .expect("b connected"); // leaves b current
 
         let template = f.bytes(IFANSI_FIXTURE, true);
-        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf for b");
+        f.invoke(prf, &Fixture::far(template)).expect("prf for b");
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "XTAIL", "b is line-mode, so the ASCII form");
 
         f.host
             .point_curusr(&mut f.machine, a)
             .expect("a is current now");
-        f.invoke(clrprf_wg16, &[]).expect("cleared");
-        f.invoke(prf_wg16, &Fixture::far(template)).expect("prf for a");
+        f.invoke(clrprf, &[]).expect("cleared");
+        f.invoke(prf, &Fixture::far(template)).expect("prf for a");
         assert_eq!(
             f.read(buffer),
             "\x1b[1;37mTAIL",
@@ -2814,7 +2598,7 @@ mod tests {
         // It returns void, so the only observable effect is the buffer.
         let mut f = Fixture::new();
         let at = f.text("  the quick brown fox  ");
-        assert!(matches!(f.invoke(rmvwht_wg16, &Fixture::far(at)), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rmvwht, &Fixture::far(at)), Ok(Ret::Void)));
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"thequickbrownfox");
     }
 
@@ -2822,7 +2606,7 @@ mod tests {
     fn rmvwht_handles_a_string_that_is_entirely_whitespace() {
         let mut f = Fixture::new();
         let at = f.text(" \t\r\n ");
-        f.invoke(rmvwht_wg16, &Fixture::far(at)).expect("void");
+        f.invoke(rmvwht, &Fixture::far(at)).expect("void");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"");
     }
 
@@ -2833,7 +2617,7 @@ mod tests {
         // into the wrong segment and the module would read rubbish.
         let mut f = Fixture::new();
         let at = f.text("   abc");
-        let Ret::Far(p) = f.invoke(skpwht_wg16, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwht returns char *");
         };
         assert_eq!(p.selector, at.selector);
@@ -2845,7 +2629,7 @@ mod tests {
     fn skpwht_stops_at_a_tab_because_the_original_tests_one_byte() {
         let mut f = Fixture::new();
         let at = f.text("\tabc");
-        let Ret::Far(p) = f.invoke(skpwht_wg16, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwht, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwht returns char *");
         };
         assert_eq!(p.offset, at.offset, "a tab is not 0x20");
@@ -2855,7 +2639,7 @@ mod tests {
     fn skpwrd_answers_the_space_that_ended_the_word() {
         let mut f = Fixture::new();
         let at = f.text("word rest");
-        let Ret::Far(p) = f.invoke(skpwrd_wg16, &Fixture::far(at)).expect("a pointer") else {
+        let Ret::Far(p) = f.invoke(skpwrd, &Fixture::far(at)).expect("a pointer") else {
             panic!("skpwrd returns char *");
         };
         assert_eq!(p.offset, at.offset + 4);
@@ -2866,7 +2650,7 @@ mod tests {
     fn depad_truncates_the_buffer_and_returns_the_count() {
         let mut f = Fixture::new();
         let at = f.text("text   ");
-        let Ret::U16(n) = f.invoke(depad_wg16, &Fixture::far(at)).expect("a count") else {
+        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
             panic!("depad returns an int");
         };
         assert_eq!(n, 3, "three characters went");
@@ -2877,7 +2661,7 @@ mod tests {
     fn depad_leaves_a_string_that_needs_nothing_alone() {
         let mut f = Fixture::new();
         let at = f.text("  text");
-        let Ret::U16(n) = f.invoke(depad_wg16, &Fixture::far(at)).expect("a count") else {
+        let Ret::U16(n) = f.invoke(depad, &Fixture::far(at)).expect("a count") else {
             panic!("depad returns an int");
         };
         assert_eq!(n, 0, "leading padding is not padding");
@@ -2913,7 +2697,7 @@ mod tests {
             .write(&mut f.machine, "margc", &3u16.to_le_bytes())
             .expect("margc");
 
-        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
         assert_eq!(f.machine.read_cstr(line).expect("a string"), b"look at this");
     }
 
@@ -2927,7 +2711,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "margc", &0u16.to_le_bytes())
             .expect("margc");
-        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
     }
 
     /// A far pointer, read out of module memory at `at`.
@@ -2951,7 +2735,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -2969,7 +2753,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get   all")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 2);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -2987,7 +2771,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
         let margv = f.host.globals().address("margv").expect("margv");
@@ -3006,7 +2790,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         let margn = f.host.globals().address("margn").expect("margn");
         let end0 = read_ptr(&f.machine, slot(margn, 0));
@@ -3034,7 +2818,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold  ")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
 
         let margn = f.host.globals().address("margn").expect("margn");
@@ -3054,8 +2838,8 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
-        assert!(matches!(f.invoke(rstrin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rstrin, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.machine.read_cstr(input).expect("a string"), b"get all gold");
     }
@@ -3067,7 +2851,7 @@ mod tests {
             .globals()
             .write(&mut f.machine, "input", b"get all gold")
             .expect("input");
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         // The offset of the terminating NUL from the start of `input` -- the
         // early-return path inside the inner loop is what sets this, since
@@ -3094,7 +2878,7 @@ mod tests {
         buf[7] = 0;
         f.machine.write(input, &buf).expect("input with a stale tail");
 
-        assert!(matches!(f.invoke(parsin_wg16, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
 
         assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 1);
         assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 4);
@@ -3116,8 +2900,7 @@ mod tests {
         let list = f.words(&[who.offset, who.selector, what.offset, what.selector, 21]);
 
         let ret = f
-            .invoke(
-                vsprintf_wg16,
+            .invoke(vsprintf,
                 &[
                     out.offset,
                     out.selector,
@@ -3143,8 +2926,7 @@ mod tests {
         let template = f.text("%d");
         let list = f.words(&[7]);
 
-        f.invoke(
-            vsprintf_wg16,
+        f.invoke(vsprintf,
             &[
                 out.offset,
                 out.selector,
@@ -3172,6 +2954,6 @@ mod tests {
             0,
             0,
         ];
-        assert!(f.invoke(vsprintf_wg16, &args).is_err());
+        assert!(f.invoke(vsprintf, &args).is_err());
     }
 }

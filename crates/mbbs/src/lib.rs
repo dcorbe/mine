@@ -3895,7 +3895,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
 
         f.host.gsbl_mut().push_input(console, b"look\r");
@@ -3924,7 +3924,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
 
         f.host.gsbl_mut().push_input(console, b"look\r");
@@ -3968,7 +3968,7 @@ mod tests {
         let mut bytes = b"MajorMUD".to_vec();
         bytes.resize(25 + 9 * 4, 0);
         let block = f.bytes(&bytes, false);
-        f.invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
+        f.invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
 
         let outcome = f
@@ -3998,7 +3998,7 @@ mod tests {
         }
         let block = f.bytes(&bytes, false);
         let ret = f
-            .invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
+            .invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
         match ret {
             Ret::U16(n) => n,
@@ -4039,7 +4039,7 @@ mod tests {
         }
         let block = f.bytes(&bytes, false);
         let ret = f
-            .invoke(crate::shims::system::register_module_wg16, &Fixture::far(block))
+            .invoke(crate::shims::system::register_module, &Fixture::far(block))
             .expect("registered");
         match ret {
             Ret::U16(n) => n,
@@ -4256,20 +4256,19 @@ mod tests {
 
         let name = f.text("FSDFORM.MSG");
         let opened = f
-            .invoke(crate::shims::msg::opnmsg_wg16, &Fixture::far(name))
+            .invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
             .expect("opened");
         assert!(matches!(opened, Ret::Far(_)));
 
         let spec = f.text("NAME RANK");
         let Ok(Ret::U16(size)) =
-            f.invoke(crate::shims::fsd::fsdroom_wg16, &[0, spec.offset, spec.selector, 0])
+            f.invoke(crate::shims::fsd::fsdroom, &[0, spec.offset, spec.selector, 0])
         else {
             panic!("fsdroom refused")
         };
         let buffer = f.buffer(size);
         let defaults = f.bytes(b"\0", false);
-        f.invoke(
-            crate::shims::fsd::fsdapr_wg16,
+        f.invoke(crate::shims::fsd::fsdapr,
             &[
                 buffer.offset,
                 buffer.selector,
@@ -4279,7 +4278,7 @@ mod tests {
             ],
         )
         .expect("prepared");
-        f.invoke(crate::shims::fsd::fsdego_wg16, &[0, 0, 0, 0])
+        f.invoke(crate::shims::fsd::fsdego, &[0, 0, 0, 0])
             .expect("handed the channel to the FSD");
 
         // Enough to fill part of a field, deliberately with no `\r` --
@@ -4920,7 +4919,7 @@ mod tests {
         // isn't already uppercase.
         for lock in ["USER", "wccsysop"] {
             let at = f.text(lock);
-            f.invoke(crate::shims::user::haskey_wg16, &Fixture::far(at))
+            f.invoke(crate::shims::user::haskey, &Fixture::far(at))
                 .expect("answered");
         }
 

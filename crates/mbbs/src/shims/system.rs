@@ -42,7 +42,7 @@
 // its generic `Call<A>`/`Host<A>` core instead, per `shims::mod`'s own
 // `call` doc comment.
 #[cfg(test)]
-use mbbs16::{Machine, Ret};
+use mbbs16::Ret;
 use mbbs_ptr::ModulePtr;
 
 use crate::{DateBuffers, Host};
@@ -95,12 +95,6 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
-/// The dispatch-table entry for [`now`]. See `shims::call`'s own doc comment.
-#[cfg(test)]
-pub fn now_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    now(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `USHORT today(VOID)` -- `DNTAPI.H:199-200` -- the date, packed as DOS
 /// packs it.
 ///
@@ -120,13 +114,6 @@ pub fn today<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>,
         .dos_date()
         .map_err(|why| ShimError::Failed(format!("today: {why}")))?;
     Ok(abi::Ret::Int(A::Int::from(packed)))
-}
-
-/// The dispatch-table entry for [`today`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn today_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    today(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `long time(long *tloc)` -- seconds since 1970, and stored if asked.
@@ -158,13 +145,6 @@ pub fn time<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
     Ok(abi::Ret::Long(seconds))
-}
-
-/// The dispatch-table entry for [`time`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn time_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    time(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Bytes of the three date statics, measured from their spacing in
@@ -245,13 +225,6 @@ pub fn nctime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
-/// The dispatch-table entry for [`nctime`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn nctime_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    nctime(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `const CHAR *ncdate(USHORT date)` -- `DNTAPI.H:208-210` -- a DOS-packed
 /// date as `MM/DD/YY`.
 ///
@@ -289,13 +262,6 @@ pub fn ncdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     );
     write_cstr_mem::<A>(call.mem(), all.date, text.as_bytes(), DATE_LEN)?;
     Ok(abi::Ret::Ptr(all.date))
-}
-
-/// The dispatch-table entry for [`ncdate`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn ncdate_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    ncdate(&mut super::call(machine), host).map(Into::into)
 }
 
 /// Days before each month in a non-leap year, measured -- not reasoned out --
@@ -362,13 +328,6 @@ pub fn cofdat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 
     let days = year * 365 + leap_before + i64::from(cumulative) + leap_this_year + day - 1;
     Ok(abi::Ret::Int(A::Int::from(days as u16)))
-}
-
-/// The dispatch-table entry for [`cofdat`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn cofdat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    cofdat(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `EXPWGSV(CHAR) moname[16][4]` -- `DNTAPI.H:195` -- sixteen four-byte
@@ -457,13 +416,6 @@ pub fn ncedat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(all.edat))
 }
 
-/// The dispatch-table entry for [`ncedat`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn ncedat_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    ncedat(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `void srand(unsigned seed)`.
 ///
 /// No vendor prototype: Borland's own runtime, re-exported by `MAJORBBS.DLL`,
@@ -476,13 +428,6 @@ pub fn srand<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     let seed = Into::<u32>::into(call.int()) as u16;
     host.random = Random::new(seed);
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`srand`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn srand_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    srand(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `INT genrdn(INT min, INT max)` -- `BBSUTILS.H:69` -- a random number in
@@ -503,13 +448,6 @@ pub fn genrdn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .genrdn(min, max)
         .map(|n| abi::Ret::Int(A::Int::from(n as u16)))
         .map_err(|e| ShimError::Failed(e.to_string()))
-}
-
-/// The dispatch-table entry for [`genrdn`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn genrdn_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    genrdn(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `LONG lngrnd(LONG min, LONG max)` -- `BBSUTILS.H:70` -- [`genrdn`] in
@@ -552,13 +490,6 @@ pub fn lngrnd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .lngrnd(min, max)
         .map(|n| abi::Ret::Long(n as u32))
         .map_err(|e| ShimError::Failed(e.to_string()))
-}
-
-/// The dispatch-table entry for [`lngrnd`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn lngrnd_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    lngrnd(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `int access(char *path, int amode)` -- is this file there, and may I use it?
@@ -655,13 +586,6 @@ pub fn gmdnam<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
-/// The dispatch-table entry for [`gmdnam`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn gmdnam_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    gmdnam(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `VOID shocst(const CHAR *brief, const CHAR *detail, ...)` --
 /// `MAJORBBS.H:1083-1087` -- one line of audit trail.
 ///
@@ -687,13 +611,6 @@ pub fn shocst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         String::from_utf8_lossy(&detail)
     ));
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`shocst`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn shocst_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    shocst(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID rtkick(INT delay, VOID (*dstrou)())` -- `GCOMM.H:228-231` -- run
@@ -741,13 +658,6 @@ pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`rtkick`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn rtkick_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    rtkick(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `VOID dclvda(INT size)` -- `MAJORBBS.H:771` -- declare how much volatile
 /// data area this module needs.
 ///
@@ -765,13 +675,6 @@ pub fn dclvda<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             .map_err(|e| ShimError::Failed(e.to_string()))?;
     }
     Ok(abi::Ret::Void)
-}
-
-/// The dispatch-table entry for [`dclvda`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn dclvda_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    dclvda(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `INT register_module(struct module *mod)` -- `MAJORBBS.H:769` -- take a
@@ -820,13 +723,6 @@ pub fn register_module<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result
     }
 
     Ok(abi::Ret::Int(A::Int::from(host.register(description, block))))
-}
-
-/// The dispatch-table entry for [`register_module`]. See `shims::call`'s own
-/// doc comment.
-#[cfg(test)]
-pub fn register_module_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    register_module(&mut super::call(machine), host).map(Into::into)
 }
 
 /// `VOID register_agent(struct agent *agdptr)` -- `GCSPSRV.H:141` -- take a
@@ -909,13 +805,6 @@ pub fn register_agent<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<
     Ok(abi::Ret::Void)
 }
 
-/// The dispatch-table entry for [`register_agent`]. See `shims::call`'s own
-/// doc comment.
-#[cfg(test)]
-pub fn register_agent_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    register_agent(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `INT register_textvar(CHAR *name, CHAR *(*varrou)())` -- `MAJORBBS.H:767`
 /// -- register a text variable.
 ///
@@ -978,13 +867,6 @@ pub fn register_textvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Resul
     Ok(abi::Ret::Int(A::Int::from(n)))
 }
 
-/// The dispatch-table entry for [`register_textvar`]. See `shims::call`'s
-/// own doc comment.
-#[cfg(test)]
-pub fn register_textvar_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    register_textvar(&mut super::call(machine), host).map(Into::into)
-}
-
 /// `VOID catastro(CHAR *string, ...)` -- `GCOMM.H:287-290` -- the module has
 /// given up.
 ///
@@ -1003,13 +885,6 @@ pub fn catastro<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
         "catastro: {}",
         String::from_utf8_lossy(&text)
     )))
-}
-
-/// The dispatch-table entry for [`catastro`]. See `shims::call`'s own doc
-/// comment.
-#[cfg(test)]
-pub fn catastro_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimError> {
-    catastro(&mut super::call(machine), host).map(Into::into)
 }
 
 /// A module routine the host has been asked to run later.
@@ -1355,7 +1230,7 @@ mod tests {
     fn now_and_today_are_packed_the_way_dos_packs_them() {
         let mut f = Fixture::new();
 
-        let Ret::U16(time) = f.invoke(now_wg16, &[]).expect("now") else {
+        let Ret::U16(time) = f.invoke(now, &[]).expect("now") else {
             panic!("now returns an int");
         };
         let (hour, minute, second) = (time >> 11, (time >> 5) & 0x3f, (time & 0x1f) * 2);
@@ -1363,7 +1238,7 @@ mod tests {
         assert!(minute < 60, "{minute}");
         assert!(second < 60, "{second}");
 
-        let Ret::U16(date) = f.invoke(today_wg16, &[]).expect("today") else {
+        let Ret::U16(date) = f.invoke(today, &[]).expect("today") else {
             panic!("today returns an int");
         };
         let (year, month, day) = (1980 + (date >> 9), (date >> 5) & 0x0f, date & 0x1f);
@@ -1384,9 +1259,9 @@ mod tests {
         let mut f = Fixture::new();
         f.host.set_clock(crate::Clock::pinned(BUILD));
 
-        assert_eq!(f.invoke(today_wg16, &[]).expect("today"), Ret::U16(13214));
-        assert_eq!(f.invoke(now_wg16, &[]).expect("now"), Ret::U16(29314));
-        assert_eq!(f.invoke(time_wg16, &[0, 0]).expect("time"), Ret::U32(BUILD));
+        assert_eq!(f.invoke(today, &[]).expect("today"), Ret::U16(13214));
+        assert_eq!(f.invoke(now, &[]).expect("now"), Ret::U16(29314));
+        assert_eq!(f.invoke(time, &[0, 0]).expect("time"), Ret::U32(BUILD));
     }
 
     #[test]
@@ -1398,12 +1273,12 @@ mod tests {
         let mut f = Fixture::new();
         f.host.set_clock(crate::Clock::pinned(BUILD));
 
-        let Ret::U32(seconds) = f.invoke(time_wg16, &[0, 0]).expect("time") else {
+        let Ret::U32(seconds) = f.invoke(time, &[0, 0]).expect("time") else {
             panic!("time returns a long");
         };
         let civil = crate::Clock::pinned(seconds).civil().expect("in range");
 
-        let Ret::U16(date) = f.invoke(today_wg16, &[]).expect("today") else {
+        let Ret::U16(date) = f.invoke(today, &[]).expect("today") else {
             panic!("today returns an int");
         };
         assert_eq!(u32::from(date >> 9) + 1980, civil.year as u32);
@@ -1425,13 +1300,13 @@ mod tests {
         let mut f = Fixture::new();
 
         f.host.set_clock(crate::Clock::pinned(0));
-        let e = f.invoke(today_wg16, &[]).expect_err("1970 is not a DOS year");
+        let e = f.invoke(today, &[]).expect_err("1970 is not a DOS year");
         assert!(format!("{e}").contains("1970"), "{e}");
 
         // The last second a `u32` can hold is still inside the range, so the
         // ceiling stays a refusal nothing trips over.
         f.host.set_clock(crate::Clock::pinned(u32::MAX));
-        assert!(f.invoke(today_wg16, &[]).is_ok(), "2106 is a DOS year");
+        assert!(f.invoke(today, &[]).is_ok(), "2106 is a DOS year");
     }
 
     #[test]
@@ -1439,14 +1314,14 @@ mod tests {
         let mut f = Fixture::new();
         let tloc = f.buffer(4);
 
-        let Ret::U32(seconds) = f.invoke(time_wg16, &Fixture::far(tloc)).expect("time") else {
+        let Ret::U32(seconds) = f.invoke(time, &Fixture::far(tloc)).expect("time") else {
             panic!("time returns a long");
         };
         let stored = f.machine.resolve(tloc, 4).expect("in bounds");
         assert_eq!(u32::from_le_bytes(stored.try_into().unwrap()), seconds);
 
         // A null pointer means "do not store it", which is the ordinary call.
-        assert!(f.invoke(time_wg16, &[0, 0]).is_ok());
+        assert!(f.invoke(time, &[0, 0]).is_ok());
     }
 
     #[test]
@@ -1454,15 +1329,15 @@ mod tests {
         let mut f = Fixture::new();
         let vdasiz = |f: &Fixture| f.host.globals().word(&f.machine, "vdasiz").expect("vdasiz");
 
-        f.invoke(dclvda_wg16, &[512]).expect("declared");
+        f.invoke(dclvda, &[512]).expect("declared");
         assert_eq!(vdasiz(&f), 512);
 
         // Every module shares one volatile data area per channel, so a smaller
         // declaration must not shrink it.
-        f.invoke(dclvda_wg16, &[128]).expect("declared");
+        f.invoke(dclvda, &[128]).expect("declared");
         assert_eq!(vdasiz(&f), 512);
 
-        f.invoke(dclvda_wg16, &[1024]).expect("declared");
+        f.invoke(dclvda, &[1024]).expect("declared");
         assert_eq!(vdasiz(&f), 1024);
     }
 
@@ -1470,7 +1345,7 @@ mod tests {
     fn gmdnam_returns_the_name_after_the_label() {
         let mut f = Fixture::new();
         let name = f.text("SAMPLE.MDF");
-        let Ret::Far(at) = f.invoke(gmdnam_wg16, &Fixture::far(name)).expect("read") else {
+        let Ret::Far(at) = f.invoke(gmdnam, &Fixture::far(name)).expect("read") else {
             panic!("gmdnam returns a pointer");
         };
         assert_eq!(f.read(at), "Sample Module");
@@ -1482,14 +1357,14 @@ mod tests {
         // filesystem underneath is not as forgiving as DOS was.
         let mut f = Fixture::new();
         let name = f.text("sample.mdf");
-        assert!(f.invoke(gmdnam_wg16, &Fixture::far(name)).is_ok());
+        assert!(f.invoke(gmdnam, &Fixture::far(name)).is_ok());
     }
 
     #[test]
     fn gmdnam_stops_the_module_rather_than_inventing_a_name() {
         let mut f = Fixture::new();
         let name = f.text("NOSUCH.MDF");
-        assert!(f.invoke(gmdnam_wg16, &Fixture::far(name)).is_err());
+        assert!(f.invoke(gmdnam, &Fixture::far(name)).is_err());
     }
 
     #[test]
@@ -1507,7 +1382,7 @@ mod tests {
             who.selector,
             3,
         ];
-        f.invoke(shocst_wg16, &args).expect("recorded");
+        f.invoke(shocst, &args).expect("recorded");
         assert_eq!(f.host.audit(), ["MODULE ONLINE: rangerdan on channel 3"]);
     }
 
@@ -1529,7 +1404,7 @@ mod tests {
         let block = module_block(&mut f, "MajorMUD", &entries);
 
         assert_eq!(
-            f.invoke(register_module_wg16, &Fixture::far(block)).expect("ok"),
+            f.invoke(register_module, &Fixture::far(block)).expect("ok"),
             Ret::U16(want),
             "a module registers into the next free slot, past the FSD's own"
         );
@@ -1555,7 +1430,7 @@ mod tests {
         let mut f = Fixture::new();
         let want = f.host.modules().len();
         let block = module_block(&mut f, "MajorMUD", &[]);
-        f.invoke(register_module_wg16, &Fixture::far(block)).expect("ok");
+        f.invoke(register_module, &Fixture::far(block)).expect("ok");
 
         assert_eq!(
             f.host.modules()[want]
@@ -1591,11 +1466,11 @@ mod tests {
         // from.
         let mut f = Fixture::new();
         let short = module_block(&mut f, "AB", &[]);
-        assert!(f.invoke(register_module_wg16, &Fixture::far(short)).is_err());
+        assert!(f.invoke(register_module, &Fixture::far(short)).is_err());
 
         let mut f = Fixture::new();
         let full = module_block(&mut f, "0123456789012345678901234", &[]);
-        assert!(f.invoke(register_module_wg16, &Fixture::far(full)).is_err());
+        assert!(f.invoke(register_module, &Fixture::far(full)).is_err());
     }
 
     #[test]
@@ -1603,7 +1478,7 @@ mod tests {
         let mut f = Fixture::new();
         let template = f.text("BAD LIBRARY FILE DATA POINTER (%d)");
         let failed = f
-            .invoke(catastro_wg16, &[template.offset, template.selector, 7])
+            .invoke(catastro, &[template.offset, template.selector, 7])
             .expect_err("catastro never returns");
         assert!(
             failed
@@ -1618,14 +1493,14 @@ mod tests {
         // What `srand` is *for*. The seed was stored and unused from step 7
         // until now; this is the first test that can see it do anything.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[0x1234]).expect("seeded");
+        f.invoke(srand, &[0x1234]).expect("seeded");
         let first: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
 
-        f.invoke(srand_wg16, &[0x1234]).expect("seeded again");
+        f.invoke(srand, &[0x1234]).expect("seeded again");
         let again: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
         assert_eq!(first, again);
 
-        f.invoke(srand_wg16, &[0x1235]).expect("a different seed");
+        f.invoke(srand, &[0x1235]).expect("a different seed");
         let other: Vec<u16> = (0..8).map(|_| f.host.random.rand()).collect();
         assert_ne!(first, other);
     }
@@ -1635,9 +1510,9 @@ mod tests {
         // Measured: the two calls initialisation makes are both
         // `genrdn(0, 343)`, so this is that call, a thousand times over.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[40615]).expect("seeded");
+        f.invoke(srand, &[40615]).expect("seeded");
         for _ in 0..1000 {
-            let Ret::U16(n) = f.invoke(genrdn_wg16, &[0, 343]).expect("a number") else {
+            let Ret::U16(n) = f.invoke(genrdn, &[0, 343]).expect("a number") else {
                 panic!("genrdn returns an int");
             };
             assert!(n < 343, "{n} is outside 0..343");
@@ -1649,9 +1524,9 @@ mod tests {
         // A shim that read its arguments and returned one of them would pass
         // the bounds check above.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[40615]).expect("seeded");
+        f.invoke(srand, &[40615]).expect("seeded");
         let drawn: std::collections::HashSet<u16> = (0..100)
-            .map(|_| match f.invoke(genrdn_wg16, &[0, 343]).expect("a number") {
+            .map(|_| match f.invoke(genrdn, &[0, 343]).expect("a number") {
                 Ret::U16(n) => n,
                 other => panic!("genrdn returns an int, not {other:?}"),
             })
@@ -1680,10 +1555,10 @@ mod tests {
         // spacing, min becomes word 0 (1) and max word 1 (2), so the answer is
         // 1 -- outside the asserted range by five orders of magnitude.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[40615]).expect("seeded");
+        f.invoke(srand, &[40615]).expect("seeded");
         for _ in 0..500 {
             let Ret::U32(n) = f
-                .invoke(lngrnd_wg16, &[0x0001, 0x0002, 0x0000, 0x0003])
+                .invoke(lngrnd, &[0x0001, 0x0002, 0x0000, 0x0003])
                 .expect("a number")
             else {
                 panic!("lngrnd returns a long");
@@ -1702,10 +1577,10 @@ mod tests {
         // that the modulo cannot bite. The observable property of the
         // generator, through the shim rather than the pure function.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[40615]).expect("seeded");
+        f.invoke(srand, &[40615]).expect("seeded");
         for _ in 0..2000 {
             // min = 0, max = 0x0003_0000 = 196608.
-            let Ret::U32(n) = f.invoke(lngrnd_wg16, &[0, 0, 0, 3]).expect("a number") else {
+            let Ret::U32(n) = f.invoke(lngrnd, &[0, 0, 0, 3]).expect("a number") else {
                 panic!("lngrnd returns a long");
             };
             assert!(
@@ -1720,11 +1595,11 @@ mod tests {
         // 100000 is past what one rand() can produce, so the loop is the only
         // way to satisfy it -- and the answer still has to land under max.
         let mut f = Fixture::new();
-        f.invoke(srand_wg16, &[40615]).expect("seeded");
+        f.invoke(srand, &[40615]).expect("seeded");
         for _ in 0..500 {
             // min = 100000 = 0x0001_86A0, max = 1000000 = 0x000F_4240.
             let Ret::U32(n) = f
-                .invoke(lngrnd_wg16, &[0x86A0, 0x0001, 0x4240, 0x000F])
+                .invoke(lngrnd, &[0x86A0, 0x0001, 0x4240, 0x000F])
                 .expect("a number")
             else {
                 panic!("lngrnd returns a long");
@@ -1745,7 +1620,7 @@ mod tests {
         };
 
         let args = [1, dstrou.offset, dstrou.selector];
-        assert!(matches!(f.invoke(rtkick_wg16, &args), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(rtkick, &args), Ok(Ret::Void)));
 
         assert_eq!(f.host.kicks(), [Kick { delay: 1, dstrou }]);
     }
@@ -1766,9 +1641,9 @@ mod tests {
             selector: 0x0067,
         };
 
-        f.invoke(rtkick_wg16, &[5, first.offset, first.selector])
+        f.invoke(rtkick, &[5, first.offset, first.selector])
             .expect("first");
-        f.invoke(rtkick_wg16, &[5, second.offset, second.selector])
+        f.invoke(rtkick, &[5, second.offset, second.selector])
             .expect("second");
 
         assert_eq!(
@@ -1795,7 +1670,7 @@ mod tests {
         let mut f = Fixture::new();
 
         let e = f
-            .invoke(rtkick_wg16, &[0xffff, 0x0a21, 0x0067])
+            .invoke(rtkick, &[0xffff, 0x0a21, 0x0067])
             .expect_err("refused");
         assert!(format!("{e}").contains("negative delay"), "{e}");
         assert!(f.host.kicks().is_empty());
@@ -1812,7 +1687,7 @@ mod tests {
         let mut f = Fixture::new();
         let dstrou = f.machine.code_ptr(0);
         assert!(matches!(
-            f.invoke(rtkick_wg16, &[0, dstrou.offset, dstrou.selector]),
+            f.invoke(rtkick, &[0, dstrou.offset, dstrou.selector]),
             Ok(Ret::Void)
         ));
         assert!(f.host.kicks().is_empty(), "RTKICK.C would never fire it");
@@ -1838,7 +1713,7 @@ mod tests {
         let block = agent_block(&mut f, "WCCMMUD", &vectors);
 
         assert_eq!(
-            f.invoke(register_agent_wg16, &Fixture::far(block))
+            f.invoke(register_agent, &Fixture::far(block))
                 .expect("registered"),
             Ret::Void,
             "register_agent returns nothing"
@@ -1864,7 +1739,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "WCCMMUD", &[read]);
-        f.invoke(register_agent_wg16, &Fixture::far(block))
+        f.invoke(register_agent, &Fixture::far(block))
             .expect("registered");
 
         let at = FarPtr {
@@ -1889,7 +1764,7 @@ mod tests {
         // `Agent`.
         let mut f = Fixture::new();
         let block = agent_block(&mut f, "SILENT", &[]);
-        f.invoke(register_agent_wg16, &Fixture::far(block))
+        f.invoke(register_agent, &Fixture::far(block))
             .expect("registered");
 
         let agent = &f.host.agents()[0];
@@ -1911,7 +1786,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "WCCMMUD", &[start]);
-        f.invoke(register_agent_wg16, &Fixture::far(block))
+        f.invoke(register_agent, &Fixture::far(block))
             .expect("registered");
 
         assert_eq!(f.host.agents()[0].read, Some(start));
@@ -1928,7 +1803,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
         let block = agent_block(&mut f, "ABCDEFGHI", &[read]);
-        f.invoke(register_agent_wg16, &Fixture::far(block))
+        f.invoke(register_agent, &Fixture::far(block))
             .expect("registered");
 
         assert_eq!(f.host.agents()[0].appid, "ABCDEFGHI");
@@ -1951,7 +1826,7 @@ mod tests {
 
         let args = [name.offset, name.selector, varrou.offset, varrou.selector];
         assert_eq!(
-            f.invoke(register_textvar_wg16, &args).expect("registered"),
+            f.invoke(register_textvar, &args).expect("registered"),
             Ret::U16(0),
             "the first text variable is number zero"
         );
@@ -1993,16 +1868,14 @@ mod tests {
         };
 
         assert_eq!(
-            f.invoke(
-                register_textvar_wg16,
+            f.invoke(register_textvar,
                 &[first.offset, first.selector, a.offset, a.selector]
             )
             .expect("registered"),
             Ret::U16(0)
         );
         assert_eq!(
-            f.invoke(
-                register_textvar_wg16,
+            f.invoke(register_textvar,
                 &[second.offset, second.selector, b.offset, b.selector]
             )
             .expect("registered"),
@@ -2056,8 +1929,7 @@ mod tests {
             selector: f.machine.code_selector(),
         };
 
-        f.invoke(
-            register_textvar_wg16,
+        f.invoke(register_textvar,
             &[name.offset, name.selector, varrou.offset, varrou.selector],
         )
         .expect("registered");
@@ -2081,7 +1953,7 @@ mod tests {
         let mut f = Fixture::new();
         let name = f.text("MUDCHARINFO");
 
-        f.invoke(register_textvar_wg16, &[name.offset, name.selector, 0, 0])
+        f.invoke(register_textvar, &[name.offset, name.selector, 0, 0])
             .expect("registered");
 
         let row = f
@@ -2105,7 +1977,7 @@ mod tests {
         let name = f.text("");
 
         let e = f
-            .invoke(register_textvar_wg16, &[name.offset, name.selector, 0x1e, 0x67])
+            .invoke(register_textvar, &[name.offset, name.selector, 0x1e, 0x67])
             .expect_err("refused");
         assert!(format!("{e}").contains("no name"), "{e}");
         assert!(f.host.textvars().is_empty());
@@ -2129,7 +2001,7 @@ mod tests {
         let block = agent_block(&mut f, "", &[]);
 
         let e = f
-            .invoke(register_agent_wg16, &Fixture::far(block))
+            .invoke(register_agent, &Fixture::far(block))
             .expect_err("refused");
         assert!(format!("{e}").contains("no appid"), "{e}");
         assert!(f.host.agents().is_empty());
@@ -2143,7 +2015,7 @@ mod tests {
         // `sar 0x5 / and 0x3f`, and `add ax,ax / and 0x3e`.
         let packed = (13 << 11) | (45 << 5) | 15;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(nctime_wg16, &[packed]).expect("nctime") else {
+        let Ret::Far(at) = f.invoke(nctime, &[packed]).expect("nctime") else {
             panic!("nctime returns a far pointer");
         };
         assert_eq!(f.read(at), "13:45:30");
@@ -2155,7 +2027,7 @@ mod tests {
         // instructions. Five bits will not hold 59, so what is stored is half
         // the seconds and an odd second cannot be represented at all.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(nctime_wg16, &[(23 << 11) | (59 << 5) | 29]).expect("nctime")
+        let Ret::Far(at) = f.invoke(nctime, &[(23 << 11) | (59 << 5) | 29]).expect("nctime")
         else {
             panic!("far pointer");
         };
@@ -2169,13 +2041,13 @@ mod tests {
         // host must not be quietly kinder about it than the thing it
         // reproduces.
         let mut f = Fixture::new();
-        let Ret::Far(first) = f.invoke(nctime_wg16, &[(1 << 11) | (2 << 5) | 1]).expect("nctime")
+        let Ret::Far(first) = f.invoke(nctime, &[(1 << 11) | (2 << 5) | 1]).expect("nctime")
         else {
             panic!("far pointer");
         };
         assert_eq!(f.read(first), "01:02:02");
 
-        let Ret::Far(second) = f.invoke(nctime_wg16, &[0]).expect("nctime") else {
+        let Ret::Far(second) = f.invoke(nctime, &[0]).expect("nctime") else {
             panic!("far pointer");
         };
         assert_eq!(first, second, "one buffer, not two");
@@ -2187,7 +2059,7 @@ mod tests {
         // 2026-08-05, packed the way `today` packs it.
         let packed = ((2026 - 1980) << 9) | (8 << 5) | 5;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncdate_wg16, &[packed]).expect("ncdate") else {
+        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "08/05/26");
@@ -2200,11 +2072,11 @@ mod tests {
         // is still standing afterwards, which a shim formatting "00/00/00"
         // would have destroyed.
         let mut f = Fixture::new();
-        let Ret::Far(real) = f.invoke(ncdate_wg16, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        let Ret::Far(real) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
         else {
             panic!("far pointer");
         };
-        let Ret::Far(none) = f.invoke(ncdate_wg16, &[0]).expect("ncdate") else {
+        let Ret::Far(none) = f.invoke(ncdate, &[0]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_ne!(none, real, "the empty string is not the buffer");
@@ -2219,7 +2091,7 @@ mod tests {
         // 2007. That is the original's limitation, reproduced.
         let packed = (127 << 9) | (12 << 5) | 31;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncdate_wg16, &[packed]).expect("ncdate") else {
+        let Ret::Far(at) = f.invoke(ncdate, &[packed]).expect("ncdate") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "12/31/07");
@@ -2231,11 +2103,11 @@ mod tests {
         // module may hold an ncdate result across an nctime call, so sharing
         // one block here would corrupt it in a way nothing else would catch.
         let mut f = Fixture::new();
-        let Ret::Far(date) = f.invoke(ncdate_wg16, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
+        let Ret::Far(date) = f.invoke(ncdate, &[(46 << 9) | (8 << 5) | 5]).expect("ncdate")
         else {
             panic!("far pointer");
         };
-        let Ret::Far(time) = f.invoke(nctime_wg16, &[(13 << 11) | (45 << 5) | 15]).expect("nctime")
+        let Ret::Far(time) = f.invoke(nctime, &[(13 << 11) | (45 << 5) | 15]).expect("nctime")
         else {
             panic!("far pointer");
         };
@@ -2250,11 +2122,11 @@ mod tests {
         // 366, not 365. Hand-computable, and the first place `(year+3)/4`
         // could be off by one and still leave every formatted date correct.
         let mut f = Fixture::new();
-        let Ret::U16(d1980) = f.invoke(cofdat_wg16, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1980) = f.invoke(cofdat, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(d1981) = f.invoke(cofdat_wg16, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2264,11 +2136,11 @@ mod tests {
     #[test]
     fn cofdat_of_two_new_years_that_do_not_cross_a_leap_day_is_365() {
         let mut f = Fixture::new();
-        let Ret::U16(d1981) = f.invoke(cofdat_wg16, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1981) = f.invoke(cofdat, &[(1 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(d1982) = f.invoke(cofdat_wg16, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1982) = f.invoke(cofdat, &[(2 << 9) | (1 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2279,11 +2151,11 @@ mod tests {
     fn cofdat_of_28_feb_and_1_mar_in_a_leap_year_is_2() {
         // Year 20 is 2000 -- divisible by 4, so 29 Feb falls between them.
         let mut f = Fixture::new();
-        let Ret::U16(feb28) = f.invoke(cofdat_wg16, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
+        let Ret::U16(feb28) = f.invoke(cofdat, &[(20 << 9) | (2 << 5) | 28]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
-        let Ret::U16(mar1) = f.invoke(cofdat_wg16, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
+        let Ret::U16(mar1) = f.invoke(cofdat, &[(20 << 9) | (3 << 5) | 1]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2304,7 +2176,7 @@ mod tests {
         // tests use, formatted `07-Aug-26`. `datetime.date(2026, 8, 7) -
         // datetime.date(1980, 1, 1)` is 17,020 days.
         let mut f = Fixture::new();
-        let Ret::U16(days) = f.invoke(cofdat_wg16, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (8 << 5) | 7]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2317,7 +2189,7 @@ mod tests {
         // exercises month 12, or anything past March. `datetime.date(2026,
         // 12, 31) - datetime.date(1980, 1, 1)` is 17,166 days.
         let mut f = Fixture::new();
-        let Ret::U16(days) = f.invoke(cofdat_wg16, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
+        let Ret::U16(days) = f.invoke(cofdat, &[(46 << 9) | (12 << 5) | 31]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2332,7 +2204,7 @@ mod tests {
         // refuses instead.
         let mut f = Fixture::new();
         let e = f
-            .invoke(cofdat_wg16, &[(0 << 9) | (13 << 5) | 1])
+            .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
             .expect_err("refused");
         assert!(format!("{e}").contains("13"), "{e}");
     }
@@ -2344,7 +2216,7 @@ mod tests {
         // 88, DGROUP:0x00, of `MAJORBBS-wg101.EXE`.
         let packed = (46 << 9) | (8 << 5) | 7;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "07-AUG-26");
@@ -2354,7 +2226,7 @@ mod tests {
     fn ncedat_wraps_the_year_at_a_century() {
         let packed = (127 << 9) | (12 << 5) | 31;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "31-DEC-07");
@@ -2366,7 +2238,7 @@ mod tests {
         // measured slot -- the `"000"` sentinel -- not one array element
         // before the table. `ncedat(0)` unpacks to day 0, month 0, year 80.
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat_wg16, &[0]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat, &[0]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "00-000-80");
@@ -2378,7 +2250,7 @@ mod tests {
         // too, `"XXX"` each -- table shape, not an out-of-bounds read.
         let packed = (0 << 9) | (13 << 5) | 1;
         let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(ncedat_wg16, &[packed]).expect("ncedat") else {
+        let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
             panic!("far pointer");
         };
         assert_eq!(f.read(at), "01-XXX-80");
@@ -2388,7 +2260,7 @@ mod tests {
     fn ncedat_writes_over_what_the_last_call_left() {
         let mut f = Fixture::new();
         let Ret::Far(first) = f
-            .invoke(ncedat_wg16, &[(46 << 9) | (8 << 5) | 7])
+            .invoke(ncedat, &[(46 << 9) | (8 << 5) | 7])
             .expect("ncedat")
         else {
             panic!("far pointer");
@@ -2396,7 +2268,7 @@ mod tests {
         assert_eq!(f.read(first), "07-AUG-26");
 
         let Ret::Far(second) = f
-            .invoke(ncedat_wg16, &[(20 << 9) | (3 << 5) | 1])
+            .invoke(ncedat, &[(20 << 9) | (3 << 5) | 1])
             .expect("ncedat")
         else {
             panic!("far pointer");
