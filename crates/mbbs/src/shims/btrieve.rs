@@ -266,7 +266,7 @@ pub fn opnbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
     let block = {
         let Host { btrieve, heap, .. } = host;
         btrieve
-            .open(call.cpu, heap, &name, &path, geometry, maxlen)
+            .open(call.mem(), heap, &name, &path, geometry, maxlen)
             .map_err(|e| ShimError::Failed(format!("opnbtv({name}): {e}")))?
     };
 
@@ -298,7 +298,7 @@ pub fn opnbtv_wg16(machine: &mut Machine, host: &mut Host) -> Result<Ret, ShimEr
 /// position block and read 128 bytes of whatever it was.
 pub fn setbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
     let block = call.ptr();
-    if block != Btrieve::null() {
+    if block != Btrieve::<Wg16>::null() {
         host.btrieve.block(block).map_err(ShimError::Failed)?;
     }
     push(call, host, block)?;
@@ -497,7 +497,7 @@ pub fn dinsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
 
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::null() {
+    let recptr = match recptr == Btrieve::<Wg16>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -628,7 +628,7 @@ pub fn dupdbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
         })?
         .position;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::null() {
+    let recptr = match recptr == Btrieve::<Wg16>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -760,7 +760,7 @@ pub fn clsbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
 
     let Host { btrieve, heap, .. } = host;
     btrieve
-        .close(call.cpu, heap, bbp)
+        .close(call.mem(), heap, bbp)
         .map_err(|e| ShimError::Failed(format!("clsbtv: {e}")))?;
     Ok(abi::Ret::Void)
 }
@@ -993,7 +993,7 @@ pub fn qnpbtv(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<W
             block,
             op,
             keynum: -1,
-            value: Btrieve::null(),
+            value: Btrieve::<Wg16>::null(),
             into: Some(into),
             // `int qnpbtv(int getopt)` -- one argument, no `loktyp`.
             lock: 0,
@@ -1051,7 +1051,7 @@ pub fn obtbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
             "obtbtvl with option {opt}, which is none of the nine BTVSTF.H's a-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::null() {
+    let into = match into == Btrieve::<Wg16>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1112,7 +1112,7 @@ pub fn stpbtvl(call: &mut Call<Wg16>, host: &mut Host<Wg16>) -> Result<abi::Ret<
     let opt = call.int() as i16;
     let lock = call.int() as i16;
 
-    let into = match into == Btrieve::null() {
+    let into = match into == Btrieve::<Wg16>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1410,7 +1410,7 @@ fn absolute(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Position) -> Resu
         return Ok(false);
     };
 
-    let into = match into == Btrieve::null() {
+    let into = match into == Btrieve::<Wg16>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1518,7 +1518,7 @@ fn locate(call: &mut Call<Wg16>, host: &mut Host<Wg16>, req: Request) -> Result<
     // before anything else, and that is where it is read from afterwards. So a
     // module may pass the buffer it was given last time and mean "the same key
     // again", which only works if the copy really happens.
-    if value != Btrieve::null() {
+    if value != Btrieve::<Wg16>::null() {
         // **The original measured this copy with the key number as passed**,
         // before `:268` resolved a negative one to `bb->lastkn`:
         //
@@ -1840,7 +1840,7 @@ fn load(host: &mut Host, block: FarPtr) -> Result<(), ShimError> {
 /// which is [`setbtv`]'s contract and unrelated to the null case.
 fn positioned(call: &mut Call<Wg16>, host: &Host<Wg16>, who: &str) -> Result<Option<FarPtr>, ShimError> {
     let block = current(call, host)?;
-    if block == Btrieve::null() {
+    if block == Btrieve::<Wg16>::null() {
         return Ok(None);
     }
     host.btrieve
@@ -2005,7 +2005,7 @@ mod tests {
     #[test]
     fn opening_a_file_makes_it_current() {
         let mut f = Fixture::new();
-        assert_eq!(bb(&f), Btrieve::null(), "nothing is current to begin with");
+        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing is current to begin with");
         let block = open(&mut f, "SAMPLE.DAT", 64);
         assert_eq!(bb(&f), block);
     }
@@ -2087,7 +2087,7 @@ mod tests {
         // module was written to expect.
         let mut f = Fixture::new();
         f.invoke(rstbtv_wg16, &[]).expect("not an error");
-        assert_eq!(bb(&f), Btrieve::null());
+        assert_eq!(bb(&f), Btrieve::<Wg16>::null());
         assert!(
             f.host.notes().iter().any(|n| n.contains("rstbtv")),
             "and it is reported"
@@ -2248,7 +2248,7 @@ mod tests {
     fn acquire(f: &mut Fixture, key: Option<u16>, keynum: i16, opt: i16) -> bool {
         let value = match key {
             Some(n) => f.bytes(&n.to_le_bytes(), false),
-            None => Btrieve::null(),
+            None => Btrieve::<Wg16>::null(),
         };
         f.invoke(
             obtbtvl_wg16,
@@ -2455,7 +2455,7 @@ mod tests {
         let mut f = Fixture::new();
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let key = f.host.btrieve().block(block).expect("open").key();
-        assert_ne!(key, Btrieve::null(), "opnbtv allocates it");
+        assert_ne!(key, Btrieve::<Wg16>::null(), "opnbtv allocates it");
 
         assert!(query(&mut f, 0, 63), "highest");
         assert_eq!(got(&f, key), 7);
@@ -3028,7 +3028,7 @@ mod tests {
     /// `rstbtv` too many puts it back.
     fn nothing_current() -> Fixture {
         let f = Fixture::new();
-        assert_eq!(bb(&f), Btrieve::null(), "nothing is current to begin with");
+        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing is current to begin with");
         f
     }
 
@@ -3183,7 +3183,7 @@ mod tests {
 
         f.invoke(rstbtv_wg16, &[]).expect("restores");
         f.invoke(rstbtv_wg16, &[]).expect("and past the bottom");
-        assert_eq!(bb(&f), Btrieve::null(), "nothing current now");
+        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing current now");
         let no_file = f.invoke(qrybtv_wg16, &[0, 0, 0, 62]).expect("no file");
 
         assert_eq!(not_found, no_file, "the module cannot tell them apart");

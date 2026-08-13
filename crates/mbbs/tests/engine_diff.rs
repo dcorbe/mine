@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use btrieve_engine::{Engine, Request};
+use mbbs::abi::Wg16;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};
 use mbbs16::Machine;
@@ -144,11 +145,11 @@ fn wccspels_reindexed_matches_our_own_walk_and_the_real_engine() {
 
     // Our own reader, over the SAME reindexed bytes the engine will read.
     let mut machine = Machine::new().expect("a 16-bit machine");
-    let mut heap = Heap::new(Config::default());
+    let mut heap = Heap::<Wg16>::new(Config::default());
     let mut btrieve = Btrieve::default();
     let geometry = Geometry::read(name, &staged).expect("WCCSPELS.VIR's geometry reads");
     let at = btrieve
-        .open(&mut machine, &mut heap, name, &staged, geometry, geometry.reclen)
+        .open(machine.mem_mut(), &mut heap, name, &staged, geometry, geometry.reclen)
         .expect("opening WCCSPELS.VIR");
     let block = btrieve.block_mut(at).unwrap_or_else(|e| panic!("{e}"));
     let ours: Vec<Vec<u8>> = {
@@ -160,7 +161,7 @@ fn wccspels_reindexed_matches_our_own_walk_and_the_real_engine() {
     };
     block.reindex().unwrap_or_else(|e| panic!("{e}"));
     btrieve
-        .close(&mut machine, &mut heap, at)
+        .close(machine.mem_mut(), &mut heap, at)
         .unwrap_or_else(|e| panic!("{e}"));
 
     let mut engine = Engine::spawn().expect("spawning btrvprobe serve");
@@ -347,11 +348,11 @@ fn keyed_get_then_step_matches_the_real_engines_duplicate_chain_walk() {
     // per `tests/forge.rs`'s `insert_duplicate_users`), distinct on keys 0
     // and 1 (name, owner -- both forbid duplicates).
     let mut machine = Machine::new().expect("a 16-bit machine");
-    let mut heap = Heap::new(Config::default());
+    let mut heap = Heap::<Wg16>::new(Config::default());
     let mut btrieve = Btrieve::default();
     let geometry = Geometry::read(name, &staged).expect("WCCUSERS.DAT's geometry reads");
     let at = btrieve
-        .open(&mut machine, &mut heap, name, &staged, geometry, geometry.reclen)
+        .open(machine.mem_mut(), &mut heap, name, &staged, geometry, geometry.reclen)
         .expect("opening WCCUSERS.DAT");
     let block = btrieve.block_mut(at).unwrap_or_else(|e| panic!("{e}"));
 
@@ -423,7 +424,7 @@ fn keyed_get_then_step_matches_the_real_engines_duplicate_chain_walk() {
     };
 
     btrieve
-        .close(&mut machine, &mut heap, at)
+        .close(machine.mem_mut(), &mut heap, at)
         .unwrap_or_else(|e| panic!("{e}"));
 
     // The real engine's own answer, over the identical bytes this process

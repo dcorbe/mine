@@ -141,9 +141,14 @@ impl Forge {
         // `maxlen` is the module's own idea of the record length, and a module
         // that opened these would pass its `struct`'s size. The file's own
         // `reclen` is the only value here that cannot be wrong.
-        let at = self
-            .btrieve
-            .open(&mut self.machine, &mut self.heap, name, &path, geometry, geometry.reclen)?;
+        let at = self.btrieve.open(
+            self.machine.mem_mut(),
+            &mut self.heap,
+            name,
+            &path,
+            geometry,
+            geometry.reclen,
+        )?;
 
         let result = work(self.btrieve.block_mut(at)?);
 
@@ -151,7 +156,7 @@ impl Forge {
         // block into the next file's open table.
         let closed = self
             .btrieve
-            .close(&mut self.machine, &mut self.heap, at)
+            .close(self.machine.mem_mut(), &mut self.heap, at)
             .map_err(|e| e.to_string());
 
         // And the copy is REMOVED when `work` failed. The copy is made before
