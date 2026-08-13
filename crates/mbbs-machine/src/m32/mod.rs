@@ -342,7 +342,7 @@ impl Machine {
     /// which is the one that is true. See `crate::m16::Machine::poison`'s own
     /// doc comment for why a host-reached reason (e.g. an unimplemented
     /// import) is worth having at all, alongside the fault path that already
-    /// poisons through [`Machine::run`]'s `Exit::Fault` arm.
+    /// poisons through `Machine::run`'s `Exit::Fault` arm.
     ///
     /// **One deliberate divergence from `crate::m16::Machine::poison`:** that
     /// method also disarms its machine's watchdog timer (`self.ctx.disarm()`).
@@ -352,8 +352,10 @@ impl Machine {
     /// There is nothing armed here for a poisoned machine to leave running, so
     /// skipping that step is not a shortcut around a real hazard, only the
     /// absence of one. `io::Result` stays on the signature regardless, for
-    /// parity with [`crate::abi::Abi::poison`] and so Task 16's watchdog can
-    /// grow a fallible disarm here later without changing callers.
+    /// parity with `mbbs::abi::Abi::poison` -- a different crate, so this is
+    /// deliberately not an intra-doc link; `mbbs-machine` does not depend on
+    /// `mbbs` and rustdoc cannot resolve it from here -- and so Task 16's
+    /// watchdog can grow a fallible disarm later without changing callers.
     ///
     /// # Errors
     ///
@@ -615,8 +617,16 @@ impl Machine {
     }
 
     /// The bytes of the outstanding call's argument frame, starting right
-    /// after the 4-byte near return address [`Machine::call`] pushed beneath
-    /// the arguments, and running to the end of this machine's stack.
+    /// after the 4-byte near return address **the module's own `call`**
+    /// pushed beneath the arguments, and running to the end of this
+    /// machine's stack.
+    ///
+    /// Not the return address [`Machine::call`] builds for the entry frame:
+    /// that one is consumed on `Exit::Returned` through the return-thunk
+    /// slot. The frame this reads is the one captured into
+    /// `frame_sp` at `Exit::Call`, when a module called an import thunk. The
+    /// two coincide only when a test enters directly at a thunk address, so
+    /// naming the wrong pusher reads plausibly and is still wrong.
     ///
     /// Mirrors `crate::m16::Machine::arg_frame`: the same "widest slice that
     /// is still honestly backed by real memory" answer, for the same reason

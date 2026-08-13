@@ -10,7 +10,7 @@
 //! (which can only ever prove the *first* host symbol's call shape) is
 //! trusted.
 
-use mbbs_machine::m32::{Exit, Machine, Mapping, Ret};
+use mbbs_machine::m32::{Exit, Machine, Mapping, Poison, Ret};
 
 /// A fresh low mapping holding exactly `code`, and the linear address of its
 /// first byte.
@@ -564,4 +564,93 @@ fn arg_frame_starts_with_the_pushed_dwords_in_order() {
     assert_eq!(&frame[0..4], machine.arg_u32(0).to_le_bytes().as_slice());
     assert_eq!(&frame[4..8], machine.arg_u32(1).to_le_bytes().as_slice());
     assert_eq!(&frame[8..12], machine.arg_u32(2).to_le_bytes().as_slice());
+}
+
+/// [`Machine::poison`] is the **host-invoked** setter: the host reaching its
+/// own judgement -- "this module asked for an import I do not implement" --
+/// with no `Exit` behind it at all. Every other poisoned-machine test in this
+/// file arrives at `self.poisoned` through the *fault* path inside `run`, so
+/// until this test the setter itself was never exercised from either crate.
+///
+/// That gap was measured, not guessed. Replacing the body with
+/// `let _ = reason;` -- a machine that says "poisoned, certainly" and forgets
+/// -- left **187 passed, 0 failed** here and **1445 passed, 0 failed** in
+/// `mbbs`. A null mutation that survives the whole suite is a finding about
+/// the tests, not a note about the code.
+///
+/// Mirrors m16's `an_unimplemented_import_poisons_by_name`
+/// (`crates/mbbs-machine/tests/host.rs`), which is why m16 never had this
+/// hole.
+#[test]
+fn a_host_poisoned_machine_stores_the_reason_and_refuses_call_and_resume() {
+    let mut machine = Machine::new().expect("a Machine");
+
+    machine
+        .poison(Poison::Unimplemented {
+            module: "WGSERVER.EXE".to_owned(),
+            symbol: "_nosuchroutine".to_owned(),
+        })
+        .expect("poisoning is a judgement, not a failure");
+
+    let stored = machine
+        .poisoned()
+        .expect("the setter must STORE the reason, not merely accept it")
+        .to_string();
+    assert!(
+        stored.contains("_nosuchroutine") && stored.contains("WGSERVER.EXE"),
+        "the poison must name what the module asked for, got: {stored}"
+    );
+
+    // `ret` -- would run fine on a healthy machine, which is what makes the
+    // refusal below attributable to the poison and not to bad code.
+    let (_code, entry) = code_at(&[0xc3]);
+    let err = machine
+        .call(entry, &[])
+        .expect_err("call() on a host-poisoned machine must refuse");
+    assert!(
+        err.to_string().contains("poisoned"),
+        "call() refused without saying why: {err}"
+    );
+
+    let err = machine
+        .resume(Ret::Void)
+        .expect_err("resume() on a host-poisoned machine must refuse");
+    assert!(
+        err.to_string().contains("poisoned"),
+        "resume() refused without saying why: {err}"
+    );
+}
+
+/// First reason wins, matching `crate::m16::Machine::poison`'s own contract:
+/// a module poisoned for one thing that then trips over another is still
+/// poisoned for the first, because that is the one that is true.
+///
+/// This is what `get_or_insert` buys over a plain assignment, and nothing
+/// else in either crate distinguishes the two.
+#[test]
+fn poisoning_a_second_time_keeps_the_first_reason() {
+    let mut machine = Machine::new().expect("a Machine");
+
+    machine
+        .poison(Poison::Unimplemented {
+            module: "WGSERVER.EXE".to_owned(),
+            symbol: "_first".to_owned(),
+        })
+        .expect("first poison");
+    machine
+        .poison(Poison::Unimplemented {
+            module: "GALGSBL.DLL".to_owned(),
+            symbol: "_second".to_owned(),
+        })
+        .expect("second poison is accepted and discarded");
+
+    let stored = machine.poisoned().expect("still poisoned").to_string();
+    assert!(
+        stored.contains("_first"),
+        "the FIRST reason must survive; got: {stored}"
+    );
+    assert!(
+        !stored.contains("_second"),
+        "the second reason must not overwrite the first; got: {stored}"
+    );
 }
