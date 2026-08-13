@@ -97,9 +97,7 @@ pub use strings::{depad, is_white, rmvwht, skpwht, skpwrd};
 pub use textvar::{TextVar, TextVars};
 pub use users::{Connection, Users};
 
-use mbbs_machine::m16::{
-    Exit, FarPtr, Machine, Module, NeImage, Poison, Relocation, Ret, Source, Symbol, Target,
-};
+use mbbs_machine::m16::{FarPtr, Machine, Module, NeImage, Poison, Relocation, Source, Symbol, Target};
 
 // `ModuleMem` for `Machine::mem_mut().alloc_region(..)` below -- `Host::new`'s
 // own 64 KiB allocation goes through the `Abi` trait's allocator now, same as
@@ -114,14 +112,57 @@ use crate::abi::{Abi, ModuleMem, Wg16};
 use mbbs_machine::ptr::ModulePtr;
 
 /// How a module entry point ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    /// It returned. `ax` alone for an `int`, `dx:ax` for anything 32 bits wide.
-    Returned { ax: u16, dx: u16 },
+///
+/// `A` carries no default -- Task 10 of
+/// `docs/plans/2026-08-12-abi-border-implementation.md` added the parameter
+/// (the plan's "Corrections, measured during execution" section is explicit
+/// that this type never had one to change). `Returned`/`Stopped` mirror
+/// [`crate::abi::Exit`]'s own two live variants: `lo`/`hi` are `AX`/`DX`
+/// zero-extended for `Wg16`, `EAX`/`EDX` for `Wg32`, and `Stopped` carries
+/// this ABI's own poison rather than `mbbs_machine::m16::Poison` by name.
+///
+/// Not `#[derive(..)]`: the derive macro's generated bound is `A: Trait`,
+/// wrong here for the same reason `Ret<A>`/`Exit<A>` in `abi.rs` are
+/// hand-written -- the only field that varies by `A` is `A::Poison`
+/// (`Abi::Poison` already requires `Clone + Debug + PartialEq`), not `A`
+/// itself.
+pub enum Outcome<A: Abi> {
+    /// It returned. `lo` is `AX`/`EAX` zero-extended, `hi` is `DX`/`EDX`.
+    Returned { lo: u32, hi: u32 },
 
     /// It was stopped for good, and will not run again.
-    Stopped(Poison),
+    Stopped(A::Poison),
 }
+
+impl<A: Abi> Clone for Outcome<A> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Returned { lo, hi } => Self::Returned { lo: *lo, hi: *hi },
+            Self::Stopped(poison) => Self::Stopped(poison.clone()),
+        }
+    }
+}
+
+impl<A: Abi> std::fmt::Debug for Outcome<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Returned { lo, hi } => f.debug_struct("Returned").field("lo", lo).field("hi", hi).finish(),
+            Self::Stopped(poison) => f.debug_tuple("Stopped").field(poison).finish(),
+        }
+    }
+}
+
+impl<A: Abi> PartialEq for Outcome<A> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Returned { lo, hi }, Self::Returned { lo: lo2, hi: hi2 }) => lo == lo2 && hi == hi2,
+            (Self::Stopped(a), Self::Stopped(b)) => a == b,
+            (Self::Returned { .. }, Self::Stopped(_)) | (Self::Stopped(_), Self::Returned { .. }) => false,
+        }
+    }
+}
+
+impl<A: Abi> Eq for Outcome<A> {}
 
 /// Which of `struct module`'s two disconnect vectors a disconnect runs.
 ///
@@ -404,11 +445,22 @@ impl<A: Abi> Eq for DateBuffers<A> where A::Ptr: Eq {}
 #[derive(Debug)]
 pub enum LoadError {
     /// The file is not a module this loader can map. See
-    /// [`NeError`](mbbs_machine::m16::NeError).
+    /// [`NeError`](mbbs_machine::m16::NeError) (`Wg16`) and
+    /// [`PeError`](mbbs_machine::m32::PeError) (`Wg32`).
     Image(io::Error),
 
     /// The module addresses host globals the host cannot honestly provide.
     Globals(Vec<MissingGlobal>),
+
+    /// A host table answered [`mbbs_machine::module::Import::Absolute`] for a
+    /// symbol a PE import site asked to bind -- `Wg32` only. See
+    /// [`mbbs_machine::m32::AbsoluteImport`]'s own doc comment for why only
+    /// NE relocations can ever honour that answer: an NE fixup can patch
+    /// part of an address into an instruction's own immediate field, and a
+    /// PE fixup always writes a whole address-sized IAT slot and never can.
+    /// Refused rather than silently written as if it were data or a thunk --
+    /// both would compile and both would be wrong.
+    Absolute { module: String, symbol: String },
 }
 
 impl std::fmt::Display for LoadError {
@@ -422,6 +474,12 @@ impl std::fmt::Display for LoadError {
                 }
                 Ok(())
             }
+            Self::Absolute { module, symbol } => write!(
+                f,
+                "{module}.{symbol} resolved to Import::Absolute, which a PE import site \
+                 cannot bind (a PE fixup writes a whole address-sized IAT slot, never an \
+                 instruction's immediate field)"
+            ),
         }
     }
 }
@@ -431,6 +489,21 @@ impl std::error::Error for LoadError {}
 impl From<io::Error> for LoadError {
     fn from(e: io::Error) -> Self {
         Self::Image(e)
+    }
+}
+
+impl From<mbbs_machine::m32::PeError> for LoadError {
+    fn from(e: mbbs_machine::m32::PeError) -> Self {
+        Self::Image(io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+}
+
+impl From<mbbs_machine::m32::AbsoluteImport> for LoadError {
+    fn from(e: mbbs_machine::m32::AbsoluteImport) -> Self {
+        Self::Absolute {
+            module: e.module,
+            symbol: e.symbol.to_string(),
+        }
     }
 }
 
@@ -1532,23 +1605,25 @@ impl<A: Abi> Host<A> {
     /// load will use (host policy: this host's export table and placed
     /// globals), hand it to `A::load`, then decide what the walk found.
     ///
-    /// **Refusal is checked after the walk, not before it,** which is a
-    /// real behaviour change from the `Wg16`-only `Host::load` this
-    /// replaces: that method ran what is now `Resolver`'s own
-    /// miss-detection as a wholly separate pass over the image *before*
-    /// calling `Machine::load_ne` at all, so a refused load left the
-    /// machine untouched. Folding the check into the one resolver walk
-    /// (Task 9's own brief) means the walk -- and therefore every fixup it
-    /// applies -- runs to completion before this method ever inspects
-    /// `resolver`'s recorded misses, so a `Wg16` module that is ultimately
-    /// refused has still had `cpu` written to: segments allocated, thunks
-    /// assigned, relocations applied. No test today depends on the old
-    /// "untouched on refusal" behaviour (`LoadError::Globals` has no
-    /// synthetic fixture test, only the real-`WCCMMUD.DLL` one, which finds
-    /// zero misses) -- but a caller that gets `Err(LoadError::Globals(_))`
-    /// back must still treat `cpu` as no longer usable for a fresh load of
-    /// anything else, exactly as it always should have for any other
-    /// `LoadError`.
+    /// **Refusal is checked before `A::load` ever touches `cpu`, in a pass
+    /// of its own.** Task 9 folded the miss-detection into `Resolver`'s own
+    /// walk and left it running *inside* `A::load`, which meant a `Wg16`
+    /// module that was ultimately refused had still had `cpu` written to --
+    /// segments allocated, thunks assigned, relocations applied -- before
+    /// this method ever inspected `resolver`'s recorded misses. Every other
+    /// `LoadError` left `cpu` untouched by construction (parsing fails
+    /// before anything is mapped); this was the one case whose contract
+    /// depended on which error came back, and two independent reviews
+    /// called it a defect during Task 10.
+    ///
+    /// The fix costs nothing extra to compute: `Resolver::resolve`'s
+    /// miss-detection reads only `self.exports`/`self.globals`/`self.reach`
+    /// -- never `cpu`, never anything `A::load` has mutated -- so calling it
+    /// once per key in `reach` *before* `A::load` runs finds exactly the
+    /// same misses the walk inside `A::load` would, without waiting for
+    /// that walk to run at all. If this pass finds nothing, `cpu` has not
+    /// been touched yet either, so `A::load` runs clean; if it finds
+    /// something, `cpu` is refused before a single byte is written to it.
     ///
     /// The `reach` classification `Resolver` uses to decide *which* misses
     /// matter (see `addressed_as_data`'s own doc comment) is NE
@@ -1587,15 +1662,233 @@ impl<A: Abi> Host<A> {
             missing: std::cell::RefCell::new(Vec::new()),
         };
 
+        // Refuse before `cpu` is touched at all: every symbol that could
+        // ever be recorded as missing is a key of `resolver.reach` (see
+        // `Resolver::resolve`'s own doc comment -- the check only runs
+        // `if let Some(reach) = self.reach.get(..)`), and `resolve` reads
+        // nothing but `self.exports`/`self.globals`/`self.reach` to answer,
+        // so walking those keys here finds the identical misses the same
+        // walk would find from inside `A::load`, without `A::load` having
+        // run yet.
+        use mbbs_machine::module::ImportResolver as _;
+        for (module, symbol) in resolver.reach.keys() {
+            resolver.resolve(module, symbol);
+        }
+        let mut missing = resolver.missing.replace(Vec::new());
+        if !missing.is_empty() {
+            missing.sort_by(|a, b| (&a.module, &a.symbol).cmp(&(&b.module, &b.symbol)));
+            return Err(LoadError::Globals(missing));
+        }
+
         let module = A::load(cpu, file, &resolver)?;
 
-        let mut missing = resolver.missing.into_inner();
+        // The pass above already found every miss `reach` can produce, so
+        // this is a closed set, not a second independent source of
+        // refusals -- kept as the honest fallback rather than an
+        // `unreachable!()`, since `resolve` is a `dyn` trait method and
+        // nothing prevents a *future* resolver from recording a miss this
+        // pre-check did not anticipate.
+        missing = resolver.missing.into_inner();
         if missing.is_empty() {
             Ok(module)
         } else {
             missing.sort_by(|a, b| (&a.module, &a.symbol).cmp(&(&b.module, &b.symbol)));
             Err(LoadError::Globals(missing))
         }
+    }
+
+    /// Call a module entry point, servicing its imports until it stops.
+    ///
+    /// `chan` names which channel this call is being made on -- purely for
+    /// [`survey::Inventory`]'s own record-keeping (see [`Host::enable_survey`]),
+    /// never read for anything else. `None` when the call genuinely has no
+    /// channel to name: [`Host::prcrtk`]'s kick sweep (a timer callback is
+    /// not running on behalf of any player), or the module's own init
+    /// routine, called before any channel exists to connect.
+    ///
+    /// Generic since Task 10 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: every touch of
+    /// the machine goes through `A::call`/`A::resume`/`A::poisoned`/
+    /// `A::unimplemented`/`A::import`/`A::caller` rather than
+    /// `mbbs_machine::m16::Machine` directly. `A::resume` already folds the
+    /// caller/callee-clean split and the `Ret<A>` conversion in -- see
+    /// [`Abi::resume`]'s own doc comment -- so the `let ret: Ret =
+    /// ret.into()` this method used to do by hand, and the `match cleans {
+    /// .. }` beside it, both sink into that one call; this is the actual
+    /// content of the move, not merely a signature change.
+    ///
+    /// # Errors
+    ///
+    /// If the module cannot be entered, or the machine malfunctions. A module
+    /// that faults, overruns or asks for something unimplemented is not an
+    /// error -- it is [`Outcome::Stopped`], which says which.
+    pub fn run(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        entry: A::Ptr,
+        args: &[crate::abi::Arg<A>],
+        chan: Option<Chan>,
+    ) -> io::Result<Outcome<A>> {
+        let mut exit = A::call(machine, entry, args)?;
+        loop {
+            let index = match exit {
+                crate::abi::Exit::Returned { lo, hi } => return Ok(Outcome::Returned { lo, hi }),
+                // Never continued past, survey mode or not -- see
+                // `crate::survey`'s module doc. The machine is poisoned
+                // already (`A::call`/`A::resume` do that before handing back
+                // a terminal `Exit`), its globals may be mid-update, and the
+                // machine has already forgotten the call frame: there is no
+                // resume point left to fabricate a continuation into even if
+                // this crate wanted to.
+                crate::abi::Exit::Stopped => {
+                    let poison = A::poisoned(machine).expect("a terminal exit poisons the machine");
+                    return Ok(Outcome::Stopped(poison));
+                }
+                crate::abi::Exit::Call { index } => index,
+                // Not a real variant -- see `Exit`'s own doc comment.
+                crate::abi::Exit::_Phantom(never, _) => match never {},
+            };
+
+            // A thunk index the module does not have is not something a module
+            // can cause -- it comes from the bridge, and the bridge is the
+            // host's. Report it as an unnamed import rather than panicking, so
+            // that a loader bug looks like every other refusal.
+            let (from, symbol, ordinal) = match A::import(module, index) {
+                Some(site) => (
+                    site.module.clone(),
+                    self.symbol_name(&site.module, &site.symbol),
+                    match &site.symbol {
+                        Symbol::Ordinal(n) => Some(*n),
+                        Symbol::Name(_) => None,
+                    },
+                ),
+                None => (String::new(), format!("thunk #{index}"), None),
+            };
+
+            let (shim, cleans) = match shims::entry::<A>(&from, &symbol) {
+                Entry::Routine(shim, cleans) => {
+                    // `MBBS_TRACE_SHIMS`: name every shim the module reaches.
+                    //
+                    // This exists because the in-Realm wedge (2026-08-12) was
+                    // invisible to every other instrument. Diffing one working
+                    // command's dispatch sequence against a failing one's is
+                    // what localised it: `look` ran
+                    // `toupper x4 -> prf x35 -> btutsw -> btuxmt x5`, while a
+                    // move ran `toupper -> prf -> f_ludiv@ x5 -> btuech ->
+                    // rstmbk x3` and never transmitted. Nothing else in this
+                    // host could have shown that.
+                    //
+                    // Costs one `var_os` per dispatch when off. Read with the
+                    // `KICK-FIRE` line in `prcrtk` and the `PRF` line in
+                    // `shims::text::prf`, which share the same variable.
+                    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+                        eprintln!("mbbs-trace: chan={chan:?} {from}!{symbol}");
+                    }
+                    (shim, cleans)
+                }
+                other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
+                    let kind = match other {
+                        Entry::Datum => survey::Kind::Datum,
+                        Entry::Absolute(_) => survey::Kind::Absolute,
+                        Entry::Unimplemented => survey::Kind::Unimplemented,
+                        Entry::Routine(..) => unreachable!("matched above"),
+                    };
+                    let context = A::caller(machine, module);
+
+                    if let Some(inventory) = &self.survey {
+                        inventory.borrow_mut().record(
+                            &from,
+                            &symbol,
+                            ordinal,
+                            chan,
+                            context.as_deref(),
+                            kind,
+                        );
+                    }
+
+                    // Only `Entry::Unimplemented`, only in survey mode, and
+                    // only when the cleanup convention is one this host is
+                    // willing to guess -- see `shims::survey_continue_convention`
+                    // for what "willing" means and why. Every other case
+                    // (survey mode off; `Entry::Datum`/`Entry::Absolute`, a
+                    // mismodelled *type* rather than a missing routine; a
+                    // convention this host refuses to guess) falls through to
+                    // the same stop it always has.
+                    if self.survey.is_some()
+                        && kind == survey::Kind::Unimplemented
+                        && let Some(continue_as) = shims::survey_continue_convention(&symbol)
+                    {
+                        exit = A::resume(machine, crate::abi::Ret::Void, continue_as)?;
+                        continue;
+                    }
+
+                    let symbol = match &context {
+                        Some(at) => format!("{symbol}, called from {at}"),
+                        None => symbol,
+                    };
+                    return self.stop(machine, A::unimplemented(from, symbol));
+                }
+            };
+
+            self.calls += 1;
+            if self.trace {
+                eprintln!("{:4} {symbol}", self.calls);
+            }
+            // `shims::entry`'s `Shim<A>` takes a `Call<A>`, not a bare
+            // `&mut A::Cpu` -- this is the one place that gap is bridged, now
+            // that `routines` names generic cores directly rather than 111
+            // individual `_wg16` siblings; see `shims::mod`'s own `call` doc
+            // comment.
+            let mut call = shims::call::<A>(machine);
+            match shim(&mut call, self) {
+                Ok(ret) => {
+                    exit = A::resume(machine, ret, cleans)?;
+                }
+                Err(e) => {
+                    let symbol = match A::caller(machine, module) {
+                        Some(at) => format!("{symbol} ({e}), called from {at}"),
+                        None => format!("{symbol} ({e})"),
+                    };
+                    return self.stop(machine, A::unimplemented(from, symbol));
+                }
+            }
+        }
+    }
+
+    fn stop(&self, machine: &mut A::Cpu, reason: A::Poison) -> io::Result<Outcome<A>> {
+        A::poison(machine, reason)?;
+        let poison = A::poisoned(machine).expect("just poisoned");
+        Ok(Outcome::Stopped(poison))
+    }
+
+    /// Cross a `ShimError` from [`Host::connect`] or [`Host::poll`]'s own
+    /// internal calls into a poisoned machine, the same way [`Host::run`]
+    /// does for a `ShimError` a shim it dispatched through a thunk returns.
+    ///
+    /// `connect_state`, `point_curusr` and `get_input` predate `connect`/
+    /// `poll` and already answer in `Result<_, ShimError>`, reached directly
+    /// rather than through a thunk -- so `run`'s own crossing does not cover
+    /// them, and this is the only other place a `ShimError` becomes an
+    /// `Outcome`. Refusing plausible-but-wrong state is this crate's whole
+    /// ethic; leaving the machine runnable after `connect_state` half-wrote
+    /// an account record, or after `point_curusr` pointed `usrnum` at the
+    /// wrong channel, would be a hole in it -- so this does what `run` does
+    /// for the identical failure reached through a thunk: poison and answer
+    /// `Outcome::Stopped`, rather than an `Err` that leaves the machine
+    /// runnable.
+    ///
+    /// `where_` names the call that failed, since none of the three is an
+    /// imported symbol with a DLL of its own to report. The
+    /// `BadPointer`/`Failed` distinction survives into the poison's
+    /// `symbol` rather than being flattened through `Display` alone --
+    /// `ShimError` has no `Error` impl to recover it from afterwards.
+    fn shim_stop(&self, machine: &mut A::Cpu, where_: &str, e: ShimError) -> io::Result<Outcome<A>> {
+        let symbol = match &e {
+            ShimError::BadPointer(_) => format!("{where_}: bad pointer, {e}"),
+            ShimError::Failed(_) => format!("{where_}: {e}"),
+        };
+        self.stop(machine, A::unimplemented("mbbs".to_owned(), symbol))
     }
 }
 
@@ -2192,7 +2485,7 @@ impl Host<Wg16> {
         module: &Module,
         chan: Chan,
         who: &users::Connection,
-    ) -> io::Result<Option<Outcome>> {
+    ) -> io::Result<Option<Outcome<Wg16>>> {
         if let Err(e) = self.connect_state(machine, chan, who) {
             return self.shim_stop(machine, "connect_state", e).map(Some);
         }
@@ -2286,7 +2579,7 @@ impl Host<Wg16> {
         machine: &mut Machine,
         module: &Module,
         chan: Chan,
-    ) -> io::Result<Option<Outcome>> {
+    ) -> io::Result<Option<Outcome<Wg16>>> {
         self.disconnect(machine, module, chan, Vector::Hangup)
     }
 
@@ -2333,7 +2626,7 @@ impl Host<Wg16> {
         machine: &mut Machine,
         module: &Module,
         chan: Chan,
-    ) -> io::Result<Option<Outcome>> {
+    ) -> io::Result<Option<Outcome<Wg16>>> {
         self.disconnect(machine, module, chan, Vector::Logoff)
     }
 
@@ -2357,7 +2650,7 @@ impl Host<Wg16> {
         module: &Module,
         chan: Chan,
         vector: Vector,
-    ) -> io::Result<Option<Outcome>> {
+    ) -> io::Result<Option<Outcome<Wg16>>> {
         if let Err(e) = self.point_curusr(machine, chan) {
             return self.shim_stop(machine, "point_curusr", e).map(Some);
         }
@@ -2427,7 +2720,7 @@ impl Host<Wg16> {
         // is refused rather than discarded. `huprou` is `void` and has no
         // protocol, so its words are not read.
         let outcome = match (vector, outcome) {
-            (Vector::Logoff, Some(Outcome::Returned { ax, .. })) if ax == 1 => {
+            (Vector::Logoff, Some(Outcome::Returned { lo: ax, .. })) if ax == 1 => {
                 Some(self.stop(
                     machine,
                     Poison::Unimplemented {
@@ -2470,7 +2763,7 @@ impl Host<Wg16> {
         machine: &mut Machine,
         module: &Module,
         chan: Chan,
-    ) -> io::Result<Option<Outcome>> {
+    ) -> io::Result<Option<Outcome<Wg16>>> {
         let rou = match self.users.polrou_mem(machine.mem(), chan) {
             Ok(Some(rou)) => rou,
             Ok(None) => return Ok(None),
@@ -2597,7 +2890,7 @@ impl Host<Wg16> {
     /// If no module has registered. (A write running off a segment, or the
     /// module being unenterable, poisons the machine and comes back as
     /// `Ok(Some(Outcome::Stopped(..)))` instead -- see above.)
-    pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome>> {
+    pub fn poll(&mut self, machine: &mut Machine, module: &Module) -> io::Result<Option<Outcome<Wg16>>> {
         Ok(self.poll_with_chan(machine, module)?.map(|(outcome, _chan)| outcome))
     }
 
@@ -2613,7 +2906,7 @@ impl Host<Wg16> {
         &mut self,
         machine: &mut Machine,
         module: &Module,
-    ) -> io::Result<Option<(Outcome, Chan)>> {
+    ) -> io::Result<Option<(Outcome<Wg16>, Chan)>> {
         // R23: a status this host does not dispatch (`OVRFLW`, say) is not
         // the same fact as "nothing queued" -- looping past it here, rather
         // than answering `Ok(None)` for it, keeps that distinction from
@@ -3078,222 +3371,6 @@ impl Host<Wg16> {
         self.globals.write(machine, "vdaptr", &area.to_bytes())?;
         self.globals.write(machine, "vdatmp", &temp.to_bytes())?;
         Ok(())
-    }
-
-    /// Call a module entry point, servicing its imports until it stops.
-    ///
-    /// `chan` names which channel this call is being made on -- purely for
-    /// [`survey::Inventory`]'s own record-keeping (see [`Host::enable_survey`]),
-    /// never read for anything else. `None` when the call genuinely has no
-    /// channel to name: [`Host::prcrtk`]'s kick sweep (a timer callback is
-    /// not running on behalf of any player), or the module's own init
-    /// routine, called before any channel exists to connect.
-    ///
-    /// # Errors
-    ///
-    /// If the module cannot be entered, or the machine malfunctions. A module
-    /// that faults, overruns or asks for something unimplemented is not an
-    /// error -- it is [`Outcome::Stopped`], which says which.
-    pub fn run(
-        &mut self,
-        machine: &mut Machine,
-        module: &Module,
-        entry: FarPtr,
-        args: &[u16],
-        chan: Option<Chan>,
-    ) -> io::Result<Outcome> {
-        let mut exit = machine.call(entry, args)?;
-        loop {
-            let index = match exit {
-                Exit::Returned { ax, dx } => return Ok(Outcome::Returned { ax, dx }),
-                // Never continued past, survey mode or not -- see
-                // `crate::survey`'s module doc. The machine is poisoned
-                // already (`Machine::call`/`resume` do that before handing
-                // back a terminal `Exit`), its globals may be mid-update, and
-                // `Machine::poison` has already forgotten the call frame:
-                // there is no resume point left to fabricate a continuation
-                // into even if this crate wanted to.
-                Exit::Fault { .. } | Exit::Timeout { .. } => {
-                    let poison = machine
-                        .poisoned()
-                        .expect("a terminal exit poisons the machine")
-                        .clone();
-                    return Ok(Outcome::Stopped(poison));
-                }
-                Exit::Call { index } => index,
-            };
-
-            // A thunk index the module does not have is not something a module
-            // can cause -- it comes from the bridge, and the bridge is the
-            // host's. Report it as an unnamed import rather than panicking, so
-            // that a loader bug looks like every other refusal.
-            let (from, symbol, ordinal) = match module.import(index) {
-                Some(site) => (
-                    site.module.clone(),
-                    self.symbol_name(&site.module, &site.symbol),
-                    match &site.symbol {
-                        Symbol::Ordinal(n) => Some(*n),
-                        Symbol::Name(_) => None,
-                    },
-                ),
-                None => (String::new(), format!("thunk #{index}"), None),
-            };
-
-            let (shim, cleans) = match shims::entry::<Wg16>(&from, &symbol) {
-                Entry::Routine(shim, cleans) => {
-                    // `MBBS_TRACE_SHIMS`: name every shim the module reaches.
-                    //
-                    // This exists because the in-Realm wedge (2026-08-12) was
-                    // invisible to every other instrument. Diffing one working
-                    // command's dispatch sequence against a failing one's is
-                    // what localised it: `look` ran
-                    // `toupper x4 -> prf x35 -> btutsw -> btuxmt x5`, while a
-                    // move ran `toupper -> prf -> f_ludiv@ x5 -> btuech ->
-                    // rstmbk x3` and never transmitted. Nothing else in this
-                    // host could have shown that.
-                    //
-                    // Costs one `var_os` per dispatch when off. Read with the
-                    // `KICK-FIRE` line in `prcrtk` and the `PRF` line in
-                    // `shims::text::prf`, which share the same variable.
-                    if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
-                        eprintln!("mbbs-trace: chan={chan:?} {from}!{symbol}");
-                    }
-                    (shim, cleans)
-                }
-                other @ (Entry::Datum | Entry::Absolute(_) | Entry::Unimplemented) => {
-                    let kind = match other {
-                        Entry::Datum => survey::Kind::Datum,
-                        Entry::Absolute(_) => survey::Kind::Absolute,
-                        Entry::Unimplemented => survey::Kind::Unimplemented,
-                        Entry::Routine(..) => unreachable!("matched above"),
-                    };
-                    let context = caller(machine, module);
-
-                    if let Some(inventory) = &self.survey {
-                        inventory.borrow_mut().record(
-                            &from,
-                            &symbol,
-                            ordinal,
-                            chan,
-                            context.as_deref(),
-                            kind,
-                        );
-                    }
-
-                    // Only `Entry::Unimplemented`, only in survey mode, and
-                    // only when the cleanup convention is one this host is
-                    // willing to guess -- see `shims::survey_continue_convention`
-                    // for what "willing" means and why. Every other case
-                    // (survey mode off; `Entry::Datum`/`Entry::Absolute`, a
-                    // mismodelled *type* rather than a missing routine; a
-                    // convention this host refuses to guess) falls through to
-                    // the same stop it always has.
-                    if self.survey.is_some()
-                        && kind == survey::Kind::Unimplemented
-                        && let Some(continue_as) = shims::survey_continue_convention(&symbol)
-                    {
-                        exit = match continue_as {
-                            shims::Cleans::Caller => machine.resume(Ret::Void)?,
-                            shims::Cleans::Callee(bytes) => {
-                                machine.resume_cleaning(Ret::Void, bytes)?
-                            }
-                        };
-                        continue;
-                    }
-
-                    let symbol = match &context {
-                        Some(at) => format!("{symbol}, called from {at}"),
-                        None => symbol,
-                    };
-                    return self.stop(
-                        machine,
-                        Poison::Unimplemented {
-                            module: from,
-                            symbol,
-                        },
-                    );
-                }
-            };
-
-            self.calls += 1;
-            if self.trace {
-                eprintln!("{:4} {symbol}", self.calls);
-            }
-            // `shims::entry`'s `Shim<Wg16>` takes a `Call<Wg16>`, not a bare
-            // `&mut Machine` -- this is the one place that gap is bridged now
-            // that `routines` names generic cores directly rather than 111
-            // individual `_wg16` siblings; see `shims::mod`'s own `call` doc
-            // comment. `shims::call` is generic over `Abi` since Task 7, but
-            // `run` itself stays concrete on `Wg16` until Task 10 moves it
-            // into `impl<A: Abi> Host<A>`, so the turbofish is explicit here
-            // rather than inferred -- `machine`'s type (`mbbs_machine::m16::Machine`)
-            // equals `Wg16::Cpu`, but the compiler cannot invert an
-            // associated-type equality to recover `A` on its own.
-            let mut call = shims::call::<Wg16>(machine);
-            match shim(&mut call, self) {
-                Ok(ret) => {
-                    let ret: Ret = ret.into();
-                    exit = match cleans {
-                        shims::Cleans::Caller => machine.resume(ret)?,
-                        shims::Cleans::Callee(bytes) => machine.resume_cleaning(ret, bytes)?,
-                    };
-                }
-                Err(e) => {
-                    let symbol = match caller(machine, module) {
-                        Some(at) => format!("{symbol} ({e}), called from {at}"),
-                        None => format!("{symbol} ({e})"),
-                    };
-                    return self.stop(
-                        machine,
-                        Poison::Unimplemented {
-                            module: from,
-                            symbol,
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    fn stop(&self, machine: &mut Machine, reason: Poison) -> io::Result<Outcome> {
-        machine.poison(reason)?;
-        let poison = machine.poisoned().expect("just poisoned").clone();
-        Ok(Outcome::Stopped(poison))
-    }
-
-    /// Cross a `ShimError` from [`Host::connect`] or [`Host::poll`]'s own
-    /// internal calls into a poisoned machine, the same way [`Host::run`]
-    /// does for a `ShimError` a shim it dispatched through a thunk returns.
-    ///
-    /// `connect_state`, `point_curusr` and `get_input` predate `connect`/
-    /// `poll` and already answer in `Result<_, ShimError>`, reached directly
-    /// rather than through a thunk -- so `run`'s own crossing does not cover
-    /// them, and this is the only other place a `ShimError` becomes an
-    /// `Outcome`. Refusing plausible-but-wrong state is this crate's whole
-    /// ethic; leaving the machine runnable after `connect_state` half-wrote
-    /// an account record, or after `point_curusr` pointed `usrnum` at the
-    /// wrong channel, would be a hole in it -- so this does what `run` does
-    /// for the identical failure reached through a thunk: poison and answer
-    /// `Outcome::Stopped`, rather than an `Err` that leaves the machine
-    /// runnable.
-    ///
-    /// `where_` names the call that failed, since none of the three is an
-    /// imported symbol with a DLL of its own to report. The
-    /// `BadPointer`/`Failed` distinction survives into the poison's
-    /// `symbol` rather than being flattened through `Display` alone --
-    /// `ShimError` has no `Error` impl to recover it from afterwards.
-    fn shim_stop(&self, machine: &mut Machine, where_: &str, e: ShimError) -> io::Result<Outcome> {
-        let symbol = match &e {
-            ShimError::BadPointer(_) => format!("{where_}: bad pointer, {e}"),
-            ShimError::Failed(_) => format!("{where_}: {e}"),
-        };
-        self.stop(
-            machine,
-            Poison::Unimplemented {
-                module: "mbbs".to_owned(),
-                symbol,
-            },
-        )
     }
 }
 
@@ -4815,7 +4892,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            Outcome::Returned { ax: 0xffff, dx: 0 },
+            Outcome::Returned { lo: 0xffff, hi: 0 },
             "-1 is not 1, so `:4100` sends it to the menu like any other value"
         );
         assert!(
@@ -4835,7 +4912,7 @@ mod tests {
 
         assert_eq!(
             outcome,
-            Some(Outcome::Returned { ax: 0, dx: 0 }),
+            Some(Outcome::Returned { lo: 0, hi: 0 }),
             "0 is 'I am done', the only answer this host can act on"
         );
         assert!(
@@ -4855,8 +4932,8 @@ mod tests {
         assert_eq!(
             outcome,
             Some(Outcome::Returned {
-                ax: u16::from(b'r'),
-                dx: 0
+                lo: u32::from(b'r'),
+                hi: 0
             }),
             "huprou read `rangerdan`'s first byte through usaptr -- a reset that \
              ran first would hand the module a zeroed record, which is what \
@@ -4989,8 +5066,8 @@ mod tests {
         assert_eq!(
             outcome,
             Some(Outcome::Returned {
-                ax: u16::from(b'K'),
-                dx: 0
+                lo: u32::from(b'K'),
+                hi: 0
             }),
             "huprou ran with usaptr on channel 1 -- `Kaimon`, not `rangerdan`"
         );
@@ -5874,7 +5951,7 @@ mod tests {
         let outcome = f.host.run(&mut f.machine, &module, entry, &[], Some(chan)).expect("ran");
         assert_eq!(
             outcome,
-            Outcome::Returned { ax: 0, dx: 0 },
+            Outcome::Returned { lo: 0, hi: 0 },
             "the module must see the fabricated Ret::Void and reach its own retf"
         );
 
@@ -5895,7 +5972,7 @@ mod tests {
         f.host.enable_survey(inventory.clone());
 
         let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
-        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+        assert_eq!(outcome, Outcome::Returned { lo: 0, hi: 0 });
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1, "one distinct symbol, called twice");
@@ -5912,7 +5989,7 @@ mod tests {
         f.host.enable_survey(inventory.clone());
 
         let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
-        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+        assert_eq!(outcome, Outcome::Returned { lo: 0, hi: 0 });
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 2);
@@ -6129,7 +6206,7 @@ mod tests {
         f.host.enable_survey(inventory.clone());
 
         let outcome = f.host.run(&mut f.machine, &module, entry, &[], None).expect("ran");
-        assert_eq!(outcome, Outcome::Returned { ax: 0, dx: 0 });
+        assert_eq!(outcome, Outcome::Returned { lo: 0, hi: 0 });
 
         let inv = inventory.borrow();
         assert_eq!(inv.len(), 1);
@@ -6214,7 +6291,7 @@ mod tests {
             .connect(&mut f.machine, &module, console, &Connection::ansi("rangerdan"))
             .expect("connect_state ran");
         assert!(
-            matches!(outcome, Some(Outcome::Returned { ax: 0, dx: 0 })),
+            matches!(outcome, Some(Outcome::Returned { lo: 0, hi: 0 })),
             "{outcome:?}"
         );
 
@@ -6263,7 +6340,7 @@ mod tests {
 
         let outcome = f.host.poll(&mut f.machine, &module).expect("polled");
         assert!(
-            matches!(outcome, Some(Outcome::Returned { ax: 0, dx: 0 })),
+            matches!(outcome, Some(Outcome::Returned { lo: 0, hi: 0 })),
             "{outcome:?}"
         );
 

@@ -1360,12 +1360,12 @@ pub(crate) fn fsdprc(
                 machine,
                 module,
                 fldvfy,
-                &[u16::from(entfld), scratch.offset, scratch.selector],
+                &[crate::abi::Arg::Int(u16::from(entfld)), crate::abi::Arg::Ptr(scratch)],
                 Some(chan),
             )
             .map_err(|e| ShimError::Failed(format!("fsdprc: fldvfy call failed: {e}")))?;
         match outcome {
-            crate::Outcome::Returned { ax, .. } => ax as i16,
+            crate::Outcome::Returned { lo, .. } => lo as i16,
             crate::Outcome::Stopped(poison) => {
                 return Err(ShimError::Failed(format!(
                     "fsdprc: fldvfy at {fldvfy} stopped the machine: {poison}"
@@ -1645,7 +1645,13 @@ pub(crate) fn goback(
     match session.whndun {
         Some(whndun) => {
             let outcome = host
-                .run(machine, module, whndun, &[u16::from(session.save)], Some(chan))
+                .run(
+                    machine,
+                    module,
+                    whndun,
+                    &[crate::abi::Arg::Int(u16::from(session.save))],
+                    Some(chan),
+                )
                 .map_err(|e| ShimError::Failed(format!("goback: whndun call failed: {e}")))?;
             match outcome {
                 crate::Outcome::Returned { .. } => {}

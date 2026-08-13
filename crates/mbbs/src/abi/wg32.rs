@@ -240,46 +240,102 @@ impl Abi for Wg32 {
         mbbs_machine::m32::Poison::Unimplemented { module, symbol }
     }
 
-    /// `()`, temporarily: Task 10 builds the real PE-backed `Module` (the
-    /// demo's `pe::PeImage` parse, `Memory::load`, `relocate`, `bind_imports`
-    /// and `patch_thunk_addresses`, composed into one struct carrying the
-    /// import table). Nothing calls [`Abi::load`], [`Abi::import`] or
-    /// [`Abi::caller`] for `Wg32` yet -- see their own bodies below -- so
-    /// there is nothing this placeholder needs to hold.
-    type Module = ();
+    type Module = mbbs_machine::m32::Module;
 
-    /// Not implemented. Task 10 is the real arm (see [`Wg32::Module`]'s own
-    /// doc comment for what it composes); this trait method exists now only
-    /// so `Abi` compiles with two implementations, per Task 9's brief. A
-    /// panic here is honest where `Ok(())` would not be: nothing has
-    /// actually mapped `file` or resolved a single import, so claiming
-    /// success would be the exact "shim that lies" this crate's own module
-    /// doc comment refuses to be.
+    /// The real arm, Task 10 of
+    /// `docs/plans/2026-08-12-abi-border-implementation.md`: `pe::PeImage::parse`
+    /// → `Image::load` → `Image::relocate` → `Image::bind_imports` →
+    /// `Image::patch_thunk_addresses`, the same sequence
+    /// `examples/both_loaders.rs`'s `pe()` proves interactively -- but driven
+    /// by this host's own `resolve`, not a closure that answers `Routine` to
+    /// everything.
+    ///
+    /// **No adapter sits between `resolve` and `Image::bind_imports`.**
+    /// `resolve`'s `Ptr` is already `Self::Ptr` (`Flat32Ptr`), and
+    /// `m32::image::ImportResolver`/`Import32` are a re-export and a type
+    /// alias onto that same shared trait/enum now (`m32/image.rs`'s own
+    /// module doc comment, "Reconciled" -- mirroring `Wg16::load`'s
+    /// identical note). Task 9 left this reconciliation to this task because
+    /// this is the file that owns the real PE arm.
+    ///
+    /// **`cpu.mem` is replaced, not grown.** Unlike `Wg16::load`, which
+    /// mutates the `Segments` a `Machine::new` scratch build already carries
+    /// (`Machine::load_ne` appends), `mbbs_machine::m32::Memory` has no
+    /// "swap in a freshly loaded image" operation short of building a new
+    /// one -- `Memory::new` is the only way to pair an `Image` with a fresh
+    /// allocation arena (`mem.rs`'s own module doc comment, "why not fold
+    /// this into `Image`"). So this method builds the whole `Image` first,
+    /// against `file` alone, and only once loading, relocating, binding and
+    /// patching have all succeeded does it commit -- assigning the result to
+    /// `cpu.mem` (a public field, per [`Wg32Cpu`]'s own doc comment) in the
+    /// same motion that returns `Ok`. `cpu.machine` is never rebuilt: its
+    /// thunk table, fault-recovery arming and TID binding all predate this
+    /// call and must survive it, which is exactly why `cpu.machine.thunk_addr`
+    /// is read from but `cpu.machine` itself is never reassigned.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::LoadError::Image`] if `file` does not parse as PE32, is not
+    /// i386, or its relocations cannot be applied (stripped, but the image
+    /// did not land at its own preferred base). [`crate::LoadError::Absolute`]
+    /// if `resolve` answers [`mbbs_machine::module::Import::Absolute`] for any
+    /// import site -- see [`mbbs_machine::m32::AbsoluteImport`]'s own doc
+    /// comment for why a PE loader can never honour one. `cpu.mem` is
+    /// unchanged in every error case: nothing is assigned to it until every
+    /// step above has already succeeded.
     fn load(
-        _cpu: &mut Self::Cpu,
-        _file: &[u8],
-        _resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
+        cpu: &mut Self::Cpu,
+        file: &[u8],
+        resolve: &dyn mbbs_machine::module::ImportResolver<Self::Ptr>,
     ) -> Result<Self::Module, crate::LoadError> {
-        unimplemented!(
-            "Wg32::load is Task 10's arm; nothing calls this yet (see \
-             docs/plans/2026-08-12-abi-border-implementation.md, Task 10)"
-        )
+        let pe = mbbs_machine::m32::PeImage::parse(file)?;
+
+        let mut image = mbbs_machine::m32::Image::load(file, &pe)?;
+        image.relocate(&pe)?;
+
+        let thunks = image.bind_imports(&pe, resolve)?;
+
+        image.patch_thunk_addresses(&pe, &thunks, |index| {
+            cpu.machine.thunk_addr(u16::try_from(index).expect("bind_imports never exceeds MAX_THUNKS"))
+        });
+
+        let entry = image.base().wrapping_add(pe.entry_point);
+
+        // Every step above succeeded -- commit. `ARENA_LEN` is a generous
+        // placeholder headroom, not a measured requirement: nothing through
+        // this task allocates out of it (`Globals<Wg32>` placement is
+        // Task 13/22's job), so there is no real workload yet to size it
+        // against.
+        cpu.mem = mbbs_machine::m32::Memory::new(image, ARENA_LEN)?;
+
+        Ok(mbbs_machine::m32::Module::new(entry, thunks))
     }
 
-    /// `None`, always: [`Wg32::Module`] is `()` until Task 10, so there is no
-    /// import table to look `index` up in.
-    fn import(_module: &Self::Module, _index: u16) -> Option<&mbbs_machine::module::ImportSite> {
-        None
+    /// Direct delegation -- `mbbs_machine::m32::Module::import` (this task).
+    fn import(module: &Self::Module, index: u16) -> Option<&mbbs_machine::module::ImportSite> {
+        module.import(index)
     }
 
-    /// `None`, always, for the same reason as [`Abi::import`] above -- a
-    /// `()` module carries no section table to resolve a return address
-    /// against. Not a stub awaiting a smarter answer under the *current*
-    /// `Module`; a real answer needs Task 10's real one.
+    /// `None`, always. [`Wg32::Module`] now carries the bound import table,
+    /// but not a section table or symbol map to resolve a return address
+    /// against -- "section and offset, once `Wg32::Module` carries enough
+    /// to answer it" (this trait method's own doc comment) is still future
+    /// work, not something this task's `Module` composes. Best-effort
+    /// diagnostics staying `None` costs nothing today: nothing through this
+    /// task calls `Host::run` against a `Wg32` module (that is Task 15's
+    /// synthetic round-trip), so nothing yet reads this answer.
     fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
         None
     }
 }
+
+/// Headroom `Wg32::load` reserves for host-allocated regions
+/// ([`mbbs_machine::m32::Memory::alloc`]) alongside the loaded image. 1 MiB:
+/// comfortably more than any 16-bit segment could ever hold (`SEGMENT_BYTES`,
+/// 64 KiB) and nothing through this task allocates out of it at all --
+/// `Globals<Wg32>` placement is Task 13/22's job, which is what actually
+/// measures this number instead of guessing it.
+const ARENA_LEN: usize = 1 << 20;
 
 /// [`mbbs_machine::m32::Ret`] has no `Far` counterpart -- this ABI is flat, so
 /// a pointer comes back in `EAX` exactly as an `int` does. `Ret::Long` maps
