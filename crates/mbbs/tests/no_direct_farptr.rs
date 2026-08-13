@@ -65,8 +65,10 @@ use std::path::{Path, PathBuf};
 /// free to carry meaning. See this file's module comment before editing.
 const ALLOWED: &[&str] = &[
     // Where the type is SUPPOSED to live: `Wg16::Ptr = mbbs_machine::m16::FarPtr` is
-    // declared here. Not a leak, and this entry never leaves.
-    "abi.rs",
+    // declared here, in `Wg16`'s own `impl Abi` (`abi.rs` split this out
+    // once `abi/wg32.rs` existed beside it -- see that commit). Not a leak,
+    // and this entry never leaves.
+    "abi/wg16.rs",
     // Irreducibly 16-bit, and staying. `alctile`/`ptrtile` are LDT segment
     // tiling, which has no flat-memory counterpart at all -- the 32-bit
     // equivalents `alcblok`/`ptrblok` are different routines, among the 56
