@@ -133,7 +133,9 @@ pub fn sprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     let template = call.ptr();
     let (text, _) = format_call(call, template)?;
     fill::<A>(call.mem(), buffer, &text)?;
-    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+    // The length at `A`'s own int width. `as u16` wrapped a format longer
+    // than 65535 bytes into a small, plausible, wrong count.
+    Ok(abi::Ret::Int(A::int_from_u32(text.len() as u32)))
 }
 
 /// `int vsprintf(char *buf, const char *fmat, va_list ap)` -- format into the
@@ -160,7 +162,9 @@ pub fn vsprintf<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<
     let list = call.ptr();
     let (text, _) = crate::fmt::format_va_list(call, template, list)?;
     fill::<A>(call.mem(), buffer, &text)?;
-    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+    // The length at `A`'s own int width. `as u16` wrapped a format longer
+    // than 65535 bytes into a small, plausible, wrong count.
+    Ok(abi::Ret::Int(A::int_from_u32(text.len() as u32)))
 }
 
 /// `void prf(char *fmat, ...)` -- append to the channel's output.
@@ -480,7 +484,9 @@ pub fn strlen<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     let text = s
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+    // The length at `A`'s own int width. `as u16` wrapped a format longer
+    // than 65535 bytes into a small, plausible, wrong count.
+    Ok(abi::Ret::Int(A::int_from_u32(text.len() as u32)))
 }
 
 /// `void rmvwht(char *string)` -- remove every whitespace character, in place.
@@ -1087,7 +1093,9 @@ pub fn strncat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     // did, after every argument is in hand.
     let dst = call.ptr();
     let src = call.ptr();
-    let max = usize::from(Into::<u32>::into(call.int()) as u16);
+    // `int maxlen`, at `A`'s own width: `as u16` truncated any 32-bit bound
+    // above 65535 into a much smaller one, silently shortening the copy.
+    let max = Into::<u32>::into(call.int()) as usize;
     let end = dst
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
@@ -1123,7 +1131,8 @@ pub fn strncpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
     // property that made the original safe on a source that is not there.
     let dst = call.ptr();
     let src = call.ptr();
-    let n = usize::from(Into::<u32>::into(call.int()) as u16);
+    // `unsigned n`, at `A`'s own width -- see `strncat`'s own note.
+    let n = Into::<u32>::into(call.int()) as usize;
     if n == 0 {
         // All three `rep` prefixes are no-ops, so the original dereferences
         // neither pointer. Same reason `stzcpy` returns early on a zero.
@@ -1178,28 +1187,49 @@ pub fn strcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// its low byte and zero-extended back -- so `toupper(0x161)` is `toupper('a')`
 /// and answers `0x41`, not `0x141`.
 pub fn toupper<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let c = Into::<u32>::into(call.int()) as u16;
-    Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::toupper))))
+    let c: u32 = call.int().into();
+    Ok(abi::Ret::Int(A::int_from_u32(fold::<A>(
+        c,
+        crate::strings::toupper,
+    ))))
 }
 
 /// `int tolower(int c)` -- [`toupper`]'s mirror, and the routine `sameas`,
 /// `sameto` and `samein` fold with.
 pub fn tolower<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let c = Into::<u32>::into(call.int()) as u16;
-    Ok(abi::Ret::Int(A::Int::from(fold(c, crate::strings::tolower))))
+    let c: u32 = call.int().into();
+    Ok(abi::Ret::Int(A::int_from_u32(fold::<A>(
+        c,
+        crate::strings::tolower,
+    ))))
 }
 
 /// The `int` wrapper both case-folding routines share: EOF through untouched,
 /// everything else truncated to a byte and zero-extended back.
-fn fold(c: u16, by: fn(u8) -> u8) -> u16 {
-    /// What `cmp cx,0xffff` compares against, and the one argument that is not
-    /// truncated.
-    const EOF: u16 = -1i16 as u16;
+///
+/// # `EOF` is `-1` at `A`'s width, not at 16 bits
+///
+/// This used to take and return a `u16`, with `EOF` spelled `-1i16 as u16`.
+/// Under `Wg16` that is exactly the `cmp cx,0xffff` the disassembly shows.
+/// Under `Wg32` it broke the C idiom it exists to serve: a module calling
+/// `toupper(EOF)` passes a full 32-bit `0xFFFFFFFF`, the old code narrowed
+/// it to `0xFFFF`, recognised *that* as its own EOF, and answered
+/// `A::Int::from(0xFFFFu16)` -- which zero-extends to `0x0000FFFF`. The
+/// module's own `if (toupper(c) == EOF)` then compared `65535` against `-1`
+/// and took the wrong branch, silently.
+///
+/// Both the comparison and the answer are now at `A::INT_WIDTH`, so `-1`
+/// goes in and `-1` comes back out under either ABI.
+fn fold<A: Abi>(c: u32, by: fn(u8) -> u8) -> u32 {
+    // All ones at `A`'s own int width: `0xFFFF` for a 2-byte int (the
+    // `cmp cx,0xffff` the 16-bit disassembly shows), `0xFFFFFFFF` for a
+    // 4-byte one.
+    let eof = u32::MAX >> (32 - A::INT_WIDTH * 8);
 
-    if c == EOF {
-        EOF
+    if c == eof {
+        eof
     } else {
-        u16::from(by(c as u8))
+        u32::from(by(c as u8))
     }
 }
 
@@ -1290,6 +1320,47 @@ mod tests {
     use crate::abi::Wg16;
     use crate::testing::Fixture;
     use mbbs_machine::m16::FarPtr;
+
+    /// `toupper(EOF)` must answer `EOF`, at whatever width `A`'s `int` is.
+    ///
+    /// This is the C idiom the routine exists to serve --
+    /// `if (toupper(c) == EOF)` -- and the one the 16-bit-shaped `fold` broke
+    /// under `Wg32`: it narrowed the incoming `0xFFFFFFFF` to `0xFFFF`,
+    /// matched its own 16-bit sentinel, and answered `0x0000FFFF`, so the
+    /// module compared `65535` against `-1` and took the wrong branch in
+    /// silence.
+    ///
+    /// Tested on `fold` directly rather than through a `Call`: the frame
+    /// decoding is [`crate::abi::Cursor`]'s and already width-tested, and
+    /// building a `Wg32` `Call` here would need a real `m32::Machine`, which
+    /// arms this thread's fault recovery and so cannot happen inside `--lib`.
+    #[test]
+    fn eof_survives_case_folding_at_both_int_widths() {
+        use crate::abi::Wg32;
+
+        // Every-bit-set at each width is that ABI's own `EOF`.
+        assert_eq!(fold::<Wg16>(0xFFFF, crate::strings::toupper), 0xFFFF);
+        assert_eq!(fold::<Wg32>(0xFFFF_FFFF, crate::strings::toupper), 0xFFFF_FFFF);
+        assert_eq!(fold::<Wg16>(0xFFFF, crate::strings::tolower), 0xFFFF);
+        assert_eq!(fold::<Wg32>(0xFFFF_FFFF, crate::strings::tolower), 0xFFFF_FFFF);
+
+        // And `0xFFFF` under `Wg32` is *not* EOF -- it is 65535, an ordinary
+        // out-of-byte-range value, folded to its low byte like any other.
+        // This is the case the old code could not tell apart from EOF.
+        assert_eq!(
+            fold::<Wg32>(0x0000_FFFF, crate::strings::toupper),
+            u32::from(crate::strings::toupper(0xFF)),
+        );
+
+        // Ordinary letters are unaffected by any of this.
+        assert_eq!(fold::<Wg16>(u32::from(b'a'), crate::strings::toupper), u32::from(b'A'));
+        assert_eq!(fold::<Wg32>(u32::from(b'a'), crate::strings::toupper), u32::from(b'A'));
+
+        // `toupper(0x161)` is `toupper('a')` -- the low-byte truncation the
+        // disassembly shows -- and stays so at both widths.
+        assert_eq!(fold::<Wg16>(0x161, crate::strings::toupper), u32::from(b'A'));
+        assert_eq!(fold::<Wg32>(0x161, crate::strings::toupper), u32::from(b'A'));
+    }
 
     #[test]
     fn lastwd_answers_a_pointer_into_the_callers_own_string() {

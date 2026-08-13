@@ -55,7 +55,7 @@ use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::dos;
 use crate::fmt::format_call;
-use crate::shims::{NO, ShimError};
+use crate::shims::{NO, ShimError, sign_extend};
 use crate::stream::Mode;
 
 /// The null pointer, in this ABI's own representation.
@@ -173,7 +173,12 @@ pub fn fgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     // header redeclares it (`GCOMM.H`'s `mdfgets` is a different routine with
     // the same shape, not this one -- see this file's commit message).
     let buffer = call.ptr();
-    let n = Into::<u32>::into(call.int()) as i16;
+    // `n` is an `int`, so it is signed at `A::INT_WIDTH` -- not at 16 bits.
+    // Sign-extending from `A`'s own width is what makes the `n < 1` check
+    // below mean the same thing under both ABIs: `as i16` turned a 32-bit
+    // `70000` into `4464`, and a 32-bit `40000` into a *negative* number that
+    // this shim would then have refused outright.
+    let n = sign_extend::<A>(call.int().into());
     let cookie = call.ptr();
 
     // Borland would write the terminator into a buffer it was told has no room
@@ -220,23 +225,35 @@ pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     // `size_t fread(void *p, size_t size, size_t n, FILE *f)` -- Borland's;
     // no Galacticomm header redeclares it.
     let buffer = call.ptr();
-    let size = Into::<u32>::into(call.int()) as u16;
-    let count = Into::<u32>::into(call.int()) as u16;
+    // `size_t` is `A::INT_WIDTH` bytes, and `call.int()` already read exactly
+    // that many -- so widening to `u32` is the whole conversion. These used to
+    // be `as u16`, which under `Wg32` truncated before the overflow check
+    // below could see the real numbers: `fread(buf, 1, 100000, f)` became
+    // `count = 34464`, which then *passed* the check and short-read by 65536
+    // bytes in silence. That is worse than the refusal it looked like.
+    let size: u32 = call.int().into();
+    let count: u32 = call.int().into();
     let cookie = call.ptr();
 
     if size == 0 || count == 0 {
         return Ok(abi::Ret::Int(A::Int::from(0u16)));
     }
 
-    // `size_t` is 16 bits here, so Borland would have wrapped. A wrap reads the
-    // wrong amount into a buffer of the right size, which nothing downstream
-    // could notice.
-    let want = u32::from(size) * u32::from(count);
-    if want > u32::from(u16::MAX) {
+    // A `size_t` that cannot count the product is a wrap, and a wrap reads the
+    // wrong amount into a buffer of the right size -- which nothing
+    // downstream could notice. The ceiling is `A`'s own, not 16 bits: Borland
+    // would have wrapped at `0xFFFF` compiling for DOS and at `0xFFFFFFFF`
+    // compiling for NT, and the point of the check is to refuse what the real
+    // runtime would have silently got wrong.
+    let ceiling = u64::from(u32::MAX) >> (32 - A::INT_WIDTH * 8);
+    let want = u64::from(size) * u64::from(count);
+    if want > ceiling {
         return Err(ShimError::Failed(format!(
-            "fread of {count} items of {size} bytes, which a 16-bit size_t cannot count"
+            "fread of {count} items of {size} bytes, which a {}-bit size_t cannot count",
+            A::INT_WIDTH * 8
         )));
     }
+    let want = want as u32;
 
     let bytes = host
         .streams
@@ -245,8 +262,11 @@ pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     buffer
         .write(call.mem(), &bytes)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(abi::Ret::Int(A::Int::from(
-        (bytes.len() / usize::from(size)) as u16,
+    // The count of whole items read, at `A`'s int width -- `as u16` here
+    // would have wrapped a 32-bit short read back into a plausible-looking
+    // small number.
+    Ok(abi::Ret::Int(A::int_from_u32(
+        (bytes.len() / size as usize) as u32,
     )))
 }
 
@@ -276,7 +296,8 @@ pub fn fprintf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     host.streams
         .write(cookie, &text)
         .map_err(|e| ShimError::Failed(format!("fprintf: {e}")))?;
-    Ok(abi::Ret::Int(A::Int::from(text.len() as u16)))
+    // At `A`'s own int width -- see `sprintf`'s own note on the same line.
+    Ok(abi::Ret::Int(A::int_from_u32(text.len() as u32)))
 }
 
 /// `int fflush(FILE *f)` -- push what is buffered.

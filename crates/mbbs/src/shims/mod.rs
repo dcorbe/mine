@@ -482,6 +482,31 @@ fn canonical_dll(dll: &str) -> &str {
     }
 }
 
+/// A C `int` argument, sign-extended from `A`'s own width to `i32`.
+///
+/// [`Call::int`](crate::abi::Call::int) already reads exactly
+/// [`Abi::INT_WIDTH`] bytes and hands back an `A::Int`, so widening it to
+/// `u32` is lossless -- but it is *zero*-extended, and a C `int` is signed.
+/// Under `Wg16` a `-1` arrives as `0x0000FFFF`; under `Wg32` as
+/// `0xFFFFFFFF`. Neither is `-1` as an `i32` until the sign is put back at
+/// the right width, which is what this does.
+///
+/// # Why a helper and not `as i16`
+///
+/// `as i16` was the idiom throughout this module, and it is `Wg16`'s answer
+/// hard-coded. It gets the sign right for a 2-byte `int` and silently
+/// mangles a 4-byte one: `fgets(buf, 40000, f)` under `Wg32` became a
+/// *negative* length and was refused, and `70000` became `4464`. There is no
+/// unsigned counterpart here because none is needed -- an `unsigned`
+/// argument is already correct as `Into::<u32>::into(call.int())`, since
+/// zero-extension from `A`'s width is exactly what that does.
+pub(crate) fn sign_extend<A: Abi>(raw: u32) -> i32 {
+    // `INT_WIDTH` is 2 or 4, so `bits` is 16 or 0 -- both in range for a
+    // shift, and the 0 case is the identity it should be.
+    let bits = 32 - A::INT_WIDTH as u32 * 8;
+    ((raw << bits) as i32) >> bits
+}
+
 /// What the host knows about a symbol, for `A`.
 ///
 /// `symbol` is the C name when the export tables have one and `#<ordinal>` when
@@ -569,6 +594,30 @@ mod tests {
     use super::*;
     use crate::exports::GALGSBL;
     use crate::testing::Fixture;
+
+    /// The whole point of [`sign_extend`]: a C `int` is signed at `A`'s own
+    /// width, and the old `as i16` was `Wg16`'s answer hard-coded.
+    ///
+    /// The `Wg32` column is what the 16-bit-shaped idiom got wrong. `-1`
+    /// arrives as `0xFFFFFFFF` and must stay `-1`; `40000` is a positive
+    /// `int` under a 4-byte `int` and became *negative* under `as i16`, which
+    /// is what made `fgets(buf, 40000, f)` a refusal instead of a read.
+    #[test]
+    fn a_c_int_is_signed_at_the_abis_own_width() {
+        // (raw bits on the frame, what Wg16 means, what Wg32 means)
+        let cases: &[(u32, i32, i32)] = &[
+            (0x0000_0000, 0, 0),
+            (0x0000_0001, 1, 1),
+            (0x0000_FFFF, -1, 65535),
+            (0xFFFF_FFFF, -1, -1),
+            (0x0000_9C40, -25536, 40000),
+            (0x0001_1170, 4464, 70000),
+        ];
+        for &(raw, w16, w32) in cases {
+            assert_eq!(sign_extend::<Wg16>(raw), w16, "Wg16 of {raw:#010x}");
+            assert_eq!(sign_extend::<crate::abi::Wg32>(raw), w32, "Wg32 of {raw:#010x}");
+        }
+    }
 
     #[test]
     fn a_global_is_a_datum() {
