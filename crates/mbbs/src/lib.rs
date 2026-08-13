@@ -3174,10 +3174,13 @@ impl Host<Wg16> {
             // `&mut Machine` -- this is the one place that gap is bridged now
             // that `routines` names generic cores directly rather than 111
             // individual `_wg16` siblings; see `shims::mod`'s own `call` doc
-            // comment. `shims::call` itself, not a second copy of it: this is
-            // now that helper's one production caller, the 128 `_wg16`
-            // bridges that used to be all of them having gone `#[cfg(test)]`.
-            let mut call = shims::call(machine);
+            // comment. `shims::call` is generic over `Abi` since Task 7, but
+            // `run` itself stays concrete on `Wg16` until Task 10 moves it
+            // into `impl<A: Abi> Host<A>`, so the turbofish is explicit here
+            // rather than inferred -- `machine`'s type (`mbbs_machine::m16::Machine`)
+            // equals `Wg16::Cpu`, but the compiler cannot invert an
+            // associated-type equality to recover `A` on its own.
+            let mut call = shims::call::<Wg16>(machine);
             match shim(&mut call, self) {
                 Ok(ret) => {
                     let ret: Ret = ret.into();

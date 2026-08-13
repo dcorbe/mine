@@ -13,8 +13,6 @@ pub mod system;
 pub mod text;
 pub mod user;
 
-use mbbs_machine::m16::Machine;
-
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
@@ -30,27 +28,32 @@ use crate::globals::GLOBALS;
 // subsumes it -- `Call::ptr`/`int`/`long` walk the same frame in the same
 // order, and `Call::mem` is the part a bare `Cursor` could never provide.
 
-/// A [`Call<Wg16>`] over the outstanding call's argument frame.
+/// A [`Call<A>`] over the outstanding call's argument frame, for any `Abi`.
 ///
-/// One caller: `lib.rs`'s dispatch loop, which holds a `&mut Machine` and
-/// needs the `Call<Wg16>` that [`Shim<Wg16>`](Shim) wants.
+/// One production caller: `lib.rs`'s dispatch loop (`Host::run`, still
+/// concrete on `Wg16` until Task 10), which holds a `&mut A::Cpu` and needs
+/// the `Call<A>` that [`Shim<A>`](Shim) wants. No `Wg16`-shaped bridge was
+/// needed to keep that caller compiling -- `Wg16::Cpu` already *is*
+/// `mbbs_machine::m16::Machine`, so `call::<Wg16>(machine)` binds directly
+/// against the concrete `&mut Machine` `Host::run` still holds; the plan's
+/// sanctioned fallback (a thin one-task-span `Wg16` wrapper) was not needed.
 ///
-/// It used to have 126 more. Every converted routine carried a `_wg16`
-/// bridge built from this function -- `foo(&mut super::call(machine), host)
+/// It used to have 126 more callers. Every converted routine carried a
+/// `_wg16` bridge built from this function -- `foo(&mut super::call(machine), host)
 /// .map(Into::into)` -- for one reason: `crate::testing::Fixture::invoke`
 /// took a bare `fn(&mut Machine, &mut Host)` and so could not be handed a
 /// shim directly. That made every addition to the API surface cost two
 /// functions instead of one. `Fixture::invoke` builds its own `Call` now and
 /// the bridges are deleted.
 ///
-/// Computes the frame before taking `machine` mutably -- the same ordering
+/// Computes the frame before taking `cpu` mutably -- the same ordering
 /// [`Call::new`]'s own doc comment describes, and the reason this copies the
-/// frame out rather than borrowing it: `Call` needs `machine` mutably for
+/// frame out rather than borrowing it: `Call` needs `cpu` mutably for
 /// [`Call::mem`], so a `Cursor` still borrowing it immutably would be a
 /// second live borrow of the same object.
-pub(crate) fn call(machine: &mut Machine) -> Call<'_, Wg16> {
-    let frame = machine.arg_frame().to_vec();
-    Call::new(machine, &frame)
+pub(crate) fn call<A: Abi>(cpu: &mut A::Cpu) -> Call<'_, A> {
+    let frame = A::arg_frame(cpu).to_vec();
+    Call::new(cpu, &frame)
 }
 
 /// -1, as a 16-bit `int`.
