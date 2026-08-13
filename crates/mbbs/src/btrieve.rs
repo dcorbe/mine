@@ -40,7 +40,9 @@ pub(crate) mod v6;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use mbbs16::{FarPtr, Machine};
+use mbbs_ptr::ModulePtr;
+
+use crate::abi::{Abi, Wg16};
 
 pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
@@ -546,7 +548,20 @@ pub enum Cursor {
 }
 
 /// One open Btrieve file.
-pub struct Block {
+///
+/// # Generic (over `A: Abi`), as of this task
+///
+/// `block`/`data`/`key` are `A::Ptr` rather than `mbbs16::FarPtr` -- they are
+/// module-memory addresses the host handed a module, and the module's own
+/// ABI decides their shape. `A` defaults to [`Wg16`] so every existing caller
+/// keeps naming this type as plain `Block`, the same convention
+/// [`crate::heap::Heap`] and [`crate::msg::Messages`] already use. Every
+/// method that never resolved a pointer against module memory -- `query`,
+/// `get`, `step`, `insert`, `update`, `delete`, `reindex`, and the getters
+/// below -- has no `A`-dependent behaviour and lives on `impl<A: Abi>
+/// Block<A>` unchanged; only the three fields below and their own getters
+/// name `A::Ptr`.
+pub struct Block<A: Abi = Wg16> {
     /// This block's identity for [`ops::LockTable`] -- see [`ops::BlockId`]'s
     /// own doc comment for why it is not the module's `struct btvblk *`.
     id: ops::BlockId,
@@ -565,7 +580,7 @@ pub struct Block {
 
     /// The `struct btvblk` the module was handed. Also this block's identity:
     /// `setbtv`, `cntrbtv` and `clsbtv` name it and nothing else does.
-    block: FarPtr,
+    block: A::Ptr,
 
     /// What the module said its records are -- `opnbtv`'s `maxlen`, which sizes
     /// `data` and is what `bb->reclen` holds. **Not** the file's record length:
@@ -574,12 +589,12 @@ pub struct Block {
     maxlen: u16,
 
     /// The record buffer, `maxlen` bytes of the module's heap.
-    data: FarPtr,
+    data: A::Ptr,
 
     /// The key buffer, `clckln()` bytes of the module's heap. What a search
     /// value is copied into, and what a `Get Key` operation leaves the found
     /// key in.
-    key: FarPtr,
+    key: A::Ptr,
 
     /// The records, read the first time something asks for one.
     ///
@@ -676,7 +691,7 @@ fn normalized(bytes: &[u8], reclen: u16) -> Vec<u8> {
     out
 }
 
-impl Block {
+impl<A: Abi> Block<A> {
     /// What the module named this file.
     pub fn name(&self) -> &str {
         &self.name
@@ -772,7 +787,7 @@ impl Block {
     }
 
     /// The `struct btvblk` the module holds.
-    pub fn block(&self) -> FarPtr {
+    pub fn block(&self) -> A::Ptr {
         self.block
     }
 
@@ -782,7 +797,7 @@ impl Block {
     }
 
     /// The record buffer the module may read into.
-    pub fn data(&self) -> FarPtr {
+    pub fn data(&self) -> A::Ptr {
         self.data
     }
 
@@ -792,7 +807,7 @@ impl Block {
     /// one. The buffer exists whether or not the module ever searches by key,
     /// because the real host allocated it in `opnbtv` and a module is entitled
     /// to find a pointer there.
-    pub fn key(&self) -> FarPtr {
+    pub fn key(&self) -> A::Ptr {
         self.key
     }
 
@@ -1505,12 +1520,24 @@ impl Block {
 /// memory (`BTVSTF.H:36`), read back out of there every time -- the same rule
 /// `curmbk` and `prfptr` are under. What is here is the stack behind it, which
 /// `PLBTVSTF.C` keeps in a `static` the module cannot see either.
-pub struct Btrieve {
-    open: Vec<Block>,
+///
+/// # Generic (over `A: Abi`), as of this task
+///
+/// `open: Vec<Block<A>>` and `stack: [A::Ptr; BBSTSZ]` -- every pointer this
+/// type keeps is a module address, and the module's own ABI decides its
+/// shape. `A` defaults to [`Wg16`], the same convention every other generic
+/// type in this crate uses, so every existing caller keeps naming this type
+/// as plain `Btrieve`. `crate::lib::Host<A>::btrieve` still names it without
+/// `<A>` (bare `btrieve::Btrieve`, i.e. `Btrieve<Wg16>` through that default)
+/// -- widening it to `Btrieve<A>` is the one remaining step, and it is in
+/// `crates/mbbs/src/lib.rs`, a file this task does not own; see this crate's
+/// own worklog for the exact edit.
+pub struct Btrieve<A: Abi = Wg16> {
+    open: Vec<Block<A>>,
 
     /// `bbstk`: what `rstbtv` will restore, nearest first. Fixed at ten and
     /// **shifting**, which is not an implementation detail -- see [`Self::set`].
-    stack: [FarPtr; BBSTSZ],
+    stack: [A::Ptr; BBSTSZ],
 
     /// `bbomode`: the mode the next `opnbtv` opens in. `PRIMBV`, which is zero,
     /// until `omdbtv` says otherwise.
@@ -1537,16 +1564,21 @@ pub struct Btrieve {
     locks: ops::LockTable,
 }
 
-impl Default for Btrieve {
+impl<A: Abi> Default for Btrieve<A> {
     /// Nothing open, nothing stacked, and `PRIMBV`.
     ///
     /// Ten null pointers rather than an empty vector, because that is what
     /// `static struct btvblk *bbstk[BBSTSZ]` is and what makes `rstbtv` past
     /// the bottom yield null instead of nothing.
+    ///
+    /// Not `#[derive(Default)]`: the derive macro bounds `A: Default` on the
+    /// generated impl, which the bare marker struct [`Wg16`] does not satisfy
+    /// -- the same problem `crates/mbbs/src/abi.rs`'s `Ret<A>` and
+    /// `crates/mbbs/src/msg.rs`'s `Messages<A>` hit, and the same fix.
     fn default() -> Self {
         Self {
             open: Vec::new(),
-            stack: [FarPtr::NULL; BBSTSZ],
+            stack: [A::null_ptr(); BBSTSZ],
             mode: 0,
             transaction: false,
             locks: ops::LockTable::default(),
@@ -1554,7 +1586,7 @@ impl Default for Btrieve {
     }
 }
 
-impl Btrieve {
+impl<A: Abi> Btrieve<A> {
     /// Open a file, and give the module a `struct btvblk` to name it by.
     ///
     /// The block is real memory from the module's own heap, laid out as
@@ -1567,19 +1599,26 @@ impl Btrieve {
     /// and for a reason that is worth reading in
     /// [`shims::btrieve::opnbtv`](crate::shims::btrieve::opnbtv).
     ///
+    /// Takes `mem: &mut A::Mem` rather than a whole machine -- the same
+    /// generic-core shape [`crate::heap::Heap::reserve`] and
+    /// [`crate::msg::Messages::open_mem`] already use. `heap` allocates
+    /// through [`Heap::reserve`](crate::heap::Heap::reserve), the generic
+    /// core behind [`Heap::alloc`](crate::heap::Heap::alloc)'s `Wg16` facade,
+    /// so this needs no facade of its own.
+    ///
     /// # Errors
     ///
     /// If the file's key definitions cannot be read, or the heap has no room
     /// for the block, its name, its record buffer or its key buffer.
     pub fn open(
         &mut self,
-        machine: &mut Machine,
-        heap: &mut crate::Heap,
+        mem: &mut A::Mem,
+        heap: &mut crate::Heap<A>,
         name: &str,
         path: &Path,
         geometry: Geometry,
         maxlen: u16,
-    ) -> Result<FarPtr, String> {
+    ) -> Result<A::Ptr, String> {
         // The key definitions come out of the same first page the geometry did,
         // and they are read at open time rather than with the records because
         // `clckln()` -- which sizes the key buffer below -- is part of what
@@ -1591,37 +1630,33 @@ impl Btrieve {
         // `PLBTVSTF.C:148` -- `bb->filnam=alcmem(strlen(filnam)+1)`. The
         // module's, not the host's: `clsbtv` frees it.
         let bytes = name.as_bytes();
-        let filnam = heap.alloc(machine, bytes.len() as u16 + 1)?;
+        let filnam = heap.reserve(mem, bytes.len() as u16 + 1)?;
         let mut terminated = bytes.to_vec();
         terminated.push(0);
-        machine
-            .write(filnam, &terminated)
-            .map_err(|e| e.to_string())?;
+        filnam.write(mem, &terminated).map_err(|e| e.to_string())?;
 
-        let data = heap.alloc(machine, maxlen)?;
-        machine
-            .write(data, &vec![0u8; usize::from(maxlen)])
+        let data = heap.reserve(mem, maxlen)?;
+        data.write(mem, &vec![0u8; usize::from(maxlen)])
             .map_err(|e| e.to_string())?;
 
         // `clckln()` returns the longest key plus one, and that is what the
         // real host allocated. Plus one because a Btrieve key buffer for a
         // string key holds a terminator the key length does not count.
         let longest = parsed.iter().map(Key::length).max().unwrap_or(0);
-        let key = heap.alloc(machine, longest + 1)?;
-        machine
-            .write(key, &vec![0u8; usize::from(longest) + 1])
+        let key = heap.reserve(mem, longest + 1)?;
+        key.write(mem, &vec![0u8; usize::from(longest) + 1])
             .map_err(|e| e.to_string())?;
 
-        let block = heap.alloc(machine, field::SIZE)?;
+        let block = heap.reserve(mem, field::SIZE)?;
         let mut image = vec![0u8; usize::from(field::SIZE)];
         let put = |image: &mut Vec<u8>, offset: u16, bytes: &[u8]| {
             let at = usize::from(offset);
             image[at..at + bytes.len()].copy_from_slice(bytes);
         };
-        put(&mut image, field::FILNAM, &filnam.to_bytes());
+        put(&mut image, field::FILNAM, &A::ptr_to_bytes(filnam));
         put(&mut image, field::RECLEN, &maxlen.to_le_bytes());
-        put(&mut image, field::DATA, &data.to_bytes());
-        put(&mut image, field::KEY, &key.to_bytes());
+        put(&mut image, field::DATA, &A::ptr_to_bytes(data));
+        put(&mut image, field::KEY, &A::ptr_to_bytes(key));
 
         // `bb->keylns[n]`, which `clckln()` fills in and which `qrybtv` and the
         // acquire family read to know how many bytes of the module's buffer are
@@ -1632,7 +1667,7 @@ impl Btrieve {
                 put(&mut image, at, &definition.length().to_le_bytes());
             }
         }
-        machine.write(block, &image).map_err(|e| e.to_string())?;
+        block.write(mem, &image).map_err(|e| e.to_string())?;
 
         self.open.push(Block {
             id: ops::BlockId::fresh(),
@@ -1676,11 +1711,11 @@ impl Btrieve {
     ///
     /// Only the stack is touched. `bb` itself is written by the caller, because
     /// `bb` is in module memory and this type deliberately keeps no copy of it.
-    pub fn set(&mut self, current: FarPtr) -> Option<String> {
+    pub fn set(&mut self, current: A::Ptr) -> Option<String> {
         let dropped = self.stack[BBSTSZ - 1];
         self.stack.copy_within(0..BBSTSZ - 1, 1);
         self.stack[0] = current;
-        if dropped == FarPtr::NULL {
+        if dropped == A::null_ptr() {
             return None;
         }
         Some(match self.find(dropped) {
@@ -1703,15 +1738,15 @@ impl Btrieve {
     /// is what this gives.
     ///
     /// Returns what to put in `bb`, and whether the stack was empty.
-    pub fn restore(&mut self) -> (FarPtr, bool) {
+    pub fn restore(&mut self) -> (A::Ptr, bool) {
         let restored = self.stack[0];
         self.stack.copy_within(1..BBSTSZ, 0);
-        (restored, restored == FarPtr::NULL)
+        (restored, restored == A::null_ptr())
     }
 
     /// The null `struct btvblk *`.
-    pub fn null() -> FarPtr {
-        FarPtr::NULL
+    pub fn null() -> A::Ptr {
+        A::null_ptr()
     }
 
     /// The mode the next `opnbtv` will use.
@@ -1865,7 +1900,7 @@ impl Btrieve {
     /// # Errors
     ///
     /// If it names no open file.
-    pub fn block(&self, at: FarPtr) -> Result<&Block, String> {
+    pub fn block(&self, at: A::Ptr) -> Result<&Block<A>, String> {
         Ok(&self.open[self.find(at)?])
     }
 
@@ -1874,7 +1909,7 @@ impl Btrieve {
     /// # Errors
     ///
     /// If it names no open file.
-    pub fn block_mut(&mut self, at: FarPtr) -> Result<&mut Block, String> {
+    pub fn block_mut(&mut self, at: A::Ptr) -> Result<&mut Block<A>, String> {
         let index = self.find(at)?;
         Ok(&mut self.open[index])
     }
@@ -1890,7 +1925,7 @@ impl Btrieve {
     }
 
     /// Every open file, in the order they were opened.
-    pub fn files(&self) -> &[Block] {
+    pub fn files(&self) -> &[Block<A>] {
         &self.open
     }
 
@@ -1955,11 +1990,11 @@ impl Btrieve {
     /// stops holding for one file and nothing says so.
     pub fn close(
         &mut self,
-        machine: &mut Machine,
-        heap: &mut crate::Heap,
-        at: FarPtr,
+        mem: &mut A::Mem,
+        heap: &mut crate::Heap<A>,
+        at: A::Ptr,
     ) -> Result<bool, BtvError> {
-        if at == FarPtr::NULL {
+        if at == A::null_ptr() {
             // `goodptr(bb=bbp)` is false for a null `bbp`.
             return Ok(false);
         }
@@ -1987,20 +2022,19 @@ impl Btrieve {
             ));
         }
 
-        let filnam_at = FarPtr {
-            offset: at.offset + field::FILNAM,
-            selector: at.selector,
-        };
-        let bytes = machine.resolve(filnam_at, 4).map_err(|e| fail(e.to_string()))?;
-        let filnam = FarPtr::from_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let filnam_at = A::ptr_offset(at, field::FILNAM);
+        let bytes = filnam_at
+            .resolve(mem, A::PTR_WIDTH)
+            .map_err(|e| fail(e.to_string()))?;
+        let filnam = A::ptr_from_bytes(bytes);
 
         // `bb->filnam=NULL` -- still written, and still before anything is
         // freed, exactly where `PLBTVSTF.C:639` writes it. A module that
         // reads its own `bb->filnam` after this call sees what the original
         // left there; this host just no longer *relies* on reading it back
         // to decide whether there was a file to close.
-        machine
-            .write(filnam_at, &FarPtr::NULL.to_bytes())
+        filnam_at
+            .write(mem, &A::ptr_to_bytes(A::null_ptr()))
             .map_err(|e| fail(e.to_string()))?;
 
         // The flush point. A block that was never written is never
@@ -2042,7 +2076,7 @@ impl Btrieve {
     /// # Errors
     /// If `at` names no open file, or [`ops::OpError`] (mode mixing, or the
     /// defensive not-positioned case -- see [`ops::Block::take_lock`]).
-    pub fn take_lock(&mut self, at: FarPtr, lock: i16) -> Result<(), String> {
+    pub fn take_lock(&mut self, at: A::Ptr, lock: i16) -> Result<(), String> {
         let index = self.find(at)?;
         self.open[index]
             .take_lock(lock, &mut self.locks)
@@ -2054,7 +2088,7 @@ impl Btrieve {
     ///
     /// # Errors
     /// If `at` names no open file.
-    pub fn lock_at_current(&self, at: FarPtr) -> Result<Option<i16>, String> {
+    pub fn lock_at_current(&self, at: A::Ptr) -> Result<Option<i16>, String> {
         let index = self.find(at)?;
         Ok(self.open[index].lock_at_current(&self.locks))
     }
@@ -2065,13 +2099,13 @@ impl Btrieve {
     ///
     /// # Errors
     /// If `at` names no open file.
-    pub fn unlock_current(&mut self, at: FarPtr) -> Result<(), String> {
+    pub fn unlock_current(&mut self, at: A::Ptr) -> Result<(), String> {
         let index = self.find(at)?;
         self.open[index].unlock(&mut self.locks);
         Ok(())
     }
 
-    fn find(&self, at: FarPtr) -> Result<usize, String> {
+    fn find(&self, at: A::Ptr) -> Result<usize, String> {
         self.open
             .iter()
             .position(|b| b.block == at)
@@ -2082,6 +2116,7 @@ impl Btrieve {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mbbs16::{FarPtr, Machine};
 
     /// A file control record with a page length, a record length and a count,
     /// and enough pages behind it to match.
@@ -3800,7 +3835,7 @@ mod tests {
         );
 
         btrieve
-            .close(&mut machine, &mut heap, dirty)
+            .close(machine.mem_mut(), &mut heap, dirty)
             .expect("closes, and reindexes on the way");
         assert_eq!(
             key_records(&dirty_path),
@@ -3819,7 +3854,7 @@ mod tests {
         let before = std::fs::read(&clean_path).expect("read before");
         let clean = open_indexed(&mut machine, &mut heap, &mut btrieve, clean_path.clone());
         btrieve
-            .close(&mut machine, &mut heap, clean)
+            .close(machine.mem_mut(), &mut heap, clean)
             .expect("closes without ever asking to reindex");
         let after = std::fs::read(&clean_path).expect("read after");
         assert_eq!(before, after, "a clean close never touches the file");
@@ -3847,7 +3882,7 @@ mod tests {
         let at = open_indexed(&mut machine, &mut heap, &mut btrieve, path);
 
         assert!(
-            btrieve.close(&mut machine, &mut heap, at).expect("closes"),
+            btrieve.close(machine.mem_mut(), &mut heap, at).expect("closes"),
             "the first close finds an open file"
         );
 
@@ -3865,7 +3900,7 @@ mod tests {
         }
 
         let second = btrieve
-            .close(&mut machine, &mut heap, at)
+            .close(machine.mem_mut(), &mut heap, at)
             .expect("a second close of the same pointer must be a quiet no-op");
         assert!(!second, "nothing was open the second time");
     }
@@ -3907,7 +3942,7 @@ mod tests {
         );
 
         btrieve
-            .close(&mut machine, &mut heap, at)
+            .close(machine.mem_mut(), &mut heap, at)
             .expect("closes");
         assert_eq!(
             btrieve.locks.get(id, position),
@@ -4258,7 +4293,15 @@ mod tests {
     #[test]
     fn a_file_opened_after_begin_is_covered_too() {
         let mut machine = Machine::new().expect("a 16-bit machine");
-        let mut heap = crate::Heap::new(crate::Config::default());
+        // Explicit `<Wg16>`, unlike every other `Heap::new` in this module:
+        // this is the first test to call the real `Btrieve::open` directly
+        // rather than through `open_indexed` (whose own signature is
+        // concrete and pins the type there) -- with nothing else in this
+        // test naming a concrete `A::Mem`/`A::Ptr`, `A` has nothing to
+        // infer from until `open`'s own call below, and Rust does not solve
+        // an associated-type equation backwards from an argument's concrete
+        // type to find which `A` produces it.
+        let mut heap = crate::Heap::<Wg16>::new(crate::Config::default());
         let mut btrieve = Btrieve::default();
 
         btrieve.begin().expect("begin before anything is open");
@@ -4274,7 +4317,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/SAMPLE.DAT");
         let geometry = Geometry::read("SAMPLE.DAT", &path).expect("reads");
         let at = btrieve
-            .open(&mut machine, &mut heap, "SAMPLE.DAT", &path, geometry, 64)
+            .open(machine.mem_mut(), &mut heap, "SAMPLE.DAT", &path, geometry, 64)
             .expect("opens");
 
         assert!(
@@ -4613,7 +4656,7 @@ mod tests {
             .expect("insert, which captures a pre-image");
 
         let e = btrieve
-            .close(&mut machine, &mut heap, at)
+            .close(machine.mem_mut(), &mut heap, at)
             .expect_err("a write from this transaction has nowhere to go on abort otherwise");
         assert!(e.why.contains("transaction"), "{e}");
 

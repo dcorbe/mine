@@ -135,6 +135,8 @@
 
 use std::fmt;
 
+use crate::abi::Abi;
+
 use super::keys::Key;
 use super::{Block, BtvError, Cursor};
 
@@ -592,7 +594,7 @@ fn here_for(cursor: Cursor, key: u16) -> Result<Option<usize>, OpError> {
 /// `GetNext` chain walk by this exact computation and gets the same record
 /// back. So [`Block::step`] keeps it; only [`here_for`] (the reverse
 /// direction Task 12 never tested) does not.
-fn physical_of(block: &Block, key: u16, at: usize) -> Result<usize, OpError> {
+fn physical_of<A: Abi>(block: &Block<A>, key: u16, at: usize) -> Result<usize, OpError> {
     let records = block.loaded().expect("Block::step already loaded the records");
     records
         .ordered(key, at)
@@ -600,7 +602,7 @@ fn physical_of(block: &Block, key: u16, at: usize) -> Result<usize, OpError> {
         .ok_or(OpError::CursorStale)
 }
 
-impl Block {
+impl<A: Abi> Block<A> {
     /// Btrieve ops 55-63, `dfaQuery` -- position the file by `key`,
     /// delivering nothing. `dfaQuery` (`DFAAPI.C:227`) is the position-only
     /// half of the family; [`Block::get`] is the half that also delivers.

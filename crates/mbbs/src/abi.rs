@@ -206,6 +206,18 @@ pub trait Abi {
     /// `u32`.
     fn ptr_checked_add(base: Self::Ptr, by: usize) -> Option<Self::Ptr>;
 
+    /// The null pointer, in this ABI's own representation.
+    ///
+    /// `crate::btrieve::Btrieve<A>` needs one to fill its ten-deep `setbtv`
+    /// stack (`FarPtr::NULL` before this task) and to answer `goodptr`-style
+    /// null checks (`bb == NULL`, `bb->filnam == NULL`) generically -- see
+    /// `crate::btrieve::Btrieve::null`'s own doc comment. `Wg16`'s is
+    /// `mbbs16::FarPtr::NULL`, a `seg:off` of `0:0`; `Wg32`'s is a flat
+    /// address of `0`, the ordinary meaning of a null pointer once "near" and
+    /// "far" collapse to one address space -- the same collapse
+    /// [`Abi::data_ptr`]'s own doc comment describes.
+    fn null_ptr() -> Self::Ptr;
+
     /// Reach this ABI's memory through its execution handle.
     ///
     /// A reborrow, not a second field: see the module doc comment ("`Call`
@@ -551,6 +563,10 @@ impl Abi for Wg16 {
         })
     }
 
+    fn null_ptr() -> Self::Ptr {
+        mbbs16::FarPtr::NULL
+    }
+
     /// `Machine::mem_mut` is the one deliberate exception Task 1's facade
     /// left: every other memory method is a narrow delegation (`resolve`,
     /// `read_cstr`, `write`, ...), but reaching `Segments` generically means
@@ -770,6 +786,10 @@ mod tests {
         fn ptr_checked_add(_base: Self::Ptr, _by: usize) -> Option<Self::Ptr> {
             // Same reasoning as `ptr_offset` above.
             unreachable!("Call's read tests never offset a pointer by a module-held value")
+        }
+
+        fn null_ptr() -> Self::Ptr {
+            Wg16::null_ptr()
         }
 
         fn mem(_cpu: &mut Self::Cpu) -> &mut Self::Mem {

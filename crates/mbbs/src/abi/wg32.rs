@@ -137,6 +137,13 @@ impl Abi for Wg32 {
         base.0.checked_add(by).map(mbbs32::Flat32Ptr)
     }
 
+    /// Flat address `0` -- there is no `seg:off` pair to be zero in both
+    /// halves of, only the one address space every other `Wg32` pointer
+    /// already names. See [`Abi::null_ptr`]'s own doc comment.
+    fn null_ptr() -> Self::Ptr {
+        mbbs32::Flat32Ptr(0)
+    }
+
     fn mem(cpu: &mut Self::Cpu) -> &mut Self::Mem {
         &mut cpu.mem
     }

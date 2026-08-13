@@ -135,6 +135,8 @@
 
 use std::path::Path;
 
+use crate::abi::Abi;
+
 use super::keys::Key;
 use super::{pages, BtvError, Geometry, Version};
 
@@ -410,7 +412,7 @@ pub fn deliver(full: &[u8], buffer_len: usize) -> (&[u8], bool) {
     (&full[..usable], usable < full.len())
 }
 
-impl super::Block {
+impl<A: Abi> super::Block<A> {
     /// This file's `B_STAT` reply, as [`Stat::read`] measures it -- see that
     /// function's doc comment for why `&self` is enough (no record load).
     ///
