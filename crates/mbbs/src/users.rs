@@ -430,6 +430,13 @@ pub struct Users<A: Abi> {
 /// `[-2]` and `[-3]` are reads rather than accidents.
 const SENTINELS: u16 = 3;
 
+/// `CHAR col`'s offset inside `struct extusr`, for a GCV2 ABI (`Wg16`).
+///
+/// Not part of [`UserLayout`], for the same reason [`EXTUSR_WID`] is not --
+/// see that constant's own doc comment. `lingo` (`SHORT`, 2 bytes) puts
+/// `col` at offset 2, one byte wide, immediately before `wid`.
+const EXTUSR_COL: Field = Field::new(0x02, 1);
+
 /// `CHAR wid`'s offset inside `struct extusr`, for a GCV2 ABI (`Wg16`).
 ///
 /// Not part of [`UserLayout`] -- a GCV2 build does not declare `wid` in
@@ -444,6 +451,23 @@ const SENTINELS: u16 = 3;
 /// this offset is trusted rather than re-measured from nothing.
 const EXTUSR_WID: Field = Field::new(0x03, 1);
 
+/// `CHAR ech`'s offset inside `struct extusr`, for a GCV2 ABI (`Wg16`).
+///
+/// Not part of [`UserLayout`], for the same reason [`EXTUSR_WID`] is not --
+/// see that constant's own doc comment. Immediately after `wid`, one byte
+/// wide, at offset 4 -- the sentinel byte `wid_mem_round_trips_through_extusr_
+/// without_disturbing_its_neighbours` already pokes at this exact offset,
+/// before this constant existed to name it.
+const EXTUSR_ECH: Field = Field::new(0x04, 1);
+
+/// `CHAR col`'s offset inside `struct user`, for a non-GCV2 ABI (`Wg32`).
+///
+/// `MAJORBBS.H:98`'s `#ifndef GCV2` branch keeps `col` inline, immediately
+/// before `wid`. See [`WG32_USER_WID`]'s own doc comment for how this whole
+/// neighbourhood (`col`/`wid`/`ech`/`byecnt` landing exactly on `lcstat`'s
+/// already-measured 0x54) was derived.
+const WG32_USER_COL: Field = Field::new(0x50, 1);
+
 /// `CHAR wid`'s offset inside `struct user`, for a non-GCV2 ABI (`Wg32`).
 ///
 /// `MAJORBBS.H:98`'s `#ifndef GCV2` branch keeps `wid` inline, immediately
@@ -455,6 +479,12 @@ const EXTUSR_WID: Field = Field::new(0x03, 1);
 /// `lcstat`'s own already-measured 0x54
 /// (`user_layout_matches_both_abis_declared_field_sets`'s `Wg32` half).
 const WG32_USER_WID: Field = Field::new(0x51, 1);
+
+/// `CHAR ech`'s offset inside `struct user`, for a non-GCV2 ABI (`Wg32`).
+///
+/// `MAJORBBS.H:98`'s `#ifndef GCV2` branch keeps `ech` inline, immediately
+/// after `wid`. See [`WG32_USER_WID`]'s own doc comment for the derivation.
+const WG32_USER_ECH: Field = Field::new(0x52, 1);
 
 impl<A: Abi> Users<A> {
     /// How many channels there are -- and the only thing that names one.
@@ -804,24 +834,43 @@ impl<A: Abi> Users<A> {
         self.write_field_u16(mem, at, self.user.substt, substt)
     }
 
-    /// Where `usrptr->wid` lives for this ABI, and how wide it is.
+    /// Where a `struct extusr`-relocated field lives for this ABI, and how
+    /// wide it is -- the shape `wid`/`col`/`ech` all share.
     ///
-    /// Not one offset off one base: GCV2 (`Wg16`) moved `wid` out of
-    /// `struct user` entirely, into `struct extusr` ([`Users::extra`],
-    /// [`EXTUSR_WID`]); non-GCV2 (`Wg32`) never moved it, and it is read
-    /// inline off [`Users::slot`] at [`WG32_USER_WID`]. See those two
-    /// constants' own doc comments for how each offset was derived.
-    fn wid_field(&self, unum: Chan) -> Result<(A::Ptr, Field), ShimError> {
+    /// Not one offset off one base: GCV2 (`Wg16`) moved all three out of
+    /// `struct user` entirely, into `struct extusr` ([`Users::extra`]);
+    /// non-GCV2 (`Wg32`) never moved them, and each is read inline off
+    /// [`Users::slot`] instead. `gcv2`/`wg32` are the pair of constants for
+    /// whichever one field this call is resolving -- [`EXTUSR_WID`]/
+    /// [`WG32_USER_WID`] and their `col`/`ech` siblings -- and `name` is only
+    /// for the error message, so a GCV2 host with no `extusr` table says
+    /// which field it failed to find rather than just "some field".
+    fn extusr_field(&self, unum: Chan, name: &str, gcv2: Field, wg32: Field) -> Result<(A::Ptr, Field), ShimError> {
         if A::GCV2 {
             let base = self.extra(unum).ok_or_else(|| {
                 ShimError::Failed(format!(
-                    "user[{unum}].wid: this ABI is GCV2 but built no extusr table"
+                    "user[{unum}].{name}: this ABI is GCV2 but built no extusr table"
                 ))
             })?;
-            Ok((A::ptr_offset(base, EXTUSR_WID.at), EXTUSR_WID))
+            Ok((A::ptr_offset(base, gcv2.at), gcv2))
         } else {
-            Ok((A::ptr_offset(self.slot(unum), WG32_USER_WID.at), WG32_USER_WID))
+            Ok((A::ptr_offset(self.slot(unum), wg32.at), wg32))
         }
+    }
+
+    /// Where `usrptr->wid` lives for this ABI. See [`Users::extusr_field`].
+    fn wid_field(&self, unum: Chan) -> Result<(A::Ptr, Field), ShimError> {
+        self.extusr_field(unum, "wid", EXTUSR_WID, WG32_USER_WID)
+    }
+
+    /// Where `usrptr->col` lives for this ABI. See [`Users::extusr_field`].
+    fn col_field(&self, unum: Chan) -> Result<(A::Ptr, Field), ShimError> {
+        self.extusr_field(unum, "col", EXTUSR_COL, WG32_USER_COL)
+    }
+
+    /// Where `usrptr->ech` lives for this ABI. See [`Users::extusr_field`].
+    fn ech_field(&self, unum: Chan) -> Result<(A::Ptr, Field), ShimError> {
+        self.extusr_field(unum, "ech", EXTUSR_ECH, WG32_USER_ECH)
     }
 
     /// `usrptr->wid` -- the secret-character-echo line width, against
@@ -850,6 +899,63 @@ impl<A: Abi> Users<A> {
     /// Same as [`Users::wid_mem`].
     pub fn set_wid_mem(&mut self, mem: &mut A::Mem, unum: Chan, value: u8) -> Result<(), ShimError> {
         let (at, _field) = self.wid_field(unum)?;
+        at.write(mem, &[value]).map_err(|e| ShimError::Failed(e.to_string()))
+    }
+
+    /// `usrptr->col` -- the secret-echo column cursor `echsec` resets to
+    /// zero, against memory directly rather than a whole `Machine`. See
+    /// [`Users::wid_mem`] for the ABI-split this shares.
+    ///
+    /// Nothing on this host reads it back: `secchi`, the only real reader
+    /// (`MAJORBBS.C:4577`), has no shim here -- see `shims::user::echsec`'s
+    /// own doc comment for what that costs. The accessor exists anyway so a
+    /// write lands at the true vendor byte rather than nowhere, and so a
+    /// test can prove it does.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Users::wid_mem`].
+    pub fn col_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u8, ShimError> {
+        let (at, field) = self.col_field(unum)?;
+        let bytes = at
+            .resolve(mem, usize::from(field.width))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(bytes[0])
+    }
+
+    /// Write `usrptr->col`. See [`Users::col_mem`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Users::wid_mem`].
+    pub fn set_col_mem(&mut self, mem: &mut A::Mem, unum: Chan, value: u8) -> Result<(), ShimError> {
+        let (at, _field) = self.col_field(unum)?;
+        at.write(mem, &[value]).map_err(|e| ShimError::Failed(e.to_string()))
+    }
+
+    /// `usrptr->ech` -- the character `secchi` would echo back in place of
+    /// whatever was typed, against memory directly rather than a whole
+    /// `Machine`. See [`Users::col_mem`] for why this is write-observable
+    /// only through a test, not through any consumer this host runs.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Users::wid_mem`].
+    pub fn ech_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u8, ShimError> {
+        let (at, field) = self.ech_field(unum)?;
+        let bytes = at
+            .resolve(mem, usize::from(field.width))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(bytes[0])
+    }
+
+    /// Write `usrptr->ech`. See [`Users::ech_mem`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Users::wid_mem`].
+    pub fn set_ech_mem(&mut self, mem: &mut A::Mem, unum: Chan, value: u8) -> Result<(), ShimError> {
+        let (at, _field) = self.ech_field(unum)?;
         at.write(mem, &[value]).map_err(|e| ShimError::Failed(e.to_string()))
     }
 
@@ -1860,5 +1966,42 @@ mod tests {
         let stride = UserLayout::of::<Wg16>().stride;
         let bytes = f.machine.resolve(slot, usize::from(stride)).expect("readable");
         assert!(bytes.iter().all(|b| *b == 0), "struct user is untouched by a wid write");
+    }
+
+    /// `Users::col_mem`/`set_col_mem` and `ech_mem`/`set_ech_mem` round-trip
+    /// through `extusr`, the same way [`wid_mem_round_trips_through_extusr_
+    /// without_disturbing_its_neighbours`] already proved for `wid` -- and
+    /// `wid` itself, sitting directly between them at 0x03, is the sentinel
+    /// this time: a `col` or `ech` write that landed one byte short or long
+    /// would show up here as `wid` corruption instead.
+    #[test]
+    fn col_and_ech_mem_round_trip_through_extusr_without_disturbing_wid() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+
+        assert_eq!(f.host.users().col_mem(f.machine.mem(), console).expect("read"), 0);
+        assert_eq!(f.host.users().ech_mem(f.machine.mem(), console).expect("read"), 0);
+
+        f.host
+            .users_mut()
+            .set_wid_mem(f.machine.mem_mut(), console, 0xCC)
+            .expect("sentinel write");
+
+        f.host
+            .users_mut()
+            .set_col_mem(f.machine.mem_mut(), console, 7)
+            .expect("write");
+        f.host
+            .users_mut()
+            .set_ech_mem(f.machine.mem_mut(), console, b'*')
+            .expect("write");
+
+        assert_eq!(f.host.users().col_mem(f.machine.mem(), console).expect("read"), 7);
+        assert_eq!(f.host.users().ech_mem(f.machine.mem(), console).expect("read"), b'*');
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            0xCC,
+            "col/ech writes must not have touched wid, sitting between them"
+        );
     }
 }

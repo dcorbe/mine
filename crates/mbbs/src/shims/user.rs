@@ -907,22 +907,22 @@ const BBSPRV: u16 = 2;
 ///
 /// **What is lost**: on the real host, installing `NULL` also means no
 /// handler runs on the *next* keystroke; the handler itself (`secchi`,
-/// `MAJORBBS.C:4570`, the per-character `'*'`-masking routine `echsec`
-/// installs) has no shim here -- `echsec` is not implemented. So today,
-/// nothing this host runs ever sets `wid` above zero in the first place,
-/// which means the `if` branch below is unreachable in practice until
-/// `echsec` lands. It is implemented anyway, faithfully, rather than
-/// assumed dead: a module can write `usrptr->wid` directly without going
-/// through `echsec` at all, and leaving the branch out would be exactly the
-/// quiet wrongness this crate refuses to ship.
+/// `MAJORBBS.C:4570`, the per-character `'*'`-masking routine [`echsec`]
+/// installs) has no shim here -- see [`echsec`]'s own doc comment for what
+/// that costs. `echsec` **is** implemented (it is what installs `wid > 0` in
+/// the first place, via `raw = true`), so the branch below is live the
+/// moment a channel that called `echsec` calls `echon`/`echonu` to end the
+/// session -- not merely "implemented anyway, in case a module pokes `wid`
+/// directly" the way it was before `echsec` landed.
 ///
 /// # `raw` is a shared slot, and this reproduces that conflation rather than fixing it
 ///
-/// If some *other* consumer of `Channel::raw` (today, only FSD) is holding
-/// it when `echonu` fires with `wid > 0`, this clears it out from under that
-/// consumer -- exactly what the real host's single `btuchi` slot would also
-/// have done, since `secchi` and `fsdchi` compete for the same one handler
-/// there too. Not a fidelity gap this port introduced.
+/// If some *other* consumer of `Channel::raw` (FSD, or an `echsec` session
+/// that has not yet ended) is holding it when `echonu` fires with `wid > 0`,
+/// this clears it out from under that consumer -- exactly what the real
+/// host's single `btuchi` slot would also have done, since `secchi` and
+/// `fsdchi` compete for the same one handler there too. Not a fidelity gap
+/// this port introduced.
 ///
 /// # Errors
 ///
@@ -934,19 +934,169 @@ pub fn echonu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .terms()
         .chan(usrnum)
         .ok_or_else(|| ShimError::Failed(format!("echonu({usrnum}): there is no such channel")))?;
+    turn_echo_on(call, host, chan)
+}
 
+/// The body `echonu`'s own doc comment already walks through in full --
+/// `btuech(usrnum, echtyp[grpnum[usrnum]])` then, if a secret-echo session
+/// (`echsec`) left `wid > 0`, `btuchi(usrnum,NULL)` and `wid=0` -- pulled out
+/// so [`echon`] can reach it too. Both routines resolve `usrnum` to a
+/// [`crate::Chan`] their own way -- `echonu` reads it as an argument,
+/// `echon` reads the global -- and hand the same channel in here.
+fn turn_echo_on<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, chan: crate::Chan) -> Result<abi::Ret<A>, ShimError> {
     // `btuech(usrnum, echtyp[grpnum[usrnum]])` -- always turns echo ON on
-    // this host. See this function's own doc comment for why `1` is a fact
+    // this host. See [`echonu`]'s own doc comment for why `1` is a fact
     // about the vendor source rather than a stand-in for missing
     // configuration.
     host.gsbl_mut().channel_mut(chan).echo = true;
 
     if host.users().wid_mem(call.mem(), chan)? > 0 {
-        // `btuchi(usrnum,NULL)` -- see this function's own doc comment for
-        // why that collapses to `raw = false` here.
+        // `btuchi(usrnum,NULL)` -- see [`echonu`]'s own doc comment for why
+        // that collapses to `raw = false` here.
         host.gsbl_mut().channel_mut(chan).raw = false;
         host.users_mut().set_wid_mem(call.mem(), chan, 0)?;
     }
+
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID echon(VOID)` -- turn echo on for whichever channel is current.
+///
+/// `MAJORBBS.C:4541`:
+///
+///
+/// One line in the original, and this shim is not much more: [`echonu`]'s
+/// own doc comment already covers everything the body does (why `echtyp[
+/// grpnum[usrnum]]` is always `1` here, where `wid` lives for a GCV2 ABI,
+/// and what `btuchi(usrnum,NULL)` collapses to) -- [`turn_echo_on`] is that
+/// body, shared rather than copied. This shim's only job is the half
+/// `echonu` did not have to do for itself: `echon` takes no argument, so the
+/// channel comes from the `usrnum` global instead, read the same way
+/// [`getin`]/[`haskey`] already do.
+///
+/// # Errors
+///
+/// If `usrnum` cannot be read, if it names no channel, or if the `wid`
+/// read/write fails.
+pub fn echon<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let usrnum = host
+        .globals()
+        .word_mem(call.mem(), "usrnum")
+        .map_err(|e| ShimError::Failed(format!("echon: usrnum: {e}")))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(usrnum)
+        .ok_or_else(|| ShimError::Failed(format!("echon: usrnum {usrnum} names no channel")))?;
+    turn_echo_on(call, host, chan)
+}
+
+/// `VOID echsec(CHAR ech, INT lwidth)` -- start a secret-character-echo
+/// session on the current channel: echo `ech` in place of whatever the user
+/// actually types, up to `lwidth` characters, the mechanism a password
+/// prompt is built on.
+///
+/// `MAJORBBS.C:4558`:
+///
+///
+/// Like [`echon`], this takes no channel argument -- `usrnum` names it, read
+/// the same way [`getin`]/[`haskey`]/`echon` already do.
+///
+/// # `ech` is a byte, read as one regardless of how it was widened
+///
+/// `CHAR` is promoted to `int` in the calling convention (`INC/MAJORBBS.H:846`'s
+/// prototype), and Borland's plain `char` is signed, so a real masking
+/// character with the high bit set arrives sign-extended rather than
+/// zero-extended. That does not matter here: sign- and zero-extension both
+/// leave the low 8 bits exactly as the caller wrote them, so a plain
+/// truncating cast recovers the original byte either way. This is
+/// deliberately **not** `shims::gsbl`'s `u8_arg` -- that reader *refuses* a
+/// value that does not fit a `u8`, which is right for an argument that is
+/// genuinely bounded (a pause character, a flow-control byte) but wrong
+/// here: a sign-extended `0xFF` char widens to `0xFFFFFFFF` under `Wg32`,
+/// which does not fit a `u8` at all even though it names a perfectly good
+/// masking character once truncated. `lwidth`, by contrast, is read through
+/// [`super::sign_extend`] -- the same helper [`mdfgets`] uses for its `size`
+/// -- because `lwidth` is a genuine signed quantity the `max(1,min(255,_))`
+/// clamp below has to see the true sign of (a negative `lwidth` must clamp
+/// to `1`, not wrap into a huge unsigned width).
+///
+/// # `col`/`ech` are written faithfully; nothing on this host reads them back
+///
+/// See [`Users::col_mem`](crate::users::Users::col_mem)'s own doc comment:
+/// `secchi` (`MAJORBBS.C:4570`), the per-character interrupt handler that
+/// would consult `col`/`wid`/`ech` on every keystroke, has no shim here --
+/// [`echonu`]'s own doc comment already established that `btuchi` collapses
+/// to the single shared [`crate::gsbl::Channel::raw`] flag, and that nothing
+/// this host runs implements a real per-character handler at all. This shim
+/// still writes all three fields at their true vendor offsets, because a
+/// module (or a future `secchi` shim) reading `usrptr` directly must see
+/// what the real host would have left there -- but no output this host
+/// produces today is shaped by any of the three.
+///
+/// # What `raw = true` gets right, and what it does not
+///
+/// `btuchi(usrnum,secchi)` is rendered as `ch.raw = true` -- the same
+/// direction [`crate::shims::fsd::fsdcon`] already turns it, and the exact
+/// mirror of `echonu`'s own `ch.raw = false` for `btuchi(usrnum,NULL)`.
+/// [`crate::gsbl::Gsbl::take`]'s own doc comment is what that flag actually
+/// buys: every keystroke bypasses the ordinary line editor/echo pipeline
+/// entirely and lands in the channel's raw input queue untouched, waking the
+/// module with `CYCLE` instead of `CRSTG` -- which is a faithful rendering
+/// of "control has left line mode for a character-at-a-time handler", the
+/// half `secchi`'s *installation* is responsible for.
+///
+/// What is lost is everything `secchi` itself would have done on each of
+/// those keystrokes: no `ech` character is echoed back in its place (this
+/// host echoes nothing at all while `raw` is set, per `Gsbl::take`), no
+/// backspace visually erases a masked character, and no `col`/`wid` gate
+/// silently drops input past the configured width. On the real host, a user
+/// typing a password under `echsec` sees a row of `ech` characters growing
+/// and shrinking as they type; on this host today they see nothing echoed
+/// at all, and the raw bytes queue up for whatever reads `chi`-style input
+/// directly rather than being pre-filtered by `secchi`'s `return(c)`
+/// gate. That is a real, user-visible gap -- not a naming difference -- and
+/// it stays open until a `secchi` shim exists to read the fields this
+/// routine faithfully writes.
+///
+/// # `raw` is a shared slot, same as `echonu`
+///
+/// If FSD is holding [`crate::gsbl::Channel::raw`] for its own reasons when
+/// `echsec` fires, this claims it -- exactly what the real host's one
+/// `btuchi` slot would also have done, and not a fidelity gap this port
+/// introduced; see [`echonu`]'s own doc comment for the fuller discussion.
+///
+/// # Errors
+///
+/// If `usrnum` cannot be read, if it names no channel, or if any of the
+/// `col`/`wid`/`ech` writes fail.
+pub fn echsec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let ech = Into::<u32>::into(call.int()) as u8;
+    let lwidth = super::sign_extend::<A>(call.int().into());
+
+    let usrnum = host
+        .globals()
+        .word_mem(call.mem(), "usrnum")
+        .map_err(|e| ShimError::Failed(format!("echsec: usrnum: {e}")))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(usrnum)
+        .ok_or_else(|| ShimError::Failed(format!("echsec: usrnum {usrnum} names no channel")))?;
+
+    // `btuech(usrnum,0)` -- echo OFF, the opposite of `echonu`'s always-on.
+    host.gsbl_mut().channel_mut(chan).echo = false;
+    // `usrptr->col=0`
+    host.users_mut().set_col_mem(call.mem(), chan, 0)?;
+    // `usrptr->wid=(CHAR)(max(1,min(255,lwidth)))`
+    let wid = lwidth.clamp(1, 255) as u8;
+    host.users_mut().set_wid_mem(call.mem(), chan, wid)?;
+    // `usrptr->ech=ech`
+    host.users_mut().set_ech_mem(call.mem(), chan, ech)?;
+    // `btuchi(usrnum,secchi)` -- see this function's own doc comment for what
+    // installing the real handler is lost, and why `raw = true` is the
+    // faithful collapse anyway.
+    host.gsbl_mut().channel_mut(chan).raw = true;
 
     Ok(abi::Ret::Void)
 }
@@ -1817,10 +1967,11 @@ mod tests {
 
     #[test]
     fn echonu_ends_a_secret_echo_session_once_wid_is_set() {
-        // Simulates what `echsec` (not implemented -- see `echonu`'s own doc
-        // comment) would have left behind: a nonzero `wid` and the shared
-        // `raw` flag turned on for `secchi`. `echonu` is the paired
-        // teardown -- both must clear.
+        // Simulates what `echsec` leaves behind (and see
+        // `echsec_installs_a_secret_echo_session`, below, for the same thing
+        // proven through the real call rather than poked directly): a
+        // nonzero `wid` and the shared `raw` flag turned on for `secchi`.
+        // `echonu` is the paired teardown -- both must clear.
         let mut f = Fixture::new();
         let console = f.console();
         f.host
@@ -1865,5 +2016,113 @@ mod tests {
         let mut f = Fixture::new();
         let past = f.host.users().terms().count();
         assert!(f.invoke(echonu, &[past]).is_err());
+    }
+
+    #[test]
+    fn echon_turns_echo_on_for_whichever_channel_usrnum_names() {
+        // `echon(VOID)` is `echonu(usrnum)` -- it takes no argument of its
+        // own and reads the current channel out of the `usrnum` global
+        // instead, the same way `getin`/`haskey` do.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+        f.host.gsbl_mut().channel_mut(console).echo = false;
+
+        f.invoke(echon, &[]).expect("ok");
+
+        assert!(f.host.gsbl().channel(console).echo, "echon() always turns echo on");
+    }
+
+    #[test]
+    fn echon_stops_when_usrnum_names_no_channel() {
+        // `usrnum` is -1 for as long as nobody is on a channel -- the same
+        // sentinel `haskey`'s own doc comment already names.
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &(-1i16).to_le_bytes())
+            .expect("usrnum is placed");
+
+        assert!(f.invoke(echon, &[]).is_err());
+    }
+
+    #[test]
+    fn echsec_installs_a_secret_echo_session() {
+        // `MAJORBBS.C:4558`: `btuech(usrnum,0)`, `col=0`,
+        // `wid=max(1,min(255,lwidth))`, `ech=ech`, `btuchi(usrnum,secchi)`.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+        f.host.gsbl_mut().channel_mut(console).echo = true;
+        f.host
+            .users_mut()
+            .set_col_mem(f.machine.mem_mut(), console, 9)
+            .expect("nonzero col before the call");
+
+        f.invoke(echsec, &[b'*' as u16, 40]).expect("ok");
+
+        assert!(!f.host.gsbl().channel(console).echo, "btuech(usrnum,0) turns echo off");
+        assert_eq!(f.host.users().col_mem(f.machine.mem(), console).expect("read"), 0);
+        assert_eq!(f.host.users().wid_mem(f.machine.mem(), console).expect("read"), 40);
+        assert_eq!(f.host.users().ech_mem(f.machine.mem(), console).expect("read"), b'*');
+        assert!(
+            f.host.gsbl().channel(console).raw,
+            "btuchi(usrnum,secchi) installs a handler -- see echsec's own doc comment for the collapse"
+        );
+    }
+
+    #[test]
+    fn echsec_clamps_lwidth_to_one_through_two_hundred_fifty_five() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+
+        f.invoke(echsec, &[b'*' as u16, 0]).expect("ok");
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            1,
+            "max(1, min(255, 0)) == 1"
+        );
+
+        f.invoke(echsec, &[b'*' as u16, 9000]).expect("ok");
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            255,
+            "max(1, min(255, 9000)) == 255"
+        );
+
+        f.invoke(echsec, &[b'*' as u16, -5i16 as u16]).expect("ok");
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            1,
+            "max(1, min(255, -5)) == 1"
+        );
+    }
+
+    #[test]
+    fn echsec_reads_ech_as_a_byte_not_a_checked_small_int() {
+        // `CHAR ech` is promoted to `int` at the call site -- Borland's plain
+        // `char` is signed, so a byte like 0xFF (a real, if unusual,
+        // masking character) arrives sign-extended. The low byte survives
+        // either extension untouched, so a truncating cast is the right
+        // reading; a `u8`-checked reader like `shims::gsbl`'s `u8_arg` would
+        // wrongly refuse it.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+
+        f.invoke(echsec, &[0xFFu16, 10]).expect("ok");
+        assert_eq!(f.host.users().ech_mem(f.machine.mem(), console).expect("read"), 0xFF);
+    }
+
+    #[test]
+    fn echsec_stops_when_usrnum_names_no_channel() {
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &(-1i16).to_le_bytes())
+            .expect("usrnum is placed");
+
+        assert!(f.invoke(echsec, &[b'*' as u16, 40]).is_err());
     }
 }
