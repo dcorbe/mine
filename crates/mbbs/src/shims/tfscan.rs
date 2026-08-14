@@ -97,6 +97,11 @@
 //! above scans a config file start-to-finish inside one routine, in one
 //! uninterrupted `while (tfsrdl() != TFSDUN)` loop -- nothing yields
 //! mid-scan. So [`TfScan`] is a single value, not a per-channel table.
+//!
+//! The reachability argument for this family -- a uniform two-call-site
+//! count, exclusive to MajorMUD rather than shared with LunatiX,
+//! Tele-Arena or The Rose, and both sites confirmed genuine gameplay use
+//! -- is recorded in `docs/2026-08-14-tfscan-reachability.md`.
 
 use std::collections::VecDeque;
 use std::fs::File;
