@@ -167,6 +167,28 @@ struct Cli {
     /// state must never collide.
     #[arg(long, value_name = "PATH")]
     root32: Option<PathBuf>,
+
+    /// This board's Galacticomm registration number -- the `bturno` global,
+    /// `BRKTHU.H:108`, eight digits.
+    ///
+    /// Absent, `bturno` stays as `Host::new` placed it: nine zero bytes, a
+    /// board with no serial. That was this binary's only behaviour until
+    /// now, and it is not neutral -- `bturno` is a `GALGSBL` datum modules
+    /// read directly, and MajorBBS-family modules key their own licensing on
+    /// it, so a blank one makes every board look identical and unregistered
+    /// to anything that checks.
+    #[arg(long, value_name = "DIGITS")]
+    bturno: Option<String>,
+
+    /// `--bturno` for the 32-bit machine, when the two boards do not share a
+    /// serial. Falls back to `--bturno` when absent.
+    ///
+    /// Two machines on one server are two boards; nothing says one
+    /// registration covers both, and a module on the second machine reading
+    /// the first machine's serial would be a quiet lie rather than a
+    /// convenience.
+    #[arg(long, value_name = "DIGITS")]
+    bturno32: Option<String>,
 }
 
 /// Range-check `--terms` before it ever reaches `Terms::new`, which panics
@@ -309,6 +331,7 @@ async fn main() -> ExitCode {
         root: cli.root.clone(),
         module: cli.module.clone(),
         terms,
+        bturno: cli.bturno.clone(),
         polls_per_wake: cli.polls_per_wake,
         passes: cli.passes,
         clock_reads: None,
@@ -331,6 +354,7 @@ async fn main() -> ExitCode {
             root: root32,
             module: module32,
             terms,
+            bturno: cli.bturno32.clone().or_else(|| cli.bturno.clone()),
             polls_per_wake: cli.polls_per_wake,
             passes: cli.passes,
             clock_reads: None,

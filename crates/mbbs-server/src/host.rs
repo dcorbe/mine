@@ -103,6 +103,20 @@ pub struct Boot<A: Abi> {
     pub module: PathBuf,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,
+    /// The board's own Galacticomm registration number -- `bturno`,
+    /// `BRKTHU.H:108`, eight digits and a NUL.
+    ///
+    /// `None` leaves the global as `Host::new` placed it: nine zero bytes.
+    /// That is what this host did unconditionally until now, and it is not a
+    /// neutral default -- it is a board with no serial. The real article got
+    /// this from the board's own registration and modules read it: it is a
+    /// `GALGSBL` datum (`crate::shims`'s table serves it), MajorBBS-family
+    /// modules key their own licensing on it, and a module that finds it
+    /// blank cannot tell a board apart from any other.
+    ///
+    /// Set per machine rather than per process because two machines on one
+    /// server are two boards; nothing says they share a serial.
+    pub bturno: Option<String>,
     /// Poll dispatches granted per driver wake. See [`Host::refill_polls`].
     pub polls_per_wake: usize,
     /// Passes made per [`Host::cycle`] call.
@@ -416,6 +430,14 @@ fn life<A: Abi>(
     if let Some(inventory) = survey {
         host.enable_survey(inventory.clone());
     }
+    // Before the module runs a single instruction: `bturno` is read during
+    // init by modules that gate on it, so a serial written after ordinal 1
+    // would be written too late to be seen. See `Boot::bturno`.
+    if let Some(serial) = &boot.bturno {
+        host.globals()
+            .write_mem(A::mem(&mut machine), "bturno", serial.as_bytes())?;
+    }
+
     let file = std::fs::read(&boot.module)?;
     let module = host.load(&mut machine, &file).map_err(io::Error::other)?;
     let entry = A::init_entry(&module)
