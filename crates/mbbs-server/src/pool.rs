@@ -19,18 +19,19 @@
 //!
 //! **[`MachineId`] and [`Routed`] are that fact, made a value.** Task 20 of
 //! `docs/plans/2026-08-12-abi-border-implementation.md` built the pairing
-//! the paragraph above only used to describe: `main.rs` assigns one
-//! `MachineId` per `serve` call it makes (`crate::host::Boot::machine`), and
-//! [`Pool::take`] hands back a `Routed` -- the id plus the `Chan` -- rather
-//! than a bare `Chan`. That is the actual process-wide key wherever a
-//! connection gets mapped to a host: `crate::msg::In::Connect`'s reply and
-//! `In::Input`/`In::Disconnect`'s `chan` field all carry `Routed`, and
-//! `crate::conn`'s per-connection state holds one for the connection's whole
-//! life. Only one machine boots today (`main.rs` calls `conn::serve` once),
-//! so every `Routed` in a running process currently shares the same
-//! `MachineId` -- the type does not depend on that changing, and nothing
-//! here builds a registry or a selector across machines; see Task 22 for
-//! that, not yet designed.
+//! the paragraph above only used to describe: whoever builds a
+//! `crate::conn::Machine` assigns one `MachineId` per machine
+//! (`crate::host::Boot::machine`), and [`Pool::take`] hands back a `Routed`
+//! -- the id plus the `Chan` -- rather than a bare `Chan`. That is the
+//! actual process-wide key wherever a connection gets mapped to a host:
+//! `crate::msg::In::Connect`'s reply and `In::Input`/`In::Disconnect`'s
+//! `chan` field all carry `Routed`, and `crate::conn`'s per-connection state
+//! holds one for the connection's whole life. Task 22 (same plan) built the
+//! registry and the connect-time selector this comment used to say did not
+//! exist yet -- `main.rs` may now call `conn::spawn_machine` more than once
+//! and hand every result to one `conn::serve_on` call, so a running process
+//! can genuinely mint `Routed` values with different `MachineId`s; see
+//! `crate::conn`'s own module doc, "The connect-time selector".
 
 use std::collections::VecDeque;
 

@@ -1,12 +1,13 @@
 //! The `mbbs-server` binary: parse arguments, boot the host thread, listen.
 
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use mbbs::Terms;
-use mbbs::abi::Wg16;
-use mbbs_server::conn::{self, Listener, default_keys};
+use mbbs::abi::{Wg16, Wg32, Wg32Cpu};
+use mbbs_server::conn::{self, Listener, Machine, default_keys};
 use mbbs_server::host::Boot;
 use mbbs_server::pool::MachineId;
 use mbbs_server::termcompat::Stack;
@@ -14,6 +15,36 @@ use mbbs_server::termcompat::Stack;
 const DEFAULT_MODULE: &str = "re/WCCMMUD.DLL";
 const DEFAULT_LISTEN: &str = "127.0.0.1:2323";
 const DEFAULT_TERMS: u16 = 2;
+
+/// [`select_machine`]'s label for the always-present `Wg16` machine.
+///
+/// [`select_machine`]: mbbs_server::conn
+const WG16_LABEL: &str = "MajorMUD";
+
+/// [`select_machine`]'s label for the optional `Wg32` machine, `--module32`.
+///
+/// [`select_machine`]: mbbs_server::conn
+const WG32_LABEL: &str = "LunatiX";
+
+/// The arena [`Wg32Cpu::new`]'s placeholder `Memory` reserves for
+/// `--module32`'s host-allocated regions (`ModuleMem::alloc_region`, design
+/// doc Part 3) -- everything a `Wg32` module asks the host to allocate at
+/// runtime, on top of its own loaded image.
+///
+/// **Provisional, the same way `DEFAULT_POLLS_PER_WAKE` is provisional.** No
+/// real 32-bit module has ever run against this host long enough to measure
+/// what it actually needs (`crates/mbbs/tests/wg32_round_trip.rs`'s own
+/// fixture gets by on `0x0002_0000`, but that is a synthetic one-import
+/// module built to prove the border works, not LunatiX). 16 MiB is a
+/// generous guess, not a measurement: undershoot fails loudly
+/// (`Memory::alloc`'s `OutOfMemory`, not silent corruption -- `flatptr.rs`
+/// bounds-checks every access against the arena's real mapped range), so the
+/// honest failure mode of guessing too small is a board that refuses to
+/// serve rather than one that corrupts state, and overshoot only costs
+/// address space `MAP_32BIT` has to spare, not RSS (anonymous pages are not
+/// resident until touched). Retune from a real session's high-water mark,
+/// not from this comment.
+const DEFAULT_WG32_ARENA_BYTES: usize = 0x0100_0000;
 
 /// Poll dispatches granted per driver wake -- `--polls-per-wake`'s default.
 ///
@@ -116,6 +147,26 @@ struct Cli {
     /// gaps at PATH; never leave it on for real play.
     #[arg(long, value_name = "PATH")]
     survey_unimplemented_and_corrupt_the_session: Option<PathBuf>,
+
+    /// A second, 32-bit module to boot alongside the primary `Wg16` one
+    /// (LunatiX, design doc §4a). When given, a connect-time selector
+    /// appears -- see `mbbs_server::conn`'s module doc, "The connect-time
+    /// selector" -- naming this machine `LunatiX` and the always-present one
+    /// `MajorMUD`. When absent, this binary behaves exactly as it did before
+    /// this flag existed: no prompt, one machine. Requires `--root32`, since
+    /// this machine's own data files must not share a directory with the
+    /// primary machine's.
+    #[arg(long, requires = "root32", value_name = "PATH")]
+    module32: Option<PathBuf>,
+
+    /// The 32-bit module's own board directory -- only meaningful together
+    /// with `--module32`. Deliberately has no default and is not allowed to
+    /// fall back to `--root`: two machines writing into the same root would
+    /// silently share (and corrupt) one module's Btrieve files with the
+    /// other's -- see `mbbs_server::pool`'s module doc on why two machines'
+    /// state must never collide.
+    #[arg(long, value_name = "PATH")]
+    root32: Option<PathBuf>,
 }
 
 /// Range-check `--terms` before it ever reaches `Terms::new`, which panics
@@ -176,6 +227,38 @@ fn listeners(cli: &Cli) -> Vec<Listener<'_>> {
         .collect()
 }
 
+/// Build [`Boot::build`]'s closure for a `Wg32` machine: read `module_path`'s
+/// bytes, parse them as a PE, and build a placeholder [`Wg32Cpu`] -- a
+/// [`mbbs_machine::m32::Machine`] plus a [`mbbs_machine::m32::Memory`]
+/// wrapping this same file's own [`mbbs_machine::m32::Image`], exactly the
+/// shape `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
+/// builds from a synthetic fixture -- this one is real. `host::life` (in
+/// `mbbs-server/src/host.rs`) reads `boot.module` (the same path) again
+/// immediately after this runs and calls `host.load`, whose `Wg32::load`
+/// replaces this placeholder image wholesale via
+/// [`mbbs_machine::m32::Memory::replace_image`] while leaving the arena this
+/// closure reserved untouched -- see that method's own doc comment, and
+/// `wg32_round_trip.rs`'s module doc, "The load-order hazard this file first
+/// exposed, now fixed". Building the placeholder from the module's own
+/// bytes, rather than a throwaway skeleton, means a file that cannot even be
+/// read or parsed as a PE fails here, on `Boot::build`, with the same error
+/// `host.load` would otherwise report one line later.
+///
+/// `Fn`, not `FnOnce`: [`host::run`]'s restart loop calls [`Boot::build`]
+/// once per life (see its own doc comment, "Surviving a module stop"), so
+/// this closure re-reads and re-parses the file every restart rather than
+/// only once at process start.
+fn build_wg32_cpu(module_path: PathBuf) -> impl Fn() -> io::Result<Wg32Cpu> + Send {
+    move || {
+        let file = std::fs::read(&module_path)?;
+        let pe = mbbs_machine::m32::PeImage::parse(&file).map_err(io::Error::other)?;
+        let image = mbbs_machine::m32::Image::load(&file, &pe)?;
+        let mem = mbbs_machine::m32::Memory::new(image, DEFAULT_WG32_ARENA_BYTES)?;
+        let machine = mbbs_machine::m32::Machine::new()?;
+        Ok(Wg32Cpu::new(machine, mem))
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -203,24 +286,23 @@ async fn main() -> ExitCode {
         );
     }
 
-    // This CLI boots exactly one machine, `Wg16` -- `re/WCCMMUD.DLL`'s own
-    // ABI. `conn::serve` is generic over `A: Abi` since Task 20 of
-    // `docs/plans/2026-08-12-abi-border-implementation.md`, and each call
-    // spawns its own dedicated thread that builds its own `A::Cpu` *on* that
-    // thread (`Boot::build`, called from `host::life` -- never here, since
-    // `A::Cpu` is `!Send` and can never cross into this `async fn`). A board
-    // that also serves a 32-bit module (LunatiX, design doc §4a) would call
-    // `conn::serve::<Wg32>` a second time, with its own `Boot` and its own
-    // `MachineId` (below) -- wiring a connect-time selector between the two
-    // is Task 22's, not this one's -- see `conn.rs`'s own module doc, "One
-    // `serve` call is one machine".
+    // This CLI always boots `Wg16` -- `re/WCCMMUD.DLL`'s own ABI -- and
+    // optionally a second, `Wg32` machine when `--module32` is given
+    // (LunatiX, design doc §4a). `conn::spawn_machine` is generic over
+    // `A: Abi` since Task 20 of
+    // `docs/plans/2026-08-12-abi-border-implementation.md`; each call spawns
+    // its own dedicated thread that builds its own `A::Cpu` *on* that thread
+    // (`Boot::build`, called from `host::life` -- never here, since `A::Cpu`
+    // is `!Send` and can never cross into this `async fn`). Every machine's
+    // sender is wrapped in a `conn::Machine` and handed to one `serve_on`
+    // call, which is what wires the connect-time selector between them --
+    // see `conn.rs`'s own module doc, "The connect-time selector".
     //
-    // `MachineId(0)` is arbitrary -- there is exactly one machine, so any id
-    // would do -- but it is a real assignment, not a placeholder: every
-    // `Chan` this board's `Pool` hands out is tagged with it (`pool.rs`), and
-    // that tag is what a future second `serve` call's own `MachineId` would
-    // need to differ from for the two boards' channel zeros to stay
-    // distinguishable. See `mbbs_server::pool`'s module doc.
+    // `MachineId(0)` for `Wg16` and `MachineId(1)` for `Wg32` are not
+    // placeholders: every `Chan` a machine's `Pool` hands out is tagged with
+    // its own id (`pool.rs`), and that tag is what keeps the two boards'
+    // channel zeros distinguishable process-wide. See `mbbs_server::pool`'s
+    // module doc.
     let boot: Boot<Wg16> = Boot {
         machine: MachineId(0),
         build: Box::new(mbbs_machine::m16::Machine::new),
@@ -236,7 +318,35 @@ async fn main() -> ExitCode {
         survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
     };
 
-    let addrs = match conn::serve(boot, keys, &listeners).await {
+    let mut machines = vec![Machine {
+        id: MachineId(0),
+        label: WG16_LABEL.to_string(),
+        tx: conn::spawn_machine(boot),
+    }];
+
+    if let (Some(module32), Some(root32)) = (cli.module32.clone(), cli.root32.clone()) {
+        let boot32: Boot<Wg32> = Boot {
+            machine: MachineId(1),
+            build: Box::new(build_wg32_cpu(module32.clone())),
+            root: root32,
+            module: module32,
+            terms,
+            polls_per_wake: cli.polls_per_wake,
+            passes: cli.passes,
+            clock_reads: None,
+            wake_age_ms: None,
+            dispatched_total: None,
+            calls_total: None,
+            survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
+        };
+        machines.push(Machine {
+            id: MachineId(1),
+            label: WG32_LABEL.to_string(),
+            tx: conn::spawn_machine(boot32),
+        });
+    }
+
+    let addrs = match conn::serve_on(machines, keys, &listeners).await {
         Ok(addrs) => addrs,
         Err(e) => {
             eprintln!("mbbs-server: failed to start: {e}");
@@ -390,6 +500,47 @@ mod tests {
     fn missing_root_is_an_error() {
         let err = Cli::try_parse_from(args(&["--terms", "2"])).unwrap_err();
         assert!(err.to_string().contains("--root"), "error should name the missing flag: {err}");
+    }
+
+    /// `--module32` without `--root32` is refused by clap's own `requires`
+    /// enforcement, not left to `main` to notice at boot -- two machines
+    /// sharing one root would silently corrupt one module's Btrieve files
+    /// with the other's (see `--root32`'s own doc comment).
+    #[test]
+    fn module32_without_root32_is_an_error() {
+        let err = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("root32"),
+            "error should name the flag that is missing: {err}"
+        );
+    }
+
+    /// `--module32` together with `--root32` parses cleanly, and without
+    /// either flag both are simply absent -- a board with no second module
+    /// need not mention either one.
+    #[test]
+    fn module32_and_root32_parse_together_and_default_to_absent() {
+        let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
+        assert!(cli.module32.is_none());
+        assert!(cli.root32.is_none());
+
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        assert_eq!(cli.module32, Some(std::path::PathBuf::from("LUNATIX.EXE")));
+        assert_eq!(cli.root32, Some(std::path::PathBuf::from("tmp32")));
     }
 
     /// A flag this binary does not know about is refused, not ignored.
