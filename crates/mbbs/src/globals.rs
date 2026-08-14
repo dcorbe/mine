@@ -203,6 +203,19 @@ pub const GLOBALS: &[Global] = &[
     // modules in the corpus census, 522 call sites.
     g("usaptr", PTR),
     g("othuap", PTR),
+    // FILEXFER.H / FTG.H (wg1) -- the File Transfer Framework's two live
+    // pointers and its "tag scan header" message buffer. Placed as data, not
+    // implemented as routines: 7 modules address `ftgptr` (210 sites) and 6
+    // address `ftfscb` (70) and `tshmsg` (82). The framework's ROUTINES
+    // (`ftgnew`/`ftgsbm`) refuse loudly -- none of `ftuser`/`ftgblok`/
+    // `scbblok`/`maxtags` exists here -- but a module that only reads these
+    // pointers needs a real slot to read, not a missing global.
+    //   FTG.H:97-98   extern struct ftg *ftgptr;
+    //   FTF.C:26-27   extern struct ftfscb *ftfscb;
+    //   FTG.H:74,:66  extern char tshmsg[TSHLEN+1];  TSHLEN == 80
+    g("ftgptr", PTR),
+    g("ftfscb", PTR),
+    g("tshmsg", 81),
     // MAJORBBS.H:156, :489 -- BTVFILE *accbb, *genbb;
     g("accbb", PTR),
     g("genbb", PTR),
@@ -805,12 +818,16 @@ mod tests {
         assert_eq!(at("margv"), 256);
         assert_eq!(at("margn"), 256 + 512);
         let last = *placed.last().expect("non-empty");
-        // 3415 until 2026-08-14, when `othuap` (PTR, 4 bytes) was placed
-        // beside `usaptr` -- USRACC.H:73-76 declares them in one statement,
-        // and 17 modules in the corpus census address it. A change to this
-        // number is only ever legitimate alongside a deliberate change to
-        // the table above; it is pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3419);
+        // 3415 until 2026-08-14. The corpus survey placed four data the
+        // modules address but this host had no slot for:
+        //   +4  othuap  (USRACC.H:73-76, beside usaptr -- 17 modules)
+        //   +4  ftgptr  (FTG.H:97-98    -- 7 modules, 210 sites)
+        //   +4  ftfscb  (FTF.C:26-27    -- 6 modules)
+        //   +81 tshmsg  (FTG.H:74,:66, TSHLEN+1 -- 6 modules, 82 sites)
+        // plus one alignment byte. A change to this number is only ever
+        // legitimate alongside a deliberate change to the table above; it is
+        // pinned so that an accidental one is loud.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3509);
     }
 
     #[test]

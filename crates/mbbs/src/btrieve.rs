@@ -528,6 +528,12 @@ const SEGMAX: u16 = 24;
 /// `BTVSTF.H:14` -- how deep `setbtv`'s stack is.
 const BBSTSZ: usize = 10;
 
+/// `DFAAPI.H:24` -- how deep `dfaSetBlk`/`dfaRstBlk`'s stack is. Numerically
+/// the same ten as [`BBSTSZ`], but a separate constant because it is a
+/// separate stack behind a separate pointer -- see [`Btrieve::dfa_set`]'s own
+/// doc comment for why `dfa`/`dfastk` are never aliases of `bb`/`bbstk`.
+const DFSTSZ: usize = 10;
+
 /// Where a file is positioned: the cursor Btrieve keeps in its position block.
 ///
 /// Not in the module's memory. Btrieve kept it in `posblk`, which is 128 opaque
@@ -1569,6 +1575,48 @@ pub struct Btrieve<A: Abi> {
     /// comment for why this lives here (on the session) rather than on any
     /// one [`Block`].
     locks: ops::LockTable,
+
+    /// `dfa`: DFAAPI.C's own current-file pointer, the `dfa*` family's
+    /// counterpart to `bb` above and entirely independent of it -- opening a
+    /// file with `dfaOpen` never changes what `opnbtv` left current, and vice
+    /// versa. `WCCMMUD.DLL` (16-bit, the one module this host has run
+    /// end-to-end) never calls a `dfa*` routine at all; the family is what
+    /// the 32-bit modules in the corpus survey import instead.
+    ///
+    /// **Kept here, not in module memory.** `BTVSTF.H:36` declares
+    /// `extern struct btvblk *bb;`, which is what lets [`crate::globals`]
+    /// place `bb` somewhere a module's own fixups can address directly (see
+    /// [`shims::btrieve::current`](crate::shims::btrieve)'s own doc comment).
+    /// `DFAAPI.H` declares no such extern for `dfa` -- it is a plain
+    /// file-scope `static` inside `DFAAPI.C`, invisible outside the object
+    /// file that provides `dfaOpen`/`dfaSetBlk`/etc. So unlike `bb`, this
+    /// type is the only place `dfa`'s value exists at all, and every dfa*
+    /// shim reads and writes it here rather than through module memory.
+    dfa_current: A::Ptr,
+
+    /// `dfastk`: the ten-deep stack behind [`Self::dfa_current`],
+    /// `DFAAPI.H:24`. See [`Self::dfa_set`] for why its shift rule is not
+    /// [`Self::set`]'s.
+    dfa_stack: [A::Ptr; DFSTSZ],
+
+    /// `dfaomode`: the mode the next `dfaOpen` opens in, `DFAAPI.C:26`.
+    /// `PRIMBV` (zero) until `dfaMode` says otherwise -- the `dfa*` family's
+    /// own counterpart to [`Self::mode`], and independent of it for the
+    /// identical reason `dfa`/`bb` are.
+    dfa_mode: i16,
+
+    /// `lastlen`: `DFAAPI.C:27`, `dfaLastLen`'s own answer. Updated only by
+    /// `shims::dfa`'s own read/positioning routines (`dfaQueryNP`,
+    /// `dfaGetLock`, `dfaAcqLock`, `dfaAcqNPLock`, `dfaGetAbsLock`,
+    /// `dfaAcqAbsLock`, `dfaStepLock`) -- **a simplification**, noted here
+    /// rather than left silent: the real `btvu()` (`:948`, and the two
+    /// platform branches beside it) echoes back Btrieve's own `dbflen` after
+    /// *every* call, writes included, where this host updates it only after
+    /// a record is actually delivered into a buffer. No `dfa*` symbol in
+    /// `re/wg33src/LIB/WGSERVER.DEF` reaches `dfaLastLen` in the surveyed
+    /// corpus (it is exported, but zero import count), so this is scoped to
+    /// the one shape worth reproducing rather than every call site.
+    dfa_last_len: u16,
 }
 
 impl<A: Abi> Default for Btrieve<A> {
@@ -1589,6 +1637,10 @@ impl<A: Abi> Default for Btrieve<A> {
             mode: 0,
             transaction: false,
             locks: ops::LockTable::default(),
+            dfa_current: A::null_ptr(),
+            dfa_stack: [A::null_ptr(); DFSTSZ],
+            dfa_mode: 0,
+            dfa_last_len: 0,
         }
     }
 }
@@ -1753,6 +1805,115 @@ impl<A: Abi> Btrieve<A> {
     /// The null `struct btvblk *`.
     pub fn null() -> A::Ptr {
         A::null_ptr()
+    }
+
+    /// `dfa` -- the file `dfa*` routines currently work on. See
+    /// [`Self::dfa_current`]'s sibling field doc comment for why this is
+    /// read from `self` rather than from module memory.
+    pub fn dfa_current(&self) -> A::Ptr {
+        self.dfa_current
+    }
+
+    /// Overwrite `dfa` with no other effect -- not [`Self::dfa_set`], which
+    /// also pushes the stack.
+    ///
+    /// `dfaClose`'s own `goodptr(dfa=dfap)` (`DFAAPI.C:661`) is exactly this:
+    /// an unconditional assignment to `dfa` that runs whether or not the
+    /// guard it is part of then finds a file to close, and the ten-deep
+    /// stack behind `dfa` is untouched either way -- the same "the stack is
+    /// not purged on close" shape [`shims::btrieve::clsbtv`](crate::shims::btrieve::clsbtv)'s
+    /// own doc comment already describes for `bb`/`bbstk`.
+    pub fn dfa_set_current(&mut self, at: A::Ptr) {
+        self.dfa_current = at;
+    }
+
+    /// The mode the next `dfaOpen` will use.
+    pub fn dfa_mode(&self) -> i16 {
+        self.dfa_mode
+    }
+
+    /// Set the mode the next `dfaOpen` will use, as `dfaMode` does.
+    pub fn dfa_set_mode(&mut self, mode: i16) {
+        self.dfa_mode = mode;
+    }
+
+    /// `dfaLastLen`'s own answer -- see the `dfa_last_len` field's own doc
+    /// comment for what updates it and what does not.
+    pub fn dfa_last_len(&self) -> u16 {
+        self.dfa_last_len
+    }
+
+    /// Record what a `dfa*` read just delivered, for [`Self::dfa_last_len`]
+    /// to answer later.
+    pub fn dfa_set_last_len(&mut self, len: u16) {
+        self.dfa_last_len = len;
+    }
+
+    /// `dfaSetBlk` -- `DFAAPI.C:186-192`, quoted in full because the one
+    /// line that matters is easy to misread:
+    ///
+    ///
+    /// # Not [`Self::set`], and not an oversight
+    ///
+    /// `setbtv`'s equivalent line is `*bbstk=bb;` -- it reads `bb`'s value
+    /// *before* this call overwrites it, so what lands in `bbstk[0]` is
+    /// whatever was current a moment ago. `dfaSetBlk`'s line is
+    /// `*dfastk=dfa=dfaptr;`, a chained C assignment, which evaluates its
+    /// right-hand side first: `dfa=dfaptr` runs, and the *value of that
+    /// expression* -- `dfaptr` itself, the new pointer -- is what `*dfastk`
+    /// then receives. So `dfaSetBlk` pushes the pointer it was just handed,
+    /// never the one it is replacing, and whatever `dfa` held a moment
+    /// before this call is not saved anywhere: it is gone the instant this
+    /// returns, with no `dfaRstBlk` able to reach it again.
+    ///
+    /// A concrete trace: opening `A` then `B` (each open ends with its own
+    /// `dfaSetBlk(dfa)` at `DFAAPI.C:175`, `dfa` already reassigned to the
+    /// freshly allocated block by then) leaves `dfa_stack == [B, A, ...]`,
+    /// and one [`Self::dfa_restore`] returns to `A` -- **that much reads the
+    /// same as `setbtv`'s "open pushes itself" shape**, because two
+    /// *different* pointers went in. Where the two families diverge is a
+    /// call that is not immediately paired with a restore: calling this
+    /// twice in a row on the same pointer (`dfa_set(B); dfa_set(B);`, which
+    /// nothing here forbids and nothing in `DFAAPI.C` guards against
+    /// either) leaves `dfa_stack` holding two copies of `B`, with whatever
+    /// was current before the *first* call unrecoverable by any number of
+    /// restores. `Self::set` given the same two calls would have pushed the
+    /// true previous value exactly once.
+    ///
+    /// Returns the name of the file that fell off the bottom, if the shift
+    /// dropped one -- the same shape [`Self::set`] returns, for the same
+    /// reason: an eleventh entry is not refused, because `DFAAPI.C`'s own
+    /// shift does not refuse it either.
+    pub fn dfa_set(&mut self, new: A::Ptr) -> Option<String> {
+        let dropped = self.dfa_stack[DFSTSZ - 1];
+        self.dfa_stack.copy_within(0..DFSTSZ - 1, 1);
+        self.dfa_stack[0] = new;
+        self.dfa_current = new;
+        if dropped == A::null_ptr() {
+            return None;
+        }
+        Some(match self.find(dropped) {
+            Ok(at) => self.open[at].name.clone(),
+            Err(_) => format!("{dropped:?}"),
+        })
+    }
+
+    /// `dfaRstBlk` -- `DFAAPI.C:194-199`, and this one *is* the same shape
+    /// as [`Self::restore`]:
+    ///
+    ///
+    /// An empty stack is not an error, for the same reason [`Self::restore`]'s
+    /// is not: `dfastk` starts as ten null pointers, and every `dfa*`
+    /// routine this host implements that guards on `dfa == NULL` at all does
+    /// so before touching anything else -- so a module that unbalances its
+    /// own `dfaRstBlk` calls was written to get null back, not a refusal.
+    ///
+    /// Returns what to put in `dfa`, and whether the stack was empty.
+    pub fn dfa_restore(&mut self) -> (A::Ptr, bool) {
+        let restored = self.dfa_stack[0];
+        self.dfa_stack.copy_within(1..DFSTSZ, 0);
+        self.dfa_current = restored;
+        (restored, restored == A::null_ptr())
     }
 
     /// The mode the next `opnbtv` will use.
@@ -4241,6 +4402,14 @@ mod tests {
             mode: 0,
             transaction: false,
             locks: ops::LockTable::default(),
+            // The dfa facade's own current-block and stack, empty here: these
+            // tests are about `begin`/`end`/`abort`, and a hand-written struct
+            // literal is exactly what stops compiling when the struct grows,
+            // which is how these two arrived.
+            dfa_current: FarPtr::NULL,
+            dfa_stack: [FarPtr::NULL; DFSTSZ],
+            dfa_mode: 0,
+            dfa_last_len: 0,
         }
     }
 

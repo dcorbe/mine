@@ -191,7 +191,7 @@ use crate::shims::ShimError;
 /// the only generic reading of "the low 16 bits of this argument, signed"
 /// available without a wider `mode`/`keynum`/`loktyp` this wire protocol has
 /// never had, on any `Abi` this crate has met so far.
-fn i16_arg<A: Abi>(v: A::Int) -> i16 {
+pub(crate) fn i16_arg<A: Abi>(v: A::Int) -> i16 {
     let wide: u32 = v.into();
     wide as i16
 }
@@ -216,7 +216,7 @@ fn i16_arg<A: Abi>(v: A::Int) -> i16 {
 /// # Errors
 ///
 /// If the widened value does not fit in a `u16`.
-fn u16_arg<A: Abi>(v: A::Int, who: &str) -> Result<u16, ShimError> {
+pub(crate) fn u16_arg<A: Abi>(v: A::Int, who: &str) -> Result<u16, ShimError> {
     let wide: u32 = v.into();
     u16::try_from(wide)
         .map_err(|_| ShimError::Failed(format!("{who}: {wide}, which does not fit in 16 bits")))
@@ -801,7 +801,7 @@ pub fn clsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// The caller is the one who notes it -- see [`note_duplicate_key`] -- because
 /// only the caller knows whether this is an insert or an update.
-fn duplicate_key<A: Abi>(
+pub(crate) fn duplicate_key<A: Abi>(
     host: &mut Host<A>,
     block: A::Ptr,
     bytes: &[u8],
@@ -844,7 +844,7 @@ fn duplicate_key<A: Abi>(
 /// is printed as raw bytes, the same `{:02x?}` this crate already uses for a
 /// file-control-record mismatch in [`crate::btrieve::Btrieve::open`], because
 /// a key can be text, a number, or several segments of both.
-fn note_duplicate_key<A: Abi>(host: &mut Host<A>, who: &str, name: &str, key: u16, value: &[u8]) {
+pub(crate) fn note_duplicate_key<A: Abi>(host: &mut Host<A>, who: &str, name: &str, key: u16, value: &[u8]) {
     host.note(format!(
         "{who} on {name} refused a record: key {key} already holds {value:02x?}, \
          and that key does not permit duplicates -- this call answers 0 rather \
@@ -861,7 +861,7 @@ fn note_duplicate_key<A: Abi>(host: &mut Host<A>, who: &str, name: &str, key: u1
 /// So 5 and 55 are the same request -- "equal" -- differing only in whether the
 /// record comes back with it, and that is why they are one enum here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub(crate) enum Op {
     /// The first record whose key is exactly this value.
     Equal,
     /// The next record in key order.
@@ -884,7 +884,7 @@ enum Op {
 
 impl Op {
     /// The operation a code names, or `None` for one no macro produces.
-    fn of(code: i16) -> Option<Self> {
+    pub(crate) fn of(code: i16) -> Option<Self> {
         match code {
             5 => Some(Self::Equal),
             6 => Some(Self::Next),
@@ -903,7 +903,7 @@ impl Op {
     ///
     /// `Next`, `Previous`, `Lowest` and `Highest` move relative to where the
     /// file already is, and `PLBTVSTF.C`'s macros pass `NULL` for their key.
-    fn wants_value(self) -> bool {
+    pub(crate) fn wants_value(self) -> bool {
         matches!(
             self,
             Self::Equal | Self::Greater | Self::AtLeast | Self::Less | Self::AtMost
@@ -1257,7 +1257,7 @@ pub fn aabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `PLBTVSTF.C:466` -- `return(aabbtvl(recptr,abspos,keynum,0))`. Named rather
 /// than written as a bare 0 at the call site, because a 0 there reads as "no
 /// lock was asked for" when what it means is "there was never a word to ask in".
-const UNLOCKED: i16 = 0;
+pub(crate) const UNLOCKED: i16 = 0;
 
 /// `void gabbtvl(void *recptr, long abspos, int keynum, int loktyp)` -- get the
 /// record at a file position, or stop.
@@ -1313,28 +1313,28 @@ pub fn gabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 /// rather than passed as six more parameters -- clippy already has an opinion
 /// about `absolute` at seven, and the file already has a precedent for this
 /// shape in [`Request`], below.
-struct Position<A: Abi> {
+pub(crate) struct Position<A: Abi> {
     /// The routine asking, for anything it has to refuse or note by name.
-    who: &'static str,
+    pub(crate) who: &'static str,
 
     /// Whether a position naming no record is a refusal ([`gabbtvl`]) or a
     /// quiet `false` ([`aabbtv`]). See [`absolute`]'s own doc comment.
-    fatal: bool,
+    pub(crate) fatal: bool,
 
     /// **The caller's**, not read here -- the two callers don't have the same
     /// arguments; see [`aabbtv`]'s doc comment for why `gabbtvl` has a fourth
     /// word to read and `aabbtv` does not.
-    lock: i16,
+    pub(crate) lock: i16,
 
     /// Where the record goes, or the module's null for `bb->data`.
-    into: A::Ptr,
+    pub(crate) into: A::Ptr,
 
     /// The file position to acquire -- Btrieve's Get Position number, what
     /// [`absbtv`] hands back.
-    position: u32,
+    pub(crate) position: u32,
 
     /// Which key's order the position lands in, negative for `bb->lastkn`.
-    keynum: i16,
+    pub(crate) keynum: i16,
 }
 
 /// The body of `aabbtv` and `gabbtvl`. Returns whether a record was delivered.
@@ -1353,7 +1353,7 @@ struct Position<A: Abi> {
 /// function to read the same bytes again off a cursor that has moved on.
 /// `aabbtv` now reads its own three the same way, so both callers share one
 /// shape instead of one reading through `absolute` and the other around it.
-fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Position<A>) -> Result<bool, ShimError> {
+pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Position<A>) -> Result<bool, ShimError> {
     let Position {
         who,
         fatal,
@@ -1435,36 +1435,36 @@ fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Position<A>) ->
 ///
 /// The query, acquire and key families differ in exactly these fields and in
 /// nothing else, which is what makes [`locate`] one routine.
-struct Request<'a, A: Abi> {
+pub(crate) struct Request<'a, A: Abi> {
     /// The routine asking, for anything it has to refuse by name.
-    who: &'a str,
+    pub(crate) who: &'a str,
 
     /// The file. The caller's rather than read from `bb` here, because the
     /// caller has already had to decide what a null `bb` means to it -- see
     /// [`positioned`].
-    block: A::Ptr,
+    pub(crate) block: A::Ptr,
 
     /// What to find.
-    op: Op,
+    pub(crate) op: Op,
 
     /// Which key to find it by, or negative for `bb->lastkn`.
-    keynum: i16,
+    pub(crate) keynum: i16,
 
     /// The module's key value, or null for an operation that needs none.
-    value: A::Ptr,
+    pub(crate) value: A::Ptr,
 
     /// Where the record goes, or `None` for a query, which reads none.
-    into: Option<A::Ptr>,
+    pub(crate) into: Option<A::Ptr>,
 
     /// The lock type to take once a record is found, or `0` for none --
     /// `0` for `qrybtv`/`qnpbtv`, which have no `loktyp` at either layer.
-    lock: i16,
+    pub(crate) lock: i16,
 }
 
 /// Position the file a [`Request`] names, and hand back the record if asked.
 ///
 /// Returns whether a record was found.
-fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Request<'_, A>) -> Result<bool, ShimError> {
+pub(crate) fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Request<'_, A>) -> Result<bool, ShimError> {
     let Request {
         who,
         block,
@@ -1664,7 +1664,7 @@ fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Request<'_, A>) -
 ///
 /// Shared rather than written twice: the absolute-position family had it
 /// missing for exactly as long as this was inline in [`locate`].
-fn answer_with_key<A: Abi>(
+pub(crate) fn answer_with_key<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
     block: A::Ptr,
@@ -1707,7 +1707,7 @@ fn answer_with_key<A: Abi>(
 /// status 22 and `posbtverr` (`:746`) truncates with a NUL at `bb->reclen-1`
 /// before the copy runs, where this truncates silently. `opnbtv` already notes
 /// the mismatch that would make it live.
-fn deliver<A: Abi>(
+pub(crate) fn deliver<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
     block: A::Ptr,
@@ -1729,7 +1729,7 @@ fn deliver<A: Abi>(
 /// `PLBTVSTF.C:268`: a negative key number means "the one last used", and any
 /// other means "this one, and remember it". `lastkn` is a field of the block in
 /// module memory, so it is read and written there rather than kept here.
-fn key_number<A: Abi>(
+pub(crate) fn key_number<A: Abi>(
     call: &mut Call<A>,
     host: &Host<A>,
     block: A::Ptr,
@@ -1755,10 +1755,10 @@ fn key_number<A: Abi>(
 }
 
 /// Where `lastkn` sits in a `struct btvblk`.
-const LASTKN: u16 = 142;
+pub(crate) const LASTKN: u16 = 142;
 
 /// How many bytes of the module's buffer are a key value.
-fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Result<u16, ShimError> {
+pub(crate) fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Result<u16, ShimError> {
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     file.keys()
         .get(usize::from(key))
@@ -1776,7 +1776,7 @@ fn key_length<A: Abi>(host: &Host<A>, block: A::Ptr, key: u16) -> Result<u16, Sh
 /// against the file's own index pages -- see
 /// [`Records::ties`](crate::btrieve::Records::ties) -- so it is counted and
 /// reported rather than left silent.
-fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
+pub(crate) fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     if file.loaded().is_some() {
         return Ok(());
@@ -1810,7 +1810,7 @@ fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), ShimError> {
 ///
 /// A pointer that is neither null nor a file this host opened *is* a refusal,
 /// which is [`setbtv`]'s contract and unrelated to the null case.
-fn positioned<A: Abi>(call: &mut Call<A>, host: &Host<A>, who: &str) -> Result<Option<A::Ptr>, ShimError> {
+pub(crate) fn positioned<A: Abi>(call: &mut Call<A>, host: &Host<A>, who: &str) -> Result<Option<A::Ptr>, ShimError> {
     let block = current(call, host)?;
     if block == Btrieve::<A>::null() {
         return Ok(None);
@@ -1830,7 +1830,7 @@ fn positioned<A: Abi>(call: &mut Call<A>, host: &Host<A>, who: &str) -> Result<O
 ///
 /// Once per routine. `obtbtvl` inside a loop would otherwise fill
 /// [`Host::notes`](crate::Host::notes) with thousands of identical lines.
-fn note_no_file<A: Abi>(host: &mut Host<A>, who: &str) {
+pub(crate) fn note_no_file<A: Abi>(host: &mut Host<A>, who: &str) {
     host.note_once(
         who,
         format!(
@@ -1842,7 +1842,7 @@ fn note_no_file<A: Abi>(host: &mut Host<A>, who: &str) {
 }
 
 /// Where `bb->data` points, for a file the caller has already established.
-fn data_buffer<A: Abi>(host: &Host<A>, block: A::Ptr) -> Result<A::Ptr, ShimError> {
+pub(crate) fn data_buffer<A: Abi>(host: &Host<A>, block: A::Ptr) -> Result<A::Ptr, ShimError> {
     Ok(host
         .btrieve
         .block(block)
@@ -1895,7 +1895,7 @@ fn data_buffer<A: Abi>(host: &Host<A>, block: A::Ptr) -> Result<A::Ptr, ShimErro
 /// discrimination by value, checked the hard way (mutate the shim to read
 /// the adjacent word, confirm the test fails) -- see each test's own doc
 /// comment.
-fn take_lock<A: Abi>(host: &mut Host<A>, block: A::Ptr, lock: i16) -> Result<(), ShimError> {
+pub(crate) fn take_lock<A: Abi>(host: &mut Host<A>, block: A::Ptr, lock: i16) -> Result<(), ShimError> {
     host.btrieve.take_lock(block, lock).map_err(ShimError::Failed)
 }
 
@@ -2212,7 +2212,7 @@ pub fn anpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// point. See [`anpbtv`]'s own doc comment for why the scan is bounded to
 /// `a`/`b`'s own length instead of following C's convention of continuing
 /// arbitrarily far past it.
-fn strcmp_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn strcmp_eq(a: &[u8], b: &[u8]) -> bool {
     let a = match a.iter().position(|&byte| byte == 0) {
         Some(nul) => &a[..nul],
         None => a,
@@ -2473,7 +2473,7 @@ pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// resolves out of `recptr` and hands to
 /// [`Block::update`](crate::btrieve::Block::update), which is the one place
 /// that number is actually checked against the file's own record length.
-fn update_variable<A: Abi>(
+pub(crate) fn update_variable<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
     who: &str,

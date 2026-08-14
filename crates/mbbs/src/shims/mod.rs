@@ -1,11 +1,13 @@
 //! What sits behind each import, and what to do when nothing does.
 
 pub mod btrieve;
+pub mod cnc;
 pub mod credit;
 pub mod credits;
 pub mod crt;
 pub mod echo;
 pub mod fsd;
+pub mod ftf;
 pub mod gcsp;
 pub mod gsbl;
 pub mod memory;
@@ -18,13 +20,14 @@ pub mod screen;
 pub mod stream;
 pub mod system;
 pub mod task;
+pub mod vda;
 pub mod text;
 pub mod tfscan;
 pub mod user;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
-use crate::exports::{DOSCALLS, GALGSBL, GALME, MAJORBBS};
+use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS};
 use crate::globals::GLOBALS;
 
 // `args(machine) -> Cursor<'_, Wg16>` used to live here: a bare `Cursor` over
@@ -265,7 +268,33 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // GALME ordinal 30, not a MAJORBBS symbol -- see `exports.rs`'s own
         // `galme_ordinal_30_is_the_messaging_engines_6x_compatibility_entry`.
         (GALME, "_oldsend", misc::oldsend, Cleans::Caller),
+        // `GALMSG` ordinal 30 is `_OLDSEND` -- ONE underscore, where GALME's
+        // ordinal 30 is `__OLDSEND` with two. `exports::c_name` strips exactly
+        // one, so they normalise to DIFFERENT host names (`oldsend` and
+        // `_oldsend`) and need separate rows. They are two symbols in two
+        // libraries, not one symbol seen twice; The Rose 2.0 imports the
+        // GALMSG one. Both refuse for the same reason -- neither the Messaging
+        // Engine nor its 6.x compatibility entry exists here.
+        (GALMSG, "oldsend", misc::oldsend, Cleans::Caller),
         (MAJORBBS, "initask", task::initask, Cleans::Caller),
+        (MAJORBBS, "bgncnc", cnc::bgncnc, Cleans::Caller),
+        (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller),
+        (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller),
+        (MAJORBBS, "cncall", cnc::cncall, Cleans::Caller),
+        (MAJORBBS, "onsys", cnc::onsys, Cleans::Caller),
+        (MAJORBBS, "strupr", cnc::strupr, Cleans::Caller),
+        (MAJORBBS, "injoth", cnc::injoth, Cleans::Caller),
+        (MAJORBBS, "vdaoff", vda::vdaoff, Cleans::Caller),
+        (MAJORBBS, "lngopt", vda::lngopt, Cleans::Caller),
+        (GALGSBL, "btuoba", vda::btuoba, Cleans::Caller),
+        (GALGSBL, "btuinp", vda::btuinp, Cleans::Caller),
+        (GALGSBL, "btupmt", vda::btupmt, Cleans::Caller),
+        (MAJORBBS, "mkdir", ftf::mkdir, Cleans::Caller),
+        (MAJORBBS, "stpans", ftf::stpans, Cleans::Caller),
+        (MAJORBBS, "farmalloc", ftf::farmalloc, Cleans::Caller),
+        (MAJORBBS, "dcdate", ftf::dcdate, Cleans::Caller),
+        (MAJORBBS, "ftgnew", ftf::ftgnew, Cleans::Caller),
+        (MAJORBBS, "ftgsbm", ftf::ftgsbm, Cleans::Caller),
         (MAJORBBS, "dedcrd", credit::dedcrd, Cleans::Caller),
         (MAJORBBS, "tstcrd", credit::tstcrd, Cleans::Caller),
         (MAJORBBS, "condex", credit::condex, Cleans::Caller),

@@ -58,6 +58,10 @@ pub const MAJORBBS: &str = "MAJORBBS";
 pub const GALGSBL: &str = "GALGSBL";
 pub const GALME: &str = "GALME";
 pub const DOSCALLS: &str = "DOSCALLS";
+pub const GALMSG: &str = "GALMSG";
+pub const GALFIL: &str = "GALFIL";
+pub const GALETL: &str = "GALETL";
+pub const WGSERVER: &str = "WGSERVER";
 
 /// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
 ///
@@ -65,6 +69,50 @@ pub const DOSCALLS: &str = "DOSCALLS";
 /// derived names, and a host that loses them in a fresh checkout is a host
 /// whose refusals report bare ordinals.
 const MAJORBBS_WG101: &str = include_str!("../data/majorbbs_wg101.tsv");
+/// Recovered 2026-08-14 from the WG 1.01 `GALDLL.ZIP` binaries, the same zip
+/// the `GALME`/`GALGSBL` tables came from, and verified ordinal-by-ordinal
+/// against `GALMSG.DEF`/`GALFIL.DEF` (byte-identical in the wg1 and wg20
+/// source kits). Each binary carries one entry its `.DEF` omits -- the
+/// `_INIT__*` entry point -- the same pattern `GALME`'s table already shows.
+const GALMSG_WG101: &str = include_str!("../data/galmsg_wg101.tsv");
+const GALFIL_WG101: &str = include_str!("../data/galfil_wg101.tsv");
+/// **Weaker provenance than the tables above, and deliberately said out loud.**
+/// No `GALETL.DEF` or import library survives anywhere in the archive, so this
+/// has no independent numeric cross-check -- only that its routine names match
+/// `GALETL.DOC`'s description of a teleconferencing engine. The NE header
+/// version (6.01) matches the confirmed WG-1.01 binaries, but the copy came
+/// from a third-party archive rather than the WG 1.01 CD.
+///
+/// Three GALETL builds exist and their ordinals genuinely DISAGREE (ordinal 36
+/// is `_TL2LST` in one and `___TLCACT` in another), so they are kept as
+/// separate files and must never be merged: a wrong ordinal map is worse than
+/// none, because it makes this host confidently name the wrong routine. The
+/// other two are `galetl_wg300.tsv` and `galetl_ne5.tsv`, recovered but not
+/// wired -- nothing this host loads is a WG 3.x or Entertainment Pack module.
+const GALETL_WG101: &str = include_str!("../data/galetl_wg101.tsv");
+const GALETL_WG300: &str = include_str!("../data/galetl_wg300.tsv");
+/// The 32-bit host's own export table, recovered 2026-08-14 from the genuinely
+/// NE-format `WGSERVER.EXE` copies under `archive/_acquire/pools/full` -- five
+/// are there, and they are two distinct builds (three byte-identical 3.12/3.13
+/// and two byte-identical 3.00), NOT the PE32 `WGSERVER.EXE` that 32-bit
+/// modules import by name and needs no ordinal table at all.
+///
+/// **Verified against the vendor's own export definitions**, which do survive:
+/// `re/wg33src/LIB/wg30/WGSERVER.DEF` and `re/wg33src/LIB/WGSERVER.DEF`, from
+/// the Worldgroup 3.3 source kit. 1,227 of the 3.00 DEF's 1,234 names appear
+/// in the 3.00 table (99.4%) and 1,494 of the 3.3 DEF's 1,508 in the 3.12
+/// table (99.1%). Every name the DEFs have and the binaries do not is an
+/// NT-only routine sitting behind an `#ifdef` -- `iswinnt`,
+/// `isrunasservice`, `getlasterrortext`, `excpfilter`, `geterrortext` --
+/// which a DOS-era build correctly lacks.
+///
+/// The 3.3 DEF goes further: 1,506 of its entries carry an explicit
+/// `@ordinal`, so the 3.12 table is verified ORDINAL BY ORDINAL against it --
+/// **1,494 of 1,494 shared ordinals agree on the name, zero mismatches.**
+/// The 3.00 DEF lists names only, so that table rests on the name set plus
+/// its own binary's export table for the numbering.
+const WGSERVER_WG300: &str = include_str!("../data/wgserver_wg300.tsv");
+const WGSERVER_WG312: &str = include_str!("../data/wgserver_wg312.tsv");
 const GALGSBL_WG101: &str = include_str!("../data/galgsbl_wg101.tsv");
 
 /// `GALME.DLL`'s own name table, read out of the shipped WG 1.01 binary.
@@ -110,6 +158,52 @@ impl Exports {
                 (GALGSBL, parse(GALGSBL_WG101)),
                 (GALME, parse(GALME_WG101)),
                 (DOSCALLS, parse(DOSCALLS_PHARLAP31)),
+                (GALMSG, parse(GALMSG_WG101)),
+                (GALFIL, parse(GALFIL_WG101)),
+                (GALETL, parse(GALETL_WG101)),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    /// The Worldgroup 3.00 generation's tables.
+    ///
+    /// **Deliberately only the two libraries this generation has real tables
+    /// for.** Padding it out with the WG 1.01 `GALGSBL`/`GALME`/`GALMSG`/
+    /// `GALFIL` tables would be precisely the version-mixing that already
+    /// contaminated `isv_union_symbols.tsv` -- an ordinal map is version- AND
+    /// library-keyed, and a table that silently answers with another
+    /// generation's name is worse than one that answers `None`, because
+    /// `None` is reported as a bare ordinal while a wrong name is believed.
+    ///
+    /// Nothing calls this yet: `Host::new` loads [`Exports::wg101`], and the
+    /// modules this host runs are WG 1.01. It exists because the tables were
+    /// recovered and verified, and rediscovering them later would cost the
+    /// same work twice.
+    #[must_use]
+    pub fn wg300() -> &'static Self {
+        static TABLE: OnceLock<Exports> = OnceLock::new();
+        TABLE.get_or_init(|| Exports {
+            by_dll: [
+                (WGSERVER, parse(WGSERVER_WG300)),
+                (GALETL, parse(GALETL_WG300)),
+            ]
+            .into_iter()
+            .collect(),
+        })
+    }
+
+    /// The Worldgroup 3.12 generation's tables, which the 3.13 build shares
+    /// byte for byte. See [`Exports::wg300`] for why this carries only two
+    /// libraries.
+    #[must_use]
+    pub fn wg312() -> &'static Self {
+        static TABLE: OnceLock<Exports> = OnceLock::new();
+        TABLE.get_or_init(|| Exports {
+            by_dll: [
+                (WGSERVER, parse(WGSERVER_WG312)),
+                (GALETL, parse(GALETL_WG300)),
             ]
             .into_iter()
             .collect(),
@@ -168,6 +262,41 @@ pub fn c_name(linkage: &str) -> Box<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 3.x tables load, and they are NOT the same table under two names.
+    ///
+    /// The disagreement is the point: three GALETL builds exist whose ordinals
+    /// genuinely differ (ordinal 36 is `_TL2LST` in one and `___TLCACT` in
+    /// another), and two WGSERVER builds differ by 114 entries. A refactor
+    /// that "helpfully" merged them would pass a size check and answer wrong
+    /// names forever, so this asserts they stay distinct.
+    #[test]
+    fn the_worldgroup_3x_tables_are_loaded_and_distinct_from_each_other() {
+        let wg300 = Exports::wg300();
+        let wg312 = Exports::wg312();
+        assert_eq!(wg300.len(WGSERVER), 1381);
+        assert_eq!(wg312.len(WGSERVER), 1495, "3.12 exports 114 more than 3.00");
+
+        // Spot-checks against `re/wg33src/LIB/WGSERVER.DEF`, which carries
+        // explicit `@ordinal`s. The whole 3.12 table was checked against it
+        // ordinal-by-ordinal when it was recovered (1,494/1,494 agreed); these
+        // three are pinned so a regenerated table cannot drift silently.
+        assert_eq!(wg312.name(WGSERVER, 1), Some("f_scopy@"));
+        assert_eq!(wg312.name(WGSERVER, 3), Some("f_ldiv@"));
+        assert_eq!(wg312.name(WGSERVER, 1000), Some("onsys"));
+
+        // `_dfaStat @457` is in the 3.3 DEF and NOT in this binary, which is
+        // the 3.12/3.13 build -- so the DEF is a superset, and an ordinal
+        // present there can legitimately be absent here. Pinned as a `None`
+        // so that a future table which "helpfully" invents an entry for it
+        // fails rather than quietly answering a name the binary never had.
+        assert_eq!(wg312.name(WGSERVER, 457), None);
+
+        // A 3.x table must not answer for a WG 1.01 library: mixing
+        // generations is what contaminated isv_union_symbols.tsv.
+        assert_eq!(wg300.name(MAJORBBS, 11), None, "no WG1.01 table leaked in");
+        assert_eq!(Exports::wg101().name(WGSERVER, 1), None, "and not the reverse");
+    }
 
     #[test]
     fn the_tables_are_the_size_the_host_exports() {
