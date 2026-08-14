@@ -381,6 +381,11 @@ pub struct NeImage {
     /// Entry points by ordinal: ordinal 1 is index 0. `None` where the linker
     /// skipped an ordinal.
     pub entries: Vec<Option<EntryPoint>>,
+    /// This module's own declared name -- the resident name table's own
+    /// first entry, which every other reader of this table drops (see this
+    /// field's own construction site in [`NeImage::parse`]). What another
+    /// module's import table names this one by.
+    pub own_name: String,
     /// Exported names from both name tables, mapped to their ordinals.
     pub names: HashMap<String, u16>,
 }
@@ -444,6 +449,19 @@ impl NeImage {
 
         let entries = parse_entry_table(&r, entrytab)?;
 
+        // The resident name table's own first entry -- what `collect_names`
+        // below drops as the "not an export" leading string, because that
+        // reading is only true of the *export* map it is building. It is
+        // also the one place this format ever states its own name: the
+        // string another module's own import table has to match to reach
+        // this one (`WCCMMPLS.DLL`'s own resident table leads with
+        // `WCCMMPLS`, and `WCCMMUD.DLL`'s leads with `WCCMMUD` -- exactly the
+        // spelling `WCCMMPLS.DLL`'s import records name it by; measured, not
+        // assumed). Read here, once, rather than recovered from `collect_names`
+        // after the fact, since that function's contract is "drop the first
+        // entry of every table it is given" and has no reason to hand it back.
+        let own_name = r.pstring("resident name table", restab)?.0;
+
         let mut names = HashMap::new();
         collect_names(&r, restab, &mut names)?;
         collect_names(&r, nrtab, &mut names)?;
@@ -456,6 +474,7 @@ impl NeImage {
             segments,
             modules,
             entries,
+            own_name,
             names,
         })
     }
@@ -677,12 +696,25 @@ pub struct Module {
     selectors: Vec<u16>,
     autodata: u16,
     entries: Vec<Option<EntryPoint>>,
+    /// This module's own declared name -- see [`NeImage::own_name`]. What a
+    /// *different* module's own import table would have to say to reach
+    /// this one; not to be confused with [`NeImage::modules`], which is the
+    /// list of names *this* module imports from.
+    own_name: String,
     names: HashMap<String, u16>,
     imports: Vec<ImportSite>,
     relocations: usize,
 }
 
 impl Module {
+    /// This module's own declared name -- see [`NeImage::own_name`]'s own
+    /// doc comment for where it comes from and what it is for
+    /// (`crates/mbbs`'s cross-module import registry keys loaded modules by
+    /// exactly this string).
+    pub fn name(&self) -> &str {
+        &self.own_name
+    }
+
     /// The selector a 1-based NE segment number was given.
     pub fn segment_selector(&self, segment: u16) -> Option<u16> {
         self.selectors
@@ -917,6 +949,7 @@ impl Machine {
             selectors,
             autodata,
             entries: image.entries.clone(),
+            own_name: image.own_name.clone(),
             names: image.names.clone(),
             imports: thunks.sites,
             relocations: applied,

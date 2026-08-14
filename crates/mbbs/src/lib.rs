@@ -434,7 +434,19 @@ impl<A: Abi> PartialEq for Cycles<A> {
 
 impl<A: Abi> Eq for Cycles<A> where A::Poison: Eq {}
 
-/// A global the module addresses that the host cannot place.
+/// A global the module addresses that the host cannot place -- or, since
+/// cross-module import support landed, a routine the module calls from a
+/// module that *is* loaded but does not export it (`Why::NotExported`
+/// below).
+///
+/// The second case stretches the name: it is a symbol the module *calls*,
+/// not addresses as data. It rides this same type anyway, rather than a
+/// parallel `MissingModule`/`LoadError::Module` pair, because the shape is
+/// identical in every way that matters -- a DLL name, a symbol, a reason the
+/// loader could not honour it -- and `LoadError::Globals` already carries
+/// exactly that. See `Resolver::resolve`'s own doc comment for why this is
+/// the one case that gets a hard refusal rather than the graceful
+/// degradation every other unimplemented import gets.
 ///
 /// Not a warning. A datum the host does not have would be given a *thunk* --
 /// the address of a far call -- and the module would read and write it as a
@@ -446,7 +458,8 @@ pub struct MissingGlobal {
     pub why: Why,
 }
 
-/// What is wrong with a global the module addresses.
+/// What is wrong with a global the module addresses, or a routine it calls
+/// from another loaded module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
     /// The host does not place it at all.
@@ -454,6 +467,25 @@ pub enum Why {
 
     /// The host places it, but the module reaches past the end of it.
     TooSmall { addend: i16, size: u16 },
+
+    /// `module` names another module this `Host` has already loaded in this
+    /// life -- not a host DLL, and not one still unloaded -- but its export
+    /// table has no such ordinal or name.
+    ///
+    /// **Deliberately not raised for a module the registry has never heard
+    /// of at all.** That case is indistinguishable, from the resolver's own
+    /// vantage point, from a host DLL this crate simply has not implemented
+    /// every symbol of yet (`DOSCALLS`, `PHAPI`, ...) -- both answer
+    /// [`crate::shims::Entry::Unimplemented`] and neither is in
+    /// [`Resolver`]'s registry, and the existing, load-bearing behaviour for
+    /// the second case is to load anyway and thunk the call, faulting only
+    /// if the module actually reaches it. Making *every* unrecognised module
+    /// name a hard refusal would refuse to load `WCCMMUD.DLL` itself over
+    /// its own unimplemented `DOSCALLS`/`PHAPI` imports. `NotExported` only
+    /// ever fires once a module genuinely is present in memory and
+    /// genuinely does not have what was asked of it -- a version mismatch or
+    /// a wrong ordinal, not a gap more shim code could ever close.
+    NotExported,
 }
 
 impl std::fmt::Display for MissingGlobal {
@@ -469,6 +501,7 @@ impl std::fmt::Display for MissingGlobal {
                 f,
                 "{module}.{symbol} is {size} bytes here, and the module reaches {addend} into it"
             ),
+            Why::NotExported => write!(f, "{module} is loaded, but exports no {symbol}"),
         }
     }
 }
@@ -552,7 +585,11 @@ pub enum LoadError {
     /// [`PeError`](mbbs_machine::m32::PeError) (`Wg32`).
     Image(io::Error),
 
-    /// The module addresses host globals the host cannot honestly provide.
+    /// The module addresses host globals the host cannot honestly provide --
+    /// or calls a symbol from a module this `Host` already loaded that does
+    /// not export it. See [`Why::NotExported`] and [`MissingGlobal`]'s own
+    /// doc comment for why the second case rides this variant rather than a
+    /// new one.
     Globals(Vec<MissingGlobal>),
 
     /// A host table answered [`mbbs_machine::module::Import::Absolute`] for a
@@ -773,6 +810,27 @@ pub struct Host<A: Abi> {
     /// number is its index here, which is what `register_module` returns and
     /// what the module passes back.
     modules: Vec<Registration<A>>,
+
+    /// Every module [`Host::load`] has loaded so far in this life, keyed by
+    /// its own declared name ([`Abi::module_name`]) -- **not** the same
+    /// bookkeeping as [`Host::modules`] above, which is about a module
+    /// *registering itself* with the running host (`register_module`) and
+    /// is keyed by registration order, not name. This is purely a loader
+    /// concern: what a *later* `Host::load` call's own imports may resolve
+    /// against, so that one module compiled to import another's exports
+    /// (`WCCMMPLS.DLL` importing `WCCMMUD.DLL`'s `mmlog`, the case this
+    /// exists for) can be loaded at all. See [`Resolver`]'s own doc comment
+    /// for how an import gets answered out of this map, and
+    /// [`Why::NotExported`] for what happens when the answer is "loaded, but
+    /// does not have that".
+    ///
+    /// Empty at [`Host::new`] and never touched anywhere but [`Host::load`],
+    /// so it is rebuilt fresh -- never leaked across a life -- exactly the
+    /// way every other piece of per-life state here is: a new [`Host`] is
+    /// built per life (`crates/mbbs-server`'s restart loop), and this map is
+    /// part of that fresh `Self`, not a `static` or anything else that could
+    /// outlive one.
+    loaded_modules: HashMap<String, A::Module>,
 
     /// Every client/server agent that has come online, in registration order.
     /// Unlike [`Host::modules`] these are *copies* -- see [`Agent`].
@@ -1308,6 +1366,7 @@ impl<A: Abi> Host<A> {
             clock: Clock::system()?,
             audit: Vec::new(),
             modules: Vec::new(),
+            loaded_modules: HashMap::new(),
             agents: Vec::new(),
             textvars: TextVars::default(),
             messages: msg::Messages::default(),
@@ -2089,27 +2148,41 @@ impl<A: Abi> Host<A> {
     /// addresses a global this host cannot honestly provide -- see
     /// [`LoadError`].
     pub fn load(&mut self, cpu: &mut A::Cpu, file: &[u8]) -> Result<A::Module, LoadError> {
-        let reach = NeImage::parse(file)
-            .map(|image| addressed_as_data(&image, file))
+        let image = NeImage::parse(file).ok();
+        let reach = image
+            .as_ref()
+            .map(|image| addressed_as_data(image, file))
             .unwrap_or_default();
+
+        // Every distinct symbol `file` imports, NE or not -- a strict
+        // superset of `reach`'s own keys (see `imported_symbols`'s own doc
+        // comment). Driving the pre-check loop below off this set rather
+        // than `reach.keys()` alone is what lets a missing cross-module
+        // *routine* -- a call site, invisible to `reach` by construction --
+        // get the same "refused before `cpu` is touched" guarantee
+        // `Why::NotPlaced`/`Why::TooSmall` already had; see
+        // `Why::NotExported`'s own doc comment for the case this exists for.
+        let precheck: HashSet<(String, Symbol)> =
+            image.as_ref().map(imported_symbols).unwrap_or_default();
 
         let resolver = Resolver {
             exports: self.exports,
             globals: &self.globals,
+            loaded: &self.loaded_modules,
             reach,
             missing: std::cell::RefCell::new(Vec::new()),
         };
 
         // Refuse before `cpu` is touched at all: every symbol that could
-        // ever be recorded as missing is a key of `resolver.reach` (see
-        // `Resolver::resolve`'s own doc comment -- the check only runs
-        // `if let Some(reach) = self.reach.get(..)`), and `resolve` reads
-        // nothing but `self.exports`/`self.globals`/`self.reach` to answer,
-        // so walking those keys here finds the identical misses the same
-        // walk would find from inside `A::load`, without `A::load` having
-        // run yet.
+        // ever be recorded as missing is a key of `precheck` (`reach`'s own
+        // keys are a subset of it, and `Why::NotExported` is never gated on
+        // `reach` at all -- see `Resolver::resolve`'s own doc comment), and
+        // `resolve` reads nothing but `self.exports`/`self.globals`/
+        // `self.reach`/`self.loaded` to answer, so walking those keys here
+        // finds the identical misses the same walk would find from inside
+        // `A::load`, without `A::load` having run yet.
         use mbbs_machine::module::ImportResolver as _;
-        for (module, symbol) in resolver.reach.keys() {
+        for (module, symbol) in &precheck {
             resolver.resolve(module, symbol);
         }
         let mut missing = resolver.missing.replace(Vec::new());
@@ -2120,19 +2193,28 @@ impl<A: Abi> Host<A> {
 
         let module = A::load(cpu, file, &resolver)?;
 
-        // The pass above already found every miss `reach` can produce, so
+        // The pass above already found every miss `precheck` can produce, so
         // this is a closed set, not a second independent source of
         // refusals -- kept as the honest fallback rather than an
         // `unreachable!()`, since `resolve` is a `dyn` trait method and
         // nothing prevents a *future* resolver from recording a miss this
         // pre-check did not anticipate.
         missing = resolver.missing.into_inner();
-        if missing.is_empty() {
-            Ok(module)
-        } else {
+        if !missing.is_empty() {
             missing.sort_by(|a, b| (&a.module, &a.symbol).cmp(&(&b.module, &b.symbol)));
-            Err(LoadError::Globals(missing))
+            return Err(LoadError::Globals(missing));
         }
+
+        // Make this module's own exports reachable to whatever `Host::load`
+        // call comes next in this life -- see `Host::loaded_modules`'s own
+        // doc comment. `A::module_name` answering `None` (`Wg32`, today)
+        // just means nothing else will ever find this module by name, which
+        // is no worse than today's single-module reality.
+        if let Some(name) = A::module_name(&module) {
+            self.loaded_modules.insert(name.to_owned(), module.clone());
+        }
+
+        Ok(module)
     }
 
     /// Call a module entry point, servicing its imports until it stops.
@@ -3797,6 +3879,33 @@ fn addressed_as_data(image: &NeImage, file: &[u8]) -> HashMap<(String, Symbol), 
     reach
 }
 
+/// Every distinct symbol `image` imports, however it is addressed.
+///
+/// A strict superset of [`addressed_as_data`]'s own keys: that function
+/// walks the identical `Target::Import` relocations, filtering by *how* the
+/// module reaches each one (`FAR_ADDR` -- a call -- excluded, everything
+/// else counted as data), where this walks the same relocations and names
+/// every one it finds, call sites included. Built for [`Host::load`]'s
+/// pre-check pass, so that a cross-module *routine* import -- a call site,
+/// which `addressed_as_data` never classifies as data at all -- still gets
+/// resolved, and any resulting [`Why::NotExported`] recorded, before
+/// `A::load` ever touches `cpu`. See that method's own doc comment.
+fn imported_symbols(image: &NeImage) -> HashSet<(String, Symbol)> {
+    let mut symbols = HashSet::new();
+    for segment in &image.segments {
+        for reloc in &segment.relocations {
+            let Target::Import { module, symbol } = &reloc.target else {
+                continue;
+            };
+            let Ok(from) = image.module_name(*module) else {
+                continue;
+            };
+            symbols.insert((from.to_owned(), symbol.clone()));
+        }
+    }
+    symbols
+}
+
 /// The addend a fixup carries.
 ///
 /// Only an additive record has one: a chained record's site holds the offset of
@@ -3847,6 +3956,18 @@ struct Resolver<'a, A: Abi> {
     exports: &'static Exports,
     globals: &'a Globals<A>,
 
+    /// Every module [`Host::load`] has already loaded in this life, by its
+    /// own declared name -- see [`Host::loaded_modules`]'s own doc comment.
+    /// Consulted only once the host's own tables (`exports`/`globals`, via
+    /// `shims::entry`) have nothing to say about a symbol: **order matters**,
+    /// and host tables go first, so a module can never shadow a host
+    /// routine by declaring itself under a name like `MAJORBBS` and
+    /// exporting a same-named symbol -- `shims::entry` is asked first every
+    /// time, and this map is only ever reached when that answered
+    /// [`Entry::Unimplemented`]. See [`Resolver::resolve`]'s own doc
+    /// comment for the rest of the design.
+    loaded: &'a HashMap<String, A::Module>,
+
     /// How far into each data-addressed symbol this module's own
     /// relocations reach -- see [`addressed_as_data`]'s own doc comment.
     /// Always empty for anything that does not parse as an NE image (a PE
@@ -3866,6 +3987,45 @@ struct Resolver<'a, A: Abi> {
 }
 
 impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
+    /// # Cross-module imports: order matters
+    ///
+    /// A symbol is answered by, in this order: this host's own tables
+    /// (`shims::entry`, unchanged from before this feature existed);
+    /// failing that, [`Resolver::loaded`], a module this same `Host` already
+    /// loaded earlier in this life. Host tables are consulted first and
+    /// unconditionally -- never *because* the registry came up empty, but
+    /// before it is ever asked -- so a loaded module can never shadow a host
+    /// routine: `shims::entry("MAJORBBS", "spr")` always answers
+    /// [`Entry::Routine`] before this method has any chance to notice that
+    /// some other loaded module also happens to be named `MAJORBBS` and also
+    /// happens to export something called `spr`.
+    ///
+    /// A registry hit resolves to [`Import::Data`] -- not [`Import::Routine`]
+    /// -- because it is not a host thunk: `Abi::export_address` hands back
+    /// the target module's own code address, and the loader writes it into
+    /// the fixup site directly, exactly as it would a host global's address.
+    /// A call through that site never round-trips through this host at all;
+    /// it is an ordinary far call into memory this same machine already
+    /// owns. See [`Import::Data`]'s own doc comment for why that variant is
+    /// the right one to reuse rather than adding a third that would behave
+    /// identically.
+    ///
+    /// A registry *miss* -- the module is loaded, but does not export the
+    /// requested ordinal or name -- records [`Why::NotExported`] the same
+    /// way a `reach`-tracked datum records [`Why::NotPlaced`]. This is
+    /// **not** gated behind `self.reach` the way the other two `Why` arms
+    /// are: `reach` only ever contains symbols this module addresses *as
+    /// data*, and every real case this feature exists for (`WCCMMPLS.DLL`'s
+    /// `mmlog`, `retrieve_public_usrnum_userinfo`, ...) is a **call** site,
+    /// never tracked by `reach` at all -- gating this check on `reach` the
+    /// way the others are would make it unreachable for the exact imports it
+    /// was built to catch.
+    ///
+    /// A module name `self.loaded` has never heard of at all is **not**
+    /// treated as a miss -- see [`Why::NotExported`]'s own doc comment for
+    /// why that would be wrong (indistinguishable from a host DLL this crate
+    /// has not finished implementing, and today's graceful degradation for
+    /// that case must not regress).
     fn resolve(&self, module: &str, symbol: &Symbol) -> Option<mbbs_machine::module::Import<A::Ptr>> {
         // One name computation, reused for both the miss check below and
         // the value this method returns -- `Resolver::resolve` used to
@@ -3882,6 +4042,27 @@ impl<A: Abi> mbbs_machine::module::ImportResolver<A::Ptr> for Resolver<'_, A> {
         // to report instead of silently skipping an ordinal it cannot name.
         let name = symbol_name(self.exports, module, symbol);
         let entry = shims::entry::<A>(module, &name);
+
+        // Cross-module: host tables answered first, above, and only once
+        // they came back empty is a loaded module even consulted -- see
+        // this method's own doc comment, "Order matters". A module name the
+        // registry has never heard of falls straight through to the
+        // existing `reach`/`entry` handling below, completely unchanged.
+        if matches!(entry, Entry::Unimplemented)
+            && let Some(loaded) = self.loaded.get(module)
+        {
+            return match A::export_address(loaded, symbol) {
+                Some(ptr) => Some(mbbs_machine::module::Import::Data(ptr)),
+                None => {
+                    self.missing.borrow_mut().push(MissingGlobal {
+                        module: module.to_owned(),
+                        symbol: name,
+                        why: Why::NotExported,
+                    });
+                    None
+                }
+            };
+        }
 
         // The fold: `Host::check_globals` used to walk `addressed_as_data`'s
         // whole map as a separate pass before any fixup was written. Here

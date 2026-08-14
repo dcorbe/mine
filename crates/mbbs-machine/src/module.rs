@@ -111,7 +111,20 @@ pub enum Import<Ptr> {
     /// answers.
     Routine,
 
-    /// A host global the module addresses directly.
+    /// An address the loader writes into the fixup site verbatim, no thunk
+    /// involved -- a host global the module addresses directly, **or**,
+    /// since cross-module import support landed, another already-loaded
+    /// module's own export. The two are indistinguishable to the loader on
+    /// purpose: an NE fixup does not know or care whether the instruction it
+    /// is patching is a `mov` reading a variable or a `call far`/`jmp far`
+    /// reaching a routine (see `m16::ne::apply`'s own doc comment, "the
+    /// additive-OFFSET case is the one that matters"), so a routine another
+    /// *module* exports is patched in exactly the way a datum the *host*
+    /// owns always has been -- the caller writes straight into the target's
+    /// own code, with no host-side thunk to mediate the call afterwards.
+    /// `crates/mbbs`'s `Resolver::resolve` is what decides which of the two
+    /// this is, once, at load time; this variant only says "here is the
+    /// address, write it".
     Data(Ptr),
 
     /// A constant with no address at all -- see this enum's own doc

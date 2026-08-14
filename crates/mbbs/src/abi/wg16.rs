@@ -212,6 +212,29 @@ impl Abi for Wg16 {
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
         module.entry(1)
     }
+
+    /// Direct delegation to `mbbs_machine::m16::Module::name` -- the NE
+    /// resident name table's own first entry, captured at parse time rather
+    /// than dropped the way every other reader of that table drops it. See
+    /// [`Abi::module_name`]'s own doc comment.
+    fn module_name(module: &Self::Module) -> Option<&str> {
+        Some(module.name())
+    }
+
+    /// Direct delegation to whichever of `mbbs_machine::m16::Module::entry`/
+    /// `entry_by_name` matches how `symbol` names itself -- an ordinal import
+    /// and a named one are answered by different tables in the exporting
+    /// module (`Module::entry` walks the entry table by ordinal,
+    /// `entry_by_name` walks the same resident/non-resident name tables
+    /// [`Wg16::module_name`] itself reads its own name out of), and this is
+    /// the one place that already knows which. See [`Abi::export_address`]'s
+    /// own doc comment.
+    fn export_address(module: &Self::Module, symbol: &mbbs_machine::module::Symbol) -> Option<Self::Ptr> {
+        match symbol {
+            mbbs_machine::module::Symbol::Ordinal(n) => module.entry(*n),
+            mbbs_machine::module::Symbol::Name(name) => module.entry_by_name(name),
+        }
+    }
 }
 
 /// Where in the module the call being refused came from, as a place you can

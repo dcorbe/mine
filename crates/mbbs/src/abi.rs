@@ -469,7 +469,18 @@ pub trait Abi {
     /// `Wg32`'s answer is a placeholder no code calls, guarded by a `load`
     /// that refuses to run rather than fabricate one -- see [`Abi::load`]'s
     /// own `Wg32` implementation.
-    type Module;
+    ///
+    /// **`Clone`**, since `Host::load` (`crates/mbbs/src/lib.rs`) keeps a
+    /// copy of every module it loads, keyed by [`Abi::module_name`], so that
+    /// a *later* `Host::load` call's [`Abi::export_address`] can answer
+    /// "what is `WCCMMUD.mmlog`?" against a `WCCMMUD` this same `Host` loaded
+    /// earlier in the same life -- see `crate::LoadError`'s own doc comment
+    /// for cross-module imports, the feature this bound exists for. Both
+    /// `Wg16`'s and `Wg32`'s own `Module` already derived `Clone` before this
+    /// bound was added; it costs neither implementation anything, and a
+    /// future third `Abi` inherits the requirement rather than being able to
+    /// silently skip it.
+    type Module: Clone;
 
     /// Parse and map `file` into this ABI's own memory, resolving every
     /// import through `resolve`.
@@ -573,6 +584,60 @@ pub trait Abi {
     /// Both ABIs' init lookups carry that `Option` now, so neither has to
     /// fabricate an answer this method could not honestly give.
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr>;
+
+    /// This ABI's own name for `module` -- what a *different* module's own
+    /// import table has to say to reach it, not to be confused with the DLL
+    /// names a module itself imports *from*.
+    ///
+    /// Consulted by `Host::load`'s cross-module import registry
+    /// (`crates/mbbs/src/lib.rs`'s `Resolver`, and see `crate::LoadError`'s
+    /// own doc comment): once a module has loaded, `Host` remembers it keyed
+    /// by whatever this answers, so a *later* `Host::load` call resolving an
+    /// import against it can find it by the same name its own import table
+    /// would have used.
+    ///
+    /// Default `None`, the same convention [`Abi::native`]'s own doc comment
+    /// explains: an `Abi` with nothing to add here writes no code at all.
+    /// `Wg16`'s override (`abi/wg16.rs`) reads
+    /// [`mbbs_machine::m16::Module::name`], the NE resident name table's own
+    /// first entry -- see that method's own doc comment for where the string
+    /// comes from. `Wg32` has no override yet: `mbbs_machine::m32::Module`
+    /// does not carry its own declared name today (nothing before this
+    /// method existed ever needed one), so a `Wg32` module can be loaded but
+    /// not yet *depended on* by a later one -- see `Abi::export_address`'s
+    /// own doc comment for the matching half of this gap.
+    fn module_name(module: &Self::Module) -> Option<&str>
+    where
+        Self: Sized,
+    {
+        let _ = module;
+        None
+    }
+
+    /// Where `symbol` lives in `module`'s own export table, in this ABI's
+    /// pointer type -- the read half of the cross-module registry
+    /// [`Abi::module_name`] is the write half of. `None` for a symbol
+    /// `module` does not export, or for an `Abi` that cannot yet answer this
+    /// at all (see [`Abi::module_name`]'s own doc comment on `Wg32`'s gap).
+    ///
+    /// Only ever consulted for a symbol the host's own tables (`shims::entry`
+    /// and friends) had no answer for -- see `Resolver::resolve`'s own doc
+    /// comment ("Order matters") for why a loaded module is never given the
+    /// chance to shadow a host routine.
+    ///
+    /// Default `None`, matching [`Abi::module_name`]. `Wg16`'s override
+    /// (`abi/wg16.rs`) delegates to [`mbbs_machine::m16::Module::entry`] for
+    /// an ordinal symbol and [`mbbs_machine::m16::Module::entry_by_name`]
+    /// for a named one -- both of which this crate's loader already builds
+    /// for every module it maps; nothing new is parsed or retained to answer
+    /// this, only exposed.
+    fn export_address(module: &Self::Module, symbol: &mbbs_machine::module::Symbol) -> Option<Self::Ptr>
+    where
+        Self: Sized,
+    {
+        let _ = (module, symbol);
+        None
+    }
 }
 
 /// Memory a module can address, and the host's ability to hand it more.
