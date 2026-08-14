@@ -117,6 +117,46 @@ pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
+/// `void echonu(int usrnum)` -- `MAJORBBS.C:3847`, "turn echo on utility".
+///
+///
+/// **The counterpart to the `btuech(chan,0)` a module makes when it begins a
+/// timed action, and reaching it is what ends one.** MajorMUD silences echo in
+/// its `_ADD_DELAY` and restores it here once the delay expires. Nothing could
+/// reach this routine until `Host::cycle` began calling the `syscyc` vector --
+/// which is why no survey ever named it, and why it surfaced as a module stop
+/// the first time a move ran to completion.
+///
+/// Two simplifications, both made from what this host *is* rather than by
+/// guessing at the original:
+///
+/// - `echtyp[grpnum[usrnum]]` is the echo type of the user's **group**. This
+///   host has neither: `echtyp` and `grpnum` are not placed globals, because
+///   no module it loads addresses them. Every channel it serves is an ordinary
+///   user, whose group echo type is "on", so this restores echo instead of
+///   indexing a table that would have exactly one entry.
+/// - The `extptr->wid` branch is `echsec`'s teardown -- `echsec` sets a
+///   secret echo character and a line width, and this clears both. `echsec` is
+///   not implemented here, so nothing can make `wid` non-zero and the branch is
+///   unreachable. Recorded rather than quietly dropped: a host that grows
+///   `echsec` must grow this with it.
+///
+
+pub fn echonu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    if on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).echo = true;
+    })
+    .is_none()
+    {
+        // `void`, so there is no status to answer with -- the original would
+        // have indexed `grpnum` out of bounds here. A note is the only way to
+        // say it happened.
+        host.note(format!("echonu: channel {chan} is out of range; echo not restored"));
+    }
+    Ok(abi::Ret::Void)
+}
+
 /// `int btulok(int chan, int onoff)` -- input lockout: arriving bytes are
 /// discarded while locked.
 pub fn btulok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {

@@ -2813,53 +2813,65 @@ impl<A: Abi> Host<A> {
         let mut iterations = 0;
         let mut dispatched = 0;
 
+        // **Once per `cycle`, not once per pass.** The original's test is
+        // per main-loop iteration, and its loop never slept -- it spun as fast
+        // as the CPU allowed, so the vector fired far more often than this.
+        // This host instead runs up to `max` passes and then sleeps a second,
+        // and firing per pass costs a far call into the module for each one:
+        // measured, that tripled module entries per second (about 512 polls to
+        // about 1536) and made `cycle` overrun its own second, which the host
+        // reports as "N seconds of timers in one pass -- the host stalled".
+        // The module only needs the gate set once between `_BACKGROUND_FAST`
+        // runs, and that routine is an `rtkick` heartbeat re-arming once a
+        // second, so once per cycle is enough to keep the Realm turning.
+        // `MAJORBBS.C:419-424`, the one part of the main loop this host
+        // used to decline:
+        //
+        //
+        // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
+        // `prctask()`)" -- the pointer a module chains its own real-time
+        // engine onto at init. Declining it was not a scoping saving: it
+        // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
+        // (export 106) is the ONLY writer of the module's fast-tick gate;
+        // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
+        // so with the vector uncalled the gate was set twice at init and
+        // never again -- monsters never moved, and the per-player movement
+        // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
+        // decrements, never counted down. Measured: calling this is what
+        // makes "You hear movement to the north" appear at all.
+        //
+        // `peek` rather than `scan` because the vector fires on the scan's
+        // *answer*, before the channel is serviced, and `scan` advances the
+        // rotation; `peek` is the same query without the side effect.
+        // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
+        // for every channel number -- so an idle pass fires it too, as the
+        // original's does.
+        //
+        // `prctask` -- the vector's documented tail -- is still not here.
+        // Nothing this host loads registers a task, so there is no chain to
+        // run; a module that did would need it, and would find this comment.
+        let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
+        if newunm <= self.lstunm {
+            let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
+            if vector != A::null_ptr() {
+                match self.run(machine, module, vector, &[], None)? {
+                    Outcome::Stopped(poison) => {
+                        return Ok(Cycles {
+                            iterations,
+                            dispatched,
+                            // `None`: the vector belongs to no channel.
+                            ended: Ended::Stopped(poison, None),
+                        });
+                    }
+                    Outcome::Returned { .. } => dispatched += 1,
+                }
+            }
+        }
+        self.lstunm = newunm;
+
         while iterations < max {
             iterations += 1;
 
-            // `MAJORBBS.C:419-424`, the one part of the main loop this host
-            // used to decline:
-            //
-            //
-            // `syscyc` is `MAJORBBS.H:715`, "system-cycle vector (tail is
-            // `prctask()`)" -- the pointer a module chains its own real-time
-            // engine onto at init. Declining it was not a scoping saving: it
-            // is why MajorMUD's Realm was frozen. `_MAJORMUD_SYSCYC`
-            // (export 106) is the ONLY writer of the module's fast-tick gate;
-            // `_BACKGROUND_FAST` tests that bit, does its work, and clears it,
-            // so with the vector uncalled the gate was set twice at init and
-            // never again -- monsters never moved, and the per-player movement
-            // delay at `+0x6ac`, which only `_FAST_UPDATE_CHARACTER`
-            // decrements, never counted down. Measured: calling this is what
-            // makes "You hear movement to the north" appear at all.
-            //
-            // `peek` rather than `scan` because the vector fires on the scan's
-            // *answer*, before the channel is serviced, and `scan` advances the
-            // rotation; `peek` is the same query without the side effect.
-            // `-1` is `btuscn`'s own "nothing queued", which is `<= lstunm`
-            // for every channel number -- so an idle pass fires it too, as the
-            // original's does.
-            //
-            // `prctask` -- the vector's documented tail -- is still not here.
-            // Nothing this host loads registers a task, so there is no chain to
-            // run; a module that did would need it, and would find this comment.
-            let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
-            if newunm <= self.lstunm {
-                let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
-                if vector != A::null_ptr() {
-                    match self.run(machine, module, vector, &[], None)? {
-                        Outcome::Stopped(poison) => {
-                            return Ok(Cycles {
-                                iterations,
-                                dispatched,
-                                // `None`: the vector belongs to no channel.
-                                ended: Ended::Stopped(poison, None),
-                            });
-                        }
-                        Outcome::Returned { .. } => dispatched += 1,
-                    }
-                }
-            }
-            self.lstunm = newunm;
 
             // No `pending()` guard here, and deliberately. `Host::poll`'s first
             // act is the same scan, and it returns `Ok(None)` before touching
