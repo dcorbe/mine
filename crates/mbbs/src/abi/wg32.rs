@@ -113,8 +113,13 @@ impl Wg32Cpu {
 }
 
 /// The ABI Worldgroup NT modules were compiled for: flat 32-bit addresses,
-/// cdecl throughout (no `Cleans::Callee` -- see the design's Part 2, "32-bit
-/// Worldgroup is uniformly cdecl").
+/// cdecl throughout for `WGSERVER`'s own exports (design's Part 2, "32-bit
+/// Worldgroup is uniformly cdecl") -- but not for every import a module
+/// makes. A Worldgroup NT module also imports the Win32 API directly, which
+/// is stdcall by definition, so `Cleans::Callee` is a real case here too. See
+/// [`Abi::resume`]'s own doc comment on this `impl`, and
+/// `crate::shims::borland`'s module doc comment for the two measured KERNEL32
+/// symbols that made this observable.
 pub struct Wg32;
 
 impl Abi for Wg32 {
@@ -223,27 +228,43 @@ impl Abi for Wg32 {
         Ok(exit)
     }
 
-    /// `Wg32` has no callee-cleaned routines -- 32-bit Worldgroup is
-    /// uniformly cdecl (`WGSERVER.DEF`'s `#ifdef GCDOS` block only; see this
-    /// module's own doc comment and design §2). `Cleans::Callee` reaching
-    /// this arm therefore names a bug in the host's own shim table -- some
-    /// entry wrongly marked callee-cleaned under this ABI -- not a case to
-    /// guess an answer for. This panic is permanent, not a stub awaiting
-    /// Task 6: there is no future implementation of it to write.
+    /// **`Wg32` has callee-cleaned routines after all -- just not among
+    /// `WGSERVER`'s own exports.** This doc comment used to say the opposite
+    /// and called the claim permanent: "32-bit Worldgroup is uniformly
+    /// cdecl ... this panic is permanent, not a stub awaiting Task 6: there
+    /// is no future implementation of it to write." That is still true of
+    /// `WGSERVER.DEF`'s own game-host API (the `#ifdef GCDOS` block is the
+    /// one place a reader of that header finds callee-cleaned 32-bit
+    /// routines, and a plain cdecl PE like `wccmmud.dll` never takes it). It
+    /// is false of the Win32 API a Worldgroup NT module imports *directly*,
+    /// which is stdcall by definition: `KERNEL32.dll!GetModuleHandleA` and
+    /// `!GetProcAddress` are measured that way at `LUNATIX.DLL`'s own call
+    /// sites (`0x41d61d`, `0x41d62c` -- push 4 and 8 bytes respectively,
+    /// neither followed by an `add esp`; see `crate::shims::borland`'s own
+    /// module doc comment). This ABI has to serve both: `WGSERVER`'s own
+    /// exports stay `Cleans::Caller`, and the imported Win32 routines this
+    /// host implements are `Cleans::Callee` like any other stdcall callee.
+    ///
+    /// [`mbbs_machine::m32::Machine::resume_on_cleaning`] is where the actual
+    /// cleanup happens -- the 32-bit analogue of
+    /// `mbbs_machine::m16::Machine::resume_cleaning`, which `Wg16::resume`
+    /// (`abi/wg16.rs`) already delegates to for its own ten callee-cleaned
+    /// rows. `Cleans::Callee(bytes)` here does exactly what
+    /// `Cleans::Caller` does except for how far `ESP` moves past the near
+    /// return address: `4 + bytes` instead of `4`, so the module's own
+    /// arguments come off the stack with it, exactly as a stdcall callee's
+    /// `ret bytes` would.
     fn resume(cpu: &mut Self::Cpu, ret: Ret<Self>, cleans: crate::shims::Cleans) -> std::io::Result<Exit<Self>> {
-        match cleans {
-            crate::shims::Cleans::Callee(bytes) => panic!(
-                "Wg32::resume asked to clean {bytes} callee-side bytes -- 32-bit \
-                 Worldgroup is uniformly cdecl, so a Cleans::Callee row reaching \
-                 this ABI is a bug in the host's shim table, not something to guess at"
-            ),
-            crate::shims::Cleans::Caller => {
-                let ret32: mbbs_machine::m32::Ret = ret.into();
-                let exit = convert_exit(cpu.machine.resume_on(cpu.mem.stack_mut(), ret32)?);
-                debug_assert_attributable(&exit, &cpu.machine);
-                Ok(exit)
+        let ret32: mbbs_machine::m32::Ret = ret.into();
+        let raw = match cleans {
+            crate::shims::Cleans::Caller => cpu.machine.resume_on(cpu.mem.stack_mut(), ret32)?,
+            crate::shims::Cleans::Callee(bytes) => {
+                cpu.machine.resume_on_cleaning(cpu.mem.stack_mut(), ret32, bytes)?
             }
-        }
+        };
+        let exit = convert_exit(raw);
+        debug_assert_attributable(&exit, &cpu.machine);
+        Ok(exit)
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Machine::arg_frame` (Task 6)

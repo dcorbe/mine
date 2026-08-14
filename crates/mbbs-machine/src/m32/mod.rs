@@ -641,16 +641,20 @@ impl Machine {
     /// `EAX` (`EDX:EAX` for a 64-bit result), and re-entering at the
     /// instruction after the module's own `call`.
     ///
-    /// There is no `resume_cleaning` counterpart here, unlike
-    /// `crate::m16::Machine`. That method exists there because 16-bit Borland
-    /// huge-model code has genuinely callee-cleaned helpers (`f_lumod@` and
-    /// its family); 32-bit Worldgroup does not carry that quirk forward --
-    /// it is uniformly cdecl. The ten callee-cleaned `F_*@` helpers a reader
-    /// of `WGSERVER.DEF` might expect an analogue for live inside its
-    /// `#ifdef GCDOS` block only, which a plain 32-bit cdecl PE like
-    /// `wccmmud.dll` never takes. A module always cleans its own arguments
-    /// under this ABI, so [`resume`](Machine::resume) is the only shape a
-    /// resume ever needs.
+    /// **This module's own doc comment used to claim there was no
+    /// `resume_cleaning` counterpart here "because 32-bit Worldgroup is
+    /// uniformly cdecl."** That was true of `WGSERVER`'s own game-host API --
+    /// the ten callee-cleaned `F_*@` helpers a reader of `WGSERVER.DEF` might
+    /// expect an analogue for really do live inside its `#ifdef GCDOS` block
+    /// only, which a plain 32-bit cdecl PE like `wccmmud.dll` never takes --
+    /// but it does not follow for the Win32 API a Worldgroup NT module
+    /// imports directly. `KERNEL32.dll!GetModuleHandleA` and
+    /// `!GetProcAddress` are stdcall by definition, and are measured that
+    /// way at `LUNATIX.DLL`'s own call sites (`0x41d61d`, `0x41d62c`: 4 and 8
+    /// bytes pushed, neither followed by an `add esp`). See
+    /// [`resume_cleaning`](Machine::resume_cleaning)'s own doc comment for
+    /// the counterpart this file now has, mirroring
+    /// `crate::m16::Machine::resume_cleaning` on the flat 32-bit stack.
     ///
     /// # Errors
     ///
@@ -665,17 +669,57 @@ impl Machine {
     ///
     /// If the stack has moved to `Memory`.
     pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+        self.resume_cleaning(ret, 0)
+    }
+
+    /// Resume, dropping `bytes` of the module's own arguments as well --
+    /// the self-owned form of [`Machine::resume_on_cleaning`], the same
+    /// relationship [`resume`](Machine::resume) has to
+    /// [`resume_on`](Machine::resume_on).
+    ///
+    /// For an import that pops its own arguments under Win32's stdcall
+    /// convention -- `GetModuleHandleA`/`GetProcAddress`, measured at
+    /// `LUNATIX.DLL`'s own call sites (see [`resume`](Machine::resume)'s own
+    /// doc comment). `bytes` is what the *module* pushed, so it does not
+    /// include the near return address; `0` is exactly
+    /// [`resume`](Machine::resume).
+    ///
+    /// # Panics
+    ///
+    /// If the stack has moved to `Memory`, or the module is not stopped at a
+    /// call.
+    pub fn resume_cleaning(&mut self, ret: Ret, bytes: u16) -> io::Result<Exit> {
         let mut stack = self
             .tib
             .take_stack()
-            .expect("the stack mapping has moved to `Memory`; use `resume_on`");
-        let out = self.resume_on(stack.as_mut_slice(), ret);
+            .expect("the stack mapping has moved to `Memory`; use `resume_on_cleaning`");
+        let out = self.resume_on_cleaning(stack.as_mut_slice(), ret, bytes);
         self.tib.put_stack(stack);
         out
     }
 
     /// Resume the outstanding call, reading its frame out of `stack`.
     pub fn resume_on(&mut self, stack: &mut [u8], ret: Ret) -> io::Result<Exit> {
+        self.resume_on_cleaning(stack, ret, 0)
+    }
+
+    /// [`Machine::resume_on`], dropping `bytes` of the module's own
+    /// arguments as well -- the production form of
+    /// [`Machine::resume_cleaning`], and the 32-bit analogue of
+    /// `crate::m16::Machine::resume_cleaning`. See
+    /// [`Machine::resume`]'s own doc comment for why this exists at all:
+    /// `WGSERVER`'s own exports are uniformly cdecl, but the Win32 API a
+    /// Worldgroup NT module imports directly is not, and this is what
+    /// services `Cleans::Callee` for it.
+    ///
+    /// Identical to [`Machine::resume_on`] except for the last line: where
+    /// that steps `ESP` past exactly the 4-byte near return address (leaving
+    /// the module's own arguments for *it* to clean, cdecl-style), this
+    /// steps past the return address **and** `bytes` more -- exactly what a
+    /// stdcall callee's own `ret bytes` does in real x86, collapsed into one
+    /// assignment because this host never actually executes a `ret`
+    /// instruction to get back to the module; it splices `ESP` directly.
+    pub fn resume_on_cleaning(&mut self, stack: &mut [u8], ret: Ret, bytes: u16) -> io::Result<Exit> {
         // Stated once, not left to depend on `frame_sp` happening to be
         // cleared alongside `poisoned` in `run`'s `Fault` arm below -- that
         // coupling is an accident of implementation, not a guard: removing
@@ -732,11 +776,13 @@ impl Machine {
         }
 
         // Step over the 4 bytes just read, exactly as the module's own `ret`
-        // would when the call it made returns normally: `ESP` ends up where
-        // it stood the instant after the `call` instruction pushed that
-        // return address, with the host's answer now sitting in `EAX`/`EDX`
-        // in its place.
-        self.run(at, sp + 4, ret)
+        // would when the call it made returns normally, plus `bytes` more --
+        // exactly what a stdcall callee's own `ret bytes` would additionally
+        // pop. `ESP` ends up where it stood the instant after the `call`
+        // instruction pushed that return address, advanced by whichever
+        // convention `bytes` encodes (`0` for cdecl, `resume_on`'s case),
+        // with the host's answer now sitting in `EAX`/`EDX` in its place.
+        self.run(at, sp + 4 + u32::from(bytes), ret)
     }
 
     /// Read the `n`th 32-bit cdecl argument of the outstanding call.

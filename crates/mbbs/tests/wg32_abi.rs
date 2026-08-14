@@ -218,23 +218,107 @@ fn call_round_trips_a_hand_assembled_immediate_return() {
     }
 }
 
-/// Task 6, requirement 2: `Wg32::resume` given `Cleans::Callee` must panic,
-/// not guess -- see `abi/wg32.rs`'s own doc comment on that arm ("32-bit
+/// Task (closing the `Wg32` stdcall gap): `Wg32::resume` given
+/// `Cleans::Callee` used to panic unconditionally -- see the git history of
+/// `abi/wg32.rs`'s doc comment on `Abi::resume` for the old claim ("32-bit
 /// Worldgroup is uniformly cdecl, so a `Cleans::Callee` row reaching this ABI
-/// is a bug in the host's shim table"). This is a permanent behaviour, not a
-/// stub Task 6 was meant to retire (`abi/wg32.rs`'s module doc comment says
-/// so explicitly), so the test pins the *message*, not merely that a panic
-/// happened -- a panic with the wrong reason would be just as wrong as no
-/// panic at all.
+/// is a bug in the host's shim table") and why it was wrong: true of
+/// `WGSERVER`'s own exports, false of the Win32 API a Worldgroup NT module
+/// imports directly (`KERNEL32.dll!GetModuleHandleA`/`!GetProcAddress`,
+/// measured `stdcall` at `LUNATIX.DLL`'s own call sites -- see
+/// `crate::shims::borland`'s own module doc comment).
 ///
-/// No outstanding call is needed: the `match cleans { .. }` in `Wg32::resume`
-/// dispatches on `cleans` before it ever touches `cpu`, so `Cleans::Callee`
-/// panics immediately regardless of what state `cpu` is in.
+/// This is the 32-bit analogue of
+/// `crates/mbbs-machine/tests/cleanup.rs`'s "who pops the arguments" pair,
+/// told apart the same way: real hand-assembled code, a genuine `call`
+/// executed by the CPU (not simulated), and a stack-pointer measurement the
+/// *module* takes -- `EBP` marks `ESP` before the pushes, `EAX = EBP - ESP`
+/// after the relayed call returns -- rather than an assumption about what
+/// `Cleans` "should" do. Two dwords (8 bytes) pushed either way, matching
+/// `GetProcAddress`'s own arity; only `cleans` differs between the two tests
+/// below.
+fn relay_two_dwords(thunk: u32, mapping_base: u32) -> Vec<u8> {
+    let mut code = vec![0x89, 0xe5]; // mov ebp, esp
+    for dword in [2u32, 1] {
+        code.push(0x68); // push imm32
+        code.extend_from_slice(&dword.to_le_bytes());
+    }
+    // `call rel32` -- computed against this mapping's own base, known only
+    // once it is allocated, so the displacement is patched in after the
+    // pushes above are already in `code`, not hand-computed offline.
+    let next_instruction = mapping_base + code.len() as u32 + 5;
+    code.push(0xe8);
+    code.extend_from_slice(&thunk.wrapping_sub(next_instruction).to_le_bytes());
+    code.extend_from_slice(&[
+        0x89, 0xe8, // mov eax, ebp
+        0x29, 0xe0, // sub eax, esp
+        0x89, 0xec, // mov esp, ebp
+        0xc3, // ret
+    ]);
+    code
+}
+
+/// Build the relay above into a fresh code mapping, drive it through
+/// `Wg32::call`/`Wg32::resume`, and answer how far `ESP` moved -- `0` if
+/// `cleans` popped the two pushed dwords along with the near return address,
+/// `8` if it left them for the module.
+fn stack_delta_under(cpu: &mut Wg32Cpu, cleans: mbbs::Cleans) -> u32 {
+    let thunk = cpu.machine.thunk_addr(0);
+    let mut mapping = mbbs_machine::m32::Mapping::new(4096).expect("a code mapping");
+    let base = mapping.base() as usize as u32;
+    let code = relay_two_dwords(thunk, base);
+    mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+    let entry = mbbs_machine::m32::Flat32Ptr(base);
+
+    let exit = Wg32::call(cpu, entry, &[]).expect("the relay's own call is recovered, not fatal");
+    assert!(
+        matches!(exit, Exit::Call { index: 0 }),
+        "the relay must reach thunk 0, got {exit:?}"
+    );
+    let exit = Wg32::resume(cpu, Ret::<Wg32>::Void, cleans).expect("resumed");
+    match exit {
+        Exit::Returned { lo, .. } => lo,
+        other => panic!("expected Exit::Returned, got {other:?}"),
+    }
+}
+
 #[test]
-#[should_panic(expected = "32-bit Worldgroup is uniformly cdecl")]
-fn resume_with_cleans_callee_panics_because_wg32_has_no_callee_cleaned_routines() {
+fn a_caller_cleaned_wg32_routine_leaves_its_arguments_on_the_stack() {
+    // cdecl, what every `WGSERVER` export is: `Cleans::Caller` drops only the
+    // near return address, so the module's own (never-executed here) `add
+    // esp, 8` is what was supposed to remove the rest.
     let mut cpu = cpu();
-    let _ = Wg32::resume(&mut cpu, Ret::<Wg32>::Void, mbbs::Cleans::Callee(2));
+    let moved = stack_delta_under(&mut cpu, mbbs::Cleans::Caller);
+    assert_eq!(moved, 8, "resume_on drops only the near return address");
+}
+
+#[test]
+fn a_callee_cleaned_wg32_routine_takes_its_arguments_with_it() {
+    // stdcall, what `GetProcAddress` is: the callee -- this host's own shim,
+    // via `Wg32::resume` -- pops its own two dwords too.
+    //
+    // This is also this task's mutation check: if `resume_on_cleaning` (or
+    // the `Cleans::Callee(8)` registered for `getprocaddress` in
+    // `shims::mod::routines`) ever cleaned the wrong number of bytes, `moved`
+    // would read that number's difference from `0` here instead -- e.g.
+    // `Cleans::Callee(4)` (one byte short of the real 8) reports `moved ==
+    // 4`, not `0`, and this assertion catches it. Confirmed by hand: passing
+    // `mbbs::Cleans::Callee(4)` here instead of `8` fails with `left: 4,
+    // right: 0` -- a corrupted module stack the old code would have left
+    // silently in place under `Cleans::Caller`, or panicked on for the wrong
+    // stated reason under the pre-fix `Cleans::Callee` arm.
+    let mut cpu = cpu();
+    let moved = stack_delta_under(&mut cpu, mbbs::Cleans::Callee(8));
+    assert_eq!(moved, 0, "resume_on_cleaning must pop the near return address and both dwords");
+}
+
+#[test]
+fn cleaning_zero_bytes_under_wg32_is_the_same_as_not_cleaning() {
+    // So that `Cleans::Callee(0)` is expressible and means what it says,
+    // mirroring `crates/mbbs-machine/tests/cleanup.rs`'s identical Wg16 case.
+    let mut cpu = cpu();
+    let moved = stack_delta_under(&mut cpu, mbbs::Cleans::Callee(0));
+    assert_eq!(moved, 8);
 }
 
 /// Task 6, requirement 3 -- **the one that matters** (design §6). Both `Abi`
