@@ -503,8 +503,13 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // the slot it names.
         (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
         (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
+        (MAJORBBS, "usroff", user::usroff, Cleans::Caller),
         (MAJORBBS, "getin", user::getin, Cleans::Caller),
         (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+        // The multi-user broadcast family's one member LunatiX actually
+        // imports -- see `user::clrmlt`'s own doc comment for why the other
+        // three (`prfmlt`/`pmlt`/`outmlt`) stay unimplemented.
+        (MAJORBBS, "clrmlt", user::clrmlt, Cleans::Caller),
         // Billing, which this host does not do. Both answer yes;
         // `shims::credits` is where that decision is written down.
         // `Cleans::Caller` is measured -- `re/ne_arity.py` reads

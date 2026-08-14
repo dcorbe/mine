@@ -319,6 +319,77 @@ pub fn stop_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
         .map(|()| abi::Ret::Void)
 }
 
+/// `struct user *usroff(int unum)` -- `&user[unum]`.
+///
+/// `MAJORBBS.H:345` declares the array; this is what turns a channel number
+/// into a pointer at it. [`Users::slot`](crate::users::Users::slot) already
+/// computes exactly that, at `A`'s own [`UserLayout`](crate::users::UserLayout)
+/// stride -- this shim is a channel lookup and a [`abi::Ret::Ptr`] over it,
+/// the same shape [`uacoff`] already gives the account table.
+///
+/// The oracle's own `usroff` is a stub that tail-calls a shared accessor
+/// computing `*descriptor + WORD[*descriptor] * index + 8` -- the `+8` is a
+/// block header, an allocator detail of that host's own heap. This host's
+/// `Users` has no equivalent to reproduce, so it is not: no header is added
+/// to what `Users::slot` returns.
+///
+/// **Guard the range.** `usroff(nterms)` in the real host walked off the
+/// table -- the block-header arithmetic just kept going and handed back
+/// whatever bytes followed the last real record. Runtime crashes beat
+/// undefined behaviour, so an out-of-range `unum` stops the module here
+/// instead of returning a pointer past the end.
+///
+/// This is also the routine that makes a wrong
+/// [`UserLayout`](crate::users::UserLayout) stride *visible*: at one channel
+/// every stride places channel 0 at offset 0, and only a second channel's
+/// slot depends on the number being right. See
+/// `crates/mbbs/tests/lunatix.rs`'s two-channel test for where that is
+/// actually exercised under `Wg32`.
+///
+/// # Errors
+///
+/// If `unum` names no channel.
+pub fn usroff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("usroff({unum}): there is no such channel")))?;
+    Ok(abi::Ret::Ptr(host.users().slot(chan)))
+}
+
+/// `void clrmlt(void)` -- clear the multi-line broadcast buffer.
+/// `GCOMM.H:473`.
+///
+/// # Why this is a no-op, and why that is the honest answer rather than a stub
+///
+/// `clrmlt` is one member of a four-routine family this host does not
+/// otherwise implement: `prfmlt` (`GCOMM.H:476`, formats a message into the
+/// broadcast buffer), `pmlt` (`:477`, the same with a control string) and
+/// `outmlt` (`:475`, flushes that buffer to one channel) are the other
+/// three, and `LUNATIX.DLL` imports none of them --
+/// `docs/2026-08-12-module-import-gaps.md` counts `_CLRMLT` at 23 call sites
+/// in LunatiX and the other three at zero. So nothing in this host's own
+/// reach ever writes into the buffer `clrmlt` would clear: there is no
+/// `prfmlt`/`pmlt` here for it to be cleaning up after, which is exactly the
+/// state a fresh, always-empty buffer is in. Clearing nothing is what
+/// clearing an empty buffer looks like.
+///
+/// **Not per-channel.** The real prototype takes no channel argument -- the
+/// broadcast buffer is one buffer, not one per channel, the same way
+/// `prfbuf` is one buffer shared by whichever channel is current. A no-op
+/// is trivially correct regardless of which channel called it, which is
+/// what this shim's own test calls it under channel 1 to show.
+///
+/// If a future module imports `prfmlt`/`pmlt`/`outmlt`, this stops being
+/// faithful the moment the buffer they fill has real content in it, and
+/// this comment is where that gap is written down rather than discovered
+/// as a printed-nothing bug.
+pub fn clrmlt<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
 /// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
 const BBSPRV: u16 = 2;
 
@@ -698,5 +769,63 @@ mod tests {
             None,
             "and nothing is injected on the way out"
         );
+    }
+
+    #[test]
+    fn usroff_hands_back_the_channels_own_slot() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let Ret::Far(at) = f.invoke(usroff, &[0]).expect("channel 0") else {
+            panic!("usroff returns a pointer");
+        };
+        assert_eq!(at, f.host.users().slot(console));
+    }
+
+    /// The oracle's own `usroff` tail-calls a shared accessor computing
+    /// `*descriptor + WORD[*descriptor] * index + 8` -- the `+8` is a block
+    /// header, an allocator detail of that host's own heap, and this host's
+    /// `Users` has no equivalent to reproduce. So this is exactly
+    /// `Users::slot` and nothing more, and the only way to see that it
+    /// strides correctly is to ask it for more than one channel.
+    #[test]
+    fn usroff_addresses_each_channel_at_its_own_slot() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let chan0 = f.host.users().terms().chan(0).expect("channel 0");
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+
+        let Ret::Far(at0) = f.invoke(usroff, &[0]).expect("channel 0") else {
+            panic!("usroff returns a pointer");
+        };
+        let Ret::Far(at1) = f.invoke(usroff, &[1]).expect("channel 1") else {
+            panic!("usroff returns a pointer");
+        };
+
+        assert_eq!(at0, f.host.users().slot(chan0));
+        assert_eq!(at1, f.host.users().slot(chan1));
+        assert_ne!(at0, at1, "two channels must not share a slot");
+    }
+
+    /// `usroff(nterms)` in the real host walked off the table -- the block
+    /// header arithmetic just kept going and handed back whatever followed
+    /// it. Runtime crashes beat undefined behaviour: this host refuses
+    /// instead, the same way [`uacoff`] does for the account table.
+    #[test]
+    fn usroff_refuses_a_channel_past_the_end_of_the_table() {
+        let mut f = Fixture::new();
+        let past = f.host.users().terms().count();
+        assert!(f.invoke(usroff, &[past]).is_err());
+        assert!(f.invoke(usroff, &[-1i16 as u16]).is_err());
+    }
+
+    /// `void clrmlt(void)` -- see [`clrmlt`]'s own doc comment for why a
+    /// no-op is the honest answer. Called with channel 1 current, not
+    /// channel 0, because `clrmlt` takes no channel argument at all and the
+    /// one way to show that is real is to call it when the "current" channel
+    /// is not the host's default.
+    #[test]
+    fn clrmlt_is_a_no_op_that_succeeds_regardless_of_the_current_channel() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        f.invoke(curusr, &[1]).expect("channel 1 current");
+        assert_eq!(f.invoke(clrmlt, &[]).expect("clrmlt succeeds"), Ret::Void);
     }
 }
