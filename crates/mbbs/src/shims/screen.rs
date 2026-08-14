@@ -242,7 +242,18 @@ mod tests {
         f.invoke(rstrxf, &[]).expect("rstrxf does not stop the machine");
 
         let c = f.host.gsbl().channel(chan);
-        assert_eq!((c.xon, c.xoff), (0, 0xed), "0, -19 as btuxnf would store it");
+        // `MAJORBBS.C:4490` is `btuxnf(usrnum,0,-19,...)` followed two lines
+        // later by `btucpc(usrnum,19)`, and `hpkrou` just below it has
+        // `case 19: /* XOFF char (CTRL-S) */`. So 19 is the character and
+        // `-19`'s sign is the page-mode flag, nothing more -- which is why
+        // this asserts the magnitude and not `-19`'s two's-complement bits.
+        //
+        // It used to assert `0xed`, with the comment "-19 as btuxnf would
+        // store it". That was the bug wearing its own explanation: 237 is a
+        // byte no terminal sends, and it disagreed with the
+        // `clear_pause_char == 19` four lines below it -- the same character,
+        // asserted two different ways in one test.
+        assert_eq!((c.xon, c.xoff), (0, 19), "btuxnf(0,-19) -- CTRL-S, page mode on");
         assert_eq!(c.page_lines, 22, "scnbrk(24) - CTNUOS(2)");
         assert_eq!(c.page_message.as_deref(), Some(PAUSE_MESSAGE));
         assert!(c.pause_handler_installed);
