@@ -43,9 +43,29 @@
 //! own doc comment has the other half -- why an update stream is readable at
 //! all now.
 //!
-//! `fwrite`, `fputs`, `fputc`, `fscanf`, `fgetc`, `getc` and `ungetc` are
-//! still genuinely absent: no import census, `WCCMMUD.DLL`'s or LunatiX's,
-//! has ever asked for any of them.
+//! `fputs`, `fscanf`, `getc` and `ungetc` are still genuinely absent: no
+//! import census, `WCCMMUD.DLL`'s or LunatiX's, has ever asked for any of
+//! them.
+//!
+//! # `fgetc`, `fputc`, `fwrite` and `flushall` landed with Stage 3's Task 8
+//!
+//! This paragraph used to list `fwrite`/`fputc`/`fgetc` alongside the four
+//! above, on the same "no census has asked" reasoning -- wrong by the time it
+//! was written, since the census two paragraphs up already names `_fgetc`,
+//! `_fputc` and `_fwrite` among LunatiX's imports. [`fgetc`], [`fputc`] and
+//! [`fwrite`] below are the C library routines the plan calls the "seven
+//! genuine C library" siblings (`docs/plans/2026-08-14-stage3-channel-entry-implementation.md`,
+//! Task 8); [`flushall`] is [`fflush`]'s own "everywhere" -- same honesty
+//! about buffering nothing, over every open stream instead of one.
+//! `cw3220mt.DLL` aliases onto `MAJORBBS` (`shims::mod::canonical_dll`), which
+//! is why these three plus `flushall` are registered under `MAJORBBS` rather
+//! than a `cw3220mt.DLL`-specific table.
+//!
+//! Each of the three goes through [`crate::stream::Streams::read_mem`] or
+//! [`crate::stream::Streams::write`] exactly as [`fread`]/[`fprintf`] already
+//! do -- one byte (or `size*nmemb` bytes) at a time through the same
+//! text-mode CR-squeeze/`^Z` translation, not a second read/write path with
+//! its own rules to keep in sync.
 //!
 //! # Two of these may answer instead of refusing
 //!
@@ -301,6 +321,135 @@ pub fn fread<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     )))
 }
 
+/// `int fgetc(FILE *stream)` -- one byte, or `EOF` at the end.
+///
+/// Borland's; no Galacticomm header redeclares it. Stage 3's Task 8 (this
+/// file's own module doc has the fuller account of why it landed eagerly).
+///
+/// `EOF` is `-1` at `A`'s own int width, not at 16 bits -- the same trap
+/// `shims::text::fold`'s own doc comment describes for `toupper(EOF)`:
+/// zero-extending a 16-bit `-1` into a 32-bit `int` gives `0x0000FFFF`, which
+/// is `65535`, not `-1`. `u32::MAX >> (32 - A::INT_WIDTH * 8)` is that
+/// file's own idiom for "all ones at this ABI's width," reused here rather
+/// than a second computation of the same number.
+///
+/// Goes through [`Streams::read_mem`](crate::stream::Streams::read_mem) with
+/// `want = 1`, the same text-mode CR-squeeze and soft `^Z` end-of-file
+/// [`Stream::getc`](crate::stream::Stream) already applies for [`fgets`] and
+/// [`fread`] -- one byte at a time is exactly what `getc` already does
+/// underneath either of those, so there is no second translation to keep
+/// in sync.
+///
+/// # Errors
+///
+/// If `cookie` names no open stream, or it is not open for reading.
+pub fn fgetc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int fgetc(FILE *stream)` -- Borland's; no Galacticomm header
+    // redeclares it.
+    let cookie = call.ptr();
+    let byte = host
+        .streams
+        .read_mem(call.mem(), cookie, 1)
+        .map_err(|e| ShimError::Failed(format!("fgetc: {e}")))?;
+
+    let eof = u32::MAX >> (32 - A::INT_WIDTH * 8);
+    Ok(abi::Ret::Int(A::int_from_u32(
+        byte.first().map_or(eof, |&b| u32::from(b)),
+    )))
+}
+
+/// `int fputc(int ch, FILE *stream)` -- one byte, echoed back on success.
+///
+/// Borland's; no Galacticomm header redeclares it. Stage 3's Task 8.
+///
+/// **No `EOF` return for a failed write.** Unlike [`fgetc`], where the end of
+/// a file is an ordinary answer a module polls for, a write that does not
+/// succeed is something this host has nothing safe to say about in-band --
+/// see [`ShimError`]'s own doc comment ("a plausible zero is the failure this
+/// whole design exists to avoid") -- so a stream this host cannot write to
+/// stops the module rather than answering `EOF` and letting it read `ferror`
+/// this crate does not track.
+///
+/// Only the low 8 bits of `ch` are written, and the value handed back is
+/// that same byte zero-extended to `A`'s own int width -- `WRITE.C`'s own
+/// `unsigned char` truncation, which [`crate::stream::Stream::write`]'s
+/// per-byte `\n` -> `\r\n` translation is applied to exactly as it is for
+/// [`fwrite`] and [`fprintf`].
+///
+/// # Errors
+///
+/// If `cookie` names no open stream, or it is not open for writing.
+pub fn fputc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int fputc(int ch, FILE *stream)` -- Borland's; no Galacticomm header
+    // redeclares it.
+    let ch: u32 = call.int().into();
+    let cookie = call.ptr();
+    let byte = ch as u8;
+
+    host.streams
+        .write(cookie, &[byte])
+        .map_err(|e| ShimError::Failed(format!("fputc: {e}")))?;
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(byte))))
+}
+
+/// `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
+/// -- a block, the write side of [`fread`].
+///
+/// Borland's; no Galacticomm header redeclares it. Stage 3's Task 8.
+///
+/// Mirrors [`fread`]'s own width discipline throughout, not the narrower
+/// `as u16` idiom this crate has already found and removed from six other
+/// shims: `size`/`count` are read at `A`'s own int width, and the overflow
+/// ceiling is `A`'s own, not 16 bits. **Deliberately does not mirror
+/// `shims::memory::memcpy`/`movmem`'s still-`as u16` argument count either**
+/// -- those predate this width discipline and are out of this task's scope
+/// to fix, but a new sibling has no excuse to copy a bug this crate has
+/// already named and fixed twice over.
+///
+/// Unlike `fread`, a **short write is not an answer a module can act on**:
+/// this host's writes either land in full or the underlying `write_all`
+/// fails outright, so the count returned is always `nmemb` on success.
+///
+/// # Errors
+///
+/// If `cookie` names no open stream, if it is not open for writing, if
+/// `size * nmemb` overflows what `A`'s own `size_t` can count, or if the
+/// underlying write fails.
+pub fn fwrite<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
+    // -- Borland's; no Galacticomm header redeclares it.
+    let buffer = call.ptr();
+    let size: u32 = call.int().into();
+    let count: u32 = call.int().into();
+    let cookie = call.ptr();
+
+    if size == 0 || count == 0 {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+
+    // Same ceiling `fread` checks against, at `A`'s own width -- see that
+    // routine's own doc comment for why 16 bits hard-coded here would be
+    // exactly the bug this crate keeps finding and removing.
+    let ceiling = u64::from(u32::MAX) >> (32 - A::INT_WIDTH * 8);
+    let want = u64::from(size) * u64::from(count);
+    if want > ceiling {
+        return Err(ShimError::Failed(format!(
+            "fwrite of {count} items of {size} bytes, which a {}-bit size_t cannot count",
+            A::INT_WIDTH * 8
+        )));
+    }
+    let want = want as usize;
+
+    let bytes = buffer
+        .resolve(call.mem(), want)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    host.streams
+        .write(cookie, &bytes)
+        .map_err(|e| ShimError::Failed(format!("fwrite: {e}")))?;
+    Ok(abi::Ret::Int(A::int_from_u32(count)))
+}
+
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
 /// with a destination.
 ///
@@ -354,6 +503,23 @@ pub fn fflush<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .name(cookie)
         .map_err(|e| ShimError::Failed(format!("fflush: {e}")))?;
     Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `int flushall(void)` -- [`fflush`], for every open stream at once.
+///
+/// Borland's; no Galacticomm header redeclares it. Stage 3's Task 8.
+///
+/// Same honesty as [`fflush`], for the same reason: nothing here buffers, so
+/// there is nothing to push anywhere. Borland's own `flushall` reports how
+/// many streams it flushed; this host answers with how many are open, since
+/// that is the whole of what "flushed" could mean when there was never
+/// anything to flush.
+///
+/// No handle to check, unlike `fflush` -- `flushall` takes none, so there is
+/// no single stream whose absence would be a module bug to catch here.
+pub fn flushall<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int flushall(void)` -- Borland's; no Galacticomm header redeclares it.
+    Ok(abi::Ret::Int(A::int_from_u32(host.streams.len() as u32)))
 }
 
 /// `int unlink(const char *path)` -- remove a file.
@@ -1352,6 +1518,135 @@ mod tests {
             )
             .expect_err("a refusal");
         assert!(e.to_string().contains("16-bit size_t"), "{e}");
+    }
+
+    // ---- fgetc/fputc/fwrite/flushall (Task 8) --------------------------------
+
+    #[test]
+    fn fgetc_reads_one_byte_at_a_time_and_ends_with_eof() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+
+        // "alpha\r\n..." -- binary mode, so the carriage return survives.
+        for want in b"alpha\r\n" {
+            assert_eq!(word(f.invoke(fgetc, &Fixture::far(fp)).expect("fgetc")), u16::from(*want));
+        }
+    }
+
+    #[test]
+    fn fgetc_at_end_of_file_answers_eof_not_a_plausible_zero() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        loop {
+            if word(f.invoke(fgetc, &Fixture::far(fp)).expect("fgetc")) == 0xffff {
+                break;
+            }
+        }
+        // Reading again past the end keeps answering EOF, not 0.
+        assert_eq!(word(f.invoke(fgetc, &Fixture::far(fp)).expect("fgetc")), 0xffff);
+    }
+
+    #[test]
+    fn fgetc_squeezes_carriage_returns_in_text_mode_same_as_fgets() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rt");
+        let mut got = Vec::new();
+        loop {
+            let c = word(f.invoke(fgetc, &Fixture::far(fp)).expect("fgetc"));
+            if c == 0xffff {
+                break;
+            }
+            got.push(c as u8);
+        }
+        assert!(!got.contains(&b'\r'), "text mode drops every carriage return");
+    }
+
+    #[test]
+    fn fputc_writes_one_byte_and_echoes_it_back() {
+        let root = scratch("stream-fputc");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.LOG", "wb");
+
+        for &b in b"hi" {
+            let echoed = word(
+                f.invoke(fputc, &[u16::from(b), fp.offset, fp.selector]).expect("fputc"),
+            );
+            assert_eq!(echoed, u16::from(b));
+        }
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        assert_eq!(std::fs::read(root.join("OUT.LOG")).expect("the log"), b"hi");
+    }
+
+    #[test]
+    fn fputc_translates_a_newline_in_text_mode_same_as_fprintf() {
+        let root = scratch("stream-fputc-crlf");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.LOG", "wt");
+        f.invoke(fputc, &[u16::from(b'\n'), fp.offset, fp.selector])
+            .expect("fputc");
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+        assert_eq!(std::fs::read(root.join("OUT.LOG")).expect("the log"), b"\r\n");
+    }
+
+    #[test]
+    fn fputc_to_a_stream_opened_for_reading_is_refused() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let e = f
+            .invoke(fputc, &[u16::from(b'x'), fp.offset, fp.selector])
+            .expect_err("a refusal");
+        assert!(e.to_string().contains("fputc"), "{e}");
+    }
+
+    #[test]
+    fn fwrite_writes_size_times_nmemb_bytes_and_answers_the_item_count() {
+        let root = scratch("stream-fwrite");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.DAT", "wb");
+
+        let payload = f.bytes(b"0123456789", false);
+        // 2 items of 5 bytes each -- distinct from a byte count, so a shim
+        // that swapped `size` and `nmemb` would still pass a `size==nmemb`
+        // test the way this file's own module doc warns `setmem`/`movmem`
+        // could.
+        let items = word(
+            f.invoke(fwrite,
+                &[payload.offset, payload.selector, 5, 2, fp.offset, fp.selector],
+            )
+            .expect("fwrite"),
+        );
+        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
+
+        assert_eq!(items, 2, "the item count, not the byte count");
+        assert_eq!(std::fs::read(root.join("OUT.DAT")).expect("the file"), b"0123456789");
+    }
+
+    #[test]
+    fn fwrite_of_zero_items_writes_nothing_and_is_not_a_refusal() {
+        let root = scratch("stream-fwrite-zero");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.DAT", "wb");
+        let payload = f.bytes(b"x", false);
+        let items = word(
+            f.invoke(fwrite,
+                &[payload.offset, payload.selector, 4, 0, fp.offset, fp.selector],
+            )
+            .expect("fwrite"),
+        );
+        assert_eq!(items, 0);
+    }
+
+    #[test]
+    fn flushall_answers_how_many_streams_are_open() {
+        let mut f = Fixture::new();
+        assert_eq!(word(f.invoke(flushall, &[]).expect("flushall")), 0);
+
+        let a = opened(&mut f, "LINES.TXT", "rt");
+        let _b = opened(&mut f, "LINES.TXT", "rt");
+        assert_eq!(word(f.invoke(flushall, &[]).expect("flushall")), 2);
+
+        f.invoke(fclose, &Fixture::far(a)).expect("fclose");
+        assert_eq!(word(f.invoke(flushall, &[]).expect("flushall")), 1);
     }
 
     // ---- 13, 14. the struct the module reads without asking -----------------

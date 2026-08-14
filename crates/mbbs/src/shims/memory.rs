@@ -256,6 +256,48 @@ pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Ptr(dst))
 }
 
+/// `void *memmove(void *dst, const void *src, size_t n)` -- [`memcpy`], safe
+/// when the two ranges overlap.
+///
+/// Borland's; no Galacticomm header redeclares it -- not to be confused with
+/// `GCOMM.H`'s `movmem(s,d,n)` macro (this file's own module doc, "Two
+/// argument orders that corrupt silently"), which expands to
+/// `memmove(d,s,n)` and is [`movmem`] above, a *different* import with its
+/// arguments in the other order. LunatiX imports `_memmove` directly --
+/// Stage 3's Task 8 (`docs/plans/2026-08-14-stage3-channel-entry-implementation.md`)
+/// -- so this is the plain, dst-first C library routine, not the macro.
+///
+/// # Overlap is handled for free
+///
+/// `src` is read whole into an owned `Vec` before anything is written to
+/// `dst`, exactly as [`memcpy`] already does -- so there is no forward/
+/// backward copy direction to get right for an overlapping range the way a
+/// byte-at-a-time C implementation of `memmove` has to choose one. Reading
+/// the whole source first is what makes the choice moot.
+///
+/// # Width, not `memcpy`/`memcmp`'s `as u16`
+///
+/// `count` is read at `A`'s own int width and used as a `usize` outright,
+/// **not** narrowed with `as u16`. `memcpy` and `memcmp` above still do that
+/// narrowing -- a pre-existing width trap this task did not introduce and is
+/// out of scope to fix here (see `shims::mod`'s own width discipline, and
+/// `outprf`'s note in the Stage 3 plan on the same trap) -- but there is no
+/// reason for a *new* sibling landing today to copy a bug this crate has
+/// already found and removed everywhere else it looked (`fread`, `fwrite`,
+/// `toupper`).
+pub fn memmove<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let count = Into::<u32>::into(call.int()) as usize;
+    let bytes = src
+        .resolve(call.mem(), count)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    dst.write(call.mem(), &bytes)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
 /// `int memcmp(const void *a, const void *b, size_t n)`. Borland's; no
 /// Galacticomm header redeclares it.
 ///
@@ -507,6 +549,37 @@ mod tests {
             Ret::Far(dst)
         );
         assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"source");
+    }
+
+    #[test]
+    fn memmove_takes_the_destination_first_same_as_memcpy() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"DEST!!", false);
+        let src = f.bytes(b"source", false);
+        assert_eq!(
+            f.invoke(memmove, &[dst.offset, dst.selector, src.offset, src.selector, 6])
+                .expect("moved"),
+            Ret::Far(dst)
+        );
+        assert_eq!(f.machine.resolve(dst, 6).expect("readable"), b"source");
+    }
+
+    #[test]
+    fn memmove_is_correct_when_the_ranges_overlap() {
+        // A byte-at-a-time forward copy corrupts this: by the time it reaches
+        // the tail of `dst`, it would be reading bytes it had already
+        // overwritten rather than the originals. Reading `src` whole before
+        // writing anything -- this shim's own doc comment -- sidesteps the
+        // question rather than answering it correctly by luck.
+        let mut f = Fixture::new();
+        let buf = f.bytes(b"abcdefgh", false);
+        let dst = FarPtr {
+            offset: buf.offset + 2,
+            selector: buf.selector,
+        };
+        f.invoke(memmove, &[dst.offset, dst.selector, buf.offset, buf.selector, 6])
+            .expect("moved");
+        assert_eq!(f.machine.resolve(buf, 8).expect("readable"), b"ababcdef");
     }
 
     #[test]

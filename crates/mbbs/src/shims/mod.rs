@@ -1,5 +1,6 @@
 //! What sits behind each import, and what to do when nothing does.
 
+pub mod borland;
 pub mod btrieve;
 pub mod cnc;
 pub mod credit;
@@ -30,6 +31,21 @@ use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS};
 use crate::globals::GLOBALS;
+
+/// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte
+/// from `LUNATIX.DLL` (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`):
+/// mixed case, with the `.dll` suffix, unlike `MAJORBBS`/`GALGSBL`'s bare
+/// segment-name spelling those two carry over from the 16-bit world.
+///
+/// **Not aliased through [`canonical_dll`].** KERNEL32 is not the game-host
+/// API under another name -- it is genuinely a different library -- so the
+/// routine table below has to key on this exact string for `entry`'s
+/// `dll == dll` comparison (case-sensitive; `canonical_dll` only normalises
+/// case for the two DLLs it actually does alias) to find it. Local to this
+/// file rather than in `crate::exports` alongside `MAJORBBS`/`GALGSBL`/
+/// `DOSCALLS`: there is no export table keyed on it, only this one constant
+/// string.
+const KERNEL32: &str = "KERNEL32.dll";
 
 // `args(machine) -> Cursor<'_, Wg16>` used to live here: a bare `Cursor` over
 // the argument frame, with no `Call` and so no way to reach memory. It was
@@ -372,6 +388,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "parsin", text::parsin, Cleans::Caller),
         (MAJORBBS, "atol", text::atol, Cleans::Caller),
         (MAJORBBS, "l2as", text::l2as, Cleans::Caller),
+        (MAJORBBS, "itoa", text::itoa, Cleans::Caller),
         (MAJORBBS, "toupper", text::toupper, Cleans::Caller),
         (MAJORBBS, "tolower", text::tolower, Cleans::Caller),
         (MAJORBBS, "sameas", text::sameas, Cleans::Caller),
@@ -407,14 +424,19 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "setmem", memory::setmem, Cleans::Caller),
         (MAJORBBS, "movmem", memory::movmem, Cleans::Caller),
         (MAJORBBS, "memcpy", memory::memcpy, Cleans::Caller),
+        (MAJORBBS, "memmove", memory::memmove, Cleans::Caller),
         (MAJORBBS, "memcmp", memory::memcmp, Cleans::Caller),
         // Streams: the module's own files, read and written.
         (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
         (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
         (MAJORBBS, "fgets", stream::fgets, Cleans::Caller),
+        (MAJORBBS, "fgetc", stream::fgetc, Cleans::Caller),
+        (MAJORBBS, "fputc", stream::fputc, Cleans::Caller),
         (MAJORBBS, "fread", stream::fread, Cleans::Caller),
+        (MAJORBBS, "fwrite", stream::fwrite, Cleans::Caller),
         (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller),
         (MAJORBBS, "fflush", stream::fflush, Cleans::Caller),
+        (MAJORBBS, "flushall", stream::flushall, Cleans::Caller),
         (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
         (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller),
         (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller),
@@ -486,6 +508,38 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // int)` and `(int, long, int, int)` exactly.
         (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller),
         (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller),
+        // Borland's own C++ runtime plumbing LunatiX links against from
+        // `cw3220mt.DLL`, aliased onto `MAJORBBS` same as everything above --
+        // and the one KERNEL32 call that can be served alongside it. See
+        // `borland`'s own module doc for what each of these does, why nine
+        // of the ten are no-ops, why `abort` is not, and why
+        // `GetModuleHandleA`/`GetProcAddress` are deliberately *not* here.
+        (MAJORBBS, "_startup", borland::startup, Cleans::Caller),
+        (MAJORBBS, "_startupd", borland::startupd, Cleans::Caller),
+        (MAJORBBS, "@_catchcleanup$qv", borland::catch_cleanup, Cleans::Caller),
+        (MAJORBBS, "_exceptionhandler", borland::exception_handler, Cleans::Caller),
+        (MAJORBBS, "_errormessage", borland::error_message, Cleans::Caller),
+        (
+            MAJORBBS,
+            "@__lockdebuggerdata$qv",
+            borland::lock_debugger_data,
+            Cleans::Caller,
+        ),
+        (
+            MAJORBBS,
+            "@__unlockdebuggerdata$qv",
+            borland::unlock_debugger_data,
+            Cleans::Caller,
+        ),
+        (
+            MAJORBBS,
+            "__debuggerdisableterminatecallback",
+            borland::debugger_disable_terminate_callback,
+            Cleans::Caller,
+        ),
+        (MAJORBBS, "_free_heaps", borland::free_heaps, Cleans::Caller),
+        (MAJORBBS, "abort", borland::abort, Cleans::Caller),
+        (KERNEL32, "getversion", borland::getversion, Cleans::Caller),
         // Btrieve. Seventeen routines, and the last block to reach this table
         // -- they sat in `WG16_ROUTINES` from the day it was created until
         // the engine behind them became `Btrieve<A>` and `Host<A>`'s own
