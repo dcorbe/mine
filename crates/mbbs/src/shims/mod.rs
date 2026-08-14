@@ -226,12 +226,15 @@ impl<A: Abi> Copy for Entry<A> {}
 /// [`entry`] call -- import resolution, at module load, never per instruction
 /// -- so the cost is not one this crate needs to avoid paying.
 ///
-/// One hundred and eleven entries: every routine with a generic
+/// One hundred and thirteen entries: every routine with a generic
 /// `fn<A: Abi>(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`
-/// core. The twenty-seven that do not have one -- `shims::btrieve`'s
-/// seventeen, `shims::runtime`'s eight, `shims::memory`'s `alctile`/
-/// `ptrtile` -- are not here; see [`Abi::native`] and [`wg16_native`] for
-/// where they live instead, and why.
+/// core -- the Borland runtime's `GetModuleHandleA`/`GetProcAddress` pair
+/// among them now (`borland::get_module_handle`/`get_proc_address`), the two
+/// KERNEL32 symbols that needed `Wg32::resume` to learn `Cleans::Callee`
+/// before they could be registered at all. The twenty-seven that do not have
+/// a generic core -- `shims::btrieve`'s seventeen, `shims::runtime`'s eight,
+/// `shims::memory`'s `alctile`/`ptrtile` -- are not here; see [`Abi::native`]
+/// and [`wg16_native`] for where they live instead, and why.
 fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
     vec![
         // Strings, numbers and the print buffer.
@@ -541,6 +544,23 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "_free_heaps", borland::free_heaps, Cleans::Caller),
         (MAJORBBS, "abort", borland::abort, Cleans::Caller),
         (KERNEL32, "getversion", borland::getversion, Cleans::Caller),
+        // stdcall, not cdecl -- measured at LunatiX's own call sites
+        // (0x41d61d, 0x41d62c: 4 and 8 bytes pushed, neither followed by an
+        // `add esp`). `Wg32::resume` services `Cleans::Callee` for exactly
+        // this reason; see `borland`'s own module doc comment for why both
+        // answer NULL rather than a fabricated handle or address.
+        (
+            KERNEL32,
+            "getmodulehandlea",
+            borland::get_module_handle,
+            Cleans::Callee(4),
+        ),
+        (
+            KERNEL32,
+            "getprocaddress",
+            borland::get_proc_address,
+            Cleans::Callee(8),
+        ),
         // Btrieve. Seventeen routines, and the last block to reach this table
         // -- they sat in `WG16_ROUTINES` from the day it was created until
         // the engine behind them became `Btrieve<A>` and `Host<A>`'s own
@@ -845,11 +865,19 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
 /// stop. Guessing a byte count is not, so this never does.
 ///
 /// Measured against the whole of what [`entry`] can answer -- [`routines`]
-/// plus [`WG16_ROUTINES`], 138 in all: 133 [`Cleans::Caller`] against 5
-/// [`Cleans::Callee`], and every `Callee` entry is one of the five
-/// `@`-suffixed helpers this function refuses to continue past. (An earlier
-/// count here said 136 against 10, wrong even before this file split
-/// `ROUTINES` in two -- 138 has one accounting, not several.)
+/// plus [`WG16_ROUTINES`], 140 in all: 133 [`Cleans::Caller`] against 7
+/// [`Cleans::Callee`]. Five of the seven are the `@`-suffixed helpers this
+/// function refuses to continue past; the other two,
+/// `borland::get_module_handle`/`get_proc_address` (`KERNEL32.dll`'s
+/// `GetModuleHandleA`/`GetProcAddress`), are **not** -- but that does not
+/// weaken the claim above, because this function is only ever consulted for
+/// a symbol [`entry`] answers [`Entry::Unimplemented`], and both of those two
+/// are [`Entry::Routine`]. Survey mode never has to guess their convention;
+/// it runs the real, correctly-registered shim instead. (An earlier count
+/// here said 136 against 10, wrong even before this file split `ROUTINES` in
+/// two; a later one said 138 against 5, correct before the KERNEL32 pair
+/// above was registered -- each count has one accounting for its own moment,
+/// not several at once.)
 pub(crate) fn survey_continue_convention(symbol: &str) -> Option<Cleans> {
     if symbol.contains('@') {
         None
@@ -1183,15 +1211,21 @@ mod convention {
         // shifts pass everything in registers, so there is nothing to clean and
         // `Cleans::Caller` is the honest answer for them.
         //
-        // How much each pops is asserted here too, because the two amounts are
-        // the same number for different reasons: two `long`s for the division
-        // family, two far pointers for the struct copy.
+        // How much each pops is asserted here too, because the amounts repeat
+        // for different reasons: two `long`s for the division family, two far
+        // pointers for the struct copy, and (unrelated to any of that) one
+        // and two 32-bit Win32 arguments for the KERNEL32 pair below.
         //
-        // Checked against both tables, not just `WG16_ROUTINES` (where every
-        // `Cleans::Callee` entry actually lives today) -- the invariant this
-        // pins is about the whole of what `entry` can answer, and a future
-        // routine landing in the generic table with the wrong `Cleans` should
-        // fail this test too, not be invisible to it.
+        // Checked against both tables, not just `WG16_ROUTINES` -- the
+        // invariant this pins is about the whole of what `entry` can answer,
+        // and a future routine landing in the generic table with the wrong
+        // `Cleans` should fail this test too, not be invisible to it. That
+        // is no longer a hypothetical for the generic table specifically:
+        // `borland::get_module_handle`/`get_proc_address` are the first two
+        // `Cleans::Callee` rows [`routines`] itself carries (KERNEL32's
+        // stdcall pair -- see `shims::borland`'s own module doc comment), so
+        // this list is no longer five entries pulled entirely from
+        // `WG16_ROUTINES`.
         let generic = routines::<Wg16>();
         let callee: Vec<(&str, Cleans)> = generic
             .iter()
@@ -1203,6 +1237,8 @@ mod convention {
         assert_eq!(
             callee,
             [
+                ("getmodulehandlea", Cleans::Callee(4)),
+                ("getprocaddress", Cleans::Callee(8)),
                 ("f_ldiv@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_lmod@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_ludiv@", Cleans::Callee(runtime::OPERANDS)),

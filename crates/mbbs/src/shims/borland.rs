@@ -1,5 +1,5 @@
-//! Borland's own C++ runtime plumbing, and the one KERNEL32 call this host
-//! can safely serve alongside it.
+//! Borland's own C++ runtime plumbing, and the three KERNEL32 calls this
+//! host can safely serve alongside it.
 //!
 //! Ten symbols `LUNATIX.DLL` links against from `cw3220mt.DLL` (Borland C++
 //! 5.x's own 32-bit runtime, aliased onto `MAJORBBS` -- `shims::canonical_dll`'s
@@ -29,7 +29,7 @@
 //! running is worse than one this host stops, so it does not return `Ok` at
 //! all.
 //!
-//! # Two KERNEL32 symbols this file deliberately does not implement
+//! # Two KERNEL32 symbols that needed the ABI gap closed first
 //!
 //! `GetModuleHandleA` and `GetProcAddress` are measured `stdcall`, not
 //! `cdecl`: `LUNATIX.DLL`'s own call sites
@@ -37,21 +37,35 @@
 //! `0x41d62c`) push 4 and 8 bytes of arguments respectively and neither is
 //! followed by an `add esp` -- the callee is expected to pop them, which is
 //! exactly what [`crate::shims::Cleans::Callee`] exists to tell the host.
-//! But `Wg32::resume` (`crates/mbbs/src/abi/wg32.rs`) panics unconditionally
-//! on `Cleans::Callee`, on the stated premise that 32-bit Worldgroup is
-//! uniformly `cdecl`. That premise is true for `WGSERVER`'s own game-host
-//! API and false for these two genuine Win32 system calls -- a real gap this
-//! task's own boilerplate scope runs into, not a guess to paper over.
-//! Registering them `Cleans::Caller` would silently leave 4 or 8 bytes on
-//! the module's stack after every call -- the exact "quietly wrong" failure
-//! mode this crate exists to refuse (see [`crate::shims::Cleans`]'s own doc
-//! comment); registering them `Cleans::Callee` would hit `Wg32::resume`'s
-//! panic, whose own message blames "a bug in the host's shim table," which
-//! is not what this is. Both are worse than leaving these two unresolved,
-//! so they stay [`crate::shims::Entry::Unimplemented`] and in
-//! `PINNED_MISSES`. [`getversion`] is unaffected -- it takes no arguments at
-//! either of its own call sites, so there is nothing for either calling
-//! convention to disagree about.
+//! `Wg32::resume` (`crates/mbbs/src/abi/wg32.rs`) used to panic
+//! unconditionally on `Cleans::Callee`, on the stated premise that 32-bit
+//! Worldgroup is uniformly `cdecl`. That premise is true for `WGSERVER`'s
+//! own game-host API and was always false for these two genuine Win32
+//! system calls -- a real gap this file's own boilerplate scope ran into,
+//! not a guess that got papered over. `Wg32::resume` now services
+//! `Cleans::Callee` the same way `Wg16::resume` always has (via
+//! `mbbs_machine::m32::Machine::resume_on_cleaning`, the flat-32-bit sibling
+//! of `mbbs_machine::m16::Machine::resume_cleaning`), so both symbols are
+//! registered here with the byte counts measured above:
+//! [`get_module_handle`] `Cleans::Callee(4)`, [`get_proc_address`]
+//! `Cleans::Callee(8)`. [`getversion`] was never affected either way -- it
+//! takes no arguments at either of its own call sites, so there was nothing
+//! for either calling convention to disagree about.
+//!
+//! **Neither answers anything but `NULL`, and that is the honest answer, not
+//! a stub.** See [`get_module_handle`] and [`get_proc_address`]'s own doc
+//! comments for why: this host has no notion of "a loaded module, by name or
+//! by handle" for either routine to search -- it is not a Windows process
+//! loader, and answering with a plausible-looking non-null handle or
+//! procedure address would be exactly the fabricated-but-confident failure
+//! this crate exists to refuse (see [`crate::shims::ShimError`]'s own doc
+//! comment, "every variant is terminal" -- the same refusal-over-guessing
+//! stance, applied here to a *successful*-looking return instead of an
+//! error). `LUNATIX.DLL`'s own call site agrees with this being a real,
+//! anticipated outcome and not an edge case: `GetModuleHandleA`'s result is
+//! tested with `je` before `GetProcAddress` is ever called at all, so a
+//! module written against real Windows already treats "this optional feature
+//! is not there" as an ordinary, handled branch.
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
@@ -285,11 +299,87 @@ pub fn getversion<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<ab
     Ok(abi::Ret::Long((BUILD << 16) | (MINOR << 8) | MAJOR))
 }
 
+/// `HMODULE GetModuleHandleA(LPCSTR lpModuleName)` -- KERNEL32's own
+/// find-a-loaded-module query, one of the two `stdcall` calls this file
+/// could not serve until `Wg32::resume` learned to clean callee-side bytes
+/// (see this file's own module doc comment).
+///
+/// # Measured, not assumed
+///
+/// `LUNATIX.DLL`'s own call site (`0x41d61b`-`0x41d61d`) is `push 0x0 ; call
+/// GetModuleHandleA` -- `lpModuleName == NULL`, which on real Windows asks
+/// for the handle of the file used to create the *calling process*, not the
+/// calling DLL. Registered `Cleans::Callee(4)`: one `LPCSTR` argument, four
+/// bytes, popped by the callee rather than the module -- see this file's own
+/// module doc comment for the push-count-vs-`add esp` evidence.
+///
+/// # Always `NULL`, and why that is the honest answer
+///
+/// This host is not a Windows process loader. There is no "process" here in
+/// the sense `GetModuleHandleA(NULL)` asks about -- no `WGSERVER.EXE` image
+/// mapped alongside the module the way a real Windows process would have its
+/// own `.exe` loaded before any DLL runs inside it -- and no table of
+/// "currently loaded modules, by name" for a non-`NULL` `lpModuleName` to
+/// search either. Answering with anything other than `0` would mean
+/// inventing a handle that names nothing this host actually has, which
+/// [`get_proc_address`] could then be asked to dereference -- exactly the
+/// plausible-but-fabricated failure mode this crate exists to refuse.
+/// `LUNATIX.DLL`'s own code already treats this as a real, handled outcome:
+/// its call site tests the result with `je` and skips the `GetProcAddress`
+/// call entirely when it is `NULL`, the same way it would on a genuine
+/// Windows machine that simply does not have whatever optional feature this
+/// probe was checking for.
+///
+/// The argument is not read: the answer does not depend on it, for either
+/// value `lpModuleName` can take (`NULL` or a name), and reading a pointer
+/// this host cannot honestly resolve into a live module list anyway would
+/// only look like more work went into the same fixed answer.
+pub fn get_module_handle<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Ptr(A::null_ptr()))
+}
+
+/// `FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)` -- KERNEL32's
+/// own runtime symbol lookup, the second `stdcall` call this file could not
+/// serve until `Wg32::resume` learned to clean callee-side bytes (see this
+/// file's own module doc comment).
+///
+/// # Measured, not assumed
+///
+/// `LUNATIX.DLL`'s own call site (`0x41d626`-`0x41d62c`) pushes a procedure
+/// name pointer and the handle [`get_module_handle`] returned, then calls
+/// out with no `add esp` after -- two `DWORD`-sized arguments, eight bytes,
+/// popped by the callee. Registered `Cleans::Callee(8)`.
+///
+/// # Always `NULL`, and why that is the honest answer
+///
+/// Twofold, and either one alone would already be enough. First,
+/// [`get_module_handle`] never answers with anything but `NULL`, and
+/// `LUNATIX.DLL`'s own code already refuses to call this routine at all when
+/// that happens -- so in the one call sequence this host has actually
+/// measured, `hModule` is never a value this routine would need to resolve
+/// in the first place. Second, even given some other, non-`NULL` handle from
+/// elsewhere, this host has no facility to turn an opaque `HMODULE` back into
+/// a live export table to search: `mbbs_machine::m32::PeImage::exports` walks
+/// a *file*'s export directory once, at load time, to bind the module's own
+/// static imports (`Wg32::load`) -- there is no per-handle export lookup kept
+/// around afterward for a runtime `GetProcAddress` call to reach, and
+/// inventing one now, keyed on a handle this host also never legitimately
+/// hands out, would be exactly the fabricated-looking success this crate
+/// exists to refuse. `NULL` is what a real `GetProcAddress` returns for "not
+/// found" -- a value every caller sane enough to check `GetModuleHandleA`
+/// first is already prepared to see.
+///
+/// Neither argument is read, for the same reason as
+/// [`get_module_handle`]'s own: the answer does not depend on them.
+pub fn get_proc_address<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Ptr(A::null_ptr()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abi::Wg32;
-    use crate::shims::{Entry, entry};
+    use crate::shims::{Cleans, Entry, entry};
     use crate::testing::Fixture;
 
     #[test]
@@ -363,23 +453,66 @@ mod tests {
         ));
     }
 
-    /// The finding this file's own module doc writes up: measured `stdcall`
-    /// at LunatiX's own call sites, and `Wg32::resume` cannot service
-    /// `Cleans::Callee` -- so these two stay unresolved rather than either
-    /// silently corrupting the module's stack or hitting a panic whose
-    /// message names the wrong cause. A future change that "fixes" this by
-    /// registering `Cleans::Caller` should fail this test, not silently pass
-    /// it.
+    /// The finding this file's own module doc writes up, now closed: measured
+    /// `stdcall` at LunatiX's own call sites, and `Wg32::resume` now services
+    /// `Cleans::Callee` instead of panicking on it. Pinned against the exact
+    /// byte counts measured at those call sites, not merely "some `Callee`
+    /// variant" -- registering `Cleans::Callee(4)` for the two-argument
+    /// `GetProcAddress` (or `Cleans::Callee(8)` for the one-argument
+    /// `GetModuleHandleA`) would compile, pass a looser assertion, and leave
+    /// the module's stack wrong by exactly the difference every subsequent
+    /// call after it. This is also the wiring half of this crate's own
+    /// mutation check (see the task report): flipping either byte count here
+    /// is exactly the corruption `crates/mbbs/tests/wg32_abi.rs`'s stdcall
+    /// relay tests exist to catch on the execution side, and this test
+    /// catches it on the registration side.
     #[test]
-    fn getmodulehandlea_and_getprocaddress_are_deliberately_left_unresolved() {
-        assert!(matches!(
-            entry::<Wg32>("KERNEL32.dll", "getmodulehandlea"),
-            Entry::Unimplemented
-        ));
-        assert!(matches!(
-            entry::<Wg32>("KERNEL32.dll", "getprocaddress"),
-            Entry::Unimplemented
-        ));
+    fn get_module_handle_and_get_proc_address_resolve_under_kernel32_dll_as_stdcall() {
+        assert!(
+            matches!(
+                entry::<Wg32>("KERNEL32.dll", "getmodulehandlea"),
+                Entry::Routine(_, Cleans::Callee(4))
+            ),
+            "GetModuleHandleA takes one 4-byte LPCSTR argument, and \
+             LUNATIX.DLL's own call site (0x41d61d) shows the callee popping it"
+        );
+        assert!(
+            matches!(
+                entry::<Wg32>("KERNEL32.dll", "getprocaddress"),
+                Entry::Routine(_, Cleans::Callee(8))
+            ),
+            "GetProcAddress takes two 4-byte arguments, and LUNATIX.DLL's own \
+             call site (0x41d62c) shows the callee popping both"
+        );
+    }
+
+    /// [`get_module_handle`]'s own doc comment, proven rather than only
+    /// asserted in prose: this host has no process image and no module list
+    /// to search, so `NULL` -- not a plausible-looking fabricated handle --
+    /// is what every call gets back, regardless of the argument.
+    #[test]
+    fn get_module_handle_always_answers_null() {
+        let mut f = Fixture::new();
+        let ret = f.invoke(get_module_handle, &[]).expect("get_module_handle");
+        assert_eq!(
+            ret,
+            mbbs_machine::m16::Ret::Far(mbbs_machine::m16::FarPtr::NULL),
+            "no process image exists for this host to name a handle for"
+        );
+    }
+
+    /// [`get_proc_address`]'s own doc comment, proven the same way: no live
+    /// per-handle export table exists for this host to search, so `NULL` is
+    /// the honest answer here too.
+    #[test]
+    fn get_proc_address_always_answers_null() {
+        let mut f = Fixture::new();
+        let ret = f.invoke(get_proc_address, &[]).expect("get_proc_address");
+        assert_eq!(
+            ret,
+            mbbs_machine::m16::Ret::Far(mbbs_machine::m16::FarPtr::NULL),
+            "no per-handle export table exists for this host to search"
+        );
     }
 
     #[test]
