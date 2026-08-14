@@ -23,11 +23,18 @@
 //! to a word would stride by 42 and put every channel but the first at the
 //! wrong address.
 //!
-//! The offsets in [`user`] are pinned the same way: the module reaches `+6`,
-//! `+8`, `+0x14`, `+0x15`, `+0x16` and `+0x1a`, off `usrptr` as well as off
-//! `user[usrnum]`. Those three consecutive bytes at `+0x14`..`+0x16` are one
-//! 4-byte `unsigned long flags`, and no other reading of the header produces
-//! them.
+//! The offsets in [`UserLayout`] are pinned the same way: the module reaches
+//! `+6`, `+8`, `+0x14`, `+0x15`, `+0x16` and `+0x1a`, off `usrptr` as well as
+//! off `user[usrnum]`. Those three consecutive bytes at `+0x14`..`+0x16` are
+//! one 4-byte `unsigned long flags`, and no other reading of the header
+//! produces them.
+//!
+//! **41 is `WCCMMUD.DLL`'s own stride, not the only one.** It is `Wg16`'s
+//! stride because `WCCMMUD.DLL` is a `GCV2` build; a non-`GCV2` build such as
+//! `Wg32`'s has a differently-ordered `struct user` at a different stride
+//! (88, measured against a real `WGSERVER.EXE`). See [`UserLayout::of`] and
+//! [`crate::abi::Abi::GCV2`] for why the two are not one struct at two
+//! widths.
 //!
 //! # The other two are arithmetic, and one of them is written down
 //!
@@ -346,6 +353,9 @@ pub struct Users<A: Abi> {
     /// [`Chan`] for these tables. The same value
     /// [`Gsbl`](crate::gsbl::Gsbl) was built from -- see [`crate::chan`].
     terms: Terms,
+    /// `struct user` as this ABI declares it. Held rather than recomputed
+    /// because `slot` is on the hot path of every poll.
+    user: UserLayout,
     /// `struct user *user` -- the head of the array the module indexes itself.
     users: A::Ptr,
     /// `struct extusr *extusr`.
@@ -396,9 +406,14 @@ impl<A: Abi> Users<A> {
         self.channels
     }
 
+    /// `struct user` as this ABI declares it.
+    pub fn user_layout(&self) -> &UserLayout {
+        &self.user
+    }
+
     /// `&user[unum]`.
     pub fn slot(&self, unum: Chan) -> A::Ptr {
-        self.nth(self.users, USER, unum)
+        self.nth(self.users, self.user.stride, unum)
     }
 
     /// `&extusr[unum]`.
@@ -486,17 +501,68 @@ impl<A: Abi> Users<A> {
 
     /// `&user[unum].state`.
     fn state_at(&self, unum: Chan) -> A::Ptr {
-        A::ptr_offset(self.slot(unum), user::STATE)
+        A::ptr_offset(self.slot(unum), self.user.state.at)
     }
 
     /// `&user[unum].substt`.
     fn substt_at(&self, unum: Chan) -> A::Ptr {
-        A::ptr_offset(self.slot(unum), user::SUBSTT)
+        A::ptr_offset(self.slot(unum), self.user.substt.at)
     }
 
     /// `&user[unum].polrou`.
     fn polrou_at(&self, unum: Chan) -> A::Ptr {
-        A::ptr_offset(self.slot(unum), user::POLROU)
+        A::ptr_offset(self.slot(unum), self.user.polrou.at)
+    }
+
+    /// Read a [`Field`] whole, at its own width, and narrow it to a `u16`.
+    ///
+    /// The narrowing is checked. Silently truncating is the `cw3220mt` bug
+    /// this repository already paid for once -- seventeen routines aliased
+    /// onto a 32-bit module while six of them read a C `int` through
+    /// `as u16`, which turned `fgets(buf, 40000, f)` into a negative length.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off a segment, or the value does not fit a `u16`.
+    fn field_u16(
+        &self,
+        mem: &A::Mem,
+        unum: Chan,
+        at: A::Ptr,
+        field: Field,
+        name: &'static str,
+    ) -> Result<u16, ShimError> {
+        let bytes = at
+            .resolve(mem, usize::from(field.width))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let mut wide = [0u8; 4];
+        wide[..bytes.len()].copy_from_slice(bytes);
+        let value = u32::from_le_bytes(wide);
+        u16::try_from(value).map_err(|_| {
+            ShimError::Failed(format!(
+                "user[{unum}].{name} is {value}, which does not fit the u16 this \
+                 host carries state numbers in"
+            ))
+        })
+    }
+
+    /// Write a [`Field`] whole, at its own width.
+    ///
+    /// Zero-extends. A `u16` written into a four-byte `INT` must clear the
+    /// high half rather than leave whatever the last occupant put there --
+    /// `rstchn` clears a channel precisely so the next user does not inherit
+    /// it, and a half-width write would defeat that quietly.
+    fn write_field_u16(
+        &self,
+        mem: &mut A::Mem,
+        at: A::Ptr,
+        field: Field,
+        value: u16,
+    ) -> Result<(), ShimError> {
+        let wide = u32::from(value).to_le_bytes();
+        at.write(mem, &wide[..usize::from(field.width)])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(())
     }
 
     /// `user[unum].polrou` -- the channel's polling routine, or `None` for
@@ -555,13 +621,20 @@ impl<A: Abi> Users<A> {
     ///
     /// # Errors
     ///
-    /// If the read runs off the segment.
+    /// If the read runs off a segment, or the value does not fit a `u16`.
+    ///
+    /// Read at [`UserLayout::state`]'s own width, not at a literal 2. `state`
+    /// is a C `INT`: two bytes under `Wg16` and four under `Wg32`, and a
+    /// two-byte read of a four-byte field returns a plausible number rather
+    /// than an error.
+    ///
+    /// The return stays `u16` because every state number this host deals in
+    /// fits one -- module numbers are small and `MAJORBBS.C` compares them to
+    /// `nmodul` -- and widening it would push an `A::Int` through every
+    /// caller for no information gained. A `Wg32` value that does not fit is
+    /// a real error and says so rather than truncating.
     pub fn state_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
-        let bytes = self
-            .state_at(unum)
-            .resolve(mem, 2)
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.field_u16(mem, unum, self.state_at(unum), self.user.state, "state")
     }
 
     /// Put channel `unum` in state `state`, against memory directly rather
@@ -575,10 +648,20 @@ impl<A: Abi> Users<A> {
     ///
     /// If the write runs off the segment.
     pub fn set_state_mem(&mut self, mem: &mut A::Mem, unum: Chan, state: u16) -> Result<(), ShimError> {
-        self.state_at(unum)
-            .write(mem, &state.to_le_bytes())
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        Ok(())
+        let at = self.state_at(unum);
+        self.write_field_u16(mem, at, self.user.state, state)
+    }
+
+    /// `user[unum].usrcls` -- what kind of channel this is, against memory
+    /// directly rather than a whole `Machine`. Same width caveat as
+    /// [`Users::state_mem`].
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off a segment, or the value does not fit a `u16`.
+    pub fn usrcls_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
+        let at = A::ptr_offset(self.slot(unum), self.user.usrcls.at);
+        self.field_u16(mem, unum, at, self.user.usrcls, "usrcls")
     }
 
     /// `user[unum].substt` -- the registered module's own substate, against
@@ -586,16 +669,13 @@ impl<A: Abi> Users<A> {
     ///
     /// The generic core [`Users::substt`]'s `Wg16` facade delegates into --
     /// see the struct's own doc comment for why the two need different names.
+    /// Same width caveat as [`Users::state_mem`].
     ///
     /// # Errors
     ///
-    /// If the read runs off the segment.
+    /// If the read runs off a segment, or the value does not fit a `u16`.
     pub fn substt_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
-        let bytes = self
-            .substt_at(unum)
-            .resolve(mem, 2)
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.field_u16(mem, unum, self.substt_at(unum), self.user.substt, "substt")
     }
 
     /// Put channel `unum` in substate `substt`, against memory directly
@@ -614,10 +694,8 @@ impl<A: Abi> Users<A> {
         unum: Chan,
         substt: u16,
     ) -> Result<(), ShimError> {
-        self.substt_at(unum)
-            .write(mem, &substt.to_le_bytes())
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        Ok(())
+        let at = self.substt_at(unum);
+        self.write_field_u16(mem, at, self.user.substt, substt)
     }
 
     /// Allocate `size` bytes of volatile data area per channel, against
@@ -668,6 +746,7 @@ impl<A: Abi> Users<A> {
     ///
     /// If the heap has no room.
     pub fn new(mem: &mut A::Mem, heap: &mut crate::Heap<A>, terms: Terms) -> io::Result<Self> {
+        let user = UserLayout::of::<A>();
         let count = terms.count();
         let mut block = |each: u16| -> io::Result<A::Ptr> {
             let bytes = each
@@ -680,7 +759,7 @@ impl<A: Abi> Users<A> {
                 .map_err(|e| io::Error::other(e.to_string()))?;
             Ok(at)
         };
-        let users = block(USER)?;
+        let users = block(user.stride)?;
         let extra = block(EXTUSR)?;
         let accounts = block(USRACC)?;
 
@@ -731,6 +810,7 @@ impl<A: Abi> Users<A> {
 
         Ok(Self {
             terms,
+            user,
             users,
             extra,
             accounts,
@@ -758,7 +838,7 @@ mod tests {
         // default byte alignment -- `CL.CFG` in the recovered SDK passes no
         // `-a`. A host that padded the trailing `char lcstat` to a word would
         // put every channel but the first at the wrong address.
-        assert_eq!(USER, 0x29);
+        assert_eq!(UserLayout::of::<Wg16>().stride, 0x29);
     }
 
     #[test]
@@ -767,19 +847,21 @@ mod tests {
         // off `user[usrnum]` both. `FLAGS` is the load-bearing one: the module
         // tests `+0x14 & 2`, `+0x15 & 0x40` and `+0x16 & 0x80`, which are three
         // bytes of a single 4-byte field and rule out every other layout.
-        assert_eq!(user::STATE, 6);
-        assert_eq!(user::SUBSTT, 8);
-        assert_eq!(user::FLAGS, 0x14);
-        assert_eq!(user::CRDRAT, 0x1a);
-        assert_eq!(user::LCSTAT, 40);
+        let user = UserLayout::of::<Wg16>();
+        assert_eq!(user.state.at, 6);
+        assert_eq!(user.substt.at, 8);
+        assert_eq!(user.flags.at, 0x14);
+        assert_eq!(user.crdrat.at, 0x1a);
+        assert_eq!(user.lcstat.at, 40);
     }
 
     #[test]
     fn every_user_field_fits_inside_a_slot() {
         // The check that makes the two tests above one fact rather than two
         // lists: the last field is one byte, and it ends exactly at the stride.
-        assert_eq!(user::LCSTAT + 1, USER, "lcstat is the last byte of a slot");
-        assert!(user::FLAGS + 4 <= USER, "flags is a long and must fit");
+        let user = UserLayout::of::<Wg16>();
+        assert_eq!(user.lcstat.at + 1, user.stride, "lcstat is the last byte of a slot");
+        assert!(user.flags.at + 4 <= user.stride, "flags is a long and must fit");
     }
 
     #[test]
@@ -833,8 +915,9 @@ mod tests {
             Users::new(machine.mem_mut(), &mut heap, terms).expect("four channels");
         let ch = |n| terms.chan(n).expect("one of the four");
         let at = |n| users.slot(ch(n)).offset;
-        assert_eq!(at(1) - at(0), USER);
-        assert_eq!(at(3) - at(2), USER);
+        let stride = UserLayout::of::<Wg16>().stride;
+        assert_eq!(at(1) - at(0), stride);
+        assert_eq!(at(3) - at(2), stride);
         assert_eq!(
             users.account(ch(1)).offset - users.account(ch(0)).offset,
             USRACC
@@ -869,7 +952,8 @@ mod tests {
         let f = crate::testing::Fixture::new();
         let console = f.console();
         let at = f.host.users().slot(console);
-        let bytes = f.machine.resolve(at, usize::from(USER)).expect("readable");
+        let stride = UserLayout::of::<Wg16>().stride;
+        let bytes = f.machine.resolve(at, usize::from(stride)).expect("readable");
         assert!(bytes.iter().all(|b| *b == 0), "a fresh channel is all zero");
     }
 
@@ -1050,9 +1134,10 @@ mod tests {
             .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0");
         let at = f.host.users().slot(console);
-        let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
-        assert_eq!(rec[user::STATE as usize], 0, "state is set by connect()");
-        assert_eq!(rec[user::SUBSTT as usize], 0);
+        let user = UserLayout::of::<Wg16>();
+        let rec = f.machine.resolve(at, user.stride as usize).expect("in bounds");
+        assert_eq!(rec[user.state.at as usize], 0, "state is set by connect()");
+        assert_eq!(rec[user.substt.at as usize], 0);
     }
 
     #[test]
@@ -1197,8 +1282,9 @@ mod tests {
         f.host.connect_state(&mut f.machine, console, &who).expect("channel 0");
 
         let at = f.host.users().slot(console);
-        let rec = f.machine.resolve(at, USER as usize).expect("in bounds");
-        assert_eq!(rec[user::FLAGS as usize] & 0x40, 0x40);
+        let user = UserLayout::of::<Wg16>();
+        let rec = f.machine.resolve(at, user.stride as usize).expect("in bounds");
+        assert_eq!(rec[user.flags.at as usize] & 0x40, 0x40);
     }
 
     #[test]
@@ -1221,7 +1307,7 @@ mod tests {
         // Whatever the module had set in the rest of the byte.
         let at = f.host.users().slot(console);
         let flags = mbbs_machine::m16::FarPtr {
-            offset: at.offset + user::FLAGS,
+            offset: at.offset + UserLayout::of::<Wg16>().flags.at,
             selector: at.selector,
         };
         let was = f.machine.resolve(flags, 1).expect("in bounds")[0];
@@ -1263,13 +1349,13 @@ mod tests {
         // What `WCCMMUD_named.c:12241` actually reads: the two words at
         // `user[unum] + 0x24` and `+ 0x26`.
         //
-        // `0x24` is written out rather than taken from `user::POLROU`, and that
-        // is the whole point of this assertion. An address derived from the
-        // constant under test moves when the constant moves, so the write and
-        // the check stay in agreement no matter how wrong both are -- it can
-        // only prove the accessor agrees with itself. The literal is the
-        // independent statement of `MAJORBBS.H:90`'s offset that makes a wrong
-        // `POLROU` observable.
+        // `0x24` is written out rather than taken from `UserLayout::polrou`,
+        // and that is the whole point of this assertion. An address derived
+        // from the field under test moves when the field moves, so the write
+        // and the check stay in agreement no matter how wrong both are -- it
+        // can only prove the accessor agrees with itself. The literal is the
+        // independent statement of `MAJORBBS.H:90`'s offset that makes a
+        // wrong `polrou` observable.
         let slot = f.host.users().slot(console);
         let at = mbbs_machine::m16::FarPtr {
             offset: slot.offset + 0x24,
@@ -1316,7 +1402,7 @@ mod tests {
             .expect("write");
         assert_eq!(f.host.users().state_mem(f.machine.mem(), console).expect("read"), 7);
 
-        // The literal `+6`, not `user::STATE`, for the same reason
+        // The literal `+6`, not `UserLayout::state`, for the same reason
         // `polrou_round_trips_through_the_bytes_the_module_reads` uses a
         // literal `0x24`: an address derived from the constant under test
         // could only prove the accessor agrees with itself.

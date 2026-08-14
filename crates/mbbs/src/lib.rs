@@ -1680,6 +1680,11 @@ impl<A: Abi> Host<A> {
         &self.users
     }
 
+    /// The per-channel tables, mutably. See [`Users`].
+    pub fn users_mut(&mut self) -> &mut Users<A> {
+        &mut self.users
+    }
+
     /// Every lock a module has asked about, in order.
     ///
     /// The lock names are sysop-editable text in the module's `.MSG` --
@@ -1931,9 +1936,7 @@ impl<A: Abi> Host<A> {
     ///
     /// If the read runs off a segment.
     pub(crate) fn class_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u16, ShimError> {
-        let at = A::ptr_offset(self.users().slot(unum), users::user::USRCLS);
-        let bytes = at.resolve(mem, 2).map_err(|e| ShimError::Failed(e.to_string()))?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+        self.users().usrcls_mem(mem, unum)
     }
 
     /// Point the four globals that name "the current channel" -- `usrnum`,
@@ -3216,14 +3219,19 @@ impl<A: Abi> Host<A> {
         at.write(A::mem(machine), &[who.height])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-        for (field, value) in [
-            (users::user::USRCLS, 0u16),
-            (users::user::STATE, 0u16),
-            (users::user::SUBSTT, 0u16),
+        // Zeroed at the field's own width. Under `Wg32` these are four-byte
+        // `INT`s and a two-byte store would leave the previous occupant's
+        // high half in place -- which is the same class of bug `userid`
+        // above is zeroed whole to avoid.
+        let layout = *self.users().user_layout();
+        for (field, name) in [
+            (layout.usrcls, "usrcls"),
+            (layout.state, "state"),
+            (layout.substt, "substt"),
         ] {
-            let at = A::ptr_offset(slot, field);
-            at.write(A::mem(machine), &value.to_le_bytes())
-                .map_err(|e| ShimError::Failed(e.to_string()))?;
+            let at = A::ptr_offset(slot, field.at);
+            at.write(A::mem(machine), &vec![0u8; usize::from(field.width)])
+                .map_err(|e| ShimError::Failed(format!("{name}: {e}")))?;
         }
 
         // `loadkeys()`, `LOCKNKEY.C:88`. On a real board this read `bbsk.dat`
@@ -3249,7 +3257,7 @@ impl<A: Abi> Host<A> {
         // Host-private in practice -- the module never tests 0x40 -- but the
         // bit is real and `user.flags` should not lie about it.
         const MASTER: u8 = 0x40;
-        let at = A::ptr_offset(slot, users::user::FLAGS);
+        let at = A::ptr_offset(slot, self.users().user_layout().flags.at);
         let was = at
             .resolve(A::mem_ref(machine), 1)
             .map_err(|e| ShimError::Failed(e.to_string()))?[0];
@@ -3306,8 +3314,9 @@ impl<A: Abi> Host<A> {
     /// If a write runs off a segment.
     pub fn rstchn(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
         self.users.clear_keys(chan);
+        let user_stride = self.users.user_layout().stride;
         for (at, len) in [
-            (self.users.slot(chan), users::USER),
+            (self.users.slot(chan), user_stride),
             (self.users.extra(chan), users::EXTUSR),
             (self.users.account(chan), users::USRACC),
         ] {
@@ -3972,7 +3981,7 @@ mod tests {
         // so the write runs off the end of it and into whatever the heap
         // handed out next. Alignment cannot save it -- 123 bytes of overrun is
         // wider than any padding between two heap blocks.
-        let sentinel = [0xffu8; users::USER as usize];
+        let sentinel = vec![0xffu8; usize::from(host.users().user_layout().stride)];
         for chan in host.users().terms().all() {
             machine
                 .write(host.users().slot(chan), &sentinel)
@@ -4216,7 +4225,7 @@ mod tests {
         f.host.rstchn(&mut f.machine, chan).expect("reset");
 
         for (what, at, len) in [
-            ("user", f.host.users().slot(chan), users::USER),
+            ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
             ("extusr", f.host.users().extra(chan), users::EXTUSR),
             ("usracc", f.host.users().account(chan), users::USRACC),
         ] {
@@ -4314,7 +4323,7 @@ mod tests {
                 .connect_state(&mut f.machine, chan, &who)
                 .expect("a user on every channel");
             for (at, len) in [
-                (f.host.users().slot(chan), users::USER),
+                (f.host.users().slot(chan), f.host.users().user_layout().stride),
                 (f.host.users().extra(chan), users::EXTUSR),
                 (f.host.users().account(chan), users::USRACC),
             ] {
@@ -4328,7 +4337,7 @@ mod tests {
         f.host.rstchn(&mut f.machine, middle).expect("reset");
 
         for (what, at, len) in [
-            ("user", f.host.users().slot(middle), users::USER),
+            ("user", f.host.users().slot(middle), f.host.users().user_layout().stride),
             ("extusr", f.host.users().extra(middle), users::EXTUSR),
             ("usracc", f.host.users().account(middle), users::USRACC),
         ] {
@@ -4346,7 +4355,7 @@ mod tests {
 
         for &chan in [&chans[0], &chans[2]] {
             for (what, at, len) in [
-                ("user", f.host.users().slot(chan), users::USER),
+                ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
                 ("extusr", f.host.users().extra(chan), users::EXTUSR),
                 ("usracc", f.host.users().account(chan), users::USRACC),
             ] {
@@ -4703,15 +4712,15 @@ mod tests {
 
     /// Write `state` into `user[chan].state`, the way the module does.
     ///
-    /// Through [`Users::slot`] and `user::STATE` rather than a setter, because
-    /// production code never assigns a state -- `register_module` hands the
-    /// number back and the module stores it itself, at 14 sites in
+    /// Through [`Users::slot`] and `UserLayout::state` rather than a setter,
+    /// because production code never assigns a state -- `register_module`
+    /// hands the number back and the module stores it itself, at 14 sites in
     /// `WCCMMUD.DLL`. A test that wrote it any other way would be agreeing with
     /// [`Users::state`] about an offset instead of checking it.
     fn set_state(f: &mut Fixture, chan: crate::Chan, state: u16) {
         let slot = f.host.users().slot(chan);
         let at = FarPtr {
-            offset: slot.offset + users::user::STATE,
+            offset: slot.offset + users::UserLayout::of::<Wg16>().state.at,
             selector: slot.selector,
         };
         f.machine.write(at, &state.to_le_bytes()).expect("in the segment");
@@ -5684,7 +5693,7 @@ mod tests {
         let console = f.console();
         let module = f.minimal_module();
         let slot = f.host.users().slot(console);
-        let lo = slot.offset + crate::users::user::POLROU;
+        let lo = slot.offset + crate::users::UserLayout::of::<Wg16>().polrou.at;
 
         // mov ax, <selector>       B8 ss ss
         // mov es, ax               8E C0
