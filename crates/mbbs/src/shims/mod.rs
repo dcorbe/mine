@@ -398,6 +398,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "sameas", text::sameas, Cleans::Caller),
         (MAJORBBS, "sameto", text::sameto, Cleans::Caller),
         (MAJORBBS, "samein", text::samein, Cleans::Caller),
+        // Implemented in `shims::user` rather than beside its three
+        // siblings above: this session's file ownership was `shims::user`/
+        // `shims::mod`, not `shims::text`, and `samend` needs nothing
+        // `shims::text` has that `crate::strings::sameas` does not already
+        // give it directly.
+        (MAJORBBS, "samend", user::samend, Cleans::Caller),
         (MAJORBBS, "strcmp", text::strcmp, Cleans::Caller),
         (MAJORBBS, "strcat", text::strcat, Cleans::Caller),
         (MAJORBBS, "strncat", text::strncat, Cleans::Caller),
@@ -434,6 +440,9 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
         (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
         (MAJORBBS, "fgets", stream::fgets, Cleans::Caller),
+        // `GCOMM.H`'s own `fgets` sibling -- implemented in `shims::user`
+        // for the same file-ownership reason `samend` is, above.
+        (MAJORBBS, "mdfgets", user::mdfgets, Cleans::Caller),
         (MAJORBBS, "fgetc", stream::fgetc, Cleans::Caller),
         (MAJORBBS, "fputc", stream::fputc, Cleans::Caller),
         (MAJORBBS, "fread", stream::fread, Cleans::Caller),
@@ -506,6 +515,18 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "usroff", user::usroff, Cleans::Caller),
         (MAJORBBS, "getin", user::getin, Cleans::Caller),
         (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+        // The other-user family: scan every channel for a user-id, in a
+        // given module state (`instat`) or online at all (`onsysn`), leaving
+        // `othusn`/`othusp`/`othuap` pointed at the result -- and `othkey`,
+        // which asks that channel's own keys the way `haskey` asks the
+        // current one's.
+        (MAJORBBS, "instat", user::instat, Cleans::Caller),
+        (MAJORBBS, "onsysn", user::onsysn, Cleans::Caller),
+        (MAJORBBS, "othkey", user::othkey, Cleans::Caller),
+        // The default `stsrou` a module gets if it registers none of its
+        // own. See `user::dfsthn`'s own doc comment for why its one real
+        // branch is unreachable on this host, measured rather than assumed.
+        (MAJORBBS, "dfsthn", user::dfsthn, Cleans::Caller),
         // The multi-user broadcast family's one member LunatiX actually
         // imports -- see `user::clrmlt`'s own doc comment for why the other
         // three (`prfmlt`/`pmlt`/`outmlt`) stay unimplemented.

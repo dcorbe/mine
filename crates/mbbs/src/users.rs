@@ -719,6 +719,31 @@ impl<A: Abi> Users<A> {
         self.field_u16(mem, unum, at, self.user.usrcls, "usrcls")
     }
 
+    /// `user[unum].flags` -- the whole `ULONG`, against memory directly
+    /// rather than a whole `Machine`.
+    ///
+    /// **Not routed through [`Users::field_u16`].** `flags` is a bitfield,
+    /// not a magnitude -- `WCCMMUD.DLL` tests individual bits of it
+    /// (`lib.rs`'s own `MASTER` write is the host's side of that) -- and
+    /// `field_u16` refuses any value that does not fit sixteen bits. A
+    /// caller that only wants one high bit (`INVISB` is `shims::user`'s,
+    /// `MASTER` is `lib.rs`'s) should not have a *different* high bit, set by
+    /// something else entirely, turn its read into an error. This reads the
+    /// field whole, at its own width, and leaves the masking to the caller.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off a segment.
+    pub fn flags_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u32, ShimError> {
+        let at = A::ptr_offset(self.slot(unum), self.user.flags.at);
+        let bytes = at
+            .resolve(mem, usize::from(self.user.flags.width))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        let mut wide = [0u8; 4];
+        wide[..bytes.len()].copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(wide))
+    }
+
     /// `user[unum].substt` -- the registered module's own substate, against
     /// memory directly rather than a whole `Machine`.
     ///

@@ -202,6 +202,10 @@ pub const GLOBALS: &[Global] = &[
     // the same role `usaptr` already plays for the same type. Needed by 17
     // modules in the corpus census, 522 call sites.
     g("usaptr", PTR),
+    // USRACC.H:23 -- struct usracc *othuap; the account-side twin of
+    // `othusp` (`MAJORBBS.H:345`, placed above), written on every iteration
+    // of `instat`'s and `onsysn`'s scan the same way `othusn`/`othusp` are --
+    // see `shims::user::write_oth_globals`.
     g("othuap", PTR),
     // FILEXFER.H / FTG.H (wg1) -- the File Transfer Framework's two live
     // pointers and its "tag scan header" message buffer. Placed as data, not

@@ -247,6 +247,466 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(answer as u16)))
 }
 
+/// `INVISB`, `MAJORBBS.H:274` -- bit `0x4000` of `user.flags`. A channel with
+/// this bit set answers "not here" to [`instat`]/[`onsysn`] even when the
+/// state/class test and the user-id both match -- `MAJORBBS.C:3738`'s
+/// `if (!(othusp->flags&INVISB))` and `:3697`'s `if (invis ||
+/// !(othusp->flags&INVISB))`.
+const INVISB: u32 = 0x0000_4000;
+
+/// `othusn=n; othusp=usroff(n); othuap=uacoff(n);` -- the assignment
+/// [`instat`]'s and [`onsysn`]'s loops open every iteration with,
+/// `MAJORBBS.C:3694-3695`/`:3735-3736`. One function because the assignment
+/// itself is identical in both; only what each does with the result differs.
+///
+/// Called on **every** channel the scan visits, not only a matching one --
+/// see [`scan_for`]'s own doc comment for why that is the point.
+fn write_oth_globals<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, chan: crate::Chan) -> Result<(), ShimError> {
+    let slot = host.users().slot(chan);
+    let account = host.users().account(chan);
+    host.globals()
+        .write_int_mem(call.mem(), "othusn", chan.number() as i32 as u32)
+        .map_err(|e| ShimError::Failed(format!("othusn: {e}")))?;
+    host.globals()
+        .write_mem(call.mem(), "othusp", &A::ptr_to_bytes(slot))
+        .map_err(|e| ShimError::Failed(format!("othusp: {e}")))?;
+    host.globals()
+        .write_mem(call.mem(), "othuap", &A::ptr_to_bytes(account))
+        .map_err(|e| ShimError::Failed(format!("othuap: {e}")))?;
+    Ok(())
+}
+
+/// `sameas(uid, uacoff(chan)->userid)` -- read the account record's own copy
+/// of the user-id out of module memory and fold-compare it, rather than
+/// trusting it to agree with whatever built the channel's
+/// [`crate::Connection`]. The two are the same bytes only because
+/// [`crate::Host::connect_state`] put them there; this reads what a module
+/// itself would see.
+fn userid_matches<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    chan: crate::Chan,
+    uid: &[u8],
+) -> Result<bool, ShimError> {
+    let account = host.users().account(chan);
+    let at = A::ptr_offset(account, host.users().account_layout().userid);
+    let bytes = at.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(crate::strings::sameas(uid, bytes))
+}
+
+/// The loop [`instat`] and [`onsysn`] share: walk every channel in order,
+/// writing `othusn`/`othusp`/`othuap` as we go, and stop at the first one for
+/// which `matches` and the `INVISB` gate (unless `invis` waives it) both
+/// pass.
+///
+/// # The globals are written on every iteration, not only a match
+///
+/// `MAJORBBS.C:3689-3702`/`:3730-3743` write `othusn`/`othusp`/`othuap` at the
+/// *top* of the loop body, before either test runs -- so a module reading
+/// them after the call sees wherever the loop actually finished, which is not
+/// always where it matched.
+///
+/// **On a match**, that is the matching channel -- the ordinary case, and the
+/// one every caller actually wants.
+///
+/// **On no match**, the loop runs every channel `Terms::all` produces without
+/// ever satisfying both tests, and the globals are left exactly where the
+/// last iteration wrote them: `othusn == nterms - 1` (the last real channel),
+/// `othusp`/`othuap` pointing at that channel's own slot -- **not** one past
+/// the end, because `write_oth_globals` runs before the loop's own bound
+/// check, and there is no channel numbered `nterms` to visit. A module that
+/// reads them after a `FALSE` return sees the last channel this host has, the
+/// same thing it would see against the real host once `othusn` has counted up
+/// to `nterms` without the `for` test having anything left to admit.
+///
+/// **Deliberately not reset to a sentinel on `FALSE`.** There is no "clear"
+/// story anywhere in `LOCKNKEY.C`/`MAJORBBS.C` for these three globals after a
+/// failed scan -- inventing one here would be tidiness the vendor code does
+/// not have.
+fn scan_for<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    invis: bool,
+    mut matches: impl FnMut(&mut Call<A>, &mut Host<A>, crate::Chan) -> Result<bool, ShimError>,
+) -> Result<bool, ShimError> {
+    for chan in host.users().terms().all() {
+        write_oth_globals(call, host, chan)?;
+        if matches(call, host, chan)? {
+            if invis {
+                return Ok(true);
+            }
+            let flags = host.users().flags_mem(call.mem(), chan)?;
+            if flags & INVISB == 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// `INT instat(const CHAR *uid, INT qstate)` -- is this user-id logged onto a
+/// channel currently in module state `qstate`?
+///
+/// `MAJORBBS.C:3730`:
+///
+///
+/// The `othusn`/`othusp`/`othuap` side effect is [`scan_for`]'s -- see its own
+/// doc comment for what a caller sees on both a match and a miss.
+///
+/// `state` is read through [`crate::users::UserLayout::state`], never a
+/// literal offset: a C `INT`, two bytes under `Wg16` and four under `Wg32`.
+/// `qstate` is read through `call.int()` at `A`'s own width and widened to
+/// `i32` before the comparison, so a state number that does not fit `u16`
+/// (there is no such module in practice, but nothing upstream refuses one at
+/// this layer) compares correctly rather than wrapping into a false match.
+///
+/// `sameas` is [`crate::strings::sameas`], reused rather than reimplemented --
+/// see [`sameas`](crate::shims::text::sameas)'s own doc comment for why a
+/// second copy of that fold does not belong here.
+///
+/// # Errors
+///
+/// If `uid` cannot be read, or a channel's user/account record cannot be.
+pub fn instat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uid = call.ptr();
+    let qstate = Into::<u32>::into(call.int()) as i32;
+    let uid = uid
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let found = scan_for(call, host, false, |call, host, chan| {
+        let state = i32::from(host.users().state_mem(call.mem(), chan)?);
+        if state != qstate {
+            return Ok(false);
+        }
+        userid_matches(call, host, chan, &uid)
+    })?;
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(found))))
+}
+
+/// `SUPIPG`, `MAJORBBS.H:224` -- "signup in progress". [`onsysn`]'s
+/// `usrcls > SUPIPG` test asks for a channel that has *finished* signing up.
+const SUPIPG: u16 = 3;
+
+/// `INT onsysn(const CHAR *uid, GBOOL invis)` -- is this user-id online (and
+/// past signup, not merely signing up)?
+///
+/// `MAJORBBS.C:3689`:
+///
+///
+/// Same `othusn`/`othusp`/`othuap` side effect as [`instat`]; see
+/// [`scan_for`]. `invis` (`TRUE` skips the `INVISB` gate outright) is
+/// `onsysn`'s one difference from `instat`'s unconditional check --
+/// `bootem`/`kilchn` call `onsysn(who,1)` so an operator kicking a user finds
+/// them even if they asked to be hidden from ordinary lookups.
+///
+/// # This host never sets a channel's `usrcls` above the 0 it starts at
+///
+/// [`Host::connect_state`] writes `usrcls`, `state` and `substt` all as zero
+/// on connect, and nothing afterwards advances `usrcls` -- there is no signup
+/// flow here to finish. `SUPIPG` is 3, so `usrcls > SUPIPG` is false for every
+/// channel this host has ever produced, and `onsysn` is therefore always
+/// `FALSE` here regardless of `uid`/`invis`. That is not a stub: it is the
+/// real comparison, against the real (if perpetually zero) field, the same
+/// choice [`haskey`]'s own doc comment already explains for its `BBSPRV`
+/// fallback -- written out rather than folded to a literal `false` so that it
+/// starts telling the truth on its own the day this host grows real class
+/// assignment.
+///
+/// # Errors
+///
+/// If `uid` cannot be read, or a channel's user/account record cannot be.
+pub fn onsysn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uid = call.ptr();
+    let invis = Into::<u32>::into(call.int()) != 0;
+    let uid = uid
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let found = scan_for(call, host, invis, |call, host, chan| {
+        let usrcls = host.users().usrcls_mem(call.mem(), chan)?;
+        if usrcls <= SUPIPG {
+            return Ok(false);
+        }
+        userid_matches(call, host, chan, &uid)
+    })?;
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(found))))
+}
+
+/// `INT othkey(const CHAR *lock)` -- does the channel `othusn` last pointed at
+/// hold this key?
+///
+/// `LOCKNKEY.C:332`, one line:
+///
+///
+/// [`haskey`]'s own doc comment already explains `gen_haskey`/`low_haskey` --
+/// [`crate::KeySet::evaluate`] now -- and the `usrcls == BBSPRV` fallback for
+/// a channel that never logged on. This is the same body, aimed at `othusn`
+/// instead of `usrnum`.
+///
+/// # `othusn` before anything has set it
+///
+/// Unlike `usrnum` -- which [`crate::Globals::new`] seeds to all-ones so that
+/// "nobody" is a real, checked state -- `othusn` has no such convention. It is
+/// a plain global with no initialiser, so it starts at 0, exactly what a
+/// genuine `INT othusn;` in Borland's BSS reads before anything ever assigns
+/// it. `othkey` called before any [`instat`]/[`onsysn`] has run therefore
+/// answers for channel 0, not an error -- the same answer the real
+/// (uninitialised) global would have pointed at.
+///
+/// # Errors
+///
+/// If `lock` cannot be read, or `othusn` does not name a channel of this
+/// host. The second is not reachable through anything this crate implements
+/// -- [`instat`]/[`onsysn`] only ever write a channel [`crate::Terms::all`]
+/// produced, and the zero it starts at is always channel 0 of a host with at
+/// least one channel -- so it is reachable only by a test poking the global
+/// directly.
+pub fn othkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let lock = call.ptr();
+    let lock = lock
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let lock = String::from_utf8_lossy(&lock);
+
+    let othusn = host
+        .globals()
+        .word_mem(call.mem(), "othusn")
+        .map_err(|e| ShimError::Failed(format!("othkey: othusn: {e}")))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(othusn)
+        .ok_or_else(|| ShimError::Failed(format!("othkey: othusn {othusn} names no channel")))?;
+
+    let answer = match host.users().keys(chan) {
+        Some(keys) => keys.evaluate(&lock),
+        // `low_haskey`'s `keys == NULL` case, same as `haskey`'s own: a
+        // channel that exists but never logged on is answered by class.
+        None => host.class_mem(call.mem(), chan)? == BBSPRV,
+    };
+    host.asked_for_key(othusn, &lock, answer);
+    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
+}
+
+/// `GBOOL samend(const CHAR *longs, const CHAR *ends)` -- does `longs` end
+/// with `ends`?
+///
+/// `GCOMM.H:387` / `re/wg33src/SRC/api/gcommlib/SAMEND.C`:
+///
+///
+/// `ends` longer than `longs` is `FALSE` outright -- the `<=` is what guards
+/// the subtraction it gates from wrapping, which is also why this reads both
+/// lengths and compares them before ever slicing, rather than trusting
+/// `checked_sub`/`saturating_sub` to paper over the case that guard exists
+/// for.
+///
+/// [`crate::strings::sameas`] does the tail comparison -- the same routine
+/// [`sameas`](crate::shims::text::sameas)'s own shim calls; see that
+/// function's doc comment for why a second implementation of the fold does
+/// not exist here.
+///
+/// # Errors
+///
+/// If either string cannot be read.
+pub fn samend<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let longs = call.ptr();
+    let ends = call.ptr();
+    let longs = longs
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let ends = ends
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let answer =
+        ends.len() <= longs.len() && crate::strings::sameas(&ends, &longs[longs.len() - ends.len()..]);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+}
+
+/// The null pointer, in this ABI's own representation.
+///
+/// Duplicated per shim file rather than shared -- `shims::stream` and
+/// `shims::text` each already carry their own private copy of exactly this
+/// one-liner; see [`begin_polling`]'s own doc comment for why [`Abi`] has no
+/// `NULL` constant of its own to reach for instead.
+fn null_ptr<A: Abi>() -> A::Ptr {
+    A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])
+}
+
+/// `CHAR *mdfgets(CHAR *buf, INT size, FILE *fp)` -- the server's own
+/// `fgets()`, which speaks this host's internal line convention instead of
+/// C's.
+///
+/// `GCOMM.H:360` / `re/wg33src/SRC/api/gcommlib/MDFGETS.C`:
+///
+///
+/// Three ways this differs from plain `fgets`
+/// ([`crate::shims::stream::fgets`]), all in the C source above and all
+/// deliberate: `\r` is read and thrown away rather than stored (`i--` cancels
+/// the loop's own `i++`, so the byte never lands in `buf` at all); `\n` is
+/// *replaced* with `\r` as the line's terminator rather than kept -- this
+/// host's own internal line convention is `\r`, the same one
+/// `prfmsg`/the message parser use, not C's `\n`; and a trailing Ctrl-Z (26,
+/// DOS soft end-of-file) already stored at end-of-file is trimmed back off.
+///
+/// # Built on the same byte source `fgets` reads, on purpose
+///
+/// [`crate::stream::Streams::read_mem`] reads through [`crate::stream`]'s own
+/// `getc`, which *already* squeezes `\r` and treats Ctrl-Z as end-of-file --
+/// but only for a stream opened in text mode; `fgets`'s own doc comment notes
+/// the same fact. That is not a conflict with the switch above, it is the
+/// same translation from two different places: on a text-mode stream, `getc`
+/// has already done it and the `\r`/Ctrl-Z arms below simply never have
+/// anything left to catch; on a binary-mode stream, `getc` hands back the raw
+/// bytes and those arms do exactly what `MDFGETS.C` wrote. Building this on
+/// the primitive `fgets` already uses, rather than a second raw reader, means
+/// it is correct under either mode without needing to know which one a given
+/// `fp` was opened with.
+///
+/// # Errors
+///
+/// If `fp` names no open, readable stream, if `size` leaves no room even for
+/// a terminator (the same refusal [`fgets`](crate::shims::stream::fgets)
+/// makes, for the same reason -- `MDFGETS.C` itself does not guard this, and
+/// writing into a buffer the caller says has no room is exactly the silent
+/// wrongness this crate refuses to reproduce), or if a read fails.
+pub fn mdfgets<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let buf = call.ptr();
+    let size = super::sign_extend::<A>(call.int().into());
+    let fp = call.ptr();
+
+    if size < 1 {
+        return Err(ShimError::Failed(format!(
+            "mdfgets with size of {size}, which leaves no room even for the terminator"
+        )));
+    }
+    let cap = (size - 1) as usize;
+
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if out.len() >= cap {
+            // Ran out of room without a `\n` or EOF: `buf[i]='\0'` at the
+            // loop's own `i`, the tail below this loop in `MDFGETS.C`.
+            out.push(0);
+            buf.write(call.mem(), &out)
+                .map_err(|e| ShimError::Failed(e.to_string()))?;
+            return Ok(abi::Ret::Ptr(buf));
+        }
+        let byte = host
+            .streams
+            .read_mem(call.mem(), fp, 1)
+            .map_err(|e| ShimError::Failed(format!("mdfgets: {e}")))?;
+        match byte.first().copied() {
+            Some(b'\r') => continue,
+            Some(b'\n') => {
+                out.push(b'\r');
+                out.push(0);
+                buf.write(call.mem(), &out)
+                    .map_err(|e| ShimError::Failed(e.to_string()))?;
+                return Ok(abi::Ret::Ptr(buf));
+            }
+            Some(c) => out.push(c),
+            None => {
+                if out.is_empty() {
+                    return Ok(abi::Ret::Ptr(null_ptr::<A>()));
+                }
+                // `buf[i-1] == 26` -- a Ctrl-Z the read loop already stored,
+                // trimmed back off rather than kept as part of the line.
+                if out.last() == Some(&26) {
+                    out.pop();
+                }
+                out.push(0);
+                buf.write(call.mem(), &out)
+                    .map_err(|e| ShimError::Failed(e.to_string()))?;
+                return Ok(abi::Ret::Ptr(buf));
+            }
+        }
+    }
+}
+
+// `BRKTHU.H:31-49` -- `btusts()` hardware status codes [`dfsthn`] exempts
+// from its default action. This host has no channel-group hardware and never
+// produces any of these; named here so the switch below is checked against
+// the real values rather than a guess.
+const CMDOK: i16 = 2;
+const INBLK: i16 = 4;
+const OUTMT: i16 = 5;
+const OBFCLR: i16 = 6;
+const ABOREQ: i16 = 7;
+const CMN2OK: i16 = 12;
+const CM25OK: i16 = 22;
+const RCVX29: i16 = 24;
+const IPXRER: i16 = 37;
+const IPXUNK: i16 = 38;
+/// `MAJORBBS.H:297` -- the one member of [`dfsthn`]'s exempted set this
+/// host's own [`crate::Host::poll`] really does raise.
+const CYCLE: i16 = 240;
+
+/// `VOID dfsthn(VOID)` -- the default `stsrou` a module gets if it registers
+/// none of its own.
+///
+/// `MAJORBBS.C:5202`:
+///
+///
+/// # The `default:` branch cannot fire on this host, and that is checked here rather than assumed
+///
+/// `module00` is the built-in "Menuing System" module -- `MAJORBBS.C:39` puts
+/// `loscar` in its `huprou` slot -- and this host has no menuing system: no
+/// `mnuusr`/`muusrs` table, the same deliberate absence `curusr`'s own doc
+/// comment already names. More directly, `Host::poll` (`lib.rs:2635-2652`)
+/// writes the `status` global to exactly three values before a `stsrou` is
+/// ever entered -- `gsbl::Gsbl::INBLK`, `::OUTMT` and `::CYCLE` -- and all
+/// three are members of the `break;` set above. So whenever this host
+/// actually calls a module's `stsrou`, `status` already is one of the
+/// recognised codes, which makes `dfsthn`'s `default:` dead code under this
+/// host's own dispatch, not merely an unlikely one. The eight `btusts()`
+/// hardware codes this switch also exempts never arise at all -- this host
+/// has no channel-group hardware to raise them, the same gap
+/// [`crate::Host::rstchn`]'s own doc comment names for `rcdbaud`/`lincst`/
+/// `bturst`.
+///
+/// Given that, this reproduces the `break;` half faithfully -- every status
+/// this host can actually hand a module falls through as the real no-op, at
+/// the real vendor constants (`BRKTHU.H:31-49`, `MAJORBBS.H:297`), not
+/// invented ones -- and refuses outright on the one branch nothing in this
+/// host can source, rather than inventing a body for it: there is no
+/// `module00`, no `huprou` slot on it, and no `&A::Module` at a shim call
+/// site to reach even a *loaded* module's `huprou` if there were one. A
+/// silent no-op there would be exactly the quiet-wrongness this crate
+/// refuses to ship; an error on a branch measured above to be unreachable
+/// costs nothing.
+///
+/// # Errors
+///
+/// If `status` cannot be read, or (unreachably, per above) `status` is not
+/// one of the recognised codes.
+pub fn dfsthn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let status = host
+        .globals()
+        .word_mem(call.mem(), "status")
+        .map_err(|e| ShimError::Failed(format!("dfsthn: status: {e}")))? as i16;
+
+    const RECOGNISED: &[i16] = &[
+        CMDOK, INBLK, OUTMT, OBFCLR, ABOREQ, CMN2OK, CM25OK, RCVX29, IPXRER, IPXUNK, CYCLE, 251, 252, 253,
+    ];
+    if RECOGNISED.contains(&status) {
+        return Ok(abi::Ret::Void);
+    }
+    Err(ShimError::Failed(format!(
+        "dfsthn: status {status} is not one of the codes this host ever hands a module's \
+         stsrou -- the real default branch (module00.huprou, a menuing system this host \
+         does not have) has no honest answer here"
+    )))
+}
+
 /// `void begin_polling(int unum, void (*rouptr)())` -- start calling `rouptr`
 /// for channel `unum` every time the host comes round. `MAJORBBS.C:1183`:
 ///
@@ -396,7 +856,9 @@ const BBSPRV: u16 = 2;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg16;
     use crate::testing::Fixture;
+    use mbbs_machine::m16::FarPtr;
 
     #[test]
     fn uacoff_hands_back_the_channels_account_record() {
@@ -827,5 +1289,420 @@ mod tests {
         let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
         f.invoke(curusr, &[1]).expect("channel 1 current");
         assert_eq!(f.invoke(clrmlt, &[]).expect("clrmlt succeeds"), Ret::Void);
+    }
+
+    // ---- instat/onsysn/othkey/samend/mdfgets/dfsthn -----------------------
+
+    /// A host with two channels, both connected. `instat`/`onsysn` are
+    /// meaningless at one channel -- see this module's own doc comment.
+    fn two_channels() -> Fixture {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let chan0 = f.host.users().terms().chan(0).expect("channel 0");
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host
+            .connect_state(&mut f.machine, chan0, &crate::Connection::ansi("rangerdan"))
+            .expect("channel 0 connects");
+        f.host
+            .connect_state(&mut f.machine, chan1, &crate::Connection::ansi("kaimon"))
+            .expect("channel 1 connects");
+        f
+    }
+
+    /// Poke `user[chan].flags` directly -- there is no shim that sets
+    /// `INVISB`, so the only way to arrange a channel that has it is to write
+    /// the byte the way the vendor's own `NAKED sysop` toggle would have.
+    fn set_flag_bits(f: &mut Fixture, chan: crate::Chan, bits: u32) {
+        let field = f.host.users().user_layout().flags;
+        let at = Wg16::ptr_offset(f.host.users().slot(chan), field.at);
+        f.machine.write(at, &bits.to_le_bytes()).expect("flags fit");
+    }
+
+    /// Poke `user[chan].usrcls` directly. This host's own `connect_state`
+    /// never writes anything above 0 -- see [`onsysn`]'s own doc comment --
+    /// so a test of the branch that reads a class above `SUPIPG` has no
+    /// shim to reach through and must set the field itself.
+    fn set_usrcls(f: &mut Fixture, chan: crate::Chan, value: u16) {
+        let field = f.host.users().user_layout().usrcls;
+        let at = Wg16::ptr_offset(f.host.users().slot(chan), field.at);
+        f.machine.write(at, &value.to_le_bytes()).expect("usrcls fits");
+    }
+
+    fn oth_globals(f: &Fixture) -> (i16, FarPtr, FarPtr) {
+        let g = f.host.globals();
+        (
+            g.word(&f.machine, "othusn").expect("othusn") as i16,
+            g.pointer(&f.machine, "othusp").expect("othusp"),
+            g.pointer(&f.machine, "othuap").expect("othuap"),
+        )
+    }
+
+    #[test]
+    fn instat_finds_a_userid_in_the_given_state_on_a_second_channel() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+
+        let uid = f.text("kaimon");
+        let got = f.invoke(instat, &[uid.offset, uid.selector, 42]).expect("answered");
+        assert_eq!(got, Ret::U16(1));
+
+        // The side effect: `othusn`/`othusp`/`othuap` point at the match.
+        let (othusn, othusp, othuap) = oth_globals(&f);
+        assert_eq!(othusn, 1, "othusn names the matching channel");
+        assert_eq!(othusp, f.host.users().slot(chan1));
+        assert_eq!(othuap, f.host.users().account(chan1));
+    }
+
+    #[test]
+    fn instat_is_false_when_the_state_does_not_match_and_still_leaves_the_globals_on_the_last_channel_scanned() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+
+        let uid = f.text("kaimon");
+        // 41, not 42: the userid matches but the state does not.
+        let got = f.invoke(instat, &[uid.offset, uid.selector, 41]).expect("answered");
+        assert_eq!(got, Ret::U16(0));
+
+        // No match: the loop ran to the end and left the globals on the last
+        // channel it visited, channel 1 -- not reset to anything. See
+        // `scan_for`'s own doc comment.
+        let (othusn, othusp, othuap) = oth_globals(&f);
+        assert_eq!(othusn, 1);
+        assert_eq!(othusp, f.host.users().slot(chan1));
+        assert_eq!(othuap, f.host.users().account(chan1));
+    }
+
+    #[test]
+    fn instat_is_false_when_the_userid_does_not_match() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+
+        let uid = f.text("nobody");
+        let got = f.invoke(instat, &[uid.offset, uid.selector, 42]).expect("answered");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    #[test]
+    fn instat_is_case_insensitive_on_the_userid() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+
+        let uid = f.text("KaImOn");
+        let got = f.invoke(instat, &[uid.offset, uid.selector, 42]).expect("answered");
+        assert_eq!(got, Ret::U16(1));
+    }
+
+    #[test]
+    fn instat_refuses_a_match_hidden_by_invisb() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+        set_flag_bits(&mut f, chan1, INVISB);
+
+        let uid = f.text("kaimon");
+        let got = f.invoke(instat, &[uid.offset, uid.selector, 42]).expect("answered");
+        assert_eq!(got, Ret::U16(0), "INVISB hides an otherwise exact match");
+    }
+
+    #[test]
+    fn onsysn_is_always_false_here_because_this_host_never_advances_usrcls_past_zero() {
+        // `connect_state` writes `usrcls` as 0 and nothing here ever advances
+        // it -- see `onsysn`'s own doc comment. This is the honest
+        // consequence of that gap, pinned so a future signup flow that starts
+        // writing `usrcls` has a test here that starts failing rather than a
+        // silent behaviour change.
+        let mut f = two_channels();
+        let uid = f.text("kaimon");
+        let got = f.invoke(onsysn, &[uid.offset, uid.selector, 0]).expect("answered");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    #[test]
+    fn onsysn_finds_a_userid_once_usrcls_is_past_supipg() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        set_usrcls(&mut f, chan1, SUPIPG + 1);
+
+        let uid = f.text("kaimon");
+        let got = f.invoke(onsysn, &[uid.offset, uid.selector, 0]).expect("answered");
+        assert_eq!(got, Ret::U16(1));
+
+        let (othusn, othusp, othuap) = oth_globals(&f);
+        assert_eq!(othusn, 1);
+        assert_eq!(othusp, f.host.users().slot(chan1));
+        assert_eq!(othuap, f.host.users().account(chan1));
+    }
+
+    #[test]
+    fn onsysn_at_exactly_supipg_is_still_signing_up_not_online() {
+        // `usrcls > SUPIPG`, strictly -- a channel still at `SUPIPG` itself
+        // has not finished signing up yet and must not match. The boundary
+        // that tells `<=`/`>` apart from `<`/`>=`.
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        set_usrcls(&mut f, chan1, SUPIPG);
+
+        let uid = f.text("kaimon");
+        let got = f.invoke(onsysn, &[uid.offset, uid.selector, 0]).expect("answered");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    #[test]
+    fn onsysn_invis_true_bypasses_the_invisb_gate_that_invis_false_respects() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        set_usrcls(&mut f, chan1, SUPIPG + 1);
+        set_flag_bits(&mut f, chan1, INVISB);
+
+        let uid = f.text("kaimon");
+        let hidden = f
+            .invoke(onsysn, &[uid.offset, uid.selector, 0])
+            .expect("answered");
+        assert_eq!(hidden, Ret::U16(0), "invis=0 respects INVISB");
+
+        let found = f
+            .invoke(onsysn, &[uid.offset, uid.selector, 1])
+            .expect("answered");
+        assert_eq!(found, Ret::U16(1), "invis=1 (TRUE) waives INVISB outright");
+    }
+
+    #[test]
+    fn othkey_answers_for_the_channel_instat_last_pointed_at() {
+        let mut f = two_channels();
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host.users_mut().set_state_mem(f.machine.mem_mut(), chan1, 42).expect("state set");
+        f.host.users_mut().set_keys(chan1, crate::KeySet::new(["WCCSYSOP"]));
+
+        // Point `othusn`/`othusp` at channel 1 via `instat`.
+        let uid = f.text("kaimon");
+        assert_eq!(
+            f.invoke(instat, &[uid.offset, uid.selector, 42]).expect("found"),
+            Ret::U16(1)
+        );
+        // `usrnum` is deliberately moved to channel 0 afterwards, so
+        // `othusn` (1) and `usrnum` (0) disagree -- `othkey` must answer for
+        // channel 1, not whichever channel happens to be current.
+        f.invoke(curusr, &[0]).expect("channel 0 current");
+
+        let lock = f.text("WCCSYSOP");
+        let got = f
+            .invoke(othkey, &Fixture::far(lock))
+            .expect("othkey answered");
+        assert_eq!(got, Ret::U16(1), "channel 1's own key, not channel 0's (which has none)");
+
+        let lock = f.text("SOMETHINGELSE");
+        let got = f
+            .invoke(othkey, &Fixture::far(lock))
+            .expect("othkey answered");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    #[test]
+    fn othkey_before_anything_has_run_answers_for_channel_zero() {
+        // `othusn` has no "-1 means nobody" convention -- it starts at the
+        // zero a genuine uninitialised BSS global would hold, which is
+        // channel 0. See `othkey`'s own doc comment.
+        let mut f = two_channels();
+        let chan0 = f.host.users().terms().chan(0).expect("channel 0");
+        f.host.users_mut().set_keys(chan0, crate::KeySet::new(["USER"]));
+
+        let lock = f.text("USER");
+        let got = f.invoke(othkey, &Fixture::far(lock)).expect("othkey answered");
+        assert_eq!(got, Ret::U16(1), "answered for channel 0, not an error");
+    }
+
+    #[test]
+    fn samend_is_true_when_ends_matches_the_tail_case_insensitively() {
+        let mut f = Fixture::new();
+        let longs = f.text("/ANSI/lunatix");
+        let ends = f.text("/lunatix");
+        let got = f
+            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
+            .expect("answered");
+        assert_eq!(got, Ret::U16(1));
+
+        let ends = f.text("/LUNATIX");
+        let got = f
+            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
+            .expect("answered");
+        assert_eq!(got, Ret::U16(1), "sameas -- case-insensitive");
+    }
+
+    #[test]
+    fn samend_is_false_when_ends_is_longer_than_longs() {
+        let mut f = Fixture::new();
+        let longs = f.text("hi");
+        let ends = f.text("hi there");
+        let got = f
+            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
+            .expect("answered");
+        assert_eq!(got, Ret::U16(0), "the `<=` guard, not a wrapped subtraction");
+    }
+
+    #[test]
+    fn samend_is_false_when_the_tail_does_not_match() {
+        let mut f = Fixture::new();
+        let longs = f.text("/ANSI/lunatix");
+        let ends = f.text("/majormud");
+        let got = f
+            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
+            .expect("answered");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    /// `fopen(name, mode)` that must succeed, as the `FILE *` it returned.
+    fn opened(f: &mut Fixture, name: &str, mode: &str) -> FarPtr {
+        let path = f.text(name);
+        let how = f.text(mode);
+        let Ret::Far(fp) = f
+            .invoke(
+                crate::shims::stream::fopen,
+                &[path.offset, path.selector, how.offset, how.selector],
+            )
+            .expect("fopen")
+        else {
+            panic!("fopen returns a pointer");
+        };
+        assert_ne!(fp, FarPtr::NULL, "{name} ({mode}) must open");
+        fp
+    }
+
+    /// `mdfgets(buf, n, fp)`, as the string it left behind, or `None` for
+    /// `NULL`.
+    fn mdfgets_line(f: &mut Fixture, fp: FarPtr, n: u16) -> Option<Vec<u8>> {
+        let buffer = f.bytes(&vec![0xffu8; usize::from(n) + 8], false);
+        let ret = f
+            .invoke(mdfgets, &[buffer.offset, buffer.selector, n, fp.offset, fp.selector])
+            .expect("mdfgets");
+        match ret {
+            Ret::Far(FarPtr { offset: 0, selector: 0 }) => None,
+            Ret::Far(at) => {
+                assert_eq!(at, buffer, "mdfgets returns its own first argument");
+                Some(f.machine.read_cstr(buffer).expect("terminated").to_vec())
+            }
+            _ => panic!("expected a far pointer"),
+        }
+    }
+
+    #[test]
+    fn mdfgets_terminates_a_line_with_carriage_return_not_newline() {
+        let dir = crate::testing::scratch("mdfgets-newline");
+        std::fs::write(dir.join("LINES.DAT"), b"alpha\nbeta\n").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "LINES.DAT", "rb");
+
+        assert_eq!(mdfgets_line(&mut f, fp, 64).as_deref(), Some(&b"alpha\r"[..]));
+        assert_eq!(mdfgets_line(&mut f, fp, 64).as_deref(), Some(&b"beta\r"[..]));
+    }
+
+    #[test]
+    fn mdfgets_drops_a_carriage_return_rather_than_storing_it() {
+        // Binary mode, deliberately: a text-mode stream's own `getc` would
+        // already have squeezed this `\r` out before `mdfgets`'s switch ever
+        // saw it (see `mdfgets`'s own doc comment on the two being built on
+        // the same primitive) -- so only a binary stream actually exercises
+        // this function's own `\r` branch rather than `getc`'s.
+        let dir = crate::testing::scratch("mdfgets-cr");
+        std::fs::write(dir.join("CR.DAT"), b"be\rta\n").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "CR.DAT", "rb");
+
+        assert_eq!(mdfgets_line(&mut f, fp, 64).as_deref(), Some(&b"beta\r"[..]));
+    }
+
+    #[test]
+    fn mdfgets_trims_a_control_z_sitting_exactly_at_end_of_file() {
+        let dir = crate::testing::scratch("mdfgets-ctrlz-eof");
+        std::fs::write(dir.join("EOFCZ.DAT"), b"abc\x1a").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "EOFCZ.DAT", "rb");
+
+        assert_eq!(mdfgets_line(&mut f, fp, 64).as_deref(), Some(&b"abc"[..]));
+    }
+
+    #[test]
+    fn mdfgets_does_not_treat_a_mid_line_control_z_specially() {
+        // 26 is only special as the LAST byte stored before end-of-file
+        // (`buf[i-1] == 26`); anywhere else in the line it is stored like any
+        // other byte, per `MDFGETS.C`'s own `default:` arm.
+        let dir = crate::testing::scratch("mdfgets-ctrlz-midline");
+        std::fs::write(dir.join("MIDCZ.DAT"), b"\x1adropped\n").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "MIDCZ.DAT", "rb");
+
+        assert_eq!(mdfgets_line(&mut f, fp, 64).as_deref(), Some(&b"\x1adropped\r"[..]));
+    }
+
+    #[test]
+    fn mdfgets_returns_null_at_true_end_of_file_with_nothing_read() {
+        let dir = crate::testing::scratch("mdfgets-empty");
+        std::fs::write(dir.join("EMPTY.DAT"), b"").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "EMPTY.DAT", "rb");
+
+        assert_eq!(mdfgets_line(&mut f, fp, 64), None);
+    }
+
+    #[test]
+    fn mdfgets_stops_and_terminates_when_the_buffer_runs_out_of_room() {
+        let dir = crate::testing::scratch("mdfgets-short-buffer");
+        std::fs::write(dir.join("LONG.DAT"), b"abcdefgh\n").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+        let fp = opened(&mut f, "LONG.DAT", "rb");
+
+        // size=5 leaves room for 4 bytes plus the terminator -- one short of
+        // the `\n` at index 8.
+        assert_eq!(mdfgets_line(&mut f, fp, 5).as_deref(), Some(&b"abcd"[..]));
+    }
+
+    #[test]
+    fn mdfgets_refuses_a_size_with_no_room_for_the_terminator() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let buffer = f.buffer(8);
+        let e = f
+            .invoke(mdfgets, &[buffer.offset, buffer.selector, 0, fp.offset, fp.selector])
+            .expect_err("a refusal");
+        assert!(e.to_string().contains("size of 0"), "{e}");
+    }
+
+    #[test]
+    fn mdfgets_agrees_with_itself_whether_the_stream_is_binary_or_text_mode() {
+        let dir = crate::testing::scratch("mdfgets-mode-agreement");
+        std::fs::write(dir.join("PLAIN.DAT"), b"line\r\n").expect("scratch file");
+        let mut f = Fixture::rooted(dir);
+
+        let text = opened(&mut f, "PLAIN.DAT", "rt");
+        let binary = opened(&mut f, "PLAIN.DAT", "rb");
+        assert_eq!(mdfgets_line(&mut f, text, 64), mdfgets_line(&mut f, binary, 64));
+    }
+
+    #[test]
+    fn dfsthn_is_a_no_op_for_every_status_this_host_can_actually_raise() {
+        let mut f = Fixture::new();
+        for status in [CMDOK, INBLK, OUTMT, OBFCLR, ABOREQ, CMN2OK, CM25OK, RCVX29, IPXRER, IPXUNK, CYCLE, 251, 252, 253] {
+            f.host
+                .globals()
+                .write_int_mem(f.machine.mem_mut(), "status", status as i32 as u32)
+                .expect("status set");
+            assert_eq!(f.invoke(dfsthn, &[]).unwrap_or_else(|e| panic!("status {status}: {e}")), Ret::Void);
+        }
+    }
+
+    #[test]
+    fn dfsthn_refuses_a_status_this_host_never_hands_a_module() {
+        // Measured unreachable through `Host::poll` (see `dfsthn`'s own doc
+        // comment); reached directly here to prove the refusal itself works,
+        // not to claim a real dispatch path exercises it.
+        let mut f = Fixture::new();
+        f.host
+            .globals()
+            .write_int_mem(f.machine.mem_mut(), "status", 1)
+            .expect("status set");
+        let e = f.invoke(dfsthn, &[]).expect_err("a refusal");
+        assert!(e.to_string().contains("status 1"), "{e}");
     }
 }
