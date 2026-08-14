@@ -278,6 +278,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "today", system::today, Cleans::Caller),
         (MAJORBBS, "time", system::time, Cleans::Caller),
         (MAJORBBS, "srand", system::srand, Cleans::Caller),
+        (MAJORBBS, "rand", system::rand, Cleans::Caller),
         (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller),
         // Caller-cleaned, read off the host rather than assumed from its
         // neighbours: lngrnd ends in a bare `retf` (segment 13, offset

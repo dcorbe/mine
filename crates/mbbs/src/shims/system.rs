@@ -429,6 +429,22 @@ pub fn srand<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     Ok(abi::Ret::Void)
 }
 
+/// `int rand(void)` -- Borland's own, re-exported by `MAJORBBS.DLL` in 16-bit
+/// and imported from `cw3220mt.DLL` in 32-bit.
+///
+/// The same generator [`genrdn`] draws from, exposed raw. `WCCMMUD.DLL`
+/// never imports it -- it always goes through `genrdn`/`lngrnd` -- but
+/// LunatiX calls it directly, twice during init.
+///
+/// [`Random::rand`](crate::random::Random::rand) already masks to `RAND_MAX`,
+/// so the value is in `[0, RAND_MAX]` exactly as C promises. Returned through
+/// [`Abi::int_from_u32`] rather than `A::Int::from(u16)`: both are correct for
+/// a value this small, and the former is the one that stays correct if
+/// `RAND_MAX` ever stops fitting in sixteen bits.
+pub fn rand<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(host.random.rand()))))
+}
+
 /// `INT genrdn(INT min, INT max)` -- `BBSUTILS.H:69` -- a random number in
 /// `[min, max)`.
 ///
