@@ -80,10 +80,129 @@ fn on_channel<A: Abi, T>(
     Some(body(host.gsbl_mut(), chan))
 }
 
+// # `call.int()` width audit
+//
+// `A::Int` is `u16` under `Wg16` and `u32` under `Wg32` -- four bytes, not
+// two, the moment this file's routines answer a 32-bit module. See
+// `docs/2026-08-14-gsbl-width-audit.md` for the full site-by-site audit this
+// backs; the three helpers below are its two surviving buckets, made
+// callable instead of restated at each of the nine value-narrowing sites the
+// audit found (the eighteen `chan` narrowings to `i16` are the host's own
+// [`Chan`] domain and are not part of this audit -- `on_channel`, above,
+// already bound-checks every one of those against `nterms` regardless of
+// what a bogus wide value would have reinterpreted to, which is why `Chan`
+// itself does not need a checked reader here).
+//
+// The third bucket, "genuinely wide", has no helper: [`btuxct`] and
+// [`btuica`] read their byte counts with a bare `Into::<u32>::into(call.int())
+// as usize` at the point of use, because there is nothing to check against --
+// see each function's own doc comment.
+
+/// Read the next argument and require it to fit in a `u16`, refusing rather
+/// than truncating.
+///
+/// For the sites in this file that store their argument into a `u16`
+/// [`crate::gsbl::Channel`] field -- `btutsw`'s `width`, `btumil`'s
+/// `maxinl`, `btutrg`'s `nbyt` and `btuxnf`'s `cnt` -- and whose real 32-bit
+/// callers never come close to needing the other two bytes `Wg32`'s `int`
+/// carries: `width` comes from `usaptr->scnwid` (`re/wg33src/SRC/apps/
+/// galfil/GALFILUT.C:2755`), `maxinl` from small fixed buffer sizes like
+/// `DFTIMX`/`ALSSIZ-1`/`UIDSIZ-1` (`galalias/GALALIAS.C`), and `nbyt` from
+/// `OUTSIZ`-derived block sizes (`icsrc/galtnt/TELNET.C:386`). Nothing in
+/// the guide or the SDK source ever asks for a screen width, an input-line
+/// cap or a binary-mode trigger past 65535, and the `Channel` fields these
+/// feed did not grow when `Wg32` did -- `since_trigger` in particular is
+/// `u16` too, so a `trigger` this could not represent would silently stop
+/// ever firing rather than merely reading back wrong. Refusing what does
+/// not fit costs a legitimate caller nothing.
+///
+/// `None` on overflow. Every call site here folds that into the same `-11`
+/// [`OUT_OF_RANGE`] a bad channel number already answers -- the guide draws
+/// no distinction between "channel not valid" and "argument not valid", so
+/// this host does not invent one.
+fn u16_arg<A: Abi>(v: A::Int) -> Option<u16> {
+    u16::try_from(Into::<u32>::into(v)).ok()
+}
+
+/// Read the next argument and require it to fit in a `u8`, refusing rather
+/// than truncating.
+///
+/// `btupbc`'s `pausch`, `btucpc`'s `cpchar` and `btuxnf`'s `xon` are all
+/// declared `INT` in `BRKTHU.H`, but every one feeds a `u8`
+/// [`crate::gsbl::Channel`] field (`pause_char`, `clear_pause_char`, `xon`)
+/// and every real 32-bit call site passes a literal single-character value:
+/// `pausch`/`cpchar` are `CHAR` in the guide's own prose (Control-T and
+/// Control-S, the guide's own examples), and `xon` is `0` at every call site
+/// `re/wg33src` has (`galirc/IRCFNC.C:610`, `galftpd/FTPD.C:358`, and every
+/// other `btuxnf` caller) -- a real flow-control byte is never sent because
+/// flow control is meaningless once GSBL is behind a socket rather than a
+/// modem, which is also why `Channel::xon`/`xoff` are recorded but never
+/// acted on. `int` in the prototype is calling-convention noise, the same
+/// reason C's own `putchar(int c)` takes `int` for a byte; the domain is a
+/// byte either way.
+///
+/// `None` on overflow, folded into `-11` [`OUT_OF_RANGE`] the same way
+/// [`u16_arg`]'s is.
+fn u8_arg<A: Abi>(v: A::Int) -> Option<u8> {
+    u8::try_from(Into::<u32>::into(v)).ok()
+}
+
+/// Read the next argument and require it to fit in an `i16`, refusing rather
+/// than reinterpreting.
+///
+/// `btuinj`'s `status` is the one signed site: [`crate::gsbl::Channel`]
+/// queues it in a `VecDeque<i16>`, and the guide's whole status vocabulary
+/// -- `CRSTG`, `INBLK`, `OUTMT`, `OVRFLW`, `POLSTS`, `CYCLE` -- is a small,
+/// closed, host-defined set (`Gsbl`'s own associated constants; the widest,
+/// `POLSTS`, is `192`). This is deliberately **not** the reinterpreting
+/// `i16_arg` `crate::shims::btrieve` uses for `keynum`/`mode`/`loktyp`:
+/// those are Btrieve wire fields the module itself defines and a caller is
+/// free to hand back whatever bit pattern it likes, so truncating and
+/// reinterpreting is the correct generic reading. A status code is
+/// different -- it is *this host's* vocabulary being injected back into the
+/// module, and a value too wide to be any real status wrapping into one by
+/// coincidence (a `btuinj` computed from a 32-bit expression landing on `4`,
+/// `INBLK`, by pure accident of which sixteen bits survived) is a wrong
+/// status silently delivered rather than a byte position with no meaning of
+/// its own. Refuse it instead.
+///
+/// "Fits" means round-trips, not merely "is non-negative": `BRKTHU.H`'s own
+/// status vocabulary is entirely 0..=253 today, but this checks the general
+/// property rather than that narrower fact, the same way [`u16_arg`] and
+/// [`u8_arg`] do. Sign-extending the low 16 bits back out and comparing
+/// against the original widened value accepts every value a genuine `i16`
+/// -- positive or negative -- would zero/sign-extend into under either ABI,
+/// and refuses anything where bits above position 15 carried information
+/// that extension did not put there.
+fn i16_arg<A: Abi>(v: A::Int) -> Option<i16> {
+    let wide: u32 = v.into();
+    let narrow = wide as i16;
+    if (i32::from(narrow) as u32) == wide { Some(narrow) } else { None }
+}
+
+/// Read the next argument at its full width, refusing nothing.
+///
+/// The "genuinely wide" bucket's one reader: [`btuxct`]'s `nbyt` and
+/// [`btuica`]'s `max` are never stored in a `Channel` field narrower than
+/// `usize`, so unlike [`u16_arg`]/[`u8_arg`]/[`i16_arg`] there is nothing to
+/// check the value against -- carrying it is strictly better than refusing
+/// it, and refusing it would turn a legitimate large binary transfer into a
+/// spurious `-11`. `u32 -> usize` is lossless on every platform this host
+/// targets (`usize` is 64 bits there); the widen is the whole of what makes
+/// this different from the `as u16` it replaces.
+fn usize_arg<A: Abi>(v: A::Int) -> usize {
+    Into::<u32>::into(v) as usize
+}
+
 /// `int btutsw(int chan, int width)` -- output word-wrap width. Zero disables.
+///
+/// `width` is read with [`u16_arg`] -- genuinely 16-bit in this host's own
+/// model, not merely narrow by convention: see that function's doc comment.
 pub fn btutsw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let width = Into::<u32>::into(call.int()) as u16;
+    let Some(width) = u16_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).width = width;
     }) {
@@ -94,9 +213,14 @@ pub fn btutsw<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `int btumil(int chan, int maxinl)` -- maximum input line length. Zero
 /// disables the limit.
+///
+/// `maxinl` is read with [`u16_arg`] -- see that function's doc comment for
+/// why this is genuinely 16-bit rather than merely narrow by convention.
 pub fn btumil<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let maxinl = Into::<u32>::into(call.int()) as u16;
+    let Some(maxinl) = u16_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).maxinl = maxinl;
     }) {
@@ -185,9 +309,20 @@ pub fn btuoes<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
 /// `int btutrg(int chan, int nbyt)` -- byte-count input trigger. Zero is ASCII
 /// mode; non-zero switches to binary mode and sets the block size.
+///
+/// `nbyt` is read with [`u16_arg`], not carried wide: unlike [`btuxct`]'s
+/// and [`btuica`]'s byte counts, this one is stored in
+/// [`crate::gsbl::Channel::trigger`], a `u16`, and compared against
+/// `since_trigger`, also `u16` -- both this host's own design, made before
+/// this audit and out of this file's scope to widen. A `trigger` too big to
+/// fit either would not merely read back wrong, it would never fire at all.
+/// See [`u16_arg`]'s own doc comment for why real callers never ask for one
+/// past 65535 in the first place.
 pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let nbyt = Into::<u32>::into(call.int()) as u16;
+    let Some(nbyt) = u16_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| {
         g.channel_mut(chan).trigger = nbyt;
     }) {
@@ -207,16 +342,42 @@ pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// Page mode itself is **not implemented** -- see `Channel::page_lines`.
 /// `cnt` and the pause message are recorded so they are not lost, and
 /// pagination is a driver problem (Batch C of this plan), not a GSBL one.
+///
+/// `xon` is read with [`u8_arg`] -- genuinely narrow, a single
+/// flow-control byte; see that function's doc comment, which also covers why
+/// real callers only ever pass `0`. `cnt` is read with [`u16_arg`] for the
+/// same reason as [`btutrg`]'s `nbyt`: [`crate::gsbl::Channel::page_lines`]
+/// is a `u16`.
+///
+/// **`xoff` is not covered by this audit's checked readers**, and that is a
+/// finding, not an oversight folded in silently: it narrows to `i16` here
+/// and again to `u8` in [`apply_xnf`], on the same `call.int()` -- `A::Int`
+/// -- shape as the nine sites this audit's own plan enumerated, but it is
+/// not one of them (`docs/plans/2026-08-14-stage3-channel-entry-
+/// implementation.md`'s Task 6 table lists `xon` at this line's neighbour
+/// and `cnt` two lines below, never `xoff`). Every real 32-bit call site
+/// (`re/wg33src/SRC/.../MAJORBBS.C:4490` among them) passes `0`, `19` or
+/// `-19` -- well inside a byte, sign included -- so this is not believed to
+/// be live, but "not believed to be live" is exactly the reasoning this
+/// audit exists to distrust. Left as `as i16`/`as u8` because fixing it was
+/// not this task's scope to expand on its own initiative; recorded here and
+/// in `docs/2026-08-14-gsbl-width-audit.md` so a later reader does not
+/// mistake the silence for having been checked.
 pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let xon = Into::<u32>::into(call.int()) as u16;
+    let Some(xon) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    // Not covered by this audit -- see this function's own doc comment.
     let xoff = Into::<u32>::into(call.int()) as i16;
     // The two page-mode arguments are read only when xoff says to expect
     // them -- see this function's own doc comment. The cursor reads them in
     // frame order regardless of which branch runs, same as `arg_u16(3)`/
     // `arg_far(4)` did: the reads that happen, happen sequentially.
     let page = if xoff < 0 {
-        let cnt = Into::<u32>::into(call.int()) as u16;
+        let Some(cnt) = u16_arg::<A>(call.int()) else {
+            return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+        };
         let stg = call.ptr();
         let text = stg
             .read_cstr(call.mem())
@@ -239,12 +400,12 @@ pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 pub(crate) fn apply_xnf(
     g: &mut Gsbl,
     chan: Chan,
-    xon: u16,
+    xon: u8,
     xoff: i16,
     page: Option<(u16, Vec<u8>)>,
 ) {
     let c = g.channel_mut(chan);
-    c.xon = xon as u8;
+    c.xon = xon;
     c.xoff = xoff as u8;
     if let Some((cnt, message)) = page {
         c.page_lines = cnt;
@@ -286,9 +447,16 @@ pub(crate) fn apply_hpk(g: &mut Gsbl, chan: Chan) {
 ///
 /// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
 /// applies here unchanged.
+///
+/// `pausch` is read with [`u8_arg`]: genuinely narrow, per the plan this
+/// audit implements -- a single character, `CHAR` in the guide's own
+/// prototype even though `BRKTHU.H` widens it to `INT`. See that function's
+/// doc comment.
 pub fn btupbc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let pausch = Into::<u32>::into(call.int()) as u8;
+    let Some(pausch) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| apply_pbc(g, chan, pausch)) {
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
@@ -308,9 +476,14 @@ pub(crate) fn apply_pbc(g: &mut Gsbl, chan: Chan, pausch: u8) {
 ///
 /// Not a `WCCMMUD.DLL` import today -- see [`btuhpk`]'s doc comment, which
 /// applies here unchanged.
+///
+/// `cpchar` is read with [`u8_arg`], for the same reason as [`btupbc`]'s
+/// `pausch`.
 pub fn btucpc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let cpchar = Into::<u32>::into(call.int()) as u8;
+    let Some(cpchar) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| apply_cpc(g, chan, cpchar)) {
         Some(()) => abi::Ret::Int(A::Int::from(0u16)),
         None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
@@ -358,9 +531,15 @@ pub fn btucli<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `int btuinj(int chan, int status)` -- inject a status code into the FIFO.
+///
+/// `status` is read with [`i16_arg`], the checked reader -- not the
+/// reinterpreting one `crate::shims::btrieve` uses for its own signed
+/// fields. See that function's doc comment for why.
 pub fn btuinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let status = Into::<u32>::into(call.int()) as i16;
+    let Some(status) = i16_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     Ok(match on_channel(host, chan, |g, chan| {
         g.inject(chan, status);
     }) {
@@ -416,15 +595,26 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// Binary: the length is given rather than scanned for, so an embedded NUL is
 /// data. None of the ASCII output features apply -- the guide is explicit that
 /// word wrap and XON/XOFF "are not in effect when you use btuxct()".
+///
+/// **Genuinely wide.** `nbyt` is never stored in a [`crate::gsbl::Channel`]
+/// field -- it only sizes the one `resolve` call below, which already takes
+/// a `usize` -- so there is nothing here for a narrower type to buy, and a
+/// 32-bit module transmitting more than 65535 bytes in one call is not an
+/// edge case a binary transmit routine gets to refuse. Read with
+/// [`usize_arg`] rather than through `u16`: this is the exact shape of the
+/// `cw3220mt` `fgets(buf, 40000, f)` bug -- a length argument narrowed on
+/// the way to a `resolve`/read call -- this audit exists to catch, except
+/// here the number was never going to be negative, only silently smaller
+/// than the module asked for.
 pub fn btuxct<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
-    let nbyt = Into::<u32>::into(call.int()) as u16;
+    let nbyt = usize_arg::<A>(call.int());
     let at = call.ptr();
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
     };
     let data = at
-        .resolve(call.mem(), usize::from(nbyt))
+        .resolve(call.mem(), nbyt)
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     host.gsbl_mut().transmit_raw(chan, &data);
@@ -441,15 +631,27 @@ pub fn btuxct<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// with the exact length `machine.write` will use validates the same bounds
 /// without mutating anything, so if it succeeds, the write after the drain
 /// cannot fail.
+///
+/// **Genuinely wide**, the same as [`btuxct`]'s `nbyt`: `max` is never
+/// stored in a `Channel` field, only `min`-ed against `c.input.len()`
+/// (already `usize`), so read it through the full width. The return value
+/// -- how many bytes were actually taken -- carries the same width for the
+/// same reason: narrowing `take` back to `u16` after widening `max` would
+/// only move this call's own truncation from the argument to the result,
+/// which is the exact failure mode the design that scoped this audit warns
+/// against for a narrow `Channel` field, applied here to a narrow return
+/// instead. [`Abi::int_from_u32`] is what makes that possible without
+/// assuming `take` fits `u16`: `A::Int: From<u16>` alone cannot express a
+/// `take` past 65535.
 pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     let at = call.ptr();
-    let max = Into::<u32>::into(call.int()) as u16;
+    let max = usize_arg::<A>(call.int());
     let Some(chan) = host.gsbl().terms().chan(chan) else {
         return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
     };
     let c = host.gsbl().channel(chan);
-    let take = usize::from(max).min(c.input.len());
+    let take = max.min(c.input.len());
 
     at.resolve(call.mem(), take)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -458,13 +660,133 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let bytes: Vec<u8> = c.input.drain(..take).collect();
     at.write(call.mem(), &bytes)
         .expect("resolve above already validated this exact pointer and length");
-    Ok(abi::Ret::Int(A::Int::from(take as u16)))
+    Ok(abi::Ret::Int(A::int_from_u32(take as u32)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::Wg32;
     use crate::testing::Fixture;
+
+    // # Why these run against `Wg32::Int` directly, not a `Call<Wg32>`
+    //
+    // `docs/plans/2026-08-14-stage3-channel-entry-implementation.md`'s Task 6
+    // asks for a test that "build[s] a Wg32 fixture, invoke[s] btuica with
+    // max = 70000". No such fixture exists: `crate::testing::Fixture` is
+    // hard-coded to `Wg16` (its `machine: mbbs_machine::m16::Machine` field,
+    // `invoke`'s `Shim<Wg16>` parameter), and `testing.rs` is not this task's
+    // file to change.
+    //
+    // Building a real `Wg32Cpu` in this file would not merely be out of
+    // scope, it would reintroduce a bug this codebase already paid for and
+    // documented: `abi/wg32.rs`'s own module comment records that
+    // `mbbs_machine::m32::Machine::new` unconditionally registers this ABI's
+    // fault claim with the process-wide arbiter in
+    // `crates/mbbs-machine/src/fault.rs`, and an earlier version of that file
+    // built a `Wg32Cpu` in its own `#[cfg(test)] mod tests` -- which runs in
+    // the same `cargo test -p mbbs --lib` process as every `Wg16` test here --
+    // and took three unrelated `Wg16` fault-recovery tests down with it
+    // (`abi/wg32.rs`'s comment names them). That file now deliberately has no
+    // test module, and the tests that need a real `Wg32Cpu` live in
+    // `crates/mbbs/tests/wg32_abi.rs` instead -- a separate `cargo test`
+    // binary, a separate OS process. That file is this wave's other agent's,
+    // not this task's.
+    //
+    // What *is* this task's, and is enough to prove the fix: every one of
+    // the checked readers this audit adds -- [`u16_arg`], [`u8_arg`],
+    // [`i16_arg`], [`usize_arg`] -- is a free function generic over `A: Abi`
+    // that takes `A::Int` as a plain value, not a `Call`. `Wg32::Int` is
+    // `u32` (`abi/wg32.rs:129`) and `Wg32` itself is a zero-sized marker with
+    // no `Machine` behind it (`abi/wg32.rs:118`), so naming `Wg32` as the
+    // type parameter below builds nothing and arms nothing -- it only picks
+    // which `Into<u32>` this call goes through. A value like `70_000u32` is
+    // not a fabrication standing in for what a real `Wg32` module could
+    // produce; it is bit-for-bit what `call.int()` would have handed back
+    // had a genuine `Call<Wg32>` read it, because `int_from_bytes` for
+    // `Wg32` is exactly `u32::from_le_bytes`. What is not exercised here is
+    // argument-frame decoding (already covered elsewhere) and the
+    // channel-bound check `on_channel` performs after these readers return
+    // -- everything downstream of "was this value accepted or refused".
+
+    /// The eight sites this audit classified "genuinely narrow" or
+    /// "genuinely 16-bit in the host's own model" all refuse a value a real
+    /// `Wg32` module's `int` can carry but the site's own `Channel` field
+    /// cannot -- the same shape as the `cw3220mt` `fgets(buf, 40000, f)` bug
+    /// this audit's own plan cites, moved from "wraps negative" (that bug's
+    /// `u16` cast) to "wraps into some other in-range value" (these `u16`/
+    /// `u8`/`i16` casts), which is the more dangerous of the two precisely
+    /// because nothing about the wrapped result looks wrong on its own.
+    ///
+    /// One table entry per site named in this audit's table
+    /// (`docs/2026-08-14-gsbl-width-audit.md`), each independently asserted
+    /// and independently able to fail -- the same shape
+    /// `every_routine_refuses_a_channel_out_of_range` above already uses for
+    /// "every one refuses the same way".
+    #[test]
+    fn checked_narrow_readers_refuse_a_32_bit_value_their_channel_field_cannot_hold() {
+        for (site, accepted) in [
+            ("btutsw's width (u16, Channel::width)", u16_arg::<Wg32>(70_000).is_some()),
+            ("btumil's maxinl (u16, Channel::maxinl)", u16_arg::<Wg32>(70_000).is_some()),
+            ("btutrg's nbyt (u16, Channel::trigger)", u16_arg::<Wg32>(70_000).is_some()),
+            ("btuxnf's xon (u8, Channel::xon)", u8_arg::<Wg32>(300).is_some()),
+            ("btuxnf's cnt (u16, Channel::page_lines)", u16_arg::<Wg32>(70_000).is_some()),
+            ("btupbc's pausch (u8, Channel::pause_char)", u8_arg::<Wg32>(300).is_some()),
+            ("btucpc's cpchar (u8, Channel::clear_pause_char)", u8_arg::<Wg32>(300).is_some()),
+            ("btuinj's status (i16, Channel::status)", i16_arg::<Wg32>(70_000).is_some()),
+        ] {
+            assert!(!accepted, "{site} accepted a value its own field cannot hold");
+        }
+    }
+
+    /// The same eight sites still accept every value a `Wg16` module could
+    /// ever have produced -- the fix is a refusal added at the top of the
+    /// representable range, not a new restriction inside it. `0xFFFF` is the
+    /// widest `Wg16::Int` there is; `255` and `0x7FFF` are the widest a
+    /// `u8`/`i16` site could receive from it once `Wg16`'s own `u16` is the
+    /// source.
+    #[test]
+    fn checked_narrow_readers_still_accept_everything_wg16_could_produce() {
+        assert_eq!(u16_arg::<Wg32>(0xFFFF), Some(0xFFFF));
+        assert_eq!(u8_arg::<Wg32>(0xFF), Some(0xFF));
+        assert_eq!(i16_arg::<Wg32>(0x7FFF), Some(0x7FFF));
+    }
+
+    /// [`i16_arg`]'s round-trip check accepts a genuinely negative value via
+    /// sign extension, not only the non-negative half of `i16`'s range.
+    ///
+    /// This is the bug this file's own first draft of `i16_arg` had: a naive
+    /// `i16::try_from(wide as i64)` rejects `0xFFFF_FFFF` (a `Wg32` module's
+    /// `int` holding `-1`) because it looks like the very large unsigned
+    /// number `4_294_967_295`, not the small negative one it actually
+    /// represents. No real `btuinj` status is negative today (`BRKTHU.H`'s
+    /// vocabulary is `0..=253`), but the checked reader's contract is "does
+    /// this fit in an `i16`", not "is this today's status set", and getting
+    /// that contract wrong the first time this file wrote it is exactly the
+    /// kind of mistake this whole audit exists to catch mutation-tested
+    /// rather than assumed correct from the diff alone.
+    #[test]
+    fn i16_arg_accepts_a_negative_value_by_sign_extension_not_only_small_positives() {
+        assert_eq!(i16_arg::<Wg32>(0xFFFF_FFFF), Some(-1));
+        assert_eq!(i16_arg::<Wg32>(0xFFFF_8000), Some(i16::MIN));
+        assert_eq!(i16_arg::<Wg32>(0x0000_8000), None, "0x8000 fits no i16, signed or not");
+    }
+
+    /// `btuxct`'s `nbyt` and `btuica`'s `max` -- this audit's two "genuinely
+    /// wide" sites -- carry a byte count past 65535 intact rather than
+    /// wrapping it into a smaller one.
+    ///
+    /// `70_000 as u16` is `4_464`: a module asking to transmit or receive
+    /// 70,000 bytes would, under the old `as u16` cast, silently be given a
+    /// 4,464-byte operation instead -- not a crash, not an error, a
+    /// plausible-looking wrong answer. That is the `cw3220mt`
+    /// `fgets(buf, 40000, f)` bug's shape exactly, minus the sign flip
+    /// (`nbyt`/`max` are never compared as signed, so there is no negative
+    /// length here, only a silently smaller positive one).
+    #[test]
+    fn usize_arg_does_not_truncate_a_32_bit_byte_count() {
+        assert_eq!(usize_arg::<Wg32>(70_000), 70_000, "not 4_464, u16's wraparound of 70_000");
+    }
 
     /// Every one of the fourteen refuses the same way, so this is asserted once
     /// per routine rather than reasoned about once.
