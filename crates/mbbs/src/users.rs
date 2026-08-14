@@ -430,6 +430,32 @@ pub struct Users<A: Abi> {
 /// `[-2]` and `[-3]` are reads rather than accidents.
 const SENTINELS: u16 = 3;
 
+/// `CHAR wid`'s offset inside `struct extusr`, for a GCV2 ABI (`Wg16`).
+///
+/// Not part of [`UserLayout`] -- a GCV2 build does not declare `wid` in
+/// `struct user` at all; it is one of the nine fields `MAJORBBS.H:139`'s
+/// `struct extusr` holds instead (see [`extusr_stride`]'s own doc comment).
+/// Byte-packed like `struct user`, and summed the same way
+/// [`extusr_stride`] itself was: `lingo` (`SHORT`, 2 bytes) then `col`
+/// (`CHAR`, 1 byte) puts `wid` at offset 3, one byte wide -- and the six
+/// fields after it (`ech`, `baud`, `tspxt`, `tckrst`, `tckonl`, `byecnt`,
+/// `entstt`) still sum to the 22 `extusr_stride` already has independent
+/// confirmation for (`an_extusr_slot_is_twenty_two_bytes`), which is why
+/// this offset is trusted rather than re-measured from nothing.
+const EXTUSR_WID: Field = Field::new(0x03, 1);
+
+/// `CHAR wid`'s offset inside `struct user`, for a non-GCV2 ABI (`Wg32`).
+///
+/// `MAJORBBS.H:98`'s `#ifndef GCV2` branch keeps `wid` inline, immediately
+/// after `col`. Computed the same way every other `Wg32` offset in
+/// [`UserLayout::of`] was -- summing the declared fields in order at
+/// 32-bit widths -- and checked against two fields that arithmetic already
+/// measured independently: `col`/`wid` land at 0x50/0x51, and the two
+/// fields after them (`ech` at 0x52, `byecnt` at 0x53) land exactly on
+/// `lcstat`'s own already-measured 0x54
+/// (`user_layout_matches_both_abis_declared_field_sets`'s `Wg32` half).
+const WG32_USER_WID: Field = Field::new(0x51, 1);
+
 impl<A: Abi> Users<A> {
     /// How many channels there are -- and the only thing that names one.
     pub fn terms(&self) -> Terms {
@@ -776,6 +802,55 @@ impl<A: Abi> Users<A> {
     ) -> Result<(), ShimError> {
         let at = self.substt_at(unum);
         self.write_field_u16(mem, at, self.user.substt, substt)
+    }
+
+    /// Where `usrptr->wid` lives for this ABI, and how wide it is.
+    ///
+    /// Not one offset off one base: GCV2 (`Wg16`) moved `wid` out of
+    /// `struct user` entirely, into `struct extusr` ([`Users::extra`],
+    /// [`EXTUSR_WID`]); non-GCV2 (`Wg32`) never moved it, and it is read
+    /// inline off [`Users::slot`] at [`WG32_USER_WID`]. See those two
+    /// constants' own doc comments for how each offset was derived.
+    fn wid_field(&self, unum: Chan) -> Result<(A::Ptr, Field), ShimError> {
+        if A::GCV2 {
+            let base = self.extra(unum).ok_or_else(|| {
+                ShimError::Failed(format!(
+                    "user[{unum}].wid: this ABI is GCV2 but built no extusr table"
+                ))
+            })?;
+            Ok((A::ptr_offset(base, EXTUSR_WID.at), EXTUSR_WID))
+        } else {
+            Ok((A::ptr_offset(self.slot(unum), WG32_USER_WID.at), WG32_USER_WID))
+        }
+    }
+
+    /// `usrptr->wid` -- the secret-character-echo line width, against
+    /// memory directly rather than a whole `Machine`. See [`Users::wid_field`]
+    /// for where this actually reads from.
+    ///
+    /// # Errors
+    ///
+    /// If the read runs off the segment, or (GCV2 only, and unreachable for
+    /// any `Users` this crate constructs -- [`Users::new`] always builds the
+    /// `extusr` table alongside `struct user` for a GCV2 ABI) if this ABI
+    /// has no `extusr` table.
+    pub fn wid_mem(&self, mem: &A::Mem, unum: Chan) -> Result<u8, ShimError> {
+        let (at, field) = self.wid_field(unum)?;
+        let bytes = at
+            .resolve(mem, usize::from(field.width))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        Ok(bytes[0])
+    }
+
+    /// Write `usrptr->wid`, against memory directly rather than a whole
+    /// `Machine`. See [`Users::wid_mem`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Users::wid_mem`].
+    pub fn set_wid_mem(&mut self, mem: &mut A::Mem, unum: Chan, value: u8) -> Result<(), ShimError> {
+        let (at, _field) = self.wid_field(unum)?;
+        at.write(mem, &[value]).map_err(|e| ShimError::Failed(e.to_string()))
     }
 
     /// Allocate `size` bytes of volatile data area per channel, against
@@ -1706,5 +1781,84 @@ mod tests {
             "Wg32 is non-GCV2: those nine fields are inline in struct user, \
              and there is no second table to index"
         );
+    }
+
+    /// `echonu` (`MAJORBBS.C:4548`) reads `usrptr->wid` directly, and `wid`
+    /// is not at the same address for both ABIs -- GCV2 moved it into
+    /// `struct extusr`. This is the offsets alone, before any shim exists to
+    /// call them: [`EXTUSR_WID`] must sit inside the 22-byte `extusr` slot,
+    /// and [`WG32_USER_WID`] must sit inside `struct user`'s own 88-byte
+    /// `Wg32` stride, distinct from where `Wg16` would have put it.
+    #[test]
+    fn wid_is_at_a_different_address_for_each_abi() {
+        use crate::abi::Wg32;
+
+        assert_eq!(EXTUSR_WID, Field::new(0x03, 1), "lingo (2) + col (1) puts wid at 3");
+        assert!(
+            u16::from(EXTUSR_WID.at) + u16::from(EXTUSR_WID.width)
+                <= extusr_stride::<Wg16>().expect("Wg16 has extusr"),
+            "wid must fit inside the 22-byte extusr slot"
+        );
+
+        assert_eq!(WG32_USER_WID, Field::new(0x51, 1));
+        let wg32 = UserLayout::of::<Wg32>();
+        assert!(
+            u16::from(WG32_USER_WID.at) + u16::from(WG32_USER_WID.width) <= wg32.stride,
+            "wid must fit inside struct user's own 88-byte Wg32 stride"
+        );
+        // Not the same offset repurposed for the other ABI's `struct user` --
+        // Wg16's `struct user` has no `wid` at all, so a shared offset here
+        // would be a coincidence, not a design.
+        assert_ne!(
+            u16::from(EXTUSR_WID.at),
+            u16::from(WG32_USER_WID.at),
+            "one is extusr-relative, the other is user-slot-relative -- \
+             agreeing would be an accident"
+        );
+    }
+
+    /// `Users::wid_mem`/`set_wid_mem` round-trip through `extusr`, not
+    /// through `struct user` -- and leave `extusr`'s neighbouring fields
+    /// alone. This is the test that would have caught writing `wid` at the
+    /// wrong offset, the exact class of bug this session has already hit
+    /// four times (`user`, `usracc`, `module`, `FILE`).
+    #[test]
+    fn wid_mem_round_trips_through_extusr_without_disturbing_its_neighbours() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            0,
+            "a fresh channel's extusr is zeroed"
+        );
+
+        // Sentinel bytes either side of `wid` (`col` at 0x02, `ech` at
+        // 0x04), written directly rather than through an accessor this
+        // crate does not have yet -- so a `wid` write that lands one byte
+        // short or long is caught here, not just a `wid` write that lands
+        // in the completely wrong table.
+        let extra = f.host.users().extra(console).expect("Wg16 has extusr");
+        let col_at = mbbs_machine::m16::FarPtr { offset: extra.offset + 0x02, selector: extra.selector };
+        let ech_at = mbbs_machine::m16::FarPtr { offset: extra.offset + 0x04, selector: extra.selector };
+        f.machine.write(col_at, &[0xAA]).expect("sentinel written");
+        f.machine.write(ech_at, &[0xBB]).expect("sentinel written");
+
+        f.host
+            .users_mut()
+            .set_wid_mem(f.machine.mem_mut(), console, 40)
+            .expect("write");
+        assert_eq!(f.host.users().wid_mem(f.machine.mem(), console).expect("read"), 40);
+
+        assert_eq!(f.machine.resolve(col_at, 1).expect("readable")[0], 0xAA, "col untouched");
+        assert_eq!(f.machine.resolve(ech_at, 1).expect("readable")[0], 0xBB, "ech untouched");
+
+        // And not in `struct user` either -- a fresh slot is all zero
+        // (`the_tables_start_zeroed`), so a `wid` write that landed there
+        // instead would show up as a nonzero byte somewhere in it.
+        let slot = f.host.users().slot(console);
+        let stride = UserLayout::of::<Wg16>().stride;
+        let bytes = f.machine.resolve(slot, usize::from(stride)).expect("readable");
+        assert!(bytes.iter().all(|b| *b == 0), "struct user is untouched by a wid write");
     }
 }

@@ -515,6 +515,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "usroff", user::usroff, Cleans::Caller),
         (MAJORBBS, "getin", user::getin, Cleans::Caller),
         (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+        // "Turn echo on utility" -- and end any `echsec` secret-echo session
+        // still in progress. See `user::echonu`'s own doc comment for why
+        // `echtyp[grpnum[usrnum]]` is a constant on this host, where `wid`
+        // really lives for a GCV2 ABI, and what `btuchi(usrnum,NULL)`
+        // collapses to.
+        (MAJORBBS, "echonu", user::echonu, Cleans::Caller),
         // The other-user family: scan every channel for a user-id, in a
         // given module state (`instat`) or online at all (`onsysn`), leaving
         // `othusn`/`othusp`/`othuap` pointed at the result -- and `othkey`,

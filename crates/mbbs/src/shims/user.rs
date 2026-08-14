@@ -853,6 +853,104 @@ pub fn clrmlt<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
 /// `BBSPRV`, `MAJORBBS.H:163` -- online, private class, internal to the host.
 const BBSPRV: u16 = 2;
 
+/// `VOID echonu(INT usrnum)` -- turn echo on for `usrnum`, and end any
+/// secret-character-echo session `echsec` started.
+///
+/// `MAJORBBS.C:4548`:
+///
+///
+/// (`echon()`, `MAJORBBS.C:4544`, is `echonu(usrnum)` against the current
+/// channel; it is not itself imported, only `echonu` and `echsec` are.)
+///
+/// # `echtyp[grpnum[usrnum]]` is always `1` here, and that is a fact about
+/// the vendor source, not a gap this host is filling in
+///
+/// `grpnum`/`echtyp` are per-channel-group hardware settings
+/// (`MAJORBBS.C:192`/`:202`) this host never places as globals -- neither
+/// symbol appears in `docs/2026-08-12-module-import-gaps.md`, so nothing
+/// this host runs can ask for either by name. But this particular
+/// expression does not depend on that gap: the local console's group is
+/// hardcoded to 0 (`grpnum[usrnum]=0`, `MAJORBBS.C:1217`, reached with no
+/// hardware channel groups configured -- exactly `crate::users::Users::new`'s
+/// own shape) and `echtyp[0]=1` unconditionally, one line above it
+/// (`MAJORBBS.C:1211`), before the value could depend on anything a real
+/// operator configured. `1` means "echo on" -- `btuech`'s `onoff` argument --
+/// so this always turns echo on, which is also the only thing the routine's
+/// own name ("turn echo on utility") ever promised.
+///
+/// # `wid` is `struct extusr`'s, not `struct user`'s, for this ABI
+///
+/// GCV2 moves `wid` out of `struct user` into `struct extusr`
+/// (`MAJORBBS.H:139` vs `:98`'s `#ifndef GCV2` branch), and `Wg16` is a
+/// GCV2 build -- independently confirmed by its own measured 41-byte
+/// `UserLayout::of::<Wg16>` stride (`crates/mbbs/src/users.rs`'s own doc
+/// comment), since a non-GCV2 `struct user` would stride by 88 instead. So
+/// this reads and writes [`crate::users::Users::wid_mem`]/`set_wid_mem`,
+/// which resolve to `extusr[usrnum].wid` under `Wg16` and (faithfully, for
+/// the day a non-GCV2 module runs here) `user[usrnum].wid` under `Wg32` --
+/// see those constants' own doc comments for the two derivations. Reading
+/// `usrptr->wid` as if it were still in `struct user` under `Wg16` would
+/// read three bytes into `crdrat`/`polrou` instead -- the "user, usracc,
+/// module, FILE" class of bug this session has already paid for four times.
+///
+/// # `btuchi(usrnum,NULL)` has no shim of its own to call
+///
+/// Nothing in this host implements `btuchi` as a callable routine at all --
+/// `crate::shims::fsd::fsdcon`'s own doc comment already establishes why:
+/// the whole `btuchi` family collapses to [`crate::gsbl::Channel::raw`], a
+/// single shared "is this channel in character-at-a-time mode" flag, the
+/// same one [`crate::shims::fsd`]'s `fsdcon`/`fsdcof` toggle directly rather
+/// than through a `btuchi` shim. `btuchi(usrnum,NULL)` uninstalls whatever
+/// handler currently occupies that one slot, and this host has exactly one
+/// slot to clear: `ch.raw = false`, the same translation `fsdcof` already
+/// makes on its own way out of an FSD session.
+///
+/// **What is lost**: on the real host, installing `NULL` also means no
+/// handler runs on the *next* keystroke; the handler itself (`secchi`,
+/// `MAJORBBS.C:4570`, the per-character `'*'`-masking routine `echsec`
+/// installs) has no shim here -- `echsec` is not implemented. So today,
+/// nothing this host runs ever sets `wid` above zero in the first place,
+/// which means the `if` branch below is unreachable in practice until
+/// `echsec` lands. It is implemented anyway, faithfully, rather than
+/// assumed dead: a module can write `usrptr->wid` directly without going
+/// through `echsec` at all, and leaving the branch out would be exactly the
+/// quiet wrongness this crate refuses to ship.
+///
+/// # `raw` is a shared slot, and this reproduces that conflation rather than fixing it
+///
+/// If some *other* consumer of `Channel::raw` (today, only FSD) is holding
+/// it when `echonu` fires with `wid > 0`, this clears it out from under that
+/// consumer -- exactly what the real host's single `btuchi` slot would also
+/// have done, since `secchi` and `fsdchi` compete for the same one handler
+/// there too. Not a fidelity gap this port introduced.
+///
+/// # Errors
+///
+/// If `usrnum` names no channel, or the `wid` read/write fails.
+pub fn echonu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let usrnum = Into::<u32>::into(call.int()) as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(usrnum)
+        .ok_or_else(|| ShimError::Failed(format!("echonu({usrnum}): there is no such channel")))?;
+
+    // `btuech(usrnum, echtyp[grpnum[usrnum]])` -- always turns echo ON on
+    // this host. See this function's own doc comment for why `1` is a fact
+    // about the vendor source rather than a stand-in for missing
+    // configuration.
+    host.gsbl_mut().channel_mut(chan).echo = true;
+
+    if host.users().wid_mem(call.mem(), chan)? > 0 {
+        // `btuchi(usrnum,NULL)` -- see this function's own doc comment for
+        // why that collapses to `raw = false` here.
+        host.gsbl_mut().channel_mut(chan).raw = false;
+        host.users_mut().set_wid_mem(call.mem(), chan, 0)?;
+    }
+
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1704,5 +1802,68 @@ mod tests {
             .expect("status set");
         let e = f.invoke(dfsthn, &[]).expect_err("a refusal");
         assert!(e.to_string().contains("status 1"), "{e}");
+    }
+
+    #[test]
+    fn echonu_turns_channel_echo_on() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).echo = false;
+
+        f.invoke(echonu, &[0]).expect("ok");
+
+        assert!(f.host.gsbl().channel(console).echo, "echonu(usrnum) always turns echo on");
+    }
+
+    #[test]
+    fn echonu_ends_a_secret_echo_session_once_wid_is_set() {
+        // Simulates what `echsec` (not implemented -- see `echonu`'s own doc
+        // comment) would have left behind: a nonzero `wid` and the shared
+        // `raw` flag turned on for `secchi`. `echonu` is the paired
+        // teardown -- both must clear.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host
+            .users_mut()
+            .set_wid_mem(f.machine.mem_mut(), console, 40)
+            .expect("wid set");
+        f.host.gsbl_mut().channel_mut(console).raw = true;
+
+        f.invoke(echonu, &[0]).expect("ok");
+
+        assert_eq!(
+            f.host.users().wid_mem(f.machine.mem(), console).expect("read"),
+            0,
+            "usrptr->wid=0"
+        );
+        assert!(!f.host.gsbl().channel(console).raw, "btuchi(usrnum,NULL) uninstalls the handler");
+        assert!(f.host.gsbl().channel(console).echo, "echo is still turned on either way");
+    }
+
+    #[test]
+    fn echonu_leaves_raw_alone_when_no_secret_echo_session_is_active() {
+        // `wid` stays at its fresh-channel 0, so the `if (usrptr->wid > 0)`
+        // guard must not fire -- and in particular must not clear `raw`,
+        // which some *other* consumer (this test stands in for FSD's
+        // `fsdcon`) may have turned on for an unrelated reason. A mutant
+        // that dropped the `> 0` guard turns this false.
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).raw = true;
+
+        f.invoke(echonu, &[0]).expect("ok");
+
+        assert!(
+            f.host.gsbl().channel(console).raw,
+            "wid was never set, so echonu must not touch someone else's raw mode"
+        );
+        assert!(f.host.gsbl().channel(console).echo);
+    }
+
+    #[test]
+    fn echonu_stops_on_a_channel_that_does_not_exist() {
+        let mut f = Fixture::new();
+        let past = f.host.users().terms().count();
+        assert!(f.invoke(echonu, &[past]).is_err());
     }
 }
