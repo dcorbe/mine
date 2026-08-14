@@ -1624,7 +1624,9 @@ mod tests {
     /// The non-GCV2 declaration sums to 301 and the struct's alignment is 4
     /// (it carries five `LONG`s), so `sizeof` is 304. Measured rather than
     /// trusted: `push 0x130` at the account table's allocation site in
-    /// `cfca0b96eae9602a_WGSERVER.EXE` (VA `0x40129b`), counted by the same
+    /// `cfca0b96eae9602a_WGSERVER.EXE` (VA `0x40128e` -- `0x40129b` is the
+    /// `call` thirteen bytes later, which earlier drafts of this comment and
+    /// the plan both cited by mistake), counted by the same
     /// `nterms` global `ds:0x4548c0` the user table's site uses, and present at
     /// VA `0x401281` in *both* sibling builds.
     #[test]
