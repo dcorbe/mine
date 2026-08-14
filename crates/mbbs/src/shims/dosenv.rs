@@ -225,12 +225,11 @@
 //! contradicts it, only extends it with the reachability question it left
 //! open.
 
-use mbbs_machine::m16::FarPtr;
 use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
-use crate::abi::{self, Call, Wg16};
+use crate::abi::{self, Abi, Call};
 
 /// `USHORT APIENTRY DosSetVec(USHORT usVecNum, PFN pfnRoutine, PFN FAR *ppfnPrev)`
 /// -- install a Phar Lap interrupt-vector handler.
@@ -258,12 +257,14 @@ use crate::abi::{self, Call, Wg16};
 ///
 /// If `*ppfnPrev`'s far pointer does not resolve (a module bug this host can
 /// name, not a value this host invented).
-pub fn dossetvec(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn dossetvec<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let _vecnum = call.int();
-    let _pfn_routine: FarPtr = call.ptr();
-    let ppfn_prev: FarPtr = call.ptr();
-    ppfn_prev.write(call.mem(), &FarPtr::NULL.to_bytes())?;
-    Ok(abi::Ret::Int(0u16))
+    let _pfn_routine = call.ptr();
+    let ppfn_prev = call.ptr();
+    ppfn_prev
+        .write(call.mem(), &A::ptr_to_bytes(A::null_ptr()))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
 /// `USHORT APIENTRY DosCreateDSAlias(SEL sel, PSEL aselp)` -- mint a writable
@@ -288,14 +289,16 @@ pub fn dossetvec(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::R
 /// # Errors
 ///
 /// If `*aselp`'s far pointer does not resolve.
-pub fn doscreatedsalias(
-    call: &mut Call<Wg16>,
-    _host: &mut Host<Wg16>,
-) -> Result<abi::Ret<Wg16>, ShimError> {
+pub fn doscreatedsalias<A: Abi>(
+    call: &mut Call<A>,
+    _host: &mut Host<A>,
+) -> Result<abi::Ret<A>, ShimError> {
     let _sel = call.int();
-    let aselp: FarPtr = call.ptr();
-    aselp.write(call.mem(), &0u16.to_le_bytes())?;
-    Ok(abi::Ret::Int(0u16))
+    let aselp = call.ptr();
+    aselp
+        .write(call.mem(), &0u16.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
 /// `BOOL _oldsend(struct oldmsg *msg, char *to)` -- send a MajorBBS 6.x-format
@@ -318,9 +321,9 @@ pub fn doscreatedsalias(
 /// # Errors
 ///
 /// Always. See above.
-pub fn oldsend(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
-    let msg: FarPtr = call.ptr();
-    let to: FarPtr = call.ptr();
+pub fn oldsend<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msg = call.ptr();
+    let to = call.ptr();
     Err(ShimError::Failed(format!(
         "_oldsend({msg}, {to}): this host has no GALME messaging-engine subsystem -- \
          no simpsnd, no message store -- to hand a converted 6.x message to, and \
@@ -333,7 +336,11 @@ pub fn oldsend(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use mbbs_machine::m16::Ret;
+    // `Fixture` is `Host<Wg16>`-only (see its own doc comment), so these
+    // tests are `Wg16`-concrete by construction and name `FarPtr` for the
+    // same reason `testing.rs` itself does. The shims above are generic;
+    // only the fixture that drives them is not.
+    use mbbs_machine::m16::{FarPtr, Ret};
 
     /// The bug a no-op most easily hides: forgetting to write anything at all,
     /// so the module reads back whatever garbage was already in

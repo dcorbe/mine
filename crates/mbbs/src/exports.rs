@@ -62,6 +62,9 @@ pub const GALMSG: &str = "GALMSG";
 pub const GALFIL: &str = "GALFIL";
 pub const GALETL: &str = "GALETL";
 pub const WGSERVER: &str = "WGSERVER";
+/// Phar Lap's DOS-extender API, which a Borland huge-model module's own
+/// crt0 trampoline links against. See `crate::shims::dosenv`.
+pub const PHAPI: &str = "PHAPI";
 
 /// WG 1.01's export tables, from `MAJORBBS.DEF` and `GSBLIMP.LIB`.
 ///

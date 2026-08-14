@@ -7,6 +7,7 @@ pub mod credit;
 pub mod credits;
 pub mod dfa;
 pub mod crt;
+pub mod dosenv;
 pub mod echo;
 pub mod fsd;
 pub mod ftf;
@@ -17,6 +18,7 @@ pub mod memory;
 pub mod misc;
 pub mod mlt;
 pub mod msg;
+pub mod mudtext;
 pub mod output;
 pub mod runtime;
 pub mod screen;
@@ -30,7 +32,7 @@ pub mod user;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
-use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS};
+use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI};
 use crate::globals::GLOBALS;
 
 /// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte
@@ -492,6 +494,49 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
         (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
         (MAJORBBS, "outprf", fsd::outprf, Cleans::Caller),
+        // MajorMUD's text and field-conversion helpers. See `shims::mudtext`.
+        (MAJORBBS, "prat", mudtext::prat, Cleans::Caller),
+        (MAJORBBS, "profan", mudtext::profan, Cleans::Caller),
+        (MAJORBBS, "c2bcpy", mudtext::c2bcpy, Cleans::Caller),
+        (MAJORBBS, "b2ccpy", mudtext::b2ccpy, Cleans::Caller),
+        (MAJORBBS, "findtvar", mudtext::findtvar, Cleans::Caller),
+        (MAJORBBS, "hdlinp", mudtext::hdlinp, Cleans::Caller),
+        // Galacticomm's text-file scanner. Reachable and MajorMUD-exclusive
+        // (zero sites in Lunatix/Tele-Arena/The Rose), which is the opposite
+        // signature from `dfsthn`'s shared boilerplate. `tfsopn`/`tfsrdl`
+        // refuse loudly pending cross-call scan state on `Host`; see
+        // `docs/2026-08-14-tfscan-reachability.md`.
+        (MAJORBBS, "tfsopn", tfscan::tfsopn, Cleans::Caller),
+        (MAJORBBS, "tfsrdl", tfscan::tfsrdl, Cleans::Caller),
+        (MAJORBBS, "tfspfx", tfscan::tfspfx, Cleans::Caller),
+        (MAJORBBS, "tfsabt", tfscan::tfsabt, Cleans::Caller),
+        // The DOS/Phar Lap/GALME environment imports. `dossetvec` and
+        // `doscreatedsalias` are documented no-ops inside an unreachable
+        // crt0 trampoline; `oldsend` refuses, because answering TRUE would
+        // claim mail was sent that this host silently discarded. See
+        // `docs/2026-08-14-dos-imports-reachability.md`.
+        (DOSCALLS, "dossetvec", dosenv::dossetvec, Cleans::Callee(10)),
+        (PHAPI, "doscreatedsalias", dosenv::doscreatedsalias, Cleans::Callee(6)),
+        (GALME, "_oldsend", dosenv::oldsend, Cleans::Caller),
+        // `shims::gcsp`'s seven GCSPSRV routines are deliberately NOT
+        // registered here. They are provably unreachable on a telnet host
+        // (`docs/2026-08-14-gcsp-reachability.md`: the module's `struct
+        // agent` read/write vectors, which nothing dispatches, and
+        // `_TELL_USER`'s `ISGCSU`-gated branch, which nothing sets), and
+        // registering a refusal would make `re/importgaps.py` report them
+        // as *served* when the truth is *never reached*. A gap report that
+        // counts a refusal as coverage is worse than one that says the
+        // symbol is missing.
+        //
+        // Registering them also breaks a real invariant: `GCSPSRV.H`
+        // declares `rsp2read`, `rsp2write` and `senddpk` twice behind
+        // `GCV2` with differing arity, so `re/widthscan.py` reports them
+        // under "ambiguous: disagreeing declarations" -- a section
+        // `crates/mbbs/tests/argument_widths.rs` asserts is always empty,
+        // on the stated principle that a non-empty result means fixing the
+        // scanner rather than widening an allowlist. Teaching `widthscan`
+        // to resolve a `GCV2` conditional is the honest fix, and it is
+        // worth doing the day one of these becomes reachable -- not before.
         (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
         (MAJORBBS, "register_module", system::register_module, Cleans::Caller),
         (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller),
@@ -1307,6 +1352,16 @@ mod convention {
         assert_eq!(
             callee,
             [
+                // Far pascal, not cdecl -- the OS/2-derived DOS and Phar Lap
+                // extender APIs a Borland huge-model crt0 links against
+                // declare `APIENTRY`, and the callee pops. `dossetvec` takes
+                // `USHORT` + two far pointers (2+4+4); `doscreatedsalias`
+                // takes `SEL` + `PSEL` (2+4). Both live inside an
+                // unreachable crt0 trampoline, so these byte counts are
+                // measured from the declarations rather than from a call
+                // this host will ever make -- see `shims::dosenv`.
+                ("dossetvec", Cleans::Callee(10)),
+                ("doscreatedsalias", Cleans::Callee(6)),
                 ("getmodulehandlea", Cleans::Callee(4)),
                 ("getprocaddress", Cleans::Callee(8)),
                 ("f_ldiv@", Cleans::Callee(runtime::OPERANDS)),
