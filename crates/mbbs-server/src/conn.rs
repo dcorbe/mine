@@ -89,7 +89,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::host::{self, Boot};
 use crate::iac::Filter;
 use crate::msg::{In, Out};
-use crate::pool::Routed;
+use crate::pool::{MachineId, Routed};
 use crate::termcompat::Stack;
 
 const IAC: u8 = 255;
