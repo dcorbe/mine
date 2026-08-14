@@ -163,7 +163,7 @@ const PAUSE_MESSAGE: &[u8] = b"Press any key to continue...";
 /// positive one for the wrong reason.
 fn account_scnbrk<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: Chan) -> Result<i8, ShimError> {
     let account = host.users().account(chan);
-    let at = A::ptr_offset(account, crate::users::usracc::SCNBRK as u16);
+    let at = A::ptr_offset(account, host.users().account_layout().scnbrk);
     let byte = at
         .resolve(mem, 1)
         .map_err(|e| ShimError::Failed(e.to_string()))?[0];
@@ -227,7 +227,7 @@ mod tests {
     fn write_scnbrk(f: &mut Fixture, chan: Chan, value: i8) {
         let account = f.host.users().account(chan);
         let at = FarPtr {
-            offset: account.offset + crate::users::usracc::SCNBRK as u16,
+            offset: account.offset + f.host.users().account_layout().scnbrk,
             selector: account.selector,
         };
         f.machine.write(at, &[value as u8]).expect("account memory");

@@ -1499,7 +1499,7 @@ fn outprf<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> Resul
 /// `usrnum` fresh on every call instead of remembering it.
 fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Result<u16, ShimError> {
     let account = host.users.account(chan);
-    let at = offset::<A>(account, crate::users::usracc::SCNWID)?;
+    let at = offset::<A>(account, usize::from(host.users().account_layout().scnwid))?;
     let byte = at
         .resolve(A::mem_ref(machine), 1)
         .map_err(|e| ShimError::Failed(e.to_string()))?[0];

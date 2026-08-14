@@ -60,6 +60,12 @@ use crate::chan::{Chan, Terms};
 pub const EXTUSR: u16 = 22;
 
 /// `sizeof(struct usracc)`, `USRACC.H:24`, and the 338 that `:22` writes down.
+///
+/// **Superseded by [`AccountLayout::stride`], and left in place only because
+/// `shims/mod.rs:842` and `shims/text.rs:461` still name this and
+/// [`usracc`] directly.** Both files belong to a different owner than this
+/// task, so they were not migrated -- see `AccountLayout`'s own doc comment
+/// for why 338 is the `GCV2` size and not the one every ABI shares.
 pub const USRACC: u16 = 338;
 
 /// One field of a per-channel struct: where its first byte sits, and how many
@@ -205,6 +211,15 @@ impl UserLayout {
 /// Continuing the same sum through `birthd` totals exactly 301 declared
 /// bytes, which is what `USRACC.H:22`'s `#define USRACCSPARE (338-301)` says
 /// it should be -- so the total and the four offsets confirm each other.
+///
+/// **Superseded by [`AccountLayout`].** These offsets are still correct --
+/// they are the leading, ABI-independent run `AccountLayout::of` also
+/// places -- but [`SIZE`](usracc::SIZE) is `Wg16`'s (GCV2's) stride only, and
+/// a caller that strides by it under `Wg32` walks off the end of every
+/// account past the first. Kept because `shims/mod.rs:842` (`SCNBRK`) and
+/// `shims/text.rs:461` (`ANSIFL`) still read this module directly and belong
+/// to a different task's file ownership; every call site this task owns was
+/// migrated to `AccountLayout`.
 pub mod usracc {
     /// `sizeof(struct usracc)`. `USRACC.H:22`'s `(338-301)` writes the total
     /// down, which is why this is 338 and not a sum.
@@ -229,6 +244,57 @@ pub mod usracc {
     pub const SCNBRK: usize = 0xd2;
     /// `char scnfse` -- screen length for full-screen stuff.
     pub const SCNFSE: usize = 0xd3;
+}
+
+/// `struct usracc`'s stride and the field offsets this host writes, at `A`'s
+/// own field set. `re/wg33src/INC/UStructs.h:20`.
+///
+/// # Only the stride is ABI-dependent
+///
+/// Unlike [`UserLayout`], the two branches of this struct share a declaration:
+/// `GCV2` adds a trailing `CHAR spare[338-301]` and changes nothing in front of
+/// it. Every field named here lives in the leading run of `CHAR` arrays and
+/// single bytes, so all five offsets are identical for both ABIs and only
+/// `sizeof` moves.
+///
+/// That is worth stating rather than assuming, because it is the reason
+/// [`Host::connect_state`](crate::Host::connect_state) needed no change when
+/// `Wg32` arrived while [`Users::account`] did: writing the *right* bytes of
+/// the *wrong* record is exactly what a shared field offset and an unshared
+/// stride produce, and it only becomes visible above channel zero.
+#[derive(Clone, Copy, Debug)]
+pub struct AccountLayout {
+    /// `sizeof(struct usracc)` -- what `uacoff` strides by.
+    pub stride: u16,
+    /// `CHAR userid[UIDSIZ]` -- 30 bytes including the trailing NUL. What
+    /// `obtbtvl` keys the character lookup on.
+    pub userid: u16,
+    /// `CHAR ansifl` -- ANSI flags. Bit `ANSON` is 1.
+    pub ansifl: u16,
+    /// `CHAR scnwid` -- screen width in columns. MajorMUD wants at least 80.
+    pub scnwid: u16,
+    /// `CHAR scnbrk` -- screen length for page breaks.
+    pub scnbrk: u16,
+    /// `CHAR scnfse` -- screen length for full-screen entry. MajorMUD wants at
+    /// least 23.
+    pub scnfse: u16,
+}
+
+impl AccountLayout {
+    /// `struct usracc` as `A`'s host declares it.
+    pub fn of<A: Abi>() -> Self {
+        Self {
+            // 301 declared either way. GCV2 pads with `spare[338-301]` to a
+            // round 338; non-GCV2 has no spare and pads only to the struct's
+            // own 4-byte alignment, giving the 304 the oracle pushes.
+            stride: if A::GCV2 { 338 } else { 304 },
+            userid: 0x00,
+            ansifl: 0xd0,
+            scnwid: 0xd1,
+            scnbrk: 0xd2,
+            scnfse: 0xd3,
+        }
+    }
 }
 
 /// What a connecting user is.
@@ -356,6 +422,9 @@ pub struct Users<A: Abi> {
     /// `struct user` as this ABI declares it. Held rather than recomputed
     /// because `slot` is on the hot path of every poll.
     user: UserLayout,
+    /// `struct usracc` as this ABI declares it. Held for the same reason
+    /// [`Users::user`] is: [`Users::account`] is on the same hot path.
+    usracc: AccountLayout,
     /// `struct user *user` -- the head of the array the module indexes itself.
     users: A::Ptr,
     /// `struct extusr *extusr`.
@@ -411,6 +480,16 @@ impl<A: Abi> Users<A> {
         &self.user
     }
 
+    /// `struct usracc` as this ABI declares it.
+    pub fn account_layout(&self) -> &AccountLayout {
+        &self.usracc
+    }
+
+    /// `sizeof(struct usracc)` -- what [`Users::account`] strides by.
+    pub fn account_stride(&self) -> u16 {
+        self.usracc.stride
+    }
+
     /// `&user[unum]`.
     pub fn slot(&self, unum: Chan) -> A::Ptr {
         self.nth(self.users, self.user.stride, unum)
@@ -423,7 +502,7 @@ impl<A: Abi> Users<A> {
 
     /// `uacoff(unum)` -- the channel's account record.
     pub fn account(&self, unum: Chan) -> A::Ptr {
-        self.nth(self.accounts, USRACC, unum)
+        self.nth(self.accounts, self.usracc.stride, unum)
     }
 
     /// `vdaoff(unum)` -- the channel's volatile data area, or `None` if
@@ -747,6 +826,7 @@ impl<A: Abi> Users<A> {
     /// If the heap has no room.
     pub fn new(mem: &mut A::Mem, heap: &mut crate::Heap<A>, terms: Terms) -> io::Result<Self> {
         let user = UserLayout::of::<A>();
+        let usracc = AccountLayout::of::<A>();
         let count = terms.count();
         let mut block = |each: u16| -> io::Result<A::Ptr> {
             let bytes = each
@@ -761,7 +841,7 @@ impl<A: Abi> Users<A> {
         };
         let users = block(user.stride)?;
         let extra = block(EXTUSR)?;
-        let accounts = block(USRACC)?;
+        let accounts = block(usracc.stride)?;
 
         // `MAJORBBS.C:740-743`, which is three statements doing one thing:
         //
@@ -811,6 +891,7 @@ impl<A: Abi> Users<A> {
         Ok(Self {
             terms,
             user,
+            usracc,
             users,
             extra,
             accounts,
@@ -1535,5 +1616,49 @@ mod tests {
             selector: slot.selector,
         };
         assert_eq!(f.machine.resolve(at, 2).expect("in the slot"), &[1, 0]);
+    }
+
+    /// `struct usracc` at both ABIs.
+    ///
+    /// # The stride moves and the fields do not
+    ///
+    /// `re/wg33src/INC/UStructs.h:20` declares one struct with a trailing
+    /// `spare[USRACCSPARE]` gated on `GCV2`, where
+    /// `#define USRACCSPARE (338-301)`. So the *declaration* is shared and only
+    /// the tail differs: every field this host writes sits in the leading
+    /// `CHAR` region -- `userid[30]`, `psword[10]`, five `NADSIZ` name/address
+    /// lines, `usrpho[16]`, then eight single bytes -- none of which has a
+    /// width that varies and none of which needs alignment padding. Summing
+    /// them puts `ansifl` at 208, `scnwid` 209, `scnbrk` 210, `scnfse` 211 in
+    /// *both* branches, which is why only the stride is ABI-dependent here.
+    ///
+    /// The non-GCV2 declaration sums to 301 and the struct's alignment is 4
+    /// (it carries five `LONG`s), so `sizeof` is 304. Measured rather than
+    /// trusted: `push 0x130` at the account table's allocation site in
+    /// `cfca0b96eae9602a_WGSERVER.EXE` (VA `0x40129b`), counted by the same
+    /// `nterms` global `ds:0x4548c0` the user table's site uses, and present at
+    /// VA `0x401281` in *both* sibling builds.
+    #[test]
+    fn account_layout_moves_the_stride_and_not_the_fields() {
+        use crate::abi::Wg32;
+
+        let wg16 = AccountLayout::of::<Wg16>();
+        let wg32 = AccountLayout::of::<Wg32>();
+
+        assert_eq!(wg16.stride, 338, "Wg16: GCV2, 301 declared plus 37 spare");
+        assert_eq!(wg32.stride, 304, "Wg32: the `push 0x130` in the oracle -- \
+                                      301 declared, padded to the struct's \
+                                      4-byte alignment");
+        assert_ne!(wg16.stride, wg32.stride, "the account table is not one \
+                                              stride for both ABIs, and othusp \
+                                              is what notices");
+
+        for (name, layout) in [("Wg16", &wg16), ("Wg32", &wg32)] {
+            assert_eq!(layout.userid, 0x00, "{name} userid");
+            assert_eq!(layout.ansifl, 0xd0, "{name} ansifl");
+            assert_eq!(layout.scnwid, 0xd1, "{name} scnwid");
+            assert_eq!(layout.scnbrk, 0xd2, "{name} scnbrk");
+            assert_eq!(layout.scnfse, 0xd3, "{name} scnfse");
+        }
     }
 }

@@ -3203,19 +3203,20 @@ impl<A: Abi> Host<A> {
         let take = userid.len().min(UIDSIZ - 1);
         let mut field = [0u8; UIDSIZ];
         field[..take].copy_from_slice(&userid[..take]);
-        let at = A::ptr_offset(account, users::usracc::USERID as u16);
+        let account_layout = *self.users().account_layout();
+        let at = A::ptr_offset(account, account_layout.userid);
         at.write(A::mem(machine), &field)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-        let at = A::ptr_offset(account, users::usracc::ANSIFL as u16);
+        let at = A::ptr_offset(account, account_layout.ansifl);
         at.write(A::mem(machine), &[u8::from(who.ansi)])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-        let at = A::ptr_offset(account, users::usracc::SCNWID as u16);
+        let at = A::ptr_offset(account, account_layout.scnwid);
         at.write(A::mem(machine), &[who.width])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-        let at = A::ptr_offset(account, users::usracc::SCNFSE as u16);
+        let at = A::ptr_offset(account, account_layout.scnfse);
         at.write(A::mem(machine), &[who.height])
             .map_err(|e| ShimError::Failed(e.to_string()))?;
 
@@ -3315,10 +3316,11 @@ impl<A: Abi> Host<A> {
     pub fn rstchn(&mut self, machine: &mut A::Cpu, chan: Chan) -> Result<(), ShimError> {
         self.users.clear_keys(chan);
         let user_stride = self.users.user_layout().stride;
+        let account_stride = self.users.account_stride();
         for (at, len) in [
             (self.users.slot(chan), user_stride),
             (self.users.extra(chan), users::EXTUSR),
-            (self.users.account(chan), users::USRACC),
+            (self.users.account(chan), account_stride),
         ] {
             at.write(A::mem(machine), &vec![0u8; usize::from(len)])
                 .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -3990,7 +3992,7 @@ mod tests {
         for chan in host.users().terms().all() {
             for (what, at, len) in [
                 ("extusr", host.users().extra(chan), users::EXTUSR),
-                ("usracc", host.users().account(chan), users::USRACC),
+                ("usracc", host.users().account(chan), host.users().account_stride()),
             ] {
                 let bytes = machine.resolve(at, usize::from(len)).expect(what);
                 assert!(
@@ -4227,7 +4229,7 @@ mod tests {
         for (what, at, len) in [
             ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
             ("extusr", f.host.users().extra(chan), users::EXTUSR),
-            ("usracc", f.host.users().account(chan), users::USRACC),
+            ("usracc", f.host.users().account(chan), f.host.users().account_stride()),
         ] {
             let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
             assert!(
@@ -4325,7 +4327,7 @@ mod tests {
             for (at, len) in [
                 (f.host.users().slot(chan), f.host.users().user_layout().stride),
                 (f.host.users().extra(chan), users::EXTUSR),
-                (f.host.users().account(chan), users::USRACC),
+                (f.host.users().account(chan), f.host.users().account_stride()),
             ] {
                 f.machine
                     .write(at, &vec![mark(chan); usize::from(len)])
@@ -4339,7 +4341,7 @@ mod tests {
         for (what, at, len) in [
             ("user", f.host.users().slot(middle), f.host.users().user_layout().stride),
             ("extusr", f.host.users().extra(middle), users::EXTUSR),
-            ("usracc", f.host.users().account(middle), users::USRACC),
+            ("usracc", f.host.users().account(middle), f.host.users().account_stride()),
         ] {
             let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
             assert!(
@@ -4357,7 +4359,7 @@ mod tests {
             for (what, at, len) in [
                 ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
                 ("extusr", f.host.users().extra(chan), users::EXTUSR),
-                ("usracc", f.host.users().account(chan), users::USRACC),
+                ("usracc", f.host.users().account(chan), f.host.users().account_stride()),
             ] {
                 let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
                 assert!(
