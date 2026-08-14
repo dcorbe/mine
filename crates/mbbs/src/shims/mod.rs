@@ -705,18 +705,39 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// `toupper` that cannot return `EOF` and `fread` that silently short-reads.
 /// See those routines' own doc comments.
 ///
-/// Still a list of named aliases, not a general suffix-stripping rule:
-/// `GALGSBL.dll` is deliberately absent, because its seven `btu*` imports
-/// are genuinely unserved rather than served under another name, and an
-/// alias would only move where they fail. Case-insensitive because PE import
-/// directory names are conventionally upper-cased but nothing in the format
-/// requires it.
+/// # The third alias: `GALGSBL.dll`
+///
+/// This paragraph used to say the opposite, and the wrong version was
+/// load-bearing: it is why the alias was not added, which is why this stage's
+/// terminal I/O looked bigger than it was. What it said was that
+/// `GALGSBL.dll`'s seven `btu*` imports "are genuinely unserved rather than
+/// served under another name, and an alias would only move where they fail."
+///
+/// Six of the seven were already served. `btuclo`, `btuinj`, `btumil`,
+/// `btuoes` and `btuxnf` are entries in [`routines`] keyed `GALGSBL`, and
+/// `bturno` is a host global in `crate::globals`. The only thing between a PE
+/// module and all six was that `crate::exports::GALGSBL` is the bare
+/// `"GALGSBL"` a 16-bit NE segment is named, while a PE import directory
+/// spells the same library `"GALGSBL.dll"`. Exactly the `WGSERVER.EXE`
+/// situation, one generation later and one library over.
+///
+/// Only `btuxmn` is genuinely absent, and it stays
+/// [`Entry::Unimplemented`] before and after: aliasing maps a library name, it
+/// does not invent entries.
+///
+/// Still a list of named aliases, not a general suffix-stripping rule.
+/// Case-insensitive because PE import directory names are conventionally
+/// upper-cased but nothing in the format requires it.
 fn canonical_dll(dll: &str) -> &str {
-    if dll.eq_ignore_ascii_case("WGSERVER.EXE") || dll.eq_ignore_ascii_case("cw3220mt.DLL") {
-        MAJORBBS
-    } else {
-        dll
-    }
+    const ALIASES: &[(&str, &str)] = &[
+        ("WGSERVER.EXE", MAJORBBS),
+        ("cw3220mt.DLL", MAJORBBS),
+        ("GALGSBL.dll", GALGSBL),
+    ];
+    ALIASES
+        .iter()
+        .find(|(from, _)| dll.eq_ignore_ascii_case(from))
+        .map_or(dll, |(_, to)| to)
 }
 
 /// A C `int` argument, sign-extended from `A`'s own width to `i32`.
@@ -899,6 +920,54 @@ mod tests {
         // DLL that merely shares a suffix or a prefix.
         assert!(matches!(
             entry::<crate::abi::Wg32>("GALGSBL.DLL", "l2as"),
+            Entry::Unimplemented
+        ));
+    }
+
+    /// A PE module's `GALGSBL.dll` reaches the same table a 16-bit module's
+    /// `GALGSBL` does.
+    ///
+    /// The library renamed when Worldgroup moved off segmented binaries, the
+    /// same way `MAJORBBS` became `WGSERVER.EXE`. `crate::exports::GALGSBL` is
+    /// the bare `"GALGSBL"` a 16-bit NE names; the PE import directory spells
+    /// it `"GALGSBL.dll"`. One alias, not six per-symbol renames.
+    #[test]
+    fn galgsbl_dll_is_the_same_library_as_galgsbl() {
+        for name in ["btuclo", "btuinj", "btumil", "btuoes", "btuxnf"] {
+            assert!(
+                matches!(
+                    entry::<crate::abi::Wg32>("GALGSBL.dll", name),
+                    Entry::Routine(..)
+                ),
+                "{name} is implemented and a PE module must reach it"
+            );
+        }
+        assert!(
+            matches!(entry::<crate::abi::Wg32>("GALGSBL.dll", "bturno"), Entry::Datum),
+            "bturno is a host global, not a routine -- the alias has to carry \
+             data lookups too, or the module gets a null IAT slot"
+        );
+        assert!(
+            matches!(
+                entry::<crate::abi::Wg32>("GALGSBL.dll", "btuxmn"),
+                Entry::Unimplemented
+            ),
+            "btuxmn is the one that really is absent; aliasing maps a library \
+             name, it does not invent entries"
+        );
+
+        // Case-insensitively, because nothing in the PE format requires the
+        // conventional upper-casing.
+        assert!(matches!(
+            entry::<crate::abi::Wg32>("galgsbl.DLL", "btuclo"),
+            Entry::Routine(..)
+        ));
+
+        // And the alias must not have moved GSBL's symbols into MAJORBBS.
+        // Ordinals collide across DLLs and `bturno` is GALGSBL's, not
+        // MAJORBBS's -- see `a_global_belongs_to_the_dll_that_exports_it`.
+        assert!(matches!(
+            entry::<crate::abi::Wg32>(MAJORBBS, "bturno"),
             Entry::Unimplemented
         ));
     }
