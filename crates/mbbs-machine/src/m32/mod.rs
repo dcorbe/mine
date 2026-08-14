@@ -109,6 +109,15 @@ const TRAMPOLINE_OFFSET: usize = THUNK_TABLE_OFFSET + (MAX_THUNKS as usize + 1) 
 /// module's own `ret` lands here.
 const RETURN_THUNK_SLOT: u16 = MAX_THUNKS;
 
+/// Bytes reserved past the trampoline in the bridge mapping for
+/// [`Machine::arm_st0_capture`]'s scratch qword: one `f64`, the width
+/// `fstp`/`fld` `m64fp` addresses. See that method's doc comment for why it
+/// exists and why a plain qword is enough -- Borland's `__ftol` is fed by a
+/// preceding `fld`/`fild`/`fmul` at every call site this crate has measured
+/// (`cw3220mt.DLL!__ftol`, 13 sites in `LUNATIX.DLL`), never a value that
+/// needs the FPU's full 80-bit extended range to survive intact.
+const ST0_SCRATCH_LEN: usize = 8;
+
 /// What kind of thunk reached the trampoline, carried in `ECX` --
 /// [`asm::Ctx::out_ecx`].
 ///
@@ -318,6 +327,17 @@ pub struct Machine {
     /// Set once this machine has faulted or overrun, and never cleared. A
     /// poisoned machine refuses to be entered again.
     poisoned: Option<Poison>,
+
+    /// Where the x87 `ST0` capture scratch qword sits within [`Machine::bridge`],
+    /// past the trampoline. See [`Machine::arm_st0_capture`] for why it
+    /// exists at all and why it lives here rather than in [`asm::Ctx`].
+    st0_scratch_off: usize,
+
+    /// The one thunk slot currently wired to capture `ST0`, if any -- see
+    /// [`Machine::arm_st0_capture`]. `None` until armed; [`Machine::take_st0`]
+    /// panics against that, rather than silently handing back whatever
+    /// garbage happens to sit in the scratch qword.
+    st0_capture_slot: Option<u16>,
 }
 
 impl Machine {
@@ -338,7 +358,8 @@ impl Machine {
     /// fault recovery on this thread.
     pub fn new() -> io::Result<Self> {
         let tramp = trampoline();
-        let mut bridge = Mapping::new(TRAMPOLINE_OFFSET + tramp.len())?;
+        let st0_scratch_off = TRAMPOLINE_OFFSET + tramp.len();
+        let mut bridge = Mapping::new(st0_scratch_off + ST0_SCRATCH_LEN)?;
 
         let cs64 = current_cs();
         fault::arm(cs64)?;
@@ -411,6 +432,8 @@ impl Machine {
             frame_sp: None,
             budget: DEFAULT_BUDGET,
             poisoned: None,
+            st0_scratch_off,
+            st0_capture_slot: None,
         })
     }
 
@@ -521,6 +544,145 @@ impl Machine {
 
     fn return_thunk_addr(&self) -> u32 {
         self.thunk_slot_addr(RETURN_THUNK_SLOT)
+    }
+
+    /// The linear address of [`Machine::arm_st0_capture`]'s scratch qword,
+    /// within [`Machine::bridge`] and therefore -- like every address in that
+    /// mapping -- guaranteed below 4 GiB, so a compat-mode `fstp m64fp` can
+    /// address it with a plain `disp32`.
+    fn st0_scratch_addr(&self) -> u32 {
+        self.bridge.base() as usize as u32 + self.st0_scratch_off as u32
+    }
+
+    /// Rewrite thunk `slot`'s bytes so that, once bound to an import site,
+    /// the call it services captures the x87 `ST0` the module left there --
+    /// its own preceding `fld`/`fild`/`fmul`'s result -- before anything else
+    /// runs.
+    ///
+    /// # Why this exists: Borland's `__ftol` needs its argument off the FPU
+    /// stack, not off the cdecl stack
+    ///
+    /// `cw3220mt.DLL!__ftol` (Borland's float-to-long helper -- `fld <value>;
+    /// call __ftol` is the calling convention, measured at all 13 of
+    /// `LUNATIX.DLL`'s call sites: every one is immediately preceded by
+    /// `fld`/`fild`/`fmul` and immediately followed by reading the result out
+    /// of `EAX` alone, never `EDX`) takes its argument on `ST0`, which
+    /// nothing in this crate's ordinary crossing protocol touches, saves, or
+    /// exposes -- [`asm::Ctx`] carries GPRs and segment state only.
+    ///
+    /// # Why this happens in the module-side thunk, not the (shared, 64-bit)
+    /// trampoline in `asm.rs`
+    ///
+    /// This machine's own worry, once execution is back in 64-bit long mode,
+    /// is that ordinary compiled Rust code between the trampoline landing and
+    /// a shim actually reading `ST0` might disturb it: the x87 register file
+    /// is architecturally distinct from the `XMM` registers System V
+    /// mandates for `f64`/`f32`, so ordinary floating-point Rust code cannot
+    /// touch it, but "cannot today" is not the standard this crate holds
+    /// itself to elsewhere (`asm.rs`'s own module doc comment: "measured, not
+    /// assumed"). Capturing `ST0` *before* the far jump back -- while still
+    /// in 32-bit compat mode, in code this method controls completely --
+    /// closes that question rather than resting on it: no Rust code, and
+    /// therefore no compiler decision this crate does not control, ever runs
+    /// between the module's `call` and the `fstp` that reads `ST0`.
+    ///
+    /// The alternative -- capturing unconditionally for *every* thunk, in the
+    /// shared trampoline -- was considered and rejected: `fstp` pops. Doing
+    /// that on every host call regardless of whether the import was
+    /// `__ftol` would, for every other import, either discard a value the
+    /// module still needed further down its own FPU stack or -- when `ST0`
+    /// legitimately held nothing -- raise a masked stack-fault/invalid-
+    /// operation condition that leaves a spurious mark in the module's own
+    /// status word for no reason connected to what it called. Confining the
+    /// pop to the one slot that is actually bound to `__ftol` costs nothing
+    /// on every other call, which an unconditional capture cannot say.
+    ///
+    /// # What the caller (the ABI layer) still owes
+    ///
+    /// This does not know, and cannot know, which slot `bind_imports` gave
+    /// `cw3220mt.DLL!__ftol` -- that binding happens one layer up, after this
+    /// machine exists. Call this once, after `Image::bind_imports` names the
+    /// slot, before the module can reach it.
+    ///
+    /// # Panics
+    ///
+    /// If `slot` is not below [`MAX_THUNKS`], or if the specialised encoding
+    /// below somehow outgrows [`THUNK_STRIDE`] (it does not: 6 + 17 = 23
+    /// bytes against a 32-byte stride, and the `assert!` in [`Machine::new`]'s
+    /// own thunk-building loop is the precedent for checking this at the
+    /// point of construction rather than trusting the arithmetic silently).
+    pub fn arm_st0_capture(&mut self, slot: u16) {
+        assert!(
+            slot < MAX_THUNKS,
+            "thunk slot {slot} is beyond MAX_THUNKS ({MAX_THUNKS})"
+        );
+
+        let scratch_addr = self.st0_scratch_addr();
+        let tramp_addr = self.bridge.base() as usize as u32 + TRAMPOLINE_OFFSET as u32;
+        let cs64 = current_cs();
+
+        let mut thunk = Vec::with_capacity(THUNK_STRIDE);
+        // fstp qword ptr [scratch_addr] -- DD /3, ModRM 00_011_101 (disp32,
+        // no base/index -- the 32-bit-mode encoding for a bare absolute
+        // address), then the disp32 itself. Pops ST0, storing it as an
+        // IEEE-754 double; exactly what a real `__ftol` does to read its
+        // argument before converting it.
+        thunk.push(0xdd);
+        thunk.push(0x1d);
+        thunk.extend_from_slice(&scratch_addr.to_le_bytes());
+        // The ordinary call-thunk body: announce the kind, announce the
+        // slot, far-jump to the trampoline. Identical to the generic thunk
+        // `Machine::new` wrote here, because from this point on the crossing
+        // is exactly as generic as any other -- only what led up to the jump
+        // is special.
+        thunk.push(0xb9); // mov ecx, imm32
+        thunk.extend_from_slice(&KIND_CALL.to_le_bytes());
+        thunk.push(0xb8); // mov eax, imm32
+        thunk.extend_from_slice(&u32::from(slot).to_le_bytes());
+        thunk.push(0xea); // ljmp ptr16:32
+        thunk.extend_from_slice(&tramp_addr.to_le_bytes());
+        thunk.extend_from_slice(&cs64.to_le_bytes());
+
+        assert!(
+            thunk.len() <= THUNK_STRIDE,
+            "the ST0-capturing thunk needs {} bytes and the stride is {THUNK_STRIDE}",
+            thunk.len(),
+        );
+
+        let off = THUNK_TABLE_OFFSET + usize::from(slot) * THUNK_STRIDE;
+        self.bridge.as_mut_slice()[off..off + thunk.len()].copy_from_slice(&thunk);
+        self.st0_capture_slot = Some(slot);
+    }
+
+    /// The `f64` [`Machine::arm_st0_capture`]'s thunk most recently popped
+    /// off the module's `ST0`.
+    ///
+    /// Reads the scratch qword directly; there is exactly one, not one per
+    /// call, so this is only meaningful immediately after the
+    /// [`Exit::Call`] the armed slot produced, before anything resumes the
+    /// module past it -- the same "read it before you move on" contract
+    /// [`Machine::arg`] already carries for an ordinary cdecl argument.
+    ///
+    /// # Panics
+    ///
+    /// If [`Machine::arm_st0_capture`] was never called. A value read out of
+    /// an unarmed scratch qword is not a *wrong* `f64` in any sense a caller
+    /// could detect -- it is silently whatever `Mapping::new`'s zeroed page
+    /// happens to still hold, which reads as a perfectly plausible `0.0`.
+    /// This crate's standard is a diagnosable crash over a value that is
+    /// wrong without announcing it (see the crate root and
+    /// `docs/plans/2026-08-08-mbbs32-design.md`), so this panics instead of
+    /// answering.
+    pub fn take_st0(&self) -> f64 {
+        assert!(
+            self.st0_capture_slot.is_some(),
+            "take_st0 called before arm_st0_capture bound a thunk slot to capture ST0"
+        );
+        let off = self.st0_scratch_off;
+        let bytes: [u8; 8] = self.bridge.as_slice()[off..off + ST0_SCRATCH_LEN]
+            .try_into()
+            .expect("ST0_SCRATCH_LEN is 8, matching f64::from_le_bytes's input");
+        f64::from_le_bytes(bytes)
     }
 
     /// Call 32-bit code the way the real host does: a flat cdecl frame,
@@ -1015,5 +1177,81 @@ impl Machine {
         self.frame_sp = None;
         self.ctx.disarm()?;
         Ok(exit)
+    }
+}
+
+#[cfg(test)]
+mod st0_tests {
+    use super::*;
+
+    /// The shape every real `cw3220mt.DLL!__ftol` call site uses (measured
+    /// by disassembling `LUNATIX.DLL`'s 13 call sites): the module loads a
+    /// value onto `ST0` -- here a bare `fld`, where the real module also
+    /// interposes an `fmul`, which changes nothing about what crosses the
+    /// boundary -- then calls the thunk with no cdecl arguments at all,
+    /// because `__ftol`'s one argument lives on the FPU stack.
+    ///
+    /// This is the failing test this feature did not have before
+    /// [`Machine::arm_st0_capture`] existed: without it, nothing captures
+    /// `ST0` at all, and [`Machine::take_st0`] has nothing to read.
+    #[test]
+    fn arm_st0_capture_delivers_the_module_s_fld_across_the_crossing() {
+        const VALUE: f64 = 12345.5; // exactly representable in f64 and in the eye
+        const SLOT: u16 = 3;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        machine.arm_st0_capture(SLOT);
+
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+
+        const CONST_OFF: usize = 512;
+        let const_addr = base + CONST_OFF as u32;
+        code_mapping.as_mut_slice()[CONST_OFF..CONST_OFF + 8]
+            .copy_from_slice(&VALUE.to_le_bytes());
+
+        // fld qword ptr [const_addr] -- DD /0, ModRM 00_000_101 (disp32, no
+        // base/index), then the absolute address itself.
+        let mut code = vec![0xdd_u8, 0x05];
+        code.extend_from_slice(&const_addr.to_le_bytes());
+
+        // call rel32 -- E8, then target - (address right after this
+        // instruction), the ordinary near-call encoding.
+        let target = machine.thunk_addr(SLOT);
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8);
+        code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = machine
+            .call(base, &[])
+            .expect("the module traps into the armed thunk");
+        assert_eq!(
+            exit,
+            Exit::Call { index: SLOT },
+            "the armed thunk must still report as an ordinary Exit::Call"
+        );
+
+        assert_eq!(
+            machine.take_st0(),
+            VALUE,
+            "ST0 did not survive the module -> host crossing intact"
+        );
+
+        // `code_mapping` must outlive `machine.call`, matching every other
+        // crossing test in this crate family (`asm.rs`'s own module doc
+        // comment on `low_mapping_with`).
+        drop(code_mapping);
+    }
+
+    /// A value read out of an unarmed scratch qword would be indistinguishable
+    /// from a genuine `0.0` -- this crate's standard is a diagnosable panic
+    /// over an answer that is wrong without announcing it.
+    #[test]
+    #[should_panic(expected = "take_st0 called before arm_st0_capture")]
+    fn take_st0_refuses_to_answer_before_a_slot_is_armed() {
+        let machine = Machine::new().expect("a fresh machine");
+        let _ = machine.take_st0();
     }
 }
