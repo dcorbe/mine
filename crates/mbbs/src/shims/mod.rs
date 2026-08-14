@@ -478,6 +478,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "findtvar", system::findtvar, Cleans::Caller),
         (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
         (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
+        (MAJORBBS, "outprf", fsd::outprf, Cleans::Caller),
         (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
         (MAJORBBS, "register_module", system::register_module, Cleans::Caller),
         (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller),

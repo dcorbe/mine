@@ -1480,7 +1480,18 @@ pub(crate) fn fsdprc<A: Abi>(
 /// simply `powprf` without it. Transmit whatever `prf`/`append` have queued
 /// since the last flush, then clear the buffer the way [`crate::shims::text::clrprf`]
 /// (`clrprf()`) already does.
-fn outprf<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> Result<(), ShimError> {
+///
+/// The shared core. `chan` arrives already resolved -- this file's four
+/// internal callers (`fsdcof`/`goback`/`fsd_drain_edge`, plus their own test)
+/// all have one on hand already and none of them read it off a `Call` --
+/// which is why this stayed a plain `fn` taking `(machine, host, chan)`
+/// rather than the `(call, host)` shape `crate::shims::mod::Shim<A>` wants.
+/// [`outprf`], below, is that shape: it is `WGSERVER.EXE`'s own routine-table
+/// entry (Task 11 -- `WCCMMUD.DLL` never imported `outprf`, so `Wg16`'s
+/// routine table has never needed one, but `LUNATIX.DLL` imports it directly
+/// from the 32-bit host), and it does nothing but read `chan` off the frame
+/// and hand off to this.
+fn outprf_chan<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> Result<(), ShimError> {
     let start = host
         .globals()
         .pointer_mem(A::mem_ref(machine), "prfbuf")
@@ -1493,6 +1504,32 @@ fn outprf<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> Resul
     crate::shims::text::clrprf_mem(A::mem(machine), host)?;
     Ok(())
 }
+
+pub fn outprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let raw = Into::<u32>::into(call.int()) as i16;
+    let Some(chan) = host.gsbl().terms().chan(raw) else {
+        return Ok(abi::Ret::Void);
+    };
+    outprf_chan(call.cpu, host, chan)?;
+    Ok(abi::Ret::Void)
+}
+
+/// `void outprf(int chan)` -- the routine-table entry. `GCOMM.H:447`
+/// declares it `INT usrnum`, i.e. the same "channel" domain every other
+/// `Chan`-bearing shim in this codebase reads with a bare reinterpret to
+/// `i16`, not one of [`crate::shims::gsbl`]'s checked `u16_arg`/`i16_arg`
+/// readers -- see that module's own width-audit comment ("the eighteen
+/// `chan` narrowings to `i16` are the host's own `Chan` domain and are not
+/// part of this audit"). [`crate::Users::terms`]'s [`crate::chan::Terms::chan`]
+/// already bound-checks the result against `nterms` regardless of what a
+/// bogus wide value reinterpreted to, so a second, narrower check here would
+/// only restate one that already happens.
+///
+/// `outprf` is `void`: the real signature has nothing to hand a caller on a
+/// bad channel, unlike `btuclo`/`btuinj` (`INT`-returning, `-11`
+/// `OUT_OF_RANGE`) -- so an out-of-range `chan` here is a silent no-op, not a
+/// reported failure, which is the closest a typed host can get to the
+/// original's own undefined behaviour on an out-of-range `usrnum`.
 
 /// `usaptr->scnwid`, read directly out of the account record rather than
 /// cached anywhere -- the same reason [`Host::current_channel`] reads
@@ -1568,8 +1605,8 @@ fn account_scnwid<A: Abi>(machine: &A::Cpu, host: &Host<A>, chan: Chan) -> Resul
 /// -- without flushing it before returning, which is not this host's
 /// business to require of a callback -- still reaches the channel. There is
 /// no third statement; this is the session's last word, and this port's own
-/// final [`outprf`] call is exactly that flush, not an extra step invented
-/// on top of the original.
+/// final [`outprf_chan`] call is exactly that flush, not an extra step
+/// invented on top of the original.
 ///
 /// # The callback discipline
 ///
@@ -1657,7 +1694,7 @@ pub(crate) fn goback<A: Abi>(
     // function's own doc comment on why the colour reset is ported
     // unconditionally.
     crate::shims::text::append_mem(A::mem(machine), host, b"\x1b[0;1;32m")?;
-    outprf(machine, host, chan)?;
+    outprf_chan(machine, host, chan)?;
     // `prf("");` -- FSDBBS.C:233. No text of its own; its only effect is
     // making sure `prfptr` is back at `prfbuf`'s own start before whatever
     // `whndun` itself queues, which `append` with an empty slice already
@@ -1694,7 +1731,7 @@ pub(crate) fn goback<A: Abi>(
         }
     }
 
-    outprf(machine, host, chan)?;
+    outprf_chan(machine, host, chan)?;
     Ok(abi::Ret::Void)
 }
 
@@ -1867,7 +1904,7 @@ pub(crate) fn fsd_cycle<A: Abi>(
             // The session is still open: `fsdprc`'s own output (a
             // reprompt, or a rejection message) is sitting in `prfbuf`,
             // unflushed -- no module code runs to `tell_user` it for us.
-            outprf(machine, host, chan)?;
+            outprf_chan(machine, host, chan)?;
         }
     }
 
@@ -4532,7 +4569,7 @@ mod tests {
         f.invoke(fsdbkg, &[templt.offset, templt.selector])
             .expect("painted");
         f.invoke(fsdego, &[0, 0, 0, 0]).expect("started");
-        outprf(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");
+        outprf_chan(&mut f.machine, &mut f.host, chan).expect("the caller's own flush");
         let painted = f.host.gsbl_mut().drain_output(chan);
         assert!(!painted.is_empty(), "the initial paint must have reached the channel");
 
@@ -4553,6 +4590,73 @@ mod tests {
             "unlike the original, oes must stay armed -- it is fsdqoe's only way to run for \
              the rest of the session (this function's own doc comment, 'not ported alongside \
              it')"
+        );
+    }
+
+    /// Task 11: `outprf` promoted from [`outprf_chan`]'s four internal
+    /// callers to a routine-table entry `WGSERVER.EXE` (aliased onto
+    /// `MAJORBBS` -- `shims/mod.rs`'s own `canonical_dll`) can serve
+    /// directly, which is what `LUNATIX.DLL` imports. Exercised through
+    /// [`Fixture::invoke`] rather than by calling [`outprf`] itself, the same
+    /// way [`btuxmt_transmits_and_btutsw_is_what_wraps_it`]
+    /// (`shims/gsbl.rs`) exercises `btuxmt` -- proof the routine-table shape
+    /// works, not just the core it delegates to.
+    #[test]
+    fn outprf_flushes_prfbuf_to_the_named_channel_and_clears_it() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        let text = f.text("banner");
+        f.invoke(crate::shims::text::prf, &[text.offset, text.selector])
+            .expect("printed");
+        assert_eq!(f.read(f.host.globals().prf_buffer()), "banner");
+
+        f.invoke(outprf, &[chan.number() as u16]).expect("flushed");
+        assert_eq!(f.host.gsbl_mut().drain_output(chan), b"banner".to_vec());
+        assert_eq!(
+            f.read(f.host.globals().prf_buffer()),
+            "",
+            "outprf's clrprf half must run too, or the same banner repeats on the next flush"
+        );
+    }
+
+    /// The channel-selectivity half of Task 11's mutation check: `outprf`
+    /// takes `chan` as its own argument (`GCOMM.H:447`'s `usrnum`), not
+    /// `Host::current_channel` -- the same distinction
+    /// [`btuxmt_writes_to_the_channel_it_was_given_and_not_the_current_one`]
+    /// (`shims/gsbl.rs`) already proves for `btuxmt`. Three channels, not
+    /// two, for the same reason that test gives: with only two, "wrote to
+    /// the given channel" and "wrote to the current one" cannot be told
+    /// apart from a single passing assertion.
+    #[test]
+    fn outprf_writes_to_the_channel_it_was_given_not_the_current_one() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
+        let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        let two = f.host.gsbl().terms().chan(2).expect("channel 2");
+
+        // The module runs as channel 2, current per `point_curusr`, but the
+        // flush this test asks for names channel 1 explicitly.
+        f.host
+            .point_curusr(&mut f.machine, two)
+            .expect("channel 2 is current");
+
+        let text = f.text("Kaimon just entered the Realm.");
+        f.invoke(crate::shims::text::prf, &[text.offset, text.selector])
+            .expect("printed");
+        f.invoke(outprf, &[1]).expect("flushed to channel 1");
+
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(one),
+            b"Kaimon just entered the Realm.".to_vec(),
+            "the channel outprf was given"
+        );
+        assert!(
+            f.host.gsbl_mut().drain_output(zero).is_empty(),
+            "not channel 0"
+        );
+        assert!(
+            f.host.gsbl_mut().drain_output(two).is_empty(),
+            "not the current channel"
         );
     }
 
