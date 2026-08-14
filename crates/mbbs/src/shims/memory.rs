@@ -682,4 +682,75 @@ mod tests {
         );
         assert_eq!(f.invoke(memcmp, &args(b, a)).expect("more"), Ret::U16(1));
     }
+
+    /// Manual measurement, not a correctness check -- `#[ignore]`d so a
+    /// normal `cargo test` run stays deterministic and fast. Run with
+    /// `cargo test --release -p mbbs --lib shims::memory::tests::ptrtile_round_trip_cost \
+    /// -- --ignored --nocapture`.
+    ///
+    /// Written for `docs/2026-08-14-ptrtile-hot-path.md`'s "what one dispatch
+    /// actually costs" question, which the doc says to measure rather than
+    /// assume. Two loops, same tile, same index, same iteration count:
+    ///
+    /// - **round trip**: [`Fixture::invoke`], which loads real 16-bit `push`/
+    ///   `lcall` bytes into the machine and runs them until the thunk traps
+    ///   out (`Machine::call` to `Exit::Call`) -- the same trap every real
+    ///   `ptrtile` call in a running module goes through -- and then runs the
+    ///   shim over the frame that trap left behind. It does not additionally
+    ///   pay for `shims::entry`'s ordinal lookup or `Abi::resume`'s write-back
+    ///   into `AX`/`DX` and continuation to `retf`; both are one match arm and
+    ///   a handful of register writes; on this crate's own numbers the
+    ///   surrounding I/O-bound emulation dwarfs them, so the round trip
+    ///   measured here is a lower bound on the real per-dispatch cost, not an
+    ///   over-count.
+    /// - **shim body**: the same [`ptrtile`] call, direct, over a `Call` built
+    ///   once outside the timed loop -- no trap, no thunk, just the region
+    ///   lookup and the arithmetic.
+    ///
+    /// The gap between the two is what a host round trip costs beyond the
+    /// arithmetic itself, which is `shims/memory.rs`'s own leaf cost and (per
+    /// `heap.rs`) a linear scan of `Heap::tiles` -- twelve entries on
+    /// MajorMUD's own boot (`wccmmud.rs`'s "twelve regions" measurement), so
+    /// `O(twelve)` word comparisons, not a hash lookup.
+    #[test]
+    #[ignore = "manual timing, not a correctness assertion -- see this test's own doc comment"]
+    fn ptrtile_round_trip_cost() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 200_000;
+
+        let mut f = Fixture::new();
+        let Ret::Far(base) = f.invoke(alctile, &[8, 4096]).expect("tiled") else {
+            panic!("alctile returns a pointer")
+        };
+
+        // The round trip: real 16-bit trap-out, once per iteration.
+        let started = Instant::now();
+        for i in 0..ITERATIONS {
+            let index = (i % 8) as u16;
+            f.invoke(ptrtile, &[base.offset, base.selector, index])
+                .expect("in range");
+        }
+        let round_trip = started.elapsed();
+
+        // The shim body alone: one trap, reused as the frame for every
+        // iteration, so what is timed is only `ptrtile`'s own region lookup
+        // and arithmetic -- no `Machine::call`, no thunk.
+        f.call(&[base.offset, base.selector, 0]);
+        let frame = f.machine.arg_frame().to_vec();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            let mut call = Call::<Wg16>::new(&mut f.machine, &frame);
+            ptrtile(&mut call, &mut f.host).expect("in range");
+        }
+        let shim_body = started.elapsed();
+
+        eprintln!(
+            "ptrtile: {ITERATIONS} calls -- round trip {round_trip:?} ({:.0} ns/call), \
+             shim body alone {shim_body:?} ({:.0} ns/call), overhead {:.0} ns/call",
+            round_trip.as_nanos() as f64 / f64::from(ITERATIONS),
+            shim_body.as_nanos() as f64 / f64::from(ITERATIONS),
+            (round_trip.as_nanos() as f64 - shim_body.as_nanos() as f64) / f64::from(ITERATIONS),
+        );
+    }
 }
