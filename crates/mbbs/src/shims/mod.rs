@@ -18,6 +18,7 @@ pub mod memory;
 pub mod misc;
 pub mod mlt;
 pub mod msg;
+pub mod mudmisc;
 pub mod mudtext;
 pub mod output;
 pub mod runtime;
@@ -501,6 +502,19 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "b2ccpy", mudtext::b2ccpy, Cleans::Caller),
         (MAJORBBS, "findtvar", mudtext::findtvar, Cleans::Caller),
         (MAJORBBS, "hdlinp", mudtext::hdlinp, Cleans::Caller),
+        // MajorMUD's remaining gameplay and screen helpers. `curcury` and
+        // `listing`'s `whndun` half refuse rather than fabricate: this host
+        // tracks no cursor row, and a `Shim<A>` is never handed the
+        // `&A::Module` every callback-into-module mechanism needs. See
+        // `shims::mudmisc`.
+        (MAJORBBS, "hrtval", mudmisc::hrtval, Cleans::Caller),
+        (MAJORBBS, "injacr", mudmisc::injacr, Cleans::Caller),
+        (MAJORBBS, "byenow", mudmisc::byenow, Cleans::Caller),
+        (MAJORBBS, "listing", mudmisc::listing, Cleans::Caller),
+        (MAJORBBS, "locate", mudmisc::locate, Cleans::Caller),
+        (MAJORBBS, "msgscan", mudmisc::msgscan, Cleans::Caller),
+        (MAJORBBS, "curcurx", mudmisc::curcurx, Cleans::Caller),
+        (MAJORBBS, "curcury", mudmisc::curcury, Cleans::Caller),
         // Galacticomm's text-file scanner. Reachable and MajorMUD-exclusive
         // (zero sites in Lunatix/Tele-Arena/The Rose), which is the opposite
         // signature from `dfsthn`'s shared boilerplate. `tfsopn`/`tfsrdl`
