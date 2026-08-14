@@ -4,6 +4,7 @@ pub mod btrieve;
 pub mod cnc;
 pub mod credit;
 pub mod credits;
+pub mod dfa;
 pub mod crt;
 pub mod echo;
 pub mod fsd;
@@ -277,6 +278,48 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // Engine nor its 6.x compatibility entry exists here.
         (GALMSG, "oldsend", misc::oldsend, Cleans::Caller),
         (MAJORBBS, "initask", task::initask, Cleans::Caller),
+
+        // The `dfa*` facade -- the 32-bit Btrieve API. Registered under
+        // MAJORBBS because `canonical_dll` already aliases `WGSERVER.EXE` to
+        // it (see this file's own doc comment): Worldgroup NT's PE modules
+        // import the identical symbols from a differently-NAMED container, and
+        // one alias covers the whole surface.
+        //
+        // The host name is lowercased by `exports::c_name`, so `_dfaSetBlk`
+        // arrives here as `dfasetblk`.
+        (MAJORBBS, "dfaopen", dfa::dfaOpen, Cleans::Caller),
+        (MAJORBBS, "dfaclose", dfa::dfaClose, Cleans::Caller),
+        (MAJORBBS, "dfasetblk", dfa::dfaSetBlk, Cleans::Caller),
+        (MAJORBBS, "dfarstblk", dfa::dfaRstBlk, Cleans::Caller),
+        (MAJORBBS, "dfaquery", dfa::dfaQuery, Cleans::Caller),
+        (MAJORBBS, "dfaquerynp", dfa::dfaQueryNP, Cleans::Caller),
+        (MAJORBBS, "dfagetlock", dfa::dfaGetLock, Cleans::Caller),
+        (MAJORBBS, "dfaacqlock", dfa::dfaAcqLock, Cleans::Caller),
+        (MAJORBBS, "dfaacqnplock", dfa::dfaAcqNPLock, Cleans::Caller),
+        (MAJORBBS, "dfaabs", dfa::dfaAbs, Cleans::Caller),
+        (MAJORBBS, "dfaacqabslock", dfa::dfaAcqAbsLock, Cleans::Caller),
+        (MAJORBBS, "dfagetabslock", dfa::dfaGetAbsLock, Cleans::Caller),
+        (MAJORBBS, "dfasteplock", dfa::dfaStepLock, Cleans::Caller),
+        (MAJORBBS, "dfainsertv", dfa::dfaInsertV, Cleans::Caller),
+        (MAJORBBS, "dfainsert", dfa::dfaInsert, Cleans::Caller),
+        (MAJORBBS, "dfainsertdup", dfa::dfaInsertDup, Cleans::Caller),
+        (MAJORBBS, "dfaupdatev", dfa::dfaUpdateV, Cleans::Caller),
+        (MAJORBBS, "dfaupdate", dfa::dfaUpdate, Cleans::Caller),
+        (MAJORBBS, "dfaupdatedup", dfa::dfaUpdateDup, Cleans::Caller),
+        (MAJORBBS, "dfadelete", dfa::dfaDelete, Cleans::Caller),
+        (MAJORBBS, "dfamode", dfa::dfaMode, Cleans::Caller),
+        (MAJORBBS, "dfabegtrans", dfa::dfaBegTrans, Cleans::Caller),
+        (MAJORBBS, "dfaendtrans", dfa::dfaEndTrans, Cleans::Caller),
+        (MAJORBBS, "dfaabttrans", dfa::dfaAbtTrans, Cleans::Caller),
+        (MAJORBBS, "dfacountrec", dfa::dfaCountRec, Cleans::Caller),
+        (MAJORBBS, "dfareclen", dfa::dfaRecLen, Cleans::Caller),
+        (MAJORBBS, "dfastat", dfa::dfaStat, Cleans::Caller),
+        (MAJORBBS, "dfaunlock", dfa::dfaUnlock, Cleans::Caller),
+        (MAJORBBS, "dfawaslocked", dfa::dfaWasLocked, Cleans::Caller),
+        (MAJORBBS, "dfalastlen", dfa::dfaLastLen, Cleans::Caller),
+        (MAJORBBS, "dfavirgin", dfa::dfaVirgin, Cleans::Caller),
+        (MAJORBBS, "dfacreate", dfa::dfaCreate, Cleans::Caller),
+        (MAJORBBS, "dfacreatespec", dfa::dfaCreateSpec, Cleans::Caller),
         (MAJORBBS, "bgncnc", cnc::bgncnc, Cleans::Caller),
         (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller),
         (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller),

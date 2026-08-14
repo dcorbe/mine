@@ -119,6 +119,13 @@
 //! one open question (`crate::exports::WGSERVER` already exists, unused,
 //! and is *not* what these rows should key on -- see that report).
 
+// The C names throughout `DFAAPI.H`/`DFAAPI.C` are mixed-case
+// (`dfaSetBlk`, not `dfa_set_blk`), and every routine below keeps its
+// vendor spelling verbatim -- the same convention every other shim file in
+// this crate follows for its own (all-lowercase, so never triggering this
+// lint) C names.
+#![allow(non_snake_case)]
+
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
@@ -1116,4 +1123,771 @@ pub fn dfaDelete<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
     let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
     file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Void)
+}
+
+// ---------------------------------------------------------------------------
+// Everything below was added after this file's first pass, once
+// `re/wg33src/LIB/WGSERVER.DEF` -- the vendor's own export definition file,
+// not merely a corpus survey of what surveyed modules happen to import --
+// turned out to name thirteen more `dfa*` ordinals (433-465 plus 1517) than
+// the nineteen/twenty this file started with. `_dfalgrec` (ordinal 20, far
+// from the 433-465 block and spelled nothing like `DFAAPI.H`'s own
+// camelCase convention) and `_audfAddEntry`/`_audfAddLowLevel` (a different
+// prefix entirely) are excluded as unrelated symbols that merely share a
+// substring, not omissions.
+//
+// `dfaStatus` (`DFAAPI.H:390-394`) is deliberately not implemented: it is
+// declared in the header but `WGSERVER.DEF` exports no `_dfaStatus` symbol
+// at all, so it is not part of the surface a PE module can actually import.
+
+/// `VOID dfaMode(SHORT mode)` -- set the mode the next `dfaOpen` uses.
+///
+/// `DFAAPI.C:179-184`: `dfaomode=mode;`, unconditional -- no validation at
+/// all, unlike [`btv::omdbtv`]'s own refusal of a value outside the five
+/// `PRIMBV`/`ACCLBV`/`RONLBV`/`VERFBV`/`EXCLBV` constants. Reproduced rather
+/// than tightened: `dfaMode` genuinely stores whatever it is given, and
+/// nothing reads it back until a `dfaOpen` -- which, like `opnbtv`, does not
+/// yet do anything with the mode beyond keeping it (see `omdbtv`'s own doc
+/// comment for why).
+pub fn dfaMode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mode = btv::i16_arg::<A>(call.int());
+    host.btrieve.dfa_set_mode(mode);
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID dfaBegTrans(USHORT loktyp)` -- begin a datafile transaction.
+///
+/// `DFAAPI.C:201-209`: `btvu(19+loktyp,NULL,NULL,0,0)`, opcode 19 -- the
+/// identical Btrieve call [`crate::btrieve::Btrieve::begin`] already
+/// implements and measured against genuine Btrieve; that method's own doc
+/// comment already cites this exact line for why a transaction has no file
+/// argument at all (a property of the whole session, not of any one file).
+///
+/// `loktyp` is read and discarded -- `begin`'s own doc comment: measured
+/// with no observable difference on a host that is single-process by
+/// construction, so there is never a second session to wait on or not.
+pub fn dfaBegTrans<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _loktyp = btv::i16_arg::<A>(call.int());
+    host.btrieve
+        .begin()
+        .map_err(|e| ShimError::Failed(format!("dfaBegTrans: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID dfaEndTrans(VOID)` -- end the current datafile transaction, keeping
+/// every write made since [`dfaBegTrans`].
+///
+/// `DFAAPI.C:219-225`, opcode 20 -- [`crate::btrieve::Btrieve::end`].
+pub fn dfaEndTrans<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    host.btrieve
+        .end()
+        .map_err(|e| ShimError::Failed(format!("dfaEndTrans: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID dfaAbtTrans(VOID)` -- abort the current datafile transaction,
+/// undoing every write made since [`dfaBegTrans`].
+///
+/// `DFAAPI.C:211-217`, opcode 21 -- [`crate::btrieve::Btrieve::abort`].
+pub fn dfaAbtTrans<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    host.btrieve
+        .abort()
+        .map_err(|e| ShimError::Failed(format!("dfaAbtTrans: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `ULONG dfaCountRec(VOID)` -- how many records the current dfa file holds.
+///
+/// `DFAAPI.C:778-792`. Reads exactly [`crate::btrieve::Geometry::records`]
+/// -- the same field [`btv::cntrbtv`] answers with -- rather than building a
+/// full `B_STAT` reply just to pull one field back out of it:
+/// `crate::btrieve::stat`'s own module doc comment names `dfaCountRec` and
+/// [`dfaRecLen`] specifically as needing none of that machinery, because
+/// this host already has both fields on `Geometry` without a wire reply to
+/// build one from.
+///
+/// **No guard of any kind**, not even `ASSERT` -- straight to
+/// `btvu(15,...)`, which dereferences `dfa->posblk` unconditionally.
+pub fn dfaCountRec<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = dfa_required(host, "dfaCountRec")?;
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Ok(abi::Ret::Long(file.geometry().records))
+}
+
+/// `USHORT dfaRecLen(VOID)` -- the file's own record length.
+///
+/// `DFAAPI.C:794-808`. `statbf.fs.reclen` is the *file's* record length
+/// ([`crate::btrieve::Geometry::reclen`]), not the module's own declared one
+/// ([`crate::btrieve::Block::maxlen`], what [`dfaOpen`]'s `maxlen` argument
+/// set) -- the identical two-numbers-allowed-to-differ distinction
+/// [`btv::opnbtv`]'s own doc comment works through for `bb->reclen`.
+///
+/// **No guard of any kind.**
+pub fn dfaRecLen<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = dfa_required(host, "dfaRecLen")?;
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Ok(abi::Ret::Int(A::Int::from(file.geometry().reclen)))
+}
+
+/// `VOID dfaStat(USHORT len)` -- Btrieve's own `B_STAT` reply, verbatim,
+/// into `dfa->data`.
+///
+/// `DFAAPI.C:810-818`:
+///
+///
+/// The wire reply this writes is [`crate::btrieve::Block::stat`]'s own
+/// [`crate::btrieve::Stat::wire`] -- measured against genuine Pervasive
+/// Btrieve 6.15 (`crate::btrieve::stat`'s own module doc comment,
+/// `tools/btrieve-oracle/statprobe.c`), the same reply this host already
+/// hands back verbatim for whatever routine reaches it first.
+///
+/// # `len` too short is a refusal, not a truncated delivery
+///
+/// `:815-817` has no exception for status 22 ("buffer too short") the way
+/// [`dfaAcqAbsLock`]'s own `:489-497` does -- *any* nonzero status,
+/// truncation included, goes straight to `dfaErrPtr("STAT")`. So a module
+/// that offers too small a buffer stops the board on the real host, and
+/// this refuses by name rather than delivering
+/// [`crate::btrieve::deliver`]'s own truncated prefix, which exists
+/// for exactly the read-family calls that *do* have a 22-is-fine exception.
+///
+/// **`ASSERT` only, no runtime guard** (`:814`) -- a missing file is
+/// refused.
+pub fn dfaStat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let len = btv::u16_arg::<A>(call.int(), "dfaStat")?;
+    let block = dfa_required(host, "dfaStat")?;
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let stat = file.stat().map_err(|e| ShimError::Failed(e.to_string()))?;
+    let version = file.geometry().version;
+    let name = file.name().to_owned();
+    let data = file.data();
+    let full = stat.wire(version, 0);
+
+    let (usable, short) = crate::btrieve::deliver(&full, usize::from(len));
+    if short {
+        return Err(ShimError::Failed(format!(
+            "dfaStat({len}) on {name}: a {}-byte STAT reply does not fit -- DFAAPI.C:815-817 \
+             sends any nonzero status (including 22, \"buffer too short\") straight to \
+             dfaErrPtr(\"STAT\"), with no exception for it, so this refuses rather than \
+             deliver a truncated reply",
+            full.len()
+        )));
+    }
+    let bytes = usable.to_vec();
+    data.write(call.mem(), &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID dfaUnlock(LONG abspos, SHORT keynum)` -- release a lock.
+///
+/// `DFAAPI.C:836-850`:
+///
+///
+/// `DFAAPI.H:211-214`'s four macros produce three distinct `keynum`s:
+/// `dfaUnlockOne()` (`0`: release the single lock this session holds at the
+/// file's *current* position), `dfaUnlockCur()`/`dfaUnlockSel(f)` (`-1`:
+/// release the lock at an explicit `abspos`, current position or not), and
+/// `dfaUnlockAll()` (`-2`: release every lock this session holds, on every
+/// file).
+///
+/// **Only `keynum == 0` is implemented.** It is exactly what
+/// [`crate::btrieve::Btrieve::unlock_current`] already is -- release the
+/// lock this session holds at `at`'s own current cursor position, Btrieve op
+/// 27 with `keynum = 0`, per that method's own doc comment. The other two
+/// are refused by name rather than approximated: `keynum == -1` needs an
+/// unlock-at-an-arbitrary-position primitive (`unlock_current` only ever
+/// reads the block's *own* current position, never an explicit one), and
+/// `keynum == -2` needs a release-every-lock-this-session-holds-across-
+/// every-file primitive -- [`crate::btrieve::ops::LockTable::release_all_for`]
+/// releases every lock on *one* block, not across the whole session. Neither
+/// primitive exists in the engine today.
+pub fn dfaUnlock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _abspos = call.long();
+    let keynum = btv::i16_arg::<A>(call.int());
+    let block = dfa_required(host, "dfaUnlock")?;
+    match keynum {
+        0 => {
+            host.btrieve.unlock_current(block).map_err(ShimError::Failed)?;
+            Ok(abi::Ret::Void)
+        }
+        -1 => Err(ShimError::Failed(
+            "dfaUnlock with keynum -1 (dfaUnlockCur/dfaUnlockSel: unlock at an explicit \
+             abspos) -- this host's engine has no unlock-at-an-arbitrary-position \
+             primitive, only unlock-at-the-block's-own-current-position \
+             (crate::btrieve::Btrieve::unlock_current)"
+                .to_owned(),
+        )),
+        -2 => Err(ShimError::Failed(
+            "dfaUnlock with keynum -2 (dfaUnlockAll: release every lock this session \
+             holds, on every file) -- this host's LockTable only releases every lock on \
+             one block at a time (release_all_for), not across the whole session"
+                .to_owned(),
+        )),
+        _ => Err(ShimError::Failed(format!(
+            "dfaUnlock with keynum {keynum}, which is none of 0, -1 or -2 -- DFAAPI.H's own \
+             four macros produce only those three"
+        ))),
+    }
+}
+
+/// `GBOOL dfaWasLocked(VOID)` -- whether the last dfa* call failed because
+/// the record or file was locked by another session.
+///
+/// `DFAAPI.C:852-856`: `return(status == 84 || status == 85)` -- Btrieve's
+/// own "record locked by another user" and "file locked by another process"
+/// statuses.
+///
+/// **Always `FALSE`.** This host is single-process by construction (see,
+/// among several others, [`crate::btrieve::Btrieve::begin`]'s own doc
+/// comment), so there is never a second session to hold a conflicting lock
+/// -- statuses 84/85 describe a condition this host cannot produce, not one
+/// it has chosen not to reproduce. `FALSE` is the honestly-derived answer
+/// here, not a placeholder standing in for future work.
+pub fn dfaWasLocked<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `USHORT dfaLastLen(VOID)` -- length of the last record a `dfa*` call
+/// read.
+///
+/// `DFAAPI.C:442-446`: `return(lastlen)`. See the engine's own
+/// `Btrieve::dfa_last_len` field doc comment for exactly which calls in this
+/// file update it (every one that delivers a record into the module's
+/// buffer) and the one respect in which that is narrower than the real
+/// host's own `lastlen` (updated after *every* `btvu()` call, writes
+/// included).
+pub fn dfaLastLen<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Int(A::Int::from(host.btrieve.dfa_last_len())))
+}
+
+/// `GBOOL dfaVirgin(const CHAR *src, const CHAR *dst)` -- copy a virgin
+/// database file into place.
+///
+/// `DFAAPI.C:858-873`, and `dfaCopyFile` (`:987-1017`), which does the
+/// actual copy. `src`/`dst` are stems without extension --
+/// `stlcat(stlcpy(srcfil,src,...),".vir",...)` and
+/// `stlcat(stlcpy(dstfil,(dst==NULL)?src:dst,...),".dat",...)` -- so `dst`
+/// null means the same stem as `src`.
+///
+/// This host already performs the identical atomic copy-then-rename
+/// implicitly, in [`Host::btrieve_file`], whenever [`dfaOpen`]/`opnbtv`
+/// finds no `.DAT` but a matching `.VIR` beside it. `dfaVirgin` needs its
+/// own copy of that shape rather than a call into `btrieve_file` because it
+/// allows `dst` to differ from `src`, which `btrieve_file`'s own
+/// same-stem-only convention does not.
+///
+/// # Answers `FALSE`, never refuses
+///
+/// `dfaCopyFile` (`:987-1017`) never `catastro`s -- every failure path
+/// (`fopen` on the source, `fopen` on the destination, a write error)
+/// returns `FALSE` and nothing else. So a missing virgin file or a failed
+/// copy is a quiet `FALSE` here too, matching this one routine's own
+/// graceful-failure convention rather than this crate's usual refusal.
+pub fn dfaVirgin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let src = call.ptr();
+    let dst = call.ptr();
+
+    let src_stem = String::from_utf8_lossy(
+        src.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let dst_stem = if dst == Btrieve::<A>::null() {
+        src_stem.clone()
+    } else {
+        String::from_utf8_lossy(
+            dst.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+        )
+        .into_owned()
+    };
+
+    let virgin_name = format!("{src_stem}.VIR");
+    let dat_name = format!("{dst_stem}.DAT");
+    let Some(from) = host.find(&virgin_name) else {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+
+    let to = host.root.join(&dat_name);
+    let part = host.root.join(format!("{dat_name}.{}.part", std::process::id()));
+    let copied = std::fs::copy(&from, &part).and_then(|_| std::fs::rename(&part, &to));
+    match copied {
+        Ok(_) => {
+            host.note(format!("installed {dat_name} from {} via dfaVirgin", from.display()));
+            Ok(abi::Ret::Int(A::Int::from(1u16)))
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&part);
+            Ok(abi::Ret::Int(A::Int::from(0u16)))
+        }
+    }
+}
+
+/// `VOID dfaCreate(const CHAR *filnam, VOID *databuf, SHORT keyno, USHORT
+/// lendbuf)` -- create a new datafile from a raw create-request buffer.
+///
+/// `DFAAPI.C:757-776`. `filnam` -- despite doubling as the underlying
+/// Btrieve call's *key* argument (`:767`, `crtdfa->key=(CHAR *)filnam`) --
+/// really is the filename: every file-identifying opcode in this API passes
+/// the name through the key slot ([`dfaOpen`]'s own `:155` does the
+/// identical thing). `databuf`/`lendbuf` are one `struct dfaStatFileSpec`
+/// (`DFAAPI.H:147-155`, 16 bytes, fixed width -- `USHORT`/`UCHAR` fields
+/// throughout, nothing ABI-dependent) followed by one `struct
+/// dfaStatKeySpec` (`:157-165`, 16 bytes) per key *segment* -- the exact
+/// shape [`dfaCreateSpec`] builds and the exact shape
+/// `crate::btrieve::stat` measured a STAT *reply* as (one entry per
+/// segment, not per key -- see that module's own doc comment).
+///
+/// # `keyno` is an overwrite flag, not a key count
+///
+/// `DFAAPI.H`'s own prototype comment calls it "number of keys", and that
+/// does not match the one call site that exists: `dfaCreateSpec`'s own
+/// `:753` passes `overwrite ? 0 : -1`, and the number of keys travels
+/// inside the buffer instead (`fs.nKeys`). Real Btrieve's `B_CREATE`
+/// `keynum` argument selects overwrite behaviour (`0` = replace an existing
+/// file, `-1` = refuse if one exists), which is what this host honours:
+/// [`crate::btrieve::create`] never overwrites regardless of
+/// `keyno` (see its own doc comment), so `keyno == 0` on a file that
+/// already exists is refused here exactly as `keyno == -1` would be -- an
+/// honest refusal in place of an overwrite this engine cannot perform, not
+/// a silent one.
+///
+/// # What this engine cannot represent
+///
+/// [`crate::btrieve::FileSpec`] has no `flags` field and always
+/// pre-allocates exactly one data page -- so a nonzero `fs.flags`
+/// (`DFACF_VARIABLE`/`BLANKTRUNC`/`COMPRESS`/`KEYONLY`/`FREESPACE*`) or an
+/// `fs.nPreAllocate` other than `0`/`1` is refused before anything is
+/// written, rather than silently creating a file with a shape the module
+/// did not ask for. A segment's `DFASF_ALTCOLLATE` bit is refused the same
+/// way: this host has no alternate collating sequence file to read one
+/// from either.
+///
+/// # Unverified against a live engine
+///
+/// Every other write path in this crate is measured against genuine
+/// Pervasive Btrieve (`tools/btrieve-oracle`); this one and
+/// [`dfaCreateSpec`] are derived from `DFAAPI.H`'s struct layouts and
+/// `DFAAPI.C`'s own build loop with no oracle run against either, because
+/// no PE module in this repository's corpus calls either routine and there
+/// is no create-side probe for this wire format yet. Stated as a fact about
+/// this implementation's confidence, not smoothed over.
+pub fn dfaCreate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let filnam = call.ptr();
+    let databuf = call.ptr();
+    let keyno = btv::i16_arg::<A>(call.int());
+    let lendbuf = btv::u16_arg::<A>(call.int(), "dfaCreate")?;
+
+    let named = String::from_utf8_lossy(
+        filnam.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<A>::dos_name(&named).map_err(ShimError::Failed)?;
+
+    if keyno != 0 && keyno != -1 {
+        return Err(ShimError::Failed(format!(
+            "dfaCreate({name}) with keyno {keyno}, which is neither 0 (overwrite) nor -1 \
+             (refuse if it exists) -- DFAAPI.C:753's own call site produces only those two"
+        )));
+    }
+
+    let bytes = databuf
+        .resolve(call.mem(), usize::from(lendbuf))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let spec = decode_create_buffer(&bytes)?;
+
+    let path = host.root.join(&name);
+    crate::btrieve::create(&path, &spec)
+        .map_err(|e| ShimError::Failed(format!("dfaCreate({name}): {e}")))?;
+    host.note(format!("created {name} via dfaCreate"));
+    Ok(abi::Ret::Void)
+}
+
+/// Decode one `struct dfaStatFileSpec` + N `struct dfaStatKeySpec` buffer
+/// (`DFAAPI.H:147-165`) into a [`crate::btrieve::FileSpec`]. See
+/// [`dfaCreate`]'s own doc comment for the byte layout and for what this
+/// refuses outright.
+fn decode_create_buffer(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimError> {
+    use crate::btrieve::{FileSpec, KeySpec, SegmentSpec};
+
+    const FILE_SPEC: usize = 16;
+    const KEY_SPEC: usize = 16;
+    const DFAKF_DUPLICATE: u16 = 1;
+    const DFAKF_MODIFYABLE: u16 = 2;
+    const DFAKF_MANUAL: u16 = 8;
+    const DFAKF_NULL: u16 = 512;
+    const DFASF_SEGMENT: u16 = 16;
+    const DFASF_ALTCOLLATE: u16 = 32;
+    const DFASF_DESCENDING: u16 = 64;
+
+    if bytes.len() < FILE_SPEC {
+        return Err(ShimError::Failed(format!(
+            "a create buffer of {} bytes, shorter than one dfaStatFileSpec ({FILE_SPEC})",
+            bytes.len()
+        )));
+    }
+    let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+
+    let record_length = word(0);
+    let page_size = word(2);
+    let n_keys = word(4);
+    let flags = word(10);
+    let n_pre_allocate = word(14);
+
+    if flags != 0 {
+        return Err(ShimError::Failed(format!(
+            "create flags {flags:#06x} -- this engine's FileSpec has no representation for \
+             DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*, so any nonzero flags \
+             word is refused rather than silently ignored"
+        )));
+    }
+    if n_pre_allocate > 1 {
+        return Err(ShimError::Failed(format!(
+            "nPreAllocate {n_pre_allocate} -- this engine always pre-allocates exactly one \
+             data page, so anything else cannot be honoured"
+        )));
+    }
+
+    let mut keys: Vec<KeySpec> = Vec::new();
+    let mut segments: Vec<SegmentSpec> = Vec::new();
+    let mut duplicates = false;
+    let mut modifiable = false;
+    let mut at = FILE_SPEC;
+    let mut seen_keys = 0u16;
+
+    while seen_keys < n_keys {
+        if at + KEY_SPEC > bytes.len() {
+            return Err(ShimError::Failed(format!(
+                "a create buffer with {n_keys} keys declared, but the key spec at byte {at} \
+                 runs past the buffer's own {} bytes",
+                bytes.len()
+            )));
+        }
+        let position = word(at);
+        let length = word(at + 2);
+        let seg_flags = word(at + 4);
+        let ext_type = bytes[at + 10];
+
+        if seg_flags & DFASF_ALTCOLLATE != 0 {
+            return Err(ShimError::Failed(
+                "a key segment with DFASF_ALTCOLLATE set -- this host has no alternate \
+                 collating sequence file to read one from"
+                    .to_owned(),
+            ));
+        }
+        if seg_flags & (DFAKF_MANUAL | DFAKF_NULL) != 0 {
+            return Err(ShimError::Failed(format!(
+                "a key with flags {seg_flags:#06x} setting DFAKF_MANUAL and/or DFAKF_NULL -- \
+                 unsupported on the read side (see keys::parse's own UNSUPPORTED table), so \
+                 refused here rather than written and discovered broken later"
+            )));
+        }
+
+        duplicates = seg_flags & DFAKF_DUPLICATE != 0;
+        modifiable = seg_flags & DFAKF_MODIFYABLE != 0;
+
+        segments.push(SegmentSpec {
+            // `position` is 1-based on the wire (`DFAAPI.C:734`'s own
+            // `+1`); `SegmentSpec::offset` is 0-based, `create.rs`'s own
+            // convention.
+            offset: position.checked_sub(1).ok_or_else(|| {
+                ShimError::Failed(
+                    "a key segment at wire position 0, which is not valid -- positions are \
+                     1-based"
+                        .to_owned(),
+                )
+            })?,
+            length,
+            kind: ext_type,
+            descending: seg_flags & DFASF_DESCENDING != 0,
+        });
+
+        let more_segments = seg_flags & DFASF_SEGMENT != 0;
+        at += KEY_SPEC;
+        if !more_segments {
+            keys.push(KeySpec {
+                segments: std::mem::take(&mut segments),
+                duplicates,
+                modifiable,
+            });
+            seen_keys += 1;
+        }
+    }
+
+    Ok(FileSpec {
+        record_length,
+        page_size,
+        keys,
+    })
+}
+
+/// `VOID dfaCreateSpec(const CHAR *fileName, GBOOL overwrite, size_t
+/// recordLength, size_t pageSize, INT flags, INT nPreAllocate, INT nKeys,
+/// struct dfaKeySpec *keys, const CHAR *altFile)` -- create a new datafile
+/// from a structured key specification.
+///
+/// `DFAAPI.C:674-755`. The one PE ordinal in the whole family that lives far
+/// from the rest (`WGSERVER.DEF` ordinal 1517, against 433-465 for
+/// everything else) -- consistent with it being a later, higher-level
+/// addition over [`dfaCreate`].
+///
+/// # This does not build the wire buffer at all
+///
+/// The vendor implementation builds exactly the `struct dfaStatFileSpec` +
+/// `struct dfaStatKeySpec[]` buffer [`dfaCreate`]'s own doc comment
+/// describes, then calls `dfaCreate` (`:753`) to do the actual work. This
+/// host skips that intermediate step: it reads `keys`' own module-memory
+/// arrays directly into a [`crate::btrieve::FileSpec`] and calls
+/// [`crate::btrieve::create`] itself. That is a faithful
+/// reimplementation of the *observable* behaviour (a file is created with
+/// the record length, page size and keys the module described, or it is
+/// not) without re-deriving `dfaCreate`'s own wire format only to decode it
+/// straight back out again one call later.
+///
+/// # Reading `struct dfaKeySpec`/`struct dfaSegSpec` out of module memory
+///
+/// `DFAAPI.H:60-92`:
+///
+///
+/// Every `size_t`/`INT`/pointer field is read at `A`'s own width
+/// ([`Abi::INT_WIDTH`]/[`Abi::PTR_WIDTH`]) -- realistically always `Wg32`,
+/// since no `Wg16` module imports any `dfa*` symbol at all (`MAJORBBS.DEF`
+/// exports none; only `WGSERVER.DEF` does).
+///
+/// **Assumed struct layout, not measured.** `dfaSegSpec`'s four `size_t`/
+/// `INT` fields plus one `CHAR` sum to `4*INT_WIDTH + 1` bytes, and the
+/// ordinary C ABI pads a struct to its widest member's alignment (`INT_WIDTH`
+/// itself, here) with nothing in `DFAAPI.H` suggesting `#pragma pack` --
+/// so each `segs[]` entry is read at a `round_up(4*INT_WIDTH + 1,
+/// INT_WIDTH)` stride (20 bytes under `Wg32`). This is the one place in
+/// this file with no compiled binary or measured wire capture behind it: no
+/// PE module in this repository's corpus calls `dfaCreateSpec`, so there is
+/// nothing to check the stride against. If a module using this turns up and
+/// this refuses or misreads its `segs[]` array past the first segment, this
+/// assumption is where to look first.
+///
+/// # What this engine cannot represent
+///
+/// Identical to [`dfaCreate`]'s own list: any nonzero `flags`, an
+/// `nPreAllocate` other than `0`/`1`, and a non-null `altFile`/
+/// `DFASF_ALTCOLLATE` segment (an alternate collating sequence this host
+/// cannot read). All three refuse before anything is created.
+///
+/// `overwrite` has the identical caveat [`dfaCreate`]'s own doc comment
+/// gives `keyno`: this engine's `create()` never overwrites, so
+/// `overwrite != 0` on a file that already exists is refused rather than
+/// honoured.
+pub fn dfaCreateSpec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    use crate::btrieve::{FileSpec, KeySpec, SegmentSpec};
+
+    const DFAKF_DUPLICATE: u32 = 1;
+    const DFAKF_MODIFYABLE: u32 = 2;
+    const DFAKF_MANUAL: u32 = 8;
+    const DFAKF_NULL: u32 = 512;
+    const DFASF_ALTCOLLATE: u32 = 32;
+    const DFASF_DESCENDING: u32 = 64;
+
+    let file_name = call.ptr();
+    let _overwrite: u32 = call.int().into();
+    let record_length: u32 = call.int().into();
+    let page_size: u32 = call.int().into();
+    let flags: u32 = call.int().into();
+    let n_pre_allocate: u32 = call.int().into();
+    let n_keys: u32 = call.int().into();
+    let keys_ptr = call.ptr();
+    let alt_file = call.ptr();
+
+    let name = {
+        let named = String::from_utf8_lossy(
+            file_name.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+        )
+        .into_owned();
+        Host::<A>::dos_name(&named).map_err(ShimError::Failed)?
+    };
+
+    if flags != 0 {
+        return Err(ShimError::Failed(format!(
+            "dfaCreateSpec({name}) with flags {flags:#010x} -- this engine's FileSpec has \
+             no representation for DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*, \
+             so any nonzero flags word is refused"
+        )));
+    }
+    if n_pre_allocate > 1 {
+        return Err(ShimError::Failed(format!(
+            "dfaCreateSpec({name}) with nPreAllocate {n_pre_allocate} -- this engine always \
+             pre-allocates exactly one data page"
+        )));
+    }
+    if alt_file != Btrieve::<A>::null() {
+        return Err(ShimError::Failed(format!(
+            "dfaCreateSpec({name}) with a non-null altFile -- this host has no alternate \
+             collating sequence support to read one into"
+        )));
+    }
+
+    let record_length = u16::try_from(record_length).map_err(|_| {
+        ShimError::Failed(format!(
+            "dfaCreateSpec({name}): record length {record_length} does not fit in 16 bits"
+        ))
+    })?;
+    let page_size = u16::try_from(page_size).map_err(|_| {
+        ShimError::Failed(format!(
+            "dfaCreateSpec({name}): page size {page_size} does not fit in 16 bits"
+        ))
+    })?;
+
+    // `struct dfaKeySpec { INT flags; INT nSegments; struct dfaSegSpec *segs; }`
+    // -- no padding: two same-width `INT`s followed by a pointer of the
+    // same width is already aligned.
+    let key_stride = 2 * A::INT_WIDTH + A::PTR_WIDTH;
+    // `struct dfaSegSpec { size_t position; size_t length; INT type; INT
+    // flags; CHAR nullChar; }` -- padded to `INT_WIDTH`, see this routine's
+    // own doc comment.
+    let seg_stride = (4 * A::INT_WIDTH + 1).next_multiple_of(A::INT_WIDTH);
+
+    let mut file_keys: Vec<KeySpec> = Vec::with_capacity(n_keys as usize);
+    for key_index in 0..n_keys {
+        let key_at = A::ptr_checked_add(keys_ptr, key_index as usize * key_stride).ok_or_else(|| {
+            ShimError::Failed(format!(
+                "dfaCreateSpec({name}): key {key_index}'s own dfaKeySpec entry runs past \
+                 addressable memory"
+            ))
+        })?;
+
+        let key_flags: u32 = read_uint::<A>(call, key_at)?;
+        let n_segments: u32 =
+            read_uint::<A>(call, A::ptr_checked_add(key_at, A::INT_WIDTH).ok_or_else(|| {
+                ShimError::Failed(format!("dfaCreateSpec({name}): key {key_index}'s nSegments field is unaddressable"))
+            })?)?;
+        let segs_at = read_ptr::<A>(
+            call,
+            A::ptr_checked_add(key_at, 2 * A::INT_WIDTH).ok_or_else(|| {
+                ShimError::Failed(format!("dfaCreateSpec({name}): key {key_index}'s segs field is unaddressable"))
+            })?,
+        )?;
+
+        if key_flags & DFAKF_MANUAL != 0 || key_flags & DFAKF_NULL != 0 {
+            return Err(ShimError::Failed(format!(
+                "dfaCreateSpec({name}): key {key_index} sets DFAKF_MANUAL and/or DFAKF_NULL \
+                 -- unsupported on the read side (see keys::parse's own UNSUPPORTED table)"
+            )));
+        }
+        let duplicates = key_flags & DFAKF_DUPLICATE != 0;
+        let modifiable = key_flags & DFAKF_MODIFYABLE != 0;
+
+        let mut segments: Vec<SegmentSpec> = Vec::with_capacity(n_segments as usize);
+        for seg_index in 0..n_segments {
+            let seg_at = A::ptr_checked_add(segs_at, seg_index as usize * seg_stride).ok_or_else(|| {
+                ShimError::Failed(format!(
+                    "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s dfaSegSpec \
+                     entry runs past addressable memory"
+                ))
+            })?;
+            let position = read_uint::<A>(call, seg_at)?;
+            let length = read_uint::<A>(
+                call,
+                A::ptr_checked_add(seg_at, A::INT_WIDTH).ok_or_else(|| {
+                    ShimError::Failed(format!(
+                        "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s length \
+                         field is unaddressable"
+                    ))
+                })?,
+            )?;
+            let kind = read_uint::<A>(
+                call,
+                A::ptr_checked_add(seg_at, 2 * A::INT_WIDTH).ok_or_else(|| {
+                    ShimError::Failed(format!(
+                        "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s type \
+                         field is unaddressable"
+                    ))
+                })?,
+            )?;
+            let seg_flags = read_uint::<A>(
+                call,
+                A::ptr_checked_add(seg_at, 3 * A::INT_WIDTH).ok_or_else(|| {
+                    ShimError::Failed(format!(
+                        "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s flags \
+                         field is unaddressable"
+                    ))
+                })?,
+            )?;
+
+            if seg_flags & DFASF_ALTCOLLATE != 0 {
+                return Err(ShimError::Failed(format!(
+                    "dfaCreateSpec({name}): key {key_index} segment {seg_index} sets \
+                     DFASF_ALTCOLLATE -- this host has no alternate collating sequence file \
+                     to read one from"
+                )));
+            }
+
+            let kind = u8::try_from(kind).map_err(|_| {
+                ShimError::Failed(format!(
+                    "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s type \
+                     {kind} does not fit in a byte"
+                ))
+            })?;
+            let position = u16::try_from(position).map_err(|_| {
+                ShimError::Failed(format!(
+                    "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s position \
+                     {position} does not fit in 16 bits"
+                ))
+            })?;
+            let length = u16::try_from(length).map_err(|_| {
+                ShimError::Failed(format!(
+                    "dfaCreateSpec({name}): key {key_index} segment {seg_index}'s length \
+                     {length} does not fit in 16 bits"
+                ))
+            })?;
+
+            segments.push(SegmentSpec {
+                // `dfaCreateSpec`'s own segments are already 0-based
+                // (`struct dfaSegSpec`'s own doc comment, `DFAAPI.H:61`) --
+                // unlike the wire format [`decode_create_buffer`] reads,
+                // which is 1-based. No `-1` here.
+                offset: position,
+                length,
+                kind,
+                descending: seg_flags & DFASF_DESCENDING != 0,
+            });
+        }
+
+        file_keys.push(KeySpec {
+            segments,
+            duplicates,
+            modifiable,
+        });
+    }
+
+    let path = host.root.join(&name);
+    let spec = FileSpec {
+        record_length,
+        page_size,
+        keys: file_keys,
+    };
+    crate::btrieve::create(&path, &spec)
+        .map_err(|e| ShimError::Failed(format!("dfaCreateSpec({name}): {e}")))?;
+    host.note(format!("created {name} via dfaCreateSpec"));
+    Ok(abi::Ret::Void)
+}
+
+/// Read one `A::INT_WIDTH`-byte `INT`/`size_t` field out of module memory
+/// at an arbitrary address, zero-extended to `u32`. [`Call::int`] cannot do
+/// this: it reads the *next* argument off the call frame in order, not an
+/// arbitrary address, which is what walking a `struct dfaKeySpec`/`struct
+/// dfaSegSpec` array needs.
+fn read_uint<A: Abi>(call: &mut Call<A>, at: A::Ptr) -> Result<u32, ShimError> {
+    let bytes = at
+        .resolve(call.mem(), A::INT_WIDTH)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(A::int_from_bytes(bytes).into())
+}
+
+/// Read one pointer-width field out of module memory at an arbitrary
+/// address -- the `segs` field of a `struct dfaKeySpec`, specifically. See
+/// [`read_uint`]'s own doc comment for why this cannot be [`Call::ptr`].
+fn read_ptr<A: Abi>(call: &mut Call<A>, at: A::Ptr) -> Result<A::Ptr, ShimError> {
+    let bytes = at
+        .resolve(call.mem(), A::PTR_WIDTH)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(A::ptr_from_bytes(bytes))
 }
