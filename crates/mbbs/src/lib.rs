@@ -874,6 +874,30 @@ pub struct Host<A: Abi> {
     /// first pass fires the vector.
     lstunm: i16,
 
+    /// Routines registered through `initask` (`GCOMM.H:493`,
+    /// `int initask(void (*tskaddr)(int taskid))`), in registration order --
+    /// the index IS the task id the original hands back, and what it passes
+    /// each routine when it runs it.
+    ///
+    /// [`Host::prctask`] runs them. `MAJORBBS.C:323` initialises the
+    /// `syscyc` vector to `prctask` itself, so on the original every module
+    /// that chains onto that vector calls the task runner at its own tail;
+    /// this host runs it from [`Host::cycle`] instead, which reaches the same
+    /// place without depending on every module chaining correctly. See
+    /// `cycle`'s own comment.
+    ///
+    /// **Not per channel.** A task is a system-wide routine, not a user's --
+    /// `The Rose 2.0` registers one at init and `GALMHS.C:707` keeps its id
+    /// in a global, neither of which is channel-scoped.
+    pub(crate) tasks: Vec<A::Ptr>,
+
+    /// The one live `tfsopn` text-file scan, if any. `TFSCAN.H`'s family is
+    /// stateful -- `tfsopn` opens, `tfsrdl` walks, `tfspfx` tests the current
+    /// line, `tfsabt` drops it -- and the original keeps that state in host
+    /// globals (`tfstate`, `tfsbuf`, `tfspst`), one set for the whole host
+    /// rather than one per channel. This is that state.
+    pub(crate) tfscan: shims::tfscan::TfScan,
+
     /// Poll dispatches left in this burst.
     ///
     /// [`Host::dopoll`] spends one per call and stops re-arming at zero;
@@ -1295,6 +1319,8 @@ impl<A: Abi> Host<A> {
             noted: HashSet::new(),
             kicks: Vec::new(),
             lstunm: 0,
+            tasks: Vec::new(),
+            tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
             forms: HashMap::new(),
             fsdscb: vec![None; usize::from(terms.count())],
@@ -2469,6 +2495,44 @@ impl<A: Abi> Host<A> {
     /// Returns the poison if a callback stopped the machine, and `None`
     /// otherwise. A callback's return value is discarded, as `prcrtk` discards
     /// it.
+    /// `prctask()` -- run every routine `initask` registered, in
+    /// registration order, handing each its own task id.
+    ///
+    /// `MAJORBBS.C:323` makes this the `syscyc` vector's initial value, so on
+    /// the original it is the tail of every module's chain and runs once per
+    /// system cycle. This host calls it from [`Host::cycle`] directly instead
+    /// -- see the comment at that call site for why depending on a module to
+    /// chain correctly would be the wrong bet.
+    ///
+    /// Every registered task runs every cycle; there is no expiry, which is
+    /// what separates a task from a [`Kick`]. `fired` is added to rather than
+    /// assigned, matching [`Host::prcrtk`]'s own contract.
+    ///
+    /// A task that stops the machine ends the sweep and returns the poison --
+    /// the remaining tasks do not run, exactly as they would not on a host
+    /// whose task jumped into a fault.
+    ///
+    /// # Errors
+    ///
+    /// If a task's own call tree fails in a way [`Host::run`] reports as an
+    /// error rather than a poisoning.
+    fn prctask(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        fired: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        for at in 0..self.tasks.len() {
+            let task = self.tasks[at];
+            *fired += 1;
+            match self.run(machine, module, task, &[], None)? {
+                Outcome::Stopped(poison) => return Ok(Some(poison)),
+                Outcome::Returned { .. } => {}
+            }
+        }
+        Ok(None)
+    }
+
     fn prcrtk(
         &mut self,
         machine: &mut A::Cpu,
@@ -2847,9 +2911,13 @@ impl<A: Abi> Host<A> {
         // for every channel number -- so an idle pass fires it too, as the
         // original's does.
         //
-        // `prctask` -- the vector's documented tail -- is still not here.
-        // Nothing this host loads registers a task, so there is no chain to
-        // run; a module that did would need it, and would find this comment.
+        // `prctask`, the vector's documented tail, runs immediately below.
+        // `MAJORBBS.C:323` makes it the vector's INITIAL value, so on the
+        // original a chaining module ends by running it; this host runs it
+        // here instead, which reaches the same place without depending on
+        // every module's own chain bookkeeping being right. The Rose 2.0
+        // (`RCIROSE.DLL`) is the module that made this necessary -- it calls
+        // `initask`, where MajorMUD registers nothing.
         let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
         if newunm <= self.lstunm {
             let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
@@ -2868,6 +2936,15 @@ impl<A: Abi> Host<A> {
             }
         }
         self.lstunm = newunm;
+
+        if let Some(poison) = self.prctask(machine, module, &mut dispatched)? {
+            return Ok(Cycles {
+                iterations,
+                dispatched,
+                // `None`: a task belongs to no channel, same as a kick.
+                ended: Ended::Stopped(poison, None),
+            });
+        }
 
         while iterations < max {
             iterations += 1;
@@ -5744,6 +5821,27 @@ mod tests {
              dispatched was {}",
             turned.dispatched
         );
+    }
+
+    /// A registered task runs on every cycle, and keeps running -- that is
+    /// what separates it from a `Kick`, which fires once and is consumed.
+    /// `The Rose 2.0` registers one at init and expects it every cycle
+    /// thereafter.
+    #[test]
+    fn prctask_runs_every_registered_task_every_time() {
+        let (mut f, module, rou) = polling_fixture();
+
+        let mut fired = 0;
+        assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 0, "nothing registered, nothing run");
+
+        f.host.tasks.push(rou);
+        assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 1, "the registered task runs");
+
+        assert_eq!(f.host.prctask(&mut f.machine, &module, &mut fired).expect("ran"), None);
+        assert_eq!(fired, 2, "and again -- a task is not consumed the way a kick is");
+        assert_eq!(f.host.tasks.len(), 1, "and stays registered");
     }
 
     #[test]

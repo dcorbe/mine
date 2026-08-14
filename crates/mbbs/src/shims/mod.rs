@@ -1,21 +1,30 @@
 //! What sits behind each import, and what to do when nothing does.
 
 pub mod btrieve;
+pub mod credit;
 pub mod credits;
+pub mod crt;
+pub mod echo;
 pub mod fsd;
+pub mod gcsp;
 pub mod gsbl;
 pub mod memory;
+pub mod misc;
+pub mod mlt;
 pub mod msg;
+pub mod output;
 pub mod runtime;
 pub mod screen;
 pub mod stream;
 pub mod system;
+pub mod task;
 pub mod text;
+pub mod tfscan;
 pub mod user;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
-use crate::exports::{DOSCALLS, GALGSBL, MAJORBBS};
+use crate::exports::{DOSCALLS, GALGSBL, GALME, MAJORBBS};
 use crate::globals::GLOBALS;
 
 // `args(machine) -> Cursor<'_, Wg16>` used to live here: a bare `Cursor` over
@@ -210,6 +219,75 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller),
         (MAJORBBS, "vsprintf", text::vsprintf, Cleans::Caller),
         (MAJORBBS, "prf", text::prf, Cleans::Caller),
+
+        // --- Symbols surveyed as missing across the module corpus and
+        // --- implemented 2026-08-14. Each cites its vendor source at its own
+        // --- definition; see docs/2026-08-12-module-import-gaps.md for the
+        // --- census that ranked them.
+        (MAJORBBS, "outprf", output::outprf, Cleans::Caller),
+        (MAJORBBS, "outmlt", output::outmlt, Cleans::Caller),
+        (MAJORBBS, "clrmlt", output::clrmlt, Cleans::Caller),
+        (MAJORBBS, "prat", output::prat, Cleans::Caller),
+        (MAJORBBS, "locate", output::locate, Cleans::Caller),
+        (MAJORBBS, "curcurx", output::curcurx, Cleans::Caller),
+        (MAJORBBS, "curcury", output::curcury, Cleans::Caller),
+        (MAJORBBS, "prfmlt", mlt::prfmlt, Cleans::Caller),
+        (MAJORBBS, "pmlt", mlt::pmlt, Cleans::Caller),
+        (MAJORBBS, "getmsg", mlt::getmsg, Cleans::Caller),
+        (MAJORBBS, "tfsopn", tfscan::tfsopn, Cleans::Caller),
+        (MAJORBBS, "tfsrdl", tfscan::tfsrdl, Cleans::Caller),
+        (MAJORBBS, "tfspfx", tfscan::tfspfx, Cleans::Caller),
+        (MAJORBBS, "tfsabt", tfscan::tfsabt, Cleans::Caller),
+        (MAJORBBS, "echon", echo::echon, Cleans::Caller),
+        (MAJORBBS, "echsec", echo::echsec, Cleans::Caller),
+        (MAJORBBS, "injacr", echo::injacr, Cleans::Caller),
+        (MAJORBBS, "hdlinp", echo::hdlinp, Cleans::Caller),
+        (MAJORBBS, "instat", echo::instat, Cleans::Caller),
+        (GALGSBL, "btuxmn", echo::btuxmn, Cleans::Caller),
+        (MAJORBBS, "fgetc", crt::fgetc, Cleans::Caller),
+        (MAJORBBS, "fputc", crt::fputc, Cleans::Caller),
+        (MAJORBBS, "fwrite", crt::fwrite, Cleans::Caller),
+        (MAJORBBS, "itoa", crt::itoa, Cleans::Caller),
+        (MAJORBBS, "mdfgets", crt::mdfgets, Cleans::Caller),
+        (MAJORBBS, "samend", crt::samend, Cleans::Caller),
+        // `__LOCALECONVENTION` keeps ONE leading underscore: `exports::c_name`
+        // strips exactly one, and stripping greedily would merge `_OLDSEND`
+        // with `__OLDSEND`, which are two different symbols.
+        (MAJORBBS, "_localeconvention", crt::localeconvention, Cleans::Caller),
+        (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller),
+        (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller),
+        (MAJORBBS, "msgscan", misc::msgscan, Cleans::Caller),
+        (MAJORBBS, "c2bcpy", misc::c2bcpy, Cleans::Caller),
+        (MAJORBBS, "b2ccpy", misc::b2ccpy, Cleans::Caller),
+        (MAJORBBS, "profan", misc::profan, Cleans::Caller),
+        (MAJORBBS, "listing", misc::listing, Cleans::Caller),
+        (MAJORBBS, "byenow", misc::byenow, Cleans::Caller),
+        // GALME ordinal 30, not a MAJORBBS symbol -- see `exports.rs`'s own
+        // `galme_ordinal_30_is_the_messaging_engines_6x_compatibility_entry`.
+        (GALME, "_oldsend", misc::oldsend, Cleans::Caller),
+        (MAJORBBS, "initask", task::initask, Cleans::Caller),
+        (MAJORBBS, "dedcrd", credit::dedcrd, Cleans::Caller),
+        (MAJORBBS, "tstcrd", credit::tstcrd, Cleans::Caller),
+        (MAJORBBS, "condex", credit::condex, Cleans::Caller),
+        (MAJORBBS, "hasmkey", credit::hasmkey, Cleans::Caller),
+        (MAJORBBS, "sscanf", credit::sscanf, Cleans::Caller),
+        (MAJORBBS, "memset", credit::memset, Cleans::Caller),
+        (MAJORBBS, "intdos", credit::intdos, Cleans::Caller),
+        (MAJORBBS, "getbtv", btrieve::getbtv, Cleans::Caller),
+        (MAJORBBS, "obtbtv", btrieve::obtbtv, Cleans::Caller),
+        (MAJORBBS, "anpbtv", btrieve::anpbtv, Cleans::Caller),
+        (MAJORBBS, "gabbtv", btrieve::gabbtv, Cleans::Caller),
+        (MAJORBBS, "stpbtv", btrieve::stpbtv, Cleans::Caller),
+        (MAJORBBS, "updbtv", btrieve::updbtv, Cleans::Caller),
+        (MAJORBBS, "upvbtv", btrieve::upvbtv, Cleans::Caller),
+        (MAJORBBS, "insbtv", btrieve::insbtv, Cleans::Caller),
+        (MAJORBBS, "stdmchk", gcsp::stdmchk, Cleans::Caller),
+        (MAJORBBS, "rejectreq", gcsp::rejectreq, Cleans::Caller),
+        (MAJORBBS, "rsp2read", gcsp::rsp2read, Cleans::Caller),
+        (MAJORBBS, "rsp2write", gcsp::rsp2write, Cleans::Caller),
+        (MAJORBBS, "senddpk", gcsp::senddpk, Cleans::Caller),
+        (MAJORBBS, "cnvs2d", gcsp::cnvs2d, Cleans::Caller),
+        (MAJORBBS, "stp4cs", gcsp::stp4cs, Cleans::Caller),
         (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller),
         (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller),
         (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller),

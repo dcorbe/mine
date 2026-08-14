@@ -1924,6 +1924,661 @@ fn set_current<A: Abi>(call: &mut Call<A>, host: &Host<A>, block: A::Ptr) -> Res
         .map_err(|e| ShimError::Failed(e.to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// The eight plain routines below (`getbtv`, `obtbtv`, `anpbtv`, `gabbtv`,
+// `stpbtv`, `updbtv`, `upvbtv`, `insbtv`) round out `BTVSTF.H:144-164`.
+// `WCCMMUD.DLL` imports none of them -- `re/exports/imports.txt` has no
+// entry for any of the eight, unlike every routine above this point, which
+// was implemented because the module calls it. These are implemented
+// anyway, on the same standing instruction [`take_lock`]'s own doc comment
+// records: a routine that exists in `PLBTVSTF.C` is not skipped merely
+// because the one module under test does not reach it.
+//
+// Four of the eight (`obtbtv`, `stpbtv`, `gabbtv`, and `anpbtv`, in the loose
+// sense that its ancestor `anpbtvlk` calls `obtbtvl`) are pure tail calls in
+// the vendor source onto an "l" sibling already implemented above, fixing
+// `loktyp` at 0 -- the same shape [`aabbtv`] is to [`gabbtvl`]. The other
+// four (`getbtv`, `updbtv`, `upvbtv`, `insbtv`) have no implemented "l"
+// sibling to call through: `getbtvl` and `anpbtvlk` are named but not built
+// in this file (see the module doc comment's "remaining five guards"
+// section), and `updbtv`/`insbtv` are themselves the tail calls (onto
+// `upvbtv`/`invbtv`), not routines with siblings at all.
+
+/// `void getbtv(void *recptr, void *key, int keynum, int getopt)` -- get a
+/// record by key, or stop.
+///
+/// `PLBTVSTF.C:300-308` is a pure tail call fixing `loktyp` at 0:
+///
+///
+/// `getbtvl` (`:310-337`) is not implemented elsewhere in this file -- see
+/// the module doc comment's "remaining five guards" list, which already
+/// named it (`:318`) as one of the routines this host does not build. This
+/// is that routine's body, with `loktyp` fixed the way `getbtv` fixes it,
+/// four words rather than five -- the same shape `obtbtv` (below) is to the
+/// already-implemented [`obtbtvl`].
+///
+/// # `getbtv` is `obtbtvl`'s twin with one convention inverted
+///
+/// `getbtvl` (`:310-337`) and `obtbtvl` (`:349-380`) read their five
+/// arguments identically, copy the key the same way, resolve `keynum` the
+/// same way, and issue the same underlying Btrieve call
+/// (`(*btvuptr)(getopt+loktyp,...)` vs `(*btvuptr)(obtopt+loktyp,...)`,
+/// same opcode range 5-13). **They diverge in exactly one place**, and nowhere
+/// else:
+///
+///
+/// `obtbtvl` treats "no such key" (status 4), "end of file" (status 9) and a
+/// lock conflict (`wslbtv()`) as legitimate answers and returns 0 without
+/// ever reaching `posbtverr`. `getbtvl` has no such case: **every** nonzero
+/// status, not-found included, goes straight to `posbtverr`, which
+/// `catastro`s unless the status is specifically 22 (a too-short buffer,
+/// unrelated to whether a record was found). So a module written against
+/// `getbtv` is entitled to assume the record is there; one written against
+/// `obtbtv` is not. That is the whole of the difference between the "Get"
+/// and "Obtain/Acquire" families this header groups by name, and it is why
+/// [`locate`]'s `false` becomes a refusal here and a quiet 0 in [`obtbtv`].
+///
+/// # `bb == NULL` is still the quiet case
+///
+/// `:318-320` guards exactly like every other routine that has no record to
+/// answer about: nothing found, nothing refused, nothing written. That part
+/// of the convention is shared with `obtbtvl`; only the *found-a-file, still
+/// no record* case differs.
+pub fn getbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let Some(block) = positioned(call, host, "getbtv")? else {
+        note_no_file(host, "getbtv");
+        return Ok(abi::Ret::Void);
+    };
+
+    let into = call.ptr();
+    let value = call.ptr();
+    let keynum = i16_arg::<A>(call.int());
+    let opt = i16_arg::<A>(call.int());
+
+    let op = Op::of(opt).ok_or_else(|| {
+        ShimError::Failed(format!(
+            "getbtv with option {opt}, which is none of the nine BTVSTF.H's g-macros produce"
+        ))
+    })?;
+    let into = match into == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => into,
+    };
+    let found = locate(
+        call,
+        host,
+        Request {
+            who: "getbtv",
+            block,
+            op,
+            keynum,
+            value,
+            into: Some(into),
+            lock: 0,
+        },
+    )?;
+    if !found {
+        let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+        return Err(ShimError::Failed(format!(
+            "getbtv found no record in {} -- PLBTVSTF.C:333-335 sends any \
+             nonzero status straight to posbtverr(\"GET\"), unlike obtbtvl's \
+             status-4/9/wslbtv special case (:373), so this refuses instead \
+             of answering 0",
+            file.name()
+        )));
+    }
+    Ok(abi::Ret::Void)
+}
+
+/// `int obtbtv(void *recptr, void *key, int keynum, int obtopt)` -- acquire
+/// a record by key.
+///
+/// `PLBTVSTF.C:339-347`:
+///
+///
+/// A pure tail call fixing `loktyp` at 0 -- four words rather than
+/// [`obtbtvl`]'s five, the same shape [`aabbtv`] is to [`gabbtvl`]. Every
+/// other line of this function is [`obtbtvl`]'s own body, because `:357-379`
+/// is unconditionally what `obtbtv` calls, with `loktyp` never present to
+/// read.
+///
+/// Same error convention as `obtbtvl`: `bb == NULL` and a not-found key
+/// (status 4/9, or a lock conflict) both answer 0 rather than refusing --
+/// see [`getbtv`]'s doc comment for why `getbtv` does not get to make the
+/// same claim.
+pub fn obtbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let Some(block) = positioned(call, host, "obtbtv")? else {
+        note_no_file(host, "obtbtv");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+
+    let into = call.ptr();
+    let value = call.ptr();
+    let keynum = i16_arg::<A>(call.int());
+    let opt = i16_arg::<A>(call.int());
+
+    let op = Op::of(opt).ok_or_else(|| {
+        ShimError::Failed(format!(
+            "obtbtv with option {opt}, which is none of the nine BTVSTF.H's a-macros produce"
+        ))
+    })?;
+    let into = match into == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => into,
+    };
+    Ok(abi::Ret::Int(A::Int::from(u16::from(locate(
+        call,
+        host,
+        Request {
+            who: "obtbtv",
+            block,
+            op,
+            keynum,
+            value,
+            into: Some(into),
+            lock: 0,
+        },
+    )?))))
+}
+
+/// `int anpbtv(void *recptr, int anpopt)` -- step to the next/previous
+/// record and say whether it is still in the same key group.
+///
+/// `PLBTVSTF.C:382-388`:
+///
+///
+/// A pure tail call fixing `chkcas` at 1 (case-sensitive) and `loktyp` at 0.
+/// `anpbtvl`/`anpbtvlk` -- the routines that let either vary -- are neither
+/// asked for by this task nor implemented separately in this file (the
+/// module doc comment's "remaining five guards" section already named
+/// `anpbtvlk` at `:406`); this is `anpbtvlk`'s body with both fixed.
+///
+/// # What `anpbtvlk` does, per `PLBTVSTF.C:399-415`
+///
+///
+/// It saves the *current* key value into `bb->data` -- borrowing the record
+/// buffer as scratch, before the step below can touch it -- then steps with
+/// [`obtbtvl`]'s own semantics: `recptr` may default to `bb->data`, the key
+/// argument is `NULL` so nothing is written to `bb->key` on the way in, and
+/// the key number is -1 so the step continues in whichever key `bb->lastkn`
+/// already names. A successful step refreshes `bb->key` with the record it
+/// landed on -- [`answer_with_key`], same as every other read op -- so the
+/// final comparison is "does the key of the record we just stepped to match
+/// the key we were on before the step", which is how `WCCMMUD.DLL` would
+/// walk a group of same-keyed records and learn when it has walked off the
+/// end of it, if it called this at all.
+///
+/// **If `recptr` is null, the comparison is not what it looks like.**
+/// `obtbtvl` then defaults its own `recptr` to `bb->data` too, and delivers
+/// the newly found record there -- overwriting the old-key scratch this
+/// routine just wrote, before the comparison reads it. That makes the
+/// comparison "does the new record start with the same bytes as its own
+/// key", which agrees with the group-boundary check only when the key sits
+/// at the record's own first bytes. Reproduced rather than corrected: it is
+/// the order `PLBTVSTF.C` runs in, not a bug this host gets to fix.
+///
+/// # `bb == NULL` is the quiet 0, same as `obtbtvl`
+///
+/// `:406-408` is exactly `obtbtvl`'s own guard, read the same way here --
+/// [`positioned`]/[`note_no_file`], answering 0 rather than refusing. A step
+/// that finds no record is the same quiet 0, because `anpbtvlk` only ever
+/// forwards `obtbtvl`'s own return in that case ([`locate`] returning
+/// `false`) -- there is nothing left to compare.
+///
+/// # The `strcmp`, bounded
+///
+/// Real `strcmp` scans as far as it must to find a NUL in either operand,
+/// with no length limit. This host has no undefined memory on the other
+/// side of either buffer to scan into, so [`strcmp_eq`] is bounded to the
+/// key's own length -- `bb->keylns[bb->lastkn]`, the same span `:409`'s own
+/// `movmem` used to write the scratch copy in the first place -- and
+/// compares C-string-style within that span. A key that legitimately holds
+/// no NUL before that boundary is compared as a fixed-length buffer, which
+/// is what `strcmp` would also have done as long as the byte immediately
+/// past it was not itself where the two diverged; reading past a buffer this
+/// host does not own is exactly the case "runtime crashes are better than
+/// undefined behaviour" rules out, so this stops at the boundary instead of
+/// guessing what lies beyond it.
+pub fn anpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let anpopt = i16_arg::<A>(call.int());
+
+    let Some(block) = positioned(call, host, "anpbtv")? else {
+        note_no_file(host, "anpbtv");
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+
+    // `:409` -- `movmem(bb->key,bb->data,bb->keylns[bb->lastkn])`, read
+    // before the step below can overwrite either buffer.
+    let key = key_number(call, host, block, -1)?;
+    let key_len = key_length(host, block, key)?;
+    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
+    let old = key_buffer
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let data_buf = data_buffer(host, block)?;
+    data_buf
+        .write(call.mem(), &old)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // `:410` -- `obtbtvl(recptr,NULL,-1,anpopt,loktyp)`, `loktyp` fixed at 0
+    // by `anpbtv`'s own `:387` tail call.
+    let op = Op::of(anpopt).ok_or_else(|| {
+        ShimError::Failed(format!("anpbtv with option {anpopt}, which is not a get operation"))
+    })?;
+    let into = match recptr == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => recptr,
+    };
+    let found = locate(
+        call,
+        host,
+        Request {
+            who: "anpbtv",
+            block,
+            op,
+            keynum: -1,
+            value: Btrieve::<A>::null(),
+            into: Some(into),
+            lock: 0,
+        },
+    )?;
+    if !found {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+
+    // `:411-412` -- compare the scratch copy against the key the step just
+    // refreshed. Read fresh, not from `old`/`into` above: if `recptr` was
+    // null, the step just overwrote what was saved at `bb->data` -- see this
+    // routine's own doc comment on why that is reproduced, not corrected.
+    let data_buf = data_buffer(host, block)?;
+    let now = data_buf
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
+    let landed = key_buffer
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(strcmp_eq(&now, &landed)))))
+}
+
+/// Compare two byte buffers the way C's `strcmp` compares two NUL-terminated
+/// strings: byte-for-byte up to the first NUL in either, with a shorter
+/// terminated prefix unequal to a longer one that only agrees up to that
+/// point. See [`anpbtv`]'s own doc comment for why the scan is bounded to
+/// `a`/`b`'s own length instead of following C's convention of continuing
+/// arbitrarily far past it.
+fn strcmp_eq(a: &[u8], b: &[u8]) -> bool {
+    let a = match a.iter().position(|&byte| byte == 0) {
+        Some(nul) => &a[..nul],
+        None => a,
+    };
+    let b = match b.iter().position(|&byte| byte == 0) {
+        Some(nul) => &b[..nul],
+        None => b,
+    };
+    a == b
+}
+
+/// `void gabbtv(void *recptr, long abspos, int keynum)` -- get the record at
+/// a file position, or stop.
+///
+/// `PLBTVSTF.C:436-443`:
+///
+///
+/// A pure tail call fixing `loktyp` at 0 -- three words, not [`gabbtvl`]'s
+/// four, the same shape [`aabbtv`] is to `gabbtvl` itself (see that
+/// routine's own doc comment for why a four-word cursor cannot be shared
+/// with a three-word caller). Unlike `aabbtv`, though, `gabbtv` keeps
+/// `gabbtvl`'s `fatal: true`: a position that names no record is a refusal
+/// here exactly as it is for `gabbtvl`, and the only thing `gabbtv` changes
+/// is `loktyp`.
+///
+/// `re/exports/imports.txt` has no `gabbtv` entry -- `WCCMMUD.DLL` imports
+/// `gabbtvl` (34 sites) and not this. `re/ordinal_map.tsv`'s `gabbtv` row
+/// (ordinal 999) is that tooling's own placeholder for a symbol it could not
+/// map to a real export, not evidence of a genuine import. Implemented
+/// anyway, on the same standing instruction [`take_lock`]'s own doc comment
+/// records.
+pub fn gabbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let into = call.ptr();
+    let position = call.long();
+    let keynum = i16_arg::<A>(call.int());
+    absolute(
+        call,
+        host,
+        Position {
+            who: "gabbtv",
+            fatal: true,
+            lock: UNLOCKED,
+            into,
+            position,
+            keynum,
+        },
+    )?;
+    Ok(abi::Ret::Void)
+}
+
+/// `int stpbtv(void *recptr, int stpopt)` -- walk the file in the order the
+/// pages hold it, or stop.
+///
+/// `PLBTVSTF.C:495-501`:
+///
+///
+/// A pure tail call fixing `loktyp` at 0 -- two words rather than
+/// [`stpbtvl`]'s three. Duplicated rather than shared through a common
+/// helper: `stpbtvl` (`:503-522`) is one function with no separable core the
+/// way `obtbtvl`/`getbtv` share [`locate`] or `aabbtv`/`gabbtvl` share
+/// [`absolute`], and this task's own instructions are to append rather than
+/// restructure an existing, already-tested routine. What follows is
+/// `stpbtvl`'s body verbatim with `lock` replaced by the literal 0 `stpbtv`
+/// supplies instead of a sixth argument.
+///
+/// # No guard, same as `stpbtvl`
+///
+/// `stpbtv` itself does not check `bb` before tail-calling `stpbtvl`, and
+/// `stpbtvl`'s own `:504-511` has no guard either -- it dereferences `bb`
+/// twice (`bb->data`, `bb->reclen`) before anything is checked. A real board
+/// that stepped with no file current faulted there, so this refuses by name
+/// rather than reproducing the fault -- exactly [`stpbtvl`]'s own doc
+/// comment's reasoning, one level removed.
+pub fn stpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = positioned(call, host, "stpbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "stpbtv with no Btrieve file current -- PLBTVSTF.C:495-501 tail-calls \
+             stpbtvl, whose :504-511 has no guard and dereferences bb twice, so \
+             the real host faulted here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    let into = call.ptr();
+    let opt = i16_arg::<A>(call.int());
+    let into = match into == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => into,
+    };
+    load(host, block)?;
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    let count = file.records().map_err(|e| ShimError::Failed(e.to_string()))?.len();
+
+    // Verbatim from `stpbtvl` -- see that routine's own doc comment for why
+    // each arm answers the way it does, including the Task 12 correction on
+    // stepping off a keyed cursor.
+    let at = match (opt, file.cursor()) {
+        (33, _) => 0,
+        (34, _) if count > 0 => count - 1,
+        (34, _) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
+        (24, Cursor::Physical { at }) => at + 1,
+        (35, Cursor::Physical { at }) if at > 0 => at - 1,
+        (35, Cursor::Physical { .. }) => return Ok(abi::Ret::Int(A::Int::from(0u16))),
+        (24 | 35, Cursor::Ordered { key, at }) => {
+            let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+            let physical = records
+                .ordered(key, at)
+                .and_then(|record| records.find_physical(record.position))
+                .ok_or_else(|| {
+                    ShimError::Failed(format!(
+                        "stpbtv({opt}) on {}: the ordered cursor (key {key}, {at}) does \
+                         not resolve to a physical record -- the file changed under it",
+                        file.name()
+                    ))
+                })?;
+            match opt {
+                24 => physical + 1,
+                _ if physical > 0 => physical - 1,
+                _ => return Ok(abi::Ret::Int(A::Int::from(0u16))),
+            }
+        }
+        (24 | 35, Cursor::Nowhere) => {
+            return Err(ShimError::Failed(format!(
+                "stpbtv({opt}) on {}, which is positioned Nowhere -- nothing has \
+                 positioned it yet, by a key or by a step",
+                file.name()
+            )));
+        }
+        _ => {
+            return Err(ShimError::Failed(format!(
+                "stpbtv with option {opt}, which is none of 24, 33, 34 and 35"
+            )));
+        }
+    };
+
+    if at >= count {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    file.seek_to(Cursor::Physical { at });
+    take_lock(host, block, 0)?;
+    deliver(call, host, block, into)?;
+    Ok(abi::Ret::Int(A::Int::from(1u16)))
+}
+
+/// `void updbtv(void *recptr)` -- update the record the file is positioned
+/// on, at the module's own record length.
+///
+/// `PLBTVSTF.C:524-529`:
+///
+///
+/// # No guard of its own, and it reads `bb` before `upvbtv` ever checks it
+///
+/// `:528` is `bb->reclen` -- a dereference of `bb`, evaluated to build
+/// `upvbtv`'s second argument, **before control ever reaches `upvbtv`'s own
+/// `:536-538` guard**. A real board with no file current faulted right here,
+/// the same shape [`dinsbtv`]/[`dupdbtv`] read `bb->reclen` unguarded, and
+/// unlike [`upvbtv`] itself (whose *own* guard this host does honour once
+/// it is reached) or [`insbtv`]/`invbtv`'s quiet no-op. So this refuses by
+/// name on a missing file rather than delegating to `upvbtv`'s ordinarily
+/// quiet convention, which never gets the chance to run.
+///
+/// # Once a file is current, this is `upvbtv`'s own write
+///
+/// `length` is `bb->reclen` -- [`Block::maxlen`](crate::btrieve::Block::maxlen),
+/// the module's own declared record length, the same number [`dinsbtv`] and
+/// [`dupdbtv`] use. Everything past that point is [`update_variable`], the
+/// body `upvbtv` and `updbtv` share -- see that function's doc comment for
+/// the write itself and its error convention.
+pub fn updbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let block = positioned(call, host, "updbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "updbtv with no Btrieve file current -- PLBTVSTF.C:528 reads \
+             bb->reclen with no guard of its own, before upvbtv's own guard \
+             at :536 is ever reached, so the real host faulted here rather \
+             than answering"
+                .to_owned(),
+        )
+    })?;
+    let length = host.btrieve.block(block).map_err(ShimError::Failed)?.maxlen();
+    update_variable(call, host, "updbtv", block, recptr, length)?;
+    Ok(abi::Ret::Void)
+}
+
+/// `void upvbtv(void *recptr, int length)` -- update the record the file is
+/// positioned on, at a module-supplied length.
+///
+/// `PLBTVSTF.C:531-547`, quoted in full:
+///
+///
+/// # `bb == NULL` is the quiet no-op, same as `invbtv`/`delbtv`
+///
+/// `:536-538` answers nothing with no file current -- [`positioned`]/
+/// [`note_no_file`], same convention as [`invbtv`]/[`delbtv`], and unlike
+/// [`dinsbtv`]/[`dupdbtv`]'s unguarded fault. `upvbtv` itself is the one
+/// with the guard; it is `updbtv` (above), reading `bb->reclen` before ever
+/// calling this, that does not have one.
+///
+/// # Opcode 3, same as `dupdbtv` -- and the one place the two disagree
+///
+/// `:544` is `(*btvuptr)(3,gpbseg,bb->keyseg,bb->lastkn,length)`, the
+/// identical Btrieve call [`dupdbtv`] makes at its own `:561`. **The
+/// difference is what happens to a nonzero status.** `dupdbtv`'s `:561-569`
+/// switches on it: 0 succeeds, 5 (a duplicate-key violation) answers 0
+/// quietly, anything else `catastro`s. `upvbtv`'s `:544-546` has no switch
+/// at all -- **every** nonzero status, duplicate-key included, goes straight
+/// to `(*btverrptr)("UPDATE")`. So a module that collides on a key without
+/// duplicates gets a discarded write and a running program from `dupdbtv`,
+/// and a stopped one from `upvbtv`. [`update_variable`] is what this and
+/// [`updbtv`] share, and it refuses on that collision rather than answering
+/// 0, for exactly this reason -- see its own doc comment.
+///
+/// # Length is the module's, not necessarily the file's
+///
+/// Unlike `dupdbtv`/`dinsbtv`, which always use `bb->reclen`, `upvbtv` takes
+/// `length` as an argument -- this is the "variable-length" member of the
+/// pair, per its own name. [`Block::update`](crate::btrieve::Block::update)
+/// still refuses a buffer that is not exactly the file's own `reclen`, per
+/// [`dupdbtv`]'s own doc comment on why this host does not write
+/// variable-length records at all; a `length` that does not match is
+/// refused there rather than accepted here, so nothing above duplicates that
+/// check.
+///
+/// `int`, per `BTVSTF.H:160` -- signed in the declaration, but read the way
+/// [`opnbtv`]'s `maxlen` is (via [`u16_arg`]) rather than [`i16_arg`]:
+/// `length` flows into exactly the same "how many bytes" role `maxlen` does
+/// (`maksur(length)`, `movmem(...,length)`, and the Btrieve call's own `rlen`
+/// argument), never a value that is compared or branched on as negative, so
+/// this refuses rather than reinterprets a value that would not fit as a
+/// byte count.
+pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let length = u16_arg::<A>(call.int(), "upvbtv")?;
+
+    let Some(block) = positioned(call, host, "upvbtv")? else {
+        note_no_file(host, "upvbtv");
+        return Ok(abi::Ret::Void);
+    };
+    update_variable(call, host, "upvbtv", block, recptr, length)?;
+    Ok(abi::Ret::Void)
+}
+
+/// The write [`upvbtv`] and [`updbtv`] share: opcode 3 at a module-supplied
+/// length, on the record the file is positioned on, refusing rather than
+/// quietly discarding a duplicate-key collision.
+///
+/// This is [`dupdbtv`]'s own body (`:601-736`'s update path -- resolve the
+/// buffer, check every non-duplicate-permitting key, write, re-derive
+/// currency) with one change: where `dupdbtv` answers a collision with a
+/// quiet `0`, this refuses. See [`upvbtv`]'s own doc comment for why that
+/// difference is the vendor's, not this host's invention -- `:544-546` has
+/// no `case 5` branch at all, unlike `dupdbtv`'s `:564-565`.
+///
+/// `who` and `block` are the caller's, already past its own `bb == NULL`
+/// question (`upvbtv`'s own guard, or `updbtv`'s refusal on the unguarded
+/// dereference that precedes this). `length` is `upvbtv`'s own argument or
+/// `updbtv`'s `bb->reclen` -- either way, the number of bytes this call
+/// resolves out of `recptr` and hands to
+/// [`Block::update`](crate::btrieve::Block::update), which is the one place
+/// that number is actually checked against the file's own record length.
+fn update_variable<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    who: &str,
+    block: A::Ptr,
+    recptr: A::Ptr,
+    length: u16,
+) -> Result<(), ShimError> {
+    let recptr = match recptr == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => recptr,
+    };
+    let bytes = recptr
+        .resolve(call.mem(), usize::from(length))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "{who} on {}, which is not positioned on a record -- opcode 3 \
+                 updates the record the file is positioned on, and nothing has \
+                 positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        return Err(ShimError::Failed(format!(
+            "{who} on {name} collided with an existing record on key {key} \
+             ({value:02x?}), which does not permit duplicates -- unlike \
+             dupdbtv's case-5 branch (PLBTVSTF.C:564-565), upvbtv's own \
+             :544-546 sends every nonzero status to btverrptr(\"UPDATE\") with \
+             no exception for a duplicate, so this refuses instead of \
+             answering 0 and silently discarding the write"
+        )));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Currency maintenance, identical to `dupdbtv`'s own tail -- see that
+    // routine's doc comment for why an `Ordered` cursor is re-derived rather
+    // than carried forward, and why `Physical` needs no correction.
+    if let Cursor::Ordered { key, .. } = file.cursor() {
+        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+        let physical = records
+            .find_physical(position)
+            .expect("update just wrote this position");
+        let cursor = match records.place_in(key, physical) {
+            Some(at) => Cursor::Ordered { key, at },
+            None => Cursor::Physical { at: physical },
+        };
+        file.seek_to(cursor);
+    }
+    Ok(())
+}
+
+/// `void insbtv(void *recptr)` -- insert a new record, at the module's own
+/// record length.
+///
+/// `PLBTVSTF.C:572-577`:
+///
+///
+/// # No guard of its own, and it reads `bb` before `invbtv` ever checks it
+///
+/// `:576` is `bb->reclen`, a dereference of `bb` evaluated to build
+/// `invbtv`'s second argument, **before control ever reaches [`invbtv`]'s
+/// own `:584-586` guard** -- the identical shape [`updbtv`] has relative to
+/// [`upvbtv`], and for the identical reason: a real board with no file
+/// current faulted right here, rather than reaching `invbtv`'s ordinarily
+/// quiet no-op. So this refuses by name on a missing file, where `invbtv`
+/// called directly answers nothing.
+///
+/// # With a file current, this is `invbtv`'s own refusal
+///
+/// `recptr` is read and discarded rather than resolved: [`invbtv`] itself
+/// -- the routine this tail-calls, once a file is known current -- never
+/// reads `recptr` or `length` either, because it refuses unconditionally
+/// once `bb` is non-null (nothing in this host writes a variable-length
+/// insert; see `invbtv`'s own doc comment). Resolving `recptr`'s bytes first
+/// would risk failing on a bad pointer *before* naming the real reason this
+/// call cannot succeed, which is a worse error for the same outcome.
+pub fn insbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _recptr = call.ptr();
+    let block = positioned(call, host, "insbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "insbtv with no Btrieve file current -- PLBTVSTF.C:576 reads \
+             bb->reclen with no guard of its own, before invbtv's own guard \
+             at :584 is ever reached, so the real host faulted here rather \
+             than answering"
+                .to_owned(),
+        )
+    })?;
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Err(ShimError::Failed(format!(
+        "insbtv (invbtv(recptr, bb->reclen), PLBTVSTF.C:576) into {}, and \
+         nothing in this host writes to a Btrieve file",
+        file.name()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

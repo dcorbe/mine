@@ -187,8 +187,22 @@ pub const GLOBALS: &[Global] = &[
     g("vdatmp", PTR),
     // MAJORBBS.H:440 -- int vdasiz;
     gi("vdasiz"),
-    // MAJORBBS.H:74 -- struct usracc *usaptr;
+    // USRACC.H:73-76, one `extern` statement declaring three names:
+    //   struct usracc *usaptr,   /* user accounting block ptr for usrnum */
+    //                 *othuap,   /* gen purp other-user accounting ptr   */
+    //                  acctmp;   /* temporary user account storage       */
+    // (`acctmp` is a value, not a pointer, and is not placed here.)
+    // Reached through MAJORBBS.H:15's `#include "usracc.h"` -- the citation
+    // this row used to carry, MAJORBBS.H:74, is `struct user`, not `usaptr`.
+    //
+    // `othuap` needs no host-side value: the module sets it itself with
+    // `othuap=uacoff(othusn)` (Tele-Arena does exactly that at
+    // re/tasrc/tsgarn-4.c:629) and then reads fields off it. It only has to
+    // be a real 4-byte slot in module memory for those writes to land on --
+    // the same role `usaptr` already plays for the same type. Needed by 17
+    // modules in the corpus census, 522 call sites.
     g("usaptr", PTR),
+    g("othuap", PTR),
     // MAJORBBS.H:156, :489 -- BTVFILE *accbb, *genbb;
     g("accbb", PTR),
     g("genbb", PTR),
@@ -791,7 +805,12 @@ mod tests {
         assert_eq!(at("margv"), 256);
         assert_eq!(at("margn"), 256 + 512);
         let last = *placed.last().expect("non-empty");
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3415);
+        // 3415 until 2026-08-14, when `othuap` (PTR, 4 bytes) was placed
+        // beside `usaptr` -- USRACC.H:73-76 declares them in one statement,
+        // and 17 modules in the corpus census address it. A change to this
+        // number is only ever legitimate alongside a deliberate change to
+        // the table above; it is pinned so that an accidental one is loud.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3419);
     }
 
     #[test]
