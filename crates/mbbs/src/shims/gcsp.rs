@@ -8,6 +8,11 @@
 //! Full evidence and methodology for the unreachability argument below
 //! live in `docs/2026-08-14-gcsp-reachability.md`; this comment carries
 //! the summary a reader of the code needs without leaving the file.
+//! Registering a proven-unreachable refusal is not a compromise:
+//! `re/importgaps.py` reports these seven as served, and "served" there
+//! means this host has a named answer for the symbol, not that the answer
+//! reproduces the vendor's real behaviour -- the same distinction `dfsthn`
+//! and `onsysn` already established.
 //!
 //! # What GCSP is, and why none of the seven routines here can run
 //!

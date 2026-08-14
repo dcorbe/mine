@@ -533,25 +533,45 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (DOSCALLS, "dossetvec", dosenv::dossetvec, Cleans::Callee(10)),
         (PHAPI, "doscreatedsalias", dosenv::doscreatedsalias, Cleans::Callee(6)),
         (GALME, "_oldsend", dosenv::oldsend, Cleans::Caller),
-        // `shims::gcsp`'s seven GCSPSRV routines are deliberately NOT
-        // registered here. They are provably unreachable on a telnet host
+        // `shims::gcsp`'s seven GCSPSRV routines. All twelve of their real
+        // call sites are provably unreachable on a telnet host
         // (`docs/2026-08-14-gcsp-reachability.md`: the module's `struct
-        // agent` read/write vectors, which nothing dispatches, and
-        // `_TELL_USER`'s `ISGCSU`-gated branch, which nothing sets), and
-        // registering a refusal would make `re/importgaps.py` report them
-        // as *served* when the truth is *never reached*. A gap report that
-        // counts a refusal as coverage is worse than one that says the
-        // symbol is missing.
+        // agent` read/write vectors, which nothing here ever dispatches to,
+        // and `_TELL_USER`'s `ISGCSU`-gated branch, which nothing here ever
+        // sets), so every one of the seven answers with a loud, named
+        // refusal rather than a body -- the same shape `dfsthn`/`onsysn`
+        // already have for the same reason (see those routines' own doc
+        // comments). `re/importgaps.py` now reports these seven as served,
+        // which is the honest reading of that word: it means this host has
+        // a named answer for the symbol, not that the answer is a faithful
+        // implementation -- see that script's own module comment.
         //
-        // Registering them also breaks a real invariant: `GCSPSRV.H`
-        // declares `rsp2read`, `rsp2write` and `senddpk` twice behind
-        // `GCV2` with differing arity, so `re/widthscan.py` reports them
-        // under "ambiguous: disagreeing declarations" -- a section
-        // `crates/mbbs/tests/argument_widths.rs` asserts is always empty,
-        // on the stated principle that a non-empty result means fixing the
-        // scanner rather than widening an allowlist. Teaching `widthscan`
-        // to resolve a `GCV2` conditional is the honest fix, and it is
-        // worth doing the day one of these becomes reachable -- not before.
+        // `rsp2read`/`rsp2write`/`senddpk` were the reason these seven
+        // stayed unregistered until now: `GCSPSRV.H:153-171` declares all
+        // three twice, behind `#ifdef GCV2`, with differing arity (3/3/6
+        // arguments under `GCV2`, 4/4/7 under `#else`), and `re/widthscan.py`
+        // used to have no opinion on which branch was real -- registering
+        // any of the three would have moved it from "unregistered" straight
+        // to "ambiguous: disagreeing declarations", a section
+        // `crates/mbbs/tests/argument_widths.rs` asserts is always empty.
+        // It has an opinion now: `Wg16` is a measured `GCV2` ABI
+        // (`crate::abi::Wg16::GCV2`, corroborated by `struct user`'s
+        // measured 41-byte stride -- see `crates/mbbs/src/users.rs`), and
+        // `re/widthscan.py`'s `strip_dead_code`/`resolve_via_gcv2` now use
+        // that fact to pick the `GCV2` branch when (and only when) a name is
+        // otherwise genuinely ambiguous. `WCCMMUD.DLL`'s own call sites
+        // confirm the pick independently: `re/ne_arity.py`'s measured
+        // caller-cleanup for every one of the three -- 5, 4 and 9 words --
+        // matches the `GCV2` branch's 3/3/6-argument prototypes exactly
+        // (2+1+2, 1+1+2, 1+2+1+2+1+2 words) and does not match the
+        // non-`GCV2` branch's 4/4/7 at all.
+        (MAJORBBS, "stdmchk", gcsp::stdmchk, Cleans::Caller),
+        (MAJORBBS, "rejectreq", gcsp::rejectreq, Cleans::Caller),
+        (MAJORBBS, "cnvs2d", gcsp::cnvs2d, Cleans::Caller),
+        (MAJORBBS, "rsp2read", gcsp::rsp2read, Cleans::Caller),
+        (MAJORBBS, "rsp2write", gcsp::rsp2write, Cleans::Caller),
+        (MAJORBBS, "senddpk", gcsp::senddpk, Cleans::Caller),
+        (MAJORBBS, "stp4cs", gcsp::stp4cs, Cleans::Caller),
         (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
         (MAJORBBS, "register_module", system::register_module, Cleans::Caller),
         (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller),
