@@ -29,6 +29,7 @@ impl Abi for Wg16 {
     const PTR_WIDTH: usize = 4;
     const INT_WIDTH: usize = 2;
     const LONG_WIDTH: usize = 4;
+    const GCV2: bool = true;
 
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))

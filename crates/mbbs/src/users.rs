@@ -49,51 +49,139 @@ use crate::ShimError;
 use crate::abi::Abi;
 use crate::chan::{Chan, Terms};
 
-/// `sizeof(struct user)`, `MAJORBBS.H:74`. See the module header: this is the
-/// `0x29` the module strides by, not arithmetic from the declaration.
-pub const USER: u16 = 41;
-
 /// `sizeof(struct extusr)`, `MAJORBBS.H:94`.
 pub const EXTUSR: u16 = 22;
 
 /// `sizeof(struct usracc)`, `USRACC.H:24`, and the 338 that `:22` writes down.
 pub const USRACC: u16 = 338;
 
-/// Field offsets within `struct user`.
+/// One field of a per-channel struct: where its first byte sits, and how many
+/// bytes it occupies at this ABI's widths.
 ///
-/// Only the five the module reaches for. The rest of `MAJORBBS.H:74` is real
-/// and is what the arithmetic between these is made of, but a constant nothing
-/// indexes by is a constant nothing checks.
-pub mod user {
-    /// `int usrcls` -- the class of channel this is (console, remote, etc).
-    /// `MAJORBBS.H:74`'s GCV2 layout puts it first. The module itself never
-    /// reads it -- the host does, to decide what a channel is before any
-    /// module gets a look -- so there is no call site to cite, only the
-    /// header's own field order.
-    pub const USRCLS: u16 = 0;
-    /// `int state` -- the module number in effect on this channel. Assigned the
-    /// module's own state number at 14 sites.
-    pub const STATE: u16 = 6;
-    /// `int substt` -- the module's own substate. Assigned `0x38`, `0x82`,
-    /// `0x0b`, `0x11`..`0x15` and `0x84`..`0x88`.
-    pub const SUBSTT: u16 = 8;
-    /// `unsigned long flags` -- runtime flags. Tested a byte at a time:
-    /// `+0x14 & 2/4/0x10`, `+0x15 & 0x40`, `+0x16 & 0x80`.
-    pub const FLAGS: u16 = 0x14;
-    /// `int crdrat` -- credit-consumption rate. Assigned at `+0x1a`.
-    pub const CRDRAT: u16 = 0x1a;
-    /// `void (*polrou)()` -- the channel's current polling routine, or NULL.
-    /// `MAJORBBS.H:90`, four bytes.
-    ///
-    /// **The module reads this one.** `WCCMMUD_named.c:12241` indexes
-    /// `user[usrnum]` by hand and tests `+0x24` and `+0x26` for zero before
-    /// calling `begin_polling`, so unlike the keyring at offset 2 this field
-    /// cannot live Rust-side. See
+/// An offset alone is not enough to read a field. `struct user`'s `state` is a
+/// C `int` -- two bytes under `Wg16`, four under `Wg32` -- so a reader that
+/// knows only where it starts reads half of it and gets a plausible number.
+/// That is the failure this type exists to make impossible: every call site
+/// takes both halves from the same place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field {
+    /// Byte offset from the start of the slot.
+    pub at: u16,
+    /// How many bytes the field occupies.
+    pub width: u8,
+}
+
+impl Field {
+    const fn new(at: u16, width: u8) -> Self {
+        Self { at, width }
+    }
+}
+
+/// `struct user`'s stride and field offsets, at `A`'s own widths and field set.
+///
+/// The shape [`FndblkLayout`](crate::shims::stream) established for `ffblk`,
+/// for the same reason: two ABIs whose records are not one record. This one is
+/// worse than `ffblk` was, because the difference is not only width. See
+/// [`Abi::GCV2`](crate::abi::Abi::GCV2).
+///
+/// # Which fields are here
+///
+/// Only the ones something reads. The rest of `MAJORBBS.H:98` is real, and is
+/// what the arithmetic between these is made of, but a constant nothing indexes
+/// by is a constant nothing checks.
+///
+/// # Why no field is optional
+///
+/// The design doc asked for fields that can be *absent*, so that asking for one
+/// an ABI does not have fails loudly instead of returning a plausible zero.
+/// That requirement is right and it is met -- one level up, at
+/// [`Users::extra`]. Summing both branches of `MAJORBBS.H:98` shows non-GCV2 is
+/// a strict superset of GCV2's field set: every field placed here exists in
+/// both ABIs, at different offsets and sometimes different widths. What GCV2
+/// does is move nine of them (`tckrst`, `tckonl`, `lingo`, `entstt`, `tspxt`,
+/// `col`, `wid`, `ech`, `byecnt`) out into a separate `struct extusr`, which a
+/// non-GCV2 build has no table for at all. So the thing that can be absent is
+/// that whole table, not any field here, and an `Option` on each field would
+/// have a `None` arm no caller could ever reach.
+#[derive(Clone, Copy)]
+pub struct UserLayout {
+    /// `sizeof(struct user)` -- what `usroff` strides by.
+    pub stride: u16,
+    /// `INT usrcls` -- the class of channel this is (offline, or type of
+    /// online). The module never reads it; the host does, to decide what a
+    /// channel is before any module gets a look.
+    pub usrcls: Field,
+    /// `INT state` -- the module number in effect on this channel.
+    pub state: Field,
+    /// `INT substt` -- the module's own substate. `LUNATIX.DLL` dereferences
+    /// `usrptr` at this offset at 134 sites, more than at any other, which is
+    /// what a module's own state machine should look like.
+    pub substt: Field,
+    /// `ULONG flags` -- runtime flags, tested a byte at a time by the module
+    /// and read-modify-written a bit at a time by [`Host::connect_state`].
+    pub flags: Field,
+    /// `SHORT crdrat` -- credit-consumption rate. A `SHORT` in both branches,
+    /// which is why its width does not follow `INT_WIDTH`.
+    pub crdrat: Field,
+    /// `VOID (*polrou)()` -- the channel's current polling routine, or NULL.
+    /// The module reads this one directly; see
     /// `docs/plans/2026-08-08-polling-design.md`.
-    pub const POLROU: u16 = 0x24;
-    /// `char lcstat` -- LAN channel state, and the odd byte that makes the
-    /// stride 41 and not 42.
-    pub const LCSTAT: u16 = 40;
+    pub polrou: Field,
+    /// `CHAR lcstat` -- LAN channel state, and the last declared byte in both
+    /// branches.
+    pub lcstat: Field,
+}
+
+impl UserLayout {
+    /// `struct user` as `A`'s host declares it.
+    pub fn of<A: Abi>() -> Self {
+        if A::GCV2 {
+            // `MAJORBBS.H:98`, `#ifdef GCV2`, at `Wg16`'s widths. `usrcls`
+            // first; `flags` and `baud` demoted to the middle; `lingo`,
+            // `entstt`, `tspxt`, `col`, `wid`, `ech` and `byecnt` living in
+            // `struct extusr` instead. Sums to 41.
+            Self {
+                stride: 41,
+                usrcls: Field::new(0x00, 2),
+                state: Field::new(0x06, 2),
+                substt: Field::new(0x08, 2),
+                flags: Field::new(0x14, 4),
+                crdrat: Field::new(0x1a, 2),
+                polrou: Field::new(0x24, 4),
+                lcstat: Field::new(40, 1),
+            }
+        } else {
+            // `MAJORBBS.H:98`, `#ifndef GCV2`, at `Wg32`'s widths. `flags`
+            // first, then two tick stamps and a `LONG baud` before `usrcls`
+            // -- which is why every offset here is larger than a naive
+            // "same struct, wider fields" reading predicts. Sums to 85,
+            // padded to the 88 the oracle's allocation site pushes.
+            Self {
+                stride: 88,
+                usrcls: Field::new(0x10, 4),
+                state: Field::new(0x18, 4),
+                substt: Field::new(0x1c, 4),
+                flags: Field::new(0x00, 4),
+                crdrat: Field::new(0x4c, 2),
+                polrou: Field::new(0x48, 4),
+                lcstat: Field::new(0x54, 1),
+            }
+        }
+    }
+
+    /// Every field this layout places, named, for checks that must cover all
+    /// of them rather than the ones a test author remembered.
+    pub fn fields(&self) -> [(&'static str, Field); 7] {
+        [
+            ("usrcls", self.usrcls),
+            ("state", self.state),
+            ("substt", self.substt),
+            ("flags", self.flags),
+            ("crdrat", self.crdrat),
+            ("polrou", self.polrou),
+            ("lcstat", self.lcstat),
+        ]
+    }
 }
 
 /// Field offsets within `struct usracc` (`UStructs.h:20`, v10 SDK).
@@ -1238,6 +1326,100 @@ mod tests {
             selector: slot.selector,
         };
         assert_eq!(f.machine.resolve(at, 2).expect("in the slot"), &[7, 0]);
+    }
+
+    /// Both ABIs' `struct user`, asserted explicitly so a mutation to either is
+    /// visible.
+    ///
+    /// # Where these numbers come from
+    ///
+    /// Not from this host. `Wg32`'s stride is the literal in the allocation
+    /// site of the real Worldgroup host's own user table, read off
+    /// `archive/_acquire/pools/full/cfca0b96eae9602a_WGSERVER.EXE` at
+    /// VA `0x4210c8`:
+    ///
+    /// ```text
+    /// 6a 58                 push 0x58            ; sizeof(struct user) = 88
+    /// 66 a1 c0 48 45 00     mov  ax,ds:0x4548c0  ; nterms
+    /// 50                    push eax
+    /// e8 4e 6a 01 00        call 0x437b24        ; alloc(count, elemsize)
+    /// ```
+    ///
+    /// `usroff` itself carries no multiply -- it tail-calls a shared accessor
+    /// that reads the element size back out of the block header the allocator
+    /// wrote -- so the allocation site is the only place the number is a
+    /// compile-time immediate. The same `push 0x58` appears byte-for-byte in
+    /// the sibling build `bfe3ab588c1273a4_WGSERVER.EXE` at VA `0x41f0fc`.
+    ///
+    /// The field offsets are the `#ifndef GCV2` branch of
+    /// `re/wg33src/INC/MAJORBBS.H:98` summed at 32-bit widths, which lands on
+    /// 85 declared and 88 padded -- selecting that branch exactly, where the
+    /// GCV2 branch computes to 64. Eleven of them were independently read off
+    /// instructions in the oracle; see the design doc's table.
+    #[test]
+    fn user_layout_matches_both_abis_declared_field_sets() {
+        use crate::abi::Wg32;
+
+        let wg16 = UserLayout::of::<Wg16>();
+        assert_eq!(wg16.stride, 41, "Wg16: GCV2 at 16-bit widths, and the odd \
+                                     trailing `lcstat` byte is why it is not 42");
+        assert_eq!(wg16.usrcls, Field { at: 0x00, width: 2 }, "Wg16 usrcls");
+        assert_eq!(wg16.state, Field { at: 0x06, width: 2 }, "Wg16 state");
+        assert_eq!(wg16.substt, Field { at: 0x08, width: 2 }, "Wg16 substt");
+        assert_eq!(wg16.flags, Field { at: 0x14, width: 4 }, "Wg16 flags -- a ULONG \
+                                                              even at 16-bit INT");
+        assert_eq!(wg16.crdrat, Field { at: 0x1a, width: 2 }, "Wg16 crdrat");
+        assert_eq!(wg16.polrou, Field { at: 0x24, width: 4 }, "Wg16 polrou -- a far \
+                                                               pointer, 4 bytes");
+        assert_eq!(wg16.lcstat, Field { at: 40, width: 1 }, "Wg16 lcstat");
+
+        let wg32 = UserLayout::of::<Wg32>();
+        assert_eq!(wg32.stride, 88, "Wg32: the `push 0x58` in the oracle");
+        assert_eq!(wg32.flags, Field { at: 0x00, width: 4 }, "Wg32 flags -- non-GCV2 \
+                                                              puts it first, not at 0x14");
+        assert_eq!(wg32.usrcls, Field { at: 0x10, width: 4 }, "Wg32 usrcls");
+        assert_eq!(wg32.state, Field { at: 0x18, width: 4 }, "Wg32 state");
+        assert_eq!(wg32.substt, Field { at: 0x1c, width: 4 }, "Wg32 substt -- the \
+                                                               offset LunatiX \
+                                                               dereferences at 134 sites");
+        assert_eq!(wg32.polrou, Field { at: 0x48, width: 4 }, "Wg32 polrou");
+        assert_eq!(wg32.crdrat, Field { at: 0x4c, width: 2 }, "Wg32 crdrat -- still a \
+                                                               SHORT, after polrou not \
+                                                               before it");
+        assert_eq!(wg32.lcstat, Field { at: 0x54, width: 1 }, "Wg32 lcstat -- last, \
+                                                               and 0x55 declared rounds \
+                                                               to the 0x58 stride");
+
+        // The two ABIs are not one struct at two widths. If a refactor ever
+        // makes these agree, it has collapsed a real distinction.
+        assert_ne!(wg16.usrcls.at, wg32.usrcls.at, "GCV2 puts usrcls first; \
+                                                    non-GCV2 puts flags first");
+        assert_ne!(wg16.flags.at, wg32.flags.at, "and the same in reverse");
+    }
+
+    /// Every placed field lies inside its own slot.
+    ///
+    /// A field whose last byte runs past `stride` would read the next
+    /// channel's record -- silently, because a wrong `int` read still returns
+    /// a number. Cheap to state, and it is the one property no offset table
+    /// can satisfy by accident.
+    #[test]
+    fn every_placed_field_fits_inside_the_stride() {
+        use crate::abi::Wg32;
+
+        for (name, layout) in [
+            ("Wg16", UserLayout::of::<Wg16>()),
+            ("Wg32", UserLayout::of::<Wg32>()),
+        ] {
+            for (field_name, field) in layout.fields() {
+                let end = usize::from(field.at) + usize::from(field.width);
+                assert!(
+                    end <= usize::from(layout.stride),
+                    "{name}: {field_name} ends at {end}, past the {}-byte stride",
+                    layout.stride
+                );
+            }
+        }
     }
 
     #[test]

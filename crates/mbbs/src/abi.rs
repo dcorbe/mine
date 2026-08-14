@@ -151,6 +151,27 @@ pub trait Abi {
     /// Bytes a C `long` occupies in this ABI's argument frame: 4 in both.
     const LONG_WIDTH: usize;
 
+    /// Whether this ABI's host was built with Galacticomm's `GCV2` flag set.
+    ///
+    /// **Not a width, and not derivable from one.** `GCV2` is a compile-time
+    /// switch that changes which *fields* a struct has, and several of
+    /// Galacticomm's headers declare a struct twice behind it --
+    /// `re/wg33src/INC/MAJORBBS.H:98` declares `struct user` two different
+    /// ways, and `re/wg33src/INC/UStructs.h:52` gives `struct usracc` two
+    /// different sizes. Pick the wrong branch and every offset past byte 0 is
+    /// wrong silently, because a wrong `int` read still returns a number.
+    ///
+    /// Measured, not assumed. `Wg16`'s layout is the one this host already
+    /// implements and its offsets are GCV2's field order at 16-bit widths
+    /// (`crate::users::UserLayout`'s own test says which). `Wg32`'s stride was
+    /// read off a genuine PE32 `WGSERVER.EXE`: 88 bytes, which is the non-GCV2
+    /// declaration's sum and not the GCV2 one's 64.
+    ///
+    /// Named here rather than spelled `INT_WIDTH >= 4` at each use site,
+    /// because the two axes are independent and a reader who sees a width test
+    /// has no way to know a field *set* was meant.
+    const GCV2: bool;
+
     /// Decode a pointer from exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
@@ -942,6 +963,7 @@ mod tests {
         const PTR_WIDTH: usize = Wg16::PTR_WIDTH;
         const INT_WIDTH: usize = Wg16::INT_WIDTH;
         const LONG_WIDTH: usize = Wg16::LONG_WIDTH;
+        const GCV2: bool = Wg16::GCV2;
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)

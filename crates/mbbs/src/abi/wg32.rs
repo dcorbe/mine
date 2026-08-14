@@ -131,6 +131,7 @@ impl Abi for Wg32 {
     const PTR_WIDTH: usize = 4;
     const INT_WIDTH: usize = 4;
     const LONG_WIDTH: usize = 4;
+    const GCV2: bool = false;
 
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m32::Flat32Ptr(u32::from_le_bytes(
