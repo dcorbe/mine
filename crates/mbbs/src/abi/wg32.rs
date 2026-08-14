@@ -138,6 +138,17 @@ impl Abi for Wg32 {
     const LONG_WIDTH: usize = 4;
     const GCV2: bool = false;
 
+    /// The `Wg32`-only routines, the mirror of `Wg16`'s own override.
+    ///
+    /// One entry: `__ftol`, whose argument arrives in the x87 register stack
+    /// rather than the call frame, so its shim reads
+    /// [`take_st0`](mbbs_machine::m32::Machine::take_st0) -- a method this
+    /// machine has and the segmented one does not. See
+    /// `crate::shims::WG32_ROUTINES`.
+    fn native(dll: &str, symbol: &str) -> Option<(crate::shims::Shim<Self>, crate::shims::Cleans)> {
+        crate::shims::wg32_native(dll, symbol)
+    }
+
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m32::Flat32Ptr(u32::from_le_bytes(
             bytes.try_into().expect("PTR_WIDTH bytes"),
@@ -373,6 +384,29 @@ impl Abi for Wg32 {
         image.patch_thunk_addresses(&pe, &thunks, |index| {
             cpu.machine.thunk_addr(u16::try_from(index).expect("bind_imports never exceeds MAX_THUNKS"))
         });
+
+        // `__ftol` takes its argument in x87 `ST0`, not in the call frame,
+        // so the value has to be captured *before* any host code runs --
+        // arming rewrites this one thunk's own bytes to `fstp` ahead of the
+        // generic body, so the pop happens in 32-bit compat mode with
+        // nothing of ours in between. See
+        // [`arm_st0_capture`](mbbs_machine::m32::Machine::arm_st0_capture),
+        // whose doc comment explains why this is scoped to a single armed
+        // slot rather than done unconditionally in the shared trampoline: an
+        // `fstp` on every host call would discard a value the module still
+        // needed further down its FPU stack, or fault when `ST0` was
+        // legitimately empty.
+        //
+        // Matched on the import's own spelling (`__ftol`, two underscores),
+        // not the table key `_ftol` that `exports::c_name` produces -- this
+        // is the raw import directory, before that stripping.
+        if let Some(slot) = thunks.iter().position(|site| {
+            site.module.eq_ignore_ascii_case("cw3220mt.DLL")
+                && matches!(&site.symbol, mbbs_machine::module::Symbol::Name(n) if n == "__ftol")
+        }) {
+            cpu.machine
+                .arm_st0_capture(u16::try_from(slot).expect("bind_imports never exceeds MAX_THUNKS"));
+        }
 
         let entry = image.base().wrapping_add(pe.entry_point);
 

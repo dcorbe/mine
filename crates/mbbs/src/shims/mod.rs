@@ -10,6 +10,7 @@ pub mod crt;
 pub mod echo;
 pub mod fsd;
 pub mod ftf;
+pub mod ftol;
 pub mod gcsp;
 pub mod gsbl;
 pub mod memory;
@@ -658,6 +659,37 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
 /// the door exists and not what is behind it.
 pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans)> {
     WG16_ROUTINES
+        .iter()
+        .find(|(d, n, _, _)| *d == dll && *n == symbol)
+        .map(|(_, _, shim, cleans)| (*shim, *cleans))
+}
+
+/// The `Wg32` half of the same idea: routines that cannot be generic over
+/// `A` because their answer comes from somewhere only the 32-bit machine
+/// has.
+///
+/// One entry so far, and it is the same reason [`WG16_ROUTINES`] exists at
+/// all. `__ftol` takes its argument in the x87 register stack rather than in
+/// the call frame, so its shim reads
+/// [`take_st0`](mbbs_machine::m32::Machine::take_st0) -- a method on the flat
+/// 32-bit machine, with no counterpart on the segmented one and no accessor
+/// on [`Abi`]. Making it generic would mean inventing an `Abi` method that
+/// exactly one ABI could ever answer.
+///
+/// The key is `_ftol`, with **one** leading underscore, not `ftol`.
+/// [`crate::exports::c_name`] strips exactly one, so the module's
+/// `__ftol` arrives here as `_ftol` -- `borland.rs`'s own test asserts that
+/// mapping rather than leaving it to be rediscovered.
+///
+/// `Cleans::Caller` because no call site pushes a stack argument at all: the
+/// operand is on the FPU stack, and all thirteen of LunatiX's call sites are
+/// preceded by `fld`/`fild`/`fmul` with nothing pushed.
+const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans)] =
+    &[(MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller)];
+
+/// [`Abi::native`]'s `Wg32` half. See [`wg16_native`], which this mirrors.
+pub(crate) fn wg32_native(dll: &str, symbol: &str) -> Option<(Shim<crate::abi::Wg32>, Cleans)> {
+    WG32_ROUTINES
         .iter()
         .find(|(d, n, _, _)| *d == dll && *n == symbol)
         .map(|(_, _, shim, cleans)| (*shim, *cleans))
