@@ -99,8 +99,105 @@ pub struct Boot<A: Abi> {
     pub build: Box<dyn Fn() -> io::Result<A::Cpu> + Send>,
     /// The board directory the module's own files live in.
     pub root: PathBuf,
-    /// The module to load, e.g. `re/WCCMMUD.DLL`.
-    pub module: PathBuf,
+    /// Every module to load onto this machine, in the order [`life`] must
+    /// load and initialise them -- dependency order, not registration
+    /// importance. Must be non-empty; [`life`] refuses an empty list rather
+    /// than panicking on `modules[0]` (see its own doc, "Booting N modules").
+    ///
+    /// # Why order is the whole contract
+    ///
+    /// Each entry gets `Host::load` (which makes its exports reachable to
+    /// every *later* entry's own imports -- see [`mbbs::Host`]'s
+    /// `loaded_modules` doc comment, the mechanism `071c5a0` landed for
+    /// exactly this: MajorMUD Plus's `WCCMMPLS.DLL` imports eight symbols --
+    /// `mmlog`, `register_mud_addon`, and six others -- directly from
+    /// `WCCMMUD.DLL`, and can only load at all once `WCCMMUD.DLL` is already
+    /// in the registry `Host::load` consults), then `A::init_entry` (ordinal
+    /// 1, resolved by export table -- **not** the PE/NE entry point, which a
+    /// real bug this session fixed had been reading instead), then
+    /// `Host::run` to completion, in that order, one module fully before the
+    /// next one starts.
+    ///
+    /// **Load order is registration order, and registration order decides
+    /// who owns a channel.** A module's own ordinal 1 is what calls
+    /// `register_module` (`MAJORBBS!register_module`, `crate::shims::system::register_module`);
+    /// this driver does not call it and has no say in whether a given module
+    /// calls it at all. `Host::connect`/`Host::hangup` dispatch through
+    /// `Host::first_module()` -- the earliest `Registration::Module` in the
+    /// table, skipping the FSD's native slot -- so **the first module in this
+    /// list to run its own init and call `register_module` is the one every
+    /// connecting channel enters**, for as long as this life lasts.
+    ///
+    /// Put the module that should own channels first. A later entry that
+    /// also calls `register_module` (measured true of MajorMUD Plus's
+    /// `WCCMMPLS.DLL`: it imports `MAJORBBS!register_module`, one call site,
+    /// confirmed served and distinct from `WCCMMUD!register_mud_addon` --
+    /// WCCMMUD's own tiny in-module addon table, unrelated to this host's
+    /// module registry) still gets a `Registration` of its own, but
+    /// `first_module()` never reaches it: `Host::connect`/`Host::hangup`
+    /// dispatching to every registered module's `lonrou`/`huprou`, the way
+    /// the real host's `cyclon`/`aschup` loops do, is `first_module`'s own
+    /// doc comment's "still owed" debt, unaffected by this change. A second
+    /// module here is therefore an **addon** in the sense that matters
+    /// operationally: it never owns a channel, but its own exports are
+    /// reachable the moment it loads, so the primary module can call into it
+    /// directly (MajorMUD Plus's own `register_mud_addon` hook is exactly
+    /// that shape from the *module* side -- WCCMMUD's own code, not this
+    /// host, is what would call back into it).
+    ///
+    /// # A caveat this driver does not paper over -- MEASURED, not merely reasoned
+    ///
+    /// `Host::run`'s `module: &A::Module` argument names whose import table
+    /// an unimplemented-symbol trap resolves against (thunk indices are
+    /// assigned fresh, from zero, by each module's own `Host::load` call --
+    /// see `mbbs_machine::m16::ne::Thunks::new` -- and every module's own
+    /// thunk table lives at the *same* physical addresses in the machine's
+    /// one shared bridge segment, so the same numeric index means a
+    /// different symbol in two different modules' own tables). Whichever
+    /// `A::Module` handle a given `Host::run` call is made with is the only
+    /// table a trap during that call is ever resolved against -- for the
+    /// whole call, even if execution crosses into a *different* already-
+    /// loaded module's own code along the way (exactly the cross-module
+    /// linkage `071c5a0` added `Host::load`'s `loaded_modules` registry to
+    /// allow: a call resolved as `Import::Data` is a real far call straight
+    /// into the other module's own code, with no host involvement and no
+    /// hand-off of which `A::Module` names its thunk table).
+    ///
+    /// This is not a hypothetical. Booting `re/WCCMMUD.DLL` then
+    /// `WCCMMPLS.DLL` (MajorMUD Plus) on one `Wg16` machine -- both real
+    /// files, this driver's own per-module loop, `modules[1]`'s own handle
+    /// passed to *its own* `Host::run` call exactly as this loop is
+    /// written -- reached `WCCMMPLS.DLL: module ordinal 1 (init) stopped
+    /// before boot completed: .thunk #66 is not implemented`. The leading
+    /// `.` (an empty module name ahead of the symbol) is `Host::run`'s own
+    /// fallback for `A::import` answering `None`: Plus's own thunk table
+    /// index 66 came up empty. Plus's own `WCCMMUD.DLL` cross-module calls
+    /// (`register_mud_addon` among them) are exactly the kind of direct,
+    /// no-thunk far call described above, and `WCCMMUD.DLL` -- loaded and
+    /// initialised first in this same run, `188` distinct host symbols
+    /// measured -- has more than 66 of its own. The far likelier reading is
+    /// that Plus's init transitively called into `WCCMMUD.DLL`'s own code,
+    /// that code hit its *own* thunk 66, and this driver -- still holding
+    /// Plus's `A::Module` for the `Host::run` call it made -- resolved index
+    /// 66 against the wrong table and reported a symbol that may well
+    /// already be served. Confirming exactly which symbol thunk 66 names in
+    /// each module's own table was not done (out of scope for this driver,
+    /// and arguably `mbbs-machine`'s call to fix: thunk allocation would
+    /// need to be shared across every module loaded onto one machine, not
+    /// restarted at zero per `Host::load` call, for a trap's raw index to
+    /// mean one thing regardless of which module's code was executing when
+    /// it fired).
+    ///
+    /// This is a pre-existing fact about cross-module calls (true since
+    /// `071c5a0`, not introduced by N-module boot) that N-module-per-machine
+    /// boot is simply the first feature to actually exercise -- a single
+    /// module never crosses into another's code at all, and neither does two
+    /// modules on two *separate* machines (this repository's only other
+    /// multi-module configuration, `--module32`'s own `Wg32` machine, has its
+    /// own separate `Machine`/thunk table entirely). Not something this stage
+    /// claims to fix; recorded here, with the real run that found it, rather
+    /// than assumed away.
+    pub modules: Vec<PathBuf>,
     /// The fixed channel count. Sizes every per-channel table at `Host::new`.
     pub terms: Terms,
     /// The board's own Galacticomm registration number -- `bturno`,
@@ -399,25 +496,44 @@ fn report_notes<A: Abi>(host: &mut Host<A>) {
     }
 }
 
-/// Build a fresh machine, boot `boot.module` on it, and drive the steady
-/// state until the module stops or every connection is gone.
+/// Build a fresh machine, boot every module in `boot.modules` on it in the
+/// order given, and drive the steady state until the module stops or every
+/// connection is gone.
 ///
 /// # Errors
 ///
-/// If the machine cannot be built, the module cannot be loaded or relocated,
-/// ordinal 1 (the init routine) itself stops, or `finish_init` fails, this
-/// returns `Err` -- a broken deployment, which [`run`] does not retry (see
-/// the module doc). Once the steady state begins, only
-/// [`LifeEnd::Stopped`] is reported through the `Ok` path; any other error
-/// out of `apply`/`cycle`/`flush` (a host bug, not a module poisoning) still
-/// ends the whole supervisor -- restarting on an error this crate does not
-/// understand would hide it, not fix it.
+/// If the machine cannot be built, `boot.modules` is empty, any module
+/// cannot be loaded or relocated, any module's ordinal 1 (the init routine)
+/// itself stops, or `finish_init` fails, this returns `Err` -- a broken
+/// deployment, which [`run`] does not retry (see the module doc). Every one
+/// of those errors names the module's own path, the way [`LoadError::Globals`]
+/// names the symbol it refuses -- with `N` modules "the module failed to
+/// load" is not an answer an operator can act on. Once the steady state
+/// begins, only [`LifeEnd::Stopped`] is reported through the `Ok` path; any
+/// other error out of `apply`/`cycle`/`flush` (a host bug, not a module
+/// poisoning) still ends the whole supervisor -- restarting on an error this
+/// crate does not understand would hide it, not fix it.
+///
+/// [`LoadError::Globals`]: mbbs::LoadError::Globals
 fn life<A: Abi>(
     boot: &Boot<A>,
     rx: &std::sync::mpsc::Receiver<In>,
     deadline: &watch::Sender<Option<Duration>>,
     survey: Option<&mbbs::survey::Shared>,
 ) -> io::Result<LifeEnd<A>> {
+    if boot.modules.is_empty() {
+        // A caller bug, not an operator mistake -- the CLI layer (`main.rs`)
+        // always supplies at least one path (`--module`'s own default), so
+        // this can only be reached by a `Boot` built by hand. Refused here,
+        // loudly, rather than left to panic on `loaded[0]` below: "compile
+        // errors beat runtime crashes beat undefined behaviour", and a
+        // `Vec<PathBuf>` cannot enforce non-emptiness at the type level
+        // without a bespoke wrapper this one call site does not justify.
+        return Err(io::Error::other(
+            "Boot::modules is empty; at least one module is required to boot a machine",
+        ));
+    }
+
     // 1. Build the machine HERE, via `Boot::build`. It is !Send; it cannot
     //    be handed in.
     let mut machine = (boot.build)()?;
@@ -430,39 +546,80 @@ fn life<A: Abi>(
     if let Some(inventory) = survey {
         host.enable_survey(inventory.clone());
     }
-    // Before the module runs a single instruction: `bturno` is read during
-    // init by modules that gate on it, so a serial written after ordinal 1
-    // would be written too late to be seen. See `Boot::bturno`.
+    // Before any module runs a single instruction: `bturno` is read during
+    // init by modules that gate on it, so a serial written after the first
+    // module's ordinal 1 would be written too late to be seen. See
+    // `Boot::bturno`.
     if let Some(serial) = &boot.bturno {
         host.globals()
             .write_mem(A::mem(&mut machine), "bturno", serial.as_bytes())?;
     }
 
-    let file = std::fs::read(&boot.module)?;
-    let module = host.load(&mut machine, &file).map_err(io::Error::other)?;
-    let entry = A::init_entry(&module)
-        .ok_or_else(|| io::Error::other("module has no ordinal 1 (the init routine)"))?;
-    match host.run(&mut machine, &module, entry, &[], None)? {
-        Outcome::Returned { .. } => {}
-        // Ordinal 1 itself poisoning the machine is a boot failure, not a
-        // survivable stop: `Host::run` reports it as `Ok(Outcome::Stopped)`
-        // rather than an `Err`, so it has to be checked here rather than
-        // relying on `?` above to catch it. Continuing to `finish_init` on
-        // an already-poisoned machine would be running setup on a machine
-        // that will refuse every call, so this is caught before that.
-        Outcome::Stopped(poison) => {
-            return Err(io::Error::other(format!(
-                "module ordinal 1 (init) stopped before boot completed: {poison}"
-            )));
+    // 2. Load and initialise every module, in the order `boot.modules` gives
+    //    them -- one module fully loaded, entered at ordinal 1, and run to
+    //    completion before the next one's file is even read. See
+    //    `Boot::modules`'s own doc for why this order is the entire channel-
+    //    entry contract (load order -> registration order -> who
+    //    `Host::connect` dispatches into) and not merely a loop shape.
+    //
+    //    `loaded[0]` -- not the last, not "whichever registered" -- is what
+    //    every `apply`/`flush` call below hands to `Host::connect`/
+    //    `Host::hangup`/`Host::run` as "the module": see `Boot::modules`'s
+    //    doc, "A caveat this driver does not paper over", for exactly what
+    //    that does and does not promise.
+    let mut loaded: Vec<A::Module> = Vec::with_capacity(boot.modules.len());
+    for path in &boot.modules {
+        let file = std::fs::read(path)
+            .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?;
+        let module = host
+            .load(&mut machine, &file)
+            .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))?;
+        let entry = A::init_entry(&module).ok_or_else(|| {
+            io::Error::other(format!("{}: module has no ordinal 1 (the init routine)", path.display()))
+        })?;
+        match host.run(&mut machine, &module, entry, &[], None)? {
+            Outcome::Returned { .. } => {}
+            // Ordinal 1 itself poisoning the machine is a boot failure, not a
+            // survivable stop: `Host::run` reports it as `Ok(Outcome::Stopped)`
+            // rather than an `Err`, so it has to be checked here rather than
+            // relying on `?` above to catch it. Continuing to load the next
+            // module (or to `finish_init`) on an already-poisoned machine
+            // would run setup on a machine that will refuse every call, so
+            // this stops the whole boot before either happens.
+            Outcome::Stopped(poison) => {
+                return Err(io::Error::other(format!(
+                    "{}: module ordinal 1 (init) stopped before boot completed: {poison}",
+                    path.display()
+                )));
+            }
         }
+        loaded.push(module);
     }
+    // `alcvda`'s allocation, inside `finish_init`, sizes every channel's
+    // volatile data area off `vdasiz` -- and `vdasiz` is still accumulating
+    // as each module's own `dclvda` calls run during ITS init (see
+    // `Host::finish_init`'s own doc, `MAJORBBS.C:896`: `inimod()` over every
+    // module, `alcvda()` next, in that order). Calling this once, after the
+    // loop above rather than inside it, is not a convenience -- a machine
+    // with two modules that each call `dclvda` and got `finish_init` per
+    // module would size the volatile area off whichever module's own
+    // `dclvda` total happened to be visible at that module's own turn, never
+    // the sum every module actually needs.
     host.finish_init(&mut machine)?;
+    let module = loaded
+        .into_iter()
+        .next()
+        .expect("boot.modules was checked non-empty above, so the loop pushed at least one");
     // Boot has its own notes -- every `opnbtv` whose `maxlen` disagrees with
     // the file, every `setbtv` stack overflow during init -- and they are
     // reported here rather than waiting for the first driver turn, so a board
     // that boots and then sits idle still says what it noticed on the way up.
     report_notes(&mut host);
-    eprintln!("mbbs-server: module booted, serving {} channel(s)", boot.terms.count());
+    eprintln!(
+        "mbbs-server: {} module(s) booted, serving {} channel(s)",
+        boot.modules.len(),
+        boot.terms.count()
+    );
 
     let terms = boot.terms;
     let mut pool = Pool::new(boot.machine, terms);

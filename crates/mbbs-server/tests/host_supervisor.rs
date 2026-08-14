@@ -593,7 +593,7 @@ mod builder {
 }
 
 /// Writes `bytes` to a fresh file under `mbbs::testing::scratch(name)` and
-/// returns its path -- `Boot::module` wants a path, not bytes in memory.
+/// returns its path -- `Boot::modules` wants paths, not bytes in memory.
 fn module_file(name: &str, bytes: &[u8]) -> PathBuf {
     let dir = mbbs::testing::scratch(name);
     let path = dir.join("TESTMOD.DLL");
@@ -601,13 +601,25 @@ fn module_file(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
+/// One module, the shape every test in this file but the N-module ones
+/// below wants -- see [`boot_many`] for a `Boot` with more than one.
 fn boot(module: PathBuf, root_name: &str, terms: u16) -> Boot<Wg16> {
+    boot_many(vec![module], root_name, terms)
+}
+
+/// `Boot::modules` in the order given -- the N-module boot-ordering tests
+/// below (`a_second_module_faulting_on_ordinal_one_names_itself_not_the_first`
+/// and `a_first_module_faulting_on_ordinal_one_names_itself_and_the_second_is_never_reached`)
+/// are what this exists for; every other test in this file still goes
+/// through [`boot`], the one-module case.
+fn boot_many(modules: Vec<PathBuf>, root_name: &str, terms: u16) -> Boot<Wg16> {
     Boot {
         machine: MachineId(0),
         build: Box::new(mbbs_machine::m16::Machine::new),
         root: mbbs::testing::scratch(root_name),
-        module,
+        modules,
         terms: mbbs::Terms::new(terms),
+        bturno: None,
         polls_per_wake: 8,
         passes: 32,
         clock_reads: None,
@@ -763,6 +775,103 @@ async fn a_module_that_faults_during_boot_is_not_restarted() {
     assert!(
         text.contains("ordinal 1") || text.contains("init"),
         "the error should say boot failed at the init routine, not something else: {text:?}"
+    );
+}
+
+/// Two modules, in order: the first boots cleanly, the second faults on its
+/// own ordinal 1. The failure must name the *second* module's own path, not
+/// merely say "a module" -- see `Boot::modules`'s own doc on why an N-module
+/// boot failure has to be actionable. This also proves the boot is
+/// *sequential*: if `life` loaded every file before initialising any of
+/// them, or initialised them out of order, this would either fail on the
+/// wrong module or (loading `faults_on_ordinal_one` first) never reach the
+/// second file's read at all.
+///
+/// The companion test below swaps the two modules' positions and checks the
+/// named path flips with them -- the discriminating half, since a driver that
+/// always reported (say) "the last module given" would pass this test alone.
+#[tokio::test]
+async fn a_second_module_faulting_on_ordinal_one_names_itself_not_the_first() {
+    let first = module_file(
+        "mbbs-server-host-supervisor-n-module-first-clean",
+        &builder::boots_and_runs_forever(),
+    );
+    let second = module_file(
+        "mbbs-server-host-supervisor-n-module-second-faults",
+        &builder::faults_on_ordinal_one(),
+    );
+    let boot = boot_many(
+        vec![first.clone(), second.clone()],
+        "mbbs-server-host-supervisor-n-module-second-faults-root",
+        1,
+    );
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, no_bell())),
+    )
+    .await
+    .expect("boot failing must return promptly, not hang the host thread")
+    .expect("the host thread did not panic");
+
+    let err = result.expect_err("the second module's ordinal 1 fault must not boot successfully");
+    let text = err.to_string();
+    assert!(
+        text.contains(&second.display().to_string()),
+        "the error should name the module that actually faulted: {text:?}"
+    );
+    assert!(
+        !text.contains(&first.display().to_string()),
+        "the error must not blame the first module, which booted cleanly: {text:?}"
+    );
+    assert!(
+        text.contains("ordinal 1") || text.contains("init"),
+        "the error should say boot failed at the init routine, not something else: {text:?}"
+    );
+}
+
+/// The mirror of the test above: the *first* module faults on ordinal 1 and
+/// the second (which would otherwise boot cleanly) is never even reached --
+/// its own file is never read, because `life` loads and initialises one
+/// module fully before starting the next. The error names the first module,
+/// proving position in `Boot::modules`, not which builder function was used,
+/// is what determines which module's failure is reported.
+#[tokio::test]
+async fn a_first_module_faulting_on_ordinal_one_names_itself_and_the_second_is_never_reached() {
+    let first = module_file(
+        "mbbs-server-host-supervisor-n-module-first-faults",
+        &builder::faults_on_ordinal_one(),
+    );
+    let second = module_file(
+        "mbbs-server-host-supervisor-n-module-second-clean",
+        &builder::boots_and_runs_forever(),
+    );
+    let boot = boot_many(
+        vec![first.clone(), second.clone()],
+        "mbbs-server-host-supervisor-n-module-first-faults-root",
+        1,
+    );
+
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || mbbs_server::host::run(boot, rx, no_bell())),
+    )
+    .await
+    .expect("boot failing must return promptly, not hang the host thread")
+    .expect("the host thread did not panic");
+
+    let err = result.expect_err("the first module's ordinal 1 fault must not boot successfully");
+    let text = err.to_string();
+    assert!(
+        text.contains(&first.display().to_string()),
+        "the error should name the module that actually faulted: {text:?}"
+    );
+    assert!(
+        !text.contains(&second.display().to_string()),
+        "the second module's own file is never read once the first one's init stops the \
+         machine, so its path must not appear in the error: {text:?}"
     );
 }
 

@@ -96,15 +96,23 @@ const DEFAULT_PASSES: usize = 1024;
 // it, and a panic is a worse answer than a message and a non-zero exit, so
 // `parse_terms` range-checks before `main` ever calls `Terms::new`.
 #[derive(Parser, Debug)]
-#[command(name = "mbbs-server", about = "a tokio edge in front of one WCCMMUD.DLL host")]
+#[command(name = "mbbs-server", about = "a tokio edge in front of one or more MajorBBS-family modules")]
 struct Cli {
     /// The board directory (holds the module's own data files)
     #[arg(long)]
     root: PathBuf,
 
-    /// The module to load
+    /// The module to load onto the `Wg16` machine. Repeatable: give it more
+    /// than once to boot more than one module, in dependency order --
+    /// `mbbs_server::host::Boot`'s own doc, "Booting N modules", is the full
+    /// contract. The first one given is the one every connecting channel
+    /// enters (`Host::connect`'s `first_module()`); anything after it is an
+    /// addon, loaded and initialised so its own exports are reachable and its
+    /// own imports can resolve against the module before it, but never
+    /// dispatched a channel directly. One `--module` with no others, the
+    /// default, is exactly this binary's original single-module behaviour.
     #[arg(long, default_value = DEFAULT_MODULE)]
-    module: PathBuf,
+    module: Vec<PathBuf>,
 
     /// Address to bind for a modern client: CP437 transcoded to UTF-8, and
     /// the ANSI.SYS divergences patched. Repeatable, to listen on more than
@@ -148,7 +156,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     survey_unimplemented_and_corrupt_the_session: Option<PathBuf>,
 
-    /// A second, 32-bit module to boot alongside the primary `Wg16` one
+    /// A second, 32-bit machine to boot alongside the primary `Wg16` one
     /// (LunatiX, design doc §4a). When given, a connect-time selector
     /// appears -- see `mbbs_server::conn`'s module doc, "The connect-time
     /// selector" -- naming this machine `LunatiX` and the always-present one
@@ -156,8 +164,21 @@ struct Cli {
     /// this flag existed: no prompt, one machine. Requires `--root32`, since
     /// this machine's own data files must not share a directory with the
     /// primary machine's.
+    ///
+    /// Repeatable in the same shape `--module` is, for CLI uniformity --
+    /// `mbbs::Host<Wg32>` has no architectural objection to more than one
+    /// registered module. **`main` refuses more than one value here today**,
+    /// with a named error, rather than accepting it and silently corrupting
+    /// the machine: `Wg32::load` reaches
+    /// [`mbbs_machine::m32::Memory::replace_image`], which -- true to its
+    /// name -- replaces the *whole* placeholder image wholesale on every
+    /// call, so a second `host.load` for a second `Wg32` module would discard
+    /// the first module's own loaded image, not add to it. No second Wg32
+    /// module (LunatiX has no known addon) exists to prove multi-module Wg32
+    /// boot against, and extending `Memory::replace_image` to append rather
+    /// than replace is `mbbs-machine`'s call to make, not this binary's.
     #[arg(long, requires = "root32", value_name = "PATH")]
-    module32: Option<PathBuf>,
+    module32: Vec<PathBuf>,
 
     /// The 32-bit module's own board directory -- only meaningful together
     /// with `--module32`. Deliberately has no default and is not allowed to
@@ -249,14 +270,37 @@ fn listeners(cli: &Cli) -> Vec<Listener<'_>> {
         .collect()
 }
 
+/// `--module32` given more than once is refused, not silently truncated to
+/// its first value or accepted and left to corrupt the machine at boot --
+/// see `--module32`'s own doc comment for why the underlying loader cannot
+/// honour a second one. `Ok(())` for zero or one value.
+///
+/// A free function for the same reason [`listeners`] is: `main` is
+/// unreachable from a test, so the one thing worth unit-testing about this
+/// check -- that it names the count and fires only past one -- lives here
+/// instead.
+fn check_module32_count(cli: &Cli) -> Result<(), String> {
+    if cli.module32.len() > 1 {
+        return Err(format!(
+            "--module32 was given {} times, but the Wg32 loader can only host one module today \
+             (Memory::replace_image replaces the whole image on every load, so a second one \
+             would silently discard the first) -- see --module32's own doc comment",
+            cli.module32.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Build [`Boot::build`]'s closure for a `Wg32` machine: read `module_path`'s
 /// bytes, parse them as a PE, and build a placeholder [`Wg32Cpu`] -- a
 /// [`mbbs_machine::m32::Machine`] plus a [`mbbs_machine::m32::Memory`]
 /// wrapping this same file's own [`mbbs_machine::m32::Image`], exactly the
 /// shape `crates/mbbs/tests/wg32_round_trip.rs`'s `machine_and_placeholder`
 /// builds from a synthetic fixture -- this one is real. `host::life` (in
-/// `mbbs-server/src/host.rs`) reads `boot.module` (the same path) again
-/// immediately after this runs and calls `host.load`, whose `Wg32::load`
+/// `mbbs-server/src/host.rs`) reads `boot.modules[0]` (the same path, and
+/// today the *only* path -- see `--module32`'s own doc comment on why this
+/// binary refuses more than one) again immediately after this runs and calls
+/// `host.load`, whose `Wg32::load`
 /// replaces this placeholder image wholesale via
 /// [`mbbs_machine::m32::Memory::replace_image`] while leaving the arena this
 /// closure reserved untouched -- see that method's own doc comment, and
@@ -329,7 +373,7 @@ async fn main() -> ExitCode {
         machine: MachineId(0),
         build: Box::new(mbbs_machine::m16::Machine::new),
         root: cli.root.clone(),
-        module: cli.module.clone(),
+        modules: cli.module.clone(),
         terms,
         bturno: cli.bturno.clone(),
         polls_per_wake: cli.polls_per_wake,
@@ -347,12 +391,21 @@ async fn main() -> ExitCode {
         tx: conn::spawn_machine(boot),
     }];
 
-    if let (Some(module32), Some(root32)) = (cli.module32.clone(), cli.root32.clone()) {
+    // `--module32` is repeatable for surface uniformity with `--module` (see
+    // its own doc comment), but `Wg32::load`'s wholesale `replace_image`
+    // cannot host a second module without discarding the first -- so more
+    // than one value here is refused, loudly, before anything is built.
+    if let Err(msg) = check_module32_count(&cli) {
+        eprintln!("mbbs-server: {msg}");
+        return ExitCode::FAILURE;
+    }
+
+    if let (Some(module32), Some(root32)) = (cli.module32.first().cloned(), cli.root32.clone()) {
         let boot32: Boot<Wg32> = Boot {
             machine: MachineId(1),
             build: Box::new(build_wg32_cpu(module32.clone())),
             root: root32,
-            module: module32,
+            modules: vec![module32],
             terms,
             bturno: cli.bturno32.clone().or_else(|| cli.bturno.clone()),
             polls_per_wake: cli.polls_per_wake,
@@ -392,7 +445,7 @@ async fn main() -> ExitCode {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, listeners};
+    use super::{Cli, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, check_module32_count, listeners};
 
     fn args<'a>(v: &[&'a str]) -> Vec<&'a str> {
         let mut a = vec!["mbbs-server"];
@@ -450,7 +503,7 @@ mod tests {
     fn defaults_are_applied_when_only_root_is_given() {
         let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
         assert_eq!(cli.root, std::path::PathBuf::from("tmp"));
-        assert_eq!(cli.module, std::path::PathBuf::from("re/WCCMMUD.DLL"));
+        assert_eq!(cli.module, vec![std::path::PathBuf::from("re/WCCMMUD.DLL")]);
         assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
         assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
@@ -551,7 +604,7 @@ mod tests {
     #[test]
     fn module32_and_root32_parse_together_and_default_to_absent() {
         let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
-        assert!(cli.module32.is_none());
+        assert!(cli.module32.is_empty());
         assert!(cli.root32.is_none());
 
         let cli = Cli::try_parse_from(args(&[
@@ -563,8 +616,94 @@ mod tests {
             "tmp32",
         ]))
         .expect("parses");
-        assert_eq!(cli.module32, Some(std::path::PathBuf::from("LUNATIX.EXE")));
+        assert_eq!(cli.module32, vec![std::path::PathBuf::from("LUNATIX.EXE")]);
         assert_eq!(cli.root32, Some(std::path::PathBuf::from("tmp32")));
+    }
+
+    /// `--module` is repeatable, and in the order given -- load order is the
+    /// whole channel-entry contract (`mbbs_server::host::Boot::modules`'s own
+    /// doc), so the parse must preserve it rather than merely collecting the
+    /// values.
+    #[test]
+    fn module_is_repeatable_and_keeps_order() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module",
+            "re/WCCMMUD.DLL",
+            "--module",
+            "WCCMMPLS.DLL",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.module,
+            vec![
+                std::path::PathBuf::from("re/WCCMMUD.DLL"),
+                std::path::PathBuf::from("WCCMMPLS.DLL"),
+            ]
+        );
+    }
+
+    /// `--module32` is repeatable too, in the same shape as `--module` --
+    /// this is what `check_module32_count`'s own tests, below, have
+    /// something to refuse.
+    #[test]
+    fn module32_is_repeatable_at_the_parse_layer() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+            "--module32",
+            "SECOND.DLL",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            cli.module32,
+            vec![std::path::PathBuf::from("LUNATIX.EXE"), std::path::PathBuf::from("SECOND.DLL")]
+        );
+    }
+
+    /// Zero or one `--module32` value is fine -- `check_module32_count` must
+    /// not fire on the ordinary cases.
+    #[test]
+    fn check_module32_count_accepts_zero_or_one() {
+        let none = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
+        assert_eq!(check_module32_count(&none), Ok(()));
+
+        let one = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        assert_eq!(check_module32_count(&one), Ok(()));
+    }
+
+    /// Two or more `--module32` values are refused, with the count in the
+    /// message -- `Wg32::load`'s `replace_image` would otherwise silently
+    /// discard every module but the last.
+    #[test]
+    fn check_module32_count_refuses_more_than_one() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+            "--module32",
+            "SECOND.DLL",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        let err = check_module32_count(&cli).expect_err("two values must be refused");
+        assert!(err.contains("--module32"), "error should name the flag: {err}");
+        assert!(err.contains('2'), "error should say how many were given: {err}");
     }
 
     /// A flag this binary does not know about is refused, not ignored.
