@@ -393,3 +393,154 @@ fn the_same_arg_list_encodes_to_a_different_byte_length_under_each_abi() {
     assert_eq!(&frame16[2..4], &(B as u16).to_le_bytes(), "Wg16: B's bytes at offset 2");
     assert_eq!(&frame32[4..8], &B.to_le_bytes(), "Wg32: B's bytes at offset 4");
 }
+
+/// A live `mbbs-server` bug, reproduced twice against a real board: booting
+/// `LUNATIX.DLL` faulted --
+/// `module faulted with signal 11 at 0x413de00d` (and, a second run under a
+/// different ASLR base, `0x40c9100d`) -- both thirteen bytes into whatever
+/// `Wg32::init_entry` handed the host, and both offsets page-aligned once
+/// the loaded base is subtracted (`0x413de00d - 0x100d == 0x413dd000`).
+/// `0x100d` is `AddressOfEntryPoint + 0xd`: the host was entering the PE's
+/// raw entry point -- a Borland C runtime startup stub for a DLL that is
+/// never meant to run through `DllMain` -- instead of the module's real
+/// init routine.
+///
+/// Every in-process test before this one resolved init by name
+/// (`pe.export_rva("_init__lunatix")`, see `tests/lunatix.rs`) and called
+/// `Host::run` directly, never `Abi::init_entry`. That is a *different*
+/// code path from what `mbbs-server` actually calls -- `crates/mbbs-server`
+/// `Wg32 as Abi>::init_entry` -- so the whole suite stayed green while
+/// production's own boot sequence was broken. This test is the one that
+/// goes through `Abi::init_entry` itself, against a real, unmodified
+/// `LUNATIX.DLL`.
+///
+/// `_init__lunatix` is exported ordinal 1 at RVA `0x115c` -- measured
+/// directly from the file's export directory (`Base = 1`, so ordinal 1 is
+/// function index 0), independently confirmed by `objdump -p` (see
+/// `tests/lunatix.rs`'s own doc comment on `the_init_entry_surveys`).
+/// `AddressOfEntryPoint` is RVA `0x1000`, the address `Wg32::init_entry`
+/// answered before this fix.
+mod boot_bug {
+    use super::*;
+
+    /// The repository root, from this crate's own manifest directory.
+    /// Duplicated from `tests/lunatix_offsets.rs` rather than shared --
+    /// integration test binaries do not share code with each other.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("the crate's own manifest directory resolves")
+    }
+
+    /// LunatiX 5.3F, as recovered -- byte-for-byte the same fixture
+    /// `tests/lunatix.rs` and `tests/lunatix_offsets.rs` read. `None` (and
+    /// every test below skips) when this tree does not have it, exactly
+    /// like every other real-module test in this crate.
+    fn lunatix_bytes() -> Option<Vec<u8>> {
+        let path = repo_root().join("archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL");
+        if !path.exists() {
+            eprintln!("skipping: {} is not in this tree", path.display());
+            return None;
+        }
+        Some(std::fs::read(&path).expect("LUNATIX.DLL reads"))
+    }
+
+    /// Answers `None` for every import -- `Image::bind_imports` still gives
+    /// each one a thunk (see its own doc comment: "an unresolved symbol is
+    /// given an index rather than skipped"), so `Wg32::load` succeeds
+    /// without needing a single shim wired up. This test is about *which
+    /// address* the host enters, not about running the module to
+    /// completion -- `tests/lunatix.rs` already owns that (full `Host<Wg32>`
+    /// with the real shim table).
+    fn no_host(
+        _library: &str,
+        _symbol: &mbbs_machine::module::Symbol,
+    ) -> Option<mbbs_machine::module::Import<mbbs_machine::m32::Flat32Ptr>> {
+        None
+    }
+
+    /// The proof this bug fix exists for: `<Wg32 as Abi>::init_entry`, the
+    /// exact method `crates/mbbs-server`'s host thread calls, must resolve
+    /// to `_init__lunatix` (ordinal 1) and not to `Module::entry()` (the PE
+    /// entry stub) -- through `Wg32::load`, the same loader the server
+    /// uses, not a hand-built `Module`.
+    ///
+    /// # Mutation check
+    ///
+    /// Reverting `Wg32::init_entry` to
+    /// `Some(mbbs_machine::m32::Flat32Ptr(module.entry()))` makes this fail
+    /// with `left: 0x1000, right: 0x115c` -- verbatim in the task report.
+    #[test]
+    fn init_entry_resolves_ordinal_1_not_the_pe_entry_stub() {
+        let Some(file) = lunatix_bytes() else { return };
+        let mut cpu = cpu();
+
+        let module = Wg32::load(&mut cpu, &file, &no_host)
+            .expect("LunatiX's own imports all bind -- unresolved ones just get a thunk");
+
+        let base = cpu.mem.image().base();
+        let got = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
+
+        assert_eq!(
+            got.0.wrapping_sub(base),
+            0x115c,
+            "init_entry must answer _init__lunatix's RVA (ordinal 1), not \
+             AddressOfEntryPoint's 0x1000"
+        );
+        assert_ne!(
+            got.0,
+            module.entry(),
+            "the bug itself: init_entry must not answer the same address as \
+             Module::entry() (the Borland startup stub) -- entering that \
+             stub is exactly what faulted mbbs-server"
+        );
+    }
+
+    /// The same bug, reproduced and then shown fixed by actually entering
+    /// silicon -- not just comparing addresses. Calling through the raw PE
+    /// entry point on this real module faults (reproducing the server's
+    /// `signal 11`); calling through `init_entry` after the fix does not.
+    ///
+    /// `Wg32::call` recovers a fault into `Exit::Stopped` rather than
+    /// taking the test process down with it (`crates/mbbs-machine/src/m32/fault.rs`),
+    /// so this can assert on the *shape* of what happened without a
+    /// subprocess.
+    #[test]
+    fn entering_the_pe_entry_stub_faults_but_the_real_init_routine_does_not() {
+        let Some(file) = lunatix_bytes() else { return };
+
+        // The bug, reproduced: entering `Module::entry()` -- what
+        // `Wg32::init_entry` answered before this fix -- on the real,
+        // unmodified module.
+        let mut stub_cpu = cpu();
+        let module = Wg32::load(&mut stub_cpu, &file, &no_host).expect("LunatiX loads");
+        let stub = mbbs_machine::m32::Flat32Ptr(module.entry());
+        let exit = Wg32::call(&mut stub_cpu, stub, &[]).expect("a fault is recovered, not fatal");
+        assert!(
+            matches!(exit, Exit::Stopped),
+            "expected the PE entry stub to fault (reproducing mbbs-server's \
+             signal 11), got {exit:?}"
+        );
+        assert!(
+            matches!(
+                Wg32::poisoned(&stub_cpu),
+                Some(mbbs_machine::m32::Poison::Fault { .. })
+            ),
+            "expected Poison::Fault entering the Borland startup stub, got {:?}",
+            Wg32::poisoned(&stub_cpu)
+        );
+
+        // The fix: a fresh machine, entering `init_entry`'s answer instead.
+        let mut init_cpu = cpu();
+        let module = Wg32::load(&mut init_cpu, &file, &no_host).expect("LunatiX loads");
+        let entry = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
+        let exit = Wg32::call(&mut init_cpu, entry, &[]).expect("must not error building the call");
+        assert!(
+            !matches!(exit, Exit::Stopped),
+            "the real init routine must not fault the way the entry stub \
+             did -- got {exit:?}, poison {:?}",
+            Wg32::poisoned(&init_cpu)
+        );
+    }
+}

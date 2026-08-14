@@ -438,6 +438,23 @@ pub struct PeImage {
     /// indistinguishable from the symbol not existing at all. See the crate
     /// doc's "Two things this is not" for the scope decision.
     pub exports: Vec<Export>,
+    /// Every function slot in `AddressOfFunctions`, 0-based -- unlike
+    /// `exports`, this includes ordinal-only slots that have no name at all
+    /// (see `m32::mod`'s module doc comment: `WGSERVER.EXE` has 222 such
+    /// exports out of 1615 functions, `GALGSBL.DLL` 20 out of 109). Built
+    /// once, directly from the raw address table, forwarder-detecting every
+    /// slot the same way the named loop below does -- so a forwarder is
+    /// represented identically whether or not a name ever pointed at it.
+    ///
+    /// This is a 0-based array index, exactly what `AddressOfNameOrdinals`
+    /// entries already are and exactly what `export_base`'s own doc comment
+    /// warns must never have `Base` subtracted from it a second time. A
+    /// caller-supplied *public* ordinal (what `GetProcAddress`, and
+    /// `export_rva_by_ordinal`, take) is `Base` higher than the index that
+    /// finds it here -- see `export_rva_by_ordinal`.
+    ///
+    /// Empty when the image has no export directory.
+    pub export_table: Vec<ExportAddress>,
     /// The export directory's `Base` field (`+16`): the value that would be
     /// added to a function's index in `AddressOfFunctions` to produce its
     /// public exported ordinal number.
@@ -448,9 +465,15 @@ pub struct PeImage {
     /// plain 0-based array index, not a `Base`-relative ordinal. Subtracting
     /// `Base` from it -- a classic mistake, since ordinals handed to
     /// `GetProcAddress` *are* `Base`-relative -- indexes the wrong function
-    /// whenever `Base != 0`. This field is kept anyway, for whatever later
-    /// needs a module's true exported ordinal numbers. `None` when the image
-    /// has no export directory.
+    /// whenever `Base != 0`. `None` when the image has no export directory.
+    ///
+    /// `export_rva_by_ordinal` is the later need this field was kept for: a
+    /// *public* ordinal (Galacticomm's "ordinal 1" init-routine convention,
+    /// carried from the 16-bit side -- see `crate::m16::ne::Module::entry`)
+    /// genuinely is `Base`-relative, so that method subtracts `Base` from
+    /// its argument before indexing `export_table` -- the opposite
+    /// correction from the one this doc comment warns `export_rva` must not
+    /// make, because the value being adjusted is a different kind of number.
     pub export_base: Option<u32>,
 }
 
@@ -928,6 +951,7 @@ impl PeImage {
         let export_dir_rva = r.u32("export directory rva", dirs + DIR_EXPORT * 8)?;
         let export_dir_size = r.u32("export directory size", dirs + DIR_EXPORT * 8 + 4)?;
         let mut exports = Vec::new();
+        let mut export_table = Vec::new();
         let mut export_base = None;
         if export_dir_rva != 0 && export_dir_size != 0 {
             let field = |offset: u32, what: &'static str| -> Result<u32, PeError> {
@@ -966,29 +990,13 @@ impl PeImage {
                 })?;
             }
 
-            let mut names_cursor = addr_of_names;
-            let mut ordinals_cursor = addr_of_name_ordinals;
-            for _ in 0..number_of_names {
-                let name_rva =
-                    u32_at_rva(&sections, &r, "export name pointer table entry", names_cursor)?;
-                let name = read_cstr_at_rva(&sections, &r, "export name", name_rva)?;
-                let ordinal =
-                    u16_at_rva(&sections, &r, "export name ordinal table entry", ordinals_cursor)?;
-
-                // `ordinal` is a plain 0-based index into `functions` -- see
-                // `PeImage::export_base` for why it is never combined with
-                // `Base`. It was read from a perfectly valid location, so an
-                // out-of-range value here is a data inconsistency between
-                // two arrays this loader has already finished reading, not
-                // a truncated read.
-                let func_rva = *functions.get(usize::from(ordinal)).ok_or(
-                    PeError::ExportOrdinalOutOfRange {
-                        name: name.clone(),
-                        ordinal,
-                        functions: number_of_functions,
-                    },
-                )?;
-
+            // The ordinal-indexed table: every slot in `functions`,
+            // forwarder-detected once here rather than per name below, so
+            // an ordinal-only export (no entry in the name loop at all)
+            // gets exactly the same treatment as a named one. `exports`
+            // still only grows for named entries -- this is a second,
+            // complete view of the same data, not a replacement for it.
+            for &func_rva in &functions {
                 let address = if func_rva >= export_dir_rva && func_rva < dir_end {
                     ExportAddress::Forwarded(read_cstr_at_rva(
                         &sections,
@@ -999,6 +1007,31 @@ impl PeImage {
                 } else {
                     ExportAddress::Rva(func_rva)
                 };
+                export_table.push(address);
+            }
+
+            let mut names_cursor = addr_of_names;
+            let mut ordinals_cursor = addr_of_name_ordinals;
+            for _ in 0..number_of_names {
+                let name_rva =
+                    u32_at_rva(&sections, &r, "export name pointer table entry", names_cursor)?;
+                let name = read_cstr_at_rva(&sections, &r, "export name", name_rva)?;
+                let ordinal =
+                    u16_at_rva(&sections, &r, "export name ordinal table entry", ordinals_cursor)?;
+
+                // `ordinal` is a plain 0-based index into `export_table` --
+                // see `PeImage::export_base` for why it is never combined
+                // with `Base` here. It was read from a perfectly valid
+                // location, so an out-of-range value here is a data
+                // inconsistency between two arrays this loader has already
+                // finished reading, not a truncated read.
+                let address = export_table.get(usize::from(ordinal)).cloned().ok_or(
+                    PeError::ExportOrdinalOutOfRange {
+                        name: name.clone(),
+                        ordinal,
+                        functions: number_of_functions,
+                    },
+                )?;
 
                 exports.push(Export { name, address });
 
@@ -1024,6 +1057,7 @@ impl PeImage {
             relocations,
             imports,
             exports,
+            export_table,
             export_base,
         })
     }
@@ -1074,6 +1108,40 @@ impl PeImage {
                 ExportAddress::Forwarded(_) => None,
             }
         })
+    }
+
+    /// The RVA of the function at *public* exported ordinal `ordinal`, by
+    /// direct indexing into `export_table` -- O(1), unlike `export_rva`'s
+    /// linear search by name.
+    ///
+    /// Unlike `export_rva`, this correctly serves an ordinal-only export
+    /// (no entry in the name pointer table at all -- see `export_table`'s
+    /// own doc comment for why those are not silently absent here the way
+    /// they are from `exports`). This is exactly the case a caller like
+    /// `Wg32::init_entry` needs: Galacticomm's own "ordinal 1" init-routine
+    /// convention (`crate::m16::ne::Module::entry`'s doc comment) says
+    /// nothing about the export having a name at all, only about its
+    /// public ordinal.
+    ///
+    /// `Base` is subtracted here, deliberately the opposite of what
+    /// `export_base`'s own doc comment warns `export_rva`'s internal lookup
+    /// must never do: `ordinal` is a caller-supplied *public* ordinal (what
+    /// `GetProcAddress` takes), and `export_table` is indexed 0-based, so
+    /// the adjustment belongs here, not there. See `export_base`'s doc
+    /// comment for the full contrast.
+    ///
+    /// `None` if the image has no export directory, if `ordinal < Base`, if
+    /// the `Base`-adjusted index is past the end of `export_table`, or if
+    /// the export at that ordinal is a forwarder rather than code --
+    /// mirroring `export_rva`'s own `None` cases.
+    #[must_use]
+    pub fn export_rva_by_ordinal(&self, ordinal: u16) -> Option<u32> {
+        let base = self.export_base?;
+        let index = u32::from(ordinal).checked_sub(base)?;
+        match self.export_table.get(index as usize)? {
+            ExportAddress::Rva(rva) => Some(*rva),
+            ExportAddress::Forwarded(_) => None,
+        }
     }
 }
 

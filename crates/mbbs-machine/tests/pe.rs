@@ -1240,6 +1240,30 @@ fn exports_resolve_through_the_name_ordinal_indirection_not_position_or_base() {
     assert_eq!(image.export_rva("Beta"), Some(0x2000));
     assert_eq!(image.export_rva("Gamma"), Some(0x2020));
     assert_eq!(image.export_rva("Missing"), None);
+
+    // `export_rva_by_ordinal` reaches every function slot, not just the
+    // three with names -- the property `export_rva` cannot prove at all,
+    // since function index 1 (0x2010) has no name for it to look up.
+    // Public ordinal = Base(5) + 0-based function index.
+    assert_eq!(
+        image.export_rva_by_ordinal(6),
+        Some(0x2010),
+        "ordinal 6 (Base 5 + index 1) is the ordinal-only export -- no name \
+         ever pointed at it, so only ordinal lookup can find it"
+    );
+    assert_eq!(image.export_rva_by_ordinal(5), Some(0x2000), "Base + index 0 == Beta's function");
+    assert_eq!(image.export_rva_by_ordinal(7), Some(0x2020), "Base + index 2 == Gamma's function");
+    assert_eq!(image.export_rva_by_ordinal(8), Some(0x2030), "Base + index 3 == Alpha's function");
+    assert_eq!(
+        image.export_rva_by_ordinal(4),
+        None,
+        "ordinal 4 is below Base(5) -- checked_sub must refuse it, not wrap"
+    );
+    assert_eq!(
+        image.export_rva_by_ordinal(9),
+        None,
+        "Base + index 4 is past NumberOfFunctions(4) -- out of range"
+    );
 }
 
 #[test]
@@ -1289,6 +1313,11 @@ fn a_forwarder_is_not_mistaken_for_an_address() {
         image.export_rva("Exported"),
         None,
         "a forwarder has no function rva to hand back"
+    );
+    assert_eq!(
+        image.export_rva_by_ordinal(1), // Base(1) + index 0
+        None,
+        "export_rva_by_ordinal must refuse a forwarder exactly like export_rva does"
     );
 }
 

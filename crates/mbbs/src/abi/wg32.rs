@@ -410,13 +410,23 @@ impl Abi for Wg32 {
 
         let entry = image.base().wrapping_add(pe.entry_point);
 
+        // The module's real init routine, NOT `entry` above -- see
+        // `mbbs_machine::m32::Module::entry`'s doc comment for why the two
+        // differ (a Borland startup stub vs. `_init__lunatix`) and the
+        // production fault this line exists to prevent. Ordinal 1 is
+        // Galacticomm's own convention, carried forward unchanged from the
+        // 16-bit side (`Wg16::init_entry`, `abi/wg16.rs`) -- `LUNATIX.MDF`
+        // names the DLL but never the routine, so the ordinal is all there
+        // is to go on.
+        let init = pe.export_rva_by_ordinal(1).map(|rva| image.base().wrapping_add(rva));
+
         // Every step above succeeded -- commit. `replace_image` swaps in
         // `image` without touching `cpu.mem`'s arena -- see this method's
         // own doc comment ("Only the image is replaced -- the arena is
         // not.").
         cpu.mem.replace_image(image);
 
-        Ok(mbbs_machine::m32::Module::new(entry, thunks))
+        Ok(mbbs_machine::m32::Module::new(entry, init, thunks))
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Module::import` (this task).
@@ -436,12 +446,20 @@ impl Abi for Wg32 {
         None
     }
 
-    /// Always `Some` -- `mbbs_machine::m32::Module::entry` is a bare `u32`
-    /// set unconditionally by [`Wg32::load`](Abi::load), never an
-    /// `Option`. See [`Abi::init_entry`]'s own doc comment for why that is
-    /// not the same claim as "every PE has a meaningful entry point".
+    /// `mbbs_machine::m32::Module::init` -- exported ordinal 1, not
+    /// `Module::entry()` (the PE's `AddressOfEntryPoint`, a Borland startup
+    /// stub for a real Worldgroup DLL). Conflating the two was a real,
+    /// measured bug: `mbbs-server` faulted with SIGSEGV 13 bytes into the
+    /// stub trying to boot `LUNATIX.DLL`, because the entry point is not
+    /// where `register_module` is called from. See `Module::entry`'s own
+    /// doc comment and `Wg32::load`'s `init` local for the fix.
+    ///
+    /// `None` exactly when `Module::init` is -- the image had no export
+    /// directory, or no export at ordinal 1. `Wg16::init_entry` has the
+    /// identical `None` case for an NE segment lacking ordinal 1
+    /// (`abi/wg16.rs`); this is the same convention, PE-side.
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
-        Some(mbbs_machine::m32::Flat32Ptr(module.entry()))
+        module.init().map(mbbs_machine::m32::Flat32Ptr)
     }
 }
 

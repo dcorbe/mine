@@ -259,17 +259,48 @@ impl Ret {
 #[derive(Debug, Clone)]
 pub struct Module {
     entry: u32,
+    init: Option<u32>,
     imports: Vec<crate::module::ImportSite>,
 }
 
 impl Module {
-    pub fn new(entry: u32, imports: Vec<crate::module::ImportSite>) -> Self {
-        Self { entry, imports }
+    pub fn new(entry: u32, init: Option<u32>, imports: Vec<crate::module::ImportSite>) -> Self {
+        Self { entry, init, imports }
     }
 
-    /// The linear address `DllMain`/the module's own entry point sits at.
+    /// The linear address `DllMain`/the module's own entry point sits at --
+    /// `AddressOfEntryPoint`, the address the OS loader would jump to.
+    ///
+    /// **This is not where a Worldgroup module's own init routine lives.**
+    /// For a Borland-linked PE, `AddressOfEntryPoint` is the C runtime
+    /// startup stub, not `DllMain` and certainly not `register_module`'s
+    /// caller -- see [`Module::init`], which is the address a host actually
+    /// wants. Measured against `LUNATIX.DLL`: `entry()` answers RVA
+    /// `0x1000` (the Borland stub), `init()` answers RVA `0x115c`
+    /// (`_init__lunatix`, exported ordinal 1). Entering `entry()` directly
+    /// is exactly the bug this doc comment exists to keep from happening
+    /// again -- `mbbs-server`'s host thread took SIGSEGV 13 bytes into the
+    /// stub, at `entry() + 0xd`, before `Module::init` existed to answer
+    /// the question correctly.
     pub fn entry(&self) -> u32 {
         self.entry
+    }
+
+    /// The linear address of the module's own init routine -- exported
+    /// ordinal 1, Galacticomm's convention carried forward from the 16-bit
+    /// side (`crate::m16::ne::Module::entry`'s own doc comment: "ordinal 1"
+    /// is `MAJORBBS.C`'s `init_module`/`register_module` convention). This,
+    /// not [`Module::entry`], is what a host must call to reach
+    /// `register_module`.
+    ///
+    /// `None` if the image has no export directory, or no export at
+    /// ordinal 1 -- mirrors `crate::m16::ne::Module::entry`'s own `None`
+    /// case for an NE segment lacking that ordinal. Set at load time by
+    /// `crate::abi::wg32::Wg32::load` (a different crate; not doc-linked
+    /// from here for the same reason `Module`'s own module doc comment
+    /// gives) from `PeImage::export_rva_by_ordinal(1)`.
+    pub fn init(&self) -> Option<u32> {
+        self.init
     }
 
     /// What thunk `index` stands for, as [`Exit::Call`] reports it. Mirrors

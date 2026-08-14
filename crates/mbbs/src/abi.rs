@@ -533,25 +533,27 @@ pub trait Abi {
     /// carries enough to answer it (design §3).
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
 
-    /// Where the module's init routine sits -- "ordinal 1" for `Wg16`, the
-    /// PE's sole entry point for `Wg32` (a PE has no ordinal table of its
-    /// own the way an NE segment's export table does; there is exactly one
-    /// entry, and it is the vendor's `ordinal 1` for every purpose a caller
-    /// of this method has). Added for `crates/mbbs-server/src/host.rs`'s
-    /// `life`, generic since Task 20 of
-    /// `docs/plans/2026-08-12-abi-border-implementation.md`: it used to
+    /// Where the module's init routine sits -- "ordinal 1" in both ABIs.
+    /// `Wg16` reads it from an NE segment's own export/ordinal table.
+    /// `Wg32` reads it from the PE export table's ordinal 1, which is
+    /// **not** `AddressOfEntryPoint`: for a Borland-linked DLL like
+    /// `LUNATIX.DLL`, the PE entry point is a C-runtime startup stub (RVA
+    /// `0x1000`), while ordinal 1 is `_init__lunatix` (RVA `0x115c`), the
+    /// routine that actually calls `register_module`. Conflating the two
+    /// was a real, measured bug -- `mbbs-server` faulted taking the entry
+    /// point as the init routine -- fixed in `abi/wg32.rs`'s `Wg32::load`
+    /// (`PeImage::export_rva_by_ordinal(1)`) and `Wg32::init_entry`. Added
+    /// for `crates/mbbs-server/src/host.rs`'s `life`, generic since Task 20
+    /// of `docs/plans/2026-08-12-abi-border-implementation.md`: it used to
     /// call `mbbs_machine::m16::Module::entry(1)` directly, which has no
     /// `Wg32` analogue by that name or that signature.
     ///
-    /// `None` if this ABI's module has no such entry. Only `Wg16` can
-    /// answer that honestly today: its NE export table may simply lack
-    /// ordinal 1, and `mbbs_machine::m16::Module::entry` already returns
-    /// `Option`. `Wg32`'s `Module` carries its PE entry point as a bare
-    /// `u32` set unconditionally at load (`abi/wg32.rs`'s `load`), so its
-    /// implementation always answers `Some` -- there is no loaded `Wg32`
-    /// module this method could report `None` for, not because the
-    /// question is meaningless for PE, only because nothing upstream of
-    /// this method has built a `Wg32::Module` that could lack one yet.
+    /// `None` if this ABI's module has no such entry -- an NE segment
+    /// lacking ordinal 1 (`Wg16`), or a PE with no export directory, or no
+    /// export at ordinal 1 (`Wg32`; `mbbs_machine::m32::Module::init`,
+    /// distinct from `Module::entry` -- see that method's own doc comment).
+    /// Both ABIs' init lookups carry that `Option` now, so neither has to
+    /// fabricate an answer this method could not honestly give.
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr>;
 }
 
