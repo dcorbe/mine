@@ -132,7 +132,12 @@ pub enum NeError {
     /// A relocation source type the format does not define.
     UnknownSource { source: u8 },
 
-    /// The module has more distinct imports than there are thunks.
+    /// This load's own distinct imports would need a thunk index the
+    /// machine has none left of. `needed` is the machine-wide total --
+    /// every thunk already spoken for by an earlier load into this same
+    /// [`Machine`], plus this one's own -- not merely this module's own
+    /// import count, since the index space this module is drawing from is
+    /// the machine's, not its own (see [`Thunks`]'s own doc comment).
     TooManyImports { needed: usize, limit: u16 },
 
     /// The header names an automatic data segment that does not exist.
@@ -190,7 +195,8 @@ impl fmt::Display for NeError {
             }
             Self::TooManyImports { needed, limit } => write!(
                 f,
-                "the module imports {needed} distinct symbols, and there are {limit} thunks"
+                "this machine would need {needed} thunks across every module loaded into it, \
+                 and it has {limit}"
             ),
             Self::NoAutoData { segment } => {
                 write!(
@@ -702,6 +708,11 @@ pub struct Module {
     /// list of names *this* module imports from.
     own_name: String,
     names: HashMap<String, u16>,
+    /// Where this module's own slice of the machine-wide thunk index space
+    /// begins -- [`Machine::next_thunk`](crate::m16::Machine) when this
+    /// module's [`Thunks`] started counting. `imports[0]`, if it exists, is
+    /// always the import behind global index `base`; see [`Module::import`].
+    base: u16,
     imports: Vec<ImportSite>,
     relocations: usize,
 }
@@ -766,8 +777,18 @@ impl Module {
     /// What thunk `index` stands for, as [`Exit::Call`](crate::m16::Exit::Call)
     /// reports it. This is how an unimplemented import is named rather than
     /// merely counted.
+    ///
+    /// `index` is the machine-wide index `Exit::Call` reports, not a
+    /// position in [`Module::imports`] -- the two only coincide for the
+    /// first module loaded into a machine, whose `base` is zero. `index`
+    /// below `base`, or `base + imports.len()` or beyond, answers `None`:
+    /// both are "not this module's own import" (see this module's own doc
+    /// comment on [`Thunks`], and `Host::run`'s doc comment in `crates/mbbs`
+    /// for why a caller who gets `None` here must try *other* loaded
+    /// modules before concluding the index names nothing at all).
     pub fn import(&self, index: u16) -> Option<&ImportSite> {
-        self.imports.get(usize::from(index))
+        let local = index.checked_sub(self.base)?;
+        self.imports.get(usize::from(local))
     }
 
     /// Every import the module has, in thunk-index order.
@@ -783,21 +804,48 @@ impl Module {
 }
 
 /// Assigns thunk indices to imported routines, densely and in first-encounter
-/// order.
+/// order, out of the **machine-wide** index space [`Machine::next_thunk`]
+/// tracks.
 ///
 /// Densely rather than by ordinal: `MAJORBBS` alone reaches ordinal 1,233, and
 /// MajorMUD uses 188 of them.
+///
+/// Machine-wide, not per-load: the trampoline table a thunk index names is
+/// one physical structure belonging to the [`Machine`], built once and
+/// shared by every module that loads into it (`mbbs-server` boots more than
+/// one, `1a67e7d`). A `Thunks` that counted from zero on every load handed
+/// two modules the same physical slot for two different imports --
+/// `Exit::Call` only ever reports the bare index, so nothing downstream
+/// could tell which module's table it named. `base` is where *this* load's
+/// slice of that shared space starts, seeded from the machine's own
+/// high-water mark and never reused by a later load.
 struct Thunks {
+    base: u16,
     by_symbol: HashMap<(String, Symbol), u16>,
     sites: Vec<ImportSite>,
 }
 
 impl Thunks {
-    fn new() -> Self {
+    /// `base`: the machine-wide index this load's own imports start
+    /// counting from -- [`Machine::next_thunk`] at the moment this load
+    /// began.
+    fn new(base: u16) -> Self {
         Self {
+            base,
             by_symbol: HashMap::new(),
             sites: Vec::new(),
         }
+    }
+
+    /// This load's own high-water mark, machine-wide: `base` plus every
+    /// distinct import assigned so far. What [`Machine::next_thunk`] must
+    /// become once this load finishes successfully, so the *next* load's
+    /// `Thunks::new` starts past every slot this one just spoke for.
+    fn next_index(&self) -> u16 {
+        // `index_of` never lets `sites.len()` grow past what fit below
+        // `MAX_THUNKS` once added to `base` (see the `filter` below), so
+        // this cannot overflow back below `base`.
+        self.base + self.sites.len() as u16
     }
 
     fn index_of(&mut self, module: &str, symbol: &Symbol, resolved: bool) -> Result<u16, NeError> {
@@ -808,9 +856,16 @@ impl Thunks {
 
         let index = u16::try_from(self.sites.len())
             .ok()
+            .and_then(|n| self.base.checked_add(n))
             .filter(|n| *n < MAX_THUNKS)
             .ok_or(NeError::TooManyImports {
-                needed: self.sites.len() + 1,
+                // Machine-wide: how many thunks the *machine* would need to
+                // give every module loaded into it its own slot, not merely
+                // this one load's own count -- `limit` is now genuinely a
+                // machine-wide ceiling (see `MAX_THUNKS`'s own doc comment),
+                // so `needed` has to speak the same currency to mean
+                // anything next to it.
+                needed: usize::from(self.base) + self.sites.len() + 1,
                 limit: MAX_THUNKS,
             })?;
         self.by_symbol.insert(key, index);
@@ -876,7 +931,10 @@ impl Machine {
             self.mem.segments.push(segment);
         }
 
-        let mut thunks = Thunks::new();
+        // Seeded from the machine's own high-water mark, not zero -- see
+        // `Thunks`'s own doc comment. Read before anything below can move
+        // it, so this load's whole slice is contiguous.
+        let mut thunks = Thunks::new(self.next_thunk);
         let mut applied = 0;
 
         // Every distinct symbol is resolved exactly once, and every fixup naming
@@ -945,12 +1003,19 @@ impl Machine {
             })?;
         self.mem.data = autodata;
 
+        // Only now, with the load fully successful: a failed load (the `?`s
+        // above) must leave `next_thunk` exactly where it was, so a retried
+        // or abandoned load never burns machine-wide indices it never ended
+        // up using.
+        self.next_thunk = thunks.next_index();
+
         Ok(Module {
             selectors,
             autodata,
             entries: image.entries.clone(),
             own_name: image.own_name.clone(),
             names: image.names.clone(),
+            base: thunks.base,
             imports: thunks.sites,
             relocations: applied,
         })

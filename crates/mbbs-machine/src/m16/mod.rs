@@ -313,6 +313,22 @@ pub struct Machine {
     /// The thunk table and the trampoline. The host's, and no module's.
     bridge: u16,
 
+    /// The next machine-wide thunk index [`ne::Thunks`] may hand out.
+    ///
+    /// Lives here, not on any one load's [`ne::Thunks`], because the
+    /// trampoline table it indexes into is a property of the *machine*
+    /// (`bridge`, above) -- one physical table, built once in [`Machine::new`]
+    /// -- not of any one module. Multiple modules load into one `Machine`
+    /// (`mbbs-server` boots N modules per machine, `1a67e7d`), and a `Thunks`
+    /// that started counting from zero on every load handed two modules the
+    /// same physical trampoline slot for two different imports: `Exit::Call`
+    /// only ever reports the numeric index, so the host had no way to tell
+    /// which module's import table it named. See `ne::Thunks`'s own doc
+    /// comment for the allocation this field feeds, and
+    /// `crate::m16::ne::Module::base`/`crate::m16::ne::Module::import` for
+    /// how a loaded module turns a global index back into its own local one.
+    next_thunk: u16,
+
     /// The state the assembly is entered through, together with the CPU-time
     /// timer that stops a module which will not stop itself. One object because
     /// the timer holds the context's address; see [`watchdog::Watched`]. Armed
@@ -423,6 +439,7 @@ impl Machine {
         Ok(Self {
             mem: Segments::new(vec![code, stack, data, bridge], code_sel, stack_sel, data_sel),
             bridge: bridge_sel,
+            next_thunk: 0,
             ctx: Watched::new()?,
             frame_sp: None,
             call_ax: 0,

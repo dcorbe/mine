@@ -2093,6 +2093,54 @@ impl<A: Abi> Host<A> {
         symbol_name(self.exports, from, symbol)
     }
 
+    /// Which loaded module `index` -- a thunk index off a live [`Exit::Call`]
+    /// -- actually belongs to, and what it names there.
+    ///
+    /// `entered` is the module [`Host::run`] was *called with*: the one whose
+    /// entry point started this call chain. It is tried first, and it is
+    /// right every time execution never leaves that module's own code -- the
+    /// overwhelming majority of calls. It stops being right the moment
+    /// `entered`'s code far-calls directly into a *different* loaded
+    /// module's own exported routine (an ordinary, thunk-free cross-module
+    /// call -- see `crates/mbbs/tests/cross_module_imports.rs`'s
+    /// `an_ordinal_import_reaches_another_loaded_modules_own_code`) and that
+    /// routine then hits an unresolved import of its *own*: the `Exit::Call`
+    /// names a thunk `entered` never had a hand in, and `entered.import`
+    /// correctly answers `None` for it (see
+    /// `mbbs_machine::m16::ne::Module::import`'s own doc comment on why an
+    /// out-of-range index is `None`, not a panic).
+    ///
+    /// Falling back to `self.loaded_modules` -- every module this `Host` has
+    /// loaded, keyed by [`Abi::module_name`] -- is safe rather than a guess:
+    /// thunk indices are disjoint across every module loaded into one
+    /// machine (`mbbs_machine::m16::ne::Thunks`'s own doc comment), so at
+    /// most one candidate can ever answer `Some`. This method belongs on
+    /// `Host`, not on `A::Cpu`/`A::Module`: only `Host` keeps the
+    /// cross-module registry `loaded_modules` is, and neither `mbbs_machine`
+    /// machine has -- or should have -- any notion of "which modules has
+    /// this host loaded" (see `Host::loaded_modules`'s own doc comment).
+    /// `Wg32` never populates `loaded_modules` at all (`Abi::module_name`'s
+    /// default `None`), so this degrades to exactly `A::import(entered,
+    /// index)` for it -- unchanged from before this method existed, which is
+    /// correct: only one `Wg32` module can be loaded today at all
+    /// (`Memory::replace_image` replaces the image wholesale), so there is
+    /// no second module a `Wg32` index could ever belong to.
+    ///
+    /// Returns owned copies (`A::Module: Clone`, already required for
+    /// `Host::loaded_modules` itself), not borrows: `Host::run`'s caller
+    /// needs the answer to outlive a later `&mut self` reborrow
+    /// (`shim(&mut call, self)`), which a borrow rooted in `self` cannot.
+    /// This runs once per stop, never per dispatch, so the clone costs
+    /// nothing worth avoiding.
+    fn import_owner(&self, entered: &A::Module, index: u16) -> Option<(A::Module, mbbs_machine::module::ImportSite)> {
+        if let Some(site) = A::import(entered, index) {
+            return Some((entered.clone(), site.clone()));
+        }
+        self.loaded_modules
+            .values()
+            .find_map(|candidate| A::import(candidate, index).map(|site| (candidate.clone(), site.clone())))
+    }
+
     /// Parse and map `file`, resolving every import against this host's own
     /// tables, and refuse to load a module that addresses a global this
     /// host cannot honestly place.
@@ -2270,20 +2318,32 @@ impl<A: Abi> Host<A> {
                 crate::abi::Exit::_Phantom(never, _) => match never {},
             };
 
-            // A thunk index the module does not have is not something a module
-            // can cause -- it comes from the bridge, and the bridge is the
-            // host's. Report it as an unnamed import rather than panicking, so
-            // that a loader bug looks like every other refusal.
-            let (from, symbol, ordinal) = match A::import(module, index) {
-                Some(site) => (
+            // A thunk index neither `module` nor any other loaded module
+            // claims is not something a module can cause -- it comes from
+            // the bridge, and the bridge is the host's. Report it as an
+            // unnamed import rather than panicking, so that a loader bug
+            // looks like every other refusal.
+            //
+            // `owner` -- not `module` -- is who `index` actually belongs to;
+            // see [`Host::import_owner`]'s own doc comment for why the two
+            // can differ (a cross-module far call landing inside a different
+            // module's code, which then hits its own unresolved import).
+            // Every read below that used to name `module` for a *diagnostic*
+            // (`A::caller`) now names `owner`, since a return address is only
+            // ever meaningful decoded against the module whose code was
+            // actually running -- which, once execution has crossed into
+            // `owner`, is no longer `module`.
+            let (from, symbol, ordinal, owner) = match self.import_owner(module, index) {
+                Some((owner, site)) => (
                     site.module.clone(),
                     self.symbol_name(&site.module, &site.symbol),
                     match &site.symbol {
                         Symbol::Ordinal(n) => Some(*n),
                         Symbol::Name(_) => None,
                     },
+                    owner,
                 ),
-                None => (String::new(), format!("thunk #{index}"), None),
+                None => (String::new(), format!("thunk #{index}"), None, module.clone()),
             };
 
             let (shim, cleans) = match shims::entry::<A>(&from, &symbol) {
@@ -2314,7 +2374,7 @@ impl<A: Abi> Host<A> {
                         Entry::Unimplemented => survey::Kind::Unimplemented,
                         Entry::Routine(..) => unreachable!("matched above"),
                     };
-                    let context = A::caller(machine, module);
+                    let context = A::caller(machine, &owner);
 
                     if let Some(inventory) = &self.survey {
                         inventory.borrow_mut().record(
@@ -2366,7 +2426,7 @@ impl<A: Abi> Host<A> {
                     exit = A::resume(machine, ret, cleans)?;
                 }
                 Err(e) => {
-                    let symbol = match A::caller(machine, module) {
+                    let symbol = match A::caller(machine, &owner) {
                         Some(at) => format!("{symbol} ({e}), called from {at}"),
                         None => format!("{symbol} ({e})"),
                     };

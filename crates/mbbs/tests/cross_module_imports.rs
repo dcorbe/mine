@@ -33,8 +33,8 @@
 //!   instead of a direct address) either faults or returns a different `AX`.
 
 use mbbs::testing::Fixture;
-use mbbs::{LoadError, Why};
-use mbbs_machine::m16::{Exit, FarPtr, Symbol};
+use mbbs::{LoadError, Outcome, Why};
+use mbbs_machine::m16::{Exit, FarPtr, Machine, Poison, Symbol};
 
 const ALIGN: u16 = 4;
 const SECTOR: usize = 1 << ALIGN;
@@ -169,6 +169,18 @@ fn exporter_bytes_named(own_name: &str, export_name: &str) -> Vec<u8> {
 /// `export_module`, and whose entry point (segment 1, offset 0) is a single
 /// `jmp far` straight through the fixup site.
 fn importer_bytes(export_module: &str, symbol: Symbol) -> Vec<u8> {
+    importer_bytes_named("IMPORTER", export_module, symbol)
+}
+
+/// [`importer_bytes`], generalised over its own declared name -- the
+/// `exporter_bytes`/`exporter_bytes_named` split, mirrored. Needed by
+/// `a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner`,
+/// which loads two importers side by side: `Host::loaded_modules` keys a
+/// loaded module by its own declared name (`Abi::module_name`), so two
+/// modules both calling themselves `IMPORTER` would have the second load
+/// silently overwrite the first's own entry in that registry -- not the bug
+/// under test, and a confusing way to fail if it went unnoticed.
+fn importer_bytes_named(own_name: &str, export_module: &str, symbol: Symbol) -> Vec<u8> {
     let mut impnames = vec![0u8];
     let module_at = impnames.len();
     impnames.extend_from_slice(&plain_pstring(export_module));
@@ -177,7 +189,7 @@ fn importer_bytes(export_module: &str, symbol: Symbol) -> Vec<u8> {
         impnames.extend_from_slice(&plain_pstring(name));
     }
 
-    let mut restab = pstring("IMPORTER", 0);
+    let mut restab = pstring(own_name, 0);
     restab.push(0);
 
     let mut nrtab = pstring("a synthetic import sink", 0);
@@ -394,4 +406,144 @@ fn a_loaded_module_cannot_shadow_a_host_routine_of_the_same_name() {
         importer.imports()[0].resolved,
         "the host's own spr must have answered, not the shadow module's"
     );
+}
+
+/// A raw `lcall` to thunk `index`, then `retf` -- byte-for-byte
+/// `crate::lib::tests::lcall_thunks` (that copy is `#[cfg(test)]`-private to
+/// `mbbs`, unreachable from an integration test), trimmed to the one-index
+/// case this file needs. Reaches a thunk directly, independent of which
+/// module -- if any -- a real relocation would have written it into; that
+/// independence is exactly what the test below needs: it names the thunk
+/// index a *different* module owns while entering under this one.
+fn lcall_thunk(machine: &mut Machine, index: u16) -> FarPtr {
+    let mut code = vec![0x9a]; // lcall
+    code.extend_from_slice(&machine.thunk_address(index).to_bytes());
+    code.push(0xcb); // retf
+    machine.load_code(&code).expect("code fits");
+    machine.code_ptr(0)
+}
+
+/// The bug `docs/plans/2026-08-14-...` (thunk indices colliding across
+/// modules) reduced to its essential shape, with no NE relocation gymnastics
+/// standing between the test and the claim: **a thunk index identifies
+/// exactly one import in exactly one loaded module, no matter which module
+/// `Host::run` was told the call was entered through.**
+///
+/// A real occurrence of this looks like `WCCMMPLS.DLL`'s init (entered under
+/// `Host::run(module: Plus)`) far-calling directly into `WCCMMUD.DLL`'s own
+/// code (an ordinary cross-module call, proven safe by the tests above --
+/// never a thunk), which then hits *its own* unresolved import. The thunk
+/// `Exit::Call` reports belongs to `WCCMMUD`, not `Plus`, but `Host::run`'s
+/// only handle on "which module" was the one its own top-level entry point
+/// belonged to. This test skips the middle far call (irrelevant to the
+/// claim -- proven separately above) and reaches the mismatch directly: it
+/// hand-builds a call to `MODA`'s own thunk 0, then enters through
+/// `Host::run(module: &mod_b)`.
+///
+/// Before the fix: `MODA` and `MODB` each get exactly one thunk, and a
+/// per-load index resets to 0 for each, so both land on physical thunk slot
+/// 0 -- `mod_b.import(0)` answers `MODB`'s own site, not `MODA`'s, and the
+/// stop silently names the wrong DLL and symbol. After the fix, thunk
+/// indices are disjoint machine-wide (`MODA` gets 0, `MODB` gets 1), so
+/// `mod_b.import(0)` correctly answers `None` (out of `MODB`'s own range)
+/// and `Host::run` must consult the *other* loaded module to find the true
+/// owner.
+#[test]
+fn a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner() {
+    let mut f = Fixture::new();
+
+    // Loaded first: one unresolved import, so it gets machine-wide thunk
+    // index 0. Named distinctly from MODB (`Host::loaded_modules` keys a
+    // loaded module by its own declared name -- see `importer_bytes_named`'s
+    // own doc comment), so both stay reachable through that registry rather
+    // than the second silently overwriting the first's entry.
+    let _mod_a = f
+        .host
+        .load(
+            &mut f.machine,
+            &importer_bytes_named("MODA", "MISSING_DLL_A", Symbol::Name("symA".to_owned())),
+        )
+        .expect("MODA loads with an unresolved import of its own");
+
+    // Loaded second: its own unresolved import must land on a *different*
+    // machine-wide index than MODA's -- 1, not 0 -- or the two collide on
+    // the same physical trampoline slot.
+    let mod_b = f
+        .host
+        .load(
+            &mut f.machine,
+            &importer_bytes_named("MODB", "MISSING_DLL_B", Symbol::Name("symB".to_owned())),
+        )
+        .expect("MODB loads with its own unresolved import");
+
+    // Call MODA's own thunk (index 0) directly, but enter under MODB --
+    // exactly the mismatch a cross-module far call into MODA's code,
+    // triggered from MODB's own entry point, would produce.
+    let entry = lcall_thunk(&mut f.machine, 0);
+
+    let outcome = f.host.run(&mut f.machine, &mod_b, entry, &[], None).expect("ran");
+    match outcome {
+        Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
+            assert_eq!(module, "MISSING_DLL_A", "thunk 0 is MODA's own import, not MODB's");
+            assert!(
+                symbol.to_lowercase().starts_with("syma"),
+                "expected MODA's own symbol, got {symbol:?}"
+            );
+        }
+        other => panic!("expected an unimplemented stop naming MODA's own import, got {other:?}"),
+    }
+}
+
+/// The sibling proof `a_thunk_reached_under_the_wrong_module_still_resolves_to_its_true_owner`
+/// cannot give on its own: that test names `MODA`'s thunk by its numeric
+/// value (0), which is the same whether or not indices are disjoint --
+/// `MODA` is loaded first either way, so its own base is 0 regardless. It
+/// says nothing about whether `MODB`'s *own* thunk actually landed on a
+/// different physical slot, only that slot 0 belongs to `MODA`.
+///
+/// This test closes that gap from the other side: it calls `MODB`'s own
+/// entry point -- a genuine `jmp far` through `MODB`'s own fixup, exactly
+/// the shape `an_ordinal_import_reaches_another_loaded_modules_own_code`
+/// proves for a resolved import -- and requires the stop to name `MODB`'s
+/// own symbol. A `Thunks::index_of` that silently dropped `base` from its
+/// allocation (while `Module::base` still recorded the intended one) would
+/// write `MODB`'s fixup pointing at physical thunk slot 0 -- `MODA`'s own --
+/// while `MODB`'s own `Module::base` still claimed slot 1: `MODB.import(0)`
+/// then answers `None` (0 is below `MODB`'s own base), `Host::import_owner`
+/// falls back to the registry, and the stop wrongly names `MODA`, not
+/// `MODB`. Only a `Thunks` whose *actual* physical allocation and whose
+/// `Module::base` agree passes both this test and the one above.
+#[test]
+fn a_second_modules_own_thunk_still_resolves_to_itself_once_a_first_module_has_claimed_the_earlier_range() {
+    let mut f = Fixture::new();
+
+    f.host
+        .load(
+            &mut f.machine,
+            &importer_bytes_named("MODA", "MISSING_DLL_A", Symbol::Name("symA".to_owned())),
+        )
+        .expect("MODA loads with an unresolved import of its own, claiming the earlier range");
+
+    let mod_b = f
+        .host
+        .load(
+            &mut f.machine,
+            &importer_bytes_named("MODB", "MISSING_DLL_B", Symbol::Name("symB".to_owned())),
+        )
+        .expect("MODB loads with its own unresolved import");
+
+    let outcome = f
+        .host
+        .run(&mut f.machine, &mod_b, importer_entry(&mod_b), &[], None)
+        .expect("ran");
+    match outcome {
+        Outcome::Stopped(Poison::Unimplemented { module, symbol }) => {
+            assert_eq!(module, "MISSING_DLL_B", "MODB's own thunk must resolve to MODB's own import");
+            assert!(
+                symbol.to_lowercase().starts_with("symb"),
+                "expected MODB's own symbol, got {symbol:?}"
+            );
+        }
+        other => panic!("expected an unimplemented stop naming MODB's own import, got {other:?}"),
+    }
 }
