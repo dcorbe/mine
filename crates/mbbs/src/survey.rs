@@ -131,6 +131,12 @@ struct Record {
     count: u64,
     first_chan: Option<Chan>,
     first_context: Option<String>,
+    /// The order this symbol was first seen in, relative to every other
+    /// symbol this inventory has recorded. `entries`' own key is
+    /// `(module, symbol)`, which a `BTreeMap` iterates alphabetically -- not
+    /// in the order a running module actually reached them -- so this is the
+    /// only place encounter order survives. See [`Inventory::encounter_order`].
+    seq: u64,
 }
 
 /// Everything survey mode has seen this run, and where it is being written.
@@ -155,6 +161,10 @@ struct Record {
 pub struct Inventory {
     entries: BTreeMap<(String, String), Record>,
     out: Option<File>,
+    /// How many distinct symbols have been recorded so far. Handed out as
+    /// each `Record`'s `seq` and never reused, so `seq` is a total order over
+    /// first-sightings even though `entries`' own key is not.
+    next_seq: u64,
 }
 
 impl Inventory {
@@ -181,6 +191,7 @@ impl Inventory {
         Ok(Self {
             entries: BTreeMap::new(),
             out: Some(out),
+            next_seq: 0,
         })
     }
 
@@ -191,6 +202,7 @@ impl Inventory {
         Self {
             entries: BTreeMap::new(),
             out: None,
+            next_seq: 0,
         }
     }
 
@@ -217,12 +229,15 @@ impl Inventory {
             return false;
         }
 
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let record = Record {
             kind,
             ordinal,
             count: 1,
             first_chan: chan,
             first_context: context.map(str::to_owned),
+            seq,
         };
 
         if let Some(out) = &mut self.out {
@@ -286,6 +301,31 @@ impl Inventory {
             out.push('\n');
         }
         out
+    }
+
+    /// Every distinct symbol, in the order this inventory first saw it --
+    /// what "the order the survey named" (implementation plan, Task order)
+    /// actually means.
+    ///
+    /// [`Inventory::render`] is deliberately *not* this: it ranks by count,
+    /// which is the right view for "what's the highest-value gap" and the
+    /// wrong one for "what happened first" -- ties (the common case, one hit
+    /// each) break alphabetically there, which reads as encounter order by
+    /// coincidence at best. `entries`' own key is `(module, symbol)`, so even
+    /// its raw iteration order is alphabetical, not chronological. `seq` is
+    /// the only field that remembers which came first, which is why this
+    /// exists instead of a caller sorting [`Inventory::render`]'s text back
+    /// apart.
+    ///
+    /// Formatted `"module!symbol"`, matching the `"LIBRARY!symbol"` shape
+    /// `tests/lunatix.rs`'s `PINNED_MISSES` already uses, so the two are
+    /// directly comparable by eye.
+    pub fn encounter_order(&self) -> Vec<String> {
+        let mut rows: Vec<(&(String, String), &Record)> = self.entries.iter().collect();
+        rows.sort_by_key(|(_, record)| record.seq);
+        rows.into_iter()
+            .map(|(key, _)| format!("{}!{}", key.0, key.1))
+            .collect()
     }
 
     /// Overwrite the output file with [`Inventory::render`]'s full, sorted,
@@ -375,6 +415,32 @@ mod tests {
         assert_eq!(inv.len(), 2);
         assert_eq!(inv.count_of("MAJORBBS", "gmdnam"), Some(1));
         assert_eq!(inv.count_of("MAJORBBS", "rtihdlr"), Some(1));
+    }
+
+    #[test]
+    fn encounter_order_is_discovery_order_not_alphabetical() {
+        // Chosen so alphabetical order ("WGSERVER.EXE!globalcmd" first) and
+        // discovery order disagree -- a test that recorded them already
+        // sorted would not notice `encounter_order` silently degenerating
+        // into `entries`' own `BTreeMap` order.
+        let mut inv = Inventory::in_memory();
+        inv.record("WGSERVER.EXE", "_samend", None, None, None, Kind::Unimplemented);
+        inv.record("WGSERVER.EXE", "_globalcmd", None, None, None, Kind::Unimplemented);
+        inv.record("cw3220mt.DLL", "_strcpy", None, None, None, Kind::Unimplemented);
+        // A repeat must not move `_samend` -- only the *first* sighting sets
+        // its place in this order.
+        inv.record("WGSERVER.EXE", "_samend", None, None, None, Kind::Unimplemented);
+
+        assert_eq!(
+            inv.encounter_order(),
+            vec![
+                "WGSERVER.EXE!_samend",
+                "WGSERVER.EXE!_globalcmd",
+                "cw3220mt.DLL!_strcpy",
+            ],
+            "first-seen order, not the BTreeMap's own (module, symbol) order \
+             and not render()'s count-then-alphabetical order"
+        );
     }
 
     #[test]
