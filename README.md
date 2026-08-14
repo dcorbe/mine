@@ -167,8 +167,10 @@ Full source provenance: [`docs/MIRRORS.md`](docs/MIRRORS.md).
 
 ## Provenance and licence
 
-This host contains no Galacticomm, Borland, or Phar Lap code. It is an original
-Rust implementation written against a documented API surface.
+This host contains no Galacticomm, Borland, Pervasive, or Phar Lap IP. It is
+an original Rust implementation written against a documented API surface —
+including the Btrieve record manager, which is implemented from the file
+format up rather than wrapped.
 
 The one vendor-derived artefact is a set of ordinal→symbol-name tables for
 `MAJORBBS`, `GSBL`, `GALME` and Phar Lap's `DOSCALLS`, extracted from the
@@ -179,4 +181,4 @@ years.
 You supply your own module binaries and your own board data. Nothing here
 distributes either.
 
-MIT.
+MIT — see [`LICENSE.md`](LICENSE.md).
