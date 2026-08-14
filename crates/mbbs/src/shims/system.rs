@@ -53,6 +53,13 @@ use crate::shims::{NO, ShimError};
 use crate::shims::text::write_cstr_mem;
 
 /// `MAJORBBS.H:37` -- maximum size for module names, terminator included.
+///
+/// A **size**, not an offset. It bounds `descrp`'s own bytes -- what
+/// [`register_module`] reads and refuses on -- and it happens to equal
+/// `Wg16`'s header stride because Borland's 16-bit compiler byte-packs
+/// `struct module`. It is not `Wg32`'s stride: see [`ModuleLayout`] for the
+/// padded offset [`Registration::dispatch`] actually reads the routine
+/// pointers from.
 const MNMSIZ: u16 = 25;
 
 /// `GCSP.H:19` -- application id size, terminator included.
@@ -1278,6 +1285,58 @@ impl<A: Abi> PartialEq for Dispatch<A> {
 
 impl<A: Abi> Eq for Dispatch<A> {}
 
+/// `struct module`'s header stride at `A`'s own layout: how many bytes come
+/// before the nine routine pointers `re/wg33src/INC/MAJORBBS.H:301` declares
+/// right after `descrp` (`lonrou`, `sttrou`, `stsrou`, `injrou`, `lofrou`,
+/// `huprou`, `mcurou`, `dlarou`, `finrou`, in that order).
+///
+/// # Not a `GCV2` question
+///
+/// [`Abi::GCV2`](crate::abi::Abi::GCV2) picks between two different
+/// *declarations* of a struct -- see [`crate::users::UserLayout`]'s own doc
+/// comment. This is not that: `MAJORBBS.H:301` declares `struct module`
+/// exactly once, with no `#ifdef` anywhere in it. What differs between
+/// `Wg16` and `Wg32` is not which fields exist but a fact about the compiler
+/// that built each host: whether it packs a struct byte-tight or aligns a
+/// pointer member to its own width. Borland's 16-bit compiler byte-packs, so
+/// `MNMSIZ` (25) is already the correct offset for `Wg16` -- every test in
+/// this file that predates this type already assumes that and none of them
+/// had to change. A 32-bit compiler 4-byte-aligns the pointer array that
+/// follows, so the same 25-byte `descrp` leaves 3 bytes of padding before
+/// `lonrou`.
+///
+/// That is the same axis [`FndblkLayout`](crate::shims::stream::FndblkLayout)
+/// already tests, for the same underlying reason (`struct ffblk`'s 16-bit
+/// DOS-DTA shape vs. Borland's incompatible 32-bit one) -- so this reuses
+/// its discriminator, `A::INT_WIDTH >= 4`, rather than inventing a
+/// differently-named test for what is the same fact about the same two
+/// compilers.
+///
+/// # Measured, not derived from the header alone
+///
+/// See [`tests::module_layout_pads_the_header_to_four_bytes_at_wg32`] for
+/// both independent confirmations: LunatiX's own registered block (a real
+/// in-image code pointer starts at byte 28, not 25) and three separate PE32
+/// `WGSERVER.EXE` builds dispatching through this same table at header
+/// offset 28.
+struct ModuleLayout {
+    /// Bytes before the first routine pointer (`lonrou`, `n == 0`).
+    header: u16,
+}
+
+impl ModuleLayout {
+    /// `struct module`'s header as `A`'s host compiler laid it out.
+    fn of<A: Abi>() -> Self {
+        if A::INT_WIDTH >= 4 {
+            // Wg32: MNMSIZ padded to a 4-byte boundary.
+            Self { header: 28 }
+        } else {
+            // Wg16: byte-packed, so MNMSIZ is already the offset.
+            Self { header: MNMSIZ }
+        }
+    }
+}
+
 impl<A: Abi> Registration<A> {
     /// Where one of the nine entry points is, or which native handler runs
     /// instead.
@@ -1305,7 +1364,8 @@ impl<A: Abi> Registration<A> {
     pub fn dispatch(&self, mem: &A::Mem, n: usize) -> Result<Dispatch<A>, ShimError> {
         match self {
             Self::Module { block, .. } => {
-                let at = A::ptr_offset(*block, MNMSIZ + (n as u16) * A::PTR_WIDTH as u16);
+                let header = ModuleLayout::of::<A>().header;
+                let at = A::ptr_offset(*block, header + (n as u16) * A::PTR_WIDTH as u16);
                 let bytes = at
                     .resolve(mem, A::PTR_WIDTH)
                     .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -1346,6 +1406,65 @@ mod tests {
         }
         bytes.resize(usize::from(AGENT_SIZE), 0);
         f.bytes(&bytes, false)
+    }
+
+    /// `ModuleLayout` at both ABIs -- `Wg16`'s header is `MNMSIZ` itself
+    /// (Borland's 16-bit compiler byte-packs `struct module`), `Wg32`'s pads
+    /// that same 25-byte `descrp` to a 4-byte boundary before the routine
+    /// pointers start.
+    ///
+    /// # Where 28 comes from
+    ///
+    /// Not the header alone -- `MAJORBBS.H:301` declares one `struct module`
+    /// with no `#ifdef` in it, so the header cannot say which compiler pads
+    /// it. Measured two ways, independently:
+    ///
+    /// * LunatiX's own registered block, printed raw by
+    ///   `tests/lunatix.rs`'s `a_wg32_channel_entering_lunatix_surveys`:
+    ///   bytes `7..28` are zero padding after `"Lunatix\0"`, and byte `28` is
+    ///   where a real in-image code pointer starts (`0x40xxxxxx`, matching
+    ///   the loaded module's own base) -- not byte 25, which is the last
+    ///   zero byte of `descrp`'s own padding.
+    /// * The real PE32 `WGSERVER.EXE` oracle
+    ///   (`archive/_acquire/pools/full/cfca0b96eae9602a_WGSERVER.EXE`)
+    ///   dispatches through this same table at VA `0x44dab7`/`0x44dac7`:
+    ///   `lea ecx,[ebx+ebx*2]` (stride-3 index into the module array),
+    ///   `mov edx,[eax+ecx*4]` (the module pointer), then
+    ///   `call [edx+0x24]` immediately followed by `call [edx+0x30]` --
+    ///   `0x24` (36) and `0x30` (48) are `stsrou` and `huprou` at header
+    ///   offsets `28 + 2*4` and `28 + 5*4`, which only lands on the header's
+    ///   own field order if the header is 28. Byte-for-byte identical code
+    ///   (only the global data addresses differ) at VA `0x44a3c3`/`0x44a3d3`
+    ///   in the sibling build `bfe3ab588c1273a4_WGSERVER.EXE` and VA
+    ///   `0x44a393`/`0x44a3a3` in `c9e8ff33f5b80c65_WGSERVER.EXE` -- three
+    ///   independent binaries, same offsets.
+    ///
+    /// # Why the discriminator is not `Abi::GCV2`
+    ///
+    /// `struct module` has one declaration, not two -- unlike `struct user`
+    /// ([`crate::users::UserLayout`]), nothing about its *field set* changes
+    /// between builds. What changes is a fact about the compiler that built
+    /// the host: whether it packs a struct byte-tight or aligns a pointer
+    /// member to its own width. That is the same fact
+    /// [`FndblkLayout`](crate::shims::stream::FndblkLayout) already
+    /// encodes for `struct ffblk`'s two incompatible shapes, so this reuses
+    /// its discriminator (`A::INT_WIDTH >= 4`) rather than inventing a
+    /// second name for the same axis.
+    #[test]
+    fn module_layout_pads_the_header_to_four_bytes_at_wg32() {
+        use crate::abi::Wg32;
+
+        assert_eq!(
+            ModuleLayout::of::<Wg16>().header,
+            25,
+            "Wg16: Borland's 16-bit compiler byte-packs, MNMSIZ is already right"
+        );
+        assert_eq!(
+            ModuleLayout::of::<Wg32>().header,
+            28,
+            "Wg32: MNMSIZ (25) padded to a 4-byte boundary -- the oracle's own \
+             call sites land on stsrou/huprou only if this is 28, not 25"
+        );
     }
 
     #[test]
