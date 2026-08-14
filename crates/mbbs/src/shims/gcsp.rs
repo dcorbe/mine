@@ -5,6 +5,10 @@
 //! wg20 has different line numbers and would make every citation below
 //! silently wrong).
 //!
+//! Full evidence and methodology for the unreachability argument below
+//! live in `docs/2026-08-14-gcsp-reachability.md`; this comment carries
+//! the summary a reader of the code needs without leaving the file.
+//!
 //! # What GCSP is, and why none of the seven routines here can run
 //!
 //! GCSP is the wire protocol between the host and a genuine **Worldgroup
