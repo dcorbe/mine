@@ -34,6 +34,44 @@ use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::shims::ShimError;
 
+// # Argument width
+//
+// `A::Int` is `u16` under `Wg16` and `u32` under `Wg32`, the same shape
+// `shims::gsbl` already audited in full
+// (`docs/2026-08-14-gsbl-width-audit.md`). This file has the same two
+// surviving buckets that document names: a byte count with nothing
+// narrower behind it (`memcpy`, `memcmp`, `movmem` and `setmem`'s `count`
+// -- "genuinely wide", read whole with [`count_arg`]) and a size this
+// crate's own [`Heap`](crate::heap::Heap) already commits to sixteen bits
+// regardless of `A` (`alcmem`/`alczer`'s `size` -- "16-bit host model",
+// read with [`heap_size_arg`], which refuses rather than truncates).
+// `setmem`'s fill byte is the third, "genuinely narrow" bucket -- a `char`
+// argument that only ever contributes its low byte, exactly like
+// `memset`'s own `c` parameter -- and needs no checked reader because
+// every value of that byte is already valid.
+
+/// Read a byte count at `A`'s own int width, never narrowed.
+///
+/// `memcpy`, `memcmp`, `movmem` and `setmem`'s counts are not stored in any
+/// field narrower than the `usize`
+/// [`ModulePtr::resolve`]/[`ModulePtr::write`] already take -- there is
+/// nothing to refuse, so this widens rather than truncates. Same shape as
+/// `shims::gsbl`'s `usize_arg`; extracted here because four call sites read
+/// it, not one.
+fn count_arg<A: Abi>(v: A::Int) -> usize {
+    Into::<u32>::into(v) as usize
+}
+
+/// Read a `size`/`nbytes` argument, refusing rather than truncating if it
+/// does not fit the `u16` [`Heap::reserve`](crate::heap::Heap::reserve)
+/// takes regardless of `A` -- this crate's own heap model, committed to
+/// sixteen bits independent of what `Wg32`'s `int` can carry, the same
+/// shape `shims::gsbl`'s `u16_arg` documents
+/// (`docs/2026-08-14-gsbl-width-audit.md`).
+fn heap_size_arg<A: Abi>(v: A::Int) -> Option<u16> {
+    u16::try_from(Into::<u32>::into(v)).ok()
+}
+
 /// `VOID *alcmem(UINT size)` -- `GCOMM.H:256-258` -- reserve memory the
 /// module will free.
 ///
@@ -49,7 +87,8 @@ use crate::shims::ShimError;
 /// called it), it takes `&mut A::Mem` straight from [`Call::mem`] rather
 /// than a whole `&mut Machine`.
 pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let size = Into::<u32>::into(call.int()) as u16;
+    let size = heap_size_arg::<A>(call.int())
+        .ok_or_else(|| ShimError::Failed("alcmem: size does not fit this heap's u16 block size".to_owned()))?;
     let at = host
         .heap
         .reserve(call.mem(), size)
@@ -67,7 +106,8 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// [`mbbs_machine::ptr::ModulePtr::write`] on [`Call::mem`] rather than
 /// `Machine::write`.
 pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let size = Into::<u32>::into(call.int()) as u16;
+    let size = heap_size_arg::<A>(call.int())
+        .ok_or_else(|| ShimError::Failed("alczer: size does not fit this heap's u16 block size".to_owned()))?;
     let at = host
         .heap
         .reserve(call.mem(), size)
@@ -208,10 +248,12 @@ pub fn ptrtile(
 /// [`mbbs_machine::ptr::ModulePtr::write`] rather than a whole `&mut Machine`.
 pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let at = call.ptr();
-    let count = Into::<u32>::into(call.int()) as u16;
-    // A `char` argument still arrives as a whole word; the fill is its low byte.
+    let count = count_arg::<A>(call.int());
+    // A `char` argument still arrives as a whole word; the fill is its low
+    // byte -- genuinely narrow, not this file's width bug: every value of
+    // a fill byte is already valid, exactly like `memset`'s own `c`.
     let fill = Into::<u32>::into(call.int()) as u8;
-    at.write(call.mem(), &vec![fill; usize::from(count)])
+    at.write(call.mem(), &vec![fill; count])
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Void)
 }
@@ -227,9 +269,9 @@ pub fn setmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let src = call.ptr();
     let dst = call.ptr();
-    let count = Into::<u32>::into(call.int()) as u16;
+    let count = count_arg::<A>(call.int());
     let bytes = src
-        .resolve(call.mem(), usize::from(count))
+        .resolve(call.mem(), count)
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     dst.write(call.mem(), &bytes)
@@ -246,9 +288,9 @@ pub fn movmem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dst = call.ptr();
     let src = call.ptr();
-    let count = Into::<u32>::into(call.int()) as u16;
+    let count = count_arg::<A>(call.int());
     let bytes = src
-        .resolve(call.mem(), usize::from(count))
+        .resolve(call.mem(), count)
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     dst.write(call.mem(), &bytes)
@@ -275,20 +317,20 @@ pub fn memcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
 /// byte-at-a-time C implementation of `memmove` has to choose one. Reading
 /// the whole source first is what makes the choice moot.
 ///
-/// # Width, not `memcpy`/`memcmp`'s `as u16`
+/// # Width
 ///
-/// `count` is read at `A`'s own int width and used as a `usize` outright,
-/// **not** narrowed with `as u16`. `memcpy` and `memcmp` above still do that
-/// narrowing -- a pre-existing width trap this task did not introduce and is
-/// out of scope to fix here (see `shims::mod`'s own width discipline, and
-/// `outprf`'s note in the Stage 3 plan on the same trap) -- but there is no
-/// reason for a *new* sibling landing today to copy a bug this crate has
-/// already found and removed everywhere else it looked (`fread`, `fwrite`,
-/// `toupper`).
+/// `count` is read with [`count_arg`], `A`'s own int width widened rather
+/// than narrowed to a `usize` outright -- **not** the `as u16` `memcpy` and
+/// `memcmp` above used to carry (see this module's "Argument width" note
+/// and `docs/2026-08-14-gsbl-width-audit.md`, which found and fixed the
+/// same shape eleven times over in `shims/gsbl.rs`). Both are fixed now,
+/// through the same helper, so there is no bug left here for a new sibling
+/// to have copied -- consistent with `fread`, `fwrite` and `toupper`, which
+/// this crate already fixed elsewhere.
 pub fn memmove<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dst = call.ptr();
     let src = call.ptr();
-    let count = Into::<u32>::into(call.int()) as usize;
+    let count = count_arg::<A>(call.int());
     let bytes = src
         .resolve(call.mem(), count)
         .map_err(|e| ShimError::Failed(e.to_string()))?
@@ -308,7 +350,7 @@ pub fn memmove<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 pub fn memcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let a = call.ptr();
     let b = call.ptr();
-    let count = usize::from(Into::<u32>::into(call.int()) as u16);
+    let count = count_arg::<A>(call.int());
 
     let left = a
         .resolve(call.mem(), count)
@@ -332,6 +374,49 @@ mod tests {
     // production code above reaches memory through the ABI.
     use mbbs_machine::m16::Ret;
     use crate::testing::Fixture;
+    // `Wg32` only, for the two width-checked readers below: no `Call`, no
+    // `Cpu`, no `Machine` needed to exercise them, and building a real
+    // `Wg32Cpu` in this file's own test module would arm the process-wide
+    // fault claim every `Wg16` test in this binary shares -- see
+    // `docs/2026-08-14-gsbl-width-audit.md`'s "Why the tests exercise the
+    // four helper functions rather than a full `Call<Wg32>`" for the
+    // incident that discipline exists to prevent.
+    use crate::abi::Wg32;
+
+    /// The bug this task exists to close: a `Wg32` module's byte count
+    /// above 65535 must survive `count_arg` whole, not wrap.
+    ///
+    /// `70_000u32` is bit-for-bit what `call.int()` hands back for a
+    /// genuine `Wg32` module -- `Wg32::Int` is `u32` and `int_from_bytes`
+    /// is exactly `u32::from_le_bytes` -- so naming `Wg32` here is not a
+    /// stand-in, it selects which `Into<u32>` the read goes through.
+    #[test]
+    fn count_arg_does_not_truncate_a_32_bit_byte_count() {
+        assert_eq!(count_arg::<Wg32>(70_000), 70_000);
+    }
+
+    /// Every count a genuine `Wg16` module could produce still round-trips.
+    /// The regression guard for the fix above: it must not narrow a
+    /// legitimate `Wg32` count, but it also must not change what a `Wg16`
+    /// module -- whose `A::Int` is already only two bytes -- has always
+    /// gotten.
+    #[test]
+    fn count_arg_still_accepts_everything_wg16_could_produce() {
+        assert_eq!(count_arg::<Wg16>(0), 0);
+        assert_eq!(count_arg::<Wg16>(u16::MAX), usize::from(u16::MAX));
+    }
+
+    /// `heap_size_arg` refuses a size `Heap::reserve`'s own `u16` cannot
+    /// hold, rather than silently allocating a block far smaller than the
+    /// module asked for -- the truncation this task exists to close, one
+    /// call site earlier than `count_arg`'s (there is a narrower field
+    /// behind this one: `Heap::reserve(size: u16)`, unlike `memcpy` et al).
+    #[test]
+    fn heap_size_arg_refuses_a_size_that_does_not_fit_the_heaps_u16_block() {
+        assert_eq!(heap_size_arg::<Wg32>(70_000), None);
+        assert_eq!(heap_size_arg::<Wg32>(4096), Some(4096));
+        assert_eq!(heap_size_arg::<Wg16>(u16::from(u8::MAX)), Some(255));
+    }
 
     fn far(at: FarPtr) -> [u16; 2] {
         [at.offset, at.selector]
