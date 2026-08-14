@@ -113,9 +113,7 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     .into_owned();
 
     let mode = Mode::parse(&spelt).map_err(ShimError::Failed)?;
-    let name = Host::<Wg16>::dos_name(&named)
-        .map_err(ShimError::Failed)?
-        .to_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
 
     let path = match host.find(&name) {
         Some(path) => path,
@@ -126,7 +124,22 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         None if mode.read => return Ok(abi::Ret::Ptr(null_ptr::<A>())),
 
         // Not there, and the module asked to write it. That is a create.
-        None => host.root.join(&name),
+        // `name` may now hold a subdirectory (`Host::dos_name` accepts one),
+        // and this host never ran the installer that would have made
+        // `LUN5DATA` for it -- an `OpenOptions::create` inside `open_mem`
+        // cannot make the directory it lands in, only the file. So the
+        // directory is made here, and a failure to make it is reported as
+        // that rather than surfacing forty lines away as `open_mem`'s own
+        // opaque "No such file or directory".
+        None => {
+            let at = host.root.join(&name);
+            if let Some(parent) = at.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ShimError::Failed(format!("fopen({named}, {spelt}): {}: {e}", parent.display()))
+                })?;
+            }
+            at
+        }
     };
 
     let cookie = host
@@ -348,7 +361,7 @@ pub fn unlink<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     .into_owned();
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
 
-    let Some(path) = host.find(name) else {
+    let Some(path) = host.find(&name) else {
         return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
     std::fs::remove_file(&path)
@@ -447,10 +460,22 @@ pub fn getdtd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// # Errors
 ///
-/// If the spec names a directory ([`Host::dos_name`]'s rule, the same one
-/// `fopen` and `unlink` keep), if it is a wildcard with no extension
-/// ([`dos::Name::spec`]'s), if the module's directory cannot be read, or if the
-/// total will not fit in the `long` the module reads it as.
+/// If the spec escapes the module's own directory ([`Host::dos_name`]'s
+/// rule, the same one `fopen` and `unlink` keep), if it names a subdirectory
+/// at all -- `dos::Name::spec` has no field for a path separator, so a spec
+/// `Host::dos_name` now accepts (e.g. `LUN5DATA/*.*`) still fails here,
+/// naming the file field rather than the directory rule -- if it is a
+/// wildcard with no extension ([`dos::Name::spec`]'s), if the module's
+/// directory cannot be read, or if the total will not fit in the `long` the
+/// module reads it as.
+///
+/// **Known gap, not fixed here:** `cntdir` counts only `host.root`'s own
+/// entries even for a spec `Host::dos_name` now lets through with a leading
+/// subdirectory -- it never `read_dir`s into that subdirectory, it just
+/// fails one step later at the FCB parse above. No recovered call site asks
+/// it to count inside a subdirectory, so this is not a live divergence, but
+/// making `cntdir` walk one is a separate task from the fopen path LunatiX's
+/// `INSTALL.CFG` measured.
 ///
 /// A directory that will not open is a refusal and not a zero, because "no such
 /// file" and "nobody looked" are the same answer to a module and only one of
@@ -469,7 +494,7 @@ pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     .into_owned();
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
     let spec =
-        dos::Name::spec(name).map_err(|why| ShimError::Failed(format!("cntdir({named}): {why}")))?;
+        dos::Name::spec(&name).map_err(|why| ShimError::Failed(format!("cntdir({named}): {why}")))?;
 
     let failed =
         |what: &str, e: std::io::Error| ShimError::Failed(format!("cntdir({named}): {what}: {e}"));
@@ -811,6 +836,23 @@ mod tests {
         let mut f = Fixture::rooted(scratch("stream-flags"));
         let fp = opened(&mut f, "OUT.LOG", "at");
         assert_eq!(flags_of(&f, fp), F_WRIT);
+    }
+
+    #[test]
+    fn opening_a_file_for_write_in_a_subdirectory_makes_the_directory_lunatix_never_installed() {
+        // A fresh board never ran LunatiX's installer, so `LUN5DATA` is not
+        // there yet -- and the `OpenOptions::create` inside `open_mem` can
+        // only make the file, not the directory it lands in. `fopen` has to
+        // make that directory itself, the way `INSTALL.CFG`'s `MAKEDIR`
+        // would have.
+        let root = scratch("stream-subdirectory-create");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "lun5data\\lunrand1.txt", "wt");
+        assert_eq!(flags_of(&f, fp), F_WRIT);
+        assert!(
+            root.join("lun5data").join("lunrand1.txt").is_file(),
+            "fopen must create lun5data/ before creating the file inside it"
+        );
     }
 
     #[test]
@@ -1239,8 +1281,14 @@ mod tests {
 
     #[test]
     fn cntdir_refuses_a_directory_and_an_ambiguous_wildcard() {
-        // The first is `Host::dos_name`'s rule, the same one `fopen` and
-        // `unlink` keep. The second is `dos::Name::spec`'s.
+        // `D:\MUD\*.DAT` is `Host::dos_name`'s rule, the same one `fopen` and
+        // `unlink` keep -- a drive is somewhere this host does not look.
+        // `SUBDIR\*.*` is no longer `dos_name`'s refusal (a real subdirectory
+        // is accepted now, see that method's own doc comment) but still
+        // fails, one step later: `dos::Name::spec` has no field for a path
+        // separator, and `cntdir` never `read_dir`s into a subdirectory
+        // anyway (see this routine's own doc comment). `*` is
+        // `dos::Name::spec`'s ambiguous-wildcard refusal.
         let mut f = Fixture::rooted(directory("cntdir-refuse"));
         for spec in ["D:\\MUD\\*.DAT", "SUBDIR\\*.*", "*"] {
             let at = f.text(spec);

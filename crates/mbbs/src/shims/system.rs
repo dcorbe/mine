@@ -528,7 +528,7 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     // its signature to pin `A`) -- the same reading `shims::stream::fopen`/
     // `unlink` already established for the identical call.
     let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
-    let Some(path) = host.find(name) else {
+    let Some(path) = host.find(&name) else {
         return Ok(abi::Ret::Int(A::Int::from(NO)));
     };
     let Ok(metadata) = std::fs::metadata(&path) else {

@@ -282,7 +282,7 @@ pub fn opnbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let filnam = call.ptr();
     let maxlen = u16_arg::<A>(call.int(), "opnbtv")?;
     let named = String::from_utf8_lossy(filnam.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?).into_owned();
-    let name = Host::<A>::dos_name(&named).map_err(ShimError::Failed)?.to_owned();
+    let name = Host::<A>::dos_name(&named).map_err(ShimError::Failed)?;
 
     let path = host.btrieve_file(&name).map_err(ShimError::Failed)?;
     let geometry = Geometry::read(&name, &path).map_err(|e| ShimError::Failed(e.to_string()))?;

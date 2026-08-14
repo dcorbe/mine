@@ -1298,11 +1298,46 @@ impl<A: Abi> Host<A> {
     /// module's own directory, which is [`Host::root`] and is where this host
     /// looks anyway. That prefix is accepted and removed.
     ///
-    /// **Any other directory is refused rather than stripped.** A module
-    /// configured with `DATADIR` of `D:\MUD\DATA` means it, and quietly reading
-    /// the file of the same name from somewhere else would be the exact failure
-    /// this crate exists to avoid -- with the added charm that a board with two
-    /// installs would silently play the wrong one.
+    /// **The rule is containment, not "no directories."** It used to be the
+    /// latter: any `\`, `/` or `:` in the name at all was refused outright.
+    /// That was too strict for the world it models. LunatiX 5.3F's own
+    /// installer config (`INSTALL.CFG`, in its distribution ZIP) does
+    ///
+    /// ```text
+    /// MAKEDIR LUN5DATA
+    /// COPY LUNJOKES.TXT LUN5DATA
+    /// UPDATE LUNRAND1.TXT LUN5DATA
+    /// ```
+    ///
+    /// and the module then opens what it just installed with
+    /// `fopen("lun5data\lunrand1.txt", ...)`. A module that ships and uses a
+    /// subdirectory of its own install is not naming somewhere else -- it is
+    /// naming a real part of what [`Host::root`] holds, and refusing it
+    /// outright meant LunatiX's own init could never finish. So a relative
+    /// path with subdirectory components -- `lun5data\lunrand1.txt`,
+    /// `.\lun5data\lunrand1.txt`, either separator -- is now accepted and
+    /// normalised to `/`; [`Host::find`] resolves it case-insensitively at
+    /// every level, the same way it always has for a bare name.
+    ///
+    /// **What is still refused is anything that names, or could reach,
+    /// somewhere outside [`Host::root`]** -- because that half of the old
+    /// rule was never about directories as such, it was about this: a
+    /// module configured with `DATADIR` of `D:\MUD\DATA` means it, and
+    /// quietly reading the file of the same name from somewhere else would
+    /// be the exact failure this crate exists to avoid, with the added
+    /// charm that a board with two installs would silently play the wrong
+    /// one. That reasoning does not weaken just because subdirectories are
+    /// now allowed -- it is the part of the old rule that was always load-
+    /// bearing, and it is kept in full:
+    ///
+    /// - a drive letter, or any `:` at all (`D:\MUD\DATA\X.DAT` and every
+    ///   other reading of `:` DOS ever had);
+    /// - a leading `\` or `/` -- root-absolute, and root of *what* is a
+    ///   question this host has no business answering;
+    /// - any `..` component, checked after separators are normalised, so a
+    ///   name cannot walk back out through subdirectories it was just
+    ///   allowed into (`lun5data\..\..\etc\passwd` is refused for the same
+    ///   reason `D:\` is, not a weaker one).
     ///
     /// # No `Machine`, and no `self`, and generic anyway
     ///
@@ -1316,20 +1351,58 @@ impl<A: Abi> Host<A> {
     /// infer which `Abi` a bare `impl<A: Abi> Host<A>` copy means from a
     /// signature that mentions neither `Self` nor `A`.
     ///
+    /// **Returns an owned `String`, not `&str`.** Normalising `\` to `/`
+    /// means the answer is not always a substring of `named` any more --
+    /// `.\lun5data\lunrand1.txt` has no `lun5data/lunrand1.txt` inside it to
+    /// borrow.
+    ///
     /// # Errors
     ///
-    /// If the name has a directory component other than `.\`.
-    pub fn dos_name(named: &str) -> Result<&str, String> {
+    /// If the name has a drive letter, is root-absolute, or has a `..`
+    /// component anywhere in it.
+    pub fn dos_name(named: &str) -> Result<String, String> {
         let bare = named
             .strip_prefix(".\\")
             .or_else(|| named.strip_prefix("./"))
             .unwrap_or(named);
-        if bare.contains(['\\', '/', ':']) {
-            return Err(format!(
-                "{named} names a directory; this host only opens a module's own"
-            ));
+
+        let escapes = || {
+            format!(
+                "{named} names a directory outside this host's own; this host only opens a module's own"
+            )
+        };
+
+        // A colon is a drive letter under every DOS reading this crate has
+        // found (`D:`, but also the bare `:` a well-formed name never has),
+        // so any of it at all is refused before separators are even looked
+        // at.
+        if bare.contains(':') {
+            return Err(escapes());
         }
-        Ok(bare)
+        // Root-absolute in either spelling. Root of *this host's* filesystem
+        // is not a question a module gets to ask.
+        if bare.starts_with('\\') || bare.starts_with('/') {
+            return Err(escapes());
+        }
+
+        let mut parts = Vec::new();
+        for part in bare.split(['\\', '/']) {
+            // Both separators collapse together and repeats vanish, so
+            // `a\\b` and `a/b` and `a\/b` all normalise the same way.
+            if part.is_empty() {
+                continue;
+            }
+            // Checked component-wise, after normalisation, so a name cannot
+            // spell its way back out through a subdirectory it was just let
+            // into -- `lun5data\..\..\etc\passwd` is exactly as refused as
+            // `D:\etc\passwd` is, not merely inconvenienced.
+            if part == ".." {
+                return Err(escapes());
+            }
+            parts.push(part);
+        }
+
+        Ok(parts.join("/"))
     }
 
     /// Turn on survey mode: [`Host::run`] will fabricate a continuation past
@@ -1617,16 +1690,30 @@ impl<A: Abi> Host<A> {
     /// some places and not in others; the filesystem underneath is not. An
     /// exact match first, then one scan of the directory -- so the ordinary
     /// case costs nothing and the awkward one still works.
+    ///
+    /// **Every component, not just the last.** [`Host::dos_name`] now accepts
+    /// a subdirectory, and a 1997 DOS distribution stores its names in upper
+    /// case (`LUN5DATA/LUNRAND1.TXT`) while the module that reads them was
+    /// compiled to ask in lower case (`fopen("lun5data\lunrand1.txt", ...)`).
+    /// Matching only the final segment case-insensitively would still miss
+    /// `LUN5DATA` itself, so this walks `name` one path component at a time,
+    /// `read_dir`-ing and matching case-insensitively at each step, rather
+    /// than case-folding only the leaf.
     pub fn find(&self, name: &str) -> Option<PathBuf> {
         let exact = self.root.join(name);
         if exact.is_file() {
             return Some(exact);
         }
-        std::fs::read_dir(&self.root)
-            .ok()?
-            .filter_map(Result::ok)
-            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-            .map(|e| e.path())
+
+        let mut at = self.root.clone();
+        for part in name.split(['\\', '/']).filter(|p| !p.is_empty()) {
+            at = std::fs::read_dir(&at)
+                .ok()?
+                .filter_map(Result::ok)
+                .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(part))
+                .map(|e| e.path())?;
+        }
+        Some(at)
     }
 
     /// Find one of the module's Btrieve files, installing it if this is a fresh
@@ -1668,6 +1755,12 @@ impl<A: Abi> Host<A> {
         // interrupted -- or merely *read* while it is still going -- is a file
         // whose header says it has 29,232 pages and whose body does not. That
         // file would then look installed forever after.
+        //
+        // No `create_dir_all` for `to`'s parent, unlike `shims::stream::fopen`:
+        // `name` may hold a subdirectory now that [`Host::dos_name`] accepts
+        // one, but `from` was just resolved through it by [`Host::find`], so
+        // that directory already exists -- a `.VIR` cannot have been found
+        // inside a directory that is not there.
         let to = self.root.join(name);
         let part = self
             .root
@@ -6593,5 +6686,93 @@ mod tests {
             "dopoll's own channel must be the one recorded: {}",
             inv.render()
         );
+    }
+
+    // ---- `Host::dos_name`/`Host::find`: containment, not "no directories" --
+
+    #[test]
+    fn dos_name_leaves_a_bare_name_alone() {
+        assert_eq!(
+            Host::<Wg16>::dos_name("WCCITEMS.DAT").expect("no directory to refuse"),
+            "WCCITEMS.DAT"
+        );
+    }
+
+    #[test]
+    fn dos_name_strips_the_modules_own_directory_prefix_either_spelling() {
+        assert_eq!(
+            Host::<Wg16>::dos_name(".\\WCCITEMS.DAT").expect("the module's own prefix"),
+            "WCCITEMS.DAT"
+        );
+        assert_eq!(
+            Host::<Wg16>::dos_name("./WCCITEMS.DAT").expect("the forward-slash spelling too"),
+            "WCCITEMS.DAT"
+        );
+    }
+
+    #[test]
+    fn dos_name_accepts_and_normalises_a_subdirectory_lunatix_actually_ships() {
+        // LunatiX 5.3F's own `INSTALL.CFG` does `MAKEDIR LUN5DATA` and copies
+        // `LUNRAND1.TXT` into it; the module then opens
+        // `fopen("lun5data\lunrand1.txt", ...)`. That subdirectory is real,
+        // is under this host's own root, and is exactly the case this rule
+        // was relaxed to let through.
+        assert_eq!(
+            Host::<Wg16>::dos_name("lun5data\\lunrand1.txt").expect("a real subdirectory of root"),
+            "lun5data/lunrand1.txt"
+        );
+        // The `.\` prefix and both separators together, since a module is
+        // free to mix them.
+        assert_eq!(
+            Host::<Wg16>::dos_name(".\\lun5data/lunrand1.txt").expect("mixed separators"),
+            "lun5data/lunrand1.txt"
+        );
+    }
+
+    #[test]
+    fn dos_name_refuses_a_drive_letter() {
+        let e = Host::<Wg16>::dos_name("D:\\MUD\\DATA\\X.DAT")
+            .expect_err("a drive is somewhere this host does not look");
+        assert!(e.contains("D:\\MUD\\DATA\\X.DAT"), "{e}");
+    }
+
+    #[test]
+    fn dos_name_refuses_a_leading_separator_root_absolute_in_either_spelling() {
+        for named in ["\\MUD\\DATA\\X.DAT", "/MUD/DATA/X.DAT"] {
+            assert!(Host::<Wg16>::dos_name(named).is_err(), "{named}");
+        }
+    }
+
+    #[test]
+    fn dos_name_refuses_a_dotdot_escape_including_a_sneaky_one_through_a_real_subdirectory() {
+        for named in [
+            "..\\WCCITEMS.DAT",
+            "lun5data\\..\\..\\etc\\passwd",
+        ] {
+            assert!(
+                Host::<Wg16>::dos_name(named).is_err(),
+                "{named} must not escape root, however many real components lead up to the .."
+            );
+        }
+    }
+
+    #[test]
+    fn find_resolves_a_two_level_path_case_insensitively_at_every_level() {
+        // The distribution stores 1997 DOS names in upper case
+        // (`LUN5DATA/LUNRAND1.TXT`), and the module asks in lower case
+        // (`lun5data/lunrand1.txt`, what `Host::dos_name` hands back). Matching
+        // only the last segment would still miss `LUN5DATA` itself.
+        let root = testing::scratch("dos-name-find-two-level");
+        std::fs::create_dir(root.join("LUN5DATA")).expect("a directory");
+        std::fs::write(root.join("LUN5DATA").join("LUNRAND1.TXT"), b"jokes\r\n")
+            .expect("a file inside it");
+
+        let f = Fixture::rooted(root.clone());
+
+        let found = f
+            .host
+            .find("lun5data/lunrand1.txt")
+            .expect("case-insensitive at every level, not just the last");
+        assert_eq!(found, root.join("LUN5DATA").join("LUNRAND1.TXT"));
     }
 }
