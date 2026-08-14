@@ -228,6 +228,51 @@ pub fn numopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(parsed as i16 as u16)))
 }
 
+/// `long lngopt(int msgnum, long floor, long ceiling)` -- [`numopt`]'s
+/// `long` sibling.
+///
+/// `MCVAPI.H:75-79` (wg33src):
+///
+///
+/// No surviving `.C` body -- `MCVAPI.H` is a prototype header with nothing to
+/// quote, the same gap [`numopt`]'s own citation does not have. But
+/// `GCOMM.H:289`'s declaration and every real call site
+/// (`GALFIL.C:359`'s `lngopt(THRESH,1,1000)*1024L*1024L`,
+/// `MAJORBBS.C:596`'s `gpslmt=(unsigned)lngopt(GPSLMT,1L,50000L)`) agree with
+/// `numopt`'s own shape one word wider: read the option's trailing value,
+/// parse it, and refuse a sysop-misconfigured board rather than clamp or
+/// wrap it silently -- the same rule this file's own module doc comment
+/// states once for the whole family.
+///
+/// `re/ne_arity.py 389 <WCCMMPLS.DLL>` measures 4/4 call sites cleaning five
+/// words (one `int` plus two `long`s, 2+4+4=10 bytes), matching this
+/// prototype exactly -- `389` is `_LNGOPT`'s ordinal in
+/// `crates/mbbs/data/majorbbs_wg101.tsv`.
+///
+/// Generic: `call.long()` reads a `long` at `A::LONG_WIDTH` regardless of
+/// `A`, the same as [`prfmsg`]'s varargs cursor already relies on; the parsed
+/// value is narrowed into [`abi::Ret::Long`], which -- like `Call::long` --
+/// carries no `A`-dependent width at all (see `abi::Ret`'s own doc comment).
+pub fn lngopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let number = Into::<u32>::into(call.int()) as u16;
+    let floor = call.long() as i32;
+    let ceiling = call.long() as i32;
+
+    let text = read_mem(call.mem(), host, number)?;
+    let name = option_mem(call.mem(), host, number)?;
+    let text = String::from_utf8_lossy(value(&text)).into_owned();
+
+    let parsed: i64 = text
+        .parse()
+        .map_err(|_| ShimError::Failed(format!("{name} is {text:?}, which is not a number")))?;
+    if parsed < i64::from(floor) || parsed > i64::from(ceiling) {
+        return Err(ShimError::Failed(format!(
+            "{name} is {parsed}, outside the {floor}..={ceiling} this module accepts"
+        )));
+    }
+    Ok(abi::Ret::Long(parsed as i32 as u32))
+}
+
 /// `int ynopt(int msgnum)`.
 ///
 /// Across the 91 recovered `.MSG` files every one of the 267 `B` options ends
@@ -585,6 +630,61 @@ mod tests {
         assert_eq!(
             f.invoke(numopt, &[5, floor, 32767]).expect("read"),
             Ret::U16((-5i16) as u16)
+        );
+    }
+
+    #[test]
+    fn lngopt_reads_the_number_off_the_end_of_the_prompt() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        assert_eq!(f.invoke(lngopt, &[2, 0, 0, 32767, 0]).expect("read"), Ret::U32(60));
+    }
+
+    #[test]
+    fn lngopt_outside_its_bounds_refuses_and_names_the_message() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let e = f.invoke(lngopt, &[2, 0, 0, 50, 0]).expect_err("60 is over 50");
+        assert!(e.to_string().contains("60"), "{e}");
+        assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
+    }
+
+    /// A bound wider than `numopt`'s own `i16` could ever hold -- the whole
+    /// reason `lngopt` exists alongside it. `THRESH` in `GALFIL.C:359`
+    /// reads `lngopt(THRESH,1,1000)`, but `FTPZWINDOW`
+    /// (`FILEXFER.C:229`) reads up to `1000000000L`, which does not fit an
+    /// `i16` floor/ceiling at all -- proving the argument really is 32 bits
+    /// wide, not truncated to 16 and sign-extended back.
+    #[test]
+    fn lngopt_accepts_a_ceiling_that_does_not_fit_a_16_bit_int() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let ceiling = 1_000_000_000i32;
+        assert_eq!(
+            f.invoke(
+                lngopt,
+                &[2, 0, 0, ceiling as u16, (ceiling >> 16) as u16]
+            )
+            .expect("read"),
+            Ret::U32(60)
+        );
+    }
+
+    #[test]
+    fn lngopt_reads_a_negative_bound_as_negative() {
+        // The same discrimination `numopt_reads_a_negative_bound_as_negative`
+        // makes, one word wider: `msg 5` (`NEGOPT`) is -5, and read as
+        // unsigned a -32767 floor would refuse every negative option.
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let floor = -32767i32;
+        assert_eq!(
+            f.invoke(
+                lngopt,
+                &[5, floor as u16, (floor >> 16) as u16, 32767, 0]
+            )
+            .expect("read"),
+            Ret::U32((-5i32) as u32)
         );
     }
 

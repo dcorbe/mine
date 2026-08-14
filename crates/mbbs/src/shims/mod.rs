@@ -423,6 +423,7 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "rstmbk", msg::rstmbk, Cleans::Caller),
         (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller),
         (MAJORBBS, "numopt", msg::numopt, Cleans::Caller),
+        (MAJORBBS, "lngopt", msg::lngopt, Cleans::Caller),
         (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller),
         (MAJORBBS, "chropt", msg::chropt, Cleans::Caller),
         (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller),
@@ -572,8 +573,10 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
         (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
         (MAJORBBS, "usroff", user::usroff, Cleans::Caller),
+        (MAJORBBS, "vdaoff", user::vdaoff, Cleans::Caller),
         (MAJORBBS, "getin", user::getin, Cleans::Caller),
         (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
+        (MAJORBBS, "hasmkey", user::hasmkey, Cleans::Caller),
         // The echo family. "Turn echo on" (`echon`) is `echonu(usrnum)`
         // against the current channel; "turn echo on utility" (`echonu`)
         // also ends any `echsec` secret-echo session still in progress. See
@@ -679,9 +682,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
         (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
         (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
+        (MAJORBBS, "upvbtv", btrieve::upvbtv, Cleans::Caller),
         (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
         (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
         (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
+        (MAJORBBS, "clsbb", btrieve::clsbb, Cleans::Caller),
         // The GSBL terminal layer. Fourteen routines, seventy-seven call
         // sites, none of them reached by initialisation, plus three more
         // (`btuhpk`/`btupbc`/`btucpc`) registered even though `WCCMMUD.DLL`

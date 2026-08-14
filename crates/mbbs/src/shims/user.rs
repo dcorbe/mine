@@ -217,7 +217,62 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .read_cstr(call.mem())
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
-    let lock = String::from_utf8_lossy(&lock);
+    let lock = String::from_utf8_lossy(&lock).into_owned();
+    gen_haskey(call, host, &lock)
+}
+
+/// `int hasmkey(int mnum)` -- does the current user hold the key named in
+/// message `mnum`?
+///
+/// `LOCKNKEY.H:193-194` (wg33src) declares it; `LOCKNKEY.C:239-243` (wg1) is
+/// the whole body:
+///
+///
+/// `re/ne_arity.py 335 <WCCMMPLS.DLL>` measures 18/18 call sites cleaning one
+/// word, matching this one-`int` prototype -- `335` is `_HASMKEY`'s ordinal in
+/// `crates/mbbs/data/majorbbs_wg101.tsv`.
+///
+/// `rawmsg` is not itself implemented here -- `shims::msg`'s own module doc
+/// comment already says why: `WCCMMUD.DLL` never imports it, so there is
+/// nothing pinning its behaviour against that oracle. But `rawmsg(mnum)` is
+/// just "the stored text of message `mnum`, uninterpreted" -- exactly what
+/// [`crate::shims::msg::message_mem`] plus a raw `read_cstr` already gives
+/// [`stgopt`](crate::shims::msg::stgopt) before that routine allocates a
+/// module-owned copy. This shim reads the same bytes and stops there: a lock
+/// expression is evaluated host-side, never handed back to the module, so
+/// there is no allocation to make.
+///
+/// # Everything past the lock string is [`haskey`]'s own
+///
+/// Same `usrnum` read, same three-case channel test (`keys == NULL` answers
+/// `class == BBSPRV`, a channel naming nobody answers `false`, a real keyring
+/// is [`crate::KeySet::evaluate`]), same [`Host::asked_for_key`] bookkeeping
+/// -- [`gen_haskey`] is exactly `LOCKNKEY.C:239` and `:254`'s shared
+/// `gen_haskey(lock,usrnum,usrptr)` tail, factored out once a second caller
+/// needed it rather than copied.
+///
+/// # Errors
+///
+/// If message `mnum` cannot be read from the current message block.
+pub fn hasmkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mnum = Into::<u32>::into(call.int()) as u16;
+    let at = crate::shims::msg::message_mem(call.mem(), host, mnum)?;
+    let lock = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let lock = String::from_utf8_lossy(&lock).into_owned();
+    gen_haskey(call, host, &lock)
+}
+
+/// `gen_haskey(lock,usrnum,usrptr)` -- [`haskey`] and [`hasmkey`]'s shared
+/// tail, once the lock expression is in hand as a host-side string.
+///
+/// `LOCKNKEY.C:194-196`'s `usrnum`/three-case-channel logic; see [`haskey`]'s
+/// own doc comment for the case-by-case account, which is unchanged by this
+/// split -- only where the lock string comes from differs between the two
+/// callers.
+fn gen_haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, lock: &str) -> Result<abi::Ret<A>, ShimError> {
     // `globals()` reports `io::Error` and `ShimError` has no `From` for it, so
     // the map_err is the house pattern here -- see `shims/fsd.rs:72`.
     let unum = host
@@ -234,7 +289,7 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let answer = match host.users().terms().chan(unum) {
         None => false,
         Some(chan) => match host.users().keys(chan) {
-            Some(keys) => keys.evaluate(&lock),
+            Some(keys) => keys.evaluate(lock),
             // A channel that exists but never logged on -- `keys == NULL`.
             // Answered by class, and `usrcls` is 0 here, so it refuses; the
             // comparison is written out rather than folded away so that it
@@ -243,7 +298,7 @@ pub fn haskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             None => host.class_mem(call.mem(), chan)? == BBSPRV,
         },
     };
-    host.asked_for_key(unum, &lock, answer);
+    host.asked_for_key(unum, lock, answer);
     Ok(abi::Ret::Int(A::Int::from(answer as u16)))
 }
 
@@ -819,6 +874,46 @@ pub fn usroff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(host.users().slot(chan)))
 }
 
+/// `char *vdaoff(int unum)` -- the channel's volatile data area.
+///
+/// `MAJORBBS.H:665` (wg1) declares it; `MAJORBBS.C:1379-1383` is the whole
+/// body:
+///
+///
+/// `re/ne_arity.py 636 <WCCMMPLS.DLL>` measures 31/31 call sites cleaning one
+/// word after the far call, matching this one-`int` prototype exactly --
+/// `636` is `_VDAOFF`'s ordinal in `crates/mbbs/data/majorbbs_wg101.tsv`, the
+/// same committed table `re/importgaps.py` resolved the missing-symbol name
+/// from.
+///
+/// This is [`usroff`]'s own shape against a different table:
+/// [`Users::vda`](crate::users::Users::vda) already computes `ptrblok`'s
+/// arithmetic at `A`'s own stride, the range guard is
+/// [`Terms::chan`](crate::users::Terms::chan) exactly as `usroff` uses it, and
+/// the channel lookup and [`abi::Ret::Ptr`] wrapping are identical.
+///
+/// # `None` is `vdahdl == NULL`, not "no such channel" -- and it is a pointer, not a refusal
+///
+/// [`Users::vda`]'s own doc comment: a `None` here means only that
+/// [`Host::alcvda`](crate::Host::alcvda) has not run yet, because every
+/// module's `dclvda` has to be counted before `vdasiz` -- and so `vdahdl` --
+/// is known. `vdaoff` on the real host answered this the same way `ptrblok`
+/// answers any lookup against a null block handle: a pointer built from
+/// address zero, not a fault. A channel number that names no channel at all
+/// is the *other* failure `usroff` already guards against, and remains a
+/// stop rather than a null -- runtime crashes over undefined behaviour, per
+/// this crate's own rule, is for the case this host cannot represent at all,
+/// not for the case the real host represented as a legitimate zero.
+pub fn vdaoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("vdaoff({unum}): there is no such channel")))?;
+    Ok(abi::Ret::Ptr(host.users().vda(chan).unwrap_or_else(A::null_ptr)))
+}
+
 /// `void clrmlt(void)` -- clear the multi-line broadcast buffer.
 /// `GCOMM.H:473`.
 ///
@@ -1365,6 +1460,67 @@ mod tests {
         assert_eq!(f.read(lock), "user", "and left the module's string alone");
     }
 
+    /// `hasmkey(mnum)` reaches [`haskey`]'s own [`gen_haskey`] tail once the
+    /// lock string comes from a message instead of a module pointer -- this
+    /// is that sharing, checked the same way
+    /// [`haskey_answers_for_the_channel_usrnum_names`] checks `haskey` itself:
+    /// two different answers through the same call path.
+    ///
+    /// `SAMPLE.MSG`'s `ACTIVATE` option is message 1, storing "DEMO" --
+    /// `crates/mbbs/src/shims/msg.rs`'s own `stgopt_returns_the_whole_message`
+    /// test already establishes that raw text. Reused here as a lock name
+    /// rather than adding a second fixture file for the same shape of thing;
+    /// message 2 (`GAMCRD`) stores a multi-word prompt that is not a key
+    /// anyone holds, which is the "answers differently" half of the pair.
+    #[test]
+    fn hasmkey_answers_for_the_channel_usrnum_names() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                console,
+                &crate::Connection::ansi("rangerdan").with_keys(["DEMO"]),
+            )
+            .expect("channel 0");
+        let name = f.text("SAMPLE.MSG");
+        f.invoke(crate::shims::msg::opnmsg, &crate::testing::Fixture::far(name))
+            .expect("opens");
+
+        let got = f.invoke(super::hasmkey, &[1]).expect("answered");
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(1), "message 1 is \"DEMO\", and the channel holds it");
+
+        let got = f.invoke(super::hasmkey, &[2]).expect("answered");
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(0), "message 2 is not a key this channel holds");
+    }
+
+    /// `LOCKNKEY.C:239`'s `bb == NULL` case has no counterpart for `hasmkey`
+    /// -- there is no Btrieve file involved -- but the *channel* three-case
+    /// test [`gen_haskey`] shares with [`haskey`] does, and this is that case:
+    /// nobody on the channel `usrnum` names.
+    #[test]
+    fn hasmkey_refuses_when_no_channel_is_current() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                console,
+                &crate::Connection::ansi("rangerdan").with_keys(["DEMO"]),
+            )
+            .expect("channel 0");
+        f.host
+            .globals()
+            .write(&mut f.machine, "usrnum", &(-1i16).to_le_bytes())
+            .expect("usrnum is placed");
+        let name = f.text("SAMPLE.MSG");
+        f.invoke(crate::shims::msg::opnmsg, &crate::testing::Fixture::far(name))
+            .expect("opens");
+
+        let got = f.invoke(super::hasmkey, &[1]).expect("answered");
+        assert_eq!(got, mbbs_machine::m16::Ret::U16(0));
+    }
+
     /// `MAJORBBS.C:1183`. The status is what makes the channel tick; the store
     /// is what makes it tick *into the right routine*.
     #[test]
@@ -1525,6 +1681,54 @@ mod tests {
         let past = f.host.users().terms().count();
         assert!(f.invoke(usroff, &[past]).is_err());
         assert!(f.invoke(usroff, &[-1i16 as u16]).is_err());
+    }
+
+    #[test]
+    fn vdaoff_hands_back_the_channels_own_volatile_area_once_alcvda_has_run() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.alcvda(&mut f.machine).expect("allocated");
+
+        let Ret::Far(at) = f.invoke(vdaoff, &[0]).expect("channel 0") else {
+            panic!("vdaoff returns a pointer");
+        };
+        assert_eq!(at, f.host.users().vda(console).expect("allocated"));
+    }
+
+    /// `Users::vda`'s own stride check, driven through the shim rather than
+    /// the accessor directly -- the same discrimination
+    /// [`usroff_addresses_each_channel_at_its_own_slot`] applies to the user
+    /// table.
+    #[test]
+    fn vdaoff_addresses_each_channel_at_its_own_area() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.alcvda(&mut f.machine).expect("allocated");
+
+        let Ret::Far(at0) = f.invoke(vdaoff, &[0]).expect("channel 0") else {
+            panic!("vdaoff returns a pointer");
+        };
+        let Ret::Far(at1) = f.invoke(vdaoff, &[1]).expect("channel 1") else {
+            panic!("vdaoff returns a pointer");
+        };
+        assert_ne!(at0, at1, "two channels must not share a volatile data area");
+    }
+
+    /// `vdahdl == NULL` before [`Host::alcvda`] has run -- a real answer, not
+    /// a refusal, per [`crate::users::Users::vda`]'s own doc comment. A
+    /// channel number that names no channel at all is the other failure and
+    /// stays a stop; this test is what tells the two apart.
+    #[test]
+    fn vdaoff_answers_null_before_alcvda_has_run_but_still_refuses_no_such_channel() {
+        let mut f = Fixture::new();
+        let Ret::Far(at) = f.invoke(vdaoff, &[0]).expect("a real channel, just no area yet") else {
+            panic!("vdaoff returns a pointer");
+        };
+        assert_eq!(at, mbbs_machine::m16::FarPtr::NULL);
+
+        let past = f.host.users().terms().count();
+        assert!(f.invoke(vdaoff, &[past]).is_err(), "no such channel is still a stop");
     }
 
     /// `void clrmlt(void)` -- see [`clrmlt`]'s own doc comment for why a

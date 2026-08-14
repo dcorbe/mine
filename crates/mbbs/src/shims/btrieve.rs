@@ -80,12 +80,21 @@
 //! file *it* is positioned on, and this host has no TSR to ask. Both refuse,
 //! and each says which of the two it is.
 //!
-//! The remaining five guards belong to routines this host does not implement,
+//! Four more guards belong to routines this host does not implement,
 //! recorded here so the step that adds one does not derive them again:
-//! `getbtvl` (`:318`, returns), `anpbtvlk` (`:406`, 0), `upvbtv` (`:536`,
-//! returns), `invbtv` (`:584`, returns), `delbtv` (`:623`, returns). Note that
-//! `dupdbtv` and `dinsbtv` have *no* guard and read `bb->reclen` immediately,
-//! which is the `stpbtvl` shape again.
+//! `getbtvl` (`:318`, returns), `anpbtvlk` (`:406`, 0), `invbtv` (`:584`,
+//! returns), `delbtv` (`:623`, returns). Note that `dupdbtv` and `dinsbtv`
+//! have *no* guard and read `bb->reclen` immediately, which is the `stpbtvl`
+//! shape again.
+//!
+//! [`upvbtv`] (`:534-536`, also a quiet return) used to be on this list; it is
+//! implemented now, but not for `WCCMMUD.DLL` -- that module never imports
+//! it, only `WCCMMPLS.DLL` (MajorMUD Plus) does, alongside [`clsbb`], which
+//! has no `PLBTVSTF.C` guard to cite at all (see that routine's own doc
+//! comment for why). Both stay in this file because this is where the
+//! Btrieve engine and its `Cursor`/`duplicate_key` machinery already live,
+//! not because either is part of the seventeen-symbol/716-site `WCCMMUD.DLL`
+//! survey above.
 //!
 //! # This is where matching the original beats refusing
 //!
@@ -700,6 +709,121 @@ pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
+/// `void upvbtv(void *recptr, int length)` -- update the record the file is
+/// positioned on, at a caller-given length rather than the file's own
+/// `reclen`.
+///
+/// `BTVSTF.H:160` declares it; `PLBTVSTF.C:531-541`, quoted in full:
+///
+///
+/// [`dupdbtv`] is the same opcode 3 with `length` fixed at `bb->reclen`
+/// (`updbtv(recptr)` is literally `upvbtv(recptr,bb->reclen)`,
+/// `PLBTVSTF.C:524-527`) -- `WCCTEXT`'s variable part is exactly what
+/// `length` past `reclen` lets a caller reach, and
+/// [`Block::update`](crate::btrieve::Block::update) already knows how to
+/// rewrite that shape (`has_body`/`rewrite_variable`, this crate's own
+/// variable-length write path). So this shim differs from `dupdbtv` in
+/// three places, not in how the write itself happens:
+///
+/// - **`length` is the caller's**, read as a fourth cursor value rather than
+///   taken from [`Block::maxlen`](crate::btrieve::Block::maxlen).
+/// - **A duplicate key is fatal, not a quiet `0`.** `PLBTVSTF.C:539-541`
+///   sends *any* nonzero status to `btverrptr` unconditionally -- there is no
+///   `switch` carving out status 5 the way [`dupdbtv`]'s own body does
+///   (`:562-568`). A board that hit a collision through `upvbtv` stopped, and
+///   this host stopping the module rather than answering a success value the
+///   caller cannot tell from a real one is the same rule the rest of this
+///   crate is under.
+/// - **The return type is `void`.** There is no `1`/`0` to report at all.
+///
+/// # `bb == NULL` is a quiet no-op, not a refusal
+///
+/// The one guard `upvbtv` has that [`dupdbtv`]/[`dinsbtv`] do not --
+/// `:534-536` returns before touching `recptr` or `length`. This is the same
+/// answer [`qrybtv`]/[`obtbtvl`]/[`absbtv`] already give with no file
+/// current (this file's own module doc comment, "What every routine does
+/// when no file is current"), just shaped as `void`'s own version of "0".
+///
+/// `re/ne_arity.py 622 <WCCMMPLS.DLL>` finds 2 call sites; one cleans three
+/// words (`68 c0 03; 6a 00; 6a 00` -- push `length=0x3c0`, push a far-null
+/// `recptr` -- then `add sp,6`), matching `(void *, int)` exactly and the
+/// vendor's own `upvbtv(NULL,length)` idiom seen throughout `GALFILU.C`/
+/// `GALFILCS.C`. The other cleans nothing directly after the call because
+/// control leaves through an unconditional `jmp` to a shared cleanup point a
+/// few bytes on (`eb 13`) rather than falling through to one -- the deferred
+/// case this tool's own module doc comment names, not a second arity. `622`
+/// is `_UPVBTV`'s ordinal in `crates/mbbs/data/majorbbs_wg101.tsv`.
+///
+/// # Errors
+///
+/// If the write collides with a key that forbids duplicates, if `bytes` does
+/// not fit what [`Block::update`] accepts (a fixed-length file needs it
+/// exactly `reclen`; a variable-length file needs a position this host
+/// already tracks -- see [`Block::update`]'s own doc comment), or if `recptr`
+/// cannot be read for `length` bytes.
+pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let length = u16_arg::<A>(call.int(), "upvbtv")?;
+
+    let Some(block) = positioned(call, host, "upvbtv")? else {
+        note_no_file(host, "upvbtv");
+        return Ok(abi::Ret::Void);
+    };
+
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "upvbtv on {}, which is not positioned on a record -- opcode 3 \
+                 updates the record the file is positioned on, and nothing has \
+                 positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+    let recptr = match recptr == Btrieve::<A>::null() {
+        true => file.data(),
+        false => recptr,
+    };
+    let bytes = recptr
+        .resolve(call.mem(), usize::from(length))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
+        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
+        return Err(ShimError::Failed(format!(
+            "upvbtv on {name} refused a record: key {key} already holds \
+             {value:02x?}, and that key does not permit duplicates -- \
+             PLBTVSTF.C:539 sends any nonzero status to btverrptr \
+             unconditionally, unlike dupdbtv's own status-5 special case, so \
+             this stops the module rather than answering a value it cannot \
+             tell from success"
+        )));
+    }
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // Currency maintenance, identical to `dupdbtv`'s own -- see that
+    // routine's doc comment for the full account of why an `Ordered` cursor
+    // has to be re-derived after a write that just re-sorted every key.
+    if let Cursor::Ordered { key, .. } = file.cursor() {
+        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
+        let physical = records
+            .find_physical(position)
+            .expect("update just wrote this position");
+        let cursor = match records.place_in(key, physical) {
+            Some(at) => Cursor::Ordered { key, at },
+            None => Cursor::Physical { at: physical },
+        };
+        file.seek_to(cursor);
+    }
+
+    Ok(abi::Ret::Void)
+}
+
 /// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
 ///
 /// `PLBTVSTF.C:632`, quoted in full because every line of it does something:
@@ -781,6 +905,66 @@ pub fn clsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     btrieve
         .close(call.mem(), heap, bbp)
         .map_err(|e| ShimError::Failed(format!("clsbtv: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `void clsbb(void)` -- close the Btrieve file `setbtv` currently has in
+/// force.
+///
+/// # No surviving prototype, and what stands in for one
+///
+/// `_CLSBB` is a genuine `MAJORBBS.DEF` export (`archive/galacticomm/extract/wg1/GALDSRC/DLIB/MAJORBBS.DEF:119`,
+/// ordinal 116) with no declaration anywhere in `re/wg33src/INC/`'s 198
+/// headers or `archive/galacticomm/extract/wg1/GALDSRC/SRC/`'s surviving
+/// `.C`/`.H` files -- every hit for the bare identifier `clsbb` in either
+/// tree is the *variable* `BTVFILE *clsbb` (`ACCOUNT.C:24`, `REMSYS.C:81`,
+/// and their `wg33src`/`mbbs625sdk` counterparts), Galacticomm's own class
+/// database file pointer, unrelated by anything but spelling.
+///
+/// So this is not sourced from a header the way every other routine in this
+/// crate is. What stands in for one, converging from three directions:
+///
+/// - **Arity, measured.** `re/ne_arity.py 116 <WCCMMPLS.DLL>` finds 10 real
+///   call sites and every one cleans zero bytes after the far call returns.
+///   Every other `MAJORBBS` entry in this table is caller-cleans/cdecl, so
+///   "cleans nothing" here can only mean "nothing was pushed" -- a
+///   zero-argument routine -- not a deferred cleanup, which would have to
+///   show up as a *sometimes*-zero pattern the way [`upvbtv`]'s own
+///   measurement does, not a *uniform* one across all 10 sites.
+/// - **Ordinal placement.** `_CLSBB` (@116) sits directly between `_CLS`
+///   (@115, `MAJORBBS.H:818`, clear screen) and `_CLSBTV` (@117,
+///   `BTVSTF.H:166`, close a *named* file) in the export table -- the
+///   ordinary Galacticomm convention of grouping a family alphabetically by
+///   what it does, and the one export between "clear" and "close a named
+///   file" that a zero-argument close naturally is.
+/// - **The `bb` global itself.** [`clsbtv`]'s own quoted body opens with
+///   `goodptr(bb=bbp)` -- `bb` (`PLBTVSTF.C:31`, `struct btvblk *bb; /*
+///   current btvu file pointer set */`) is a plain module-DGROUP global,
+///   the exact one [`current`]/[`set_current`] in this file already read and
+///   write for `setbtv`/`rstbtv`. A zero-argument sibling of "close this
+///   named file" that needs no argument at all can only mean "close
+///   whichever file is current" -- `clsbtv(bb)` with `bb` supplied by the
+///   host instead of the caller.
+///
+/// This shim is that: [`clsbtv`]'s own body, called against [`current`]
+/// instead of a module-supplied argument. If `_CLSBB` ever turns out to do
+/// something else, the reasoning above -- not a citation -- is exactly what
+/// a reader should distrust, and this paragraph is where that would be
+/// found.
+///
+/// `bb == NULL` (nothing current) is not a special case here either: the
+/// null branch of `clsbtv`'s own `goodptr` check already covers it, and
+/// [`Btrieve::close`](crate::btrieve::Btrieve::close) already answers `Ok(false)`
+/// for a null pointer -- see that method's own doc comment, `"goodptr(bb=bbp)
+/// is false for a null bbp"`.
+pub fn clsbb<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let bbp = current(call, host)?;
+    set_current(call, host, bbp)?;
+
+    let Host { btrieve, heap, .. } = host;
+    btrieve
+        .close(call.mem(), heap, bbp)
+        .map_err(|e| ShimError::Failed(format!("clsbb: {e}")))?;
     Ok(abi::Ret::Void)
 }
 
@@ -4216,6 +4400,106 @@ mod tests {
         assert!(e.to_string().contains("dupdbtv"), "{e}");
     }
 
+    // # `upvbtv`, `dupdbtv`'s variable-length sibling
+
+    #[test]
+    fn upvbtv_updates_the_record_the_cursor_names_at_a_caller_given_length() {
+        let dir = crate::testing::scratch_with("upvbtv-update", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(5, "TROLLX"), false);
+
+        f.invoke(upvbtv, &[recptr.offset, recptr.selector, 64])
+            .expect("updates");
+
+        // Re-read from disk with a fresh host, the check that matters -- an
+        // in-memory model that agrees with itself proves nothing.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(5), 0, 5), "still key 5");
+        assert_eq!(
+            g.read(FarPtr {
+                offset: into.offset + 2,
+                selector: into.selector
+            }),
+            "TROLLX"
+        );
+        assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+    }
+
+    /// If this hard-coded `file.maxlen()` the way [`dupdbtv`] does instead of
+    /// reading its own `length` argument, a deliberately wrong length would
+    /// still succeed. `Block::update` refuses a fixed-length file a buffer
+    /// that is not exactly its own `reclen` (64), so a 32-byte call only
+    /// fails if `length` genuinely came from the argument.
+    #[test]
+    fn upvbtv_reads_its_own_length_argument_rather_than_the_files_reclen() {
+        let dir = crate::testing::scratch_with("upvbtv-length-argument", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let half = &sample_record(5, "TROLLX")[..32];
+        let recptr = f.bytes(half, false);
+
+        let e = f
+            .invoke(upvbtv, &[recptr.offset, recptr.selector, 32])
+            .expect_err("a 32-byte write to a 64-byte fixed-length file");
+        assert!(e.to_string().contains("64"), "{e}");
+    }
+
+    /// The behavioural difference from [`dupdbtv`]: `PLBTVSTF.C:539` sends
+    /// *any* nonzero status to `btverrptr` unconditionally -- there is no
+    /// `switch` carving status 5 (duplicate key) into a quiet `0` the way
+    /// `dupdbtv`'s own body does. A collision through `upvbtv` stops the
+    /// module.
+    #[test]
+    fn upvbtv_refuses_a_duplicate_key_rather_than_answering_zero() {
+        let dir = crate::testing::scratch_with("upvbtv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        let e = f
+            .invoke(upvbtv, &[recptr.offset, recptr.selector, 64])
+            .expect_err("key 6 already belongs to Elf");
+        assert!(e.to_string().contains("upvbtv"), "{e}");
+    }
+
+    #[test]
+    fn upvbtv_with_nothing_positioned_stops_the_module() {
+        // Cursor::Nowhere: the file is current but nothing has positioned it,
+        // so there is no record for opcode 3 to update.
+        let dir = crate::testing::scratch_with("upvbtv-unpositioned", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(1, "Nobody"), false);
+
+        let e = f
+            .invoke(upvbtv, &[recptr.offset, recptr.selector, 64])
+            .expect_err("nothing has positioned the file");
+        assert!(e.to_string().contains("upvbtv"), "{e}");
+    }
+
+    /// The other behavioural difference from [`dupdbtv`]/[`dinsbtv`]:
+    /// `PLBTVSTF.C:534-536` has a `bb == NULL` guard where those two do not,
+    /// so no file current answers with nothing rather than stopping the
+    /// module -- the same "answer rather than refuse" shape
+    /// `qrybtv`/`obtbtvl`/etc. already get, shaped as `void`'s own version of
+    /// `0`.
+    #[test]
+    fn upvbtv_with_no_file_current_is_a_quiet_no_op() {
+        let mut f = nothing_current();
+        let recptr = f.bytes(&sample_record(1, "Nobody"), false);
+        f.invoke(upvbtv, &[recptr.offset, recptr.selector, 64])
+            .expect("a quiet no-op, not a stop");
+        let noted = f.host.notes().iter().filter(|n| n.contains("upvbtv")).count();
+        assert_eq!(noted, 1, "{:?}", f.host.notes());
+    }
+
     // # `clsbtv`, which rebuilds the index and gives four allocations back
     //
     // `SAMPLE.DAT` and `OTHER.DAT` are hand-built fixtures with no real index
@@ -4302,6 +4586,56 @@ mod tests {
 
         let after = std::fs::read(&path).expect("read after");
         assert_eq!(before, after, "a clean close never touches the file");
+    }
+
+    // # `clsbb`, `clsbtv`'s zero-argument sibling -- see that shim's own doc
+    // comment for why it reads `clsbtv(bb)` rather than a source citation.
+
+    #[test]
+    fn clsbb_closes_whatever_file_setbtv_left_current() {
+        let dir = crate::testing::scratch_with("clsbb-close", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(bb(&f), block, "opening made it current");
+
+        f.invoke(clsbb, &[]).expect("closes");
+
+        assert!(
+            f.host.btrieve.files().iter().all(|b| b.block() != block),
+            "the block is gone from the open files"
+        );
+        assert!(f.host.heap.block(block).is_none(), "the block itself came back");
+    }
+
+    #[test]
+    fn clsbb_with_nothing_current_is_a_quiet_no_op() {
+        let mut f = nothing_current();
+        f.invoke(clsbb, &[]).expect("a no-op, not an error");
+    }
+
+    /// The discriminator against a shim that closes "whatever `opnbtv` last
+    /// returned" instead of "whatever `bb` names": open two files, `setbtv`
+    /// back to the first, and check `clsbb` takes the one `setbtv` actually
+    /// left current -- not the second, more-recently-opened one.
+    #[test]
+    fn clsbb_closes_the_current_file_not_merely_the_last_one_opened() {
+        let dir = crate::testing::scratch_with("clsbb-current-not-last", &["SAMPLE.DAT", "OTHER.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        let first = open(&mut f, "SAMPLE.DAT", 64);
+        let second = open(&mut f, "OTHER.DAT", 32);
+        f.invoke(setbtv, &Fixture::far(first)).expect("set back to the first");
+        assert_eq!(bb(&f), first, "setbtv moved current back to the first file");
+
+        f.invoke(clsbb, &[]).expect("closes");
+
+        assert!(
+            f.host.btrieve.files().iter().all(|b| b.block() != first),
+            "the block setbtv left current is the one that closed"
+        );
+        assert!(
+            f.host.btrieve.files().iter().any(|b| b.block() == second),
+            "the other file, not current, stays open"
+        );
     }
 
     #[test]
