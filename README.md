@@ -1,4 +1,4 @@
-# &lt;name&gt;
+# PROJECT_NAME_TBD
 
 Runs unmodified MajorBBS and Worldgroup modules natively on Linux.
 
