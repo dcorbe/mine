@@ -268,6 +268,9 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
         (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller),
         (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller),
+        (MAJORBBS, "fseek", stream::fseek, Cleans::Caller),
+        (MAJORBBS, "ftell", stream::ftell, Cleans::Caller),
+        (MAJORBBS, "rewind", stream::rewind, Cleans::Caller),
         // The clock, the audit trail, and coming online.
         (MAJORBBS, "access", system::access, Cleans::Caller),
         (MAJORBBS, "now", system::now, Cleans::Caller),

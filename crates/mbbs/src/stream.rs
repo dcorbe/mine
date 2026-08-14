@@ -1,14 +1,18 @@
 //! Streams: the module's own files, opened by name and read or written through.
 //!
-//! Seven routines over a handle -- `fopen`, `fclose`, `fgets`, `fread`,
-//! `fprintf`, `fflush`, `unlink` -- and no `fseek`, `ftell` or `rewind`
-//! anywhere in `WCCMMUD.DLL`. Every stream is read or written straight through,
-//! once. The design is `docs/plans/2026-08-04-streams.md`.
+//! Ten routines over a handle -- `fopen`, `fclose`, `fgets`, `fread`,
+//! `fprintf`, `fflush`, `unlink`, `fseek`, `ftell`, `rewind`. `WCCMMUD.DLL`
+//! imports none of the last three -- every stream in it is read or written
+//! straight through, once -- but a second module now does (see
+//! [`Streams::readable`]'s own doc comment), so this crate carries them. The
+//! design is `docs/plans/2026-08-04-streams.md`.
 //!
-//! One stream is neither: `_GENERATE_TOP_LIST` opens `log.log` `"w+"` at
-//! `seg 34:0x010a`, the module's only update mode. It is written like any other
-//! and reading it is refused -- see [`Streams::readable`], which is where the
-//! reason lives.
+//! One stream in `WCCMMUD.DLL` is neither read-only nor write-only:
+//! `_GENERATE_TOP_LIST` opens `log.log` `"w+"` at `seg 34:0x010a`, the
+//! module's only update mode. It is written like any other, and -- now that
+//! `fseek`/`ftell`/`rewind` exist somewhere in this host -- reading it is
+//! *mechanically* possible; `WCCMMUD.DLL` itself never asks to, so this is
+//! inert for that module and only load-bearing for the one that does.
 //!
 //! # The import census does not cover this one
 //!
@@ -34,7 +38,7 @@
 //! against the source.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use mbbs_machine::ptr::ModulePtr;
@@ -174,6 +178,20 @@ impl Mode {
     }
 }
 
+/// `fseek`'s three origins, `STDIO.H`'s own numbering (`SEEK_SET` 0,
+/// `SEEK_CUR` 1, `SEEK_END` 2) already resolved into a type the host cannot
+/// mis-widen -- decoding the raw `int` into one of these three is
+/// [`crate::shims::stream::fseek`]'s job, not this module's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whence {
+    /// `SEEK_SET` -- from the start of the file.
+    Set,
+    /// `SEEK_CUR` -- from the stream's current position.
+    Cur,
+    /// `SEEK_END` -- from the end of the file.
+    End,
+}
+
 /// An open file, and how the module is reading or writing it.
 ///
 /// Reading is buffered because it is done a byte at a time -- see [`Self::getc`]
@@ -183,12 +201,15 @@ enum Io {
     Read(BufReader<File>),
     Write(File),
 
-    /// Opened for update -- `O_RDWR`. Written exactly like [`Self::Write`] and
-    /// deliberately **not** read: see [`Streams::readable`].
+    /// Opened for update -- `O_RDWR`. Written exactly like [`Self::Write`],
+    /// and readable too -- see [`Streams::readable`]'s own doc comment for
+    /// why that changed and what still gates it.
     ///
     /// Unbuffered, like `Write` and unlike `Read`, which is not an oversight.
     /// A `BufReader` over a handle this host also writes through would answer
-    /// from a buffer filled before the write.
+    /// from a buffer filled before the write -- so [`Stream::getc`] reads
+    /// this variant directly off the `File` rather than through a second
+    /// `BufReader`.
     Update(File),
 }
 
@@ -252,17 +273,32 @@ impl<A: Abi> Stream<A> {
     /// exception in the RTL fires only when a `\r` is the last byte of an
     /// internal buffer, which is an artefact of where the buffer happened to
     /// end rather than a rule about the file, and is not reproduced here.
+    ///
+    /// **Reads `Io::Update` too, now.** Until `Streams::readable` stopped
+    /// refusing an update stream outright, nothing ever called this with
+    /// `self.io` in that variant, so the byte-at-a-time read below only ever
+    /// matched `Io::Read`'s `BufReader` and answered `None` for anything
+    /// else -- silently correct only because the caller it was silently
+    /// correct *for* could never be reached. `Io::Update` reads straight off
+    /// its `File`, unbuffered, the same reason `Io::Update`'s own doc
+    /// comment gives for why it is not a second `BufReader`.
     fn getc(&mut self) -> io::Result<Option<u8>> {
-        let Io::Read(reader) = &mut self.io else {
-            return Ok(None);
-        };
         if self.ended {
             return Ok(None);
         }
 
         loop {
             let mut one = [0u8; 1];
-            if reader.read(&mut one)? == 0 {
+            let n = match &mut self.io {
+                Io::Read(reader) => reader.read(&mut one)?,
+                Io::Update(file) => file.read(&mut one)?,
+                // A write-only stream has nothing to read. `Streams::readable`
+                // already refuses this case before `getc` is ever reached; this
+                // arm exists so the match is exhaustive rather than because
+                // anything is expected to hit it.
+                Io::Write(_) => return Ok(None),
+            };
+            if n == 0 {
                 self.ended = true;
                 return Ok(None);
             }
@@ -334,6 +370,48 @@ impl<A: Abi> Stream<A> {
         }
         file.write_all(&out)
     }
+
+    /// Move this stream's real, physical position, and answer where it
+    /// landed.
+    ///
+    /// **A raw byte offset into the file, not the module's logical one.**
+    /// Borland's own `FSEEK.C` calls `lseek` on the underlying DOS handle;
+    /// the CR-squeeze and soft `^Z` end-of-file [`Self::getc`] layers on top
+    /// of that never see this call, and neither does this host's -- see this
+    /// file's own module doc ("measured against Borland's own runtime") for
+    /// why that is the answer being matched rather than a looser one.
+    ///
+    /// Clears [`Self::ended`] unconditionally on success, which is what
+    /// zeroes `_F_EOF` in the module's `FILE.flags` (through
+    /// [`Streams::seek_mem`]'s own call to `Streams::sync`, after this
+    /// returns): `FSEEK.C` and `REWIND.C` both clear it whether or not the
+    /// new position is provably before the end, and a stream a module has
+    /// just repositioned must be readable again even if the read right
+    /// before the seek had hit the end.
+    ///
+    /// A [`BufReader`]'s own `Seek` discards whatever it had buffered, so a
+    /// read immediately after this is never answered out of bytes read
+    /// before the seek.
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let at = match &mut self.io {
+            Io::Read(reader) => reader.seek(pos)?,
+            Io::Write(file) | Io::Update(file) => file.seek(pos)?,
+        };
+        self.ended = false;
+        Ok(at)
+    }
+
+    /// This stream's real, physical position -- what `ftell` reports.
+    ///
+    /// A [`BufReader`] answers this without discarding its buffer (unlike a
+    /// bare `seek(SeekFrom::Current(0))`, which would), so calling this does
+    /// not itself disturb a read in progress.
+    fn tell(&mut self) -> io::Result<u64> {
+        match &mut self.io {
+            Io::Read(reader) => reader.stream_position(),
+            Io::Write(file) | Io::Update(file) => file.stream_position(),
+        }
+    }
 }
 
 /// The streams that are open, and every cookie ever issued.
@@ -343,20 +421,26 @@ impl<A: Abi> Stream<A> {
 /// `Stream::cookie` and `retired`'s addresses are typed `A::Ptr` rather than
 /// `FarPtr`, and `arena` is `Arena<A>`, so this is genuinely `Streams<A>`.
 /// Every method that never touched a `Machine` -- `close`, `name`,
-/// `modified`, `write`, `len`, `is_empty`, and the private `find`/`readable`/
-/// `free_fd` -- lives on `impl<A: Abi> Streams<A>`, `cookie` widened from
-/// `FarPtr` to `A::Ptr`.
+/// `modified`, `write`, `tell`, `len`, `is_empty`, and the private
+/// `find`/`readable`/`free_fd` -- lives on `impl<A: Abi> Streams<A>`,
+/// `cookie` widened from `FarPtr` to `A::Ptr`.
 ///
-/// `open_mem`, `line_mem`, `read_mem` and the private `sync` touch memory and
-/// take `&mut A::Mem` for it. There was a period when each of the first three
-/// also had a `Wg16` facade -- `open`/`line`/`read`, keeping the original
-/// `&mut Machine` signature and reborrowing through `Machine::mem_mut` -- to
-/// spare shim call sites built against the pre-generic shape. Those facades
-/// are gone: once the shim layer took `Call<A>`, every call site had an
-/// `A::Mem` of its own via `Call::mem` and went straight to the `_mem` core,
-/// which left all three facades with **zero callers** while still forcing
-/// `mbbs_machine::m16::FarPtr` and `mbbs_machine::m16::Machine` into this file's imports. Deleting
-/// them is what took `stream.rs` off `no_direct_farptr.rs`'s `ALLOWED` list.
+/// `open_mem`, `line_mem`, `read_mem`, `seek_mem` and the private `sync`
+/// touch memory and take `&mut A::Mem` for it. `seek_mem` needs it for the
+/// same reason `sync` exists at all: a successful seek clears `_F_EOF` in
+/// the module's own `FILE.flags` (see `Stream::seek`'s own doc comment),
+/// which `tell` never touches -- finding out where a stream is changes
+/// nothing a module can observe, which is why `tell` is in the first list
+/// and `seek_mem` is in this one. There was a period when each of the first
+/// three also had a `Wg16` facade -- `open`/`line`/`read`, keeping the
+/// original `&mut Machine` signature and reborrowing through
+/// `Machine::mem_mut` -- to spare shim call sites built against the
+/// pre-generic shape. Those facades are gone: once the shim layer took
+/// `Call<A>`, every call site had an `A::Mem` of its own via `Call::mem` and
+/// went straight to the `_mem` core, which left all three facades with
+/// **zero callers** while still forcing `mbbs_machine::m16::FarPtr` and
+/// `mbbs_machine::m16::Machine` into this file's imports. Deleting them is
+/// what took `stream.rs` off `no_direct_farptr.rs`'s `ALLOWED` list.
 ///
 /// The `_mem` suffix is now vestigial -- there is no unsuffixed sibling left
 /// to distinguish them from -- but renaming three public methods to drop it
@@ -630,6 +714,80 @@ impl<A: Abi> Streams<A> {
             .map_err(|e| format!("{}: {e}", stream.name))
     }
 
+    /// Move a stream's position -- `SEEK_SET` from the start, `SEEK_CUR` from
+    /// where it is, `SEEK_END` from the end -- and answer where it landed.
+    ///
+    /// Takes `mem` (unlike [`Self::write`], which never touches it): a
+    /// successful seek clears `_F_EOF` in the module's own `FILE.flags`
+    /// ([`Stream::seek`]'s own doc comment), the same field [`Self::sync`]
+    /// keeps current everywhere else in this file, and `feof` is a macro
+    /// that never asks the host (this file's own module doc) -- so a seek
+    /// that left a stale `_F_EOF` behind would make the module believe it
+    /// was still at the end of a file it had just been moved off of.
+    ///
+    /// **A seek past the end of the file is allowed, on any stream, not only
+    /// a writable one.** C only promises this for a writable stream -- seek
+    /// past the end, then write, leaves a hole -- and says nothing about the
+    /// read side. This host does not distinguish them: an OS-level seek past
+    /// a regular file's length is not an error either way, so refusing it
+    /// here for a read-only stream would be inventing a restriction neither
+    /// POSIX's `lseek` nor DOS's own enforces. Reading after such a seek
+    /// answers zero bytes, which is [`Stream::getc`]'s ordinary
+    /// end-of-file arm -- not a fabricated value, and not a refusal.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream; if `whence` is [`Whence::Set`] and
+    /// `offset` is negative (`SEEK_SET`'s offset is measured from zero, so a
+    /// negative one names no position at all); or the underlying seek fails
+    /// (`SEEK_CUR`/`SEEK_END` landing before the start of the file, which
+    /// this host refuses the same way the OS call underneath it does rather
+    /// than clamping to zero and pretending the module asked for that).
+    pub fn seek_mem(
+        &mut self,
+        mem: &mut A::Mem,
+        cookie: A::Ptr,
+        offset: i64,
+        whence: Whence,
+    ) -> Result<u64, String> {
+        let at = self.find(cookie)?;
+
+        let from = match whence {
+            Whence::Set => SeekFrom::Start(u64::try_from(offset).map_err(|_| {
+                format!(
+                    "{}: fseek(SEEK_SET, {offset}) -- a negative offset names no position",
+                    self.open[at].name
+                )
+            })?),
+            Whence::Cur => SeekFrom::Current(offset),
+            Whence::End => SeekFrom::End(offset),
+        };
+
+        let pos = self.open[at]
+            .seek(from)
+            .map_err(|e| format!("{}: {e}", self.open[at].name))?;
+        self.sync(mem, at)?;
+        Ok(pos)
+    }
+
+    /// A stream's current position -- what `ftell` reports.
+    ///
+    /// Never touches `mem`, unlike [`Self::seek_mem`]: finding out where the
+    /// stream is changes nothing a module could observe through
+    /// `FILE.flags`.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream. The position this returns is a
+    /// plain `u64`; whether it fits the `long` the module reads it back as
+    /// is [`crate::shims::stream::ftell`]'s question to ask, not this one's.
+    pub fn tell(&mut self, cookie: A::Ptr) -> Result<u64, String> {
+        let at = self.find(cookie)?;
+        self.open[at]
+            .tell()
+            .map_err(|e| format!("{}: {e}", self.open[at].name))
+    }
+
     /// How many streams are open.
     pub fn len(&self) -> usize {
         self.open.len()
@@ -656,32 +814,43 @@ impl<A: Abi> Streams<A> {
 
     /// Where the stream `cookie` names is, given it must be readable.
     ///
-    /// Two refusals, for two different things. The first is the module asking
-    /// to read a stream it opened `w` or `a`. The second is subtler and is why
-    /// this is not one check: an update stream **is** readable as far as its
-    /// mode and its `flags` word go, and there is still no defined moment at
-    /// which reading it would mean anything.
+    /// One refusal now: the module asking to read a stream it opened `w` or
+    /// `a`.
+    ///
+    /// # History: the second refusal this used to have
+    ///
+    /// Until this crate implemented `fseek`/`ftell`/`rewind` anywhere at
+    /// all, an update stream was refused here too, on top of the mode check
+    /// above. `fopen`'s own documentation (`FOPEN.C:261-266`) says "output
+    /// may not be directly followed by input without an intervening fseek
+    /// or rewind", and `WCCMMUD.DLL` -- the only module measured against
+    /// this host when that refusal was written -- imports none of the
+    /// three. So every read it could have made of its one update stream
+    /// (`log.log`, `"w+"`) was one the original had no defined answer for;
+    /// answering anyway would have meant inventing behaviour, and the
+    /// answer this host would have invented -- end of file, from
+    /// [`Stream::getc`]'s `else` arm -- was a plausible zero rather than a
+    /// visible one.
+    ///
+    /// That census does not survive LunatiX 5.3F
+    /// (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`), a second real
+    /// 32-bit module that imports `_fseek`, `_ftell`, `_fgetc`, `_fputc`,
+    /// `_fwrite` and `_flushall`, and opens its own `CWDLOPTS.DAT` for
+    /// update before reading it. This host now has `fseek`/`ftell`/`rewind`
+    /// ([`Streams::seek_mem`], [`Streams::tell`], and
+    /// [`crate::shims::stream::rewind`]) with a real position behind them,
+    /// so a read of an update stream has a defined answer: whatever is at
+    /// its current position, the same as any other readable stream --
+    /// [`Stream::getc`] reads `Io::Update` directly now too (see that
+    /// method's own doc comment), which is the other half of what made the
+    /// old refusal here true in the first place: even removing this check
+    /// alone would not have produced a real read, only a stream that opened
+    /// readable and delivered nothing.
     fn readable(&self, cookie: A::Ptr) -> Result<usize, String> {
         let at = self.find(cookie)?;
         let stream = &self.open[at];
         if !stream.mode.readable() {
             return Err(format!("{} is open for writing", stream.name));
-        }
-
-        // `fopen`'s own documentation, FOPEN.C:261-266: "output may not be
-        // directly followed by input without an intervening fseek or rewind".
-        // `WCCMMUD.DLL` imports no `fseek`, no `ftell` and no `rewind`, so
-        // every read it could make of an update stream is one the original had
-        // no defined answer for. A host that answered anyway would be inventing
-        // behaviour, and the answer it would invent -- end of file, from
-        // `getc`'s `else` arm -- is a plausible zero rather than a visible one.
-        if matches!(stream.io, Io::Update(_)) {
-            return Err(format!(
-                "{} is open for update, and this module imports no fseek, ftell \
-                 or rewind -- so there is no point at which reading it would \
-                 mean anything",
-                stream.name
-            ));
         }
         Ok(at)
     }

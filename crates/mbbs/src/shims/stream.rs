@@ -1,4 +1,4 @@
-//! The nine file routines, seven of them over a `FILE *` the module holds.
+//! The twelve file routines, ten of them over a `FILE *` the module holds.
 //!
 //! Borland's, re-exported by `MAJORBBS.DLL`:
 //!
@@ -24,12 +24,28 @@
 //! What a stream *is* -- the struct, the modes, the text translation -- is
 //! [`crate::stream`]'s. This is the part that knows about the module.
 //!
-//! `fseek`, `ftell`, `rewind`, `fwrite`, `fputs`, `fputc`, `fscanf`, `fgetc`,
-//! `getc` and `ungetc` are absent on purpose: `WCCMMUD.DLL` imports none of
-//! them. Every stream in it is read or written straight through, once -- and
-//! that census is what makes a stream opened `"w+"` unreadable rather than
-//! merely unread. Without a seek there is no legal transition from writing it
-//! to reading it, so there is nothing to implement.
+//! # `fseek`, `ftell` and `rewind` are here now; the census that excluded
+//! them was `WCCMMUD.DLL`-only
+//!
+//! For a long time this module doc said these three were absent on purpose,
+//! because `WCCMMUD.DLL` imports none of them and every stream in it is read
+//! or written straight through, once -- there was no legal transition from
+//! writing a stream to reading it, so there was nothing to implement.
+//!
+//! That was a fact about one module, stated as if it were a fact about this
+//! host. LunatiX 5.3F
+//! (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`) imports `_fseek`,
+//! `_ftell`, `_fgetc`, `_fputc`, `_fwrite` and `_flushall`, and opens its own
+//! `CWDLOPTS.DAT` for update before reading it -- exactly the transition
+//! `WCCMMUD.DLL` never needed. [`fseek`], [`ftell`] and [`rewind`] below are
+//! that, over [`crate::stream::Streams::seek_mem`] and
+//! [`crate::stream::Streams::tell`]; [`crate::stream::Streams::readable`]'s
+//! own doc comment has the other half -- why an update stream is readable at
+//! all now.
+//!
+//! `fwrite`, `fputs`, `fputc`, `fscanf`, `fgetc`, `getc` and `ungetc` are
+//! still genuinely absent: no import census, `WCCMMUD.DLL`'s or LunatiX's,
+//! has ever asked for any of them.
 //!
 //! # Two of these may answer instead of refusing
 //!
@@ -56,7 +72,7 @@ use crate::abi::{self, Abi, Call, Wg16};
 use crate::dos;
 use crate::fmt::format_call;
 use crate::shims::{NO, ShimError, sign_extend};
-use crate::stream::Mode;
+use crate::stream::{Mode, Whence};
 
 /// The null pointer, in this ABI's own representation.
 ///
@@ -545,6 +561,117 @@ pub fn cntdir<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `int fseek(FILE *f, long offset, int whence)` -- move a stream's
+/// position.
+///
+/// Zero on success, matching C's convention (and this crate's own `fclose`
+/// note above: the only failures a real caller would see here are ones this
+/// host would already have refused before returning at all -- see
+/// [`Streams::seek_mem`](crate::stream::Streams::seek_mem)'s own `# Errors`).
+/// There is no plausible non-zero to invent for a case this host cannot
+/// answer, so a seek this host cannot honour stops the module instead of
+/// returning one.
+///
+/// **A seek past the end of the file is allowed, not refused**, on any
+/// stream -- see `Streams::seek_mem`'s own doc comment for why: C only
+/// promises this for a writable stream (it creates a hole on the next
+/// write), and this host does not narrow the read side to match, because an
+/// OS-level seek past a regular file's length is not an error either way.
+///
+/// # Width discipline
+///
+/// `offset` is a `long` -- [`Abi::LONG_WIDTH`] bytes in every ABI this crate
+/// has met, always signed, so `SEEK_CUR`/`SEEK_END` can move backwards.
+/// `call.long()` already hands back the raw bits at that width; `as i32`
+/// puts the sign back (a `long` is never narrower than 4 bytes here, so
+/// there is no [`sign_extend`]-shaped question to ask of it the way there is
+/// for `whence`).
+///
+/// `whence` is a C `int`, which is [`Abi::INT_WIDTH`] bytes -- 2 under
+/// `Wg16`, 4 under `Wg32`. `SEEK_SET`/`SEEK_CUR`/`SEEK_END` are small
+/// non-negative values, so the zero-extending `Into::<u32>::into(call.int())`
+/// is exactly right and needs no sign at all; what it must **not** be is
+/// narrowed back down with `as u16`/`as i16` afterwards -- the idiom this
+/// crate found and removed from six other shims (`fgets`, `fread` and
+/// their neighbours), because it is `Wg16`'s width hard-coded and silently
+/// wrong under `Wg32`.
+pub fn fseek<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `int fseek(FILE *f, long offset, int whence)` -- Borland's; no
+    // Galacticomm header redeclares it.
+    let cookie = call.ptr();
+    let offset = call.long() as i32 as i64;
+    let whence = match Into::<u32>::into(call.int()) {
+        0 => Whence::Set,
+        1 => Whence::Cur,
+        2 => Whence::End,
+        other => {
+            return Err(ShimError::Failed(format!(
+                "fseek: whence {other} is none of SEEK_SET (0), SEEK_CUR (1), SEEK_END (2)"
+            )));
+        }
+    };
+
+    host.streams
+        .seek_mem(call.mem(), cookie, offset, whence)
+        .map_err(|e| ShimError::Failed(format!("fseek: {e}")))?;
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `long ftell(FILE *f)` -- a stream's current position.
+///
+/// **Returns [`abi::Ret::Long`], not `Ret::Int`.** `ftell` is a `long` in
+/// both ABIs -- unlike `fseek`'s `whence`, there is no width this crate needs
+/// to reconcile between `Wg16` and `Wg32` here, only the right variant of
+/// `Ret` to pick, the same trap `Ret<Wg16>`'s own conversion note (`abi.rs`)
+/// warns a swap between `Int` and `Long` is not caught by the type checker.
+///
+/// # Errors
+///
+/// If `cookie` names no open stream, or the stream's position does not fit
+/// the 32-bit `long` the module reads it back as -- which cannot happen for
+/// any file this host can actually open (nothing here maps a file larger
+/// than `u32::MAX` bytes), but is checked rather than truncated in silence,
+/// on this crate's usual principle that a wrap is worse than a refusal.
+pub fn ftell<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `long ftell(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
+    let cookie = call.ptr();
+    let at = host
+        .streams
+        .tell(cookie)
+        .map_err(|e| ShimError::Failed(format!("ftell: {e}")))?;
+    let at = u32::try_from(at)
+        .map_err(|_| ShimError::Failed(format!("ftell: position {at} does not fit a 32-bit long")))?;
+    Ok(abi::Ret::Long(at))
+}
+
+/// `void rewind(FILE *f)` -- put a stream back at the start.
+///
+/// C defines this as `(void)fseek(stream, 0L, SEEK_SET)` plus clearing the
+/// error indicator, and that is exactly what this does: [`fseek`]'s own
+/// `SEEK_SET` arm, through the same [`Streams::seek_mem`](crate::stream::Streams::seek_mem).
+/// This host tracks no error indicator separate from `_F_EOF` -- there is no
+/// `ferror`-only bit anywhere in [`crate::stream::Stream`] -- so "clearing
+/// the error indicator" and "clearing `_F_EOF`" are the same write here, and
+/// `Stream::seek`'s own doc comment is where that clear happens.
+///
+/// **Void, not "void unless the seek fails".** C's `rewind` has nowhere to
+/// report a failure and does not try to; a real caller cannot tell a refused
+/// rewind from a successful one by its return value at all. This host does
+/// not invent a way to tell it either: a `rewind` this host cannot honour --
+/// only reachable if `cookie` is not a stream this host opened, since
+/// `offset` 0 and `SEEK_SET` can never themselves be refused -- stops the
+/// module the same way any other unanswerable call does, rather than
+/// returning silently and leaving the module's next read wherever the seek
+/// did not actually happen.
+pub fn rewind<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `void rewind(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
+    let cookie = call.ptr();
+    host.streams
+        .seek_mem(call.mem(), cookie, 0, Whence::Set)
+        .map_err(|e| ShimError::Failed(format!("rewind: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +700,28 @@ mod tests {
             Ret::U16(n) => n,
             _ => panic!("expected an int"),
         }
+    }
+
+    fn long(ret: Ret) -> u32 {
+        match ret {
+            Ret::U32(n) => n,
+            _ => panic!("expected a long"),
+        }
+    }
+
+    /// `fseek(fp, offset, whence)`. `offset` is a signed 32-bit `long`, laid
+    /// out low word then high word -- the same spacing `lngrnd`'s own tests
+    /// (`shims::system`) pin for a `long` argument.
+    fn seek(f: &mut Fixture, fp: FarPtr, offset: i32, whence: u16) -> Result<Ret, ShimError> {
+        let bits = offset as u32;
+        f.invoke(fseek,
+            &[fp.offset, fp.selector, bits as u16, (bits >> 16) as u16, whence],
+        )
+    }
+
+    /// `ftell(fp)`, as the position it answered.
+    fn tell(f: &mut Fixture, fp: FarPtr) -> u32 {
+        long(f.invoke(ftell, &Fixture::far(fp)).expect("ftell"))
     }
 
     /// `fopen(name, mode)`.
@@ -947,24 +1096,193 @@ mod tests {
     }
 
     #[test]
-    fn reading_a_stream_opened_for_update_is_refused_rather_than_answered_with_the_end() {
-        // The mode opens; the read does not. `fopen`'s own documentation
-        // (FOPEN.C:261-266) says input may not directly follow output without
-        // an intervening `fseek` or `rewind`, and `WCCMMUD.DLL` imports
-        // neither, nor `ftell` -- so there is no point at which reading one of
-        // these means anything. The alternative is not an implementation, it is
-        // a silent end-of-file on a stream whose flags say `_F_READ`.
+    fn a_stream_opened_for_update_can_now_be_read_once_it_has_been_written_and_rewound() {
+        // The exact case `Streams::readable` used to refuse outright: `fopen`'s
+        // own documentation (FOPEN.C:261-266) says output may not directly be
+        // followed by input without an intervening `fseek` or `rewind`.
+        // `WCCMMUD.DLL` imports neither, so there was no point at which
+        // reading its one `"w+"` stream meant anything -- but LunatiX imports
+        // both (this file's own module doc), and the sequence its own
+        // documentation always allowed now works end to end: write, rewind,
+        // read back what was written.
         let mut f = Fixture::rooted(scratch("stream-update-read"));
         let fp = opened(&mut f, "LOG.LOG", "w+");
 
-        let buffer = f.buffer(64);
-        let e = f
-            .invoke(fgets,
-                &[buffer.offset, buffer.selector, 64, fp.offset, fp.selector],
-            )
-            .expect_err("a refusal");
-        assert!(e.to_string().contains("LOG.LOG is open for update"), "{e}");
-        assert!(e.to_string().contains("fseek"), "and says why: {e}");
+        let template = f.text("hello\n");
+        f.invoke(fprintf,
+            &[fp.offset, fp.selector, template.offset, template.selector],
+        )
+        .expect("fprintf");
+
+        assert!(f.invoke(rewind, &Fixture::far(fp)).is_ok(), "rewind");
+        assert_eq!(
+            gets(&mut f, fp, 64).as_deref(),
+            Some("hello\n"),
+            "an update stream now reads back what it just wrote"
+        );
+    }
+
+    #[test]
+    fn opening_for_update_without_writing_first_is_also_readable_now() {
+        // Not every update-mode read follows a write in the same session --
+        // `"r+"` opens an existing file without truncating it, so a module
+        // may open one purely to read it, the way `Streams::readable`'s own
+        // doc comment now describes.
+        let root = scratch("stream-update-read-only");
+        std::fs::write(root.join("LOG.LOG"), b"first\r\nsecond\r\n").expect("seed content");
+        let mut f = Fixture::rooted(root);
+        let fp = opened(&mut f, "LOG.LOG", "r+");
+
+        assert_eq!(gets(&mut f, fp, 64).as_deref(), Some("first\n"));
+        assert_eq!(gets(&mut f, fp, 64).as_deref(), Some("second\n"));
+    }
+
+    // ---- 16-18. fseek, ftell, rewind ----------------------------------------
+
+    #[test]
+    fn fseek_and_ftell_round_trip_through_all_three_origins() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let len = std::fs::metadata(crate::testing::data().join("LINES.TXT"))
+            .expect("the fixture")
+            .len() as u32;
+
+        // SEEK_SET: absolute, from the start.
+        assert_eq!(word(seek(&mut f, fp, 10, 0).expect("fseek")), 0, "fseek returns 0 on success");
+        assert_eq!(tell(&mut f, fp), 10);
+
+        // SEEK_CUR: relative to wherever the stream already is, including
+        // backwards -- a negative offset, which is the case `call.long()`'s
+        // sign has to survive.
+        assert_eq!(word(seek(&mut f, fp, 5, 1).expect("fseek")), 0);
+        assert_eq!(tell(&mut f, fp), 15);
+        assert_eq!(word(seek(&mut f, fp, -7, 1).expect("fseek")), 0);
+        assert_eq!(tell(&mut f, fp), 8);
+
+        // SEEK_END: from the end -- 0 lands exactly on the file's length.
+        assert_eq!(word(seek(&mut f, fp, 0, 2).expect("fseek")), 0);
+        assert_eq!(tell(&mut f, fp), len);
+    }
+
+    #[test]
+    fn a_read_after_a_seek_returns_the_bytes_at_the_new_position_not_the_start() {
+        // LINES.TXT's own raw bytes (binary mode, so nothing is translated):
+        // "alpha\r\n" is seven bytes, then "be\rta\r\n" -- see
+        // `every_carriage_return_is_dropped_in_text_mode_not_only_those_before_a_newline`
+        // above for the same seven bytes read from the front instead of
+        // seeked to.
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+
+        assert_eq!(word(seek(&mut f, fp, 7, 0).expect("fseek")), 0);
+        assert_eq!(
+            gets(&mut f, fp, 64).as_deref(),
+            Some("be\rta\r\n"),
+            "the seek landed past the first line's raw seven bytes, not at the start"
+        );
+    }
+
+    #[test]
+    fn rewind_puts_a_partially_read_stream_back_to_the_start() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rt");
+        assert_eq!(gets(&mut f, fp, 64).as_deref(), Some("alpha\n"));
+        assert_eq!(gets(&mut f, fp, 64).as_deref(), Some("beta\n"));
+
+        assert!(matches!(f.invoke(rewind, &Fixture::far(fp)).expect("rewind"), Ret::Void));
+        assert_eq!(
+            gets(&mut f, fp, 64).as_deref(),
+            Some("alpha\n"),
+            "rewind put the stream back at the start"
+        );
+    }
+
+    #[test]
+    fn rewind_clears_the_eof_flag_a_read_to_the_end_set() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "CTRLZ.TXT", "rt");
+        while gets(&mut f, fp, 64).is_some() {}
+        assert_eq!(flags_of(&f, fp) & F_EOF, F_EOF, "the read hit the end");
+
+        f.invoke(rewind, &Fixture::far(fp)).expect("rewind");
+        assert_eq!(
+            flags_of(&f, fp) & F_EOF,
+            0,
+            "rewind clears _F_EOF the same way a plain fseek does"
+        );
+    }
+
+    #[test]
+    fn ftell_after_a_write_reflects_the_bytes_written() {
+        let mut f = Fixture::rooted(scratch("stream-ftell-write"));
+        let fp = opened(&mut f, "OUT.LOG", "wb");
+        assert_eq!(tell(&mut f, fp), 0, "nothing written yet");
+
+        let template = f.text("12345");
+        f.invoke(fprintf,
+            &[fp.offset, fp.selector, template.offset, template.selector],
+        )
+        .expect("fprintf");
+        assert_eq!(tell(&mut f, fp), 5);
+    }
+
+    #[test]
+    fn seeking_past_the_end_of_file_is_allowed_and_a_read_there_is_simply_the_end() {
+        // The design decision `Streams::seek_mem`'s own doc comment states:
+        // this host does not narrow "past the end is fine" to writable
+        // streams only, because an OS-level seek past a regular file's
+        // length is not an error on the read side either.
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let len = std::fs::metadata(crate::testing::data().join("LINES.TXT"))
+            .expect("the fixture")
+            .len() as i32;
+
+        assert_eq!(
+            word(seek(&mut f, fp, len + 100, 0).expect("fseek")),
+            0,
+            "a seek past the end is not refused"
+        );
+        assert_eq!(gets(&mut f, fp, 64), None, "and a read there is just the end");
+    }
+
+    #[test]
+    fn seek_set_with_a_negative_offset_is_refused() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let e = seek(&mut f, fp, -1, 0).expect_err("a refusal");
+        assert!(e.to_string().contains("negative offset"), "{e}");
+    }
+
+    #[test]
+    fn seeking_before_the_start_of_the_file_is_refused() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let e = seek(&mut f, fp, -1, 1).expect_err("a refusal"); // SEEK_CUR at position 0
+        assert!(e.to_string().contains("LINES.TXT"), "{e}");
+    }
+
+    #[test]
+    fn fseek_with_an_unknown_whence_is_refused_naming_it() {
+        let mut f = Fixture::new();
+        let fp = opened(&mut f, "LINES.TXT", "rb");
+        let e = seek(&mut f, fp, 0, 3).expect_err("a refusal");
+        assert!(e.to_string().contains('3'), "{e}");
+    }
+
+    #[test]
+    fn fseek_ftell_and_rewind_all_refuse_a_handle_this_host_never_issued() {
+        let mut f = Fixture::new();
+        let invented = f.buffer(FILE_SIZE as u16);
+
+        let e = seek(&mut f, invented, 0, 0).expect_err("a refusal");
+        assert!(e.to_string().contains("not a stream this host opened"), "{e}");
+
+        let e = f.invoke(ftell, &Fixture::far(invented)).expect_err("a refusal");
+        assert!(e.to_string().contains("not a stream this host opened"), "{e}");
+
+        let e = f.invoke(rewind, &Fixture::far(invented)).expect_err("a refusal");
+        assert!(e.to_string().contains("not a stream this host opened"), "{e}");
     }
 
     #[test]
