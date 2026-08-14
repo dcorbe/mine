@@ -245,7 +245,12 @@ fn walk<A: Abi>(
             continue;
         }
 
+        let spec_start = rest;
         let (spec, conv, tail) = parse(rest, call, args, &mut consumed)?;
+        // The conversion exactly as the module spelled it, `%` included --
+        // for the passthrough below, which has to reproduce it byte for byte
+        // rather than reconstruct it from `spec`.
+        let raw = &spec_start[..spec_start.len() - tail.len()];
         rest = tail;
 
         match conv {
@@ -292,15 +297,32 @@ fn walk<A: Abi>(
                 consumed += size;
                 out.extend_from_slice(&integer(value, false, 16, conv == b'X', &spec));
             }
-            other => {
-                // `%f`, `%e`, `%g` and `%n` land here. Each has already been
-                // given the wrong number of argument bytes by the time this
-                // returns, so there is nothing to carry on with.
+            // `%f`, `%e`, `%g` and `%n`: the caller has already pushed
+            // argument bytes for these -- a `double` for the first three, a
+            // pointer for the last -- and this host cannot consume them, so
+            // every conversion after this one would read the wrong bytes.
+            // Stopping is the only honest answer.
+            b'f' | b'e' | b'E' | b'g' | b'G' | b'n' => {
                 return Err(ShimError::Failed(format!(
-                    "%{} is a conversion the host does not implement",
-                    other as char
+                    "%{} is a conversion the host does not implement (template {:?})",
+                    conv as char,
+                    String::from_utf8_lossy(&template)
                 )));
             }
+
+            // Anything else is not a conversion at all, and consumed no
+            // argument -- so it is safe to put back exactly as written,
+            // which is what the C runtime this host stands in for does with
+            // an unrecognised one.
+            //
+            // Not hypothetical, and not a malformed module: MajorBBS message
+            // text is handed to `printf` as the format string, and that text
+            // carries Galacticomm's own backtick colour codes. LunatiX's
+            // init prints "`%...`#D`5octor `#H`5ammer `6says:", where `%...`
+            // parses as a precision of zero followed by `.` as the
+            // conversion. Refusing it stopped the module over a display
+            // string.
+            _ => out.extend_from_slice(raw),
         }
     }
 

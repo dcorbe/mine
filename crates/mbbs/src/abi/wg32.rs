@@ -87,7 +87,27 @@ pub struct Wg32Cpu {
 }
 
 impl Wg32Cpu {
-    pub fn new(machine: mbbs_machine::m32::Machine, mem: mbbs_machine::m32::Memory) -> Self {
+    /// Bundle a machine and its memory, moving the module's stack out of the
+    /// former and into the latter.
+    ///
+    /// # The transfer is the point, not a detail
+    ///
+    /// `Memory` resolves every linear address the module can name. Until
+    /// this call it owned two mappings -- the loaded image and the host
+    /// arena -- while the stack was a third, hidden inside the machine's
+    /// `Tib`. A module that passed a pointer to one of its own locals, which
+    /// is what `char buf[128]; fgets(buf, sizeof buf, f);` does, handed the
+    /// host an address that resolved in neither and got a refusal naming the
+    /// image. LunatiX's init died exactly there.
+    ///
+    /// This is the one place both halves are in scope, so it is the one
+    /// place the move can happen. See
+    /// [`Memory::adopt_stack`](mbbs_machine::m32::Memory::adopt_stack) for
+    /// why ownership moves rather than being shared.
+    pub fn new(mut machine: mbbs_machine::m32::Machine, mut mem: mbbs_machine::m32::Memory) -> Self {
+        if let Some(stack) = machine.take_stack() {
+            mem.adopt_stack(stack);
+        }
         Self { machine, mem }
     }
 }
@@ -197,7 +217,7 @@ impl Abi for Wg32 {
                 Arg::Ptr(p) => p.0,
             })
             .collect();
-        let exit = convert_exit(cpu.machine.call(entry.0, &dwords)?);
+        let exit = convert_exit(cpu.machine.call_on(cpu.mem.stack_mut(), entry.0, &dwords)?);
         debug_assert_attributable(&exit, &cpu.machine);
         Ok(exit)
     }
@@ -218,7 +238,7 @@ impl Abi for Wg32 {
             ),
             crate::shims::Cleans::Caller => {
                 let ret32: mbbs_machine::m32::Ret = ret.into();
-                let exit = convert_exit(cpu.machine.resume(ret32)?);
+                let exit = convert_exit(cpu.machine.resume_on(cpu.mem.stack_mut(), ret32)?);
                 debug_assert_attributable(&exit, &cpu.machine);
                 Ok(exit)
             }
@@ -232,7 +252,7 @@ impl Abi for Wg32 {
     /// no `THUNK_SAVES`-sized register-save area to step over here, unlike
     /// `Wg16`'s arm.
     fn arg_frame(cpu: &Self::Cpu) -> &[u8] {
-        cpu.machine.arg_frame()
+        cpu.machine.arg_frame(cpu.mem.stack())
     }
 
     /// Direct delegation -- `mbbs_machine::m32::Machine::poison` mirrors

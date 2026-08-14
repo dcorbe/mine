@@ -469,10 +469,10 @@ fn arg_u32_reads_each_argument_at_its_own_index_in_order() {
     // implementation that only works for ascending reads, or that caches the
     // previous `n`) would show up here even if a simple ascending scan
     // happened to pass.
-    assert_eq!(machine.arg_u32(2), ARG2, "argument 2 (read first) was wrong");
-    assert_eq!(machine.arg_u32(0), ARG0, "argument 0 (read second) was wrong");
-    assert_eq!(machine.arg_u32(3), ARG3, "argument 3 (read third) was wrong");
-    assert_eq!(machine.arg_u32(1), ARG1, "argument 1 (read fourth) was wrong");
+    assert_eq!(machine.arg_u32(machine.stack_bytes(), 2), ARG2, "argument 2 (read first) was wrong");
+    assert_eq!(machine.arg_u32(machine.stack_bytes(), 0), ARG0, "argument 0 (read second) was wrong");
+    assert_eq!(machine.arg_u32(machine.stack_bytes(), 3), ARG3, "argument 3 (read third) was wrong");
+    assert_eq!(machine.arg_u32(machine.stack_bytes(), 1), ARG1, "argument 1 (read fourth) was wrong");
 }
 
 /// Argument 0 specifically, isolated from the others -- the `+4` skip of the
@@ -498,7 +498,7 @@ fn arg_u32_reads_argument_zero_immediately_above_the_return_address() {
     let exit = machine.call(entry, &[]).expect("reaches the import call");
     assert_eq!(exit, Exit::Call { index: 23 });
 
-    assert_eq!(machine.arg_u32(0), SENTINEL);
+    assert_eq!(machine.arg_u32(machine.stack_bytes(), 0), SENTINEL);
 }
 
 /// `arg_u32`'s internal arithmetic must be checked, not merely `debug_assert`-
@@ -524,7 +524,7 @@ fn arg_u32_panics_rather_than_wrapping_on_an_overflowing_index() {
     let exit = machine.call(entry, &[]).expect("reaches the import call");
     assert_eq!(exit, Exit::Call { index: 25 });
 
-    let _ = machine.arg_u32(usize::MAX);
+    let _ = machine.arg_u32(machine.stack_bytes(), usize::MAX);
 }
 
 /// `Machine::arg_frame()` (Task 6 of `docs/plans/2026-08-12-abi-border-implementation.md`):
@@ -553,7 +553,7 @@ fn arg_frame_starts_with_the_pushed_dwords_in_order() {
     let exit = machine.call(entry, &[]).expect("reaches the import call");
     assert_eq!(exit, Exit::Call { index: 27 });
 
-    let frame = machine.arg_frame();
+    let frame = machine.arg_frame(machine.stack_bytes());
     assert!(frame.len() >= 12, "frame is at least the three pushed dwords");
     assert_eq!(&frame[0..4], &ARG0.to_le_bytes(), "arg_frame()[0..4] must be argument 0");
     assert_eq!(&frame[4..8], &ARG1.to_le_bytes(), "arg_frame()[4..8] must be argument 1");
@@ -561,9 +561,9 @@ fn arg_frame_starts_with_the_pushed_dwords_in_order() {
 
     // Cross-check against arg_u32 itself, so the two readers of the same
     // frame cannot silently disagree with each other.
-    assert_eq!(&frame[0..4], machine.arg_u32(0).to_le_bytes().as_slice());
-    assert_eq!(&frame[4..8], machine.arg_u32(1).to_le_bytes().as_slice());
-    assert_eq!(&frame[8..12], machine.arg_u32(2).to_le_bytes().as_slice());
+    assert_eq!(&frame[0..4], machine.arg_u32(machine.stack_bytes(), 0).to_le_bytes().as_slice());
+    assert_eq!(&frame[4..8], machine.arg_u32(machine.stack_bytes(), 1).to_le_bytes().as_slice());
+    assert_eq!(&frame[8..12], machine.arg_u32(machine.stack_bytes(), 2).to_le_bytes().as_slice());
 }
 
 /// [`Machine::poison`] is the **host-invoked** setter: the host reaching its

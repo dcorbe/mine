@@ -26,6 +26,11 @@ pub struct Memory {
     /// free list -- see [`Memory::alloc`] for why nothing here needs to
     /// reclaim.
     arena_used: u32,
+    /// The module's own stack, moved here out of the `Tib` that made it --
+    /// see [`Memory::adopt_stack`]. `None` until that transfer happens.
+    stack: Option<crate::m32::Mapping>,
+    /// The stack's low end, valid only when `stack` is `Some`.
+    stack_base: u32,
 }
 
 impl Memory {
@@ -41,6 +46,8 @@ impl Memory {
             image,
             arena: crate::m32::Mapping::new(arena_len)?,
             arena_used: 0,
+            stack: None,
+            stack_base: 0,
         })
     }
 
@@ -72,6 +79,56 @@ impl Memory {
     /// place -- it is only the arena this method is careful to leave alone.
     pub fn replace_image(&mut self, image: crate::m32::Image) {
         self.image = image;
+    }
+
+    /// Take ownership of the module's stack mapping.
+    ///
+    /// # Why the stack belongs here
+    ///
+    /// `Memory` resolves every linear address the module can name. Before
+    /// this, it owned two mappings -- the loaded image and the host arena --
+    /// and the stack was a third, hidden inside the `Tib` inside `Machine`.
+    /// A module passing a pointer to one of its own locals therefore handed
+    /// the host an address that resolved in neither, and the shim refused it
+    /// with "runs past the end of the image".
+    ///
+    /// That is not an edge case. `char buf[128]; fgets(buf, sizeof buf, f);`
+    /// is the commonest C idiom there is, and it is exactly what LunatiX's
+    /// init does -- measured: the pointer it passed, `0x41025ed4`, sat 300
+    /// bytes below the top of a stack running `0x40f26000..0x41026000`,
+    /// while the image began at `0x40587000` and the arena at `0x41a00000`.
+    ///
+    /// Ownership *moves* rather than being shared. Two owners of one mapping
+    /// would mean two live `&mut [u8]` over the same bytes; `Tib` kept only
+    /// the two addresses it writes into the TIB structure, which are plain
+    /// numbers and stay correct -- an `mmap` region does not move when the
+    /// Rust value owning it does.
+    pub fn adopt_stack(&mut self, stack: crate::m32::Mapping) {
+        self.stack_base = stack.base() as usize as u32;
+        self.stack = Some(stack);
+    }
+
+    /// The module's stack, for `Machine::arg_frame` to read an outstanding
+    /// call's argument frame out of. Empty when no stack has been adopted.
+    pub fn stack(&self) -> &[u8] {
+        self.stack.as_ref().map_or(&[], |m| m.as_slice())
+    }
+
+    /// The module's stack, mutably -- for `Machine::call_on`/`resume_on` to
+    /// write a call frame into. Empty when no stack has been adopted.
+    pub fn stack_mut(&mut self) -> &mut [u8] {
+        self.stack.as_mut().map_or(&mut [], |m| m.as_mut_slice())
+    }
+
+    /// The stack's own linear range, `(base, len)`. `(0, 0)` when none has
+    /// been adopted.
+    pub fn stack_range(&self) -> (u32, usize) {
+        (self.stack_base, self.stack.as_ref().map_or(0, |m| m.len()))
+    }
+
+    /// The arena's own linear range, `(base, len)`.
+    pub fn arena_range(&self) -> (u32, usize) {
+        (self.arena_base(), self.arena.len())
     }
 
     fn arena_base(&self) -> u32 {
@@ -133,10 +190,18 @@ impl Memory {
         if let Some(bytes) = in_image {
             return Some(bytes);
         }
-        let off = addr.checked_sub(self.arena_base())?;
-        let off = usize::try_from(off).ok()?;
+        if let Some(off) = addr.checked_sub(self.arena_base())
+            && let Ok(off) = usize::try_from(off)
+            && let Some(end) = off.checked_add(len)
+            && let Some(bytes) = self.arena.as_slice().get(off..end)
+        {
+            return Some(bytes);
+        }
+        // The stack, third and last -- see `adopt_stack`.
+        let stack = self.stack.as_ref()?;
+        let off = usize::try_from(addr.checked_sub(self.stack_base)?).ok()?;
         let end = off.checked_add(len)?;
-        self.arena.as_slice().get(off..end)
+        stack.as_slice().get(off..end)
     }
 
     /// Write `bytes` at linear address `addr`. `None` (nothing written) if
@@ -149,10 +214,20 @@ impl Memory {
         if wrote_image {
             return Some(());
         }
-        let off = addr.checked_sub(self.arena_base())?;
-        let off = usize::try_from(off).ok()?;
+        let arena_base = self.arena_base();
+        if let Some(off) = addr.checked_sub(arena_base)
+            && let Ok(off) = usize::try_from(off)
+            && let Some(end) = off.checked_add(bytes.len())
+            && let Some(dst) = self.arena.as_mut_slice().get_mut(off..end)
+        {
+            dst.copy_from_slice(bytes);
+            return Some(());
+        }
+        let stack_base = self.stack_base;
+        let stack = self.stack.as_mut()?;
+        let off = usize::try_from(addr.checked_sub(stack_base)?).ok()?;
         let end = off.checked_add(bytes.len())?;
-        let dst = self.arena.as_mut_slice().get_mut(off..end)?;
+        let dst = stack.as_mut_slice().get_mut(off..end)?;
         dst.copy_from_slice(bytes);
         Some(())
     }
@@ -170,9 +245,17 @@ impl Memory {
                 return Some(&full[off..off + n]);
             }
         }
-        let off = addr.checked_sub(self.arena_base())?;
-        let off = usize::try_from(off).ok()?;
-        let full = self.arena.as_slice();
+        if let Some(off) = addr.checked_sub(self.arena_base())
+            && let Ok(off) = usize::try_from(off)
+        {
+            let full = self.arena.as_slice();
+            if let Some(n) = full.len().checked_sub(off).filter(|n| *n > 0) {
+                return Some(&full[off..off + n]);
+            }
+        }
+        let stack = self.stack.as_ref()?;
+        let off = usize::try_from(addr.checked_sub(self.stack_base)?).ok()?;
+        let full = stack.as_slice();
         let n = full.len().checked_sub(off).filter(|n| *n > 0)?;
         Some(&full[off..off + n])
     }
@@ -182,6 +265,57 @@ impl Memory {
 mod tests {
     use super::*;
     use crate::m32::pe::PeImage;
+
+    /// A pointer into the module's own stack resolves, reads and writes.
+    ///
+    /// This is the third mapping. `Memory` owned the image and the arena,
+    /// and the stack lived in the `Tib` inside `Machine` where nothing that
+    /// resolves an address could see it -- so `char buf[128]; fgets(buf,
+    /// sizeof buf, f);`, the commonest C idiom there is, handed the host an
+    /// address it refused with "runs past the end of the image".
+    ///
+    /// Measured, not theorised: LunatiX's init passed `0x41025ed4` while its
+    /// stack ran `0x40f26000..0x41026000`, its image began at `0x40587000`
+    /// and its arena at `0x41a00000`. 300 bytes below the stack top, which
+    /// is exactly where a local buffer in an early frame sits.
+    #[test]
+    fn an_address_in_the_adopted_stack_resolves_reads_and_writes() {
+        let mut mem = Memory::new(load(), 0x1000).expect("arena");
+
+        // Nothing is adopted yet, so a stack address is unresolvable -- the
+        // state this test exists to prove we left behind.
+        assert_eq!(mem.stack_range(), (0, 0));
+
+        let stack = crate::m32::Mapping::new(0x2000).expect("a stack mapping");
+        let base = stack.base() as usize as u32;
+        let len = stack.len();
+        mem.adopt_stack(stack);
+        assert_eq!(mem.stack_range(), (base, len));
+
+        // A local 300 bytes below the top, the shape LunatiX actually used.
+        let local = base + len as u32 - 300;
+        assert!(
+            mem.write_at(local, b"hello\0").is_some(),
+            "a stack address must be writable"
+        );
+        assert_eq!(mem.read_at(local, 6), Some(&b"hello\0"[..]));
+
+        // `tail_from` too -- `read_cstr` scans through it, and a shim that
+        // reads a C string out of a stack buffer is just as ordinary.
+        let tail = mem.tail_from(local).expect("a tail inside the stack");
+        assert_eq!(&tail[..5], b"hello");
+        assert_eq!(tail.len(), 300, "the tail runs to the top of the stack");
+
+        // The other two mappings still answer, and the stack has not
+        // shadowed them: a bug that resolved everything into the stack would
+        // pass every assertion above.
+        assert!(mem.read_at(mem.image.base(), 4).is_some(), "the image still resolves");
+        let (arena_base, _) = mem.arena_range();
+        assert!(mem.read_at(arena_base, 4).is_some(), "the arena still resolves");
+
+        // One past the end of the stack is not in it.
+        assert_eq!(mem.read_at(base + len as u32, 1), None);
+    }
 
     /// Mirrors `flatptr.rs`'s own fixture -- see that module's test
     /// constants for why this exact size.

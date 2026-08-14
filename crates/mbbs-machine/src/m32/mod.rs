@@ -321,6 +321,19 @@ pub struct Machine {
 }
 
 impl Machine {
+    /// The module's own stack, as `(limit, base)` -- low end and high end.
+    ///
+    /// Exposed because a stack address is a linear address like any other,
+    /// and `crate::m32::Memory` (image plus host arena) cannot resolve one:
+    /// the stack is a third `Mapping`, owned by the `Tib` in here. Any
+    /// module passing a pointer to one of its own locals -- `char buf[128];
+    /// fgets(buf, sizeof buf, f);`, the commonest C idiom there is -- hands
+    /// the host an address that resolves in neither of `Memory`'s two
+    /// mappings.
+    pub fn stack_range(&self) -> (u32, u32) {
+        (self.tib.stack_limit(), self.tib.stack_base())
+    }
+
     /// Build the thunk table and trampoline, a module stack and TIB, and arm
     /// fault recovery on this thread.
     pub fn new() -> io::Result<Self> {
@@ -532,7 +545,36 @@ impl Machine {
     ///
     /// If this machine is [`Machine::poisoned`], or the arguments and frame
     /// will not fit on the module's stack.
+    /// The self-owned form: uses this machine's own stack, which it still
+    /// holds when no `crate::m32::Memory` has adopted it. Every crossing
+    /// test in this crate goes through here.
+    ///
+    /// The mapping is taken out for the duration and handed straight back,
+    /// so that the stack slice and `&mut self` are never two live borrows of
+    /// the same object -- which is also why [`Machine::call_on`] exists as
+    /// the form production uses.
+    ///
+    /// # Panics
+    ///
+    /// If the stack has moved to `Memory` (see `Memory::adopt_stack`). After
+    /// that move there is exactly one owner, and this is the wrong one.
     pub fn call(&mut self, entry: u32, args: &[u32]) -> io::Result<Exit> {
+        let mut stack = self
+            .tib
+            .take_stack()
+            .expect("the stack mapping has moved to `Memory`; use `call_on`");
+        let out = self.call_on(stack.as_mut_slice(), entry, args);
+        self.tib.put_stack(stack);
+        out
+    }
+
+    /// Enter the module at `entry`, writing the call frame into `stack`.
+    ///
+    /// `stack` is the module's own stack bytes. Production passes
+    /// `Memory`'s, because that is where they live once a `Wg32Cpu` exists
+    /// -- see `Memory::adopt_stack` for why the stack has to be one of the
+    /// mappings `Memory` can resolve.
+    pub fn call_on(&mut self, stack: &mut [u8], entry: u32, args: &[u32]) -> io::Result<Exit> {
         if let Some(poison) = &self.poisoned {
             return Err(io::Error::other(format!(
                 "refusing to enter a poisoned module: {poison}"
@@ -555,7 +597,6 @@ impl Machine {
 
         let ret = self.return_thunk_addr();
         let stack_off = (sp - stack_limit) as usize;
-        let stack = self.tib.stack_mut();
         stack[stack_off..stack_off + 4].copy_from_slice(&ret.to_le_bytes());
         for (i, arg) in args.iter().enumerate() {
             let off = stack_off + 4 + i * 4;
@@ -605,7 +646,23 @@ impl Machine {
     /// # Panics
     ///
     /// If the module is not stopped at a call.
+    /// The self-owned form of [`Machine::resume_on`]; see [`Machine::call`].
+    ///
+    /// # Panics
+    ///
+    /// If the stack has moved to `Memory`.
     pub fn resume(&mut self, ret: Ret) -> io::Result<Exit> {
+        let mut stack = self
+            .tib
+            .take_stack()
+            .expect("the stack mapping has moved to `Memory`; use `resume_on`");
+        let out = self.resume_on(stack.as_mut_slice(), ret);
+        self.tib.put_stack(stack);
+        out
+    }
+
+    /// Resume the outstanding call, reading its frame out of `stack`.
+    pub fn resume_on(&mut self, stack: &mut [u8], ret: Ret) -> io::Result<Exit> {
         // Stated once, not left to depend on `frame_sp` happening to be
         // cleared alongside `poisoned` in `run`'s `Fault` arm below -- that
         // coupling is an accident of implementation, not a guard: removing
@@ -642,7 +699,6 @@ impl Machine {
             .expect("resume(): the remembered call frame is below this machine's own stack")
             as usize;
         let at = {
-            let stack = self.tib.stack_mut();
             let bytes = stack.get(off..off + 4).expect(
                 "resume(): the remembered call frame is outside this machine's own stack",
             );
@@ -691,7 +747,31 @@ impl Machine {
     /// and for the same reason: a corrupted `frame_sp`, or a caller-supplied
     /// `n` far larger than any real argument list, must not silently wrap
     /// into an offset that `.get()` then accepts and reads garbage back for.
-    pub fn arg_u32(&self, n: usize) -> u32 {
+    /// Give up ownership of the module's stack mapping.
+    ///
+    /// Called once, by `mbbs::abi::Wg32Cpu::new`, to hand the stack to the
+    /// `Memory` that will resolve addresses into it. `None` afterwards.
+    pub fn take_stack(&mut self) -> Option<crate::m32::Mapping> {
+        self.tib.take_stack()
+    }
+
+    /// This machine's own stack bytes, valid only while it still owns them.
+    ///
+    /// A `Machine` built on its own -- no `Memory` beside it -- keeps its
+    /// stack in its `Tib`, which is where every one of this crate's own
+    /// crossing tests reads an argument frame from. Once a `Wg32Cpu` is
+    /// built, ownership moves to `Memory` (see `Memory::adopt_stack`) and
+    /// this panics: after the move there is exactly one owner, and asking
+    /// the wrong one is a bug rather than a fallback.
+    pub fn stack_bytes(&self) -> &[u8] {
+        self.tib.stack()
+    }
+
+    /// `stack` is the module's own stack bytes, which live in
+    /// `crate::m32::Memory` rather than in here -- see
+    /// `Memory::adopt_stack`. Passed in because this `Machine` no longer
+    /// owns them and the caller (`Wg32::arg_frame`) holds both halves.
+    pub fn arg_u32(&self, stack: &[u8], n: usize) -> u32 {
         let sp = self
             .frame_sp
             .expect("arg_u32() with no outstanding call to read from");
@@ -715,9 +795,7 @@ impl Machine {
         let end = off
             .checked_add(4)
             .expect("arg_u32(): argument slot overflows this machine's own stack");
-        let bytes = self
-            .tib
-            .stack()
+        let bytes = stack
             .get(off..end)
             .expect("arg_u32(): argument slot runs past this machine's own stack");
         u32::from_le_bytes(bytes.try_into().expect("checked to be exactly 4 bytes"))
@@ -765,7 +843,8 @@ impl Machine {
     /// the end of the stack -- mirroring [`Machine::arg_u32`]'s own panics,
     /// for the same reason: a corrupted `frame_sp` must fail loudly rather
     /// than read garbage or silently wrap.
-    pub fn arg_frame(&self) -> &[u8] {
+    /// `stack` is the module's own stack bytes -- see [`Machine::arg_u32`].
+    pub fn arg_frame<'s>(&self, stack: &'s [u8]) -> &'s [u8] {
         let sp = self
             .frame_sp
             .expect("arg_frame() with no outstanding call to read from");
@@ -776,7 +855,6 @@ impl Machine {
         let start = frame_off
             .checked_add(4)
             .expect("arg_frame(): the argument frame start overflows this machine's own stack");
-        let stack = self.tib.stack();
         stack.get(start..).unwrap_or_else(|| {
             panic!(
                 "arg_frame(): the module called out at a frame starting at {start:#x}, \

@@ -179,7 +179,20 @@ pub(crate) struct Tib {
     // unmaps it -- not for its contents.
     #[allow(dead_code)]
     tib: Mapping,
-    stack: Mapping,
+    /// The module's own stack.
+    ///
+    /// `Option` because ownership of this mapping *moves*, once, into
+    /// `crate::m32::Memory` -- see [`Tib::take_stack`]. The addresses in the
+    /// TIB structure above are written at construction and stay correct
+    /// across that move: an `mmap` region does not change address when the
+    /// Rust value owning it does.
+    stack: Option<Mapping>,
+    /// The stack's low end, kept as a number so that it survives
+    /// [`Tib::take_stack`] -- `Machine::call` needs it to set `ESP` long
+    /// after the mapping itself has moved out.
+    stack_limit: u32,
+    /// The stack's high end, kept for the same reason.
+    stack_base: u32,
     entry: u32,
 }
 
@@ -222,7 +235,13 @@ impl Tib {
             return Err(e);
         }
 
-        Ok(Self { tib, stack, entry })
+        Ok(Self {
+            tib,
+            stack: Some(stack),
+            stack_limit: stack_base,
+            stack_base: stack_top,
+            entry,
+        })
     }
 
     /// The `FS` selector to load before entering 32-bit code that expects
@@ -233,25 +252,60 @@ impl Tib {
 
     /// The stack's high end -- what `+0x04 StackBase` holds.
     pub(crate) fn stack_base(&self) -> u32 {
-        self.stack.base() as usize as u32 + self.stack.len() as u32
+        self.stack_base
+    }
+
+    /// Hand the stack mapping to whoever will own it from now on.
+    ///
+    /// `crate::m32::Memory` is that owner: a stack address is a linear
+    /// address like any other, and a module passing a pointer to one of its
+    /// own locals -- `char buf[128]; fgets(buf, sizeof buf, f);` -- expects
+    /// the host to be able to read and write it. `Memory` resolves every
+    /// linear address the module can name, so the stack has to be one of the
+    /// mappings it owns rather than a third one hidden in here.
+    ///
+    /// Moved rather than shared. Two owners of one mapping would mean two
+    /// live `&mut [u8]` into the same bytes, which is exactly the aliasing
+    /// this crate must not have; and `Tib` never needed the *contents*, only
+    /// the two addresses, which are kept as numbers above.
+    ///
+    /// `None` on the second call: the mapping is already somewhere else.
+    /// Put a stack mapping back after [`Tib::take_stack`] borrowed it out.
+    ///
+    /// Used by `Machine::call`/`resume`'s self-owned convenience forms,
+    /// which take the mapping out for the duration of a crossing so that the
+    /// stack slice and `&mut self` are not two borrows of the same object,
+    /// then hand it straight back.
+    pub(crate) fn put_stack(&mut self, stack: Mapping) {
+        self.stack = Some(stack);
+    }
+
+    pub(crate) fn take_stack(&mut self) -> Option<Mapping> {
+        self.stack.take()
     }
 
     /// The stack's low end -- what `+0x08 StackLimit` holds.
     pub(crate) fn stack_limit(&self) -> u32 {
-        self.stack.base() as usize as u32
+        self.stack_limit
     }
 
     /// The stack's contents, writable -- for planting words below `StackBase`
     /// a test (or, eventually, a real entry) expects to read back.
     pub(crate) fn stack_mut(&mut self) -> &mut [u8] {
-        self.stack.as_mut_slice()
+        self.stack
+            .as_mut()
+            .expect("the stack mapping has moved to `Memory`")
+            .as_mut_slice()
     }
 
     /// The stack's contents, read-only -- for [`Machine::arg_u32`] to read a
     /// cdecl argument back off an outstanding call's frame without needing
     /// `&mut self` (`crates/mbbs-machine/src/m32/mod.rs`, near `resume`).
     pub(crate) fn stack(&self) -> &[u8] {
-        self.stack.as_slice()
+        self.stack
+            .as_ref()
+            .expect("the stack mapping has moved to `Memory`")
+            .as_slice()
     }
 }
 
