@@ -39,8 +39,10 @@
 //! # The other two are arithmetic, and one of them is written down
 //!
 //! Nothing in `WCCMMUD.DLL` strides by `struct extusr` -- the module imports
-//! neither `extusr` nor `extptr` -- so [`EXTUSR`] is the header's eleven fields
-//! added up and nothing more.
+//! neither `extusr` nor `extptr` -- so [`extusr_stride`] is the header's
+//! eleven fields added up and nothing more, for the one ABI that has the
+//! table at all. See [`extusr_stride`]'s own doc comment for why a non-GCV2
+//! build (`Wg32`) has none.
 //!
 //! [`USRACC`] would be the same, except that Galacticomm recorded the total
 //! themselves. `USRACC.H:22` is `#define USRACCSPARE (338-301)`: the declared
@@ -56,8 +58,23 @@ use crate::ShimError;
 use crate::abi::Abi;
 use crate::chan::{Chan, Terms};
 
-/// `sizeof(struct extusr)`, `MAJORBBS.H:94`.
-pub const EXTUSR: u16 = 22;
+/// `sizeof(struct extusr)` for an ABI that has one, `None` for an ABI that
+/// does not. `MAJORBBS.H:139`.
+///
+/// `struct extusr` is a GCV2 invention. Where a non-GCV2 build declares
+/// `tckrst`, `tckonl`, `lingo`, `entstt`, `tspxt`, `col`, `wid`, `ech` and
+/// `byecnt` inline in `struct user`, GCV2 moves them into a second per-channel
+/// table and shortens `struct user` from 88 bytes to 41. So this is not a
+/// table whose size varies -- it is a table that exists for one ABI and not the
+/// other, and every caller has to say what it does when there is none.
+///
+/// Returning `None` rather than `Some(0)` is the whole point. A zero stride
+/// would make `extoff(unum)` hand back the table head for every channel, which
+/// reads as a working lookup right up until two channels disagree about their
+/// own data.
+pub fn extusr_stride<A: Abi>() -> Option<u16> {
+    A::GCV2.then_some(22)
+}
 
 /// `sizeof(struct usracc)`, `USRACC.H:24`, and the 338 that `:22` writes down.
 ///
@@ -427,8 +444,9 @@ pub struct Users<A: Abi> {
     usracc: AccountLayout,
     /// `struct user *user` -- the head of the array the module indexes itself.
     users: A::Ptr,
-    /// `struct extusr *extusr`.
-    extra: A::Ptr,
+    /// `struct extusr *extusr` -- `None` for a non-GCV2 ABI, which has no such
+    /// table. See [`extusr_stride`].
+    extra: Option<A::Ptr>,
     /// `uablok`, `ACCOUNT.C:30` -- the account records, one per channel.
     accounts: A::Ptr,
     /// `int *channel` -- and this one points [`SENTINELS`] words *into* its own
@@ -495,9 +513,14 @@ impl<A: Abi> Users<A> {
         self.nth(self.users, self.user.stride, unum)
     }
 
-    /// `&extusr[unum]`.
-    pub fn extra(&self, unum: Chan) -> A::Ptr {
-        self.nth(self.extra, EXTUSR, unum)
+    /// `&extusr[unum]`, or `None` if this ABI has no `extusr` table.
+    ///
+    /// See [`extusr_stride`] for why the `None` is a real answer and not a
+    /// failure to look.
+    pub fn extra(&self, unum: Chan) -> Option<A::Ptr> {
+        let base = self.extra?;
+        let stride = extusr_stride::<A>()?;
+        Some(self.nth(base, stride, unum))
     }
 
     /// `uacoff(unum)` -- the channel's account record.
@@ -840,7 +863,13 @@ impl<A: Abi> Users<A> {
             Ok(at)
         };
         let users = block(user.stride)?;
-        let extra = block(EXTUSR)?;
+        // Allocated only for an ABI that has the struct. A non-GCV2 host never
+        // made this table, and reserving heap for it here would be inventing
+        // storage the module has no name for.
+        let extra = match extusr_stride::<A>() {
+            Some(each) => Some(block(each)?),
+            None => None,
+        };
         let accounts = block(usracc.stride)?;
 
         // `MAJORBBS.C:740-743`, which is three statements doing one thing:
@@ -960,8 +989,10 @@ mod tests {
         // `WCCMMUD.DLL` strides by it -- the module imports neither `extusr`
         // nor `extptr` -- so unlike `USER` this one is arithmetic from the
         // header. It is here because `curusr`'s array is real whether or not
-        // this module looks at it.
-        assert_eq!(EXTUSR, 22);
+        // this module looks at it. `Wg16` is the GCV2 build this crate has
+        // always run, and is the only ABI with a table to measure; see
+        // `extusr_exists_for_gcv2_only` for the `Wg32` half.
+        assert_eq!(extusr_stride::<Wg16>(), Some(22));
     }
 
     #[test]
@@ -974,7 +1005,11 @@ mod tests {
             // is that the slots are distinct and inside the tables -- which
             // `nth`'s own panic covers. The loop stands as the statement that
             // every channel `terms` names has a slot in all three.
-            assert_ne!(users.slot(unum), users.extra(unum), "user[{unum}] vs extusr[{unum}]");
+            assert_ne!(
+                users.slot(unum),
+                users.extra(unum).expect("Wg16 is GCV2, extusr exists"),
+                "user[{unum}] vs extusr[{unum}]"
+            );
             assert_ne!(users.slot(unum), users.account(unum), "user[{unum}] vs uacoff({unum})");
         }
     }
@@ -1660,5 +1695,35 @@ mod tests {
             assert_eq!(layout.scnbrk, 0xd2, "{name} scnbrk");
             assert_eq!(layout.scnfse, 0xd3, "{name} scnfse");
         }
+    }
+
+    /// `struct extusr` exists in GCV2 builds and nowhere else.
+    ///
+    /// This is the absence the design doc asked [`UserLayout`] to model, in the
+    /// place it actually occurs. GCV2 moves nine fields -- `tckrst`, `tckonl`,
+    /// `lingo`, `entstt`, `tspxt`, `col`, `wid`, `ech`, `byecnt` -- out of
+    /// `struct user` and into a second per-channel table
+    /// (`MAJORBBS.H:139`). A non-GCV2 build keeps them inline and has no such
+    /// table, which the oracle confirms from the other side: of the twelve
+    /// calls to `WGSERVER.EXE`'s table allocator, the two counted by `nterms`
+    /// stride by 88 and 304, and nothing strides by anything `extusr`-shaped.
+    ///
+    /// So asking a `Wg32` host for a channel's `extusr` is not a lookup that
+    /// returns zeros -- it is a question with no answer, and it says so.
+    #[test]
+    fn extusr_exists_for_gcv2_only() {
+        use crate::abi::Wg32;
+
+        assert_eq!(
+            extusr_stride::<Wg16>(),
+            Some(22),
+            "Wg16 is GCV2, so struct extusr is real and is 22 bytes"
+        );
+        assert_eq!(
+            extusr_stride::<Wg32>(),
+            None,
+            "Wg32 is non-GCV2: those nine fields are inline in struct user, \
+             and there is no second table to index"
+        );
     }
 }

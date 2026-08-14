@@ -3317,11 +3317,16 @@ impl<A: Abi> Host<A> {
         self.users.clear_keys(chan);
         let user_stride = self.users.user_layout().stride;
         let account_stride = self.users.account_stride();
-        for (at, len) in [
+        // `extusr` is GCV2's, and this may be a host that has none. A missing
+        // table is not a table of zero bytes: there is nothing to clear.
+        let mut tables = vec![
             (self.users.slot(chan), user_stride),
-            (self.users.extra(chan), users::EXTUSR),
             (self.users.account(chan), account_stride),
-        ] {
+        ];
+        if let (Some(at), Some(each)) = (self.users.extra(chan), users::extusr_stride::<A>()) {
+            tables.push((at, each));
+        }
+        for (at, len) in tables {
             at.write(A::mem(machine), &vec![0u8; usize::from(len)])
                 .map_err(|e| ShimError::Failed(e.to_string()))?;
         }
@@ -3991,7 +3996,11 @@ mod tests {
         }
         for chan in host.users().terms().all() {
             for (what, at, len) in [
-                ("extusr", host.users().extra(chan), users::EXTUSR),
+                (
+                    "extusr",
+                    host.users().extra(chan).expect("Wg16 is GCV2, extusr exists"),
+                    users::extusr_stride::<Wg16>().expect("Wg16 is GCV2"),
+                ),
                 ("usracc", host.users().account(chan), host.users().account_stride()),
             ] {
                 let bytes = machine.resolve(at, usize::from(len)).expect(what);
@@ -4228,7 +4237,11 @@ mod tests {
 
         for (what, at, len) in [
             ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
-            ("extusr", f.host.users().extra(chan), users::EXTUSR),
+            (
+                "extusr",
+                f.host.users().extra(chan).expect("Wg16 is GCV2, extusr exists"),
+                users::extusr_stride::<Wg16>().expect("Wg16 is GCV2"),
+            ),
             ("usracc", f.host.users().account(chan), f.host.users().account_stride()),
         ] {
             let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
@@ -4326,7 +4339,10 @@ mod tests {
                 .expect("a user on every channel");
             for (at, len) in [
                 (f.host.users().slot(chan), f.host.users().user_layout().stride),
-                (f.host.users().extra(chan), users::EXTUSR),
+                (
+                    f.host.users().extra(chan).expect("Wg16 is GCV2, extusr exists"),
+                    users::extusr_stride::<Wg16>().expect("Wg16 is GCV2"),
+                ),
                 (f.host.users().account(chan), f.host.users().account_stride()),
             ] {
                 f.machine
@@ -4340,7 +4356,11 @@ mod tests {
 
         for (what, at, len) in [
             ("user", f.host.users().slot(middle), f.host.users().user_layout().stride),
-            ("extusr", f.host.users().extra(middle), users::EXTUSR),
+            (
+                "extusr",
+                f.host.users().extra(middle).expect("Wg16 is GCV2, extusr exists"),
+                users::extusr_stride::<Wg16>().expect("Wg16 is GCV2"),
+            ),
             ("usracc", f.host.users().account(middle), f.host.users().account_stride()),
         ] {
             let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
@@ -4358,7 +4378,11 @@ mod tests {
         for &chan in [&chans[0], &chans[2]] {
             for (what, at, len) in [
                 ("user", f.host.users().slot(chan), f.host.users().user_layout().stride),
-                ("extusr", f.host.users().extra(chan), users::EXTUSR),
+                (
+                    "extusr",
+                    f.host.users().extra(chan).expect("Wg16 is GCV2, extusr exists"),
+                    users::extusr_stride::<Wg16>().expect("Wg16 is GCV2"),
+                ),
                 ("usracc", f.host.users().account(chan), f.host.users().account_stride()),
             ] {
                 let bytes = f.machine.resolve(at, usize::from(len)).expect(what);
