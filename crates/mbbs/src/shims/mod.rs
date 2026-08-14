@@ -575,6 +575,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (GALGSBL, "btuxct", gsbl::btuxct, Cleans::Caller),
         (GALGSBL, "btuxnf", gsbl::btuxnf, Cleans::Caller),
         (GALGSBL, "btuxmt", gsbl::btuxmt, Cleans::Caller),
+        // Not one of the fourteen above -- `WCCMMUD.DLL` never imports it.
+        // `LUNATIX.DLL` does, seven times, and is why `GALGSBL.dll!_btuxmn`
+        // was the seventh name Task 5's alias could not serve. See
+        // `gsbl::btuxmn`'s own doc comment for the prototype, the call-site
+        // arity check, and the one property it does not yet reproduce.
+        (GALGSBL, "btuxmn", gsbl::btuxmn, Cleans::Caller),
         (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller),
         (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller),
         (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller),
@@ -721,10 +727,14 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// spells the same library `"GALGSBL.dll"`. Exactly the `WGSERVER.EXE`
 /// situation, one generation later and one library over.
 ///
-/// Only `btuxmn` is genuinely absent, and it stays
-/// [`Entry::Unimplemented`] before and after: aliasing maps a library name, it
-/// does not invent entries.
+/// The seventh, `btuxmn`, was genuinely absent when this paragraph was
+/// written -- aliasing maps a library name, it does not invent entries, and
+/// there was no entry to map onto. It is implemented now
+/// ([`gsbl::btuxmn`], Task 7), so as of this alias all seven `btu*` imports
+/// are served. Kept as a footnote rather than deleted: it is the reason this
+/// alias shipped one commit ahead of full coverage instead of waiting for it.
 ///
+
 /// Still a list of named aliases, not a general suffix-stripping rule.
 /// Case-insensitive because PE import directory names are conventionally
 /// upper-cased but nothing in the format requires it.
@@ -947,13 +957,15 @@ mod tests {
             "bturno is a host global, not a routine -- the alias has to carry \
              data lookups too, or the module gets a null IAT slot"
         );
+        // `btuxmn` was the one genuinely absent entry when this test was
+        // written for Task 5; Task 7 implemented it in the same session, so
+        // the alias now reaches all seven `btu*` imports, not six.
         assert!(
             matches!(
                 entry::<crate::abi::Wg32>("GALGSBL.dll", "btuxmn"),
-                Entry::Unimplemented
+                Entry::Routine(..)
             ),
-            "btuxmn is the one that really is absent; aliasing maps a library \
-             name, it does not invent entries"
+            "btuxmn is implemented (Task 7) and a PE module must reach it too"
         );
 
         // Case-insensitively, because nothing in the PE format requires the

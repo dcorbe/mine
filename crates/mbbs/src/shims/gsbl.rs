@@ -617,6 +617,68 @@ pub fn btuxmt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
+/// `int btuxmn(int chan, char *datstg)` -- transmit an ASCIIZ string the
+/// module's own [`btuclo`] cannot cancel.
+///
+/// # Prototype and arity
+///
+/// `re/wg33src/INC/BRKTHU.H:202`: `INT btuxmn(INT chan,CHAR *datstg);` --
+/// the same two parameters as [`btuxmt`], and confirmed independently at a
+/// real call site rather than trusted from the header alone. `LUNATIX.DLL`
+/// imports `_btuxmn` from `GALGSBL.dll` (`objdump -p`, IAT slot at RVA
+/// `0x3638c`) and calls it seven times through the thunk at VA `0x41d9be`;
+/// every site is the same shape, e.g. VA `0x402fa8`:
+///
+/// ```text
+/// 8b 15 48 63 43 00    mov  edx,ds:0x436348
+/// ff 32                push dword ptr [edx]   ; datstg, pushed first (cdecl: right-to-left)
+/// 8b 0d 74 63 43 00    mov  ecx,ds:0x436374
+/// ff 31                push dword ptr [ecx]   ; chan, pushed last -- the near parameter
+/// e8 01 aa 01 00        call 0x41d9be
+/// 83 c4 08              add  esp,0x8          ; two 4-byte args, caller cleans -- cdecl
+/// ```
+///
+/// Two arguments, caller-cleaned, matching the header and matching every
+/// other `GALGSBL` entry in this file (all `Cleans::Caller`).
+///
+/// # What the guide says, and what this host actually does
+///
+/// GSBL guide page 187: `btuxmn` is the same as `btuxmt`, except
+/// the block it writes is one `btuclo()` cannot discard -- real GSBL marks
+/// it with a trailing `\x01` rather than `btuxmt`'s `\x00`, and `btuclo`
+/// only throws away blocks of the latter kind. The guide's example use is a
+/// message the user cannot skip or abort.
+///
+/// **Finding, not a guess: this host does not reproduce the non-clearable
+/// half.** [`crate::gsbl::Channel::output`] is one flat `Vec<u8>` with no
+/// block boundaries -- [`btuclo`] clears it unconditionally, with no way to
+/// ask "except what `btuxmn` wrote". Giving `btuxmn` that protection for
+/// real needs a field on `Channel`, which lives in `crate::gsbl`
+/// (`src/gsbl.rs`), outside this file's ownership for this task. Until that
+/// lands, `btuxmn` transmits exactly like `btuxmt` and a `btuclo` right
+/// after it *will* discard the "unskippable" message --
+/// `btuxmn_is_not_actually_protected_from_btuclo_on_this_host` asserts the
+/// current behaviour explicitly, so this is a stated gap rather than a
+/// silent one.
+///
+/// The primary behaviour -- transmitting the string, word-wrapped exactly as
+/// `btuxmt` -- is not in doubt, which is why this is implemented rather than
+/// left pinned: the module calls it seven times and the guide is explicit
+/// about everything but the one property this host cannot yet keep.
+pub fn btuxmn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let at = call.ptr();
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    host.gsbl_mut().transmit(chan, &text);
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
 /// `int btuxct(int chan, int nbyt, const char *datstg)` -- transmit `nbyt`
 /// bytes.
 ///
@@ -917,6 +979,44 @@ mod tests {
                 Vec::new()
             ],
             "the argument names the ring -- not the current channel, and not zero"
+        );
+    }
+
+    #[test]
+    fn btuxmn_transmits_like_btuxmt() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(btutsw, &[0, 10]).expect("width set");
+        let text = f.text("the quick brown fox");
+        f.invoke(btuxmn, &[0, text.offset, text.selector])
+            .expect("transmitted");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"the quick\r\nbrown fox".to_vec()
+        );
+    }
+
+    /// A stated finding, not a silent one. Real GSBL's `btuxmn` writes a
+    /// block `btuclo()` cannot clear (guide page 187: it terminates the
+    /// block with `\x01` rather than `btuxmt`'s `\x00`, and `btuclo` only
+    /// discards blocks of the latter kind). This host's
+    /// [`crate::gsbl::Channel::output`] is one flat byte buffer with no
+    /// block boundaries at all -- `btuclo` clears it unconditionally -- so
+    /// there is currently no way for `btuxmn` to keep a message alive
+    /// through a `btuclo` the way real GSBL would. See `btuxmn`'s own doc
+    /// comment for why that is not fixed here.
+    #[test]
+    fn btuxmn_is_not_actually_protected_from_btuclo_on_this_host() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let text = f.text("you cannot skip this");
+        f.invoke(btuxmn, &[0, text.offset, text.selector])
+            .expect("transmitted");
+        f.invoke(btuclo, &[0]).expect("cleared");
+        assert!(
+            f.host.gsbl_mut().drain_output(console).is_empty(),
+            "real GSBL would refuse to clear this -- this host does; see \
+             btuxmn's doc comment"
         );
     }
 
