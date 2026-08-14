@@ -44,11 +44,13 @@
 //! table at all. See [`extusr_stride`]'s own doc comment for why a non-GCV2
 //! build (`Wg32`) has none.
 //!
-//! [`USRACC`] would be the same, except that Galacticomm recorded the total
-//! themselves. `USRACC.H:22` is `#define USRACCSPARE (338-301)`: the declared
-//! fields come to 301 bytes and the spare array pads the record to 338, so that
-//! it can grow without moving. That makes 338 the size on disk as well as in
-//! memory, and it is what `ACCOUNT.C:108` opens `bbsusr.dat` with.
+//! [`AccountLayout::stride`] would be the same, except that Galacticomm
+//! recorded the total themselves. `USRACC.H:22` is `#define USRACCSPARE
+//! (338-301)`: the declared fields come to 301 bytes and the spare array
+//! pads the record to 338, so that it can grow without moving. That makes
+//! 338 the size on disk as well as in memory (for `Wg16`; see
+//! [`AccountLayout::of`] for why `Wg32` pads to 304 instead), and it is
+//! what `ACCOUNT.C:108` opens `bbsusr.dat` with.
 
 use std::io;
 
@@ -75,15 +77,6 @@ use crate::chan::{Chan, Terms};
 pub fn extusr_stride<A: Abi>() -> Option<u16> {
     A::GCV2.then_some(22)
 }
-
-/// `sizeof(struct usracc)`, `USRACC.H:24`, and the 338 that `:22` writes down.
-///
-/// **Superseded by [`AccountLayout::stride`], and left in place only because
-/// `shims/mod.rs:842` and `shims/text.rs:461` still name this and
-/// [`usracc`] directly.** Both files belong to a different owner than this
-/// task, so they were not migrated -- see `AccountLayout`'s own doc comment
-/// for why 338 is the `GCV2` size and not the one every ABI shares.
-pub const USRACC: u16 = 338;
 
 /// One field of a per-channel struct: where its first byte sits, and how many
 /// bytes it occupies at this ABI's widths.
@@ -214,55 +207,6 @@ impl UserLayout {
     }
 }
 
-/// Field offsets within `struct usracc` (`UStructs.h:20`, v10 SDK).
-///
-/// The five this crate reads. **`UIDSIZ` is 30 here, not the 10 of the
-/// v6 header** -- every offset below moves if that is got wrong, and nothing
-/// would report it except the module quietly taking a different branch.
-///
-/// Independently derived, not copied: adding up `UStructs.h:21-34` under the
-/// same byte alignment `struct user` uses (`userid[30]`, `psword[10]`,
-/// `usrnam[30]`, `usrad1..4[30]` each, `usrpho[16]`, then the two one-byte
-/// flags `systyp` and `usrprf`) lands `ansifl` at 208 (`0xd0`), `scnwid` at
-/// 209 (`0xd1`), `scnbrk` at 210 (`0xd2`) and `scnfse` at 211 (`0xd3`).
-/// Continuing the same sum through `birthd` totals exactly 301 declared
-/// bytes, which is what `USRACC.H:22`'s `#define USRACCSPARE (338-301)` says
-/// it should be -- so the total and the four offsets confirm each other.
-///
-/// **Superseded by [`AccountLayout`].** These offsets are still correct --
-/// they are the leading, ABI-independent run `AccountLayout::of` also
-/// places -- but [`SIZE`](usracc::SIZE) is `Wg16`'s (GCV2's) stride only, and
-/// a caller that strides by it under `Wg32` walks off the end of every
-/// account past the first. Kept because `shims/mod.rs:842` (`SCNBRK`) and
-/// `shims/text.rs:461` (`ANSIFL`) still read this module directly and belong
-/// to a different task's file ownership; every call site this task owns was
-/// migrated to `AccountLayout`.
-pub mod usracc {
-    /// `sizeof(struct usracc)`. `USRACC.H:22`'s `(338-301)` writes the total
-    /// down, which is why this is 338 and not a sum.
-    pub const SIZE: usize = 338;
-    /// `char userid[30]` -- and what `obtbtvl` keys the character lookup on.
-    pub const USERID: usize = 0x00;
-    /// `char ansifl` -- bit 0 is `ANSON`.
-    pub const ANSIFL: usize = 0xd0;
-    /// `char scnwid` -- screen width in columns.
-    pub const SCNWID: usize = 0xd1;
-    /// `char scnbrk` -- screen length for page breaks, i.e. how many lines
-    /// `rstrxf` (`MAJORBBS.C:3776`) tells `btuxnf` to show before pausing
-    /// (`cnt = scnbrk-CTNUOS`). Between `ansifl` and `scnwid`'s neighbour
-    /// `scnfse` in `UStructs.h`'s field order, hence 0xd0+2.
-    ///
-    /// **Never written by [`Host::connect_state`](crate::Host::connect_state)**
-    /// -- it sets `userid`, `ansifl`, `scnwid` and `scnfse` and stops there,
-    /// because this host has no account-level page-break setting to source
-    /// one from. A channel therefore always reads this as whatever its
-    /// account memory happened to hold, ordinarily zero. `rstrxf`'s own doc
-    /// comment says what that does to its computed `cnt`.
-    pub const SCNBRK: usize = 0xd2;
-    /// `char scnfse` -- screen length for full-screen stuff.
-    pub const SCNFSE: usize = 0xd3;
-}
-
 /// `struct usracc`'s stride and the field offsets this host writes, at `A`'s
 /// own field set. `re/wg33src/INC/UStructs.h:20`.
 ///
@@ -290,7 +234,16 @@ pub struct AccountLayout {
     pub ansifl: u16,
     /// `CHAR scnwid` -- screen width in columns. MajorMUD wants at least 80.
     pub scnwid: u16,
-    /// `CHAR scnbrk` -- screen length for page breaks.
+    /// `CHAR scnbrk` -- screen length for page breaks, i.e. how many lines
+    /// `rstrxf` (`MAJORBBS.C:3776`) tells `btuxnf` to show before pausing
+    /// (`cnt = scnbrk-CTNUOS`).
+    ///
+    /// **Never written by [`Host::connect_state`](crate::Host::connect_state)**
+    /// -- it sets `userid`, `ansifl`, `scnwid` and `scnfse` and stops there,
+    /// because this host has no account-level page-break setting to source
+    /// one from. A channel therefore always reads this as whatever its
+    /// account memory happened to hold, ordinarily zero. `shims::screen::rstrxf`'s
+    /// own doc comment says what that does to its computed `cnt`.
     pub scnbrk: u16,
     /// `CHAR scnfse` -- screen length for full-screen entry. MajorMUD wants at
     /// least 23.
@@ -975,15 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn an_account_record_is_the_three_hundred_and_thirty_eight_bytes_usracc_h_says() {
-        // `USRACC.H:24` declares the fields and `:22` writes the total down:
-        // `#define USRACCSPARE (338-301)`. The spare array exists so the record
-        // can grow without moving, so 338 is the size on disk *and* in memory,
-        // and it is also what `ACCOUNT.C:108` opens `bbsusr.dat` with.
-        assert_eq!(USRACC, 338);
-    }
-
-    #[test]
     fn an_extusr_slot_is_twenty_two_bytes() {
         // `MAJORBBS.H:94`, byte-aligned like `struct user`. Nothing in
         // `WCCMMUD.DLL` strides by it -- the module imports neither `extusr`
@@ -1036,7 +980,7 @@ mod tests {
         assert_eq!(at(3) - at(2), stride);
         assert_eq!(
             users.account(ch(1)).offset - users.account(ch(0)).offset,
-            USRACC
+            AccountLayout::of::<Wg16>().stride
         );
     }
 
@@ -1234,12 +1178,20 @@ mod tests {
             .connect_state(&mut f.machine, console, &Connection::ansi("rangerdan"))
             .expect("channel 0");
         let at = f.host.users().account(console);
-        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+        let account = AccountLayout::of::<Wg16>();
+        let rec = f.machine.resolve(at, account.stride as usize).expect("in bounds");
 
+        // `0xd0`/`0xd1`/`0xd3`, not `account.ansifl`/`.scnwid`/`.scnfse`,
+        // deliberately: `connect_state` (`lib.rs`) writes through this same
+        // `AccountLayout`, so reading back through it too would only prove
+        // the two agree with each other, not that either is where
+        // `WCCMMUD_named.c:11201` (quoted above) actually looks. These are
+        // the same literals `account_layout_moves_the_stride_and_not_the_fields`
+        // pins independently.
         assert_eq!(&rec[..9], b"rangerdan", "userid keys the character lookup");
-        assert_eq!(rec[usracc::ANSIFL] & 1, 1, "ANSON");
-        assert!(rec[usracc::SCNWID] >= 0x50, "80 columns");
-        assert!(rec[usracc::SCNFSE] >= 0x17, "23 rows");
+        assert_eq!(rec[0xd0] & 1, 1, "ANSON");
+        assert!(rec[0xd1] >= 0x50, "80 columns");
+        assert!(rec[0xd3] >= 0x17, "23 rows");
     }
 
     #[test]
@@ -1271,7 +1223,8 @@ mod tests {
             .connect_state(&mut f.machine, console, &Connection::ansi(&long))
             .expect("channel 0");
         let at = f.host.users().account(console);
-        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+        let account = AccountLayout::of::<Wg16>();
+        let rec = f.machine.resolve(at, account.stride as usize).expect("in bounds");
 
         assert_eq!(&rec[..29], vec![b'a'; 29].as_slice(), "29 characters, not 30");
         assert_eq!(rec[29], 0, "byte 29 is the trailing zero UIDSIZ counts in");
@@ -1299,7 +1252,8 @@ mod tests {
             .expect("channel 0, second connect");
 
         let at = f.host.users().account(console);
-        let rec = f.machine.resolve(at, usracc::SIZE).expect("in bounds");
+        let account = AccountLayout::of::<Wg16>();
+        let rec = f.machine.resolve(at, account.stride as usize).expect("in bounds");
 
         assert_eq!(&rec[..3], b"dan", "the second userid");
         assert!(
