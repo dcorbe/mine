@@ -19,19 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## Scope
-
-This licence covers the original work in this repository: the Rust crates
-under `crates/`, and the tooling and documentation that accompany them.
-
-It does not, and cannot, cover third-party material. This project contains no
-Galacticomm, Borland, Pervasive, or Phar Lap IP, and distributes no game
-content and no module binaries — you supply those yourself.
-
-See *Provenance and licence* in [`README.md`](README.md) for the full account,
-including the one vendor-derived artefact: ordinal→symbol-name tables
-extracted from export tables, which are interoperability information of the
-kind Wine has shipped as `.spec` files for thirty years.
