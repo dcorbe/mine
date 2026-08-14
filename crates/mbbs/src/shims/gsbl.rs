@@ -169,13 +169,41 @@ fn u8_arg<A: Abi>(v: A::Int) -> Option<u8> {
 /// "Fits" means round-trips, not merely "is non-negative": `BRKTHU.H`'s own
 /// status vocabulary is entirely 0..=253 today, but this checks the general
 /// property rather than that narrower fact, the same way [`u16_arg`] and
-/// [`u8_arg`] do. Sign-extending the low 16 bits back out and comparing
-/// against the original widened value accepts every value a genuine `i16`
-/// -- positive or negative -- would zero/sign-extend into under either ABI,
-/// and refuses anything where bits above position 15 carried information
-/// that extension did not put there.
+/// [`u8_arg`] do.
+///
+/// The two ABIs do not agree on how a genuine `i16` arrives in `A::Int`, so
+/// the round-trip check below only makes sense on one of them.
+/// `Into::<u32>::into` **zero-extends**: it has no notion of the source
+/// type's signedness, only its width. Under `Wg32` (`A::Int = u32`) that is
+/// irrelevant -- a real `-1` was already sign-extended to `0xFFFF_FFFF` by
+/// the module's own 32-bit `int` before this ever saw it, so `wide` already
+/// carries the sign and re-widening the narrowed candidate is a real check
+/// against real extra bits. Under `Wg16` (`A::Int = u16`) there is no such
+/// extension: every 16 bits of `A::Int` already *are* the whole `i16`, sign
+/// included, and `wide`'s top 16 bits are always zero regardless of what
+/// the low 16 bits mean. Running the same round-trip there compares a
+/// sign-extended candidate (`i32::from(narrow) as u32`, which is
+/// `0xFFFF_FFFF` for a negative `narrow`) against a zero-extended `wide`
+/// (`0x0000_FFFF`) and always disagrees for the entire negative half --
+/// this file's own first shipped version of this function had exactly that
+/// bug, rejecting a genuine `Wg16` status of `-1`. `A::INT_WIDTH <= 2`
+/// therefore skips the check rather than performing a broken one: every
+/// bit pattern `A::Int` can hold is already exactly an `i16`'s worth of
+/// bits, so a plain reinterpret is not merely adequate but the only
+/// question that has an answer at that width. `Wg32`, `A::INT_WIDTH == 4`,
+/// keeps the round-trip: there the check is answering a real question
+/// (did the extra 16 bits carry information a genuine `i16` could not have
+/// produced) and accepts every value a genuine `i16` -- positive or
+/// negative -- would sign-extend into.
 fn i16_arg<A: Abi>(v: A::Int) -> Option<i16> {
     let wide: u32 = v.into();
+    if A::INT_WIDTH <= 2 {
+        // Every bit pattern `A::Int` can hold already IS an `i16`'s worth
+        // of bits -- see this function's own doc comment for why the
+        // round-trip check below would be wrong here, not merely
+        // redundant.
+        return Some(wide as i16);
+    }
     let narrow = wide as i16;
     if (i32::from(narrow) as u32) == wide { Some(narrow) } else { None }
 }
@@ -666,7 +694,7 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Wg32;
+    use crate::abi::{Wg16, Wg32};
     use crate::testing::Fixture;
 
     // # Why these run against `Wg32::Int` directly, not a `Call<Wg32>`
@@ -745,11 +773,25 @@ mod tests {
     /// widest `Wg16::Int` there is; `255` and `0x7FFF` are the widest a
     /// `u8`/`i16` site could receive from it once `Wg16`'s own `u16` is the
     /// source.
+    ///
+    /// `i16_arg` gets its own `A = Wg16` half here, not only the `A = Wg32`
+    /// half above: `Wg16::Int` is `u16`, and `Into::<u32>::into` for a `u16`
+    /// **zero-extends** -- there is no sign to preserve on the way in, unlike
+    /// `Wg32::Int = u32`, which arrives already sign-extended by the CPU that
+    /// produced it. A genuine `i16` status of `-1` is the bit pattern
+    /// `0xFFFF` under `Wg16`; that is a value `i16_arg::<Wg16>` must accept,
+    /// and the widest-positive-only case above cannot catch a bug in how the
+    /// negative half is handled because it never exercises the negative
+    /// half. This is the actual claim this test's name makes -- "everything
+    /// `Wg16` could produce" includes the values with the high bit set.
     #[test]
     fn checked_narrow_readers_still_accept_everything_wg16_could_produce() {
         assert_eq!(u16_arg::<Wg32>(0xFFFF), Some(0xFFFF));
         assert_eq!(u8_arg::<Wg32>(0xFF), Some(0xFF));
         assert_eq!(i16_arg::<Wg32>(0x7FFF), Some(0x7FFF));
+
+        assert_eq!(i16_arg::<Wg16>(0xFFFF), Some(-1), "Wg16's zero-extended -1");
+        assert_eq!(i16_arg::<Wg16>(0x8000), Some(i16::MIN), "Wg16's zero-extended i16::MIN");
     }
 
     /// [`i16_arg`]'s round-trip check accepts a genuinely negative value via
