@@ -208,6 +208,28 @@ fn i16_arg<A: Abi>(v: A::Int) -> Option<i16> {
     if (i32::from(narrow) as u32) == wide { Some(narrow) } else { None }
 }
 
+/// Read the next argument as a sign-and-magnitude byte, refusing rather than
+/// truncating either half.
+///
+/// [`btuxnf`]'s `xoff` is the one site this shape describes. The guide
+/// (page 193) overloads its sign as the page-mode flag and its magnitude as
+/// the flow-control character -- `Channel::xoff` is a `u8` -- so a checked
+/// reader here has to protect two different things a plain `i16_arg` alone
+/// would not: that the value round-trips through `A::Int`'s width at all
+/// (same check `i16_arg` makes), and that what is left after the sign is
+/// removed still fits the byte it is ultimately stored in. Every real
+/// 32-bit call site (`re/wg33src/SRC/.../MAJORBBS.C:4490` among them) passes
+/// `0`, `19` or `-19`, so this is the tenth member of this audit's
+/// "genuinely narrow" bucket, not a new bucket -- see
+/// `docs/2026-08-14-gsbl-width-audit.md` for why it was filed separately
+/// from the other nine when it was found, and this reader for why it no
+/// longer needs to be.
+fn signed_byte_arg<A: Abi>(v: A::Int) -> Option<i16> {
+    let xoff = i16_arg::<A>(v)?;
+    u8::try_from(xoff.unsigned_abs()).ok()?;
+    Some(xoff)
+}
+
 /// Read the next argument at its full width, refusing nothing.
 ///
 /// The "genuinely wide" bucket's one reader: [`btuxct`]'s `nbyt` and
@@ -377,27 +399,33 @@ pub fn btutrg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// same reason as [`btutrg`]'s `nbyt`: [`crate::gsbl::Channel::page_lines`]
 /// is a `u16`.
 ///
-/// **`xoff` is not covered by this audit's checked readers**, and that is a
-/// finding, not an oversight folded in silently: it narrows to `i16` here
-/// and again to `u8` in [`apply_xnf`], on the same `call.int()` -- `A::Int`
-/// -- shape as the nine sites this audit's own plan enumerated, but it is
-/// not one of them (`docs/plans/2026-08-14-stage3-channel-entry-
-/// implementation.md`'s Task 6 table lists `xon` at this line's neighbour
-/// and `cnt` two lines below, never `xoff`). Every real 32-bit call site
-/// (`re/wg33src/SRC/.../MAJORBBS.C:4490` among them) passes `0`, `19` or
-/// `-19` -- well inside a byte, sign included -- so this is not believed to
-/// be live, but "not believed to be live" is exactly the reasoning this
-/// audit exists to distrust. Left as `as i16`/`as u8` because fixing it was
-/// not this task's scope to expand on its own initiative; recorded here and
-/// in `docs/2026-08-14-gsbl-width-audit.md` so a later reader does not
-/// mistake the silence for having been checked.
+/// `xoff` is read with [`signed_byte_arg`] -- the tenth "genuinely narrow"
+/// site this audit's width pass found (`docs/2026-08-14-gsbl-width-audit.md`
+/// has the full history: found after the plan's own table was already
+/// written, fixed in a later pass rather than the same one that found it).
+/// Its sign survives the read -- it is what selects page mode below -- and
+/// its magnitude is checked against the byte [`crate::gsbl::Channel::xoff`]
+/// actually is, the same guarantee [`u8_arg`] gives `xon`.
+///
+/// **A second, independent bug lived here past the width check**:
+/// `apply_xnf` used to store `xoff as u8` -- a bit-truncating reinterpret,
+/// not a width bug (`i16` and `u8` disagree about `-19`'s *bits*, not about
+/// which module produced them, so this part was already ABI-invariant) but
+/// a *domain* bug. The guide's own page-193 example calls the negative form
+/// "xoff = -19, CTRL+S pauses, page mode is selected" -- the same CTRL+S
+/// (`19`) the positive form uses, not `-19`'s two's-complement byte `0xED`.
+/// `xoff`'s sign is a mode flag glued onto the character argument, not part
+/// of the character. Fixed alongside the width check rather than filed as a
+/// second finding, since both live in the same three lines and the correct
+/// fix touches both: see [`apply_xnf`].
 pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     let Some(xon) = u8_arg::<A>(call.int()) else {
         return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
     };
-    // Not covered by this audit -- see this function's own doc comment.
-    let xoff = Into::<u32>::into(call.int()) as i16;
+    let Some(xoff) = signed_byte_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
     // The two page-mode arguments are read only when xoff says to expect
     // them -- see this function's own doc comment. The cursor reads them in
     // frame order regardless of which branch runs, same as `arg_u16(3)`/
@@ -425,6 +453,18 @@ pub fn btuxnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// so that [`crate::shims::screen::rstrxf`] (`MAJORBBS.C:3778`) can drive the
 /// same channel-state update with values it already has in hand, rather than
 /// a second copy of these four lines that could drift from the first.
+///
+/// `xoff`'s sign selects page mode in [`btuxnf`] (the caller already
+/// resolved that into `page`); by the time it reaches here the sign has one
+/// job left, which is deciding whether to negate before storing. `-19` and
+/// `19` are the guide's own page-193 example of the *same* flow-control
+/// character, so `c.xoff` stores the magnitude, `xoff.unsigned_abs()`, not
+/// `xoff`'s two's-complement bits. Trusts its caller for range the way
+/// `c.xon = xon` already does: [`btuxnf`] checked it with
+/// [`signed_byte_arg`] before calling this, and `rstrxf`'s own call passes
+/// the literal `-19` -- magnitude `19`, trivially in range. The
+/// `debug_assert` says so instead of leaving it to be discovered by whoever
+/// adds the next caller.
 pub(crate) fn apply_xnf(
     g: &mut Gsbl,
     chan: Chan,
@@ -434,7 +474,12 @@ pub(crate) fn apply_xnf(
 ) {
     let c = g.channel_mut(chan);
     c.xon = xon;
-    c.xoff = xoff as u8;
+    debug_assert!(
+        xoff.unsigned_abs() <= u16::from(u8::MAX),
+        "apply_xnf's caller must validate xoff's magnitude fits a byte \
+         before calling -- see this function's own doc comment"
+    );
+    c.xoff = xoff.unsigned_abs() as u8;
     if let Some((cnt, message)) = page {
         c.page_lines = cnt;
         c.page_message = Some(message);
@@ -799,7 +844,7 @@ mod tests {
     // channel-bound check `on_channel` performs after these readers return
     // -- everything downstream of "was this value accepted or refused".
 
-    /// The eight sites this audit classified "genuinely narrow" or
+    /// The nine sites this audit classified "genuinely narrow" or
     /// "genuinely 16-bit in the host's own model" all refuse a value a real
     /// `Wg32` module's `int` can carry but the site's own `Channel` field
     /// cannot -- the same shape as the `cw3220mt` `fgets(buf, 40000, f)` bug
@@ -820,6 +865,7 @@ mod tests {
             ("btumil's maxinl (u16, Channel::maxinl)", u16_arg::<Wg32>(70_000).is_some()),
             ("btutrg's nbyt (u16, Channel::trigger)", u16_arg::<Wg32>(70_000).is_some()),
             ("btuxnf's xon (u8, Channel::xon)", u8_arg::<Wg32>(300).is_some()),
+            ("btuxnf's xoff (sign+u8, Channel::xoff)", signed_byte_arg::<Wg32>(300).is_some()),
             ("btuxnf's cnt (u16, Channel::page_lines)", u16_arg::<Wg32>(70_000).is_some()),
             ("btupbc's pausch (u8, Channel::pause_char)", u8_arg::<Wg32>(300).is_some()),
             ("btucpc's cpchar (u8, Channel::clear_pause_char)", u8_arg::<Wg32>(300).is_some()),
@@ -829,7 +875,7 @@ mod tests {
         }
     }
 
-    /// The same eight sites still accept every value a `Wg16` module could
+    /// The same nine sites still accept every value a `Wg16` module could
     /// ever have produced -- the fix is a refusal added at the top of the
     /// representable range, not a new restriction inside it. `0xFFFF` is the
     /// widest `Wg16::Int` there is; `255` and `0x7FFF` are the widest a
@@ -851,9 +897,12 @@ mod tests {
         assert_eq!(u16_arg::<Wg32>(0xFFFF), Some(0xFFFF));
         assert_eq!(u8_arg::<Wg32>(0xFF), Some(0xFF));
         assert_eq!(i16_arg::<Wg32>(0x7FFF), Some(0x7FFF));
+        assert_eq!(signed_byte_arg::<Wg32>(255), Some(255));
+        assert_eq!(signed_byte_arg::<Wg32>(0xFFFF_FF01), Some(-255), "-255, the widest magnitude a byte-and-sign holds");
 
         assert_eq!(i16_arg::<Wg16>(0xFFFF), Some(-1), "Wg16's zero-extended -1");
         assert_eq!(i16_arg::<Wg16>(0x8000), Some(i16::MIN), "Wg16's zero-extended i16::MIN");
+        assert_eq!(signed_byte_arg::<Wg16>(0xFF01), Some(-255), "Wg16's zero-extended -255");
     }
 
     /// [`i16_arg`]'s round-trip check accepts a genuinely negative value via
@@ -1175,11 +1224,49 @@ mod tests {
         f.invoke(btuxnf, &[0, 0, 0xffed, 22, msg.offset, msg.selector])
             .expect("ok");
         let c = f.host.gsbl().channel(console);
-        assert_eq!(c.xoff, 0xed, "the low byte still lands, negative or not");
+        assert_eq!(
+            c.xoff, 19,
+            "the guide's own page-193 example: xoff=-19 still means CTRL+S \
+             (19), the same byte the positive form uses -- not 0xed, the \
+             bit pattern -19 happens to have"
+        );
         assert_eq!(c.page_lines, 22);
         assert_eq!(
             c.page_message.as_deref(),
             Some(b"Hit any key to continue...".as_slice())
+        );
+    }
+
+    /// The guide's positive form of the same character: `btuxnf(chan,0,19)`
+    /// is the documented default (page 194) and must store the identical
+    /// byte the negative form (page-mode) does -- the sign is a mode flag,
+    /// not part of the character.
+    #[test]
+    fn btuxnf_with_a_positive_xoff_stores_the_same_byte_as_its_negation() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(btuxnf, &[0, 0, 19]).expect("ok");
+        assert_eq!(f.host.gsbl().channel(console).xoff, 19);
+    }
+
+    /// A 32-bit module's `xoff` whose magnitude does not fit the byte
+    /// [`crate::gsbl::Channel::xoff`] actually is. Genuinely narrow, same
+    /// bucket as `xon` (`checked_narrow_readers_refuse_a_32_bit_value_
+    /// their_channel_field_cannot_hold`) -- refused with `-11`, not
+    /// truncated into some other in-range byte.
+    #[test]
+    fn btuxnf_refuses_an_xoff_whose_magnitude_does_not_fit_a_byte() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let before = f.host.gsbl().channel(console).xoff;
+        let ret = f
+            .invoke(btuxnf, &[0, 0, 300])
+            .expect("the routine itself does not error -- it returns -11");
+        assert_eq!(ret, Ret::U16(OUT_OF_RANGE));
+        assert_eq!(
+            f.host.gsbl().channel(console).xoff,
+            before,
+            "refused, not silently truncated to 300 as u8 == 44"
         );
     }
 
