@@ -434,7 +434,7 @@ fn normalize_newlines(text: &[u8]) -> Vec<u8> {
 ///
 /// The flag itself lives in module memory, not in this host's own state:
 /// `Host::connect_state` writes `who.ansi` into `usracc.ansifl` bit `ANSON`
-/// (`users::usracc::ANSIFL`) when a channel connects, and this reads it back
+/// (`AccountLayout::ansifl`) when a channel connects, and this reads it back
 /// the same way the module's own `_EDIT_CHARACTER_STATS` fork does
 /// (`WCCMMUD_decompiled.c:1799-1805`, cited in `users::Connection::line_mode`).
 ///
@@ -458,7 +458,7 @@ fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
         return true;
     };
     let account = host.users().account(chan);
-    let ansifl = A::ptr_offset(account, crate::users::usracc::ANSIFL as u16);
+    let ansifl = A::ptr_offset(account, host.users().account_layout().ansifl);
     match ansifl.resolve(mem, 1) {
         Ok(bytes) => bytes[0] & 1 != 0,
         Err(_) => true,

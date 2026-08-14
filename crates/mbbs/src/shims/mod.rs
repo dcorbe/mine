@@ -1072,7 +1072,7 @@ mod tests {
             .expect("channel 0 is current");
         let account = f.host.users().account(console);
         let at = mbbs_machine::m16::FarPtr {
-            offset: account.offset + crate::users::usracc::SCNBRK as u16,
+            offset: account.offset + f.host.users().account_layout().scnbrk,
             selector: account.selector,
         };
         f.machine.write(at, &[24]).expect("account memory");
