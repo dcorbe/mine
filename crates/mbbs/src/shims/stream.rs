@@ -66,6 +66,8 @@
 #[cfg(test)]
 use mbbs_machine::m16::Ret;
 use mbbs_machine::ptr::ModulePtr;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
@@ -670,6 +672,401 @@ pub fn rewind<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .seek_mem(call.mem(), cookie, 0, Whence::Set)
         .map_err(|e| ShimError::Failed(format!("rewind: {e}")))?;
     Ok(abi::Ret::Void)
+}
+
+/// File attribute masks `fnd1st`'s `attr` argument is built from --
+/// `DOSFACE.H:61-66` (this file's own module doc for the header quote),
+/// used only by [`fnd1st`]/[`fndnxt`] below.
+const FAMRON: u8 = 0x01;
+const FAMHID: u8 = 0x02;
+const FAMSYS: u8 = 0x04;
+const FAMVID: u8 = 0x08;
+const FAMDIR: u8 = 0x10;
+#[allow(dead_code)] // named for completeness with the vendor header; never tested against, see `fnd1st`'s own doc comment
+const FAMARC: u8 = 0x20;
+
+/// Field offsets of `struct fndblk` at `A`'s own width, and the struct's
+/// whole size -- what [`write_fndblk`] writes and this file's own
+/// `#[cfg(test)]` block pins down per ABI, per [`fnd1st`]'s own doc comment.
+struct FndblkLayout {
+    attr: usize,
+    time: usize,
+    date: usize,
+    size: usize,
+    name: usize,
+    total: usize,
+}
+
+impl FndblkLayout {
+    /// `char junk[21]` -- both ABIs; a `char` array has no width that varies
+    /// with `A::INT_WIDTH`.
+    const JUNK: usize = 21;
+
+    /// `char name[12+1]` -- both ABIs, same reason.
+    const NAME: usize = 13;
+
+    /// The layout, per ABI -- and the two are not the same structure.
+    ///
+    /// # Measured, because the header is only half the story
+    ///
+    /// `DOSFACE.H:51` describes the 16-bit record, and it is DOS's own DTA:
+    /// `junk[21]`, `attr` at 21, `time` 22, `date` 24, `size` 26,
+    /// `name` 30, 43 bytes in all. That is Borland's 16-bit `struct ffblk`
+    /// with Galacticomm's field names on it.
+    ///
+    /// 32-bit Worldgroup does **not** widen that record. It uses Borland's
+    /// *32-bit* `struct ffblk`, which is a different shape entirely:
+    ///
+    ///
+    /// Size comes *before* the attribute, the attribute is a `long`, the
+    /// times stay 16 bits, and the name starts at 16 rather than 30.
+    ///
+    /// # How that was established
+    ///
+    /// Not from the header, which does not describe it, and not from
+    /// `WGSERVER.EXE`, which is not in this tree. LunatiX was made to answer
+    /// it: `fnd1st` filled the block with a byte-per-offset marker (`0` at
+    /// 0, `1` at 1, ... so the first character read back names the offset it
+    /// was read from), the module scanned `lun5elev\*.lun`, and it then
+    /// opened `"LUN5ELEV\@ABC..."`. `@` is ASCII 64, the marker for offset
+    /// **16**.
+    ///
+    /// Repeated with a write bounded to 43 bytes, in case a longer one had
+    /// clobbered a neighbouring stack buffer and produced the same answer by
+    /// accident. Same result.
+    ///
+    /// # What getting it wrong looked like
+    ///
+    /// Worth recording, because it was not a crash and not obviously a
+    /// layout problem. Writing the name at 30 (the DOS offset) or 36 (what
+    /// "`unsigned` follows `INT_WIDTH`" would give) left a zero byte where
+    /// the module looked, so it read an empty filename, built
+    /// `"LUN5ELEV\" + ""`, and opened **the directory**. The failure
+    /// surfaced three calls later as `fgets: Is a directory`.
+    fn of<A: Abi>() -> Self {
+        if A::PTR_WIDTH >= 4 && A::INT_WIDTH >= 4 {
+            // Borland 32-bit `struct ffblk`. `total` is what this host
+            // writes, not the structure's own 272 bytes: the tail of
+            // `ff_name` is the module's and there is nothing to put in it.
+            Self { attr: 8, time: 12, date: 14, size: 4, name: 16, total: 16 + Self::NAME }
+        } else {
+            // Borland 16-bit `struct ffblk`, which is DOS's DTA.
+            Self { attr: 21, time: 22, date: 24, size: 26, name: 30, total: 30 + Self::NAME }
+        }
+    }
+}
+
+/// One file [`fnd1st`]/[`fndnxt`] will hand back: where it is on this host's
+/// disk, and the DOS name already validated against the spec -- built once,
+/// at scan time, so [`fndnxt`] never re-parses a filename it already parsed
+/// to decide the match in the first place.
+#[derive(Debug, Clone)]
+pub(crate) struct FoundEntry {
+    at: PathBuf,
+    name: dos::Name,
+}
+
+/// Identify one scan: which `fbptr` buffer it is behind, and which `Abi`'s
+/// own pointer encoding produced those bytes.
+///
+/// The `Abi` half exists only to be honest about a hypothetical: two ABIs
+/// could in principle encode two different addresses to the same raw bytes,
+/// and nothing about a raw `Vec<u8>` key alone would tell them apart. In
+/// practice this crate's own single-threaded design (see [`SCANS`]'s own
+/// doc comment) means one thread's [`SCANS`] table only ever holds one
+/// `Abi`'s pointers at a time, so this is a belt no observed scenario needs
+/// -- kept because a key collision would be silent corruption, which is the
+/// one thing this crate refuses to let through anywhere.
+fn scan_key<A: Abi>(fbptr: A::Ptr) -> (&'static str, Vec<u8>) {
+    (std::any::type_name::<A>(), A::ptr_to_bytes(fbptr))
+}
+
+/// Resolve every component but the last of a `/`-joined path (already
+/// through [`Host::dos_name`]) against `root`, case-insensitively -- the
+/// same walk [`Host::find`] does, restricted to directory components so it
+/// can stop one short of the final, possibly-wildcarded, name.
+///
+/// `dirs` is empty for a bare filename with no subdirectory at all, which
+/// this answers with `root` itself rather than making a caller special-case
+/// it.
+fn resolve_dir(root: &Path, dirs: &str) -> Option<PathBuf> {
+    let mut at = root.to_path_buf();
+    for part in dirs.split('/').filter(|p| !p.is_empty()) {
+        at = std::fs::read_dir(&at)
+            .ok()?
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name().to_string_lossy().eq_ignore_ascii_case(part)
+                    && e.path().is_dir()
+            })
+            .map(|e| e.path())?;
+    }
+    Some(at)
+}
+
+/// Fill `fbptr`'s `fndblk` with what `found` says about one file, at `A`'s
+/// own [`FndblkLayout`].
+///
+/// **`junk` is zeroed, not reproduced.** Nothing in this crate reads it back
+/// -- `Host::finds` carries the equivalent state host-side, see its own
+/// doc comment -- so there is no DOS DTA byte format to get right here; a
+/// zero fill is honest about "this host has nothing to put there" rather
+/// than inventing bytes that look like real DOS internals but are not.
+fn write_fndblk<A: Abi>(mem: &mut A::Mem, fbptr: A::Ptr, found: &FoundEntry) -> Result<(), ShimError> {
+    let failed = |what: &str, e: String| {
+        ShimError::Failed(format!("fnd1st/fndnxt({}): {what}: {e}", found.at.display()))
+    };
+
+    let metadata = std::fs::metadata(&found.at).map_err(|e| failed("metadata", e.to_string()))?;
+
+    // Only what the filesystem actually says: `FAMDIR` when it is a
+    // directory, `FAMRON` when it is not writable. No host equivalent of
+    // DOS's hidden/system/archive bits exists, and inventing one would be
+    // the plausible-but-wrong answer this crate exists to refuse -- see
+    // `fnd1st`'s own doc comment for `FAMHID`/`FAMSYS`/`FAMARC`.
+    let mut attr = 0u8;
+    if metadata.is_dir() {
+        attr |= FAMDIR;
+    }
+    if metadata.permissions().readonly() {
+        attr |= FAMRON;
+    }
+
+    // Through the host's own calendar, not `SystemTime` directly -- the
+    // same reason `getdtd` above does, and the same conversions:
+    // `Clock::pinned` plus `Civil::dos_date`/`dos_time`.
+    let modified = metadata
+        .modified()
+        .map_err(|e| failed("modified", e.to_string()))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| failed("modified", e.to_string()))?
+        .as_secs();
+    let modified = u32::try_from(modified)
+        .map_err(|_| failed("modified", "does not fit this host's clock".to_string()))?;
+    let civil = crate::clock::Clock::pinned(modified)
+        .civil()
+        .map_err(|e| failed("modified", e))?;
+    let date = civil.dos_date().map_err(|e| failed("modified", e))?;
+    let time = civil.dos_time();
+
+    let size = u32::try_from(metadata.len())
+        .map_err(|_| failed("size", format!("{} bytes does not fit a 32-bit long", metadata.len())))?;
+
+    let layout = FndblkLayout::of::<A>();
+    let mut bytes = vec![0u8; layout.total];
+    if layout.name == 16 {
+        // `unsigned long ff_attrib` -- four bytes, not one. See
+        // `FndblkLayout::of`.
+        bytes[layout.attr..layout.attr + 4].copy_from_slice(&u32::from(attr).to_le_bytes());
+    } else {
+        bytes[layout.attr] = attr;
+    }
+    // Two bytes each, and four for the size -- the measured layout, not
+    // `A::INT_WIDTH`. See `FndblkLayout::of`.
+    bytes[layout.time..layout.time + 2].copy_from_slice(&time.to_le_bytes());
+    bytes[layout.date..layout.date + 2].copy_from_slice(&date.to_le_bytes());
+    bytes[layout.size..layout.size + 4].copy_from_slice(&size.to_le_bytes());
+    let rendered = found.name.display();
+    let rendered = rendered.as_bytes();
+    // `NAME` (13) is `8 + 1 + 3`, and `display` never produces more than
+    // `8 + 1 + 3` non-NUL bytes -- `Name::parse` already refused anything
+    // longer on the way in (`dos.rs`'s own "not a name DOS could have had").
+    bytes[layout.name..layout.name + rendered.len()].copy_from_slice(rendered);
+    // The byte after it is already 0 from the zero-fill above, which is the
+    // terminator.
+
+    fbptr.write(mem, &bytes).map_err(|e| failed("write", e.to_string()))
+}
+
+/// `int fnd1st(struct fndblk *fbptr, char *filspc, char attr)` -- the first
+/// file `filspc` names, `1`/`0` for found/none.
+///
+/// `struct fndblk` -- `DOSFACE.H:52-59` (this file's own module doc quotes
+/// the whole header):
+///
+///
+/// # The struct's layout is ABI-dependent, and half of it is inferred
+///
+/// `unsigned time`/`unsigned date` are `A::INT_WIDTH` bytes -- 2 under
+/// `Wg16`, 4 under `Wg32` -- so this struct has two different shapes, not
+/// one shape read at two widths. [`FndblkLayout::of`] computes both; this
+/// paragraph is the reasoning, and `#[cfg(test)]`'s
+/// `fndblk_layout_matches_the_derived_offset_table_for_both_abis` pins the
+/// resulting numbers down so a change to either is a test failure rather
+/// than a silent one.
+///
+/// **`Wg16`: measured, from the vendor header itself.** 16-bit Borland
+/// compiled this byte-packed -- `junk` 0..21, `attr` 21, `time` 22, `date`
+/// 24, `size` 26, `name` 30..43, total 43. Every field starts exactly where
+/// the one before it ends; there is no padding to derive.
+///
+/// **`Wg32`: INFERRED, NOT MEASURED against a real WGSERVER.** No 32-bit
+/// Galacticomm binary this repo has decompiled carries this struct or a
+/// caller of it -- `re/wg33src` has never had a 32-bit `DOSFACE.H` pass
+/// through it -- so this is Borland C++ 5.x's *documented default* applied
+/// to the vendor's own field order, not a fact read out of a binary.
+/// `bcc32`'s default is natural member alignment up to an 8-byte ceiling
+/// that never engages here (nothing in this struct is wider than 4 bytes):
+/// a member aligns to its own size, so the two 4-byte `unsigned`s and the
+/// 4-byte `long` each need 4-byte alignment, and the struct's own size
+/// rounds up to its largest member's alignment so an array of `fndblk`
+/// stays aligned element to element. That inserts padding a byte-packed
+/// 16-bit build never had: two bytes between `attr` (21) and `time` (pushed
+/// to 24), and three trailing bytes after `name` (49 rounds up to 52).
+/// **What would confirm this:** a real `bcc32` (Borland C++ 5.x, Win32
+/// target) compiling this exact struct and reporting `sizeof`/`offsetof`
+/// for each field -- no such compiler is in `archive/` today (checked while
+/// writing this) -- or a decompiled 32-bit `WGSERVER`/`DOSCALLS` binary with
+/// a `fnd1st`/`fndnxt` caller whose field accesses pin the same offsets
+/// `getdtd`'s own doc comment pins for its own struct.
+///
+/// # `attr`'s width
+///
+/// `char attr` is promoted to `int` in a cdecl call, so it is read with
+/// `call.int()` like every other C `int` argument -- never narrowed with the
+/// `as u16`/`as i16` idiom this crate removed elsewhere. Taking the low byte
+/// back out of the zero-extended `u32` (`Into::<u32>::into(call.int()) as
+/// u8`) recovers the original `char`'s bits regardless of whether Borland's
+/// default `char` was signed: sign- and zero-extension agree on the low 8
+/// bits, which is all `attr`'s bitmask ever needed.
+///
+/// # What `attr` includes
+///
+/// The FAM masks control inclusion, not the reported `attr` byte -- see
+/// `DOSFACE.H`'s own comment, and this file's module doc for the mask
+/// values. Ordinary files always match, the same as real `FindFirst`:
+/// `FAMDIR` additionally admits subdirectories into the scan. This host has
+/// no equivalent of DOS hidden/system/volume-label attributes -- a name
+/// [`dos::Name::parse`] accepts is never hidden or system the DOS way to
+/// begin with (a Unix dotfile already fails to parse as a DOS name, the
+/// same exclusion [`cntdir`]'s own doc comment describes) -- so `FAMHID`,
+/// `FAMSYS` and `FAMVID` in `attr` are accepted without error but can never
+/// widen a scan on this host: there is nothing here for them to admit.
+///
+/// # Scan state
+///
+/// The match list is computed once here, sorted by DOS name for a
+/// deterministic order this host has no on-disk equivalent for otherwise
+/// (real DOS's order was whatever the FAT directory happened to hold), and
+/// the first entry is written and consumed immediately -- `fnd1st` itself
+/// counts as the scan's first answer, not a setup step before `fndnxt`'s
+/// first one. What is left after that is [`fndnxt`]'s to drain; see
+/// `Host::finds`'s own doc comment for where it lives and what interleaving two
+/// scans does.
+///
+/// # Errors
+///
+/// If `filspc` escapes the module's own directory or names a subdirectory
+/// this host cannot see ([`Host::dos_name`]'s rule, the same one [`fopen`]
+/// and [`cntdir`] keep), if the final component is not a spec DOS could have
+/// parsed ([`dos::Name::spec`]'s), if the directory cannot be read, or if a
+/// matched file's size or modified time will not fit what the module reads
+/// it back as.
+pub fn fnd1st<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let fbptr = call.ptr();
+    let filspc = call.ptr();
+    let attr = Into::<u32>::into(call.int()) as u8;
+
+    let named = String::from_utf8_lossy(
+        filspc.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
+
+    let (dir, spec_part) = match name.rsplit_once('/') {
+        Some((dir, file)) => (dir, file),
+        None => ("", name.as_str()),
+    };
+    let spec = dos::Name::spec(spec_part)
+        .map_err(|why| ShimError::Failed(format!("fnd1st({named}): {why}")))?;
+
+    let at = resolve_dir(&host.root, dir).ok_or_else(|| {
+        ShimError::Failed(format!("fnd1st({named}): {dir} is not a directory this host can see"))
+    })?;
+
+    let entries = std::fs::read_dir(&at)
+        .map_err(|e| ShimError::Failed(format!("fnd1st({named}): {}: {e}", at.display())))?;
+
+    let include_dirs = attr & FAMDIR != 0;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| ShimError::Failed(format!("fnd1st({named}): {}: {e}", at.display())))?;
+        let found = entry.file_name();
+        let found = found.to_string_lossy();
+
+        // Not a refusal: a name DOS could not have written down is one no
+        // real `fnd1st` loop could have returned. See `dos::Name::parse`.
+        let Some(parsed) = dos::Name::parse(&found) else {
+            continue;
+        };
+        if !spec.matches(&parsed) {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata =
+            std::fs::metadata(&path).map_err(|e| ShimError::Failed(format!("fnd1st({named}): {}: {e}", path.display())))?;
+        if metadata.is_dir() {
+            if !include_dirs {
+                continue;
+            }
+        } else if !metadata.is_file() {
+            continue;
+        }
+
+        matches.push(FoundEntry { at: path, name: parsed });
+    }
+    matches.sort_by(|a, b| a.name.display().cmp(&b.name.display()));
+
+    let mut remaining: VecDeque<FoundEntry> = matches.into();
+    let first = remaining.pop_front();
+    let found = first.is_some();
+    if let Some(entry) = &first {
+        write_fndblk::<A>(call.mem(), fbptr, entry)?;
+    }
+
+    host.finds.insert(scan_key::<A>(fbptr), remaining);
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(found))))
+}
+
+/// `int fndnxt(struct fndblk *fbptr)` -- the next file the same `fnd1st`
+/// scan matched, `1`/`0` for one more/no more.
+///
+/// See [`fnd1st`]'s own doc comment for the struct layout and `Host::finds`'s
+/// for how the scan's position is kept and what reusing an `fbptr`
+/// mid-scan does.
+///
+/// # Errors
+///
+/// If `fbptr` names no scan [`fnd1st`] has started. A stale scan that has
+/// already run out answers plain `0` here, same as real `fndnxt` -- the
+/// distinction this host draws is "never started" (a host bug, refused,
+/// the same principle [`fclose`]'s own doc comment states for a handle
+/// this host never issued) versus "started and finished" (an ordinary `0`,
+/// same as [`cntdir`]'s "spec matching nothing" is a `0` and not a
+/// refusal).
+pub fn fndnxt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let fbptr = call.ptr();
+    let key = scan_key::<A>(fbptr);
+
+    let next = match host.finds.get_mut(&key) {
+        Some(remaining) => remaining.pop_front(),
+        None => {
+            return Err(ShimError::Failed(
+                "fndnxt: no fnd1st scan in progress for this find block".to_string(),
+            ));
+        }
+    };
+
+    match next {
+        Some(entry) => {
+            write_fndblk::<A>(call.mem(), fbptr, &entry)?;
+            Ok(abi::Ret::Int(A::Int::from(1u16)))
+        }
+        None => Ok(abi::Ret::Int(A::Int::from(0u16))),
+    }
 }
 
 #[cfg(test)]
@@ -1613,5 +2010,200 @@ mod tests {
             let args = Fixture::far(at);
             assert!(f.invoke(cntdir, &args).is_err(), "{spec}");
         }
+    }
+
+    // ---- fnd1st / fndnxt -----------------------------------------------------
+
+    /// `struct fndblk`'s field offsets, pinned per ABI -- `Wg16`'s to the
+    /// numbers `DOSFACE.H` gives directly (quoted in [`fnd1st`]'s own doc
+    /// comment), `Wg32`'s to this crate's inferred natural-alignment layout
+    /// (same doc comment, marked there as unmeasured). A change to either
+    /// table changes what a real 16- or 32-bit module reads out of this
+    /// struct, so it has to fail a test rather than pass one in silence.
+    #[test]
+    fn fndblk_layout_matches_the_derived_offset_table_for_both_abis() {
+        use crate::abi::Wg32;
+
+        let wg16 = FndblkLayout::of::<Wg16>();
+        assert_eq!(wg16.attr, 21, "Wg16 attr");
+        assert_eq!(wg16.time, 22, "Wg16 time");
+        assert_eq!(wg16.date, 24, "Wg16 date");
+        assert_eq!(wg16.size, 26, "Wg16 size");
+        assert_eq!(wg16.name, 30, "Wg16 name");
+        assert_eq!(wg16.total, 43, "Wg16 total -- byte-packed, no trailing pad");
+
+        // Borland's *32-bit* `struct ffblk`, which is a different record and
+        // not the 16-bit one widened: size before attribute, a `long`
+        // attribute, 16-bit times, and the name at 16. Measured out of
+        // LunatiX itself -- see `FndblkLayout::of` for how, and for what the
+        // wrong answer looked like (it opened a directory).
+        let wg32 = FndblkLayout::of::<Wg32>();
+        assert_eq!(wg32.size, 4, "Wg32 ff_fsize -- before the attribute, not after");
+        assert_eq!(wg32.attr, 8, "Wg32 ff_attrib -- an unsigned long");
+        assert_eq!(wg32.time, 12, "Wg32 ff_ftime -- still 16 bits");
+        assert_eq!(wg32.date, 14, "Wg32 ff_fdate");
+        assert_eq!(wg32.name, 16, "Wg32 ff_name -- the offset LunatiX read from");
+        assert_eq!(wg32.total, 29, "Wg32: what this host writes, not ff_name's own 256");
+
+        // The two layouts genuinely differ; a formula that collapsed them
+        // would pass every assertion above only if it produced both.
+        assert_ne!(wg16.name, wg32.name, "the two ABIs' records are not one record");
+    }
+
+    /// A `fndblk` buffer, zeroed, sized for `Wg16` -- every behavioural test
+    /// below is `Wg16`-only for the same reason every other dual-ABI shim's
+    /// behavioural tests are (see `shims::text`'s own note on why a real
+    /// `Wg32` `Call`/`Machine` cannot be built inside `--lib`): the layout
+    /// table above is what actually varies by ABI, and it is tested
+    /// directly, above, at both widths.
+    fn fndblk(f: &mut Fixture) -> FarPtr {
+        f.buffer(FndblkLayout::of::<Wg16>().total as u16)
+    }
+
+    /// `fnd1st(fbptr, filspc, attr)`.
+    fn fnd1st_(f: &mut Fixture, fbptr: FarPtr, spec: &str, attr: u16) -> Result<Ret, ShimError> {
+        let path = f.text(spec);
+        f.invoke(fnd1st, &[fbptr.offset, fbptr.selector, path.offset, path.selector, attr])
+    }
+
+    /// `fndnxt(fbptr)`.
+    fn fndnxt_(f: &mut Fixture, fbptr: FarPtr) -> Result<Ret, ShimError> {
+        f.invoke(fndnxt, &Fixture::far(fbptr))
+    }
+
+    /// The `name` field a `fnd1st`/`fndnxt` call just wrote, as a string --
+    /// read back through the same [`FndblkLayout`] the shim wrote it with,
+    /// so a test of the offsets and a test of the behaviour cannot silently
+    /// agree by both being wrong the same way.
+    fn found_name(f: &Fixture, fbptr: FarPtr) -> String {
+        let layout = FndblkLayout::of::<Wg16>();
+        let bytes = f.machine.resolve(fbptr, layout.total).expect("a fndblk");
+        let name = &bytes[layout.name..layout.total];
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        String::from_utf8_lossy(&name[..end]).into_owned()
+    }
+
+    #[test]
+    fn fnd1st_finds_the_one_file_a_literal_spec_names() {
+        let mut f = Fixture::rooted(directory("fnd1st-one"));
+        let blk = fndblk(&mut f);
+        let ret = fnd1st_(&mut f, blk, "SAMPLE.DAT", 0).expect("fnd1st");
+        assert_eq!(word(ret), 1);
+        assert_eq!(found_name(&f, blk), "SAMPLE.DAT");
+    }
+
+    #[test]
+    fn fndnxt_drains_the_remaining_matches_of_a_wildcard_scan_in_order() {
+        // `directory()` seeds SAMPLE.DAT, OTHER.DAT and EMPTY.DAT -- three
+        // matches for `*.DAT`, in the alphabetical order `fnd1st` sorts its
+        // matches into (this host has no on-disk directory order to match
+        // real DOS's FAT order with -- see `fnd1st`'s own doc comment).
+        let mut f = Fixture::rooted(directory("fnd1st-several"));
+        let blk = fndblk(&mut f);
+
+        assert_eq!(word(fnd1st_(&mut f, blk, "*.DAT", 0).expect("fnd1st")), 1);
+        assert_eq!(found_name(&f, blk), "EMPTY.DAT");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
+        assert_eq!(found_name(&f, blk), "OTHER.DAT");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
+        assert_eq!(found_name(&f, blk), "SAMPLE.DAT");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0, "no more after the third");
+    }
+
+    #[test]
+    fn fnd1st_of_a_literal_name_matching_nothing_is_zero_not_a_refusal() {
+        let mut f = Fixture::rooted(directory("fnd1st-none"));
+        let blk = fndblk(&mut f);
+        assert_eq!(word(fnd1st_(&mut f, blk, "NOSUCH.DAT", 0).expect("fnd1st")), 0);
+    }
+
+    #[test]
+    fn fnd1st_of_a_wildcard_matching_nothing_is_also_zero() {
+        // Distinct from the literal-name case above: a real extension field
+        // that simply has no files in it, exercised through the wildcard
+        // path rather than the exact-name path.
+        let mut f = Fixture::rooted(directory("fnd1st-wild-none"));
+        let blk = fndblk(&mut f);
+        assert_eq!(word(fnd1st_(&mut f, blk, "*.XYZ", 0).expect("fnd1st")), 0);
+    }
+
+    #[test]
+    fn fnd1st_scans_a_subdirectory_the_module_named() {
+        // The exact shape LunatiX's own init reaches for --
+        // `fnd1st("lun5data\*.txt", ...)` -- see this file's module doc
+        // comment on `fopen`'s subdirectory-creation test for the same
+        // install layout.
+        let root = scratch("fnd1st-subdir");
+        std::fs::create_dir(root.join("LUN5DATA")).expect("a subdirectory");
+        std::fs::write(root.join("LUN5DATA").join("LUNRAND1.TXT"), b"one").expect("a file");
+        std::fs::write(root.join("LUN5DATA").join("LUNJOKES.TXT"), b"two").expect("a file");
+        let mut f = Fixture::rooted(root);
+        let blk = fndblk(&mut f);
+
+        assert_eq!(word(fnd1st_(&mut f, blk, "lun5data\\*.txt", 0).expect("fnd1st")), 1);
+        assert_eq!(found_name(&f, blk), "LUNJOKES.TXT", "alphabetically first");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
+        assert_eq!(found_name(&f, blk), "LUNRAND1.TXT");
+
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0);
+    }
+
+    #[test]
+    fn fnd1st_admits_a_subdirectory_entry_only_when_famdir_is_set() {
+        let root = scratch("fnd1st-famdir");
+        std::fs::create_dir(root.join("SUB.DIR")).expect("a directory entry");
+        let mut f = Fixture::rooted(root);
+
+        let blk = fndblk(&mut f);
+        assert_eq!(
+            word(fnd1st_(&mut f, blk, "*.DIR", 0).expect("fnd1st")),
+            0,
+            "directories are excluded by default, same as real FindFirst"
+        );
+
+        let blk = fndblk(&mut f);
+        assert_eq!(word(fnd1st_(&mut f, blk, "*.DIR", u16::from(FAMDIR)).expect("fnd1st")), 1);
+        assert_eq!(found_name(&f, blk), "SUB.DIR");
+    }
+
+    #[test]
+    fn fndnxt_without_a_prior_fnd1st_is_refused_rather_than_answered_zero() {
+        // The distinction `fndnxt`'s own doc comment draws: "never started"
+        // is a host bug and is refused, "started and ran out" is an
+        // ordinary 0 -- see `fndnxt_drains_the_remaining_matches...` above
+        // for the second half.
+        let mut f = Fixture::new();
+        let blk = fndblk(&mut f);
+        let e = fndnxt_(&mut f, blk).expect_err("a refusal");
+        assert!(e.to_string().contains("no fnd1st scan"), "{e}");
+    }
+
+    #[test]
+    fn reusing_one_fbptr_for_a_second_fnd1st_replaces_the_first_scan() {
+        // The interleaving hazard `SCANS`'s own doc comment names: real DOS
+        // kept scan state in the DTA (`fndblk`'s own `junk`), so a second
+        // `fnd1st` into the same buffer before the first scan finished threw
+        // the first scan's position away. This host's map-keyed-by-pointer
+        // reproduces exactly that, on purpose.
+        let mut f = Fixture::rooted(directory("fnd1st-reuse"));
+        let blk = fndblk(&mut f);
+
+        assert_eq!(word(fnd1st_(&mut f, blk, "*.DAT", 0).expect("fnd1st")), 1);
+        assert_eq!(found_name(&f, blk), "EMPTY.DAT", "first scan's first match");
+
+        // A second `fnd1st`, same buffer, different spec -- before the first
+        // scan's `fndnxt` chain ever ran.
+        assert_eq!(word(fnd1st_(&mut f, blk, "*.MSG", 0).expect("fnd1st")), 1);
+        assert_eq!(found_name(&f, blk), "OTHER.MSG", "the second scan's own first match");
+
+        // `fndnxt` now continues the *second* scan, not the first's leftover
+        // `OTHER.DAT`/`SAMPLE.DAT`.
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 1);
+        assert_eq!(found_name(&f, blk), "SAMPLE.MSG");
+        assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0);
     }
 }

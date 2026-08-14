@@ -291,6 +291,7 @@ impl Tib {
 
     /// The stack's contents, writable -- for planting words below `StackBase`
     /// a test (or, eventually, a real entry) expects to read back.
+    #[cfg(test)]
     pub(crate) fn stack_mut(&mut self) -> &mut [u8] {
         self.stack
             .as_mut()

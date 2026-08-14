@@ -206,8 +206,31 @@ impl Clock {
     ///
     /// If [`Clock::epoch`] cannot answer.
     pub fn civil(&self) -> Result<Civil, String> {
-        let local = i64::from(self.epoch()?) + i64::from(self.offset);
+        Ok(Civil::from_local_epoch(
+            i64::from(self.epoch()?) + i64::from(self.offset),
+        ))
+    }
 
+    /// The local-time offset this clock applies, in seconds.
+    ///
+    /// For dating something that is not "now" -- a file's mtime, which
+    /// `fnd1st` reports -- against the same wall clock everything else here
+    /// uses. See [`Civil::from_local_epoch`].
+    pub fn offset(&self) -> i32 {
+        self.offset
+    }
+}
+
+impl Civil {
+    /// Break a *local* epoch second down into a civil date and time.
+    ///
+    /// `local` is already offset -- seconds since 1970-01-01 in whatever zone
+    /// the caller means -- so this does no zone arithmetic of its own.
+    /// [`Clock::civil`] adds its own offset before calling; `fnd1st` adds
+    /// [`Clock::offset`] to a file's mtime and calls the same function, so a
+    /// file's reported date and `today`'s cannot disagree about what day it
+    /// is.
+    pub fn from_local_epoch(local: i64) -> Self {
         // Floor division, not truncation: an offset can carry a time back
         // before the epoch, where `-1 / 86400` truncates to 0 and would put
         // 23:00 on the 31st of December 1969 onto the 1st of January 1970.
@@ -215,14 +238,14 @@ impl Clock {
         let rest = local.rem_euclid(86_400);
         let (year, month, day) = civil_from_days(days);
 
-        Ok(Civil {
+        Self {
             year,
             month,
             day,
             hour: (rest / 3600) as u32,
             minute: ((rest / 60) % 60) as u32,
             second: (rest % 60) as u32,
-        })
+        }
     }
 }
 

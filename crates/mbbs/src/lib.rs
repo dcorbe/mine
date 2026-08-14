@@ -819,6 +819,32 @@ pub struct Host<A: Abi> {
     /// `bb` equivalent to keep in module memory.
     pub(crate) streams: stream::Streams<A>,
 
+    /// Scans [`fnd1st`](crate::shims::stream::fnd1st) has started and
+    /// `fndnxt` continues, keyed by which `fbptr` buffer the module is
+    /// scanning through and which `Abi` encoded that pointer.
+    ///
+    /// Real DOS kept this in the block's own `junk[21]` -- which is what
+    /// that undocumented field was. This host keeps it beside the module
+    /// instead, because the DTA's internal layout is a DOS implementation
+    /// detail no header describes, and inventing one would be a fiction the
+    /// module could trip over.
+    ///
+    /// A `Host` field and not a `thread_local!`. A thread-local would be
+    /// *nearly* right -- a `Host` runs on one dedicated thread per machine
+    /// -- but "nearly" is how hidden process state gets in, and Tasks 1-3 of
+    /// this refactor were spent taking exactly that kind of state out of the
+    /// shadows and making it something an owner claims. Two `Host`s on one
+    /// thread (which `--lib` tests really do build) would share one scan
+    /// table, and nothing would say so.
+    ///
+    /// Keyed per block rather than kept as a single scan so that two
+    /// interleaved walks cannot eat each other's matches -- the property the
+    /// real DTA had.
+    pub(crate) finds: std::collections::HashMap<
+        (&'static str, Vec<u8>),
+        std::collections::VecDeque<shims::stream::FoundEntry>,
+    >,
+
     /// Every data file the host created from its virgin copy, in the order it
     /// did. See [`Host::btrieve_file`].
     installed: Vec<String>,
@@ -1254,6 +1280,7 @@ impl<A: Abi> Host<A> {
             empty,
             prf_end,
             random: Random::default(),
+            finds: std::collections::HashMap::new(),
             clock: Clock::system()?,
             audit: Vec::new(),
             modules: Vec::new(),

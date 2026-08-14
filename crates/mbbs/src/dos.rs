@@ -87,6 +87,24 @@ impl Name {
             .all(|(template, byte)| *template == b'?' || template == byte)
     }
 
+    /// Render a parsed (non-wildcard) name back to the DOS 8.3 form:
+    /// `"FFFFFFFF.EEE"`, upper case, padding trimmed, and the dot dropped
+    /// when there is no extension.
+    ///
+    /// What [`crate::shims::stream::fnd1st`]/[`fndnxt`](crate::shims::stream::fndnxt)
+    /// write into `fndblk.name` -- built from the very [`Name`] a scan
+    /// already parsed to match the spec against, rather than re-reading the
+    /// host's own filename string a second time.
+    pub fn display(&self) -> String {
+        let stem = std::str::from_utf8(&self.0[..STEM]).unwrap_or("").trim_end();
+        let ext = std::str::from_utf8(&self.0[STEM..]).unwrap_or("").trim_end();
+        if ext.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{stem}.{ext}")
+        }
+    }
+
     /// Split at the one dot DOS allowed and pack both fields.
     fn fields(text: &str, wild: bool) -> Option<Self> {
         let (stem, ext) = match text.split_once('.') {
@@ -214,6 +232,13 @@ mod tests {
         }
         assert!(Name::parse("README").is_some());
         assert!(Name::parse("SAMPLE.DAT").is_some());
+    }
+
+    #[test]
+    fn display_renders_the_dos_83_form_trimmed_and_upper_cased() {
+        assert_eq!(Name::parse("sample.dat").expect("a name").display(), "SAMPLE.DAT");
+        assert_eq!(Name::parse("README").expect("a name").display(), "README");
+        assert_eq!(Name::parse("a.b").expect("a name").display(), "A.B");
     }
 
     #[test]
