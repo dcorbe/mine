@@ -461,6 +461,19 @@ impl Machine {
     /// # Errors
     ///
     /// If the watchdog timer cannot be disarmed.
+    /// Is this machine's watchdog timer still counting down?
+    ///
+    /// For asserting that [`Machine::poison`] really stopped it -- see
+    /// `crate::m32::watchdog::Watchdog::armed` for why that needed an
+    /// observer rather than trust.
+    ///
+    /// # Errors
+    ///
+    /// If the kernel will not report the timer's state.
+    pub fn watchdog_armed(&self) -> io::Result<bool> {
+        self.ctx.armed()
+    }
+
     pub fn poison(&mut self, reason: Poison) -> io::Result<()> {
         self.poisoned.get_or_insert(reason);
         self.frame_sp = None;

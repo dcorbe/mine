@@ -132,6 +132,42 @@ impl Watched {
         self.set(Duration::ZERO, Duration::ZERO)
     }
 
+    /// Is the timer currently counting down?
+    ///
+    /// Asks the kernel with `timer_gettime` rather than tracking a flag,
+    /// because a flag would agree with whatever `arm`/`disarm` believed they
+    /// did rather than with what actually happened.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Watchdog::disarm`] had no observer at all. Deleting its body passed
+    /// the entire suite: every test that cared armed the timer again first,
+    /// and `arm` sets the interval unconditionally, so it papered over a
+    /// missing disarm every time. The path with no `arm` after it is exactly
+    /// the one that matters -- a poisoned machine is never re-entered, so a
+    /// timer left ticking on it goes on delivering signals for the life of
+    /// the process.
+    ///
+    /// # Errors
+    ///
+    /// If `timer_gettime` fails, which for a timer this type owns and has
+    /// not deleted should not happen.
+    pub(crate) fn armed(&self) -> io::Result<bool> {
+        let mut spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+        };
+        // SAFETY: `self.timer` is a live timer this value owns, and `spec` is
+        // a local the kernel only writes.
+        let rc = unsafe { libc::timer_gettime(self.timer, &raw mut spec) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `it_value` all-zero is how `timer_gettime` spells "disarmed" --
+        // the same encoding `set` uses in the other direction.
+        Ok(spec.it_value.tv_sec != 0 || spec.it_value.tv_nsec != 0)
+    }
+
     /// Has a tick been recorded against this context since it was armed?
     /// Volatile for the same reason `crate::m16::watchdog::Watched::expired`
     /// is -- see that method's own doc comment.
@@ -188,5 +224,48 @@ fn to_timespec(d: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: libc::c_long::from(d.subsec_nanos()),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `disarm` really stops the kernel timer, and `armed` can tell.
+    ///
+    /// # The hole this closes
+    ///
+    /// `disarm` had no observer, so deleting its body passed the whole
+    /// suite. Every test that cared armed the timer again first, and `arm`
+    /// sets the interval unconditionally -- so an absent disarm was healed
+    /// before anything looked. The path that matters has no `arm` after it:
+    /// `Machine::poison` disarms and the machine is never re-entered, so a
+    /// timer left running there keeps delivering signals for the life of the
+    /// process.
+    ///
+    /// Asserted against `timer_gettime`, not a flag this module maintains --
+    /// a flag would agree with whatever `arm`/`disarm` believed rather than
+    /// with the kernel.
+    #[test]
+    fn disarm_stops_the_kernel_timer_and_arming_starts_it_again() {
+        let mut w = Watched::new().expect("a watchdog");
+        assert!(!w.armed().expect("gettime"), "a fresh watchdog is not running");
+
+        // Long enough that it cannot plausibly expire inside this test.
+        w.arm(Duration::from_secs(3600)).expect("arm");
+        assert!(w.armed().expect("gettime"), "arm must start the timer");
+
+        w.disarm().expect("disarm");
+        assert!(!w.armed().expect("gettime"), "disarm must stop the timer");
+
+        // Idempotent, as its own doc comment claims -- and still stopped.
+        w.disarm().expect("second disarm");
+        assert!(!w.armed().expect("gettime"), "disarm twice is still stopped");
+
+        // And the timer is reusable afterwards, so disarming is not deletion.
+        w.arm(Duration::from_secs(3600)).expect("re-arm");
+        assert!(w.armed().expect("gettime"), "a disarmed timer can be armed again");
+        w.disarm().expect("tidy up");
     }
 }
