@@ -177,7 +177,8 @@ fn account_scnbrk<A: Abi>(mem: &A::Mem, host: &Host<A>, chan: Chan) -> Result<i8
 ///
 /// # `scnbrk`'s default in this host
 ///
-/// `crate::users::usracc::SCNBRK`'s own doc comment: `Host::connect_state`
+/// [`AccountLayout::scnbrk`](crate::users::AccountLayout)'s own doc comment:
+/// `Host::connect_state`
 /// never writes this byte, so it reads whatever the account's memory already
 /// held -- ordinarily zero, since nothing else writes it either. `0-CTNUOS`
 /// is `-2`, and that negative `cnt` lands in `Channel::page_lines` as
