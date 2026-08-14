@@ -51,12 +51,37 @@ use crate::arena::Arena;
 ///
 /// Large model, so the pointers are four bytes each. Twenty in total, and no
 /// padding -- every field lands on its natural boundary already.
+///
+/// One reservation size for every ABI, not `Wg16`'s alone, even though this
+/// sum is `Wg16`'s own field list: it has to be at least as large as
+/// `Wg32::FILE_FLAGS_OFFSET + 2`, the last byte either ABI's fabricated
+/// cookie is ever addressed at. Confirmed, not assumed -- `0x12 + 2 == 20`,
+/// exactly this constant, so `Wg32`'s flags word lands in the final two
+/// bytes of the same twenty rather than needing a wider reservation.
 pub const FILE_SIZE: usize = 2 + 2 + 1 + 1 + 2 + 4 + 4 + 2 + 2;
 
-/// Where `flags` is, which `feof(f)` and `ferror(f)` expand to a read of.
-const FLAGS: u16 = 2;
-
 /// Where `fd` is, which `fileno(f)` expands to a read of. **One byte.**
+///
+/// **Not per-ABI, unlike [`Abi::FILE_FLAGS_OFFSET`], and that is a known gap
+/// rather than an oversight fixed here.** `cw3220mt`'s own exported
+/// `_fileno` (`re/wg/CW3220MT.DLL`, RVA `0x6b44`, right after `_ferror`)
+/// reads `mov eax,[eax+0x16]` -- a full **four**-byte `int` at offset
+/// **22**, not this crate's one byte at offset 4. That is the same class of
+/// bug `FILE_FLAGS_OFFSET` exists to fix, and by the same evidence: `flags`
+/// sitting at 0x12 and a 4-byte gap before `fd` at 0x16 is consistent with
+/// both being full `int` fields in `cw3220mt`'s own layout, not Borland
+/// 16-bit `STDIO.H`'s packed one.
+///
+/// Left as `Wg16`'s own offset and width for every ABI because it is
+/// currently **dormant**, not because it is right: a full disassembly of
+/// `archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL` (the one 32-bit
+/// module this host runs) for the `_fileno` pattern -- `mov eXX,[reg+0x16]`
+/// -- found zero matches, unlike `flags`'s `test byte ptr [reg+0x12],0x20`,
+/// which appears dozens of times throughout that same module. `fileno` is
+/// what `WCCMMUD.DLL`'s (16-bit) `_CHECK_BEGIN_UPDATING` calls (this file's
+/// own module doc comment), not anything LunatiX reaches. A future 32-bit
+/// module that does call `fileno` would hit this exact bug, one byte
+/// truncated and twelve bytes short of where its own runtime looks.
 const FD: u16 = 4;
 
 /// `STDIO.H:59-69` -- the bits of `FILE.flags`.
@@ -555,7 +580,7 @@ impl<A: Abi> Streams<A> {
         // the stream is recorded, so a failure here cannot leave a stream the
         // host believes in behind a struct that says nothing.
         let mut image = [0u8; FILE_SIZE];
-        let at = usize::from(FLAGS);
+        let at = usize::from(A::FILE_FLAGS_OFFSET);
         image[at..at + 2].copy_from_slice(&stream.flags().to_le_bytes());
         image[usize::from(FD)] = fd;
         cookie
@@ -862,7 +887,7 @@ impl<A: Abi> Streams<A> {
     /// unlike `open`/`line`/`read`, which are public and do need one.
     fn sync(&mut self, mem: &mut A::Mem, at: usize) -> Result<(), String> {
         let stream = &self.open[at];
-        let field = A::ptr_offset(stream.cookie, FLAGS);
+        let field = A::ptr_offset(stream.cookie, A::FILE_FLAGS_OFFSET);
         field
             .write(mem, &stream.flags().to_le_bytes())
             .map_err(|e| format!("{}: {e}", stream.name))

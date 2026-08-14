@@ -172,6 +172,24 @@ pub trait Abi {
     /// has no way to know a field *set* was meant.
     const GCV2: bool;
 
+    /// Byte offset of the runtime `FILE.flags` word in this ABI's own C
+    /// library. `feof`/`ferror` are macros with no import record (see
+    /// `stream.rs`'s module doc), so a module inlines this read rather than
+    /// calling anything -- which is why the host must write the flags where
+    /// that ABI's runtime expects them.
+    ///
+    /// Measured, not assumed, the same way [`Abi::GCV2`] is. `Wg16`'s is
+    /// Borland 16-bit `STDIO.H:104-114`'s own field order. `Wg32`'s is
+    /// `cw3220mt`'s own runtime, read off its exported `_feof`
+    /// (`re/wg/CW3220MT.DLL`, RVA `0x6b24`): `mov ax, [eax+0x12] / and
+    /// eax, 0x20`. A module compiled against that runtime and linked into
+    /// this host inlines the identical read, so a host that kept writing
+    /// `flags` at `Wg16`'s offset 2 left the module reading two bytes that
+    /// were never written -- always zero, so `feof` could never observe
+    /// true. `crates/mbbs/src/stream.rs`'s own module doc names the crash
+    /// this produced in LunatiX 5.3F.
+    const FILE_FLAGS_OFFSET: u16;
+
     /// Decode a pointer from exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
@@ -966,6 +984,7 @@ mod tests {
         const INT_WIDTH: usize = Wg16::INT_WIDTH;
         const LONG_WIDTH: usize = Wg16::LONG_WIDTH;
         const GCV2: bool = Wg16::GCV2;
+        const FILE_FLAGS_OFFSET: u16 = Wg16::FILE_FLAGS_OFFSET;
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)

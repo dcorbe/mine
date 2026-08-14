@@ -138,6 +138,21 @@ impl Abi for Wg32 {
     const LONG_WIDTH: usize = 4;
     const GCV2: bool = false;
 
+    /// `cw3220mt`'s own runtime, not Borland 16-bit `STDIO.H`'s offset 2.
+    /// Measured from `re/wg/CW3220MT.DLL`'s exported `_feof`, RVA `0x6b24`:
+    ///
+    /// ```text
+    /// mov  eax,[ebp+8]      ; fp
+    /// mov  ax,[eax+0x12]    ; FILE.flags, WORD
+    /// and  eax,0x20         ; _F_EOF
+    /// ```
+    ///
+    /// `_ferror` (RVA `0x6b34`, immediately after) reads the same offset
+    /// with `and eax,0x10`, confirming this is `flags` and not some other
+    /// field the two macros happen to share. See [`Abi::FILE_FLAGS_OFFSET`]'s
+    /// own doc comment for what this fixed.
+    const FILE_FLAGS_OFFSET: u16 = 0x12;
+
     /// The `Wg32`-only routines, the mirror of `Wg16`'s own override.
     ///
     /// One entry: `__ftol`, whose argument arrives in the x87 register stack

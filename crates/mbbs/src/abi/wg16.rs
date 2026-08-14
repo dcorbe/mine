@@ -31,6 +31,10 @@ impl Abi for Wg16 {
     const LONG_WIDTH: usize = 4;
     const GCV2: bool = true;
 
+    /// `INCLUDE/STDIO.H:104-114` -- two `int`s (`level`, `flags`), so
+    /// `flags` sits right after `level`'s own two bytes.
+    const FILE_FLAGS_OFFSET: u16 = 2;
+
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
     }
