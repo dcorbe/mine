@@ -3297,15 +3297,15 @@ impl<A: Abi> Host<A> {
         // (`RCIROSE.DLL`) is the module that made this necessary -- it calls
         // `initask`, where MajorMUD registers nothing.
         let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
-        if newunm <= self.lstunm {
-            if let Some(poison) = self.syscyc(machine, module, &mut dispatched)? {
-                return Ok(Cycles {
-                    iterations,
-                    dispatched,
-                    // `None`: the vector belongs to no channel.
-                    ended: Ended::Stopped(poison, None),
-                });
-            }
+        if newunm <= self.lstunm
+            && let Some(poison) = self.syscyc(machine, module, &mut dispatched)?
+        {
+            return Ok(Cycles {
+                iterations,
+                dispatched,
+                // `None`: the vector belongs to no channel.
+                ended: Ended::Stopped(poison, None),
+            });
         }
         self.lstunm = newunm;
 
