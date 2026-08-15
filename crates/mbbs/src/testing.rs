@@ -33,9 +33,38 @@ pub fn data() -> PathBuf {
 /// repository and already ignored by git.
 ///
 /// Cleared on each call, so a test never sees what the last run left.
+///
+/// # Why the thread is part of the path
+///
+/// `name` alone is not unique. Callers derive it from data rather than from
+/// the test -- `btrieve::records`' own helper is
+/// `scratch(&format!("btv-rec-{name}"))`, keyed on the `.DAT` filename -- so
+/// four tests sharing `FREESLOT.DAT` shared one directory. Under the default
+/// parallel harness that is a race against this function's own opening
+/// `remove_dir_all`: one test deletes the directory between another's
+/// `create_dir_all` and its first `write`, and the write fails `NotFound`, or
+/// succeeds into a directory that is then removed and reads back as 0 bytes.
+///
+/// Both failures were observed, intermittently, in
+/// `splicing_matches_a_full_reindex_over_a_long_run_of_writes`, which is not
+/// itself one of the colliding tests -- it just shares the helper. That is
+/// what made it look like a flaky Btrieve test for weeks rather than a
+/// broken test fixture, and every parallel agent working in this crate hit
+/// it and was told to ignore it.
+///
+/// Keying on the thread as well makes collision impossible without changing
+/// the contract: a single test still gets one directory, still cleared on
+/// each call. Directory names stay readable because
+/// [`std::thread::ThreadId`] renders as `ThreadId(N)` and only the digits are
+/// kept.
 pub fn scratch(name: &str) -> PathBuf {
+    let thread = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
     let at = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-scratch")
+        .join(format!("t{thread}"))
         .join(name);
     let _ = std::fs::remove_dir_all(&at);
     std::fs::create_dir_all(&at).expect("a scratch directory");
