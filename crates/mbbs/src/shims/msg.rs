@@ -120,9 +120,18 @@ fn source_name(named: &str) -> String {
 pub fn clsmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let cookie = call.ptr();
     let current = current_mem(call.mem(), host)?;
-    host.messages
+    let was_current = host
+        .messages
         .close(current, cookie)
         .map_err(ShimError::Failed)?;
+    // `curmbk` named the block that was just closed, so it names nothing now.
+    // Writing the null is the whole reason closing the current block is
+    // allowed at all -- see `Messages::close`. Left unwritten it would point
+    // at a block this host has no record of, and every option read afterwards
+    // would refuse about the wrong file.
+    if was_current {
+        set_current_mem(call.mem(), host, A::null_ptr())?;
+    }
     Ok(abi::Ret::Void)
 }
 
@@ -769,16 +778,15 @@ mod tests {
     }
 
     #[test]
-    fn clsmsg_will_not_forget_a_block_that_is_still_in_use() {
+    fn clsmsg_will_not_forget_a_block_waiting_under_the_current_one() {
         let mut f = Fixture::new();
         let first = opened(&mut f);
         let second = open(&mut f, "OTHER.MSG");
 
-        // `second` is current and `first` is what the next `rstmbk` goes back
-        // to. Forgetting either leaves `curmbk` naming a block the host has no
-        // record of, and every option read after that is a refusal about the
-        // wrong thing.
-        assert!(f.invoke(clsmsg, &Fixture::far(second)).is_err());
+        // `first` is what the next `rstmbk` goes back to. Forgetting it would
+        // leave that `rstmbk` restoring a block the host has no record of, and
+        // there is no value to write that makes it right -- `saved` is a stack
+        // popped blindly, not a single name that can be cleared.
         assert!(f.invoke(clsmsg, &Fixture::far(first)).is_err());
 
         f.invoke(rstmbk, &[]).expect("back to the first");
@@ -788,6 +796,31 @@ mod tests {
         assert!(
             f.invoke(setmbk, &Fixture::far(second)).is_err(),
             "a closed block is not one to set"
+        );
+    }
+
+    /// A module closing the block it is currently reading is ordinary
+    /// teardown, not an error -- and `curmbk` stops naming it.
+    ///
+    /// LunatiX's `finrou` does exactly this on the way out. Refusing it
+    /// stopped the machine mid-shutdown, which is how it was found: the stop
+    /// only became reachable once this host started dispatching `finrou` at
+    /// all, so no survey could have seen it.
+    #[test]
+    fn clsmsg_closes_the_current_block_and_leaves_nothing_current() {
+        let mut f = Fixture::new();
+        let only = opened(&mut f);
+
+        f.invoke(clsmsg, &Fixture::far(only)).expect("closing the current block is allowed");
+
+        assert!(
+            f.invoke(stgopt, &[0]).is_err(),
+            "nothing is current now, so an option read refuses -- rather than \
+             reading through a `curmbk` that still names a closed block"
+        );
+        assert!(
+            f.invoke(setmbk, &Fixture::far(only)).is_err(),
+            "and the closed block is not one to set again"
         );
     }
 }

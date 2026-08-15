@@ -459,16 +459,38 @@ impl<A: Abi> Messages<A> {
     /// the current block would leave `curmbk` pointing at something the host
     /// has forgotten, and every option read after it would be a refusal naming
     /// the wrong thing.
-    pub fn close(&mut self, current: A::Ptr, cookie: A::Ptr) -> Result<(), String> {
+    /// Returns whether `cookie` was the current block, which the caller must
+    /// then stop naming -- see [`crate::shims::msg::clsmsg`], which clears
+    /// `curmbk` on a `true`.
+    ///
+    /// **Closing the current block is allowed; closing one saved under it is
+    /// not.** Those look like the same mistake and are not. `curmbk` is a
+    /// single value with a home in module memory, so a host that closes what
+    /// it names can put it back to nothing in the same breath, and "no block
+    /// is current" is a state this host already answers cleanly (every option
+    /// read refuses, by name). `saved` is a stack that `rstmbk` pops blindly;
+    /// removing an entry from its middle changes what a later `rstmbk`
+    /// restores, and there is no value to write that makes that right.
+    ///
+    /// The distinction was worth drawing because the blanket refusal stopped
+    /// a machine over ordinary teardown: LunatiX's `finrou` closes its own
+    /// message block while it is still current, which is the obvious thing
+    /// for a module to do on the way out, and this answered it with a
+    /// [`crate::abi::Abi::unimplemented`]-shaped stop. `MCVAPI.H:66` declares
+    /// `void clsmsg(FILE *mb)` and the library body is not in the source
+    /// tree, so nothing here is the vendor's rule -- the refusal was this
+    /// host's own invention, and only half of it was earning its keep.
+    pub fn close(&mut self, current: A::Ptr, cookie: A::Ptr) -> Result<bool, String> {
         let at = self.find(cookie)?;
-        if cookie == current || self.saved.contains(&cookie) {
+        if self.saved.contains(&cookie) {
             return Err(format!(
-                "{} is the current message block, or is waiting under one",
+                "{} is waiting under the current message block, and `rstmbk` \
+                 would go back to a block that had been closed",
                 self.open[at].name
             ));
         }
         self.open.remove(at);
-        Ok(())
+        Ok(cookie == current)
     }
 
     /// Remember what was current, so `rstmbk` can put it back.
