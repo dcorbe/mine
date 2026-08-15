@@ -1100,16 +1100,31 @@ mod tests {
     }
 
     /// A file of one page of control record and enough data pages for
-    /// `records`, each identified by its two-byte key.
-    fn of(keys: &[u16]) -> Vec<u8> {
+    /// `records`, each identified by its two-byte key, at an arbitrary page
+    /// size. Task 2: The Rose's thirteen real files span 512, 1024, 2048 and
+    /// 4096, and nothing here may hardcode which one -- `of` is this at the
+    /// fixtures' usual 512.
+    fn of_with_page_size(page: u16, keys: &[u16]) -> Vec<u8> {
         let records: Vec<Vec<u8>> = keys.iter().map(|n| record(*n)).collect();
         let borrowed: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
-        file(512, RECLEN, &borrowed, &[])
+        file(page, RECLEN, &borrowed, &[])
+    }
+
+    /// A file of one page of control record and enough data pages for
+    /// `records`, each identified by its two-byte key.
+    fn of(keys: &[u16]) -> Vec<u8> {
+        of_with_page_size(512, keys)
+    }
+
+    /// Where the `n`th record slot of the first data page is, at an
+    /// arbitrary page size.
+    fn slot_with_page(page: u16, n: u32) -> u32 {
+        u32::from(page) + u32::from(crate::btrieve::pages::HEADER) + u32::from(RECLEN) * n
     }
 
     /// Where the `n`th record slot of the first data page is.
     fn slot(n: u32) -> u32 {
-        512 + u32::from(crate::btrieve::pages::HEADER) + u32::from(RECLEN) * n
+        slot_with_page(512, n)
     }
 
     /// A page of B-tree index, appended where a walk will meet it.
@@ -1354,6 +1369,167 @@ mod tests {
                 "step {step} ({what} {n}): tie count diverged -- the seam repair is wrong"
             );
         }
+    }
+
+    /// Task 2 of `docs/plans/2026-08-15-host-api-surface-track-b.md`, Step 1.
+    ///
+    /// **What was already true, measured before this test existed:** the
+    /// design's own opening table records that page size is read from the
+    /// file (`Geometry::read`, `btrieve.rs:272`), not hardcoded -- and
+    /// [`super::pages::Layout`] takes `page` as a field on every call, not a
+    /// constant. Opening a 4096-byte-paged file was known to work; this is
+    /// what was unverified -- the walk, not the open.
+    ///
+    /// **Result: this passes first try, at all four sizes, with no
+    /// production code touched.** `walk_v5` computes every page boundary
+    /// through `layout.page_start`/`layout.position`, both of which multiply
+    /// by `self.page` rather than a literal `512` -- there is no 512 to find
+    /// and fix. Recorded here as the task instructs: a passing result is the
+    /// result, not a reason to invent a failure.
+    #[test]
+    fn records_walk_at_every_page_size_the_rose_ships() {
+        for page in [512u16, 1024, 2048, 4096] {
+            let name = format!("P{page}.DAT");
+            let bytes = of_with_page_size(page, &[3, 1, 2]);
+            let records = read(&name, &bytes).unwrap_or_else(|e| panic!("page {page}: {e}"));
+            assert_eq!(records.len(), 3, "page {page} lost records");
+            let physical: Vec<u8> = (0..3)
+                .map(|n| records.physical(n).expect("in range").bytes[0])
+                .collect();
+            assert_eq!(physical, [3, 1, 2], "page {page} reordered them");
+
+            let parsed = keys::parse(&name, &bytes, 1).expect("keys");
+            let ordered: Vec<u8> = (0..3)
+                .map(|n| records.ordered(0, n).expect("in order").bytes[0])
+                .collect();
+            assert_eq!(ordered, [1, 2, 3], "page {page}: key order is wrong");
+            let _ = parsed;
+        }
+    }
+
+    // Task 2, Step 5's mandatory mutation, applied by hand rather than left
+    // in the tree: hardcoding `geometry.page` to `512` inside `walk_v5`
+    // (temporarily, for this check only) makes every non-512 case above
+    // fail -- the 1024, 2048 and 4096 cases all read wrong page boundaries,
+    // find no data-page header where one is expected, and every one comes
+    // back with 0 records instead of 3. The 512 case alone still passes,
+    // which is what makes it a discriminating mutation rather than a
+    // vacuous one. Not committed as a standing test because there is no
+    // literal `512` in `walk_v5` to guard against reintroducing by
+    // accident -- the guard *is*
+    // `records_walk_at_every_page_size_the_rose_ships` itself, run at four
+    // sizes instead of one.
+
+    /// Task 2, Step 3: the write path, not just the read path, at every page
+    /// size -- an insert spliced incrementally must agree with a full
+    /// reindex ([`Records::reindex`]), and the bytes it lands on disk must
+    /// be readable by a completely fresh, independent `Records::read`, at
+    /// 512, 1024, 2048 and 4096 alike.
+    #[test]
+    fn an_insert_round_trips_at_every_page_size() {
+        for page in [512u16, 1024, 2048, 4096] {
+            let name = format!("W{page}.DAT");
+            let bytes = of_with_page_size(page, &[1]);
+            let dir = crate::testing::scratch(&format!("btv-rec-pagesize-{page}"));
+            let path = dir.join(&name);
+            std::fs::write(&path, &bytes).expect("written");
+
+            let geometry =
+                Geometry::read(&name, &path).unwrap_or_else(|e| panic!("page {page}: {e}"));
+            let fcr = std::fs::read(&path).expect("read");
+            let parsed = keys::parse(&name, &fcr, geometry.keys)
+                .unwrap_or_else(|e| panic!("page {page}: {e}"));
+            let mut records = Records::read(&name, &path, &geometry, &parsed)
+                .unwrap_or_else(|e| panic!("page {page}: {e}"));
+
+            let position = slot_with_page(page, 1);
+            records
+                .insert(&parsed, position, record(7))
+                .unwrap_or_else(|e| panic!("page {page}: {e}"));
+
+            // The incremental splice must agree with a full re-derivation --
+            // the same guard `splicing_matches_a_full_reindex_over_a_long_run_of_writes`
+            // applies at 512, now checked at every page size the fix has to
+            // hold at.
+            let mut oracle = records.clone();
+            oracle.reindex(&parsed);
+            assert_eq!(
+                records.order, oracle.order,
+                "page {page}: splice diverged from a full reindex (order)"
+            );
+            assert_eq!(
+                records.rank, oracle.rank,
+                "page {page}: splice diverged from a full reindex (rank)"
+            );
+            assert_eq!(
+                records.ties, oracle.ties,
+                "page {page}: splice diverged from a full reindex (ties)"
+            );
+
+            // The write actually made, on disk -- not just the in-memory
+            // model -- and read back through a completely independent
+            // `Records::read`, the same way
+            // `an_insert_through_a_free_slot_at_a_low_position_agrees_with_a_fresh_read`
+            // checks the 512 case.
+            let layout = crate::btrieve::pages::Layout {
+                page: geometry.page,
+                physical: geometry.physical,
+                pages: geometry.pages,
+            };
+            crate::btrieve::pages::write_record(
+                &path,
+                layout,
+                crate::btrieve::pages::Slot::Existing(position),
+                &record(7),
+                2,
+            )
+            .unwrap_or_else(|e| panic!("page {page}: {e}"));
+
+            let geometry2 =
+                Geometry::read(&name, &path).unwrap_or_else(|e| panic!("page {page}: {e}"));
+            let fcr2 = std::fs::read(&path).expect("read again");
+            let parsed2 = keys::parse(&name, &fcr2, geometry2.keys).expect("keys");
+            let reread = Records::read(&name, &path, &geometry2, &parsed2)
+                .unwrap_or_else(|e| panic!("page {page}: {e}"));
+            assert_eq!(
+                reread.len(),
+                2,
+                "page {page}: a fresh read after the write lost a record"
+            );
+            assert!(
+                reread.find_physical(position).is_some(),
+                "page {page}: the inserted record is not where it was written"
+            );
+        }
+    }
+
+    /// Task 2, Step 4: the real artifact, not only a synthetic one.
+    /// `RCI_HEL1.DAT` is one of The Rose's thirteen shipped files
+    /// (`tmp/gapsurvey/rose/`), measured `page=4096 reclen=2040 keys=6 V5
+    /// pages=200` -- the one 4096-byte-paged file among them. The synthetic
+    /// tests above prove the page arithmetic is size-generic; this proves it
+    /// is right about this specific, real, 200-page file with real records
+    /// in it.
+    #[test]
+    #[ignore = "needs tmp/gapsurvey/rose/; run with -- --ignored"]
+    fn the_roses_4096_byte_file_reads_its_records() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/gapsurvey/rose/RCI_HEL1.DAT");
+        let geometry = Geometry::read("RCI_HEL1.DAT", &path).expect("geometry");
+        assert_eq!(geometry.page, 4096, "measured against the real file");
+        assert_eq!(geometry.reclen, 2040);
+        assert_eq!(geometry.keys, 6);
+        assert_eq!(geometry.version, Version::V5);
+        assert_eq!(geometry.pages, 200);
+
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("RCI_HEL1.DAT", &fcr, geometry.keys).expect("keys");
+        let records =
+            Records::read("RCI_HEL1.DAT", &path, &geometry, &parsed).expect("records");
+        assert!(
+            !records.is_empty(),
+            "a 200-page file with no records is a walk that failed silently"
+        );
     }
 
     fn an_inserted_record_appears_in_physical_and_in_key_order() {
@@ -1845,6 +2021,291 @@ mod tests {
             let got =
                 layout_walk(&geometry, &path).unwrap_or_else(|e| panic!("{name} layout_walk: {e}"));
             assert_eq!(want, got, "{name}: walk and layout_walk disagree");
+        }
+    }
+
+    /// Task 9 of `docs/plans/2026-08-15-host-api-surface-track-b.md` --
+    /// findings in full at `tmp/lane-a-findings.md`.
+    ///
+    /// `(name, expected version, expected record count)` for every `.VIR`/
+    /// `.DAT` under `archive/modules/majormud-nt/wccnt8pj/out/`. Fourteen are
+    /// v6 ("WNT"). A read of physical page 0 alone -- the stale FCR shadow
+    /// copy whenever generation 1 lost -- would report every one of them as
+    /// blank; read through the live generation, most of them turn out to be
+    /// populated with real game data matching the DOS module's own counts.
+    /// Only the ones that are *also* empty in DOS on an unplayed board stay
+    /// empty here (`WCCBANK2`, `WCCGANG2`, `WCCITOW2`, `wccacms2`,
+    /// `newmp001`).
+    const MAJORMUD_NT: &[(&str, Version, u32)] = &[
+        ("newmp001.vir", Version::V6, 0),
+        ("wccacms2.vir", Version::V6, 0),
+        ("wccacts2.vir", Version::V6, 64),
+        ("WCCBANK2.VIR", Version::V6, 0),
+        ("wccclas2.vir", Version::V6, 15),
+        ("WCCGANG2.VIR", Version::V6, 0),
+        ("wccitem2.vir", Version::V5, 1950),
+        ("WCCITOW2.VIR", Version::V6, 0),
+        ("wccknms2.vir", Version::V6, 1101),
+        ("wccmp002.vir", Version::V6, 26720),
+        ("wccmsg2.vir", Version::V6, 3867),
+        ("wccrace2.vir", Version::V6, 13),
+        ("wccshop2.vir", Version::V6, 178),
+        ("wccspel2.vir", Version::V6, 1379),
+        ("wcctext2.vir", Version::V6, 3467),
+        ("wccupda2.dat", Version::V5, 38754),
+        ("wccuser2.vir", Version::V5, 0),
+    ];
+
+    /// Physical-page filenames of the three real files here this host's
+    /// *existing* v6 walk does not read correctly -- see
+    /// [`majormud_nts_multi_block_v6_files_are_a_known_gap`]. Named once so
+    /// the two tests that need to agree on the set cannot drift apart.
+    const MULTI_BLOCK_GAP: [&str; 3] = ["wccknms2.vir", "wcctext2.vir", "wccmp002.vir"];
+
+    /// The bring-up target itself, not a synthetic stand-in: does this
+    /// host's decoder -- which never hardcodes a struct field offset and
+    /// reads every key offset out of *this file's own* FCR (`keys.rs`'s
+    /// `at::OFFSET`) -- open and walk MajorMUD NT's real files?
+    ///
+    /// **On the packing axis specifically: yes, and this is not the thin
+    /// evidence a first reading of `archive/modules/majormud-nt/` suggests.**
+    /// Every one of these `.VIR`s looks like a blank virgin template by
+    /// name, and a naive read of physical page 0 alone reports every v6 one
+    /// of them as zero records -- but page 0 is only ever the *stale* FCR
+    /// shadow copy half the time (Evidence 1), and `Geometry::read` already
+    /// knows to prefer the live generation. Read correctly, most of these
+    /// v6 files turn out to be **populated with real game data**, matching
+    /// the DOS module's own counts file for file: `wccrace2.vir` holds the
+    /// same 13 races DOS's `WCCRACE.VIR` does, `wccspel2.vir` the same 1,379
+    /// spells, `wccmsg2.vir` the same 3,867 text records. Only the files
+    /// DOS's own copies are *also* empty on an unplayed board stay empty
+    /// here too (`WCCBANK2`, `WCCGANG2`, `WCCITOW2`, `wccacms2`, `newmp001`).
+    /// [`wccrace2_field_content_lands_where_the_module_expects`] goes one
+    /// step further and checks field *content*, not just record count.
+    ///
+    /// **On a second, unrelated axis, three of the seventeen expose a real
+    /// gap this task did not go looking for.** `wccknms2.vir`, `wcctext2.vir`
+    /// and `wccmp002.vir` -- [`MULTI_BLOCK_GAP`] -- do not read correctly
+    /// through the existing v6 walk at all. This is not the packed/unpacked
+    /// axis Task 9 asked about (see `tmp/lane-a-findings.md` for the full
+    /// writeup and why it is a `v6.rs` allocation-table gap, not a
+    /// `records.rs`/`keys.rs` one): every real MajorMUD NT file whose page
+    /// count needs more than one `"PP"` allocation-table block fails, and
+    /// every one that fits in a single block -- including `wccmsg2.vir` at
+    /// 3,867 records over 298 pages -- passes clean. No existing v6 fixture
+    /// (the largest is 50 records) was ever big enough to need a second
+    /// block, which is why nothing caught this before real, at-scale NT data
+    /// was available to read.
+    #[test]
+    #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
+    fn majormud_nts_own_files_read_under_this_hosts_packing_agnostic_decoder() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/majormud-nt/wccnt8pj/out");
+
+        for (name, version, expect) in MAJORMUD_NT {
+            if MULTI_BLOCK_GAP.contains(name) {
+                continue; // a separate, real finding -- see the doc comment above
+            }
+            let path = dir.join(name);
+            let geometry =
+                Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                geometry.version, *version,
+                "{name}: wrong Btrieve file version"
+            );
+
+            let fcr = std::fs::read(&path).expect("readable");
+            let parsed = keys::parse(name, &fcr, geometry.keys)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let records = Records::read(name, &path, &geometry, &parsed)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                records.len(),
+                *expect as usize,
+                "{name}: wrong record count"
+            );
+        }
+    }
+
+    /// The multi-allocation-table-block gap, pinned precisely rather than
+    /// left as a silent `continue` in the test above -- so a fix flips these
+    /// three assertions and is impossible to land unnoticed.
+    ///
+    /// All three failures are measured, not guessed, and **all three are
+    /// caught, loudly, by `Records::read`'s own count check** -- "the count
+    /// is the acceptance check" (this module's own doc comment) does exactly
+    /// its job here: nothing here hands a caller a plausible-but-wrong
+    /// answer. `Records::read` refuses all three; [`walk`] is called
+    /// directly, underneath that guard, to show *why* -- an undercount for
+    /// `wccknms2.vir` (short by exactly 1 of 1,101) and `wccmp002.vir`
+    /// (short by exactly 24 of 26,720), and an outright refusal chasing a
+    /// variable-length fragment chain across a block boundary for
+    /// `wcctext2.vir`. Every file here whose page count exceeds one `"PP"`
+    /// block's `(page_size - 0x0c) / 4` entries shows one of these two
+    /// symptoms; `wccmsg2.vir`, the largest single-block file measured (298
+    /// pages, 3,867 records), has neither.
+    #[test]
+    #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
+    fn majormud_nts_multi_block_v6_files_are_a_known_gap() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/majormud-nt/wccnt8pj/out");
+
+        let geometry_of = |name: &str| {
+            Geometry::read(name, &dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let refused = |name: &str| -> String {
+            let geometry = geometry_of(name);
+            let fcr = std::fs::read(dir.join(name)).expect("readable");
+            let parsed = keys::parse(name, &fcr, geometry.keys).expect("keys");
+            Records::read(name, &dir.join(name), &geometry, &parsed)
+                .map(|r| panic!("{name}: now reads {} records instead of refusing", r.len()))
+                .unwrap_err()
+                .why
+        };
+
+        // `Records::read` refuses all three, loudly, rather than handing
+        // back a plausible-but-short answer.
+        assert!(
+            refused("wccknms2.vir").contains("1101") && refused("wccknms2.vir").contains('1'),
+            "wccknms2.vir: expected the known count-mismatch refusal"
+        );
+        assert!(
+            refused("wccmp002.vir").contains("26720"),
+            "wccmp002.vir: expected the known count-mismatch refusal"
+        );
+        let text_why = refused("wcctext2.vir");
+        assert!(
+            text_why.contains("no live physical page"),
+            "wcctext2.vir: expected the known fragment-resolution refusal, got: {text_why}"
+        );
+
+        // Underneath that guard: `walk` (private to this module, called
+        // directly here) shows the undercount is exact and reproducible, not
+        // a flaky number.
+        let g = geometry_of("wccknms2.vir");
+        let n = walk(&g, &dir.join("wccknms2.vir")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(n.len(), 1100, "wccknms2.vir: expected the known short walk count");
+
+        let g = geometry_of("wccmp002.vir");
+        let n = walk(&g, &dir.join("wccmp002.vir")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(n.len(), 26696, "wccmp002.vir: expected the known short walk count");
+    }
+
+    /// The decisive check Task 9 asks for: not just "does the record count
+    /// match" but "do the module's own fields land where the module's own
+    /// struct expects them to."
+    ///
+    /// `wccrace2.vir` is a genuine, populated, v6/WNT file --
+    /// [`majormud_nts_own_files_read_under_this_hosts_packing_agnostic_decoder`]'s
+    /// doc comment records how that was established. Its records are read
+    /// here through the same path the shim uses to reach a record body
+    /// (`Records::read`, then `Record::bytes` directly -- the name field is
+    /// not indexed by any of this file's keys, so there is no `Key` to read
+    /// it through), and the result is checked against thirteen race names
+    /// read independently -- a raw Python scan of the same bytes, not this
+    /// crate's own code -- so this cannot pass by both readings sharing the
+    /// same bug.
+    ///
+    /// **This is a positive result for the packing axis specifically.** If
+    /// this host mis-modelled DOS-packed vs. WNT-unpacked as a per-field
+    /// offset shift, race name #0 would not read `"Half-Ogre"` at
+    /// `record.bytes[2]` of the 126-byte record -- it would read a fragment
+    /// of it, or the following field. It does, at every one of the thirteen.
+    #[test]
+    #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
+    fn wccrace2_field_content_lands_where_the_module_expects() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../../archive/modules/majormud-nt/wccnt8pj/out/wccrace2.vir",
+        );
+        let geometry = Geometry::read("wccrace2.vir", &path).expect("geometry");
+        assert_eq!(geometry.version, Version::V6);
+        let fcr = std::fs::read(&path).expect("readable");
+        let parsed = keys::parse("wccrace2.vir", &fcr, geometry.keys).expect("keys");
+        let records =
+            Records::read("wccrace2.vir", &path, &geometry, &parsed).expect("records");
+        assert_eq!(records.len(), 13);
+
+        // Physical order, page 6 (the file's only claimed data page) slots
+        // 0..13 -- measured independently with a raw Python read of the same
+        // file, skipping the two-byte v6 slot marker and reading straight
+        // off `reclen` bytes with no further adjustment: `record.bytes[0..2]`
+        // is the race id (`Python`: `\n\x00` = 10, little-endian) and the
+        // name starts right after it, at `record.bytes[2]`, NUL-terminated.
+        // The FCR's own key descriptor reads this key's `offset` as 2 as
+        // well -- but that number is measured from the *physical slot*, two
+        // bytes ahead of where `record.bytes` starts (Evidence 1b), so the
+        // id actually begins at `record.bytes[0]`, not `[2]`, and `keyed()`'s
+        // `key_shift` is exactly what reconciles the two. This assertion
+        // reads `record.bytes` directly, unshifted, since it is checking the
+        // name field a key does not cover, not going through a key at all.
+        const NAMES: [&str; 13] = [
+            "Half-Ogre", "Human", "Dwarf", "Gnome", "Halfling", "Elf", "Half-Elf",
+            "Dark-Elf", "Half-Orc", "Goblin", "Kang", "Nekojin", "Gaunt One",
+        ];
+        for (at, want) in NAMES.iter().enumerate() {
+            let record = records.physical(at).unwrap_or_else(|| panic!("slot {at}"));
+            let field = &record.bytes[2..2 + want.len()];
+            assert_eq!(
+                field, want.as_bytes(),
+                "slot {at}: expected {want:?} at byte 2 of the record"
+            );
+        }
+    }
+
+    /// Task 9, Step 1-2: what "unpacked" (`re/wg33src/SRC/api/gcommlib/CVTAPI.C`'s
+    /// `cvtp2u`/`cvtu2p`) concretely changes -- measured, not inferred, by
+    /// comparing MajorMUD NT's own record length against the DOS module's,
+    /// file for file. If unpacking only renumbered the *outer* Btrieve
+    /// container (the v5/v6 axis Task 8 already covers), `reclen` would be
+    /// unchanged; if it inserts natural-alignment padding *between fields*,
+    /// `reclen` grows by however many padding bytes that file's own field
+    /// layout needs -- a different amount per file, not a constant this
+    /// host could special-case once.
+    ///
+    /// Every file below grew except `NEWMP001.VIR` -- by amounts from 3 to
+    /// 30 bytes, matching the second theory, not the first. See
+    /// `tmp/lane-a-findings.md` for the full table (all fourteen v6 files
+    /// plus the three v5 ones) and why it is not a bug in `keys.rs`/
+    /// `records.rs` even though it is real: every key offset here comes from
+    /// *that file's own* FCR, which already reflects whichever layout wrote
+    /// it, never from a hardcoded MajorMUD struct definition.
+    #[test]
+    #[ignore = "needs tmp/ and archive/modules/majormud-nt/; run with -- --ignored"]
+    fn majormud_nts_reclen_differs_from_the_dos_modules_for_the_same_file() {
+        let dos_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tmp");
+        let nt_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/modules/majormud-nt/wccnt8pj/out");
+
+        // (DOS name, NT name, whether NT's reclen is expected to differ)
+        let pairs: &[(&str, &str, bool)] = &[
+            ("NEWMP001.VIR", "newmp001.vir", false),
+            ("WCCTEXT.VIR", "wcctext2.vir", true),
+            ("WCCUSERS.VIR", "wccuser2.vir", true),
+            ("WCCITEMS.VIR", "wccitem2.vir", true),
+            ("WCCUPDAT.DAT", "wccupda2.dat", true),
+        ];
+
+        for (dos_name, nt_name, differs) in pairs {
+            let dos = Geometry::read(dos_name, &dos_dir.join(dos_name))
+                .unwrap_or_else(|e| panic!("{dos_name}: {e}"));
+            let nt = Geometry::read(nt_name, &nt_dir.join(nt_name))
+                .unwrap_or_else(|e| panic!("{nt_name}: {e}"));
+            if *differs {
+                assert_ne!(
+                    dos.reclen, nt.reclen,
+                    "{dos_name}/{nt_name}: expected NT's record layout to have grown"
+                );
+                assert!(
+                    nt.reclen > dos.reclen,
+                    "{dos_name}/{nt_name}: NT's reclen shrank rather than grew -- the \
+                     padding theory predicts only growth"
+                );
+            } else {
+                assert_eq!(
+                    dos.reclen, nt.reclen,
+                    "{dos_name}/{nt_name}: expected an already-aligned record, unchanged"
+                );
+            }
         }
     }
 }
