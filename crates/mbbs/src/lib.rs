@@ -2862,6 +2862,30 @@ impl<A: Abi> Host<A> {
         Ok(None)
     }
 
+    /// Call the `syscyc` vector once, if a module has installed one.
+    ///
+    /// Its own function because [`Host::cycle`] fires it from two places for
+    /// two different reasons, and a second copy of the null check and the
+    /// stop handling is how those two drift apart.
+    fn syscyc(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        dispatched: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
+        if vector == A::null_ptr() {
+            return Ok(None);
+        }
+        match self.run(machine, module, vector, &[], None)? {
+            Outcome::Stopped(poison) => Ok(Some(poison)),
+            Outcome::Returned { .. } => {
+                *dispatched += 1;
+                Ok(None)
+            }
+        }
+    }
+
     fn prcrtk(
         &mut self,
         machine: &mut A::Cpu,
@@ -2882,10 +2906,18 @@ impl<A: Abi> Host<A> {
 
         for kick in due {
             *fired += 1;
-            // `MBBS_TRACE_SHIMS`: name each kick as it fires. A module whose
-            // timers are dead and one whose timers run but do nothing look
-            // identical from outside; this tells them apart.
-            if std::env::var_os("MBBS_TRACE_SHIMS").is_some() {
+            // Name each kick as it fires. A module whose timers are dead and
+            // one whose timers run but do nothing look identical from
+            // outside; this tells them apart.
+            //
+            // `MBBS_TRACE_KICKS` as well as `MBBS_TRACE_SHIMS`, because the
+            // question "is this module's heartbeat still beating?" is worth
+            // asking without the shim flood that answers it -- one idle
+            // MajorMUD window is 137,211 shim lines, 96.5% of them `ptrtile`,
+            // against a handful of kicks a second.
+            if std::env::var_os("MBBS_TRACE_SHIMS").is_some()
+                || std::env::var_os("MBBS_TRACE_KICKS").is_some()
+            {
                 eprintln!("mbbs-trace: KICK-FIRE dstrou={:?}", kick.dstrou);
             }
             match self.run(machine, module, kick.dstrou, &[], None)? {
@@ -3266,19 +3298,13 @@ impl<A: Abi> Host<A> {
         // `initask`, where MajorMUD registers nothing.
         let newunm: i16 = self.gsbl().peek().map_or(-1, |index| index as i16);
         if newunm <= self.lstunm {
-            let vector = self.globals().pointer_mem(A::mem(machine), "syscyc")?;
-            if vector != A::null_ptr() {
-                match self.run(machine, module, vector, &[], None)? {
-                    Outcome::Stopped(poison) => {
-                        return Ok(Cycles {
-                            iterations,
-                            dispatched,
-                            // `None`: the vector belongs to no channel.
-                            ended: Ended::Stopped(poison, None),
-                        });
-                    }
-                    Outcome::Returned { .. } => dispatched += 1,
-                }
+            if let Some(poison) = self.syscyc(machine, module, &mut dispatched)? {
+                return Ok(Cycles {
+                    iterations,
+                    dispatched,
+                    // `None`: the vector belongs to no channel.
+                    ended: Ended::Stopped(poison, None),
+                });
             }
         }
         self.lstunm = newunm;
@@ -3347,6 +3373,42 @@ impl<A: Abi> Host<A> {
             while last < now {
                 last += 1;
                 rounds += 1;
+                // **One `syscyc` per elapsed second, ahead of that second's
+                // kicks.** Firing it only once per `cycle` call above is not
+                // enough, and the shortfall is a lost second of the module's
+                // own time rather than a late one.
+                //
+                // MajorMUD is the case that shows it. Its whole internal timer
+                // system -- monster respawn, player saves (`SECOTH`), buffer
+                // saves (`SECBUFF`), item restocking, the medium and slow
+                // monster sweeps -- runs off a private queue (`_MY_RTKICK`)
+                // keyed on a tick counter it increments in exactly one place:
+                // inside `_BACKGROUND_FAST`, in the branch it takes only when
+                // this vector has set its gate bit, and which clears that bit
+                // on the way out. `_BACKGROUND_FAST` is an ordinary `rtkick`
+                // heartbeat, so `prcrtk` below fires it once per elapsed
+                // second -- but a `cycle` that spanned four seconds fires it
+                // four times against a single gate-set, and the module counts
+                // one tick, not four. Its clock then runs slow by however
+                // long a cycle takes and never catches up. Measured on a live
+                // board at the shipped budgets: 3 to 5 `cycle` calls per ten
+                // seconds, a module clock at a third of real time, and
+                // monsters that stayed dead.
+                //
+                // Ungated by the `btuscn` test the call above uses, on
+                // purpose: that test asks "is there a channel waiting?", which
+                // is the right question for the vendor's spin-as-fast-as-you-
+                // can loop and the wrong one for "a second of real time has
+                // passed." A board busy enough to always have a channel queued
+                // is exactly the board that must not have its world stop.
+                if let Some(poison) = self.syscyc(machine, module, &mut dispatched)? {
+                    self.tcklst = Some(last);
+                    return Ok(Cycles {
+                        iterations,
+                        dispatched,
+                        ended: Ended::Stopped(poison, None),
+                    });
+                }
                 if let Some(poison) = self.prcrtk(machine, module, &mut dispatched)? {
                     // Written back before the early return: the rounds already
                     // run must not run again on the next `cycle`.
@@ -6539,6 +6601,59 @@ mod tests {
         assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
         let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
+    }
+
+    /// A cycle that spanned four seconds owes the module four ticks, not one.
+    ///
+    /// MajorMUD's own timer queue is clocked by a counter it advances inside
+    /// `_BACKGROUND_FAST`, in the branch it takes only when `syscyc` has set
+    /// its gate -- and that branch clears the gate. `_BACKGROUND_FAST` is an
+    /// ordinary `rtkick` heartbeat, so a `cycle` spanning N seconds fires it N
+    /// times; if the gate was set once, the module counts one tick and the
+    /// other N-1 are gone for good. Its clock then runs slow by however long a
+    /// cycle takes, which is what left monsters dead.
+    ///
+    /// Counted by difference rather than by a probe: the same run with the
+    /// vector installed and with it absent differ by exactly the syscyc
+    /// dispatches, and nothing else in the run changes.
+    #[test]
+    fn a_cycle_spanning_four_seconds_fires_syscyc_once_per_second() {
+        let dispatches = |install: bool, elapsed: u32| {
+            let (mut f, module, rou) = polling_fixture();
+            if install {
+                let mut bytes = [0u8; 4];
+                bytes[0..2].copy_from_slice(&rou.offset.to_le_bytes());
+                bytes[2..4].copy_from_slice(&rou.selector.to_le_bytes());
+                f.host
+                    .globals()
+                    .write(&mut f.machine, "syscyc", &bytes)
+                    .expect("syscyc is a placed global");
+            }
+            // A pinned clock, moved by hand: the first call syncs `tcklst`,
+            // then `elapsed` seconds pass with the driver asleep -- exactly
+            // what `Ended::Waiting` tells it to do -- and the next call has
+            // all of them to catch up in one go.
+            f.host.set_clock(Clock::pinned(1_135_952_405));
+            f.host.cycle(&mut f.machine, &module, 10).expect("first");
+            f.host.set_clock(Clock::pinned(1_135_952_405 + elapsed));
+            f.host.cycle(&mut f.machine, &module, 10).expect("second").dispatched
+        };
+        let fired = |elapsed| dispatches(true, elapsed) - dispatches(false, elapsed);
+
+        // One for the vendor's own idle-pass call at the top of `cycle`
+        // (`MAJORBBS.C:421`, which fires whether or not a second has passed),
+        // plus one per elapsed second ahead of that second's kicks.
+        assert_eq!(fired(1), 2, "one second: the idle-pass call and that second's");
+        assert_eq!(fired(4), 5, "four seconds: the idle-pass call and four more");
+
+        // The scaling is the whole point. A constant here -- which is what
+        // firing once per `cycle` gave -- means the module loses every second
+        // but the first out of any cycle that spans several.
+        assert_eq!(
+            fired(4) - fired(1),
+            3,
+            "three extra seconds must buy three extra ticks, not nothing"
+        );
     }
 
     /// A poll routine that does nothing is counted as having done nothing.
