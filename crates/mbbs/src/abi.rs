@@ -459,6 +459,17 @@ pub trait Abi {
     /// and its `mbbs_machine::m32` mirror.
     fn unimplemented(module: String, symbol: String) -> Self::Poison;
 
+    /// Build the poison that says a routine this host **does** implement
+    /// refused to answer.
+    ///
+    /// The counterpart to [`Abi::unimplemented`], and deliberately not the
+    /// same thing: one says the routine is missing, the other says it ran and
+    /// could not answer. Reporting a refusal as "not implemented" sends a
+    /// reader looking for a symbol that has been present for months -- see
+    /// `mbbs_machine::m16::Poison::Refused` for the incident that separated
+    /// them.
+    fn refused(module: String, symbol: String, why: String) -> Self::Poison;
+
     /// A module loaded for this ABI: what selector or section each of its
     /// pieces got, and what sits behind each thunk.
     ///
@@ -562,27 +573,42 @@ pub trait Abi {
     /// carries enough to answer it (design §3).
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
 
-    /// Where the module's init routine sits -- "ordinal 1" in both ABIs.
-    /// `Wg16` reads it from an NE segment's own export/ordinal table.
-    /// `Wg32` reads it from the PE export table's ordinal 1, which is
-    /// **not** `AddressOfEntryPoint`: for a Borland-linked DLL like
+    /// Where the module's init routine sits -- resolved by NAME in both
+    /// ABIs now (`_init__<dll>` PE-side, `_INIT__<DLL>` NE-side, both
+    /// case-insensitive), with exported ordinal 1 as a fallback rather than
+    /// the rule it was first believed to be. `Wg16` reads it from an NE
+    /// module's own export/ordinal table (`m16::ne::Module::init`). `Wg32`
+    /// reads it from the PE export table (`m32::PeImage::init_rva`), which
+    /// is **not** `AddressOfEntryPoint`: for a Borland-linked DLL like
     /// `LUNATIX.DLL`, the PE entry point is a C-runtime startup stub (RVA
-    /// `0x1000`), while ordinal 1 is `_init__lunatix` (RVA `0x115c`), the
-    /// routine that actually calls `register_module`. Conflating the two
-    /// was a real, measured bug -- `mbbs-server` faulted taking the entry
-    /// point as the init routine -- fixed in `abi/wg32.rs`'s `Wg32::load`
-    /// (`PeImage::export_rva_by_ordinal(1)`) and `Wg32::init_entry`. Added
+    /// `0x1000`), while its init routine is `_init__lunatix` (RVA
+    /// `0x115c`), the routine that actually calls `register_module`.
+    /// Conflating entry point and init routine was a real, measured bug --
+    /// `mbbs-server` faulted taking the entry point as the init routine --
+    /// fixed in `abi/wg32.rs`'s `Wg32::load` and `Wg32::init_entry`. Added
     /// for `crates/mbbs-server/src/host.rs`'s `life`, generic since Task 20
     /// of `docs/plans/2026-08-12-abi-border-implementation.md`: it used to
     /// call `mbbs_machine::m16::Module::entry(1)` directly, which has no
     /// `Wg32` analogue by that name or that signature.
     ///
-    /// `None` if this ABI's module has no such entry -- an NE segment
-    /// lacking ordinal 1 (`Wg16`), or a PE with no export directory, or no
-    /// export at ordinal 1 (`Wg32`; `mbbs_machine::m32::Module::init`,
-    /// distinct from `Module::entry` -- see that method's own doc comment).
-    /// Both ABIs' init lookups carry that `Option` now, so neither has to
-    /// fabricate an answer this method could not honestly give.
+    /// "Ordinal 1 is the convention" was itself a bug, caught on The Rose's
+    /// PE and NE builds (both named `RCIROSE.DLL`): both `LUNATIX.DLL` and
+    /// MajorMUD's NE build happen to have their real init routine at
+    /// ordinal 1, and
+    /// generalizing that coincidence into a rule sent the host into
+    /// `RCIROSE.DLL`'s ordinal 1, which is gameplay code (`_his_mods`), and
+    /// the NE build's ordinal 1, which is `BCC286_EXE`, Borland C++ 286's
+    /// crt0 startup stub -- not an entry point at all. See
+    /// `m32::PeImage::init_rva` and `m16::ne::Module::init`'s own doc
+    /// comments for the full measurement.
+    ///
+    /// `None` if this ABI's module has no such entry -- an NE module with
+    /// neither a named `_INIT__<dll>` export nor ordinal 1 (`Wg16`), or a
+    /// PE with no export directory and neither a named nor an ordinal-1
+    /// export (`Wg32`; `mbbs_machine::m32::Module::init`, distinct from
+    /// `Module::entry` -- see that method's own doc comment). Both ABIs'
+    /// init lookups carry that `Option` now, so neither has to fabricate an
+    /// answer this method could not honestly give.
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr>;
 
     /// This ABI's own name for `module` -- what a *different* module's own
@@ -1136,6 +1162,10 @@ mod tests {
 
         fn poisoned(_cpu: &Self::Cpu) -> Option<Self::Poison> {
             unreachable!("Call's read tests never call Abi::poisoned")
+        }
+
+        fn refused(_module: String, _symbol: String, _why: String) -> Self::Poison {
+            unreachable!("Call's read tests never call Abi::refused")
         }
 
         fn unimplemented(_module: String, _symbol: String) -> Self::Poison {

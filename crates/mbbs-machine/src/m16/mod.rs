@@ -244,6 +244,27 @@ pub enum Poison {
 
     /// It called an import the host has no implementation for.
     Unimplemented { module: String, symbol: String },
+
+    /// It called an import the host **does** implement, and that
+    /// implementation refused.
+    ///
+    /// Distinct from [`Poison::Unimplemented`] because the two send a reader
+    /// in opposite directions. "Not implemented" says *go and write the
+    /// routine*; this says *the routine ran and could not answer*, which is
+    /// usually a bad pointer, a missing file, or state the module never set
+    /// up. Collapsing them cost a long detour on 2026-08-15: The Rose
+    /// reported `cw3220mt.DLL.strlen (...) is not implemented` when `strlen`
+    /// has been implemented for months and the real fault was that the host
+    /// had entered the module at the wrong address, so it was executing
+    /// gameplay code that then called `strlen` on a null pointer.
+    ///
+    /// `why` is the `ShimError`'s own text, already carrying the
+    /// `BadPointer`/`Failed` distinction.
+    Refused {
+        module: String,
+        symbol: String,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for Poison {
@@ -260,6 +281,13 @@ impl std::fmt::Display for Poison {
             }
             Self::Unimplemented { module, symbol } => {
                 write!(f, "{module}.{symbol} is not implemented")
+            }
+            Self::Refused {
+                module,
+                symbol,
+                why,
+            } => {
+                write!(f, "{module}.{symbol} refused: {why}")
             }
         }
     }

@@ -187,6 +187,17 @@ pub enum Poison {
 
     /// It called an import the host has no implementation for.
     Unimplemented { module: String, symbol: String },
+
+    /// It called an import the host **does** implement, and that
+    /// implementation refused. The `m16` mirror of this variant carries the
+    /// full reasoning; in short, "not implemented" and "implemented, and it
+    /// could not answer" send a reader in opposite directions, and collapsing
+    /// them cost a long detour tracing The Rose's boot.
+    Refused {
+        module: String,
+        symbol: String,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for Poison {
@@ -200,6 +211,13 @@ impl std::fmt::Display for Poison {
             }
             Self::Unimplemented { module, symbol } => {
                 write!(f, "{module}.{symbol} is not implemented")
+            }
+            Self::Refused {
+                module,
+                symbol,
+                why,
+            } => {
+                write!(f, "{module}.{symbol} refused: {why}")
             }
         }
     }
@@ -286,19 +304,30 @@ impl Module {
         self.entry
     }
 
-    /// The linear address of the module's own init routine -- exported
-    /// ordinal 1, Galacticomm's convention carried forward from the 16-bit
-    /// side (`crate::m16::ne::Module::entry`'s own doc comment: "ordinal 1"
-    /// is `MAJORBBS.C`'s `init_module`/`register_module` convention). This,
-    /// not [`Module::entry`], is what a host must call to reach
-    /// `register_module`.
+    /// The linear address of the module's own init routine -- what a host
+    /// must call to reach `register_module`, and, unlike [`Module::entry`],
+    /// not necessarily anywhere near the PE entry point.
     ///
-    /// `None` if the image has no export directory, or no export at
-    /// ordinal 1 -- mirrors `crate::m16::ne::Module::entry`'s own `None`
-    /// case for an NE segment lacking that ordinal. Set at load time by
-    /// `crate::abi::wg32::Wg32::load` (a different crate; not doc-linked
-    /// from here for the same reason `Module`'s own module doc comment
-    /// gives) from `PeImage::export_rva_by_ordinal(1)`.
+    /// **Not "exported ordinal 1."** That was this crate's belief until it
+    /// was measured against a second module: `LUNATIX.DLL`'s ordinal 1 is
+    /// `_init__lunatix`, its real init routine, but `RCIROSE.DLL`'s ordinal
+    /// 1 is `_his_mods`, gameplay code -- its init routine,
+    /// `_init__rcirose`, sits at ordinal 352. One module agreeing with
+    /// itself is not a convention, only a coincidence that survived because
+    /// nobody had yet measured a module linked the other way around. The
+    /// name both modules actually agree on is `_init__<dll>`
+    /// (case-insensitive; PE spells it lower-case), which is what this
+    /// field is resolved by now -- see [`crate::m32::PeImage::init_rva`]
+    /// for the full reasoning, including why ordinal 1 is tried only as a
+    /// fallback and never preferred once a name resolves.
+    ///
+    /// `None` if the image has no export directory, no `_init__<dll>`
+    /// export, and no export at ordinal 1 either -- mirrors
+    /// `crate::m16::ne::Module::init`'s own `None` case, the NE-side
+    /// analogue of this same name-first-ordinal-fallback resolution. Set at
+    /// load time by `crate::abi::wg32::Wg32::load` (a different crate; not
+    /// doc-linked from here for the same reason `Module`'s own module doc
+    /// comment gives) from `PeImage::init_rva`.
     pub fn init(&self) -> Option<u32> {
         self.init
     }

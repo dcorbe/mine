@@ -2658,11 +2658,21 @@ impl<A: Abi> Host<A> {
                     exit = A::resume(machine, ret, cleans)?;
                 }
                 Err(e) => {
-                    let symbol = match A::caller(machine, owner.as_ref().unwrap_or(module)) {
-                        Some(at) => format!("{symbol} ({e}), called from {at}"),
-                        None => format!("{symbol} ({e})"),
+                    // `refused`, not `unimplemented`. This routine EXISTS --
+                    // the table answered with it and it ran. Reporting that
+                    // as "not implemented" sends the next reader looking for
+                    // a symbol that is already there: The Rose reported
+                    // `cw3220mt.DLL.strlen (...) is not implemented` when
+                    // `strlen` had been implemented for months and the real
+                    // fault was the host entering the module at the wrong
+                    // address (`ordinal 1` is Rose's crt0 stub, not its
+                    // init), so it was running gameplay code that called
+                    // `strlen` on a null pointer.
+                    let why = match A::caller(machine, owner.as_ref().unwrap_or(module)) {
+                        Some(at) => format!("{e}, called from {at}"),
+                        None => e.to_string(),
                     };
-                    return self.stop(machine, A::unimplemented(from, symbol));
+                    return self.stop(machine, A::refused(from, symbol, why));
                 }
             }
         }
@@ -2696,11 +2706,17 @@ impl<A: Abi> Host<A> {
     /// `symbol` rather than being flattened through `Display` alone --
     /// `ShimError` has no `Error` impl to recover it from afterwards.
     fn shim_stop(&self, machine: &mut A::Cpu, where_: &str, e: ShimError) -> io::Result<Outcome<A>> {
-        let symbol = match &e {
-            ShimError::BadPointer(_) => format!("{where_}: bad pointer, {e}"),
-            ShimError::Failed(_) => format!("{where_}: {e}"),
+        // `refused`, not `unimplemented`: these three calls are host routines
+        // that ran and could not answer, which is a different thing from a
+        // symbol this host lacks. See the `Err` arm in `run`'s dispatch loop.
+        let why = match &e {
+            ShimError::BadPointer(_) => format!("bad pointer, {e}"),
+            ShimError::Failed(_) => e.to_string(),
         };
-        self.stop(machine, A::unimplemented("mbbs".to_owned(), symbol))
+        self.stop(
+            machine,
+            A::refused("mbbs".to_owned(), where_.to_owned(), why),
+        )
     }
 
     /// Entry `n` of the module channel `chan`'s `state` names -- or, if

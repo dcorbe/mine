@@ -195,13 +195,20 @@ fn a_negative_32_bit_delay_is_refused_by_the_32_bit_sign_bit() {
         panic!("expected Outcome::Stopped (rtkick must refuse a negative 32-bit delay), got {outcome:?}");
     };
     match poison {
-        Poison::Unimplemented { symbol, .. } => {
+        // `Refused`, not `Unimplemented`. `rtkick` is implemented; it ran and
+        // declined a delay it cannot honour, which is a different thing from
+        // a symbol this host lacks, and since 2026-08-15 the two have
+        // different variants. This test asserted `Unimplemented` before that
+        // -- while its own panic message called it "rtkick's own refusal",
+        // which is exactly the confusion the split removed.
+        Poison::Refused { symbol, why, .. } => {
+            assert_eq!(symbol, "rtkick", "the poison must name the routine");
             assert!(
-                symbol.contains("negative delay"),
-                "the poison must name why rtkick refused: {symbol}"
+                why.contains("negative delay"),
+                "the poison must name why rtkick refused: {why}"
             );
         }
-        other => panic!("expected Poison::Unimplemented (rtkick's own refusal), got {other:?}"),
+        other => panic!("expected Poison::Refused (rtkick ran and declined), got {other:?}"),
     }
     assert_eq!(host.kicks(), [], "a refused delay must not be stored");
 }

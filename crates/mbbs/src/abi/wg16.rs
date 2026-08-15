@@ -173,6 +173,10 @@ impl Abi for Wg16 {
         mbbs_machine::m16::Poison::Unimplemented { module, symbol }
     }
 
+    fn refused(module: String, symbol: String, why: String) -> Self::Poison {
+        mbbs_machine::m16::Poison::Refused { module, symbol, why }
+    }
+
     type Module = mbbs_machine::m16::Module;
 
     /// Direct delegation to `Machine::load_ne` -- the NE parse, segment
@@ -205,12 +209,14 @@ impl Abi for Wg16 {
         caller16(cpu, module)
     }
 
-    /// Direct delegation to `mbbs_machine::m16::Module::entry(1)` --
-    /// "ordinal 1" is the vendor's own name for the init routine
-    /// (`MAJORBBS.C`'s `init_module`/`register_module` convention every NE
-    /// module this host loads follows).
+    /// Direct delegation to `mbbs_machine::m16::Module::entry(1)` -- no
+    /// longer. `Module::init` resolves the init routine by NAME
+    /// (`_INIT__<dll>`) first, ordinal 1 only as a fallback: see that
+    /// method's own doc comment for the `RCIROSE.DLL` measurement that
+    /// overturned "ordinal 1 is the vendor's convention" (its ordinal 1 is
+    /// `BCC286_EXE`, a Borland crt0 stub, not `register_module`'s caller).
     fn init_entry(module: &Self::Module) -> Option<Self::Ptr> {
-        module.entry(1)
+        module.init()
     }
 
     /// Direct delegation to `mbbs_machine::m16::Module::name` -- the NE

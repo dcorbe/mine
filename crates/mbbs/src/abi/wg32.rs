@@ -319,6 +319,10 @@ impl Abi for Wg32 {
         mbbs_machine::m32::Poison::Unimplemented { module, symbol }
     }
 
+    fn refused(module: String, symbol: String, why: String) -> Self::Poison {
+        mbbs_machine::m32::Poison::Refused { module, symbol, why }
+    }
+
     type Module = mbbs_machine::m32::Module;
 
     /// The real arm, Task 10 of
@@ -428,12 +432,14 @@ impl Abi for Wg32 {
         // The module's real init routine, NOT `entry` above -- see
         // `mbbs_machine::m32::Module::entry`'s doc comment for why the two
         // differ (a Borland startup stub vs. `_init__lunatix`) and the
-        // production fault this line exists to prevent. Ordinal 1 is
-        // Galacticomm's own convention, carried forward unchanged from the
-        // 16-bit side (`Wg16::init_entry`, `abi/wg16.rs`) -- `LUNATIX.MDF`
-        // names the DLL but never the routine, so the ordinal is all there
-        // is to go on.
-        let init = pe.export_rva_by_ordinal(1).map(|rva| image.base().wrapping_add(rva));
+        // production fault this line exists to prevent. Resolved by NAME
+        // (`_init__<dll>`, built from the export directory's own `Name`
+        // field) with exported ordinal 1 as a fallback, NOT ordinal 1
+        // outright -- see `PeImage::init_rva`'s own doc comment for the
+        // measurement that overturned "ordinal 1 is the convention"
+        // (`RCIROSE.DLL`: ordinal 1 is gameplay code, `_init__rcirose`
+        // sits at ordinal 352).
+        let init = pe.init_rva().map(|rva| image.base().wrapping_add(rva));
 
         // Every step above succeeded -- commit. `replace_image` swaps in
         // `image` without touching `cpu.mem`'s arena -- see this method's
