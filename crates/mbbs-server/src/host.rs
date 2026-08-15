@@ -358,6 +358,55 @@ fn wake(wait: Wait, rx: &std::sync::mpsc::Receiver<In>) -> Woke {
     }
 }
 
+/// How often to report [`mbbs::PollCensus`], from `MBBS_POLL_CENSUS` -- a
+/// whole number of seconds, or absent to report never.
+///
+/// An environment variable rather than a flag for the same reason
+/// `MBBS_TRACE_SHIMS` is one: it is a diagnostic an operator turns on for a
+/// window to answer a question, not a way to configure a board. Anything
+/// unparseable is "off" rather than an error, because a board refusing to
+/// start over a malformed diagnostic knob would be the worse failure.
+fn census_interval() -> Option<Duration> {
+    std::env::var("MBBS_POLL_CENSUS")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
+/// Print what the poll budget bought, no more than once per `every`.
+///
+/// Reported from the host thread rather than sampled by a reader outside it,
+/// because unlike [`Boot::clock_reads`] and its neighbours this is not a
+/// single counter -- it is four that only mean anything read together and
+/// cleared together, which [`mbbs::Host::take_census`] does in one step.
+///
+/// The census is taken on every reporting turn and dropped between them, so
+/// the numbers describe the interval just ended rather than all of time.
+fn report_census<A: Abi>(host: &mut mbbs::Host<A>, due: &mut Instant, every: Option<Duration>) {
+    let Some(every) = every else { return };
+    if Instant::now() < *due {
+        return;
+    }
+    *due = Instant::now() + every;
+    let census = host.take_census();
+    if census.polls == 0 {
+        return;
+    }
+    let secs = every.as_secs_f64();
+    eprintln!(
+        "mbbs-server: census: {polls} polls ({rate:.0}/s), {barren} barren ({barren_pct:.1}%), \
+         {calls:.1} host calls each, worst {worst}",
+        polls = census.polls,
+        rate = census.polls as f64 / secs,
+        barren = census.barren,
+        barren_pct = census.barren_pct(),
+        calls = census.per_poll(),
+        worst = census.worst,
+    );
+}
+
 /// How many times [`run`] will rebuild a machine after [`Ended::Stopped`]
 /// before giving up, and over what window. See [`RestartPolicy`].
 ///
@@ -625,6 +674,8 @@ fn life<A: Abi>(
     let mut pool = Pool::new(boot.machine, terms);
     let mut conns: Vec<Option<Sender<Out>>> = vec![None; terms.count().into()];
     let mut wait = Wait::Now;
+    let census_every = census_interval();
+    let mut census_due = Instant::now();
 
     loop {
         // 0. Tell the bell what to ring for -- see `arm`'s own doc -- then
@@ -695,6 +746,7 @@ fn life<A: Abi>(
         if let Some(meter) = &boot.calls_total {
             meter.store(host.calls(), Ordering::Relaxed);
         }
+        report_census(&mut host, &mut census_due, census_every);
 
         // 5. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;

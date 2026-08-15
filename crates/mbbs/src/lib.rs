@@ -374,6 +374,57 @@ pub enum Wait {
     Stop,
 }
 
+/// What the poll budget is actually buying, counted per poll dispatch.
+///
+/// `polls_per_wake` is the host guessing how much simulation to allow, and
+/// the module has no way to answer "I am done": [`Host::dopoll`] re-arms
+/// after every dispatch for as long as budget remains, and a poll routine
+/// with nothing left to do simply falls through -- which still costs a full
+/// emulated far call. So the budget cannot be judged from the outside by
+/// whether it was consumed (it always is, see [`Ended::Waiting`]'s
+/// `polls_cut`), only by what the dispatches it paid for actually did.
+///
+/// `barren` is the number that answers that. A poll that made no host call
+/// at all did nothing this host can observe -- it took the far call, tested
+/// its own counters, and returned. A budget whose polls are mostly barren is
+/// a budget spending emulated far calls on nothing; one with few barren polls
+/// is too small to be starving the module of anything.
+///
+/// **Not a control input.** Nothing branches on this; it exists so an
+/// operator can size `--polls-per-wake` against measurement instead of
+/// against the 512 that has never been calibrated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollCensus {
+    /// Poll dispatches counted.
+    pub polls: u64,
+    /// ...of which made no host call whatsoever.
+    pub barren: u64,
+    /// Host routine calls the counted polls made between them.
+    pub calls: u64,
+    /// The most host calls any one of them made.
+    pub worst: u64,
+}
+
+impl PollCensus {
+    /// Host calls per poll, or `0.0` for a census that counted nothing.
+    #[must_use]
+    pub fn per_poll(&self) -> f64 {
+        if self.polls == 0 {
+            return 0.0;
+        }
+        self.calls as f64 / self.polls as f64
+    }
+
+    /// What share of the counted polls did nothing at all, as a percentage.
+    #[must_use]
+    pub fn barren_pct(&self) -> f64 {
+        if self.polls == 0 {
+            return 0.0;
+        }
+        self.barren as f64 * 100.0 / self.polls as f64
+    }
+}
+
 /// How long one pass may take before it is worth a line.
 ///
 /// One second because that is the granularity of everything it competes with:
@@ -964,6 +1015,9 @@ pub struct Host<A: Abi> {
     /// reports once for the routine that produced it.
     noted: HashSet<String>,
 
+    /// What the poll budget is actually buying. See [`PollCensus`].
+    census: PollCensus,
+
     /// Every callback `rtkick` has been asked to run later, in the order it
     /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
     /// [`Host::prcrtk`]. See [`Host::kicks`].
@@ -1428,6 +1482,7 @@ impl<A: Abi> Host<A> {
             tasks: Vec::new(),
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
+            census: PollCensus::default(),
             forms: HashMap::new(),
             fsdscb: vec![None; usize::from(terms.count())],
             fsdtmp: vec![None; usize::from(terms.count())],
@@ -2701,12 +2756,28 @@ impl<A: Abi> Host<A> {
         };
 
         self.inpolr = Some(chan);
+        // Bracketing `run` rather than the whole function so the census counts
+        // what the module's own routine did, not this host's bookkeeping
+        // around it. See `PollCensus`.
+        let before = self.calls();
         let outcome = self.run(machine, module, rou, &[], Some(chan));
         // Cleared before the `?`, so a machine that malfunctioned does not leave
         // `inpolr` naming a channel that is no longer running anything. The
         // original does the same from the `longjmp` landings at
         // `MAJORBBS.C:2488` and `:4150`.
         self.inpolr = None;
+
+        // Counted before the `?`, so a poll that ended the machine is still
+        // counted -- it is the most expensive one there is, and losing it
+        // would bias the census towards the dispatches that went well.
+        let spent = self.calls().saturating_sub(before);
+        self.census.polls += 1;
+        self.census.calls += spent;
+        self.census.worst = self.census.worst.max(spent);
+        if spent == 0 {
+            self.census.barren += 1;
+        }
+
         let outcome = outcome?;
 
         // One dispatch, one token. Saturating because the budget may already
@@ -3087,6 +3158,12 @@ impl<A: Abi> Host<A> {
     /// # Errors
     ///
     /// If a channel's `polrou` cannot be read out of the machine.
+    /// What the poll budget bought since the last [`Host::take_census`], and
+    /// clear it. See [`PollCensus`].
+    pub fn take_census(&mut self) -> PollCensus {
+        std::mem::take(&mut self.census)
+    }
+
     pub fn refill_polls(&mut self, machine: &mut A::Cpu, n: usize) -> io::Result<()> {
         self.polls_left = n;
         if n == 0 {
@@ -4353,7 +4430,7 @@ mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{
-        Clock, Dispatch, Duration, Ended, Host, Kick, Native, Outcome, Registration, Terms,
+        Clock, Dispatch, Duration, Ended, Host, Kick, Native, Outcome, PollCensus, Registration, Terms,
         gsbl, stall_note, testing, users,
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
@@ -6462,6 +6539,56 @@ mod tests {
         assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
         let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
+    }
+
+    /// A poll routine that does nothing is counted as having done nothing.
+    ///
+    /// The fixture's routine is a single `retf`, which is exactly the shape
+    /// the census exists to find: the module took a full emulated far call,
+    /// reached no host routine at all, and returned. Five budgeted polls, five
+    /// dispatches, five barren -- and `dopoll` re-armed after every one of
+    /// them regardless, which is the behaviour that makes the count worth
+    /// having.
+    #[test]
+    fn polls_that_reach_no_host_routine_are_counted_as_barren() {
+        let (mut f, module, rou) = polling_fixture();
+        let console = f.console();
+        f.host
+            .users
+            .set_polrou_mem(f.machine.mem_mut(), console, Some(rou))
+            .expect("channel 0");
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+        f.host.refill_polls(&mut f.machine, 5).expect("armed");
+
+        let cycles = f.host.cycle(&mut f.machine, &module, 100).expect("cycled");
+        let census = f.host.take_census();
+
+        assert_eq!(cycles.dispatched, 5, "the budget bought five dispatches");
+        assert_eq!(census.polls, 5, "and the census saw all five");
+        assert_eq!(census.barren, 5, "a bare retf reaches no host routine");
+        assert_eq!(census.calls, 0);
+        assert_eq!(census.worst, 0);
+        assert!((census.barren_pct() - 100.0).abs() < f64::EPSILON);
+
+        assert_eq!(
+            f.host.take_census(),
+            PollCensus::default(),
+            "taking it clears it, so a reporter measures an interval and not all time"
+        );
+    }
+
+    /// The ratios are per-poll, not per-call, and a census that counted
+    /// nothing answers zero rather than dividing by it.
+    #[test]
+    fn census_ratios_divide_by_polls_and_tolerate_an_empty_census() {
+        let census = PollCensus { polls: 4, barren: 1, calls: 10, worst: 7 };
+
+        assert!((census.per_poll() - 2.5).abs() < 1e-9, "ten calls over four polls");
+        assert!((census.barren_pct() - 25.0).abs() < 1e-9, "one of four");
+
+        let empty = PollCensus::default();
+        assert!(empty.per_poll().abs() < f64::EPSILON);
+        assert!(empty.barren_pct().abs() < f64::EPSILON);
     }
 
     /// Sleeping correctly is not stalling, and is not reported as it.
