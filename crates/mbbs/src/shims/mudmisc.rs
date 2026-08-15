@@ -1,24 +1,46 @@
-//! Eight odds and ends: the logoff entry point, an input re-prompt, a
-//! high-resolution clock read, an ASCII file lister, and the video-driver
-//! cursor primitives `WCCMMUD.DLL` imports but never gets a body for in any
-//! recovered source tree.
+//! Seven odds and ends: the logoff entry point, an input re-prompt, an
+//! ASCII file lister, and the video-driver cursor primitives `WCCMMUD.DLL`
+//! imports but never gets a body for in any recovered source tree.
 //!
 //! ```text
-//! hrtval   2    injacr   2    byenow   1    listing  1
+//! injacr   2    byenow   1    listing  1
 //! locate   1    msgscan  1    curcurx  1    curcury  1
 //! ```
 //!
-//! Ten call sites total, measured with `re/ne_arity.py` against each
-//! symbol's ordinal in `crates/mbbs/data/majorbbs_wg101.tsv` (862, 347, 91,
+//! Eight call sites total, measured with `re/ne_arity.py` against each
+//! symbol's ordinal in `crates/mbbs/data/majorbbs_wg101.tsv` (347, 91,
 //! 386, 392, 421, 147, 148 respectively) -- every one of them agrees with
 //! the vendor prototype's own argument count, cited per routine below.
+//!
+//! # `hrtval` used to be here, at the wrong tick rate
+//!
+//! This file carried a second `hrtval` -- never registered, so never
+//! reached -- deriving ticks at the PC BIOS rate of 1_193_182/65536 Hz
+//! (≈18.2065). `shims::misc::hrtval` is the registered one and uses 65536
+//! Hz. They disagreed by a factor of about 3600.
+//!
+//! `BRKTHU.H:88` settles it outright: `volatile unsigned long btuhrt;`
+//! `/* increments 65536 times a second */`. The deleted version's own doc
+//! comment claimed no header stated the rate, which was simply a miss --
+//! and then reasoned to 18.2 Hz from `MAJORBBS.C:232`'s `LOGONPOL
+//! (65535L/10)`, on the grounds that 6553.5 ticks at 18.2 Hz is exactly
+//! 360 seconds. Six minutes looks like a logon timeout, so the coincidence
+//! read as corroboration.
+//!
+//! The use site shows it is not one. `MAJORBBS.C:4005` is
+//! `if (hrtval()-routime > LOGONPOL) begin_polling(...)` -- a hog detector
+//! on a single logon-phase call, switching it to polled mode when it blocks
+//! too long. At 65536 Hz that threshold is 0.1 s, which is what a
+//! cooperatively scheduled host wants. At 18.2 Hz it is six minutes, by
+//! which time the board is dead. The exact-looking match was arithmetic
+//! coincidence, not evidence.
 //!
 //! # Three different kinds of "cannot reproduce", named rather than blurred
 //!
 //! This file has all three shapes the project's method calls for, and they
 //! are not interchangeable:
 //!
-//! 1. **Faithful.** [`hrtval`], [`injacr`], [`byenow`] and [`locate`] have
+//! 1. **Faithful.** [`injacr`], [`byenow`] and [`locate`] have
 //!    real vendor bodies (`byenow`'s cited from `MAJORBBS.C`, the other
 //!    three either bodied there too or reproducible from state this host
 //!    already keeps) and are implemented against them, with the specific
@@ -75,69 +97,6 @@ use crate::gsbl::Gsbl;
 /// established idiom for "no `Abi::NULL` constant exists".
 fn null_ptr<A: Abi>() -> A::Ptr {
     A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])
-}
-
-/// PC BIOS timer rate: the 1.193182 MHz crystal divided by the 8253's
-/// 16-bit reload count, `1_193_182 / 65536` ≈ 18.2065 Hz -- the standard
-/// IBM PC/XT `INT 1A` tick rate `btuhrt` counts in.
-///
-/// Not directly stated by any recovered header or body -- neither survives
-/// with a numeric tick rate attached -- but corroborated by the one nearby
-/// constant that does survive: `MAJORBBS.C:232` (wg1), `#define LOGONPOL
-/// (65535L/10)` "max time in btuhrt ticks for a logon cycle", 6553.5 ticks.
-/// At this rate that is 6553.5 / 18.2065 ≈ 360.0 seconds, exactly six
-/// minutes -- not an approximate match, an exact one, which is why this is
-/// treated as measured-by-corroboration rather than invented.
-const PC_TIMER_HZ_NUM: u64 = 1_193_182;
-const PC_TIMER_HZ_DEN: u64 = 65_536;
-
-/// `unsigned long hrtval(void)` -- "get btuhrt in a safe manner (dsairp)".
-/// `MAJORBBS.H:728` (wg1); body `MAJORBBS.C:3784-3793` (wg1):
-///
-///
-/// # What is reproduced, and what is not
-///
-/// `dsairp()`/`enairp()` bracket the read against `btuhrt` being updated by
-/// the hardware-timer interrupt mid-read -- a genuine torn-read hazard on a
-/// 16-bit CPU incrementing a 32-bit counter from IRQ context. This host has
-/// no IRQ context and no concurrent writer of anything a shim reads: a
-/// shim runs to completion on the one thread that would ever touch this
-/// value (this crate is single-threaded by force). So the bracket has
-/// nothing to protect here and is correctly omitted rather than reproduced
-/// as a no-op.
-///
-/// `btuhrt` itself (`GALGSBL` ordinal 66) is not modelled as a host global
-/// anywhere in this crate -- nothing places it, so a module reading it
-/// directly (as opposed to through this routine) would find nothing. What
-/// this returns instead is derived from [`Host::clock`], the same "the
-/// clock" every other time-reading shim in `shims::system` already reads
-/// from, converted to ticks at the rate [`PC_TIMER_HZ_NUM`]/
-/// [`PC_TIMER_HZ_DEN`] -- see that constant's own doc comment for why this
-/// rate and not an invented one. [`crate::clock::Clock::epoch`] only
-/// answers in whole seconds, so this has one second's resolution where the
-/// real 18.2 Hz counter had roughly 55 ms -- coarser, but the same
-/// direction of error `shims::system::now`/`today` already accept from the
-/// same clock, not a new one this routine introduces.
-///
-/// Wrapping (`as u32`) is deliberate and matches the real counter: a real
-/// `unsigned long` `btuhrt` wraps every `2^32` ticks (about 7.6 years), and
-/// every real use of `hrtval` is a *difference* between two reads, which
-/// unsigned wraparound arithmetic answers correctly either side of a wrap.
-/// This is not read from an absolute "since boot" origin -- it is read from
-/// the Unix epoch -- but nothing about the two real call sites' arity (both
-/// `void`, per this file's own module doc) suggests either reads it as
-/// anything but such a difference.
-///
-/// # Errors
-///
-/// If the host's clock cannot say what time it is (`Clock::epoch`'s own
-/// contract -- a system clock before 1970).
-///
-/// Generic: reads no argument of its own, matching `shims::system::now`.
-pub fn hrtval<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let seconds = host.clock().epoch().map_err(ShimError::Failed)?;
-    let ticks = (u64::from(seconds) * PC_TIMER_HZ_NUM / PC_TIMER_HZ_DEN) as u32;
-    Ok(abi::Ret::Long(ticks))
 }
 
 /// `clrinp()`'s own body, `MAJORBBS.C:2569-2576` (wg1):
@@ -625,36 +584,6 @@ mod tests {
             .point_curusr(&mut f.machine, chan)
             .expect("channel 0 is current");
         chan
-    }
-
-    // ---- hrtval -------------------------------------------------------------
-
-    #[test]
-    fn hrtval_derives_ticks_from_the_pinned_clock_at_the_pc_timer_rate() {
-        let mut f = Fixture::new();
-        f.host.set_clock(crate::clock::Clock::pinned(3600));
-        current(&mut f);
-
-        let Ret::U32(ticks) = f.invoke(hrtval, &[]).expect("hrtval") else {
-            panic!("hrtval returns a long");
-        };
-        assert_eq!(ticks, (3600u64 * PC_TIMER_HZ_NUM / PC_TIMER_HZ_DEN) as u32);
-    }
-
-    /// Mutation check: replacing `PC_TIMER_HZ_NUM`/`_DEN` with `1`/`1`
-    /// (i.e. seconds instead of ticks) must change the answer for a
-    /// pinned clock far from zero -- confirms the test above is not
-    /// vacuously true for every rate.
-    #[test]
-    fn hrtval_ticks_are_not_the_same_as_bare_seconds() {
-        let mut f = Fixture::new();
-        f.host.set_clock(crate::clock::Clock::pinned(3600));
-        current(&mut f);
-
-        let Ret::U32(ticks) = f.invoke(hrtval, &[]).expect("hrtval") else {
-            panic!("hrtval returns a long");
-        };
-        assert_ne!(u64::from(ticks), 3600, "must scale by the tick rate, not pass seconds through");
     }
 
     // ---- injacr ---------------------------------------------------------------
