@@ -2132,13 +2132,31 @@ impl<A: Abi> Host<A> {
     /// (`shim(&mut call, self)`), which a borrow rooted in `self` cannot.
     /// This runs once per stop, never per dispatch, so the clone costs
     /// nothing worth avoiding.
-    fn import_owner(&self, entered: &A::Module, index: u16) -> Option<(A::Module, mbbs_machine::module::ImportSite)> {
+    /// `None` for the owner means *the module that was entered* -- the
+    /// caller already holds that one, so there is nothing to hand back.
+    ///
+    /// This is the whole reason the owner is optional rather than an
+    /// `A::Module`. Returning `entered.clone()` here reads harmlessly and is
+    /// not: `A::Module` owns its import table, so a clone deep-copies a
+    /// `HashMap<String, u16>` and a `Vec<ImportSite>` of owned strings --
+    /// 2,600-odd of them for `WCCMMUD.DLL` -- and this runs once per shim
+    /// dispatch, several hundred times per driver wake. Measured against a
+    /// live board it pegged a core at 100% with `Module::clone` and its
+    /// matching drop accounting for six of eight stack samples. The
+    /// cross-module arm below still clones, which is correct: it is reached
+    /// only when a far call has landed in a *different* module's code, and
+    /// then the caller genuinely does not have that module to hand.
+    fn import_owner(
+        &self,
+        entered: &A::Module,
+        index: u16,
+    ) -> Option<(Option<A::Module>, mbbs_machine::module::ImportSite)> {
         if let Some(site) = A::import(entered, index) {
-            return Some((entered.clone(), site.clone()));
+            return Some((None, site.clone()));
         }
         self.loaded_modules
             .values()
-            .find_map(|candidate| A::import(candidate, index).map(|site| (candidate.clone(), site.clone())))
+            .find_map(|candidate| A::import(candidate, index).map(|site| (Some(candidate.clone()), site.clone())))
     }
 
     /// Parse and map `file`, resolving every import against this host's own
@@ -2343,7 +2361,7 @@ impl<A: Abi> Host<A> {
                     },
                     owner,
                 ),
-                None => (String::new(), format!("thunk #{index}"), None, module.clone()),
+                None => (String::new(), format!("thunk #{index}"), None, None),
             };
 
             let (shim, cleans) = match shims::entry::<A>(&from, &symbol) {
@@ -2374,7 +2392,7 @@ impl<A: Abi> Host<A> {
                         Entry::Unimplemented => survey::Kind::Unimplemented,
                         Entry::Routine(..) => unreachable!("matched above"),
                     };
-                    let context = A::caller(machine, &owner);
+                    let context = A::caller(machine, owner.as_ref().unwrap_or(module));
 
                     if let Some(inventory) = &self.survey {
                         inventory.borrow_mut().record(
@@ -2426,7 +2444,7 @@ impl<A: Abi> Host<A> {
                     exit = A::resume(machine, ret, cleans)?;
                 }
                 Err(e) => {
-                    let symbol = match A::caller(machine, &owner) {
+                    let symbol = match A::caller(machine, owner.as_ref().unwrap_or(module)) {
                         Some(at) => format!("{symbol} ({e}), called from {at}"),
                         None => format!("{symbol} ({e})"),
                     };
