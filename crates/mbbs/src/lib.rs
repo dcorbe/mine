@@ -1858,6 +1858,30 @@ impl<A: Abi> Host<A> {
         std::mem::take(&mut self.notes)
     }
 
+    /// Everything the module has announced through `shocst` since the last
+    /// call, and clear it.
+    ///
+    /// **`shocst` is the module's console, not a log this host keeps for
+    /// itself.** `SHOCST.C`'s whole job is putting a line in front of the
+    /// operator; a host that collects them and never prints them has taken
+    /// the module's one channel for talking to a human and pointed it at a
+    /// wall. [`Host::audit`] existed, with no caller anywhere in the
+    /// workspace, for exactly as long as that was true.
+    ///
+    /// What it cost: MajorMUD announces "Recovery mode has now completed."
+    /// this way, and the board it was running on could not have said whether
+    /// recovery ever finished. The one recovery message anyone did see
+    /// ("Some monsters may not regenerate") was visible only because
+    /// `_DISPLAY_RECOVERY_MODE_STATUS` also prints it to a player entering
+    /// the Realm.
+    ///
+    /// Drained rather than read, matching [`Host::drain_notes`]: a driver
+    /// that prints on a schedule wants what is new, and anything else grows
+    /// without bound for the life of the process.
+    pub fn drain_audit(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.audit)
+    }
+
     /// Record something the module cannot be told. See [`Host::notes`].
     pub(crate) fn note(&mut self, what: String) {
         self.notes.push(what);

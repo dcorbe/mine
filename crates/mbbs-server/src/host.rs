@@ -621,6 +621,14 @@ fn collapse(notes: &[String]) -> Vec<String> {
 /// turn of the driver loop, and is also what stops the list growing without
 /// bound -- see `Host::drain_notes`.
 fn report_notes<A: Abi>(host: &mut Host<A>) {
+    // The module's own console first: `shocst` is how a module addresses the
+    // operator directly (MajorMUD announces "Recovery mode has now
+    // completed." this way), so it outranks this host's observations about
+    // it. Collapsed the same way for the same reason -- a module that
+    // announces from inside a loop announces thousands of times.
+    for line in collapse(&host.drain_audit()) {
+        eprintln!("mbbs-server: console: {line}");
+    }
     for line in collapse(&host.drain_notes()) {
         eprintln!("mbbs-server: note: {line}");
     }
