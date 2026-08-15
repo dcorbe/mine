@@ -125,8 +125,27 @@ pub fn alczer<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// Generic (Task 5): [`Heap::free`](crate::heap::Heap::free) never touched a
 /// `Machine`, so this was already `impl<A: Abi> Heap<A>` before this task.
+///
+/// # A null block is a no-op, not a refusal
+///
+/// `GALMEMDB.C:183` does carry `ASSERTM(block != NULL,"Can't free() a NULL
+/// pointer!")` -- but it sits inside `#ifdef DEBUG`, and the 16-bit branch a
+/// shipped host compiles is `free(block); nmfree++;` with nothing in front of
+/// it. ANSI C defines `free(NULL)` as doing nothing, so the real host
+/// swallowed a null free silently and carried on.
+///
+/// Refusing it made this host stricter than the one it reproduces, and the
+/// cost was not theoretical: on a live board a background `rtkick` freed a
+/// null, `galfree` refused, and the refusal stopped the whole module --
+/// which from a player's seat is an unexplained disconnect. Everything
+/// *else* still refuses, including a stray pointer into the middle of a live
+/// block and a double free; only the vendor's own documented no-op is
+/// allowed through.
 pub fn galfree<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let at = call.ptr();
+    if at == A::null_ptr() {
+        return Ok(abi::Ret::Void);
+    }
     host.heap
         .free(at)
         .map_err(|e| ShimError::Failed(format!("galfree: {e}")))?;
@@ -457,6 +476,25 @@ mod tests {
             f.machine.resolve(b, 64).expect("readable"),
             &[0u8; 64],
             "alczer left what the last owner wrote"
+        );
+    }
+
+    /// `GALMEMDB.C:183` asserts a non-NULL block, but that `ASSERTM` sits
+    /// inside `#ifdef DEBUG`; what a shipped host compiles is `free(block);`
+    /// on its own, and ANSI C defines `free(NULL)` as doing nothing. So the
+    /// real host swallowed this silently, and a refusal here is this host
+    /// being stricter than the thing it reproduces.
+    ///
+    /// Found on a live board: a background `rtkick` freed a null and the
+    /// module stopped, which from a player's seat is being disconnected for
+    /// no visible reason.
+    #[test]
+    fn galfree_of_a_null_pointer_does_nothing_the_way_free_null_does() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.invoke(galfree, &far(FarPtr { offset: 0, selector: 0 }))
+                .expect("free(NULL) is a no-op, not an error"),
+            Ret::Void
         );
     }
 
