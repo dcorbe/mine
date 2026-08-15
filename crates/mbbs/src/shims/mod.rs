@@ -275,6 +275,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "_localeconvention", crt::localeconvention, Cleans::Caller),
         (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller),
         (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller),
+        // Both MajorMUD NT builds and Rose 3.0NT import hrtval from GALGSBL,
+        // not MAJORBBS -- see `hrtval_resolves_from_galgsbl_as_well_as_majorbbs`.
+        // Same body, genuinely two libraries' export tables, not a
+        // `canonical_dll` alias: only this one symbol is exported from both.
+        (GALGSBL, "hrtval", misc::hrtval, Cleans::Caller),
         (MAJORBBS, "msgscan", misc::msgscan, Cleans::Caller),
         (MAJORBBS, "byenow", misc::byenow, Cleans::Caller),
         // GALME ordinal 30, not a MAJORBBS symbol -- see `exports.rs`'s own
@@ -1040,6 +1045,21 @@ mod tests {
         // other's memory.
         assert!(matches!(entry::<Wg16>(MAJORBBS, "bturno"), Entry::Unimplemented));
         assert!(matches!(entry::<Wg16>(GALGSBL, "usrnum"), Entry::Unimplemented));
+    }
+
+    #[test]
+    fn hrtval_resolves_from_galgsbl_as_well_as_majorbbs() {
+        // Both MajorMUD NT builds and Rose 3.0NT import hrtval from GALGSBL,
+        // not MAJORBBS. canonical_dll folds "GALGSBL.dll" to GALGSBL, so a
+        // MAJORBBS-only registration is unreachable for them.
+        assert!(
+            matches!(entry::<Wg16>(GALGSBL, "hrtval"), Entry::Routine(..)),
+            "hrtval must resolve under GALGSBL"
+        );
+        assert!(
+            matches!(entry::<Wg16>(MAJORBBS, "hrtval"), Entry::Routine(..)),
+            "and must still resolve under MAJORBBS"
+        );
     }
 
     /// Task 15's unstated dependency, settled: the real PE spells the
