@@ -1106,6 +1106,28 @@ pub enum Registration<A: Abi> {
     /// `inifsd()` registering FSDBBS as an ordinary module is the reason
     /// this variant exists; see [`Native`].
     Native(Native),
+
+    /// Slot zero: the BBS's own menuing system, which this host does not
+    /// have.
+    ///
+    /// `MAJORBBS.C:3097-3106`'s `inimod()` calls
+    /// `register_module(&module00)` *before* `callinits()` lets any DLL
+    /// register itself, so on a real host `module[0]` is the BBS and real
+    /// modules start at one. A channel's `state` is an index into that same
+    /// table, so `state == 0` means "this user is at the BBS menu", and a
+    /// module hands a user back by writing it.
+    ///
+    /// This host is headless -- there is no menuing system, no `module00`,
+    /// and nothing above a module to return to. Reserving the slot anyway is
+    /// what keeps every other index matching the real host's, and it turns
+    /// the handback into something nameable: `state == 0` here means the
+    /// session is over, because the thing it names does not exist.
+    ///
+    /// Without this the first real module registered at zero and caught its
+    /// own goodbye: MajorMUD's "Exit Game" set `state = 0`, this host read
+    /// that as "dispatch to MajorMUD", and the module redrew the menu it had
+    /// just been asked to leave.
+    AbsentBbs,
 }
 
 impl<A: Abi> std::fmt::Debug for Registration<A>
@@ -1120,6 +1142,7 @@ where
                 .field("block", block)
                 .finish(),
             Self::Native(native) => f.debug_tuple("Native").field(native).finish(),
+            Self::AbsentBbs => f.write_str("AbsentBbs"),
         }
     }
 }
@@ -1132,6 +1155,7 @@ impl<A: Abi> Clone for Registration<A> {
                 block: *block,
             },
             Self::Native(native) => Self::Native(*native),
+            Self::AbsentBbs => Self::AbsentBbs,
         }
     }
 }
@@ -1251,6 +1275,10 @@ pub enum Dispatch<A: Abi> {
     Module(Option<A::Ptr>),
     /// A host-native handler, run directly rather than through a far call.
     Native(Native),
+
+    /// The channel's `state` names [`Registration::AbsentBbs`]: it has been
+    /// handed back to a BBS this host does not have, so the session is over.
+    SessionOver,
 }
 
 impl<A: Abi> std::fmt::Debug for Dispatch<A>
@@ -1261,6 +1289,7 @@ where
         match self {
             Self::Module(ptr) => f.debug_tuple("Module").field(ptr).finish(),
             Self::Native(native) => f.debug_tuple("Native").field(native).finish(),
+            Self::SessionOver => f.write_str("SessionOver"),
         }
     }
 }
@@ -1374,6 +1403,7 @@ impl<A: Abi> Registration<A> {
                 Ok(Dispatch::Module((!is_null).then_some(ptr)))
             }
             Self::Native(native) => Ok(Dispatch::Native(*native)),
+            Self::AbsentBbs => Ok(Dispatch::SessionOver),
         }
     }
 }

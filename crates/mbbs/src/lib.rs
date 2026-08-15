@@ -811,6 +811,12 @@ pub struct Host<A: Abi> {
     /// what the module passes back.
     modules: Vec<Registration<A>>,
 
+    /// Channels whose module handed them back to the absent BBS, waiting for
+    /// the driver to close them. Drained by [`Host::drain_ended`], the same
+    /// shape [`Host::drain_notes`] already uses to get information out to
+    /// whatever is running this host.
+    ended: Vec<Chan>,
+
     /// Every module [`Host::load`] has loaded so far in this life, keyed by
     /// its own declared name ([`Abi::module_name`]) -- **not** the same
     /// bookkeeping as [`Host::modules`] above, which is about a module
@@ -1365,7 +1371,12 @@ impl<A: Abi> Host<A> {
             finds: std::collections::HashMap::new(),
             clock: Clock::system()?,
             audit: Vec::new(),
-            modules: Vec::new(),
+            // Slot zero is the BBS's own menuing system, which this host does
+            // not have -- see `Registration::AbsentBbs`. Reserving it is what
+            // makes every other index match a real host's, where
+            // `inimod()` registers `module00` before any DLL registers itself.
+            modules: vec![Registration::AbsentBbs],
+            ended: Vec::new(),
             loaded_modules: HashMap::new(),
             agents: Vec::new(),
             textvars: TextVars::default(),
@@ -1556,6 +1567,16 @@ impl<A: Abi> Host<A> {
     /// ahead of it in the table -- [`Host::connect`]'s `lonrou` lookup and
     /// [`Host::disconnect`]'s `huprou` lookup both want "the one real module"
     /// and neither wants to mistake the FSD's native slot for it.
+    /// The index of the first real module -- what a freshly connected
+    /// channel's `state` is set to, since this host has no menuing system to
+    /// arrive at first. See [`Host::connect_state`].
+    fn first_module_index(&self) -> Option<u16> {
+        self.modules
+            .iter()
+            .position(|r| matches!(r, Registration::Module { .. }))
+            .map(|i| i as u16)
+    }
+
     fn first_module(&self) -> Option<&Registration<A>> {
         self.modules
             .iter()
@@ -1704,6 +1725,44 @@ impl<A: Abi> Host<A> {
     /// Its promise is "once per host", not "once per drain" -- resetting it
     /// would turn every drain into a fresh licence to repeat, which is the
     /// flood it exists to prevent.
+    /// Note every connected channel whose `state` now names the absent BBS.
+    ///
+    /// The dispatch path cannot see this on its own. A module that hands a
+    /// user back stops raising statuses for that channel in the same breath,
+    /// so `poll_with_chan` never looks at it again and `state_entry` is never
+    /// reached -- the channel simply goes quiet forever. Reading `state`
+    /// directly is what notices.
+    ///
+    /// A channel that has never connected also reads zero, because its slot
+    /// is zeroed memory. That is why this only records, and why the driver
+    /// closes only channels it actually holds a connection for: a never-used
+    /// channel has nothing to close and is skipped there. A channel that
+    /// *has* connected was put into the first real module by
+    /// [`Host::connect_state`], so zero on one of those means the module put
+    /// it back.
+    pub fn sweep_ended(&mut self, machine: &mut A::Cpu) {
+        let chans: Vec<Chan> = self.users().terms().all().collect();
+        for chan in chans {
+            if matches!(self.users().state_mem(A::mem(machine), chan), Ok(0))
+                && !self.ended.contains(&chan)
+            {
+                self.ended.push(chan);
+            }
+        }
+    }
+
+    /// Channels whose module handed them back to the absent BBS since the
+    /// last call, and which the driver should now close.
+    ///
+    /// The same shape [`Host::drain_notes`] uses, and for the same reason:
+    /// this host does not own the sockets. It can observe that a session is
+    /// over -- a module wrote `state = 0`, naming the menuing system that
+    /// `Registration::AbsentBbs` stands in for -- but only whatever is
+    /// driving it can hang the connection up.
+    pub fn drain_ended(&mut self) -> Vec<Chan> {
+        std::mem::take(&mut self.ended)
+    }
+
     pub fn drain_notes(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notes)
     }
@@ -2917,6 +2976,17 @@ impl<A: Abi> Host<A> {
                 Ok(Dispatch::Native(_native)) => {
                     self.fsd_dispatch(machine, module, chan, entry_index)
                 }
+                // The module handed this channel back to a BBS this host does
+                // not have -- see `Registration::AbsentBbs`. There is nothing
+                // above a module here to take the user, so the session is
+                // over: record it for the driver to close, and service the
+                // status without a module call.
+                Ok(Dispatch::SessionOver) => {
+                    if !self.ended.contains(&chan) {
+                        self.ended.push(chan);
+                    }
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             };
             let entry = match entry {
@@ -3395,6 +3465,23 @@ impl<A: Abi> Host<A> {
                 .map_err(|e| ShimError::Failed(format!("{name}: {e}")))?;
         }
 
+        // Zero is right for a real board and wrong here. `state` indexes the
+        // module table, and on a real MajorBBS slot zero is `module00`: a
+        // user arrives at the BBS's own menu and picks a module from it.
+        // This host has no menu -- slot zero is `Registration::AbsentBbs` --
+        // so a channel left at zero would arrive already handed back, and
+        // the driver would close it on the first pass.
+        //
+        // A headless host puts the user straight into the module instead.
+        // This used to happen by accident, because the first module
+        // registered *at* zero and a zeroed `state` named it; reserving slot
+        // zero is what made the difference visible.
+        if let Some(index) = self.first_module_index() {
+            self.users
+                .set_state_mem(A::mem(machine), chan, index)
+                .map_err(|e| ShimError::Failed(format!("state: {e}")))?;
+        }
+
         // `loadkeys()`, `LOCKNKEY.C:88`. On a real board this read `bbsk.dat`
         // and a `&CLASS` keyring record; here the keys arrived with the
         // connection, because whatever authenticated the user is what knows
@@ -3554,9 +3641,10 @@ impl<A: Abi> Host<A> {
             })?;
             match registered.dispatch(A::mem(machine), 0) {
                 Ok(Dispatch::Module(rou)) => Ok(rou),
-                // `first_module` never answers `Native`, but the match stays
-                // exhaustive and the fallback stays correct if that changes.
-                Ok(Dispatch::Native(_)) => Ok(None),
+                // `first_module` never answers `Native` or `AbsentBbs`, but
+                // the match stays exhaustive and the fallback stays correct
+                // if that changes.
+                Ok(Dispatch::Native(_)) | Ok(Dispatch::SessionOver) => Ok(None),
                 Err(e) => Err(e),
             }
         };
@@ -3734,7 +3822,7 @@ impl<A: Abi> Host<A> {
         let rou = match vector {
             Vector::Logoff => match self.state_entry(machine, chan, vector.entry())? {
                 Ok(Dispatch::Module(rou)) => Ok(rou),
-                Ok(Dispatch::Native(_)) => Ok(None),
+                Ok(Dispatch::Native(_)) | Ok(Dispatch::SessionOver) => Ok(None),
                 Err(e) => Err(e),
             },
             Vector::Hangup => {
@@ -3745,7 +3833,7 @@ impl<A: Abi> Host<A> {
                 })?;
                 match registered.dispatch(A::mem(machine), vector.entry()) {
                     Ok(Dispatch::Module(rou)) => Ok(rou),
-                    Ok(Dispatch::Native(_)) => Ok(None),
+                    Ok(Dispatch::Native(_)) | Ok(Dispatch::SessionOver) => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -4763,7 +4851,7 @@ mod tests {
         // state 3 with one module registered are now different sentences,
         // and conflating them is what this assertion exists to stop.
         assert!(
-            err.to_string().contains("state 99") && err.to_string().contains("1 module(s)"),
+            err.to_string().contains("state 99") && err.to_string().contains("2 module(s)"),
             "expected the missing-registration message, got: {err}"
         );
     }
@@ -5248,6 +5336,45 @@ mod tests {
     /// Falling back to module 0 would deliver another module's keystrokes to
     /// MajorMUD, which from outside looks like a module that ignored its input
     /// -- the least diagnosable failure this host could choose.
+    /// Slot zero is the BBS this host does not have, so a channel whose
+    /// `state` names it has been handed back to nothing, and the driver
+    /// should close it.
+    ///
+    /// `MENUING.C:390` is where zero is the vendor's own test:
+    /// `for (i=0 ; i < XTRIES && usrptr->state != 0 ; i++)`, with `:397`
+    /// returning `usrptr->state == 0` -- "did the module let go?". So this
+    /// is the documented handback, not an invention here.
+    ///
+    /// MajorMUD's own "[X] Exit Game" does *not* use it. Measured on a live
+    /// board, a channel's `state` goes to one at connect and never returns
+    /// to zero, which is why pressing X leaves you sitting at the menu
+    /// instead of disconnected. That is a gap in what this host can detect,
+    /// not a reason for the mechanism to be wrong.
+    #[test]
+    fn a_channel_handed_back_to_the_absent_bbs_is_reported_as_ended() {
+        let mut f = Fixture::new();
+        let console = f.host.gsbl().terms().chan(0).expect("channel 0");
+
+        set_state(&mut f, console, 1);
+        f.host.sweep_ended(&mut f.machine);
+        assert!(
+            f.host.drain_ended().is_empty(),
+            "a channel inside a module has not been handed back"
+        );
+
+        set_state(&mut f, console, 0);
+        f.host.sweep_ended(&mut f.machine);
+        assert_eq!(
+            f.host.drain_ended(),
+            vec![console],
+            "state 0 names the absent BBS, so the session is over"
+        );
+        assert!(
+            f.host.drain_ended().is_empty(),
+            "draining twice must not report the same channel again"
+        );
+    }
+
     #[test]
     fn poll_refuses_a_state_that_names_no_registered_module() {
         let mut f = Fixture::new();
@@ -5259,9 +5386,10 @@ mod tests {
         register_named(&mut f, "only", &[(1, sttrou)]);
         f.machine.load_code(&stub).expect("the stub fits");
 
-        // `Fixture::new` -> `finish_init` has already taken slot 0 for the
-        // FSD, so two slots are occupied (the FSD, then "only") and the
-        // count the error names has grown to match.
+        // Slot 0 is `Registration::AbsentBbs`, the menuing system this host
+        // does not have, and `Fixture::new` -> `finish_init` has taken slot 1
+        // for the FSD -- so three slots are occupied (the absent BBS, the
+        // FSD, then "only") and the count the error names has grown to match.
         set_state(&mut f, console, 3);
         f.host.gsbl_mut().push_input(console, b"look\r");
         let err = f
@@ -5270,7 +5398,7 @@ mod tests {
             .expect_err("state 3 names nothing");
         let text = err.to_string();
         assert!(
-            text.contains("state 3") && text.contains("2 module(s)"),
+            text.contains("state 3") && text.contains("3 module(s)"),
             "the error names the state and the count, got: {text}"
         );
     }

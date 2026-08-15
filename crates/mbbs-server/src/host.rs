@@ -705,6 +705,23 @@ fn life<A: Abi>(
         //    that `return` would never run on the turn that mattered.
         report_notes(&mut host);
 
+        // 6b. Close any channel whose module handed it back to the BBS.
+        //
+        //     `Registration::AbsentBbs` is what a module reaches when it
+        //     writes `state = 0` -- "return this user to the menuing
+        //     system". A real MajorBBS has one; this host is headless and
+        //     the only thing above a module here is this driver, so the
+        //     honest answer to a handback is to hang the connection up
+        //     rather than leave the player at a prompt nothing will ever
+        //     answer again. See `Host::drain_ended`.
+        host.sweep_ended(&mut machine);
+        for chan in host.drain_ended() {
+            if let Some(conn) = conns.get(chan.index()).and_then(Option::as_ref) {
+                eprintln!("mbbs-server: channel {chan} left the module; closing");
+                let _ = conn.try_send(Out::Close);
+            }
+        }
+
         match cycles.ended {
             Ended::Stopped(poison, chan) => {
                 for conn in conns.iter().flatten() {
