@@ -75,19 +75,38 @@ const DEFAULT_POLLS_PER_WAKE: usize = 512;
 
 /// Passes made per `Host::cycle` call -- `--passes`'s default.
 ///
-/// `Host::cycle`'s `max` bounds dispatch *attempts*, not dispatches
-/// themselves: the call returns the instant its queue is empty, so `passes`
-/// only matters as a ceiling against a queue that keeps refilling. That
-/// queue is bounded per wake by `--polls-per-wake` re-arms of the polling
-/// status, plus up to one already-queued-but-not-rearmed `POLSTS` per
-/// channel once the budget runs out (`Host::dopoll`'s budget comment), plus
-/// whatever `In` messages this wake drained (one status each). With the
-/// defaults above, `DEFAULT_POLLS_PER_WAKE` plus `DEFAULT_TERMS` must stay
-/// under it, so this is the poll budget plus room for a burst of
-/// connects and input rather than a number chosen on its own for a burst of connects or input
-/// on top of a full poll budget without ever being the thing that cuts a
-/// wake short.
-const DEFAULT_PASSES: usize = 1024;
+/// **This is the input-latency knob, and it must sit well below
+/// `DEFAULT_POLLS_PER_WAKE`.** `crates/mbbs-server/src/host.rs`'s `life` reads
+/// the socket in exactly one place, at the top of its loop, so a keystroke
+/// arriving one instruction after `cycle` was entered waits for that whole
+/// call to finish. `passes` is the only bound on how long that is.
+///
+/// It used to be 1024, chosen to sit *above* the poll budget so that a wake
+/// was never cut short. That reasoning had the trade backwards. At 1024 the
+/// budget (512) always ran out first, `Ended::Bound` became unreachable, and
+/// with it `Wait::Now` -- the mechanism by which a burst is interrupted at all
+/// -- so one `cycle` call ran the entire budget without ever returning to look
+/// at the socket.
+///
+/// Measured on the live board, same module, same budget, nobody else
+/// connected:
+///
+/// ```text
+/// --passes 1024   worst cycle 279ms, 2s, 4s, 4s      3-5 driver turns / 10s
+/// --passes 32     worst cycle 104ms, 131ms, 243ms, 352ms   55-210 turns / 10s
+/// ```
+///
+/// Eleven times better, at the same poll throughput: nothing is taken from the
+/// module, the same 512 dispatches are simply spread over about sixteen calls
+/// instead of one. The cost is the per-call overhead paid sixteen times --
+/// one `syscyc` test and one kick sweep each -- which is noise next to a
+/// dispatch.
+///
+/// Lower would be lower still; 32 is where the measurement was taken rather
+/// than a floor anyone has found. The flag stays because it is the seam that
+/// found this: sweeping it against `worst cycle` is what turned "the board
+/// feels laggy" into a number.
+const DEFAULT_PASSES: usize = 32;
 
 // Every rejection (an unknown flag, a missing required one, a number that
 // does not parse) is a clear message to stderr and a non-zero exit, never a
@@ -602,6 +621,31 @@ mod tests {
         assert_eq!(cli.polls_per_wake, DEFAULT_POLLS_PER_WAKE);
         assert_eq!(cli.passes, DEFAULT_PASSES);
         assert!(cli.keys.is_empty(), "no --keys given, so main falls back to default_keys()");
+    }
+
+    /// The pass bound has to sit below the poll budget, or bursts stop being
+    /// interruptible at all.
+    ///
+    /// `Ended::Bound` -- and so `Wait::Now`, and so the driver getting back to
+    /// its one `rx` read -- is reachable only when `passes` runs out *before*
+    /// `polls_per_wake` does. Above it, the budget always wins the race,
+    /// `cycle` exits through `!pending()` every time, and one call spends the
+    /// entire budget without looking at the socket once. That was the shipped
+    /// configuration (1024 against 512) and it measured as four-second input
+    /// latency on a live board.
+    ///
+    /// Pinned as a relationship rather than as two numbers, because either
+    /// one may be retuned and the ordering is what must survive it. The
+    /// assertion the other tests make (`cli.passes == DEFAULT_PASSES`) cannot
+    /// catch this: it compares the constant against itself.
+    #[test]
+    fn the_pass_bound_sits_below_the_poll_budget_so_a_burst_stays_interruptible() {
+        assert!(
+            DEFAULT_PASSES < DEFAULT_POLLS_PER_WAKE,
+            "passes ({DEFAULT_PASSES}) must run out before the poll budget \
+             ({DEFAULT_POLLS_PER_WAKE}), or `Ended::Bound` is unreachable and a \
+             cycle call never returns to read the socket mid-burst"
+        );
     }
 
     /// `--listen` repeated binds more than one modern-stack address, in the
