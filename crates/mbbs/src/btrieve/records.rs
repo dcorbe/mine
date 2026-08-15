@@ -195,13 +195,186 @@ impl Records {
         self.key_shift
     }
 
+    /// Where `a` sits relative to `b` under `key`, as the sort orders them.
+    ///
+    /// The tie-break on `position` is what makes the order *total*, and it has
+    /// to match [`Self::reindex`]'s comparator exactly -- the incremental
+    /// paths below binary-search with this against an order that was built
+    /// with that, and two comparators that disagree anywhere put a record in a
+    /// place a later search will not find it.
+    fn cmp_under(&self, key: &Key, a: usize, b: usize) -> Ordering {
+        match key.compare(
+            &self.keyed(&self.records[a].bytes),
+            &self.keyed(&self.records[b].bytes),
+        ) {
+            Ordering::Equal => self.records[a].position.cmp(&self.records[b].position),
+            other => other,
+        }
+    }
+
+    /// Whether `a` and `b` hold the same value under `key`, ignoring the
+    /// position tie-break -- which is what [`Self::ties`] counts.
+    fn same_value(&self, key: &Key, a: usize, b: usize) -> bool {
+        key.compare(
+            &self.keyed(&self.records[a].bytes),
+            &self.keyed(&self.records[b].bytes),
+        ) == Ordering::Equal
+    }
+
+    /// Put `index` into every key's order, and fix `rank` and `ties`.
+    ///
+    /// `records` must already hold the record at `index`, and every order must
+    /// already be numbered for it -- see [`Self::renumber`]. This only finds
+    /// the place and links it in.
+    ///
+    /// **This is the whole point of the incremental paths.** Re-sorting cost
+    /// `n log n` *comparisons* per key per write, and a comparison is a key
+    /// extraction plus a `memcmp`; a binary search costs `log n` of them. On
+    /// `WCCUPDAT.DAT`'s 38,754 records that is about 590,000 comparisons
+    /// against about 16. The `O(n)` renumber and `rank` rebuild stay, but they
+    /// are `memmove` and integer stores -- no key bytes are read at all --
+    /// which is the difference between the two costs.
+    ///
+    /// Worth doing because the sort was measured rather than guessed at: a
+    /// profile of the live board put `keys::Segment::order` at 18.5% of all
+    /// CPU and the `memcmp` it calls at roughly 23% more. See `BUGS.md`.
+    fn link(&mut self, keys: &[Key], index: usize) {
+        for k in 0..keys.len() {
+            let key = &keys[k];
+            let mut ord = std::mem::take(&mut self.order[k]);
+
+            let place = ord.partition_point(|&e| self.cmp_under(key, e, index) == Ordering::Less);
+
+            // `ties` changes only at the seam: the pair that used to straddle
+            // `place` is replaced by the two the new record makes.
+            let before = place.checked_sub(1).map(|p| ord[p]);
+            let after = ord.get(place).copied();
+            if let (Some(b), Some(a)) = (before, after)
+                && self.same_value(key, b, a)
+            {
+                self.ties[k] -= 1;
+            }
+            if let Some(b) = before
+                && self.same_value(key, b, index)
+            {
+                self.ties[k] += 1;
+            }
+            if let Some(a) = after
+                && self.same_value(key, index, a)
+            {
+                self.ties[k] += 1;
+            }
+
+            ord.insert(place, index);
+            self.rerank(k, &ord);
+            self.order[k] = ord;
+        }
+    }
+
+    /// Take `index` out of every key's order, and fix `rank` and `ties`.
+    ///
+    /// The record must still be in `records` with the bytes it was linked
+    /// under: the seam is repaired by comparing against it, and `rank` is what
+    /// says where it sits without searching for it.
+    ///
+    /// Renumbering is deliberately **not** done here. A delete needs it and an
+    /// update must not have it -- an updated record keeps its place in
+    /// `records` and only moves within the key orders -- and folding the two
+    /// together is how the update path silently corrupts every index above
+    /// the one it touched. See [`Self::renumber`].
+    fn unlink(&mut self, keys: &[Key], index: usize) {
+        for k in 0..keys.len() {
+            let key = &keys[k];
+            let mut ord = std::mem::take(&mut self.order[k]);
+            let place = self.rank[k][index];
+
+            let before = place.checked_sub(1).map(|p| ord[p]);
+            let after = ord.get(place + 1).copied();
+            if let Some(b) = before
+                && self.same_value(key, b, index)
+            {
+                self.ties[k] -= 1;
+            }
+            if let Some(a) = after
+                && self.same_value(key, index, a)
+            {
+                self.ties[k] -= 1;
+            }
+            if let (Some(b), Some(a)) = (before, after)
+                && self.same_value(key, b, a)
+            {
+                self.ties[k] += 1;
+            }
+
+            ord.remove(place);
+            self.rerank(k, &ord);
+            self.order[k] = ord;
+        }
+    }
+
+    /// Renumber every order after `records` grew or shrank at `at`.
+    ///
+    /// `order` names records by their index in `records`, so a `Vec::insert`
+    /// or `Vec::remove` moves every record above `at` and every entry naming
+    /// one has to follow. Integer compares and stores; no key bytes are read.
+    ///
+    /// `grew` is which way: `true` after an insert, `false` after a remove.
+    fn renumber(&mut self, at: usize, grew: bool) {
+        let total = self.records.len();
+        for (k, ord) in self.order.iter_mut().enumerate() {
+            for entry in ord.iter_mut() {
+                if grew {
+                    if *entry >= at {
+                        *entry += 1;
+                    }
+                } else if *entry > at {
+                    *entry -= 1;
+                }
+            }
+            let places = &mut self.rank[k];
+            places.clear();
+            places.resize(total, 0);
+            for (place, &record) in ord.iter().enumerate() {
+                places[record] = place;
+            }
+        }
+    }
+
+    /// Rebuild `rank[k]` from `ord`.
+    ///
+    /// `rank` is indexed by record, `order` by place; one is the other
+    /// inverted, and there is no way to update a prefix of it when a splice
+    /// moves everything after the seam. `O(n)` integer stores, no comparisons.
+    fn rerank(&mut self, k: usize, ord: &[usize]) {
+        // Sized by `records`, not by `ord`: `rank` is indexed by record and
+        // `order` by place, and the two lengths differ for exactly as long as
+        // a record is unlinked but not yet removed -- which is the window
+        // `unlink` hands back to its caller.
+        let total = self.records.len();
+        let places = &mut self.rank[k];
+        places.clear();
+        places.resize(total, 0);
+        for (place, &record) in ord.iter().enumerate() {
+            places[record] = place;
+        }
+    }
+
     /// Re-derive `order`, `rank` and `ties` from `records`, for the given keys.
     ///
-    /// Re-sorted rather than spliced: at these record counts a sort is cheap,
-    /// and a splice is the kind of thing that is right for a year and then is
-    /// not. `read` calls this once after walking the pages, and `insert`,
-    /// `update` and `delete` each call it again after touching `records` --
-    /// one derivation, so the two cannot drift.
+    /// **Once, when the file is read.** It used to run again after every
+    /// `insert`, `update` and `delete` -- the comment here said "at these
+    /// record counts a sort is cheap, and a splice is the kind of thing that
+    /// is right for a year and then is not", and that year is up: on
+    /// `WCCUPDAT.DAT`'s 38,754 records it is a full `n log n` sort per key per
+    /// write, and a live profile put the comparator and its `memcmp` at over
+    /// 40% of the board's CPU. [`Self::splice_in`] and [`Self::splice_out`]
+    /// maintain the same three tables incrementally now.
+    ///
+    /// It stays because it is the definition of what those tables mean, and
+    /// the incremental paths are checked against it rather than against a
+    /// restatement of themselves --
+    /// `splicing_matches_a_full_reindex_over_a_long_run_of_writes` runs both
+    /// and compares.
     fn reindex(&mut self, keys: &[Key]) {
         let mut order = Vec::with_capacity(keys.len());
         let mut rank = Vec::with_capacity(keys.len());
@@ -370,7 +543,13 @@ impl Records {
         }
         let at = self.records.partition_point(|r| r.position < position);
         self.records.insert(at, Record { position, bytes });
-        self.reindex(keys);
+        // Renumber first, so every existing entry names the record it did
+        // before the shift, then link the new one into the gap that leaves.
+        self.renumber(at, true);
+        for places in &mut self.rank {
+            places.resize(self.records.len(), 0);
+        }
+        self.link(keys, at);
         Ok(())
     }
 
@@ -384,13 +563,18 @@ impl Records {
     ///
     /// If `position` holds no record.
     pub fn update(&mut self, keys: &[Key], position: u32, bytes: Vec<u8>) -> Result<(), String> {
-        let record = self
+        let index = self
             .records
-            .iter_mut()
-            .find(|r| r.position == position)
+            .iter()
+            .position(|r| r.position == position)
             .ok_or_else(|| format!("position {position} holds no record"))?;
-        record.bytes = bytes;
-        self.reindex(keys);
+        // The record stays where it is in `records` -- an update is in place,
+        // so nothing is renumbered -- but its key value may have changed, so
+        // it leaves and re-enters every order. `unlink` runs first, while the
+        // old bytes are still there for it to repair the seam against.
+        self.unlink(keys, index);
+        self.records[index].bytes = bytes;
+        self.link(keys, index);
         Ok(())
     }
 
@@ -418,8 +602,11 @@ impl Records {
             .iter()
             .position(|r| r.position == position)
             .ok_or_else(|| format!("position {position} holds no record"))?;
+        // Before the removal: the key bytes have to still be there to
+        // compare the seam against.
+        self.unlink(keys, index);
         self.records.remove(index);
-        self.reindex(keys);
+        self.renumber(index, false);
         Ok(())
     }
 
@@ -1102,6 +1289,73 @@ mod tests {
     }
 
     #[test]
+    /// Splicing has to agree with a full re-derivation, for every table, after
+    /// every write -- not just on the first one.
+    ///
+    /// This is the guard that makes the incremental paths safe to have at all.
+    /// `reindex` is the definition of what `order`, `rank` and `ties` mean;
+    /// `link`/`unlink`/`renumber` are an optimisation of it, and an
+    /// optimisation is only correct if it is indistinguishable. So this runs a
+    /// long mixed sequence of inserts, updates and deletes and compares all
+    /// three tables against a freshly sorted copy after *each* one -- a
+    /// divergence that only appears on the ninth write is exactly the kind
+    /// this replaces a sort with.
+    ///
+    /// The values are chosen to collide: duplicate keys are what make `ties`
+    /// non-zero and what put the position tie-break to work, and a comparator
+    /// that is subtly wrong about equal values is invisible against distinct
+    /// ones. `9` recurs for that reason.
+    ///
+    /// Deterministic rather than random: a property test that fails once in a
+    /// hundred runs on someone else's machine is worse than one that either
+    /// always fails or always passes.
+    #[test]
+    fn splicing_matches_a_full_reindex_over_a_long_run_of_writes() {
+        let bytes = of(&[5, 9, 1, 9]);
+        let parsed = keys::parse("SPLICE.DAT", &bytes, 1).expect("keys");
+        let mut records = read("SPLICE.DAT", &bytes).expect("reads");
+
+        // (what to do, which slot, which key value)
+        let script: &[(&str, u32, u16)] = &[
+            ("insert", 4, 7),
+            ("insert", 5, 9),   // ties with two existing records
+            ("update", 0, 9),   // a distinct value becomes a duplicate
+            ("delete", 2, 0),   // remove from the middle, renumbering the rest
+            ("insert", 2, 0),   // reuse a freed slot: a low position, inserted late
+            ("update", 5, 1),   // a duplicate stops being one
+            ("delete", 0, 0),   // remove the first record in physical order
+            ("insert", 6, 9),
+            ("update", 4, 9),
+            ("delete", 5, 0),
+        ];
+
+        for (step, (what, n, value)) in script.iter().enumerate() {
+            let position = slot(*n);
+            match *what {
+                "insert" => records.insert(&parsed, position, record(*value)).expect("inserts"),
+                "update" => records.update(&parsed, position, record(*value)).expect("updates"),
+                "delete" => records.delete(&parsed, position).expect("deletes"),
+                other => panic!("unknown step {other}"),
+            }
+
+            let mut oracle = records.clone();
+            oracle.reindex(&parsed);
+            assert_eq!(
+                records.order, oracle.order,
+                "step {step} ({what} {n}): key order diverged from a full reindex"
+            );
+            assert_eq!(
+                records.rank, oracle.rank,
+                "step {step} ({what} {n}): rank diverged -- rank is order inverted, so \
+                 this fails when a renumber missed an entry"
+            );
+            assert_eq!(
+                records.ties, oracle.ties,
+                "step {step} ({what} {n}): tie count diverged -- the seam repair is wrong"
+            );
+        }
+    }
+
     fn an_inserted_record_appears_in_physical_and_in_key_order() {
         let bytes = of(&[1, 3]);
         let mut records = read("INSERT.DAT", &bytes).expect("reads");
