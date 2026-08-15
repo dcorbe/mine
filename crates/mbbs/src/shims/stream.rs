@@ -199,9 +199,24 @@ pub fn fopen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 pub fn fclose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `int fclose(FILE *f)` -- Borland's; no Galacticomm header redeclares it.
     let cookie = call.ptr();
-    host.streams
-        .close(cookie)
-        .map_err(|e| ShimError::Failed(format!("fclose: {e}")))?;
+    // **`EOF`, not a stop.** `fclose` reports failure the way C says to, in
+    // its return value, and the only way `Streams::close` fails is a cookie
+    // that names no open stream -- a double close, or a close of something
+    // never opened. Borland's runtime answers that with `EOF` and carries on;
+    // stopping the machine over it is this host being stricter than the
+    // runtime it stands in for, about a value the caller is free to ignore.
+    //
+    // Found on the shutdown path, which is where it would be: teardown closes
+    // things it is not always sure are open, and until `d0cc910` this host
+    // never ran a module's `finrou` at all. LunatiX's closes `Cwd5igms.txt`
+    // twice.
+    //
+    // The note is kept because a double close still says something about the
+    // module -- it is just not this host's place to end the process over it.
+    if let Err(e) = host.streams.close(cookie) {
+        host.note(format!("fclose: {e}; answered EOF, as the runtime does"));
+        return Ok(abi::Ret::Int(A::Int::from(-1i16 as u16)));
+    }
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
@@ -1768,16 +1783,31 @@ mod tests {
             "the address is retired, so the refusal can name the file: {e}"
         );
 
-        let e = f.invoke(fclose, &Fixture::far(fp)).expect_err("a refusal");
-        assert!(e.to_string().contains("LINES.TXT was closed"), "{e}");
+        // Closing it a second time is `EOF`, not a stop: that is what C says
+        // `fclose` does and what Borland's runtime did. The note still names
+        // the file, so the double close is visible without being fatal.
+        let again = f.invoke(fclose, &Fixture::far(fp)).expect("a second fclose answers");
+        assert_eq!(again, Ret::U16(0xFFFF), "EOF");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("LINES.TXT was closed")),
+            "the double close is noted by name: {:?}",
+            f.host.notes()
+        );
     }
 
     #[test]
-    fn a_handle_this_host_never_issued_is_refused() {
+    fn a_handle_this_host_never_issued_is_answered_with_eof() {
         let mut f = Fixture::new();
         let invented = f.buffer(FILE_SIZE as u16);
-        let e = f.invoke(fclose, &Fixture::far(invented)).expect_err("a refusal");
-        assert!(e.to_string().contains("not a stream this host opened"), "{e}");
+
+        let answer = f.invoke(fclose, &Fixture::far(invented)).expect("fclose answers");
+
+        assert_eq!(answer, Ret::U16(0xFFFF), "EOF, the way C reports a bad fclose");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("not a stream this host opened")),
+            "and it is still said out loud: {:?}",
+            f.host.notes()
+        );
     }
 
     #[test]

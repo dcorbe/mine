@@ -777,21 +777,31 @@ mod tests {
         assert!(f.invoke(stgopt, &[0]).is_err(), "nothing is current");
     }
 
+    /// Closing a block waiting under the current one keeps the `rstmbk` stack
+    /// the same depth, and the restore lands on "nothing current".
+    ///
+    /// LunatiX's `finrou` does this: it closes `cwdlunat.MSG` while current
+    /// and then `cwdrooms.MSG` from under it. Refusing stopped the machine;
+    /// *removing* the entry would be worse than either, because `rstmbk` pairs
+    /// one pop per unmatched `setmbk` and a shorter stack re-points every
+    /// later restore at the wrong block.
     #[test]
-    fn clsmsg_will_not_forget_a_block_waiting_under_the_current_one() {
+    fn clsmsg_nulls_a_block_waiting_under_the_current_one_and_keeps_the_depth() {
         let mut f = Fixture::new();
         let first = opened(&mut f);
         let second = open(&mut f, "OTHER.MSG");
 
-        // `first` is what the next `rstmbk` goes back to. Forgetting it would
-        // leave that `rstmbk` restoring a block the host has no record of, and
-        // there is no value to write that makes it right -- `saved` is a stack
-        // popped blindly, not a single name that can be cleared.
-        assert!(f.invoke(clsmsg, &Fixture::far(first)).is_err());
+        f.invoke(clsmsg, &Fixture::far(first)).expect("closing from under is allowed");
 
-        f.invoke(rstmbk, &[]).expect("back to the first");
+        // Still one pop for the one unmatched `setmbk`, not zero.
+        f.invoke(rstmbk, &[]).expect("the depth is unchanged");
+        assert!(
+            f.invoke(stgopt, &[0]).is_err(),
+            "the restore landed on the null, so nothing is current -- rather than \
+             on a block that had been closed"
+        );
+
         f.invoke(rstmbk, &[]).expect("back to none");
-
         f.invoke(clsmsg, &Fixture::far(second)).expect("no longer in use");
         assert!(
             f.invoke(setmbk, &Fixture::far(second)).is_err(),

@@ -463,33 +463,46 @@ impl<A: Abi> Messages<A> {
     /// then stop naming -- see [`crate::shims::msg::clsmsg`], which clears
     /// `curmbk` on a `true`.
     ///
-    /// **Closing the current block is allowed; closing one saved under it is
-    /// not.** Those look like the same mistake and are not. `curmbk` is a
-    /// single value with a home in module memory, so a host that closes what
-    /// it names can put it back to nothing in the same breath, and "no block
-    /// is current" is a state this host already answers cleanly (every option
-    /// read refuses, by name). `saved` is a stack that `rstmbk` pops blindly;
-    /// removing an entry from its middle changes what a later `rstmbk`
-    /// restores, and there is no value to write that makes that right.
+    /// **A module may close any block it opened, including the current one
+    /// and any waiting under it.** This used to refuse both, on the reasoning
+    /// that either would leave something naming a block the host had no
+    /// record of. The goal was right and the answer was not: there is a value
+    /// to write in both cases, and writing it beats refusing.
     ///
-    /// The distinction was worth drawing because the blanket refusal stopped
-    /// a machine over ordinary teardown: LunatiX's `finrou` closes its own
-    /// message block while it is still current, which is the obvious thing
-    /// for a module to do on the way out, and this answered it with a
+    /// `curmbk` is a single value with a home in module memory, so closing
+    /// what it names is paired with putting it back to nothing. `saved` is a
+    /// stack `rstmbk` pops blindly, so an entry naming a closed block becomes
+    /// the null instead of disappearing -- depth is what `rstmbk` pairs
+    /// against, and removing an entry would re-point every later restore at
+    /// the wrong block. Either way the end state is "no block is current",
+    /// which this host answers cleanly rather than reading through a dangling
+    /// pointer.
+    ///
+    /// The refusal was worth removing because it stopped machines over
+    /// ordinary teardown, twice. LunatiX's `finrou` closes its own message
+    /// blocks on the way out -- `cwdlunat.MSG` while current, then
+    /// `cwdrooms.MSG` from under it -- which is the obvious thing for a
+    /// module to do, and each half in turn answered it with a
     /// [`crate::abi::Abi::unimplemented`]-shaped stop. `MCVAPI.H:66` declares
     /// `void clsmsg(FILE *mb)` and the library body is not in the source
-    /// tree, so nothing here is the vendor's rule -- the refusal was this
-    /// host's own invention, and only half of it was earning its keep.
+    /// tree, so none of this was ever the vendor's rule; the refusal was this
+    /// host's own invention and neither half was earning its keep.
     pub fn close(&mut self, current: A::Ptr, cookie: A::Ptr) -> Result<bool, String> {
         let at = self.find(cookie)?;
-        if self.saved.contains(&cookie) {
-            return Err(format!(
-                "{} is waiting under the current message block, and `rstmbk` \
-                 would go back to a block that had been closed",
-                self.open[at].name
-            ));
-        }
         self.open.remove(at);
+
+        // A block waiting under the current one is closed too, and every
+        // `saved` entry naming it becomes the null rather than disappearing.
+        // Depth is what `rstmbk` pairs against -- one pop per unmatched
+        // `setmbk` -- so removing an entry would silently re-point every
+        // `rstmbk` after it at the wrong block. Nulling keeps the pairing and
+        // makes the restore land on "no block is current", which this host
+        // already answers cleanly: every option read refuses, by name.
+        for saved in &mut self.saved {
+            if *saved == cookie {
+                *saved = A::null_ptr();
+            }
+        }
         Ok(cookie == current)
     }
 
