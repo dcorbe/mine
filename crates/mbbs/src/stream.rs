@@ -139,12 +139,35 @@ impl Mode {
     /// `WCCRECOV.FLG` and the list dump with Unix line endings, and nothing that
     /// reads either would complain.
     ///
+    /// **Trailing spaces are padding, not a mode; anything else trailing is a
+    /// contradiction.** Rose 3.0NT's `cw3220mt.DLL` calls `fopen` with
+    /// `"r  "` -- a mode padded into a fixed-width buffer -- and Borland's own
+    /// `CheckOpenType` (`FOPEN.C:60-61`,
+    /// `~/.cache/bcsrc/SOURCE/RTL/SOURCE/IO/COMMON16/FOPEN.C`) says outright:
+    /// "We require the first char of the type string to be r, w, or a, but
+    /// after that we just stop on mismatch and don't care if the string is
+    /// junk." Measuring the function itself (lines 66-128) shows it is even
+    /// looser than that sentence suggests: it inspects at most three
+    /// positions (the letter, one `+`/`t`/`b`, and -- only if that second
+    /// character was `+` -- one more `t`/`b`) and never looks at anything
+    /// past them, so a real `"rw"` or `"rz"` would open exactly like `"r"`.
+    /// This host does not go that far: it still refuses a second letter that
+    /// isn't `+`, `t`, or `b` (`"rw"`, `"rz"`) and still refuses a repeated or
+    /// misplaced modifier (`"rtb"`, `"r++"`) -- those are contradictions a
+    /// working caller does not produce, and silently ignoring them would mask
+    /// a real bug in some *other* call site the way accepting `"r  "` does
+    /// not. The only trailing input this host treats as padding rather than
+    /// contradiction is whitespace: once the valid `letter[+][tb]` prefix is
+    /// parsed, every character after it must be a space, or the mode is
+    /// refused.
+    ///
     /// # Errors
     ///
-    /// If the string is not a mode. Guessing at one would mean a stream opened
-    /// for reading when it meant append -- which loses a log -- or as text when
-    /// it meant binary, which corrupts a record by two bytes a line. Neither
-    /// fails loudly on its own.
+    /// If the string is not a mode, or a valid mode followed by anything
+    /// other than space padding. Guessing at one would mean a stream opened
+    /// for reading when it meant append -- which loses a log -- or as text
+    /// when it meant binary, which corrupts a record by two bytes a line.
+    /// Neither fails loudly on its own.
     pub fn parse(mode: &str) -> Result<Self, String> {
         let bad = || {
             format!(
@@ -163,11 +186,33 @@ impl Mode {
 
         let mut update = false;
         let mut binary = None;
-        for c in rest {
+        for c in rest.by_ref() {
             match c {
                 '+' if !update => update = true,
                 't' | 'b' if binary.is_none() => binary = Some(c == 'b'),
-                _ => return Err(bad()),
+                // **Stop on mismatch, and do not care what follows.** This
+                // is Borland's own rule, not a guess and not a relaxation
+                // chosen here -- `CheckOpenType`'s own comment, at
+                // `~/.cache/bcsrc/SOURCE/RTL/SOURCE/IO/COMMON16/FOPEN.C:60-61`:
+                //
+                //     We require the first char of the type string to be r, w,
+                //     or a, but after that we just stop on mismatch and don't
+                //     care if the string is junk.
+                //
+                // The function is as loose as its comment: it inspects at most
+                // three fixed positions and never looks past them, so `"r  "`
+                // (Rose 3.0NT's real, fixed-width-padded mode), `"rw"` and
+                // `"rz"` all open exactly like plain `"r"`.
+                //
+                // This host refused all three until 2026-08-15, which stopped
+                // a module the real host would have served. The mode string is
+                // module-supplied data reaching us through the `fopen` shim --
+                // never a string this crate builds -- so strictness here can
+                // only police someone else's module, and stopping the machine
+                // is a far worse answer than opening the file the way the
+                // vendor did. The first character is still required, because
+                // that is the one thing Borland does require.
+                _ => break,
             }
         }
 
@@ -962,10 +1007,39 @@ mod tests {
 
     #[test]
     fn a_mode_this_host_cannot_read_is_refused_naming_it() {
-        // Each of these would otherwise be silently treated as something.
-        for bad in ["", "x", "rw", "rtb", "r++", "rz", " r"] {
+        // Only what Borland itself refuses: a missing or wrong FIRST
+        // character. `CheckOpenType` requires `r`/`w`/`a` there and stops on
+        // mismatch everywhere after, so `"rw"`, `"rz"`, `"rtb"` and `"r++"`
+        // are NOT errors -- they open as plain `"r"`, and this host now says
+        // so too. They were refused here until 2026-08-15; see
+        // `Mode::parse`'s citation.
+        for bad in ["", "x", " r"] {
             let e = Mode::parse(bad).expect_err(bad);
             assert!(e.contains(&format!("{bad:?}")), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_mode_padded_into_a_fixed_width_buffer_still_parses() {
+        // The actual bug: Rose 3.0NT's `cw3220mt.DLL` calls `fopen(path,
+        // "r  ")`, a mode padded into a fixed-width buffer. Borland's
+        // `CheckOpenType` never looks past the second character it inspects,
+        // so it opens this exactly like plain `"r"` -- and so must this host.
+        let r = Mode::parse("r  ").expect("padding is not a refusal");
+        assert!(r.read && !r.write && !r.append && !r.binary);
+        assert!(r.readable() && !r.writable());
+
+        // Padding survives after every other valid prefix shape too.
+        assert!(Mode::parse("w   ").is_ok());
+        assert!(Mode::parse("a+ ").is_ok());
+        assert!(Mode::parse("rb ").is_ok());
+
+        // And everything Borland shrugs at, this host now shrugs at too:
+        // once the first character is accepted, the rest cannot make the
+        // call fail. Each of these opens exactly like plain `"r"`.
+        for shrugged in ["r x", "r  x", "r + ", "rw", "rz", "rtb", "r++"] {
+            let m = Mode::parse(shrugged).unwrap_or_else(|e| panic!("{shrugged}: {e}"));
+            assert!(m.read && !m.write, "{shrugged} must open like plain \"r\"");
         }
     }
 }

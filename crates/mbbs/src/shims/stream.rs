@@ -52,14 +52,17 @@
 //! This paragraph used to list `fwrite`/`fputc`/`fgetc` alongside the four
 //! above, on the same "no census has asked" reasoning -- wrong by the time it
 //! was written, since the census two paragraphs up already names `_fgetc`,
-//! `_fputc` and `_fwrite` among LunatiX's imports. [`fgetc`], [`fputc`] and
-//! [`fwrite`] below are the C library routines the plan calls the "seven
-//! genuine C library" siblings (`docs/plans/2026-08-14-stage3-channel-entry-implementation.md`,
-//! Task 8); [`flushall`] is [`fflush`]'s own "everywhere" -- same honesty
+//! `_fputc` and `_fwrite` among LunatiX's imports. [`fgetc`] and [`fputc`]
+//! below are two of the C library routines the plan calls the "seven genuine
+//! C library" siblings (`docs/plans/2026-08-14-stage3-channel-entry-implementation.md`,
+//! Task 8) -- the third, `fwrite`, was implemented here too but turned out
+//! to be a dead duplicate of the registered `shims::crt::fwrite` (removed
+//! 2026-08-15, `docs/2026-08-15-dead-twin-shims.md`); `shims::crt` carries
+//! it now. [`flushall`] is [`fflush`]'s own "everywhere" -- same honesty
 //! about buffering nothing, over every open stream instead of one.
 //! `cw3220mt.DLL` aliases onto `MAJORBBS` (`shims::mod::canonical_dll`), which
-//! is why these three plus `flushall` are registered under `MAJORBBS` rather
-//! than a `cw3220mt.DLL`-specific table.
+//! is why `fgetc`/`fputc`/`fwrite` plus `flushall` are registered under
+//! `MAJORBBS` rather than a `cw3220mt.DLL`-specific table.
 //!
 //! Each of the three goes through [`crate::stream::Streams::read_mem`] or
 //! [`crate::stream::Streams::write`] exactly as [`fread`]/[`fprintf`] already
@@ -389,7 +392,7 @@ pub fn fgetc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 /// that same byte zero-extended to `A`'s own int width -- `WRITE.C`'s own
 /// `unsigned char` truncation, which [`crate::stream::Stream::write`]'s
 /// per-byte `\n` -> `\r\n` translation is applied to exactly as it is for
-/// [`fwrite`] and [`fprintf`].
+/// `shims::crt::fwrite` and [`fprintf`].
 ///
 /// # Errors
 ///
@@ -407,63 +410,6 @@ pub fn fputc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     Ok(abi::Ret::Int(A::int_from_u32(u32::from(byte))))
 }
 
-/// `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
-/// -- a block, the write side of [`fread`].
-///
-/// Borland's; no Galacticomm header redeclares it. Stage 3's Task 8.
-///
-/// Mirrors [`fread`]'s own width discipline throughout, not the narrower
-/// `as u16` idiom this crate has already found and removed from six other
-/// shims: `size`/`count` are read at `A`'s own int width, and the overflow
-/// ceiling is `A`'s own, not 16 bits. **Deliberately does not mirror
-/// `shims::memory::memcpy`/`movmem`'s still-`as u16` argument count either**
-/// -- those predate this width discipline and are out of this task's scope
-/// to fix, but a new sibling has no excuse to copy a bug this crate has
-/// already named and fixed twice over.
-///
-/// Unlike `fread`, a **short write is not an answer a module can act on**:
-/// this host's writes either land in full or the underlying `write_all`
-/// fails outright, so the count returned is always `nmemb` on success.
-///
-/// # Errors
-///
-/// If `cookie` names no open stream, if it is not open for writing, if
-/// `size * nmemb` overflows what `A`'s own `size_t` can count, or if the
-/// underlying write fails.
-pub fn fwrite<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    // `size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)`
-    // -- Borland's; no Galacticomm header redeclares it.
-    let buffer = call.ptr();
-    let size: u32 = call.int().into();
-    let count: u32 = call.int().into();
-    let cookie = call.ptr();
-
-    if size == 0 || count == 0 {
-        return Ok(abi::Ret::Int(A::Int::from(0u16)));
-    }
-
-    // Same ceiling `fread` checks against, at `A`'s own width -- see that
-    // routine's own doc comment for why 16 bits hard-coded here would be
-    // exactly the bug this crate keeps finding and removing.
-    let ceiling = u64::from(u32::MAX) >> (32 - A::INT_WIDTH * 8);
-    let want = u64::from(size) * u64::from(count);
-    if want > ceiling {
-        return Err(ShimError::Failed(format!(
-            "fwrite of {count} items of {size} bytes, which a {}-bit size_t cannot count",
-            A::INT_WIDTH * 8
-        )));
-    }
-    let want = want as usize;
-
-    let bytes = buffer
-        .resolve(call.mem(), want)
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    host.streams
-        .write(cookie, &bytes)
-        .map_err(|e| ShimError::Failed(format!("fwrite: {e}")))?;
-    Ok(abi::Ret::Int(A::int_from_u32(count)))
-}
 
 /// `int fprintf(FILE *f, const char *fmt, ...)` -- the print buffer's formatter,
 /// with a destination.
@@ -1614,44 +1560,6 @@ mod tests {
     }
 
     #[test]
-    fn fwrite_writes_size_times_nmemb_bytes_and_answers_the_item_count() {
-        let root = scratch("stream-fwrite");
-        let mut f = Fixture::rooted(root.clone());
-        let fp = opened(&mut f, "OUT.DAT", "wb");
-
-        let payload = f.bytes(b"0123456789", false);
-        // 2 items of 5 bytes each -- distinct from a byte count, so a shim
-        // that swapped `size` and `nmemb` would still pass a `size==nmemb`
-        // test the way this file's own module doc warns `setmem`/`movmem`
-        // could.
-        let items = word(
-            f.invoke(fwrite,
-                &[payload.offset, payload.selector, 5, 2, fp.offset, fp.selector],
-            )
-            .expect("fwrite"),
-        );
-        f.invoke(fclose, &Fixture::far(fp)).expect("fclose");
-
-        assert_eq!(items, 2, "the item count, not the byte count");
-        assert_eq!(std::fs::read(root.join("OUT.DAT")).expect("the file"), b"0123456789");
-    }
-
-    #[test]
-    fn fwrite_of_zero_items_writes_nothing_and_is_not_a_refusal() {
-        let root = scratch("stream-fwrite-zero");
-        let mut f = Fixture::rooted(root.clone());
-        let fp = opened(&mut f, "OUT.DAT", "wb");
-        let payload = f.bytes(b"x", false);
-        let items = word(
-            f.invoke(fwrite,
-                &[payload.offset, payload.selector, 4, 0, fp.offset, fp.selector],
-            )
-            .expect("fwrite"),
-        );
-        assert_eq!(items, 0);
-    }
-
-    #[test]
     fn flushall_answers_how_many_streams_are_open() {
         let mut f = Fixture::new();
         assert_eq!(word(f.invoke(flushall, &[]).expect("flushall")), 0);
@@ -1812,9 +1720,19 @@ mod tests {
 
     #[test]
     fn a_mode_this_host_does_not_understand_is_refused_naming_it() {
+        // `"rw"` is NOT one of them any more. Borland's `CheckOpenType`
+        // (`~/.cache/bcsrc/SOURCE/RTL/SOURCE/IO/COMMON16/FOPEN.C:60-61`) says
+        // it "just stop[s] on mismatch and doesn't care if the string is
+        // junk", so `"rw"` opens as plain `"r"` -- and refusing it stopped a
+        // module the real host served. Only a missing or wrong FIRST
+        // character is an error; see `crate::stream::Mode::parse`.
         let mut f = Fixture::new();
-        let e = open(&mut f, "LINES.TXT", "rw").expect_err("a refusal");
-        assert!(e.to_string().contains("\"rw\""), "{e}");
+        let e = open(&mut f, "LINES.TXT", "x").expect_err("a refusal");
+        assert!(e.to_string().contains("\"x\""), "{e}");
+
+        // And the case that used to be refused now opens, readable.
+        open(&mut f, "LINES.TXT", "rw")
+            .expect("junk after the first char is Borland's shrug, not an error");
     }
 
     #[test]
