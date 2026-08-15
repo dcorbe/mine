@@ -1819,6 +1819,17 @@ pub(crate) fn answer_with_key<A: Abi>(
 /// status 22 and `posbtverr` (`:746`) truncates with a NUL at `bb->reclen-1`
 /// before the copy runs, where this truncates silently. `opnbtv` already notes
 /// the mismatch that would make it live.
+///
+/// # `lastlen`, for [`llnbtv`]
+///
+/// This is the one chokepoint every read routine in this file already
+/// funnels a successful positioning through -- `locate`/`absolute`'s own
+/// `into.is_some()` call, `stpbtv`/`stpbtvl`'s direct one -- so it is also
+/// where [`crate::btrieve::Btrieve::set_lastlen`] is fed: `take`, the number
+/// of bytes actually copied, is exactly `PLBTVSTF.C:812`'s own
+/// `lastlen=btvdatptr->dbflen` for the shape this host reproduces. See the
+/// engine's own `lastlen` field doc comment for the scoping this shares with
+/// [`crate::btrieve::Btrieve::dfa_last_len`]'s identical simplification.
 pub(crate) fn deliver<A: Abi>(
     call: &mut Call<A>,
     host: &mut Host<A>,
@@ -1833,6 +1844,7 @@ pub(crate) fn deliver<A: Abi>(
     let bytes = record.bytes[..take].to_vec();
     into.write(call.mem(), &bytes)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
+    host.btrieve.set_lastlen(take as u16);
     Ok(())
 }
 
@@ -2701,6 +2713,749 @@ pub fn insbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
          nothing in this host writes to a Btrieve file",
         file.name()
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 (docs/plans/2026-08-15-host-api-surface-track-b.md): `bxabtv`/
+// `exabtv`, thin wrappers over the transaction engine `Btrieve::begin`/
+// `Btrieve::end` already implement, reached today by the registered
+// `dfaBegTrans`/`dfaEndTrans`. Neither is declared in MajorBBS 6.25's
+// `BTVSTF.H` at all -- Worldgroup 1.0's `BTVSTF.H:140-141` is the only
+// recovered generation that has them, and its `PLBTVSTF.C` the only one
+// with bodies.
+// ---------------------------------------------------------------------------
+
+/// `void bxabtv(int loktyp)` -- begin a Btrieve transaction.
+///
+/// `PLBTVSTF.C:239-246` (Worldgroup 1.0 only; not declared in MajorBBS
+/// 6.25's `BTVSTF.H` at all), quoted in full:
+///
+///
+/// Op 19 plus `loktyp` -- `WAITBV` (0) or `NOWTBV` (200), `BTVSTF.H:48-49`
+/// -- exactly matches `dfaBegTrans`'s own `19+loktyp` (`shims/dfa.rs`,
+/// citing `DFAAPI.C:201-209`), and both reach the identical
+/// [`crate::btrieve::Btrieve::begin`]. **This task's own instruction is
+/// that they must agree, not each invent an answer** -- two wrappers over
+/// one engine disagreeing about the same state would be worse than either
+/// choice alone. `loktyp` is read and discarded for the identical reason
+/// `dfaBegTrans` discards it: `Btrieve::begin`'s own doc comment records
+/// that the real engine showed no observable difference between `WAITBV`
+/// and `NOWTBV` with a single client (`xactprobe`'s `loktyp` scenario), and
+/// this host is single-process and single-threaded by construction, so
+/// there is never a second session to wait on or not.
+///
+/// A nonzero status here goes to `(*btverrptr)("BEGIN-XACTION")`, a
+/// `catastro` -- the identical fate `dfaBegTrans`'s own `ShimError`
+/// produces for [`TransactionError::AlreadyActive`](crate::btrieve::TransactionError),
+/// so a begin-while-open stops the module here exactly as it does through
+/// `dfaBegTrans`.
+pub fn bxabtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _loktyp = i16_arg::<A>(call.int());
+    host.btrieve
+        .begin()
+        .map_err(|e| ShimError::Failed(format!("bxabtv: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `void exabtv(void)` -- end (commit) the current Btrieve transaction,
+/// keeping every write made since [`bxabtv`].
+///
+/// `PLBTVSTF.C:248-254` (Worldgroup 1.0 only; same generation gap as
+/// [`bxabtv`]), quoted in full:
+///
+///
+/// Op 20, no arguments -- exactly `dfaEndTrans` (`shims/dfa.rs`, citing
+/// `DFAAPI.C:219-225`) -- and both reach the identical
+/// [`crate::btrieve::Btrieve::end`]. A second `exabtv` with nothing open
+/// gives `TransactionError::NoneActive` (`crate::btrieve::TransactionError`),
+/// refused the same way `dfaEndTrans` refuses it -- one engine, one answer,
+/// per this task's own instruction.
+pub fn exabtv<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    host.btrieve
+        .end()
+        .map_err(|e| ShimError::Failed(format!("exabtv: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: the locking variants -- `getbtvl`, `anpbtvl`, `anpbtvlk`,
+// `aabbtvl`, `unlbtv`.
+//
+// **Locks are modelled, for real** -- the first of the three answers Task 4
+// asks to establish before writing anything. `crate::btrieve::ops::LockTable`
+// already exists, reached from this file through [`take_lock`], and
+// [`obtbtvl`]/[`stpbtvl`]/[`gabbtvl`] already thread a `loktyp` through it.
+// This is not the "locks are not modelled, single-threaded, so unlbtv is a
+// no-op" branch: what IS true of a single-threaded, single-client host is
+// narrower than that -- no lock this table records can ever be *contended*,
+// because there is only ever one client to contend with itself. See
+// [`wslbtv`]'s own doc comment for exactly where that narrower fact matters
+// (it does, for one routine) and `ops.rs`'s own "Cross-client conflict" doc
+// section for the full reasoning this defers to rather than repeats.
+// ---------------------------------------------------------------------------
+
+/// `void getbtvl(void *recptr, void *key, int keynum, int getopt, int
+/// loktyp)` -- get a record by key, taking a lock once it is found.
+///
+/// [`getbtv`]'s own doc comment already quotes this routine's full body
+/// (`PLBTVSTF.C:310-337`, Worldgroup 1.0 -- MajorBBS 6.25 has no `getbtvl`
+/// at all) and its one-place divergence from [`obtbtvl`] (every nonzero
+/// status refuses here, where `obtbtvl` answers 0 on status 4/9/a lock
+/// conflict). This is exactly what `getbtv` tail-calls with `loktyp` fixed
+/// at 0 (`PLBTVSTF.C:300-308`) -- five words instead of four, the fifth
+/// read after `getopt` and passed straight into [`locate`]'s own `lock`
+/// field, the same slot [`obtbtvl`] already reads its own fifth word into.
+///
+/// `lock` is taken only once a record is actually found: `locate`'s own
+/// `take_lock` call runs after `Cursor::seek_to`, never before -- see
+/// [`take_lock`]'s doc comment for why that ordering is load-bearing.
+pub fn getbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let Some(block) = positioned(call, host, "getbtvl")? else {
+        note_no_file(host, "getbtvl");
+        return Ok(abi::Ret::Void);
+    };
+
+    let into = call.ptr();
+    let value = call.ptr();
+    let keynum = i16_arg::<A>(call.int());
+    let opt = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
+
+    let op = Op::of(opt).ok_or_else(|| {
+        ShimError::Failed(format!(
+            "getbtvl with option {opt}, which is none of the nine BTVSTF.H's g-macros produce"
+        ))
+    })?;
+    let into = match into == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => into,
+    };
+    let found = locate(
+        call,
+        host,
+        Request {
+            who: "getbtvl",
+            block,
+            op,
+            keynum,
+            value,
+            into: Some(into),
+            lock,
+        },
+    )?;
+    if !found {
+        let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+        return Err(ShimError::Failed(format!(
+            "getbtvl found no record in {} -- PLBTVSTF.C:333-335 sends any \
+             nonzero status straight to posbtverr(\"GET\"), unlike obtbtvl's \
+             status-4/9/wslbtv special case (:373), so this refuses instead \
+             of answering 0",
+            file.name()
+        )));
+    }
+    Ok(abi::Ret::Void)
+}
+
+/// `int anpbtvl(void *recptr, int chkcas, int anpopt)` -- step to the
+/// next/previous record, with `chkcas` left to the caller rather than
+/// [`anpbtv`]'s own fixed `1`.
+///
+/// `PLBTVSTF.C:390-397` (Worldgroup 1.0; MajorBBS 6.25 has no `anpbtvl`/
+/// `anpbtvlk` split at all -- its own `anpbtvl` is the routine [`anpbtv`]'s
+/// doc comment already quotes in full, calling `obtbtv` rather than
+/// `obtbtvl` because 6.25 has neither locking variant), quoted in full:
+///
+///
+/// A pure tail call fixing `loktyp` at 0. [`anpbtvlk`] is this routine's own
+/// body, with `loktyp` read as a fourth argument instead of fixed.
+pub fn anpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let chkcas = i16_arg::<A>(call.int());
+    let anpopt = i16_arg::<A>(call.int());
+    anp(call, host, "anpbtvl", recptr, chkcas != 0, anpopt, 0)
+}
+
+/// `int anpbtvlk(void *recptr, int chkcas, int anpopt, int loktyp)` -- step
+/// to the next/previous record, checking case and taking a lock exactly as
+/// the module chooses.
+///
+/// `PLBTVSTF.C:399-415` (Worldgroup 1.0; not in MajorBBS 6.25 at all -- see
+/// [`anpbtvl`]'s own doc comment). [`anpbtv`]'s own doc comment already
+/// quotes this routine's full body while explaining what `anpbtv`'s own
+/// fixed-`chkcas=1,loktyp=0` tail call does to it; this is that body with
+/// both left free, through the shared [`anp`] helper [`anpbtv`] itself does
+/// **not** use -- this file's own established convention
+/// ([`stpbtv`]/[`stpbtvl`]'s doc comment: "duplicated rather than shared...
+/// append rather than restructure an existing, already-tested routine")
+/// keeps `anpbtv` exactly as it was; only `anpbtvl` and `anpbtvlk` are new
+/// here, and sharing code between the two of them is not restructuring
+/// anything already tested.
+pub fn anpbtvlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let recptr = call.ptr();
+    let chkcas = i16_arg::<A>(call.int());
+    let anpopt = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
+    anp(call, host, "anpbtvlk", recptr, chkcas != 0, anpopt, lock)
+}
+
+/// The body [`anpbtvl`] and [`anpbtvlk`] share -- [`anpbtv`]'s own body
+/// (`PLBTVSTF.C:399-415`) with `chkcas`/`loktyp` taken as parameters
+/// instead of the literal `1`/`0` its own tail call fixes them at. See
+/// [`anpbtv`]'s own doc comment for the full accounting of what this does
+/// and why, including the ordering hazard when `recptr` is null -- every
+/// word of that reasoning applies here unchanged; only the two fixed
+/// constants became parameters.
+fn anp<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    who: &'static str,
+    recptr: A::Ptr,
+    chkcas: bool,
+    anpopt: i16,
+    lock: i16,
+) -> Result<abi::Ret<A>, ShimError> {
+    let Some(block) = positioned(call, host, who)? else {
+        note_no_file(host, who);
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    };
+
+    // `:409` -- `movmem(bb->key,bb->data,bb->keylns[bb->lastkn])`, read
+    // before the step below can overwrite either buffer.
+    let key = key_number(call, host, block, -1)?;
+    let key_len = key_length(host, block, key)?;
+    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
+    let old = key_buffer
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let data_buf = data_buffer(host, block)?;
+    data_buf
+        .write(call.mem(), &old)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    // `:410` -- `obtbtvl(recptr,NULL,-1,anpopt,loktyp)`.
+    let op = Op::of(anpopt).ok_or_else(|| {
+        ShimError::Failed(format!("{who} with option {anpopt}, which is not a get operation"))
+    })?;
+    let into = match recptr == Btrieve::<A>::null() {
+        true => data_buffer(host, block)?,
+        false => recptr,
+    };
+    let found = locate(
+        call,
+        host,
+        Request {
+            who,
+            block,
+            op,
+            keynum: -1,
+            value: Btrieve::<A>::null(),
+            into: Some(into),
+            lock,
+        },
+    )?;
+    if !found {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+
+    // `:411-412` -- compare the scratch copy against the key the step just
+    // refreshed, `strcmp` or `stricmp` depending on `chkcas`. See
+    // [`strcmp_eq`]'s own doc comment for why the scan is bounded to the
+    // key's own length rather than following C's unbounded convention;
+    // lowercasing first is safe against that bound because ASCII-lowering a
+    // NUL byte is still a NUL byte, so it cannot move where the scan stops.
+    let data_buf = data_buffer(host, block)?;
+    let now = data_buf
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let key_buffer = host.btrieve.block(block).map_err(ShimError::Failed)?.key();
+    let landed = key_buffer
+        .resolve(call.mem(), usize::from(key_len))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let equal = if chkcas {
+        strcmp_eq(&now, &landed)
+    } else {
+        strcmp_eq(&now.to_ascii_lowercase(), &landed.to_ascii_lowercase())
+    };
+    Ok(abi::Ret::Int(A::Int::from(u16::from(equal))))
+}
+
+/// `int aabbtvl(void *recptr, long abspos, int keynum, int loktyp)` --
+/// acquire the record at a file position, taking a lock once it is found.
+///
+/// `PLBTVSTF.C:469-493` (Worldgroup 1.0; not in MajorBBS 6.25, whose
+/// `aabbtv` IS this routine's own body with no `loktyp` word at all -- the
+/// same generation gap [`aabbtv`]'s own doc comment already records for
+/// `gabbtvl`). [`aabbtv`]'s own doc comment quotes the one-line tail call
+/// this is the target of (`:466`: `return(aabbtvl(recptr,abspos,keynum,0))`)
+/// and explains at length why a single cursor cannot read both this
+/// routine's four words and `aabbtv`'s own three verbatim -- the same
+/// problem [`gabbtvl`]'s own doc comment names for the identical shape on
+/// the `gabbtv`/`gabbtvl` side. `aabbtvl` reads exactly [`gabbtvl`]'s own
+/// four words (`recptr`, `abspos`, `keynum`, `loktyp`) in the same order and
+/// passes them into [`absolute`] with `fatal: false` -- `aabbtv`'s own
+/// answer-with-nothing convention, not `gabbtvl`'s refusal -- because
+/// `aabbtvl` and `gabbtvl` differ in exactly the one field [`Position::
+/// fatal`] exists to carry, and nowhere else.
+pub fn aabbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let into = call.ptr();
+    let position = call.long();
+    let keynum = i16_arg::<A>(call.int());
+    let lock = i16_arg::<A>(call.int());
+    Ok(abi::Ret::Int(A::Int::from(u16::from(absolute(
+        call,
+        host,
+        Position {
+            who: "aabbtvl",
+            fatal: false,
+            lock,
+            into,
+            position,
+            keynum,
+        },
+    )?))))
+}
+
+/// `void unlbtv(long abspos, int keynum)` -- release a lock.
+///
+/// `PLBTVSTF.C:713-728` (Worldgroup 1.0 only -- not in MajorBBS 6.25),
+/// quoted in full:
+///
+///
+/// Op 27, "Unlock", flavoured entirely by `keynum`. `BTVSTF.H:125-128`
+/// names the only three flavours a module can reach this with:
+///
+///
+/// The C body itself only branches on `keynum == -1` versus everything
+/// else -- `0` and `-2` both fall into the same `else` arm and are told
+/// apart purely by which raw `keynum` the real low-level Btrieve call
+/// receives, a distinction this host has to make explicit because it has
+/// no low-level call underneath to make it implicitly:
+///
+/// - `keynum == -1`: release the lock at `abspos`, an explicit file
+///   position -- [`crate::btrieve::Btrieve::unlock_at`].
+/// - `keynum == -2`: release every lock this session holds on the current
+///   file -- [`crate::btrieve::Btrieve::unlock_all`], the module-callable
+///   form of what [`crate::btrieve::Btrieve::close`] already does for every
+///   file it closes.
+/// - `keynum == 0`: release the lock at wherever the file is currently
+///   positioned -- [`crate::btrieve::Btrieve::unlock_current`].
+/// - Anything else: refused. `BTVSTF.H`'s own macros never produce a fourth
+///   value, and the real host's `else` arm would have handed Btrieve a
+///   `keynum` none of its own documented flavours name.
+///
+/// # No guard of its own, and this host supplies a refusal anyway
+///
+/// `unlbtv` itself never tests `bb` -- but `btvu()` (`PLBTVSTF.C:792-813`,
+/// `btvdatptr->posp38seg=bb->realseg`) unconditionally dereferences it to
+/// build the low-level parameter block, on every call including this one.
+/// So a real board that called `unlbtv` with no file current faulted inside
+/// `btvu`, one level down from `unlbtv`'s own body -- the same shape
+/// [`stpbtvl`]'s own doc comment already documents for a routine with no
+/// guard of its own. This refuses by name rather than reproducing the
+/// fault.
+pub fn unlbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let position = call.long();
+    let keynum = i16_arg::<A>(call.int());
+
+    let block = positioned(call, host, "unlbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "unlbtv with no Btrieve file current -- unlbtv itself never tests \
+             bb, but btvu() (PLBTVSTF.C:792-813) unconditionally dereferences it \
+             to build the low-level parameter block, so the real host faulted \
+             one level down from here rather than answering"
+                .to_owned(),
+        )
+    })?;
+
+    match keynum {
+        -1 => host.btrieve.unlock_at(block, position).map_err(ShimError::Failed)?,
+        -2 => host.btrieve.unlock_all(block).map_err(ShimError::Failed)?,
+        0 => host.btrieve.unlock_current(block).map_err(ShimError::Failed)?,
+        _ => {
+            return Err(ShimError::Failed(format!(
+                "unlbtv with key number {keynum}, which is none of the three \
+                 flavours BTVSTF.H's ul-macros produce (0 = ulsbtv, -1 = \
+                 ulmbtv/ulobtv, -2 = ulabtv)"
+            )));
+        }
+    }
+    Ok(abi::Ret::Void)
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: variable-length records -- `sttbtv`, `rlenbtv`, `wslbtv`,
+// `llnbtv`. Three of the four turn out to be accessors over state this file
+// or the engine already computes; the fourth (`sttbtv`) has no vendor body
+// anywhere to be an accessor over.
+// ---------------------------------------------------------------------------
+
+/// `void sttbtv(int len)` -- **no vendor body exists to cite.**
+///
+/// Declared at `BTVSTF.H:169` (Worldgroup-era numbering; MajorBBS 6.25's own
+/// header has no `sttbtv` at all) and implemented in **none** of the three
+/// recovered `PLBTVSTF.C` generations -- MajorBBS 6.25, Worldgroup 1.0,
+/// Worldgroup 2.0 (Task 1's own finding). No macro in any recovered
+/// `BTVSTF.H` references it, and nothing else in `archive/` or `re/` calls
+/// it either (`grep -a -rn sttbtv archive/ re/`: zero hits outside the two
+/// header declarations). Implemented from the declaration alone, per this
+/// task's own instruction, with the uncertainty recorded here rather than
+/// papered over with a citation to a file that does not contain it.
+///
+/// See the engine's own `stt_length` field doc comment
+/// ([`crate::btrieve::Btrieve`]) for the full, honest account of what is and
+/// is not known about this routine's purpose, and why the right
+/// implementation is "store the argument, wire nothing to it yet" rather
+/// than a guess at which write path was meant to consume it. `len` is read
+/// the way [`upvbtv`]'s own `length` is (via [`u16_arg`] rather than
+/// [`i16_arg`]) on the same reasoning: both are declared plain `int` but
+/// name a byte count, the one role every other `int len`/`length` argument
+/// in this file plays.
+pub fn sttbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let len = u16_arg::<A>(call.int(), "sttbtv")?;
+    host.btrieve.set_stt_length(len);
+    Ok(abi::Ret::Void)
+}
+
+/// `int rlenbtv(void)` -- the current file's own fixed record length.
+///
+/// `PLBTVSTF.C:696-710` (MajorBBS 6.25; identical body in Worldgroup 1.0/2.0
+/// modulo line numbers), quoted in full:
+///
+///
+/// The identical shape [`cntrbtv`] already has for `fs.numofr` -- same
+/// Btrieve `STAT` call (op 15), same reply struct, a different field. See
+/// [`cntrbtv`]'s own doc comment for the full account of why this has no
+/// `bb == NULL` guard at all (`:696-709` never mentions `bb`) and why the
+/// refusal here is nonetheless this host's own rather than a reproduction
+/// of one: with no file current there is no file for "whatever Btrieve is
+/// positioned on" to resolve to, on a host with no Btrieve TSR holding a
+/// position in the first place. Answered from [`crate::btrieve::Geometry::
+/// reclen`], the field this host already reads directly off the file
+/// control record rather than through an emulated `STAT` reply, the same
+/// substitution `cntrbtv` already makes for `numofr`.
+///
+/// **Not fed by [`sttbtv`], despite sitting beside it in `BTVSTF.H`'s
+/// list.** `fs.reclen` is a Btrieve `STAT` reply field describing the file
+/// itself, fixed at `crtbtv` time; `sttbtv`'s own argument is per-call
+/// session state with no recovered consumer at all -- see the engine's own
+/// `stt_length` field doc comment. The test in this file's own `mod tests`
+/// that might look like a round trip between the two is deliberately not
+/// written that way, for this exact reason.
+pub fn rlenbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let block = positioned(call, host, "rlenbtv")?.ok_or_else(|| {
+        ShimError::Failed(
+            "rlenbtv with no Btrieve file current -- PLBTVSTF.C:696-709 would \
+             have asked Btrieve to STAT whatever file the TSR was last \
+             positioned on, and this host has no such position to fall back on"
+                .to_owned(),
+        )
+    })?;
+    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
+    Ok(abi::Ret::Int(A::Int::from(file.geometry().reclen)))
+}
+
+/// `int wslbtv(void)` -- **despite sitting in `BTVSTF.H`'s list beside the
+/// variable-length family, this has nothing to do with variable-length
+/// records.** The name suggests "was short last"; the body says otherwise
+/// -- exactly the "names are not evidence" trap this task's own
+/// instructions warn about.
+///
+/// `PLBTVSTF.C:730-739` (Worldgroup 1.0; not in MajorBBS 6.25, which has no
+/// lock-conflict statuses to report because it has no locking variants at
+/// all), quoted in full:
+///
+///
+/// "Was status Locked" -- checked against the module-static `status` every
+/// `btvu()` call leaves behind, the same variable [`llnbtv`]'s own
+/// `lastlen` sits beside in `PLBTVSTF.C`'s file scope. [`obtbtvl`]/
+/// [`stpbtvl`] both already call this internally (`PLBTVSTF.C:373`/`:513`,
+/// quoted in [`obtbtvl`]'s own doc comment) to fold a lock conflict into
+/// the same quiet 0 a not-found key gets.
+///
+/// # Always answers 0 here, and says why rather than leaving a reader to wonder
+///
+/// This host cannot produce Btrieve status 84 or 85 at all: both are
+/// **cross-client** lock conflicts, and `crate::btrieve::ops`'s own
+/// "Locking" module doc section -- "Cross-client conflict (statuses 84/85)
+/// is deferred, not architecturally absent" -- already establishes that
+/// this host has exactly one Btrieve client, so no lock any operation takes
+/// can ever be contended (`mbbs-single-threaded-by-force`). Locks
+/// themselves ARE modelled here -- [`crate::btrieve::ops::LockTable`],
+/// reached through [`take_lock`] -- so this is not Task 4's "locks are not
+/// modelled at all" branch; it is the narrower gap `ops.rs`'s own doc
+/// comment already named and reasoned through at length. Answered as a
+/// routine rather than refused, because a module asking "was I just
+/// refused for a lock" is entitled to the honest answer "no, nothing here
+/// can refuse you for that reason" -- the vendor's own defined answer for
+/// the one case that can never arise on this host, not an invented one.
+pub fn wslbtv<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `int llnbtv(void)` -- the length of the last record actually delivered.
+///
+/// `PLBTVSTF.C:352-356` (MajorBBS 6.25; identical body in Worldgroup 1.0/2.0
+/// modulo line numbers), quoted in full:
+///
+///
+/// `lastlen` is `PLBTVSTF.C`'s own file-scope static, set inside `btvu()`
+/// (`:687` in 6.25's own numbering) after *every* low-level call -- see the
+/// engine's own `lastlen` field doc comment ([`crate::btrieve::Btrieve`])
+/// for where this host updates its counterpart instead ([`deliver`], the
+/// one chokepoint every read routine in this file already funnels a
+/// successful positioning through), and why that scoping is the identical
+/// simplification already applied to `dfaLastLen`. `llnbtv` has zero call
+/// sites anywhere in this crate's survey corpus (this file's own module doc
+/// comment names `WCCMMUD.DLL`'s seventeen imports, and this is not one of
+/// them), so it is implemented on the same standing instruction as every
+/// other unexercised routine this task covers ([`take_lock`]'s own doc
+/// comment) rather than left out because nothing on hand calls it.
+pub fn llnbtv<A: Abi>(_call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Int(A::Int::from(host.btrieve.lastlen())))
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: `crtbtv` -- create a file from a module's own request. The engine
+// half (`crate::btrieve::create`, `btrieve/create.rs`) already exists and is
+// fully tested; this is the marshalling from the module's raw buffer into
+// its `FileSpec`.
+// ---------------------------------------------------------------------------
+
+/// `void crtbtv(char *filnam, void *databuf, int lendbuf, int keyno)` --
+/// create a new Btrieve file from a module's own request.
+///
+/// `PLBTVSTF.C:571-597` (MajorBBS 6.25; Worldgroup 1.0/2.0's own `:650-676`
+/// wraps every `movmem` in this file in a `goodblk()` bounds macro this one
+/// does not have -- the same textual difference every other routine this
+/// file cites from both generations shows, and no difference in what either
+/// generation actually does), quoted in full:
+///
+///
+/// Op 14, Create -- the same opcode [`crate::btrieve::create`] (this
+/// crate's own engine half) already writes a v5 file for. This routine's
+/// whole job is marshalling `databuf`/`lendbuf` -- `lendbuf` bytes at
+/// `databuf`, a Btrieve file specification block -- into that engine's
+/// [`FileSpec`](crate::btrieve::FileSpec)/[`KeySpec`](crate::btrieve::KeySpec)/
+/// [`SegmentSpec`](crate::btrieve::SegmentSpec).
+///
+/// # The buffer layout, measured against the Programmer's Reference
+///
+/// `archive/tooling/reference-documents/Btrieve_Programmers_Reference_1998.pdf`,
+/// Table 2-1 ("Data Buffer Structure for Create Operation", printed pages
+/// 51-52 -- confirmed with `pdftotext -layout`): one 16-byte File
+/// Specification (`reclen: u16, pagsiz: u16, numofx: u16, reserved: [u8;
+/// 4], flags: u16, "number of duplicate pointers to reserve": u8, unused:
+/// u8, allocation: u16`) followed by one 16-byte Key Specification per key
+/// **segment** (`keypos: u16, keylen: u16, keyflags: u16, reserved: [u8;
+/// 4], ext_type: u8, null_value: u8, unused: [u8;2], manual_keyno: u8,
+/// acs_number: u8`).
+///
+/// This is exactly `PLBTVSTF.C`'s own `struct filspc`/`struct keyspc` (this
+/// file's own top-of-file comment quotes both) -- the same 16+16-byte
+/// structures [`cntrbtv`]/[`rlenbtv`] already read a *reply* to op 15
+/// (`STAT`) as -- with a few fields neither of those routines happens to
+/// name (`filspc.reserved`/`unupag`; `keyspc.numofk`/`dontcare`/`reserved`)
+/// because they never read them, not because the buffer is shaped
+/// differently for a Create than for a Stat reply. `BTVSTF.H`'s own
+/// `#define ANOSEG 0x10` -- "key has another segment" -- is `keyspc.flags`
+/// bit 4, the identical bit `DFASF_SEGMENT` names in the richer structure
+/// `shims/dfa.rs`'s `dfaCreate` decodes from `DFAAPI.H`. **Two independent
+/// derivations -- this task's own PDF citation against a 1990s C struct,
+/// and `dfaCreate`'s own doc comment against `DFAAPI.H` and a live oracle
+/// run for Worldgroup's `dfaCreateSpec`  -- land on the identical
+/// 16+16-byte layout.** Not a shared implementation: `dfa.rs`'s own
+/// `decode_create_buffer` is private to its module, and this task's own
+/// file list forbids reaching into `shims/dfa.rs` to change that. The
+/// decoder below is the same wire format decoded a second time,
+/// independently, and agreeing.
+///
+/// # `keyno` is an overwrite selector, not a key count
+///
+/// Real Btrieve's `B_CREATE` `keynum` argument is `0` (replace an existing
+/// file) or `-1` (refuse if one exists) -- the identical fact [`dfaCreate`]'s
+/// own doc comment establishes for the same argument on the `dfa*` side of
+/// this API. [`crate::btrieve::create`] never overwrites regardless of
+/// `keyno` (its own doc comment), so this refuses any `keyno` outside
+/// `{0, -1}` rather than reinterpreting it as a key count, and `keyno == 0`
+/// on a file that already exists is refused the same honest way
+/// `keyno == -1` would be.
+///
+/// # What this refuses, and why none of it is new
+///
+/// Every limit [`crate::btrieve::create`]'s own doc comment names --
+/// variable-length records, more than one duplicate-permitting key, a key
+/// segment type this crate's reader cannot order, and so on -- is refused
+/// there, through that function's own `Result`, and surfaces here rather
+/// than being reimplemented. A nonzero `flags` word or an `allocation`
+/// other than 0/1 is refused in the decode below, the identical refusal
+/// [`dfaCreate`]'s own doc comment documents for the identical fields,
+/// because [`FileSpec`](crate::btrieve::FileSpec) has no representation for
+/// either.
+///
+/// # Unverified against a live engine
+///
+/// Like [`dfaCreate`], this marshalling is derived from the Programmer's
+/// Reference and cross-checked against `DFAAPI.H`'s independent structure,
+/// not measured against a live create through *this* wrapper --
+/// `tools/btrieve-oracle/crtprobe.c` exercises `crate::btrieve::create`
+/// directly, one layer below this marshalling. Stated as a fact about
+/// confidence, not smoothed over.
+pub fn crtbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let filnam = call.ptr();
+    let databuf = call.ptr();
+    let lendbuf = u16_arg::<A>(call.int(), "crtbtv")?;
+    let keyno = i16_arg::<A>(call.int());
+
+    let named = String::from_utf8_lossy(
+        filnam.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+    let name = Host::<A>::dos_name(&named).map_err(ShimError::Failed)?;
+
+    if keyno != 0 && keyno != -1 {
+        return Err(ShimError::Failed(format!(
+            "crtbtv({name}) with keyno {keyno}, which real Btrieve's B_CREATE \
+             takes as an overwrite selector (0 = replace an existing file, -1 = \
+             refuse if one exists), not a key count"
+        )));
+    }
+
+    let bytes = databuf
+        .resolve(call.mem(), usize::from(lendbuf))
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let spec = decode_file_spec(&bytes)?;
+
+    let path = host.root.join(&name);
+    crate::btrieve::create(&path, &spec)
+        .map_err(|e| ShimError::Failed(format!("crtbtv({name}): {e}")))?;
+    host.note(format!("created {name} via crtbtv"));
+    Ok(abi::Ret::Void)
+}
+
+/// Decode one Btrieve file-specification buffer (16-byte File Specification
+/// + N 16-byte Key Specifications -- [`crtbtv`]'s own doc comment) into a
+/// [`FileSpec`](crate::btrieve::FileSpec). Not shared with `shims/dfa.rs`'s
+/// own `decode_create_buffer`: that function is private to its module and
+/// this task's own file list forbids editing `shims/dfa.rs` to export it --
+/// but independently derived from the same wire format and checked to
+/// agree; see [`crtbtv`]'s own doc comment for both derivations side by
+/// side.
+fn decode_file_spec(bytes: &[u8]) -> Result<crate::btrieve::FileSpec, ShimError> {
+    use crate::btrieve::{FileSpec, KeySpec, SegmentSpec};
+
+    const FILE_SPEC: usize = 16;
+    const KEY_SPEC: usize = 16;
+    const DUPLICATE: u16 = 1;
+    const MODIFIABLE: u16 = 2;
+    const MANUAL: u16 = 8;
+    const NULL_KEY: u16 = 512;
+    const ANOSEG: u16 = 16;
+    const ALTCOLLATE: u16 = 32;
+    const DESCENDING: u16 = 64;
+
+    if bytes.len() < FILE_SPEC {
+        return Err(ShimError::Failed(format!(
+            "a create buffer of {} bytes, shorter than one 16-byte File \
+             Specification (Btrieve Programmer's Reference, Table 2-1)",
+            bytes.len()
+        )));
+    }
+    let word = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+
+    let record_length = word(0);
+    let page_size = word(2);
+    let n_keys = word(4);
+    let flags = word(10);
+    let allocation = word(14);
+
+    if flags != 0 {
+        return Err(ShimError::Failed(format!(
+            "create flags {flags:#06x} -- this engine's FileSpec has no \
+             representation for any file-flags bit, so any nonzero flags word \
+             is refused rather than silently ignored"
+        )));
+    }
+    if allocation > 1 {
+        return Err(ShimError::Failed(format!(
+            "an Allocation of {allocation} -- this engine always pre-allocates \
+             exactly one data page, so anything else cannot be honoured"
+        )));
+    }
+
+    let mut keys: Vec<KeySpec> = Vec::new();
+    let mut segments: Vec<SegmentSpec> = Vec::new();
+    let mut duplicates = false;
+    let mut modifiable = false;
+    let mut at = FILE_SPEC;
+    let mut seen_keys = 0u16;
+
+    while seen_keys < n_keys {
+        if at + KEY_SPEC > bytes.len() {
+            return Err(ShimError::Failed(format!(
+                "a create buffer with {n_keys} keys declared, but the key spec \
+                 at byte {at} runs past the buffer's own {} bytes",
+                bytes.len()
+            )));
+        }
+        let position = word(at);
+        let length = word(at + 2);
+        let seg_flags = word(at + 4);
+        let ext_type = bytes[at + 10];
+
+        if seg_flags & ALTCOLLATE != 0 {
+            return Err(ShimError::Failed(
+                "a key segment with an alternate collating sequence bit set -- \
+                 this host has no ACS file to read one from"
+                    .to_owned(),
+            ));
+        }
+        if seg_flags & (MANUAL | NULL_KEY) != 0 {
+            return Err(ShimError::Failed(format!(
+                "a key with flags {seg_flags:#06x} setting a manually-assigned \
+                 key number and/or a null value -- unsupported on the read side \
+                 (keys::parse's own UNSUPPORTED table), so refused here rather \
+                 than written and discovered broken later"
+            )));
+        }
+
+        duplicates = seg_flags & DUPLICATE != 0;
+        modifiable = seg_flags & MODIFIABLE != 0;
+
+        segments.push(SegmentSpec {
+            offset: position.checked_sub(1).ok_or_else(|| {
+                ShimError::Failed(
+                    "a key segment at wire position 0, which is not valid -- \
+                     positions are 1-based"
+                        .to_owned(),
+                )
+            })?,
+            length,
+            kind: ext_type,
+            descending: seg_flags & DESCENDING != 0,
+        });
+
+        let more_segments = seg_flags & ANOSEG != 0;
+        at += KEY_SPEC;
+        if !more_segments {
+            keys.push(KeySpec {
+                segments: std::mem::take(&mut segments),
+                duplicates,
+                modifiable,
+            });
+            seen_keys += 1;
+        }
+    }
+
+    Ok(FileSpec {
+        record_length,
+        page_size,
+        keys,
+    })
 }
 
 #[cfg(test)]
@@ -4667,5 +5422,375 @@ mod tests {
             .expect_err("{who} on a block that was never opened");
             assert!(e.to_string().contains(who), "{who}: {e}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Task 3: `bxabtv`/`exabtv`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bxabtv_then_exabtv_commits_and_leaves_no_transaction_open() {
+        let dir = crate::testing::scratch_with("bxabtv-commit", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+
+        f.invoke(bxabtv, &[0]).expect("begin");
+        assert_eq!(
+            f.invoke(dinsbtv, &Fixture::far(recptr)).expect("inserts"),
+            Ret::U16(1)
+        );
+        f.invoke(exabtv, &[]).expect("end (commit)");
+
+        // A second end with nothing open must be refused the same way
+        // dfaEndTrans refuses it -- one engine, one answer.
+        let e = f.invoke(exabtv, &[]).expect_err("no transaction is open");
+        assert!(e.to_string().contains("NoneActive") || e.to_string().to_lowercase().contains("no"), "{e}");
+
+        // The commit is real, not merely in-memory: a fresh host reading the
+        // same file from disk still finds the record.
+        let mut g = Fixture::rooted(dir);
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut g, Some(99), 0, 5), "Zorro survived the commit");
+    }
+
+    #[test]
+    fn bxabtv_twice_is_refused_exactly_as_dfabegtrans_is() {
+        let mut f = Fixture::new();
+        f.invoke(bxabtv, &[0]).expect("begin");
+        let e = f.invoke(bxabtv, &[0]).expect_err("already open");
+        assert!(e.to_string().contains("Already") || e.to_string().to_lowercase().contains("already"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4: `getbtvl`, `anpbtvl`, `anpbtvlk`, `aabbtvl`, `unlbtv`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn getbtvl_reads_the_same_record_getbtv_does() {
+        // The locking variant differs from the unlocked one only in the lock
+        // it takes -- if this host cannot contend a lock, the RECORD must
+        // still match exactly. A divergence here would be a bug in the
+        // argument frame, since getbtvl reads one more argument than getbtv.
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let key = f.bytes(&5i16.to_le_bytes(), false);
+        let into_a = f.bytes(&[0u8; 64], false);
+        let into_b = f.bytes(&[0u8; 64], false);
+
+        f.invoke(getbtv, &[into_a.offset, into_a.selector, key.offset, key.selector, 0, 5])
+            .expect("gets");
+        f.invoke(getbtvl,
+            &[into_b.offset, into_b.selector, key.offset, key.selector, 0, 5, 0],
+        )
+        .expect("gets, locked");
+
+        let a = f.machine.resolve(into_a, 64).expect("readable").to_vec();
+        let b = f.machine.resolve(into_b, 64).expect("readable").to_vec();
+        assert_eq!(a, b, "getbtvl must deliver the same record getbtv does");
+    }
+
+    /// Verified the hard way, same discipline as `obtbtvl_records_its_
+    /// lock_type_by_value`: `keynum = 0` (word 5) and `opt = 5` (word 6) are
+    /// both different from `lock = 100` (word 7), so reading the wrong word
+    /// for the lock records the wrong value rather than merely succeeding.
+    #[test]
+    fn getbtvl_records_its_lock_type_by_value() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let key = f.bytes(&5i16.to_le_bytes(), false);
+
+        f.invoke(getbtvl, &[0, 0, key.offset, key.selector, 0, 5, 100])
+            .expect("equal to 5, single lock with wait");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(100),
+            "word 7 is the lock; reading word 6 would have recorded 5 (opt)"
+        );
+    }
+
+    #[test]
+    fn getbtvl_with_no_file_current_answers_nothing_at_all() {
+        let mut f = nothing_current();
+        // void, so success with no write is the whole of the answer.
+        f.invoke(getbtvl, &[0, 0, 0, 0, 0, 5, 0]).expect("answers");
+    }
+
+    fn anp_setup() -> (Fixture, FarPtr) {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(4), 0, 5), "equal to 4");
+        (f, block)
+    }
+
+    #[test]
+    fn anpbtvl_and_anpbtvlk_agree_with_anpbtv_at_their_default_arguments() {
+        let (mut a, _) = anp_setup();
+        let want = a.invoke(anpbtv, &[0, 0, 6]).expect("acquire-next");
+
+        let (mut b, _) = anp_setup();
+        let got_l = b.invoke(anpbtvl, &[0, 0, 1, 6]).expect("chkcas=1, acquire-next");
+
+        let (mut c, _) = anp_setup();
+        let got_lk = c.invoke(anpbtvlk, &[0, 0, 1, 6, 0]).expect("chkcas=1, loktyp=0, acquire-next");
+
+        assert_eq!(want, got_l, "anpbtvl(recp,1,opt) must match anpbtv(recp,opt)");
+        assert_eq!(want, got_lk, "anpbtvlk(recp,1,opt,0) must match anpbtv(recp,opt)");
+    }
+
+    #[test]
+    fn anpbtvlk_records_its_lock_type_by_value() {
+        let (mut f, block) = anp_setup();
+        f.invoke(anpbtvlk, &[0, 0, 1, 6, 100]).expect("acquire-next, locked");
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(100),
+            "word 5 is the lock, not chkcas (word 3) or anpopt (word 4)"
+        );
+    }
+
+    #[test]
+    fn anpbtvl_with_no_file_current_answers_nothing_found() {
+        let mut f = nothing_current();
+        assert_eq!(
+            f.invoke(anpbtvl, &[0, 0, 1, 6]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn aabbtvl_records_its_lock_type_by_value() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(6), 0, 5), "equal to 6");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        f.invoke(aabbtvl,
+            &[0, 0, position as u16, (position >> 16) as u16, 0, 100],
+        )
+        .expect("acquires, locked");
+
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            Some(100),
+            "word 6 is the lock, not keynum (word 5)"
+        );
+    }
+
+    #[test]
+    fn aabbtvl_answers_zero_rather_than_refusing_when_nothing_is_at_the_position() {
+        // aabbtvl shares aabbtv's fatal:false convention (a quiet no), not
+        // gabbtvl's refusal -- the two differ in exactly Position::fatal.
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(
+            f.invoke(aabbtvl, &[0, 0, 0xff, 0xff, 0, 0]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn aabbtvl_with_no_file_current_answers_nothing_found() {
+        let mut f = nothing_current();
+        assert_eq!(
+            f.invoke(aabbtvl, &[0, 0, 7, 0, 0, 0]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    #[test]
+    fn unlbtv_releases_the_lock_at_the_current_position_with_keynum_zero() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100]).expect("lowest, single lock");
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), Some(100));
+
+        f.invoke(unlbtv, &[0, 0, 0]).expect("unlocks");
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), None);
+    }
+
+    #[test]
+    fn unlbtv_releases_a_lock_at_an_explicit_position_with_keynum_minus_one() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 100]).expect("lowest, single lock");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+
+        let minus_one = -1i16 as u16;
+        f.invoke(unlbtv, &[position as u16, (position >> 16) as u16, minus_one])
+            .expect("unlocks at the explicit position");
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), None);
+    }
+
+    #[test]
+    fn unlbtv_releases_every_lock_even_when_positioned_elsewhere_with_keynum_minus_two() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        f.invoke(obtbtvl, &[0, 0, 0, 0, 0, 12, 300]).expect("lowest, multiple lock");
+        let Ret::U32(position) = f.invoke(absbtv, &[]).expect("position") else {
+            panic!("absbtv returns a long");
+        };
+        // Move elsewhere, taking no new lock (loktyp 0) -- so the file is no
+        // longer positioned where the lock above was taken.
+        assert!(acquire(&mut f, None, 0, 13), "highest, no lock");
+
+        let minus_two = -2i16 as u16;
+        f.invoke(unlbtv, &[0, 0, minus_two]).expect("unlocks everything");
+
+        f.invoke(aabbtv, &[0, 0, position as u16, (position >> 16) as u16, 0])
+            .expect("re-acquire the earlier, locked position");
+        assert_eq!(
+            f.host.btrieve().lock_at_current(block).expect("open"),
+            None,
+            "keynum -2 released a lock held somewhere other than the current position"
+        );
+    }
+
+    #[test]
+    fn unlbtv_with_no_file_current_refuses_by_name() {
+        let mut f = Fixture::new();
+        let e = f.invoke(unlbtv, &[0, 0, 0]).expect_err("no file current");
+        assert!(e.to_string().contains("unlbtv"), "{e}");
+    }
+
+    #[test]
+    fn unlbtv_with_an_unrecognised_keynum_is_refused() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f.invoke(unlbtv, &[0, 0, 7]).expect_err("7 is none of the three flavours");
+        assert!(e.to_string().contains("flavours"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 5: `sttbtv`, `rlenbtv`, `wslbtv`, `llnbtv`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sttbtv_stores_the_argument_it_is_given() {
+        let mut f = Fixture::new();
+        f.invoke(sttbtv, &[300]).expect("stores");
+        assert_eq!(f.host.btrieve().stt_length(), 300);
+    }
+
+    #[test]
+    fn rlenbtv_answers_the_files_own_fixed_record_length_not_sttbtvs() {
+        // sttbtv and rlenbtv sit beside each other in BTVSTF.H's list, but
+        // rlenbtv's real body (PLBTVSTF.C, both generations) queries the
+        // file's own STAT reply, unrelated to whatever sttbtv was last told.
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        f.invoke(sttbtv, &[9999]).expect("stores, irrelevant to rlenbtv");
+        assert_eq!(f.invoke(rlenbtv, &[]).expect("answers"), Ret::U16(64));
+    }
+
+    #[test]
+    fn rlenbtv_with_no_file_current_refuses_by_name() {
+        let mut f = Fixture::new();
+        let e = f.invoke(rlenbtv, &[]).expect_err("no file current");
+        assert!(e.to_string().contains("rlenbtv"), "{e}");
+    }
+
+    #[test]
+    fn wslbtv_always_answers_zero() {
+        // This host cannot produce Btrieve status 84/85 at all -- see
+        // wslbtv's own doc comment -- so there is no call sequence on hand
+        // that makes this answer anything else.
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(wslbtv, &[]).expect("answers"), Ret::U16(0));
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(!acquire(&mut f, Some(9999), 0, 5), "no such key");
+        assert_eq!(f.invoke(wslbtv, &[]).expect("still zero"), Ret::U16(0));
+    }
+
+    #[test]
+    fn llnbtv_answers_the_length_deliver_last_copied() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(f.invoke(llnbtv, &[]).expect("answers"), Ret::U16(0), "nothing read yet");
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5");
+        assert_eq!(
+            f.invoke(llnbtv, &[]).expect("answers"),
+            Ret::U16(64),
+            "SAMPLE.DAT's own record length, the whole record delivered"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Task 6: `crtbtv`.
+    // -----------------------------------------------------------------
+
+    /// Build a Btrieve create buffer: one 16-byte File Specification and one
+    /// 16-byte Key Specification per key, per `crtbtv`'s own doc comment.
+    fn file_spec_block(reclen: u16, page: u16, keys: &[(u16, u16, u8, bool)]) -> Vec<u8> {
+        let mut out = vec![0u8; 16 + 16 * keys.len()];
+        out[0..2].copy_from_slice(&reclen.to_le_bytes());
+        out[2..4].copy_from_slice(&page.to_le_bytes());
+        out[4..6].copy_from_slice(&(keys.len() as u16).to_le_bytes());
+        // flags (10..12) and allocation (14..16) left zero.
+        let mut at = 16;
+        for &(offset, length, kind, duplicates) in keys {
+            out[at..at + 2].copy_from_slice(&(offset + 1).to_le_bytes()); // 1-based
+            out[at + 2..at + 4].copy_from_slice(&length.to_le_bytes());
+            let flags: u16 = if duplicates { 1 } else { 0 };
+            out[at + 4..at + 6].copy_from_slice(&flags.to_le_bytes());
+            out[at + 10] = kind;
+            at += 16;
+        }
+        out
+    }
+
+    #[test]
+    fn crtbtv_creates_a_file_the_hosts_own_reader_can_open() {
+        let dir = crate::testing::scratch("crtbtv-create");
+        let mut f = Fixture::rooted(dir.clone());
+        let name = f.text("MADE.DAT");
+        let spec = file_spec_block(64, 512, &[(0, 4, 0x0e, false)]);
+        let spec_ptr = f.bytes(&spec, false);
+
+        f.invoke(crtbtv,
+            &[name.offset, name.selector, spec_ptr.offset, spec_ptr.selector, spec.len() as u16, 0],
+        )
+        .expect("creates");
+
+        let g = crate::btrieve::Geometry::read("MADE.DAT", &dir.join("MADE.DAT")).expect("opens");
+        assert_eq!((g.page, g.reclen, g.keys), (512, 64, 1));
+    }
+
+    #[test]
+    fn crtbtv_refuses_a_keyno_that_is_not_an_overwrite_selector() {
+        let dir = crate::testing::scratch("crtbtv-bad-keyno");
+        let mut f = Fixture::rooted(dir);
+        let name = f.text("MADE2.DAT");
+        let spec = file_spec_block(64, 512, &[(0, 4, 0x0e, false)]);
+        let spec_ptr = f.bytes(&spec, false);
+
+        let e = f.invoke(crtbtv,
+            &[name.offset, name.selector, spec_ptr.offset, spec_ptr.selector, spec.len() as u16, 7],
+        )
+        .expect_err("7 is neither 0 nor -1");
+        assert!(e.to_string().contains("overwrite"), "{e}");
+    }
+
+    #[test]
+    fn crtbtv_creates_a_two_key_file_with_the_right_geometry() {
+        let dir = crate::testing::scratch("crtbtv-two-keys");
+        let mut f = Fixture::rooted(dir.clone());
+        let name = f.text("MADE3.DAT");
+        let spec = file_spec_block(8, 512, &[(0, 4, 0x0e, false), (4, 4, 0x0e, true)]);
+        let spec_ptr = f.bytes(&spec, false);
+
+        f.invoke(crtbtv,
+            &[name.offset, name.selector, spec_ptr.offset, spec_ptr.selector, spec.len() as u16, 0],
+        )
+        .expect("creates");
+
+        let g = crate::btrieve::Geometry::read("MADE3.DAT", &dir.join("MADE3.DAT")).expect("opens");
+        assert_eq!(g.keys, 2, "two keys declared in the buffer");
+        assert_eq!(g.reclen, 8);
     }
 }

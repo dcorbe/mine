@@ -1617,6 +1617,59 @@ pub struct Btrieve<A: Abi> {
     /// corpus (it is exported, but zero import count), so this is scoped to
     /// the one shape worth reproducing rather than every call site.
     dfa_last_len: u16,
+
+    /// `lastlen`: `PLBTVSTF.C:34` (MajorBBS 6.25 -- `llnbtv` has a body
+    /// there, `:352-356`), `llnbtv`'s own answer -- the BTVSTF
+    /// family's counterpart to [`Self::dfa_last_len`], and independent of it
+    /// for the identical reason `dfa_last_len` gives for why it is
+    /// independent of `dfa`/`bb`: `PLBTVSTF.C` and `DFAAPI.C` are two
+    /// different translation units, each with its own file-scope `static int
+    /// lastlen`, both fed by their own low-level call into the same
+    /// underlying `INT 0x7B` -- not the same variable.
+    ///
+    /// Updated in exactly one place, [`shims::btrieve::deliver`]
+    /// (`crate::shims::btrieve`) -- the chokepoint every read routine in that
+    /// file already funnels a successful positioning through
+    /// (`locate`/`absolute`/`stpbtvl`'s own direct calls) -- with the same
+    /// scoping [`Self::dfa_last_len`]'s own doc comment already applies to
+    /// its family: the real `btvu()` (`:812`, `lastlen=btvdatptr->dbflen`)
+    /// echoes back Btrieve's own `dbflen` after *every* call, including a
+    /// query that delivers nothing and a write; this host updates it only
+    /// where a record is actually copied into module memory. `llnbtv` has no
+    /// import anywhere in `WCCMMUD.DLL`'s own seventeen-symbol survey (this
+    /// file's own module doc comment), so -- exactly as for `dfa_last_len`
+    /// -- this is scoped to the one shape worth reproducing rather than
+    /// instrumented at every call site on no evidence any of them matters.
+    lastlen: u16,
+
+    /// The length `sttbtv` last stored, for a future `llnbtv`... no,
+    /// `rlenbtv`... **no consumer has been found for this at all.**
+    ///
+    /// `sttbtv(int len)` is declared at `BTVSTF.H:169` (Worldgroup-era
+    /// numbering) and has **no body in any of the three recovered
+    /// `PLBTVSTF.C` generations** -- MajorBBS 6.25, Worldgroup 1.0 or
+    /// Worldgroup 2.0 (Task 1's own finding) -- and no macro in `BTVSTF.H`
+    /// and no call site anywhere in `archive/` or `re/` references it either
+    /// (checked: `grep -a -rn sttbtv archive/ re/`, zero hits outside the two
+    /// header declarations). So this field's very existence is inferred, not
+    /// measured: `sttbtv` sits in `BTVSTF.H`'s list immediately after the
+    /// insert/update family, which is the only reason to guess "set the
+    /// length for the next variable write" over any other reading of `int
+    /// len`, and `rlenbtv`'s own real body (`PLBTVSTF.C:696-710`, both
+    /// generations agree) does **not** read anything like it back -- it
+    /// queries the file's own fixed `reclen` off a Btrieve `STAT` (op 15),
+    /// unrelated to whatever a module last told `sttbtv`. Nothing in this
+    /// crate reads this field back through any other shim either: it is
+    /// stored, and stored only, on the standing instruction that a real
+    /// Btrieve feature is implemented even where the one surveyed module
+    /// never reaches it (`take_lock`'s own doc comment) -- but "implemented"
+    /// here can only mean "the argument is read at the right width and
+    /// remembered", because inventing which write path consumes it would be
+    /// inventing behaviour with zero evidence behind it, the one thing this
+    /// project's "no plausible zeros" rule forbids outright. [`Self::stt_length`]
+    /// exists so a test can observe the argument landed correctly; nothing
+    /// downstream of it exists yet.
+    stt_length: u16,
 }
 
 impl<A: Abi> Default for Btrieve<A> {
@@ -1641,6 +1694,8 @@ impl<A: Abi> Default for Btrieve<A> {
             dfa_stack: [A::null_ptr(); DFSTSZ],
             dfa_mode: 0,
             dfa_last_len: 0,
+            lastlen: 0,
+            stt_length: 0,
         }
     }
 }
@@ -1847,6 +1902,32 @@ impl<A: Abi> Btrieve<A> {
     /// to answer later.
     pub fn dfa_set_last_len(&mut self, len: u16) {
         self.dfa_last_len = len;
+    }
+
+    /// `llnbtv`'s own answer -- see the `lastlen` field's own doc comment for
+    /// what updates it and what does not.
+    pub fn lastlen(&self) -> u16 {
+        self.lastlen
+    }
+
+    /// Record what a BTVSTF-family read just delivered, for [`Self::lastlen`]
+    /// to answer later. Called from exactly one place,
+    /// [`shims::btrieve::deliver`](crate::shims::btrieve::deliver) -- see the
+    /// `lastlen` field's own doc comment for why that one chokepoint is
+    /// enough.
+    pub fn set_lastlen(&mut self, len: u16) {
+        self.lastlen = len;
+    }
+
+    /// What `sttbtv` last stored -- see the `stt_length` field's own doc
+    /// comment for the honest account of what this is (and is not yet) for.
+    pub fn stt_length(&self) -> u16 {
+        self.stt_length
+    }
+
+    /// Record what `sttbtv` was just given.
+    pub fn set_stt_length(&mut self, len: u16) {
+        self.stt_length = len;
     }
 
     /// `dfaSetBlk` -- `DFAAPI.C:186-192`, quoted in full because the one
@@ -2269,6 +2350,35 @@ impl<A: Abi> Btrieve<A> {
     pub fn unlock_current(&mut self, at: A::Ptr) -> Result<(), String> {
         let index = self.find(at)?;
         self.open[index].unlock(&mut self.locks);
+        Ok(())
+    }
+
+    /// Release the lock this session holds at an explicit file position --
+    /// Btrieve op 27 with `keynum = -1`, `unlbtv`'s `ulmbtv`/`ulobtv`
+    /// flavour (`BTVSTF.H:126-127`: `unlbtv(absbtv(),-1)` /
+    /// `unlbtv((f),-1)`). Always succeeds, for the identical reason
+    /// [`Self::unlock_current`] does: releasing a position that was never
+    /// locked is a no-op, not an error.
+    ///
+    /// # Errors
+    /// If `at` names no open file.
+    pub fn unlock_at(&mut self, at: A::Ptr, position: u32) -> Result<(), String> {
+        let index = self.find(at)?;
+        self.locks.release_at(self.open[index].id(), position);
+        Ok(())
+    }
+
+    /// Release every lock this session holds on `at` -- Btrieve op 27 with
+    /// `keynum = -2`, `unlbtv`'s `ulabtv` flavour (`BTVSTF.H:128`:
+    /// `unlbtv(NULL,-2)`). The same operation [`Self::close`] already
+    /// performs on every file it closes; this is the module-callable form of
+    /// it, on a file that stays open.
+    ///
+    /// # Errors
+    /// If `at` names no open file.
+    pub fn unlock_all(&mut self, at: A::Ptr) -> Result<(), String> {
+        let index = self.find(at)?;
+        self.locks.release_all_for(self.open[index].id());
         Ok(())
     }
 
@@ -4410,6 +4520,8 @@ mod tests {
             dfa_stack: [FarPtr::NULL; DFSTSZ],
             dfa_mode: 0,
             dfa_last_len: 0,
+            lastlen: 0,
+            stt_length: 0,
         }
     }
 

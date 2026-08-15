@@ -668,6 +668,35 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
         (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
         (MAJORBBS, "clsbb", btrieve::clsbb, Cleans::Caller),
+        // --- Track B, 2026-08-15: the rest of BTVSTF.H's declared surface ---
+        // Twelve wrappers, taking this layer from 26 of 36 to all 36. Their
+        // only surviving implementation is `PLBTVSTF.C`, the Phar Lap BTVSTF
+        // layer -- NOT MajorBBS 5.11's `BTVSTF.C`, which predates all twelve,
+        // and not `re/wg33src`, which carries no BTVSTF layer at all.
+        //
+        // Eight of the twelve are absent from the MajorBBS 6.25 copy and come
+        // from Worldgroup 1.0: the transaction pair, every locking variant,
+        // and `wslbtv`. Locking and explicit transactions are post-6.25
+        // additions to this layer, which is worth knowing before citing "the
+        // v6-era body" for any of them.
+        //
+        // `sttbtv` has no body in any of the three generations -- declared at
+        // `BTVSTF.H:169` and implemented nowhere recovered. It stores its
+        // argument and is wired to nothing, because no consumer exists in
+        // `archive/` or `re/` to wire it to. That uncertainty is recorded in
+        // its own doc comment rather than papered over.
+        (MAJORBBS, "bxabtv", btrieve::bxabtv, Cleans::Caller),
+        (MAJORBBS, "exabtv", btrieve::exabtv, Cleans::Caller),
+        (MAJORBBS, "getbtvl", btrieve::getbtvl, Cleans::Caller),
+        (MAJORBBS, "anpbtvl", btrieve::anpbtvl, Cleans::Caller),
+        (MAJORBBS, "anpbtvlk", btrieve::anpbtvlk, Cleans::Caller),
+        (MAJORBBS, "aabbtvl", btrieve::aabbtvl, Cleans::Caller),
+        (MAJORBBS, "unlbtv", btrieve::unlbtv, Cleans::Caller),
+        (MAJORBBS, "sttbtv", btrieve::sttbtv, Cleans::Caller),
+        (MAJORBBS, "rlenbtv", btrieve::rlenbtv, Cleans::Caller),
+        (MAJORBBS, "wslbtv", btrieve::wslbtv, Cleans::Caller),
+        (MAJORBBS, "llnbtv", btrieve::llnbtv, Cleans::Caller),
+        (MAJORBBS, "crtbtv", btrieve::crtbtv, Cleans::Caller),
         // The GSBL terminal layer. Fourteen routines, seventy-seven call
         // sites, none of them reached by initialisation, plus three more
         // (`btuhpk`/`btupbc`/`btucpc`) registered even though `WCCMMUD.DLL`
@@ -1706,6 +1735,35 @@ mod import_surface {
             assert!(served16(MAJORBBS, name), "{name} must serve Wg16");
             assert!(served32(MAJORBBS, name), "{name} must serve Wg32");
         }
+    }
+
+    /// Every routine `BTVSTF.H` declares is registered — all 36.
+    ///
+    /// Track B took this from 26. The list is the header's, not a
+    /// hand-maintained one: re-derive it with
+    ///
+    /// ```text
+    /// grep -aoE "^(void|int|long|char|unsigned) +\*? *[a-z_0-9]+ *\(" \
+    ///   archive/galacticomm/extract/wg1/GALDSRC/SRC/BTVSTF.H
+    /// ```
+    ///
+    /// Note the `-a`: `grep` here is `ugrep -I` and silently skips files it
+    /// judges binary, 1990s C headers included.
+    #[test]
+    fn the_whole_btvstf_declared_surface_is_registered() {
+        const BTVSTF: &[&str] = &[
+            "aabbtv", "aabbtvl", "absbtv", "anpbtv", "anpbtvl", "anpbtvlk", "bxabtv", "clsbtv",
+            "cntrbtv", "crtbtv", "delbtv", "dinsbtv", "dupdbtv", "exabtv", "gabbtv", "gabbtvl",
+            "getbtv", "getbtvl", "insbtv", "invbtv", "llnbtv", "obtbtv", "obtbtvl", "omdbtv",
+            "qnpbtv", "qrybtv", "rlenbtv", "rstbtv", "setbtv", "stpbtv", "stpbtvl", "sttbtv",
+            "unlbtv", "updbtv", "upvbtv", "wslbtv",
+        ];
+        let missing: Vec<_> = BTVSTF
+            .iter()
+            .filter(|n| matches!(entry::<Wg16>(MAJORBBS, n), Entry::Unimplemented))
+            .collect();
+        assert!(missing.is_empty(), "BTVSTF.H declares these and they are unserved: {missing:?}");
+        assert_eq!(BTVSTF.len(), 36, "BTVSTF.H declares 36; this list drifted");
     }
 
     #[test]
