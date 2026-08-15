@@ -312,6 +312,97 @@ pub fn f_scopy(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret
     Ok(abi::Ret::Long(dxax(machine)))
 }
 
+/// `void far *f_spush@(void far *src, unsigned len)` -- Borland's
+/// structure-by-value stack push, ordinal 884.
+///
+/// # Where this comes from
+///
+/// Not declared in any recovered Galacticomm header
+/// (`archive/galacticomm/extract/wg1/GALDSRC/SRC`), any more than its seven
+/// siblings above are -- this is the compiler's own runtime, not the
+/// MajorBBS API, linked into `MAJORBBS.DLL` the same incidental way. Ordinal
+/// 884 is stable across every export map this project has recovered:
+/// MajorBBS 5.11 (`archive/galacticomm/majorbbs_mbbs625.tsv:945`),
+/// Worldgroup 1.01 (`majorbbs_wg101.tsv:1086`) and Worldgroup 2.00
+/// (`majorbbs_wg200.tsv:1109`). No body survives in `re/wg33src` or
+/// `mbbs511s.zip` either -- neither SDK ships the compiler's own runtime
+/// source -- so, like `f_scopy@` above it, this is implemented from The
+/// Rose's own call sites rather than from a declaration: six of them, in
+/// `RCIROSE.DLL` segment 8, at fixups `0x26b`, `0x279`, `0x287` and their
+/// exact duplicates `0x37e`, `0x38c`, `0x39a`.
+///
+/// # The calling convention, measured and not assumed
+///
+/// Every site is
+///
+///
+/// with nothing pushed before the call and no `add sp`/`pop` after it --
+/// `re/ne_arity.py 884 tmp/gapsurvey/rose/RCIROSE.DLL` reports "cleans void"
+/// for all six sites, exactly what it reports for `f_lxmul@`/`f_lxlsh@`/
+/// `f_lxursh@` above for the same reason: a register-only routine looks
+/// identical to a callee-cleaned one to a tool that only watches for a
+/// caller-side stack adjustment after the call. **`Cleans::Caller`, not
+/// `Callee`** -- there are no argument words on the module's stack for
+/// either side to clean. The plan that scheduled this task expected
+/// `Callee` from this routine's family resemblance to the four division
+/// helpers; the guess does not survive the disassembly, which is the entire
+/// point of measuring instead of assuming.
+///
+/// # What the routine actually does, and why this host cannot do it
+///
+/// `F_SPUSH@`'s name is literal: it pushes the struct at `AX:DX` onto the
+/// module's own hardware stack, `CX` bytes at a time (`SP -= CX`, then a
+/// copy into the space that opens up), so that a struct passed by value can
+/// be built on the stack without a run of individual `push` instructions --
+/// the same problem `f_scopy@` solves for a plain assignment, here solved
+/// for an argument. Confirmed at both of The Rose's call groups: three
+/// consecutive `F_SPUSH@` calls of `0xe0` (224) bytes each are immediately
+/// followed by `push cs; call near <seg 8:0x3f5>; add sp,0x2a0` -- and
+/// `0x2a0 == 3 * 0xe0` exactly, so the *caller's* own cleanup after that
+/// near call removes precisely what the three pushes added, nothing more
+/// and nothing less. `seg 8:0x3f5` itself opens with the ordinary `push bp;
+/// mov bp,sp` prologue and reads its own arguments starting at `[bp+0x1e]`
+/// and beyond: real struct fields, addressed the only way a compiler ever
+/// addresses a by-value argument -- relative to a stack pointer that
+/// actually has to have moved before the call reads it.
+///
+/// This host's shim layer has no way to move it. [`crate::shims::Cleans`]
+/// only ever *adds* bytes to the module's `SP` on return
+/// (`Machine::resume_cleaning`), for popping arguments a module already
+/// pushed before the call -- there is no direction that subtracts, and
+/// neither [`Call`] nor [`Machine`] exposes an `SP` setter at all; the
+/// resume path is the only place `SP` is ever written, and it is driven
+/// entirely by the table's static `Cleans` value, not by anything a shim
+/// decides mid-call. That is the same shape of gap `shims::misc`'s module
+/// doc names for `byenow` and `listing` -- a capability the call needs and
+/// the shim layer does not have -- except there the missing piece is
+/// calling back into the module's own code, and here it is moving the
+/// module's own stack pointer. Reading the arguments faithfully and
+/// refusing, rather than reporting a copy that repositioned nothing a
+/// subsequent instruction could find, is the same choice this crate makes
+/// everywhere else that happens.
+///
+/// # Errors
+///
+/// Always. There is no argument value this can succeed for.
+pub fn f_spush(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
+    // Formatted from the registers rather than built into a `FarPtr`: this
+    // routine always errors and never dereferences the address, so naming
+    // `Wg16`'s concrete pointer type here would put a 16-bit type into a
+    // shim purely to make a debug string -- exactly what
+    // `tests/no_direct_farptr.rs` exists to keep out. `selector:offset` is
+    // the same rendering `FarPtr`'s own `Display` produces.
+    let src = format!("{:04x}:{:04x}", machine.dx(), machine.ax());
+    let len = machine.cx();
+
+    Err(ShimError::Failed(format!(
+        "f_spush@({src}, {len}): this host cannot grow the module's own \
+         stack from inside a shim -- see this function's own doc comment \
+         for exactly what capability is missing"
+    )))
+}
+
 /// The single signed pair that has no answer: `i32::MIN / -1`.
 fn overflow(name: &str, a: i32, b: i32) -> ShimError {
     ShimError::Failed(format!(
@@ -620,5 +711,35 @@ mod tests {
         assert!(format!("{e}").contains("does not fit"), "{e}");
         let e = div(f_lmod, i32::MIN as u32, -1i32 as u32).expect_err("refused");
         assert!(format!("{e}").contains("does not fit"), "{e}");
+    }
+
+    #[test]
+    fn f_spush_reads_ax_dx_cx_and_refuses() {
+        // AX = source offset, DX = source segment, CX = length -- measured
+        // off The Rose's own six call sites (`lea ax,[bp+disp]; mov dx,ss;
+        // mov cx,<len>; call far F_SPUSH@`). Three distinct field values,
+        // and the full formatted `selector:offset` pair asserted in order
+        // rather than a bare `contains` on one number, so a shim that read
+        // AX and DX swapped -- exactly the kind of silent-shift bug
+        // `Cleans` exists to catch one level up -- fails this test too.
+        let mut f = Fixture::new();
+        let e = f
+            .invoke_with(f_spush, &[], [0x00aa, 0, 0x0038, 0x1234])
+            .expect_err("f_spush@ always refuses: no shim can grow the module's own stack");
+        let msg = format!("{e}");
+        assert!(msg.contains("1234:00aa"), "{msg}");
+        assert!(msg.contains("56"), "{msg}"); // 0x0038 == 56, CX as a plain decimal length
+    }
+
+    #[test]
+    fn f_spush_refuses_regardless_of_the_arguments() {
+        // The mutation this has to survive is reporting `Ok` -- a
+        // plausible-looking success that claims a struct landed somewhere a
+        // later instruction could find it, when nothing on the module's
+        // real stack pointer moved. That is true for every input, not just
+        // the six measured sites, so this checks a second, unrelated set of
+        // values: an all-zero call is not special-cased into succeeding.
+        let mut f = Fixture::new();
+        assert!(f.invoke_with(f_spush, &[], [0, 0, 0, 0]).is_err());
     }
 }

@@ -699,6 +699,75 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         (GALGSBL, "btuhpk", gsbl::btuhpk, Cleans::Caller),
         (GALGSBL, "btupbc", gsbl::btupbc, Cleans::Caller),
         (GALGSBL, "btucpc", gsbl::btucpc, Cleans::Caller),
+        // --- Track A, 2026-08-15: closing the ten-build import survey ---
+        // The GALGSBL character-interrupt family. Ordinals confirmed against
+        // the vendor's own `re/wg33src/LIB/GALGSBL.DEF` (3, 4, 5, 8, 52, 64)
+        // rather than a reconstructed map. `btuchi` refuses: its callback
+        // replaces the character-translation stage of every later character,
+        // and this host's input path has no equivalent of the `tasks`/
+        // `Host::prctask` sweep that lets `initask` defer invocation.
+        (GALGSBL, "btuche", gsbl::btuche, Cleans::Caller),
+        (GALGSBL, "btuchi", gsbl::btuchi, Cleans::Caller),
+        (GALGSBL, "btuclc", gsbl::btuclc, Cleans::Caller),
+        (GALGSBL, "btucls", gsbl::btucls, Cleans::Caller),
+        (GALGSBL, "btutru", gsbl::btutru, Cleans::Caller),
+        (GALGSBL, "chiout", gsbl::chiout, Cleans::Caller),
+        // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
+        // vendor branches have structurally different headers, so they are
+        // ABI-concrete in both native tables below.
+        (MAJORBBS, "galmalloc", memory::galmalloc, Cleans::Caller),
+        (MAJORBBS, "sizmem", memory::sizmem, Cleans::Caller),
+        // Borland's runtime, re-exported through MAJORBBS. `_fgetc` points at
+        // `stream::fgetc` deliberately: Borland's `_fgetc` is
+        // `{ ++fp->level; return fgetc(fp); }`, observably the same routine,
+        // and `crt` carried a dead duplicate body that has been deleted. It is
+        // a *different symbol* from the already-registered `fgetc` because this
+        // host strips exactly one leading underscore -- stripping greedily
+        // would merge `_OLDSEND` and `__OLDSEND`, which are two real symbols.
+        (MAJORBBS, "_fgetc", stream::fgetc, Cleans::Caller),
+        (MAJORBBS, "stricmp", crt::stricmp, Cleans::Caller),
+        (MAJORBBS, "ultoa", crt::ultoa, Cleans::Caller),
+        (MAJORBBS, "ungetc", crt::ungetc, Cleans::Caller),
+        (MAJORBBS, "rename", crt::rename, Cleans::Caller),
+        (MAJORBBS, "getenv", crt::getenv, Cleans::Caller),
+        (MAJORBBS, "gettime", crt::gettime, Cleans::Caller),
+        (MAJORBBS, "_doserror", crt::doserror, Cleans::Caller),
+        (MAJORBBS, "__errno", crt::errno, Cleans::Caller),
+        (MAJORBBS, "_lrand", crt::lrand, Cleans::Caller),
+        (MAJORBBS, "searchpath", crt::searchpath, Cleans::Caller),
+        (MAJORBBS, "setmode", crt::setmode, Cleans::Caller),
+        (MAJORBBS, "read", crt::read, Cleans::Caller),
+        (MAJORBBS, "write", crt::write, Cleans::Caller),
+        // `mfytask` completes the pair `initask` opened: a module could
+        // register a task and then fail modifying it.
+        (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller),
+        // `.MSG` access. Both of these were previously "absent on purpose"
+        // because `WCCMMUD.DLL` does not import them -- the reasoning the
+        // scope rule suspends. The Rose imports `getasc` at six sites.
+        (MAJORBBS, "getasc", msg::getasc, Cleans::Caller),
+        (MAJORBBS, "rawmsg", msg::rawmsg, Cleans::Caller),
+        // FSD. `fsdfxt` deliberately does NOT refuse an out-of-range field:
+        // it is the vendor's own guarded wrapper around the unguarded
+        // `fsdnan`, and `buffer[0]='\0'` is its documented answer.
+        (MAJORBBS, "fsdfxt", fsd::fsdfxt, Cleans::Caller),
+        (MAJORBBS, "fsdrhd", fsd::fsdrhd, Cleans::Caller),
+        // Five fixed arguments, measured: the wg1 and WG3.3 headers and
+        // `ACCOUNT.C` all agree, and Rose's own call site cleans 7 words.
+        (MAJORBBS, "swtcls", user::swtcls, Cleans::Caller),
+        // Runtime name resolution: one shared resolver, two ABI-native faces.
+        // Both answer library presence truthfully and report "not found" for a
+        // symbol address, which is the real API's own contract -- thunk indices
+        // are minted only at module load.
+        (DOSCALLS, "dosgetmodhandle", dosenv::dosgetmodhandle, Cleans::Callee(8)),
+        (DOSCALLS, "dosgetprocaddr", dosenv::dosgetprocaddr, Cleans::Callee(10)),
+        (KERNEL32, "loadlibrarya", borland::loadlibrarya, Cleans::Callee(4)),
+        (KERNEL32, "freelibrary", borland::freelibrary, Cleans::Callee(4)),
+        // The last unresolved import across all ten surveyed builds. Answers
+        // GMEERR because that is what the vendor's own body answers when the
+        // messaging engine is not running, which for this host is always --
+        // see `dosenv::simpsnd`, and note it is NOT zero, which would mean
+        // "still processing" and spin the caller.
+        (GALME, "simpsnd", dosenv::simpsnd, Cleans::Caller),
     ]
 }
 
@@ -734,6 +803,27 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
     // And this one is a struct copy: two far pointers on the stack, which it
     // pops, and the length in `CX`.
     (MAJORBBS, "f_scopy@", runtime::f_scopy, Cleans::Callee(runtime::POINTERS)),
+    // `f_spush@` looks like `f_scopy@`'s sibling and is NOT callee-cleaned.
+    // Measured, not assumed: all six of The Rose's call sites disassemble to
+    // `lea ax,[bp+disp]; mov dx,ss; mov cx,<len>; call far F_SPUSH@` -- nothing
+    // pushed, no `add sp` after. That is the register-only shape of
+    // `f_lxmul@`/`f_lxlsh@`/`f_lxursh@` above, not the stack-argument shape of
+    // the four division helpers. Getting this wrong does not crash; it leaves
+    // arguments on the module's own stack and shifts every later frame.
+    (MAJORBBS, "f_spush@", runtime::f_spush, Cleans::Caller),
+    // The block allocator, `Wg16` half. ABI-concrete rather than generic
+    // because the vendor's two branches are structurally different, not just
+    // reordered: GCDOS chains globs through a `segarray` of pointers, the flat
+    // branch stores data inline. Both headers here are byte-identical to
+    // `ALCBLOK.C`'s own.
+    (MAJORBBS, "alcblok", memory::alcblok, Cleans::Caller),
+    (MAJORBBS, "ptrblok", memory::ptrblok, Cleans::Caller),
+    (MAJORBBS, "freblok", memory::freblok, Cleans::Caller),
+    // Screen and per-user state that only the 16-bit builds import. `extoff`
+    // additionally *needs* `Wg16`: it reaches the GCV2-only `extusr` table.
+    (MAJORBBS, "explode", screen::explode, Cleans::Caller),
+    (MAJORBBS, "iniscn", screen::iniscn, Cleans::Caller),
+    (MAJORBBS, "extoff", user::extoff, Cleans::Caller),
 ];
 
 /// [`Abi::native`]'s `Wg16` half: a lookup into [`WG16_ROUTINES`], the table
@@ -767,8 +857,28 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 /// `Cleans::Caller` because no call site pushes a stack argument at all: the
 /// operand is on the FPU stack, and all thirteen of LunatiX's call sites are
 /// preceded by `fld`/`fild`/`fmul` with nothing pushed.
-const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans)] =
-    &[(MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller)];
+const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans)] = &[
+    (MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller),
+    // The block allocator, `Wg32` half. Same C export names as the `Wg16`
+    // entries in `WG16_ROUTINES` -- this is deliberate, not the duplicate
+    // registration `6d8af77` cleaned up. One symbol, two ABI-concrete bodies,
+    // reached through `Abi::native`, exactly as `wg16_native`/`wg32_native`
+    // already dispatch. The vendor's flat branch is a single inline
+    // allocation with `size` at offset 0 and element 0 at +8; this matches it
+    // byte for byte and adds the `qty` the vendor omits, in the six header
+    // bytes `alczer` already zeroes, so the bounds check the flat branch
+    // structurally cannot have costs no compatibility.
+    (MAJORBBS, "alcblok", memory::alcblok32, Cleans::Caller),
+    (MAJORBBS, "ptrblok", memory::ptrblok32, Cleans::Caller),
+    (MAJORBBS, "freblok", memory::freblok32, Cleans::Caller),
+    // WGNT host services. Only the PE32 builds import these -- MajorMUD NT
+    // for the first five, Rose 3.0NT for the rest.
+    (MAJORBBS, "getfiletm", system::getfiletm, Cleans::Caller),
+    (MAJORBBS, "paccit", user::paccit, Cleans::Caller),
+    (MAJORBBS, "samepatu", user::samepatu, Cleans::Caller),
+    (MAJORBBS, "vtmsend", system::vtmsend, Cleans::Caller),
+    (MAJORBBS, "vtmsndok", system::vtmsndok, Cleans::Caller),
+];
 
 /// [`Abi::native`]'s `Wg32` half. See [`wg16_native`], which this mirrors.
 pub(crate) fn wg32_native(dll: &str, symbol: &str) -> Option<(Shim<crate::abi::Wg32>, Cleans)> {
@@ -869,7 +979,6 @@ const ABSOLUTES: &[(&str, &str, u16)] = &[(
 /// ([`gsbl::btuxmn`], Task 7), so as of this alias all seven `btu*` imports
 /// are served. Kept as a footnote rather than deleted: it is the reason this
 /// alias shipped one commit ahead of full coverage instead of waiting for it.
-///
 
 /// Still a list of named aliases, not a general suffix-stripping rule.
 /// Case-insensitive because PE import directory names are conventionally
@@ -879,6 +988,15 @@ fn canonical_dll(dll: &str) -> &str {
         ("WGSERVER.EXE", MAJORBBS),
         ("cw3220mt.DLL", MAJORBBS),
         ("GALGSBL.dll", GALGSBL),
+        // Same situation as `GALGSBL.dll` directly above, one library over,
+        // found 2026-08-15. Both 32-bit builds import `GALME.dll!_simpsnd`
+        // while this host registers GALME's routines under the bare
+        // `"GALME"` an NE segment is named -- so without this alias the
+        // lookup misses a routine that exists, exactly as it did for
+        // `hrtval` under GALGSBL. Nothing else is currently imported from
+        // GALME by a PE build, but `_oldsend` would have the same problem
+        // the moment one did.
+        ("GALME.dll", GALME),
     ];
     ALIASES
         .iter()
@@ -1379,6 +1497,23 @@ mod convention {
                 ("doscreatedsalias", Cleans::Callee(6)),
                 ("getmodulehandlea", Cleans::Callee(4)),
                 ("getprocaddress", Cleans::Callee(8)),
+                // Runtime name resolution, added 2026-08-15 -- the same two
+                // conventions as the four rows above, one library over each.
+                // Phar Lap's pair is far pascal like `dossetvec`:
+                // `DosGetModHandle` takes two far pointers (4+4);
+                // `DosGetProcAddr` takes a handle and two far pointers
+                // (2+4+4). KERNEL32's pair is stdcall like
+                // `getmodulehandlea`/`getprocaddress`: one 32-bit argument
+                // each, an `LPCSTR` and an `HMODULE` respectively.
+                ("dosgetmodhandle", Cleans::Callee(8)),
+                ("dosgetprocaddr", Cleans::Callee(10)),
+                ("loadlibrarya", Cleans::Callee(4)),
+                ("freelibrary", Cleans::Callee(4)),
+                // `f_spush@` is deliberately NOT in this list. It looks like
+                // `f_scopy@`'s sibling and is not: all six of The Rose's call
+                // sites disassemble to a register-only sequence with nothing
+                // pushed and no `add sp` after, so `Cleans::Caller` is the
+                // measured answer. See its row in `WG16_ROUTINES`.
                 ("f_ldiv@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_lmod@", Cleans::Callee(runtime::OPERANDS)),
                 ("f_ludiv@", Cleans::Callee(runtime::OPERANDS)),
@@ -1425,5 +1560,187 @@ mod convention {
         for name in ["f_lxmul@", "f_lxlsh@", "f_lxursh@"] {
             assert_eq!(survey_continue_convention(name), None);
         }
+    }
+}
+
+/// Every symbol the 2026-08-15 ten-build survey found missing is now served.
+///
+/// Guards against a future refactor silently unregistering one. The module
+/// binaries live in `archive/` and outside this repo, so this asserts the
+/// **registration table**, not the DLLs -- it must run without the archive
+/// present. Re-derive the list with `re/importgaps.py <module> --abi wg16|wg32`
+/// against the ten builds named in
+/// `docs/plans/2026-08-15-host-api-surface-design.md` § 1.
+///
+/// # Why a table assertion and not a survey
+///
+/// The survey script is the thing that was wrong twice during this work. It
+/// could not see `GALMSG` at all (`634017b`), so it reported an already-served
+/// symbol as unnameable for three days; and before that it could not parse PE
+/// modules, so the entire 32-bit half of the surface went unmeasured
+/// (`c943fe4`). A test that shelled out to it would inherit both classes of
+/// blindness. Asserting [`entry`] directly is the one check a measurement bug
+/// cannot fool, because [`entry`] is what the loader itself calls.
+///
+/// Lives here rather than in `crates/mbbs/tests/` because `crate::shims` is a
+/// private module: an integration test cannot reach [`entry`], and making the
+/// module public to accommodate a test would widen the crate's API for no
+/// other reason.
+#[cfg(test)]
+mod import_surface {
+    use super::*;
+    use crate::abi::Wg32;
+
+    /// `(library, symbol)` for every gap the ten-build survey found.
+    const CLOSED_BY_TRACK_A: &[(&str, &str)] = &[
+        // GALGSBL: the character-interrupt family, plus the alias that left an
+        // already-implemented routine unreachable for three 32-bit builds.
+        (GALGSBL, "btuche"),
+        (GALGSBL, "btuchi"),
+        (GALGSBL, "btuclc"),
+        (GALGSBL, "btucls"),
+        (GALGSBL, "btutru"),
+        (GALGSBL, "chiout"),
+        (GALGSBL, "hrtval"),
+        // Allocation.
+        (MAJORBBS, "alcblok"),
+        (MAJORBBS, "ptrblok"),
+        (MAJORBBS, "freblok"),
+        (MAJORBBS, "galmalloc"),
+        (MAJORBBS, "sizmem"),
+        // Borland's runtime, re-exported through MAJORBBS.
+        (MAJORBBS, "_fgetc"),
+        (MAJORBBS, "stricmp"),
+        (MAJORBBS, "ultoa"),
+        (MAJORBBS, "ungetc"),
+        (MAJORBBS, "rename"),
+        (MAJORBBS, "getenv"),
+        (MAJORBBS, "gettime"),
+        (MAJORBBS, "_doserror"),
+        (MAJORBBS, "__errno"),
+        (MAJORBBS, "_lrand"),
+        (MAJORBBS, "searchpath"),
+        (MAJORBBS, "setmode"),
+        (MAJORBBS, "read"),
+        (MAJORBBS, "write"),
+        (MAJORBBS, "f_spush@"),
+        // Tasking, messages, FSD, screen, accounts.
+        (MAJORBBS, "mfytask"),
+        (MAJORBBS, "getasc"),
+        (MAJORBBS, "rawmsg"),
+        (MAJORBBS, "fsdfxt"),
+        (MAJORBBS, "fsdrhd"),
+        (MAJORBBS, "explode"),
+        (MAJORBBS, "iniscn"),
+        (MAJORBBS, "swtcls"),
+        (MAJORBBS, "extoff"),
+        // WGNT host services -- 32-bit builds only.
+        (MAJORBBS, "getfiletm"),
+        (MAJORBBS, "paccit"),
+        (MAJORBBS, "samepatu"),
+        (MAJORBBS, "vtmsend"),
+        (MAJORBBS, "vtmsndok"),
+        // Runtime name resolution, Phar Lap half.
+        (DOSCALLS, "dosgetmodhandle"),
+        (DOSCALLS, "dosgetprocaddr"),
+    ];
+
+    /// The datums, separate because the failure mode differs in kind: a module
+    /// *addresses* these rather than calling them, so a routine registration
+    /// puts a dispatch thunk's address into the fixup and the module reads a
+    /// function where it wanted state -- every routine implemented, nothing
+    /// happening.
+    const DATUMS: &[(&str, &str)] = &[
+        (MAJORBBS, "fsdusr"),
+        (MAJORBBS, "emlsdrou"),
+        (MAJORBBS, "errcod"),
+        (MAJORBBS, "othexp"),
+        (MAJORBBS, "kilipg"),
+        (MAJORBBS, "kilsrc"),
+    ];
+
+    fn served16(dll: &str, name: &str) -> bool {
+        !matches!(entry::<Wg16>(dll, name), Entry::Unimplemented)
+    }
+
+    fn served32(dll: &str, name: &str) -> bool {
+        !matches!(entry::<Wg32>(dll, name), Entry::Unimplemented)
+    }
+
+    #[test]
+    fn every_symbol_the_survey_found_missing_is_now_served() {
+        let unserved: Vec<_> = CLOSED_BY_TRACK_A
+            .iter()
+            .filter(|(dll, name)| !served16(dll, name) && !served32(dll, name))
+            .collect();
+        assert!(unserved.is_empty(), "unserved under BOTH ABIs: {unserved:?}");
+    }
+
+    #[test]
+    fn the_kernel32_resolution_pair_serves_wg32() {
+        // Spelled with the `.dll` suffix a PE import directory carries, which
+        // is the literal value `KERNEL32` holds; `canonical_dll` leaves it be.
+        for name in ["loadlibrarya", "freelibrary"] {
+            assert!(served32(KERNEL32, name), "KERNEL32!{name} must serve Wg32");
+        }
+    }
+
+    #[test]
+    fn the_datums_are_addressable_and_not_callable() {
+        for (dll, name) in DATUMS {
+            assert!(
+                matches!(entry::<Wg16>(dll, name), Entry::Datum),
+                "{dll}!{name} must be a Datum, not a Routine"
+            );
+        }
+    }
+
+    #[test]
+    fn the_block_allocator_serves_both_abis_from_two_bodies() {
+        // Same C export in both native tables, deliberately: the vendor's two
+        // `ALCBLOK.C` branches have structurally different headers, so no one
+        // generic body can be byte-compatible with both. This is not the
+        // duplicate registration `6d8af77` removed -- these are ABI-concrete
+        // and reached through `Abi::native`.
+        for name in ["alcblok", "ptrblok", "freblok"] {
+            assert!(served16(MAJORBBS, name), "{name} must serve Wg16");
+            assert!(served32(MAJORBBS, name), "{name} must serve Wg32");
+        }
+    }
+
+    #[test]
+    fn simpsnd_resolves_under_the_pe_spelling_of_galme() {
+        // The last unresolved import across all ten builds, and it needed two
+        // things: the routine, and `canonical_dll` learning that a PE import
+        // directory spells the library `GALME.dll` while this host registers
+        // under the bare `GALME` an NE segment carries. Both 32-bit builds ask
+        // for `GALME.dll!_simpsnd` and nothing else from that library, so the
+        // alias had no other symbol to be noticed by.
+        assert!(
+            matches!(entry::<Wg32>("GALME.dll", "simpsnd"), Entry::Routine(..)),
+            "GALME.dll!simpsnd must resolve for a PE module"
+        );
+        assert!(
+            matches!(entry::<Wg16>(GALME, "simpsnd"), Entry::Routine(..)),
+            "and under the bare NE spelling too"
+        );
+        // The alias must not have been achieved by folding GALME into
+        // MAJORBBS -- they are genuinely different libraries.
+        assert!(
+            matches!(entry::<Wg16>(MAJORBBS, "simpsnd"), Entry::Unimplemented),
+            "simpsnd is GALME's, not MAJORBBS's"
+        );
+    }
+
+    #[test]
+    fn galmsg_ordinal_thirty_is_served_and_was_never_unnameable() {
+        // Carried for three days as a symbol this host "cannot even name". It
+        // is `_OLDSEND`, mapped in `crates/mbbs/data/galmsg_wg101.tsv` and
+        // registered long before that claim was written -- the survey script
+        // simply could not see the library. Pinned so the claim cannot return.
+        assert!(
+            matches!(entry::<Wg16>(GALMSG, "oldsend"), Entry::Routine(..)),
+            "GALMSG ordinal 30 is oldsend, and is served"
+        );
     }
 }

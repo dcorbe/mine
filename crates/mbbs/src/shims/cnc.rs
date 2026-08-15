@@ -317,24 +317,32 @@ pub fn cncall<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// qstate`; this is that same loop with `usrptr->class > SUPIPG` in place of
 /// the state comparison, and no `qstate` argument to read.
 ///
-/// **Not reproduced: `onsysn`'s walk leaves `othusn`/`othusp`/`othuap`
-/// pointed at the last channel it inspected.** The vendor's `for` loop uses
-/// three placed host globals (`othusn`, `othusp`, `othuap` -- all present in
-/// `crates/mbbs/src/globals.rs`) as its own loop variables, so a module that
-/// calls `onsys()` and then reads `othusp` afterward sees whatever the scan
-/// left there -- the matching channel's slot, or one past the last channel
-/// if nothing matched. Faithfully reproducing that would still be
-/// incomplete: the vendor's loop *also* assigns a fourth pointer, `othexp
-/// = extoff(othusn)` (`MAJORBBS.H:352`), and `othexp` is not a global this
-/// host places at all -- no module in the corpus this host was built
-/// against addresses it (the same reasoning `crates/mbbs/src/users.rs`
-/// already gives for leaving `othuap` needing no host-set value of its own,
-/// but here there is no address to write *to* in the first place). Writing
-/// three of the four side-effect globals and silently skipping the fourth
-/// would be a worse, harder-to-notice divergence than writing none, so this
-/// implementation touches none of them and leaves whatever the calling
-/// module's previous host call already left there. Flagged, not silently
-/// assumed away.
+/// **Not reproduced: `onsysn`'s walk leaves `othusn`/`othusp`/`othuap`/
+/// `othexp` pointed at the last channel it inspected.** The vendor's `for`
+/// loop uses four placed host globals (`othusn`, `othusp`, `othuap`,
+/// `othexp` -- all present in `crates/mbbs/src/globals.rs`) as its own loop
+/// variables, so a module that calls `onsys()` and then reads `othusp`
+/// afterward sees whatever the scan left there -- the matching channel's
+/// slot, or one past the last channel if nothing matched.
+///
+/// **Corrected 2026-08-15 (Task 13/15 of the host-API-surface track): this
+/// used to say `othexp` "is not a global this host places at all -- no
+/// module in the corpus this host was built against addresses it," which
+/// was true when written and is not true now.** RTSLORD-NE (Twilight Lord)
+/// imports `OTHEXP` directly, 15 sites (`re/ne_arity.py 826
+/// tmp/gapsurvey/tlord_ne/RTSLORD.DLL`), and `crate::shims::user::extoff`
+/// (the routine that produces the value the vendor's loop assigns into it)
+/// is now implemented too. The comment hardened a true-at-the-time search
+/// result into a permanent claim, exactly the pattern
+/// `docs/*host-api-surface*` warns is worth checking for on sight. The
+/// *conclusion* stands regardless: writing some of the four side-effect
+/// globals and silently skipping others would be a worse, harder-to-notice
+/// divergence than writing none of them, so this implementation still
+/// touches none of `othusn`/`othusp`/`othuap`/`othexp` and leaves whatever
+/// the calling module's previous host call already left there. Flagged, not
+/// silently assumed away -- now for a real reason (an all-or-nothing
+/// side-effect this routine does not reproduce) rather than a stale one (a
+/// slot that used not to exist).
 ///
 /// # Errors
 ///

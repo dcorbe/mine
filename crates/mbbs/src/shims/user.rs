@@ -1196,6 +1196,313 @@ pub fn echsec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `char prmcls[KEYSIZ]`'s byte offset within `struct usracc` (`USRACC.H:29`,
+/// `KEYSIZ` = 16 including the terminator). See [`swtcls`]'s own doc comment
+/// for how this is derived and why it holds for both ABIs.
+const PRMCLS: u16 = 0xf0; // 240
+
+/// `char curcls[KEYSIZ]`'s byte offset. See [`PRMCLS`].
+const CURCLS: u16 = 0x100; // 256
+
+/// `unsigned fgvdys`'s byte offset -- "days since debt was last forgiven".
+/// See [`PRMCLS`].
+const FGVDYS: u16 = 0x116; // 278
+
+/// `KEYSIZ` (`USRACC.H:16`) -- 16 bytes including the NUL, what `curcls`/
+/// `prmcls` are each sized for.
+const KEYSIZ: usize = 16;
+
+/// `VOID swtcls(struct usracc *uacc, INT makprm, const CHAR *clsnam, INT dest,
+/// INT days)` -- switch an account to another class.
+///
+/// `re/wg33src/SRC/server/wgserver/ACCOUNT.C:226-...` (Worldgroup 3.3, 1997)
+/// / `archive/galacticomm/extract/wg1/GALDSRC/SRC/ACCOUNT.C:233-...` (wg1,
+/// identical body): looks the named class up in a class table (`fndcls`),
+/// **deletes the whole account** if it does not exist there, redirects to
+/// `tclptr->nxtcls[DCREDIT]` instead of switching if the class's
+/// `NOCRED`/`HASCRD` flag disagrees with the account's credit balance,
+/// updates `clsptr->users`/`tclptr->users` counters, copies the new class
+/// name into `curcls` (and, if `makprm`, into `prmcls` too, plus
+/// `daystt`/`fgvdys`), resynchronises `othusn`/`othusp`/`othuap` if the
+/// account is online elsewhere, and -- unless `dest >= 2` -- prints one of
+/// the class's four canned messages (`clsbb`, a Btrieve file) through `pmlt`.
+///
+/// # Why only the account mutation is reproduced
+///
+/// Every other piece needs a class table (`crtclass`/`fndcls`/`struct
+/// clstab`/`struct acclass`) this crate has never modeled anywhere (`grep -rl
+/// fndcls crates/mbbs/src` finds nothing). Faithfully reproducing `fndcls`
+/// returning `NULL` (`delacct` -- **deleting the whole account** on an
+/// unrecognised class name) or the credit-redirect branch would both mean
+/// inventing class-table data this host does not have, exactly the
+/// fabrication "no plausible zeros" refuses -- worse, `delacct` on a name
+/// this host merely failed to validate would be destructive on a guess. So
+/// this accepts every `clsnam` it is given (there is no table to check it
+/// against) and performs only what `ACCOUNT.C`'s own body does
+/// unconditionally, past the parts that need the table:
+///
+/// * `curcls` is always overwritten with `clsnam` (`ACCOUNT.C:270`).
+/// * `prmcls` and `fgvdys=0` are written only when `makprm` is set
+///   (`:271-272`, `:279`) -- **not** `daystt`, which the vendor computes from
+///   `tclptr->flags&DAYEXP` and `tclptr->dftday`, both class-table fields
+///   this host cannot read; writing a guessed `daystt` would be exactly the
+///   plausible-but-invented answer this crate refuses, so it stays
+///   untouched -- the same "declined, not silently assumed away" choice
+///   [`extoff`]'s own doc comment inherits from `onsysn`'s for `othexp`.
+/// * `othusn`/`othusp`/`othuap` resynchronisation, the `clsbb` exit message,
+///   and the credit-balance/class-table branches are not reproduced at all.
+///
+/// This makes `makprm` the one argument with an effect distinct from the
+/// rest: a temporary switch (`makprm==0`) touches only `curcls`; a permanent
+/// one also touches `prmcls`/`fgvdys`.
+///
+/// # `curcls`/`prmcls`/`fgvdys`'s offsets
+///
+/// Not in [`crate::users::AccountLayout`] -- that file is not this task's to
+/// edit -- derived locally instead, from `USRACC.H`'s own field list and
+/// cross-checked against the four offsets `AccountLayout::of` already
+/// carries and this crate's own tests already confirm (`ansifl`=0xd0
+/// through `scnfse`=0xd3, right where this count also puts them). Every
+/// field from `userid` through `emllim` is `char`/`int`/`long`/an array of
+/// one of those, Borland packs all of them with no alignment gap (every
+/// running total below stays even), and `curcls`/`prmcls`/`fgvdys` sit well
+/// before `spare[]` -- the one field GCV2 and non-GCV2 disagree about the
+/// size of (`AccountLayout::of`'s own doc comment) -- so these offsets are
+/// identical for both ABIs:
+///
+/// ```text
+/// scnfse(1) @0xd3   age(1) sex(1) credat(2) usedat(2) csicnt(2)
+///                    flags(2) access[7](14) emllim(4)  -> running total 0xf0
+/// prmcls[16] @0xf0 (240)
+/// curcls[16] @0x100 (256)
+/// timtdy(4) @0x110   daystt(2) @0x114
+/// fgvdys(2) @0x116 (278)
+/// ```
+///
+/// # `clsnam`'s length
+///
+/// `KEYSIZ` (16, NUL included) bounds `curcls`/`prmcls` on disk. A `clsnam`
+/// that does not fit is not a class this host's own table rejected (there is
+/// none) -- it is a write past `curcls` into `timtdy`, the unchecked-overflow
+/// shape this crate stops on rather than allows.
+///
+/// # Arity, measured rather than trusted
+///
+/// The header this task cites (`archive/galacticomm/extract/wg1/GALDSRC/SRC/
+/// USRACC.H:174`, wg1) declares exactly **five fixed arguments, no `...`** --
+/// contrary to this task's own framing, which expected the declaration to
+/// end in a variadic tail. Confirmed three independent ways, not just read
+/// once: the wg1 header, the identical `re/wg33src/INC/USRACC.H:70`
+/// (Worldgroup 3.3) and `ACCOUNT.C`'s own definition all declare five;
+/// every real call site found agrees (Elwynor's `GLOBROUS.C:3891,5014`, and
+/// `re/isv_union_pe_symbols.tsv`'s `WGSERVER _swtcls 3 3`); and Rose's own
+/// compiled call (`re/ne_arity.py 595 tmp/gapsurvey/rose/RCIROSE.DLL`)
+/// cleans **7 words** -- exactly `uacc`(2) + `makprm`(1) + `clsnam`(2) +
+/// `dest`(1) + `days`(1), a far pointer costing two words each. Rose32's PE
+/// build imports it too (`tmp/gapsurvey/round2/out_rose_pe.txt`, one call),
+/// both under `MAJORBBS`, so this is registered generically rather than
+/// per-ABI.
+///
+/// # Errors
+///
+/// If `uacc`/`clsnam` cannot be read, or `clsnam` (with its terminator) does
+/// not fit in `KEYSIZ` bytes.
+pub fn swtcls<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uacc = call.ptr();
+    let makprm = Into::<u32>::into(call.int()) != 0;
+    let clsnam = call.ptr();
+    let _dest = call.int();
+    let _days = call.int();
+
+    let name = clsnam
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("swtcls: clsnam: {e}")))?
+        .to_vec();
+    if name.len() + 1 > KEYSIZ {
+        return Err(ShimError::Failed(format!(
+            "swtcls: a {}-byte class name will not fit in curcls/prmcls's {KEYSIZ}",
+            name.len()
+        )));
+    }
+    let mut field = name;
+    field.push(0);
+
+    A::ptr_offset(uacc, CURCLS)
+        .write(call.mem(), &field)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    if makprm {
+        A::ptr_offset(uacc, PRMCLS)
+            .write(call.mem(), &field)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        A::ptr_offset(uacc, FGVDYS)
+            .write(call.mem(), &0u16.to_le_bytes())
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+    }
+
+    Ok(abi::Ret::Void)
+}
+
+/// `struct extusr *extoff(int unum)` -- pointer to `extusr[unum]`.
+///
+/// `archive/galacticomm/extract/wg1/GALDSRC/SRC/MAJORBBS.C:4304-4309` (wg1):
+///
+///
+/// [`crate::users::Users::extra`] already is this: the same `nterms`-slots
+/// `extusr` table [`curusr`]'s own doc comment names as one of the two
+/// globals it deliberately does not set (`WCCMMUD.DLL` addresses neither
+/// `extusr` nor `extptr`). RTSLORD-NE (Twilight Lord) addresses both,
+/// directly: `EXTOFF` is `MAJORBBS` ordinal 827, 5 real call sites
+/// (`re/ne_arity.py 827 tmp/gapsurvey/tlord_ne/RTSLORD.DLL`, each cleaning 1
+/// word -- the one `int unum` argument, matching the header), and `OTHEXP`
+/// is ordinal 826, imported as **data** at 15 sites (the same tool reports
+/// "cleans void" at every one -- the signature of a fixup with no call after
+/// it, not a routine). `OTHEXP` is the caller-side assignment target
+/// `othexp=extoff(othusn)` (`MAJORBBS.C:3023` &c.) writes into, the same
+/// shape `onsysn`'s own doc comment already traces for it, not a second
+/// routine this file owes.
+///
+/// **`othexp` needs a `globals.rs` entry this task's file scope does not
+/// reach** (`g("othexp", PTR)`, mirroring `othuap`) -- flagged for the
+/// integrator, not silently dropped. `onsysn`'s "no module in the corpus
+/// addresses it" is now **wrong** -- RTSLORD-NE does, 15 times -- the exact
+/// stale-comment shape the plan's Global Constraints warned would turn up,
+/// and that comment needs correcting once `othexp` is placed.
+///
+/// GCV2-only: `struct extusr` is a GCV2 invention
+/// ([`crate::users::extusr_stride`]'s own doc comment), so this refuses
+/// under a non-GCV2 ABI rather than fabricating an address -- consistent
+/// with registering it in `WG16_ROUTINES`, not the generic table.
+///
+/// # Errors
+///
+/// If `unum` names no channel of this host, or this ABI has no `extusr`
+/// table.
+pub fn extoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("extoff({unum}): there is no such channel")))?;
+    let ptr = host
+        .users()
+        .extra(chan)
+        .ok_or_else(|| ShimError::Failed("extoff: this ABI has no extusr table".to_string()))?;
+    Ok(abi::Ret::Ptr(ptr))
+}
+
+/// `VOID paccit(VOID)` -- "show input on modem monitor, check profanity" --
+/// post-process a channel's already-read line
+/// ([`crate::Host::paccin`]/[`getin`]) before the module reads it back out
+/// of `margv`.
+///
+/// `re/wg33src/SRC/server/wgserver/MAJORBBS.C:3996-4003` (Worldgroup 3.3,
+/// 1997):
+///
+///
+/// Two halves, both gated on machinery this host does not have, for two
+/// different reasons.
+///
+/// **`shomal_hook`** echoes the channel's raw input to the SYSOP's local
+/// console ("show input"), unless `MONHID` (`MAJORBBS.H:222`, "hide input
+/// from the monitor screen") is set. This is the same local-console concept
+/// [`crate::Host::paccin`]'s own doc comment already declines system-wide
+/// ("the modem monitor and the profanity check, both BBS-shaped and out of
+/// scope") -- there is no SYSOP console to echo to, so this half is a true
+/// no-op, not a gap.
+///
+/// **`(*setpfn)(input)`** defaults to `dftpfn` (`MAJORBBS.C:4005-4021`; no
+/// module in the corpus this host was built against reassigns the hook),
+/// which computes `pfnlvl=profan(input)`, clamps it against
+/// `haskey(syskey)`/`pfceil`, and -- when the clamped level exceeds 1 --
+/// accumulates it into `usrptr->pfnacc`. `profan` itself is a real routine
+/// this host implements ([`crate::shims::mudtext::profan`]), but its scan
+/// (`crate::shims::mudtext::profan_scan`) is a file-private helper of that
+/// module -- reaching it from here would mean either duplicating
+/// Galacticomm's word-list logic a second time (the exact "two
+/// implementations that can silently diverge" shape this crate has been
+/// bitten by before) or widening that helper's visibility, a change to
+/// `mudtext.rs`, outside this task's file scope. **And even with a level in
+/// hand there is nowhere faithful to put half of it**: `usracc`'s `pfnacc`
+/// accumulator has no offset in [`crate::users::UserLayout`] at all, so the
+/// reachable half of `dftpfn` (the `pfnlvl` global write) would be
+/// observable while the unreachable half (`pfnacc`) stayed silently zero --
+/// the same "writing three of four side-effect globals is worse than
+/// writing none" reasoning [`extoff`]'s own doc comment inherits from
+/// `onsysn`'s for `othexp`.
+///
+/// So this is a full, faithful no-op: not because nothing in `paccit`
+/// matters, but because every module-observable piece of it needs either a
+/// console this host does not have or a struct field this crate has not
+/// placed, and inventing either would be exactly the fabrication "no
+/// plausible zeros" refuses. One import, one call site each in MajorMUD NT
+/// (`tmp/gapsurvey/round2/out_mmud_nt7pk.txt`/`out_mmud_nt8pj.txt`), 32-bit
+/// only -- registered in `WG32_ROUTINES`.
+pub fn paccit<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
+/// `GBOOL samepatu(CHAR *sau1, CHAR *sau2, GBOOL exact)` -- do these two GCSP
+/// dynapak-name strings match?
+///
+/// `re/wg33src/INC/GCSP.H:536` declares it; `re/wg33src/INC/GCSPSRV.H:124-125`
+/// gives its only two callers, both macros:
+///
+///
+/// # No surviving body -- semantics from the macros and their call sites, not a guess
+///
+/// No `GCSP*.C` implementing `samepatu` itself survives in `re/wg33src` --
+/// only the header and hundreds of call sites reached through the two
+/// macros above, every one matching Worldgroup's internal client/server
+/// protocol token strings (`samepat("sau:irccfg",dpkstg)`,
+/// `samepato("sau:",dpkstg)`, ...; `re/wg33src/SRC/icsrc/galirc/IRCAGT.C`,
+/// `.../galfil/GALFILCS.C`, dozens more). The parameter names in
+/// `samepato`'s own macro -- `shorts`, `longs` -- are the specification the
+/// missing body cannot contradict: `exact=TRUE` (`samepat`) is a full match,
+/// `exact=FALSE` (`samepato`) is "does `longs` start with `shorts`", the
+/// shape every one of those call sites needs (`samepato("sau:",dpkstg)`
+/// asking whether a received packet name begins with a fixed prefix). This
+/// is the opposite of this task's own sample test's premise (wildcard-glob
+/// matching a user-ID against `"SYS*"`) -- `samepatu` has nothing to do with
+/// user IDs; it is a GCSP protocol-token comparison, and the test below is
+/// written to that, not to the sample -- exactly what this task's own
+/// instructions asked for when a vendor body disagrees with the premise.
+///
+/// **Recorded uncertainty: case sensitivity.** Every real call site compares
+/// two machine-generated protocol tokens (a fixed C string literal against a
+/// received dynapak name), never user input, so this compares bytes exactly
+/// -- unlike [`crate::shims::text::sameas`], which this crate already keeps
+/// case-insensitive specifically because it compares user-facing values
+/// (user-IDs, keys). No surviving body confirms this either way for
+/// `samepatu`.
+///
+/// MajorMUD NT is the only known importer (`re/wg_nt_ghidra/exports/
+/// WCCMMUD_decompiled.c:67230`, `_samepatu()` gating a state check --
+/// argument values are not visible in that decompile). 32-bit only, one call
+/// site each in `wccnt7pk`/`wccnt8pj` -- registered in `WG32_ROUTINES`.
+///
+/// # Errors
+///
+/// If `sau1`/`sau2` cannot be read as NUL-terminated strings.
+pub fn samepatu<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let sau1 = call.ptr();
+    let sau2 = call.ptr();
+    let exact = Into::<u32>::into(call.int()) != 0;
+
+    let a = sau1
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("samepatu: sau1: {e}")))?
+        .to_vec();
+    let b = sau2
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("samepatu: sau2: {e}")))?
+        .to_vec();
+
+    let matched = if exact { a == b } else { b.starts_with(a.as_slice()) };
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(matched))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2328,5 +2635,221 @@ mod tests {
             .expect("usrnum is placed");
 
         assert!(f.invoke(echsec, &[b'*' as u16, 40]).is_err());
+    }
+
+    // ---- swtcls -----------------------------------------------------------
+
+    fn read_field(f: &Fixture, uacc: FarPtr, offset: u16, len: usize) -> Vec<u8> {
+        let at = FarPtr { offset: uacc.offset + offset, selector: uacc.selector };
+        f.machine.resolve(at, len).expect("field readable").to_vec()
+    }
+
+    fn write_field(f: &mut Fixture, uacc: FarPtr, offset: u16, bytes: &[u8]) {
+        let at = FarPtr { offset: uacc.offset + offset, selector: uacc.selector };
+        f.machine.write(at, bytes).expect("field writable");
+    }
+
+    fn cstr_field(f: &Fixture, uacc: FarPtr, offset: u16) -> Vec<u8> {
+        let raw = read_field(f, uacc, offset, KEYSIZ);
+        raw.split(|&b| b == 0).next().expect("at least one segment").to_vec()
+    }
+
+    #[test]
+    fn swtcls_changes_curcls_and_leaves_prmcls_alone_when_makprm_is_zero() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let uacc = f.host.users().account(console);
+        write_field(&mut f, uacc, PRMCLS, b"NORMAL\0");
+        write_field(&mut f, uacc, CURCLS, b"NORMAL\0");
+
+        let cls = f.text("SYSOP");
+        f.invoke(swtcls, &[uacc.offset, uacc.selector, 0, cls.offset, cls.selector, 3, 0])
+            .expect("swtcls");
+
+        assert_eq!(cstr_field(&f, uacc, CURCLS), b"SYSOP");
+        // The mutation this task's own plan called out by name: a shim that
+        // ignores `makprm` and always writes `prmcls` too would pass a test
+        // that only checks `curcls`. `prmcls` must still read "NORMAL".
+        assert_eq!(
+            cstr_field(&f, uacc, PRMCLS),
+            b"NORMAL",
+            "makprm==0 must not touch prmcls"
+        );
+    }
+
+    #[test]
+    fn swtcls_with_makprm_also_sets_prmcls_and_resets_fgvdys() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let uacc = f.host.users().account(console);
+        write_field(&mut f, uacc, PRMCLS, b"NORMAL\0");
+        write_field(&mut f, uacc, CURCLS, b"NORMAL\0");
+        write_field(&mut f, uacc, FGVDYS, &99u16.to_le_bytes());
+
+        let cls = f.text("SYSOP");
+        f.invoke(swtcls, &[uacc.offset, uacc.selector, 1, cls.offset, cls.selector, 3, 0])
+            .expect("swtcls");
+
+        assert_eq!(cstr_field(&f, uacc, CURCLS), b"SYSOP");
+        assert_eq!(cstr_field(&f, uacc, PRMCLS), b"SYSOP", "makprm==1 must also set prmcls");
+        assert_eq!(
+            u16::from_le_bytes(read_field(&f, uacc, FGVDYS, 2).try_into().unwrap()),
+            0,
+            "makprm==1 resets fgvdys"
+        );
+    }
+
+    #[test]
+    fn swtcls_refuses_a_class_name_too_long_for_keysiz() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let uacc = f.host.users().account(console);
+        // 15 bytes + NUL is exactly KEYSIZ and must fit; 16 bytes + NUL does
+        // not.
+        let name16 = "A".repeat(16);
+        assert_eq!(name16.len(), 16);
+        let cls = f.text(&name16);
+        let err = f
+            .invoke(swtcls, &[uacc.offset, uacc.selector, 0, cls.offset, cls.selector, 3, 0])
+            .expect_err("a name that does not fit KEYSIZ must refuse, not overflow into timtdy");
+        assert!(err.to_string().contains("swtcls"), "{err}");
+    }
+
+    #[test]
+    fn swtcls_accepts_a_class_name_that_exactly_fills_keysiz() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let uacc = f.host.users().account(console);
+        let name15 = "B".repeat(15);
+        assert_eq!(name15.len() + 1, KEYSIZ, "the boundary this test exists to hit");
+        let cls = f.text(&name15);
+        f.invoke(swtcls, &[uacc.offset, uacc.selector, 0, cls.offset, cls.selector, 3, 0])
+            .expect("exactly KEYSIZ bytes including the terminator must fit");
+        assert_eq!(cstr_field(&f, uacc, CURCLS), name15.as_bytes());
+    }
+
+    // ---- extoff -------------------------------------------------------------
+
+    #[test]
+    fn extoff_returns_the_channels_extra_pointer() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let Ret::Far(at) = f.invoke(extoff, &[0]).expect("extoff") else {
+            panic!("extoff returns a far pointer");
+        };
+        assert_eq!(
+            at,
+            f.host.users().extra(console).expect("Wg16 is GCV2, extusr exists"),
+            "extoff(0) must be the same slot Users::extra(chan 0) is"
+        );
+    }
+
+    #[test]
+    fn extoff_reads_the_channel_the_argument_names_not_channel_zero() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        let Ret::Far(at) = f.invoke(extoff, &[1]).expect("extoff(1)") else {
+            panic!("extoff returns a far pointer");
+        };
+        assert_eq!(at, f.host.users().extra(one).expect("extusr exists"));
+        assert_ne!(at, f.host.users().account(one), "extusr is a different table from usracc");
+    }
+
+    #[test]
+    fn extoff_refuses_a_channel_that_does_not_exist() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(extoff, &[99]).is_err());
+    }
+
+    // ---- paccit -------------------------------------------------------------
+
+    #[test]
+    fn paccit_does_not_stop_the_module() {
+        let mut f = Fixture::new();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+        f.invoke(paccit, &[]).expect("paccit does not stop the machine");
+    }
+
+    #[test]
+    fn paccit_touches_no_global_this_host_can_observe() {
+        // A faithful no-op, not a silent gap papered over with an invented
+        // side effect: pfnlvl (the one piece of dftpfn's work this host
+        // *could* place a value at) must come back exactly as it went in,
+        // proving nothing here fabricates a profanity score it cannot
+        // actually compute.
+        let mut f = Fixture::new();
+        f.invoke(curusr, &[0]).expect("channel 0 is current");
+        f.host
+            .globals()
+            .write(&mut f.machine, "pfnlvl", &7u16.to_le_bytes())
+            .expect("pfnlvl is placed");
+
+        f.invoke(paccit, &[]).expect("paccit");
+
+        assert_eq!(f.host.globals().word(&f.machine, "pfnlvl").expect("pfnlvl"), 7);
+    }
+
+    // ---- samepatu -----------------------------------------------------------
+
+    #[test]
+    fn samepatu_exact_true_only_on_a_full_match() {
+        let mut f = Fixture::new();
+        let a = f.text("sau:irccfg");
+        let b = f.text("sau:irccfg");
+        let got = f
+            .invoke(samepatu, &[a.offset, a.selector, b.offset, b.selector, 1])
+            .expect("samepatu");
+        assert_eq!(got, Ret::U16(1));
+    }
+
+    #[test]
+    fn samepatu_exact_false_on_a_prefix_that_is_not_a_full_match() {
+        let mut f = Fixture::new();
+        let a = f.text("sau:");
+        let b = f.text("sau:irccfg");
+        let got = f
+            .invoke(samepatu, &[a.offset, a.selector, b.offset, b.selector, 1])
+            .expect("samepatu");
+        assert_eq!(got, Ret::U16(0), "exact=TRUE must not accept a mere prefix");
+    }
+
+    #[test]
+    fn samepatu_not_exact_true_when_the_first_string_prefixes_the_second() {
+        // samepato(shorts,longs) == samepatu(shorts,longs,FALSE) --
+        // GCSPSRV.H's own macro names: the first argument is the shorter
+        // prefix, the second the string it must start.
+        let mut f = Fixture::new();
+        let shorts = f.text("sau:");
+        let longs = f.text("sau:irccfg");
+        let got = f
+            .invoke(samepatu, &[shorts.offset, shorts.selector, longs.offset, longs.selector, 0])
+            .expect("samepatu");
+        assert_eq!(got, Ret::U16(1));
+    }
+
+    #[test]
+    fn samepatu_not_exact_false_when_the_first_string_does_not_prefix_the_second() {
+        let mut f = Fixture::new();
+        let shorts = f.text("sauf:");
+        let longs = f.text("sau:irccfg");
+        let got = f
+            .invoke(samepatu, &[shorts.offset, shorts.selector, longs.offset, longs.selector, 0])
+            .expect("samepatu");
+        assert_eq!(got, Ret::U16(0));
+    }
+
+    #[test]
+    fn samepatu_is_case_sensitive() {
+        // Recorded uncertainty, exercised rather than left implicit: no
+        // surviving body confirms this, but every real call site compares
+        // fixed protocol literals, never user input -- see this function's
+        // own doc comment.
+        let mut f = Fixture::new();
+        let a = f.text("sau:IRCCFG");
+        let b = f.text("sau:irccfg");
+        let got = f
+            .invoke(samepatu, &[a.offset, a.selector, b.offset, b.selector, 1])
+            .expect("samepatu");
+        assert_eq!(got, Ret::U16(0), "differently-cased tokens must not match");
     }
 }

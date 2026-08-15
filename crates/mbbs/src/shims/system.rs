@@ -572,6 +572,189 @@ pub fn access<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(0u16)))
 }
 
+/// `VOID getFileTm(const CHAR *fname, USHORT *dtim, USHORT *ddat)` -- a
+/// file's last-modified time and date, DOS-packed.
+///
+/// `re/wg33src/SRC/api/gcommlib/FIOAPI.C:407-437` (Worldgroup 3.3, 1997),
+/// the non-`GCWINNT` half (the `GCWINNT`/`FindFirstFile` half is the same
+/// answer, through Win32 instead of `stat`):
+///
+///
+/// **The vendor tolerates a missing file -- so does this.** `*ddat=*dtim=0`
+/// runs unconditionally before `stat` is even attempted, and a failed `stat`
+/// returns with those zeros left in place -- the routine's own caller
+/// comments it explicitly (`FIOAPI.C:448`: "getFileTm() returns dat == 0 if
+/// the file doesn't exist"). This host reproduces exactly that: zero both
+/// outputs first, and if the sandboxed lookup ([`Host::find`], the same one
+/// [`access`] uses) finds nothing -- or the metadata read otherwise fails --
+/// stop there and hand back the zeros. Not a refusal; the documented answer.
+///
+/// `dddate`/`dttime`'s packing (`re/wg33src/INC/DNTAPI.H:184,190`:
+/// `((year-1980)<<9)+(mon<<5)+day` / `(hour<<11)+(min<<5)+(sec>>1)`) is the
+/// ordinary DOS FAT date/time this crate already has a packer for --
+/// [`crate::clock::Civil::dos_date`]/[`dos_time`](crate::clock::Civil::dos_time)
+/// -- the same pair `shims::stream`'s `fnd1st`/`fndnxt` already use for a
+/// file's modified time (`write_fndblk`'s own doc comment there names the
+/// identical `Clock::pinned` + `Civil::dos_date`/`dos_time` conversion).
+///
+/// One import, one call site, 32-bit only: MajorMUD NT (both `wccnt7pk` and
+/// `wccnt8pj`, `tmp/gapsurvey/round2/out_mmud_nt7pk.txt`/
+/// `out_mmud_nt8pj.txt`), `MAJORBBS` ordinal -- registered in
+/// `WG32_ROUTINES`, no 16-bit build imports it.
+///
+/// # Errors
+///
+/// If `fname` cannot be read as a string, `dtim`/`ddat` cannot be written,
+/// or a file this host *did* find has a modified time outside
+/// [`crate::clock::Civil::dos_date`]'s `1980..=2107` range.
+pub fn getfiletm<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let fname = call.ptr();
+    let dtim = call.ptr();
+    let ddat = call.ptr();
+
+    let named = String::from_utf8_lossy(
+        fname
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(format!("getfiletm: fname: {e}")))?,
+    )
+    .into_owned();
+
+    dtim.write(call.mem(), &0u16.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    ddat.write(call.mem(), &0u16.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
+    let Some(path) = host.find(&name) else {
+        return Ok(abi::Ret::Void);
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return Ok(abi::Ret::Void);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(abi::Ret::Void);
+    };
+    let modified = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ShimError::Failed(format!("getfiletm: {named}: {e}")))?
+        .as_secs();
+    let modified = u32::try_from(modified).map_err(|_| {
+        ShimError::Failed(format!("getfiletm: {named}: modified time does not fit this host's clock"))
+    })?;
+    let civil = crate::clock::Clock::pinned(modified)
+        .civil()
+        .map_err(|e| ShimError::Failed(format!("getfiletm: {named}: {e}")))?;
+    let date = civil
+        .dos_date()
+        .map_err(|e| ShimError::Failed(format!("getfiletm: {named}: {e}")))?;
+    let time = civil.dos_time();
+
+    dtim.write(call.mem(), &time.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    ddat.write(call.mem(), &date.to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(abi::Ret::Void)
+}
+
+/// `GBOOL vtmsndok(INT tochan)` -- is it OK to send to this channel right now?
+///
+/// `re/wg33src/INC/GCSPSRV.H:220-222` (Worldgroup 3.3, 1997) documents `INT
+/// tochan` directly as "c/s user's usrnum". No `.C` implementing it survives
+/// in `re/wg33src` -- WGSERVER's own Virtual Terminal Multiplexer (VTM),
+/// which owns it, is not among the recovered source files, only its two
+/// prototypes (`vtmsndok`/[`vtmsend`], `GCSPSRV.H:220-228`) and the one real
+/// call site this host has evidence for
+/// (`re/wg33src/SRC/apps/galmjd/GALMJD.C:1605-1607`, a door gateway: `if
+/// (xfrbyts > 0 && vtmsndok(mjdptr->othchn)) { vtmsend(...); }`) --
+/// MajorMUD NT's own decompile
+/// (`re/wg_nt_ghidra/exports/WCCMMUD_decompiled.c:65011`) gates an identical
+/// `vtmsend` call the same way.
+///
+/// This host has no VTM at all -- no cross-process routing table, because a
+/// module this host runs is native, not a spawned door on the far side of
+/// one -- so the only readiness question this host can honestly answer is
+/// whether `tochan` names a channel of this host at all, the same check
+/// [`crate::shims::gsbl::btuxmn`]/[`crate::shims::gsbl::btuxct`] already make
+/// before transmitting. `GBOOL`/`TRUE`/`FALSE`
+/// (`re/wg33src/INC/GCTYPDEF.H:105-109`) are plain `0`/`1`, not the `-1`/`0`
+/// [`access`]'s own convention uses -- this returns `1`/`0` accordingly.
+///
+/// # Errors
+///
+/// Never -- reporting "not ready" for a channel this host does not have is
+/// this routine's whole purpose, the same absence-reporting exception
+/// [`access`] already claims.
+pub fn vtmsndok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let tochan = Into::<u32>::into(call.int()) as i16;
+    let ok = host.users().terms().chan(tochan).is_some();
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(ok))))
+}
+
+/// `VOID vtmsend(INT srcid, INT length, VOID *value)` -- send `length` bytes
+/// of `value` through the VTM. "Call right after `vtmsndok() == TRUE`"
+/// (`GCSPSRV.H:224`).
+///
+/// Same source situation as [`vtmsndok`]'s own doc comment: no surviving
+/// body, one real call site each in `GALMJD.C:1607` and MajorMUD NT's own
+/// decompile (`WCCMMUD_decompiled.c:65011-65014`). The decompile is worth
+/// reading closely, because it rules out the obvious guess for `srcid`:
+///
+/// ```text
+/// vtmsend(*(undefined4*)(DAT_00479100+0x10+param_1*0x14), sVar7, uVar8)
+/// ```
+///
+/// `srcid` here is **not** the channel `vtmsndok(param_1)` was just asked
+/// about -- it is looked up in a per-channel table the module keeps
+/// privately, and only `param_1` (the channel) indexes that lookup. This
+/// matches the header's own description of `srcid` as a "source identifier
+/// (hwnd)": WGSERVER's real VTM is a cross-process relay (how a spawned door
+/// pushes bytes back through the server that spawned it), and `srcid` names
+/// one leg of that relay, not a channel number.
+///
+/// **Recorded uncertainty, not a guess dressed up as an answer.** This host
+/// has no cross-process VTM and no window-handle table to resolve `srcid`
+/// against -- a module this host runs *is* the channel, with nothing else in
+/// between, so the hwnd-indirection `vtmsend` was designed for has no
+/// counterpart here, only the channel number itself. This reads `srcid` as
+/// that channel number directly -- the one numeric handle a native module
+/// actually has, matching how every channel-addressing routine elsewhere in
+/// this crate (`btuxmn`/`btuxct`/[`vtmsndok`] above) already takes a channel
+/// number as its first argument -- rather than refuse a call whose own
+/// header contract says it only ever follows a successful [`vtmsndok`]. If a
+/// future build is found routing genuinely unrelated `srcid` values through
+/// this call, that would falsify this reading, and this comment says so
+/// plainly rather than hiding behind silence.
+///
+/// Binary, not ASCIIZ: `length` is given explicitly, matching
+/// [`crate::shims::gsbl::btuxct`]'s own "genuinely wide" length argument
+/// (read at full width, never narrowed to `u16` first), not
+/// [`crate::shims::gsbl::btuxmn`]'s NUL scan.
+///
+/// # Errors
+///
+/// If `srcid` does not name a channel of this host -- the header's own
+/// contract says a caller checks [`vtmsndok`] first, so a caller that
+/// reaches here on a bad channel has broken that contract, not asked a
+/// legitimate question with a "no" answer.
+pub fn vtmsend<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let srcid = Into::<u32>::into(call.int()) as i16;
+    let length = Into::<u32>::into(call.int()) as usize;
+    let value = call.ptr();
+
+    let Some(chan) = host.users().terms().chan(srcid) else {
+        return Err(ShimError::Failed(format!(
+            "vtmsend({srcid}): no such channel -- vtmsndok should have refused first"
+        )));
+    };
+    let data = value
+        .resolve(call.mem(), length)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    host.gsbl_mut().transmit_raw(chan, &data);
+    Ok(abi::Ret::Void)
+}
+
 /// `CHAR *gmdnam(CHAR *mdfnam)` -- `GCOMM.H:954-956` -- a module's name, out
 /// of its `.MDF`.
 ///
@@ -1413,6 +1596,16 @@ mod tests {
     use super::*;
     use crate::testing::Fixture;
     use mbbs_machine::m16::FarPtr;
+
+    /// A DOS packed date: `(year - 1980) << 9 | month << 5 | day`.
+    ///
+    /// Spelled as a helper rather than inline so the three fields stay named
+    /// at each call site. Written inline, a year offset of 0 reads as
+    /// `(0 << 9) | ...`, which documents the field but computes nothing and
+    /// which clippy correctly flags as a no-op operation.
+    const fn dos_date(year_from_1980: u16, month: u16, day: u16) -> u16 {
+        (year_from_1980 << 9) | (month << 5) | day
+    }
 
     /// A `struct module` in module memory: 25 bytes of name, then nine far
     /// pointers.
@@ -2449,7 +2642,7 @@ mod tests {
         // 366, not 365. Hand-computable, and the first place `(year+3)/4`
         // could be off by one and still leave every formatted date correct.
         let mut f = Fixture::new();
-        let Ret::U16(d1980) = f.invoke(cofdat, &[(0 << 9) | (1 << 5) | 1]).expect("cofdat")
+        let Ret::U16(d1980) = f.invoke(cofdat, &[dos_date(0, 1, 1)]).expect("cofdat")
         else {
             panic!("cofdat returns an int");
         };
@@ -2531,7 +2724,7 @@ mod tests {
         // refuses instead.
         let mut f = Fixture::new();
         let e = f
-            .invoke(cofdat, &[(0 << 9) | (13 << 5) | 1])
+            .invoke(cofdat, &[dos_date(0, 13, 1)])
             .expect_err("refused");
         assert!(format!("{e}").contains("13"), "{e}");
     }
@@ -2575,7 +2768,7 @@ mod tests {
     fn ncedat_is_total_months_past_december_are_xxx_not_a_refusal() {
         // The 4-bit field can hold 13..=15; `moname` has real slots there
         // too, `"XXX"` each -- table shape, not an out-of-bounds read.
-        let packed = (0 << 9) | (13 << 5) | 1;
+        let packed = dos_date(0, 13, 1);
         let mut f = Fixture::new();
         let Ret::Far(at) = f.invoke(ncedat, &[packed]).expect("ncedat") else {
             panic!("far pointer");
@@ -2602,5 +2795,146 @@ mod tests {
         };
         assert_eq!(first, second, "one buffer, not two");
         assert_eq!(f.read(second), "01-MAR-00");
+    }
+
+    // ---- getfiletm ----------------------------------------------------------
+
+    fn word_at(f: &Fixture, at: FarPtr) -> u16 {
+        u16::from_le_bytes(f.machine.resolve(at, 2).expect("readable").try_into().unwrap())
+    }
+
+    #[test]
+    fn getfiletm_reports_a_known_files_exact_dos_date_and_time() {
+        // 2024-03-15 10:30:00 UTC, set with `File::set_modified` so the
+        // expected bytes are a literal, hand-computed absolute value --
+        // not merely "whatever the same formula this shim uses also
+        // computes" (memory: difference-based/self-referential tests can be
+        // blind to the bug they exist to catch).
+        let root = crate::testing::scratch("system-getfiletm-known");
+        let mut f = Fixture::rooted(root.clone());
+        let path = root.join("TEST.DAT");
+        std::fs::write(&path, b"hi").expect("fixture");
+        let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_710_498_600);
+        std::fs::File::open(&path).expect("open").set_modified(epoch).expect("set_modified");
+
+        let name = f.text("TEST.DAT");
+        let dtim = f.buffer(2);
+        let ddat = f.buffer(2);
+        f.invoke(
+            getfiletm,
+            &[name.offset, name.selector, dtim.offset, dtim.selector, ddat.offset, ddat.selector],
+        )
+        .expect("getfiletm");
+
+        assert_eq!(word_at(&f, ddat), 22639, "(2024-1980)<<9 | 3<<5 | 15");
+        assert_eq!(word_at(&f, dtim), 21440, "10<<11 | 30<<5 | 0>>1");
+    }
+
+    #[test]
+    fn getfiletm_on_a_missing_file_reports_zero_not_a_refusal() {
+        // The vendor's own comment: "getFileTm() returns dat == 0 if the
+        // file doesn't exist" -- tolerated, not stopped.
+        let mut f = Fixture::rooted(crate::testing::scratch("system-getfiletm-missing"));
+        let name = f.text("NOSUCH.DAT");
+        let dtim = f.buffer(2);
+        let ddat = f.buffer(2);
+        f.invoke(
+            getfiletm,
+            &[name.offset, name.selector, dtim.offset, dtim.selector, ddat.offset, ddat.selector],
+        )
+        .expect("getfiletm tolerates a missing file");
+        assert_eq!(word_at(&f, dtim), 0);
+        assert_eq!(word_at(&f, ddat), 0);
+    }
+
+    #[test]
+    fn getfiletm_zeroes_its_outputs_before_the_lookup_not_only_on_failure() {
+        // MAJORBBS.C:418/429 -- `*ddat=*dtim=0` runs unconditionally, before
+        // stat() is even attempted. Pre-seed non-zero garbage and confirm a
+        // missing file really does overwrite it rather than leaving it
+        // alone because "there was nothing to fail".
+        let mut f = Fixture::rooted(crate::testing::scratch("system-getfiletm-preseeded"));
+        let name = f.text("NOSUCH.DAT");
+        let dtim = f.buffer(2);
+        let ddat = f.buffer(2);
+        f.machine.write(FarPtr { offset: dtim.offset, selector: dtim.selector }, &0xBEEFu16.to_le_bytes())
+            .expect("preseed");
+        f.machine.write(FarPtr { offset: ddat.offset, selector: ddat.selector }, &0xBEEFu16.to_le_bytes())
+            .expect("preseed");
+
+        f.invoke(
+            getfiletm,
+            &[name.offset, name.selector, dtim.offset, dtim.selector, ddat.offset, ddat.selector],
+        )
+        .expect("getfiletm");
+        assert_eq!(word_at(&f, dtim), 0);
+        assert_eq!(word_at(&f, ddat), 0);
+    }
+
+    // ---- vtmsndok -------------------------------------------------------------
+
+    #[test]
+    fn vtmsndok_is_true_for_a_channel_this_host_has() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(vtmsndok, &[0]).expect("vtmsndok"), Ret::U16(1));
+    }
+
+    #[test]
+    fn vtmsndok_is_false_for_a_channel_this_host_does_not_have() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(vtmsndok, &[99]).expect("vtmsndok"), Ret::U16(0));
+    }
+
+    // ---- vtmsend --------------------------------------------------------------
+
+    #[test]
+    fn vtmsend_transmits_the_given_bytes_to_the_named_channel() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let payload = f.bytes(b"hello worldgroup", false);
+        f.invoke(vtmsend, &[0, 16, payload.offset, payload.selector])
+            .expect("vtmsend");
+        assert_eq!(f.host.gsbl_mut().drain_output(console), b"hello worldgroup");
+    }
+
+    #[test]
+    fn vtmsend_routes_by_srcid_not_always_channel_zero() {
+        // A mutation that hardcoded channel 0 regardless of `srcid` would
+        // still pass the single-channel test above (srcid happens to be 0
+        // there too) -- two channels, and asserting BOTH the target and the
+        // untouched sibling, is what actually pins the argument to its own
+        // channel.
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        let payload = f.bytes(b"for channel one", false);
+
+        f.invoke(vtmsend, &[1, 15, payload.offset, payload.selector])
+            .expect("vtmsend");
+
+        assert_eq!(f.host.gsbl_mut().drain_output(one), b"for channel one");
+        assert!(
+            f.host.gsbl_mut().drain_output(zero).is_empty(),
+            "srcid 1 must not land on channel 0"
+        );
+    }
+
+    #[test]
+    fn vtmsend_refuses_a_channel_that_does_not_exist() {
+        let mut f = Fixture::new();
+        let payload = f.bytes(b"x", false);
+        assert!(f.invoke(vtmsend, &[99, 1, payload.offset, payload.selector]).is_err());
+    }
+
+    #[test]
+    fn vtmsend_is_binary_not_nul_scanned() {
+        // Length-driven, matching btuxct: an embedded NUL is data, not a
+        // terminator.
+        let mut f = Fixture::new();
+        let console = f.console();
+        let payload = f.bytes(b"ab\0cd", false);
+        f.invoke(vtmsend, &[0, 5, payload.offset, payload.selector])
+            .expect("vtmsend");
+        assert_eq!(f.host.gsbl_mut().drain_output(console), b"ab\0cd");
     }
 }

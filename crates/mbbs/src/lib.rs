@@ -1045,6 +1045,45 @@ pub struct Host<A: Abi> {
     /// in a global, neither of which is channel-scoped.
     pub(crate) tasks: Vec<A::Ptr>,
 
+    /// Whether each of DOS's five pre-opened standard handles is currently
+    /// in binary mode, for `shims::crt::setmode`/`read`/`write` -- Borland's
+    /// low-level POSIX-shaped `int handle` I/O, not the `FILE *` streams
+    /// [`Host::streams`](Host#structfield.streams) owns.
+    ///
+    /// Index `0..=4` is `stdin`/`stdout`/`stderr`/`aux`/`prn`, in that
+    /// order -- the same five DOS hands every process before it opens
+    /// anything of its own, which is exactly why
+    /// [`crate::stream::Streams`]'s own numbering (`FIRST_FD`) starts
+    /// immediately *after* them, at `5`. `false` (text mode) is DOS's own
+    /// default for all five until a module calls `setmode`.
+    ///
+    /// # A second table, not a view onto `Streams` -- and why
+    ///
+    /// The natural design ties a `read`/`write` handle to the exact open
+    /// file `Streams` already tracks -- a module that `fopen`s a stream and
+    /// reads `fileno(fp)` (a macro over `FILE.fd`, so it leaves no import
+    /// record: `tmp/gapsurvey/round2/rose32/RCIROSE.DLL` imports `read` and
+    /// `write` but never `fileno`, `open` or `creat`) is naming exactly the
+    /// `fd` `Streams::open_mem` already assigned. Reusing that identity
+    /// would need `Streams` to answer "which cookie does this `fd` name",
+    /// and its `fd`/`open` fields are private to `stream.rs`
+    /// (`crates/mbbs/src/stream.rs:484-498`) -- reaching them from here would
+    /// mean `stream.rs` growing a new `pub(crate)` accessor, which is a
+    /// second file this task's grant does not cover (only `lib.rs` was
+    /// extended, not `stream.rs`). So this table is deliberately narrower
+    /// instead: it covers only the five handles DOS pre-opens, which
+    /// `Streams` structurally never touches (`FIRST_FD = 5` is the proof --
+    /// `Streams` cannot assign any of `0..=4` even by accident), so there is
+    /// no shared identity to diverge from in the first place. A module
+    /// calling `read`/`write`/`setmode` on an `fd` `Streams` itself handed
+    /// out (`5` or above, from a real `fopen`) is refused by name, not
+    /// silently answered from a second, unsynchronised copy of `Streams`'s
+    /// own state. Whoever gets `stream.rs` next can fold the two together by
+    /// adding that accessor and widening this table; until then, keeping
+    /// them apart is the choice that cannot drift, because there is nothing
+    /// in this table for `Streams` to invalidate.
+    pub(crate) stdio_modes: [bool; 5],
+
     /// The one live `tfsopn` text-file scan, if any. `TFSCAN.H`'s family is
     /// stateful -- `tfsopn` opens, `tfsrdl` walks, `tfspfx` tests the current
     /// line, `tfsabt` drops it -- and the original keeps that state in host
@@ -1480,6 +1519,7 @@ impl<A: Abi> Host<A> {
             kicks: Vec::new(),
             lstunm: 0,
             tasks: Vec::new(),
+            stdio_modes: [false; 5],
             tfscan: shims::tfscan::TfScan::default(),
             polls_left: 0,
             census: PollCensus::default(),

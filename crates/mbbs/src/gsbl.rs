@@ -201,6 +201,26 @@ pub struct Channel {
     pub xon: u8,
     pub xoff: u8,
 
+    /// `btutru` -- the output-abort character (guide `btutru`, page 171):
+    /// while ASCII output is in progress, receiving this byte from the
+    /// channel is supposed to truncate the *current* output block -- the one
+    /// the most recent `btuxmt`/`btuxct` queued -- leaving the rest of the
+    /// output buffer alone. Zero disables it, and it is disabled by default.
+    ///
+    /// Recorded for the same reason `xon`/`xoff`/`pause_char` are: **the
+    /// abort-on-receipt mechanism itself is not implemented**, so nothing
+    /// ever compares an arriving byte against this. [`Channel::output`] is
+    /// one flat `VecDeque<u8>` with no block boundaries -- the same gap
+    /// [`crate::shims::gsbl::btuxmn`]'s own doc comment names for a
+    /// different routine -- so there is no "current output block" for a
+    /// matching byte to truncate even if `Channel::take` compared against
+    /// this field. RTSLORD sets it at 5 sites; storing the value rather
+    /// than discarding it means a future task that adds block boundaries to
+    /// `output` finds today's calls already landed somewhere, instead of
+    /// having to explain why every `btutru` before that task shipped is
+    /// unrecoverably lost.
+    pub(crate) trunch: u8,
+
     /// `btuxnf`'s page-mode parameters (R5, guide page 193): a negative
     /// `xoff` selects page mode, and `cnt` is how many lines to show before
     /// pausing. Recorded so the values are not lost, but **pagination itself
@@ -243,6 +263,23 @@ pub struct Channel {
     /// dispatch to -- this field says a handler exists, not what it is.
     pub(crate) pause_handler_installed: bool,
 
+    /// `btuche` -- whether the [`crate::shims::gsbl::btuchi`] interceptor
+    /// should be called an extra time, with pseudo-key-code `-1`, whenever
+    /// this channel's echo buffer goes idle (guide `btuche`, page 42).
+    ///
+    /// Recorded for the same reason [`Channel::pause_handler_installed`]
+    /// is: the mechanism this flag configures is not implemented, but the
+    /// caller's intent still is. `btuchi` never installs a live interceptor
+    /// on this host -- it refuses every call -- so today there is no
+    /// reachable state in which anything reads this flag. It is stored
+    /// anyway rather than discarded, on the same reasoning `pause_handler_
+    /// installed` documents: **what would reveal this is wrong** is a
+    /// future host that closes the `btuchi` gap (the wall is a driver-
+    /// thread access problem, not a fundamental one -- see `btuchi`'s own
+    /// doc comment) finding every `btuche` call before that day silently
+    /// unrecorded.
+    pub(crate) chi_notify_on_idle: bool,
+
     /// Set when the last byte written was a CR whose LF this host supplied, so
     /// that a module sending an explicit `\r\n` does not get two linefeeds.
     /// On `Channel` rather than local to `transmit` because the pair can arrive
@@ -273,11 +310,13 @@ impl Default for Channel {
             oes: false,
             xon: 0,
             xoff: 0,
+            trunch: 0,
             page_lines: 0,
             page_message: None,
             pause_char: 0,
             clear_pause_char: 0,
             pause_handler_installed: false,
+            chi_notify_on_idle: false,
             supplied_lf: false,
             csi: CsiScan::Text,
         }

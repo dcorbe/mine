@@ -230,6 +230,227 @@ use mbbs_machine::ptr::ModulePtr;
 use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
+use crate::shims::Entry;
+
+/// One resolver behind both ABI faces of runtime name resolution --
+/// Rose16's Phar Lap `DosGetModHandle`/`DosGetProcAddr`
+/// ([`dosgetmodhandle`], [`dosgetprocaddr`]) and Rose32's
+/// `KERNEL32!LoadLibraryA`/`FreeLibrary` (`crate::shims::borland::loadlibrarya`,
+/// `crate::shims::borland::freelibrary`). Both resolve a host library, and
+/// then a routine within it, **by name at runtime** -- something load-time
+/// ordinal binding (`shims::mod::entry`'s only caller until now,
+/// `Resolver::resolve` at load time) never had to do, because a fixup
+/// already names its own target before the module ever runs.
+///
+/// # What this resolver genuinely shares, and how it was measured
+///
+/// [`known_library`] and [`resolves`] are the two functions every one of the
+/// four faces above calls -- see each one's own doc comment. Both run the
+/// caller's raw strings through the same [`super::canonical_dll`] and
+/// [`crate::exports::c_name`] that [`crate::shims::entry`] itself applies,
+/// so a name reached at runtime and the same name reached through a
+/// load-time fixup are answering the identical question against the
+/// identical table -- not two independent copies of "does this host
+/// implement X" that could silently drift apart.
+///
+/// Genuinely exercised against a real 32-bit build, not assumed: this task
+/// disassembled `tmp/gapsurvey/round2/rose32/RCIROSE.DLL`'s own two call
+/// sites for `LoadLibraryA`/`GetProcAddress` (`objdump -d`, thunks at
+/// `0x46d534`/`0x46d528`, called from `0x46c30b`/`0x46c324`) and found
+/// `push "GALME" ; call LoadLibraryA ; push "_fixadr" ; push <handle> ;
+/// call GetProcAddress` -- a real runtime probe, gated behind a flag byte
+/// (`cmp byte ds:0x4707f0,1`) the module's own later code checks before
+/// ever calling through the resolved pointer (`call dword ptr
+/// ds:0x47930c` at `0x429875`). `known_library` correctly answers `GALME`
+/// itself is known -- `(GALME, "_oldsend", dosenv::oldsend, ...)` is a real
+/// `routines()` entry, registered by an earlier task (see [`oldsend`]'s own
+/// doc comment) -- but [`resolves`] answers `false` for `_fixadr`
+/// specifically: nothing under `GALME` is named `_fixadr`, and `_oldsend`
+/// itself always refuses when called (no messaging-engine subsystem exists
+/// behind it), which is a different, narrower fact than "the library name
+/// is unrecognised". Either way the module's own flag ends up `0` and the
+/// indirect call at `0x429875` never fires -- this host answering honestly
+/// keeps the real call site safe regardless of which of the two questions
+/// (library known? symbol present?) is the one that actually says no.
+///
+/// # The one thing this resolver cannot yet do, even for a hit
+///
+/// **[`resolves`] can tell a caller whether this host implements a named
+/// routine. It cannot hand back an address the module can `call far`
+/// through and reach it**, and every one of the four faces above is honest
+/// about that rather than fabricating one. The reason is structural, not an
+/// oversight this task ran out of time for:
+///
+/// - A module reaches a host routine by executing a far call into
+///   [`mbbs_machine::m16::Machine`]'s thunk table (`MAX_THUNKS = 512`,
+///   `crates/mbbs-machine/src/m16/mod.rs:156`); the CPU trap that produces
+///   `Exit::Call{index}` is driven purely by *which offset* the call
+///   landed on, decoded generically, with no notion of "this index means
+///   `prfmsg`" baked in anywhere near it.
+/// - That meaning lives in an `ImportSite`, and indices are assigned
+///   **only at module load**, densely, "in first-encounter order" straight
+///   out of the loading module's own relocations
+///   (`crates/mbbs-machine/src/m16/ne.rs`'s own `Thunks` doc comment) --
+///   never for a symbol nobody's fixups happened to name.
+/// - Minting a *new* index at runtime -- which is what handing back a
+///   working address for an arbitrary, not-already-imported symbol would
+///   need -- means mutating `Machine::next_thunk` and pushing a new
+///   `ImportSite`, and both are private to `mbbs_machine::m16::ne`, with no
+///   public method anywhere that exposes either. This crate's own
+///   `crate::shims::misc` documents the identical shape of gap for the
+///   opposite direction (`dfsthn`/`byenow`/`listing` needing `A::Module` to
+///   call *into* a module, which no shim has either -- "`Host` never stores
+///   a loaded module's own selector/section map"): a [`Call<A>`] carries
+///   only `cpu`, never the loaded module, and `Host<A>` keeps its own
+///   `loaded_modules` registry private with no accessor a shim can reach.
+///
+/// So a hit and a miss both write the documented "not found" answer for
+/// *the address* today: `NULL`/`ERROR_PROC_NOT_FOUND`, never a fabricated
+/// non-null pointer that would fault -- or, worse, silently misdispatch --
+/// the moment a module actually called through it. That is squarely inside
+/// this crate's sanctioned exception for absence-reporting routines (see
+/// `crate::shims::ShimError`'s own doc comment), not a corner this task cut:
+/// **[`known_library`]/[`resolves`] still make the *library* and *symbol
+/// presence* questions genuinely answerable** (see their own doc comments),
+/// which is real, tested, shared behaviour -- only the final "give me
+/// something callable" step is blocked, and by exactly one missing public
+/// primitive: a way for a shim to reach the executing module's own
+/// `ImportSite` table, or a way to mint a new one at runtime. Either would
+/// let [`dosgetprocaddr`]/`borland::get_proc_address`'s KERNEL32 sibling
+/// progress from "always not-found" to "not-found only for a genuine miss"
+/// without changing this resolver's own shape at all.
+pub(crate) mod runtime_name {
+    use super::Entry;
+    use crate::abi::Abi;
+
+    /// Every library [`crate::shims::routines`] serves at least one routine
+    /// under, after [`super::canonical_dll`]'s own case-insensitive
+    /// aliasing -- computed from the live table rather than a hand-kept
+    /// list, so this can never drift out of step with what `entry` itself
+    /// would answer.
+    ///
+    /// Deliberately does **not** also walk `WG16_ROUTINES`/`WG32_ROUTINES`
+    /// (`crate::shims::mod`'s `Abi::native` doors): checked directly, every
+    /// entry in both of those is already registered under `MAJORBBS` in
+    /// `routines()` too (`alctile`/`ptrtile`/the Borland arithmetic helpers/
+    /// `_ftol` sit beside dozens of other `MAJORBBS` routines there), so
+    /// there is no library identity either table would add. Should a future
+    /// task register an ABI-native-only routine under a library `routines()`
+    /// never mentions, this note is the reason to revisit this function, not
+    /// a silent gap.
+    ///
+    /// Registered in `routines()`, but not a Worldgroup-family subsystem a
+    /// module resolves by name to find out whether it is *present* -- the
+    /// question `DosGetModHandle`/`LoadLibraryA` actually ask. `KERNEL32.dll`
+    /// carries `getversion`/`get_module_handle`/`get_proc_address`; `DOSCALLS`
+    /// carries `dossetvec`; `PHAPI` carries `doscreatedsalias` -- all real
+    /// entries `entry`'s own `dll == dll` match would answer `true` for, but
+    /// none of them is a module asking "does this *optional* subsystem
+    /// exist", the way probing for `GALME`/`GALMSG` is. Excluded here, once,
+    /// so a reader of [`distinct_libraries`] does not have to wonder whether
+    /// their exclusion was an oversight.
+    const NOT_A_WORLDGROUP_PROBE: &[&str] = &[super::super::KERNEL32, "cw3220mt.DLL", crate::exports::DOSCALLS, crate::exports::PHAPI];
+
+    fn distinct_libraries<A: Abi>() -> Vec<&'static str> {
+        let mut seen = Vec::new();
+        for (dll, _, _, _) in super::super::routines::<A>() {
+            if !seen.contains(&dll) && !NOT_A_WORLDGROUP_PROBE.contains(&dll) {
+                seen.push(dll);
+            }
+        }
+        seen
+    }
+
+    /// Whether `name` -- a raw string a module supplied, not yet
+    /// canonicalised -- names a library this host serves at least one
+    /// routine under. `Some` carries the canonical name back, for a caller
+    /// that wants to feed it straight to [`resolves`].
+    ///
+    /// `GALME` answers `Some("GALME")`: `(GALME, "_oldsend", ...)` is a real
+    /// entry (see [`super::oldsend`]'s own doc comment) -- the library
+    /// *name* is genuinely registered, even though calling `_oldsend` itself
+    /// always refuses because the messaging-engine subsystem behind it does
+    /// not exist. Whether a specific *routine* resolves is [`resolves`]'s
+    /// own, separate question.
+    pub(crate) fn known_library<A: Abi>(name: &str) -> Option<&'static str> {
+        let canonical = super::super::canonical_dll(name);
+        distinct_libraries::<A>().into_iter().find(|&d| d == canonical)
+    }
+
+    /// One opaque, host-minted handle per distinct entry in
+    /// [`distinct_libraries`] -- 1-based, so `0` stays free to mean "no
+    /// handle" everywhere this crate already uses it that way.
+    ///
+    /// Not a real address, and not meant to look like one: it is never
+    /// dereferenced by anything on this host, only round-tripped back
+    /// through [`library_for`] by [`super::dosgetprocaddr`]/
+    /// `borland::freelibrary`. `distinct_libraries` is a pure function of
+    /// the crate's own `routines()` literal, so the same name always maps
+    /// to the same handle within one process, which is all a round trip
+    /// needs -- it does not need to survive a restart or agree with any
+    /// other host.
+    pub(crate) fn handle_for<A: Abi>(name: &str) -> Option<u32> {
+        let canonical = known_library::<A>(name)?;
+        distinct_libraries::<A>()
+            .iter()
+            .position(|&d| d == canonical)
+            .map(|i| i as u32 + 1)
+    }
+
+    /// The inverse of [`handle_for`]: what library a previously-minted
+    /// handle names, or `None` for `0` or a value this process never handed
+    /// out.
+    pub(crate) fn library_for<A: Abi>(handle: u32) -> Option<&'static str> {
+        let index = handle.checked_sub(1)?;
+        distinct_libraries::<A>().get(index as usize).copied()
+    }
+
+    /// Whether this host implements `raw_symbol` under `dll` -- `dll`
+    /// already canonical (a [`known_library`] hit), `raw_symbol` a module's
+    /// raw string, run through [`crate::exports::c_name`] here so the
+    /// comparison is against exactly what [`crate::shims::entry`] itself
+    /// would be asked, at load time, for the identical name.
+    pub(crate) fn resolves<A: Abi>(dll: &str, raw_symbol: &str) -> bool {
+        let symbol = crate::exports::c_name(raw_symbol);
+        matches!(crate::shims::entry::<A>(dll, &symbol), Entry::Routine(..))
+    }
+
+    /// Encode a small handle into `A::PTR_WIDTH` bytes, least-significant
+    /// byte first, and decode it back. The two are each other's exact
+    /// inverse for any handle this module ever mints (see [`handle_for`]'s
+    /// own doc comment on why that is the only round trip that has to
+    /// hold), which is what lets `borland::loadlibrarya`/`freelibrary`
+    /// share one encoding without needing to agree on it separately.
+    pub(crate) fn ptr_for_handle<A: Abi>(handle: u32) -> A::Ptr {
+        let mut bytes = handle.to_le_bytes().to_vec();
+        bytes.resize(A::PTR_WIDTH, 0);
+        A::ptr_from_bytes(&bytes)
+    }
+
+    /// The inverse of [`ptr_for_handle`].
+    pub(crate) fn handle_for_ptr<A: Abi>(ptr: A::Ptr) -> u32 {
+        let bytes = A::ptr_to_bytes(ptr);
+        let mut raw = [0u8; 4];
+        let n = bytes.len().min(4);
+        raw[..n].copy_from_slice(&bytes[..n]);
+        u32::from_le_bytes(raw)
+    }
+}
+
+/// The OS/2 DosCalls status-code family this Phar Lap API descends from.
+/// `archive/galacticomm/extract/phar312/PHAPI.H:587,591` give
+/// `DosGetModHandle`/`DosGetProcAddr`'s prototypes but this tree has no
+/// surviving header naming their numeric failure codes. `126`/`127` are the
+/// standard, widely-documented OS/2 (and later Win32) `ERROR_MOD_NOT_FOUND`/
+/// `ERROR_PROC_NOT_FOUND` values this API family is known elsewhere to use --
+/// unverified against anything recovered in this repository, and it does not
+/// matter for `RCIROSE.DLL`'s own one real call site (`re/WCCMMUD.DLL`-style
+/// NE relocation walk against `DOSCALLS #45`/`#47`, segment 33, fixups at
+/// segment offsets `0x1AD8`/`0x1AEE`): both of that module's own checks are a
+/// bare `or ax,ax` / `jnz` -- nonzero is "failed", and no call site this task
+/// found inspects which nonzero value it got.
+const ERROR_MOD_NOT_FOUND: u16 = 126;
+const ERROR_PROC_NOT_FOUND: u16 = 127;
 
 /// `USHORT APIENTRY DosSetVec(USHORT usVecNum, PFN pfnRoutine, PFN FAR *ppfnPrev)`
 /// -- install a Phar Lap interrupt-vector handler.
@@ -330,6 +551,172 @@ pub fn oldsend<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::R
          answering TRUE would tell the caller mail was sent that was in fact silently \
          discarded"
     )))
+}
+
+/// `INT simpsnd(struct message *msg, const CHAR *text, const CHAR *filatt)` --
+/// `GME.H:1538`, "simple send msg (non-user specific)" -- returns standard GME
+/// status codes. Body: `re/wg33src/SRC/api/galme/GMEONL.C:3918` (Worldgroup
+/// 3.3). Exported as `_simpsnd @113` (`re/wg33src/LIB/GALME.DEF:116`).
+///
+/// The only symbol either 32-bit build imports from GALME, once each --
+/// MajorMUD NT (`wccnt7pk` through `wccnt8pj`, unchanged across all thirteen
+/// versions) and The Rose 3.0NT.
+///
+/// # This is answered, not refused, and the vendor is why
+///
+/// [`oldsend`] above refuses, and this does not. They are not inconsistent:
+/// the difference is in what each routine's return type can express.
+///
+/// `_oldsend` returns `BOOL`. There is no value in `{TRUE, FALSE}` meaning
+/// "the messaging engine is not running" -- a fabricated `TRUE` claims mail
+/// went out, a fabricated `FALSE` blames the message. Neither is true, so it
+/// refuses.
+///
+/// `simpsnd` returns a GME status code, and the vendor's own body opens by
+/// answering precisely our case:
+///
+///
+/// A host that never initialised a messaging engine has `gmeinit` false, in
+/// perpetuity. `GMEERR` is therefore not a plausible zero invented to fill a
+/// gap -- it is the documented answer for the exact state this host is in,
+/// and the engine's absence *is* the error condition the vendor anticipated.
+/// Serving it faithfully needs no GME.
+///
+/// # Zero would be actively harmful here
+///
+/// `GME.H:390-394` gives `GMEAGAIN 0`, `GMEOK 1`, `GMEERR -1`. **Zero means
+/// "still processing, call again"** -- and the vendor's own shutdown path is
+/// `while ((rc=gsndmsg(...)) == GMEAGAIN) {}`. A caller handed 0 by a host
+/// with no engine spins forever. This is one of the few places in this crate
+/// where the reflexive zero does not merely lie, it hangs the module.
+///
+/// # Arguments
+///
+/// Read and discarded rather than ignored, so a bad pointer is still a bad
+/// pointer: the real routine `ASSERT`s `msg` and `text` non-NULL before it
+/// reaches the `gmeinit` test.
+///
+/// # Errors
+///
+/// Never. `GMEERR` is a return value, not a refusal.
+pub fn simpsnd<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _msg = call.ptr();
+    let _text = call.ptr();
+    let _filatt = call.ptr();
+    // GMEERR, `GME.H:394`. Not GMEAGAIN (0), which would spin the caller.
+    Ok(abi::Ret::Int(A::Int::from(-1i16 as u16)))
+}
+
+/// `USHORT APIENTRY DosGetModHandle(PSZ namep, PHMODULE mhandp)` --
+/// `archive/galacticomm/extract/phar312/PHAPI.H:587` -- resolve a library
+/// name to a handle, by name, at runtime.
+///
+/// See this module's own doc comment ([`runtime_name`]) for the shared
+/// mechanism this delegates to and what it can and cannot yet answer.
+/// `mhandp` is always written -- `0` on a miss, the same "shim never
+/// touched it is a distinct, observable failure from the shim wrote the
+/// documented sentinel" discipline [`dossetvec`]'s own doc comment states --
+/// never left holding whatever garbage was there before.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `namep` is `PSZ` (far `char *`, 4 bytes,
+/// `PHAPI.H:97`), `mhandp` is `PHMODULE` (far pointer to a `HMODULE`, 4
+/// bytes, `PHAPI.H:102`) -- 4 + 4 = 8 bytes, `Cleans::Callee(8)`. Confirmed
+/// against `RCIROSE.DLL`'s own one real call site (NE segment 33, fixup at
+/// segment offset `0x1AD8`, `DOSCALLS #47`): `push ds ; push <namep offset>
+/// ; push ss ; lea ax,[bp-2] ; push ax ; call DosGetModHandle` -- two far
+/// pointers, in declaration order.
+///
+/// # Errors
+///
+/// If `mhandp` does not resolve.
+pub fn dosgetmodhandle<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let namep = call.ptr();
+    let mhandp = call.ptr();
+
+    let name_bytes = namep.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?.to_vec();
+    let name = String::from_utf8_lossy(&name_bytes);
+
+    let handle = runtime_name::handle_for::<A>(&name).unwrap_or(0);
+    mhandp
+        .write(call.mem(), &(handle as u16).to_le_bytes())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    if handle == 0 {
+        Ok(abi::Ret::Int(A::Int::from(ERROR_MOD_NOT_FOUND)))
+    } else {
+        Ok(abi::Ret::Int(A::Int::from(0u16)))
+    }
+}
+
+/// `USHORT APIENTRY DosGetProcAddr(HMODULE mhand, PSZ pnamep, PPFN paddrp)`
+/// -- `archive/galacticomm/extract/phar312/PHAPI.H:591` -- resolve a
+/// routine within a library [`dosgetmodhandle`] already found a handle for,
+/// by name, at runtime.
+///
+/// See [`runtime_name`]'s own doc comment for why `paddrp` is written
+/// `NULL` -- never a fabricated non-null pointer -- whether `mhand` names a
+/// library this host does not serve, or names one that does not export
+/// `pnamep`, or names one that does export it but this call site cannot yet
+/// mint a dispatchable address for it (today, every case: see that doc
+/// comment's own accounting). All three collapse to the same wire answer a
+/// real `DosGetProcAddr` gives for "not found", which is the routine's own
+/// documented failure mode, not a plausible zero invented to paper over an
+/// unknown.
+///
+/// `GALME` is the library `RCIROSE.DLL`'s own 32-bit sibling
+/// (`tmp/gapsurvey/round2/rose32/RCIROSE.DLL`) actually probes for at
+/// runtime via the KERNEL32 pair (`LoadLibraryA("GALME")` then
+/// `GetProcAddress(handle, "_fixadr")`, disassembled for [`runtime_name`]'s
+/// own doc comment). `runtime_name::known_library` correctly answers
+/// `GALME` itself *is* known -- `(GALME, "_oldsend", oldsend, ...)` is a
+/// real `routines()` entry -- but `_fixadr` is not `_oldsend`, so
+/// [`runtime_name::resolves`] answers `false` for it regardless; either way
+/// the honest wire answer this routine gives is "not found", not a gap this
+/// routine papers over.
+///
+/// # Argument order and byte count
+///
+/// Far pascal, callee cleans. `mhand` is `HMODULE` (`USHORT`, 2 bytes,
+/// `PHAPI.H:101`), `pnamep` is `PSZ` (4 bytes), `paddrp` is `PPFN` (far
+/// pointer to a far pointer, 4 bytes) -- 2 + 4 + 4 = 10 bytes,
+/// `Cleans::Callee(10)`. Confirmed against `RCIROSE.DLL`'s own one real call
+/// site (segment 33, fixup at segment offset `0x1AEE`, `DOSCALLS #45`):
+/// `push [bp-2] ; push ds ; push <pnamep offset> ; push 0x0 ; push
+/// <paddrp offset> ; call DosGetProcAddr` -- five words, in declaration
+/// order.
+///
+/// # Errors
+///
+/// If `paddrp` does not resolve.
+pub fn dosgetprocaddr<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mhand: u32 = call.int().into();
+    let pnamep = call.ptr();
+    let paddrp = call.ptr();
+
+    let proc_bytes = pnamep.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?.to_vec();
+    let proc_name = String::from_utf8_lossy(&proc_bytes);
+
+    // Always the documented sentinel -- see this function's own doc comment
+    // for the three cases that collapse into it today.
+    paddrp
+        .write(call.mem(), &A::ptr_to_bytes(A::null_ptr()))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    let Some(dll) = runtime_name::library_for::<A>(mhand) else {
+        return Ok(abi::Ret::Int(A::Int::from(ERROR_MOD_NOT_FOUND)));
+    };
+    // Computed and not branched on: whether this host implements
+    // `proc_name` under `dll` genuinely differs (`resolves` is real,
+    // shared, tested behaviour -- see `runtime_name`'s own doc comment),
+    // but the *address* answer is `ERROR_PROC_NOT_FOUND` either way today,
+    // for the structural reason that doc comment names. Calling it anyway,
+    // rather than skipping straight to the shared return, is what makes a
+    // future close of that gap a one-line change here (branch on the
+    // result) instead of a rediscovery of which function to call.
+    let _ = runtime_name::resolves::<A>(dll, &proc_name);
+    Ok(abi::Ret::Int(A::Int::from(ERROR_PROC_NOT_FOUND)))
 }
 
 #[cfg(test)]
@@ -439,5 +826,222 @@ mod tests {
         let args = [0u16, 0, 0, 0];
         f.invoke(oldsend, &args)
             .expect_err("four words is the whole frame, and it still refuses");
+    }
+
+    // -- runtime_name: the pure lookup, tested directly -----------------
+
+    #[test]
+    fn known_library_recognises_every_worldgroup_family_dll_this_host_serves_at_least_one_routine_under() {
+        use crate::abi::Wg16;
+        for dll in ["MAJORBBS", "GALGSBL", "GALMSG", "GALME"] {
+            assert_eq!(
+                runtime_name::known_library::<Wg16>(dll),
+                Some(dll),
+                "{dll} has routine-table entries and must be known"
+            );
+        }
+        assert_eq!(
+            runtime_name::known_library::<Wg16>("NOSUCHLIBRARY"),
+            None,
+            "a name nothing registers must not be known"
+        );
+        assert_eq!(
+            runtime_name::known_library::<Wg16>("KERNEL32.dll"),
+            None,
+            "the DOS extender/compiler runtime is not a Worldgroup-family probe -- \
+             see NOT_A_WORLDGROUP_PROBE"
+        );
+    }
+
+    /// `GALME` is a subtler case than "known or not": `(GALME, "_oldsend",
+    /// ...)` is a real `routines()` entry (see [`super::oldsend`]'s own doc
+    /// comment), so the *library* resolves -- but `_oldsend` always refuses
+    /// when called, because the messaging-engine subsystem behind it does
+    /// not exist, and no `_fixadr` entry exists under `GALME` at all. This
+    /// is exactly the real call site `RCIROSE.DLL`'s own 32-bit sibling
+    /// makes (see [`runtime_name`]'s own module doc comment).
+    #[test]
+    fn galme_the_library_resolves_but_neither_of_its_two_probed_routines_does() {
+        use crate::abi::Wg16;
+        assert_eq!(runtime_name::known_library::<Wg16>("GALME"), Some("GALME"));
+        assert!(
+            !runtime_name::resolves::<Wg16>("GALME", "_fixadr"),
+            "nothing under GALME is named _fixadr"
+        );
+        assert!(
+            // `__OLDSEND` (two leading underscores) is GALME's own NE name
+            // table spelling for ordinal 30 (see this file's own module doc
+            // comment, "Which _oldsend, settled") -- the raw string a real
+            // caller supplies, which `c_name` strips to the registered key
+            // "_oldsend" (one underscore). Passing the already-canonical
+            // "_oldsend" here would get double-stripped to "oldsend" and
+            // wrongly answer false -- this is the input `resolves`'s own
+            // doc comment documents it expects.
+            runtime_name::resolves::<Wg16>("GALME", "__OLDSEND"),
+            "__OLDSEND IS registered (as oldsend::<A>) -- it refuses when actually \
+             called, which is a different question from whether it resolves"
+        );
+    }
+
+    #[test]
+    fn known_library_canonicalises_a_pe_style_spelling() {
+        // The mutation Task 16 names explicitly: skip `canonical_dll` here
+        // and this fails, because `routines()` registers the bare
+        // "GALGSBL", never "GALGSBL.dll".
+        use crate::abi::Wg16;
+        assert_eq!(runtime_name::known_library::<Wg16>("GALGSBL.dll"), Some("GALGSBL"));
+        assert_eq!(runtime_name::known_library::<Wg16>("galgsbl.DLL"), Some("GALGSBL"));
+    }
+
+    #[test]
+    fn handle_and_library_round_trip_for_every_known_library() {
+        use crate::abi::Wg16;
+        for dll in ["MAJORBBS", "GALGSBL", "GALMSG", "GALME"] {
+            let handle = runtime_name::handle_for::<Wg16>(dll).expect("a known library mints a handle");
+            assert_ne!(handle, 0, "0 stays free for \"no handle\"");
+            assert_eq!(runtime_name::library_for::<Wg16>(handle), Some(dll));
+        }
+        assert_eq!(runtime_name::handle_for::<Wg16>("nonexistent"), None);
+        assert_eq!(runtime_name::library_for::<Wg16>(0), None);
+        assert_eq!(runtime_name::library_for::<Wg16>(0xffff), None, "never handed out");
+    }
+
+    #[test]
+    fn resolves_agrees_with_entry_for_a_real_routine_and_a_real_miss() {
+        use crate::abi::Wg16;
+        assert!(
+            runtime_name::resolves::<Wg16>("MAJORBBS", "prfmsg"),
+            "prfmsg is implemented -- shims::mlt::prfmsg"
+        );
+        assert!(
+            runtime_name::resolves::<Wg16>("MAJORBBS", "_prfmsg"),
+            "c_name strips exactly one leading underscore, so the decorated \
+             spelling a module's own relocation table carries must resolve too"
+        );
+        assert!(
+            !runtime_name::resolves::<Wg16>("MAJORBBS", "no_such_routine"),
+            "a name nothing registers must not resolve"
+        );
+    }
+
+    // -- dosgetmodhandle / dosgetprocaddr: the shim bodies ----------------
+
+    #[test]
+    fn dosgetmodhandle_resolves_a_known_library_and_writes_a_nonzero_handle() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let mhandp = f.words(&[0xdead]);
+        let args = [name.offset, name.selector, mhandp.offset, mhandp.selector];
+
+        let ret = f
+            .invoke(dosgetmodhandle, &args)
+            .expect("dosgetmodhandle never refuses");
+
+        assert_eq!(ret, Ret::U16(0), "NO_ERROR for a library this host serves");
+        let bytes = f.machine.resolve(mhandp, 2).expect("mhandp resolves");
+        assert_ne!(
+            u16::from_le_bytes([bytes[0], bytes[1]]),
+            0xdead,
+            "the shim must have written its own answer, not left the seed untouched"
+        );
+        assert_ne!(u16::from_le_bytes([bytes[0], bytes[1]]), 0, "a real, nonzero handle");
+    }
+
+    #[test]
+    fn dosgetmodhandle_resolves_the_pe_spelling_through_canonical_dll() {
+        let mut f = Fixture::new();
+        let name = f.text("GALGSBL.dll");
+        let mhandp = f.words(&[0]);
+        let args = [name.offset, name.selector, mhandp.offset, mhandp.selector];
+
+        let ret = f
+            .invoke(dosgetmodhandle, &args)
+            .expect("dosgetmodhandle never refuses");
+        assert_eq!(
+            ret,
+            Ret::U16(0),
+            "GALGSBL.dll must canonicalise to GALGSBL, which this host serves"
+        );
+    }
+
+    #[test]
+    fn dosgetmodhandle_answers_error_mod_not_found_for_a_library_this_host_does_not_serve() {
+        let mut f = Fixture::new();
+        let name = f.text("NOSUCHLIBRARY");
+        let mhandp = f.words(&[0xbeef]);
+        let args = [name.offset, name.selector, mhandp.offset, mhandp.selector];
+
+        let ret = f
+            .invoke(dosgetmodhandle, &args)
+            .expect("dosgetmodhandle never refuses");
+        assert_eq!(
+            ret,
+            Ret::U16(ERROR_MOD_NOT_FOUND),
+            "nothing in routines() is registered under this name"
+        );
+        assert_eq!(
+            f.machine.resolve(mhandp, 2).expect("mhandp resolves"),
+            &0u16.to_le_bytes()[..],
+            "the documented zero sentinel, not the 0xbeef it was seeded with"
+        );
+    }
+
+    #[test]
+    fn dosgetprocaddr_answers_error_mod_not_found_for_a_handle_never_minted() {
+        let mut f = Fixture::new();
+        let name = f.text("prfmsg");
+        let paddrp = f.words(&[0xdead, 0xbeef]);
+        let args = [0u16, name.offset, name.selector, paddrp.offset, paddrp.selector];
+
+        let ret = f
+            .invoke(dosgetprocaddr, &args)
+            .expect("dosgetprocaddr never refuses");
+        assert_eq!(
+            ret,
+            Ret::U16(ERROR_MOD_NOT_FOUND),
+            "handle 0 was never minted by dosgetmodhandle"
+        );
+        assert_eq!(
+            f.machine.resolve(paddrp, 4).expect("paddrp resolves"),
+            &FarPtr::NULL.to_bytes()[..],
+            "NULL, not the 0xdead/0xbeef it was seeded with"
+        );
+    }
+
+    /// The documented gap this file's own `runtime_name` module doc comment
+    /// names: `prfmsg` genuinely is implemented, and [`runtime_name::resolves`]
+    /// agrees (see the test above), but this call site still cannot mint a
+    /// dispatchable address for it -- so the wire answer for a real hit is,
+    /// today, indistinguishable from a genuine miss. Written down as a test
+    /// rather than left to be rediscovered: closing that gap should make
+    /// this assertion fail, on purpose, pointing straight at the doc comment
+    /// that explains what changed.
+    #[test]
+    fn dosgetprocaddr_answers_error_proc_not_found_even_for_a_genuinely_implemented_routine() {
+        let mut f = Fixture::new();
+        let libname = f.text("MAJORBBS");
+        let mhandp = f.words(&[0]);
+        f.invoke(
+            dosgetmodhandle,
+            &[libname.offset, libname.selector, mhandp.offset, mhandp.selector],
+        )
+        .expect("dosgetmodhandle never refuses");
+        let handle_bytes = f.machine.resolve(mhandp, 2).expect("mhandp resolves");
+        let handle = u16::from_le_bytes([handle_bytes[0], handle_bytes[1]]);
+        assert_ne!(handle, 0, "MAJORBBS must have minted a real handle");
+
+        let proc = f.text("prfmsg");
+        let paddrp = f.words(&[0xdead, 0xbeef]);
+        let args = [handle, proc.offset, proc.selector, paddrp.offset, paddrp.selector];
+
+        let ret = f
+            .invoke(dosgetprocaddr, &args)
+            .expect("dosgetprocaddr never refuses");
+        assert_eq!(ret, Ret::U16(ERROR_PROC_NOT_FOUND));
+        assert_eq!(
+            f.machine.resolve(paddrp, 4).expect("paddrp resolves"),
+            &FarPtr::NULL.to_bytes()[..],
+            "NULL -- never a fabricated non-null pointer -- see this function's own doc comment"
+        );
     }
 }

@@ -50,7 +50,7 @@ use mbbs_machine::ptr::ModulePtr;
 use crate::abi::{self, Abi, Call, ModuleMem};
 use crate::fsd::{self, MBPMAX};
 use crate::globals::OUTBSZ;
-use crate::shims::{NO, ShimError};
+use crate::shims::{NO, ShimError, text};
 use crate::{Chan, Host};
 
 /// Whether `ptr` is the null pointer, in this ABI's own representation --
@@ -535,6 +535,168 @@ pub fn fsdnan<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         block.newans(),
         usize::from(answer_offset(&record)),
     )?))
+}
+
+/// `char *fsdfxt(int fldi, char *buffer, int length)` -- copy field `fldi`'s
+/// answer into a caller-supplied buffer.
+///
+/// `archive/galacticomm/extract/wg1/GALDSRC/SRC/FSD.H:626-631` declares it,
+/// and `archive/galacticomm/extract/wg1/GALDSRC/SRC/FSD.C:2174-2188`
+/// (Worldgroup, generation wg1) is the whole body -- the same tree, not a
+/// second guess from a different one:
+///
+///
+/// Two things this settles beyond doubt, not just beyond a header comment:
+///
+/// - **Zero-based.** `0 <= fldi && fldi < fsdscb->numfld` is the bound check
+///   itself, not a paraphrase of one -- the same bound [`fsdnan`]'s own
+///   already-tested [`field_record_mem`] enforces, on the same
+///   `fsdscb->flddat` this routine reads through [`fsdnan`]'s own logic.
+///   The Rose's four call sites did not survive to cross-check independently
+///   -- the NE module targets MajorBBS v6, bracketed between the wg1/wg33
+///   and `mbbs511s` trees this crate cites, with nothing of its own left --
+///   but a body this exact needs no second source.
+/// - **`stzcpy`, not a fresh copy loop.** `length` is "bytes in buffer, incl
+///   final `\0`" (`FSDBBS.H:179`), and the real `stzcpy`
+///   (`re/wg33src/SRC/api/gcommlib/STZCPY.C:18-34`) copies at most
+///   `length - 1` characters and then zero-fills the rest of the buffer out
+///   to `length`. This host's own [`text::stzcpy`] shim already made the
+///   choice not to reproduce that trailing zero-fill -- write the text and
+///   one terminator, nothing past it -- and every caller of it elsewhere in
+///   this crate already lives with that; repeating the zero-fill here for
+///   `fsdfxt` alone, and nowhere else this host does `stzcpy`'s job, would be
+///   a second, disagreeing answer to the same question. So this reuses
+///   [`text::write_cstr_mem`] the same truncate-and-terminate way
+///   [`text::stzcpy`] does, not a byte-exact port of `STZCPY.C`.
+///
+/// **`fsdnan` and `fsdfxt` disagree on purpose, and both stay as they measure.**
+/// [`fsdnan`]'s own body (`FSD.C:2190-2195`) is `return(fsdscb->newans +
+/// fsdscb->flddat[fldi].ansoff)` -- no bound check at all, so an out-of-range
+/// `fldi` there is C's undefined behaviour, an out-of-bounds array read with
+/// no defined answer to be faithful *to*. That is why [`fsdnan`] refuses: a
+/// runtime stop is strictly better than reproducing UB, and there is no
+/// vendor-documented tolerance being overridden by refusing it.
+///
+/// `fsdfxt` is different **in the vendor's own source**, not by this crate's
+/// choice: it is the guarded wrapper built on top of that unsafe accessor,
+/// and its bound check is the entire reason it exists as a separate entry
+/// point rather than a second name for `fsdnan`. Its answer for out-of-range
+/// -- `buffer[0]='\0'; return(buffer);` -- is not a gap in the record this
+/// host is filling in with a guess; it is the line the vendor wrote. The
+/// same is true of an unprepared session: no `fsdroom` at all leaves
+/// `fsdscb` zeroed, so `numfld` is 0 and every `fldi` fails the bound the
+/// same way, landing on the identical empty-string branch -- there is only
+/// one "not in range" branch in this body, and it does not distinguish "no
+/// session" from "session too small". A `fsdroom` that ran but no `fsdapr`
+/// yet (`newans` still null) is not literally covered by the vendor's own
+/// two branches -- `fldi < numfld` could already be true there, and the real
+/// `stzcpy(buffer,fsdnan(fldi),length)` would read through a near-null
+/// pointer, which is real-mode DOS's own kind of undefined answer, not one
+/// this host can reproduce or would want to. Treated as "not ready", it
+/// lands on the same empty-string branch as the other two -- still a defined
+/// answer, and the conservative reading of a state the vendor's own two
+/// branches do not actually distinguish. Refusing in `fsdfxt` for any of the
+/// three would have converted the vendor's own forgiving, documented answer
+/// into a stopped machine over four real call sites in The Rose -- so this
+/// host does not.
+///
+/// A forged `numfld` that makes a field's own address overflow the 16-bit
+/// segment computing it is not one of those three states, and is not covered
+/// by this leniency: that is [`offset`]'s own cross-cutting refusal (see its
+/// doc comment), the same one every other routine in this file is subject
+/// to, entirely independent of what any one routine's vendor body tolerates.
+/// `fsdfxt` still refuses there, the same as [`fsdnan`] and [`fsdord`] do.
+///
+/// # Errors
+///
+/// If `length` is zero, which leaves no room for even the terminator
+/// `stzcpy`'s own contract promises -- `STZCPY.C`'s own loop computes
+/// `num-1` unsigned, so a real `length` of 0 is not "write nothing", it is
+/// `num-1` wrapping to 65535 and copying until the source's own NUL, a
+/// vendor buffer overflow this host will not reproduce either. Or if
+/// `buffer` itself will not resolve -- not a state any vendor branch has an
+/// opinion about. Or if a forged `numfld` overflows the segment computing a
+/// field's address -- see above.
+///
+/// Generic: [`prepared_mem`], [`field_record_mem`] and [`text::write_cstr_mem`]
+/// are already `impl<A: Abi>`.
+pub fn fsdfxt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `char *fsdfxt(int fldi, char *buffer, int length)` -- FSD.H:626-630.
+    let field = Into::<u32>::into(call.int()) as u16;
+    let buffer = call.ptr();
+    let length = Into::<u32>::into(call.int()) as u16;
+
+    if length == 0 {
+        return Err(ShimError::Failed(format!(
+            "fsdfxt({field}): a 0-byte buffer has no room for even the terminator"
+        )));
+    }
+
+    let answer = fsdfxt_answer::<A>(call.mem(), host, field)?;
+
+    // "No more than maxlen bytes (incl \0)" -- room for the terminator comes
+    // out of `length` before the answer is fit into what remains, the same
+    // truncation the real routine's own comment states as its purpose.
+    let room = usize::from(length) - 1;
+    let truncated = &answer[..answer.len().min(room)];
+    text::write_cstr_mem::<A>(call.mem(), buffer, truncated, length)?;
+    Ok(abi::Ret::Ptr(buffer))
+}
+
+/// Field `field`'s answer for [`fsdfxt`] -- empty where the vendor's own
+/// `0 <= fldi && fldi < fsdscb->numfld` bound (or this host's stand-in for
+/// "no session prepared yet") says there is none, per that routine's own doc
+/// comment.
+///
+/// Deliberately does **not** delegate the field bound to
+/// [`field_record_mem`] wholesale: that function's own out-of-range refusal
+/// is exactly the branch this routine must turn into an empty answer instead
+/// of a refusal, but its *other* refusal -- a forged `numfld` overflowing
+/// the segment computing a field's address, from [`offset`] -- must still
+/// propagate. Checking `field >= block.numfld()` here first, before ever
+/// calling [`field_record_mem`], means any `Err` that still reaches this
+/// function's own `?` is that second kind, and only that kind.
+fn fsdfxt_answer<A: Abi>(mem: &A::Mem, host: &Host<A>, field: u16) -> Result<Vec<u8>, ShimError> {
+    let Ok((block, _)) = prepared_mem(mem, host, "fsdfxt") else {
+        return Ok(Vec::new());
+    };
+    if field >= block.numfld() {
+        return Ok(Vec::new());
+    }
+    let record = field_record_mem(mem, &block, field, "fsdfxt")?;
+    let at = offset::<A>(block.newans(), usize::from(answer_offset(&record)))?;
+    at.read_cstr(mem)
+        .map(<[u8]>::to_vec)
+        .map_err(|e| ShimError::Failed(e.to_string()))
+}
+
+/// `void fsdrhd(char *titl)` -- send a header (with title) for a RIP FSD
+/// session.
+///
+/// `archive/galacticomm/extract/wg1/GALDSRC/SRC/FSDBBS.C:242-251` is the
+/// whole of it:
+///
+///
+/// `isripu()` asks whether the connected terminal speaks RIPscrip, the
+/// graphical BBS protocol -- and this host has no notion of a RIP terminal
+/// anywhere: nothing in [`crate::term`] or [`Host`] ever sets one. So
+/// `isripu()` is false for every channel this host can have, always, and the
+/// real routine's own answer for that case is to do nothing at all -- not a
+/// header suppressed by a refusal, but no header ever sent, exactly as the
+/// vendor wrote it. That is why this reads and discards `titl` rather than
+/// opening `fsdmb` (the FSD subsystem's own message file, `FSDBBS.C:63`) and
+/// calling `prfmsg`: there is no path through the real body, on this host's
+/// actual terminal population, that would ever reach it. If a future
+/// terminal model adds RIP detection, this is where that branch belongs.
+///
+/// Generic: takes no memory-dependent action, so this needs no `Mem`/`Cpu`
+/// split at all.
+pub fn fsdrhd<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `void fsdrhd(char *titl)` -- FSDBBS.H:265-266. Read and discarded --
+    // see the module doc comment above for why every real path from here
+    // does nothing with it.
+    let _titl = call.ptr();
+    Ok(abi::Ret::Void)
 }
 
 /// `int fsdord(int fldi)` -- which `ALT=` value field `fldi` holds.
@@ -1505,15 +1667,6 @@ fn outprf_chan<A: Abi>(machine: &mut A::Cpu, host: &mut Host<A>, chan: Chan) -> 
     Ok(())
 }
 
-pub fn outprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let raw = Into::<u32>::into(call.int()) as i16;
-    let Some(chan) = host.gsbl().terms().chan(raw) else {
-        return Ok(abi::Ret::Void);
-    };
-    outprf_chan(call.cpu, host, chan)?;
-    Ok(abi::Ret::Void)
-}
-
 /// `void outprf(int chan)` -- the routine-table entry. `GCOMM.H:447`
 /// declares it `INT usrnum`, i.e. the same "channel" domain every other
 /// `Chan`-bearing shim in this codebase reads with a bare reinterpret to
@@ -1530,6 +1683,15 @@ pub fn outprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// `OUT_OF_RANGE`) -- so an out-of-range `chan` here is a silent no-op, not a
 /// reported failure, which is the closest a typed host can get to the
 /// original's own undefined behaviour on an out-of-range `usrnum`.
+pub fn outprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let raw = Into::<u32>::into(call.int()) as i16;
+    let Some(chan) = host.gsbl().terms().chan(raw) else {
+        return Ok(abi::Ret::Void);
+    };
+    outprf_chan(call.cpu, host, chan)?;
+    Ok(abi::Ret::Void)
+}
+
 
 /// `usaptr->scnwid`, read directly out of the account record rather than
 /// cached anywhere -- the same reason [`Host::current_channel`] reads
@@ -2463,6 +2625,148 @@ mod tests {
             .expect("sized");
         let e = f.invoke(fsdnan, &[0]).expect_err("refused");
         assert!(format!("{e}").contains("fsdapr"), "{e}");
+    }
+
+    #[test]
+    fn fsdfxt_copies_the_answer_into_the_caller_buffer_and_returns_it() {
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME RANK", b"NAME=ALPHA\0RANK=BETA\0\0");
+        let out = f.buffer(30);
+
+        let Ok(Ret::Far(returned)) = f.invoke(fsdfxt, &[1, out.offset, out.selector, 30]) else {
+            panic!("fsdfxt refused")
+        };
+        assert_eq!(returned, out, "stzcpy's own contract: returns the destination");
+        assert_eq!(f.read(out), "BETA", "field 1 is the second, zero-based");
+
+        let Ok(Ret::Far(_)) = f.invoke(fsdfxt, &[0, out.offset, out.selector, 30]) else {
+            panic!("fsdfxt refused")
+        };
+        assert_eq!(f.read(out), "ALPHA", "field 0 is the first");
+    }
+
+    #[test]
+    fn fsdfxt_truncates_to_the_buffer_it_was_given() {
+        // FSDBBS.H:179's whole point: "making sure that you write no more
+        // than maxlen bytes (incl \0)". 4 bytes is 3 characters and a NUL.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=ALPHABETA\0\0");
+        let out = f.buffer(4);
+
+        f.invoke(fsdfxt, &[0, out.offset, out.selector, 4]).expect("fsdfxt");
+        assert_eq!(f.read(out), "ALP");
+    }
+
+    #[test]
+    fn fsdfxt_past_the_last_field_answers_empty_while_fsdnan_still_refuses() {
+        // `FSD.C:2181-2186`'s own `else { buffer[0]='\0'; }` -- this is the
+        // vendor's documented answer, not a guess, and it stands in
+        // deliberate contrast with `fsdnan`, which has no bound check of its
+        // own to be faithful to and refuses instead. See `fsdfxt`'s own doc
+        // comment for the full reasoning; this test is the pair it says
+        // documents the intent.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let out = f.bytes(b"UNTOUCHED", true);
+
+        let Ok(Ret::Far(returned)) = f.invoke(fsdfxt, &[1, out.offset, out.selector, 10]) else {
+            panic!("fsdfxt must not refuse on an out-of-range field")
+        };
+        assert_eq!(returned, out);
+        assert_eq!(f.read(out), "", "the vendor's own buffer[0]='\\0'");
+
+        let e = f.invoke(fsdnan, &[1]).expect_err("fsdnan has no bound of its own");
+        assert!(format!("{e}").contains("1 field"), "{e}");
+    }
+
+    #[test]
+    fn fsdfxt_before_a_session_answers_empty_while_fsdnan_still_refuses() {
+        // The same two states `fsdnan_before_a_session_stops_the_module`
+        // covers: no form sized at all (vendor's own zeroed `fsdscb`, so
+        // `numfld` is 0 and every `fldi` fails the bound the ordinary way),
+        // and sized but not yet answered (`newans` still null, a state the
+        // vendor's own two branches do not distinguish from the first).
+        let mut f = Fixture::new();
+        current(&mut f);
+        let out = f.bytes(b"UNTOUCHED", true);
+
+        let Ok(Ret::Far(_)) = f.invoke(fsdfxt, &[0, out.offset, out.selector, 10]) else {
+            panic!("fsdfxt must not refuse before fsdroom")
+        };
+        assert_eq!(f.read(out), "");
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdroom"), "{e}");
+
+        let _ = open_form(&mut f);
+        let spec = f.text("NAME");
+        f.invoke(fsdroom, &[0, spec.offset, spec.selector, 0])
+            .expect("sized");
+        let out = f.bytes(b"UNTOUCHED", true);
+        let Ok(Ret::Far(_)) = f.invoke(fsdfxt, &[0, out.offset, out.selector, 10]) else {
+            panic!("fsdfxt must not refuse before fsdapr")
+        };
+        assert_eq!(f.read(out), "");
+        let e = f.invoke(fsdnan, &[0]).expect_err("refused");
+        assert!(format!("{e}").contains("fsdapr"), "{e}");
+    }
+
+    #[test]
+    fn fsdfxt_with_no_room_even_for_the_terminator_is_refused() {
+        // The one refusal `fsdfxt` keeps: `STZCPY.C`'s own loop computes
+        // `num-1` unsigned, so a real `length` of 0 is a buffer overflow in
+        // the vendor's own code, not "write nothing" -- see the module doc
+        // comment. There is no forgiving vendor answer here to be faithful
+        // to.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"NAME=X\0\0");
+        let out = f.buffer(1);
+        let e = f
+            .invoke(fsdfxt, &[0, out.offset, out.selector, 0])
+            .expect_err("refused");
+        assert!(format!("{e}").contains("fsdfxt"), "{e}");
+    }
+
+    #[test]
+    fn fsdfxt_with_a_forged_numfld_still_stops_the_module() {
+        // The other refusal `fsdfxt` keeps: a forged `numfld` that makes a
+        // field's own address overflow the 16-bit segment computing it is
+        // `offset`'s own cross-cutting hardening, unrelated to what
+        // `fsdfxt`'s vendor body tolerates -- the same case
+        // `a_field_count_the_module_forged_cannot_index_out_of_the_segment`
+        // exercises for `fsdnan`/`fsdord`.
+        let mut f = Fixture::new();
+        let _ = session(&mut f, "NAME", b"\0");
+        let at = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdscb")
+            .expect("placed");
+        let mut scb = block(&f);
+        scb.set_numfld(60000);
+        f.machine.write(at, scb.as_bytes()).expect("written");
+
+        let out = f.buffer(10);
+        // 3000 * 23 = 69000, which is not a u16 -- passes the vendor's own
+        // `fldi < numfld` bound (3000 < 60000) so this is not the
+        // empty-string branch.
+        let e = f
+            .invoke(fsdfxt, &[3000, out.offset, out.selector, 10])
+            .expect_err("refused");
+        assert!(matches!(e, ShimError::Failed(_)), "{e}");
+    }
+
+    #[test]
+    fn fsdrhd_is_a_no_op_because_this_host_has_no_rip_terminal() {
+        // `FSDBBS.C:242-251`'s whole body is `if (isripu()) { ... }`, and
+        // this host never sets a RIP flag anywhere -- see the module doc
+        // comment. Confirms the shim neither refuses nor touches `prfbuf`
+        // for a title that would only ever have been sent to a terminal
+        // type this host does not model.
+        let mut f = Fixture::new();
+        current(&mut f);
+        let titl = f.text("Editing Forum");
+        f.invoke(fsdrhd, &Fixture::far(titl)).expect("never refuses");
+        assert_eq!(f.read(f.host.globals().prf_buffer()), "", "nothing queued");
     }
 
     #[test]

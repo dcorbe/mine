@@ -137,8 +137,13 @@ use mbbs_machine::ptr::ModulePtr;
 use super::ShimError;
 use super::gsbl::{apply_cpc, apply_hpk, apply_pbc, apply_xnf};
 use crate::Host;
-use crate::abi::{self, Abi, Call};
+use crate::abi::{self, Abi, Call, Wg16};
 use crate::chan::Chan;
+
+/// `VIDAPI.H:193` (Worldgroup 3.3): `#define GVIDSCNSIZ 4000` -- bytes per
+/// 80x25 screen image, 2 per cell (character, attribute). What [`iniscn`]
+/// reads and, when `where` is non-null, writes.
+const GVIDSCNSIZ: usize = 4000;
 
 /// `MAJORBBS.H:31`: `#define CTNUOS 2` -- "screen length code used for
 /// 'continuous'", i.e. no pausing. `rstrxf` subtracts it from the account's
@@ -203,6 +208,141 @@ pub fn rstrxf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     apply_hpk(g, chan);
     apply_pbc(g, chan, 20);
     apply_cpc(g, chan, 19);
+
+    Ok(abi::Ret::Void)
+}
+
+/// `void explode(char *sctptr, int wulx, int wuly, int wlrx, int wlry)` --
+/// pop a shadowed window onto the SYSOP's local console, animated.
+///
+/// `re/wg33src/SRC/api/gcommlib/EXPLODE.C:36-45` (Worldgroup 3.3, 1997):
+/// `explode(sctptr,wulx,wuly,wlrx,wlry)` is
+/// `explodell(sctptr,wulx,wuly,wlrx,wlry,wulx,wuly,1)` -- the private
+/// `explodell` worker, called with the "from" and "to" rectangles the same
+/// (no repositioning) and shadowing on. `explodell` itself
+/// (`EXPLODE.C:73-163`) reads `sctptr` as an 80x25 CGA/VGA text-mode screen
+/// image (2 bytes/cell) and grows a rectangle of it, cell by cell, onto the
+/// SYSOP's own local console video memory (`scn2scn`/`mem2scn`, `gvscnoff`),
+/// with a one-cell drop shadow along the bottom and right edges once the
+/// growth finishes, paced by `gcdelay(10)` between frames.
+///
+/// # Why this is a no-op here, not a partial reproduction
+///
+/// Every one of `explodell`'s primitives -- `scn2scn`, `mem2scn`,
+/// `gvscnoff`, `scngetc`/`scnputc`, `gcdelay` -- addresses a local
+/// text-mode video buffer this host does not have and, by design, never
+/// will: [`Host::paccin`](crate::Host::paccin)'s own doc comment already
+/// declines the "modem monitor" (the SYSOP's local console) as "BBS-shaped
+/// and out of scope" for a headless host, and this is the same console.
+/// There is no CRT to draw a window on and no SYSOP sitting in front of one,
+/// so the closest faithful behaviour is what a real Worldgroup running with
+/// no local console attached would produce: no visible effect, and no
+/// error. The routine's whole purpose (a cosmetic local-console animation)
+/// is unreachable by construction on this host, not merely unimplemented.
+///
+/// `explodeto`/`nsexploto`, `explodell`'s other two callers, are not
+/// imported by any of the ten surveyed builds and are not added here.
+///
+/// # What is still checked
+///
+/// A non-null `sctptr` is read (one byte, thrown away) so a module passing
+/// a genuinely bad pointer stops here rather than appearing to have drawn a
+/// window it did not. A null `sctptr` is accepted without reading it --
+/// `explodell` itself branches on `sptr == 0` to mean "read from the live
+/// screen instead of a memory image", a legitimate argument this host has
+/// no live screen to honour either way, so there is nothing to read.
+///
+/// One import, one call site: Rose (`re/ne_arity.py 198
+/// tmp/gapsurvey/rose/RCIROSE.DLL` cleans 6 words -- one far pointer plus
+/// four ints, matching the header). 16-bit only
+/// (`tmp/gapsurvey/round2/out_rose_pe.txt` does not import it), so this is
+/// generic rather than `WG16_ROUTINES`-only: nothing here depends on a
+/// GCV2-only structure the way [`crate::shims::user::extoff`] does, so a
+/// future 32-bit importer would already be served.
+///
+/// # Errors
+///
+/// If `sctptr` is non-null and not even one byte of it can be read.
+pub fn explode<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let sctptr = call.ptr();
+    let _wulx = call.int();
+    let _wuly = call.int();
+    let _wlrx = call.int();
+    let _wlry = call.int();
+
+    if sctptr != A::null_ptr() {
+        sctptr
+            .resolve(call.mem(), 1)
+            .map_err(|e| ShimError::Failed(format!("explode: sctptr: {e}")))?;
+    }
+
+    Ok(abi::Ret::Void)
+}
+
+/// `void iniscn(char *filnam, void *where)` -- load a `.SCN` binary screen
+/// image file, either into a caller's buffer or (if `where` is null) onto
+/// the local console screen directly.
+///
+/// `re/wg33src/SRC/api/gcommlib/INISCN.C:18-40` (Worldgroup 3.3, 1997):
+///
+///
+/// # What this host reproduces, and why
+///
+/// The file I/O, the exact byte count ([`GVIDSCNSIZ`], 4000 -- 80x25 cells
+/// at 2 bytes each, `re/wg33src/INC/VIDAPI.H:193`), and both `catastro`
+/// paths are faithful: refusing (stopping the module) rather than
+/// fabricating success on a missing or short file is what the vendor's own
+/// `catastro` does too -- a hard stop, just a fatal one instead of a
+/// refusal. `cvtscn` (`re/wg33src/SRC/api/gcommlib/CVTSCN.C:19-55`) is
+/// reproduced as the no-op it always is on a modern, colour-capable board:
+/// its entire body is gated on `if (!color)` -- monochrome-only, remapping
+/// cell attributes for a screen mode this host does not have -- so a
+/// `color` build (every board this host has ever measured or could plausibly
+/// serve over telnet) runs `cvtscn` and changes nothing. Drawing to the
+/// local console when `where` is null is the same "no CRT to draw on" case
+/// [`explode`]'s own doc comment covers: the file is still opened and its
+/// 4000 bytes still validated (a bad file is still a refusal either way),
+/// but nothing visible happens, because nothing here has a screen either
+/// way.
+///
+/// One import, one call site: Rose (`re/ne_arity.py 346
+/// tmp/gapsurvey/rose/RCIROSE.DLL` cleans 4 words -- one far pointer per
+/// argument, matching the header). 16-bit only, and generic for the same
+/// reason [`explode`]'s own doc comment gives.
+///
+/// # Errors
+///
+/// If `filnam` cannot be read, names a file this host will not open or does
+/// not find, or that file is shorter than [`GVIDSCNSIZ`] bytes.
+pub fn iniscn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let filnam = call.ptr();
+    let dest = call.ptr();
+
+    let named = String::from_utf8_lossy(
+        filnam
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(format!("iniscn: filnam: {e}")))?,
+    )
+    .into_owned();
+    let name = Host::<Wg16>::dos_name(&named).map_err(ShimError::Failed)?;
+    let path = host.find(&name).ok_or_else(|| {
+        ShimError::Failed(format!("iniscn: \"{named}\" not found -- INISCN UNABLE TO OPEN"))
+    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ShimError::Failed(format!("iniscn: \"{named}\" -- INISCN UNABLE TO OPEN: {e}")))?;
+    if bytes.len() < GVIDSCNSIZ {
+        return Err(ShimError::Failed(format!(
+            "iniscn: \"{named}\" is {} bytes -- INISCN ERROR READING (need {GVIDSCNSIZ})",
+            bytes.len()
+        )));
+    }
+
+    if dest != A::null_ptr() {
+        dest.write(call.mem(), &bytes[..GVIDSCNSIZ])
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+    }
+    // `cvtscn(where)`: a no-op under `color`, which this host always is --
+    // see this function's own doc comment.
 
     Ok(abi::Ret::Void)
 }
@@ -316,5 +456,107 @@ mod tests {
             "channel 0 was never current and rstrxf must not touch it"
         );
         assert_eq!(f.host.gsbl().channel(one).page_lines, 8, "10 - CTNUOS(2)");
+    }
+
+    // ---- explode --------------------------------------------------------
+
+    #[test]
+    fn explode_does_not_stop_the_module() {
+        // No local console to draw on -- the whole point of the routine is
+        // unreachable here, so the only thing to prove is that a module
+        // calling it keeps running.
+        let mut f = Fixture::new();
+        let img = f.bytes(&[0x41, 0x07, 0x42, 0x07], false);
+        f.invoke(explode, &[img.offset, img.selector, 0, 0, 79, 24])
+            .expect("explode does not stop the machine");
+    }
+
+    #[test]
+    fn explode_accepts_a_null_sctptr() {
+        // `sptr == 0` means "read from the live screen" in the vendor body
+        // -- a legitimate argument this host has no screen to honour either
+        // way, not a bad pointer.
+        let mut f = Fixture::new();
+        f.invoke(explode, &[0, 0, 0, 0, 79, 24])
+            .expect("a null sctptr is accepted");
+    }
+
+    #[test]
+    fn explode_refuses_an_unreadable_sctptr() {
+        // A module passing a genuinely bad pointer must stop here, not
+        // silently appear to have drawn a window it did not.
+        let mut f = Fixture::new();
+        f.invoke(explode, &[0x9999, 0x9999, 0, 0, 79, 24])
+            .expect_err("an unresolvable sctptr is refused");
+    }
+
+    // ---- iniscn -----------------------------------------------------------
+
+    #[test]
+    fn iniscn_loads_a_full_scn_file_into_the_supplied_buffer() {
+        // GVIDSCNSIZ (4000 bytes) exactly -- not the plan's own sample
+        // test's 512-byte buffer, which would have been an under-allocation
+        // this routine writes straight past (memory note: round-trip tests
+        // are blind to under-allocation; a 4000-byte destination is the only
+        // one this routine's own vendor body ever writes).
+        let root = crate::testing::scratch("screen-iniscn-full");
+        let mut f = Fixture::rooted(root.clone());
+        let mut image = vec![0u8; GVIDSCNSIZ];
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+        std::fs::write(root.join("TEST.SCN"), &image).expect("fixture");
+
+        let path = f.text("TEST.SCN");
+        let dest = f.buffer(GVIDSCNSIZ as u16);
+        f.invoke(iniscn, &[path.offset, path.selector, dest.offset, dest.selector])
+            .expect("iniscn");
+
+        let at = FarPtr { offset: dest.offset, selector: dest.selector };
+        let got = f.machine.resolve(at, GVIDSCNSIZ).expect("dest is readable");
+        assert_eq!(got, image.as_slice(), "every one of the 4000 bytes must round-trip, not just the first few");
+    }
+
+    #[test]
+    fn iniscn_on_a_missing_file_is_refused() {
+        let mut f = Fixture::rooted(crate::testing::scratch("screen-iniscn-missing"));
+        let path = f.text("NOSUCH.SCN");
+        let dest = f.buffer(GVIDSCNSIZ as u16);
+        f.invoke(iniscn, &[path.offset, path.selector, dest.offset, dest.selector])
+            .expect_err("a refusal");
+    }
+
+    #[test]
+    fn iniscn_on_a_short_file_is_refused_not_padded() {
+        // The vendor's own `catastro` on a short read is fatal, not
+        // tolerant -- a short `.SCN` is not the "vendor tolerates" case.
+        let root = crate::testing::scratch("screen-iniscn-short");
+        let mut f = Fixture::rooted(root.clone());
+        std::fs::write(root.join("SHORT.SCN"), vec![0x41u8; GVIDSCNSIZ - 1]).expect("fixture");
+
+        let path = f.text("SHORT.SCN");
+        let dest = f.buffer(GVIDSCNSIZ as u16);
+        f.invoke(iniscn, &[path.offset, path.selector, dest.offset, dest.selector])
+            .expect_err("a refusal, not a short/zero-padded load");
+    }
+
+    #[test]
+    fn iniscn_with_a_null_where_still_validates_the_file_but_writes_nothing() {
+        // `where == 0` means "draw straight onto the local console" in the
+        // vendor body. There is no console here, so the only observable
+        // behaviour left is the file validation itself.
+        let root = crate::testing::scratch("screen-iniscn-null-where");
+        let mut f = Fixture::rooted(root.clone());
+        std::fs::write(root.join("TEST.SCN"), vec![0x41u8; GVIDSCNSIZ]).expect("fixture");
+        let path = f.text("TEST.SCN");
+        f.invoke(iniscn, &[path.offset, path.selector, 0, 0])
+            .expect("a null where is accepted once the file itself is valid");
+
+        // And a missing file is still refused even with where == 0 --
+        // proving the file check runs regardless of where the bytes would
+        // have gone.
+        let missing = f.text("NOSUCH.SCN");
+        f.invoke(iniscn, &[missing.offset, missing.selector, 0, 0])
+            .expect_err("a missing file is refused even with a null where");
     }
 }

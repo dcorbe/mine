@@ -67,6 +67,8 @@
 //! module written against real Windows already treats "this optional feature
 //! is not there" as an ordinary, handled branch.
 
+use mbbs_machine::ptr::ModulePtr;
+
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::shims::ShimError;
@@ -375,6 +377,80 @@ pub fn get_proc_address<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Res
     Ok(abi::Ret::Ptr(A::null_ptr()))
 }
 
+/// `HMODULE LoadLibraryA(LPCSTR lpLibFileName)` -- Rose32's runtime
+/// name-resolution entry, the `KERNEL32` sibling of `dosenv`'s Phar Lap
+/// `DosGetModHandle`/`DosGetProcAddr` pair on Rose16.
+///
+/// **Not the same question [`get_module_handle`] answers, and not touched by
+/// this change.** [`get_module_handle`]/[`get_proc_address`] serve
+/// `GetModuleHandleA`/`GetProcAddress` as this crate found them --
+/// `GetModuleHandleA(NULL)` asking "what is *this process's own* image", a
+/// question this host has no process image to answer honestly, so both stay
+/// unconditionally `NULL` exactly as their own doc comments already argue.
+/// `LoadLibraryA` asks something this host genuinely can answer: "does a
+/// library by this name exist for me to resolve routines against" -- see
+/// `dosenv`'s `runtime_name` module doc comment for the shared mechanism,
+/// what it can answer, and the one thing (a dispatchable address for a
+/// resolved routine) it cannot yet.
+///
+/// The handle this mints is a small, host-owned integer
+/// (`dosenv::runtime_name::handle_for`) -- never a real base address, and
+/// never dereferenced by anything on this host, only decoded back by
+/// [`freelibrary`] and (via the same table) `dosenv::dosgetprocaddr`'s
+/// 16-bit sibling. That is not the same fabrication
+/// [`get_module_handle`]'s own doc comment refuses: that routine's objection
+/// was to inventing a handle for a process image this host does not have at
+/// all, where any answer would be a lie about something real existing.
+/// "This library name is one the host's own routine table recognises" is a
+/// true, computed fact, and an opaque handle naming *which* one is not
+/// pretending to be a memory address the way a fabricated `HMODULE` for
+/// `GetModuleHandleA(NULL)` would.
+///
+/// # Argument order and byte count
+///
+/// `stdcall`, one `LPCSTR` argument -- the same shape [`get_module_handle`]'s
+/// own doc comment measures for `GetModuleHandleA`, `Cleans::Callee(4)`.
+///
+/// # Errors
+///
+/// If `lpLibFileName` does not resolve.
+pub fn loadlibrarya<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let lp_lib_file_name = call.ptr();
+    let name_bytes = lp_lib_file_name
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let name = String::from_utf8_lossy(&name_bytes);
+
+    match super::dosenv::runtime_name::handle_for::<A>(&name) {
+        Some(handle) => Ok(abi::Ret::Ptr(super::dosenv::runtime_name::ptr_for_handle::<A>(handle))),
+        None => Ok(abi::Ret::Ptr(A::null_ptr())),
+    }
+}
+
+/// `BOOL FreeLibrary(HMODULE hLibModule)` -- releases a handle
+/// [`loadlibrarya`] minted.
+///
+/// This host holds no real resource behind the handle -- no file mapping, no
+/// refcount -- so there is nothing to release; the only honest question left
+/// to answer is whether `hLibModule` is one [`loadlibrarya`] actually handed
+/// out. `TRUE` for a handle that decodes to a library this host still
+/// recognises, `FALSE` for `0`, a value never minted, or one whose library
+/// has since stopped being served (`routines()` is a compile-time literal,
+/// so that last case cannot happen today, but the check costs nothing and
+/// does not assume it never will).
+///
+/// # Argument order and byte count
+///
+/// `stdcall`, one `HMODULE` argument, `Cleans::Callee(4)` -- the same shape
+/// as [`loadlibrarya`]'s own single argument.
+pub fn freelibrary<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let h_lib_module = call.ptr();
+    let handle = super::dosenv::runtime_name::handle_for_ptr::<A>(h_lib_module);
+    let ok = super::dosenv::runtime_name::library_for::<A>(handle).is_some();
+    Ok(abi::Ret::Int(A::Int::from(u16::from(ok))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +634,88 @@ mod tests {
         ] {
             f.invoke(shim, &[]).unwrap_or_else(|e| panic!("expected Ok: {e}"));
         }
+    }
+
+    #[test]
+    fn loadlibrarya_mints_a_nonzero_handle_for_a_library_this_host_serves() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let ret = f
+            .invoke(loadlibrarya, &[name.offset, name.selector])
+            .expect("loadlibrarya never refuses");
+        let mbbs_machine::m16::Ret::Far(handle) = ret else {
+            panic!("LoadLibraryA returns a pointer-shaped HMODULE")
+        };
+        assert_ne!(
+            handle,
+            mbbs_machine::m16::FarPtr::NULL,
+            "a real, host-minted handle -- MAJORBBS has routine-table entries"
+        );
+    }
+
+    #[test]
+    fn loadlibrarya_answers_null_for_a_library_this_host_does_not_serve() {
+        let mut f = Fixture::new();
+        let name = f.text("NOSUCHLIBRARY");
+        let ret = f
+            .invoke(loadlibrarya, &[name.offset, name.selector])
+            .expect("loadlibrarya never refuses");
+        assert_eq!(ret, mbbs_machine::m16::Ret::Far(mbbs_machine::m16::FarPtr::NULL));
+    }
+
+    /// `GALME` is the library `RCIROSE.DLL`'s own 32-bit sibling
+    /// (`tmp/gapsurvey/round2/rose32/RCIROSE.DLL`) actually probes for at
+    /// runtime (`LoadLibraryA("GALME")` then `GetProcAddress(handle,
+    /// "_fixadr")`, disassembled for `dosenv`'s `runtime_name` module doc
+    /// comment) -- and it resolves here too, non-null, because
+    /// `(GALME, "_oldsend", ...)` is a real `routines()` entry (see
+    /// `dosenv::oldsend`'s own doc comment). `GetProcAddress` still answers
+    /// `NULL` for `_fixadr` regardless (unconditionally, per
+    /// [`get_proc_address`]'s own doc comment, unchanged by this task), so
+    /// the module's own flag byte still ends up `0` and the real call site
+    /// stays safe -- see `runtime_name`'s own module doc comment for the
+    /// full trace.
+    #[test]
+    fn loadlibrarya_resolves_galme_even_though_its_one_probed_routine_still_will_not() {
+        let mut f = Fixture::new();
+        let name = f.text("GALME");
+        let ret = f
+            .invoke(loadlibrarya, &[name.offset, name.selector])
+            .expect("loadlibrarya never refuses");
+        assert_ne!(
+            ret,
+            mbbs_machine::m16::Ret::Far(mbbs_machine::m16::FarPtr::NULL),
+            "GALME the library IS registered (_oldsend)"
+        );
+    }
+
+    #[test]
+    fn freelibrary_accepts_a_handle_loadlibrarya_minted_and_rejects_one_it_never_did() {
+        let mut f = Fixture::new();
+        let name = f.text("MAJORBBS");
+        let minted = f
+            .invoke(loadlibrarya, &[name.offset, name.selector])
+            .expect("loadlibrarya never refuses");
+        let mbbs_machine::m16::Ret::Far(handle) = minted else {
+            panic!("LoadLibraryA returns a pointer-shaped HMODULE")
+        };
+
+        let ok = f
+            .invoke(freelibrary, &[handle.offset, handle.selector])
+            .expect("freelibrary never refuses");
+        assert_eq!(
+            ok,
+            mbbs_machine::m16::Ret::U16(1),
+            "TRUE for a handle loadlibrarya actually minted"
+        );
+
+        let bogus = f
+            .invoke(freelibrary, &[0xdead, 0xbeef])
+            .expect("freelibrary never refuses");
+        assert_eq!(
+            bogus,
+            mbbs_machine::m16::Ret::U16(0),
+            "FALSE for a value this process never handed out"
+        );
     }
 }

@@ -7,10 +7,12 @@
 //!
 //!
 //! The file format and what a value is are [`crate::msg`]'s; this is the part
-//! that knows about the module. `rawmsg` and `getasc` are not imported by
-//! `WCCMMUD.DLL` and are absent on purpose, as is `listing` -- which despite the
-//! name is `FILEXFER.H:78`, listing an ASCII file to the user's screen, and
-//! belongs with file transfer.
+//! that knows about the module. `rawmsg` and `getasc` are both implemented:
+//! The Rose imports `getasc` at six sites, and this host serves an API
+//! surface rather than one module's needs, which is reason enough for
+//! `rawmsg` on its own. `listing` -- despite the name -- is `FILEXFER.H:78`,
+//! listing an ASCII file to the user's screen, and belongs with file
+//! transfer.
 //!
 //! # A misconfigured board is refused, not guessed at
 //!
@@ -205,6 +207,64 @@ pub fn stgopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .reserve(call.mem(), size)
         .map_err(|e| ShimError::Failed(format!("stgopt: {e}")))?;
     text::write_cstr_mem::<A>(call.mem(), out, &text, size)?;
+    Ok(abi::Ret::Ptr(out))
+}
+
+/// `char *rawmsg(int msgnum)` -- a message's text, compact, host-owned.
+///
+/// `re/wg33src/SRC/api/gcommlib/MCVAPI.C:178-191` (Worldgroup 3.3) reads the
+/// message into `msgbuf`, a buffer the host owns and reuses on the very next
+/// call -- the module must not free what this returns, and every other
+/// option reader in that file (`chropt`, `stgopt`, `pthopt`, `lngopt`) is
+/// built by calling `rawmsg` and reading or copying its result immediately.
+/// This host already interns each message's text at a stable address --
+/// [`message_mem`], the same one [`stgopt`] and [`numopt`] read from -- so
+/// `rawmsg` hands that address straight back rather than copying through a
+/// scratch buffer of its own. That is a deliberate improvement over the real
+/// host, not a plausible zero: the address stays valid instead of being
+/// silently overwritten by the module's next message-file call.
+///
+/// Generic: [`message_mem`] is already `impl<A: Abi>`.
+pub fn rawmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msgnum = Into::<u32>::into(call.int()) as u16;
+    let at = message_mem(call.mem(), host, msgnum)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
+/// `char *getasc(int msgnum)` -- [`rawmsg`]'s text with every line break
+/// doubled to `\r\n`.
+///
+/// `re/wg33src/SRC/api/gcommlib/GETASC.C:22-57` (Worldgroup 3.3) is `rawmsg`
+/// with the substitution done character-by-character while reading, writing
+/// into the same host-owned `msgbuf`. The transform itself is
+/// [`crate::msg::getasc`] -- this is the shim that reaches it by message
+/// number, per this task's own `Consumes` line, and does not duplicate it.
+///
+/// Unlike [`rawmsg`], the result cannot be [`message_mem`]'s address handed
+/// back unchanged: that address holds the compact form other option readers
+/// still rely on, and overwriting it in place would corrupt them. So this
+/// gives the module a fresh block from [`crate::heap::Heap`], the same
+/// mechanism [`stgopt`] already uses for a computed string -- a deliberate
+/// point of divergence from the real host's single reused `msgbuf`, recorded
+/// here rather than silently matched: this host has no equivalent scratch
+/// buffer, and a fresh block per call is safe where a reused one would only
+/// be an aliasing hazard.
+///
+/// Generic: [`read_mem`] is already `impl<A: Abi>`;
+/// [`Heap::reserve`](crate::heap::Heap::reserve) and
+/// [`text::write_cstr_mem`] are the same generic pair [`stgopt`] uses.
+pub fn getasc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msgnum = Into::<u32>::into(call.int()) as u16;
+    let compact = read_mem(call.mem(), host, msgnum)?;
+    let expanded = crate::msg::getasc(&compact);
+
+    let size = u16::try_from(expanded.len() + 1)
+        .map_err(|_| ShimError::Failed(format!("a {}-byte message", expanded.len())))?;
+    let out = host
+        .heap
+        .reserve(call.mem(), size)
+        .map_err(|e| ShimError::Failed(format!("getasc: {e}")))?;
+    text::write_cstr_mem::<A>(call.mem(), out, &expanded, size)?;
     Ok(abi::Ret::Ptr(out))
 }
 
@@ -832,5 +892,87 @@ mod tests {
             f.invoke(setmbk, &Fixture::far(only)).is_err(),
             "and the closed block is not one to set again"
         );
+    }
+
+    #[test]
+    fn rawmsg_returns_the_compact_text_by_message_number() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let Ret::Far(at) = f.invoke(rawmsg, &[1]).expect("read") else {
+            panic!("rawmsg returns a pointer");
+        };
+        assert_eq!(f.read(at), "DEMO");
+    }
+
+    #[test]
+    fn rawmsg_names_the_same_address_message_mem_already_does() {
+        // Real GETASC.C/MCVAPI.C both hand back a pointer into a host-owned
+        // buffer the module must not free, unlike stgopt's fresh copy. This
+        // host already keeps each message at a stable address; rawmsg names
+        // it directly rather than copying through a scratch buffer of its
+        // own.
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let Ret::Far(at) = f.invoke(rawmsg, &[2]).expect("read") else {
+            panic!("rawmsg returns a pointer");
+        };
+        let expected = message(&f.machine, &f.host, 2).expect("message_mem");
+        assert_eq!(at, expected);
+    }
+
+    #[test]
+    fn rawmsg_with_no_message_block_current_is_refused() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(rawmsg, &[1]).is_err(), "no block current is a refusal");
+    }
+
+    /// A `.MSG` file with one option whose value has an embedded line break
+    /// that survives `MsgFile::parse`'s `line_endings` as a bare `\n` -- the
+    /// break is followed by an alphanumeric character (`l` of "line two"),
+    /// which `line_endings` keeps literal rather than turning into `\r`. See
+    /// `crate::msg::line_endings`. Message 0 is `TESTMSG`, the only option.
+    fn open_multiline(f: &mut Fixture) {
+        let dir = crate::testing::scratch("getasc-shim");
+        std::fs::write(
+            dir.join("MULTI.MSG"),
+            b"TESTMSG {line one\nline two} S 30 whatever\n",
+        )
+        .expect("write a test .MSG file");
+        *f = Fixture::rooted(dir);
+        let name = f.text("MULTI.MSG");
+        f.invoke(opnmsg, &Fixture::far(name)).expect("opens");
+    }
+
+    #[test]
+    fn getasc_expands_bare_newlines_the_way_the_msg_helper_does() {
+        // char *getasc(int msgnum) -- GCOMM.H:283. The transform itself is
+        // crate::msg::getasc; this asserts the shim reaches it by message
+        // number and returns a pointer to the expanded text.
+        let mut f = Fixture::new();
+        open_multiline(&mut f);
+        let Ret::Far(p) = f.invoke(getasc, &[0]).expect("getasc") else {
+            panic!("getasc returns a pointer");
+        };
+        assert_eq!(f.read(p), "line one\r\nline two");
+    }
+
+    #[test]
+    fn getasc_with_no_message_block_current_is_refused() {
+        let mut f = Fixture::new();
+        assert!(f.invoke(getasc, &[1]).is_err(), "no block current is a refusal");
+    }
+
+    #[test]
+    fn getasc_result_is_the_modules_own_fresh_block() {
+        // Unlike rawmsg, which names the host's stable per-message address
+        // directly, getasc cannot: that address holds the compact form
+        // other option readers still rely on. Confirm it is a heap block
+        // like stgopt's, not message_mem's own address.
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let Ret::Far(p) = f.invoke(getasc, &[1]).expect("getasc") else {
+            panic!("getasc returns a pointer");
+        };
+        assert_eq!(f.host.heap().block(p), Some(5), "DEMO plus a terminator");
     }
 }

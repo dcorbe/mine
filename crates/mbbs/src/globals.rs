@@ -170,6 +170,26 @@ pub const GLOBALS: &[Global] = &[
     g("user", PTR),
     g("usrptr", PTR),
     g("othusp", PTR),
+    // MAJORBBS.H:351-352 -- the next `extern` statement, declaring two names:
+    //   struct extusr *extptr,        /* global pointer to extra info about cur usr*/
+    //                 *othexp;        /* gen purp other-user user structre ptr     */
+    // `extptr` is not placed: `curusr`'s own doc comment already declines it
+    // system-wide (`WCCMMUD.DLL` addresses neither `extusr` nor `extptr`).
+    // `othexp` is needed anyway -- RTSLORD-NE (Twilight Lord) imports it
+    // directly, 15 sites (`re/ne_arity.py 826 tmp/gapsurvey/tlord_ne/
+    // RTSLORD.DLL` reports "cleans void" at every one -- the signature of a
+    // data fixup with no call after it, confirming it is addressed, never
+    // called). Like `othuap`, it needs no host-side value: the caller sets
+    // it itself with `othexp=extoff(othusn)` (`MAJORBBS.C:3023` &c.,
+    // `crate::shims::user::extoff` implements `extoff` itself) and then
+    // reads fields off it -- this only has to be a real 4-byte slot in
+    // module memory for that write to land on, the same role `othuap`
+    // already plays for `struct usracc *`. GCV2-only in practice
+    // (`crate::users::extusr_stride`'s own doc comment: `struct extusr` is a
+    // GCV2 invention), but the slot itself is placed for every ABI the same
+    // way every other global here is -- a `Wg32` module simply never writes
+    // anything useful through it.
+    g("othexp", PTR),
     // MAJORBBS.H:400 -- int nglobs, (*globs[GLBMAX])();
     gi("nglobs"),
     g("globs", GLBMAX * PTR),
@@ -300,12 +320,36 @@ pub const GLOBALS: &[Global] = &[
     // reaches for by address, never a call. Unchanged in wg33
     // (`EXPWGSF(VOID,emlsdrou)(VOID);`, `re/wg33src/INC/MAJORBBS.H:527`).
     g("emlsdrou", PTR),
-    // REMOTE.H:11 -- one `extern` statement declaring seven remote-sysop
-    // ints; this places only the second, `errcod`, "MS-DOS exit codes (for
-    // batch files)." The Rose addresses it at 4 sites. `INT`, not a pointer
-    // -- `gi`, so it is `Abi::INT_WIDTH` bytes rather than a fixed 2 or 4.
-    // Unchanged in wg33 (`EXPWGSV(INT) errcod;`, `re/wg33src/INC/REMOTE.H:46`).
+    // REMOTE.H:10-17 -- one `extern` statement declaring seven remote-sysop
+    // ints, in this order:
+    //   int kilipg,   /* kill-system command in progress           */
+    //       errcod,   /* MS-DOS exit codes (for batch files)       */
+    //       kilsrc,   /* kill-command source (-1=console, -2=MCU,  */
+    //                 /* -3=timed event, >=0=chan #)               */
+    //       kilctr, rsetop, chnemd, rmtsys;
+    // This places the first three -- `kilctr`/`rsetop`/`chnemd`/`rmtsys` are
+    // not addressed by anything in the corpus this host was built against.
+    // All three are plain `int` globals, not routines: `EXPWGSV(INT)` is
+    // `EXPORT_VARIABLE(...)` (`GCOMM.H:20`), a data export, and `grep -a
+    // "kilipg("|"kilsrc(" --include=*.C --include=*.H re/wg33src` finds zero
+    // call-syntax uses anywhere -- every real site is a bare read or a plain
+    // assignment (`re/wg33src/SRC/server/wgserver/MAJORBBS.C:160`: `INT
+    // kilipg=0;`, `:2360`: `kilipg=1;`). Registering either as a routine
+    // would be the exact trap this table exists to avoid: the module would
+    // get a dispatch thunk's address where it expected an `int`, and the
+    // routine would look implemented while nothing ever happened -- the same
+    // reasoning `fsdusr`/`emlsdrou` above already established for pointers.
+    //
+    // `kilipg` ("kill-system command in progress") and `kilsrc`
+    // ("kill-command source") are both `MAJORBBS` ordinal data imports in
+    // Rose32 (`tmp/gapsurvey/round2/out_rose_pe.txt`, one site each) --
+    // 32-bit only, unlike `errcod` (The Rose, 16-bit, 4 sites), but placed
+    // for every ABI the same way every other global here is.
+    // Unchanged in wg33 (`EXPWGSV(INT) kilipg/errcod/kilsrc;`,
+    // `re/wg33src/INC/MAJORBBS.H:590` and `re/wg33src/INC/REMOTE.H:44-47`).
+    gi("kilipg"),
     gi("errcod"),
+    gi("kilsrc"),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -799,10 +843,11 @@ mod tests {
 
     /// The one number this whole `Width` distinction exists for.
     ///
-    /// Fifteen globals are declared `int`. Under `Wg16` that is two bytes and
-    /// under `Wg32` it is four, so the 32-bit table is exactly 30 bytes
-    /// longer -- and, far more importantly, a 32-bit module's four-byte write
-    /// to `usrnum` lands entirely inside `usrnum`.
+    /// Eighteen globals are declared `int` (sixteen until `kilipg`/`kilsrc`
+    /// joined `errcod` as REMOTE.H's other two placed members). Under `Wg16`
+    /// that is two bytes and under `Wg32` it is four, so the 32-bit table is
+    /// exactly 36 bytes longer -- and, far more importantly, a 32-bit
+    /// module's four-byte write to `usrnum` lands entirely inside `usrnum`.
     ///
     /// Before this, `const INT: u16 = 2` made both columns 2 and the whole
     /// table one length. Nothing failed, because nothing asked.
@@ -813,7 +858,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 16, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 18, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -849,7 +894,15 @@ mod tests {
         assert_eq!(at("margv"), 256);
         assert_eq!(at("margn"), 256 + 512);
         let last = *placed.last().expect("non-empty");
-        // 3415 until 2026-08-14, 3509 until 2026-08-15's three datums:
+        // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
+        // 3520 until Task 12/13/15's second pass added three more:
+        //   +4 othexp    (MAJORBBS.H:352 -- RTSLORD-NE, 15 sites)
+        //   +2 kilipg    (MAJORBBS.H:590/REMOTE.H:44, an int -- Rose32, 1 site)
+        //   +2 kilsrc    (REMOTE.H:46 -- 47, an int -- Rose32, 1 site)
+        // no new alignment byte: `othexp` (4 bytes) follows `othusp`, itself
+        // 4-byte-aligned, and `kilipg`/`kilsrc` (2 bytes each) sit beside
+        // `errcod`, already 2-byte-aligned -- 3520 + 4 + 2 + 2 = 3528.
+        // Before that:
         //   +4 fsdusr    (FSDBBS.H:225 -- The Rose, 12 sites)
         //   +4 emlsdrou  (MAJORBBS.H:461 -- The Rose, 6 sites)
         //   +2 errcod    (REMOTE.H:11, an int -- The Rose, 4 sites)
@@ -863,7 +916,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3520);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3528);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
@@ -901,6 +954,72 @@ mod tests {
             .expect("read fsdusr");
         assert_eq!(back.offset, 0x5678, "a datum the module writes must read back");
         assert_eq!(back.selector, 0x1234, "a datum the module writes must read back");
+    }
+
+    /// The same class of mistake `fsdusr`/`emlsdrou`/`errcod` already guard
+    /// against: `othexp`, `kilipg` and `kilsrc` are data a module addresses,
+    /// never routines it calls. Registering one under `routines()`/
+    /// `WG16_ROUTINES`/`WG32_ROUTINES` instead would leave the fixup pointing
+    /// at a dispatch thunk -- the module would read a function address where
+    /// it expected a pointer or an `int`, and the "routine" would look
+    /// implemented while nothing ever ran.
+    #[test]
+    fn the_second_pass_datums_are_addressable_not_callable() {
+        for name in ["othexp", "kilipg", "kilsrc"] {
+            assert!(
+                matches!(
+                    crate::shims::entry::<crate::abi::Wg16>(crate::exports::MAJORBBS, name),
+                    crate::shims::Entry::Datum
+                ),
+                "{name} must be a Datum, not a Routine"
+            );
+        }
+    }
+
+    /// `othexp` is a far pointer (`struct extusr *`, `MAJORBBS.H:352`), so
+    /// this round-trips through [`crate::abi::wg16`]'s `Globals::pointer`
+    /// facade, the same shape [`fsdusr_round_trips_through_module_memory`]
+    /// already established.
+    #[test]
+    fn othexp_round_trips_through_module_memory() {
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "othexp", &0x2222_3333u32.to_le_bytes())
+            .expect("write othexp");
+        let back = f.host.globals().pointer(&f.machine, "othexp").expect("read othexp");
+        assert_eq!(back.offset, 0x3333);
+        assert_eq!(back.selector, 0x2222);
+    }
+
+    /// `kilipg`/`kilsrc` are plain `int`s (`REMOTE.H:44,46`), so this
+    /// round-trips through the `Globals::word` facade rather than
+    /// `Globals::pointer` -- the same distinction
+    /// [`an_int_global_is_two_bytes_under_wg16_and_four_under_wg32`] tests at
+    /// the byte-width level, exercised here through an actual write/read.
+    #[test]
+    fn kilipg_and_kilsrc_round_trip_through_module_memory_independently() {
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "kilipg", &1i16.to_le_bytes())
+            .expect("write kilipg");
+        f.host
+            .globals()
+            .write(&mut f.machine, "kilsrc", &(-2i16).to_le_bytes())
+            .expect("write kilsrc");
+
+        assert_eq!(f.host.globals().word(&f.machine, "kilipg").expect("read kilipg"), 1);
+        assert_eq!(
+            f.host.globals().word(&f.machine, "kilsrc").expect("read kilsrc") as i16,
+            -2,
+            "kilsrc's -2 = timed event, per REMOTE.H:12's own comment"
+        );
+
+        // Not the same slot, and not `errcod` (placed between them) either --
+        // a mutation that collapsed the three into one address would still
+        // pass a test that checked only one name back.
+        assert_eq!(f.host.globals().word(&f.machine, "errcod").expect("errcod"), 0);
     }
 
     #[test]

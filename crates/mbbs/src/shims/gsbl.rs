@@ -29,6 +29,65 @@
 //! to dispatch and no stack to read arguments off -- it calls each `apply_*`
 //! function directly with values it already has.
 //!
+//! # Task 3: the character-interrupt family (`btuche`, `btuchi`, `btuclc`,
+//! `btucls`, `btutru`, `chiout`)
+//!
+//! `WCCMMUD.DLL` imports none of these; RTSLORD imports all six and The Rose
+//! imports `btuchi`. Ordinals from the vendor's own `re/wg33src/LIB/
+//! GALGSBL.DEF` (`btuche@3`, `btuchi@4`, `btuclc@5`, `btucls@8`, `btutru@52`,
+//! `chiout@64`), declarations from `archive/galacticomm/extract/wg1/
+//! GALDSRC/SRC/BRKTHU.H` (the **wg1** tree; wg20 shares the filenames at
+//! different line numbers) and semantics from `.scratch/gsbl_guide.txt`, a
+//! full-text extraction of the *Worldgroup 1.0 GSBL Development Guide*
+//! (`archive/tooling/reference-documents/`) -- no `GALGSBL.C` survives
+//! anywhere in this archive (only compiled `.LIB`s and `.DLL`s; checked), so
+//! the guide is the only oracle for these six the way it is not for
+//! `btuxnf`/`btupbc`/`btucpc`, which had `re/wg33src` callers to cross-check
+//! against instead.
+//!
+//! **This task's file scope started as `crates/mbbs/src/shims/gsbl.rs`
+//! only** and was extended mid-task, by the coordinator, to include
+//! `crates/mbbs/src/gsbl.rs` (where [`crate::gsbl::Channel`] lives) once it
+//! became clear that `btutru` was refusing for a boundary drawn one file
+//! too narrow, not a real capability gap. Both files are in scope below.
+//!
+//! **Five implement for real.** [`btucls`] clears
+//! [`crate::gsbl::Channel::status`], the FIFO this host already uses for
+//! every status it raises -- exactly the "status-input buffer" the guide
+//! describes, simplified for a host with no modem to sense but not
+//! reinvented. [`btuclc`] answers the channel-bound check and nothing else,
+//! because `btucmd` (the command channel it would abort) is not implemented
+//! anywhere in this crate -- and, unlike everything else refused or
+//! recorded-inert below, this is not contingent on a gap this host might
+//! close later: there is no modem to command on a socket-based host, ever,
+//! so "a command was in progress" is a structural invariant, not today's
+//! implementation status. [`chiout`] writes into
+//! [`crate::gsbl::Channel::output`], the same place ordinary echoed input
+//! already lands, because this host has no echo buffer distinct from the
+//! data output buffer either. [`btutru`] stores its abort character in
+//! [`crate::gsbl::Channel::trunch`], and [`btuche`] stores its notify flag
+//! in [`crate::gsbl::Channel::chi_notify_on_idle`] -- both **recorded, not
+//! acted on**, the same established shape `xon`/`xoff`/`pause_char`/
+//! `clear_pause_char`/`pause_handler_installed` already use for a setting
+//! whose consuming mechanism this host does not (yet, or ever) drive. See
+//! each field's own doc comment for why storing them honestly, rather than
+//! refusing or discarding, is the right call for these two specifically.
+//!
+//! **One refuses.** [`btuchi`] installs a module callback -- `char far
+//! (*rouadr)(int chan, int c)` -- invoked on every character a channel
+//! receives, replacing the input pipeline's translate-table stage. This
+//! host has a real, working precedent for recording a callback pointer now
+//! and invoking it later from somewhere with `A::Module` access
+//! ([`crate::shims::task::initask`]/`Host::prctask`), but that precedent's
+//! shape needs a place to attach to -- a periodic sweep, the way
+//! `Host::cycle` sweeps `host.tasks` once a cycle -- and character arrival
+//! has no such sweep today; it runs straight from the transport layer into
+//! `Channel::take`. Building one is input-path work this task does not do.
+//! See `btuchi`'s own doc comment for the precise wall and for why, even
+//! setting that aside, this callback's all-or-nothing substitution of a
+//! mandatory pipeline stage makes "record and silently do nothing" a worse
+//! failure here than it is for `btuche`'s merely-additive flag.
+//!
 //! # Generic core, converted together with `shims::screen`
 //!
 //! All seventeen routines here (the fourteen real imports plus `btuhpk`/
@@ -314,7 +373,6 @@ pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///   not implemented here, so nothing can make `wid` non-zero and the branch is
 ///   unreachable. Recorded rather than quietly dropped: a host that grows
 ///   `echsec` must grow this with it.
-///
 
 pub fn echonu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
@@ -798,6 +856,278 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::int_from_u32(take as u32)))
 }
 
+/// `int btuclc(int chan)` -- abort any command in progress and clear the
+/// command output buffer (guide `btuclc`, page 50): cancels any command in progress (`btucmd()`, page 54) and empties the channel's command buffer.
+///
+/// This host has no command channel at all. `btucmd` -- Xecom/Hayes/UART
+/// modem-command control, guide page 54 -- is not implemented anywhere in
+/// this crate (checked: no `btucmd` shim, no command-buffer field on
+/// [`crate::gsbl::Channel`]), and nothing else writes to a "command buffer"
+/// distinct from [`btuclo`]'s ordinary data output buffer. So "a command
+/// was in progress" is never true on this host -- there is no code path
+/// that could have started one -- and "clears the command buffer" is
+/// satisfied because the buffer it would clear does not exist. This
+/// follows from `btucmd`'s absence, checked directly, not from a guess
+/// standing in for unconfirmed vendor behaviour.
+pub fn btuclc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    Ok(match on_channel(host, chan, |_, _| ()) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btucls(int chan)` -- clear the status input buffer (guide `btucls`,
+/// page 53): the status-input buffer that modem-condition sensing depends on, provided for completeness alone -- the guide warns against calling it casually, since it
+/// can discard something like a queued "lost carrier".
+///
+/// This host has no modem to sense, but [`crate::gsbl::Channel::status`] --
+/// the FIFO [`btuinj`] pushes onto and the (unimplemented, not imported by
+/// any surveyed build) `btusts` would drain -- is exactly the buffer the
+/// guide describes, simplified rather than reinvented: every status this
+/// host ever raises (`CRSTG`, `INBLK`, `OUTMT`, `Gsbl::CYCLE`, ...) already
+/// goes through this one queue. Clearing it here is the genuine operation,
+/// not a stand-in for one this host cannot perform -- unlike [`btuclc`],
+/// which has nothing real to touch.
+pub fn btucls<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).status.clear();
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btuche(int chan, int onoff)` -- enable calling the [`btuchi`]
+/// interceptor an extra time, with pseudo-key-code `-1`, whenever the
+/// channel's echo buffer goes idle (guide `btuche`, page 42): it switches a callback on or off: whenever the channel's echo buffer drains, the `btuchi()` routine is called with the channel number and a pseudo key code of -1.
+///
+/// **Not the same routine as the already-implemented [`btuech`]**, despite
+/// the near-identical name and identical two-`int` signature -- `btuech`
+/// (guide page 84, `Channel::echo`) is the ordinary input-echo toggle;
+/// `btuche` is this narrower thing, documented by the guide as existing
+/// "mainly to support certain advanced real-time protocols" and a routine
+/// its own CAUTIONS say not to use until `btuchi` is fully understood.
+///
+/// # Revised: records rather than refuses
+///
+/// An earlier version of this routine refused, reasoning that its only
+/// effect is notifying an *already-installed* [`btuchi`] interceptor, and
+/// `btuchi` can never install a live one on this host. That premise is
+/// still true -- see `btuchi`'s own doc comment -- but the conclusion was
+/// wrong: [`crate::gsbl::Channel::pause_handler_installed`] already
+/// establishes the precedent for exactly this shape ("record the caller's
+/// intent for a mechanism this host does not yet drive"), and `btuche`'s
+/// flag is additive in the same way -- unlike `btuchi`'s callback, which
+/// *replaces* a mandatory pipeline stage for every future character (see
+/// `btuchi`'s own doc comment for why that difference matters), `btuche`'s
+/// only effect is whether one *extra*, otherwise-nonexistent notification
+/// fires. Nothing else about this channel's behaviour depends on it either
+/// way, so recording it and answering `0` is not a fabrication -- it is
+/// the same honest bookkeeping `pause_handler_installed` already performs,
+/// stored in [`crate::gsbl::Channel::chi_notify_on_idle`]. **What would
+/// reveal this is wrong**, the same test `pause_handler_installed`'s doc
+/// comment names for its own field: the day a future host closes the
+/// `btuchi` gap, an interceptor that never gets its `c == -1` notification
+/// despite `btuche(chan, 1)` having succeeded would be the bug this
+/// recording exists to prevent.
+pub fn btuche<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let onoff = Into::<u32>::into(call.int());
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).chi_notify_on_idle = onoff != 0;
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btuchi(int chan, char far (*rouadr)(int chan, int c))` -- install an
+/// input character interceptor (guide `btuchi`, page 44): every byte
+/// received from the channel, in ASCII input mode, is handed to `rouadr`
+/// instead of the ordinary translate table, and `rouadr`'s return value
+/// becomes the character that continues down the rest of the input
+/// pipeline (backspace handling, line assembly, echo, ...). A `NULL`
+/// `rouadr` de-installs it.
+///
+/// # The wall, stated precisely -- not "no shim can ever invoke a callback"
+///
+/// A shim genuinely cannot call *synchronously* into a module: `Call` holds
+/// only `cpu`, so a routine dispatched through the shim table has no
+/// `A::Module` to run against, ever. But this host already routes around
+/// that for a different callback, and the precise version of the wall has
+/// to say why the same route does not reach here.
+///
+/// [`crate::shims::task::initask`] does not refuse: it appends the far
+/// pointer it is handed to `host.tasks` and returns success, and
+/// [`Host::prctask`] (`lib.rs`) later calls `self.run(machine, module,
+/// task, ...)` for every one of them -- it can, because `Host::cycle`,
+/// which calls `prctask`, is invoked by the driver thread
+/// (`crates/mbbs-server/src/host.rs`) with both `machine` and `module`
+/// already in scope; the shim only ever had to remember the pointer, not
+/// invoke it. That is a real, working precedent for "record now, call back
+/// later from somewhere that has `A::Module`" -- not a wall this host
+/// cannot route around in general.
+///
+/// What `btuchi` is missing is not that precedent's *shape*, it is a place
+/// for that shape to attach to: `prctask` exists because `Host::cycle`
+/// already sweeps `host.tasks` once every cycle, on its own schedule. A
+/// character interceptor does not fire once a cycle -- it fires **on
+/// arrival**, from `Channel::take` (`crates/mbbs/src/gsbl.rs`), which is
+/// driven directly by the transport layer's `push_input`, not by
+/// `Host::cycle` and not by anything holding `A::Module`. There is no
+/// per-character equivalent of `tasks`/`prctask` today. Building one would
+/// mean giving the input-cooking path the same treatment `initask` gets --
+/// record the pointer somewhere `Host::cycle` (or a new per-character sweep
+/// with the same access) can reach, and invoke it from there instead of
+/// from `Channel::take` directly. That is real work on the input path,
+/// which this task does not do -- it is out of scope here, the same way it
+/// was named out of scope when this refusal was written, and the shape
+/// above is recorded so the next task that does take it on does not have
+/// to rediscover `initask`/`prctask` as the model.
+///
+/// # Why this still refuses at install, now that recording is possible
+///
+/// `crate::gsbl::Channel` is in scope for this task (see `btutru`'s own
+/// revision), so storing *something* at install time is no longer
+/// physically blocked the way it was in this routine's first version. Two
+/// reasons this still refuses rather than recording `rouadr` and deferring
+/// the refusal to the first character, the way [`btuche`] now defers to a
+/// flag nothing reads:
+///
+/// 1. **`Channel` is not generic over `A`.** `host.tasks: Vec<A::Ptr>`
+///    works because `Host<A>` is generic and can hold a typed pointer per
+///    ABI; `Channel` holds concrete `u8`/`u16`/`bool` fields shared by both
+///    ABIs, precisely so it does not need to be. Storing a genuinely
+///    invokable `A::Ptr` here would need `Channel` (or `Gsbl`) to grow an
+///    ABI parameter -- a structural change to every existing field's
+///    owner, not a task-sized addition next to `chi_notify_on_idle`.
+/// 2. **The consequence of a wrong deferral is worse here than `btuche`'s.**
+///    `btuche`'s flag gates one *additional* notification nothing else
+///    depends on; recording it and never firing it changes nothing else
+///    about the channel. `btuchi`'s callback *replaces* the translate-table
+///    stage of every character's processing from then on (the guide is
+///    explicit: "Our character handler routine replaces the character
+///    translation function... However, the effects of all functions
+///    associated with ASCII input mode are still in effect" -- guide page
+///    46). A module that installed one and got `0` back would believe
+///    every subsequent keystroke is running through its own logic; this
+///    host would silently keep running the default translate table
+///    instead, with no error at the moment that stops mattering and no
+///    error ever, for as long as the channel lives. That is an active,
+///    continuous divergence from what the caller was told succeeded, not
+///    an inert flag -- refusing at the one moment this host can still be
+///    honest about it is the smaller failure.
+///
+/// A channel out of range still refuses with the ordinary `-11`, ahead of
+/// the capability question, matching every other routine in this file.
+pub fn btuchi<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let rouadr = call.ptr();
+    if host.gsbl().terms().chan(chan).is_none() {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    }
+    Err(ShimError::Failed(format!(
+        "btuchi({chan}, {rouadr}): this host has no per-character equivalent \
+         of shims::task::initask's tasks/Host::prctask arrangement -- \
+         Channel::take fires on every byte the transport layer delivers, \
+         not once a cycle from Host::cycle, so there is nowhere with \
+         A::Module access to invoke this from, and building one is input-\
+         path work outside this task. Even setting invocation aside, the \
+         callback replaces the translate-table stage of every future \
+         character (guide page 46) rather than gating an optional feature, \
+         so recording success now and silently keeping the default \
+         pipeline would be an active, continuing divergence from what this \
+         call told the caller succeeded -- worse than refusing here"
+    )))
+}
+
+/// `int btutru(int chan, char trunch)` -- set the output-abort character
+/// (guide `btutru`, page 171): while ASCII output is in progress, receiving
+/// this byte from the channel truncates the *current* output block -- the
+/// one the most recent [`btuxmt`]/[`btuxct`] queued -- leaving the rest of
+/// the output buffer alone. Zero disables it, and it is disabled by
+/// default; the guide's own worked example uses Control-O (Worldgroup) or
+/// Control-X (other systems).
+///
+/// # Revised: this task's file scope grew to include `crate::gsbl::Channel`
+///
+/// The first version of this routine refused: `Channel` had no field to
+/// hold `trunch`, and this task's files were `crates/mbbs/src/shims/gsbl.rs`
+/// only, which excluded `crates/mbbs/src/gsbl.rs` where `Channel` lives.
+/// That was a boundary drawn one file too narrow, not a real capability
+/// gap -- the coordinator confirmed no other agent owns that file and
+/// extended this task's scope to include it. [`crate::gsbl::Channel::trunch`]
+/// now exists, and this stores into it, following exactly the shape
+/// `xon`/`xoff`/`pause_char`/`clear_pause_char` already use: **the
+/// abort-on-receipt mechanism itself is still not implemented** (see
+/// `Channel::trunch`'s own doc comment for why -- `Channel::output` has no
+/// block boundaries for a matching byte to truncate), so `trunch` is
+/// recorded, not yet acted on. That is a real, previously-established
+/// shape in this file, not the fabricated "0 and discard it" this routine
+/// refused rather than do the first time.
+///
+/// `trunch` is read with [`u8_arg`] -- `CHAR` in the guide's synopsis, the
+/// same genuinely-narrow shape as `btupbc`'s `pausch`/`btucpc`'s `cpchar` --
+/// and a value that does not fit answers the ordinary `-11`, same as a
+/// channel out of range.
+pub fn btutru<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(trunch) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).trunch = trunch;
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `void chiout(int chan, char c)` -- character output via the echo buffer
+/// (guide, documented under `btuchi`, page 47): character output through the echo buffer.
+///
+/// The guide restricts `chiout`/`chious`/`chiinp`/`chiinj` to being called
+/// only from inside a `btuchi` interceptor or a `bturti` real-time
+/// interrupt handler -- neither of which this host can ever run (see
+/// [`btuchi`]'s own doc comment) -- but `chiout` is a real, independently
+/// linkable `GALGSBL` export (ordinal 64), and RTSLORD imports it directly
+/// rather than only reaching it from inside an interceptor this host could
+/// never invoke anyway. The guide's restriction is a caution for the
+/// *module author* writing the interceptor ("must be called only by the
+/// routines that are used as input character interceptors"), not a
+/// contract this host's own callers observe through a return code -- there
+/// is no return code; `chiout` is `void`. So this implements the
+/// mechanical half -- route the byte to the channel's echo path -- without
+/// trying to police who called it.
+///
+/// This host has no echo buffer distinct from
+/// [`crate::gsbl::Channel::output`] -- ordinary echoed input already lands
+/// there (`Channel::take`'s echo stage) -- so `chiout` writes to the same
+/// place. `void`, so a bad channel or an over-wide character has no return
+/// code to carry a refusal; [`echonu`] is the precedent for what a `void`
+/// routine does instead: note it and otherwise do nothing, rather than
+/// stopping the machine over a byte nobody but this host's own log will
+/// ever see was dropped.
+pub fn chiout<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(c) = u8_arg::<A>(call.int()) else {
+        host.note(format!(
+            "chiout: channel {chan}: character argument does not fit a byte"
+        ));
+        return Ok(abi::Ret::Void);
+    };
+    if on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).output.push_back(c);
+    })
+    .is_none()
+    {
+        host.note(format!("chiout: channel {chan} is out of range; character dropped"));
+    }
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1291,16 @@ mod tests {
             ("btuhpk", f.invoke(btuhpk, &[past, 0, 0])),
             ("btupbc", f.invoke(btupbc, &[past, 20])),
             ("btucpc", f.invoke(btucpc, &[past, 19])),
+            ("btuclc", f.invoke(btuclc, &[past])),
+            ("btucls", f.invoke(btucls, &[past])),
+            // The three that refuse once the channel is valid still answer
+            // the ordinary -11 for one that is not -- the capability
+            // question is unrelated to the bound check, and every routine
+            // in this file makes the bound check first. See each one's own
+            // doc comment.
+            ("btuche", f.invoke(btuche, &[past, 1])),
+            ("btuchi", f.invoke(btuchi, &[past, 0, 0])),
+            ("btutru", f.invoke(btutru, &[past, 15])),
         ] {
             assert_eq!(
                 ret.expect(name),
@@ -1335,5 +1675,179 @@ mod tests {
         f.invoke(btucli, &[0]).expect("cleared");
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(crate::gsbl::Gsbl::CRSTG));
         assert_eq!(f.host.gsbl_mut().take_line(console), None);
+    }
+
+    // # Task 3: the six GALGSBL character-interrupt routines
+    //
+    // `btuclc`/`btucls`/`btuche`/`btuchi`/`btutru` on a channel out of range
+    // are already covered by `every_routine_refuses_a_channel_out_of_range`,
+    // above -- what follows is each routine's *own* behaviour on a valid
+    // channel, which that shared table cannot exercise.
+
+    #[test]
+    fn btucls_clears_the_status_fifo_but_btuclc_touches_nothing() {
+        // The discriminating test: btuclc and btucls have the identical
+        // shape everywhere except here -- both take only a channel, both
+        // answer 0 on a valid one, both answer -11 on a bad one. A mutation
+        // that swapped their bodies, or that made either one a pure no-op,
+        // would pass every other test in this file. Only checking the
+        // status FIFO itself tells them apart.
+        let mut f = Fixture::new();
+        let console = f.console();
+
+        f.invoke(btuinj, &[0, 3]).expect("injected");
+        f.invoke(btuclc, &[0]).expect("btuclc has nothing to clear");
+        // `next_status` *pops*: reading it here to check btuclc's effect and
+        // again below to check btucls's would drain the one entry on the
+        // first read, leaving the second assertion checking an
+        // already-empty buffer regardless of what either routine did. That
+        // was this test's own first draft, and it passed against a btucls
+        // that never cleared anything -- a mutation that should have failed
+        // and did not, caught by hand rather than by cargo-mutants. Reading
+        // the field directly here, and reserving the one `next_status` call
+        // for the real proof below, is what makes the two halves actually
+        // independent.
+        assert_eq!(
+            f.host.gsbl().channel(console).status.front().copied(),
+            Some(3),
+            "btuclc must not touch the status FIFO -- it has no command \
+             buffer of its own to clear, see its own doc comment"
+        );
+
+        f.invoke(btucls, &[0]).expect("cleared");
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            None,
+            "btucls empties the status buffer btuinj fills"
+        );
+    }
+
+    #[test]
+    fn btuclc_answers_ok_on_a_valid_channel() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btuclc, &[0]).expect("ok"), Ret::U16(0));
+    }
+
+    /// `btuchi` alone has a valid-channel refusal path left in this family;
+    /// it still makes the ordinary bound check first -- a channel out of
+    /// range is not this host's missing capability, and every other
+    /// routine in this file answers `-11` for it rather than stopping the
+    /// machine. Covered once here rather than folded into
+    /// `every_routine_refuses_a_channel_out_of_range`, which asserts
+    /// `Ok(Ret::U16(..))` for the whole table; a routine that *also* has a
+    /// valid-channel refusal path needs its own two-sided test to prove the
+    /// ordering, not just the one side that table already checks.
+    #[test]
+    fn a_bad_channel_answers_out_of_range_even_though_btuchi_otherwise_refuses() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(
+            f.invoke(btuchi, &[past, 0, 0]).expect("must not stop the machine"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    /// Mirrors `btuhpk_records_that_a_handler_was_installed`: `btuche`
+    /// records caller intent for a mechanism this host does not drive,
+    /// exactly the shape `pause_handler_installed` already established.
+    /// Both `onoff` values are exercised on *different* channels so a
+    /// mutation that ignored `chan` (always writing channel 0) or ignored
+    /// `onoff` (always recording the same value) would leave one of the
+    /// two assertions false.
+    #[test]
+    fn btuche_records_the_notify_flag_per_channel() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+
+        assert!(!f.host.gsbl().channel(zero).chi_notify_on_idle, "off by default");
+        f.invoke(btuche, &[0, 1]).expect("ok");
+        f.invoke(btuche, &[1, 0]).expect("ok");
+
+        assert!(f.host.gsbl().channel(zero).chi_notify_on_idle, "channel 0 turned on");
+        assert!(!f.host.gsbl().channel(one).chi_notify_on_idle, "channel 1 turned off");
+    }
+
+    #[test]
+    fn btuchi_refuses_on_a_valid_channel_and_names_the_input_path_gap() {
+        let mut f = Fixture::new();
+        // rouadr as a far pointer: offset 0x0010, segment 0x1234 -- the same
+        // shape btuhpk's own test uses for its (deliberately unread) handler
+        // pointer.
+        let e = f
+            .invoke(btuchi, &[0, 0x0010, 0x1234])
+            .expect_err("no per-character equivalent of tasks/Host::prctask exists");
+        let msg = e.to_string();
+        assert!(msg.contains("btuchi"), "{msg}");
+        assert!(msg.contains("1234:0010"), "must name the far pointer it was handed: {msg}");
+        assert!(msg.contains("initask"), "{msg}");
+    }
+
+    /// Mirrors `btupbc_and_btucpc_record_their_characters`: `trunch` is
+    /// recorded exactly like the sibling settings it now shares a field
+    /// shape with, per-channel rather than globally.
+    #[test]
+    fn btutru_records_the_abort_character_per_channel() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+
+        f.invoke(btutru, &[0, 15]).expect("Control-O, Worldgroup's own default"); // 0x0F
+        f.invoke(btutru, &[1, 24]).expect("Control-X, the other systems' default"); // 0x18
+
+        assert_eq!(f.host.gsbl().channel(zero).trunch, 15);
+        assert_eq!(f.host.gsbl().channel(one).trunch, 24);
+    }
+
+    /// `trunch` not fitting a byte is the same ordinary `-11` every other
+    /// `u8_arg` site in this file answers.
+    #[test]
+    fn btutru_answers_the_ordinary_code_for_a_trunch_that_does_not_fit_a_byte() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let before = f.host.gsbl().channel(console).trunch;
+        let ret = f
+            .invoke(btutru, &[0, 300])
+            .expect("the routine itself does not error for a bad width");
+        assert_eq!(ret, Ret::U16(OUT_OF_RANGE));
+        assert_eq!(
+            f.host.gsbl().channel(console).trunch,
+            before,
+            "refused, not silently truncated to 300 as u8 == 44"
+        );
+    }
+
+    #[test]
+    fn chiout_writes_the_character_to_the_channels_output() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(chiout, &[0, b'~' as u16]).expect("void");
+        assert_eq!(f.host.gsbl_mut().drain_output(console), vec![b'~']);
+    }
+
+    #[test]
+    fn chiout_writes_to_the_channel_it_was_given_not_channel_zero() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let terms = f.host.gsbl().terms();
+        let zero = terms.chan(0).expect("channel 0");
+        let one = terms.chan(1).expect("channel 1");
+
+        f.invoke(chiout, &[1, b'Q' as u16]).expect("void");
+
+        assert_eq!(
+            [f.host.gsbl_mut().drain_output(zero), f.host.gsbl_mut().drain_output(one)],
+            [Vec::new(), vec![b'Q']],
+            "the argument names the channel -- not channel zero"
+        );
+    }
+
+    #[test]
+    fn chiout_on_a_channel_out_of_range_drops_the_character_without_stopping_the_machine() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        f.invoke(chiout, &[past, b'x' as u16])
+            .expect("void routines note and continue, like echonu -- see chiout's own doc comment");
     }
 }
