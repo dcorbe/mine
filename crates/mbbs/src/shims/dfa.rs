@@ -1891,3 +1891,862 @@ fn read_ptr<A: Abi>(call: &mut Call<A>, at: A::Ptr) -> Result<A::Ptr, ShimError>
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(A::ptr_from_bytes(bytes))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::Wg16;
+    use crate::testing::Fixture;
+    use mbbs_machine::m16::{FarPtr, Ret};
+
+    /// Open a file through `dfaOpen`, as a module would.
+    fn open(f: &mut Fixture, name: &str, maxlen: u16) -> FarPtr {
+        let at = f.text(name);
+        let Ret::Far(block) = f
+            .invoke(dfaOpen, &[at.offset, at.selector, maxlen, 0, 0])
+            .expect("dfaOpen")
+        else {
+            panic!("dfaOpen returns a pointer");
+        };
+        block
+    }
+
+    /// Where a dfa file's own record buffer lives.
+    fn buffer(f: &Fixture, block: FarPtr) -> FarPtr {
+        f.host.btrieve().block(block).expect("open").data()
+    }
+
+    /// The two-byte key of the record a read left in a buffer.
+    fn got(f: &Fixture, at: FarPtr) -> u16 {
+        let bytes = f.machine.resolve(at, 2).expect("readable");
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+
+    /// `dfaQuery(key, keynum, opt)` with a real key value, or the lowest,
+    /// highest, next or previous.
+    fn query(f: &mut Fixture, keynum: i16, opt: i16) -> bool {
+        f.invoke(dfaQuery, &[0, 0, keynum as u16, opt as u16])
+            .expect("dfaQuery")
+            == Ret::U16(1)
+    }
+
+    /// `dfaAcqLock(NULL, key, keynum, opt, lock)` -- acquire into the file's
+    /// own data buffer, taking whatever lock `lock` names (`0` for none).
+    fn acquire(f: &mut Fixture, key: Option<u16>, keynum: i16, opt: i16, lock: i16) -> bool {
+        let value = match key {
+            Some(n) => f.bytes(&n.to_le_bytes(), false),
+            None => Btrieve::<Wg16>::null(),
+        };
+        f.invoke(
+            dfaAcqLock,
+            &[0, 0, value.offset, value.selector, keynum as u16, opt as u16, lock as u16],
+        )
+        .expect("dfaAcqLock")
+            == Ret::U16(1)
+    }
+
+    /// A 64-byte `SAMPLE.DAT`-shaped record: the key at offset 0, a
+    /// NUL-terminated name from offset 2, the rest zero. Identical shape to
+    /// `shims::btrieve`'s own `sample_record` -- not shared, because that one
+    /// is private to that file's test module.
+    fn sample_record(key: i16, name: &str) -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[..2].copy_from_slice(&key.to_le_bytes());
+        let name = name.as_bytes();
+        bytes[2..2 + name.len()].copy_from_slice(name);
+        bytes
+    }
+
+    // -----------------------------------------------------------------
+    // `dfaSetBlk`/`dfaRstBlk`: the ten-deep, shifting stack, and the one
+    // place it is not the same shape as `setbtv`/`rstbtv`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfa_current_is_null_before_any_open_and_dfaopen_makes_the_new_file_current() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(f.host.btrieve().dfa_current(), block);
+    }
+
+    /// **The highest-value test in this file.** `dfaSetBlk` pushes the
+    /// pointer it was just handed (`DFAAPI.C:186-192`, `*dfastk=dfa=dfaptr;`
+    /// evaluates its right-hand side first); `setbtv` pushes the pointer it
+    /// is *replacing* (`*bbstk=bb;` reads `bb` before this call's own
+    /// assignment). See `Btrieve::dfa_set`'s own doc comment for the full
+    /// derivation, including why an open alone cannot tell the two shapes
+    /// apart -- an open's own `dfaSetBlk(dfa)` always fires after `dfa` has
+    /// already been reassigned to the same new pointer, so both shapes push
+    /// the same value.
+    ///
+    /// They diverge on a call not immediately paired with a restore: calling
+    /// `dfaSetBlk` a second time on the pointer that is *already* current.
+    /// Traced by hand against both shapes (this file's own commit message
+    /// carries the full trace):
+    ///
+    /// - the real (`dfa_set`) shape pushes `A` **twice**, so it takes THREE
+    ///   `dfaRstBlk` calls to reach null, and the first two both still
+    ///   answer `A`;
+    /// - a `setbtv`-shape "simplification" reads the true previous current
+    ///   (`A`, since the redundant call runs after `A` is already current)
+    ///   and pushes it once, so only TWO `dfaRstBlk` calls are needed, and
+    ///   the second is already null.
+    ///
+    /// So the discriminating assertion is that the **second** `dfaRstBlk`
+    /// after the redundant set still answers `A`, not null. A "simplified"
+    /// implementation makes that specific assertion fail while every other
+    /// assertion in this file (and in `shims::btrieve`'s own `setbtv`/
+    /// `rstbtv` suite) keeps passing -- which is exactly the kind of
+    /// divergence invisible to the type system the task that added this test
+    /// was written to catch.
+    #[test]
+    fn dfasetblk_pushing_the_current_pointer_again_diverges_from_the_setbtv_shape() {
+        let mut f = Fixture::new();
+        let a = open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(f.host.btrieve().dfa_current(), a, "dfaOpen makes the new file current");
+
+        // The redundant, explicit re-set: the module calling dfaSetBlk again
+        // on the file that is already current. Nothing in DFAAPI.C guards
+        // against this.
+        f.invoke(dfaSetBlk, &[a.offset, a.selector]).expect("re-sets the same pointer");
+        assert_eq!(f.host.btrieve().dfa_current(), a);
+
+        f.invoke(dfaRstBlk, &[]).expect("restores");
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            a,
+            "first restore after the redundant set: still A -- a setbtv-shape \
+             implementation would already be null here"
+        );
+
+        f.invoke(dfaRstBlk, &[]).expect("restores");
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            a,
+            "second restore: STILL A. dfaSetBlk pushed the pointer it was handed \
+             twice, and popping twice answers it twice -- this is the assertion a \
+             setbtv-shape simplification fails"
+        );
+
+        f.invoke(dfaRstBlk, &[]).expect("restores");
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            Btrieve::<Wg16>::null(),
+            "only the third restore runs the stack out"
+        );
+    }
+
+    #[test]
+    fn the_dfa_stack_is_ten_deep_and_the_eleventh_drops_the_oldest_and_is_reported() {
+        // `DFSTSZ` is 10 and the shift is `movmem`, not an index -- so an
+        // eleventh push neither refuses nor grows the stack: it silently
+        // loses the outermost entry, and this host reports it.
+        let mut f = Fixture::new();
+        let first = open(&mut f, "SAMPLE.DAT", 64);
+        let other = open(&mut f, "OTHER.DAT", 32);
+
+        // Eleven explicit sets on top of what the two opens already pushed.
+        for _ in 0..11 {
+            f.invoke(dfaSetBlk, &[other.offset, other.selector]).expect("sets");
+        }
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("fell off")),
+            "the overflow is reported: {:?}",
+            f.host.notes()
+        );
+
+        for _ in 0..10 {
+            f.invoke(dfaRstBlk, &[]).expect("restores");
+        }
+        assert_ne!(
+            f.host.btrieve().dfa_current(),
+            first,
+            "the outermost entry never comes back -- it fell off the bottom"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `dfaOpen`/`dfaClose`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfaopen_refuses_a_non_null_owner() {
+        // A refusal this host ADDS -- DFAAPI.C:146-152 passes a non-null
+        // owner straight to Btrieve as an access password; this host checks
+        // no such password, so honouring it would be a fabricated success.
+        let mut f = Fixture::new();
+        let name = f.text("SAMPLE.DAT");
+        let owner = f.text("PASSWORD");
+        let e = f
+            .invoke(dfaOpen, &[name.offset, name.selector, 64, owner.offset, owner.selector])
+            .expect_err("this host checks no such password");
+        assert!(e.to_string().contains("dfaOpen"), "{e}");
+        assert!(e.to_string().contains("owner"), "{e}");
+    }
+
+    #[test]
+    fn dfaopen_notes_a_maxlen_smaller_than_the_files_own_record_length() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 32);
+        let note = f.host.notes().last().expect("noted").clone();
+        assert!(note.contains("dfaOpen"), "{note}");
+        assert!(note.contains("truncated"), "{note}");
+    }
+
+    #[test]
+    fn dfaclose_writes_its_argument_into_dfa_unconditionally_even_a_file_that_was_never_opened() {
+        // `DFAAPI.C:661`'s `goodptr(dfa=dfap)` assigns as part of evaluating
+        // its own argument, whichever way the guard then goes.
+        let mut f = Fixture::new();
+        let nonsense = FarPtr {
+            offset: 0x40,
+            selector: f.host.globals().selector(),
+        };
+        assert_eq!(
+            f.invoke(dfaClose, &[nonsense.offset, nonsense.selector]).expect("closes"),
+            Ret::Void
+        );
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            nonsense,
+            "dfa now names a pointer this host never opened"
+        );
+        // And whatever asks next, with no other dfaOpen/dfaSetBlk in between,
+        // refuses -- it names nothing this host ever opened.
+        assert!(f.invoke(dfaAbs, &[]).is_err());
+    }
+
+    #[test]
+    fn dfaclose_really_closes_the_named_file_and_leaves_a_different_one_open() {
+        let mut f = Fixture::new();
+        let a = open(&mut f, "SAMPLE.DAT", 64);
+        let b = open(&mut f, "OTHER.DAT", 32);
+        assert_eq!(f.host.btrieve().dfa_current(), b);
+
+        f.invoke(dfaClose, &[a.offset, a.selector]).expect("closes A, not the current file");
+        assert_eq!(
+            f.host.btrieve().dfa_current(),
+            a,
+            "closing A makes A current, overriding B, which was current a moment ago"
+        );
+        assert!(f.host.btrieve().block(a).is_err(), "A is really closed");
+        assert!(f.host.btrieve().block(b).is_ok(), "B is untouched");
+    }
+
+    // -----------------------------------------------------------------
+    // The query family, and the position it leaves behind.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfaquery_positions_and_leaves_the_key_but_does_not_read_a_record() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+        let key = f.host.btrieve().block(block).expect("open").key();
+
+        assert!(query(&mut f, 0, 63), "highest");
+        assert_eq!(got(&f, key), 7, "the key it found");
+        assert_eq!(got(&f, into), 0, "but the record buffer is untouched");
+    }
+
+    #[test]
+    fn dfaquerynp_steps_in_key_order_and_reads() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(query(&mut f, 0, 62), "lowest, positions only");
+        assert_eq!(got(&f, into), 0, "a query reads no record");
+
+        assert_eq!(f.invoke(dfaQueryNP, &[56]).expect("next"), Ret::U16(1));
+        assert_eq!(got(&f, into), 2, "key order: 1 is lowest, so next is 2");
+    }
+
+    #[test]
+    fn dfaquery_with_no_dfa_file_current_answers_nothing_found() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert!(!query(&mut f, 0, 62));
+    }
+
+    // -----------------------------------------------------------------
+    // The lock family: dfaAcqLock, dfaGetAbsLock, dfaAcqAbsLock,
+    // dfaStepLock -- and dfaGetLock, whose one divergence from dfaAcqLock
+    // is worth pinning by value.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfaacqlock_finds_a_record_by_key_and_records_its_lock_type() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(5), 0, 5, 100), "equal to 5, locked with type 100");
+        assert_eq!(got(&f, into), 5);
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), Some(100));
+    }
+
+    #[test]
+    fn dfaacqlock_answers_false_on_a_key_that_does_not_exist() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(!acquire(&mut f, Some(99), 0, 5, 0), "there is no key 99");
+    }
+
+    /// The one documented behavioural difference between `dfaGetLock` and
+    /// `dfaAcqLock`: `DFAAPI.C:352-353` sends *any* nonzero status straight
+    /// to `dfaPosError("GET")`, with no status-4/9/`dfaWasLocked` exception
+    /// -- unlike `dfaAcqLock`'s own `:404-411`. Same file, same missing key,
+    /// opposite outcome.
+    #[test]
+    fn dfagetlock_refuses_on_the_identical_not_found_case_dfaacqlock_answers_quietly() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(!acquire(&mut f, Some(99), 0, 5, 0), "dfaAcqLock on this case: quiet false");
+
+        let value = f.bytes(&99u16.to_le_bytes(), false);
+        let e = f
+            .invoke(dfaGetLock, &[0, 0, value.offset, value.selector, 0, 5, 0])
+            .expect_err("dfaGetLock refuses instead of answering false");
+        assert!(e.to_string().contains("dfaGetLock"), "{e}");
+    }
+
+    #[test]
+    fn dfaacqabslock_finds_the_record_dfaabs_named() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        assert!(acquire(&mut f, Some(6), 0, 5, 0), "equal to 6");
+        let Ret::U32(position) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+        assert!(acquire(&mut f, None, 0, 12, 0), "somewhere else entirely");
+
+        assert_eq!(
+            f.invoke(dfaAcqAbsLock, &[0, 0, position as u16, (position >> 16) as u16, 0, 0])
+                .expect("acquires"),
+            Ret::U16(1)
+        );
+        assert_eq!(got(&f, into), 6, "back on the record dfaAbs named");
+    }
+
+    #[test]
+    fn dfaacqabslock_answers_false_at_a_position_no_record_has() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let bogus: u32 = 0xFFFF_FFF0;
+        assert_eq!(
+            f.invoke(dfaAcqAbsLock, &[0, 0, bogus as u16, (bogus >> 16) as u16, 0, 0])
+                .expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    /// `DFAAPI.C:459-470`: `dfaGetAbsLock` sends a failed `dfaAcqAbsLock`
+    /// straight to `dfaPosError`, with no quiet-false exception. Identical
+    /// bogus position, opposite outcome from the test above.
+    #[test]
+    fn dfagetabslock_refuses_at_the_identical_position_dfaacqabslock_answers_quietly() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let bogus: u32 = 0xFFFF_FFF0;
+        let e = f
+            .invoke(dfaGetAbsLock, &[0, 0, bogus as u16, (bogus >> 16) as u16, 0, 0])
+            .expect_err("dfaGetAbsLock has no quiet-false exception for a bad position");
+        assert!(e.to_string().contains("dfaGetAbsLock"), "{e}");
+    }
+
+    /// `DFAAPI.C:466,484` `ASSERT(keynum >= 0)` -- unlike `aabbtv`/
+    /// `gabbtvl`, which tolerate and store a negative one unchecked
+    /// (`btv::absolute`'s own doc comment). A behavioural divergence the
+    /// vendor source marks deliberately, not an oversight.
+    #[test]
+    fn dfaacqabslock_refuses_a_negative_key_number_unlike_aabbtv_and_gabbtvl() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f
+            .invoke(dfaAcqAbsLock, &[0, 0, 0, 0, (-1i16) as u16, 0])
+            .expect_err("DFAAPI.C ASSERTs keynum >= 0");
+        assert!(e.to_string().contains("dfaAcqAbsLock"), "{e}");
+        assert!(e.to_string().contains("-1"), "{e}");
+    }
+
+    #[test]
+    fn dfasteplock_walks_the_file_in_the_order_the_pages_hold_it() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let into = buffer(&f, block);
+
+        let mut stepped = vec![];
+        assert_eq!(f.invoke(dfaStepLock, &[0, 0, 33, 0]).expect("first"), Ret::U16(1));
+        stepped.push(got(&f, into));
+        while f.invoke(dfaStepLock, &[0, 0, 24, 0]).expect("next") == Ret::U16(1) {
+            stepped.push(got(&f, into));
+        }
+        assert_eq!(stepped, [4, 1, 7, 2, 6, 3, 5], "the order the pages hold, not key order");
+    }
+
+    /// `stpbtvl` has no guard at all and refuses by name with no file
+    /// current (`shims::btrieve`'s own `stpbtvl_with_no_file_current_refuses_by_name`);
+    /// `DFAAPI.C:513-516` genuinely checks first, so `dfaStepLock` answers a
+    /// quiet `FALSE` instead -- the one member of this family where `dfa*`
+    /// is *more* defensive than its `btv*` counterpart.
+    #[test]
+    fn dfasteplock_with_no_dfa_file_current_answers_quietly_unlike_stpbtvl() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert_eq!(f.invoke(dfaStepLock, &[0, 0, 33, 0]).expect("answers"), Ret::U16(0));
+    }
+
+    // -----------------------------------------------------------------
+    // Insert/update/delete, including the V and Dup variants.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfainsertv_inserts_a_record_readable_after_reopening_and_establishes_currency() {
+        let dir = crate::testing::scratch_with("dfa-insertv", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+
+        f.invoke(dfaInsertV, &[recptr.offset, recptr.selector, 64]).expect("inserts");
+        let Ret::U32(after) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+
+        // Re-read from disk with a fresh host -- the check that matters.
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(99), 0, 5, 0), "the new record is on disk");
+        assert_eq!(
+            g.read(FarPtr { offset: into.offset + 2, selector: into.selector }),
+            "Zorro"
+        );
+        let Ret::U32(expected) = g.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+        assert_eq!(after, expected, "dfaInsertV established currency on the record it just inserted");
+    }
+
+    #[test]
+    fn dfainsertv_refuses_a_record_colliding_on_a_key_without_duplicates() {
+        let dir = crate::testing::scratch_with("dfa-insertv-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        let e = f
+            .invoke(dfaInsertV, &[recptr.offset, recptr.selector, 64])
+            .expect_err("key 5 already belongs to Troll, and dfaInsertV has no case-5 exception");
+        assert!(e.to_string().contains("dfaInsertV"), "{e}");
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(7), "nothing written");
+    }
+
+    /// `DFAAPI.C:637-638`'s own `case 5: break;` -- the one insert routine
+    /// that answers quietly on the identical collision the test above
+    /// refuses on.
+    #[test]
+    fn dfainsertdup_answers_false_on_the_identical_collision_instead_of_refusing() {
+        let dir = crate::testing::scratch_with("dfa-insertdup-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let recptr = f.bytes(&sample_record(5, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dfaInsertDup, &[recptr.offset, recptr.selector]).expect("answers"),
+            Ret::U16(0)
+        );
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(7), "nothing written");
+    }
+
+    #[test]
+    fn dfaupdatev_updates_the_positioned_record_in_place_and_it_is_readable_afterwards() {
+        let dir = crate::testing::scratch_with("dfa-updatev", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "equal to 5, which is Troll");
+        let Ret::U32(before) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+
+        let recptr = f.bytes(&sample_record(5, "TROLLX"), false);
+        f.invoke(dfaUpdateV, &[recptr.offset, recptr.selector, 64]).expect("updates");
+        let Ret::U32(after) = f.invoke(dfaAbs, &[]).expect("position") else {
+            panic!("dfaAbs returns a long");
+        };
+        assert_eq!(before, after, "opcode 3 rewrites the record in place");
+
+        let mut g = Fixture::rooted(dir);
+        let block = open(&mut g, "SAMPLE.DAT", 64);
+        let into = buffer(&g, block);
+        assert!(acquire(&mut g, Some(5), 0, 5, 0), "still key 5");
+        assert_eq!(
+            g.read(FarPtr { offset: into.offset + 2, selector: into.selector }),
+            "TROLLX"
+        );
+    }
+
+    #[test]
+    fn dfaupdatev_refuses_a_duplicate_key_collision_with_no_case_5_exception() {
+        let dir = crate::testing::scratch_with("dfa-updatev-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        let e = f
+            .invoke(dfaUpdateV, &[recptr.offset, recptr.selector, 64])
+            .expect_err("key 6 already belongs to Elf, and upvbtv's own :544-546 has no case 5");
+        assert!(e.to_string().contains("dfaUpdateV"), "{e}");
+    }
+
+    #[test]
+    fn dfaupdatedup_answers_false_on_the_identical_collision_instead_of_refusing() {
+        let dir = crate::testing::scratch_with("dfa-updatedup-collide", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "equal to 5, which is Troll");
+        let recptr = f.bytes(&sample_record(6, "Imposter"), false);
+
+        assert_eq!(
+            f.invoke(dfaUpdateDup, &[recptr.offset, recptr.selector]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    /// `DFAAPI.C:567-570` really does check `dfa == NULL` first for
+    /// `dfaUpdateDup` -- unlike `dfaUpdate`/`dfaUpdateV`, which read
+    /// `dfa->data` unguarded and so refuse. Same missing file, opposite
+    /// outcome from the family it otherwise mirrors.
+    #[test]
+    fn dfaupdatedup_has_its_own_explicit_guard_and_answers_quietly_with_no_dfa_file_current() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        let recptr = f.bytes(&sample_record(1, "X"), false);
+        assert_eq!(
+            f.invoke(dfaUpdateDup, &[recptr.offset, recptr.selector]).expect("answers"),
+            Ret::U16(0)
+        );
+
+        let e = f
+            .invoke(dfaUpdateV, &[recptr.offset, recptr.selector, 64])
+            .expect_err("dfaUpdateV has no such guard and refuses instead");
+        assert!(e.to_string().contains("dfaUpdateV"), "{e}");
+    }
+
+    /// `dfaDelete` is the first shim in this crate to call
+    /// `Block::delete` -- `btv::delbtv`/`invbtv` both still refuse outright.
+    #[test]
+    fn dfadelete_removes_the_positioned_record_and_it_is_gone_after_reopening() {
+        let dir = crate::testing::scratch_with("dfa-delete", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(5), 0, 5, 0), "equal to 5, which is Troll");
+        f.invoke(dfaDelete, &[]).expect("deletes");
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(6));
+
+        let mut g = Fixture::rooted(dir);
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert!(!acquire(&mut g, Some(5), 0, 5, 0), "gone from disk, not just from memory");
+        assert_eq!(g.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(6));
+    }
+
+    #[test]
+    fn dfadelete_with_nothing_positioned_refuses() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f.invoke(dfaDelete, &[]).expect_err("never positioned");
+        assert!(e.to_string().contains("dfaDelete"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // `dfaUnlock` -- only `keynum == 0` is implemented.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfaunlock_keynum_zero_releases_the_lock_at_the_current_position() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert!(acquire(&mut f, Some(6), 0, 5, 100), "equal to 6, locked");
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), Some(100));
+
+        f.invoke(dfaUnlock, &[0, 0, 0]).expect("unlocks");
+        assert_eq!(f.host.btrieve().lock_at_current(block).expect("open"), None);
+    }
+
+    #[test]
+    fn dfaunlock_refuses_every_keynum_this_engine_cannot_honour() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        // dfaUnlockCur/dfaUnlockSel: unlock at an explicit abspos. No such
+        // primitive exists in this engine.
+        let e = f.invoke(dfaUnlock, &[0, 0, (-1i16) as u16]).expect_err("-1 refuses");
+        assert!(e.to_string().contains("dfaUnlock"), "{e}");
+        assert!(e.to_string().contains("-1"), "{e}");
+
+        // dfaUnlockAll: release every lock this session holds, on every
+        // file. No such primitive either.
+        let e = f.invoke(dfaUnlock, &[0, 0, (-2i16) as u16]).expect_err("-2 refuses");
+        assert!(e.to_string().contains("-2"), "{e}");
+
+        // 7 is none of the three DFAAPI.H's four macros actually produce.
+        let e = f.invoke(dfaUnlock, &[0, 0, 7]).expect_err("7 refuses");
+        assert!(e.to_string().contains("dfaUnlock"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // The transaction trio.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dfabegtrans_then_dfaendtrans_keeps_the_insert_on_disk() {
+        let dir = crate::testing::scratch_with("dfa-endtrans-keeps", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(dfaBegTrans, &[0]).expect("begin");
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+        f.invoke(dfaInsertV, &[recptr.offset, recptr.selector, 64]).expect("inserts");
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(8));
+        f.invoke(dfaEndTrans, &[]).expect("end");
+
+        let mut g = Fixture::rooted(dir);
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert_eq!(g.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(8), "kept on disk");
+        assert!(acquire(&mut g, Some(99), 0, 5, 0), "and findable by its key");
+    }
+
+    #[test]
+    fn dfabegtrans_then_dfaabttrans_undoes_the_insert_on_disk() {
+        let dir = crate::testing::scratch_with("dfa-abttrans-undoes", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        f.invoke(dfaBegTrans, &[0]).expect("begin");
+        let recptr = f.bytes(&sample_record(99, "Zorro"), false);
+        f.invoke(dfaInsertV, &[recptr.offset, recptr.selector, 64]).expect("inserts");
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(8), "visible before abort");
+        f.invoke(dfaAbtTrans, &[]).expect("abort");
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(7), "undone in memory");
+
+        let mut g = Fixture::rooted(dir);
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert_eq!(g.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(7), "and on disk");
+        assert!(!acquire(&mut g, Some(99), 0, 5, 0), "never really there");
+    }
+
+    #[test]
+    fn dfabegtrans_twice_without_ending_is_refused() {
+        let mut f = Fixture::new();
+        f.invoke(dfaBegTrans, &[0]).expect("the first begin opens one");
+        let e = f.invoke(dfaBegTrans, &[0]).expect_err("nested begin is refused, not stacked");
+        assert!(e.to_string().contains("already"), "{e}");
+    }
+
+    // -----------------------------------------------------------------
+    // dfaWasLocked, and the rest of the surface: dfaLastLen, dfaMode,
+    // dfaCountRec/dfaRecLen, dfaVirgin, dfaCreate/dfaCreateSpec.
+    // -----------------------------------------------------------------
+
+    /// This host is single-process by construction (`Btrieve::begin`'s own
+    /// doc comment), so Btrieve statuses 84/85 ("locked by another
+    /// user/process") describe a condition it cannot produce. `FALSE` here
+    /// is the honestly-derived answer, not a stand-in for unimplemented
+    /// locking -- which is why this test also checks right after the one
+    /// case a module would plausibly go looking for a lock conflict, and
+    /// gets the same answer.
+    #[test]
+    fn dfawaslocked_always_answers_false() {
+        let mut f = Fixture::new();
+        open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(f.invoke(dfaWasLocked, &[]).expect("answers"), Ret::U16(0));
+
+        assert!(!acquire(&mut f, Some(99), 0, 5, 0), "a failed acquire");
+        assert_eq!(f.invoke(dfaWasLocked, &[]).expect("answers"), Ret::U16(0));
+    }
+
+    #[test]
+    fn dfalastlen_is_zero_before_any_read_and_the_delivered_length_after_one() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        assert_eq!(f.invoke(dfaLastLen, &[]).expect("answers"), Ret::U16(0), "nothing read yet");
+
+        let reclen = f.host.btrieve().block(block).expect("open").geometry().reclen;
+        assert!(acquire(&mut f, Some(6), 0, 5, 0));
+        let expected = 64u16.min(reclen);
+        assert_eq!(f.invoke(dfaLastLen, &[]).expect("answers"), Ret::U16(expected));
+    }
+
+    /// `DFAAPI.C:179-184`'s `dfaomode=mode;` has no validation at all --
+    /// unlike `omdbtv`, which refuses a value outside the five documented
+    /// mode constants (`shims::btrieve`'s own
+    /// `omdbtv_keeps_the_mode_and_refuses_one_that_is_not_a_mode`). Same
+    /// invalid value, opposite outcome.
+    #[test]
+    fn dfamode_stores_whatever_it_is_given_with_no_validation_unlike_omdbtv() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.btrieve().dfa_mode(), 0, "PRIMBV until told otherwise");
+        f.invoke(dfaMode, &[7]).expect("stores 7 unchecked");
+        assert_eq!(f.host.btrieve().dfa_mode(), 7);
+    }
+
+    #[test]
+    fn dfacountrec_and_dfareclen_answer_the_files_own_geometry() {
+        let mut f = Fixture::new();
+        let block = open(&mut f, "SAMPLE.DAT", 64);
+        let reclen = f.host.btrieve().block(block).expect("open").geometry().reclen;
+
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(7));
+        assert_eq!(f.invoke(dfaRecLen, &[]).expect("answers"), Ret::U16(reclen));
+    }
+
+    /// The one behaviour `dfaVirgin` has that `btrieve_file`'s own implicit
+    /// install (whatever `dfaOpen`/`opnbtv` do when a `.DAT` is missing)
+    /// does not: `dst` may name a different stem than `src`.
+    #[test]
+    fn dfavirgin_honours_a_destination_stem_that_differs_from_the_source() {
+        let dir = crate::testing::scratch_with("dfa-virgin-rename", &["VIRGIN.VIR"]);
+        let mut f = Fixture::rooted(dir);
+        assert!(f.host.find("VIRGIN.DAT").is_none());
+
+        let src = f.text("VIRGIN");
+        let dst = f.text("RENAMED");
+        assert_eq!(
+            f.invoke(dfaVirgin, &[src.offset, src.selector, dst.offset, dst.selector])
+                .expect("copies"),
+            Ret::U16(1)
+        );
+        assert!(f.host.find("RENAMED.DAT").is_some(), "installed under the DESTINATION stem");
+        assert!(
+            f.host.find("VIRGIN.DAT").is_none(),
+            "never installed under the source stem"
+        );
+    }
+
+    #[test]
+    fn dfavirgin_answers_false_rather_than_refusing_when_there_is_no_virgin_file() {
+        // `dfaCopyFile` never `catastro`s -- every failure path returns
+        // FALSE, unlike this crate's usual refusal convention.
+        let mut f = Fixture::new();
+        let src = f.text("NOSUCH");
+        assert_eq!(
+            f.invoke(dfaVirgin, &[src.offset, src.selector, 0, 0]).expect("answers"),
+            Ret::U16(0)
+        );
+    }
+
+    /// Pins the raw wire layout `decode_create_buffer` reads
+    /// (`dfaStatFileSpec` + one `dfaStatKeySpec`) by round-tripping it
+    /// through a real `dfaOpen`. Like `dfaCreate`/`dfaCreateSpec`
+    /// themselves, this is unverified against a live engine -- there is no
+    /// PE module in this repository's corpus that calls either routine --
+    /// so this pins *current* behaviour, not a measured-correct one.
+    #[test]
+    fn dfacreate_builds_a_file_from_a_raw_buffer_that_dfaopen_can_then_open() {
+        let dir = crate::testing::scratch("dfa-create-raw-buffer");
+        let mut f = Fixture::rooted(dir);
+        let filnam = f.text("CREATED.DAT");
+
+        let mut buf = vec![0u8; 32];
+        buf[0..2].copy_from_slice(&8u16.to_le_bytes()); // record_length
+        buf[2..4].copy_from_slice(&512u16.to_le_bytes()); // page_size
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes()); // n_keys
+        // flags (byte 10) and n_pre_allocate (byte 14) stay zero.
+        buf[16..18].copy_from_slice(&1u16.to_le_bytes()); // key position, 1-based
+        buf[18..20].copy_from_slice(&2u16.to_le_bytes()); // key length
+        buf[26] = 1; // ext_type
+        let databuf = f.bytes(&buf, false);
+
+        f.invoke(
+            dfaCreate,
+            &[filnam.offset, filnam.selector, databuf.offset, databuf.selector, (-1i16) as u16, 32],
+        )
+        .expect("creates");
+
+        let block = open(&mut f, "CREATED.DAT", 8);
+        assert_eq!(f.host.btrieve().block(block).expect("open").geometry().reclen, 8);
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(0));
+    }
+
+    #[test]
+    fn dfacreate_refuses_nonzero_flags() {
+        // This engine's FileSpec has no representation for
+        // DFACF_VARIABLE/BLANKTRUNC/COMPRESS/KEYONLY/FREESPACE*.
+        let dir = crate::testing::scratch("dfa-create-refuses-flags");
+        let mut f = Fixture::rooted(dir);
+        let filnam = f.text("BAD.DAT");
+
+        let mut buf = vec![0u8; 32];
+        buf[0..2].copy_from_slice(&8u16.to_le_bytes());
+        buf[2..4].copy_from_slice(&512u16.to_le_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[10..12].copy_from_slice(&1u16.to_le_bytes()); // nonzero flags
+        buf[16..18].copy_from_slice(&1u16.to_le_bytes());
+        buf[18..20].copy_from_slice(&2u16.to_le_bytes());
+        buf[26] = 1;
+        let databuf = f.bytes(&buf, false);
+
+        let e = f
+            .invoke(
+                dfaCreate,
+                &[filnam.offset, filnam.selector, databuf.offset, databuf.selector, (-1i16) as u16, 32],
+            )
+            .expect_err("nonzero flags refused");
+        assert!(e.to_string().contains("flags"), "{e}");
+    }
+
+    /// Pins `dfaCreateSpec`'s own module-memory `struct dfaKeySpec`/`struct
+    /// dfaSegSpec` stride (`key_stride`/`seg_stride`, this file's own doc
+    /// comment on `dfaCreateSpec` marks this as an assumed layout, not a
+    /// measured one) by writing one real key with one real segment and
+    /// confirming the file `dfaCreateSpec` builds is the one the buffer
+    /// described, not garbage read from the wrong offset.
+    #[test]
+    fn dfacreatespec_reads_its_key_and_segment_arrays_and_creates_the_matching_file() {
+        let dir = crate::testing::scratch("dfa-createspec");
+        let mut f = Fixture::rooted(dir);
+
+        // `struct dfaSegSpec`: position 0 (already 0-based, DFAAPI.H:61),
+        // length 2, type 1, flags 0 -- each field A::INT_WIDTH (2) bytes
+        // under Wg16, per this routine's own doc comment.
+        let mut seg_bytes = vec![0u8; 10];
+        seg_bytes[0..2].copy_from_slice(&0u16.to_le_bytes());
+        seg_bytes[2..4].copy_from_slice(&2u16.to_le_bytes());
+        seg_bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+        seg_bytes[6..8].copy_from_slice(&0u16.to_le_bytes());
+        let seg_at = f.bytes(&seg_bytes, false);
+
+        // `struct dfaKeySpec`: flags 0, nSegments 1, segs -> the one above.
+        let mut key_bytes = vec![0u8; 8];
+        key_bytes[0..2].copy_from_slice(&0u16.to_le_bytes());
+        key_bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
+        key_bytes[4..6].copy_from_slice(&seg_at.offset.to_le_bytes());
+        key_bytes[6..8].copy_from_slice(&seg_at.selector.to_le_bytes());
+        let key_at = f.bytes(&key_bytes, false);
+
+        let name = f.text("SPECCED.DAT");
+        f.invoke(
+            dfaCreateSpec,
+            &[
+                name.offset, name.selector,
+                0,   // overwrite
+                8,   // recordLength
+                512, // pageSize
+                0,   // flags
+                0,   // nPreAllocate
+                1,   // nKeys
+                key_at.offset, key_at.selector,
+                0, 0, // altFile, null
+            ],
+        )
+        .expect("creates");
+
+        let block = open(&mut f, "SPECCED.DAT", 8);
+        assert_eq!(f.host.btrieve().block(block).expect("open").geometry().reclen, 8);
+        assert_eq!(f.invoke(dfaCountRec, &[]).expect("counts"), Ret::U32(0));
+    }
+}

@@ -656,3 +656,362 @@ pub fn tfsabt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))?;
     Ok(abi::Ret::Void)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mbbs_machine::m16::{FarPtr, Ret};
+
+    use crate::testing::{Fixture, scratch};
+
+    fn word(ret: Ret) -> u16 {
+        match ret {
+            Ret::U16(n) => n,
+            _ => panic!("expected an int"),
+        }
+    }
+
+    /// `tfsopn(fname)`.
+    fn tfsopn_(f: &mut Fixture, pattern: &str) -> Result<Ret, ShimError> {
+        let name = f.text(pattern);
+        f.invoke(tfsopn, &Fixture::far(name))
+    }
+
+    /// `tfsrdl()`.
+    fn tfsrdl_(f: &mut Fixture) -> Result<Ret, ShimError> {
+        f.invoke(tfsrdl, &[])
+    }
+
+    /// `tfspfx(prefix)`.
+    fn tfspfx_(f: &mut Fixture, prefix: &str) -> Result<Ret, ShimError> {
+        let p = f.text(prefix);
+        f.invoke(tfspfx, &Fixture::far(p))
+    }
+
+    /// `tfsabt()`.
+    fn tfsabt_(f: &mut Fixture) -> Result<Ret, ShimError> {
+        f.invoke(tfsabt, &[])
+    }
+
+    /// `tfstate`, read straight out of module memory.
+    fn tfstate(f: &Fixture) -> u16 {
+        f.host.globals().word(&f.machine, "tfstate").expect("tfstate is a placed global")
+    }
+
+    /// `tfsbuf`, read straight out of module memory, as a C string.
+    fn tfsbuf(f: &Fixture) -> String {
+        let at = f.host.globals().address("tfsbuf").expect("tfsbuf is a placed global");
+        String::from_utf8_lossy(f.machine.read_cstr(at).expect("readable")).into_owned()
+    }
+
+    /// `tfspst`'s four raw bytes -- the pointer itself, not what it points at.
+    /// Used to prove a non-match leaves it untouched, byte for byte.
+    fn tfspst_bytes(f: &Fixture) -> [u8; 4] {
+        let at = f.host.globals().address("tfspst").expect("tfspst is a placed global");
+        f.machine.resolve(at, 4).expect("in bounds").try_into().expect("4 bytes")
+    }
+
+    /// `tfspst`, dereferenced and read as a C string -- what `tfspfx` left a
+    /// module free to pass straight to another string-consuming routine.
+    fn tfspst_text(f: &Fixture) -> String {
+        let ptr = FarPtr::from_bytes(tfspst_bytes(f));
+        String::from_utf8_lossy(f.machine.read_cstr(ptr).expect("readable")).into_owned()
+    }
+
+    // ---- tfsopn -------------------------------------------------------------
+
+    #[test]
+    fn tfsopn_matches_a_wildcard_and_always_leaves_tfstate_at_tfsbgn() {
+        let root = scratch("tfscan-opn-count");
+        std::fs::write(root.join("ALPHA.TXT"), b"a\n").expect("a file");
+        std::fs::write(root.join("BETA.TXT"), b"b\n").expect("a file");
+        std::fs::write(root.join("OTHER.DAT"), b"c\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 2);
+        // TFSCAN.H:36's own definition: TFSBGN unconditionally, not
+        // "...if it found anything" -- see `tfsopn`'s own doc comment.
+        assert_eq!(tfstate(&f), 1, "TFSBGN");
+    }
+
+    #[test]
+    fn tfsopn_matching_nothing_still_sets_tfsbgn_and_tfsrdl_answers_tfsdun_at_once() {
+        let root = scratch("tfscan-opn-none");
+        let mut f = Fixture::rooted(root);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.XYZ").expect("tfsopn")), 0);
+        assert_eq!(tfstate(&f), 1, "TFSBGN even though nothing matched");
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "TFSDUN");
+        assert_eq!(tfstate(&f), 0, "TFSDUN");
+    }
+
+    #[test]
+    fn tfsopn_refuses_a_name_with_a_path_prefix() {
+        // TFSCAN.H's own top comment: "stay in the current directory (no
+        // path prefixes)".
+        let mut f = Fixture::new();
+        let e = tfsopn_(&mut f, "SUB/FILE.TXT").expect_err("a refusal");
+        assert!(e.to_string().contains("path prefixes"), "{e}");
+    }
+
+    // ---- tfsrdl's state machine ---------------------------------------------
+
+    #[test]
+    fn tfsrdl_walks_bgn_bof_lin_eof_across_two_files_then_dun_and_stays_there() {
+        let root = scratch("tfscan-rdl-two-files");
+        std::fs::write(root.join("ALPHA.TXT"), b"one\ntwo\n").expect("a file");
+        std::fs::write(root.join("BETA.TXT"), b"three\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 2);
+
+        // ALPHA.TXT, sorted first.
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF: about to start ALPHA.TXT");
+        assert_eq!(tfstate(&f), 2);
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "TFSLIN");
+        assert_eq!(tfstate(&f), 3);
+        assert_eq!(tfsbuf(&f), "one");
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "TFSLIN, second line");
+        assert_eq!(tfsbuf(&f), "two");
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 4, "TFSEOF: ALPHA.TXT ran out");
+        assert_eq!(tfstate(&f), 4);
+
+        // BETA.TXT, sorted second.
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF: about to start BETA.TXT");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "TFSLIN");
+        assert_eq!(tfsbuf(&f), "three");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 4, "TFSEOF: BETA.TXT ran out");
+
+        // No file left: the whole scan is done.
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "TFSDUN");
+        assert_eq!(tfstate(&f), 0);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "TFSDUN stays TFSDUN");
+    }
+
+    #[test]
+    fn tfsrdl_of_an_empty_file_answers_tfseof_immediately_with_no_line() {
+        let root = scratch("tfscan-rdl-empty");
+        std::fs::write(root.join("EMPTY.TXT"), b"").expect("an empty file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF");
+        assert_eq!(
+            word(tfsrdl_(&mut f).expect("tfsrdl")),
+            4,
+            "TFSEOF straight away, never TFSLIN"
+        );
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "TFSDUN");
+    }
+
+    #[test]
+    fn tfsrdl_strips_a_trailing_crlf_and_reads_a_final_line_with_no_newline() {
+        let root = scratch("tfscan-rdl-crlf");
+        std::fs::write(root.join("CRLF.TXT"), b"abc\r\ndef").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+        assert_eq!(tfsbuf(&f), "abc", "the \\r\\n is gone, not just the \\n");
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "the file's last line, unterminated");
+        assert_eq!(tfsbuf(&f), "def");
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 4, "TFSEOF");
+    }
+
+    #[test]
+    fn tfsrdl_truncates_a_line_longer_than_tfsbufs_128_byte_capacity() {
+        // MAXTFS is 129 (globals.rs), so 128 bytes of content plus a NUL.
+        let root = scratch("tfscan-rdl-long-line");
+        let content = format!("{}\n", "A".repeat(200));
+        std::fs::write(root.join("LONG.TXT"), content.as_bytes()).expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+        let got = tfsbuf(&f);
+        assert_eq!(got.len(), 128, "truncated to tfsbuf's capacity minus the NUL");
+        assert_eq!(got, "A".repeat(128));
+    }
+
+    // ---- tfsopn discarding a live scan --------------------------------------
+
+    #[test]
+    fn tfsopn_called_again_mid_scan_discards_the_live_scan_and_starts_the_new_pattern_fresh() {
+        let root = scratch("tfscan-opn-reopen-mid-scan");
+        std::fs::write(root.join("ALPHA.TXT"), b"hello\n").expect("a file");
+        std::fs::write(root.join("BETA.DAT"), b"data\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF on ALPHA.TXT");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "mid-file, ALPHA.TXT open");
+        assert_eq!(tfsbuf(&f), "hello");
+
+        // BBSMAINM.C:1014-1034's own shape: tfsopn called again while a scan
+        // is still running.
+        assert_eq!(word(tfsopn_(&mut f, "*.DAT").expect("tfsopn")), 1);
+        assert_eq!(tfstate(&f), 1, "TFSBGN immediately after the second tfsopn");
+
+        // If the old scan had merely been left running underneath, this
+        // would still read from ALPHA.TXT.
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF on BETA.DAT, not ALPHA.TXT");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+        assert_eq!(tfsbuf(&f), "data", "reading the NEW pattern's file");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 4);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0);
+    }
+
+    #[test]
+    fn tfsopn_of_the_same_pattern_after_a_full_scan_restarts_from_the_top() {
+        // BBSMAINM.C:1014-1034's `gappnams`: the identical `tfsopn` name
+        // called a second time, once the first scan has already run to
+        // TFSDUN, has to walk the file again from its first line.
+        let root = scratch("tfscan-opn-reopen-same-pattern");
+        std::fs::write(root.join("X.CFG"), b"one\ntwo\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.CFG").expect("tfsopn")), 1);
+        // Drain the first pass to TFSDUN.
+        while word(tfsrdl_(&mut f).expect("tfsrdl")) != 0 {}
+        assert_eq!(tfstate(&f), 0);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.CFG").expect("tfsopn")), 1, "same count, second pass");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF again");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+        assert_eq!(tfsbuf(&f), "one", "back at the top, not still exhausted");
+    }
+
+    // ---- tfsabt ---------------------------------------------------------------
+
+    #[test]
+    fn tfsabt_mid_scan_then_tfsrdl_behaves_like_an_already_exhausted_scan() {
+        let root = scratch("tfscan-abt-mid-scan");
+        std::fs::write(root.join("ONE.TXT"), b"a\nb\n").expect("a file");
+        std::fs::write(root.join("TWO.TXT"), b"c\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2, "TFSBOF");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3, "TFSLIN, mid ONE.TXT");
+        assert_eq!(tfsbuf(&f), "a");
+
+        assert!(matches!(tfsabt_(&mut f).expect("tfsabt"), Ret::Void));
+        assert_eq!(tfstate(&f), 0, "TFSDUN written immediately");
+
+        // Not "b" (the next line of the aborted file) -- the scan is over.
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "TFSDUN");
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 0, "still TFSDUN");
+    }
+
+    // ---- tfspfx -----------------------------------------------------------
+
+    #[test]
+    fn tfspfx_reads_tfsbuf_live_from_module_memory_not_a_host_side_copy() {
+        // A host that cached the line `advance()` last read, rather than
+        // re-reading `tfsbuf` on every call, would still see "BREQUEST FOO"
+        // here after the buffer was overwritten out from under it.
+        let root = scratch("tfscan-pfx-live-read");
+        std::fs::write(root.join("LINE.TXT"), b"BREQUEST FOO\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+        assert_eq!(tfsbuf(&f), "BREQUEST FOO");
+
+        // Overwrite tfsbuf directly, bypassing tfsrdl entirely.
+        f.host
+            .globals()
+            .write(&mut f.machine, "tfsbuf", b"ZEBRA BAR\0")
+            .expect("seed tfsbuf directly");
+
+        assert_eq!(
+            word(tfspfx_(&mut f, "BREQUEST").expect("tfspfx")),
+            0,
+            "the old prefix no longer matches the new content"
+        );
+        assert_eq!(
+            word(tfspfx_(&mut f, "ZEBRA").expect("tfspfx")),
+            1,
+            "the new content matches a prefix tfsrdl never saw"
+        );
+        assert_eq!(tfspst_text(&f), "BAR");
+    }
+
+    #[test]
+    fn tfspfx_tests_two_different_prefixes_against_the_same_line_without_mutating_it() {
+        // PLBBS.C:69-92's own `setbparm`: two different prefixes, tested
+        // against the same current line, one after the other.
+        let root = scratch("tfscan-pfx-two-prefixes");
+        std::fs::write(root.join("BTR.BAT"), b"BTRIEVE >NUL extra_arg\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.BAT").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+
+        assert_eq!(word(tfspfx_(&mut f, "BREQUEST").expect("tfspfx")), 0, "first prefix: no match");
+        assert_eq!(
+            word(tfspfx_(&mut f, "BTRIEVE >NUL").expect("tfspfx")),
+            1,
+            "second prefix, same line: matches"
+        );
+        assert_eq!(tfspst_text(&f), "extra_arg");
+        assert_eq!(tfsbuf(&f), "BTRIEVE >NUL extra_arg", "neither call mutated tfsbuf");
+    }
+
+    #[test]
+    fn tfspfx_is_case_sensitive() {
+        let root = scratch("tfscan-pfx-case");
+        std::fs::write(root.join("CASE.TXT"), b"needed4 lower\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+
+        assert_eq!(
+            word(tfspfx_(&mut f, "NEEDED4 ").expect("tfspfx")),
+            0,
+            "the vendor's own shouting-case prefix does not match a lower-case line"
+        );
+        assert_eq!(word(tfspfx_(&mut f, "needed4 ").expect("tfspfx")), 1);
+        assert_eq!(tfspst_text(&f), "lower");
+    }
+
+    #[test]
+    fn tfspfx_skips_a_literal_space_after_the_prefix_but_not_a_tab() {
+        // `crate::strings::skpwht`: a literal 0x20 only, not every
+        // whitespace byte -- see `tfspfx`'s own doc comment.
+        let root = scratch("tfscan-pfx-skpwht");
+        std::fs::write(root.join("TAB.CFG"), b"DLL=\tFOO.DLL\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.CFG").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+
+        assert_eq!(word(tfspfx_(&mut f, "DLL=").expect("tfspfx")), 1);
+        assert_eq!(tfspst_text(&f), "\tFOO.DLL", "a tab is not skipped, only a literal space");
+    }
+
+    #[test]
+    fn tfspfx_leaves_tfspst_untouched_on_a_non_match() {
+        let root = scratch("tfscan-pfx-untouched");
+        std::fs::write(root.join("MATCH.TXT"), b"MATCH123\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+        assert_eq!(word(tfsopn_(&mut f, "*.TXT").expect("tfsopn")), 1);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 2);
+        assert_eq!(word(tfsrdl_(&mut f).expect("tfsrdl")), 3);
+
+        assert_eq!(word(tfspfx_(&mut f, "MATCH").expect("tfspfx")), 1);
+        let before = tfspst_bytes(&f);
+
+        assert_eq!(word(tfspfx_(&mut f, "NOPE").expect("tfspfx")), 0, "does not match");
+        let after = tfspst_bytes(&f);
+        assert_eq!(before, after, "a failed match must not disturb tfspst");
+    }
+}
