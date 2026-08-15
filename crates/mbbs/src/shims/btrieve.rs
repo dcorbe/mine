@@ -28,15 +28,24 @@
 //! with is Galacticomm's own `PLBTVSTF.C`, which is quoted rather than
 //! paraphrased wherever it decided something.
 //!
-//! # `dinsbtv` and `dupdbtv` write; `invbtv` and `delbtv` still only say they
+//! # `dinsbtv`, `dupdbtv` and `delbtv` write; `invbtv` still only says it
 //! # would
 //!
 //! A module that saves a character now gets an honest insert or update --
 //! [`dinsbtv`] calls [`Block::insert`](crate::btrieve::Block::insert) and
-//! [`dupdbtv`] calls [`Block::update`](crate::btrieve::Block::update).
-//! `invbtv` and `delbtv` do not write yet, so a module that reaches either of
-//! them with a file current gets a refusal rather than a host that appears to
-//! work and loses the data.
+//! [`dupdbtv`] calls [`Block::update`](crate::btrieve::Block::update) -- and
+//! one that deletes gets an honest delete, [`delbtv`] through
+//! [`Block::delete`](crate::btrieve::Block::delete). `invbtv` does not write
+//! yet, so a module that reaches it with a file current gets a refusal rather
+//! than a host that appears to work and loses the data.
+//!
+//! `delbtv` was the last of the four to land, and it landed because a board
+//! built fresh from its `.VIR` templates reaches it during login where a warm
+//! one never did -- MajorMUD prunes `WCCACMSR.DAT` on the way in, and the
+//! refusal stopped the module every time. Nothing about the refusal was
+//! wrong; it had simply outlived its own stated reason ("nothing in this host
+//! writes to a Btrieve file"), which stopped being true when `dinsbtv` and
+//! `dupdbtv` landed.
 //!
 //! [`invbtv`] and [`delbtv`] are nonetheless *present*, because refusing is
 //! only half of what the real host did. Both are guarded with
@@ -53,11 +62,11 @@
 //! `setbtv` handed a null. Whichever module-side pointer is still zero, the
 //! guard is the same guard and the insert is discarded either way.
 //!
-//! With a file current, `invbtv` and `delbtv` refuse and name it. `dinsbtv`
-//! and `dupdbtv` have no guard at all -- `:603` and `:555` read `bb->reclen`
-//! first, so the real host faulted with no file current rather than
-//! answering. This host stops the module instead of faulting, which is the
-//! same outcome honestly reached and a deliberately different shape from
+//! With a file current, `invbtv` refuses and names it, and `delbtv` deletes.
+//! `dinsbtv` and `dupdbtv` have no guard at all -- `:603` and `:555` read
+//! `bb->reclen` first, so the real host faulted with no file current rather
+//! than answering. This host stops the module instead of faulting, which is
+//! the same outcome honestly reached and a deliberately different shape from
 //! `invbtv`/`delbtv`'s quiet no-op.
 //!
 //! # What every routine does when no file is current
@@ -475,18 +484,51 @@ pub fn invbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// takes a record pointer: the record is whichever one the current file is
 /// positioned on, and `:626` passes `bb->lastkn` to say in which key's order.
 ///
-/// Answers nothing with no file current, refuses with one, for exactly the
-/// reasons in [`invbtv`].
+/// Answers nothing with no file current -- `:623`'s own `if (bb == NULL)
+/// return;` -- and otherwise deletes, through [`Block::delete`].
+///
+/// # Currency after a delete
+///
+/// The cursor is set to [`Cursor::Nowhere`], because after opcode 4 there is
+/// no current record to name. Leaving it alone would be worse than useless:
+/// an [`Cursor::Ordered`] cursor holds an *index into the key's order*, and
+/// removing a record shifts every index after it, so a carried-forward
+/// cursor would quietly start naming the record that took the deleted one's
+/// place -- a silently wrong `qnpbtv`, which is exactly the class of bug
+/// this crate keeps finding.
+///
+/// **This is a decision, not a measurement.** Real Btrieve's post-delete
+/// currency is not something this host has put to the Wine oracle
+/// (`tools/btrieve-oracle/`), and the two candidate behaviours -- "no
+/// current record" versus "the key path remembers where the deleted record
+/// sat, so Get Next still steps from it" -- are distinguishable by a probe
+/// nobody has written. `Nowhere` is the conservative half: it refuses to
+/// answer rather than answering from a position whose meaning changed.
+/// [`Block::delete`]'s own doc comment reasons the other way, about the
+/// *model* rather than the cursor, and the two are not in conflict.
 pub fn delbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let Some(block) = positioned(call, host, "delbtv")? else {
         note_no_file(host, "delbtv");
         return Ok(abi::Ret::Void);
     };
+
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    Err(ShimError::Failed(format!(
-        "delbtv from {}, and nothing in this host writes to a Btrieve file",
-        file.name()
-    )))
+    let position = file
+        .current()
+        .ok_or_else(|| {
+            ShimError::Failed(format!(
+                "delbtv on {}, which is not positioned on a record -- opcode 4 \
+                 deletes the record the file is positioned on, and nothing has \
+                 positioned this one",
+                file.name()
+            ))
+        })?
+        .position;
+
+    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
+    file.delete(position).map_err(|e| ShimError::Failed(e.to_string()))?;
+    file.seek_to(Cursor::Nowhere);
+    Ok(abi::Ret::Void)
 }
 
 /// `int dinsbtv(void *recptr)` -- insert a new record into the current file.
@@ -3957,10 +3999,10 @@ mod tests {
     }
 
     #[test]
-    fn delbtv_with_a_file_current_refuses_and_names_the_file() {
+    fn delbtv_with_a_file_open_but_unpositioned_refuses_and_names_the_file() {
         let mut f = Fixture::new();
         open(&mut f, "SAMPLE.DAT", 64);
-        let e = f.invoke(delbtv, &[]).expect_err("nothing here writes");
+        let e = f.invoke(delbtv, &[]).expect_err("open, but not positioned");
         assert!(e.to_string().contains("delbtv"), "{e}");
         assert!(e.to_string().contains("SAMPLE.DAT"), "{e}");
     }
@@ -4299,6 +4341,38 @@ mod tests {
     }
 
     // # `upvbtv`, `dupdbtv`'s variable-length sibling
+
+    /// The record the cursor names is gone from the file on disk, and the
+    /// count drops with it. Re-read through a fresh `Fixture` on purpose --
+    /// an in-memory model that agrees with itself proves nothing.
+    #[test]
+    fn delbtv_deletes_the_record_the_cursor_names() {
+        let dir = crate::testing::scratch_with("delbtv-delete", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir.clone());
+        open(&mut f, "SAMPLE.DAT", 64);
+
+        assert!(acquire(&mut f, Some(5), 0, 5), "equal to 5, which is Troll");
+        assert_eq!(f.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(7));
+
+        f.invoke(delbtv, &[]).expect("deletes");
+
+        let mut g = Fixture::rooted(dir);
+        open(&mut g, "SAMPLE.DAT", 64);
+        assert_eq!(g.invoke(cntrbtv, &[]).expect("counts"), Ret::U32(6));
+        assert!(!acquire(&mut g, Some(5), 0, 5), "key 5 is gone from the file");
+    }
+
+    /// Opcode 4 deletes *the record the file is positioned on*. With nothing
+    /// positioned there is no such record, and this refuses rather than
+    /// picking one -- the same shape [`upvbtv`] already refuses with.
+    #[test]
+    fn delbtv_with_nothing_positioned_stops_the_module() {
+        let dir = crate::testing::scratch_with("delbtv-unpositioned", &["SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(dir);
+        open(&mut f, "SAMPLE.DAT", 64);
+        let e = f.invoke(delbtv, &[]).expect_err("nothing positioned");
+        assert!(e.to_string().contains("delbtv"), "{e}");
+    }
 
     #[test]
     fn upvbtv_updates_the_record_the_cursor_names_at_a_caller_given_length() {
