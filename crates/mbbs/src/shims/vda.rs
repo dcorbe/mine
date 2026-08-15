@@ -1,9 +1,14 @@
-//! The volatile data area address routine, one more `.MSG`-option reader,
-//! and the three GALGSBL routines the corpus's outstanding-symbol census
-//! flags heaviest after it: `_VDAOFF` (7 modules, 1,228 call sites -- the
-//! single heaviest outstanding symbol in the corpus), `_BTUPMT` (13
-//! modules), `_BTUOBA` (10), `_BTUINP` (imported on the 32-bit/PE side
-//! only), and `_LNGOPT` (10).
+//! The volatile data area address routine, and the three GALGSBL routines
+//! the corpus's outstanding-symbol census flags heaviest after it: `_VDAOFF`
+//! (7 modules, 1,228 call sites -- the single heaviest outstanding symbol in
+//! the corpus), `_BTUPMT` (13 modules), `_BTUOBA` (10), and `_BTUINP`
+//! (imported on the 32-bit/PE side only).
+//!
+//! `lngopt` (`GCOMM.H:289`) also lived here once -- it is [`crate::shims::msg`]'s
+//! registered `_LNGOPT` now, and this file's copy was the dead twin
+//! (`docs/2026-08-15-dead-twin-shims.md`), deleted rather than kept because
+//! the two bodies agreed observably and `msg.rs`'s own tests already covered
+//! more (a ceiling too wide for `numopt`'s `i16`).
 //!
 //! Two more names on the same census, `_OUTBSZ` and `_NMODS`, turn out to be
 //! **data**, not routines -- `MAJORBBS.H` declares both `extern int`, with no
@@ -38,7 +43,6 @@ use super::ShimError;
 use super::gsbl::OUT_OF_RANGE;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
-use crate::msg::value;
 
 /// `char *vdaoff(int unum)` -- the volatile data area calculation routine.
 ///
@@ -79,60 +83,6 @@ pub fn vdaoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .ok_or_else(|| ShimError::Failed(format!("vdaoff({unum}): there is no such channel")))?;
     let ptr = host.users().vda(chan).unwrap_or_else(A::null_ptr);
     Ok(abi::Ret::Ptr(ptr))
-}
-
-/// `long lngopt(int msgnum, long floor, long ceiling)` -- `GCOMM.H:289` --
-/// the `long`-width sibling of [`crate::shims::msg::numopt`].
-///
-/// Six call sites in `GALDSRC/SRC` establish the shape, e.g.
-/// `MAJORBBS.C:596`: `gpslmt=(unsigned)lngopt(GPSLMT,1L,50000L);` and
-/// `FILEXFER.C:287`: `ztzone=lngopt(ZTZONE,-86400L,86400L);` -- a message
-/// number and an inclusive `long` range, read off the current message block
-/// exactly as `numopt` reads an `int` range. There is no independent
-/// `GALGSBL`/`MAJORBBS` prototype naming a `long` variant differently;
-/// `numopt`'s own doc comment's rule applies unchanged: **a misconfigured
-/// board is refused, not guessed at.**
-///
-/// Not delegated to `crate::shims::msg`'s private `read_mem`/`option_mem`
-/// helpers -- both are plain `fn`s, visible only inside that file -- so the
-/// two-line "current block, then its text" lookup they wrap is repeated here
-/// against the same public [`crate::msg::Messages`] API they call, not
-/// duplicated logic.
-///
-/// # Errors
-///
-/// If no message block is current, message `number` does not exist, its text
-/// is not a valid `long`, or the parsed value falls outside
-/// `floor..=ceiling`.
-pub fn lngopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let number = Into::<u32>::into(call.int()) as u16;
-    let floor = call.long() as i32;
-    let ceiling = call.long() as i32;
-
-    let block = host
-        .globals()
-        .pointer_mem(call.mem(), "curmbk")
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let at = host.messages.text(block, number).map_err(ShimError::Failed)?;
-    let text = at
-        .read_cstr(call.mem())
-        .map(<[u8]>::to_vec)
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let name = host.messages.name(block).map_err(ShimError::Failed)?;
-    let context = format!("message {number} of {name}");
-    let text = String::from_utf8_lossy(value(&text)).into_owned();
-
-    let parsed: i64 = text
-        .parse()
-        .map_err(|_| ShimError::Failed(format!("{context} is {text:?}, which is not a number")))?;
-    if parsed < i64::from(floor) || parsed > i64::from(ceiling) {
-        return Err(ShimError::Failed(format!(
-            "{context} is {parsed}, outside the {floor}..={ceiling} this module accepts"
-        )));
-    }
-    // `parsed` is inside `floor..=ceiling`, both `i32`, so the narrowing just
-    // below is lossless -- the check above is what makes it so.
-    Ok(abi::Ret::Long(parsed as i32 as u32))
 }
 
 /// `int btuoba(int chan)` -- `BRKTHU.H:164` -- free bytes remaining in the
@@ -388,24 +338,7 @@ mod tests {
     use mbbs_machine::m16::{FarPtr, Ret};
 
     use super::*;
-    use crate::shims::msg::opnmsg;
     use crate::testing::Fixture;
-
-    /// Open the shared sample message file and make it current, as
-    /// `crate::shims::msg`'s own `numopt` tests do -- `lngopt` reads the same
-    /// file and the same message numbers mean the same things here.
-    fn open_sample(f: &mut Fixture) {
-        let at = f.text("SAMPLE.MSG");
-        f.invoke(opnmsg, &Fixture::far(at)).expect("opens");
-    }
-
-    /// A `long` argument, low word first -- matching
-    /// `crate::shims::credit`'s own `long_words` and the order
-    /// `Call::long`/`Cursor::long` read back.
-    fn long_words(v: i64) -> [u16; 2] {
-        let v = v as u32;
-        [v as u16, (v >> 16) as u16]
-    }
 
     // -- vdaoff --
 
@@ -436,38 +369,23 @@ mod tests {
         assert_ne!(ptr, FarPtr::NULL);
     }
 
-    // -- lngopt --
-
+    /// `Users::vda`'s own stride check, driven through the shim rather than
+    /// the accessor directly. Moved from `shims::user`'s dead twin of this
+    /// routine (`docs/2026-08-15-dead-twin-shims.md`) because it is the only
+    /// test in either copy that exercised more than channel 0.
     #[test]
-    fn lngopt_reads_the_number_off_the_end_of_the_prompt() {
-        let mut f = Fixture::new();
-        open_sample(&mut f);
-        let mut args = vec![2];
-        args.extend(long_words(0));
-        args.extend(long_words(32767));
-        assert_eq!(f.invoke(lngopt, &args).expect("read"), Ret::U32(60));
-    }
+    fn vdaoff_addresses_each_channel_at_its_own_area() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
+        f.host.alcvda(&mut f.machine).expect("allocated");
 
-    #[test]
-    fn lngopt_outside_its_bounds_refuses_and_names_the_message() {
-        let mut f = Fixture::new();
-        open_sample(&mut f);
-        let mut args = vec![2];
-        args.extend(long_words(0));
-        args.extend(long_words(50));
-        let e = f.invoke(lngopt, &args).expect_err("60 is over 50");
-        assert!(e.to_string().contains("60"), "{e}");
-        assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
-    }
-
-    #[test]
-    fn lngopt_reads_a_negative_bound_as_negative() {
-        let mut f = Fixture::new();
-        open_sample(&mut f);
-        let mut args = vec![5];
-        args.extend(long_words(-32767));
-        args.extend(long_words(32767));
-        assert_eq!(f.invoke(lngopt, &args).expect("read"), Ret::U32((-5i32) as u32));
+        let Ret::Far(at0) = f.invoke(vdaoff, &[0]).expect("channel 0") else {
+            panic!("vdaoff returns a pointer");
+        };
+        let Ret::Far(at1) = f.invoke(vdaoff, &[1]).expect("channel 1") else {
+            panic!("vdaoff returns a pointer");
+        };
+        assert_ne!(at0, at1, "two channels must not share a volatile data area");
     }
 
     // -- btuoba --

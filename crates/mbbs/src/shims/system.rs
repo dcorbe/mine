@@ -1134,46 +1134,6 @@ pub fn register_textvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Resul
     Ok(abi::Ret::Int(A::Int::from(n)))
 }
 
-/// `INT findtvar(CHAR *name)` -- `MAJORBBS.H:768`, "find text variable &
-/// return number". `MAJORBBS.C:1297`:
-///
-///
-/// The lookup counterpart to [`register_textvar`], and case-insensitive
-/// because `sameas` is. `-1` for "no such variable" is the original's own
-/// answer and a legitimate one -- a caller is expected to test it -- so this
-/// does not refuse an unknown name.
-///
-/// Reached on MajorMUD's **quit** path (`_CMD_QUIT`), which is why it went
-/// missing until movement worked: nothing could quit the Realm before, so
-/// nothing reached this. Same class of gap as `echonu`, and the same reason no
-/// survey named it -- an unreachable call site is invisible to one.
-///
-/// The table is walked through [`TextVars`](crate::TextVars) rather than the
-/// `txtvars` global, because that is where this host keeps it; the global is
-/// what the *module* reads it through, and `register_textvar` keeps the two
-/// pointing at the same rows.
-pub fn findtvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let name_ptr = call.ptr();
-    let name = String::from_utf8_lossy(
-        name_ptr
-            .read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?,
-    )
-    .into_owned();
-
-    let mut found: i16 = -1;
-    for n in 0..host.textvars.len() {
-        if let Some(var) = host.textvars.get_mem(call.mem(), n)?
-            && var.name.eq_ignore_ascii_case(&name)
-        {
-            found = n as i16;
-            break;
-        }
-    }
-
-    Ok(abi::Ret::Int(A::Int::from(found as u16)))
-}
-
 /// `VOID catastro(CHAR *string, ...)` -- `GCOMM.H:287-290` -- the module has
 /// given up.
 ///

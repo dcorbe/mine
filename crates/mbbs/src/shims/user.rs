@@ -549,43 +549,6 @@ pub fn othkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(answer as u16)))
 }
 
-/// `GBOOL samend(const CHAR *longs, const CHAR *ends)` -- does `longs` end
-/// with `ends`?
-///
-/// `GCOMM.H:387` / `re/wg33src/SRC/api/gcommlib/SAMEND.C`:
-///
-///
-/// `ends` longer than `longs` is `FALSE` outright -- the `<=` is what guards
-/// the subtraction it gates from wrapping, which is also why this reads both
-/// lengths and compares them before ever slicing, rather than trusting
-/// `checked_sub`/`saturating_sub` to paper over the case that guard exists
-/// for.
-///
-/// [`crate::strings::sameas`] does the tail comparison -- the same routine
-/// [`sameas`](crate::shims::text::sameas)'s own shim calls; see that
-/// function's doc comment for why a second implementation of the fold does
-/// not exist here.
-///
-/// # Errors
-///
-/// If either string cannot be read.
-pub fn samend<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let longs = call.ptr();
-    let ends = call.ptr();
-    let longs = longs
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    let ends = ends
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    let answer =
-        ends.len() <= longs.len() && crate::strings::sameas(&ends, &longs[longs.len() - ends.len()..]);
-    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
-}
-
 /// The null pointer, in this ABI's own representation.
 ///
 /// Duplicated per shim file rather than shared -- `shims::stream` and
@@ -872,46 +835,6 @@ pub fn usroff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .chan(unum)
         .ok_or_else(|| ShimError::Failed(format!("usroff({unum}): there is no such channel")))?;
     Ok(abi::Ret::Ptr(host.users().slot(chan)))
-}
-
-/// `char *vdaoff(int unum)` -- the channel's volatile data area.
-///
-/// `MAJORBBS.H:665` (wg1) declares it; `MAJORBBS.C:1379-1383` is the whole
-/// body:
-///
-///
-/// `re/ne_arity.py 636 <WCCMMPLS.DLL>` measures 31/31 call sites cleaning one
-/// word after the far call, matching this one-`int` prototype exactly --
-/// `636` is `_VDAOFF`'s ordinal in `crates/mbbs/data/majorbbs_wg101.tsv`, the
-/// same committed table `re/importgaps.py` resolved the missing-symbol name
-/// from.
-///
-/// This is [`usroff`]'s own shape against a different table:
-/// [`Users::vda`](crate::users::Users::vda) already computes `ptrblok`'s
-/// arithmetic at `A`'s own stride, the range guard is
-/// [`Terms::chan`](crate::users::Terms::chan) exactly as `usroff` uses it, and
-/// the channel lookup and [`abi::Ret::Ptr`] wrapping are identical.
-///
-/// # `None` is `vdahdl == NULL`, not "no such channel" -- and it is a pointer, not a refusal
-///
-/// [`Users::vda`]'s own doc comment: a `None` here means only that
-/// [`Host::alcvda`](crate::Host::alcvda) has not run yet, because every
-/// module's `dclvda` has to be counted before `vdasiz` -- and so `vdahdl` --
-/// is known. `vdaoff` on the real host answered this the same way `ptrblok`
-/// answers any lookup against a null block handle: a pointer built from
-/// address zero, not a fault. A channel number that names no channel at all
-/// is the *other* failure `usroff` already guards against, and remains a
-/// stop rather than a null -- runtime crashes over undefined behaviour, per
-/// this crate's own rule, is for the case this host cannot represent at all,
-/// not for the case the real host represented as a legitimate zero.
-pub fn vdaoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let unum = Into::<u32>::into(call.int()) as i16;
-    let chan = host
-        .users()
-        .terms()
-        .chan(unum)
-        .ok_or_else(|| ShimError::Failed(format!("vdaoff({unum}): there is no such channel")))?;
-    Ok(abi::Ret::Ptr(host.users().vda(chan).unwrap_or_else(A::null_ptr)))
 }
 
 /// `void clrmlt(void)` -- clear the multi-line broadcast buffer.
@@ -1828,6 +1751,26 @@ mod tests {
         assert_eq!(got, mbbs_machine::m16::Ret::U16(0));
     }
 
+    /// Moved from the dead `credit::hasmkey` twin
+    /// (`docs/2026-08-15-dead-twin-shims.md`), which had this case and this
+    /// file's own [`hasmkey_answers_for_the_channel_usrnum_names`] did not:
+    /// `mnum` naming a message when no `.MSG` block is even open --
+    /// [`crate::shims::msg::message_mem`]'s own error, surfacing unchanged.
+    #[test]
+    fn hasmkey_refuses_with_no_message_block_open() {
+        let mut f = crate::testing::Fixture::new();
+        let console = f.console();
+        f.host
+            .connect_state(
+                &mut f.machine,
+                console,
+                &crate::Connection::ansi("rangerdan").with_keys(["DEMO"]),
+            )
+            .expect("channel 0");
+
+        assert!(f.invoke(super::hasmkey, &[1]).is_err());
+    }
+
     /// `MAJORBBS.C:1183`. The status is what makes the channel tick; the store
     /// is what makes it tick *into the right routine*.
     #[test]
@@ -1990,54 +1933,6 @@ mod tests {
         assert!(f.invoke(usroff, &[-1i16 as u16]).is_err());
     }
 
-    #[test]
-    fn vdaoff_hands_back_the_channels_own_volatile_area_once_alcvda_has_run() {
-        let mut f = Fixture::new();
-        let console = f.console();
-        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
-        f.host.alcvda(&mut f.machine).expect("allocated");
-
-        let Ret::Far(at) = f.invoke(vdaoff, &[0]).expect("channel 0") else {
-            panic!("vdaoff returns a pointer");
-        };
-        assert_eq!(at, f.host.users().vda(console).expect("allocated"));
-    }
-
-    /// `Users::vda`'s own stride check, driven through the shim rather than
-    /// the accessor directly -- the same discrimination
-    /// [`usroff_addresses_each_channel_at_its_own_slot`] applies to the user
-    /// table.
-    #[test]
-    fn vdaoff_addresses_each_channel_at_its_own_area() {
-        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
-        f.invoke(crate::shims::system::dclvda, &[512]).expect("declared");
-        f.host.alcvda(&mut f.machine).expect("allocated");
-
-        let Ret::Far(at0) = f.invoke(vdaoff, &[0]).expect("channel 0") else {
-            panic!("vdaoff returns a pointer");
-        };
-        let Ret::Far(at1) = f.invoke(vdaoff, &[1]).expect("channel 1") else {
-            panic!("vdaoff returns a pointer");
-        };
-        assert_ne!(at0, at1, "two channels must not share a volatile data area");
-    }
-
-    /// `vdahdl == NULL` before [`Host::alcvda`] has run -- a real answer, not
-    /// a refusal, per [`crate::users::Users::vda`]'s own doc comment. A
-    /// channel number that names no channel at all is the other failure and
-    /// stays a stop; this test is what tells the two apart.
-    #[test]
-    fn vdaoff_answers_null_before_alcvda_has_run_but_still_refuses_no_such_channel() {
-        let mut f = Fixture::new();
-        let Ret::Far(at) = f.invoke(vdaoff, &[0]).expect("a real channel, just no area yet") else {
-            panic!("vdaoff returns a pointer");
-        };
-        assert_eq!(at, mbbs_machine::m16::FarPtr::NULL);
-
-        let past = f.host.users().terms().count();
-        assert!(f.invoke(vdaoff, &[past]).is_err(), "no such channel is still a stop");
-    }
-
     /// `void clrmlt(void)` -- see [`clrmlt`]'s own doc comment for why a
     /// no-op is the honest answer. Called with channel 1 current, not
     /// channel 0, because `clrmlt` takes no channel argument at all and the
@@ -2050,7 +1945,7 @@ mod tests {
         assert_eq!(f.invoke(clrmlt, &[]).expect("clrmlt succeeds"), Ret::Void);
     }
 
-    // ---- instat/onsysn/othkey/samend/mdfgets/dfsthn -----------------------
+    // ---- instat/onsysn/othkey/mdfgets/dfsthn -----------------------
 
     /// A host with two channels, both connected. `instat`/`onsysn` are
     /// meaningless at one channel -- see this module's own doc comment.
@@ -2166,6 +2061,35 @@ mod tests {
         assert_eq!(got, Ret::U16(0), "INVISB hides an otherwise exact match");
     }
 
+    /// Moved from the dead `echo::instat` twin
+    /// (`docs/2026-08-15-dead-twin-shims.md`), which had this case and
+    /// [`instat_refuses_a_match_hidden_by_invisb`] does not: an invisible
+    /// match is not the *only* match. `scan_for`'s own doc comment says the
+    /// loop does not stop at an invisible hit, only continues past it -- this
+    /// is the test that would fail if a future edit turned that `continue`
+    /// into an early `return Ok(false)`.
+    #[test]
+    fn instat_skips_an_invisible_match_but_keeps_looking() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        let two = f.host.gsbl().terms().chan(2).expect("channel 2");
+        f.host
+            .connect_state(&mut f.machine, one, &crate::Connection::ansi("rangerdan"))
+            .expect("channel 1 connected");
+        f.host
+            .connect_state(&mut f.machine, two, &crate::Connection::ansi("rangerdan"))
+            .expect("channel 2 connected, same userid, still visible");
+        set_flag_bits(&mut f, one, INVISB);
+
+        let uid = f.text("rangerdan");
+        let ret = f.invoke(instat, &[uid.offset, uid.selector, 0]).expect("instat");
+        assert_eq!(
+            ret,
+            Ret::U16(1),
+            "channel 1's match is invisible, but channel 2's is not"
+        );
+    }
+
     #[test]
     fn onsysn_is_always_false_here_because_this_host_never_advances_usrcls_past_zero() {
         // `connect_state` writes `usrcls` as 0 and nothing here ever advances
@@ -2271,45 +2195,6 @@ mod tests {
         let lock = f.text("USER");
         let got = f.invoke(othkey, &Fixture::far(lock)).expect("othkey answered");
         assert_eq!(got, Ret::U16(1), "answered for channel 0, not an error");
-    }
-
-    #[test]
-    fn samend_is_true_when_ends_matches_the_tail_case_insensitively() {
-        let mut f = Fixture::new();
-        let longs = f.text("/ANSI/lunatix");
-        let ends = f.text("/lunatix");
-        let got = f
-            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
-            .expect("answered");
-        assert_eq!(got, Ret::U16(1));
-
-        let ends = f.text("/LUNATIX");
-        let got = f
-            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
-            .expect("answered");
-        assert_eq!(got, Ret::U16(1), "sameas -- case-insensitive");
-    }
-
-    #[test]
-    fn samend_is_false_when_ends_is_longer_than_longs() {
-        let mut f = Fixture::new();
-        let longs = f.text("hi");
-        let ends = f.text("hi there");
-        let got = f
-            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
-            .expect("answered");
-        assert_eq!(got, Ret::U16(0), "the `<=` guard, not a wrapped subtraction");
-    }
-
-    #[test]
-    fn samend_is_false_when_the_tail_does_not_match() {
-        let mut f = Fixture::new();
-        let longs = f.text("/ANSI/lunatix");
-        let ends = f.text("/majormud");
-        let got = f
-            .invoke(samend, &[longs.offset, longs.selector, ends.offset, ends.selector])
-            .expect("answered");
-        assert_eq!(got, Ret::U16(0));
     }
 
     /// `fopen(name, mode)` that must succeed, as the `FILE *` it returned.
