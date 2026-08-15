@@ -625,3 +625,273 @@ pub fn oldsend<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
          own doc comment"
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mbbs_machine::m16::{FarPtr, Ret};
+
+    use crate::testing::{Fixture, scratch};
+
+    fn long(ret: Ret) -> u32 {
+        match ret {
+            Ret::U32(n) => n,
+            _ => panic!("expected a long"),
+        }
+    }
+
+    fn pointer(ret: Ret) -> FarPtr {
+        match ret {
+            Ret::Far(at) => at,
+            _ => panic!("expected a far pointer"),
+        }
+    }
+
+    // ---- dfsthn -------------------------------------------------------------
+
+    fn set_status(f: &mut Fixture, value: u16) {
+        f.host
+            .globals()
+            .write(&mut f.machine, "status", &value.to_le_bytes())
+            .expect("status");
+    }
+
+    #[test]
+    fn dfsthn_is_a_noop_for_all_fourteen_harmless_status_codes() {
+        // MAJORBBS.C:4488-4499's own `switch`, quoted whole in `dfsthn`'s
+        // doc comment: CMDOK, INBLK, OUTMT, OBFCLR, ABOREQ, CMN2OK, CM25OK,
+        // RCVX29, IPXRER, IPXUNK, CYCLE, 251, 252, 253.
+        const HARMLESS: [u16; 14] = [2, 4, 5, 6, 7, 12, 22, 24, 37, 38, 240, 251, 252, 253];
+        let mut f = Fixture::new();
+        for code in HARMLESS {
+            set_status(&mut f, code);
+            assert!(
+                matches!(f.invoke(dfsthn, &[]).expect("dfsthn"), Ret::Void),
+                "status {code} should be a silent no-op"
+            );
+        }
+    }
+
+    #[test]
+    fn dfsthn_refuses_a_status_none_of_the_fourteen_codes_names() {
+        let mut f = Fixture::new();
+        set_status(&mut f, 99);
+        let e = f.invoke(dfsthn, &[]).expect_err("a refusal");
+        assert!(e.to_string().contains("99"), "{e}");
+    }
+
+    #[test]
+    fn dfsthn_refuses_at_254_just_past_the_three_literal_harmless_codes() {
+        // 251, 252 and 253 are harmless; 254 is the very next status and is
+        // not one of them -- catches an off-by-one in the HARMLESS table.
+        let mut f = Fixture::new();
+        set_status(&mut f, 254);
+        let e = f.invoke(dfsthn, &[]).expect_err("a refusal");
+        assert!(e.to_string().contains("254"), "{e}");
+    }
+
+    // ---- hrtval ---------------------------------------------------------------
+
+    #[test]
+    fn hrtval_is_the_epoch_second_times_65536() {
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(1));
+        assert_eq!(long(f.invoke(hrtval, &[]).expect("hrtval")), 65536);
+
+        f.host.set_clock(crate::Clock::pinned(100));
+        assert_eq!(long(f.invoke(hrtval, &[]).expect("hrtval")), 6_553_600);
+    }
+
+    #[test]
+    fn hrtval_wraps_like_the_free_running_hardware_counter_would() {
+        // 65536 seconds * 65536 = 2**32, which wraps to 0 -- `wrapping_mul`,
+        // not a saturating or panicking multiply. See `hrtval`'s own doc
+        // comment on why wrapping is the honest answer here.
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(65536));
+        assert_eq!(long(f.invoke(hrtval, &[]).expect("hrtval")), 0);
+    }
+
+    // ---- msgscan --------------------------------------------------------------
+
+    fn msgscan_(f: &mut Fixture, file: &str, name: &str) -> Result<Ret, ShimError> {
+        let file_p = f.text(file);
+        let name_p = f.text(name);
+        f.invoke(
+            msgscan,
+            &[file_p.offset, file_p.selector, name_p.offset, name_p.selector],
+        )
+    }
+
+    #[test]
+    fn msgscan_returns_the_value_of_the_named_option() {
+        // BBSRPT.C:826's own call site: msgscan("galme.msg","FORSYS").
+        let root = scratch("misc-msgscan-found");
+        std::fs::write(root.join("GALME.MSG"), b"FORSYS{myserver}\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        let ret = msgscan_(&mut f, "galme.msg", "FORSYS").expect("msgscan");
+        let at = pointer(ret);
+        assert_eq!(f.machine.read_cstr(at).expect("readable"), b"myserver");
+    }
+
+    #[test]
+    fn msgscan_returns_null_when_the_name_is_not_present() {
+        let root = scratch("misc-msgscan-absent");
+        std::fs::write(root.join("GALME.MSG"), b"OTHER{val}\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        let ret = msgscan_(&mut f, "galme.msg", "FORSYS").expect("msgscan");
+        assert_eq!(pointer(ret), FarPtr::NULL, "no source says what an absent name answers -- see msgscan's own doc comment");
+    }
+
+    #[test]
+    fn msgscan_resolves_tilde_and_brace_escapes_inside_the_value() {
+        // `~~` is a literal tilde, `~}` is a literal closing brace.
+        let root = scratch("misc-msgscan-escapes");
+        std::fs::write(root.join("GALME.MSG"), b"ESCAPE{a~~b~}c}\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        let ret = msgscan_(&mut f, "galme.msg", "ESCAPE").expect("msgscan");
+        let at = pointer(ret);
+        assert_eq!(f.machine.read_cstr(at).expect("readable"), b"a~b}c");
+    }
+
+    #[test]
+    fn msgscan_refuses_a_stray_open_brace_before_any_option_name() {
+        let root = scratch("misc-msgscan-stray-brace");
+        std::fs::write(root.join("GALME.MSG"), b"{oops}\n").expect("a file");
+        let mut f = Fixture::rooted(root);
+
+        let e = msgscan_(&mut f, "galme.msg", "ANYTHING").expect_err("a refusal");
+        assert!(e.to_string().contains("byte 0"), "{e}");
+    }
+
+    // ---- c2bcpy -----------------------------------------------------------
+
+    /// A buffer pre-filled with a non-zero sentinel, so a test can tell
+    /// "the shim wrote a real NUL here" from "this byte was already zero".
+    fn sentinel_buffer(f: &mut Fixture, len: u16) -> FarPtr {
+        let at = f.buffer(len);
+        f.machine.write(at, &vec![0xFFu8; len as usize]).expect("sentinel");
+        at
+    }
+
+    fn c2bcpy_(f: &mut Fixture, dest: FarPtr, src: &str, length: u16) -> Result<Ret, ShimError> {
+        let src_p = f.text(src);
+        f.invoke(
+            c2bcpy,
+            &[dest.offset, dest.selector, src_p.offset, src_p.selector, length],
+        )
+    }
+
+    #[test]
+    fn c2bcpy_pads_a_short_string_with_nuls_to_fill_the_destination_field() {
+        // No `.C` survives for c2bcpy -- this pins the behaviour read off
+        // call sites (see c2bcpy's own doc comment), not a measured
+        // correctness against vendor source.
+        let mut f = Fixture::new();
+        let dest = sentinel_buffer(&mut f, 5);
+        c2bcpy_(&mut f, dest, "hi", 5).expect("c2bcpy");
+        assert_eq!(f.machine.resolve(dest, 5).expect("in bounds"), b"hi\0\0\0");
+    }
+
+    #[test]
+    fn c2bcpy_truncates_a_longer_string_with_no_guaranteed_terminator() {
+        // Pins behaviour, not measured correctness -- see this file's own
+        // doc comment on c2bcpy/b2ccpy's provenance.
+        let mut f = Fixture::new();
+        let dest = sentinel_buffer(&mut f, 4);
+        c2bcpy_(&mut f, dest, "abcdef", 4).expect("c2bcpy");
+        assert_eq!(
+            f.machine.resolve(dest, 4).expect("in bounds"),
+            b"abcd",
+            "all 4 bytes are the source's own, no room left for a NUL"
+        );
+    }
+
+    // ---- b2ccpy -----------------------------------------------------------
+
+    #[test]
+    fn b2ccpy_stops_at_an_embedded_nul_within_the_fixed_width_field() {
+        // Pins behaviour, not measured correctness -- see this file's own
+        // doc comment on c2bcpy/b2ccpy's provenance.
+        //
+        // `f.read(dest)` alone would NOT catch a mutant that copied the
+        // whole 5-byte field ("ab\0cd") instead of stopping at the embedded
+        // NUL: `read_cstr` stops at the first NUL either way, and "ab" comes
+        // back either way. The sentinel bytes past the true 3-byte answer
+        // ("ab\0") are what actually prove the "cd" was never written.
+        let mut f = Fixture::new();
+        let src = f.bytes(b"ab\0cd", false);
+        let dest = sentinel_buffer(&mut f, 8);
+        f.invoke(b2ccpy, &[dest.offset, dest.selector, src.offset, src.selector, 5])
+            .expect("b2ccpy");
+        assert_eq!(f.read(dest), "ab");
+        assert_eq!(
+            f.machine.resolve(dest, 8).expect("in bounds"),
+            b"ab\0\xff\xff\xff\xff\xff",
+            "nothing past the embedded NUL's own terminator was written"
+        );
+    }
+
+    #[test]
+    fn b2ccpy_reads_the_full_field_when_there_is_no_embedded_terminator() {
+        // Pins behaviour, not measured correctness -- see this file's own
+        // doc comment on c2bcpy/b2ccpy's provenance.
+        let mut f = Fixture::new();
+        let src = f.bytes(b"abcde", false);
+        let dest = f.buffer(16);
+        f.invoke(b2ccpy, &[dest.offset, dest.selector, src.offset, src.selector, 5])
+            .expect("b2ccpy");
+        assert_eq!(f.read(dest), "abcde");
+    }
+
+    // ---- the loud refusals --------------------------------------------------
+
+    #[test]
+    fn profan_refuses_rather_than_fabricating_a_clean_score() {
+        let mut f = Fixture::new();
+        let text = f.text("damn you");
+        let e = f.invoke(profan, &Fixture::far(text)).expect_err("a refusal");
+        let msg = e.to_string();
+        assert!(msg.contains("profan("), "{msg}");
+        assert!(msg.contains("damn you"), "{msg}");
+    }
+
+    #[test]
+    fn listing_refuses_rather_than_running_a_file_transfer_framework_this_host_lacks() {
+        let mut f = Fixture::new();
+        let path = f.text("SOMEFILE.LST");
+        let ret = f.invoke(
+            listing,
+            &[path.offset, path.selector, 0x1234, 0x0000],
+        );
+        let e = ret.expect_err("a refusal");
+        let msg = e.to_string();
+        assert!(msg.contains("listing("), "{msg}");
+        assert!(msg.contains("SOMEFILE.LST"), "{msg}");
+    }
+
+    #[test]
+    fn byenow_refuses_rather_than_silently_leaving_the_channel_running() {
+        let mut f = Fixture::new();
+        // msgnum=5, p1=100, p2=200, p3=300 -- long args as [lo, hi] words.
+        let e = f
+            .invoke(byenow, &[5, 100, 0, 200, 0, 300, 0])
+            .expect_err("a refusal");
+        assert!(e.to_string().contains("byenow(5, 100, 200, 300)"), "{e}");
+    }
+
+    #[test]
+    fn oldsend_refuses_rather_than_fabricating_a_queued_message() {
+        let mut f = Fixture::new();
+        let to = f.text("someone");
+        let e = f
+            .invoke(oldsend, &[0x0010, 0x0020, to.offset, to.selector])
+            .expect_err("a refusal");
+        let msg = e.to_string();
+        assert!(msg.contains("_oldsend("), "{msg}");
+        assert!(msg.contains("someone"), "{msg}");
+    }
+}
