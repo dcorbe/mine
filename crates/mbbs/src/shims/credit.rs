@@ -113,7 +113,7 @@ pub fn tstcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 }
 
 /// `CONCEX`, `MAJORBBS.H:211` -- "commands concatenated -- exit fast". Bit
-/// `0x800` of `user.flags`, which [`crate::users::user::FLAGS`] locates at
+/// `0x800` of `user.flags`, which [`crate::users::UserLayout::flags`] locates at
 /// `+0x14` in `struct user` (four bytes, little-endian -- `users.rs`'s own
 /// module doc comment measures the field off `WCCMMUD.DLL`'s own byte
 /// accesses, though this bit is never one of the ones that module tests).
@@ -178,7 +178,7 @@ const CONCEX: u32 = 0x0000_0800;
 /// answer it for real, rather than reporting it and continuing.
 pub fn condex<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = host.current_channel_mem(call.mem())?;
-    let flags_at = A::ptr_offset(host.users().slot(chan), crate::users::user::FLAGS);
+    let flags_at = A::ptr_offset(host.users().slot(chan), host.users().user_layout().flags.at);
     let bytes = flags_at
         .resolve(call.mem(), A::LONG_WIDTH)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -681,7 +681,7 @@ mod tests {
         let console = connect(&mut f, &[]);
         let slot = f.host.users().slot(console);
         let flags_at = FarPtr {
-            offset: slot.offset + crate::users::user::FLAGS,
+            offset: slot.offset + f.host.users().user_layout().flags.at,
             selector: slot.selector,
         };
         // Set only the CONCEX bit (0x0800), little-endian, leaving the rest

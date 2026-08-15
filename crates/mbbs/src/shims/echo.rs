@@ -46,7 +46,6 @@ use super::gsbl::OUT_OF_RANGE;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::gsbl::Gsbl;
-use crate::users::{user, usracc};
 
 /// `void echon(void)` -- `MAJORBBS.C:3840-3844`:
 ///
@@ -284,8 +283,8 @@ pub fn hdlinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// host places and a shim can read: `user[i].state`
 /// ([`crate::users::Users::state_mem`]), `uacoff(i)->userid`
 /// ([`crate::users::Users::account`] offset by
-/// [`crate::users::usracc::USERID`]) and `user[i].flags`
-/// ([`crate::users::Users::slot`] offset by [`crate::users::user::FLAGS`]).
+/// [`crate::users::AccountLayout::userid`]) and `user[i].flags`
+/// ([`crate::users::Users::slot`] offset by [`crate::users::UserLayout::flags`]).
 /// `othexp` (`extoff(othusn)`, the extra-user pointer) is read by the
 /// vendor and never used inside the loop body -- dead in the original, so
 /// there is nothing to reproduce.
@@ -329,7 +328,7 @@ pub fn instat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         }
 
         let account = host.users().account(chan);
-        let userid_ptr = A::ptr_offset(account, usracc::USERID as u16);
+        let userid_ptr = A::ptr_offset(account, host.users().account_layout().userid);
         let userid = userid_ptr
             .read_cstr(call.mem())
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -338,7 +337,7 @@ pub fn instat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         }
 
         let slot = host.users().slot(chan);
-        let flags1 = A::ptr_offset(slot, user::FLAGS + 1);
+        let flags1 = A::ptr_offset(slot, host.users().user_layout().flags.at + 1);
         let byte = flags1
             .resolve(call.mem(), 1)
             .map_err(|e| ShimError::Failed(e.to_string()))?[0];
@@ -553,7 +552,7 @@ mod tests {
         // invisible.
         let slot = f.host.users().slot(one);
         let flags1 = mbbs_machine::m16::FarPtr {
-            offset: slot.offset + user::FLAGS + 1,
+            offset: slot.offset + f.host.users().user_layout().flags.at + 1,
             selector: slot.selector,
         };
         let was = f.machine.resolve(flags1, 1).expect("in bounds")[0];

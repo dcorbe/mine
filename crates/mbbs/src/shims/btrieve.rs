@@ -709,120 +709,6 @@ pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(1u16)))
 }
 
-/// `void upvbtv(void *recptr, int length)` -- update the record the file is
-/// positioned on, at a caller-given length rather than the file's own
-/// `reclen`.
-///
-/// `BTVSTF.H:160` declares it; `PLBTVSTF.C:531-541`, quoted in full:
-///
-///
-/// [`dupdbtv`] is the same opcode 3 with `length` fixed at `bb->reclen`
-/// (`updbtv(recptr)` is literally `upvbtv(recptr,bb->reclen)`,
-/// `PLBTVSTF.C:524-527`) -- `WCCTEXT`'s variable part is exactly what
-/// `length` past `reclen` lets a caller reach, and
-/// [`Block::update`](crate::btrieve::Block::update) already knows how to
-/// rewrite that shape (`has_body`/`rewrite_variable`, this crate's own
-/// variable-length write path). So this shim differs from `dupdbtv` in
-/// three places, not in how the write itself happens:
-///
-/// - **`length` is the caller's**, read as a fourth cursor value rather than
-///   taken from [`Block::maxlen`](crate::btrieve::Block::maxlen).
-/// - **A duplicate key is fatal, not a quiet `0`.** `PLBTVSTF.C:539-541`
-///   sends *any* nonzero status to `btverrptr` unconditionally -- there is no
-///   `switch` carving out status 5 the way [`dupdbtv`]'s own body does
-///   (`:562-568`). A board that hit a collision through `upvbtv` stopped, and
-///   this host stopping the module rather than answering a success value the
-///   caller cannot tell from a real one is the same rule the rest of this
-///   crate is under.
-/// - **The return type is `void`.** There is no `1`/`0` to report at all.
-///
-/// # `bb == NULL` is a quiet no-op, not a refusal
-///
-/// The one guard `upvbtv` has that [`dupdbtv`]/[`dinsbtv`] do not --
-/// `:534-536` returns before touching `recptr` or `length`. This is the same
-/// answer [`qrybtv`]/[`obtbtvl`]/[`absbtv`] already give with no file
-/// current (this file's own module doc comment, "What every routine does
-/// when no file is current"), just shaped as `void`'s own version of "0".
-///
-/// `re/ne_arity.py 622 <WCCMMPLS.DLL>` finds 2 call sites; one cleans three
-/// words (`68 c0 03; 6a 00; 6a 00` -- push `length=0x3c0`, push a far-null
-/// `recptr` -- then `add sp,6`), matching `(void *, int)` exactly and the
-/// vendor's own `upvbtv(NULL,length)` idiom seen throughout `GALFILU.C`/
-/// `GALFILCS.C`. The other cleans nothing directly after the call because
-/// control leaves through an unconditional `jmp` to a shared cleanup point a
-/// few bytes on (`eb 13`) rather than falling through to one -- the deferred
-/// case this tool's own module doc comment names, not a second arity. `622`
-/// is `_UPVBTV`'s ordinal in `crates/mbbs/data/majorbbs_wg101.tsv`.
-///
-/// # Errors
-///
-/// If the write collides with a key that forbids duplicates, if `bytes` does
-/// not fit what [`Block::update`] accepts (a fixed-length file needs it
-/// exactly `reclen`; a variable-length file needs a position this host
-/// already tracks -- see [`Block::update`]'s own doc comment), or if `recptr`
-/// cannot be read for `length` bytes.
-pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let recptr = call.ptr();
-    let length = u16_arg::<A>(call.int(), "upvbtv")?;
-
-    let Some(block) = positioned(call, host, "upvbtv")? else {
-        note_no_file(host, "upvbtv");
-        return Ok(abi::Ret::Void);
-    };
-
-    let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let position = file
-        .current()
-        .ok_or_else(|| {
-            ShimError::Failed(format!(
-                "upvbtv on {}, which is not positioned on a record -- opcode 3 \
-                 updates the record the file is positioned on, and nothing has \
-                 positioned this one",
-                file.name()
-            ))
-        })?
-        .position;
-    let recptr = match recptr == Btrieve::<A>::null() {
-        true => file.data(),
-        false => recptr,
-    };
-    let bytes = recptr
-        .resolve(call.mem(), usize::from(length))
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    if let Some((key, value)) = duplicate_key(host, block, &bytes, Some(position))? {
-        let name = host.btrieve.block(block).map_err(ShimError::Failed)?.name().to_owned();
-        return Err(ShimError::Failed(format!(
-            "upvbtv on {name} refused a record: key {key} already holds \
-             {value:02x?}, and that key does not permit duplicates -- \
-             PLBTVSTF.C:539 sends any nonzero status to btverrptr \
-             unconditionally, unlike dupdbtv's own status-5 special case, so \
-             this stops the module rather than answering a value it cannot \
-             tell from success"
-        )));
-    }
-
-    let file = host.btrieve.block_mut(block).map_err(ShimError::Failed)?;
-    file.update(position, &bytes).map_err(|e| ShimError::Failed(e.to_string()))?;
-
-    // Currency maintenance, identical to `dupdbtv`'s own -- see that
-    // routine's doc comment for the full account of why an `Ordered` cursor
-    // has to be re-derived after a write that just re-sorted every key.
-    if let Cursor::Ordered { key, .. } = file.cursor() {
-        let records = file.records().map_err(|e| ShimError::Failed(e.to_string()))?;
-        let physical = records
-            .find_physical(position)
-            .expect("update just wrote this position");
-        let cursor = match records.place_in(key, physical) {
-            Some(at) => Cursor::Ordered { key, at },
-            None => Cursor::Physical { at: physical },
-        };
-        file.seek_to(cursor);
-    }
-
-    Ok(abi::Ret::Void)
-}
 
 /// `void clsbtv(struct btvblk *bbp)` -- close a Btrieve file.
 ///
@@ -2627,6 +2513,18 @@ pub fn updbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// argument), never a value that is compared or branched on as negative, so
 /// this refuses rather than reinterprets a value that would not fit as a
 /// byte count.
+///
+/// # Arity, measured
+///
+/// `re/ne_arity.py 622 <WCCMMPLS.DLL>` finds 2 call sites; one cleans three
+/// words (`68 c0 03; 6a 00; 6a 00` -- push `length=0x3c0`, push a far-null
+/// `recptr` -- then `add sp,6`), matching `(void *, int)` exactly and the
+/// vendor's own `upvbtv(NULL,length)` idiom seen throughout `GALFILU.C`/
+/// `GALFILCS.C`. The other cleans nothing directly after the call because
+/// control leaves through an unconditional `jmp` to a shared cleanup point a
+/// few bytes on (`eb 13`) rather than falling through to one -- the deferred
+/// case that tool's own module doc comment names, not a second arity. `622`
+/// is `_UPVBTV`'s ordinal in `crates/mbbs/data/majorbbs_wg101.tsv`.
 pub fn upvbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let recptr = call.ptr();
     let length = u16_arg::<A>(call.int(), "upvbtv")?;

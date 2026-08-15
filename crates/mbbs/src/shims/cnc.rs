@@ -79,7 +79,6 @@ use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::shims::ShimError;
 use crate::shims::text;
-use crate::users::{user, usracc};
 
 /// The upper bound `maxcat` would carry if this host parsed a message-file
 /// config option -- `numopt(MAXCAT,1,32767)`'s own ceiling
@@ -104,7 +103,7 @@ const MAXCAT: u16 = 32767;
 const SUPIPG: u16 = 3;
 
 /// `NOINJO`, `MAJORBBS.H:200` -- `#define NOINJO 0x00000001L`, bit 0 of
-/// `user.flags`'s low byte (`user::FLAGS + 0`). Set, a channel refuses every
+/// `user.flags`'s low byte (`UserLayout::flags` + 0). Set, a channel refuses every
 /// injected message; [`injoth`] answers `0` without touching the channel at
 /// all.
 const NOINJO: u8 = 0x01;
@@ -350,7 +349,7 @@ pub fn onsys<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
 
     for chan in host.users().terms().all() {
         let slot = host.users().slot(chan);
-        let usrcls_ptr = A::ptr_offset(slot, user::USRCLS);
+        let usrcls_ptr = A::ptr_offset(slot, host.users().user_layout().usrcls.at);
         let usrcls_bytes = usrcls_ptr
             .resolve(call.mem(), 2)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -360,7 +359,7 @@ pub fn onsys<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         }
 
         let account = host.users().account(chan);
-        let userid_ptr = A::ptr_offset(account, usracc::USERID as u16);
+        let userid_ptr = A::ptr_offset(account, host.users().account_layout().userid);
         let userid = userid_ptr
             .read_cstr(call.mem())
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -372,7 +371,7 @@ pub fn onsys<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
         // the same per-byte addressing `crate::shims::echo::instat` already
         // measures against and `crates/mbbs/src/users.rs`'s own master-flag
         // test confirms for a different bit of the same field.
-        let flags1 = A::ptr_offset(slot, user::FLAGS + 1);
+        let flags1 = A::ptr_offset(slot, host.users().user_layout().flags.at + 1);
         let byte = flags1
             .resolve(call.mem(), 1)
             .map_err(|e| ShimError::Failed(e.to_string()))?[0];
@@ -518,7 +517,7 @@ pub fn injoth<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     };
 
     let slot = host.users().slot(chan);
-    let flags0_ptr = A::ptr_offset(slot, user::FLAGS);
+    let flags0_ptr = A::ptr_offset(slot, host.users().user_layout().flags.at);
     let flags0 = flags0_ptr
         .resolve(call.mem(), 1)
         .map_err(|e| ShimError::Failed(e.to_string()))?[0];
@@ -734,7 +733,7 @@ mod tests {
 
         let slot = f.host.users().slot(one);
         let usrcls = FarPtr {
-            offset: slot.offset + user::USRCLS,
+            offset: slot.offset + f.host.users().user_layout().usrcls.at,
             selector: slot.selector,
         };
         f.machine.write(usrcls, &5u16.to_le_bytes()).expect("in bounds");
@@ -764,7 +763,7 @@ mod tests {
         for chan in [one, two] {
             let slot = f.host.users().slot(chan);
             let usrcls = FarPtr {
-                offset: slot.offset + user::USRCLS,
+                offset: slot.offset + f.host.users().user_layout().usrcls.at,
                 selector: slot.selector,
             };
             f.machine.write(usrcls, &5u16.to_le_bytes()).expect("in bounds");
@@ -773,7 +772,7 @@ mod tests {
         // Mark channel 1 invisible (`INVISB`, bit 6 of `FLAGS + 1`).
         let slot = f.host.users().slot(one);
         let flags1 = FarPtr {
-            offset: slot.offset + user::FLAGS + 1,
+            offset: slot.offset + f.host.users().user_layout().flags.at + 1,
             selector: slot.selector,
         };
         let was = f.machine.resolve(flags1, 1).expect("in bounds")[0];
@@ -828,7 +827,7 @@ mod tests {
 
         let slot = f.host.users().slot(one);
         let flags0 = FarPtr {
-            offset: slot.offset + user::FLAGS,
+            offset: slot.offset + f.host.users().user_layout().flags.at,
             selector: slot.selector,
         };
         let byte = f.machine.resolve(flags0, 1).expect("in bounds")[0];
@@ -848,7 +847,7 @@ mod tests {
 
         let slot = f.host.users().slot(one);
         let flags0 = FarPtr {
-            offset: slot.offset + user::FLAGS,
+            offset: slot.offset + f.host.users().user_layout().flags.at,
             selector: slot.selector,
         };
         let was = f.machine.resolve(flags0, 1).expect("in bounds")[0];
