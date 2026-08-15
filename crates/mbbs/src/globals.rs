@@ -280,6 +280,32 @@ pub const GLOBALS: &[Global] = &[
     // the header and printed as `%.9s` at ABOUT.C:85. MajorMUD reads it at
     // 1,096 sites: its activation code is a function of the board's serial.
     s("bturno", BTURNO),
+    // FSDBBS.H:225 -- extern struct fsdbbs *fsdusr; "above info for current
+    // user." A module *addresses* this rather than calling it -- The Rose
+    // reads it at 12 sites -- so it belongs here, not in the routine table:
+    // registering it as a `Routine` would leave the fixup pointing at a
+    // dispatch thunk, and the module would read a function address where it
+    // expected the current user's FSD state. Unchanged in wg33
+    // (`EXPWGSV(struct fsdbbs*) fsdusr;`, `re/wg33src/INC/FSDBBS.H:232`).
+    g("fsdusr", PTR),
+    // MAJORBBS.H:461 -- one `extern` statement declaring three function
+    // pointers; this places only the third:
+    //   void (*tjoinrou)(),           /* teleconference "join from other" */
+    //        (*ntfysopr)(char *audrec),   /* notify remote sysop routine */
+    //        (*emlsdrou)();       /* Send Email to Sysop/New User routine */
+    // `tjoinrou`/`ntfysopr` are not placed: nothing in the corpus addresses
+    // them, and unlike `curmbk`/`bb` this group has no single call site
+    // forcing the whole declaration in. `emlsdrou` alone is needed -- The
+    // Rose addresses it at 6 sites -- and, like `fsdusr`, is data a module
+    // reaches for by address, never a call. Unchanged in wg33
+    // (`EXPWGSF(VOID,emlsdrou)(VOID);`, `re/wg33src/INC/MAJORBBS.H:527`).
+    g("emlsdrou", PTR),
+    // REMOTE.H:11 -- one `extern` statement declaring seven remote-sysop
+    // ints; this places only the second, `errcod`, "MS-DOS exit codes (for
+    // batch files)." The Rose addresses it at 4 sites. `INT`, not a pointer
+    // -- `gi`, so it is `Abi::INT_WIDTH` bytes rather than a fixed 2 or 4.
+    // Unchanged in wg33 (`EXPWGSV(INT) errcod;`, `re/wg33src/INC/REMOTE.H:46`).
+    gi("errcod"),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -787,8 +813,9 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 15, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 16, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
+        assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
         for name in &ints {
             let w16 = GLOBALS.iter().find(|g| &g.name == name).expect("found");
@@ -822,8 +849,13 @@ mod tests {
         assert_eq!(at("margv"), 256);
         assert_eq!(at("margn"), 256 + 512);
         let last = *placed.last().expect("non-empty");
-        // 3415 until 2026-08-14. The corpus survey placed four data the
-        // modules address but this host had no slot for:
+        // 3415 until 2026-08-14, 3509 until 2026-08-15's three datums:
+        //   +4 fsdusr    (FSDBBS.H:225 -- The Rose, 12 sites)
+        //   +4 emlsdrou  (MAJORBBS.H:461 -- The Rose, 6 sites)
+        //   +2 errcod    (REMOTE.H:11, an int -- The Rose, 4 sites)
+        // plus one alignment byte ahead of fsdusr, because bturno (9 bytes)
+        // ends on an odd offset. Before that, the corpus survey placed four
+        // data the modules address but this host had no slot for:
         //   +4  othuap  (USRACC.H:73-76, beside usaptr -- 17 modules)
         //   +4  ftgptr  (FTG.H:97-98    -- 7 modules, 210 sites)
         //   +4  ftfscb  (FTF.C:26-27    -- 6 modules)
@@ -831,7 +863,44 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3509);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3520);
+    }
+
+    /// A module *addresses* these -- it never calls them. Registering one as
+    /// a `Routine` makes the fixup point at a dispatch thunk, and the module
+    /// reads a function address where it expected data.
+    #[test]
+    fn the_three_rose_datums_are_addressable() {
+        for name in ["fsdusr", "emlsdrou", "errcod"] {
+            assert!(
+                matches!(
+                    crate::shims::entry::<crate::abi::Wg16>(crate::exports::MAJORBBS, name),
+                    crate::shims::Entry::Datum
+                ),
+                "{name} must be a Datum, not a Routine"
+            );
+        }
+    }
+
+    /// Storage a module writes must read back what it wrote, not just exist.
+    /// `fsdusr` is a far pointer (`struct fsdbbs *`, `FSDBBS.H:225`), so the
+    /// round trip goes through [`crate::abi::wg16`]'s `Globals::pointer`
+    /// facade rather than a bare word or long -- offset first in memory, per
+    /// [`FarPtr::from_bytes`](mbbs_machine::m16::FarPtr::from_bytes).
+    #[test]
+    fn fsdusr_round_trips_through_module_memory() {
+        let mut f = crate::testing::Fixture::new();
+        f.host
+            .globals()
+            .write(&mut f.machine, "fsdusr", &0x1234_5678u32.to_le_bytes())
+            .expect("write fsdusr");
+        let back = f
+            .host
+            .globals()
+            .pointer(&f.machine, "fsdusr")
+            .expect("read fsdusr");
+        assert_eq!(back.offset, 0x5678, "a datum the module writes must read back");
+        assert_eq!(back.selector, 0x1234, "a datum the module writes must read back");
     }
 
     #[test]
