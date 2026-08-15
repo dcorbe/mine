@@ -1351,6 +1351,22 @@ impl<A: Abi> PartialEq for Registration<A> {
                 Self::Module { description: d2, block: b2 },
             ) => d1 == d2 && b1 == b2,
             (Self::Native(n1), Self::Native(n2)) => n1 == n2,
+            // Carries nothing, so two of them are the same slot.
+            //
+            // Missing until 2026-08-15, and the catch-all below answered
+            // `false` for it -- making `AbsentBbs != AbsentBbs`, a
+            // non-reflexive `PartialEq` beneath an `impl Eq` that promises
+            // reflexivity. `209d2ff` added the variant; nothing compared two
+            // of them until an `--ignored` integration test did, three weeks
+            // later.
+            //
+            // **The catch-all is the hazard.** It is needed for genuinely
+            // different variants, and it also absorbs any same-variant pair a
+            // future arm forgets -- turning a missing case into a wrong
+            // answer rather than a compile error. Add the arm with the
+            // variant; `equality_is_reflexive_for_every_variant` is the guard
+            // that notices if you do not.
+            (Self::AbsentBbs, Self::AbsentBbs) => true,
             _ => false,
         }
     }
@@ -1490,6 +1506,17 @@ impl<A: Abi> PartialEq for Dispatch<A> {
         match (self, other) {
             (Self::Module(p1), Self::Module(p2)) => p1 == p2,
             (Self::Native(n1), Self::Native(n2)) => n1 == n2,
+            // The same omission as `Registration::AbsentBbs` above, in the
+            // same commit, found in the same minute: `SessionOver` carries
+            // nothing and two of them are the same outcome, but there was no
+            // arm for it and the catch-all made `SessionOver != SessionOver`
+            // beneath an `impl Eq`.
+            //
+            // Two hand-written `PartialEq`s in one file, each given a new
+            // variant by `209d2ff`, each silently wrong the same way. That is
+            // the argument against a catch-all in a hand-written equality:
+            // the compiler cannot tell you what it swallowed.
+            (Self::SessionOver, Self::SessionOver) => true,
             _ => false,
         }
     }
@@ -1594,6 +1621,67 @@ impl<A: Abi> Registration<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `a == a`, for every variant of both hand-written `PartialEq`s.
+    ///
+    /// Both `Registration` and `Dispatch` write `eq` by hand with a
+    /// `_ => false` catch-all, and on 2026-08-15 both were found
+    /// non-reflexive: `Registration::AbsentBbs` and `Dispatch::SessionOver`
+    /// were each added by `209d2ff` without an arm, and the catch-all
+    /// answered `false` for a value compared with itself. Both types also
+    /// `impl Eq`, which *promises* reflexivity, so the bug was a broken
+    /// contract rather than a surprising result -- anything using them as a
+    /// `HashMap` key or sorting them was entitled to assume otherwise.
+    ///
+    /// Nothing compared two of either until an `--ignored` integration test
+    /// did, three weeks later. This test is the cheap version of that
+    /// discovery: add a variant without an arm and it fails immediately.
+    #[test]
+    fn equality_is_reflexive_for_every_variant() {
+        // Exhaustive by construction: a new variant makes this `match` fail
+        // to compile, which is the point -- it forces whoever adds one to
+        // come here, and coming here means seeing the `eq` arm they owe.
+        fn all_registrations<A: Abi>(r: &Registration<A>) -> &'static str {
+            match r {
+                Registration::Module { .. } => "Module",
+                Registration::Native(_) => "Native",
+                Registration::AbsentBbs => "AbsentBbs",
+            }
+        }
+        fn all_dispatches<A: Abi>(d: &Dispatch<A>) -> &'static str {
+            match d {
+                Dispatch::Module(_) => "Module",
+                Dispatch::Native(_) => "Native",
+                Dispatch::SessionOver => "SessionOver",
+            }
+        }
+
+        let registrations: [Registration<Wg16>; 3] = [
+            Registration::Module {
+                description: "MajorMUD".to_owned(),
+                block: FarPtr { offset: 136, selector: 351 },
+            },
+            Registration::Native(Native::Fsd),
+            Registration::AbsentBbs,
+        ];
+        for r in &registrations {
+            assert_eq!(r, r, "Registration::{} is not equal to itself", all_registrations(r));
+        }
+
+        let dispatches: [Dispatch<Wg16>; 3] = [
+            Dispatch::Module(Some(FarPtr { offset: 8, selector: 16 })),
+            Dispatch::Native(Native::Fsd),
+            Dispatch::SessionOver,
+        ];
+        for d in &dispatches {
+            assert_eq!(d, d, "Dispatch::{} is not equal to itself", all_dispatches(d));
+        }
+
+        // And still distinguishing: a reflexive `eq` that answered `true` for
+        // everything would pass the loops above and be just as wrong.
+        assert_ne!(registrations[1], registrations[2]);
+        assert_ne!(dispatches[1], dispatches[2]);
+    }
     use crate::testing::Fixture;
     use mbbs_machine::m16::FarPtr;
 
