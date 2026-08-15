@@ -724,34 +724,37 @@ impl<A: Abi> Block<A> {
         records::keyed(shift, bytes)
     }
 
-    /// Whether this host will write to the file at all.
+    /// Whether this host will write to the file the v5 way: seeking a
+    /// position as a literal byte offset.
+    ///
+    /// **No longer the whole v6 gate.** [`Self::insert`] now has its own v6
+    /// path ([`Self::insert_v6`]), with its own narrower scope, called
+    /// *before* this would ever see a v6 file. [`Self::update`] and
+    /// [`Self::delete`] still call this unconditionally and still refuse
+    /// every v6 file, because both of them still assume `pages::write_record`
+    /// /`pages::delete_record`'s literal-byte-offset arithmetic, and neither
+    /// has been made v6-aware -- an update would still land on whatever
+    /// physical page happened to sit at a logical id's arithmetic, or past
+    /// the end of the file, exactly the corruption this refusal was written
+    /// to prevent (Task 13 of
+    /// `docs/plans/2026-08-15-host-api-surface-track-b.md`, "the refusal at
+    /// 754" this doc comment used to describe in full).
     ///
     /// # Errors
     ///
-    /// If the file is v6. Reading one is Tasks 1-6 of
-    /// `docs/plans/2026-08-11-btrieve-v6-page-addressing.md`; **writing one is
-    /// deliberately out of that plan's scope**, and needs the allocation-table
-    /// maintenance, shadow-copy flipping and generation bumping the engine
-    /// does.
-    ///
-    /// This exists because removing the blanket v6 refusal from
-    /// `Records::read` (Task 2, lifted in Task 5) silently un-guarded the
-    /// write path, which had never been v6-safe and was only unreachable
-    /// because every v6 read failed first. A v6 record's `position` carries a
-    /// **logical** page id (Evidence 1c), and `pages::write_record` seeks to a
-    /// position as a literal byte offset -- so an insert or update would have
-    /// landed on whatever physical page happened to sit at the logical id's
-    /// arithmetic, or past the end of the file, while the in-memory model
-    /// recorded a success. Silent corruption, so: refuse.
+    /// If the file is v6.
     fn writable(&self) -> Result<(), BtvError> {
         if self.geometry.version != Version::V5 {
             return Err(BtvError {
                 file: self.name.clone(),
                 why: format!(
-                    "is a {:?} file, and this host reads those but does not write \
-                     them -- a v6 record's position names a logical page, and \
-                     writing one needs the allocation-table maintenance that is \
-                     deliberately out of the read plan's scope",
+                    "is a {:?} file, and this host does not write an update or a \
+                     delete to one -- a v6 record's position names a logical \
+                     page, and `pages::write_record`/`pages::delete_record` seek \
+                     to it as a literal byte offset. `Self::insert` no longer \
+                     shares this refusal (see `Self::insert_v6`), but neither \
+                     rewriting a record in place nor splicing one off the free \
+                     list has been made v6-safe",
                     self.geometry.version
                 ),
             });
@@ -871,6 +874,245 @@ impl<A: Abi> Block<A> {
         }
     }
 
+    /// Insert a record into a v6 file.
+    ///
+    /// The v5 half of [`Self::insert`] seeks a physical offset and writes one
+    /// slot; this reads the whole file into memory, mutates that copy through
+    /// [`v6::Map::claim`], [`v6::Map::relocate`] and [`v6::write_fcr`], and
+    /// writes it back once -- the same shape those three functions already
+    /// use internally, because every one of them is itself a
+    /// read-modify-append-elsewhere-and-flip-the-shadow-pair operation, not
+    /// an in-place edit.
+    ///
+    /// # Scope, stated rather than guessed past
+    ///
+    /// **Every key must be unique** (no duplicates), **belong to a single
+    /// `"PP"` allocation-table block**, and **have an index that still fits
+    /// one page after this record is added.** Each boundary is a real,
+    /// separate mechanism this host has not measured or implemented: a
+    /// duplicate key's chain is written into the records themselves by
+    /// [`Self::reindex`] (`pages::Shape::duplicates`'s own doc comment),
+    /// which is not v6-aware; a second allocation-table block's placement is
+    /// [`v6::Map`]'s own stated unknown (Evidence 5); and an index that
+    /// outgrows one page needs interior nodes placed on their own claimed,
+    /// relocatable pages, which nothing here does. All three are checked for
+    /// every key **before** anything is written, so a refusal never leaves
+    /// some keys' indexes updated and others not.
+    ///
+    /// # What is measured, not invented
+    ///
+    /// Every mechanism below -- claiming the record's own page, relocating
+    /// each key's root rather than editing it in place, which byte offsets
+    /// of the file control record change and which (`fcr::PAGES`) does not
+    /// -- was measured against genuine Btrieve 6.15 running under Wine
+    /// (`crtprobe.exe`, `tools/btrieve-oracle/`, 2026-08-15), not assumed
+    /// from the v5 shape. See [`v6::Map::relocate`]'s doc comment for the
+    /// measurement that found relocation-on-every-write, and
+    /// [`v6::write_fcr`]'s for the file-control-record fields.
+    ///
+    /// A v6 key's root, read from [`pages::fcr::KEY_ROOT`], is not a bare
+    /// page number the way a v5 key's is: bit 31 is set and the low 31 bits
+    /// are the root's **logical** id, resolved through [`v6::Map`] exactly
+    /// like a record's own position is. Measured on every key this host has
+    /// seen; a root without that bit is refused rather than assumed to be
+    /// something else.
+    ///
+    /// # Errors
+    ///
+    /// If any key permits duplicates, more than one `"PP"` block exists, any
+    /// key's root does not carry the v6 marker bit, any key's rebuilt index
+    /// would need more than one page, or the file cannot be read or written.
+    fn insert_v6(&mut self, bytes: Vec<u8>) -> Result<u32, BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        for key in &self.keys {
+            if key.duplicates {
+                return Err(fail(format!(
+                    "key {}: permits duplicate values, and this host does not \
+                     yet maintain a v6 duplicate key's index on insert",
+                    key.number
+                )));
+            }
+        }
+
+        let page_size = self.geometry.page;
+        let page_size_usize = usize::from(page_size);
+        let physical = usize::from(self.geometry.physical);
+        let reclen = usize::from(self.geometry.reclen);
+        // The two-byte v6 slot marker (Evidence 1b, `records.rs`'s
+        // `V6_SLOT_MARKER`) plus the record body must fit the physical slot
+        // this file declares -- the same shape `records::walk_v6` already
+        // refuses to read, checked again here because writing a record that
+        // could never be read back is the identical silent corruption
+        // `writable`'s old blanket refusal existed to prevent.
+        if physical < reclen + 2 {
+            return Err(fail(format!(
+                "a {reclen}-byte record does not fit a {physical}-byte v6 \
+                 physical slot once the two-byte slot marker is counted"
+            )));
+        }
+
+        let mut file = std::fs::read(&self.path).map_err(|e| {
+            fail(format!("{}: {e}", self.path.display()))
+        })?;
+
+        // The record's own page: one live claim, one record, matching
+        // `v6::Map::claim`'s own stated scope ("always appends; never
+        // reuses a freed page"). Real Btrieve packs several records per
+        // claimed page once one exists (measured: a second insert added to
+        // the same physical page rather than claiming a new one) -- this
+        // host does not yet find and fill that room, so every v6 insert
+        // costs a whole page. Format-valid, not space-efficient; nothing
+        // downstream distinguishes the two.
+        let mut content = vec![0u8; page_size_usize];
+        // Data bit set, stamp 1 -- `Header`'s own encoding, applied by hand
+        // because `content`'s first four bytes (tag, logical id) are
+        // `v6::Map::claim`'s to fill in, not this function's; see its doc
+        // comment on `content`.
+        content[4..6].copy_from_slice(&0x8001u16.to_le_bytes());
+        content[usize::from(pages::HEADER)..usize::from(pages::HEADER) + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        let body_at = usize::from(pages::HEADER) + 2;
+        content[body_at..body_at + bytes.len()].copy_from_slice(&bytes);
+
+        let new_logical = v6::Map::claim(&mut file, page_size, &content, [0x00, 0x44])
+            .map_err(|why| fail(format!("claiming a page for the new record: {why}")))?;
+
+        let layout = pages::Layout {
+            page: page_size,
+            physical: self.geometry.physical,
+            pages: self.geometry.pages,
+        };
+        let new_position = layout.position(new_logical, 0);
+
+        // The model, updated on a copy first: every key's index below is
+        // built from this, and nothing commits to `self.records` until the
+        // whole operation -- every key's index, the file control record,
+        // the disk write -- has succeeded. A write that fails partway must
+        // leave the model exactly where a fresh read of the untouched file
+        // would put it.
+        let mut records_clone = self
+            .records
+            .as_ref()
+            .expect("Self::insert calls Self::records() before this")
+            .clone();
+        records_clone
+            .insert(&self.keys, new_position, bytes.clone())
+            .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
+
+        // Which physical copy of the file control record is live *right
+        // now* -- read straight from `file`, which `v6::Map::claim` above
+        // never touches (it only ever appends), so this is still the same
+        // pair `Self::records` opened the file with.
+        let fcr_word = |page: usize, offset: usize| -> u16 {
+            let at = page * page_size_usize + offset;
+            u16::from_le_bytes([file[at], file[at + 1]])
+        };
+        let live_fcr = match fcr_word(0, at::GENERATION).cmp(&fcr_word(1, at::GENERATION)) {
+            std::cmp::Ordering::Greater => 0usize,
+            std::cmp::Ordering::Less => 1usize,
+            std::cmp::Ordering::Equal => {
+                return Err(fail(format!(
+                    "both file-control-record copies claim generation {}, and \
+                     there is no rule measured for choosing between them",
+                    fcr_word(0, at::GENERATION)
+                )));
+            }
+        };
+        let fcr = file[live_fcr * page_size_usize..][..page_size_usize].to_vec();
+
+        let shift = records_clone.key_shift();
+        let mut relocations: Vec<(u32, Vec<u8>)> = Vec::with_capacity(self.keys.len());
+        let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
+
+        for key in &self.keys {
+            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
+                fail(format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                ))
+            })?;
+            let mut entries: Vec<pages::Entry> = Vec::with_capacity(len);
+            for n in 0..len {
+                let record = records_clone.ordered(key.number, n).expect("in range");
+                entries.push(pages::Entry::unique(
+                    key.extract(&records::keyed(shift, &record.bytes)),
+                    record.position,
+                ));
+            }
+
+            let built = pages::build_index(layout, &entries, key.shape())
+                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
+            if built.nodes.len() != 1 {
+                return Err(fail(format!(
+                    "key {}: {len} records need {} index pages, and this host \
+                     only maintains a v6 key whose whole index fits one",
+                    key.number,
+                    built.nodes.len()
+                )));
+            }
+
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let root_at = definition + pages::fcr::KEY_ROOT;
+            let raw_root = pages::long(&fcr[root_at..root_at + 4]);
+            if raw_root & 0x8000_0000 == 0 {
+                return Err(fail(format!(
+                    "key {}: root {raw_root:#x} does not carry the v6 marker \
+                     bit (0x80000000) this host's own measurement found on \
+                     every v6 key it has seen -- refusing rather than \
+                     guessing at a shape nothing has measured",
+                    key.number
+                )));
+            }
+            let root_logical = raw_root & 0x7fff_ffff;
+
+            relocations.push((root_logical, built.nodes[0].image.clone()));
+            key_record_counts.push((
+                definition + pages::fcr::KEY_RECORDS,
+                u32::try_from(len).expect("far fewer records than u32::MAX"),
+            ));
+        }
+
+        // Every key's index fits; now the writes actually happen. Relocating
+        // a key's root before the file control record's own write matches
+        // `Self::reindex`'s own ordering (`Self::reindex`'s doc comment: the
+        // index and the record count it describes should never be
+        // observably out of step for longer than one write has to leave
+        // them).
+        for (logical, content) in &relocations {
+            v6::Map::relocate(&mut file, page_size, *logical, content, [0x00, 0x80]).map_err(
+                |why| fail(format!("relocating the index root at logical {logical}: {why}")),
+            )?;
+        }
+
+        let total_records =
+            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts)
+            .map_err(|why| fail(format!("updating the file control record: {why}")))?;
+
+        // The last point before this write actually changes anything on
+        // disk -- see `Self::capture_for_journal`'s doc comment for why it
+        // is taken here rather than at the top of the function.
+        self.capture_for_journal()?;
+
+        std::fs::write(&self.path, &file).map_err(|e| {
+            fail(format!("{}: writing the file: {e}", self.path.display()))
+        })?;
+
+        self.records = Some(records_clone);
+        self.geometry.records = total_records;
+        self.geometry.pages = u32::try_from(file.len())
+            .expect("a Btrieve file under four gigabytes")
+            / u32::from(page_size);
+        self.dirty = true;
+
+        Ok(new_position)
+    }
+
     /// Add a record, choosing its slot and writing it.
     ///
     /// Returns the file position it went to, which is what `absbtv` would
@@ -909,7 +1151,6 @@ impl<A: Abi> Block<A> {
     /// records, or the file cannot be written.
     pub fn insert(&mut self, bytes: &[u8]) -> Result<u32, BtvError> {
         self.records()?;
-        self.writable()?;
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -927,6 +1168,21 @@ impl<A: Abi> Block<A> {
         }
 
         let bytes = normalized(bytes, self.geometry.reclen);
+
+        // v6 diverges completely below this point -- a record's position
+        // names a *logical* page, not a byte offset, so every remaining line
+        // of this function (`pages::Layout::next_slot`, `pages::write_record`
+        // seeking to a literal offset) is v5-only. `Self::insert_v6` is the
+        // v6 equivalent, with its own narrower scope; see its doc comment.
+        if self.geometry.version == Version::V6 {
+            return self.insert_v6(bytes);
+        }
+
+        // Reached only for v5 now, but kept explicit rather than deleted:
+        // `writable` is what refuses a version this match does not
+        // recognise, and a future third version should hit that refusal
+        // here rather than fall through to v5's own arithmetic.
+        self.writable()?;
 
         let layout = pages::Layout {
             page: self.geometry.page,
@@ -2774,7 +3030,13 @@ mod tests {
         bytes
     }
 
-    /// Writing a v6 file is refused, and the refusal is load-bearing.
+    /// Updating or deleting from a v6 file is refused, and the refusal is
+    /// load-bearing. Inserting is not -- see
+    /// `a_v6_insert_lands_on_a_fresh_single_key_file` -- but this file's one
+    /// key permits duplicates, which `Self::insert_v6` refuses for its own,
+    /// different reason (Task 13's stated scope: a duplicate key's chain is
+    /// not v6-aware yet), so it still exercises "nothing on disk moves"
+    /// end to end.
     ///
     /// Until Task 5 the write path was v6-safe only by accident:
     /// `Records::read` refused every v6 file, and `insert`/`update` call it
@@ -2784,11 +3046,13 @@ mod tests {
     /// offset, while a v6 position carries a **logical** page id (Evidence
     /// 1c). On `DUPKEY30.DAT` logical 2 is physical 10, so an update would
     /// have written over a different page entirely and reported success.
+    /// Task 13 gave insert its own v6-safe path; update and delete still
+    /// have not, and still refuse the same way.
     ///
     /// Found by Task 5's code review, not by any test: every v6 test in this
     /// crate reads.
     #[test]
-    fn a_v6_file_is_read_but_never_written() {
+    fn a_v6_file_is_read_but_never_updated_or_deleted() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
         let mut block = block(path.clone());
@@ -2803,8 +3067,8 @@ mod tests {
         assert_eq!(block.records().expect("v6 reads").len(), 30);
 
         let bytes = vec![0u8; usize::from(block.geometry.reclen)];
-        let e = block.insert(&bytes).expect_err("v6 inserts are refused");
-        assert!(e.why.contains("does not write"), "{e}");
+        let e = block.insert(&bytes).expect_err("this file's duplicate key is refused");
+        assert!(e.why.contains("permits duplicate values"), "{e}");
         let at = block
             .records()
             .expect("read")
@@ -2818,6 +3082,97 @@ mod tests {
 
         // And the file on disk is untouched.
         assert_eq!(std::fs::read(&path).expect("readable"), fcr, "not one byte written");
+    }
+
+    /// `Self::insert_v6`'s narrow scope actually works: a fresh, virgin,
+    /// one-key v6 file (`V6EMPTY1KEY.DAT`, minted by genuine Btrieve 6.15
+    /// itself -- `crtprobe.exe create`, no records inserted) takes one
+    /// record, and a *fresh* `Block` over the same file -- cache dropped,
+    /// nothing carried over in memory -- reads it back correctly. That
+    /// second read is the whole point: `Self::records`'s v6 path
+    /// (`records::walk_v6`) resolves everything through
+    /// [`v6::Map::read`], built from what is on disk, not from anything
+    /// this test's own `Block` remembers writing.
+    #[test]
+    fn a_v6_insert_lands_on_a_fresh_single_key_file() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let dir = crate::testing::scratch("btv-v6-insert");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&fixture, &path).expect("copy fixture");
+
+        let mut block = block(path.clone());
+        block.name = "V6EMPTY1KEY.DAT".to_owned();
+        block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.maxlen = block.geometry.reclen;
+
+        assert_eq!(block.records().expect("v6 reads").len(), 0);
+
+        let mut bytes = vec![0u8; usize::from(block.geometry.reclen)];
+        bytes[..4].copy_from_slice(b"ABCD");
+        let position = block
+            .insert(&bytes)
+            .expect("a single unique-keyed, single-block, single-page-index v6 insert");
+
+        assert_eq!(block.records().expect("still loaded").len(), 1);
+        let record = block.records().expect("loaded").physical(0).expect("the record");
+        assert_eq!(record.position, position);
+        assert_eq!(record.bytes, bytes);
+
+        // The trap `a_block_that_writes_is_readable_after_its_cache_is_dropped`
+        // names for v5, exercised here for v6: a fresh `Records::read` of the
+        // file this just wrote to has to find the record through the
+        // allocation table and the file control record's own count, not
+        // through anything this `Block` still remembers.
+        block.records = None;
+        let reread = block.records().expect("re-reads after writing");
+        assert_eq!(reread.len(), 1);
+        let record = reread.physical(0).expect("the record, from a fresh read");
+        assert_eq!(record.position, position);
+        assert_eq!(record.bytes, bytes);
+
+        // Everything above reads the file back through `Records::read`, which
+        // finds records by walking *data* pages. It never consults the key
+        // index -- so every assertion above passes just as happily on a file
+        // whose B-tree is garbage, and the index is half of what `insert_v6`
+        // writes.
+        //
+        // Measured, not argued: mutating the index entries this insert builds
+        // to carry `record.position ^ 0xDEAD` leaves every assertion above
+        // green, while genuine Btrieve 6.15 rejects the resulting file
+        // outright -- `walk 0` reports "walked 0 (stopped early)" and
+        // `descend 0` reports DESCEND MISMATCH with "collect end 2 (I/O
+        // error)". That is a silently-corrupt file this suite called correct.
+        //
+        // So this reaches the index the way the engine does and asserts it
+        // points at the record: resolve key 0's root through the file control
+        // record's own `KEY_ROOT` (v6 marker bit stripped), map that *logical*
+        // id to a physical page through the `"PP"` allocation table, and decode
+        // the page. Independent of the entry construction it is checking --
+        // `position` here is the value `insert` returned and the data-page read
+        // above already confirmed.
+        let file = std::fs::read(&path).expect("readable after the insert");
+        let page_size = block.geometry.page;
+        let map = v6::Map::read(&file, page_size).expect("the allocation table");
+        let key = &block.keys[0];
+        let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+        let root_at = definition + pages::fcr::KEY_ROOT;
+        let raw_root = pages::long(&file[root_at..root_at + 4]);
+        let root_logical = raw_root & 0x7fff_ffff;
+        let root_physical = map
+            .physical(root_logical)
+            .expect("the key's root is a claimed logical page");
+        let start = root_physical as usize * usize::from(page_size);
+        let page = &file[start..start + usize::from(page_size)];
+        let index = pages::decode_index_page(page, key.shape()).expect("the root index page");
+        assert!(
+            index.entries.iter().any(|(_, head, _)| *head == position),
+            "the key index must point at the record the insert wrote \
+             (position {position}), but the root page's entries are {:?}",
+            index.entries.iter().map(|(_, head, _)| *head).collect::<Vec<_>>()
+        );
     }
 
     /// The trap the plan names: `geometry` is a `Copy` struct held by value on
