@@ -52,6 +52,54 @@
 //! than assumed from the op-code range, because the range alone reads as
 //! "11 = Lowest, 12 = Highest" and that is wrong: 11 is `AtMost`.
 //!
+//! **`+50`, "Get Key", is not a tenth family.** Real Btrieve's own alias for
+//! ops 55-63 (Programmer's Reference pp. 113-115) -- "the Get Key bias
+//! allows you to perform a Get operation without actually retrieving a data
+//! record," answering with the key in the Key Buffer and status 0, while the
+//! Data Buffer is untouched. [`Op::from_query`] already reproduces the raw
+//! arithmetic (`code - 50`), and `shims/btrieve.rs`'s `qrybtv` (`:1098`)
+//! already routes 55-63 through the same `locate`/`answer_with_key` engine
+//! `obtbtv` uses, passing `into: None` so only the key is written back --
+//! this was true before this task and needed no change. **Not reproduced
+//! here**: p. 114's duplicate-skip rule ("the MicroKernel ignores the
+//! duplicate instances of the current retrieved key value" -- a `Get
+//! Key`/`Get Equal` on a key with eight `Smith`s and one `Smythe` leaves the
+//! logical next position on `Smythe`, not the second `Smith`). Reproducing
+//! that needs [`Block::query`]'s cursor to remember *which* operation found
+//! it, not only where -- a real change to [`Cursor`], which lives in
+//! `btrieve.rs` and is out of this file's freeze. Flagged rather than
+//! silently matched: a caller driving [`Block::get`] through op 55 and
+//! discarding [`Delivery::bytes`] gets the record's key correctly but the
+//! *next* op after it would walk every duplicate, not skip them.
+//!
+//! # File- and session-level administrative operations
+//!
+//! Task 10 of `docs/plans/2026-08-15-host-api-surface-track-b.md` added six
+//! more op codes: `17`/`18` (Set/Get Directory), `26` (Version), `28`
+//! (Reset), `29`/`30` (Set/Clear Owner), `16` (Extend). None of them
+//! position a file the way everything above this section does -- two of
+//! them ([`WorkingDirectory`]'s pair, and [`EngineVersion`]) do not even
+//! take a [`Block`], because real Btrieve's own Sent/Returned tables for
+//! them have no Position Block column at all (Programmer's Reference
+//! pp. 104, 163, 213). They are grouped here rather than given a new file
+//! because they answer real Btrieve op codes the same way everything above
+//! does, and this module -- not `btrieve.rs`, under its own commit freeze,
+//! and not `shims/btrieve.rs`, under a second one -- is where op-code
+//! answers land per this track's own architecture note.
+//!
+//! Two of the six ([`Block::set_owner`]/[`Block::clear_owner`] and
+//! [`LockTable::clear_all`] for Reset) need session state this module does
+//! track (an [`OwnerTable`], sibling to [`LockTable`]) or already does
+//! ([`LockTable`] itself); [`Block::extend`] needs no state at all. None of
+//! the six needs a new field on [`Block`], which is why all six fit here
+//! without touching `btrieve.rs` -- except two gaps, named at their own
+//! doc comments rather than worked around: Reset's "abort every open
+//! transaction and close every open file" is `Btrieve`-level orchestration
+//! this module cannot reach (it has no notion of "every currently open
+//! block"), and `16 Extend`'s "already extended" one-shot rule needs a
+//! per-`Block` flag `Block`'s fixed field list does not have. Both are
+//! reported in this task's own final report, not silently worked around.
+//!
 //! # The returned-length contract
 //!
 //! `DFAAPI.C`'s `lastlen`/`dfaLastLen()` (`:934,948`) is Btrieve's own
@@ -138,7 +186,7 @@ use std::fmt;
 use crate::abi::Abi;
 
 use super::keys::Key;
-use super::{Block, BtvError, Cursor};
+use super::{Block, BtvError, Cursor, Version};
 
 /// The nine comparisons Btrieve's Query (55-63) and Get (5-13) families both
 /// make -- the same nine, fifty apart, per `BTVSTF.H`'s `q*btv` macros and
@@ -323,6 +371,45 @@ pub enum OpError {
 
     /// The records could not be read.
     Records(BtvError),
+
+    /// [`Block::set_owner`]/[`Block::clear_owner`] with a transaction
+    /// active. Real Btrieve status 41, "the MicroKernel does not allow the
+    /// attempted operation" -- `BtrieveStatusCodes.pdf` p. 11 names Set
+    /// Owner, Clear Owner, Create Index and Drop Index by name as the
+    /// operations this covers, and the Programmer's Reference states the
+    /// same precondition on both operations directly ("No transactions can
+    /// be active", pp. 41, 165).
+    NotAllowedDuringTransaction,
+
+    /// [`Block::set_owner`] on a file that already has an owner. Real
+    /// Btrieve status 50, "the file owner is already set" -- Programmer's
+    /// Reference p. 167. Use [`Block::clear_owner`] first.
+    OwnerAlreadySet,
+
+    /// [`Block::set_owner`] with a name longer than the eight characters
+    /// real Btrieve allows -- Programmer's Reference p. 165, "The owner
+    /// name can be up to eight characters long." Real status 51, "the
+    /// owner name is invalid" (p. 167); that status also covers the
+    /// Data-Buffer/Key-Buffer mismatch check p. 166 describes, which is a
+    /// 16-bit-ABI marshalling fact this ABI-independent type cannot see
+    /// and so does not check.
+    OwnerNameInvalid { len: usize },
+
+    /// [`WorkingDirectory::set`] with an empty path. Real Btrieve status
+    /// 35, "the application encountered a directory error... a Set
+    /// Directory operation specified an invalid pathname" --
+    /// `BtrieveStatusCodes.pdf` p. 10.
+    InvalidDirectory,
+
+    /// [`Block::extend`] (Btrieve op 16) against a v6-format file. Real
+    /// engines removed `Extend` in 6.0 -- it is absent from every entry in
+    /// the Programmer's Reference's own alphabetical operation list
+    /// (pp. 34-35) -- so a v6-capable engine given op 16 answers the way it
+    /// answers any operation code it does not recognise: status 1, "the
+    /// specified operation does not exist or is not valid"
+    /// (`BtrieveStatusCodes.pdf` p. 1). See [`Block::extend`]'s own doc
+    /// comment for why a v5 file is not refused the same way.
+    ObsoleteOperation,
 }
 
 impl fmt::Display for OpError {
@@ -350,6 +437,27 @@ impl fmt::Display for OpError {
                 "the cursor names a record the model no longer holds"
             ),
             Self::Records(e) => write!(f, "{e}"),
+            Self::NotAllowedDuringTransaction => write!(
+                f,
+                "the MicroKernel does not allow this operation while a transaction is active \
+                 (real Btrieve status 41)"
+            ),
+            Self::OwnerAlreadySet => write!(
+                f,
+                "the file owner is already set (real Btrieve status 50); clear it first"
+            ),
+            Self::OwnerNameInvalid { len } => write!(
+                f,
+                "an owner name must be at most 8 bytes, not {len} (real Btrieve status 51)"
+            ),
+            Self::InvalidDirectory => write!(
+                f,
+                "not a usable directory path (real Btrieve status 35)"
+            ),
+            Self::ObsoleteOperation => write!(
+                f,
+                "Extend (op 16) does not exist on a v6-format file (real Btrieve status 1)"
+            ),
         }
     }
 }
@@ -534,6 +642,21 @@ impl LockTable {
     /// Whether this session holds no locks at all.
     pub fn is_empty(&self) -> bool {
         self.held.is_empty()
+    }
+
+    /// Btrieve op 28, `Reset`'s own contribution to this table: "releases
+    /// all locks held" (Programmer's Reference p. 162), for every
+    /// [`Block`] at once -- unlike [`Self::release_all_for`], which Reset
+    /// is not. **Only one third of Reset.** The other two -- "aborts any
+    /// active transactions" and "closes all open files" (p. 162) -- are
+    /// facts about every currently-open [`Block`] and its `txn_active`
+    /// flag, which this table does not enumerate and `Btrieve` (in
+    /// `btrieve.rs`, out of this file's freeze) does. Reported rather than
+    /// worked around: a real Reset wrapper still has to loop every open
+    /// block, abort it if `txn_active`, and close it, before or after
+    /// calling this.
+    pub fn clear_all(&mut self) {
+        self.held.clear();
     }
 }
 
@@ -936,6 +1059,378 @@ impl<A: Abi> Block<A> {
         };
 
         Ok(Delivery { bytes, truncated, key })
+    }
+}
+
+/// Btrieve op 26, `Version` -- the MicroKernel/Requester identification a
+/// module gets back verbatim (Programmer's Reference pp. 213-216). **No
+/// file needs to be open and no [`Block`] is involved**: p. 213's own
+/// Sent/Returned table has no Position Block column at all, unlike every
+/// operation above this point in the file, and the body opens "Either the
+/// MicroKernel or the Requester must be loaded" -- a fact about the
+/// process, not about any one open file.
+///
+/// **The `(version, revision, engine)` triple to advertise is not this
+/// module's decision, and is not filled in here.** No surveyed module
+/// calls it -- `BTVSTF.H` has no `ver*btv` macro, and none of the three
+/// generations of `PLBTVSTF.C` surveyed for Task 1 wraps op 26 -- so there
+/// is no vendor call site measuring what a caller expects back, and
+/// inventing a specific number this host has never been told to claim is
+/// exactly the "plausible zero" this track's own Global Constraints forbid.
+/// What *is* measured, and complete, is the wire layout below
+/// ([`Self::encode`]): Table 2-29 (p. 214), worked example p. 215 ("07 00
+/// 00 00 53" is version 7, revision 0, engine `S`, little-endian
+/// throughout). Choosing the actual triple to advertise -- this crate's own
+/// repeatedly-cited oracle is Pervasive Btrieve 6.15, the least-invented
+/// candidate if one is ever needed -- is Task 14's integration call, not
+/// this file's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineVersion {
+    /// Btrieve's own major version number, e.g. `6` for "6.x".
+    pub version: u16,
+    /// Btrieve's own revision number, e.g. `15` for "6.15".
+    pub revision: u16,
+    /// The one-byte "Requester or Engine Type" identifier, Table 2-29
+    /// (p. 214) -- `N` (`0x4E`) for a client Requester, `S` (`0x53`) for a
+    /// NetWare server, and six others, none of which names a native Linux
+    /// host. Left for the caller to choose rather than guessed here.
+    pub engine: u8,
+}
+
+impl EngineVersion {
+    /// The 5-byte "Version Block" wire form (Table 2-29), one per
+    /// MicroKernel or Requester identified. Little-endian throughout,
+    /// matching every other multi-byte value this crate reads or writes --
+    /// measured against the worked example on p. 215.
+    pub fn encode(&self) -> [u8; 5] {
+        let mut out = [0u8; 5];
+        out[0..2].copy_from_slice(&self.version.to_le_bytes());
+        out[2..4].copy_from_slice(&self.revision.to_le_bytes());
+        out[4] = self.engine;
+        out
+    }
+}
+
+/// Btrieve ops 17 (`Set Directory`) / 18 (`Get Directory`) -- the
+/// MicroKernel's own idea of "the current directory," tracked independently
+/// of any open file (Programmer's Reference pp. 104, 163-164). Neither
+/// operation's own Sent/Returned table has a Position Block column, so this
+/// is a standalone type rather than a [`Block`] method -- the same shape as
+/// [`EngineVersion`], for the same reason.
+///
+/// **This host has exactly one logical drive.** Real Btrieve's `drive`
+/// parameter (1 = A, 2 = B, ..., 0 = "the default drive") names one of
+/// several DOS/NetWare drive letters; nothing in this codebase assigns a
+/// meaning to "drive 2" on a Linux filesystem, so [`Self::directory`]
+/// accepts and ignores it -- a stated environment reduction, not an
+/// invented per-drive behaviour, the same shape as the lock table's own
+/// "there is exactly one owner" reduction (this module's top-of-file doc).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingDirectory {
+    current: Vec<u8>,
+}
+
+/// Which of [`WorkingDirectory`]'s two operations a raw op code names --
+/// [`Op`]/[`Step`]'s own `from_code` pattern, reused here because Set
+/// Directory and Get Directory are exactly the shape that gets copied
+/// backwards: same [`WorkingDirectory`] receiver, same lone `[u8]`
+/// parameter, opposite direction of data flow. [`WorkingDirectory::dispatch`]
+/// is the one place this task's own mutation ("swap Set Directory and Get
+/// Directory") is aimed at, rather than at [`WorkingDirectory::set`]/
+/// [`WorkingDirectory::get`] individually.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryOp {
+    /// Op 17.
+    Set,
+    /// Op 18.
+    Get,
+}
+
+impl DirectoryOp {
+    /// The directory operation a raw op code names, or `None` for one
+    /// outside the pair.
+    pub fn from_code(code: i16) -> Option<Self> {
+        match code {
+            17 => Some(Self::Set),
+            18 => Some(Self::Get),
+            _ => None,
+        }
+    }
+}
+
+impl WorkingDirectory {
+    /// A working directory starting at `initial` -- not NUL-terminated;
+    /// see [`Self::get`] for where the terminator is added back.
+    pub fn new(initial: impl Into<Vec<u8>>) -> Self {
+        Self { current: initial.into() }
+    }
+
+    /// Op 17 -- replace or extend the current directory, per p. 163.
+    /// `path` is the module's own path bytes, already stripped of its
+    /// trailing NUL.
+    ///
+    /// **"Complete path" is measured against this host's own filesystem
+    /// convention, not DOS's.** p. 163: "If you do not specify the
+    /// complete path for the directory, the MicroKernel appends the
+    /// directory path specified in the Key Buffer to the current
+    /// directory." On this host, a path beginning with `/` is complete and
+    /// replaces the current directory outright; anything else is appended.
+    ///
+    /// # Errors
+    /// [`OpError::InvalidDirectory`] on an empty path. This host does not
+    /// check that the resulting path exists on disk -- p. 164 documents no
+    /// such prerequisite either, and [`crate::btrieve::Btrieve::open`] (out
+    /// of this module's scope) is what would fail on a nonexistent
+    /// directory in practice.
+    pub fn set(&mut self, path: &[u8]) -> Result<(), OpError> {
+        if path.is_empty() {
+            return Err(OpError::InvalidDirectory);
+        }
+        if path[0] == b'/' {
+            self.current = path.to_vec();
+        } else {
+            if !self.current.is_empty() && !self.current.ends_with(b"/") {
+                self.current.push(b'/');
+            }
+            self.current.extend_from_slice(path);
+        }
+        Ok(())
+    }
+
+    /// Op 18 -- the current directory, NUL-terminated as p. 104 requires
+    /// ("The MicroKernel returns the current directory, terminated by a
+    /// binary 0, in the Key Buffer").
+    pub fn get(&self) -> Vec<u8> {
+        let mut out = self.current.clone();
+        out.push(0);
+        out
+    }
+
+    /// Route a raw op code to [`Self::set`]/[`Self::get`] -- see
+    /// [`DirectoryOp`]'s own doc comment for why this exists as a separate
+    /// function rather than being inlined at each call site. Op 17 answers
+    /// with an empty buffer (real Btrieve returns nothing in the Data
+    /// Buffer for Set Directory, p. 163's own table); op 18 answers with
+    /// [`Self::get`]'s NUL-terminated bytes.
+    pub fn dispatch(&mut self, op: DirectoryOp, path: &[u8]) -> Result<Vec<u8>, OpError> {
+        match op {
+            DirectoryOp::Set => {
+                self.set(path)?;
+                Ok(Vec::new())
+            }
+            DirectoryOp::Get => Ok(self.get()),
+        }
+    }
+}
+
+/// Real Btrieve's four Set Owner access/encryption codes, Table 2-19
+/// (p. 166).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessCode {
+    /// 0 -- requires the owner name for any access; no encryption.
+    RequireForAnyAccess,
+    /// 1 -- read-only access is permitted without the owner name; no
+    /// encryption.
+    PermitReadOnly,
+    /// 2 -- like [`Self::RequireForAnyAccess`], and the MicroKernel
+    /// encrypts the file's data.
+    RequireForAnyAccessEncrypted,
+    /// 3 -- like [`Self::PermitReadOnly`], and the MicroKernel encrypts the
+    /// file's data.
+    PermitReadOnlyEncrypted,
+}
+
+impl AccessCode {
+    /// The access code Table 2-19's own Key Number value names, or `None`
+    /// for one outside the four the MicroKernel defines.
+    pub fn from_code(code: i16) -> Option<Self> {
+        match code {
+            0 => Some(Self::RequireForAnyAccess),
+            1 => Some(Self::PermitReadOnly),
+            2 => Some(Self::RequireForAnyAccessEncrypted),
+            3 => Some(Self::PermitReadOnlyEncrypted),
+            _ => None,
+        }
+    }
+}
+
+/// One [`Block`]'s owner, as [`Block::set_owner`] recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Owned {
+    block: BlockId,
+    name: Vec<u8>,
+    access: AccessCode,
+}
+
+/// This session's Set Owner assignments -- one table, shared by every open
+/// [`Block`], the same shape as [`LockTable`] and for the same reason: it
+/// lives beside the blocks (on `Btrieve`, `crates/mbbs/src/btrieve.rs`)
+/// rather than inside any one of them, because nothing in [`Block`]'s own
+/// fixed field list (`btrieve.rs`, out of this file's freeze) has anywhere
+/// to hold one.
+///
+/// **Gating access on the name, not encrypting the data, is what this
+/// tracks.** Real Btrieve's Set Owner also encrypts every page of the file
+/// when [`AccessCode::RequireForAnyAccessEncrypted`]/
+/// [`AccessCode::PermitReadOnlyEncrypted`] is asked for (pp. 166-167) --
+/// page-level work this module does not own (`pages.rs`, per the plan's own
+/// File Structure table). [`AccessCode`] is still recorded in full, so a
+/// caller can see which of the four was asked for even though only the
+/// gating half is honoured.
+#[derive(Debug, Default)]
+pub struct OwnerTable {
+    set: Vec<Owned>,
+}
+
+impl OwnerTable {
+    /// This block's owner name, if [`Block::set_owner`] assigned one.
+    pub fn name(&self, block: BlockId) -> Option<&[u8]> {
+        self.set.iter().find(|o| o.block == block).map(|o| o.name.as_slice())
+    }
+
+    /// This block's [`AccessCode`], if one was assigned.
+    pub fn access(&self, block: BlockId) -> Option<AccessCode> {
+        self.set.iter().find(|o| o.block == block).map(|o| o.access)
+    }
+
+    fn set(&mut self, block: BlockId, name: Vec<u8>, access: AccessCode) {
+        self.set.push(Owned { block, name, access });
+    }
+
+    /// Remove this block's owner, if any -- [`Block::clear_owner`]'s own
+    /// no-op-if-absent contract (see that method's doc comment).
+    pub fn clear(&mut self, block: BlockId) {
+        self.set.retain(|o| o.block != block);
+    }
+}
+
+/// Which of [`Block::set_owner`]/[`Block::clear_owner`] a raw op code
+/// names -- the same [`DirectoryOp`]/`Op`/`Step` pattern, and the same
+/// reason: Set Owner (29) and Clear Owner (30) take the identical call
+/// shape (a [`Block`] and an [`OwnerTable`]) and differ only in which
+/// one-line method runs. [`Block::owner`] is what this task's own mutation
+/// ("swap Set Owner and Clear Owner") is aimed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerOp {
+    /// Op 29.
+    Set,
+    /// Op 30.
+    Clear,
+}
+
+impl OwnerOp {
+    /// The owner operation a raw op code names, or `None` for one outside
+    /// the pair.
+    pub fn from_code(code: i16) -> Option<Self> {
+        match code {
+            29 => Some(Self::Set),
+            30 => Some(Self::Clear),
+            _ => None,
+        }
+    }
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 29, `Set Owner` -- pp. 165-167. Assigns `name` (at most
+    /// eight bytes, p. 165: "The owner name can be up to eight characters
+    /// long") to this block's file in `owners`, gating future access on it.
+    /// See [`OwnerTable`]'s own doc comment for what "gating" does and does
+    /// not cover.
+    ///
+    /// # Errors
+    /// [`OpError::NotAllowedDuringTransaction`] -- status 41. [`OpError::
+    /// OwnerAlreadySet`] -- status 50, if `owners` already holds a name for
+    /// this block; [`Block::clear_owner`] first. [`OpError::
+    /// OwnerNameInvalid`] -- status 51, if `name` is longer than eight
+    /// bytes.
+    pub fn set_owner(&self, name: &[u8], access: AccessCode, owners: &mut OwnerTable) -> Result<(), OpError> {
+        if self.txn_active {
+            return Err(OpError::NotAllowedDuringTransaction);
+        }
+        if owners.name(self.id).is_some() {
+            return Err(OpError::OwnerAlreadySet);
+        }
+        if name.len() > 8 {
+            return Err(OpError::OwnerNameInvalid { len: name.len() });
+        }
+        owners.set(self.id, name.to_vec(), access);
+        Ok(())
+    }
+
+    /// Btrieve op 30, `Clear Owner` -- pp. 41-42. Removes whatever owner
+    /// [`Block::set_owner`] assigned. **Always succeeds even if no owner
+    /// was ever set** -- p. 41's own procedure states no prerequisite that
+    /// one exists, the mirror of [`Block::unlock`]'s identical
+    /// no-op-on-nothing-to-undo shape.
+    ///
+    /// # Errors
+    /// [`OpError::NotAllowedDuringTransaction`] -- status 41, the same
+    /// precondition [`Block::set_owner`] enforces (p. 41: "No transactions
+    /// can be active").
+    pub fn clear_owner(&self, owners: &mut OwnerTable) -> Result<(), OpError> {
+        if self.txn_active {
+            return Err(OpError::NotAllowedDuringTransaction);
+        }
+        owners.clear(self.id);
+        Ok(())
+    }
+
+    /// Route a raw op code to [`Self::set_owner`]/[`Self::clear_owner`] --
+    /// see [`OwnerOp`]'s own doc comment for why. `name`/`access` are
+    /// ignored for [`OwnerOp::Clear`], matching real Clear Owner's own
+    /// Sent parameter table (p. 41): Operation Code and Position Block
+    /// only.
+    pub fn owner(&self, op: OwnerOp, name: &[u8], access: AccessCode, owners: &mut OwnerTable) -> Result<(), OpError> {
+        match op {
+            OwnerOp::Set => self.set_owner(name, access, owners),
+            OwnerOp::Clear => self.clear_owner(owners),
+        }
+    }
+
+    /// Btrieve op 16, `Extend` -- absent from this crate's Programmer's
+    /// Reference (a 6.15 manual): its own alphabetical operation list
+    /// (pp. 34-35, every entry in Chapter 2 checked against it) has no
+    /// "Extend" heading at all, the direct evidence that real engines
+    /// dropped it in 6.0. **The NE modules target 5.x, where it existed**,
+    /// and this track's scope rule is explicit -- YAGNI is suspended, `16
+    /// Extend` included -- so this answers per the file's own version
+    /// rather than refusing outright:
+    ///
+    /// - **v6 file: refused**, [`OpError::ObsoleteOperation`]. Measured
+    ///   indirectly: `BtrieveStatusCodes.pdf` status 16 ("application
+    ///   encountered an expansion error," p. 4) and status 31 ("file is
+    ///   already extended," p. 9) are each marked, in the vendor's own
+    ///   text, "obsolete in MicroKernel versions 6.0 and later" -- and
+    ///   nothing in the 6.x operation table (pp. 26-35) lists op 16 at all.
+    ///   A v6-capable engine given an operation code it does not recognise
+    ///   answers status 1 (p. 1); this reproduces that rather than
+    ///   inventing a v6-specific Extend behaviour the vendor never
+    ///   documented, the same reasoning `btrieve.rs:754`'s v6 write refusal
+    ///   already uses for a different operation.
+    /// - **v5 file: succeeds.** Extend's still-current neighbour, status 32
+    ///   ("the file cannot be extended... a file which is growing larger
+    ///   than the operating system file size limit," p. 9), names its
+    ///   entire documented purpose: pre-expanding a file before it outgrows
+    ///   a DOS/NetWare partition ceiling. This host has no such ceiling --
+    ///   an ordinary file on this filesystem grows as it is written -- so
+    ///   the precondition Extend exists to satisfy already holds, and
+    ///   answering success is the documented purpose degenerating to a
+    ///   no-op here, not an invented behaviour.
+    ///
+    /// **Not tracked here: "already extended," status 31's one-extend-only
+    /// rule.** Enforcing it needs a per-[`Block`] flag this type does not
+    /// have, and [`Block`]'s field list is fixed by `btrieve.rs`, out of
+    /// this file's freeze. Reported rather than worked around: a second
+    /// `extend()` call on the same v5 [`Block`] answers success again here,
+    /// where real Btrieve would answer status 31 the second time.
+    ///
+    /// # Errors
+    /// [`OpError::ObsoleteOperation`] for a v6-format file.
+    pub fn extend(&self) -> Result<(), OpError> {
+        match self.geometry().version {
+            Version::V6 => Err(OpError::ObsoleteOperation),
+            Version::V5 => Ok(()),
+        }
     }
 }
 
@@ -1616,6 +2111,32 @@ mod tests {
         }
     }
 
+    /// Task 10's own deliverable for `+50`, "Get Key": establishing that the
+    /// *raw op codes* 55-63 already route to the right comparison, per this
+    /// task's own instruction ("this task is therefore about the raw op
+    /// code, not new semantics"). The generic loop above already proves the
+    /// arithmetic; this pins the literal numbers a caller reads off the
+    /// wire, matched against the alphabetical listing in `Get Key (+50)`'s
+    /// own entry, Programmer's Reference pp. 113-115 ("Get Key/Get Equal
+    /// (55)" through the implied 63 for Get Last).
+    #[test]
+    fn get_key_op_codes_55_to_63_are_fifty_above_the_named_get_operations() {
+        let table = [
+            (55, Op::Equal),    // Get Key / Get Equal
+            (56, Op::Next),     // Get Key / Get Next
+            (57, Op::Previous), // Get Key / Get Previous
+            (58, Op::Greater),  // Get Key / Get Greater
+            (59, Op::AtLeast),  // Get Key / Get Greater Than or Equal
+            (60, Op::Less),     // Get Key / Get Less Than
+            (61, Op::AtMost),   // Get Key / Get Less Than or Equal
+            (62, Op::Lowest),   // Get Key / Get First
+            (63, Op::Highest),  // Get Key / Get Last
+        ];
+        for (code, op) in table {
+            assert_eq!(Op::from_query(code), Some(op), "raw code {code}");
+        }
+    }
+
     #[test]
     fn step_from_code_matches_dfaapi_cs_assert() {
         assert_eq!(Step::from_code(33), Some(Step::First));
@@ -1623,5 +2144,275 @@ mod tests {
         assert_eq!(Step::from_code(24), Some(Step::Next));
         assert_eq!(Step::from_code(35), Some(Step::Previous));
         assert_eq!(Step::from_code(25), None);
+    }
+
+    // -- Task 10: the cheap operation-code families --
+
+    // Version (26)
+
+    #[test]
+    fn engine_version_encodes_little_endian_matching_the_worked_example() {
+        // Programmer's Reference p. 215: Btrieve for NetWare 7.0 answers
+        // "07 00 00 00 53" -- version 7, revision 0, engine 'S' (NetWare
+        // server, Table 2-29).
+        let v = EngineVersion { version: 7, revision: 0, engine: b'S' };
+        assert_eq!(v.encode(), [0x07, 0x00, 0x00, 0x00, 0x53]);
+    }
+
+    #[test]
+    fn engine_version_encodes_a_nonzero_revision() {
+        let v = EngineVersion { version: 6, revision: 15, engine: b'S' };
+        assert_eq!(v.encode(), [0x06, 0x00, 0x0F, 0x00, 0x53]);
+    }
+
+    // Set Directory (17) / Get Directory (18)
+
+    #[test]
+    fn get_directory_on_a_fresh_working_directory_is_just_the_terminator() {
+        let dir = WorkingDirectory::default();
+        assert_eq!(dir.get(), vec![0u8]);
+    }
+
+    #[test]
+    fn set_directory_with_an_absolute_path_replaces_it() {
+        let mut dir = WorkingDirectory::new(*b"/old/place");
+        dir.set(b"/rooms/newhaven").unwrap();
+        assert_eq!(dir.get(), b"/rooms/newhaven\0".to_vec());
+    }
+
+    #[test]
+    fn set_directory_with_a_relative_path_appends_to_the_current_one() {
+        // p. 163: "the MicroKernel appends the directory path specified in
+        // the Key Buffer to the current directory."
+        let mut dir = WorkingDirectory::new(*b"/rooms");
+        dir.set(b"newhaven").unwrap();
+        assert_eq!(dir.get(), b"/rooms/newhaven\0".to_vec());
+    }
+
+    #[test]
+    fn set_directory_with_an_empty_path_is_refused() {
+        let mut dir = WorkingDirectory::default();
+        assert_eq!(dir.set(b""), Err(OpError::InvalidDirectory));
+    }
+
+    #[test]
+    fn directory_op_from_code_matches_the_published_pair() {
+        assert_eq!(DirectoryOp::from_code(17), Some(DirectoryOp::Set));
+        assert_eq!(DirectoryOp::from_code(18), Some(DirectoryOp::Get));
+        assert_eq!(DirectoryOp::from_code(19), None, "19 is Begin Transaction, not a directory op");
+    }
+
+    /// Task 10's own named mutation: swap Set Directory and Get Directory.
+    /// Dispatching `Set` must change what a following `Get` reports, and a
+    /// swapped `dispatch` -- `Set` reading instead of writing, `Get` writing
+    /// instead of reading -- must fail this.
+    #[test]
+    fn directory_dispatch_routes_set_and_get_to_the_right_halves() {
+        let mut dir = WorkingDirectory::default();
+        let set_reply = dir.dispatch(DirectoryOp::Set, b"/rooms").unwrap();
+        assert_eq!(set_reply, Vec::<u8>::new(), "Set Directory returns nothing in the Data Buffer");
+
+        let get_reply = dir.dispatch(DirectoryOp::Get, b"").unwrap();
+        assert_eq!(
+            get_reply,
+            b"/rooms\0".to_vec(),
+            "a swapped dispatch would leave the directory unset here"
+        );
+    }
+
+    #[test]
+    fn directory_dispatch_mutation_swap_is_caught() {
+        // The mutation itself, inlined: if `Set`/`Get` traded bodies, the
+        // first call below is a no-op read (state never changes) and the
+        // second is a write attempt with an empty path, which
+        // `WorkingDirectory::set` refuses -- so the swapped version returns
+        // `Err` where this test expects `Ok`.
+        fn swapped(dir: &mut WorkingDirectory, op: DirectoryOp, path: &[u8]) -> Result<Vec<u8>, OpError> {
+            match op {
+                DirectoryOp::Set => Ok(dir.get()),
+                DirectoryOp::Get => {
+                    dir.set(path)?;
+                    Ok(Vec::new())
+                }
+            }
+        }
+        let mut dir = WorkingDirectory::default();
+        swapped(&mut dir, DirectoryOp::Set, b"/rooms").unwrap();
+        let result = swapped(&mut dir, DirectoryOp::Get, b"");
+        assert!(result.is_err(), "the swapped dispatch fails, which is exactly the finding");
+    }
+
+    // Set Owner (29) / Clear Owner (30)
+
+    #[test]
+    fn access_code_from_code_matches_table_2_19() {
+        assert_eq!(AccessCode::from_code(0), Some(AccessCode::RequireForAnyAccess));
+        assert_eq!(AccessCode::from_code(1), Some(AccessCode::PermitReadOnly));
+        assert_eq!(AccessCode::from_code(2), Some(AccessCode::RequireForAnyAccessEncrypted));
+        assert_eq!(AccessCode::from_code(3), Some(AccessCode::PermitReadOnlyEncrypted));
+        assert_eq!(AccessCode::from_code(4), None);
+    }
+
+    #[test]
+    fn owner_op_from_code_matches_the_published_pair() {
+        assert_eq!(OwnerOp::from_code(29), Some(OwnerOp::Set));
+        assert_eq!(OwnerOp::from_code(30), Some(OwnerOp::Clear));
+        assert_eq!(OwnerOp::from_code(31), None, "31 is Create Index, not an owner op");
+    }
+
+    #[test]
+    fn set_owner_then_get_returns_the_name_and_access_code() {
+        let b = fixture("set_owner_then_get_returns_the_name_and_access_code");
+        let mut owners = OwnerTable::default();
+        b.set_owner(b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners).unwrap();
+        assert_eq!(owners.name(b.id()), Some(&b"SYSOP"[..]));
+        assert_eq!(owners.access(b.id()), Some(AccessCode::RequireForAnyAccess));
+    }
+
+    #[test]
+    fn set_owner_twice_is_refused_with_owner_already_set() {
+        let b = fixture("set_owner_twice_is_refused_with_owner_already_set");
+        let mut owners = OwnerTable::default();
+        b.set_owner(b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners).unwrap();
+        assert_eq!(
+            b.set_owner(b"OTHER", AccessCode::RequireForAnyAccess, &mut owners),
+            Err(OpError::OwnerAlreadySet)
+        );
+        assert_eq!(owners.name(b.id()), Some(&b"SYSOP"[..]), "the refused call did not overwrite it");
+    }
+
+    #[test]
+    fn set_owner_with_a_name_longer_than_eight_bytes_is_refused() {
+        let b = fixture("set_owner_with_a_name_longer_than_eight_bytes_is_refused");
+        let mut owners = OwnerTable::default();
+        assert_eq!(
+            b.set_owner(b"TOOLONGNAME", AccessCode::RequireForAnyAccess, &mut owners),
+            Err(OpError::OwnerNameInvalid { len: 11 })
+        );
+        assert_eq!(owners.name(b.id()), None);
+    }
+
+    #[test]
+    fn set_owner_during_a_transaction_is_refused() {
+        let mut b = fixture("set_owner_during_a_transaction_is_refused");
+        b.txn_active = true;
+        let mut owners = OwnerTable::default();
+        assert_eq!(
+            b.set_owner(b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners),
+            Err(OpError::NotAllowedDuringTransaction)
+        );
+    }
+
+    #[test]
+    fn clear_owner_removes_a_set_owner() {
+        let b = fixture("clear_owner_removes_a_set_owner");
+        let mut owners = OwnerTable::default();
+        b.set_owner(b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners).unwrap();
+        b.clear_owner(&mut owners).unwrap();
+        assert_eq!(owners.name(b.id()), None);
+    }
+
+    /// **A measured gap, not a hypothetical** -- mirrors [`LockTable`]'s own
+    /// `closing_one_file_leaves_another_files_locks_alone` for exactly the
+    /// same reason it exists: every other owner test in this module uses a
+    /// single [`Block`], so none of them could tell a per-block
+    /// [`OwnerTable::clear`] from a global one. Replacing the body with
+    /// `self.set.clear()` -- so clearing one file's owner cleared every
+    /// *other* file's too -- left the rest of this file's own suite green
+    /// (60 passed, 0 failed), measured while writing this task.
+    #[test]
+    fn clear_owner_releases_only_the_named_blocks_owner() {
+        let one = fixture("clear_owner_releases_only_the_named_blocks_owner_one");
+        let two = fixture("clear_owner_releases_only_the_named_blocks_owner_two");
+        let mut owners = OwnerTable::default();
+
+        one.set_owner(b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners).unwrap();
+        two.set_owner(b"OTHER", AccessCode::RequireForAnyAccess, &mut owners).unwrap();
+
+        one.clear_owner(&mut owners).unwrap();
+
+        assert_eq!(owners.name(one.id()), None, "the cleared file's own owner is gone");
+        assert_eq!(
+            owners.name(two.id()),
+            Some(&b"OTHER"[..]),
+            "and the other file's owner is untouched -- a clear is per block"
+        );
+    }
+
+    #[test]
+    fn clear_owner_with_nothing_set_is_a_harmless_no_op() {
+        let b = fixture("clear_owner_with_nothing_set_is_a_harmless_no_op");
+        let mut owners = OwnerTable::default();
+        b.clear_owner(&mut owners).expect("no prerequisite that an owner exists");
+    }
+
+    #[test]
+    fn clear_owner_during_a_transaction_is_refused() {
+        let mut b = fixture("clear_owner_during_a_transaction_is_refused");
+        b.txn_active = true;
+        let mut owners = OwnerTable::default();
+        assert_eq!(b.clear_owner(&mut owners), Err(OpError::NotAllowedDuringTransaction));
+    }
+
+    /// Task 10's own named mutation: swap Set Owner and Clear Owner.
+    #[test]
+    fn owner_dispatch_routes_set_and_clear_to_the_right_halves() {
+        let b = fixture("owner_dispatch_routes_set_and_clear_to_the_right_halves");
+        let mut owners = OwnerTable::default();
+
+        b.owner(OwnerOp::Set, b"SYSOP", AccessCode::RequireForAnyAccess, &mut owners)
+            .expect("Set assigns an owner");
+        assert_eq!(
+            owners.name(b.id()),
+            Some(&b"SYSOP"[..]),
+            "a swapped dispatch would run Clear here and leave no owner set"
+        );
+
+        b.owner(OwnerOp::Clear, b"", AccessCode::RequireForAnyAccess, &mut owners)
+            .expect("Clear removes it");
+        assert_eq!(
+            owners.name(b.id()),
+            None,
+            "a swapped dispatch would run Set here (again) and leave the owner in place"
+        );
+    }
+
+    // Extend (16)
+
+    #[test]
+    fn extend_succeeds_for_a_v5_file() {
+        let b = fixture("extend_succeeds_for_a_v5_file");
+        assert_eq!(b.geometry().version, Version::V5, "the fixture is v5 by construction");
+        b.extend().expect("v5's file-size ceiling does not exist on this host");
+    }
+
+    #[test]
+    fn extend_is_refused_for_a_v6_file() {
+        let mut b = fixture("extend_is_refused_for_a_v6_file");
+        b.geometry.version = Version::V6;
+        assert_eq!(b.extend(), Err(OpError::ObsoleteOperation));
+    }
+
+    // Reset (28) -- the one third of it this file owns
+
+    #[test]
+    fn lock_table_clear_all_releases_every_locked_block_not_just_one() {
+        let mut one = fixture("lock_table_clear_all_releases_every_locked_block_not_just_one_one");
+        let mut two = fixture("lock_table_clear_all_releases_every_locked_block_not_just_one_two");
+        let mut locks = LockTable::default();
+
+        one.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let in_one = one.current().unwrap().position;
+        two.get(0, Op::Equal, &10u16.to_le_bytes(), 300, &mut locks).unwrap().unwrap();
+        let in_two = two.current().unwrap().position;
+
+        locks.clear_all();
+
+        assert_eq!(locks.get(one.id(), in_one), None, "Reset releases all locks held (p. 162)");
+        assert_eq!(
+            locks.get(two.id(), in_two),
+            None,
+            "clear_all is session-wide, unlike release_all_for's per-block scope"
+        );
     }
 }
