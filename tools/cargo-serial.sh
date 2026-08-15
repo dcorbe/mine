@@ -22,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-LOCK="$ROOT/tmp/.cargo-serial.lock"
+LOCK="$ROOT/tmp/scratch/.cargo-serial.lock"
 
 mkdir -p "$(dirname "$LOCK")"
 
