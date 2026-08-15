@@ -1463,3 +1463,43 @@ async fn the_survey_inventory_is_on_disk_long_before_any_clean_shutdown() {
         "the first sighting must be on disk with no clean shutdown in sight: {text:?}"
     );
 }
+
+/// `In::Shutdown` ends the host thread instead of being treated as a stop the
+/// supervisor should restart around.
+///
+/// The distinction matters more than it looks. `RestartPolicy` exists to keep
+/// a board alive through a module that faults, and a shutdown reaching that
+/// path would rebuild the machine -- taking the board back up, and, for a
+/// module like MajorMUD, rewriting the `WCCRECOV.FLG` its `finrou` had just
+/// removed. "Shut down" and "died" have to be different answers.
+///
+/// The thread's exit is observed through the channel rather than a join
+/// handle, which `spawn_machine` does not hand back: once the host thread
+/// returns, its `Receiver<In>` drops, and every later `send` fails. Polled
+/// with a deadline rather than slept on, so a slow machine does not make this
+/// flaky and a broken one still fails in bounded time.
+#[tokio::test]
+async fn a_shutdown_ends_the_host_thread_and_does_not_restart_it() {
+    let module = module_file(
+        "mbbs-server-host-supervisor-shutdown",
+        &builder::boots_and_runs_forever(),
+    );
+    let tx = conn::spawn_machine(boot(module, "mbbs-server-host-supervisor-shutdown-root", 1));
+
+    let (done, wait) = tokio::sync::oneshot::channel();
+    tx.send(In::Shutdown { done }).expect("the host thread is alive to receive it");
+
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("shutdown must complete inside the grace period, not hang")
+        .expect("the host thread answers rather than dropping the sender");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if tx.send(In::Alarm).is_err() {
+            return; // the receiver is gone: the thread returned and stayed gone
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the host thread was still accepting messages 10s after it said it had shut down");
+}

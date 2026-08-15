@@ -3906,6 +3906,71 @@ impl<A: Abi> Host<A> {
     /// either way** -- `loscar` reaches `rstchn` at `:4593` whether or not
     /// `aschup` found a routine to call.
     ///
+    /// `mjrfin`'s module sweep -- `MAJORBBS.C:4818-4831`:
+    ///
+    ///
+    /// **The caller does `hupall` first.** This is the second half only, so
+    /// that a driver can hang its channels up through whatever path it
+    /// already has (`Host::hangup`, once per connected channel) rather than
+    /// have a second one invented here.
+    ///
+    /// From index 1, because slot zero is [`Registration::AbsentBbs`] and the
+    /// original's `module00` is the BBS rather than a module -- the same
+    /// reason the vendor's own loop starts there. `nmods` is re-read every
+    /// iteration, as the original's `i < nmods` does, so a `finrou` that
+    /// registers something is not skipped.
+    ///
+    /// **Not calling this is not a neutral omission**, which is why it exists.
+    /// MajorMUD's `_LJNGAME_FINROU` is where `_SAVE_BUFFERS(0)` runs and where
+    /// `WCCRECOV.FLG` is unlinked; a host that never dispatches the vector
+    /// loses every buffered change since the last `SECBUFF` sweep and leaves
+    /// the recovery marker behind, so the next boot comes up in recovery mode
+    /// with monster regeneration suppressed. That is a real board, observed:
+    /// see `BUGS.md`.
+    ///
+    /// Returns the poison of the first module that stopped, and stops
+    /// sweeping there -- a machine that has faulted cannot be asked to run
+    /// the next module's shutdown on top of it.
+    ///
+    /// `dispatched` counts the vectors actually called, which is how a driver
+    /// tells "every module shut down" from "no module had anything to do"
+    /// without either looking like the other in a log. An out-parameter
+    /// rather than a return value because [`Host::prcrtk`] already spells
+    /// this exact pairing that way.
+    ///
+    /// # Errors
+    ///
+    /// If a registration's `struct module` no longer names memory the module
+    /// owns.
+    pub fn finalize(
+        &mut self,
+        machine: &mut A::Cpu,
+        module: &A::Module,
+        dispatched: &mut usize,
+    ) -> io::Result<Option<A::Poison>> {
+        /// `finrou`'s position in `struct module` after `descrp`. See
+        /// [`Registration::dispatch`], whose own doc fixes the order.
+        const FINROU: usize = 8;
+
+        let mut index = 1;
+        while index < self.modules().len() {
+            let entry = self.modules()[index]
+                .dispatch(A::mem(machine), FINROU)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            // Only a real module has a `finrou` to call. `Native` has no
+            // `struct module` to index and `AbsentBbs` is the slot this loop
+            // starts past; neither is a module with shutdown work to do.
+            if let Dispatch::Module(Some(vector)) = entry {
+                match self.run(machine, module, vector, &[], None)? {
+                    Outcome::Stopped(poison) => return Ok(Some(poison)),
+                    Outcome::Returned { .. } => *dispatched += 1,
+                }
+            }
+            index += 1;
+        }
+        Ok(None)
+    }
+
     /// Generic since Task 12.
     ///
     /// # Errors

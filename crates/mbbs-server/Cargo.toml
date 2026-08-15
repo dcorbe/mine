@@ -10,7 +10,7 @@ clap = { version = "4", features = ["derive"] }
 mbbs = { path = "../mbbs" }
 mbbs-machine = { path = "../mbbs-machine" }
 mud-core = { path = "../mud-core" }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
 
 [lints]
 workspace = true

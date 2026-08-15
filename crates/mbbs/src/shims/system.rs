@@ -1426,6 +1426,62 @@ mod tests {
         f.bytes(&bytes, false)
     }
 
+    /// A registered module's shutdown vector is the one `finalize` calls.
+    ///
+    /// `finrou` is entry 8 -- the last of the nine -- so an off-by-one in
+    /// either direction reads a different routine or runs off the end of the
+    /// block. The other eight entries are deliberately left null here: if
+    /// `finalize` dispatched any of them the count would be wrong, which is
+    /// the cheapest way to pin the index without a second module.
+    #[test]
+    fn finalize_dispatches_finrou_and_nothing_else() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+
+        let mut entries = vec![FarPtr { offset: 0, selector: 0 }; 9];
+        entries[8] = f.machine.code_ptr(0);
+        let block = module_block(&mut f, "MajorMUD", &entries);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        // After the `invoke`, not before: `Fixture::invoke` builds its own
+        // trampoline at offset 0 of the scratch code segment, so a routine
+        // written there first is gone by the time `finalize` calls it -- and
+        // what runs instead is the trampoline's thunk, which stops the
+        // machine on an unimplemented import rather than returning.
+        f.machine.load_code(&[0xcb]).expect("a retf fits");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .finalize(&mut f.machine, &module, &mut dispatched)
+            .expect("finalize ran");
+
+        assert!(stopped.is_none(), "a retf shutdown routine returns, it does not stop: {stopped:?}");
+        assert_eq!(dispatched, 1, "exactly the one module's finrou, and only entry 8");
+    }
+
+    /// A module with no `finrou` is skipped, not called through a null.
+    ///
+    /// `mjrfin`'s own `if ((rouptr=module[i]->finrou) != NULL)` is the guard
+    /// this mirrors. Without it the sweep would call address zero, which on
+    /// this host is a fault and on the original was a reboot.
+    #[test]
+    fn finalize_skips_a_module_that_supplies_no_finrou() {
+        let mut f = Fixture::new();
+        let module = f.minimal_module();
+        let block = module_block(&mut f, "MajorMUD", &[FarPtr { offset: 0, selector: 0 }; 9]);
+        f.invoke(register_module, &Fixture::far(block)).expect("registered");
+
+        let mut dispatched = 0;
+        let stopped = f
+            .host
+            .finalize(&mut f.machine, &module, &mut dispatched)
+            .expect("finalize ran");
+
+        assert!(stopped.is_none());
+        assert_eq!(dispatched, 0, "a null finrou is skipped, not dispatched");
+    }
+
     /// A `struct agent` in module memory: nine bytes of appid, then four far
     /// vectors.
     fn agent_block(f: &mut Fixture, appid: &str, vectors: &[FarPtr]) -> FarPtr {

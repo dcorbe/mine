@@ -3,12 +3,14 @@
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::Parser;
 use mbbs::Terms;
 use mbbs::abi::{Wg16, Wg32, Wg32Cpu};
 use mbbs_server::conn::{self, Listener, Machine, default_keys};
 use mbbs_server::host::Boot;
+use mbbs_server::msg::In;
 use mbbs_server::pool::MachineId;
 use mbbs_server::termcompat::Stack;
 
@@ -423,6 +425,14 @@ async fn main() -> ExitCode {
         });
     }
 
+    // Cloned before `serve_on` takes ownership: these are how the signal
+    // handler below reaches each host thread, and `Sender<In>` is the only
+    // way in -- the `Machine` itself is gone once the listeners have it.
+    let shutdown: Vec<(String, std::sync::mpsc::Sender<In>)> = machines
+        .iter()
+        .map(|m| (m.label.clone(), m.tx.clone()))
+        .collect();
+
     let addrs = match conn::serve_on(machines, keys, &listeners).await {
         Ok(addrs) => addrs,
         Err(e) => {
@@ -435,10 +445,92 @@ async fn main() -> ExitCode {
         println!("mbbs-server: listening on {addr}");
     }
 
-    // The accept loop and the host thread are both spawned already; this
-    // task's only remaining job is to keep the process alive for them.
-    std::future::pending::<()>().await;
+    // The accept loop and the host threads are all spawned already; this
+    // task's only remaining job is to keep the process alive for them, and to
+    // shut them down in an orderly way when told to.
+    let signal = wait_for_signal().await;
+    eprintln!("mbbs-server: {signal} -- shutting the modules down");
+    shut_down_machines(&shutdown, SHUTDOWN_GRACE).await;
     ExitCode::SUCCESS
+}
+
+/// How long every module gets, in total, to finish shutting down.
+///
+/// A module's `finrou` is real work, not a formality: MajorMUD's writes every
+/// dirty buffer back through Btrieve, and on this host that goes through a
+/// reindex whose cost grows with the file (`BUGS.md`). Thirty seconds is
+/// generous for that and still short enough that a wedged module cannot hold
+/// a terminal open indefinitely -- and the alternative to a bound is not a
+/// slower exit, it is an exit that never happens.
+///
+/// The budget is for the whole sweep rather than per machine, because what an
+/// operator is waiting on is the process, not any one of its threads.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Resolve when the process is asked to stop, naming what asked.
+///
+/// Both signals, because they arrive from different places and mean the same
+/// thing here: SIGINT is the operator at a terminal, SIGTERM is `systemd`,
+/// `docker stop`, or a plain `kill`. Handling only the first would mean every
+/// service-managed shutdown skipped `finrou` -- which is the case that matters
+/// most, since it is the one that happens unattended.
+///
+/// SIGKILL is deliberately absent: it cannot be caught, which is the whole
+/// reason the module's own recovery marker exists and why `WCCMMUTL -recover`
+/// ships with MajorMUD. A host cannot promise a clean shutdown, only take one
+/// when it is offered.
+async fn wait_for_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            // Losing SIGTERM is not worth refusing to run over, but it is
+            // worth saying: an operator whose `systemctl stop` silently skips
+            // shutdown would otherwise find out from the next boot's recovery
+            // mode instead of from here.
+            eprintln!("mbbs-server: cannot listen for SIGTERM ({e}); SIGINT only");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+/// Ask every machine to shut down and wait for all of them, up to `grace`.
+///
+/// The requests all go out before any of them is waited on, so the machines
+/// finalise concurrently and the budget is the slowest one rather than the
+/// sum. A machine whose thread has already died fails to `send` or drops its
+/// half of the channel; both read as "nothing more to wait for", which is
+/// correct -- there is no module left to finalise either way.
+async fn shut_down_machines(machines: &[(String, std::sync::mpsc::Sender<In>)], grace: Duration) {
+    let mut waiting = Vec::new();
+    for (label, tx) in machines {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if tx.send(In::Shutdown { done }).is_ok() {
+            waiting.push((label.clone(), wait));
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + grace;
+    for (label, wait) in waiting {
+        match tokio::time::timeout_at(deadline, wait).await {
+            Ok(_) => eprintln!("mbbs-server: {label} shut down"),
+            Err(_) => {
+                eprintln!(
+                    "mbbs-server: {label} did not finish shutting down within {grace:?} -- \
+                     exiting anyway; its module may leave a recovery marker behind"
+                );
+                // No point waiting on the rest: they shared one deadline and
+                // it has passed.
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

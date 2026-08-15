@@ -384,20 +384,37 @@ fn census_interval() -> Option<Duration> {
 ///
 /// The census is taken on every reporting turn and dropped between them, so
 /// the numbers describe the interval just ended rather than all of time.
-fn report_census<A: Abi>(host: &mut mbbs::Host<A>, due: &mut Instant, every: Option<Duration>) {
+fn report_census<A: Abi>(
+    host: &mut mbbs::Host<A>,
+    who: MachineId,
+    due: &mut Instant,
+    every: Option<Duration>,
+    turns: &mut u64,
+    refills: &mut u64,
+    worst_turn: &mut Duration,
+) {
     let Some(every) = every else { return };
     if Instant::now() < *due {
         return;
     }
     *due = Instant::now() + every;
+    let (loops, grants, longest) = (*turns, *refills, *worst_turn);
+    *turns = 0;
+    *refills = 0;
+    *worst_turn = Duration::ZERO;
     let census = host.take_census();
     if census.polls == 0 {
         return;
     }
     let secs = every.as_secs_f64();
+    // Named, because a board runs one of these per machine on its own thread
+    // and both write to the same stderr. Two modules' censuses interleaved
+    // under one label read as one module changing behaviour every ten
+    // seconds, which is a conclusion the numbers do not support.
     eprintln!(
-        "mbbs-server: census: {polls} polls ({rate:.0}/s), {barren} barren ({barren_pct:.1}%), \
-         {calls:.1} host calls each, worst {worst}",
+        "mbbs-server: census[m{who}]: {polls} polls ({rate:.0}/s), {barren} barren \
+         ({barren_pct:.1}%), {calls:.1} host calls each, worst {worst}",
+        who = who.0,
         polls = census.polls,
         rate = census.polls as f64 / secs,
         barren = census.barren,
@@ -405,6 +422,64 @@ fn report_census<A: Abi>(host: &mut mbbs::Host<A>, due: &mut Instant, every: Opt
         calls = census.per_poll(),
         worst = census.worst,
     );
+    eprintln!(
+        "mbbs-server: census[m{who}]: {loops} driver turns, {grants} refills, \
+         worst cycle {longest:.0?} -- that is the ceiling on input latency",
+        who = who.0,
+    );
+}
+
+/// `mjrfin` -- `MAJORBBS.C:4818-4831`: hang every channel up, then run every
+/// module's `finrou`.
+///
+///
+/// **Hangup first, and in that order.** A module's `huprou`/`lofrou` is where
+/// per-player state is written back; its `finrou` is where the world's is.
+/// Running them the other way round would finalise a world whose players had
+/// not yet been saved into it.
+///
+/// Nothing here is allowed to abort the rest. A module that stops during its
+/// own shutdown has already had whatever `finrou` ran before the fault, and
+/// the remaining modules still have theirs to run -- so a stop is reported
+/// and the sweep continues rather than propagating. There is no next life to
+/// recover into: this is the last thing the thread does.
+fn shut_down<A: Abi>(
+    host: &mut mbbs::Host<A>,
+    machine: &mut A::Cpu,
+    module: &A::Module,
+    who: MachineId,
+    conns: &mut [Option<Sender<Out>>],
+    terms: Terms,
+) {
+    for chan in terms.all() {
+        if conns[chan.index()].is_none() {
+            continue;
+        }
+        if let Err(e) = host.hangup(machine, module, chan) {
+            eprintln!("mbbs-server: shutdown[m{}]: hanging up channel {chan}: {e}", who.0);
+        }
+        if let Some(conn) = conns[chan.index()].as_ref() {
+            let _ = conn.try_send(Out::Close);
+        }
+        conns[chan.index()] = None;
+    }
+
+    let mut dispatched = 0;
+    match host.finalize(machine, module, &mut dispatched) {
+        Ok(None) => {
+            eprintln!("mbbs-server: shutdown[m{}]: {dispatched} module(s) finalised", who.0);
+        }
+        Ok(Some(poison)) => eprintln!(
+            "mbbs-server: shutdown[m{}]: a module stopped during its own finrou after \
+             {dispatched} finalised: {poison:?}",
+            who.0
+        ),
+        Err(e) => eprintln!(
+            "mbbs-server: shutdown[m{}]: finrou sweep failed after {dispatched}: {e}",
+            who.0
+        ),
+    }
+    report_notes(host);
 }
 
 /// How many times [`run`] will rebuild a machine after [`Ended::Stopped`]
@@ -473,6 +548,12 @@ enum LifeEnd<A: Abi> {
     /// Every `Sender<In>` is gone -- see [`Woke::Gone`]. The whole
     /// supervisor should stop, not just this life.
     Gone,
+    /// [`In::Shutdown`] arrived and [`shut_down`] has already run. Distinct
+    /// from [`LifeEnd::Gone`] because a restart would be actively wrong here:
+    /// the module has been finalised, and rebuilding it would take the board
+    /// back up -- and, for MajorMUD, rewrite the `WCCRECOV.FLG` that the
+    /// shutdown just removed.
+    ShutDown,
     /// The module stopped inside the steady-state driver loop.
     ///
     /// `chan` is `None` when the stop came from [`Host::cycle`]'s kick
@@ -676,6 +757,12 @@ fn life<A: Abi>(
     let mut wait = Wait::Now;
     let census_every = census_interval();
     let mut census_due = Instant::now();
+    // Driver-loop counters for the same report: how many turns this interval
+    // took, how many of them granted a fresh poll budget, and the longest
+    // single `cycle` call -- the ceiling on input latency. Reset with it.
+    let mut turns = 0u64;
+    let mut refills = 0u64;
+    let mut worst_turn = Duration::ZERO;
 
     loop {
         // 0. Tell the bell what to ring for -- see `arm`'s own doc -- then
@@ -707,12 +794,31 @@ fn life<A: Abi>(
         //    exactly like `apply`'s other callers -- `saw_input` is what
         //    tells step 3 apart from a bare bell.
         let mut saw_input = false;
+        let mut stopping = None;
         for msg in first
             .into_iter()
             .chain(std::iter::from_fn(|| rx.try_recv().ok()))
         {
+            // Taken here rather than in `apply`, because this is the one
+            // message that ends the loop rather than acting on it, and
+            // `apply` has no way to say so. The rest of the batch is still
+            // drained: a `Disconnect` queued behind the shutdown is a channel
+            // whose module still deserves its `huprou`.
+            if let In::Shutdown { done } = msg {
+                stopping = Some(done);
+                continue;
+            }
             saw_input |= !matches!(msg, In::Alarm);
             apply(&mut host, &mut machine, &module, &mut pool, &mut conns, msg)?;
+        }
+        if let Some(done) = stopping {
+            shut_down(&mut host, &mut machine, &module, boot.machine, &mut conns, terms);
+            // Sent after the sweep, not before: the whole point of the
+            // channel is that the waiter learns when `finrou` has finished,
+            // which for MajorMUD is when its buffers are on disk and
+            // `WCCRECOV.FLG` is gone.
+            let _ = done.send(());
+            return Ok(LifeEnd::ShutDown);
         }
 
         // 3. The pump as a derived clock (design doc §7): grant a fresh poll
@@ -732,11 +838,25 @@ fn life<A: Abi>(
         //    "free rider" design doc §7 names them.
         let expected_kick = matches!(wait, Wait::Until(_));
         if saw_input || expected_kick {
+            refills += 1;
             host.refill_polls(&mut machine, boot.polls_per_wake)?;
         }
 
         // 4. Turn the world.
+        //
+        // Timed because this is exactly how long a keystroke can sit unread.
+        // Step 1 is the only place this loop looks at `rx`, so input arriving
+        // one instruction after `cycle` was entered waits for the whole call
+        // to finish -- every pass of it. The felt "it will echo when it is
+        // good and ready" is this number, and nothing else in the loop can
+        // shorten it.
+        let turn_start = Instant::now();
         let cycles = host.cycle(&mut machine, &module, boot.passes)?;
+        let spent = turn_start.elapsed();
+        turns += 1;
+        if spent > worst_turn {
+            worst_turn = spent;
+        }
         if let Some(meter) = &boot.clock_reads {
             meter.store(host.clock_reads(), Ordering::Relaxed);
         }
@@ -746,7 +866,7 @@ fn life<A: Abi>(
         if let Some(meter) = &boot.calls_total {
             meter.store(host.calls(), Ordering::Relaxed);
         }
-        report_census(&mut host, &mut census_due, census_every);
+        report_census(&mut host, boot.machine, &mut census_due, census_every, &mut turns, &mut refills, &mut worst_turn);
 
         // 5. Everything the channels queued goes out.
         flush(&mut host, &mut machine, &module, &mut pool, &mut conns, terms)?;
@@ -832,6 +952,7 @@ pub fn run<A: Abi>(
         match life(&boot, &rx, &deadline, inventory.as_ref()) {
             Err(e) => break Err(e),
             Ok(LifeEnd::Gone) => break Ok(()),
+            Ok(LifeEnd::ShutDown) => break Ok(()),
             Ok(LifeEnd::Stopped { poison, chan }) => {
                 eprintln!("mbbs-server: module stopped ({}): {poison}", describe_stop(chan));
 
@@ -925,6 +1046,17 @@ fn apply<A: Abi>(
         // unblock `wake`'s `rx.recv()`; `life`'s own loop is what reads it
         // apart from the other variants (`saw_input`), not this function.
         In::Alarm => Ok(()),
+        // `life` takes this out of the batch before `apply` is called, because
+        // it ends the loop rather than acting on it. Reaching here means a
+        // caller that is not `life` routed one in; dropping the `done` sender
+        // is the safe degradation, because a dropped `oneshot::Sender` wakes
+        // its receiver exactly as a send does (see `In::Shutdown`'s doc), so
+        // a waiter is released rather than left hanging on a shutdown that is
+        // never going to happen.
+        In::Shutdown { done } => {
+            drop(done);
+            Ok(())
+        }
     }
 }
 

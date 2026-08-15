@@ -25,6 +25,24 @@ pub enum In {
     Disconnect {
         chan: Routed,
     },
+    /// Shut this machine's module down and end the host thread.
+    ///
+    /// A message rather than an `AtomicBool` the driver polls, because the
+    /// driver spends nearly all of its life blocked in `rx.recv()` (see
+    /// `host::wake`) and a flag would not be noticed until something else
+    /// happened to wake it -- which on an idle board is the next kick, up to
+    /// a whole second away, and on a board with no kicks outstanding is
+    /// never.
+    ///
+    /// `done` fires once the module's `finrou` sweep has finished, so the
+    /// process can wait for shutdown to actually complete instead of
+    /// guessing. Dropping it (a host thread that died on the way) reads as
+    /// completion too: the waiter cannot tell the difference and there is
+    /// nothing useful it could do differently.
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
+
     /// A deadline the driver itself asked for has passed -- see
     /// `crate::alarm`. Carries nothing: the timer task never learns *why* it
     /// was armed, only *when*, and `Host::cycle`'s own clock-anchored
