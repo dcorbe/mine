@@ -76,6 +76,7 @@ pub mod users;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub use chan::{Chan, Terms};
 pub use clock::{Civil, Clock};
@@ -371,6 +372,41 @@ pub enum Wait {
     Now,
     /// The module stopped. Shut the host down.
     Stop,
+}
+
+/// How long one pass may take before it is worth a line.
+///
+/// One second because that is the granularity of everything it competes with:
+/// `prcrtk` fires on whole elapsed seconds and `rtkick` counts in them, so a
+/// pass under a second cannot have cost the module a timer.
+const STALL_FLOOR: Duration = Duration::from_secs(1);
+
+/// Whether one pass of [`Host::cycle`] took long enough to be worth reporting,
+/// and what to say about it.
+///
+/// `worked` is wall-clock **inside** `cycle`, never the epoch delta. The two
+/// are not interchangeable: `Host::tcklst` persists across calls, so an epoch
+/// delta counts the driver's sleep between them, and a note derived from it
+/// fires hardest when the driver is behaving best. That is what this used to
+/// do -- see
+/// [`tests::two_seconds_of_correct_sleep_are_not_reported_as_a_stall`].
+///
+/// Pure, and separate from `cycle`, so that both answers can be tested without
+/// a fixture that really does burn a second of wall-clock -- the same reason
+/// `mbbs-server`'s own `describe_stop` is its own function.
+fn stall_note(worked: Duration, rounds: u32, polled: Option<Chan>) -> Option<String> {
+    if worked < STALL_FLOOR {
+        return None;
+    }
+    let who = match polled {
+        Some(chan) => format!("channel {chan}'s poll"),
+        None => "the kick sweep".to_owned(),
+    };
+    Some(format!(
+        "cycle: one pass took {:.1}s -- {who} stalled the host, and {rounds} second(s) \
+         of timers fired to catch up",
+        worked.as_secs_f32()
+    ))
 }
 
 impl<A: Abi> Ended<A> {
@@ -3179,6 +3215,11 @@ impl<A: Abi> Host<A> {
             });
         }
 
+        // Wall-clock for the stall note below, reset at the end of every pass.
+        // Started here rather than before the `syscyc` dispatch above so that
+        // the first pass is charged for its own work and not for the vector's.
+        let mut pass_mark = std::time::Instant::now();
+
         while iterations < max {
             iterations += 1;
 
@@ -3190,6 +3231,10 @@ impl<A: Abi> Host<A> {
             // It was written as one, and review found that mutating the guard
             // away left all 739 tests passing, which is what unobservable looks
             // like.
+            // Who this pass served, for the stall note below to name. `None`
+            // stays `None` when nothing was dispatched, which is the honest
+            // answer: the time went to the kick sweep, not to a channel.
+            let mut polled = None;
             match self.poll_with_chan(machine, module)? {
                 Some((Outcome::Stopped(poison), chan)) => {
                     return Ok(Cycles {
@@ -3198,7 +3243,10 @@ impl<A: Abi> Host<A> {
                         ended: Ended::Stopped(poison, Some(chan)),
                     });
                 }
-                Some((Outcome::Returned { .. }, _chan)) => dispatched += 1,
+                Some((Outcome::Returned { .. }, chan)) => {
+                    polled = Some(chan);
+                    dispatched += 1;
+                }
                 // A status that dispatched nothing: a stale `POLSTS`, or an
                 // entry point the module never registered. `poll` has
                 // consumed it either way.
@@ -3237,10 +3285,26 @@ impl<A: Abi> Host<A> {
                 }
             }
             self.tcklst = Some(last);
-            if rounds > 1 {
-                self.note(format!(
-                    "cycle: {rounds} seconds of timers in one pass -- the host stalled"
-                ));
+            // **Elapsed epoch time is not evidence of a stall.** `tcklst`
+            // persists across `cycle` calls, and between two of them the
+            // driver is asleep -- that is what `Ended::Waiting` is for. So
+            // `rounds` counts sleep and work alike, and reporting it as a
+            // stall reports the healthy case: the longer the driver correctly
+            // sleeps, the more "stalls" it announces. It did, for as long as
+            // this note existed, and two investigations
+            // (`e0ae785`, `0903399`) built conclusions on the flood --
+            // `--passes` could not move the count because passes were never
+            // what it measured.
+            //
+            // `pass_mark` is wall-clock inside this call only, reset every
+            // pass, so it cannot see the sleep that happened before `cycle`
+            // was entered. A pass that really did take a second or more is a
+            // stall and says so, with the channel it was serving; anything
+            // else is time this host spent asleep, which is not worth a line.
+            let worked = pass_mark.elapsed();
+            pass_mark = std::time::Instant::now();
+            if let Some(note) = stall_note(worked, rounds, polled) {
+                self.note(note);
             }
 
             // Nothing queued. Whether a timer is outstanding decides which
@@ -4289,8 +4353,8 @@ mod tests {
     use crate::testing::Fixture;
     use crate::users::Connection;
     use crate::{
-        Clock, Dispatch, Ended, Host, Kick, Native, Outcome, Registration, Terms, gsbl, testing,
-        users,
+        Clock, Dispatch, Duration, Ended, Host, Kick, Native, Outcome, Registration, Terms,
+        gsbl, stall_note, testing, users,
     };
     use mbbs_machine::m16::{FarPtr, Machine, Poison, Ret};
 
@@ -6398,6 +6462,83 @@ mod tests {
         assert_eq!(calls, 4, "two reads to the second, two seconds to the kick");
         let cycles = f.host.cycle(&mut f.machine, &module, 50).expect("cycled");
         assert_eq!(cycles.ended, Ended::Idle, "and then there was nothing left");
+    }
+
+    /// Sleeping correctly is not stalling, and is not reported as it.
+    ///
+    /// `tcklst` persists across `cycle` calls, and the catch-up loop compares
+    /// it against the clock on the *first pass of the next call*. Between two
+    /// calls the driver is asleep -- that is the whole point of
+    /// `Ended::Waiting` -- so `rounds` counts sleep and work alike. Reporting
+    /// it as a stall reported the healthy case, and the healthier the sleep
+    /// the louder the report: every note on a live board read "2 seconds",
+    /// the signature of a two-second sleep rather than of any real work,
+    /// and `e0ae785` and `0903399` both built conclusions on that flood.
+    ///
+    /// Nothing is pending in this fixture and both calls return on their
+    /// first pass having dispatched nothing, so the two seconds are pure
+    /// sleep with no work anywhere to attribute them to.
+    #[test]
+    fn two_seconds_of_correct_sleep_are_not_reported_as_a_stall() {
+        let (mut f, module, rou) = polling_fixture();
+        f.host.kicks.push(Kick { delay: 60, dstrou: rou });
+        f.host.set_clock(Clock::pinned(1_135_952_405));
+
+        let first = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+        assert_eq!(first.iterations, 1, "nothing pending; one pass");
+        f.host.drain_notes();
+
+        // The driver sleeps. It was told a kick was 60 seconds out, and it
+        // woke two seconds later on input that turned out to be nothing.
+        f.host.set_clock(Clock::pinned(1_135_952_405 + 2));
+
+        let second = f.host.cycle(&mut f.machine, &module, 10).expect("cycled");
+        assert_eq!(second.iterations, 1, "still nothing pending; still one pass");
+        assert_eq!(second.dispatched, 0, "and nothing was dispatched at all");
+
+        let notes = f.host.notes().to_vec();
+        assert!(
+            !notes.iter().any(|n| n.contains("stalled")),
+            "two seconds of sleep is not a stall; got {notes:?}"
+        );
+    }
+
+    /// ...and a pass that really does take a second says so, and names who.
+    ///
+    /// The counterpart to
+    /// [`two_seconds_of_correct_sleep_are_not_reported_as_a_stall`]: the note
+    /// has to survive as a signal for the case it was named for, or removing
+    /// the false positive would just have deleted the diagnostic instead of
+    /// correcting it.
+    #[test]
+    fn a_pass_that_really_took_a_second_is_reported_and_names_the_channel() {
+        let note = stall_note(Duration::from_millis(1_100), 2, Terms::new(4).chan(3))
+            .expect("1.1s of work in one pass is a stall");
+
+        assert!(note.contains("1.1s"), "it must say how long: {note}");
+        assert!(note.contains("channel 3's poll"), "and who: {note}");
+    }
+
+    /// The threshold is a floor on *work*, so work below it is silent no
+    /// matter how many seconds of timers the catch-up fired -- which is the
+    /// whole distinction the old note could not draw.
+    #[test]
+    fn a_fast_pass_is_silent_however_many_timer_rounds_it_fired() {
+        assert_eq!(
+            stall_note(Duration::from_millis(3), 6, Terms::new(1).chan(0)),
+            None,
+            "three milliseconds of work is not a stall, even six seconds behind"
+        );
+    }
+
+    /// A stall with nothing dispatched belongs to the kick sweep, and saying
+    /// "channel" there would name a channel that did nothing.
+    #[test]
+    fn a_stall_with_no_channel_polled_names_the_kick_sweep() {
+        let note = stall_note(Duration::from_secs(4), 4, None).expect("four seconds is a stall");
+
+        assert!(note.contains("the kick sweep"), "got {note}");
+        assert!(!note.contains("channel"), "no channel was served: {note}");
     }
 
     /// The anti-spin test. Nothing is pending and a kick is outstanding, so
