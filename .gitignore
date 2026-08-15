@@ -98,3 +98,9 @@ tools/btrieve-oracle/crtprobe.exe
 # takes a format string, and so on -- which headers alone do not settle. Not
 # ours to commit; the zip it came from is already in archive/.
 re/tasrc/
+
+# `unzip -j archive/galacticomm/mbbs511s.zip 'BTVSTF.*' 'ECBTVSTF.C' -d re/btvsrc`
+# MajorBBS 5.11's Btrieve wrapper layer. Note it does NOT contain the twelve
+# wrappers Track B adds -- see that plan's Task 1. The oracle for those is
+# PLBTVSTF.C, which lives in archive/ and needs no extraction.
+re/btvsrc/
