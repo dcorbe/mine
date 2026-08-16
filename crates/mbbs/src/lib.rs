@@ -911,6 +911,15 @@ pub struct Host<A: Abi> {
     setcnf: Vec<(Vec<u8>, Vec<u8>)>,
     setcnf_applied: bool,
 
+    /// The line `scnmdf` answers a `.MDF` option out of.
+    ///
+    /// The vendor's is `tmpbuf`, a shared `BUFSIZ` scratch buffer, and its
+    /// `scnmdf` returns a pointer *into* it -- so in the real host too the
+    /// answer only survives until the next thing that uses `tmpbuf`. This is
+    /// that buffer, sized the same and owned here instead of shared with
+    /// `gmdnam`'s much smaller line.
+    scnmdf: A::Ptr,
+
     /// The console's display attribute and window, as `struct curatr`
     /// (`INC/VIDAPI.H:198-228`) holds them for the real host.
     ///
@@ -1553,15 +1562,22 @@ impl<A: Abi> Host<A> {
 
         // One segment for everything the host hands a module a pointer into and
         // then keeps: `spr`'s four buffers, `gmdnam`'s line, one NUL byte for
-        // `parsin`'s empty-line `margv[0]`, and `l2as`'s own small rotation
-        // (see `Host::l2as`'s doc comment for why that is a separate pool
-        // rather than more of `spr`'s). Separate from the globals so that a
-        // module overrunning one of these cannot reach `usrnum`.
+        // `parsin`'s empty-line `margv[0]`, `l2as`'s own small rotation (see
+        // `Host::l2as`'s doc comment for why that is a separate pool rather
+        // than more of `spr`'s), and `scnmdf`'s line. Separate from the
+        // globals so that a module overrunning one of these cannot reach
+        // `usrnum`.
         let spr_bytes = shims::text::SPR_BYTES as usize * shims::text::SPR_BUFFERS;
         let l2as_bytes = shims::text::L2AS_BYTES as usize * shims::text::L2AS_BUFFERS;
+        // `scnmdf` is appended **after** `l2as` rather than inserted anywhere
+        // earlier, so that every offset already established here is unchanged
+        // by its arrival -- the four-buffer layout invariant below keeps
+        // holding for the four it was written about.
+        let scnmdf_bytes = usize::from(shims::msg::SCNMDF_BYTES);
         // `ModuleMem::alloc_region` through `Abi::mem` -- every `A::ptr_offset`
         // below is this same `base` at a chosen offset within it.
-        let base = A::mem(machine).alloc_region(spr_bytes + 64 + 1 + l2as_bytes)?;
+        let base =
+            A::mem(machine).alloc_region(spr_bytes + 64 + 1 + l2as_bytes + scnmdf_bytes)?;
 
         // The per-channel tables come off the module heap, because the real
         // host's did: `MAJORBBS.C:735-736` builds them with `alczer` and
@@ -1627,6 +1643,7 @@ impl<A: Abi> Host<A> {
             spr_next: 0,
             l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
             l2as_next: 0,
+            scnmdf: A::ptr_offset(base, spr_bytes as u16 + 64 + 1 + l2as_bytes as u16),
             display: Display::default(),
             msgbuf_size: 0,
             setcnf: Vec::new(),
@@ -2345,6 +2362,11 @@ impl<A: Abi> Host<A> {
     /// The line buffer `gmdnam` writes into.
     fn mdf_buffer(&self) -> A::Ptr {
         self.mdf
+    }
+
+    /// The line buffer `scnmdf` answers out of. See [`Host::scnmdf`].
+    pub(crate) fn scnmdf_buffer(&self) -> A::Ptr {
+        self.scnmdf
     }
 
     /// One NUL byte the host owns and keeps. See [`Host::empty`].
@@ -4922,17 +4944,23 @@ mod tests {
     }
 
     #[test]
-    fn the_four_host_buffers_cannot_drift_into_each_other_unnoticed() {
-        // `Host::new` (~line 1170) carves `spr`, `mdf`, `empty` and `l2as` out
+    fn the_host_buffers_cannot_drift_into_each_other_unnoticed() {
+        // `Host::new` carves `spr`, `mdf`, `empty`, `l2as` and `scnmdf` out
         // of one allocated region, back to back:
         //
-        //   spr   [0, spr_bytes)                  spr_bytes = SPR_BYTES * SPR_BUFFERS
-        //   mdf   [spr_bytes, spr_bytes + 64)      64 -- `gmdnam`'s line, headroom over MDF_LINE(40)
-        //   empty [spr_bytes + 64, spr_bytes + 65) one NUL byte
-        //   l2as  [spr_bytes + 65, spr_bytes + 65 + l2as_bytes)
+        //   spr    [0, spr_bytes)                  spr_bytes = SPR_BYTES * SPR_BUFFERS
+        //   mdf    [spr_bytes, spr_bytes + 64)      64 -- `gmdnam`'s line, headroom over MDF_LINE(40)
+        //   empty  [spr_bytes + 64, spr_bytes + 65) one NUL byte
+        //   l2as   [spr_bytes + 65, spr_bytes + 65 + l2as_bytes)
+        //   scnmdf [spr_bytes + 65 + l2as_bytes, .. + SCNMDF_BYTES)
+        //
+        // `scnmdf` was appended last, after `l2as`, precisely so that adding
+        // it moved none of the four offsets this test was originally written
+        // about -- see `Host::new`'s own comment.
         //
         // and `alloc_region` is asked for exactly `spr_bytes + 64 + 1 +
-        // l2as_bytes` -- so these four add up to the *whole* allocation, with
+        // l2as_bytes + scnmdf_bytes` -- so these five add up to the *whole*
+        // allocation, with
         // no padding anywhere between any of them. That was measured, not
         // assumed: shifting any one of the four offsets in `Host::new` by a
         // single byte passed every test in the repository (1448 lib/target
@@ -4981,11 +5009,16 @@ mod tests {
         let mdf_len = 64usize;
         let l2as_len =
             usize::from(crate::shims::text::L2AS_BYTES) * crate::shims::text::L2AS_BUFFERS;
+        let scnmdf_len = usize::from(crate::shims::msg::SCNMDF_BYTES);
 
+        const SCNMDF_PATTERN: u8 = 0xD2;
         const L2AS_PATTERN: u8 = 0xC3;
         const MDF_PATTERN: u8 = 0xB4;
         const SPR_PATTERN: u8 = 0xA1;
 
+        machine
+            .write(host.scnmdf, &vec![SCNMDF_PATTERN; scnmdf_len])
+            .expect("scnmdf's full declared length fits in the allocated region");
         machine
             .write(host.l2as, &vec![L2AS_PATTERN; l2as_len])
             .expect("l2as's full declared length fits in the allocated region");
@@ -5014,6 +5047,13 @@ mod tests {
             l2as_read.iter().all(|&b| b == L2AS_PATTERN),
             "l2as's own region was not entirely its own pattern -- a neighbour's \
              buffer overlaps it: {l2as_read:?}"
+        );
+
+        let scnmdf_read = machine.resolve(host.scnmdf, scnmdf_len).expect("read scnmdf");
+        assert!(
+            scnmdf_read.iter().all(|&b| b == SCNMDF_PATTERN),
+            "scnmdf's own region was not entirely its own pattern -- a \
+             neighbour's buffer overlaps it: {scnmdf_read:?}"
         );
 
         let empty_read = machine.resolve(host.empty, 1).expect("read empty");

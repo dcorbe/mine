@@ -508,6 +508,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
          Evidence::VendorBody("SRC/api/gcommlib/SETCNF.C")),
         (MAJORBBS, "dspmsg", msg::dspmsg, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/BBSUTILS.C")),
+        // mdfodmd is folded into scnmdf rather than registered beside it:
+        // no oracle build exports it, so it is scnmdf's helper here as it is
+        // in MDFUTL.C.
+        (MAJORBBS, "scnmdf", msg::scnmdf, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/MDFUTL.C")),
         (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "chropt", msg::chropt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller, Evidence::Unclassified),

@@ -631,6 +631,99 @@ pub fn hexopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(parsed as u16)))
 }
 
+/// `BUFSIZ` -- how long a `.MDF` line [`scnmdf`] will read, and so how big
+/// the buffer it answers out of has to be.
+///
+/// The vendor reads with `fgets(tmpbuf,BUFSIZ,fp)` (`MDFUTL.C:88`) into a
+/// shared `BUFSIZ` scratch buffer, and Borland's `BUFSIZ` is 512.
+pub(crate) const SCNMDF_BYTES: u16 = 512;
+
+/// `CHAR *scnmdf(CHAR *mdfnam, CHAR *linpfx)` -- `MDFUTL.C:76-97` -- the
+/// value of one prefixed line in a `.MDF` file.
+///
+///
+/// **The empty string is the answer for a prefix that is not there**, not an
+/// error: `retval=""` is set before the loop and survives it. Only failing to
+/// *open* the file is fatal, and that is `catastro`, so it is a refusal here.
+///
+/// `sameto` is a case-insensitive prefix match, so `Language:` finds
+/// `LANGUAGE:`; `unpad` strips trailing whitespace from the whole line and
+/// `skpwht` skips leading whitespace after the prefix, which together mean
+/// the value comes back trimmed at both ends but keeps its interior spacing.
+///
+/// **`mdfodmd` (`MDFUTL.C:99-116`) is folded in rather than registered**: it
+/// tries the name as given and, if that is not a file, replaces the extension
+/// with `.dmd` and tries again, `catastro`-ing if neither exists. No oracle
+/// build exports it, so it is this routine's helper here as it is there.
+///
+/// The answer is a pointer into a host-owned line buffer that the next
+/// `scnmdf` overwrites. That is the vendor's behaviour too -- its `retval`
+/// points into the shared `tmpbuf` -- so a caller that wants to keep the
+/// value has to copy it, in both hosts.
+///
+/// # Errors
+///
+/// If either argument is unreadable, if neither the named file nor its `.dmd`
+/// sibling exists, or if the line will not fit [`SCNMDF_BYTES`].
+pub fn scnmdf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let mdfnam = call.ptr();
+    let linpfx = call.ptr();
+
+    let named = String::from_utf8_lossy(
+        mdfnam
+            .read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(format!("scnmdf: {e}")))?,
+    )
+    .into_owned();
+    let prefix = linpfx
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("scnmdf: {e}")))?
+        .to_vec();
+
+    // `mdfodmd`: the name as given, or the same stem with `.dmd`.
+    let path = host.find(&named).or_else(|| {
+        let stem = named.rsplit_once('.').map_or(named.as_str(), |(stem, _)| stem);
+        host.find(&format!("{stem}.dmd"))
+    });
+    let path = path.ok_or_else(|| {
+        ShimError::Failed(format!(
+            "scnmdf: CAN'T OPEN {named:?} -- neither it nor its .dmd sibling is \
+             under {} (MDFUTL.C:107-113)",
+            host.root.display()
+        ))
+    })?;
+
+    let bytes = std::fs::read(&path)
+        .map_err(|e| ShimError::Failed(format!("scnmdf: {}: {e}", path.display())))?;
+
+    let mut value: &[u8] = b"";
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.len() >= prefix.len()
+            && line[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        {
+            // `unpad` then `skpwht(tmpbuf+strlen(linpfx))`: trailing
+            // whitespace off the whole line, then leading whitespace off what
+            // follows the prefix. `\r` counts as trailing whitespace, which is
+            // what makes this work on a CRLF file.
+            let rest = &line[prefix.len()..];
+            let end = rest
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map_or(0, |i| i + 1);
+            let start = rest[..end]
+                .iter()
+                .position(|b| !b.is_ascii_whitespace())
+                .unwrap_or(end);
+            value = &rest[start..end];
+            break;
+        }
+    }
+
+    let at = host.scnmdf_buffer();
+    text::write_cstr_mem::<A>(call.mem(), at, value, SCNMDF_BYTES)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
 /// What `curmbk` holds, read back out of module memory every time.
 ///
 /// Generic core (Task 5). No `Wg16` facade under the old `current` name: only
@@ -857,6 +950,77 @@ mod tests {
         let mut f = Fixture::new();
         opened(&mut f);
         assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
+    }
+
+    /// Call `scnmdf(mdfnam, linpfx)` and read back what it answered.
+    fn scan(f: &mut Fixture, mdfnam: &str, linpfx: &str) -> Vec<u8> {
+        let name = f.text(mdfnam);
+        let prefix = f.text(linpfx);
+        let Ret::Far(at) = f
+            .invoke(scnmdf, &[name.offset, name.selector, prefix.offset, prefix.selector])
+            .expect("scnmdf")
+        else {
+            panic!("scnmdf returns char *");
+        };
+        f.machine.read_cstr(at).expect("readable").to_vec()
+    }
+
+    /// `scnmdf` answers what follows the prefix, trimmed at both ends.
+    ///
+    /// `unpad` takes the trailing whitespace off the line -- including the
+    /// `\r` of a CRLF file -- and `skpwht` takes the leading whitespace off
+    /// what follows the prefix (`MDFUTL.C:89-92`). The interior space in
+    /// `Sample Module` has to survive both.
+    #[test]
+    fn scnmdf_answers_the_value_after_the_prefix() {
+        let mut f = Fixture::new();
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "Module Name:"), b"Sample Module");
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "Developer:"), b"nobody");
+    }
+
+    /// The prefix match is case-insensitive, because `sameto` is
+    /// (`MDFUTL.C:89`).
+    #[test]
+    fn scnmdf_matches_the_prefix_without_regard_to_case() {
+        let mut f = Fixture::new();
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "MODULE NAME:"), b"Sample Module");
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "module name:"), b"Sample Module");
+    }
+
+    /// **A prefix that is not in the file answers the empty string**, not an
+    /// error: `retval=""` is set before the loop and survives it
+    /// (`MDFUTL.C:87`). A module distinguishes "absent" from "present but
+    /// blank" by nothing at all, in either host.
+    #[test]
+    fn scnmdf_answers_an_empty_string_for_a_prefix_that_is_absent() {
+        let mut f = Fixture::new();
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "Nosuchkey:"), b"");
+    }
+
+    /// Only failing to open is fatal, and it is `catastro` in the vendor
+    /// (`MDFUTL.C:85`) -- so a refusal here, naming the file.
+    #[test]
+    fn scnmdf_refuses_a_file_that_is_not_there() {
+        let mut f = Fixture::new();
+        let name = f.text("NOSUCH.MDF");
+        let prefix = f.text("Module Name:");
+        let e = f
+            .invoke(scnmdf, &[name.offset, name.selector, prefix.offset, prefix.selector])
+            .expect_err("no such file");
+        assert!(e.to_string().contains("NOSUCH.MDF"), "{e}");
+        assert!(e.to_string().contains(".dmd"), "{e}");
+    }
+
+    /// The first matching line wins and the scan stops there (`break`,
+    /// `MDFUTL.C:93`).
+    ///
+    /// `DLLs:` and `MSGs:` are adjacent lines with the same shape, so asking
+    /// for the earlier one must not answer the later one's value.
+    #[test]
+    fn scnmdf_stops_at_the_first_line_that_matches() {
+        let mut f = Fixture::new();
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "DLLs:"), b"SAMPLE");
+        assert_eq!(scan(&mut f, "SAMPLE.MDF", "MSGs:"), b"SAMPLE");
     }
 
     /// `hexopt` reads the same last word `numopt` does, in base 16.
