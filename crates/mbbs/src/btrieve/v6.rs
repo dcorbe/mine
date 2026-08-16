@@ -720,14 +720,69 @@ impl Map {
         // Read before any mutation: `word` borrows `file` immutably.
         let new_generation = word(live, GENERATION).wrapping_add(1);
 
-        // Append the new physical page whole, exactly as `Self::claim` does,
-        // stamped with the SAME logical id rather than a fresh one.
-        let new_physical16 = u16::try_from(pages)
+        // Where the new copy goes: this logical page's **own stale twin** if
+        // it has one, and a page appended to the file if it does not.
+        //
+        // A logical page that has been written more than once has two
+        // physical homes and the engine alternates between them -- measured
+        // across a create/insert/insert/insert/update/delete/insert sequence
+        // on genuine 6.15, where the data page ran 6, 5, 6, 5, 6, 5 and its
+        // index ran 7, 4, 7, 4 (`docs/2026-08-16-v6-update-delete-oracle.md`).
+        // A page that has only ever been claimed has no twin yet, and gets
+        // one here, on its first rewrite.
+        //
+        // **Appending unconditionally was the earlier behaviour and it grew
+        // the file by a page on every write of every page** -- two pages per
+        // record inserted, once records started packing, forever. The old
+        // copy is not lost by reusing the twin: it is precisely the copy this
+        // call is superseding, and the one still live until the allocation
+        // table below is flipped.
+        //
+        // The candidate must carry this same logical id *and* be claimed by
+        // nothing. Any other unclaimed page is some other logical id's stale
+        // twin, and overwriting one of those would throw away a shadow copy
+        // that is not this call's to spend.
+        let claimed_physical = match found {
+            Found::Entry(entry) => {
+                let at = entry_at(live, entry);
+                usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]))
+            }
+            Found::Overflow => usize::from(word(live, OVERFLOW)),
+        };
+        let mut claimed = vec![false; pages];
+        for entry in 0..entries_per_page {
+            let at = entry_at(live, entry);
+            if u16::from_le_bytes([file[at], file[at + 1]]) == 0 {
+                continue;
+            }
+            let page = usize::from(u16::from_le_bytes([file[at + 2], file[at + 3]]));
+            if page < pages {
+                claimed[page] = true;
+            }
+        }
+        let overflow_page = usize::from(word(live, OVERFLOW));
+        if overflow_page < pages {
+            claimed[overflow_page] = true;
+        }
+        let twin = (4..pages).find(|&page| {
+            page != claimed_physical
+                && !claimed[page]
+                && !magic(page)
+                && word(page, LOGICAL) == logical16
+        });
+
+        let new_physical16 = u16::try_from(twin.unwrap_or(pages))
             .map_err(|_| format!("physical page {pages} does not fit in this format's u16"))?;
         let mut page = content.to_vec();
         page[..2].copy_from_slice(&tag);
         page[LOGICAL..LOGICAL + 2].copy_from_slice(&logical16.to_le_bytes());
-        file.extend_from_slice(&page);
+        match twin {
+            Some(at) => {
+                let at = at * page_size_usize;
+                file[at..at + page_size_usize].copy_from_slice(&page);
+            }
+            None => file.extend_from_slice(&page),
+        }
 
         // Copy-on-write into the stale copy, exactly `Self::claim`'s shape:
         // the live copy's own bytes, plus this one change, plus a higher
@@ -867,6 +922,80 @@ mod tests {
             .join("../../tools/btrieve-oracle/fixtures")
             .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// Eight 512-byte pages: an allocation-table pair at 2/3 whose live copy
+    /// (3) claims physical 4 **and** physical 5, and three pages -- 4, 5 and
+    /// 6 -- that all stamp themselves logical 7.
+    ///
+    /// Malformed on purpose. One logical id with two live claims is not
+    /// something a well-formed file has, which is exactly why the shape is
+    /// built by hand here: [`Map::relocate`] picks the page it writes over by
+    /// scanning for this logical id's own unclaimed twin, and the "unclaimed"
+    /// half of that rule cannot be exercised by any file where the rule's
+    /// other half already excludes every claimed candidate.
+    fn two_live_claims_on_one_logical_id() -> Vec<u8> {
+        const PAGE: usize = 512;
+        let mut out = vec![0u8; PAGE * 8];
+        let word = |out: &mut [u8], at: usize, value: u16| {
+            out[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        };
+
+        for (page, generation) in [(2usize, 1u16), (3, 2)] {
+            let at = page * PAGE;
+            out[at..at + 2].copy_from_slice(MAGIC);
+            word(&mut out, at + BLOCK, 1);
+            word(&mut out, at + GENERATION, generation);
+        }
+        // The live copy's two claims.
+        let live = 3 * PAGE;
+        word(&mut out, live + ENTRIES, 0x4400);
+        word(&mut out, live + ENTRIES + 2, 4);
+        word(&mut out, live + ENTRIES + ENTRY, 0x4400);
+        word(&mut out, live + ENTRIES + ENTRY + 2, 5);
+
+        // Three pages stamped logical 7, of which 4 and 5 are claimed.
+        for page in [4usize, 5, 6] {
+            let at = page * PAGE;
+            word(&mut out, at, 0x4400);
+            word(&mut out, at + LOGICAL, 7);
+            // Something recognisable in the body, so an overwrite shows.
+            out[at + 16..at + 24].fill(0xB0 + page as u8);
+        }
+
+        out
+    }
+
+    /// Relocating never writes over a page the allocation table still claims.
+    ///
+    /// With physical 5 claimed and carrying the same logical id as the page
+    /// being relocated, the only legitimate destination is the unclaimed 6.
+    /// Dropping the "and claimed by nothing" half of that rule sends the
+    /// write to 5 -- destroying a live page -- and every other test in this
+    /// crate stays green, which is why this one exists.
+    #[test]
+    fn relocating_skips_a_same_logical_page_that_is_still_claimed() {
+        const PAGE: usize = 512;
+        let mut file = two_live_claims_on_one_logical_id();
+        let claimed_twin = file[5 * PAGE..6 * PAGE].to_vec();
+
+        let mut content = vec![0u8; PAGE];
+        content[32..40].fill(0xCC);
+        let to = Map::relocate(&mut file, PAGE as u16, 7, &content, [0x00, 0x44])
+            .expect("logical 7 is claimed, so it can be relocated");
+
+        assert_eq!(to, 6, "the unclaimed twin is the only legitimate destination");
+        assert_eq!(
+            file[5 * PAGE..6 * PAGE],
+            claimed_twin[..],
+            "a page the table still claims must not be written over"
+        );
+        assert_eq!(file.len(), PAGE * 8, "and nothing needed appending");
+        assert_eq!(
+            &file[6 * PAGE + 32..6 * PAGE + 40],
+            &[0xCC; 8],
+            "the new content landed on 6"
+        );
     }
 
     fn assert_map(map: &Map, expected: &[(u32, u32)]) {

@@ -938,16 +938,33 @@ impl<A: Abi> Block<A> {
     /// every key **before** anything is written, so a refusal never leaves
     /// some keys' indexes updated and others not.
     ///
+    /// # Where the record goes
+    ///
+    /// The free list decides, exactly as it does for v5 and exactly as it
+    /// does in the real engine: [`Self::v6_pop_free`] when the head names a
+    /// free slot, [`Self::v6_claim_threaded_page`] when the list is empty.
+    /// **So records pack**, several to a page, and a fresh page is claimed
+    /// only when there is genuinely no room -- which is also what makes this
+    /// the other half of [`Self::delete_v6`]: the slot a delete frees is the
+    /// slot the next insert takes.
+    ///
+    /// This used to claim a whole page per record and never touch the head,
+    /// which was format-valid and cost 2 KB a record while quietly leaking
+    /// every slot a delete freed.
+    ///
     /// # What is measured, not invented
     ///
-    /// Every mechanism below -- claiming the record's own page, relocating
-    /// each key's root rather than editing it in place, which byte offsets
-    /// of the file control record change and which (`fcr::PAGES`) does not
-    /// -- was measured against genuine Btrieve 6.15 running under Wine
-    /// (`crtprobe.exe`, `tools/btrieve-oracle/`, 2026-08-15), not assumed
-    /// from the v5 shape. See [`v6::Map::relocate`]'s doc comment for the
-    /// measurement that found relocation-on-every-write, and
-    /// [`v6::write_fcr`]'s for the file-control-record fields.
+    /// Every mechanism below -- claiming the record's own page, threading a
+    /// newly claimed page's slots onto the free list, popping the head,
+    /// relocating each key's root rather than editing it in place, which byte
+    /// offsets of the file control record change and which (`fcr::PAGES`)
+    /// does not -- was measured against genuine Btrieve 6.15 running under
+    /// Wine (`crtprobe.exe` and `delprobe.exe`, `tools/btrieve-oracle/`,
+    /// 2026-08-15 and 2026-08-16), not assumed from the v5 shape. See
+    /// [`v6::Map::relocate`]'s doc comment for the measurement that found
+    /// relocation-on-every-write, [`v6::write_fcr`]'s for the
+    /// file-control-record fields, and
+    /// `docs/2026-08-16-v6-update-delete-oracle.md` for the free list.
     ///
     /// A v6 key's root, read from [`pages::fcr::KEY_ROOT`], is not a bare
     /// page number the way a v5 key's is: bit 31 is set and the low 31 bits
@@ -979,7 +996,6 @@ impl<A: Abi> Block<A> {
         }
 
         let page_size = self.geometry.page;
-        let page_size_usize = usize::from(page_size);
         let physical = usize::from(self.geometry.physical);
         let reclen = usize::from(self.geometry.reclen);
         // The two-byte v6 slot marker (Evidence 1b, `records.rs`'s
@@ -999,34 +1015,24 @@ impl<A: Abi> Block<A> {
             fail(format!("{}: {e}", self.path.display()))
         })?;
 
-        // The record's own page: one live claim, one record, matching
-        // `v6::Map::claim`'s own stated scope ("always appends; never
-        // reuses a freed page"). Real Btrieve packs several records per
-        // claimed page once one exists (measured: a second insert added to
-        // the same physical page rather than claiming a new one) -- this
-        // host does not yet find and fill that room, so every v6 insert
-        // costs a whole page. Format-valid, not space-efficient; nothing
-        // downstream distinguishes the two.
-        let mut content = vec![0u8; page_size_usize];
-        // Data bit set, stamp 1 -- `Header`'s own encoding, applied by hand
-        // because `content`'s first four bytes (tag, logical id) are
-        // `v6::Map::claim`'s to fill in, not this function's; see its doc
-        // comment on `content`.
-        content[4..6].copy_from_slice(&0x8001u16.to_le_bytes());
-        content[usize::from(pages::HEADER)..usize::from(pages::HEADER) + 2]
-            .copy_from_slice(&1u16.to_le_bytes());
-        let body_at = usize::from(pages::HEADER) + 2;
-        content[body_at..body_at + bytes.len()].copy_from_slice(&bytes);
-
-        let new_logical = v6::Map::claim(&mut file, page_size, &content, [0x00, 0x44])
-            .map_err(|why| fail(format!("claiming a page for the new record: {why}")))?;
-
         let layout = pages::Layout {
             page: page_size,
             physical: self.geometry.physical,
             pages: self.geometry.pages,
         };
-        let new_position = layout.position(new_logical, 0);
+
+        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+        let head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
+
+        // Where the record goes, and what the free-list head becomes: pop the
+        // head if it names a free slot, and claim a whole new pre-threaded
+        // page if the list is empty. Both are what genuine 6.15 does; see
+        // `Self::v6_pop_free` and `Self::v6_claim_threaded_page`.
+        let (new_position, new_head) = if head == records::NOWHERE {
+            self.v6_claim_threaded_page(&mut file, layout, &bytes).map_err(&fail)?
+        } else {
+            self.v6_pop_free(&mut file, layout, head, &bytes).map_err(&fail)?
+        };
 
         // The model, updated on a copy first: every key's index below is
         // built from this, and nothing commits to `self.records` until the
@@ -1043,39 +1049,20 @@ impl<A: Abi> Block<A> {
             .insert(&self.keys, new_position, bytes.clone())
             .map_err(|why| fail(format!("adding the new record to the model: {why}")))?;
 
-        // Which physical copy of the file control record is live *right
-        // now* -- read straight from `file`, which `v6::Map::claim` above
-        // never touches (it only ever appends), so this is still the same
-        // pair `Self::records` opened the file with.
-        let fcr_word = |page: usize, offset: usize| -> u16 {
-            let at = page * page_size_usize + offset;
-            u16::from_le_bytes([file[at], file[at + 1]])
-        };
-        let live_fcr = match fcr_word(0, at::GENERATION).cmp(&fcr_word(1, at::GENERATION)) {
-            std::cmp::Ordering::Greater => 0usize,
-            std::cmp::Ordering::Less => 1usize,
-            std::cmp::Ordering::Equal => {
-                return Err(fail(format!(
-                    "both file-control-record copies claim generation {}, and \
-                     there is no rule measured for choosing between them",
-                    fcr_word(0, at::GENERATION)
-                )));
-            }
-        };
-        let fcr = file[live_fcr * page_size_usize..][..page_size_usize].to_vec();
-
         let key_record_counts = self
             .v6_reindex(&mut file, &records_clone, &fcr, layout)
             .map_err(&fail)?;
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
-        // `None`: an insert does not move a slot on or off the free list.
-        // This host's v6 insert claims a whole new page rather than popping
-        // the free head genuine Btrieve pops -- see this function's own
-        // "Scope" note and `Self::delete_v6`'s "What this host leaks".
-        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None)
-            .map_err(|why| fail(format!("updating the file control record: {why}")))?;
+        v6::write_fcr(
+            &mut file,
+            page_size,
+            total_records,
+            &key_record_counts,
+            Some(new_head),
+        )
+        .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         // The last point before this write actually changes anything on
         // disk -- see `Self::capture_for_journal`'s doc comment for why it
@@ -1094,6 +1081,154 @@ impl<A: Abi> Block<A> {
         self.dirty = true;
 
         Ok(new_position)
+    }
+
+    /// Put `bytes` in the slot the free list's head names, and answer with
+    /// that slot's position and the list's new head.
+    ///
+    /// The head names a slot; that slot's own first four bytes name the next
+    /// one. Popping is reading the link out before overwriting the slot, and
+    /// nothing more -- the identical discipline v5 has always had, at a
+    /// different offset ([`pages::fcr::FREE_V6`]) and through the allocation
+    /// table rather than straight into the file.
+    ///
+    /// The head is *verified*, not trusted: it must be on a slot boundary, on
+    /// a page the allocation table claims, and the slot it names must
+    /// actually be free (marker zero). A head that fails any of those is a
+    /// broken file, and writing a record over whatever it names would turn a
+    /// broken free list into lost data.
+    ///
+    /// # Errors
+    ///
+    /// If the head does not name a free slot of a claimed page, or the page
+    /// cannot be relocated.
+    fn v6_pop_free(
+        &self,
+        file: &mut Vec<u8>,
+        layout: pages::Layout,
+        head: u32,
+        bytes: &[u8],
+    ) -> Result<(u32, u32), String> {
+        let page_size = self.geometry.page;
+        let page_size_usize = usize::from(page_size);
+
+        let (logical, slot) = layout.slot_of(head).ok_or_else(|| {
+            format!("the free-list head is {head}, which is not on a slot boundary")
+        })?;
+        let physical = v6::Map::read(file, page_size)?.physical(logical).ok_or_else(|| {
+            format!(
+                "the free-list head is {head}, on logical page {logical}, which the \
+                 allocation table claims no physical page for"
+            )
+        })?;
+
+        let at = physical as usize * page_size_usize;
+        if at + page_size_usize > file.len() {
+            return Err(format!(
+                "the free-list head is {head}, on logical page {logical}, which \
+                 resolves to physical page {physical}, past the end of a {}-byte file",
+                file.len()
+            ));
+        }
+        let mut content = file[at..at + page_size_usize].to_vec();
+
+        let within = layout.position(0, slot) as usize;
+        let marker = u16::from_le_bytes([content[within], content[within + 1]]);
+        if marker != 0 {
+            return Err(format!(
+                "the free-list head is {head}, whose slot carries marker \
+                 {marker} -- a live record, not a free slot"
+            ));
+        }
+
+        let body = within + V6_SLOT_MARKER;
+        let next = pages::long(&content[body..body + 4]);
+
+        content[within..within + 2].copy_from_slice(&1u16.to_le_bytes());
+        content[body..body + usize::from(self.geometry.physical) - V6_SLOT_MARKER].fill(0);
+        content[body..body + bytes.len()].copy_from_slice(bytes);
+
+        v6::Map::relocate(file, page_size, logical, &content, [0x00, 0x44])
+            .map_err(|why| format!("relocating the page the free slot is on: {why}"))?;
+
+        Ok((head, next))
+    }
+
+    /// Claim a fresh page for `bytes`, threaded the way a newly claimed page
+    /// arrives from genuine Btrieve, and answer with the record's position
+    /// and the free list's new head.
+    ///
+    /// Measured (`docs/2026-08-16-v6-update-delete-oracle.md`): a page the
+    /// engine claims comes with **every** slot free and linked to the next --
+    /// marker zero, the next slot's position in the body's first four bytes,
+    /// the last one ending the chain at `0xffffffff`. The record then takes
+    /// slot 0 and the head moves to slot 1.
+    ///
+    /// This is reached only when the list is already empty, which is why the
+    /// chain built here ends rather than continuing into whatever the head
+    /// was: there was nothing there to continue into.
+    ///
+    /// # Errors
+    ///
+    /// If the page cannot be claimed.
+    fn v6_claim_threaded_page(
+        &self,
+        file: &mut Vec<u8>,
+        layout: pages::Layout,
+        bytes: &[u8],
+    ) -> Result<(u32, u32), String> {
+        let page_size = self.geometry.page;
+        let per_page = layout.per_page();
+        if per_page == 0 {
+            return Err(format!(
+                "a {}-byte physical slot leaves no room for a record in a \
+                 {page_size}-byte page",
+                self.geometry.physical
+            ));
+        }
+
+        let mut content = vec![0u8; usize::from(page_size)];
+        // Data bit set, stamp 1 -- `Header`'s own encoding, applied by hand
+        // because `content`'s first four bytes (tag, logical id) are
+        // `v6::Map::claim`'s to fill in, not this function's; see its doc
+        // comment on `content`.
+        content[4..6].copy_from_slice(&0x8001u16.to_le_bytes());
+
+        // `claim` decides the logical id, and the thread's links are
+        // positions that depend on it -- so the page is threaded *after* the
+        // claim, in the file, rather than before it in this buffer.
+        let logical = v6::Map::claim(file, page_size, &content, [0x00, 0x44])
+            .map_err(|why| format!("claiming a page for the new record: {why}"))?;
+
+        let physical = v6::Map::read(file, page_size)?
+            .physical(logical)
+            .ok_or_else(|| format!("logical page {logical} was just claimed and is not claimed"))?;
+        let at = physical as usize * usize::from(page_size);
+
+        for slot in 0..per_page {
+            let body = at + layout.position(0, slot) as usize + V6_SLOT_MARKER;
+            let next = if slot + 1 < per_page {
+                layout.position(logical, slot + 1)
+            } else {
+                records::NOWHERE
+            };
+            file[body..body + 4].copy_from_slice(&pages::to_long(next));
+        }
+
+        // Slot 0 takes the record, so the head is slot 1 -- or nothing, on a
+        // page with room for exactly one.
+        let record_at = at + layout.position(0, 0) as usize;
+        file[record_at..record_at + 2].copy_from_slice(&1u16.to_le_bytes());
+        let body = record_at + V6_SLOT_MARKER;
+        file[body..body + usize::from(self.geometry.physical) - V6_SLOT_MARKER].fill(0);
+        file[body..body + bytes.len()].copy_from_slice(bytes);
+
+        let head = if per_page > 1 {
+            layout.position(logical, 1)
+        } else {
+            records::NOWHERE
+        };
+        Ok((layout.position(logical, 0), head))
     }
 
     /// A v6 record's page, and where its slot starts inside that page.
@@ -3822,6 +3957,164 @@ mod tests {
     /// The live half of the file control record's shadow pair.
     fn v6_fcr(block: &Block<Wg16>, file: &[u8]) -> Vec<u8> {
         block.v6_live_fcr(file).expect("a live control record")
+    }
+
+    /// v6 inserts pack: consecutive records land in consecutive slots of one
+    /// page, and the file does not grow a page per record.
+    ///
+    /// `V6EMPTY1KEY.DAT` is 512-byte pages of 22-byte slots, so 23 records
+    /// fit one page. Before this, each insert claimed its own page and the
+    /// file grew by 512 bytes every time -- format-valid, and 23 times the
+    /// size the engine would have written.
+    #[test]
+    fn v6_inserts_pack_into_one_page_rather_than_a_page_each() {
+        let (mut block, path) = v6_scratch("btv-v6-pack");
+        let before = std::fs::metadata(&path).expect("readable").len();
+
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let keys: [&[u8; 4]; 4] = [b"AAAA", b"BBBB", b"CCCC", b"DDDD"];
+        let placed: Vec<(u32, u32)> = keys
+            .iter()
+            .map(|key| {
+                let at = block.insert(&v6_record(key)).expect("insert");
+                layout.slot_of(at).expect("a slot boundary")
+            })
+            .collect();
+
+        let page = placed[0].0;
+        assert!(
+            placed.iter().all(|&(logical, _)| logical == page),
+            "four records, one page: {placed:?}"
+        );
+        assert_eq!(
+            placed.iter().map(|&(_, slot)| slot).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "and consecutive slots of it"
+        );
+
+        // Two pages, whatever the record count: one shadow twin for the data
+        // page and one for the index root, both claimed on the first write
+        // that relocates them and reused by every write after.
+        let after = std::fs::metadata(&path).expect("readable").len();
+        assert_eq!(
+            after - before,
+            u64::from(block.geometry.page) * 2,
+            "four records cost two pages of twins, not a page each"
+        );
+
+        // And the next four cost nothing at all. This is the assertion that
+        // fails if `v6::Map::relocate` goes back to appending: it grew by a
+        // page per relocation, which is two per record, forever.
+        for key in [b"EEEE", b"FFFF", b"GGGG", b"HHHH"] {
+            block.insert(&v6_record(key)).expect("insert");
+        }
+        assert_eq!(
+            std::fs::metadata(&path).expect("readable").len(),
+            after,
+            "a record that fits an already-claimed page grows the file by nothing"
+        );
+
+        block.records = None;
+        assert_eq!(block.records().expect("re-reads").len(), 8);
+    }
+
+    /// Filling a page past its capacity claims a second one, threads it, and
+    /// keeps inserting into it.
+    ///
+    /// **This is the only test that reaches
+    /// [`Block::v6_claim_threaded_page`] at all.** `V6EMPTY1KEY.DAT` arrives
+    /// from genuine Btrieve with a free list already covering its one data
+    /// page's 23 slots, so every insert up to the 23rd pops that list and the
+    /// claim path is never entered. Found by mutation: gutting the threading
+    /// loop entirely left the whole suite green.
+    ///
+    /// The 24th record is the first that has to claim. The **26th** is what
+    /// proves the claimed page was *threaded*: the 25th is placed at slot 1,
+    /// which `v6_claim_threaded_page` also computes arithmetically when it
+    /// sets the new head, so a claim that threads nothing still gets that far
+    /// -- measured, by mutation, on the version of this test that stopped at
+    /// 25 records. Only slot 2 has to come out of a link written on disk.
+    #[test]
+    fn a_v6_insert_past_a_full_page_claims_and_threads_another() {
+        let (mut block, _path) = v6_scratch("btv-v6-second-page");
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let per_page = layout.per_page();
+        assert_eq!(per_page, 23, "this fixture's page holds 23 slots");
+
+        let mut placed = Vec::new();
+        for n in 0..per_page + 3 {
+            let key = [
+                b'A' + (n / 26) as u8,
+                b'A' + (n % 26) as u8,
+                b'0',
+                b'0',
+            ];
+            let at = block.insert(&v6_record(&key)).expect("insert");
+            placed.push(layout.slot_of(at).expect("a slot boundary"));
+        }
+
+        let first_page = placed[0].0;
+        assert!(
+            placed[..per_page as usize].iter().all(|&(page, _)| page == first_page),
+            "the first {per_page} records fill one page: {placed:?}"
+        );
+        let second_page = placed[per_page as usize].0;
+        assert_ne!(second_page, first_page, "the 24th record needs a new page");
+        assert_eq!(
+            placed[per_page as usize],
+            (second_page, 0),
+            "and lands in its first slot"
+        );
+        assert_eq!(
+            placed[per_page as usize + 1],
+            (second_page, 1),
+            "the 25th follows it"
+        );
+        assert_eq!(
+            placed[per_page as usize + 2],
+            (second_page, 2),
+            "and the 26th is the one that proves the claimed page was THREADED: \
+             slot 1's own body is the only place the position of slot 2 is \
+             written down, so a claim that placed slot 1 by arithmetic and \
+             threaded nothing gets here with a free-list head of zero"
+        );
+
+        block.records = None;
+        assert_eq!(
+            block.records().expect("re-reads both pages").len(),
+            (per_page + 3) as usize
+        );
+    }
+
+    /// The slot a delete frees is the slot the next insert takes.
+    ///
+    /// The two halves of one mechanism, which is the whole reason the free
+    /// list is maintained at all rather than merely written. Until insert
+    /// popped the head, a delete's freed slot was leaked forever and this
+    /// test's second record would have landed somewhere else entirely.
+    #[test]
+    fn a_v6_insert_reuses_the_slot_a_delete_freed() {
+        let (mut block, _path) = v6_scratch("btv-v6-reuse");
+
+        block.insert(&v6_record(b"AAAA")).expect("first insert");
+        let freed = block.insert(&v6_record(b"BBBB")).expect("second insert");
+        block.delete(freed).expect("delete the second");
+
+        let reused = block.insert(&v6_record(b"CCCC")).expect("insert after the delete");
+        assert_eq!(reused, freed, "the freed slot is where the next record goes");
+
+        block.records = None;
+        let reread = block.records().expect("re-reads");
+        assert_eq!(reread.len(), 2);
+        assert_eq!(at_position(reread, reused).expect("reused").bytes, v6_record(b"CCCC"));
     }
 
     /// An update of a v6 record rewrites it **in its own slot**, leaving its

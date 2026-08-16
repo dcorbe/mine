@@ -42,7 +42,7 @@ pub(super) const V6_SLOT_MARKER: usize = 2;
 const FREE_LIST: usize = 0x10;
 
 /// The record pointer that ends a chain.
-const NOWHERE: u32 = 0xffff_ffff;
+pub(super) const NOWHERE: u32 = 0xffff_ffff;
 
 /// One record, and where in the file it lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
