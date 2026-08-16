@@ -152,6 +152,19 @@ struct KvmRun {
 }
 
 const KVM_INTERRUPT: libc::c_ulong = 0x4004_ae86;
+const KVM_SET_GUEST_DEBUG: libc::c_ulong = 0x4048_ae9b;
+const KVM_GUESTDBG_ENABLE: u32 = 0x0000_0001;
+const KVM_GUESTDBG_SINGLESTEP: u32 = 0x0000_0002;
+const KVM_GUESTDBG_USE_HW_BP: u32 = 0x0002_0000;
+const KVM_EXIT_DEBUG: u32 = 4;
+
+/// `struct kvm_guest_debug` with x86's `debugreg[8]` arch payload.
+#[repr(C)]
+struct KvmGuestDebug {
+    control: u32,
+    pad: u32,
+    debugreg: [u64; 8],
+}
 const KVM_EXIT_IRQ_WINDOW_OPEN: u32 = 7;
 const KVM_EXIT_INTR: u32 = 10;
 
@@ -179,6 +192,8 @@ pub enum Stop {
     PortRead { port: u16 },
     /// The guest is now able to take an interrupt.
     IrqWindow,
+    /// A watchpoint fired, or a single step completed.
+    Debug,
     /// The guest halted.
     Halted,
     /// The watchdog cut in: the guest is running but not asking for anything.
@@ -543,6 +558,18 @@ impl VmGuest {
                         Ok(Stop::PortWrite { port, value })
                     }
                 }
+                KVM_EXIT_DEBUG => {
+                    let regs = std::ptr::from_mut(&mut self.regs);
+                    // SAFETY: both outlive their calls.
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_REGS, regs) } < 0 {
+                        return last_err();
+                    }
+                    let sregs = std::ptr::from_mut(&mut self.sregs);
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, sregs) } < 0 {
+                        return last_err();
+                    }
+                    Ok(Stop::Debug)
+                }
                 KVM_EXIT_IRQ_WINDOW_OPEN => Ok(Stop::IrqWindow),
                 KVM_EXIT_HLT => Ok(Stop::Halted),
                 KVM_EXIT_INTR => {
@@ -618,6 +645,89 @@ impl VmGuest {
             return last_err();
         }
         Ok(())
+    }
+
+    /// Stop when the guest touches `linear`, and/or after every instruction.
+    ///
+    /// A watchpoint is how a trace gets armed without tracing everything.
+    /// Stepping costs four to six microseconds an instruction, so a two-second
+    /// native run would take about a hundred minutes to step -- but a hardware
+    /// breakpoint runs at full speed and stops on the one access that matters
+    /// (`re/spikes/kvm_singlestep.c`).
+    ///
+    /// The stop is reported *after* the access completes, because data
+    /// breakpoints are trap-type. The instruction named is the one following
+    /// the access, which is easy to mistake for an off-by-one.
+    pub fn debug(&mut self, watch: Option<u32>, step: bool) -> io::Result<()> {
+        let mut dbg = KvmGuestDebug {
+            control: KVM_GUESTDBG_ENABLE,
+            pad: 0,
+            debugreg: [0; 8],
+        };
+        if step {
+            dbg.control |= KVM_GUESTDBG_SINGLESTEP;
+        }
+        if let Some(addr) = watch {
+            dbg.control |= KVM_GUESTDBG_USE_HW_BP;
+            dbg.debugreg[0] = u64::from(addr);
+            // L0 enables DR0; R/W0 = 11 breaks on data read or write; LEN0 = 00
+            // watches one byte.
+            dbg.debugreg[7] = 0x1 | (0x3 << 16);
+        }
+        if dbg.control == KVM_GUESTDBG_ENABLE {
+            dbg.control = 0; // nothing asked for: turn debugging off entirely
+        }
+        // SAFETY: `dbg` outlives the call, which copies it.
+        if unsafe { libc::ioctl(self.vcpu, KVM_SET_GUEST_DEBUG, std::ptr::from_ref(&dbg)) } < 0 {
+            return last_err();
+        }
+        Ok(())
+    }
+
+    /// The bytes at the current `CS:IP`, for disassembling a trace afterwards.
+    pub fn code_here(&self, len: usize) -> Vec<u8> {
+        let at = (self.sregs.cs.base as usize) + (self.regs.rip as u16 as usize);
+        let mem = self.mem_ref();
+        mem.get(at..at.saturating_add(len)).unwrap_or(&[]).to_vec()
+    }
+
+    /// Registers as a trace line wants them.
+    pub fn trace_line(&self) -> String {
+        let r = &self.regs;
+        format!(
+            "{:04x}:{:04x}  ax={:04x} bx={:04x} cx={:04x} dx={:04x} si={:04x} di={:04x}              ds={:04x} es={:04x} fl={:04x}  {}",
+            self.sregs.cs.selector,
+            r.rip as u16,
+            r.rax as u16, r.rbx as u16, r.rcx as u16, r.rdx as u16,
+            r.rsi as u16, r.rdi as u16,
+            self.sregs.ds.selector, self.sregs.es.selector,
+            r.rflags as u16,
+            self.code_here(8).iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+        )
+    }
+
+    /// Linear addresses where `value` appears as a little-endian word.
+    ///
+    /// How you find out where a program put something you typed. Cheap, and
+    /// far more direct than reasoning about a Turbo Pascal stack frame.
+    pub fn scan_u16(&self, value: u16, limit: usize) -> Vec<usize> {
+        let want = value.to_le_bytes();
+        let mem = self.mem_ref();
+        let mut hits = Vec::new();
+        for at in 0..mem.len().saturating_sub(1) {
+            if mem[at] == want[0] && mem[at + 1] == want[1] {
+                hits.push(at);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        hits
+    }
+
+    /// The current instruction's linear address, for collapsing a `rep`.
+    pub fn code_addr(&self) -> usize {
+        (self.sregs.cs.base as usize) + (self.regs.rip as u16 as usize)
     }
 
     /// Where the guest is now, for diagnostics.

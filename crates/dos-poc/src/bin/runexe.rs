@@ -84,6 +84,13 @@ fn main() -> io::Result<()> {
     let mut door = false;
     let mut baud: Option<u32> = None;
     let mut dropfile: Option<String> = None;
+    let mut watch: Option<u32> = None;
+    let mut watch_steps: u32 = 0;
+    let mut scan: Vec<u16> = Vec::new();
+    // Hits to ignore before arming the trace. The first accesses to an input
+    // variable are the code that *stored* it; the check reads it later, so
+    // skipping past the store is how the trace lands on the interesting half.
+    let mut watch_skip: u32 = 0;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -99,6 +106,21 @@ fn main() -> io::Result<()> {
             "--door" => door = true,
             "--baud" => baud = it.next().and_then(|v| v.parse().ok()),
             "--dropfile" => dropfile = it.next().cloned(),
+            "--watch" => {
+                watch = it.next().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+            }
+            "--watch-steps" => {
+                watch_steps = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "--watch-skip" => {
+                watch_skip = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            }
+            "--scan-u16" => {
+                scan = it
+                    .next()
+                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u16>().ok()).collect())
+                    .unwrap_or_default();
+            }
             other => {
                 if !tail.is_empty() {
                     tail.push(' ');
@@ -157,6 +179,13 @@ fn main() -> io::Result<()> {
         at.psp_seg, at.image_seg, at.cs, at.ip, at.ss, at.sp
     );
     vm.enter(at.cs, at.ip, at.ss, at.sp, at.psp_seg, at.psp_seg)?;
+    if let Some(addr) = watch {
+        // Run at full speed and stop on the one access that matters. Stepping
+        // from the start would take about a hundred minutes for a two-second
+        // program (re/spikes/kvm_singlestep.c).
+        vm.debug(Some(addr), false)?;
+        println!("watching {addr:#07x} for a data access");
+    }
     // A human takes as long as they take, so the watchdog that rescues an
     // unattended probe from a spinning guest must not fire on them.
     let helpers = vm.helpers(if attended { 24 * 60 * 60 * 1000 } else { 10_000 });
@@ -203,6 +232,14 @@ fn main() -> io::Result<()> {
     let mut bios: BTreeMap<(u8, u8), u32> = BTreeMap::new();
     let mut vectors: Vec<String> = Vec::new();
     let mut settles = 0u32;
+    // Set once the watchpoint has fired and we are stepping a bounded window.
+    let mut stepping = 0u32;
+    let mut window: Vec<String> = Vec::new();
+    // A `rep movsb` single-steps once per byte copied. Counting raw steps
+    // spends a whole window inside one instruction, so collapse runs at the
+    // same address and count distinct instructions instead.
+    let mut last_addr = usize::MAX;
+    let mut repeats = 0u32;
     // Calls a real machine services and we do not, named at the moment they
     // happen rather than inferred later from a screen that looks wrong.
     let mut gaps: BTreeMap<String, u32> = BTreeMap::new();
@@ -446,6 +483,43 @@ fn main() -> io::Result<()> {
                 };
                 vm.complete_port_read(value);
             }
+            Stop::Debug => {
+                if stepping > 0 {
+                    let here = vm.code_addr();
+                    if here == last_addr {
+                        repeats += 1;
+                    } else {
+                        if repeats > 0 {
+                            if let Some(prev) = window.last_mut() {
+                                prev.push_str(&format!("   (x{})", repeats + 1));
+                            }
+                            repeats = 0;
+                        }
+                        window.push(vm.trace_line());
+                        last_addr = here;
+                        stepping -= 1;
+                        if stepping == 0 {
+                            vm.debug(None, false)?;
+                            break "trace window complete".to_string();
+                        }
+                    }
+                } else if watch_skip > 0 {
+                    watch_skip -= 1;
+                    println!("  (skipping watchpoint hit at {})", vm.trace_line());
+                } else {
+                    // The access happened; a data breakpoint is trap-type, so
+                    // the instruction named is the one *after* it.
+                    println!("\n*** watchpoint hit ***\n  {}", vm.trace_line());
+                    window.push(vm.trace_line());
+                    if watch_steps > 0 {
+                        stepping = watch_steps;
+                        vm.debug(watch, true)?;
+                    } else {
+                        vm.debug(None, false)?;
+                        break "watchpoint hit".to_string();
+                    }
+                }
+            }
             Stop::IrqWindow => {}
             // With a UART present, `hlt` is not the end -- it is the guest
             // saying it has nothing to do until an interrupt arrives, which is
@@ -554,6 +628,19 @@ fn main() -> io::Result<()> {
     }
 
     println!("--- {calls} DOS calls, {ending} ---");
+    for value in &scan {
+        let hits = vm.scan_u16(*value, 12);
+        let shown: Vec<String> = hits.iter().map(|a| format!("{a:#07x}")).collect();
+        println!("scan {value:5} ({:#06x}): {}", value,
+                 if shown.is_empty() { "not in memory".into() } else { shown.join(" ") });
+    }
+
+    if !window.is_empty() {
+        println!("\n--- trace from the watchpoint ({} instructions) ---", window.len());
+        for line in &window {
+            println!("  {line}");
+        }
+    }
     println!("{}", cpu_report(started, calls));
     let wall = started.elapsed();
     let other = wall
