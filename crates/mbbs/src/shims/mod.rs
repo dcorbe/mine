@@ -1003,6 +1003,18 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "setmode", crt::setmode, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "read", crt::read, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "write", crt::write, Cleans::Caller, Evidence::Unclassified),
+        // Raw DOS handles: no FILE, reached by descriptor. `_write` is a
+        // genuinely different symbol from `write` above -- same precedent as
+        // `_fgetc` vs `fgetc` (see this file's own comment there) -- and also
+        // genuinely different behaviour: `write` honours the handle's text
+        // mode and `_write` does not.
+        (MAJORBBS, "open", crt::open, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "creat", crt::creat, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "close", crt::close, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "lseek", crt::lseek, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "tell", crt::tell, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "filelength", crt::filelength, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "_write", crt::_write, Cleans::Caller, Evidence::Standard),
         // `mfytask` completes the pair `initask` opened: a module could
         // register a task and then fail modifying it.
         (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller, Evidence::Unclassified),

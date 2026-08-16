@@ -293,7 +293,19 @@ struct Stream<A: Abi> {
     name: String,
 
     /// The `FILE *` the module holds. Unique for the life of the host.
-    cookie: A::Ptr,
+    ///
+    /// **`None` for a stream `open`/`creat` produced.** Those are raw DOS
+    /// handles: Borland's low-level I/O allocates no `FILE` for them, and the
+    /// module never has a pointer to hand back. Everything a raw handle can
+    /// do is reached by descriptor instead -- see [`Streams::find_fd`].
+    ///
+    /// Widening this rather than adding a second table is the whole design
+    /// decision of the descriptor work. `lseek`/`tell`/`filelength`/`read`/
+    /// `write` all have to work on a descriptor that came from *either*
+    /// `open` or `fileno(fopen(...))`, and two tables would mean two possible
+    /// answers to "what is fd 7" -- with nothing to stop both being live at
+    /// once.
+    cookie: Option<A::Ptr>,
 
     /// What `fileno(fp)` reads out of the struct. One byte, so it is reused
     /// after a close -- unlike the cookie. See [`Streams::close`].
@@ -445,6 +457,20 @@ impl<A: Abi> Stream<A> {
         file.write_all(&out)
     }
 
+    /// Put `bytes` on the end **without** translating, whatever the mode
+    /// says.
+    ///
+    /// What `_write` does where [`Stream::write`] is what `write` does. The
+    /// underscore is the whole difference between the two Borland symbols,
+    /// and this is where it lives -- one layer, so a caller cannot translate
+    /// a second time on top of a layer that already did.
+    fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let (Io::Write(file) | Io::Update(file)) = &mut self.io else {
+            return Ok(());
+        };
+        file.write_all(bytes)
+    }
+
     /// Move this stream's real, physical position, and answer where it
     /// landed.
     ///
@@ -580,36 +606,7 @@ impl<A: Abi> Streams<A> {
             )
         })?;
 
-        // The base letter decides create and truncate; the `+` decides only
-        // that the handle is `O_RDWR`. `CheckOpenType`'s table, FOPEN.C:44-50:
-        // `w+` creates and truncates, `a+` creates and appends, `r+` does
-        // neither and fails if the file is not there.
-        let io = if mode.update {
-            Io::Update(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(!mode.read)
-                    .append(mode.append)
-                    .truncate(mode.write && !mode.append)
-                    .open(path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?,
-            )
-        } else if mode.read {
-            Io::Read(BufReader::new(
-                File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
-            ))
-        } else {
-            Io::Write(
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .append(mode.append)
-                    .truncate(!mode.append)
-                    .open(path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?,
-            )
-        };
+        let io = Self::io_for(path, mode)?;
 
         let cookie = self
             .arena
@@ -618,7 +615,7 @@ impl<A: Abi> Streams<A> {
 
         let stream = Stream {
             name: name.to_owned(),
-            cookie,
+            cookie: Some(cookie),
             fd,
             mode,
             io,
@@ -664,9 +661,20 @@ impl<A: Abi> Streams<A> {
     /// If `cookie` names no open stream.
     pub fn close(&mut self, cookie: A::Ptr) -> Result<(), String> {
         let at = self.find(cookie)?;
-        let stream = self.open.remove(at);
-        self.retired.push((cookie, stream.name));
+        self.close_at(at);
         Ok(())
+    }
+
+    /// Drop the stream at `at`, retiring its cookie if it had one.
+    ///
+    /// A raw descriptor has nothing to retire: the descriptor itself is
+    /// reused (it is one byte, and the real runtime reuses it too), and there
+    /// is no `FILE` address that must never be handed out again.
+    fn close_at(&mut self, at: usize) {
+        let stream = self.open.remove(at);
+        if let Some(cookie) = stream.cookie {
+            self.retired.push((cookie, stream.name));
+        }
     }
 
     /// What a stream was opened as.
@@ -878,9 +886,214 @@ impl<A: Abi> Streams<A> {
         self.open.is_empty()
     }
 
+    /// Open the underlying file for `mode`.
+    ///
+    /// The base letter decides create and truncate; the `+` decides only that
+    /// the handle is `O_RDWR`. `CheckOpenType`'s table, `FOPEN.C:44-50`: `w+`
+    /// creates and truncates, `a+` creates and appends, `r+` does neither and
+    /// fails if the file is not there.
+    ///
+    /// Shared by [`Streams::open_mem`] and [`Streams::open_raw`] so that a
+    /// raw descriptor and a `FILE` opened the same way cannot end up with
+    /// different `OpenOptions`.
+    fn io_for(path: &Path, mode: Mode) -> Result<Io, String> {
+        Ok(if mode.update {
+            Io::Update(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(!mode.read)
+                    .append(mode.append)
+                    .truncate(mode.write && !mode.append)
+                    .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        } else if mode.read {
+            Io::Read(BufReader::new(
+                File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            ))
+        } else {
+            Io::Write(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(mode.append)
+                    .truncate(!mode.append)
+                    .open(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        })
+    }
+
+    /// Open a file as a **raw descriptor**, with no `FILE` behind it.
+    ///
+    /// What `open` and `creat` do. The answer is the descriptor itself,
+    /// because that is all the module gets: Borland's low-level I/O allocates
+    /// nothing from `_streams[]` for these, and there is no cookie to hand
+    /// back.
+    ///
+    /// The stream lands in the same table `fopen`'s do, so a descriptor is
+    /// unique across both and `lseek`/`tell`/`read`/`write` do not care which
+    /// call produced it.
+    ///
+    /// # Errors
+    ///
+    /// If every descriptor is in use, or the file cannot be opened.
+    pub fn open_raw(&mut self, name: &str, path: &Path, mode: Mode) -> Result<u8, String> {
+        let fd = self.free_fd().ok_or_else(|| {
+            format!(
+                "{name}: all {} descriptors are in use",
+                u16::from(u8::MAX) + 1 - u16::from(FIRST_FD)
+            )
+        })?;
+        let io = Self::io_for(path, mode)?;
+        self.open.push(Stream {
+            name: name.to_owned(),
+            cookie: None,
+            fd,
+            mode,
+            io,
+            ended: false,
+        });
+        Ok(fd)
+    }
+
+    /// Where the stream with descriptor `fd` is, or why there is none.
+    ///
+    /// The counterpart of [`Streams::find`], and the reason there is one
+    /// table rather than two: this resolves a descriptor from `open` and one
+    /// from `fileno(fopen(...))` identically, because both are rows here.
+    fn find_fd(&self, fd: u8) -> Result<usize, String> {
+        self.open
+            .iter()
+            .position(|s| s.fd == fd)
+            .ok_or_else(|| format!("descriptor {fd} names no stream this host has open"))
+    }
+
+    /// Close the stream with descriptor `fd`.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream.
+    pub fn close_fd(&mut self, fd: u8) -> Result<(), String> {
+        let at = self.find_fd(fd)?;
+        self.close_at(at);
+        Ok(())
+    }
+
+    /// Read at most `want` bytes from `fd`.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, it is not readable, or the read fails.
+    pub fn read_fd(&mut self, fd: u8, want: usize) -> Result<Vec<u8>, String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        if !stream.mode.readable() {
+            return Err(format!("{} is open for writing", stream.name));
+        }
+        stream.read(want).map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// Write `bytes` to `fd`, translating `\n` if the handle is in text
+    /// mode.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, it is not writable, or the write fails.
+    pub fn write_fd(&mut self, fd: u8, bytes: &[u8]) -> Result<(), String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        if !stream.mode.writable() {
+            return Err(format!("{} is open for reading", stream.name));
+        }
+        stream.write(bytes).map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// Write `bytes` to `fd` with **no** translation, whatever the mode says.
+    ///
+    /// `_write`'s half of the pair. The translation lives in exactly one
+    /// layer ([`Stream::write`] versus [`Stream::write_raw`]) so that no
+    /// caller can apply it twice -- which is a real hazard here rather than a
+    /// hypothetical one: `crt::write`'s descriptor branch was briefly written
+    /// to translate before calling this type, on top of a stream layer that
+    /// already did, and would have turned one `\n` into `\r\r\n`.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, it is not writable, or the write fails.
+    pub fn write_raw_fd(&mut self, fd: u8, bytes: &[u8]) -> Result<(), String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        if !stream.mode.writable() {
+            return Err(format!("{} is open for reading", stream.name));
+        }
+        stream.write_raw(bytes).map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// Move `fd`'s position, answering the new one.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, or the seek fails.
+    pub fn seek_fd(&mut self, fd: u8, pos: SeekFrom) -> Result<u64, String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        // A seek clears end-of-file, the same as `fseek`'s does: the position
+        // has moved, so whatever a previous read concluded no longer holds.
+        stream.ended = false;
+        stream.seek(pos).map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// Where `fd`'s position is.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, or the position cannot be read.
+    pub fn tell_fd(&mut self, fd: u8) -> Result<u64, String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        stream.tell().map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// How long the file behind `fd` is, **without moving its position**.
+    ///
+    /// `filelength` is specified not to disturb the file pointer, so this
+    /// saves the position, seeks to the end, and puts it back. Doing it any
+    /// other way would leave a module's next read at the wrong place, which
+    /// is the kind of bug that surfaces far from its cause.
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream, or a seek fails.
+    pub fn length_fd(&mut self, fd: u8) -> Result<u64, String> {
+        let at = self.find_fd(fd)?;
+        let stream = &mut self.open[at];
+        let here = stream.tell().map_err(|e| format!("{}: {e}", stream.name))?;
+        let end = stream
+            .seek(SeekFrom::End(0))
+            .map_err(|e| format!("{}: {e}", stream.name))?;
+        stream
+            .seek(SeekFrom::Start(here))
+            .map_err(|e| format!("{}: {e}", stream.name))?;
+        Ok(end)
+    }
+
+    /// Whether `fd` was opened in binary mode.
+    ///
+    /// What decides whether `write` translates `\n` -- and what `_write`
+    /// ignores. See [`crate::shims::crt::_write`].
+    ///
+    /// # Errors
+    ///
+    /// If `fd` names no open stream.
+    pub fn binary_fd(&self, fd: u8) -> Result<bool, String> {
+        Ok(self.open[self.find_fd(fd)?].mode.binary)
+    }
+
     /// Where the stream `cookie` names is, or why it names none.
     fn find(&self, cookie: A::Ptr) -> Result<usize, String> {
-        if let Some(at) = self.open.iter().position(|s| s.cookie == cookie) {
+        if let Some(at) = self.open.iter().position(|s| s.cookie == Some(cookie)) {
             return Ok(at);
         }
         // Retired addresses are never reissued, so this can name the file --
@@ -942,7 +1155,13 @@ impl<A: Abi> Streams<A> {
     /// unlike `open`/`line`/`read`, which are public and do need one.
     fn sync(&mut self, mem: &mut A::Mem, at: usize) -> Result<(), String> {
         let stream = &self.open[at];
-        let field = A::ptr_offset(stream.cookie, A::FILE_FLAGS_OFFSET);
+        // A raw descriptor has no `FILE` to mirror the flags into, and
+        // nothing reads them: `feof`/`ferror` are macros over a `FILE`, and a
+        // module holding only a descriptor has none to hand them.
+        let Some(cookie) = stream.cookie else {
+            return Ok(());
+        };
+        let field = A::ptr_offset(cookie, A::FILE_FLAGS_OFFSET);
         field
             .write(mem, &stream.flags().to_le_bytes())
             .map_err(|e| format!("{}: {e}", stream.name))
@@ -964,8 +1183,29 @@ impl<A: Abi> Streams<A> {
         self.open
             .iter()
             .find(|s| s.fd == fd)
-            .map(|s| s.cookie)
-            .ok_or_else(|| format!("descriptor {fd} names no stream this host has open"))
+            .ok_or_else(|| format!("descriptor {fd} names no stream this host has open"))?
+            .cookie
+            .ok_or_else(|| {
+                format!(
+                    "descriptor {fd} is a raw handle from open/creat, which has no \
+                     FILE -- reach it by descriptor rather than by cookie"
+                )
+            })
+    }
+
+    /// The descriptor a `FILE *` carries -- what `fileno(fp)` reads out of
+    /// the struct, answered by the host instead.
+    ///
+    /// The inverse of [`Streams::cookie_of_fd`]. `fileno` is a macro, so a
+    /// module reads this byte itself and never calls here; this exists for
+    /// the host's own tests, which need to know which descriptor an `fopen`
+    /// was given in order to check that a raw `open` did not collide with it.
+    ///
+    /// # Errors
+    ///
+    /// If `cookie` names no open stream.
+    pub fn fd_of_cookie(&self, cookie: A::Ptr) -> Result<u8, String> {
+        Ok(self.open[self.find(cookie)?].fd)
     }
 
     /// The lowest descriptor no open stream is using.

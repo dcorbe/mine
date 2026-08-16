@@ -1176,6 +1176,378 @@ pub fn setmode<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::int_from_u32(previous)))
 }
 
+/// Borland's `open` flags, `INCLUDE/FCNTL.H` -- the same header
+/// [`setmode`] already cites for `O_TEXT`/`O_BINARY`.
+mod oflag {
+    pub const RDONLY: u32 = 0x0000;
+    pub const WRONLY: u32 = 0x0001;
+    pub const RDWR: u32 = 0x0002;
+    /// The access is the low two bits, and they are a value rather than a
+    /// set: `O_RDWR` is 2, not `O_RDONLY | O_WRONLY`.
+    pub const ACCESS: u32 = 0x0003;
+    pub const APPEND: u32 = 0x0008;
+    pub const CREAT: u32 = 0x0100;
+    pub const TRUNC: u32 = 0x0200;
+    pub const TEXT: u32 = 0x4000;
+    pub const BINARY: u32 = 0x8000;
+}
+
+/// What DOS's low-level I/O answers when it fails: `-1`, at this ABI's `int`
+/// width.
+///
+/// A **value, not a refusal**. `open` returning -1 for a file that is not
+/// there is the ordinary case a caller tests for, exactly as `fopen`
+/// answering NULL is -- this crate already returns that null rather than
+/// stopping the module. Reserving refusals for what a module cannot be
+/// expected to handle is what keeps them meaningful.
+fn minus_one<A: Abi>() -> abi::Ret<A> {
+    abi::Ret::Int(A::int_from_u32(u32::MAX))
+}
+
+/// Turn Borland's `open` flags into the [`Mode`](crate::stream::Mode) this
+/// host's `Streams` is built around.
+///
+/// The two describe the same thing differently: `Mode`'s `read`/`write`/
+/// `append` are `fopen`'s base *letter* -- what decides create and truncate
+/// -- while `open`'s access bits say only which directions are permitted and
+/// leave create and truncate to `O_CREAT`/`O_TRUNC`. So the mapping is by
+/// what the combination *does*, not by name:
+///
+/// | flags | `fopen` equivalent |
+/// |---|---|
+/// | `O_RDONLY` | `r` |
+/// | `O_WRONLY\|O_CREAT\|O_TRUNC` | `w` |
+/// | `O_WRONLY\|O_CREAT\|O_APPEND` | `a` |
+/// | `O_RDWR` | `r+` |
+/// | `O_RDWR\|O_CREAT\|O_TRUNC` | `w+` |
+/// | `O_RDWR\|O_CREAT\|O_APPEND` | `a+` |
+///
+/// # Errors
+///
+/// On a write-side combination `Mode` cannot express -- writing without
+/// either `O_TRUNC` or `O_APPEND`, which means "open the existing file and
+/// overwrite from the start, keeping whatever is past what I write". `Mode`
+/// has no such base letter, and the nearest one (`w`) truncates. Refusing
+/// names it rather than silently discarding the tail of a module's file.
+fn mode_from_oflags(flags: u32) -> Result<crate::stream::Mode, String> {
+    let access = flags & oflag::ACCESS;
+    let creating = flags & oflag::CREAT != 0;
+    let truncating = flags & oflag::TRUNC != 0;
+    let appending = flags & oflag::APPEND != 0;
+    let writing = matches!(access, oflag::WRONLY | oflag::RDWR);
+
+    if writing && !truncating && !appending && creating {
+        return Err(format!(
+            "flags {flags:#06x}: opened for writing with O_CREAT but neither \
+             O_TRUNC nor O_APPEND, which means overwrite-in-place and keep the \
+             tail -- this host's stream modes have no such base letter, and the \
+             nearest (w) would discard the rest of the file"
+        ));
+    }
+
+    // `binary` is what decides `\n` translation. `O_TEXT` and `O_BINARY` are
+    // the two named values; neither set means the default, and this host's
+    // default is text, matching `_fmode`.
+    let binary = flags & oflag::BINARY != 0 && flags & oflag::TEXT == 0;
+
+    Ok(match access {
+        oflag::RDONLY => crate::stream::Mode {
+            read: true,
+            write: false,
+            append: false,
+            update: false,
+            binary,
+        },
+        oflag::WRONLY => crate::stream::Mode {
+            read: false,
+            write: !appending,
+            append: appending,
+            update: false,
+            binary,
+        },
+        oflag::RDWR => crate::stream::Mode {
+            // `read` here means "must already exist" -- `r+`. With `O_CREAT`
+            // the file may be made, which is `w+`/`a+`.
+            read: !creating,
+            write: creating && !appending,
+            append: appending,
+            update: true,
+            binary,
+        },
+        other => {
+            return Err(format!(
+                "flags {flags:#06x}: access bits {other} are not one of O_RDONLY \
+                 (0), O_WRONLY (1) or O_RDWR (2)"
+            ));
+        }
+    })
+}
+
+/// Resolve a module's filename for a low-level open, creating the containing
+/// directory when the call may create the file.
+///
+/// The same path `fopen` takes (`shims::stream::fopen`), and deliberately so:
+/// `Host::dos_name` is what refuses a drive letter or a `..`, and that
+/// sandbox guarantee has to hold for `open` exactly as it does for `fopen`.
+///
+/// **Answers the sandboxed name alongside the path**, so that `dos_name` is
+/// called exactly once per open. It was called twice at first -- here and
+/// again in the caller, to name the stream -- and a mutation that deleted
+/// *this* one still passed the sandbox test, because the caller's copy caught
+/// the `..` anyway. Two checks for one guarantee means neither is load-bearing
+/// and neither can be tested.
+///
+/// `Ok(None)` means "not there", which the caller turns into `-1`.
+fn resolve_for_open<A: Abi>(
+    host: &Host<A>,
+    named: &str,
+    creating: bool,
+) -> Result<Option<(String, std::path::PathBuf)>, ShimError> {
+    let name = Host::<crate::abi::Wg16>::dos_name(named).map_err(ShimError::Failed)?;
+    if let Some(path) = host.find(&name) {
+        return Ok(Some((name, path)));
+    }
+    if !creating {
+        return Ok(None);
+    }
+    let at = host.root.join(&name);
+    if let Some(parent) = at.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ShimError::Failed(format!("open({named}): {}: {e}", parent.display())))?;
+    }
+    Ok(Some((name, at)))
+}
+
+/// `int open(const char *path, int access, ...)` -- open a file as a raw DOS
+/// handle.
+///
+/// **No `FILE` is allocated.** That is the whole difference from `fopen`: the
+/// module gets a descriptor and nothing else, which is why
+/// [`crate::stream::Streams`] holds `cookie: None` for these. Everything the
+/// handle can do afterwards is keyed by that descriptor, and a descriptor
+/// from here is indistinguishable from one a module got out of
+/// `fileno(fopen(...))` -- one table, one answer.
+///
+/// The permission argument DOS takes third is read and ignored, as it is by
+/// every host that does not implement DOS's read-only attribute; it is a
+/// vararg here because `open`'s prototype makes it one.
+///
+/// Answers `-1` for a file that is not there, which is the value a caller
+/// tests -- see [`minus_one`].
+///
+/// # Errors
+///
+/// If the path escapes the sandbox, the flags name a mode this host's streams
+/// cannot express, or the file exists but will not open.
+pub fn open<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let path = call.ptr();
+    let flags = Into::<u32>::into(call.int());
+
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+
+    let mode = mode_from_oflags(flags)
+        .map_err(|e| ShimError::Failed(format!("open({named}, {flags:#06x}): {e}")))?;
+    let creating = flags & oflag::CREAT != 0;
+
+    let Some((name, at)) = resolve_for_open(host, &named, creating)? else {
+        return Ok(minus_one::<A>());
+    };
+    let fd = host
+        .streams
+        .open_raw(&name, &at, mode)
+        .map_err(|e| ShimError::Failed(format!("open({named}, {flags:#06x}): {e}")))?;
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(fd))))
+}
+
+/// `int creat(const char *path, int amode)` -- make a file, or truncate one
+/// that is there, and answer a raw handle onto it.
+///
+/// Exactly `open(path, O_WRONLY|O_CREAT|O_TRUNC)`, which is how Borland's own
+/// runtime defines it, so it is written that way rather than duplicated. The
+/// `amode` argument is DOS's permission word and is ignored for the same
+/// reason [`open`]'s third argument is.
+///
+/// **Text mode**, not binary: `creat` predates `O_BINARY` and takes the
+/// `_fmode` default, which this host keeps at text.
+///
+/// # Errors
+///
+/// As [`open`].
+pub fn creat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let path = call.ptr();
+    let _amode = call.int();
+
+    let named = String::from_utf8_lossy(
+        path.read_cstr(call.mem())
+            .map_err(|e| ShimError::Failed(e.to_string()))?,
+    )
+    .into_owned();
+
+    let mode = mode_from_oflags(oflag::WRONLY | oflag::CREAT | oflag::TRUNC)
+        .map_err(|e| ShimError::Failed(format!("creat({named}): {e}")))?;
+    let Some((name, at)) = resolve_for_open(host, &named, true)? else {
+        return Ok(minus_one::<A>());
+    };
+    let fd = host
+        .streams
+        .open_raw(&name, &at, mode)
+        .map_err(|e| ShimError::Failed(format!("creat({named}): {e}")))?;
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(fd))))
+}
+
+/// `int close(int handle)` -- close a raw handle, answering 0.
+///
+/// Closes a descriptor whichever call produced it: `open`, `creat` or
+/// `fileno(fopen(...))`. Closing the last of those closes the stream the
+/// `FILE` names too, and retires its cookie, because they are one row in one
+/// table -- a module that then used the `FILE` gets the refusal naming the
+/// file rather than a write into a reused address.
+///
+/// # Errors
+///
+/// If `handle` names no open stream. Real Borland answers `-1` and sets
+/// `errno`; a descriptor this host never issued is a module bug rather than
+/// an expected outcome, so it stops rather than being handed a value it might
+/// not check.
+pub fn close<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = sign_extend::<A>(call.int().into());
+    let fd = descriptor(handle).ok_or_else(|| {
+        ShimError::Failed(format!(
+            "close({handle}): not a descriptor this host issued (they start at {})",
+            crate::stream::FIRST_FD
+        ))
+    })?;
+    host.streams
+        .close_fd(fd)
+        .map_err(|e| ShimError::Failed(format!("close({handle}): {e}")))?;
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `long lseek(int handle, long offset, int fromwhere)` -- move a raw
+/// handle's position, answering the new one.
+///
+/// `fromwhere` is `SEEK_SET` (0), `SEEK_CUR` (1) or `SEEK_END` (2),
+/// `INCLUDE/IO.H`. **The offset is signed**, which is what makes `SEEK_CUR`
+/// with a negative offset -- reading backwards through a record file -- work
+/// at all; reading it unsigned turns a small step back into a seek two
+/// gigabytes forward.
+///
+/// # Errors
+///
+/// If `handle` names no open stream, `fromwhere` is not one of the three, or
+/// the seek fails.
+pub fn lseek<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = sign_extend::<A>(call.int().into());
+    let offset = call.long() as i32;
+    let whence = Into::<u32>::into(call.int());
+
+    let fd = descriptor(handle).ok_or_else(|| {
+        ShimError::Failed(format!("lseek({handle}, ..): not a descriptor this host issued"))
+    })?;
+    let pos = match whence {
+        0 => std::io::SeekFrom::Start(offset as u64),
+        1 => std::io::SeekFrom::Current(i64::from(offset)),
+        2 => std::io::SeekFrom::End(i64::from(offset)),
+        other => {
+            return Err(ShimError::Failed(format!(
+                "lseek({handle}, {offset}, {other}): fromwhere is not SEEK_SET (0), \
+                 SEEK_CUR (1) or SEEK_END (2)"
+            )));
+        }
+    };
+    let at = host
+        .streams
+        .seek_fd(fd, pos)
+        .map_err(|e| ShimError::Failed(format!("lseek({handle}, {offset}, {whence}): {e}")))?;
+    Ok(abi::Ret::Long(at as u32))
+}
+
+/// `long tell(int handle)` -- where a raw handle's position is.
+///
+/// # Errors
+///
+/// If `handle` names no open stream, or the position cannot be read.
+pub fn tell<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = sign_extend::<A>(call.int().into());
+    let fd = descriptor(handle).ok_or_else(|| {
+        ShimError::Failed(format!("tell({handle}): not a descriptor this host issued"))
+    })?;
+    let at = host
+        .streams
+        .tell_fd(fd)
+        .map_err(|e| ShimError::Failed(format!("tell({handle}): {e}")))?;
+    Ok(abi::Ret::Long(at as u32))
+}
+
+/// `long filelength(int handle)` -- how long the file behind a raw handle is.
+///
+/// **Does not move the position.** That is specified behaviour and it is the
+/// part a rewrite gets wrong: the obvious implementation seeks to the end and
+/// leaves it there, and the module's next read then returns nothing, far from
+/// the call that caused it. See [`crate::stream::Streams::length_fd`].
+///
+/// # Errors
+///
+/// If `handle` names no open stream, or a seek fails.
+pub fn filelength<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = sign_extend::<A>(call.int().into());
+    let fd = descriptor(handle).ok_or_else(|| {
+        ShimError::Failed(format!("filelength({handle}): not a descriptor this host issued"))
+    })?;
+    let len = host
+        .streams
+        .length_fd(fd)
+        .map_err(|e| ShimError::Failed(format!("filelength({handle}): {e}")))?;
+    Ok(abi::Ret::Long(len as u32))
+}
+
+/// `int _write(int handle, const void *buf, unsigned len)` -- write bytes to
+/// a handle **without text-mode translation**.
+///
+/// A genuinely different symbol from [`write`], not a decoration this host
+/// stripped an underscore off. `shims/mod.rs:900-903` already records the
+/// precedent that `_fgetc` and `fgetc` are two real symbols; this pair is
+/// different in a second way, because the two routines also *behave*
+/// differently.
+///
+/// Borland's `write()` honours the handle's text/binary mode and turns each
+/// `\n` into `\r\n`; `_write()` is the raw form and does not. This host
+/// already models exactly that distinction --
+/// [`write_translated`]/[`text_mode_write`] and the `binary` flag -- so
+/// `_write` is `write` with translation forced off, and the assertion that
+/// separates the two symbols is a `\n` written to a text-mode handle.
+///
+/// # Errors
+///
+/// If `handle` names no open stream, or the write fails.
+pub fn _write<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = sign_extend::<A>(call.int().into());
+    let buf = call.ptr();
+    let len = Into::<u32>::into(call.int()) as usize;
+
+    let fd = descriptor(handle).ok_or_else(|| {
+        ShimError::Failed(format!("_write({handle}, ..): not a descriptor this host issued"))
+    })?;
+    if len == 0 {
+        return Ok(abi::Ret::Int(A::Int::from(0u16)));
+    }
+    let raw = buf
+        .resolve(call.mem(), len)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    // `write_raw_fd`, not `write_fd`: that is the whole point of the
+    // underscore, and the difference lives in one place rather than being
+    // decided again at each caller.
+    host.streams
+        .write_raw_fd(fd, &raw)
+        .map_err(|e| ShimError::Failed(format!("_write({handle}, ..): {e}")))?;
+    Ok(abi::Ret::Int(A::int_from_u32(raw.len() as u32)))
+}
+
 /// Text-mode translation for a raw low-level read: drop `\r`, and stop at
 /// the first `^Z` (`0x1A`), the file's own soft end-of-file -- the same rule
 /// `SOURCE/RTL/SOURCE/IO/COMMON16/READ.CAS` documents for the DOS-handle
@@ -1308,12 +1680,12 @@ pub fn read<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
     // A descriptor an `fopen` issued, arriving here because `fileno` is a
     // macro the module expands itself -- see `descriptor_stream`.
     if let Some(fd) = descriptor(handle) {
-        let cookie = host.streams.cookie_of_fd(fd).map_err(|e| {
-            ShimError::Failed(format!("read({handle}, ...): {e}"))
-        })?;
+        // Keyed by descriptor, not translated to a cookie first: a handle
+        // from `open`/`creat` has no `FILE` at all, and this is the path that
+        // makes one descriptor mean one thing whichever call produced it.
         let bytes = host
             .streams
-            .read_mem(call.mem(), cookie, len)
+            .read_fd(fd, len)
             .map_err(|e| ShimError::Failed(format!("read({handle}, ...): {e}")))?;
         buf.write(call.mem(), &bytes)
             .map_err(|e| ShimError::Failed(e.to_string()))?;
@@ -1381,9 +1753,6 @@ pub fn write<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     // The counterpart of `read`'s own descriptor branch, and present for the
     // same reason -- see `descriptor`.
     if let Some(fd) = descriptor(handle) {
-        let cookie = host.streams.cookie_of_fd(fd).map_err(|e| {
-            ShimError::Failed(format!("write({handle}, ...): {e}"))
-        })?;
         if len == 0 {
             return Ok(abi::Ret::Int(A::Int::from(0u16)));
         }
@@ -1391,9 +1760,18 @@ pub fn write<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
             .resolve(call.mem(), len)
             .map_err(|e| ShimError::Failed(e.to_string()))?
             .to_vec();
+        // Translation happens **inside** `Streams`, per the handle's own
+        // text/binary mode -- not here. Doing it here as well, on top of a
+        // stream layer that already does it, turns one `\n` into `\r\r\n`;
+        // that was written once and caught by reading `Stream::write` rather
+        // than by any test, because nothing exercises a text-mode `\n`
+        // through this path.
         host.streams
-            .write(cookie, &raw)
+            .write_fd(fd, &raw)
             .map_err(|e| ShimError::Failed(format!("write({handle}, ...): {e}")))?;
+        // The count answered is what the caller asked to write, not what
+        // landed: a text-mode write of one `\n` puts two bytes on disk and
+        // still reports one, which is what DOS reports too.
         return Ok(abi::Ret::Int(A::int_from_u32(raw.len() as u32)));
     }
 
@@ -1434,7 +1812,7 @@ mod tests {
     use mbbs_machine::m16::{FarPtr, Ret};
 
     use crate::shims::stream::{fclose, fgetc, fopen};
-    use crate::testing::{Fixture, scratch};
+    use crate::testing::{Fixture, scratch, scratch_with};
 
     fn pointer(ret: Ret) -> FarPtr {
         match ret {
@@ -2255,6 +2633,209 @@ mod tests {
             "text mode's write (\"a\\r\\nb\") followed by binary mode's (\"a\\nb\"), \
              physically, through the real `write` shim -- not `write_translated` or \
              `write_to` called directly"
+        );
+    }
+    // ---- raw file descriptors (open/creat/close/lseek/tell/filelength) -----
+
+    /// The three flag words the tests below use, spelled as the module would.
+    const O_RDONLY: u16 = 0x0000;
+    const O_WRONLY_CREAT_TRUNC: u16 = 0x0001 | 0x0100 | 0x0200;
+
+    fn long_of(ret: Ret) -> u32 {
+        match ret {
+            Ret::U32(n) => n,
+            other => panic!("expected a long, got {other:?}"),
+        }
+    }
+
+    fn int_of(ret: Ret) -> u16 {
+        match ret {
+            Ret::U16(n) => n,
+            other => panic!("expected an int, got {other:?}"),
+        }
+    }
+
+    /// `creat`, `_write`, `close`, then read the file back off the disk.
+    ///
+    /// Reading it back through the filesystem rather than through this host
+    /// is the point: it is the only way to see that the bytes actually
+    /// landed, and at what length.
+    #[test]
+    fn creat_write_and_close_put_bytes_on_the_disk() {
+        let root = scratch("crt-creat");
+        let mut f = Fixture::rooted(root.clone());
+
+        let named = f.text("MADE.TXT");
+        let fd = int_of(
+            f.invoke(creat, &[named.offset, named.selector, 0]).expect("creat"),
+        );
+        assert!(fd >= u16::from(crate::stream::FIRST_FD), "a real descriptor");
+
+        let buf = f.bytes(b"one\ntwo", false);
+        let wrote = int_of(
+            f.invoke(_write, &[fd, buf.offset, buf.selector, 7]).expect("_write"),
+        );
+        assert_eq!(wrote, 7);
+        assert_eq!(int_of(f.invoke(close, &[fd]).expect("close")), 0);
+
+        assert_eq!(
+            std::fs::read(root.join("MADE.TXT")).expect("the file exists"),
+            b"one\ntwo",
+            "_write does not translate, so the newline is one byte"
+        );
+    }
+
+    /// `write` translates on a text-mode handle and `_write` does not.
+    ///
+    /// **This is the assertion that separates the two symbols**, and it is
+    /// the reason they are two symbols. Both write the same three bytes to
+    /// two files opened the same way; only the file `write` produced has the
+    /// `\r`.
+    #[test]
+    fn write_translates_a_newline_where_underscore_write_does_not() {
+        let root = scratch("crt-write-vs-_write");
+        let mut f = Fixture::rooted(root.clone());
+        let buf = f.bytes(b"a\nb", false);
+
+        for (name, shim) in [("TRANS.TXT", write as crate::shims::Shim<crate::abi::Wg16>),
+                             ("RAW.TXT", _write as crate::shims::Shim<crate::abi::Wg16>)] {
+            let named = f.text(name);
+            let fd = int_of(
+                f.invoke(creat, &[named.offset, named.selector, 0]).expect("creat"),
+            );
+            f.invoke(shim, &[fd, buf.offset, buf.selector, 3]).expect("wrote");
+            f.invoke(close, &[fd]).expect("close");
+        }
+
+        assert_eq!(
+            std::fs::read(root.join("TRANS.TXT")).expect("written"),
+            b"a\r\nb",
+            "write honours the handle's text mode"
+        );
+        assert_eq!(
+            std::fs::read(root.join("RAW.TXT")).expect("written"),
+            b"a\nb",
+            "_write is the raw form -- if this ever gains a \\r, the two \
+             symbols have been merged"
+        );
+    }
+
+    /// `open` an existing file, measure it, seek into the middle, and read on.
+    #[test]
+    fn open_filelength_lseek_and_tell_agree_on_one_file() {
+        let root = scratch_with("crt-open", &["LINES.TXT"]);
+        let mut f = Fixture::rooted(root.clone());
+        let on_disk = std::fs::read(root.join("LINES.TXT")).expect("the fixture");
+
+        let named = f.text("LINES.TXT");
+        let fd = int_of(
+            f.invoke(open, &[named.offset, named.selector, O_RDONLY]).expect("open"),
+        );
+
+        assert_eq!(
+            long_of(f.invoke(filelength, &[fd]).expect("filelength")),
+            on_disk.len() as u32
+        );
+        // filelength must not have moved the position.
+        assert_eq!(long_of(f.invoke(tell, &[fd]).expect("tell")), 0);
+
+        // SEEK_SET to the middle, and `tell` agrees.
+        let half = (on_disk.len() / 2) as u16;
+        assert_eq!(
+            long_of(f.invoke(lseek, &[fd, half, 0, 0]).expect("lseek")),
+            u32::from(half)
+        );
+        assert_eq!(long_of(f.invoke(tell, &[fd]).expect("tell")), u32::from(half));
+
+        // SEEK_END with a negative offset -- the case that proves the offset
+        // is read as signed.
+        let back = (-2i32) as u32;
+        assert_eq!(
+            long_of(
+                f.invoke(lseek, &[fd, back as u16, (back >> 16) as u16, 2]).expect("lseek")
+            ),
+            on_disk.len() as u32 - 2
+        );
+
+        f.invoke(close, &[fd]).expect("close");
+    }
+
+    /// A descriptor from `open` and one from `fileno(fopen(...))` are
+    /// **different numbers**, and seeking one does not move the other.
+    ///
+    /// This is what "one table" buys: both are rows in the same `Streams`, so
+    /// the numbering cannot collide, and each descriptor means exactly one
+    /// open file.
+    #[test]
+    fn a_raw_descriptor_and_a_file_descriptor_are_distinct_and_independent() {
+        let root = scratch_with("crt-two-descriptors", &["LINES.TXT", "SAMPLE.DAT"]);
+        let mut f = Fixture::rooted(root);
+
+        let named = f.text("LINES.TXT");
+        let raw = int_of(
+            f.invoke(open, &[named.offset, named.selector, O_RDONLY]).expect("open"),
+        );
+
+        let path = f.text("SAMPLE.DAT");
+        let mode = f.text("rb");
+        let cookie = pointer(
+            f.invoke(fopen, &[path.offset, path.selector, mode.offset, mode.selector])
+                .expect("fopen"),
+        );
+        let via_file = f.host.streams.fd_of_cookie(cookie).expect("fileno");
+
+        assert_ne!(
+            u16::from(via_file),
+            raw,
+            "two open files cannot share a descriptor"
+        );
+
+        // Move the raw one; the FILE-backed one must not follow.
+        f.invoke(lseek, &[raw, 4, 0, 0]).expect("lseek");
+        assert_eq!(long_of(f.invoke(tell, &[raw]).expect("tell")), 4);
+        assert_eq!(
+            long_of(f.invoke(tell, &[u16::from(via_file)]).expect("tell")),
+            0,
+            "seeking one descriptor moved another"
+        );
+    }
+
+    /// **The sandbox holds for `open` exactly as it does for `fopen`.**
+    ///
+    /// `Host::dos_name` is what refuses a `..` or a drive letter, and `open`
+    /// goes through it. If this ever passes, a module can read and write
+    /// anything the host process can.
+    #[test]
+    fn open_cannot_escape_the_sandbox() {
+        let mut f = Fixture::new();
+        for named in ["..\\ESCAPE.TXT", "..\\..\\etc\\passwd", "C:\\ESCAPE.TXT"] {
+            let at = f.text(named);
+            let e = f
+                .invoke(open, &[at.offset, at.selector, O_WRONLY_CREAT_TRUNC])
+                .expect_err(named);
+            // The message, not merely `is_err()`: a refusal that came from
+            // somewhere else -- an unreadable pointer, a mode this host
+            // cannot express -- would satisfy `expect_err` while leaving the
+            // sandbox untested.
+            let message = format!("{e}");
+            assert!(
+                message.contains("outside this host's own"),
+                "{named} was refused, but not by dos_name: {message}"
+            );
+        }
+    }
+
+    /// `open` of a file that is not there answers -1, not a refusal.
+    ///
+    /// The same choice `fopen` already makes by answering NULL: a module
+    /// tests for it, so it is a value rather than a stop.
+    #[test]
+    fn open_of_a_missing_file_answers_minus_one() {
+        let mut f = Fixture::new();
+        let named = f.text("NOSUCH.TXT");
+        assert_eq!(
+            int_of(f.invoke(open, &[named.offset, named.selector, O_RDONLY]).expect("open")),
+            0xFFFF
         );
     }
 }
