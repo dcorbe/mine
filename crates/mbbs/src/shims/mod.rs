@@ -589,6 +589,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "c2bcpy", mudtext::c2bcpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "b2ccpy", mudtext::b2ccpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "findtvar", mudtext::findtvar, Cleans::Caller, Evidence::Unclassified),
+        // Beside `findtvar` rather than in `text.rs`, because the table it
+        // walks is the one `findtvar` walks. `grbtxv` is not registered: it
+        // is `xlttxv`'s own helper here, and no oracle build exports it.
+        (MAJORBBS, "xlttxv", mudtext::xlttxv, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MENUING.C")),
         // MajorMUD's remaining gameplay and screen helpers. `curcury` and
         // `listing`'s `whndun` half refuse rather than fabricate: this host
         // tracks no cursor row, and a `Shim<A>` is never handed the
@@ -662,6 +667,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "curusr", user::curusr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "usroff", user::usroff, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "mnuoff", user::mnuoff, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MENUING.C")),
         // The user-ID cross-reference half of Task 2.6. `clrxrf` is the
         // vendor's own `numxrf == 0` branch and does nothing; `hdluid`
         // presupposes the subsystem and refuses. See their doc comments.

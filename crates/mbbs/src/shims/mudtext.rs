@@ -353,6 +353,169 @@ pub fn findtvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
     Ok(abi::Ret::Int(A::Int::from(super::NO)))
 }
 
+/// The byte that opens and closes a text-variable reference in a buffer
+/// `xlttxv` walks: `if (*ptr == 1)` (`MENUING.C:1131`).
+const TXV_ESCAPE: u8 = 1;
+
+/// How much headroom an expansion needs before `xlttxv` will attempt one:
+/// `strlen(buffer)+80 < size` (`MENUING.C:1131`).
+///
+/// 80 rather than the variable's own length because the expansion happens in
+/// place and `grbtxv` pads to a field width it has not read yet -- `len > 79`
+/// is the widest it will accept (`MENUING.C:1195`), so 80 bounds any single
+/// expansion.
+const TXV_HEADROOM: usize = 80;
+
+/// `CHAR *xlttxv(CHAR *buffer, INT size)` -- `MENUING.C:1120-1141` -- expand
+/// the text variables in a buffer, in place.
+///
+///
+/// Byte `0x01` opens a reference; the sequence is
+/// `\x01 <justify> <width+32> <name> \x01` (read off `grbtxv`,
+/// `MENUING.C:1179-1245`). Three of the four things this routine does need
+/// nothing this host lacks, and it does them:
+///
+/// - **A buffer with no `0x01` in it is returned unchanged**, and the pointer
+///   answered is the argument itself. That is the overwhelmingly common case
+///   and it is now fully served.
+/// - **Too little headroom truncates at the escape.** `*ptr='\0'` and break:
+///   the reference is not expanded and everything from it onward is
+///   discarded. This branch never reaches `grbtxv` at all.
+/// - **An unresolvable reference is deleted**, not expanded. `grbtxv` answers
+///   0 after `movmem`ing the tail down over the whole sequence when the width
+///   exceeds 79, the justification is not one of `R`/`L`/`C`/`N`, or
+///   `findtvar` does not know the name (`MENUING.C:1194-1198`). A reference
+///   with no closing `0x01` truncates the buffer instead
+///   (`MENUING.C:1187-1191`).
+///
+/// **What it cannot do is expand a reference that resolves.** `grbtxv` calls
+/// the variable's own routine -- `txtptr=(*(txtvars[num].varrou))()` --
+/// which is module code. This host stores `varrou`
+/// ([`crate::textvar::TextVar`]) but a shim has no way to re-enter the
+/// module: `Call<A>` hands out `A::Mem`, not the `Machine`, and the one place
+/// this crate does call back (`fsdprc`'s `machine.call(fldvfy, ..)`) is the
+/// host's own dispatch loop, not a shim. So a *registered* variable is a
+/// refusal that names what is missing, rather than an expansion invented
+/// here or a silent deletion that would look like the "unknown name" branch
+/// and lie about it.
+///
+/// # Errors
+///
+/// If `buffer` is unreadable or unterminated, if the expanded buffer will not
+/// fit back where it came from, or if a reference names a text variable that
+/// is actually registered -- see above.
+pub fn xlttxv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let buffer = call.ptr();
+    // `INT size` is a buffer size and no caller has a negative one. The
+    // vendor's compare is signed, so the only input on which this differs is
+    // a negative `size`, where it would take the truncate branch.
+    let size = Into::<u32>::into(call.int()) as usize;
+
+    let mut text = buffer
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("xlttxv: {e}")))?
+        .to_vec();
+
+    let mut pos = 0usize;
+    while pos < text.len() {
+        if text[pos] != TXV_ESCAPE {
+            pos += 1;
+            continue;
+        }
+        if text.len() + TXV_HEADROOM < size {
+            pos += grbtxv(&mut text, pos, host, call.mem())?;
+        } else {
+            // `*ptr='\0'; break;` -- the reference and everything after it go.
+            text.truncate(pos);
+            break;
+        }
+    }
+
+    text.push(0);
+    buffer
+        .write(call.mem(), &text)
+        .map_err(|e| ShimError::Failed(format!("xlttxv: {e}")))?;
+    Ok(abi::Ret::Ptr(buffer))
+}
+
+/// `INT grbtxv(CHAR *buffer)` -- `MENUING.C:1178-1246` -- resolve the one
+/// text-variable reference at `text[pos]`, and answer how far `xlttxv` should
+/// advance.
+///
+/// Only the branches that answer `0` are reachable here; the expanding branch
+/// needs to call module code. See [`xlttxv`]'s doc comment for why, and for
+/// what each `0` case means.
+///
+/// The vendor reads `buffer[pos+1]` and `buffer[pos+2]` before it has checked
+/// that either is inside the string, so a `0x01` in the last two bytes sends
+/// it reading past the terminator. Here a reference that cannot hold a
+/// header is treated as one with no closing escape -- the truncation the
+/// vendor's own scan reaches on that input anyway, without the read past the
+/// end.
+fn grbtxv<A: Abi>(
+    text: &mut Vec<u8>,
+    pos: usize,
+    host: &mut Host<A>,
+    mem: &A::Mem,
+) -> Result<usize, ShimError> {
+    // `\x01 <justify> <width+32> <name> \x01`: the header is three bytes and
+    // the name is at least one.
+    let name_at = pos + 3;
+    let close = text
+        .get(name_at..)
+        .and_then(|rest| rest.iter().position(|&b| b == TXV_ESCAPE))
+        .map(|i| name_at + i);
+    let Some(close) = close else {
+        // `buffer[pos-3]='\0'; return(0);` -- no closing escape, so the
+        // buffer ends at the one that opened it.
+        text.truncate(pos);
+        return Ok(0);
+    };
+
+    let justify = text[pos + 1].to_ascii_uppercase();
+    let width = i16::from(text[pos + 2]) - 32;
+    let name = text[name_at..close].to_vec();
+
+    let known = width <= 79
+        && matches!(justify, b'R' | b'L' | b'C' | b'N')
+        && find_textvar(host, mem, &name)?.is_some();
+
+    if !known {
+        // `movmem(ptr+1,&buffer[pos-3],strlen(ptr+1)+1); return(0);` -- the
+        // whole reference is spliced out and the tail closes up over it.
+        text.drain(pos..=close);
+        return Ok(0);
+    }
+
+    Err(ShimError::Failed(format!(
+        "grbtxv: expanding the text variable {:?} means calling its varrou, \
+         and a shim cannot re-enter the module -- Call hands out memory, not \
+         the Machine, and this crate's only callback (fsdprc's \
+         machine.call(fldvfy, ..)) is the host's dispatch loop rather than a \
+         shim",
+        String::from_utf8_lossy(&name)
+    )))
+}
+
+/// `findtvar`'s answer, for a name this crate already holds as bytes.
+///
+/// The same walk [`findtvar`] makes, factored out so the shim and [`grbtxv`]
+/// cannot disagree about what "registered" means.
+fn find_textvar<A: Abi>(
+    host: &mut Host<A>,
+    mem: &A::Mem,
+    name: &[u8],
+) -> Result<Option<u16>, ShimError> {
+    for i in 0..host.textvars().len() {
+        if let Some(row) = host.textvars().get_mem(mem, i)? {
+            if sameas(name, row.name.as_bytes()) {
+                return Ok(Some(i));
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +710,150 @@ mod tests {
             f.invoke(findtvar, &[query.offset, query.selector]).expect("ok"),
             Ret::U16(1)
         );
+    }
+
+    // -- xlttxv ------------------------------------------------------------
+
+    /// A reference to `name`, laid out the way `grbtxv` reads one:
+    /// `\x01 <justify> <width+32> <name> \x01` (`MENUING.C:1183-1186`).
+    fn reference(justify: u8, width: u8, name: &str) -> Vec<u8> {
+        let mut out = vec![TXV_ESCAPE, justify, width + 32];
+        out.extend_from_slice(name.as_bytes());
+        out.push(TXV_ESCAPE);
+        out
+    }
+
+    /// A buffer holding no `0x01` comes back byte-for-byte, and the pointer
+    /// answered is the argument -- callers use the return value directly
+    /// (`MENUING.C:1140`, `return(buffer)`).
+    ///
+    /// This is the case nearly every call is, so it is the one that decides
+    /// whether the routine is worth serving at all.
+    #[test]
+    fn xlttxv_returns_a_buffer_with_no_references_unchanged() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(256);
+        f.machine.write(buf, b"Newhaven Narrow Road\0").expect("seed");
+
+        assert_eq!(
+            f.invoke(xlttxv, &[buf.offset, buf.selector, 256]).expect("xlttxv"),
+            Ret::Far(buf),
+            "the argument comes back, not a copy"
+        );
+        assert_eq!(f.machine.read_cstr(buf).expect("readable"), b"Newhaven Narrow Road");
+    }
+
+    /// Too little headroom truncates **at the escape** rather than expanding.
+    ///
+    /// `strlen(buffer)+80 < size` is the guard (`MENUING.C:1131`); when it
+    /// fails the vendor writes `*ptr='\0'` and breaks, so the reference and
+    /// everything after it are gone. A port that dropped the guard would
+    /// expand here instead, and this is the assertion that says so.
+    #[test]
+    fn xlttxv_truncates_at_a_reference_it_has_no_headroom_to_expand() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(256);
+        let mut text = b"before".to_vec();
+        text.extend_from_slice(&reference(b'L', 10, "MUDCHARINFO"));
+        text.extend_from_slice(b"after");
+        text.push(0);
+        f.machine.write(buf, &text).expect("seed");
+
+        // size 40: strlen is 22, and 22 + 80 is not less than 40.
+        f.invoke(xlttxv, &[buf.offset, buf.selector, 40]).expect("xlttxv");
+        assert_eq!(
+            f.machine.read_cstr(buf).expect("readable"),
+            b"before",
+            "the reference and the text after it are discarded"
+        );
+    }
+
+    /// A reference to a name nobody registered is **deleted**, and the text
+    /// around it closes up over it (`MENUING.C:1194-1198`).
+    ///
+    /// Not left in place and not expanded: `grbtxv` `movmem`s the tail down
+    /// over the whole sequence and answers 0, so `xlttxv` re-examines the
+    /// byte that has moved into its place and carries on.
+    #[test]
+    fn xlttxv_deletes_a_reference_to_a_name_that_is_not_registered() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(256);
+        let mut text = b"before ".to_vec();
+        text.extend_from_slice(&reference(b'L', 10, "NOSUCHVAR"));
+        text.extend_from_slice(b" after");
+        text.push(0);
+        f.machine.write(buf, &text).expect("seed");
+
+        f.invoke(xlttxv, &[buf.offset, buf.selector, 256]).expect("xlttxv");
+        assert_eq!(f.machine.read_cstr(buf).expect("readable"), b"before  after");
+    }
+
+    /// A justification that is not `R`, `L`, `C` or `N` takes the same
+    /// deletion branch even when the name *is* registered
+    /// (`MENUING.C:1194-1195`), so the check is on the whole condition rather
+    /// than only on the lookup.
+    #[test]
+    fn xlttxv_deletes_a_reference_whose_justification_is_not_one_of_the_four() {
+        let mut f = Fixture::new();
+        let name = f.text("MUDCHARINFO");
+        let varrou = FarPtr { offset: 0x0010, selector: f.machine.code_selector() };
+        f.invoke(register_textvar, &[name.offset, name.selector, varrou.offset, varrou.selector])
+            .expect("registered");
+
+        let buf = f.buffer(256);
+        let mut text = b"x".to_vec();
+        text.extend_from_slice(&reference(b'Q', 10, "MUDCHARINFO"));
+        text.extend_from_slice(b"y");
+        text.push(0);
+        f.machine.write(buf, &text).expect("seed");
+
+        f.invoke(xlttxv, &[buf.offset, buf.selector, 256]).expect("xlttxv");
+        assert_eq!(f.machine.read_cstr(buf).expect("readable"), b"xy");
+    }
+
+    /// A reference with no closing `0x01` ends the buffer where it started
+    /// (`MENUING.C:1187-1191`).
+    #[test]
+    fn xlttxv_truncates_a_reference_that_is_never_closed() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(256);
+        let mut text = b"keep".to_vec();
+        text.extend_from_slice(&[TXV_ESCAPE, b'L', 10 + 32]);
+        text.extend_from_slice(b"UNCLOSED");
+        text.push(0);
+        f.machine.write(buf, &text).expect("seed");
+
+        f.invoke(xlttxv, &[buf.offset, buf.selector, 256]).expect("xlttxv");
+        assert_eq!(f.machine.read_cstr(buf).expect("readable"), b"keep");
+    }
+
+    /// A reference that **resolves** is refused, naming what is missing.
+    ///
+    /// This is the one branch this host cannot serve: `grbtxv` calls
+    /// `(*(txtvars[num].varrou))()`, which is module code, and a shim has no
+    /// way back into the module. The refusal has to be distinguishable from
+    /// the unknown-name deletion above -- silently deleting a variable the
+    /// module registered would look like success and lose the text.
+    #[test]
+    fn xlttxv_refuses_a_reference_it_would_have_to_call_the_module_to_expand() {
+        let mut f = Fixture::new();
+        let name = f.text("MUDCHARINFO");
+        let varrou = FarPtr { offset: 0x0010, selector: f.machine.code_selector() };
+        f.invoke(register_textvar, &[name.offset, name.selector, varrou.offset, varrou.selector])
+            .expect("registered");
+
+        let buf = f.buffer(256);
+        let mut text = b"hp: ".to_vec();
+        text.extend_from_slice(&reference(b'L', 10, "MUDCHARINFO"));
+        text.push(0);
+        f.machine.write(buf, &text).expect("seed");
+
+        let err = f
+            .invoke(xlttxv, &[buf.offset, buf.selector, 256])
+            .expect_err("a registered variable needs its varrou");
+        let message = err.to_string();
+        assert!(message.contains("varrou"), "{message}");
+        assert!(message.contains("MUDCHARINFO"), "{message}");
     }
 
     #[test]

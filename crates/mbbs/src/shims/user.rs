@@ -1322,6 +1322,41 @@ pub fn stop_polling<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
 /// # Errors
 ///
 /// If `unum` names no channel.
+/// `struct usrmnu *mnuoff(INT unum)` -- `MENUING.C:867-873` -- a pointer to
+/// one user's menuing state.
+///
+///
+/// **Refused, because `muusrs` does not exist here and cannot be invented.**
+/// It is `static VOID *muusrs` (`MENUING.C:32`), the menuing subsystem's own
+/// per-user block array, allocated by a subsystem this host does not run.
+/// This is the same deliberate absence [`crate::Host::setusr`]'s doc comment
+/// already names for `mnuusr` and [`dfsthn`]'s for `module00`: no menuing
+/// system, so no menuing state.
+///
+/// Answering null instead would be the plausible lie. `ptrblok` on a null
+/// `bigptr` does answer null, so a host that wanted to look faithful could
+/// return it -- but that would say "this user has no menu block", which is a
+/// statement about a table that was never built, and `MENUING.C`'s callers
+/// dereference the result without testing it. Stopping the module names the
+/// missing subsystem at the call that needed it.
+///
+/// The struct itself is `MAJORBBS.H:158-167` -- current and parent page,
+/// the select characters, the per-selection pages and key requirements, an
+/// open `FILE *`, and the page title. Placing it is not the hard part; the
+/// subsystem that fills it in is.
+///
+/// # Errors
+///
+/// Always.
+pub fn mnuoff<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let unum = Into::<u32>::into(call.int()) as u16;
+    Err(ShimError::Failed(format!(
+        "mnuoff({unum}): the menuing subsystem's muusrs block array \
+         (MENUING.C:32) is not built by this host, so there is no struct \
+         usrmnu to point at -- the same absence that leaves mnuusr unset"
+    )))
+}
+
 pub fn usroff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let unum = Into::<u32>::into(call.int()) as i16;
     let chan = host
@@ -3579,5 +3614,21 @@ mod tests {
             .invoke(samepatu, &[a.offset, a.selector, b.offset, b.selector, 1])
             .expect("samepatu");
         assert_eq!(got, Ret::U16(0), "differently-cased tokens must not match");
+    }
+
+    /// `mnuoff` refuses and names the subsystem it would need.
+    ///
+    /// The message matters more than the failure: a refusal that only said
+    /// "cannot" would be indistinguishable from a bad channel number, and the
+    /// point is that `muusrs` was never built. Asserting on the text is the
+    /// difference between a test that pins the reason and one that passes for
+    /// a pointer error too.
+    #[test]
+    fn mnuoff_refuses_and_names_the_menuing_subsystem() {
+        let mut f = Fixture::new();
+        let err = f.invoke(mnuoff, &[0]).expect_err("there is no menuing system");
+        let message = err.to_string();
+        assert!(message.contains("muusrs"), "{message}");
+        assert!(message.contains("usrmnu"), "{message}");
     }
 }
