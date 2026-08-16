@@ -232,7 +232,7 @@ impl<A: Abi> Copy for Entry<A> {}
 /// [`entry`] call -- import resolution, at module load, never per instruction
 /// -- so the cost is not one this crate needs to avoid paying.
 ///
-/// One hundred and thirteen entries: every routine with a generic
+/// Three hundred and fifteen entries: every routine with a generic
 /// `fn<A: Abi>(&mut Call<A>, &mut Host<A>) -> Result<abi::Ret<A>, ShimError>`
 /// core -- the Borland runtime's `GetModuleHandleA`/`GetProcAddress` pair
 /// among them now (`borland::get_module_handle`/`get_proc_address`), the two
@@ -241,6 +241,13 @@ impl<A: Abi> Copy for Entry<A> {}
 /// a generic core -- `shims::btrieve`'s seventeen, `shims::runtime`'s eight,
 /// `shims::memory`'s `alctile`/`ptrtile` -- are not here; see [`Abi::native`]
 /// and [`wg16_native`] for where they live instead, and why.
+///
+/// Re-derive by counting the `Evidence::Unclassified)` rows inside this
+/// function's own `vec![...]` (every row ends with one); cross-check against
+/// `crates/mbbs/tests/evidence_manifest.rs`'s `UNCLASSIFIED_CEILING`, which
+/// `tools/cargo-serial.sh test -p mbbs --test evidence_manifest` fails loudly
+/// if this table's count ever rises above. This number went stale once
+/// already, by exactly two hundred.
 fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
     vec![
         // Strings, numbers and the print buffer.
@@ -1149,19 +1156,31 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
 /// stop. Guessing a byte count is not, so this never does.
 ///
 /// Measured against the whole of what [`entry`] can answer -- [`routines`]
-/// plus [`WG16_ROUTINES`], 140 in all: 133 [`Cleans::Caller`] against 7
-/// [`Cleans::Callee`]. Five of the seven are the `@`-suffixed helpers this
-/// function refuses to continue past; the other two,
+/// plus [`WG16_ROUTINES`] (not [`WG32_ROUTINES`]: `Wg32::native` answers
+/// `None` for everything today, so nothing there is reachable through
+/// `entry`), 332 in all: 319 [`Cleans::Caller`] against 13
+/// [`Cleans::Callee`]. Five of the thirteen are the `@`-suffixed helpers this
+/// function refuses to continue past; the other eight,
 /// `borland::get_module_handle`/`get_proc_address` (`KERNEL32.dll`'s
-/// `GetModuleHandleA`/`GetProcAddress`), are **not** -- but that does not
+/// `GetModuleHandleA`/`GetProcAddress`) and `dosenv::dossetvec`/
+/// `doscreatedsalias`/`dosgetmodhandle`/`dosgetprocaddr` plus
+/// `borland::loadlibrarya`/`freelibrary`, are **not** -- but that does not
 /// weaken the claim above, because this function is only ever consulted for
-/// a symbol [`entry`] answers [`Entry::Unimplemented`], and both of those two
-/// are [`Entry::Routine`]. Survey mode never has to guess their convention;
-/// it runs the real, correctly-registered shim instead. (An earlier count
-/// here said 136 against 10, wrong even before this file split `ROUTINES` in
-/// two; a later one said 138 against 5, correct before the KERNEL32 pair
-/// above was registered -- each count has one accounting for its own moment,
-/// not several at once.)
+/// a symbol [`entry`] answers [`Entry::Unimplemented`], and all eight of
+/// those are [`Entry::Routine`]. Survey mode never has to guess their
+/// convention; it runs the real, correctly-registered shim instead. (An
+/// earlier count here said 136 against 10, wrong even before this file split
+/// `ROUTINES` in two; a later one said 138 against 5, correct before the
+/// KERNEL32 pair above was registered; a later one still said 140 against 7,
+/// correct before the DOSCALLS/PHAPI loader routines and the KERNEL32
+/// `LoadLibraryA`/`FreeLibrary` pair joined them -- each count has one
+/// accounting for its own moment, not several at once.)
+///
+/// Re-derive by counting `Cleans::Caller`/`Cleans::Callee` occurrences
+/// within [`routines`]'s and [`WG16_ROUTINES`]'s own spans (not a whole-file
+/// `grep`, which also matches non-registration sites); this split went stale
+/// three times before, which is why the history above is kept rather than
+/// overwritten.
 pub(crate) fn survey_continue_convention(symbol: &str) -> Option<Cleans> {
     if symbol.contains('@') {
         None
