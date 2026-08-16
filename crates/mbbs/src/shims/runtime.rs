@@ -225,8 +225,11 @@ pub fn f_lxlsh(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret
 /// `unsigned long F_LXURSH@(void)` -- `DX:AX` shifted right by `CL`, logically.
 ///
 /// The `U` is the whole of the difference: Worldgroup exports the arithmetic
-/// shift separately as `F_LXRSH@` at ordinal 660, and `WCCMMUD.DLL` does not
-/// import it. Corroborated at `seg 8:0x0120`, where the surrounding code shifts
+/// shift separately as `F_LXRSH@` at ordinal 660, which `WCCMMUD.DLL` does
+/// not import -- **but six other corpus modules do**, so it is implemented
+/// too, as [`f_lxrsh`] beside this. (Before Phases 3+4 this sentence ended
+/// "and nothing imports it", which was only ever true of MajorMUD.)
+/// Corroborated at `seg 8:0x0120`, where the surrounding code shifts
 /// unsigned -- the next statement is `mov ax,[bp+0xc]; shr ax,0xb`, an `shr` and
 /// not an `sar`, though on a different variable and a different count.
 ///
@@ -237,6 +240,36 @@ pub fn f_lxursh(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Re
     let machine = &mut *call.cpu;
     let by = count("f_lxursh@", machine)?;
     Ok(abi::Ret::Long(dxax(machine) >> by))
+}
+
+/// `long F_LXRSH@(void)` -- `DX:AX` shifted right by `CL`, **arithmetically**.
+///
+/// [`f_lxursh`]'s signed twin, ordinal 660 where that one is 661. The sign
+/// bit is replicated into the vacated high bits, so `-16 >> 2` is `-4` and
+/// not `0x3FFF_FFFC`. Everything else about the shape is settled by the
+/// sibling: register-only calling convention (`DX:AX` in, `CL` the count,
+/// `DX:AX` out, nothing on the stack), therefore `Cleans::Caller`, therefore
+/// `WG16_ROUTINES` rather than the generic table -- it reads raw 8086
+/// registers, which only a 16-bit ABI has.
+///
+/// The count comes from [`count`], not from `CL` read here, and that is the
+/// one thing worth getting right independently: it is what makes this routine
+/// refuse a shift of 32 or more *the same way* its three siblings do. Reading
+/// `CL` directly would compile, pass every ordinary test, and diverge from
+/// the other three on the single input none of them can answer.
+///
+/// # Errors
+///
+/// As [`f_lxlsh`]: a count of 32 or more has no established answer, because
+/// Borland's runtime source is not in `archive/galacticomm/` and the two
+/// plausible implementations disagree.
+pub fn f_lxrsh(call: &mut Call<Wg16>, _host: &mut Host<Wg16>) -> Result<abi::Ret<Wg16>, ShimError> {
+    let machine = &mut *call.cpu;
+    let by = count("f_lxrsh@", machine)?;
+    // `as i32` then back: Rust's `>>` on a signed integer is the arithmetic
+    // shift, on an unsigned one the logical shift. That choice of type *is*
+    // the difference between this routine and `f_lxursh`.
+    Ok(abi::Ret::Long((dxax(machine) as i32 >> by) as u32))
 }
 
 /// How many bytes of argument `f_scopy@` pops. Two far pointers.
@@ -557,13 +590,59 @@ mod tests {
     #[test]
     fn the_right_shift_is_logical_and_not_arithmetic() {
         // `F_LXURSH@` is the unsigned one -- Worldgroup exports `F_LXRSH@` at
-        // 660 for the signed shift and this module does not import it. An
-        // arithmetic shift would answer 0xffffffff to both of these.
+        // 660 for the signed shift, which MajorMUD does not import (six other
+        // corpus modules do; see `f_lxrsh`). An arithmetic shift would answer
+        // 0xffffffff to both of these.
         assert_eq!(
             shift(f_lxursh, 0xffff_ffff, 1).unwrap(),
             Ret::U32(0x7fff_ffff)
         );
         assert_eq!(shift(f_lxursh, 0xffff_ffff, 31).unwrap(), Ret::U32(1));
+    }
+
+    /// `F_LXRSH@` replicates the sign bit where `F_LXURSH@` does not.
+    ///
+    /// The negative case is the whole difference between the two, so it is
+    /// asserted against the sibling over the identical input -- a logical
+    /// shift passes every non-negative test there is, which is exactly why
+    /// this one has to be a comparison rather than a value.
+    #[test]
+    fn f_lxrsh_replicates_the_sign_bit_where_f_lxursh_does_not() {
+        // -16 as a long is 0xFFFFFFF0. Arithmetic >> 2 is -4 (0xFFFFFFFC);
+        // logical >> 2 is 0x3FFFFFFC.
+        assert_eq!(
+            shift(f_lxrsh, 0xffff_fff0, 2).unwrap(),
+            Ret::U32(0xffff_fffc),
+            "arithmetic shift keeps the sign"
+        );
+        assert_eq!(
+            shift(f_lxursh, 0xffff_fff0, 2).unwrap(),
+            Ret::U32(0x3fff_fffc),
+            "and the unsigned sibling does not -- the two must differ here"
+        );
+
+        // -1 stays -1 however far it is shifted, which a logical shift cannot
+        // reproduce at any count.
+        assert_eq!(shift(f_lxrsh, 0xffff_ffff, 31).unwrap(), Ret::U32(0xffff_ffff));
+
+        // A positive value shifts identically under both, so this is where
+        // the two must AGREE -- a sign-extension bug that fired unconditionally
+        // would show up here and nowhere else.
+        assert_eq!(shift(f_lxrsh, 0x7fff_ffff, 1).unwrap(), Ret::U32(0x3fff_ffff));
+        assert_eq!(
+            shift(f_lxrsh, 0x7fff_ffff, 1).unwrap(),
+            shift(f_lxursh, 0x7fff_ffff, 1).unwrap()
+        );
+    }
+
+    /// A shift of 32 or more is refused, exactly as the three siblings refuse
+    /// it -- and refused by the *same* helper, so the four cannot drift apart
+    /// on the one input none of them can answer.
+    #[test]
+    fn f_lxrsh_refuses_a_shift_of_thirty_two_or_more() {
+        let e = shift(f_lxrsh, 0xffff_fff0, 32).expect_err("32 has no answer");
+        assert!(e.to_string().contains("f_lxrsh@"), "{e}");
+        assert!(e.to_string().contains("32 or more"), "{e}");
     }
 
     #[test]

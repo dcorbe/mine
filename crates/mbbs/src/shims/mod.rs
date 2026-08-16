@@ -1065,6 +1065,10 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans, Evidence)] = &[
     (MAJORBBS, "f_lxmul@", runtime::f_lxmul, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "f_lxlsh@", runtime::f_lxlsh, Cleans::Caller, Evidence::Unclassified),
     (MAJORBBS, "f_lxursh@", runtime::f_lxursh, Cleans::Caller, Evidence::Unclassified),
+    // f_lxursh@'s signed twin, ordinal 660 where that one is 661. Same
+    // register-only convention, so the same Cleans::Caller and the same
+    // reason for living in this table rather than the generic one.
+    (MAJORBBS, "f_lxrsh@", runtime::f_lxrsh, Cleans::Caller, Evidence::Standard),
     // And this one is a struct copy: two far pointers on the stack, which it
     // pops, and the length in `CX`.
     (MAJORBBS, "f_scopy@", runtime::f_scopy, Cleans::Callee(runtime::POINTERS), Evidence::Unclassified),
@@ -1367,13 +1371,13 @@ pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
 ///
 /// **`@` alone is not even a reliable *signal* for `Callee`, let alone a way
 /// to know the byte count.** Three more `@`-suffixed routines are already
-/// registered above (`f_lxmul@`, `f_lxlsh@`, `f_lxursh@`) and every one of
-/// them is [`Cleans::Caller`] -- they take their operands in registers and
-/// put nothing on the stack, so there is nothing for either side to clean.
-/// So this cannot distinguish `Caller` from `Callee` among the eight
-/// `@`-suffixed symbols this host has already measured the answer for, and
-/// has no basis at all for guessing a byte count for a ninth this host has
-/// not. Refusing is always safe -- the caller falls back to the ordinary
+/// registered above (`f_lxmul@`, `f_lxlsh@`, `f_lxursh@`, `f_lxrsh@`) and
+/// every one of them is [`Cleans::Caller`] -- they take their operands in
+/// registers and put nothing on the stack, so there is nothing for either
+/// side to clean. So this cannot distinguish `Caller` from `Callee` among the
+/// ten `@`-suffixed symbols this host has already measured the answer for,
+/// and has no basis at all for guessing a byte count for an eleventh this
+/// host has not. Refusing is always safe -- the caller falls back to the ordinary
 /// stop. Guessing a byte count is not, so this never does.
 ///
 /// Measured against the whole of what [`entry`] can answer -- [`routines`]
