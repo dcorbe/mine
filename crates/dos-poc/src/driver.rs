@@ -239,6 +239,19 @@ impl Driver for Script {
         None
     }
 
+    /// A polling program is just as ready for a keystroke as a blocking one,
+    /// and a user typing at it cannot tell the difference. Declining here --
+    /// which is the safe-looking default -- means a script can drive a program
+    /// that blocks and silently cannot drive one that polls, which is most
+    /// games between turns.
+    fn poll_due(&self) -> bool {
+        true
+    }
+
+    fn poll_key(&mut self, screen: &Screen) -> Option<Key> {
+        self.next_key(screen)
+    }
+
     fn ending(&self) -> String {
         match &self.failure {
             Some(why) => format!("script failed: {why}"),

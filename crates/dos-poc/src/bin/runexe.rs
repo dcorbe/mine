@@ -226,8 +226,14 @@ fn main() -> io::Result<()> {
                             (video.cursor_row, video.cursor_col),
                             video.cursor_visible,
                         );
-                        if let Some(key) = script.poll_key(&screen) {
-                            keyboard.push_key(key);
+                        match script.poll_key(&screen) {
+                            Some(key) => keyboard.push_key(key),
+                            // A driver with nothing left to say ends the run,
+                            // exactly as it does at a blocking read -- otherwise
+                            // an exhausted script leaves the guest polling for a
+                            // key that will never come.
+                            None if !interactive => break script.ending(),
+                            None => {}
                         }
                     }
                     int16(&mut vm, &mut keyboard);
