@@ -167,6 +167,64 @@ pub fn int16<G: DosGuest>(g: &mut G, keys: &mut Keyboard) -> bool {
     }
 }
 
+/// Move a rectangle of cells, blanking what it leaves behind.
+///
+/// `lines == 0`, or more lines than the window is tall, means blank all of it
+/// -- which is the overwhelmingly common call, since that is `ClrScr`.
+#[allow(clippy::too_many_arguments)]
+fn scroll<G: DosGuest>(
+    g: &mut G,
+    video: &Video,
+    top: u8,
+    left: u8,
+    bottom: u8,
+    right: u8,
+    lines: u8,
+    attr: u8,
+    up: bool,
+) {
+    let last_row = video.rows.saturating_sub(1);
+    let last_col = (video.columns.saturating_sub(1)) as u8;
+    let (top, left) = (top.min(last_row), left.min(last_col));
+    let (bottom, right) = (bottom.min(last_row), right.min(last_col));
+    if bottom < top || right < left {
+        return;
+    }
+
+    let height = bottom - top + 1;
+    let width = usize::from(right - left + 1);
+    let blank: Vec<u8> = [0x20, attr].repeat(width);
+
+    if lines == 0 || lines >= height {
+        for row in top..=bottom {
+            let _ = g.write(video.cell(row, left), &blank);
+        }
+        return;
+    }
+
+    // Copy in the direction that cannot overwrite a row before it is read.
+    let rows: Vec<u8> = if up {
+        (top..=bottom - lines).collect()
+    } else {
+        (top + lines..=bottom).rev().collect()
+    };
+    for row in rows {
+        let from = if up { row + lines } else { row - lines };
+        let Ok(line) = g.read(video.cell(from, left), width * 2).map(<[u8]>::to_vec) else {
+            continue;
+        };
+        let _ = g.write(video.cell(row, left), &line);
+    }
+    let blanked: Vec<u8> = if up {
+        (bottom - lines + 1..=bottom).collect()
+    } else {
+        (top..top + lines).collect()
+    };
+    for row in blanked {
+        let _ = g.write(video.cell(row, left), &blank);
+    }
+}
+
 /// Enough of the scan-code table for letters and the keys a menu reads.
 fn scancode(ch: u8) -> u8 {
     const ROW: &[u8] = b"qwertyuiop";
@@ -307,8 +365,25 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
             }
         }
 
-        // 01h set cursor shape, 05h select page, 06h/07h scroll: accepted and
-        // ignored. Direct writes to B800 carry the rest of the screen.
+        // 06h/07h -- scroll a window up or down; AL=0 blanks it outright.
+        //
+        // Ignoring these does not merely skip an animation. Blanking a window
+        // is how a text-mode program clears the screen, so a no-op leaves the
+        // previous screen's characters in the buffer and the next one paints
+        // into the gaps between them. It reads as "issues painting" and is
+        // really "the clear never happened".
+        0x06 | 0x07 => {
+            let lines = regs.al();
+            let top = (regs.cx >> 8) as u8;
+            let left = (regs.cx & 0xff) as u8;
+            let bottom = (regs.dx >> 8) as u8;
+            let right = (regs.dx & 0xff) as u8;
+            let attr = (regs.bx >> 8) as u8;
+            scroll(g, video, top, left, bottom, right, lines, attr, regs.ah() == 0x06);
+        }
+
+        // 01h set cursor shape, 05h select page: accepted and ignored. Direct
+        // writes to B800 carry the rest of the screen.
         _ => {}
     }
 }
