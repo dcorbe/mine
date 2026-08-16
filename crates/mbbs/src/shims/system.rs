@@ -102,6 +102,74 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
+/// `CHAR *frzseg(VOID)` -- a pointer into the frozen screen segment.
+///
+/// **Refused: this host has no video, and there is no null a caller would
+/// survive.** `INC/VIDAPI.H:25` declares it under `GCV2S`, and the five
+/// macros built directly on it -- `scn2mem`, `mem2scn`, `scn2scn`, `scngetc`
+/// and `scnputc` (`VIDAPI.H:27-34`) -- every one of them *dereferences* the
+/// result, three of them inside a `memcpy`. Answering a null pointer would
+/// move the failure into the module's own copy loop, where it would look
+/// like a module bug.
+///
+/// **Measured, not assumed.** `_FRZSEG` faults (SIGSEGV) on both period
+/// builds when the rig calls it: it probes video hardware the machine does
+/// not provide, and `crates/mbbs/tests/rig/mod.rs` already records that its
+/// cached values are real-mode paragraphs "which Phar Lap's extender turns
+/// into usable selectors and this machine does not". See
+/// `tests/oracle_gate.rs::the_freeze_family_splits_into_one_no_op_and_one_fault`,
+/// which is a tripwire: if the genuine routine ever returns there, this one
+/// can be implemented rather than refused.
+///
+/// There is no Galacticomm body for it anywhere in `re/wg33src` -- only call
+/// sites (`SRC/api/galv3/VIDV3.C:31`, `ptr=frzseg()+offset`) -- which is why
+/// this carries `Evidence::Oracle` rather than a `VendorBody` citation.
+///
+/// # Errors
+///
+/// Always.
+pub fn frzseg<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Err(ShimError::Failed(
+        "frzseg: this host has no video segment to freeze. The five macros \
+         built on it (scn2mem, mem2scn, scn2scn, scngetc, scnputc, \
+         VIDAPI.H:27-34) all dereference the result, so answering null would \
+         only move the fault into the module's own memcpy. Measured: the \
+         genuine routine faults here too, probing video hardware this machine \
+         does not provide"
+            .to_owned(),
+    ))
+}
+
+/// `VOID unfrez(VOID)` -- release the screen segment [`frzseg`] froze.
+///
+/// **A complete implementation of nothing, and this one is measured rather
+/// than argued.** `unfrez` is the single symbol in the whole corpus survey
+/// with no Galacticomm source *whatsoever* -- no body, and unlike `frzseg`
+/// not even a call site -- so its behaviour cannot be read anywhere. It is
+/// exported by all four builds, which is what makes it answerable at all.
+///
+/// Called on a cold host, the genuine routine **returns normally and changes
+/// no byte of DGROUP**, on both period builds
+/// (`tests/oracle_gate.rs::the_freeze_family_splits_into_one_no_op_and_one_fault`).
+/// So an empty body is not a stub here: it is what the real thing does when
+/// nothing has been frozen, which on this host is always.
+///
+/// It leaves `AX` holding the host's own DGROUP selector, and that is
+/// deliberately **not** reproduced.
+/// `archive/tooling/MBBSDASM.IDA/majorbbs.idt:1216-1217` documents ordinal
+/// 614 as `void unfrez(void)` -- so the register is incidental leftover from
+/// the epilogue, not a result, and answering it would invent a return value
+/// the routine does not have. Two builds leaving two *different* values
+/// there (0x6a7 and 0x4df, each its own DGROUP) is the other half of that
+/// argument.
+///
+/// # Errors
+///
+/// Never.
+pub fn unfrez<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
 /// `CLK_TCK` -- how many `clock()` ticks make a second on DOS.
 ///
 /// The 8253's 18.2 Hz, which is `1193180 / 65536`. Borland's `CLK_TCK` is
@@ -2868,6 +2936,36 @@ mod tests {
             message.contains("console") || message.contains("keypress"),
             "{message}"
         );
+    }
+
+    /// `frzseg` refuses, and says why a null would be worse.
+    #[test]
+    fn frzseg_refuses_rather_than_answering_a_null_nobody_checks() {
+        let mut f = Fixture::new();
+        let e = f.invoke(frzseg, &[]).expect_err("there is no video segment");
+        let message = format!("{e}");
+        assert!(message.contains("null"), "{message}");
+        assert!(message.contains("memcpy") || message.contains("dereference"), "{message}");
+    }
+
+    /// `unfrez` completes and disturbs nothing.
+    ///
+    /// The genuine routine changes no byte of DGROUP on either period build,
+    /// so "does nothing" is measured behaviour rather than a stub -- and the
+    /// assertion here is the same shape: it must not perturb host state.
+    #[test]
+    fn unfrez_completes_without_disturbing_anything() {
+        let mut f = Fixture::new();
+        let before = f.host.globals().word(&f.machine, "usrnum").expect("usrnum");
+        let attrib = f.host.display().attrib;
+
+        assert!(matches!(f.invoke(unfrez, &[]), Ok(Ret::Void)));
+
+        assert_eq!(
+            f.host.globals().word(&f.machine, "usrnum").expect("usrnum"),
+            before
+        );
+        assert_eq!(f.host.display().attrib, attrib);
     }
 
     /// `sstatr` sets the display attribute, and the value it sets is the one

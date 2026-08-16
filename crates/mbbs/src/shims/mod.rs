@@ -595,6 +595,14 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // records what they do; INC/GCOMM.H:140's macro is the wrong
         // generation and is deliberately not cited.
         (MAJORBBS, "sstatr", system::sstatr, Cleans::Caller, Evidence::Oracle),
+        // The other two Evidence::Oracle rows, measured in the same place.
+        // frzseg faults in the genuine binary (no video here either) and
+        // unfrez returns having changed nothing -- so one refuses and one is
+        // a complete empty body. Beside the console block rather than in
+        // memory.rs as the plan listed: what they touch is the screen, and
+        // setwin/rstwin/scblank are here.
+        (MAJORBBS, "frzseg", system::frzseg, Cleans::Caller, Evidence::Oracle),
+        (MAJORBBS, "unfrez", system::unfrez, Cleans::Caller, Evidence::Oracle),
         // The vendor's own empty bodies on any hosted build: IRPS.C wraps the
         // single statement in each in #if !defined(UNIX) && !defined(GCWINNT).
         (MAJORBBS, "dsairp", system::dsairp, Cleans::Caller,
