@@ -17,6 +17,7 @@ use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
 use dos_poc::driver::{Driver, Script};
+use dos_poc::terminal::Terminal;
 use dos_poc::files::Files;
 use dos_poc::mz::{self, MzImage};
 use dos_poc::screen::Screen;
@@ -45,6 +46,7 @@ fn main() -> io::Result<()> {
     let mut root_dir = String::from("tmp/lordroot");
     let mut script_path: Option<String> = None;
     let mut trace = false;
+    let mut interactive = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -52,6 +54,7 @@ fn main() -> io::Result<()> {
             "--root" => root_dir = it.next().cloned().unwrap_or(root_dir),
             "--script" => script_path = it.next().cloned(),
             "--trace" => trace = true,
+            "--interactive" | "-i" => interactive = true,
             other => {
                 if !tail.is_empty() {
                     tail.push(' ');
@@ -87,7 +90,9 @@ fn main() -> io::Result<()> {
         at.psp_seg, at.image_seg, at.cs, at.ip, at.ss, at.sp
     );
     vm.enter(at.cs, at.ip, at.ss, at.sp, at.psp_seg, at.psp_seg)?;
-    let _helpers = vm.helpers(10_000);
+    // A human takes as long as they take, so the watchdog that rescues an
+    // unattended probe from a spinning guest must not fire on them.
+    let _helpers = vm.helpers(if interactive { 24 * 60 * 60 * 1000 } else { 10_000 });
 
     // The sandbox. Everything the guest opens resolves beneath this one
     // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
@@ -99,12 +104,20 @@ fn main() -> io::Result<()> {
     dos.files = Some(Files::new(root.into()));
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
-    let mut driver: Option<Script> = match &script_path {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)?;
-            Some(Script::parse(&text).map_err(io::Error::other)?)
+    let mut driver: Option<Box<dyn Driver>> = if interactive {
+        // The terminal takes the screen from here; anything printed while it
+        // holds the alternate screen would land in the middle of the guest's
+        // output, so the report waits until it is dropped.
+        println!("interactive: Ctrl-] gives control back");
+        Some(Box::new(Terminal::new()?))
+    } else {
+        match &script_path {
+            Some(path) => {
+                let text = std::fs::read_to_string(path)?;
+                Some(Box::new(Script::parse(&text).map_err(io::Error::other)?))
+            }
+            None => None,
         }
-        None => None,
     };
     let mut video = Video::default();
     video.install_bda(&mut vm);
@@ -142,7 +155,7 @@ fn main() -> io::Result<()> {
                         (video.cursor_row, video.cursor_col),
                     );
                     settles += 1;
-                    if trace {
+                    if trace && !interactive {
                         println!(
                             "  [settle {settles}] selected={:?} cursor={:?}",
                             screen.selected(),
@@ -151,7 +164,7 @@ fn main() -> io::Result<()> {
                     }
                     match script.next_key(&screen) {
                         Some(key) => {
-                            if trace {
+                            if trace && !interactive {
                                 println!("  [settle {settles}] send {key:?}");
                             }
                             keyboard.push_key(key);
@@ -196,6 +209,8 @@ fn main() -> io::Result<()> {
             Stop::Unexpected(reason) => break format!("unexpected KVM exit {reason}"),
         }
     };
+
+    drop(driver);
 
     // The program painted straight into the text buffer, which is just guest
     // memory -- so the screen can be read back out without the guest's help.

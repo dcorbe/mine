@@ -25,4 +25,5 @@ pub mod guest;
 pub mod kvm;
 pub mod mz;
 pub mod screen;
+pub mod terminal;
 pub mod testguest;
