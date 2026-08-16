@@ -83,6 +83,7 @@ fn main() -> io::Result<()> {
     let mut interactive = false;
     let mut door = false;
     let mut baud: Option<u32> = None;
+    let mut dropfile: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -97,6 +98,7 @@ fn main() -> io::Result<()> {
             "--interactive" | "-i" => interactive = true,
             "--door" => door = true,
             "--baud" => baud = it.next().and_then(|v| v.parse().ok()),
+            "--dropfile" => dropfile = it.next().cloned(),
             other => {
                 if !tail.is_empty() {
                     tail.push(' ');
@@ -111,6 +113,11 @@ fn main() -> io::Result<()> {
     // fired on a real session at least once -- the call cap, and the watchdog
     // twice. One name for the condition, used everywhere, is the fix.
     let attended = interactive || door;
+
+    // The BBS already knows the line rate, so ask it rather than making the
+    // sysop repeat it: DOOR.SYS carries the connect rate on line 2 and the DTE
+    // rate on line 5. An explicit --baud still wins, and 0 means no pacing.
+    let baud = baud.or_else(|| dropfile.as_deref().and_then(dropfile_baud));
 
     let data = std::fs::read(&path)?;
     let img = MzImage::parse(&data)?;
@@ -611,7 +618,7 @@ fn main() -> io::Result<()> {
     }
 
     if !vm.port_log.is_empty() {
-        println!("\nhardware ports touched (answered as an absent device):");
+        println!("\nhardware ports touched:");
         for (port, n) in &vm.port_log {
             let modelled = door && ((COM1_BASE..COM1_BASE + 8).contains(port) || matches!(port, 0x20 | 0x21))
                 || matches!(port, 0x3d4 | 0x3d5 | 0x3b4 | 0x3b5 | 0x3da | 0x3ba);
@@ -620,6 +627,64 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The line rate a DOOR.SYS describes, if it describes one.
+///
+/// Line 2 is the connect rate and line 5 the DTE rate. A telnet door often
+/// reports 0 on line 2, meaning "no modem involved", which is exactly the case
+/// where pacing should be off rather than defaulted to something invented.
+fn dropfile_baud(path: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines().map(|l| l.trim().parse::<u32>().ok());
+    let connect = lines.nth(1).flatten();
+    let dte = lines.nth(2).flatten();
+    match (connect, dte) {
+        (Some(0), Some(d)) if d > 0 => Some(d),
+        (Some(c), _) => Some(c),
+        (None, Some(d)) => Some(d),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dropfile_baud;
+
+    fn drop_with(connect: &str, dte: &str) -> String {
+        let mut lines: Vec<String> = (0..52).map(|i| format!("field{i}")).collect();
+        lines[0] = "COM1:".into();
+        lines[1] = connect.into(); // line 2
+        lines[4] = dte.into(); // line 5
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/dos-poc-tests")
+            .join(format!("drop{connect}_{dte}.sys"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, lines.join("\r\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_connect_rate_is_line_two_and_the_dte_rate_is_line_five() {
+        // Off by one either way silently picks a neighbouring field, which is
+        // a plausible-looking number rather than an error.
+        assert_eq!(dropfile_baud(&drop_with("14400", "38400")), Some(14400));
+    }
+
+    #[test]
+    fn a_telnet_door_reporting_no_modem_falls_back_to_the_dte_rate() {
+        assert_eq!(dropfile_baud(&drop_with("0", "38400")), Some(38400));
+    }
+
+    #[test]
+    fn zero_on_both_means_no_pacing_rather_than_a_made_up_default() {
+        assert_eq!(dropfile_baud(&drop_with("0", "0")), Some(0));
+    }
+
+    #[test]
+    fn a_dropfile_that_is_not_there_yields_nothing() {
+        assert_eq!(dropfile_baud("/nonexistent/DOOR.SYS"), None);
+    }
 }
 
 /// Name the ports a DOS-era runtime is likely to reach for, so the log reads
