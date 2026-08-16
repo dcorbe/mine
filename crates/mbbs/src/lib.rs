@@ -54,7 +54,13 @@ pub mod ifansi;
 pub mod keys;
 pub mod msg;
 pub mod random;
-mod shims;
+// `pub`, not `mod`: `tests/corpus_coverage.rs` is a legitimate external
+// consumer of `shims::entry`/`shims::Entry` -- the coverage ledger asks the
+// host's own resolution path directly rather than re-implementing it, so it
+// needs the module path, not just the re-exports below (which name the
+// *types* `Entry`/`Cleans`/`Shim`/`ShimError` but not the `entry` fn itself,
+// and not under the `shims::` path the ledger's `served()` spells it with).
+pub mod shims;
 pub mod strings;
 pub mod stream;
 pub mod survey;
