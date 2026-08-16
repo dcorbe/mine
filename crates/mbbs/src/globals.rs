@@ -190,11 +190,15 @@ pub const GLOBALS: &[Global] = &[
     // way every other global here is -- a `Wg32` module simply never writes
     // anything useful through it.
     g("othexp", PTR),
-    // MAJORBBS.H:314,316 -- struct module **module; int nmods; `module`
-    // itself is Task 1.5 (it joins immediately before this row, so the two
-    // stay adjacent the way the header declares them); `nmods` is the count
-    // beside it -- not a config value, the host knows this exactly. See the
-    // write beside `nterms`.
+    // MAJORBBS.H:314 -- struct module **module; the host's module table,
+    // counted by `nmods` two lines below it. This host does not build one,
+    // so the pointer addresses a real, empty region instead of NULL -- the
+    // same reasoning `bbsttl` and its neighbours above already established.
+    // Safe only because `nmods` (right below) is zero; see the write beside
+    // `nterms` for where that pairing is enforced.
+    g("module", PTR),
+    // MAJORBBS.H:316 -- int nmods; not a config value, the host knows this
+    // exactly. See the write beside `nterms`.
     gi("nmods"),
     // MAJORBBS.H:400 -- int nglobs, (*globs[GLBMAX])();
     gi("nglobs"),
@@ -389,10 +393,16 @@ pub const GLOBALS: &[Global] = &[
     // its own header with no fixed position relative to this one), placed
     // after it rather than disturbing that group's own established spot.
     gi("digalw"),
-    // LINGO.H:41 -- int clingo; current language. `languages` (LINGO.H:42,
-    // Task 1.5) joins immediately after this row -- the header declares them
-    // consecutively, and this table follows suit.
+    // LINGO.H:41 -- int clingo; current language.
     gi("clingo"),
+    // LINGO.H:42 -- struct lingo **languages; dynamic array of lingo
+    // structs. `struct lingo` is not modelled here, so -- the same as
+    // `module` above -- this points at a real, empty region rather than
+    // NULL. There is no `nlingo` counter placed to pair it with (no corpus
+    // module imports `nlingo`), so this one has no analogue of the
+    // `nmods == 0` guarantee; it is simply an array a module must never
+    // walk expecting entries.
+    g("languages", PTR),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -791,6 +801,22 @@ impl<A: Abi> Globals<A> {
             globals.write_mem(mem, name, &A::ptr_to_bytes(at))?;
         }
 
+        // Two arrays this host does not build. Each pointer addresses a real
+        // empty region rather than NULL, so a module that dereferences
+        // without checking does not fault.
+        //
+        // SAFETY OF THE EMPTY ARRAY IS `nmods == 0`. A module iterating
+        // `module[0..nmods]` iterates nothing. If `nmods` ever becomes
+        // non-zero, `module` must point at a table with that many entries
+        // first -- otherwise the module walks whatever the arena holds next.
+        for name in ["module", "languages"] {
+            // One pointer slot, zeroed. `Abi` has no NULL constant, and an
+            // all-zero far pointer is what NULL is under both ABIs anyway.
+            let at = mem.alloc_region(A::PTR_WIDTH)?;
+            at.write(mem, &vec![0u8; A::PTR_WIDTH]).map_err(|e| io::Error::other(e.to_string()))?;
+            globals.write_mem(mem, name, &A::ptr_to_bytes(at))?;
+        }
+
         // MAJORBBS.C:80-81 -- `int nterms=1, hichp1=1;`. Both were set before
         // any module's init ran, `:557` only ever adds configured groups to
         // `nterms`, and `:569` catastros above 256. There is no path to zero,
@@ -964,6 +990,31 @@ mod tests {
         }
     }
 
+    /// `module` and `languages` are pointers to arrays the host does not build.
+    ///
+    /// Both are placed and both point at real, empty storage rather than NULL.
+    /// What makes that safe is `nmods == 0`: a module iterating `module[0..nmods]`
+    /// iterates nothing. This test pins the pairing, because the day `nmods`
+    /// becomes non-zero without a table behind `module` is the day a module walks
+    /// garbage.
+    #[test]
+    fn the_pointer_arrays_are_empty_and_nmods_agrees() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        for name in ["module", "languages"] {
+            assert_eq!(g.size(name).expect(name), PTR, "{name} is a **");
+            assert_ne!(
+                g.pointer(&f.machine, name).expect(name),
+                mbbs_machine::m16::FarPtr::NULL,
+                "{name} must not be NULL even when the array is empty"
+            );
+        }
+        assert_eq!(
+            g.word(&f.machine, "nmods").expect("nmods"), 0,
+            "an empty `module` array is only safe while nmods is zero"
+        );
+    }
+
     /// `nmods` is not a configuration value -- it is how many modules are online,
     /// which the host knows exactly. A fixture with no modules loaded must read
     /// zero, and the number must move when a module lands.
@@ -1101,7 +1152,12 @@ mod tests {
         // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
         // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
-        // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven:
+        // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven,
+        // 3568 until Task 1.5 placed two more:
+        //   +4 module    (MAJORBBS.H:314 -- empty, safe only while nmods==0)
+        //   +4 languages (LINGO.H:42 -- empty, no counter pairs it)
+        // no new alignment byte: both are 4-byte pointers -- 3568 + 4*2 = 3576.
+        // Before that:
         //   +28 bbsttl, company, addres1, addres2, dataph, liveph, syskey
         //       (MAJORBBS.H:558-567, seven CHAR * at 4 bytes each)
         // no new alignment byte: all seven are 4 bytes and PTR-width entries
@@ -1144,7 +1200,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3568);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3576);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
