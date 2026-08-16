@@ -35,6 +35,15 @@ impl Abi for Wg16 {
     /// `flags` sits right after `level`'s own two bytes.
     const FILE_FLAGS_OFFSET: u16 = 2;
 
+    /// `INCLUDE/STDIO.H:104-114` again, summed: `int level`, `unsigned
+    /// flags`, `char fd`, `unsigned char hold`, `int bsize`, two pointers,
+    /// `unsigned istemp`, `short token`.
+    const FILE_SIZE: usize = 2 + 2 + 1 + 1 + 2 + 4 + 4 + 2 + 2;
+
+    /// `char fd`, third field, after two `int`s.
+    const FILE_FD_OFFSET: u16 = 4;
+    const FILE_FD_WIDTH: u16 = 1;
+
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
         mbbs_machine::m16::FarPtr::from_bytes(bytes.try_into().expect("PTR_WIDTH bytes"))
     }

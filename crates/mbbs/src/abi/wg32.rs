@@ -153,6 +153,42 @@ impl Abi for Wg32 {
     /// own doc comment for what this fixed.
     const FILE_FLAGS_OFFSET: u16 = 0x12;
 
+    /// Twenty-seven bytes, read straight out of `cw3220mt.DLL`'s own
+    /// `___getStream` (RVA `0x1a880`), which indexes the runtime's `__streams`
+    /// array:
+    ///
+    /// ```text
+    /// mov  eax,[ebp+8]        ; the stream's index
+    /// lea  eax,[eax+eax*2]    ; *3
+    /// lea  eax,[eax+eax*8]    ; *9  -- 27 altogether
+    /// add  eax,0x4288bc       ; __streams
+    /// ```
+    ///
+    /// An odd number, and deliberately not rounded up to a comfortable one:
+    /// the stride is what the runtime's own array arithmetic uses, and the
+    /// last field of the struct is as real as the first.
+    const FILE_SIZE: usize = 27;
+
+    /// `cw3220mt.DLL`'s `_fileno` (RVA `0x6b44`) is four instructions:
+    ///
+    /// ```text
+    /// push ebp; mov ebp,esp
+    /// mov  eax,[ebp+8]      ; fp
+    /// mov  eax,[eax+0x16]   ; FILE.fd, a full 32-bit int
+    /// pop  ebp; ret
+    /// ```
+    ///
+    /// **Twelve bytes further along than `Wg16`'s, and four times as wide.**
+    /// `fileno` is a macro in the module's own headers, so a module compiled
+    /// against this runtime inlines that exact read and never calls anything
+    /// -- The Rose 3.0NT does, at four call sites, each `push dword [reg+0x16]`
+    /// immediately before `call _read`. Until this constant existed, those
+    /// four bytes lay past the end of a 20-byte `FILE` this host had written,
+    /// and the module handed `read` whatever the arena held next (`458752`,
+    /// measured).
+    const FILE_FD_OFFSET: u16 = 0x16;
+    const FILE_FD_WIDTH: u16 = 4;
+
     /// The `Wg32`-only routines, the mirror of `Wg16`'s own override.
     ///
     /// One entry: `__ftol`, whose argument arrives in the x87 register stack

@@ -1100,6 +1100,26 @@ pub fn searchpath<A: Abi>(
 /// Shared by [`setmode`], [`read`] and [`write`] -- see `Host::stdio_modes`'s
 /// own doc comment for why this table stops at `4` rather than reaching into
 /// [`crate::stream::Streams`]'s own, separate numbering (`5` and up).
+/// A descriptor a real `fopen` issued, if `handle` is one.
+///
+/// [`crate::stream::Streams`] numbers its descriptors from `5`, above DOS's
+/// five standard handles, so the two spaces do not overlap and a caller can
+/// tell them apart by value alone.
+///
+/// # Why these arrive here at all
+///
+/// `fileno(f)` is a **macro** in Borland's headers -- it reads `FILE.fd`
+/// directly and never calls the runtime, so this host never sees it happen.
+/// A module that opens a file with `fopen` and then reads it with
+/// `read(fileno(fp), ...)` therefore hands a descriptor to a routine that
+/// used to accept only `0..=4`. The Rose 3.0NT does precisely that, at four
+/// call sites, each one `push dword [reg+0x16]` immediately before its
+/// `call _read` -- and `0x16` is where `cw3220mt.DLL`'s own `_fileno`
+/// (RVA `0x6b44`) reads it from.
+fn descriptor(handle: i32) -> Option<u8> {
+    u8::try_from(handle).ok().filter(|&h| h >= crate::stream::FIRST_FD)
+}
+
 fn standard_handle(handle: i32) -> Result<usize, ShimError> {
     usize::try_from(handle)
         .ok()
@@ -1284,8 +1304,23 @@ pub fn read<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
     let handle = sign_extend::<A>(call.int().into());
     let buf = call.ptr();
     let len = Into::<u32>::into(call.int()) as usize;
-    let idx = standard_handle(handle)?;
 
+    // A descriptor an `fopen` issued, arriving here because `fileno` is a
+    // macro the module expands itself -- see `descriptor_stream`.
+    if let Some(fd) = descriptor(handle) {
+        let cookie = host.streams.cookie_of_fd(fd).map_err(|e| {
+            ShimError::Failed(format!("read({handle}, ...): {e}"))
+        })?;
+        let bytes = host
+            .streams
+            .read_mem(call.mem(), cookie, len)
+            .map_err(|e| ShimError::Failed(format!("read({handle}, ...): {e}")))?;
+        buf.write(call.mem(), &bytes)
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        return Ok(abi::Ret::Int(A::int_from_u32(bytes.len() as u32)));
+    }
+
+    let idx = standard_handle(handle)?;
     if idx != 0 {
         return Err(ShimError::Failed(format!(
             "read({handle}, ...): only handle 0 (stdin) is open for reading on this host"
@@ -1342,8 +1377,27 @@ pub fn write<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<
     let handle = sign_extend::<A>(call.int().into());
     let buf = call.ptr();
     let len = Into::<u32>::into(call.int()) as usize;
-    let idx = standard_handle(handle)?;
 
+    // The counterpart of `read`'s own descriptor branch, and present for the
+    // same reason -- see `descriptor`.
+    if let Some(fd) = descriptor(handle) {
+        let cookie = host.streams.cookie_of_fd(fd).map_err(|e| {
+            ShimError::Failed(format!("write({handle}, ...): {e}"))
+        })?;
+        if len == 0 {
+            return Ok(abi::Ret::Int(A::Int::from(0u16)));
+        }
+        let raw = buf
+            .resolve(call.mem(), len)
+            .map_err(|e| ShimError::Failed(e.to_string()))?
+            .to_vec();
+        host.streams
+            .write(cookie, &raw)
+            .map_err(|e| ShimError::Failed(format!("write({handle}, ...): {e}")))?;
+        return Ok(abi::Ret::Int(A::int_from_u32(raw.len() as u32)));
+    }
+
+    let idx = standard_handle(handle)?;
     if idx != 1 && idx != 2 {
         return Err(ShimError::Failed(format!(
             "write({handle}, ...): only handles 1 (stdout) and 2 (stderr) are open for \
@@ -1422,6 +1476,65 @@ mod tests {
             Ret::Far(at) => at,
             _ => panic!("fopen returns a FILE *"),
         }
+    }
+
+    // ---- read/write on a descriptor an fopen issued ------------------------
+
+    /// `read` accepts the descriptor `fileno` would have handed a module,
+    /// and reads the file that descriptor names.
+    ///
+    /// This path exists because `fileno` is a macro: a module reads
+    /// `FILE.fd` out of the struct itself and passes the number to `read`,
+    /// so the host sees a descriptor with no record of where it came from.
+    /// The descriptor is taken out of the `FILE` image here the same way the
+    /// module's own inlined macro would take it, rather than being assumed
+    /// to be 5.
+    #[test]
+    fn read_accepts_a_descriptor_fopen_issued_and_reads_that_file() {
+        let root = scratch("crt-read-by-fd");
+        std::fs::write(root.join("IN.DAT"), b"payload").expect("a file to read");
+        let mut f = Fixture::rooted(root);
+        let fp = opened(&mut f, "IN.DAT", "rb");
+
+        // What `fileno(fp)` expands to, done by hand: the bytes at this
+        // ABI's own `FILE.fd`.
+        let image = f
+            .machine
+            .resolve(fp, crate::stream::FILE_SIZE)
+            .expect("a FILE")
+            .to_vec();
+        let at = usize::from(Wg16::FILE_FD_OFFSET);
+        let width = usize::from(Wg16::FILE_FD_WIDTH);
+        let mut raw = [0u8; 4];
+        raw[..width].copy_from_slice(&image[at..at + width]);
+        let fd = u32::from_le_bytes(raw);
+        assert!(fd >= 5, "a real descriptor, not a standard handle: {fd}");
+
+        let buf = f.buffer(16);
+        let got = f
+            .invoke(read, &[fd as u16, buf.offset, buf.selector, 7])
+            .expect("reads through the descriptor");
+        assert_eq!(got, Ret::U16(7), "seven bytes asked for, seven read");
+        assert_eq!(
+            &f.machine.resolve(buf, 7).expect("the buffer")[..],
+            b"payload"
+        );
+    }
+
+    /// A descriptor no stream carries is refused, and named.
+    ///
+    /// The Rose 3.0NT arrived here with `458752` -- four bytes read past the
+    /// end of a `FILE` this host had written too short. A refusal that says
+    /// which descriptor is the difference between diagnosing that in minutes
+    /// and not at all.
+    #[test]
+    fn read_on_a_descriptor_no_stream_carries_is_refused() {
+        let mut f = Fixture::rooted(scratch("crt-read-bad-fd"));
+        let buf = f.buffer(16);
+        let e = f
+            .invoke(read, &[9, buf.offset, buf.selector, 4])
+            .expect_err("descriptor 9 names nothing");
+        assert!(format!("{e}").contains("descriptor 9"), "{e}");
     }
 
     // ---- fwrite -------------------------------------------------------------

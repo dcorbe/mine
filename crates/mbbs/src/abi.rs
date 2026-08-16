@@ -190,6 +190,46 @@ pub trait Abi {
     /// this produced in LunatiX 5.3F.
     const FILE_FLAGS_OFFSET: u16;
 
+    /// Bytes of the `FILE` struct this ABI's runtime uses.
+    ///
+    /// What [`crate::stream::Streams::open_mem`] reserves and what `fopen`
+    /// hands back a pointer to. It is not a buffer size this host is free to
+    /// choose: a module reads fields out of it by macro, at fixed offsets,
+    /// without ever calling the host, so anything short of the real size is
+    /// memory the module reads and this host never wrote.
+    const FILE_SIZE: usize;
+
+    /// Byte offset of `FILE.fd` -- what `fileno(f)` expands to a read of.
+    ///
+    /// **A macro, not a call.** `fileno` never reaches this host, so getting
+    /// this wrong is invisible until the module passes the value it read to
+    /// something that does -- `read`, `write`, `close` -- with a number this
+    /// host never put there.
+    const FILE_FD_OFFSET: u16;
+
+    /// Width of `FILE.fd`, in bytes.
+    ///
+    /// One in Borland's 16-bit `STDIO.H` (`char fd`), four in `cw3220mt`'s
+    /// 32-bit runtime (`int`). Read as unsigned little-endian either way; no
+    /// descriptor this host issues is ever negative.
+    ///
+    /// # No test can currently tell the two widths apart, and that is a fact
+    /// about the data rather than a gap in the tests
+    ///
+    /// Measured by mutation: setting this to `1` for `Wg32` leaves the whole
+    /// suite green. Every descriptor this host issues is a `u8`
+    /// (`stream::FIRST_FD..=u8::MAX`) and the struct image is zero-filled
+    /// before the fields are written, so one byte of `5` and four bytes of
+    /// `5` are the same bytes. The distinction only becomes observable if
+    /// descriptors ever outgrow a byte, or if the image stops being zeroed.
+    ///
+    /// It is kept at the measured width anyway, because the alternative is a
+    /// host whose correctness depends on two accidents holding at once, and
+    /// because the *offset* -- which is what actually broke The Rose -- is
+    /// pinned by a real test either way
+    /// (`tests/wg32_stream_flags_offset.rs`).
+    const FILE_FD_WIDTH: u16;
+
     /// Decode a pointer from exactly [`PTR_WIDTH`](Abi::PTR_WIDTH) bytes, in
     /// this ABI's own layout.
     fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr;
@@ -1094,6 +1134,9 @@ mod tests {
         const LONG_WIDTH: usize = Wg16::LONG_WIDTH;
         const GCV2: bool = Wg16::GCV2;
         const FILE_FLAGS_OFFSET: u16 = Wg16::FILE_FLAGS_OFFSET;
+        const FILE_SIZE: usize = Wg16::FILE_SIZE;
+        const FILE_FD_OFFSET: u16 = Wg16::FILE_FD_OFFSET;
+        const FILE_FD_WIDTH: u16 = Wg16::FILE_FD_WIDTH;
 
         fn ptr_from_bytes(bytes: &[u8]) -> Self::Ptr {
             Wg16::ptr_from_bytes(bytes)

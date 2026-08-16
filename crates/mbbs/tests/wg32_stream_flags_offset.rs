@@ -162,3 +162,79 @@ fn reading_a_wg32_stream_to_eof_sets_f_eof_at_cw3220mts_own_offset() {
          zero to a 32-bit module, which is the LunatiX 5.3F strcpy crash"
     );
 }
+
+/// `Wg32`'s own `FILE.fd` offset and width, by the same standard as the
+/// flags test above: literals measured from the runtime, not the constants
+/// under test.
+///
+/// # The bug this guards
+///
+/// The Rose 3.0NT would not boot. It calls `read(fileno(fp), buf, 5000)` at
+/// four sites, and `fileno` is a **macro** -- it reads `FILE.fd` inline and
+/// never calls the host, so nothing in an import survey can see it happen.
+/// `cw3220mt.DLL`'s own exported `_fileno` (RVA `0x6b44`) is
+/// `mov eax,[eax+0x16]`: a full 32-bit `int` at offset 22. This host wrote a
+/// single byte at offset 4 -- Borland's *16-bit* layout -- into a 20-byte
+/// `FILE`, so the module's read ran four bytes **past the end of the struct
+/// entirely** and handed `read` whatever the arena held next. Measured:
+/// `458752`.
+///
+/// Each of the four call sites is `push dword [reg+0x16]` immediately before
+/// its `call _read`, which is what makes the offset attributable rather than
+/// merely plausible.
+#[test]
+fn a_wg32_streams_descriptor_is_a_four_byte_int_at_cw3220mts_own_offset() {
+    let mut cpu = cpu();
+
+    let root = scratch("wg32-stream-fd-offset");
+    let path = root.join("fd.txt");
+    std::fs::write(&path, b"hi\n").expect("a scratch file to open");
+
+    let mut streams = Streams::<Wg32>::default();
+    let cookie = streams
+        .open_mem(
+            &mut cpu.mem,
+            "fd.txt",
+            &path,
+            Mode::parse("r").expect("a mode"),
+        )
+        .expect("opens");
+
+    // Literals for the same reason the flags test gives at length: reading
+    // through `Wg32::FILE_FD_OFFSET` would make this agree with the constant
+    // even if the constant regressed, because the write site reads it too.
+    //
+    // `0x16` and four bytes are `_fileno`'s own `mov eax,[eax+0x16]`; `27` is
+    // the stride `___getStream` (RVA `0x1a880`) multiplies an index by before
+    // adding `__streams` -- `lea eax,[eax+eax*2]` then `lea eax,[eax+eax*8]`.
+    const CW3220MT_FILENO_OFFSET: usize = 0x16;
+    const CW3220MT_SIZEOF_FILE: usize = 27;
+
+    let image = cookie
+        .resolve(&cpu.mem, CW3220MT_SIZEOF_FILE)
+        .expect("a 27-byte FILE cookie resolves -- a shorter one would not")
+        .to_vec();
+
+    let fd = u32::from_le_bytes([
+        image[CW3220MT_FILENO_OFFSET],
+        image[CW3220MT_FILENO_OFFSET + 1],
+        image[CW3220MT_FILENO_OFFSET + 2],
+        image[CW3220MT_FILENO_OFFSET + 3],
+    ]);
+    assert_eq!(
+        fd, 5,
+        "the first descriptor this host issues is 5 (`stream::FIRST_FD`), and \
+         cw3220mt's own _fileno reads it as a 32-bit int at offset \
+         {CW3220MT_FILENO_OFFSET:#x}; a host writing one byte at offset 4 leaves \
+         these four bytes as whatever the arena held"
+    );
+
+    // Nothing above would notice a host that wrote all four bytes but left
+    // the struct 20 bytes long: the fd would land past the reservation and
+    // `resolve` would be reading someone else's memory that happened to hold
+    // the right value. This is the assertion that the *size* is right.
+    assert!(
+        cookie.resolve(&cpu.mem, CW3220MT_SIZEOF_FILE).is_ok(),
+        "the whole 27-byte struct has to be inside the reservation"
+    );
+}

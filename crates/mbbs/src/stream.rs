@@ -60,6 +60,10 @@ use crate::arena::Arena;
 /// bytes of the same twenty rather than needing a wider reservation.
 pub const FILE_SIZE: usize = 2 + 2 + 1 + 1 + 2 + 4 + 4 + 2 + 2;
 
+// NOTE: the constant above is `Wg16`'s, kept only because this module's own
+// tests and `tests/wg32_stream_flags_offset.rs` name it. Everything that
+// writes or reserves a `FILE` uses `A::FILE_SIZE`.
+
 /// Where `fd` is, which `fileno(f)` expands to a read of. **One byte.**
 ///
 /// **Not per-ABI, unlike [`Abi::FILE_FLAGS_OFFSET`], and that is a known gap
@@ -609,7 +613,7 @@ impl<A: Abi> Streams<A> {
 
         let cookie = self
             .arena
-            .reserve(mem, FILE_SIZE)
+            .reserve(mem, A::FILE_SIZE)
             .map_err(|e| format!("{name}: {e}"))?;
 
         let stream = Stream {
@@ -624,10 +628,16 @@ impl<A: Abi> Streams<A> {
         // The two fields a module reads without asking the host. Written before
         // the stream is recorded, so a failure here cannot leave a stream the
         // host believes in behind a struct that says nothing.
-        let mut image = [0u8; FILE_SIZE];
+        let mut image = vec![0u8; A::FILE_SIZE];
         let at = usize::from(A::FILE_FLAGS_OFFSET);
         image[at..at + 2].copy_from_slice(&stream.flags().to_le_bytes());
-        image[usize::from(FD)] = fd;
+        // `fd` at this ABI's own offset and width, little-endian. `fileno` is
+        // a macro: the module reads these bytes itself and never asks, so a
+        // byte written at the wrong offset is never noticed here -- only much
+        // later, by whatever the module passes the result to.
+        let at = usize::from(A::FILE_FD_OFFSET);
+        let width = usize::from(A::FILE_FD_WIDTH);
+        image[at..at + width].copy_from_slice(&u32::from(fd).to_le_bytes()[..width]);
         cookie
             .write(mem, &image)
             .map_err(|e| format!("{name}: {e}"))?;
@@ -936,6 +946,26 @@ impl<A: Abi> Streams<A> {
         field
             .write(mem, &stream.flags().to_le_bytes())
             .map_err(|e| format!("{}: {e}", stream.name))
+    }
+
+    /// The `FILE *` of the stream a descriptor names.
+    ///
+    /// `fileno` is a macro, so a module that has a `FILE *` can hand the host
+    /// a bare descriptor at any moment -- The Rose 3.0NT does exactly that,
+    /// `read(fileno(fp), buf, 5000)` at four call sites. Everything else in
+    /// this type is keyed by cookie, so rather than grow a second I/O path
+    /// keyed by descriptor, this translates one to the other and the existing
+    /// path is reused.
+    ///
+    /// # Errors
+    ///
+    /// If no open stream carries that descriptor.
+    pub fn cookie_of_fd(&self, fd: u8) -> Result<A::Ptr, String> {
+        self.open
+            .iter()
+            .find(|s| s.fd == fd)
+            .map(|s| s.cookie)
+            .ok_or_else(|| format!("descriptor {fd} names no stream this host has open"))
     }
 
     /// The lowest descriptor no open stream is using.
