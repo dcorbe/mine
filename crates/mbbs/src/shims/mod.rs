@@ -247,7 +247,7 @@ impl<A: Abi> Copy for Entry<A> {}
 /// `crates/mbbs/tests/evidence_manifest.rs`'s `UNCLASSIFIED_CEILING`, which
 /// `tools/cargo-serial.sh test -p mbbs --test evidence_manifest` fails loudly
 /// if this table's count ever rises above. This number went stale once
-/// already, by exactly two hundred.
+/// already, by exactly two hundred and two.
 fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
     vec![
         // Strings, numbers and the print buffer.
