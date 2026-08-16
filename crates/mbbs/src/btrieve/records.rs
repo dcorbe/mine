@@ -532,7 +532,7 @@ impl Records {
     /// order of what is left; `update` mutates a record in place), so the
     /// invariant holds for the whole lifetime of a `Records`.
     ///
-    /// [`pages::Layout::next_slot`]: super::pages::Layout::next_slot
+    /// [`pages::Layout::next_slot`]: crate::btrieve::pages::Layout::next_slot
     ///
     /// # Errors
     ///
@@ -2056,12 +2056,6 @@ mod tests {
         ("wccuser2.vir", Version::V5, 0),
     ];
 
-    /// Physical-page filenames of the three real files here this host's
-    /// *existing* v6 walk does not read correctly -- see
-    /// [`majormud_nts_multi_block_v6_files_are_a_known_gap`]. Named once so
-    /// the two tests that need to agree on the set cannot drift apart.
-    const MULTI_BLOCK_GAP: [&str; 3] = ["wccknms2.vir", "wcctext2.vir", "wccmp002.vir"];
-
     /// The bring-up target itself, not a synthetic stand-in: does this
     /// host's decoder -- which never hardcodes a struct field offset and
     /// reads every key offset out of *this file's own* FCR (`keys.rs`'s
@@ -2083,19 +2077,19 @@ mod tests {
     /// [`wccrace2_field_content_lands_where_the_module_expects`] goes one
     /// step further and checks field *content*, not just record count.
     ///
-    /// **On a second, unrelated axis, three of the seventeen expose a real
-    /// gap this task did not go looking for.** `wccknms2.vir`, `wcctext2.vir`
-    /// and `wccmp002.vir` -- [`MULTI_BLOCK_GAP`] -- do not read correctly
-    /// through the existing v6 walk at all. This is not the packed/unpacked
-    /// axis Task 9 asked about (see `tmp/lane-a-findings.md` for the full
-    /// writeup and why it is a `v6.rs` allocation-table gap, not a
-    /// `records.rs`/`keys.rs` one): every real MajorMUD NT file whose page
-    /// count needs more than one `"PP"` allocation-table block fails, and
-    /// every one that fits in a single block -- including `wccmsg2.vir` at
-    /// 3,867 records over 298 pages -- passes clean. No existing v6 fixture
-    /// (the largest is 50 records) was ever big enough to need a second
-    /// block, which is why nothing caught this before real, at-scale NT data
-    /// was available to read.
+    /// **A second, unrelated axis was found and fixed here, not merely
+    /// noted.** `wccknms2.vir`, `wcctext2.vir` and `wccmp002.vir` -- every
+    /// real MajorMUD NT file whose page count needs more than one `"PP"`
+    /// allocation-table block -- did not read correctly through the v6 walk
+    /// at all when this task started: `Records::read` refused all three
+    /// (`wccknms2.vir` and `wccmp002.vir` came up short by exactly 1 and 24
+    /// records; `wcctext2.vir` refused outright, chasing a fragment chain to
+    /// a logical page the allocation table did not claim). This is not the
+    /// packed/unpacked axis Task 9 asked about -- see `tmp/scratch/lane-a-findings.md`
+    /// for that writeup -- but a genuine `v6.rs` allocation-table gap:
+    /// [`super::v6::OVERFLOW`]'s doc comment has the root cause and the fix.
+    /// All three now read exactly the counts below, through this same loop,
+    /// no special case.
     #[test]
     #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
     fn majormud_nts_own_files_read_under_this_hosts_packing_agnostic_decoder() {
@@ -2103,9 +2097,6 @@ mod tests {
             .join("../../archive/modules/majormud-nt/wccnt8pj/out");
 
         for (name, version, expect) in MAJORMUD_NT {
-            if MULTI_BLOCK_GAP.contains(name) {
-                continue; // a separate, real finding -- see the doc comment above
-            }
             let path = dir.join(name);
             let geometry =
                 Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -2127,68 +2118,41 @@ mod tests {
         }
     }
 
-    /// The multi-allocation-table-block gap, pinned precisely rather than
-    /// left as a silent `continue` in the test above -- so a fix flips these
-    /// three assertions and is impossible to land unnoticed.
-    ///
-    /// All three failures are measured, not guessed, and **all three are
-    /// caught, loudly, by `Records::read`'s own count check** -- "the count
-    /// is the acceptance check" (this module's own doc comment) does exactly
-    /// its job here: nothing here hands a caller a plausible-but-wrong
-    /// answer. `Records::read` refuses all three; [`walk`] is called
-    /// directly, underneath that guard, to show *why* -- an undercount for
-    /// `wccknms2.vir` (short by exactly 1 of 1,101) and `wccmp002.vir`
-    /// (short by exactly 24 of 26,720), and an outright refusal chasing a
-    /// variable-length fragment chain across a block boundary for
-    /// `wcctext2.vir`. Every file here whose page count exceeds one `"PP"`
-    /// block's `(page_size - 0x0c) / 4` entries shows one of these two
-    /// symptoms; `wccmsg2.vir`, the largest single-block file measured (298
-    /// pages, 3,867 records), has neither.
+    /// The multi-allocation-table-block gap, pinned as the fix rather than
+    /// as the failure it used to be. Before `v6::OVERFLOW`, `Records::read`
+    /// refused all three of these (an undercount for `wccknms2.vir`, short
+    /// by exactly 1 of 1,101, and `wccmp002.vir`, short by exactly 24 of
+    /// 26,720; an outright refusal chasing a variable-length fragment chain
+    /// across a block boundary for `wcctext2.vir`) -- "the count is the
+    /// acceptance check" (this module's own doc comment) caught all three
+    /// rather than handing back a plausible-but-wrong answer. This test
+    /// pins the fixed behaviour precisely, redundantly with
+    /// [`majormud_nts_own_files_read_under_this_hosts_packing_agnostic_decoder`]'s
+    /// own loop, so a regression here fails two tests by name rather than
+    /// one, and names why each of the three needed a second `"PP"` block in
+    /// the first place: `wccmsg2.vir`, at 3,867 records over 298 pages, is
+    /// the largest *single-block* file measured and reads clean without the
+    /// fix at all -- the boundary these three cross is a second block
+    /// existing, not size.
     #[test]
     #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
-    fn majormud_nts_multi_block_v6_files_are_a_known_gap() {
+    fn majormud_nts_multi_block_v6_files_now_read_the_overflow_claim() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../archive/modules/majormud-nt/wccnt8pj/out");
 
-        let geometry_of = |name: &str| {
-            Geometry::read(name, &dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
-        };
-        let refused = |name: &str| -> String {
-            let geometry = geometry_of(name);
+        let read = |name: &str| -> usize {
+            let geometry =
+                Geometry::read(name, &dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             let fcr = std::fs::read(dir.join(name)).expect("readable");
             let parsed = keys::parse(name, &fcr, geometry.keys).expect("keys");
             Records::read(name, &dir.join(name), &geometry, &parsed)
-                .map(|r| panic!("{name}: now reads {} records instead of refusing", r.len()))
-                .unwrap_err()
-                .why
+                .unwrap_or_else(|e| panic!("{name}: {}", e.why))
+                .len()
         };
 
-        // `Records::read` refuses all three, loudly, rather than handing
-        // back a plausible-but-short answer.
-        assert!(
-            refused("wccknms2.vir").contains("1101") && refused("wccknms2.vir").contains('1'),
-            "wccknms2.vir: expected the known count-mismatch refusal"
-        );
-        assert!(
-            refused("wccmp002.vir").contains("26720"),
-            "wccmp002.vir: expected the known count-mismatch refusal"
-        );
-        let text_why = refused("wcctext2.vir");
-        assert!(
-            text_why.contains("no live physical page"),
-            "wcctext2.vir: expected the known fragment-resolution refusal, got: {text_why}"
-        );
-
-        // Underneath that guard: `walk` (private to this module, called
-        // directly here) shows the undercount is exact and reproducible, not
-        // a flaky number.
-        let g = geometry_of("wccknms2.vir");
-        let n = walk(&g, &dir.join("wccknms2.vir")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(n.len(), 1100, "wccknms2.vir: expected the known short walk count");
-
-        let g = geometry_of("wccmp002.vir");
-        let n = walk(&g, &dir.join("wccmp002.vir")).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(n.len(), 26696, "wccmp002.vir: expected the known short walk count");
+        assert_eq!(read("wccknms2.vir"), 1101);
+        assert_eq!(read("wcctext2.vir"), 3467);
+        assert_eq!(read("wccmp002.vir"), 26720);
     }
 
     /// The decisive check Task 9 asks for: not just "does the record count
