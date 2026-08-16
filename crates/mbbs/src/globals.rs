@@ -568,13 +568,6 @@ pub struct Globals<A: Abi> {
     /// Where `prfbuf` points: the print buffer, in a region of its own so that
     /// a module overrunning it cannot reach the globals.
     prf: A::Ptr,
-    /// The byte count `prf` was actually allocated with -- captured at the
-    /// [`ModuleMem::alloc_region`] call site itself, not re-derived from
-    /// [`OUTBSZ`], so that a test reading it back pins agreement between the
-    /// allocation and the `outbsz` global rather than comparing the same
-    /// constant to itself. See
-    /// `outbsz_is_the_size_the_print_buffer_was_actually_allocated_with`.
-    prf_len: usize,
 }
 
 impl<A: Abi> Globals<A> {
@@ -598,17 +591,6 @@ impl<A: Abi> Globals<A> {
     /// an already-generic value, and nothing else.
     pub fn prf_buffer(&self) -> A::Ptr {
         self.prf
-    }
-
-    /// The byte count [`Globals::prf_buffer`] was actually allocated with.
-    ///
-    /// `pub(crate)`, not exposed at the crate boundary: the one caller is the
-    /// `outbsz` test, which pins that the `outbsz` global agrees with this
-    /// allocation rather than with the [`OUTBSZ`] constant both are meant to
-    /// share -- a test built against the constant on both sides would pass
-    /// even if the constant and the allocation had drifted apart together.
-    pub(crate) fn prf_len(&self) -> usize {
-        self.prf_len
     }
 
     /// Where a global lives, or `None` for a name the host does not place.
@@ -780,7 +762,6 @@ impl<A: Abi> Globals<A> {
             offsets,
             sizes,
             prf,
-            prf_len,
         };
 
         // `prfbuf` and `prfptr` are `char *`, not the buffer -- GCOMM.H:449.
@@ -965,18 +946,30 @@ mod tests {
     /// fills `prfbuf` up to `outbsz` overruns a buffer the host made smaller.
     #[test]
     fn outbsz_is_the_size_the_print_buffer_was_actually_allocated_with() {
-        // Deliberately not compared against `OUTBSZ`: a test that reads the
-        // same constant the implementation writes would pass even if the
-        // constant and the `prf` allocation had drifted apart together. This
-        // reads `prf_len`, the byte count actually handed to
-        // `ModuleMem::alloc_region` when `prf` was allocated, so the
-        // assertion pins the allocation and the global to each other.
+        // Deliberately not compared against `OUTBSZ`, and deliberately not
+        // against `prf_len` either: both name the byte count `Globals::new`
+        // *asked* `ModuleMem::alloc_region` for, not what it actually got
+        // back. A test built against either would still pass if
+        // `mem.alloc_region(prf_len)` were mutated to
+        // `mem.alloc_region(prf_len * 2)` -- doubling the real allocation
+        // while leaving `prf_len` itself untouched -- because nothing above
+        // read the allocation back. This instead asks the segment
+        // `prf_buffer()` actually names for its own real length, through
+        // `Segments::region_len` -- the same bound `resolve`/`read_cstr`
+        // already check every module read against -- so a divergence
+        // between what was requested and what was really allocated is
+        // exactly what this assertion catches.
         let f = crate::testing::Fixture::new();
         let g = f.host.globals();
+        let allocated = f
+            .machine
+            .mem()
+            .region_len(g.prf_buffer())
+            .expect("prf_buffer names a real segment");
         assert_eq!(
             u64::from(g.word(&f.machine, "outbsz").expect("outbsz")),
-            g.prf_len() as u64,
-            "outbsz must agree with the prf allocation at globals.rs:696"
+            allocated as u64,
+            "outbsz must agree with the prf segment's real, allocated length"
         );
     }
 

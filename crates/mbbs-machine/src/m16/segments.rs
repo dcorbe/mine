@@ -195,6 +195,20 @@ impl Segments {
         Ok(segment.slice(start, len))
     }
 
+    /// The length of the segment `ptr` names -- the actual bound
+    /// [`Segments::resolve`] and [`Segments::read_cstr`] already check every
+    /// access against, exposed so a caller can compare what
+    /// [`Segments::alloc_segment`] was asked for against what the segment it
+    /// returned really holds, rather than trusting the two never drifted
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// If `ptr`'s selector names no segment of this module's.
+    pub fn region_len(&self, ptr: FarPtr) -> Result<usize, FarPtrError> {
+        self.segment(ptr.selector).map(Segment::len)
+    }
+
     /// Read a NUL-terminated string through a far pointer, without the NUL.
     ///
     /// Most of the MajorBBS API is shaped this way. The scan stops at the end
