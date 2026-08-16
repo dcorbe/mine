@@ -144,6 +144,15 @@ const fn s(name: &'static str, size: u16) -> Global {
     }
 }
 
+/// A `GALME` global -- the Messaging Engine's.
+const fn m(name: &'static str, size: u16) -> Global {
+    Global {
+        dll: crate::exports::GALME,
+        name,
+        size: Width::Bytes(size),
+    }
+}
+
 /// Every global the host places, in `MAJORBBS.H` declaration order.
 ///
 /// The comment on each group names the declaration it came from, so that a
@@ -410,6 +419,10 @@ pub const GLOBALS: &[Global] = &[
     // `nmods == 0` guarantee; it is simply an array a module must never
     // walk expecting entries.
     g("languages", PTR),
+    // GME.H:199 -- UINT _txtlen; message text buffer size, reached through
+    // the TXTLEN macro. GALME's, not MAJORBBS's -- it is not part of the
+    // MAJORBBS.H sequence above, so declaration order does not bind it.
+    m("txtlen", 2),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -853,6 +866,12 @@ impl<A: Abi> Globals<A> {
         // was allocated with above, so the two cannot drift.
         globals.write_mem(mem, "outbsz", &A::int_to_bytes(OUTBSZ.into()))?;
 
+        // No config read for the messaging engine's buffer size; TXTLEN is
+        // what a module sizes a message body against, so it must be
+        // non-zero. `txtlen` is `Width::Bytes(2)`, not `Width::Int`, so this
+        // goes through `write_mem` directly rather than `int_to_bytes`.
+        globals.write_mem(mem, "txtlen", &OUTBSZ.to_le_bytes())?;
+
         // `nmods` is a count the host owns, not a config value. A freshly
         // built `Globals` has nothing loaded; `Host::load` is what moves it.
         globals.write_mem(mem, "nmods", &A::int_to_bytes(0u16.into()))?;
@@ -1047,6 +1066,24 @@ mod tests {
         assert_eq!((XRFSIZ + 1) + UIDSIZ, 46, "the arithmetic, spelled out once");
     }
 
+    /// `GME.H:199` -- `extern UINT GMEEXP _txtlen`, the message text buffer size,
+    /// with `#define TXTLEN _txtlen` beside it.
+    ///
+    /// It belongs to GALME, not MAJORBBS. Registering it under the wrong library
+    /// means the import does not resolve at all, and the failure looks like a
+    /// missing symbol rather than a misfiled one.
+    #[test]
+    fn txtlen_is_a_galme_global() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(g.size("txtlen").expect("txtlen is placed"), 2, "UINT");
+        assert_eq!(
+            GLOBALS.iter().find(|x| x.name == "txtlen").expect("txtlen").dll,
+            crate::exports::GALME,
+            "the Messaging Engine's, not the executive's"
+        );
+    }
+
     /// `nmods` is not a configuration value -- it is how many modules are online,
     /// which the host knows exactly. A fixture with no modules loaded must read
     /// zero, and the number must move when a module lands.
@@ -1185,7 +1222,12 @@ mod tests {
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
         // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
         // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven,
-        // 3568 until Task 1.5 placed two more, 3576 until Task 1.6 placed one:
+        // 3568 until Task 1.5 placed two more, 3576 until Task 1.6 placed one,
+        // 3622 until Task 1.7 placed the last of this batch:
+        //   +2 txtlen    (GME.H:199 -- GALME's, not MAJORBBS.H's; `Width::Bytes(2)`
+        //                 rather than `Width::Int`, so it is 2 bytes under both ABIs)
+        // no new alignment byte: 2 is even -- 3622 + 2 = 3624.
+        // Before that:
         //   +46 uidxrf   (USRACC.H:39 -- the struct BY VALUE, xrfstg[16] +
         //                 userid[30], non-GCV2)
         // no new alignment byte: 46 is even, so alignment on both sides of it
@@ -1237,7 +1279,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3622);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3624);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
