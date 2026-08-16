@@ -202,14 +202,22 @@ pub fn dispatch(
             }
         },
 
-        // Request status. Nothing waiting and nothing to send is an idle poll,
-        // which is a door telling us it has no work.
-        0x03 => {
-            regs.ax = status(uart);
-            if uart.pending() == 0 {
-                serviced = Serviced::Yield;
-            }
-        }
+        // Request status. Deliberately never yields, which cost a measured
+        // 5.3 seconds before it was taken out.
+        //
+        // The temptation is to read "no input waiting" as "the door is idle"
+        // and hand the core back. It is not: a door polls status *while
+        // sending*, to ask whether there is room in the transmit buffer, and
+        // LORD does it 5310 times against 1467 transmitted characters. Yielding
+        // here puts a sleep between output characters and the whole session
+        // crawls.
+        //
+        // Nothing is lost by not yielding, because a door that really is idle
+        // says so by another route: LORD calls `int 15h AH=10` 6975 times in
+        // the same session, and the caller already sleeps on that. Guessing at
+        // idleness from a status poll only duplicates a signal we are given
+        // outright.
+        0x03 => regs.ax = status(uart),
 
         // Initialize. The signature is the entire point of this function.
         0x04 => {
@@ -384,6 +392,21 @@ mod tests {
         u.receive(b'Z');
         assert_eq!(call(&mut g, &mut u, 0x0200), Serviced::Done);
         assert_eq!(g.regs().al(), b'Z', "LORD reads this straight out of AL");
+    }
+
+    #[test]
+    fn a_status_poll_never_yields_even_with_nothing_to_read() {
+        // Regression: this used to yield whenever no input was waiting, which
+        // reads like "the door is idle" and is not. A door polls status while
+        // sending, so that sleep landed between output characters -- measured
+        // at 5.3 seconds of a 16.5 second session. An idle door says so via
+        // `int 15h AH=10` instead, which the caller already honours.
+        let (mut g, mut u) = setup();
+        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "empty buffer");
+        u.send(b'x');
+        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "mid-transmit");
+        u.receive(b'y');
+        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "input waiting");
     }
 
     #[test]
