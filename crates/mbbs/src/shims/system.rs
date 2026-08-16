@@ -880,6 +880,90 @@ pub fn rtkick<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `VOID rtihdlr(VOID (*rouptr)(VOID))` -- `MAJORBBS.H:750` -- install an
+/// 18 Hz real-time interrupt routine. `MAJORBBS.C:1533-1542`:
+///
+///
+/// **The handler is remembered and nothing runs it**, which is
+/// [`rtkick`]'s answer to the same question and reached the same way -- see
+/// [`Host::rtirs`], which is [`Host::kicks`]'s shape deliberately rather
+/// than a second mechanism. Running one needs an 18 Hz clock and a main
+/// loop this host does not have, and `rtihdlr` returns `void`, so it
+/// promises the caller nothing at call time.
+///
+/// **The `RTIMAX` bound is enforced.** `MAJORBBS.C:143` sets it at 10 and
+/// `:1536` `catastro`s on the eleventh install, which stops the board. A
+/// module reaching that had a bug the real host refused to carry, so this
+/// refuses too rather than growing the `Vec` quietly.
+///
+/// `bturti(18,bbsrti)` is not reproduced: it arms the hardware timer to call
+/// the vendor's own master handler, which is the very tick this host does not
+/// have. Nothing observable to a module depends on the arming itself.
+///
+/// # Errors
+///
+/// On the eleventh handler, where the real host `catastro`s.
+pub fn rtihdlr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    /// `RTIMAX`, `MAJORBBS.C:143` -- the depth of the `rtirs` array.
+    const RTIMAX: usize = 10;
+
+    let rouptr = call.ptr();
+    if host.rtirs.len() >= RTIMAX {
+        return Err(ShimError::Failed(format!(
+            "rtihdlr: TOO MANY REAL-TIME IRPT ROUTINES -- RTIMAX is {RTIMAX} \
+             (MAJORBBS.C:143) and the real host catastros here"
+        )));
+    }
+    host.rtirs.push(rouptr);
+    Ok(abi::Ret::Void)
+}
+
+/// `INT oldbgnedt(INT siz, CHAR *buf, INT tsiz, CHAR *topic,
+/// SHORT (*whndun)(SHORT), INT flags)` -- `MAJORBBS.C:5413-5424`:
+///
+///
+/// **Refuses**, and its arity is worth stating because the declaration hides
+/// it. `GALPNQH.H:494` -- *not* `MAJORBBS.H` -- declares it
+/// `extern INT oldbgnedt();`, which is K&R for "unspecified", not "none". The
+/// six arguments above come from the body, which is the stronger source; the
+/// call-site measurement `re/ne_arity.py` would give was unavailable, because
+/// that tool reads `WCCMMUD.DLL` and the four modules importing this symbol
+/// (CHRGAME, HVSTW, LOGSAS, XCLIBUR) are not it. All six are read here
+/// anyway, so the refusal can name what it was asked for.
+///
+/// The body is one line and every part of it is missing here. `bgnedt` is a
+/// **function pointer** (`FSD.H:54`, placed by `crate::globals` and NULL
+/// until something sets it) into the full-screen editor, and this host has no
+/// editor to set it. Even with a non-NULL pointer there would be nothing to
+/// do with it: no shim in this crate re-enters module code while the machine
+/// is stopped at a host call, so forwarding is not something that can be
+/// arranged locally.
+///
+/// Returning `0` would be the plausible answer, and it is the wrong one twice
+/// over: the caller believes an editing session has begun, and `whndun` --
+/// the routine it expects to be called back on when the user finishes -- never
+/// runs, so the module waits for an event that cannot arrive.
+///
+/// # Errors
+///
+/// Always, naming `bgnedt` and the editor behind it.
+pub fn oldbgnedt<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let siz: u32 = call.int().into();
+    let _buf = call.ptr();
+    let tsiz: u32 = call.int().into();
+    let _topic = call.ptr();
+    let _whndun = call.ptr();
+    let flags: u32 = call.int().into();
+
+    Err(ShimError::Failed(format!(
+        "oldbgnedt(siz={siz}, tsiz={tsiz}, flags={flags:#x}): this host has no \
+         full-screen editor -- `bgnedt` (FSD.H:54) is the function pointer this \
+         forwards to and nothing ever sets it, and a shim here cannot re-enter \
+         module code to call it even if something did; see this routine's own \
+         doc comment for why answering 0 would be worse"
+    )))
+}
+
 /// `VOID dclvda(INT size)` -- `MAJORBBS.H:771` -- declare how much volatile
 /// data area this module needs.
 ///
@@ -2186,6 +2270,74 @@ mod tests {
                 "{n} is outside 100000..1000000"
             );
         }
+    }
+
+    /// `rtihdlr` keeps the handler, in order, and enforces `RTIMAX`.
+    ///
+    /// The bound is the half worth testing: the real host `catastro`s on the
+    /// eleventh install (`MAJORBBS.C:1536`), and a `Vec` that just grew would
+    /// carry a module bug the original refused to.
+    #[test]
+    fn rtihdlr_keeps_handlers_in_order_and_stops_at_rtimax() {
+        let mut f = Fixture::new();
+
+        let handler = |n: u16| FarPtr { offset: 0x1000 + n, selector: 0x0067 };
+
+        for n in 0..10u16 {
+            let at = handler(n);
+            assert!(
+                matches!(f.invoke(rtihdlr, &Fixture::far(at)), Ok(Ret::Void)),
+                "handler {n} of ten installs"
+            );
+        }
+
+        let installed: Vec<FarPtr> = f.host.rtihdlrs().to_vec();
+        assert_eq!(installed.len(), 10);
+        assert_eq!(
+            installed,
+            (0..10u16).map(handler).collect::<Vec<_>>(),
+            "kept in install order, the order bbsrti would run them in"
+        );
+
+        let eleventh = handler(99);
+        assert!(
+            f.invoke(rtihdlr, &Fixture::far(eleventh)).is_err(),
+            "RTIMAX is 10 and MAJORBBS.C:1536 catastros on the eleventh"
+        );
+        assert_eq!(f.host.rtihdlrs().len(), 10, "and the eleventh is not kept");
+    }
+
+    /// `oldbgnedt` refuses, reading all six of the arguments its *body*
+    /// declares -- `GALPNQH.H:494`'s `extern INT oldbgnedt()` is K&R for
+    /// "unspecified" and names none of them.
+    ///
+    /// The refusal names `bgnedt`, because returning 0 would tell the caller
+    /// an editing session had begun and its `whndun` callback would then never
+    /// fire.
+    #[test]
+    fn oldbgnedt_refuses_and_names_the_editor_pointer() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(64);
+        let topic = f.buffer(16);
+        let whndun = FarPtr { offset: 0x2000, selector: 0x0067 };
+
+        // siz, buf, tsiz, topic, whndun, flags -- six arguments, from the body.
+        let args = [
+            64,
+            buf.offset,
+            buf.selector,
+            16,
+            topic.offset,
+            topic.selector,
+            whndun.offset,
+            whndun.selector,
+            0x0003,
+        ];
+        let err = f.invoke(oldbgnedt, &args).expect_err("there is no editor");
+        let message = err.to_string();
+        assert!(message.contains("bgnedt"), "names the function pointer: {message}");
+        assert!(message.contains("siz=64"), "and what it was asked for: {message}");
+        assert!(message.contains("tsiz=16"), "including the topic size: {message}");
     }
 
     #[test]

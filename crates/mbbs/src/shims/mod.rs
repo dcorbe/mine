@@ -536,6 +536,13 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "shocst", system::shocst, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller, Evidence::Unclassified),
+        // Task 2.7's real-time pair. `rtihdlr` stores its handler the way
+        // `rtkick` above stores its callback, and nothing runs either;
+        // `oldbgnedt` forwards to the `bgnedt` editor pointer and refuses.
+        (MAJORBBS, "rtihdlr", system::rtihdlr, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "oldbgnedt", system::oldbgnedt, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller, Evidence::Unclassified),
@@ -630,6 +637,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // vendor's own `numxrf == 0` branch and does nothing; `hdluid`
         // presupposes the subsystem and refuses. See their doc comments.
         (MAJORBBS, "clrxrf", user::clrxrf, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        // Task 2.7's channel/user pair. `usridx` inverts the `channel`
+        // table; `rstchn` is a modem reset this host has no hardware for.
+        (MAJORBBS, "usridx", user::usridx, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "rstchn", user::rstchn, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "hdluid", user::hdluid, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),

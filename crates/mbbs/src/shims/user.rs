@@ -820,6 +820,90 @@ pub fn istxvc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::int_from_u32(valid)))
 }
 
+/// `INT usridx(INT chan)` -- `MAJORBBS.H:752`. `MAJORBBS.C:1587-1598`:
+///
+///
+/// **Fully implemented.** The inverse of the `channel` table: `channel[unum]`
+/// is the hardware channel number a user number sits on, and this searches it
+/// backwards. `channel` is a real array here -- `crate::Host::new` writes
+/// `Users::channels()` into the placed pointer -- so the walk has something to
+/// walk.
+///
+/// **`-1` is a real answer, not a failure.** A channel number no user occupies
+/// has no user number, and the vendor says so by returning `-1` rather than by
+/// stopping. That is why this does not refuse on a miss: refusing would turn
+/// the routine's ordinary "nobody" into a stopped module.
+///
+/// The search is linear and stops at the first match, exactly as the vendor's
+/// does, so a `channel` table with a repeated entry answers the lowest user
+/// number -- which is what the original answered too.
+///
+/// # Errors
+///
+/// If `channel` is not placed, or reading `nterms` entries from it runs off
+/// the segment.
+pub fn usridx<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let want = Into::<u32>::into(call.int()) as i16;
+
+    let base = host
+        .globals()
+        .pointer_mem(call.mem(), "channel")
+        .map_err(|e| ShimError::Failed(format!("usridx: channel: {e}")))?;
+    let terms = host.users().terms().count();
+
+    for idx in 0..terms {
+        let at = A::ptr_offset(base, idx.checked_mul(A::INT_WIDTH as u16).expect("in range"));
+        let bytes = at
+            .resolve(call.mem(), A::INT_WIDTH)
+            .map_err(|e| ShimError::Failed(format!("usridx: channel[{idx}]: {e}")))?;
+        let value = Into::<u32>::into(A::int_from_bytes(bytes)) as i16;
+        if value == want {
+            return Ok(abi::Ret::Int(A::Int::from(idx)));
+        }
+    }
+
+    // `-1` at this ABI's own int width, the same all-ones spelling
+    // `crate::globals` uses for `usrnum` and for the same reason: `A::Int`
+    // is built from a `u16` by zero extension, so `From<u16>` could only
+    // ever produce 65535 under `Wg32`.
+    Ok(abi::Ret::Int(A::int_from_u32(u32::MAX)))
+}
+
+/// `VOID rstchn(VOID)` -- `MAJORBBS.H:829`. `MAJORBBS.C:4136` onward.
+///
+/// **Refuses.** "Completely reset a modem channel", and every line of it is
+/// hardware or a subsystem this host does not have: `btucmd(usrnum,"T")` to
+/// drop the line, `shochl`/`baudat` to log the speed, `btuinj(usrnum,CYCLE)`,
+/// the `lcstat`/`LSSESTB`/`LSSTERM` SPX link states, and then the
+/// `(*hdlrst)()` handler chain whose default (`dftrst`, `:4165`) calls
+/// `gcsprst`, `freekey`, zeroes `struct user`, `struct usrmnu` and
+/// `struct usracc`, and finishes with `bturst(usrnum)`.
+///
+/// This host does have a disconnect path, and reaching for it here would be
+/// the tempting wrong answer: `rstchn` is not "disconnect this user", it is
+/// "put the hardware back the way it was found", and the two differ on
+/// everything a caller would then rely on -- the menu record, the account
+/// record, the key set and the line state.
+///
+/// It returns `VOID`, so nothing is owed at call time; what makes the refusal
+/// right anyway is what the caller does next. Every real call site resets a
+/// channel *in order to hand it to somebody else*, and a quiet return would
+/// hand over a channel still holding the previous user's keys and account.
+///
+/// # Errors
+///
+/// Always, naming the reset chain it cannot run.
+pub fn rstchn<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Err(ShimError::Failed(
+        "rstchn: this host cannot reset a channel -- there is no modem to send \
+         btucmd(\"T\") to, no SPX link state to move to LSSTERM, and no (*hdlrst)() \
+         chain whose default zeroes the user, menu and account records and calls \
+         bturst(); see this routine's own doc comment for why disconnecting \
+         instead would be the wrong answer"
+            .to_string(),
+    ))
+}
+
 /// `VOID clrxrf(VOID)` -- `MAJORBBS.H:793`. `MAJORBBS.C:3437-3443`:
 ///
 ///
@@ -2703,6 +2787,69 @@ mod tests {
             Ret::U16(1),
             "the offline arm's empty-lock branch still answers"
         );
+    }
+
+    /// `usridx` inverts the `channel` table, and `-1` on a miss is a real
+    /// answer rather than a failure.
+    ///
+    /// Both directions are asserted: every channel number in the table finds
+    /// its own user number, and one that is not in the table finds nothing.
+    /// A port that always returned `-1` would pass a miss-only test, and one
+    /// that returned `chan` unchanged would pass a hit-only test on a host
+    /// where the two happen to coincide -- so the table is read first and the
+    /// expectation taken from it.
+    #[test]
+    fn usridx_inverts_the_channel_table_and_answers_minus_one_on_a_miss() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
+
+        let base = f.host.globals().pointer(&f.machine, "channel").expect("channel");
+        let mut seen = Vec::new();
+        for idx in 0..3u16 {
+            let at = Wg16::ptr_offset(base, idx * 2);
+            let bytes = f.machine.resolve(at, 2).expect("in bounds");
+            seen.push(u16::from_le_bytes([bytes[0], bytes[1]]));
+        }
+
+        // The table starts [0, -1, -1]: channel 0 is assigned and the rest
+        // hold the "nobody" marker. The vendor's loop stops at the FIRST
+        // match, so a repeated value answers its lowest index -- which is
+        // what makes this an inverse only where the table is injective.
+        for (idx, chan) in seen.iter().copied().enumerate() {
+            let first = seen.iter().position(|&c| c == chan).expect("it is in there");
+            let Ret::U16(n) = f.invoke(usridx, &[chan]).expect("usridx") else {
+                panic!("usridx returns an int");
+            };
+            assert_eq!(
+                n, first as u16,
+                "channel[{idx}] is {chan}; the first index holding it is {first}; table {seen:?}"
+            );
+        }
+
+        // A channel number nothing holds. Chosen to avoid 0xffff, which the
+        // table itself uses for "nobody" and which is therefore a real hit.
+        let absent = seen
+            .iter()
+            .copied()
+            .filter(|&c| c != 0xffff)
+            .max()
+            .unwrap_or(0)
+            + 1000;
+        assert!(!seen.contains(&absent), "the test's own miss must really miss");
+        let Ret::U16(n) = f.invoke(usridx, &[absent]).expect("usridx") else {
+            panic!("usridx returns an int");
+        };
+        assert_eq!(n, 0xffff, "no user is on channel {absent}, so -1");
+    }
+
+    /// `rstchn` refuses, and the refusal names the reset chain rather than
+    /// merely erroring.
+    #[test]
+    fn rstchn_refuses_and_names_what_it_cannot_run() {
+        let mut f = Fixture::new();
+        let err = f.invoke(rstchn, &[]).expect_err("there is no modem to reset");
+        let message = err.to_string();
+        assert!(message.contains("hdlrst"), "names the handler chain: {message}");
+        assert!(message.contains("bturst"), "and the hardware reset: {message}");
     }
 
     /// `clrxrf` is the vendor's `numxrf == 0` branch: it does nothing, and

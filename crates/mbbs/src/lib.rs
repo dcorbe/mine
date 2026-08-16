@@ -1028,6 +1028,22 @@ pub struct Host<A: Abi> {
     /// was asked. [`Host::cycle`] runs them, once per elapsed second, via
     /// [`Host::prcrtk`]. See [`Host::kicks`].
     pub(crate) kicks: Vec<Kick<A>>,
+
+    /// Real-time interrupt routines a module installed with `rtihdlr`, in
+    /// the order it installed them.
+    ///
+    /// **The host remembers them and nothing runs them**, for exactly the
+    /// reason [`Host::kicks`] documents: running one needs a main loop and a
+    /// clock this host does not have. `rtihdlr` returns `void`, so it
+    /// promises the caller nothing at call time, and a module cannot observe
+    /// an 18 Hz tick that never arrives.
+    ///
+    /// `MAJORBBS.C:145` is `VOID (*rtirs[RTIMAX])(VOID)` with `RTIMAX` 10
+    /// (`:143`), and `:1536` `catastro`s on the eleventh. That bound is
+    /// enforced here rather than let the `Vec` grow: a module installing
+    /// eleven handlers had a bug the real host stopped it for, and silently
+    /// accepting the eleventh would hide it.
+    pub(crate) rtirs: Vec<A::Ptr>,
     /// `lstunm` -- "last user-number returned by `btuscn()`"
     /// (`MAJORBBS.C:325`). Only the `syscyc` test in [`Host::cycle`] reads it.
     /// Starts at 0, as the original's uninitialised global does, so the very
@@ -1548,6 +1564,7 @@ impl<A: Abi> Host<A> {
             notes: Vec::new(),
             noted: HashSet::new(),
             kicks: Vec::new(),
+            rtirs: Vec::new(),
             lstunm: 0,
             tasks: Vec::new(),
             stdio_modes: [false; 5],
@@ -1854,6 +1871,12 @@ impl<A: Abi> Host<A> {
     /// 10, which is the last thing it does before it asks for a random number.
     pub fn kicks(&self) -> &[Kick<A>] {
         &self.kicks
+    }
+
+    /// Every 18 Hz handler a module installed with `rtihdlr`, in install
+    /// order. See [`Host::rtirs`] for why none of them runs.
+    pub fn rtihdlrs(&self) -> &[A::Ptr] {
+        &self.rtirs
     }
 
     /// Every form the module asked `fsdroom` to size, keyed by the
