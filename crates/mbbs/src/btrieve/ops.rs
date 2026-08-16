@@ -9,6 +9,35 @@
 //! nobody yet: make the shims delegate") can make the shim call through to
 //! it rather than carry two implementations of the same nine comparisons.
 //!
+//! # What is reachable from a module today, and what is not
+//!
+//! Stated because this crate has twice been bitten by implemented-but-dead
+//! code that looked like an oversight (44 shadowed registrations,
+//! `docs/2026-08-15-dead-twin-shims.md`; 26 dead twin bodies). **These are
+//! deliberate, and the difference matters to anyone tempted to delete them.**
+//!
+//! A module reaches Btrieve here through the **36 BTVSTF wrappers** —
+//! `obtbtv`, `qrybtv`, `dinsbtv`, `stpbtv` and the rest — all registered and
+//! pinned by `shims::mod`'s own `every_routine_btvstf_declares_is_registered`.
+//! Those are record verbs, and the operations backing them are reached.
+//!
+//! The families added by Track B Tasks 10–11 are **not** reachable from any
+//! registered shim, and measurably so: chunk access, index create/drop, the
+//! five extended operations, continuous operations, percentage positioning,
+//! extended-file and system-data introspection, and concurrent transactions.
+//! None of them has a BTVSTF wrapper — `BTVSTF.H` declares none — and there
+//! is **no `btrcall` in this crate at all**, so there is no raw operation-code
+//! door either. No surveyed module imports one.
+//!
+//! They are here because this host is an API surface rather than an
+//! application: a verb missing when a module finally asks for it stops the
+//! machine, and the genuine 6.15 engine is available to settle behaviour now
+//! and will not be more available later. They are unit-tested against it.
+//! What they are *not* is wired, and no test asserts otherwise — the
+//! honest record is this comment, because any test that tried to assert
+//! "unreachable" here would either be vacuous or a brittle scan of sibling
+//! source files.
+//!
 //! # The shim is a reference, not an oracle
 //!
 //! `shims/btrieve.rs` is under a commit freeze this module must not touch
