@@ -33,11 +33,18 @@ pub struct Screen {
     pub rows: usize,
     pub cells: Vec<Cell>,
     pub cursor: (u8, u8),
+    pub cursor_visible: bool,
 }
 
 impl Screen {
     /// Read the whole screen out of the guest's text buffer.
-    pub fn snapshot<G: DosGuest>(g: &G, cols: usize, rows: usize, cursor: (u8, u8)) -> Self {
+    pub fn snapshot<G: DosGuest>(
+        g: &G,
+        cols: usize,
+        rows: usize,
+        cursor: (u8, u8),
+        cursor_visible: bool,
+    ) -> Self {
         let mut cells = Vec::with_capacity(cols * rows);
         for row in 0..rows {
             let at = DosPtr::new(0xb800, (row * cols * 2) as u16);
@@ -54,6 +61,7 @@ impl Screen {
             rows,
             cells,
             cursor,
+            cursor_visible,
         }
     }
 
@@ -215,6 +223,7 @@ mod tests {
             rows,
             cells,
             cursor: (0, 0),
+            cursor_visible: true,
         }
     }
 

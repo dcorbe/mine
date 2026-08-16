@@ -27,6 +27,11 @@ pub struct Video {
     pub page: u8,
     pub cursor_row: u8,
     pub cursor_col: u8,
+    /// Whether the hardware cursor is drawn. A full-screen program hides it
+    /// and marks its selection some other way -- LORDCFG uses "=>".
+    pub cursor_visible: bool,
+    /// Start and end scan lines, as `int 10h AH=01` set them.
+    pub cursor_shape: u16,
 }
 
 impl Default for Video {
@@ -38,6 +43,8 @@ impl Default for Video {
             page: 0,
             cursor_row: 0,
             cursor_col: 0,
+            cursor_visible: true,
+            cursor_shape: 0x0607,
         }
     }
 }
@@ -248,11 +255,22 @@ fn scancode(ch: u8) -> u8 {
 pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
     let mut regs = g.regs();
     match regs.ah() {
-        // 00h -- set video mode.
+        // 00h -- set video mode. A mode set restores the default cursor.
         0x00 => {
             video.mode = regs.al() & 0x7f;
             video.cursor_row = 0;
             video.cursor_col = 0;
+            video.cursor_visible = true;
+            video.cursor_shape = 0x0607;
+        }
+
+        // 01h -- set cursor shape. Bit 5 of CH is the "no cursor" bit, which is
+        // how a program that draws its own selection marker turns the hardware
+        // cursor off. Ignoring it leaves a blinking block on a screen the
+        // program deliberately drew without one.
+        0x01 => {
+            video.cursor_shape = regs.cx;
+            video.cursor_visible = (regs.cx >> 8) as u8 & 0x20 == 0;
         }
 
         // 02h -- set cursor position (DH row, DL col).
@@ -279,7 +297,7 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
                 video.cursor_row = b[1];
             }
             regs.dx = (u16::from(video.cursor_row) << 8) | u16::from(video.cursor_col);
-            regs.cx = 0x0607; // an ordinary underline cursor
+            regs.cx = video.cursor_shape;
             g.set_regs(regs);
         }
 

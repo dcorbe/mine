@@ -155,13 +155,19 @@ impl Terminal {
             out.push_str("\x1b[0m");
         }
 
-        // Park the real cursor where the guest put its own.
+        // Park the real cursor where the guest put its own, and show it only if
+        // the guest wants it shown.
         let (row, col) = screen.cursor;
         out.push_str(&format!(
-            "\x1b[{};{}H\x1b[?25h",
+            "\x1b[{};{}H",
             u16::from(row) + 1,
             u16::from(col) + 1
         ));
+        out.push_str(if screen.cursor_visible {
+            "\x1b[?25h"
+        } else {
+            "\x1b[?25l"
+        });
 
         print!("{out}");
         let _ = io::stdout().flush();

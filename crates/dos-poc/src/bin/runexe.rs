@@ -153,6 +153,7 @@ fn main() -> io::Result<()> {
                         video.columns as usize,
                         video.rows as usize,
                         (video.cursor_row, video.cursor_col),
+                        video.cursor_visible,
                     );
                     settles += 1;
                     if trace && !interactive {
