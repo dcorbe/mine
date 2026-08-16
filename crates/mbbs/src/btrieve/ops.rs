@@ -410,6 +410,111 @@ pub enum OpError {
     /// (`BtrieveStatusCodes.pdf` p. 1). See [`Block::extend`]'s own doc
     /// comment for why a v5 file is not refused the same way.
     ObsoleteOperation,
+
+    /// A chunk operation ([`Block::get_chunks`]/[`Block::update_chunks`],
+    /// Btrieve ops 23-chunk and 53) against a pre-v6 file. Real Btrieve
+    /// status 107, verbatim: `BtrieveStatusCodes.pdf` p. 30 (also indexed
+    /// under "1 to 199"), "The application attempted to perform a chunk
+    /// operation on a pre-v6.0 file." Task 11's own instruction is that this
+    /// is a behaviour to reproduce, not a reason to refuse implementing the
+    /// operation -- see both methods' own doc comments for the v6-file path.
+    PreV6Chunk,
+
+    /// [`Block::get_chunks`]/[`Block::update_chunks`] named a chunk whose
+    /// offset and length run past the end of the record. Real status 103,
+    /// "the chunk offset is too big" (Programmer's Reference pp. 99, 211,
+    /// listed for both Get Direct/Chunk and Update Chunk).
+    ChunkOffsetTooBig,
+
+    /// [`Block::get_chunks`] with a physical position naming no record.
+    /// Real status 43, "the specified record address is invalid"
+    /// (Programmer's Reference pp. 99, 82, 86 -- shared with the percentage
+    /// operations, which name a position the same way).
+    InvalidRecordAddress,
+
+    /// [`Block::insert_extended`] with a record whose value, at a key that
+    /// forbids duplicates, already exists in the file. Real status 5, "the
+    /// record has a key field containing a duplicate key value"
+    /// (Programmer's Reference p. 148, and p. 5/`BtrieveStatusCodes.pdf`).
+    /// Mirrors `shims/btrieve.rs`'s own `duplicate_key` pre-check for plain
+    /// Insert (`dinsbtv`) -- this module has no access to that private
+    /// helper (it lives in the frozen shim file), so this recomputes the
+    /// same fact through [`Block::query`]`(key, Op::Equal, value)`, which is
+    /// already this module's own answer to "does a record with this key
+    /// value exist."
+    DuplicateKey { key: u16 },
+
+    /// [`Block::insert_extended`] asked for the no-currency-change (NCC)
+    /// option (Key Number `-1`, Programmer's Reference p. 147). **Not
+    /// implemented, and not implementable in this file alone.** NCC's own
+    /// contract is "establishes physical currency without affecting logical
+    /// currency" (p. 149) -- two currencies held independently. `Cursor`
+    /// (`btrieve.rs`, out of this file's freeze) is a single value, either
+    /// [`Cursor::Ordered`] or [`Cursor::Physical`], never both at once, so
+    /// there is nowhere to put "physical moved, logical did not" without a
+    /// new `Cursor` shape. Refused rather than approximated: leaving the
+    /// cursor untouched would silently break a `Step` that follows an NCC
+    /// insert (spec: it "operates based on the new physical currency"), and
+    /// overwriting it with `Cursor::Physical` would silently break a `Get`
+    /// that follows (spec: logical currency is unchanged). Both are the
+    /// silent-wrong-answer class this crate refuses rather than risks.
+    NccUnsupported,
+
+    /// A concurrent transaction (Btrieve op `1019`) was asked for. **Not
+    /// implementable from this file's own state, or from any state this
+    /// crate has today.** Real Btrieve's own Begin Transaction section
+    /// (Programmer's Reference p. 38) draws the line precisely: op 19 begins
+    /// an *exclusive* transaction, op 1019 a *concurrent* one -- a different
+    /// lock granularity, page/record rather than whole-engine. `Btrieve::
+    /// begin` (`btrieve.rs:2064`) is a single `bool` (`self.transaction`)
+    /// that covers every currently open [`Block`] at once the moment it
+    /// goes true; there is no per-page or per-record grain anywhere in this
+    /// engine for a concurrent transaction's own conflict tracking to hang
+    /// off of. This is not a missing case of an existing state machine (the
+    /// way [`Self::NccUnsupported`]'s `Cursor` gap is one field short); it
+    /// is a state machine this engine does not have at all. **No real
+    /// Btrieve status names this**, deliberately not invented: every real
+    /// 6.x-or-later engine supports 1019 unconditionally, so the vendor has
+    /// never had to document what a concurrency-incapable engine answers.
+    /// This is a fact about this host, not about the file or the request,
+    /// the same shape `btrieve.rs:754`'s v6-write refusal is (a `BtvError`,
+    /// not a status code) -- Task 7's marshalling decides what a module
+    /// sees; this only says the concurrent half of Begin Transaction cannot
+    /// be honoured, which is what a caller needs to know before it can
+    /// decide anything else. See this task's own final report for a fuller
+    /// account of why `19`'s own file-format-dependent granularity change
+    /// (whole-file pre-6.0, page/record 6.x) does not close this gap either.
+    ConcurrentTransactionUnsupported,
+
+    /// [`create_index`]/[`drop_index`] -- Btrieve ops 31/32. **Not
+    /// implementable from this file alone; a structural gap, not a vendor
+    /// refusal.** See both functions' own doc comments for the full
+    /// account: in short, the one piece of state that would make a new key
+    /// queryable -- [`super::records::Records`]'s private `order`/`rank`,
+    /// rebuilt only by its own private `reindex` -- lives in a sibling
+    /// module (`records.rs`) this file cannot reach, because a Rust private
+    /// item is visible to its defining module's descendants, and `ops` is
+    /// not a descendant of `records`; both hang off `btrieve` as siblings.
+    /// Mutating [`Block::keys`] without it would make [`Block::query`]/
+    /// [`Block::get`] answer [`Self::NoSuchKey`] for the very key Create
+    /// Index just claimed to add -- the silent-wrong-answer shape this
+    /// crate refuses everywhere else, so this refuses too rather than
+    /// produce it.
+    IndexMutationUnsupported,
+
+    /// [`ContinuousOperation::start`] named a file already in continuous
+    /// operation mode. Real status 88, verbatim from the operation's own
+    /// Details section (Programmer's Reference p. 47): "The MicroKernel
+    /// returns Status Code 88 if a file is specified that is already in
+    /// continuous operation mode."
+    AlreadyInContinuousOperation { file: String },
+
+    /// A percentage-based operation ([`Block::get_by_percentage`]/
+    /// [`Block::find_percentage`]) against an empty key order or an empty
+    /// file. Real status 9, "the operation encountered the end-of-file" --
+    /// listed as a failure status for both operations (Programmer's
+    /// Reference pp. 82, 87).
+    EndOfFile,
 }
 
 impl fmt::Display for OpError {
@@ -457,6 +562,48 @@ impl fmt::Display for OpError {
             Self::ObsoleteOperation => write!(
                 f,
                 "Extend (op 16) does not exist on a v6-format file (real Btrieve status 1)"
+            ),
+            Self::PreV6Chunk => write!(
+                f,
+                "a chunk operation on a pre-v6.0 file (real Btrieve status 107)"
+            ),
+            Self::ChunkOffsetTooBig => write!(
+                f,
+                "the chunk offset is too big (real Btrieve status 103)"
+            ),
+            Self::InvalidRecordAddress => write!(
+                f,
+                "the specified record address is invalid (real Btrieve status 43)"
+            ),
+            Self::DuplicateKey { key } => write!(
+                f,
+                "key {key} already holds this value, and duplicates are not allowed \
+                 (real Btrieve status 5)"
+            ),
+            Self::NccUnsupported => write!(
+                f,
+                "the no-currency-change option is not supported: this host's cursor \
+                 cannot hold a physical and a logical position at once"
+            ),
+            Self::ConcurrentTransactionUnsupported => write!(
+                f,
+                "a concurrent transaction (op 1019) cannot be honoured: this engine \
+                 models exactly one whole-engine exclusive transaction and no finer \
+                 lock granularity at all"
+            ),
+            Self::IndexMutationUnsupported => write!(
+                f,
+                "Create/Drop Index cannot be honoured: the records model that would \
+                 need to know about the change lives in a sibling module this file \
+                 cannot reach"
+            ),
+            Self::AlreadyInContinuousOperation { file } => write!(
+                f,
+                "{file} is already in continuous operation mode (real Btrieve status 88)"
+            ),
+            Self::EndOfFile => write!(
+                f,
+                "the operation encountered the end-of-file (real Btrieve status 9)"
             ),
         }
     }
@@ -1434,11 +1581,800 @@ impl<A: Abi> Block<A> {
     }
 }
 
+// # Task 11: the version-gated operation families
+//
+// `docs/plans/2026-08-15-host-api-surface-track-b.md` Task 11: `23`-chunk
+// mode and `53` (Update Chunk), `31`/`32` (Create/Drop Index), `36`-`39`
+// (extended Get/Step), `40` (Insert Extended), `42` (Continuous Operation),
+// `44`/`45` (Get By Percentage/Find Percentage), `65` (Stat Extended), and
+// `1019` (concurrent transaction).
+//
+// A version gate is a *behaviour* here, not an omission: the chunk family is
+// refused against a pre-v6 file with the real engine's own status (107),
+// never silently made to work and never silently refused for every file
+// regardless of version. Every other family in this task turned out, on
+// reading the two cited references in full
+// (`archive/tooling/reference-documents/Btrieve_Programmers_Reference_1998.pdf`,
+// `BtrieveStatusCodes.pdf`), to carry **no version restriction stated in
+// either** -- including Create/Drop Index, which the design doc's own § 4
+// survey describes as "5.x restricted to *supplemental* indexes" without a
+// citation this task could confirm. Neither reference uses the word
+// "supplemental" at all (checked by full-text search of both), so that
+// claim is not reproduced here as a gate; Create/Drop Index below is
+// unimplementable for an entirely different, structural reason -- see
+// [`OpError::IndexMutationUnsupported`].
+//
+// `36`-`39` and `40` get no "6.x-only" doc comment anywhere below, per this
+// task's own instruction: the design's § 8.7 records a search, not a
+// finding -- "no statement found in any manual here dating their
+// introduction relative to 5.x" -- and a searched-and-not-found is not
+// license to assert an age this crate never measured.
+
+/// One chunk of a record -- offset and length -- as the **direct random
+/// chunk descriptor** names it (Table 2-10, p. 92, for Get Direct/Chunk;
+/// Table 2-26, p. 203, for Update Chunk). The only chunk-descriptor shape
+/// this module reproduces.
+///
+/// **Not reproduced**: the Rectangle Chunk Descriptor (Tables 2-11, 2-27),
+/// indirect addressing (chunks read from or written to a module-memory
+/// pointer named by a chunk's own User Data element, rather than the Data
+/// Buffer itself), the Next-in-Record and Append subfunction biases
+/// (pp. 97-98, 209-210), and the Truncate Descriptor (Table 2-28, which
+/// changes a record's length -- out of scope for the reason [`Block::
+/// update_chunks`]'s own doc comment gives). All five are Data Buffer wire
+/// shapes a caller would decode before reaching this type, the same
+/// marshalling boundary [`Block::get_extended`] draws against the filter
+/// grammar it does not reproduce either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk {
+    /// Byte offset into the record, zero-relative.
+    pub offset: u32,
+    /// How many bytes, from `offset`.
+    pub length: u32,
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 23 in its chunk-mode form, `Get Direct/Chunk` -- pp. 88-100.
+    ///
+    /// `position` is a physical record address, the same coordinate
+    /// [`Block::acquire_absolute`] and [`Block::get_position`] use. Chunks
+    /// are concatenated into the returned buffer in the order given,
+    /// matching "the MicroKernel returns the chunks one after another in
+    /// the Data Buffer" (p. 98, direct descriptor case).
+    ///
+    /// A chunk that begins at or beyond the end of the record is refused
+    /// ([`OpError::ChunkOffsetTooBig`], status 103). A chunk whose offset
+    /// and length only *combine* to run past the end of the record is not
+    /// an error -- p. 98: "the MicroKernel returns Status Code 0 but
+    /// ceases processing subsequent chunks" -- so this method truncates
+    /// that one chunk to whatever remains, includes it, and stops,
+    /// returning `Ok` with however many bytes were actually collected.
+    /// There is no channel here for "succeeded, but check the length"
+    /// beyond that truncation -- this mirrors [`Delivery::truncated`], the
+    /// one other place this module carries a soft partial-success signal,
+    /// rather than invent a second one.
+    ///
+    /// **Does not update currency, deliberately.** p. 100: "no effect on
+    /// logical currency... makes the record from which chunks are
+    /// retrieved the physical current record" -- physical currency moves,
+    /// logical currency does not, the identical shape [`OpError::
+    /// NccUnsupported`]'s doc comment describes and this crate's single-
+    /// valued [`Cursor`] cannot hold. Setting `Cursor::Physical` here would
+    /// silently corrupt a following keyed `Get`; leaving the cursor alone
+    /// means a following `Step` will not see the new physical position
+    /// either. Of the two silently-incomplete choices this leaves the
+    /// cursor untouched, because `position` is a parameter the caller
+    /// already has (from a prior [`Block::get_position`]), so nothing about
+    /// *this* call depends on the cursor moving -- only a call after it
+    /// would, and that is reported here rather than answered wrong. The
+    /// same reasoning drops the optional lock bias Table entry for this
+    /// operation names: [`Block::take_lock`] keys off wherever the block is
+    /// *currently* positioned, and since this method never repositions it,
+    /// there is no "current position" left to hand it that means what the
+    /// module asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::PreV6Chunk`] -- status 107 -- against a pre-v6 file:
+    /// `BtrieveStatusCodes.pdf`, status 107, "The application attempted to
+    /// perform a chunk operation on a pre-v6.0 file," verbatim. [`OpError::
+    /// InvalidRecordAddress`] -- status 43 -- if `position` names no
+    /// record. [`OpError::ChunkOffsetTooBig`] -- status 103 -- if a chunk
+    /// begins at or past the end of the record. If the records cannot be
+    /// read.
+    pub fn get_chunks(&mut self, position: u32, chunks: &[Chunk]) -> Result<Vec<u8>, OpError> {
+        if self.geometry().version != Version::V6 {
+            return Err(OpError::PreV6Chunk);
+        }
+        let physical = self
+            .records()?
+            .find_physical(position)
+            .ok_or(OpError::InvalidRecordAddress)?;
+        let bytes = self
+            .records()?
+            .physical(physical)
+            .expect("just found")
+            .bytes
+            .clone();
+
+        let mut out = Vec::new();
+        for chunk in chunks {
+            let start = usize::try_from(chunk.offset).unwrap_or(usize::MAX);
+            if start >= bytes.len() {
+                return Err(OpError::ChunkOffsetTooBig);
+            }
+            let end = start.saturating_add(usize::try_from(chunk.length).unwrap_or(usize::MAX));
+            out.extend_from_slice(&bytes[start..end.min(bytes.len())]);
+            if end > bytes.len() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Btrieve op 53, `Update Chunk` -- pp. 201-211, restricted to
+    /// **in-place** chunks: every chunk's new data is exactly as long as
+    /// the chunk it replaces. Real Update Chunk can also append past the
+    /// end of a record or truncate it (the Append and Truncate
+    /// subfunctions, pp. 209-210) -- both change the record's own length,
+    /// which conflicts with the fixed-length contract [`Block::update`]
+    /// already enforces (see that method's own doc comment for why a short
+    /// or long buffer is refused rather than padded or grown), so neither
+    /// is modelled here.
+    ///
+    /// Splices `chunks` (each an `(offset, replacement bytes)` pair) into a
+    /// copy of the current record and calls [`Block::update`] with the
+    /// result -- which is also where this method inherits **the v6 write
+    /// refusal `btrieve.rs:754` already has**, unconditionally, for every
+    /// file version. That refusal and this method's own [`OpError::
+    /// PreV6Chunk`] gate answer two different questions and are not
+    /// redundant: the chunk gate says "this file's *format* is too old for
+    /// a chunk operation at all" (any pre-v6 file); the write refusal says
+    /// "this *host* cannot yet write a v6 file safely" (Task 13, sequenced
+    /// after this track, still open). The consequence is real and worth
+    /// stating plainly: **every Update Chunk this host is asked to perform
+    /// fails today** -- refused at the version gate on a v5 file, refused
+    /// at the write gate on a v6 file, because a chunk operation is only
+    /// ever meaningful against a v6 file (see [`Self::get_chunks`], which
+    /// has no such second wall, because reading a v6 file already works)
+    /// and v6 write does not exist yet. The splicing logic above the write
+    /// call is real and tested against [`Block::update`] directly; it is
+    /// ready the moment Task 13 lifts that refusal.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::PreV6Chunk`] -- status 107. [`OpError::NotPositioned`] if
+    /// nothing is positioned. [`OpError::ChunkOffsetTooBig`] -- status 103
+    /// -- if a chunk runs past the end of the record. [`OpError::Records`]
+    /// for anything [`Block::update`] itself refuses, v6 write included.
+    pub fn update_chunks(&mut self, chunks: &[(u32, Vec<u8>)]) -> Result<(), OpError> {
+        if self.geometry().version != Version::V6 {
+            return Err(OpError::PreV6Chunk);
+        }
+        self.records()?;
+        let record = self.current().ok_or(OpError::NotPositioned)?;
+        let position = record.position;
+        let mut bytes = record.bytes.clone();
+
+        for (offset, data) in chunks {
+            let start = usize::try_from(*offset).unwrap_or(usize::MAX);
+            let end = start.checked_add(data.len()).ok_or(OpError::ChunkOffsetTooBig)?;
+            if end > bytes.len() {
+                return Err(OpError::ChunkOffsetTooBig);
+            }
+            bytes[start..end].copy_from_slice(data);
+        }
+
+        self.update(position, &bytes)?;
+        Ok(())
+    }
+
+    /// Btrieve op 31, `Create Index` -- pp. 67-71. **Always refused.** See
+    /// [`OpError::IndexMutationUnsupported`] for the full account: the
+    /// state that would make a new key answerable at all --
+    /// [`super::records::Records`]'s private `order`/`rank`, rebuilt only by
+    /// its own private `reindex` -- lives in a sibling module this file
+    /// cannot reach under this round's file boundary. Pushing a [`Key`] onto
+    /// [`Block::keys`] without it would make the key visible to a `Stat`
+    /// but unusable by [`Block::query`]/[`Block::get`], which read a key's
+    /// order through [`super::records::Records::ordered_len`] and would
+    /// answer [`OpError::NoSuchKey`] for the very key this call just
+    /// claimed to add -- real Btrieve's own contract is the opposite ("You
+    /// can use the new key to access your data as soon as the operation
+    /// completes," p. 71). A create that cannot be used is not a smaller
+    /// version of Create Index; it is a different, wrong operation wearing
+    /// its name, so this refuses instead.
+    ///
+    /// # Errors
+    /// [`OpError::IndexMutationUnsupported`], always.
+    pub fn create_index(&mut self) -> Result<(), OpError> {
+        Err(OpError::IndexMutationUnsupported)
+    }
+
+    /// Btrieve op 32, `Drop Index` -- pp. 74-76. **Always refused**, for the
+    /// same structural reason as [`Block::create_index`]: removing `key`
+    /// from [`Block::keys`] without also rebuilding [`super::records::
+    /// Records`]'s per-key order would leave every *other* key's
+    /// [`Block::query`]/[`Block::get`] answers untouched only by accident
+    /// -- `key`'s own place in [`super::records::Records`]'s internal
+    /// per-key vectors, indexed by number, would still exist and still be
+    /// consulted by a caller that has not yet learned the number was
+    /// dropped.
+    ///
+    /// # Errors
+    /// [`OpError::IndexMutationUnsupported`], always.
+    pub fn drop_index(&mut self, key: u16) -> Result<(), OpError> {
+        let _ = key;
+        Err(OpError::IndexMutationUnsupported)
+    }
+}
+
+/// Which record an extended Get begins with -- Table 2-12 (p. 126)'s "EG"/
+/// "UC" header value. Step Next/Previous Extended always behave as "EG"
+/// (p. 126: "For Step Next Extended operations, always set this value to
+/// 'EG'"), so [`Block::step_next_extended`]/[`Block::step_previous_extended`]
+/// take no value for it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendedStart {
+    /// "EG" -- begin with the record after the one at which the file is
+    /// positioned.
+    AfterCurrent,
+    /// "UC" -- begin with the record at which the file is positioned.
+    AtCurrent,
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve ops 36/37, `Get Next/Previous Extended` -- pp. 125-141 --
+    /// and the shared core [`Block::step_next_extended`]/[`Block::
+    /// step_previous_extended`] (ops 38/39, pp. 185-196) reuse too.
+    ///
+    /// **Filtering and field-extraction are not modelled.** Table 2-12's
+    /// Filter (a logic expression of up to `n` AND/OR-combined field
+    /// comparisons, pp. 127-129) and Descriptor (which fields of a matching
+    /// record to return, p. 129) are Data Buffer wire shapes -- how a
+    /// module's raw bytes name a filter and a projection -- the same
+    /// marshalling boundary this module already draws between itself and
+    /// `shims/btrieve.rs` for every other operation (see this file's own
+    /// top-of-file note). What is modelled is the **unfiltered** case the
+    /// vendor's own spec calls out as first-class, not a degenerate one:
+    /// "0 means the MicroKernel performs no filtering" (p. 127). This
+    /// returns up to `count` whole records, walking [`Op::Next`]/[`Op::
+    /// Previous`] one at a time -- the same comparison [`Block::get`]
+    /// already answers -- and stops at the first miss, which under an
+    /// unfiltered walk is exactly end-of-file, one of the four documented
+    /// stop conditions (p. 130: "The MicroKernel reaches the end of the
+    /// file").
+    fn get_extended(
+        &mut self,
+        key: u16,
+        op: Op,
+        count: u16,
+        start: ExtendedStart,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Vec<Delivery>, OpError> {
+        let mut out = Vec::new();
+        if count == 0 {
+            return Ok(out);
+        }
+        if start == ExtendedStart::AtCurrent {
+            out.push(self.deliver_current(Some(key))?);
+        }
+        while (out.len() as u16) < count {
+            match self.get(key, op, &[], lock, locks)? {
+                Some(delivery) => out.push(delivery),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Btrieve op 36, `Get Next Extended`. See [`Block::get_extended`].
+    pub fn get_next_extended(
+        &mut self,
+        key: u16,
+        count: u16,
+        start: ExtendedStart,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Vec<Delivery>, OpError> {
+        self.get_extended(key, Op::Next, count, start, lock, locks)
+    }
+
+    /// Btrieve op 37, `Get Previous Extended`. See [`Block::get_extended`].
+    pub fn get_previous_extended(
+        &mut self,
+        key: u16,
+        count: u16,
+        start: ExtendedStart,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Vec<Delivery>, OpError> {
+        self.get_extended(key, Op::Previous, count, start, lock, locks)
+    }
+
+    /// Btrieve op 38, `Step Next Extended` -- pp. 185-190. Always "EG"; see
+    /// [`ExtendedStart`]'s own doc comment.
+    pub fn step_next_extended(
+        &mut self,
+        count: u16,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Vec<Delivery>, OpError> {
+        let mut out = Vec::new();
+        while (out.len() as u16) < count {
+            match self.step(Step::Next, lock, locks)? {
+                Some(delivery) => out.push(delivery),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Btrieve op 39, `Step Previous Extended` -- pp. 191-196.
+    pub fn step_previous_extended(
+        &mut self,
+        count: u16,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Vec<Delivery>, OpError> {
+        let mut out = Vec::new();
+        while (out.len() as u16) < count {
+            match self.step(Step::Previous, lock, locks)? {
+                Some(delivery) => out.push(delivery),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether a record with `value` already exists under `key`, without
+    /// disturbing the cursor -- [`Block::query`]'s own `Op::Equal`
+    /// arithmetic (`records.seek` then `records.matches`), recomputed
+    /// rather than called through, because `query` always repositions on a
+    /// hit and [`Block::insert_extended`] needs the same fact *without*
+    /// that side effect: refusing to insert a record must not move the
+    /// cursor toward the record it collided with.
+    fn key_exists(&mut self, key: u16, value: &[u8]) -> Result<bool, OpError> {
+        let definitions: Vec<Key> = self.keys().to_vec();
+        let records = self.records()?;
+        let at = records.seek(&definitions, key, value);
+        Ok(records.matches(&definitions, key, at, value))
+    }
+}
+
+/// [`Block::insert_extended`]'s own error: how many records made it in
+/// before the one that failed, and why the rest did not run.
+///
+/// Programmer's Reference p. 148: "the first word of the [returned] Data
+/// Buffer equals the number of records that were successfully inserted...
+/// The record that caused the error is the number of records that were
+/// successfully inserted plus one." [`Self::inserted`] is that first word,
+/// already computed rather than left for a caller to count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsertExtendedError {
+    /// Physical positions of the records inserted before the failure, in
+    /// insertion order.
+    pub inserted: Vec<u32>,
+    /// Why the next record was not inserted.
+    pub error: OpError,
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 40, `Insert Extended` -- pp. 147-150.
+    ///
+    /// `key` is the key currency is established by once every record has
+    /// been inserted; `ncc` is the no-currency-change option (Key Number
+    /// `-1`, p. 147) -- always refused, [`OpError::NccUnsupported`], see
+    /// that variant's own doc comment for why. `records` are the record
+    /// images to insert, in order.
+    ///
+    /// Every record is checked, before it is written, against every key
+    /// that forbids duplicates -- [`Block::key_exists`], the same fact
+    /// [`Block::query`]'s `Op::Equal` computes, without that method's side
+    /// effect of moving the cursor toward a hit. `dinsbtv`'s own duplicate
+    /// pre-check (`shims/btrieve.rs`'s private `duplicate_key`) is not
+    /// called through -- it lives in the frozen shim file, and is private
+    /// to it besides -- so this recomputes the same answer from the public
+    /// primitives [`Block::query`] itself is built on, rather than
+    /// duplicate its *policy* (which keys are checked; that a hit refuses
+    /// rather than warns) with a second, drifting copy.
+    ///
+    /// On success, establishes currency on the **last** inserted record
+    /// under `key` -- p. 150: "makes the last inserted record the current
+    /// one... based on the specified key" -- the same `records().
+    /// find_physical` then `records().place_in` pair [`Block::
+    /// acquire_absolute`] and `shims/btrieve.rs`'s `dinsbtv` both use.
+    ///
+    /// # Errors
+    ///
+    /// [`InsertExtendedError`], carrying every position already inserted.
+    /// [`OpError::NccUnsupported`] if `ncc` is set. [`OpError::
+    /// DuplicateKey`] -- status 5 -- for the first record that collides.
+    /// [`OpError::Records`] for anything [`Block::insert`] itself refuses
+    /// (a short disk, a variable-length file, a v6 file -- see [`Block::
+    /// insert`]'s own doc comment).
+    pub fn insert_extended(
+        &mut self,
+        key: u16,
+        ncc: bool,
+        records: &[Vec<u8>],
+    ) -> Result<Vec<u32>, InsertExtendedError> {
+        if ncc {
+            return Err(InsertExtendedError {
+                inserted: Vec::new(),
+                error: OpError::NccUnsupported,
+            });
+        }
+
+        let mut inserted = Vec::new();
+        for bytes in records {
+            for candidate in self.keys().to_vec() {
+                if candidate.duplicates {
+                    continue;
+                }
+                let value = candidate.extract(bytes);
+                match self.key_exists(candidate.number, &value) {
+                    Ok(true) => {
+                        return Err(InsertExtendedError {
+                            inserted,
+                            error: OpError::DuplicateKey { key: candidate.number },
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Err(InsertExtendedError { inserted, error }),
+                }
+            }
+
+            match self.insert(bytes) {
+                Ok(position) => inserted.push(position),
+                Err(error) => {
+                    return Err(InsertExtendedError { inserted, error: OpError::from(error) });
+                }
+            }
+        }
+
+        if let Some(&last) = inserted.last() {
+            let physical = match self.records() {
+                Ok(r) => r.find_physical(last).expect("just inserted"),
+                Err(error) => return Err(InsertExtendedError { inserted, error: OpError::from(error) }),
+            };
+            let cursor = match self.records() {
+                Ok(r) => match r.place_in(key, physical) {
+                    Some(at) => Cursor::Ordered { key, at },
+                    None => Cursor::Physical { at: physical },
+                },
+                Err(error) => return Err(InsertExtendedError { inserted, error: OpError::from(error) }),
+            };
+            self.seek_to(cursor);
+        }
+
+        Ok(inserted)
+    }
+}
+
+/// Btrieve op 42, `Continuous Operation` -- pp. 44-48. **Server-based
+/// MicroKernels only** (p. 44's own note); this host runs as one, so the
+/// operation is answered rather than refused outright.
+///
+/// File-name based rather than [`Block`]-based -- p. 44's own Sent/Returned
+/// table has no Position Block column, the same shape [`EngineVersion`]/
+/// [`WorkingDirectory`] already are and for the same reason.
+///
+/// **Only the name-set bookkeeping is modelled**, not what the operation is
+/// actually *for*: real Continuous Operation shadows writes into a delta
+/// file (p. 44) so a backup running concurrently sees a consistent
+/// snapshot, and rolls the delta back in when the file leaves continuous
+/// operation mode. This host has no backup subsystem and no delta file --
+/// nothing here reads [`Self::is_active`] to change how a write behaves.
+/// What is modelled is the part a caller can observe independent of that:
+/// which files are currently in the set, and the one status code the
+/// vendor's own text names outright.
+#[derive(Debug, Default)]
+pub struct ContinuousOperationTable {
+    active: Vec<String>,
+}
+
+impl ContinuousOperationTable {
+    /// Add `files` to the set, Key Number 0's subfunction (p. 45). **All or
+    /// nothing**: if any name in `files` is already active, none of them
+    /// are added -- an inferred reading, not a measured one (no engine was
+    /// available to check a partial-conflict batch against), chosen because
+    /// "the presence of duplicate filenames... does not affect how the
+    /// operation works" (p. 47) already establishes that repeats within one
+    /// call are harmless, and refusing the whole call on any genuine
+    /// collision is the same shape [`Block::set_owner`]'s "already set"
+    /// refusal takes rather than a half-applied batch.
+    ///
+    /// # Errors
+    /// [`OpError::AlreadyInContinuousOperation`] -- status 88, the vendor's
+    /// own text verbatim (p. 47) -- naming the first colliding file.
+    pub fn start(&mut self, files: &[String]) -> Result<(), OpError> {
+        for file in files {
+            if self.active.contains(file) {
+                return Err(OpError::AlreadyInContinuousOperation { file: file.clone() });
+            }
+        }
+        for file in files {
+            if !self.active.contains(file) {
+                self.active.push(file.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove `files` from the set (Key Number 2), or every file (Key
+    /// Number 1, `files: None`) -- p. 45's two subfunctions. Never an
+    /// error: p. 46's own Details name no precondition for ending
+    /// continuous operation on a file that was never in it.
+    pub fn end(&mut self, files: Option<&[String]>) {
+        match files {
+            Some(names) => self.active.retain(|active| !names.contains(active)),
+            None => self.active.clear(),
+        }
+    }
+
+    /// Whether `file` is currently in continuous operation mode.
+    pub fn is_active(&self, file: &str) -> bool {
+        self.active.iter().any(|active| active == file)
+    }
+}
+
+/// What [`Block::get_by_percentage`] positions by -- p. 85's Key Number
+/// rule: an actual key number for a key-path position, or `-1` (0xFF) for
+/// the record's physical location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PercentageBasis {
+    /// Relative to this key's own order.
+    Key(u16),
+    /// Relative to physical position in the file.
+    Physical,
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 44, `Get By Percentage` -- pp. 83-87.
+    ///
+    /// `percentage` is p. 85's own 0-10,000 range (0.00% to 100.00%),
+    /// clamped rather than refused for a value past 10,000 -- the
+    /// Programmer's Reference states the valid range but not what happens
+    /// outside it, and clamping to the nearest end is the smallest
+    /// extrapolation past a documented range this crate makes elsewhere
+    /// (compare [`Block::deliver_current`]'s truncation, which is the same
+    /// shape: bring an out-of-range request back to the nearest answer
+    /// this host can give rather than refuse it outright). The position
+    /// formula (`percentage * count / 10,000`, clamped to the last record)
+    /// is the natural reading of "a value in the range of 0... through
+    /// 10,000" applied to a file of `count` records or key entries; the
+    /// worked example on p. 82 (50% -> the middle record) is consistent
+    /// with it but the exact rounding at the edges was not measured
+    /// against a live engine.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NoSuchKey`] for a [`PercentageBasis::Key`] the file does
+    /// not have. [`OpError::EndOfFile`] -- status 9 -- for an empty file
+    /// or an empty key order. [`OpError::LockModeMixed`]. If the records
+    /// cannot be read.
+    pub fn get_by_percentage(
+        &mut self,
+        basis: PercentageBasis,
+        percentage: u16,
+        lock: i16,
+        locks: &mut LockTable,
+    ) -> Result<Delivery, OpError> {
+        let percentage = usize::from(percentage.min(10_000));
+        match basis {
+            PercentageBasis::Key(key) => {
+                let count = self.records()?.ordered_len(key).ok_or(OpError::NoSuchKey(key))?;
+                if count == 0 {
+                    return Err(OpError::EndOfFile);
+                }
+                let at = (percentage * count / 10_000).min(count - 1);
+                self.seek_to(Cursor::Ordered { key, at });
+                self.take_lock(lock, locks)?;
+                self.deliver_current(Some(key))
+            }
+            PercentageBasis::Physical => {
+                let count = self.records()?.len();
+                if count == 0 {
+                    return Err(OpError::EndOfFile);
+                }
+                let at = (percentage * count / 10_000).min(count - 1);
+                self.seek_to(Cursor::Physical { at });
+                self.take_lock(lock, locks)?;
+                self.deliver_current(None)
+            }
+        }
+    }
+}
+
+/// What [`Block::find_percentage`] is finding the position of -- the same
+/// two shapes [`PercentageBasis`] positions by, carrying the value or the
+/// address to look up rather than a percentage to land on. Kept as a
+/// separate type rather than reusing [`PercentageBasis`] because Find
+/// Percentage's inputs are a *value* (or an address) where Get By
+/// Percentage's is a *percentage* -- the two operations are inverses, not
+/// the same request read two ways.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindBasis {
+    /// Where this key's value would sort, per p. 80's own procedure ("set
+    /// the Key Buffer parameter to the key value").
+    Key { key: u16, value: Vec<u8> },
+    /// Where this physical address sits in the file.
+    Physical(u32),
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 45, `Find Percentage` -- pp. 80-83, the inverse of
+    /// [`Block::get_by_percentage`]: `at * 10,000 / count`, the natural
+    /// inverse of that method's own formula, clamped into `0..=10_000` by
+    /// construction (`at < count` always, since [`super::records::Records::
+    /// seek`]/[`super::records::Records::find_physical`] both bound `at` by
+    /// the order/file they search). Same rounding caveat as [`Block::
+    /// get_by_percentage`]'s doc comment: consistent with the one worked
+    /// example the Programmer's Reference gives, not measured against a
+    /// live engine at the edges.
+    ///
+    /// **Does not change any currency** -- p. 83: "The Find Percentage
+    /// operation does not change any currency information" -- so, unlike
+    /// every positioning method above this one, this never calls
+    /// [`Block::seek_to`].
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NoSuchKey`] for a [`FindBasis::Key`] the file does not
+    /// have. [`OpError::InvalidRecordAddress`] -- status 43 -- for a
+    /// [`FindBasis::Physical`] address naming no record. [`OpError::
+    /// EndOfFile`] -- status 9 -- for an empty file or key order. If the
+    /// records cannot be read.
+    pub fn find_percentage(&mut self, basis: &FindBasis) -> Result<u16, OpError> {
+        match basis {
+            FindBasis::Key { key, value } => {
+                let definitions: Vec<Key> = self.keys().to_vec();
+                let records = self.records()?;
+                let count = records.ordered_len(*key).ok_or(OpError::NoSuchKey(*key))?;
+                if count == 0 {
+                    return Err(OpError::EndOfFile);
+                }
+                let at = records.seek(&definitions, *key, value).min(count);
+                Ok(((at as u64 * 10_000) / count as u64) as u16)
+            }
+            FindBasis::Physical(position) => {
+                let records = self.records()?;
+                let count = records.len();
+                if count == 0 {
+                    return Err(OpError::EndOfFile);
+                }
+                let at = records.find_physical(*position).ok_or(OpError::InvalidRecordAddress)?;
+                Ok(((at as u64 * 10_000) / count as u64) as u16)
+            }
+        }
+    }
+}
+
+/// [`Block::extended_files`]'s answer -- Table 2-24 (p. 177), the extended-
+/// files subfunction of Stat Extended (op 65). This host never splits a
+/// file across extension files (that is a `create.rs`/`pages.rs` feature
+/// this crate does not implement at all), so [`Self::files`] is always `1`
+/// and [`Self::extensions`] is always empty -- the vendor's own defined
+/// answer for a file that has none, not an invented one: "If you specify a
+/// number higher than the number of extension files, the MicroKernel
+/// returns Status Code 0 and no filenames" (p. 176), which is this host's
+/// only possible case for every `first` past `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedFiles {
+    /// Number of operating-system files that comprise the extended file --
+    /// always `1` here.
+    pub files: u32,
+    /// Extension filenames past the base file -- always empty here.
+    pub extensions: Vec<String>,
+}
+
+/// [`Block::system_data_stat`]'s answer -- Table 2-25 (p. 178), Stat
+/// Extended's system-data subfunction. This host implements no
+/// system-defined log key (key number 125, "system data") anywhere --
+/// nothing in `keys.rs`/`create.rs` reads or writes one -- so the fixed
+/// facts about it are all `false`/`0`; [`Self::is_loggable`] is the one
+/// field genuinely computed, from whether the file has any key that
+/// forbids duplicates, which is p. 178's own definition of loggable: "a
+/// unique key that can be used to implement transaction durability... a
+/// user-defined unique key or a system-defined log key."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemDataStat {
+    /// Whether the file's records carry a system-defined log key -- always
+    /// `false`.
+    pub has_system_data: bool,
+    /// Whether the system-defined log key is in use -- always `false`.
+    pub has_log_key: bool,
+    /// Whether the file has a unique key transaction durability could use.
+    pub is_loggable: bool,
+    /// The key number used as the transaction log key -- `0` here, since
+    /// this host never designates one; real Btrieve reports `125` only
+    /// when the system-defined log key specifically is in that role.
+    pub log_key_number: u8,
+    /// Size of the system-defined log key -- the vendor's own constant,
+    /// p. 178: "which is 8."
+    pub size: u16,
+    /// The vendor's own constant, p. 178: "The constant 700 (0x2BC)."
+    pub version: u16,
+}
+
+impl<A: Abi> Block<A> {
+    /// Btrieve op 65, `Stat Extended`, extended-files subfunction
+    /// (Subfunction `1`) -- pp. 175-178. `first` is p. 176's "First File
+    /// Sequence" (`0` for the base file, `1` for the first extension, and
+    /// so on); see [`ExtendedFiles`]'s own doc comment for why this host's
+    /// answer never depends on it beyond that.
+    pub fn extended_files(&self, first: u32) -> ExtendedFiles {
+        let _ = first;
+        ExtendedFiles { files: 1, extensions: Vec::new() }
+    }
+
+    /// Btrieve op 65, `Stat Extended`, system-data subfunction (Subfunction
+    /// `2`) -- pp. 175-178. See [`SystemDataStat`]'s own doc comment.
+    pub fn system_data_stat(&self) -> SystemDataStat {
+        SystemDataStat {
+            has_system_data: false,
+            has_log_key: false,
+            is_loggable: self.keys().iter().any(|key| !key.duplicates),
+            log_key_number: 0,
+            size: 8,
+            version: 700,
+        }
+    }
+}
+
+/// Btrieve op `1019`, `Begin Transaction` in its **concurrent** form --
+/// Programmer's Reference p. 38: "Set the Operation Code to 19 to begin an
+/// exclusive transaction, or 1019 to begin a concurrent transaction." Op
+/// 19's own exclusive form is [`crate::btrieve::Btrieve::begin`]
+/// (`btrieve.rs:2064`), out of this file's freeze, and this file does not
+/// call it -- this function names only what a `1019` dispatcher needs to
+/// know before it can decide anything else: **this engine cannot honour
+/// it, at all, structurally.**
+///
+/// The design's own § 4 records the fact that motivates this task: op 19's
+/// own lock granularity already changes by target file format --
+/// whole-file on a pre-6.0 file, page/record on a 6.x one -- and 1019 is a
+/// *third*, finer granularity again, concurrent rather than exclusive.
+/// `Btrieve::begin` (`btrieve.rs:2064-2074`) is a single `bool` --
+/// `self.transaction` -- that, the instant it goes true, marks **every**
+/// currently open [`Block`] `txn_active` at once. There is no per-file, let
+/// alone per-page or per-record, grain anywhere in that state for a
+/// concurrent transaction's own conflict tracking to hang off of, and nothing
+/// in that shape can be turned into one without adding new state to
+/// `Btrieve` itself (`btrieve.rs`, out of this file's freeze this round).
+/// This is categorically different from this task's other structural gap,
+/// [`OpError::NccUnsupported`]: that one is a single [`Cursor`] field short
+/// of expressing "physical moved, logical did not." This one is a whole
+/// state machine `Btrieve` does not have at all, the same way [`OpError::
+/// IndexMutationUnsupported`]'s gap is a whole per-key index `Records` does
+/// not maintain incrementally.
+///
+/// **No real Btrieve status code names this**, deliberately not invented:
+/// every real 6.x-or-later engine supports `1019` unconditionally (Btrieve
+/// dropped 5.x-and-earlier engines' total absence of the concurrent form
+/// long before this host's target modules were written), so the vendor has
+/// never had to document what a concurrency-incapable *engine* answers --
+/// only what a well-formed *request* can go wrong. This is a fact about
+/// this host, not about the file or the request, the same shape
+/// `btrieve.rs:754`'s v6-write refusal is: a host-level message
+/// (`OpError`, here; `BtvError`, there), not a status code -- assigning the
+/// status a module actually sees is Task 7's marshalling job, same as
+/// every other [`OpError`] in this file.
+///
+/// # Errors
+/// [`OpError::ConcurrentTransactionUnsupported`], always.
+pub fn begin_concurrent_transaction() -> Result<(), OpError> {
+    Err(OpError::ConcurrentTransactionUnsupported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::abi::Wg16;
     use crate::btrieve::keys::{Kind, Segment};
+    use crate::btrieve::records::Records;
     use crate::btrieve::{Geometry, Version, pages};
     use mbbs_machine::m16::FarPtr;
     use std::path::{Path, PathBuf};
@@ -1501,18 +2437,11 @@ mod tests {
     /// `Btrieve::open` -- no module and no heap, only the file and the
     /// geometry a real `opnbtv` would have read out of it. Mirrors
     /// `btrieve.rs`'s own `tests::block`.
-    fn block(path: PathBuf) -> Block<Wg16> {
-        let geometry = Geometry {
-            version: Version::V5,
-            page: 512,
-            keys: 2,
-            reclen: RECLEN,
-            physical: PHYSICAL,
-            records: RECORDS.len() as u32,
-            pages: 2,
-            variable: false,
-        };
-        let keys = vec![
+    /// The fixture's two key definitions, factored out of [`block`] so
+    /// [`fixture_v6`] (Task 11) can build the same [`Records`] without
+    /// duplicating this list.
+    fn ops_keys() -> Vec<Key> {
+        vec![
             Key {
                 number: 0,
                 definition: 0,
@@ -1537,13 +2466,29 @@ mod tests {
                 duplicates: true,
                 chain: Some(8),
             },
-        ];
+        ]
+    }
+
+    fn ops_geometry() -> Geometry {
+        Geometry {
+            version: Version::V5,
+            page: 512,
+            keys: 2,
+            reclen: RECLEN,
+            physical: PHYSICAL,
+            records: RECORDS.len() as u32,
+            pages: 2,
+            variable: false,
+        }
+    }
+
+    fn block(path: PathBuf) -> Block<Wg16> {
         Block {
             id: BlockId::fresh(),
             name: "OPS.DAT".to_owned(),
             path,
-            geometry,
-            keys,
+            geometry: ops_geometry(),
+            keys: ops_keys(),
             block: FarPtr::NULL,
             maxlen: RECLEN,
             data: FarPtr::NULL,
@@ -1565,8 +2510,60 @@ mod tests {
         block(seed(&crate::testing::scratch(&format!("ops-{name}"))))
     }
 
+    /// The same six records, but claiming to be a v6-format file --
+    /// **Task 11's own test double for "this method's version gate must
+    /// pass a genuinely-v6 file through," not a claim that this is what a
+    /// real v6 file's bytes look like.** `seed`'s bytes are laid out for
+    /// v5 (no 2-byte v6 slot marker, no `"PP"` allocation table -- building
+    /// either is `v6.rs`/`pages.rs` work, out of this file's freeze), so
+    /// [`Records::read`] is called against the *true* v5 geometry first, to
+    /// parse correctly, and only then is the returned [`Block`]'s own
+    /// [`Geometry::version`] flipped to [`Version::V6`] -- after
+    /// [`Records`] is already built and cached in [`Block::records`], which
+    /// [`Block::records`] (`btrieve.rs:849`) never re-derives once it is
+    /// `Some`. So every test built on this fixture exercises exactly one
+    /// thing genuinely: whether a method's own `geometry.version == V6`
+    /// check lets a v6 file through -- not whether this host's v6 page
+    /// walk is correct, which is measured elsewhere entirely
+    /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`).
+    fn fixture_v6(name: &str) -> Block<Wg16> {
+        let path = seed(&crate::testing::scratch(&format!("ops-{name}")));
+        let read_geometry = ops_geometry();
+        let keys = ops_keys();
+        let records = Records::read("OPS.DAT", &path, &read_geometry, &keys)
+            .expect("the fixture's own v5-shaped bytes parse under v5 rules");
+        let mut geometry = read_geometry;
+        geometry.version = Version::V6;
+        Block {
+            id: BlockId::fresh(),
+            name: "OPS.DAT".to_owned(),
+            path,
+            geometry,
+            keys,
+            block: FarPtr::NULL,
+            maxlen: RECLEN,
+            data: FarPtr::NULL,
+            key: FarPtr::NULL,
+            records: Some(records),
+            cursor: Cursor::Nowhere,
+            dirty: false,
+            txn_active: false,
+            pre_image: None,
+        }
+    }
+
     fn tag(delivery: &Delivery) -> u8 {
         delivery.bytes[4]
+    }
+
+    /// A record buffer in the fixture's own layout (`key0: u16 @0`, `key1:
+    /// u16 @2`, `tag: u8 @4`), for Task 11's insert tests.
+    fn ops_record(key0: u16, key1: u16, tag: u8) -> Vec<u8> {
+        let mut bytes = vec![0u8; RECLEN as usize];
+        bytes[0..2].copy_from_slice(&key0.to_le_bytes());
+        bytes[2..4].copy_from_slice(&key1.to_le_bytes());
+        bytes[4] = tag;
+        bytes
     }
 
     // -- Op::Equal / Greater / AtLeast / Less / AtMost / Lowest / Highest --
@@ -2414,5 +3411,395 @@ mod tests {
             None,
             "clear_all is session-wide, unlike release_all_for's per-block scope"
         );
+    }
+
+    // -- Task 11: the version-gated operation families --
+
+    // Get Direct/Chunk (23-chunk) / Update Chunk (53)
+
+    #[test]
+    fn get_chunks_on_a_pre_v6_file_is_refused_with_status_107() {
+        let mut b = fixture("get_chunks_on_a_pre_v6_file_is_refused_with_status_107");
+        assert_eq!(b.geometry().version, Version::V5, "the fixture is v5 by construction");
+        let err = b
+            .get_chunks(0, &[Chunk { offset: 0, length: 1 }])
+            .expect_err("a chunk operation on a pre-v6 file");
+        assert_eq!(err, OpError::PreV6Chunk);
+    }
+
+    #[test]
+    fn get_chunks_on_a_v6_file_extracts_the_named_bytes() {
+        let mut b = fixture_v6("get_chunks_on_a_v6_file_extracts_the_named_bytes");
+        let position = b.records().unwrap().physical(0).unwrap().position;
+        let bytes = b
+            .get_chunks(position, &[Chunk { offset: 0, length: 2 }, Chunk { offset: 4, length: 1 }])
+            .expect("a v6 file, both chunks in range");
+        assert_eq!(bytes, vec![10, 0, 0], "key0=10 little-endian, then tag=0");
+    }
+
+    #[test]
+    fn get_chunks_a_chunk_beginning_past_the_end_of_the_record_is_refused() {
+        let mut b = fixture_v6("get_chunks_a_chunk_beginning_past_the_end_of_the_record_is_refused");
+        let position = b.records().unwrap().physical(0).unwrap().position;
+        let err = b
+            .get_chunks(position, &[Chunk { offset: 100, length: 1 }])
+            .expect_err("p. 98: begins beyond the end of the record -- status 103");
+        assert_eq!(err, OpError::ChunkOffsetTooBig);
+    }
+
+    #[test]
+    fn get_chunks_a_chunk_that_only_overruns_is_truncated_and_processing_stops() {
+        let mut b = fixture_v6("get_chunks_a_chunk_that_only_overruns_is_truncated_and_processing_stops");
+        let position = b.records().unwrap().physical(0).unwrap().position;
+        // The fixture's record is 8 bytes; offset 6, length 4 overruns by 2.
+        let bytes = b
+            .get_chunks(
+                position,
+                &[Chunk { offset: 6, length: 4 }, Chunk { offset: 0, length: 2 }],
+            )
+            .expect("p. 98: status 0, but ceases processing subsequent chunks");
+        assert_eq!(bytes.len(), 2, "only the 2 bytes remaining of the overrunning chunk");
+    }
+
+    #[test]
+    fn get_chunks_a_chunk_starting_exactly_at_the_records_end_is_refused() {
+        // The boundary `offset == record length` (not past it): "begins
+        // beyond the end" (status 103) means at-or-past one-past-the-last
+        // byte, not strictly past it -- a chunk of any positive length
+        // starting there has nothing to read. Mutation-found: `start >=
+        // bytes.len()` weakened to `start > bytes.len()` passed every other
+        // test in this file (RECLEN=8, and no other test used offset 8
+        // exactly), returning `Ok(vec![])` instead of refusing.
+        let mut b = fixture_v6("get_chunks_a_chunk_starting_exactly_at_the_records_end_is_refused");
+        let position = b.records().unwrap().physical(0).unwrap().position;
+        let err = b
+            .get_chunks(position, &[Chunk { offset: RECLEN.into(), length: 1 }])
+            .expect_err("offset == record length has nothing to read");
+        assert_eq!(err, OpError::ChunkOffsetTooBig);
+    }
+
+    #[test]
+    fn get_chunks_on_an_invalid_position_is_refused() {
+        let mut b = fixture_v6("get_chunks_on_an_invalid_position_is_refused");
+        let err = b
+            .get_chunks(999_999, &[Chunk { offset: 0, length: 1 }])
+            .expect_err("no record at that position");
+        assert_eq!(err, OpError::InvalidRecordAddress);
+    }
+
+    #[test]
+    fn update_chunks_on_a_pre_v6_file_is_refused_with_status_107() {
+        let mut b = fixture("update_chunks_on_a_pre_v6_file_is_refused_with_status_107");
+        let err = b.update_chunks(&[(4, vec![9])]).expect_err("a chunk operation on a pre-v6 file");
+        assert_eq!(err, OpError::PreV6Chunk);
+    }
+
+    #[test]
+    fn update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write() {
+        let mut b = fixture_v6("update_chunks_on_a_v6_file_passes_the_gate_and_reaches_the_still_refused_v6_write");
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks).unwrap();
+        let err = b
+            .update_chunks(&[(4, vec![9])])
+            .expect_err("v6 write does not exist yet (Task 13)");
+        assert_ne!(
+            err,
+            OpError::PreV6Chunk,
+            "the chunk gate must let a v6 file through -- it fails later, at the write"
+        );
+        assert!(
+            matches!(err, OpError::Records(_)),
+            "the failure is the pre-existing v6-write refusal (btrieve.rs:754), not this task's gate: {err}"
+        );
+    }
+
+    #[test]
+    fn update_chunks_without_a_position_is_refused() {
+        let mut b = fixture_v6("update_chunks_without_a_position_is_refused");
+        let err = b.update_chunks(&[(0, vec![1])]).expect_err("nothing positioned");
+        assert_eq!(err, OpError::NotPositioned);
+    }
+
+    #[test]
+    fn update_chunks_offset_past_the_record_is_refused() {
+        let mut b = fixture_v6("update_chunks_offset_past_the_record_is_refused");
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &10u16.to_le_bytes(), 0, &mut locks).unwrap();
+        let err = b.update_chunks(&[(100, vec![1])]).expect_err("past the end of the record");
+        assert_eq!(err, OpError::ChunkOffsetTooBig);
+    }
+
+    // Create Index (31) / Drop Index (32)
+
+    #[test]
+    fn create_index_is_always_refused_a_structural_gap_not_a_vendor_one() {
+        let mut b = fixture("create_index_is_always_refused_a_structural_gap_not_a_vendor_one");
+        assert_eq!(b.create_index(), Err(OpError::IndexMutationUnsupported));
+    }
+
+    #[test]
+    fn drop_index_is_always_refused_the_same_way() {
+        let mut b = fixture("drop_index_is_always_refused_the_same_way");
+        assert_eq!(b.drop_index(0), Err(OpError::IndexMutationUnsupported));
+    }
+
+    // Get Next/Previous Extended (36/37), Step Next/Previous Extended (38/39)
+
+    #[test]
+    fn get_next_extended_after_current_retrieves_the_requested_count_forward() {
+        let mut b = fixture("get_next_extended_after_current_retrieves_the_requested_count_forward");
+        let mut locks = LockTable::default();
+        let out = b.get_next_extended(0, 3, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        let tags: Vec<u8> = out.iter().map(tag).collect();
+        assert_eq!(tags, vec![0, 1, 2], "S1: nothing positioned behaves like Lowest, then walks forward");
+    }
+
+    #[test]
+    fn get_next_extended_stops_at_end_of_file_short_of_count() {
+        let mut b = fixture("get_next_extended_stops_at_end_of_file_short_of_count");
+        let mut locks = LockTable::default();
+        let out = b.get_next_extended(0, 100, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        assert_eq!(out.len(), 6, "only six records exist -- the fourth documented stop condition, p. 130");
+    }
+
+    #[test]
+    fn get_next_extended_at_current_includes_the_positioned_record_first() {
+        let mut b = fixture("get_next_extended_at_current_includes_the_positioned_record_first");
+        let mut locks = LockTable::default();
+        b.get(0, Op::Equal, &30u16.to_le_bytes(), 0, &mut locks).unwrap();
+        let out = b.get_next_extended(0, 2, ExtendedStart::AtCurrent, 0, &mut locks).unwrap();
+        let tags: Vec<u8> = out.iter().map(tag).collect();
+        assert_eq!(tags, vec![2, 3], "UC: begins with the positioned record (tag 2), then the next");
+    }
+
+    #[test]
+    fn get_previous_extended_walks_backward() {
+        let mut b = fixture("get_previous_extended_walks_backward");
+        let mut locks = LockTable::default();
+        b.get(0, Op::Highest, &[], 0, &mut locks).unwrap();
+        let out = b.get_previous_extended(0, 2, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        let tags: Vec<u8> = out.iter().map(tag).collect();
+        assert_eq!(tags, vec![4, 3]);
+    }
+
+    #[test]
+    fn get_next_extended_with_count_zero_returns_nothing() {
+        let mut b = fixture("get_next_extended_with_count_zero_returns_nothing");
+        let mut locks = LockTable::default();
+        let out = b.get_next_extended(0, 0, ExtendedStart::AfterCurrent, 0, &mut locks).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn step_next_extended_walks_physical_order_after_the_current_position() {
+        let mut b = fixture("step_next_extended_walks_physical_order_after_the_current_position");
+        let mut locks = LockTable::default();
+        b.step(Step::First, 0, &mut locks).unwrap();
+        let out = b.step_next_extended(2, 0, &mut locks).unwrap();
+        let tags: Vec<u8> = out.iter().map(tag).collect();
+        assert_eq!(tags, vec![1, 2], "always EG: starts after the current position, p. 126");
+    }
+
+    #[test]
+    fn step_previous_extended_walks_backward_in_physical_order() {
+        let mut b = fixture("step_previous_extended_walks_backward_in_physical_order");
+        let mut locks = LockTable::default();
+        b.step(Step::Last, 0, &mut locks).unwrap();
+        let out = b.step_previous_extended(2, 0, &mut locks).unwrap();
+        let tags: Vec<u8> = out.iter().map(tag).collect();
+        assert_eq!(tags, vec![4, 3]);
+    }
+
+    #[test]
+    fn step_next_extended_with_nothing_positioned_is_refused_not_silently_empty() {
+        let mut b = fixture("step_next_extended_with_nothing_positioned_is_refused_not_silently_empty");
+        let mut locks = LockTable::default();
+        let err = b
+            .step_next_extended(3, 0, &mut locks)
+            .expect_err("Step Next Extended needs prior positioning, same as Step Next");
+        assert_eq!(err, OpError::NotPositioned);
+    }
+
+    // Insert Extended (40)
+
+    #[test]
+    fn insert_extended_inserts_every_record_and_establishes_currency_on_the_last() {
+        let mut b = fixture("insert_extended_inserts_every_record_and_establishes_currency_on_the_last");
+        let records = vec![ops_record(100, 9, 9), ops_record(200, 9, 8)];
+        let positions = b.insert_extended(0, false, &records).expect("no collision");
+        assert_eq!(positions.len(), 2);
+        let current = b.current().expect("p. 150: currency established on the last inserted record");
+        assert_eq!(current.bytes[4], 8, "the second record's tag");
+    }
+
+    #[test]
+    fn insert_extended_refuses_a_duplicate_key_and_reports_how_many_made_it_in() {
+        let mut b = fixture("insert_extended_refuses_a_duplicate_key_and_reports_how_many_made_it_in");
+        // key0=100 is new; key0=10 already exists (tag 0), and key 0 forbids duplicates.
+        let records = vec![ops_record(100, 9, 9), ops_record(10, 9, 8)];
+        let err = b
+            .insert_extended(0, false, &records)
+            .expect_err("the second record collides on key 0");
+        assert_eq!(err.inserted.len(), 1, "p. 148: the first record made it in");
+        assert_eq!(err.error, OpError::DuplicateKey { key: 0 });
+    }
+
+    #[test]
+    fn insert_extended_ncc_is_refused() {
+        let mut b = fixture("insert_extended_ncc_is_refused");
+        let err = b.insert_extended(0, true, &[]).expect_err("NCC is not supported");
+        assert_eq!(err.error, OpError::NccUnsupported);
+        assert!(err.inserted.is_empty());
+    }
+
+    // Continuous Operation (42)
+
+    #[test]
+    fn continuous_operation_start_then_is_active() {
+        let mut c = ContinuousOperationTable::default();
+        c.start(&["A.DAT".to_owned(), "B.DAT".to_owned()]).expect("no conflict");
+        assert!(c.is_active("A.DAT"));
+        assert!(c.is_active("B.DAT"));
+        assert!(!c.is_active("C.DAT"));
+    }
+
+    #[test]
+    fn continuous_operation_starting_an_already_active_file_is_refused_with_status_88() {
+        let mut c = ContinuousOperationTable::default();
+        c.start(&["A.DAT".to_owned()]).unwrap();
+        let err = c.start(&["A.DAT".to_owned()]).expect_err("already in continuous operation mode");
+        assert_eq!(err, OpError::AlreadyInContinuousOperation { file: "A.DAT".to_owned() });
+    }
+
+    #[test]
+    fn continuous_operation_duplicate_names_in_one_call_are_harmless() {
+        let mut c = ContinuousOperationTable::default();
+        c.start(&["A.DAT".to_owned(), "A.DAT".to_owned()])
+            .expect("p. 47: duplicate filenames in one call do not error");
+        assert!(c.is_active("A.DAT"));
+    }
+
+    #[test]
+    fn continuous_operation_end_specific_files_leaves_others_active() {
+        let mut c = ContinuousOperationTable::default();
+        c.start(&["A.DAT".to_owned(), "B.DAT".to_owned()]).unwrap();
+        c.end(Some(&["A.DAT".to_owned()]));
+        assert!(!c.is_active("A.DAT"));
+        assert!(c.is_active("B.DAT"));
+    }
+
+    #[test]
+    fn continuous_operation_end_with_no_names_ends_every_file() {
+        let mut c = ContinuousOperationTable::default();
+        c.start(&["A.DAT".to_owned(), "B.DAT".to_owned()]).unwrap();
+        c.end(None);
+        assert!(!c.is_active("A.DAT"));
+        assert!(!c.is_active("B.DAT"));
+    }
+
+    // Get By Percentage (44) / Find Percentage (45)
+
+    #[test]
+    fn get_by_percentage_zero_is_the_lowest_record() {
+        let mut b = fixture("get_by_percentage_zero_is_the_lowest_record");
+        let mut locks = LockTable::default();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 0, 0, &mut locks).unwrap();
+        assert_eq!(tag(&d), 0);
+    }
+
+    #[test]
+    fn get_by_percentage_10000_is_the_highest_record() {
+        let mut b = fixture("get_by_percentage_10000_is_the_highest_record");
+        let mut locks = LockTable::default();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 10_000, 0, &mut locks).unwrap();
+        assert_eq!(tag(&d), 5);
+    }
+
+    #[test]
+    fn get_by_percentage_clamps_a_value_past_10000() {
+        let mut b = fixture("get_by_percentage_clamps_a_value_past_10000");
+        let mut locks = LockTable::default();
+        let d = b.get_by_percentage(PercentageBasis::Key(0), 60_000, 0, &mut locks).unwrap();
+        assert_eq!(tag(&d), 5, "clamped to the highest record, not out of range");
+    }
+
+    #[test]
+    fn get_by_percentage_physical_basis_returns_no_key() {
+        let mut b = fixture("get_by_percentage_physical_basis_returns_no_key");
+        let mut locks = LockTable::default();
+        let d = b.get_by_percentage(PercentageBasis::Physical, 0, 0, &mut locks).unwrap();
+        assert!(d.key.is_none(), "p. 86: physical basis returns nothing in the Key Buffer");
+    }
+
+    #[test]
+    fn get_by_percentage_no_such_key_is_refused() {
+        let mut b = fixture("get_by_percentage_no_such_key_is_refused");
+        let mut locks = LockTable::default();
+        let err = b
+            .get_by_percentage(PercentageBasis::Key(9), 0, 0, &mut locks)
+            .expect_err("no such key");
+        assert_eq!(err, OpError::NoSuchKey(9));
+    }
+
+    #[test]
+    fn find_percentage_is_the_inverse_of_get_by_percentage() {
+        let mut b = fixture("find_percentage_is_the_inverse_of_get_by_percentage");
+        // key0 = 30 (tag 2) sits at ordered index 2 of 6.
+        let pct = b
+            .find_percentage(&FindBasis::Key { key: 0, value: 30u16.to_le_bytes().to_vec() })
+            .unwrap();
+        assert_eq!(pct, (2 * 10_000) / 6);
+    }
+
+    #[test]
+    fn find_percentage_does_not_move_the_cursor() {
+        let mut b = fixture("find_percentage_does_not_move_the_cursor");
+        assert_eq!(b.cursor(), Cursor::Nowhere);
+        b.find_percentage(&FindBasis::Key { key: 0, value: 30u16.to_le_bytes().to_vec() })
+            .unwrap();
+        assert_eq!(b.cursor(), Cursor::Nowhere, "p. 83: Find Percentage changes no currency");
+    }
+
+    #[test]
+    fn find_percentage_physical_basis() {
+        let mut b = fixture("find_percentage_physical_basis");
+        let position = b.records().unwrap().physical(0).unwrap().position;
+        let pct = b.find_percentage(&FindBasis::Physical(position)).unwrap();
+        assert_eq!(pct, 0, "the first physical record is at 0%");
+    }
+
+    #[test]
+    fn find_percentage_invalid_physical_address_is_refused() {
+        let mut b = fixture("find_percentage_invalid_physical_address_is_refused");
+        let err = b.find_percentage(&FindBasis::Physical(999_999)).expect_err("no such record");
+        assert_eq!(err, OpError::InvalidRecordAddress);
+    }
+
+    // Stat Extended (65)
+
+    #[test]
+    fn extended_files_reports_one_file_and_no_extensions() {
+        let b = fixture("extended_files_reports_one_file_and_no_extensions");
+        let files = b.extended_files(0);
+        assert_eq!(files.files, 1);
+        assert!(files.extensions.is_empty());
+    }
+
+    #[test]
+    fn system_data_stat_is_loggable_because_key_0_forbids_duplicates() {
+        let b = fixture("system_data_stat_is_loggable_because_key_0_forbids_duplicates");
+        let stat = b.system_data_stat();
+        assert!(!stat.has_system_data);
+        assert!(!stat.has_log_key);
+        assert!(stat.is_loggable, "key 0 has duplicates: false");
+        assert_eq!(stat.size, 8);
+        assert_eq!(stat.version, 700);
+    }
+
+    // Begin Transaction, concurrent form (1019)
+
+    #[test]
+    fn begin_concurrent_transaction_is_always_refused() {
+        assert_eq!(begin_concurrent_transaction(), Err(OpError::ConcurrentTransactionUnsupported));
     }
 }
