@@ -504,6 +504,28 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
     }
 }
 
+/// Service one `int 15h`, and say whether the guest just asked to be paused.
+///
+/// `AH=10h` is DESQview's "give up my timeslice" and `AH=86h` is the BIOS wait.
+/// Both are a program stating plainly that it has nothing to do. Returning from
+/// them instantly is what turns a keyboard poll loop into a 100%-of-a-core
+/// spin: the guest asks to be descheduled, we decline, and it asks again a
+/// microsecond later. Honouring them is the semantics, not a throttle.
+pub fn int15<G: DosGuest>(g: &mut G) -> Option<std::time::Duration> {
+    let regs = g.regs();
+    match regs.ah() {
+        // 10h -- release the current timeslice.
+        0x10 => Some(std::time::Duration::from_millis(1)),
+        // 86h -- wait CX:DX microseconds. Capped, because a program asking to
+        // sleep for an hour should not take the session with it.
+        0x86 => {
+            let micros = (u64::from(regs.cx) << 16) | u64::from(regs.dx);
+            Some(std::time::Duration::from_micros(micros.min(50_000)))
+        }
+        _ => None,
+    }
+}
+
 /// Which `int 10h` functions [`int10`] actually services.
 pub fn int10_implemented(ah: u8) -> bool {
     matches!(

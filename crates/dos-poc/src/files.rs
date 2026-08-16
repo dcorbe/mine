@@ -398,6 +398,43 @@ impl Files {
         if rc == 0 { Ok(()) } else { Err(ERR_FILE_NOT_FOUND) }
     }
 
+    /// `56h` -- rename, which is also how a program replaces a file: write a
+    /// temporary, delete the original, rename over it. Refusing it does not
+    /// merely skip a tidy-up -- Turbo Pascal turns the DOS error into a fatal
+    /// I/O error, and LORD exits abnormally mid-game.
+    pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), u16> {
+        let from = match translate(from) {
+            Target::File(name) => self.resolve(&name)?,
+            _ => return Err(ERR_PATH_NOT_FOUND),
+        };
+        let to = match translate(to) {
+            Target::File(name) => self.resolve(&name)?,
+            _ => return Err(ERR_PATH_NOT_FOUND),
+        };
+        let (Ok(c_from), Ok(c_to)) = (
+            std::ffi::CString::new(from),
+            std::ffi::CString::new(to.clone()),
+        ) else {
+            return Err(ERR_PATH_NOT_FOUND);
+        };
+        // SAFETY: both paths are relative to a descriptor we own.
+        let rc = unsafe {
+            libc::renameat(
+                self.root.as_raw_fd(),
+                c_from.as_ptr(),
+                self.root.as_raw_fd(),
+                c_to.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(ERR_FILE_NOT_FOUND);
+        }
+        if !self.touched.contains(&to) {
+            self.touched.push(to);
+        }
+        Ok(())
+    }
+
     /// `42h` -- seek. `whence` is 0 set, 1 current, 2 end.
     pub fn seek(&mut self, dos: u16, offset: i64, whence: u8) -> Result<u64, u16> {
         let h = self.handle_of(dos).ok_or(ERR_INVALID_HANDLE)?;

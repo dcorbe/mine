@@ -12,7 +12,9 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use dos_poc::bios::{Keyboard, Video, int10, int10_implemented, int16, int16_implemented, missing};
+use dos_poc::bios::{
+    Keyboard, Video, int10, int10_implemented, int15, int16, int16_implemented, missing,
+};
 use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
@@ -232,12 +234,23 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
+            Stop::Trap(0x15) => {
+                let ah = vm.regs().ah();
+                *bios.entry((0x15, ah)).or_insert(0) += 1;
+                calls += 1;
+                if let Some(nap) = int15(&mut vm) {
+                    std::thread::sleep(nap);
+                }
+            }
             Stop::Trap(vector) if vector != 0x21 => {
                 // Not DOS. Record it and let the stub's `iret` return, which
                 // is wrong but keeps the program moving so the next gap shows.
                 let ah = vm.regs().ah();
                 *bios.entry((vector, ah)).or_insert(0) += 1;
                 calls += 1;
+                if vector == 0x2f && vm.regs().ax == 0x1680 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 if let Some(what) = missing(vector, ah) {
                     *gaps.entry(format!("int {vector:02X}h AH={ah:02X}  {what}")).or_insert(0) += 1;
                     if strict {

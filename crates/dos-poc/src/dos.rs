@@ -85,8 +85,39 @@ pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
         0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c | 0x3d
-            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c
+            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x56
     )
+}
+
+/// The host clock, broken out the way DOS reports it.
+struct Now {
+    year: u16,
+    month: u8,
+    day: u8,
+    weekday: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
+fn local_time() -> Now {
+    // SAFETY: `time` with a null argument returns the value; `localtime_r`
+    // fills a caller-owned struct and so is safe to call from any thread.
+    let now = unsafe {
+        let secs = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(std::ptr::from_ref(&secs), std::ptr::from_mut(&mut tm));
+        tm
+    };
+    Now {
+        year: (now.tm_year + 1900) as u16,
+        month: (now.tm_mon + 1) as u8,
+        day: now.tm_mday as u8,
+        weekday: now.tm_wday as u8,
+        hour: now.tm_hour as u8,
+        minute: now.tm_min as u8,
+        second: now.tm_sec as u8,
+    }
 }
 
 /// Read an ASCIIZ path argument, bounded by DOS's own 128-byte path limit.
@@ -215,12 +246,23 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
             }
         }
 
-        // 2Ah/2Ch -- get date and time. 2Bh/2Dh -- set them, which we accept
-        // and ignore: the guest does not get to move the host's clock.
-        0x2a | 0x2c => {
-            regs.cx = 1994;
-            regs.dx = 0x0101;
-            regs.set_al(0);
+        // 2Ah/2Ch -- get date and time, from the host clock.
+        //
+        // A stub date is not a harmless placeholder. LORD stamps its logs with
+        // this, resets each player's daily allowance when the day changes, and
+        // deletes players after so many days of inactivity -- all of which read
+        // a frozen clock as "no time has passed, ever".
+        0x2a => {
+            let now = local_time();
+            regs.cx = now.year;
+            regs.dx = (u16::from(now.month) << 8) | u16::from(now.day);
+            regs.set_al(now.weekday);
+            ok(g, regs)
+        }
+        0x2c => {
+            let now = local_time();
+            regs.cx = (u16::from(now.hour) << 8) | u16::from(now.minute);
+            regs.dx = u16::from(now.second) << 8;
             ok(g, regs)
         }
         0x2b | 0x2d => {
@@ -323,6 +365,25 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
                     regs.dx = ((at >> 16) & 0xffff) as u16;
                     ok(g, regs)
                 }
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 56h -- rename DS:DX to ES:DI.
+        0x56 => {
+            let from = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let to = match path_at(g, DosPtr::new(regs.es, regs.di)) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.rename(&from, &to) {
+                Ok(()) => ok(g, regs),
                 Err(code) => fail(g, regs, code),
             }
         }
