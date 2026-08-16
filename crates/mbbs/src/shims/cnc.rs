@@ -623,7 +623,7 @@ pub fn cncuid<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
     let mut taken: u16 = 0;
     while let Some(&byte) = bytes.get(usize::from(taken)) {
-        if !is_uid_char(byte) || taken >= UIDSIZ - 1 {
+        if !crate::strings::is_uid_char(byte) || taken >= UIDSIZ - 1 {
             break;
         }
         taken += 1;
@@ -640,25 +640,6 @@ pub fn cncuid<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         advance_nxtcmd::<A>(call.mem(), host, at, taken)?;
     }
     Ok(abi::Ret::Ptr(buffer))
-}
-
-/// The predicate [`isuidc`] answers with, as a plain byte test.
-///
-/// Split from the shim so [`cncuid`] can use it without building a `Call`,
-/// which is how the vendor uses it too -- `isuidc(*nxtcmd)` inside
-/// `cncuid`'s own `for` condition.
-///
-/// The two high ranges are `0x80..=0xa5` and `0xe0..=0xef` exactly, read as
-/// bytes out of `SRC/api/gcommlib/ISUIDC.C:27-28` rather than from the
-/// character literals it spells them with -- the file is CP437 and the
-/// literals do not survive being read as UTF-8. In CP437 those are the
-/// accented letters `Ç`-`Ñ` and `α`-`ε`, which is what a European user-ID
-/// needed.
-fn is_uid_char(c: u8) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(c, b'.' | b' ' | b',' | b'-' | b'_' | b'\'')
-        || (0x80..=0xa5).contains(&c)
-        || (0xe0..=0xef).contains(&c)
 }
 
 /// `GBOOL isuidc(int c)` -- `SRC/api/gcommlib/ISUIDC.C:18-30`:
@@ -685,7 +666,7 @@ fn is_uid_char(c: u8) -> bool {
 /// Never. The signature is fallible because every shim's is.
 pub fn isuidc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let c: u32 = call.int().into();
-    let valid = u32::from(u8::try_from(c).is_ok_and(is_uid_char));
+    let valid = u32::from(u8::try_from(c).is_ok_and(crate::strings::is_uid_char));
     Ok(abi::Ret::Int(A::int_from_u32(valid)))
 }
 

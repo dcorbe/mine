@@ -409,6 +409,17 @@ pub const GLOBALS: &[Global] = &[
     // its own header with no fixed position relative to this one), placed
     // after it rather than disturbing that group's own established spot.
     gi("digalw"),
+    // MAJORBBS.H:654 -- int fulalw; full names allowed as User-IDs? The
+    // declaration immediately after `digalw`, and placed after it here for
+    // the same reason.
+    //
+    // No corpus module imports it. It is placed because `issupc`
+    // (`SIGNUP.C:1148`) branches on it: with `fulalw` clear, a User-ID may
+    // not contain `. , - '` or a space, and with it set they are allowed.
+    // Reading an unplaced global there is not an option, and defaulting it
+    // inside the routine would put the value somewhere a module could not
+    // see or change.
+    gi("fulalw"),
     // LINGO.H:40 -- int nlingo; number of languages. Placed in declaration
     // order ahead of `clingo`, which is what LINGO.H does.
     //
@@ -953,6 +964,14 @@ impl<A: Abi> Globals<A> {
         // cites the declaration whose comment names the meaning.
         globals.write_mem(mem, "mmucrr", &A::int_to_bytes(0u16.into()))?;   // MAJORBBS.H:581
         globals.write_mem(mem, "digalw", &A::int_to_bytes(1u16.into()))?;   // MAJORBBS.H:653
+        // MAJORBBS.H:654 -- `fulalw=ynopt(FULALW)` in the real host
+        // (`SIGNUP.C:145`, the line after `digalw`'s own `ynopt`). There is no
+        // message-file parser here to answer `ynopt`, so this takes the
+        // permissive end for the same reason `digalw` above and `MAXCAT` in
+        // `shims::cnc` do: a restrictive guess silently rejects User-IDs a
+        // real board would have accepted, and the failure appears inside the
+        // module's signup logic rather than here.
+        globals.write_mem(mem, "fulalw", &A::int_to_bytes(1u16.into()))?;
         globals.write_mem(mem, "clingo", &A::int_to_bytes(0u16.into()))?;   // LINGO.H:41
         // LINGO.H:40 -- the count beside `languages`, and the one thing that
         // makes walking that array safe. One record is allocated above, so
@@ -1348,7 +1367,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 24, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 25, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -1450,7 +1469,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3626);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3628);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as

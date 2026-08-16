@@ -57,6 +57,32 @@ pub fn is_white(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
+/// Whether a character may appear in a user-ID --
+/// `SRC/api/gcommlib/ISUIDC.C:18-30`'s whole body, as a byte test.
+///
+///
+/// Here rather than in a shim because two registered routines answer with
+/// it -- `crate::shims::cnc::isuidc`, which *is* this predicate, and
+/// `crate::shims::text::issupc`, whose `default:` arm calls it
+/// (`SIGNUP.C:1161`) -- and because it belongs beside [`is_white`] and
+/// [`toupper`]: a byte classification, checkable over all 256 values without
+/// a 16-bit machine.
+///
+/// **`' '` is a user-ID character.** MajorBBS user-IDs contain spaces, which
+/// is why `cncuid` does not stop at the first blank.
+///
+/// The two high ranges are `0x80..=0xa5` and `0xe0..=0xef` **read as bytes**
+/// out of `ISUIDC.C`, not from the character literals it spells them with:
+/// the file is CP437 and those literals do not survive being read as UTF-8.
+/// In CP437 they are the accented letters and the Greek block a European
+/// user-ID needed.
+pub fn is_uid_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, b'.' | b' ' | b',' | b'-' | b'_' | b'\'')
+        || (0x80..=0xa5).contains(&c)
+        || (0xe0..=0xef).contains(&c)
+}
+
 /// `int toupper(int c)`, for the byte the host actually indexes with.
 ///
 /// Ordinal 604, `seg 1:0x54a9`. The original tests **bit 3 of the ctype table**

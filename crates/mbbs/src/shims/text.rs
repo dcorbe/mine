@@ -543,6 +543,236 @@ pub fn depad<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>,
     Ok(abi::Ret::Int(A::Int::from(removed)))
 }
 
+/// `UIDSIZ`, `INC/GCSP.H:27` -- 30. [`zonkhl`] pads its argument out to this
+/// many bytes, so a caller's buffer must be at least that big; see its own
+/// doc comment.
+const UIDSIZ: u16 = 30;
+
+/// `void stripb(char *stg)` -- `SIGNUP.C:826-834`:
+///
+///
+/// **Fully implemented.** [`depad`] with one extra step: when the caller
+/// passed `input` *itself*, `inplen` is brought back into agreement with it.
+///
+/// **The `stg == input` test is a pointer comparison, not a content one.**
+/// A caller passing a copy of `input`'s text gets the trim and leaves
+/// `inplen` alone; only the global's own address triggers the fix-up. That is
+/// reproduced exactly -- comparing the strings instead would update `inplen`
+/// on calls the vendor does not, and `inplen` is what `parsin` and `rstrin`
+/// both bound themselves by.
+///
+/// # Errors
+///
+/// If `stg` is not a valid pointer, if `input` or `inplen` is not placed, or
+/// if the read or write runs off the segment.
+pub fn stripb<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    stripb_mem::<A>(call.mem(), host, stg)?;
+    Ok(abi::Ret::Void)
+}
+
+/// [`stripb`]'s core, so [`makhdl`] can call it the way the vendor does
+/// (`SIGNUP.C:841`) rather than repeating it.
+fn stripb_mem<A: Abi>(mem: &mut A::Mem, host: &Host<A>, stg: A::Ptr) -> Result<(), ShimError> {
+    let text = stg
+        .read_cstr(mem)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let (kept, _) = crate::strings::depad(&text);
+    let capacity = text.len() as u16 + 1;
+    write_cstr_mem::<A>(mem, stg, &text[..kept], capacity)?;
+
+    let input = host
+        .globals()
+        .address("input")
+        .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+    if stg == input {
+        let len = u16::try_from(kept).map_err(|_| {
+            ShimError::Failed(format!("input is {kept} bytes, which will not fit in inplen"))
+        })?;
+        host.globals()
+            .write_int_mem(mem, "inplen", u32::from(len))
+            .map_err(|e| ShimError::Failed(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// `int isuplo(char *stg)` -- `SIGNUP.C:871-893`:
+///
+///
+/// **Fully implemented.** "Is uniformly cased": 1 when the string's letters
+/// are all lower **or** all upper, 0 when they are mixed. A string with no
+/// letters at all answers 1, both loops having run to the terminator.
+///
+/// Not one of the four routines Phase 2's plan named, and implemented anyway
+/// because [`zonkhl`] calls it, it is declared in `MAJORBBS.H:985`, and every
+/// oracle build exports it -- the same reason `cnclon` and `cncsig` are in
+/// `shims::cnc`.
+///
+/// **Why `zonkhl` asks.** A user who typed `"McDonald"` meant the capital D;
+/// one who typed `"mcdonald"` or `"MCDONALD"` did not choose a case at all,
+/// so the host is free to impose its own. This is the test that tells those
+/// apart, and it is why `zonkhl` leaves mixed-case names alone.
+///
+/// # Errors
+///
+/// If `stg` is not a valid pointer, or the read runs off the segment.
+pub fn isuplo<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    let text = stg
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(is_uniform_case(
+        text,
+    )))))
+}
+
+/// [`isuplo`]'s answer as a `bool`, so [`zonkhl`] can ask without a `Call`.
+fn is_uniform_case(text: &[u8]) -> bool {
+    let letters = || text.iter().copied().filter(u8::is_ascii_alphabetic);
+    letters().all(|c| c.is_ascii_lowercase()) || letters().all(|c| c.is_ascii_uppercase())
+}
+
+/// `void zonkhl(char *stg)` -- `SIGNUP.C:844-868`:
+///
+///
+/// **Fully implemented.** Title-cases a uniformly-cased name -- first letter
+/// of each blank-delimited word up, the rest down -- and leaves a mixed-case
+/// one exactly as typed, per [`isuplo`].
+///
+/// **It writes `UIDSIZ` bytes, not `strlen(stg)+1`.** The trailing `while`
+/// runs *past* the terminator the `for` stopped on and zeroes everything up
+/// to `stg[UIDSIZ-1]`. So a caller's buffer must be at least 30 bytes even
+/// to pass a three-letter name -- which is the point, since the name is on
+/// its way into a fixed-width Btrieve key field and the vendor wants the tail
+/// deterministic rather than whatever the stack held.
+///
+/// That is reproduced rather than trimmed to the string's length: a Btrieve
+/// record written from a buffer this host had left dirty would differ from
+/// the original's byte for byte, in a field a key is built over. A caller
+/// that passes a shorter buffer gets a `ShimError` here where the original
+/// silently corrupted whatever followed -- the one place this port is
+/// deliberately louder than its source, because the alternative is undefined
+/// behaviour rather than a different answer.
+///
+/// **The `space` flag starts set**, so the very first character is the one
+/// upper-cased; and a run of several blanks leaves it set, so `"van  der"`
+/// capitalises `d` and not the second blank.
+///
+/// # Errors
+///
+/// If `stg` is not a valid pointer, or if writing `UIDSIZ` bytes at it runs
+/// off the segment.
+pub fn zonkhl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    zonkhl_mem::<A>(call.mem(), host, stg)?;
+    Ok(abi::Ret::Void)
+}
+
+/// [`zonkhl`]'s core, so [`makhdl`] can call it the way the vendor does
+/// (`SIGNUP.C:842`).
+fn zonkhl_mem<A: Abi>(mem: &mut A::Mem, _host: &Host<A>, stg: A::Ptr) -> Result<(), ShimError> {
+    let text = stg
+        .read_cstr(mem)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    // The whole `UIDSIZ` field, so the tail past the terminator is written
+    // too -- see this routine's doc comment for why that is the point.
+    let mut out = vec![0u8; usize::from(UIDSIZ)];
+    let len = text.len().min(out.len());
+    out[..len].copy_from_slice(&text[..len]);
+
+    if is_uniform_case(&text) {
+        let mut space = true;
+        for byte in out[..len].iter_mut() {
+            if *byte == b' ' {
+                space = true;
+            } else if space {
+                *byte = crate::strings::toupper(*byte);
+                space = false;
+            } else {
+                *byte = crate::strings::tolower(*byte);
+            }
+        }
+    }
+
+    stg.write(mem, &out).map_err(|e| {
+        ShimError::Failed(format!("zonkhl pads its argument out to {UIDSIZ} bytes: {e}"))
+    })
+}
+
+/// `void makhdl(char *stg)` -- `SIGNUP.C:836-842`:
+///
+///
+/// **Fully implemented**, and the most demanded routine in Phase 2 -- six of
+/// the corpus's modules import it.
+///
+/// Trailing blanks off, then title-cased and padded to `UIDSIZ`: a name in
+/// the exact shape a Btrieve key field wants it. Both halves are called
+/// through their own `_mem` cores rather than through their `Call<A>`
+/// wrappers, because those wrappers would read `makhdl`'s own frame looking
+/// for an argument that is already in hand.
+///
+/// **Order matters and is not interchangeable.** `stripb` first, so the
+/// blanks are gone before [`zonkhl`] decides where words begin; running them
+/// the other way would leave a trailing blank inside the padded field and set
+/// `space` on a word that never comes.
+///
+/// # Errors
+///
+/// Whatever [`stripb`] or [`zonkhl`] reports -- in particular, a buffer
+/// shorter than `UIDSIZ`.
+pub fn makhdl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    stripb_mem::<A>(call.mem(), host, stg)?;
+    zonkhl_mem::<A>(call.mem(), host, stg)?;
+    Ok(abi::Ret::Void)
+}
+
+/// `int issupc(int c)` -- `SIGNUP.C:1147-1167`:
+///
+///
+/// **Fully implemented.** The signup-time tightening of
+/// [`crate::strings::is_uid_char`]: the same alphabet, minus whatever the
+/// board's two configuration switches disallow.
+///
+/// **`'_'` is not in the switch.** `isuidc` accepts it and `issupc` reaches
+/// it through the `default:` arm, so an underscore is allowed at signup
+/// whatever `fulalw` says -- while `'.'`, `','`, `'-'`, `'\''` and `' '` are
+/// gated. That asymmetry looks like an oversight in the vendor and is
+/// reproduced, because a module's own signup validation was written against
+/// it.
+///
+/// Both switches are read live from module memory on every call rather than
+/// cached, because a module may write either of them.
+///
+/// # Errors
+///
+/// If `fulalw` or `digalw` is not placed.
+pub fn issupc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let c: u32 = call.int().into();
+    let byte = u8::try_from(c).ok();
+
+    let mut read = |name: &str| {
+        host.globals()
+            .word_mem(call.mem(), name)
+            .map_err(|e| ShimError::Failed(e.to_string()))
+    };
+
+    let valid = match byte {
+        Some(b'.' | b' ' | b',' | b'-' | b'\'') => read("fulalw")? != 0,
+        // `isuidc(c) && (digalw || !isdigit(c))`. A value that is not a byte
+        // at all fails `isuidc` in C too, so it fails here.
+        Some(byte) => {
+            crate::strings::is_uid_char(byte) && (read("digalw")? != 0 || !byte.is_ascii_digit())
+        }
+        None => false,
+    };
+
+    Ok(abi::Ret::Int(A::int_from_u32(u32::from(valid))))
+}
+
 /// `void parsin(void)` -- parse `input` into `margv[]`.
 ///
 /// **Not in the v6 host source.** `MAJORBBS.C`'s `getin()` folds this
@@ -2810,6 +3040,196 @@ mod tests {
         };
         assert_eq!(n, 0, "leading padding is not padding");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  text");
+    }
+
+    /// A `UIDSIZ`-wide zeroed buffer holding `s`, which is what `zonkhl` and
+    /// `makhdl` require of their caller -- see `zonkhl`'s doc comment.
+    fn uid_buffer(f: &mut Fixture, s: &str) -> FarPtr {
+        assert!(s.len() < usize::from(UIDSIZ), "the test's own string must fit");
+        let at = f.buffer(UIDSIZ);
+        f.machine.write(at, s.as_bytes()).expect("fits");
+        at
+    }
+
+    /// `stripb` is `depad` plus an `inplen` fix-up (`SIGNUP.C:826`). Trailing
+    /// blanks go; leading ones are not padding and stay.
+    #[test]
+    fn stripb_trims_only_trailing_blanks() {
+        let mut f = Fixture::new();
+        let at = f.text("  Ranger Dan   ");
+        assert!(matches!(f.invoke(stripb, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  Ranger Dan");
+    }
+
+    /// The `stg == input` test is a **pointer** comparison (`SIGNUP.C:830`),
+    /// so `inplen` moves only when the caller passed the global itself. A
+    /// copy of the same text leaves it alone.
+    ///
+    /// This is the assertion that fails if the port compares contents: both
+    /// halves use the same text, and only the address differs.
+    #[test]
+    fn stripb_updates_inplen_only_for_input_itself() {
+        let mut f = Fixture::new();
+        f.host.globals().write(&mut f.machine, "input", b"look  ").expect("input");
+        f.host.globals().write(&mut f.machine, "inplen", &99u16.to_le_bytes()).expect("inplen");
+
+        // A different buffer holding the identical text: inplen must not move.
+        let copy = f.text("look  ");
+        assert!(matches!(f.invoke(stripb, &Fixture::far(copy)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(copy).expect("a string"), b"look");
+        assert_eq!(
+            f.host.globals().word(&f.machine, "inplen").expect("inplen"),
+            99,
+            "a copy of input's text is not input"
+        );
+
+        // `input` itself: inplen becomes its new length.
+        let input = f.host.globals().address("input").expect("input");
+        assert!(matches!(f.invoke(stripb, &Fixture::far(input)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(input).expect("a string"), b"look");
+        assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 4);
+    }
+
+    /// `isuplo` answers 1 for a string whose letters are all one case and 0
+    /// for a mixed one (`SIGNUP.C:871`). The mixed case is the whole point --
+    /// a routine that always answered 1 would pass a test of the other two.
+    #[test]
+    fn isuplo_accepts_uniform_case_and_rejects_mixed() {
+        let mut f = Fixture::new();
+        for (text, want) in [
+            ("rangerdan", 1u16),
+            ("RANGERDAN", 1),
+            ("RangerDan", 0),
+            ("ranger dan", 1),
+            ("12345", 1),        // no letters at all
+            ("", 1),             // and neither has the empty string
+            ("aB", 0),
+        ] {
+            let at = f.text(text);
+            assert_eq!(
+                f.invoke(isuplo, &Fixture::far(at)).expect("isuplo"),
+                Ret::U16(want),
+                "isuplo({text:?})"
+            );
+        }
+    }
+
+    /// `zonkhl` title-cases a uniformly-cased name and leaves a mixed-case one
+    /// exactly as typed (`SIGNUP.C:844`). Both halves are needed: a port that
+    /// always title-cased would pass the first assertion and fail the second.
+    #[test]
+    fn zonkhl_title_cases_uniform_names_and_leaves_mixed_ones() {
+        let mut f = Fixture::new();
+
+        let at = uid_buffer(&mut f, "ranger dan");
+        assert!(matches!(f.invoke(zonkhl, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"Ranger Dan");
+
+        let at = uid_buffer(&mut f, "RANGER DAN");
+        assert!(matches!(f.invoke(zonkhl, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"Ranger Dan");
+
+        // Mixed case: the user chose it, so it stands.
+        let at = uid_buffer(&mut f, "McDonald");
+        assert!(matches!(f.invoke(zonkhl, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"McDonald");
+
+        // A run of blanks leaves `space` set, so the next letter still rises.
+        let at = uid_buffer(&mut f, "van  der berg");
+        assert!(matches!(f.invoke(zonkhl, &Fixture::far(at)), Ok(Ret::Void)));
+        assert_eq!(f.machine.read_cstr(at).expect("a string"), b"Van  Der Berg");
+    }
+
+    /// `zonkhl`'s trailing `while` runs past the terminator and zeroes out to
+    /// `UIDSIZ` (`SIGNUP.C:865-867`), because the name is on its way into a
+    /// fixed-width Btrieve key field. A port that stopped at the NUL would
+    /// leave the tail holding whatever was there before, and the record
+    /// written from it would differ from the original's byte for byte.
+    #[test]
+    fn zonkhl_zero_fills_the_whole_uidsiz_field() {
+        let mut f = Fixture::new();
+        let at = f.buffer(UIDSIZ);
+        // Dirty the whole field first, so zeroing it is observable.
+        f.machine.write(at, &[b'#'; 30]).expect("fits");
+        f.machine.write(at, b"dan\0").expect("fits");
+
+        assert!(matches!(f.invoke(zonkhl, &Fixture::far(at)), Ok(Ret::Void)));
+
+        let field = f.machine.resolve(at, usize::from(UIDSIZ)).expect("in bounds").to_vec();
+        assert_eq!(&field[..3], b"Dan");
+        assert!(
+            field[3..].iter().all(|&b| b == 0),
+            "the tail past the terminator is zeroed too: {field:?}"
+        );
+    }
+
+    /// A buffer shorter than `UIDSIZ` is refused rather than silently
+    /// overrunning. The original corrupted whatever followed; this is the one
+    /// place the port is deliberately louder than its source.
+    #[test]
+    fn zonkhl_refuses_a_buffer_shorter_than_uidsiz() {
+        let mut f = Fixture::new();
+        // Four bytes from the end of the scratch segment: room for the string
+        // and nothing like room for thirty.
+        let at = FarPtr { offset: u16::MAX - 4, selector: f.text("x").selector };
+        assert!(
+            f.invoke(zonkhl, &Fixture::far(at)).is_err(),
+            "writing UIDSIZ bytes off the end of the segment must be an error"
+        );
+    }
+
+    /// `makhdl` is `stripb` then `zonkhl`, in that order (`SIGNUP.C:836`).
+    /// The trailing blanks must be gone *before* the title-casing runs, so
+    /// the padded field ends in zeros rather than in a blank.
+    #[test]
+    fn makhdl_strips_then_zonks() {
+        let mut f = Fixture::new();
+        let at = uid_buffer(&mut f, "ranger dan   ");
+        assert!(matches!(f.invoke(makhdl, &Fixture::far(at)), Ok(Ret::Void)));
+
+        let field = f.machine.resolve(at, usize::from(UIDSIZ)).expect("in bounds").to_vec();
+        assert_eq!(&field[..10], b"Ranger Dan");
+        assert!(
+            field[10..].iter().all(|&b| b == 0),
+            "stripb ran first, so no blank survives into the padded tail: {field:?}"
+        );
+    }
+
+    /// `issupc` is `isuidc` narrowed by the board's two switches
+    /// (`SIGNUP.C:1147`): `fulalw` gates the punctuation and the space,
+    /// `digalw` gates the digits. Both are flipped here, because a predicate
+    /// tested at one setting passes when it ignores the switch entirely.
+    #[test]
+    fn issupc_gates_punctuation_on_fulalw_and_digits_on_digalw() {
+        let mut f = Fixture::new();
+        let mut ask = |f: &mut Fixture, c: u8| {
+            let Ret::U16(n) = f.invoke(issupc, &[u16::from(c)]).expect("issupc") else {
+                panic!("issupc returns an int");
+            };
+            n
+        };
+
+        // Both switches are 1 by default.
+        for c in [b'A', b'z', b'.', b' ', b',', b'-', b'\'', b'5', b'_'] {
+            assert_eq!(ask(&mut f, c), 1, "{:?} with both switches set", c as char);
+        }
+        assert_eq!(ask(&mut f, b'!'), 0, "'!' is not a user-ID character at all");
+
+        f.host.globals().write(&mut f.machine, "fulalw", &0u16.to_le_bytes()).expect("fulalw");
+        for c in [b'.', b' ', b',', b'-', b'\''] {
+            assert_eq!(ask(&mut f, c), 0, "{:?} is gated by fulalw", c as char);
+        }
+        assert_eq!(
+            ask(&mut f, b'_'),
+            1,
+            "'_' reaches the default arm, so fulalw does not gate it -- \
+             the vendor's own asymmetry"
+        );
+        assert_eq!(ask(&mut f, b'A'), 1, "letters are never gated");
+
+        f.host.globals().write(&mut f.machine, "digalw", &0u16.to_le_bytes()).expect("digalw");
+        assert_eq!(ask(&mut f, b'5'), 0, "digits are gated by digalw");
+        assert_eq!(ask(&mut f, b'A'), 1, "and letters still are not");
     }
 
     #[test]

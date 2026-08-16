@@ -420,6 +420,24 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "skpwht", text::skpwht, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "depad", text::depad, Cleans::Caller, Evidence::Unclassified),
+        // `SIGNUP.C`'s handle-making helpers, Phase 2 Task 2.3. Four the
+        // corpus imports, and `isuplo`, which it does not -- `zonkhl` calls
+        // it, `MAJORBBS.H:985` declares it and every oracle build exports it,
+        // so it is implemented on the same terms as `cnclon` and `cncsig`.
+        //
+        // Here rather than in a file of their own because all five are what
+        // this module already is: transformations of a `CHAR *` the caller
+        // owns, beside `depad`, which `stripb` is built out of.
+        (MAJORBBS, "stripb", text::stripb, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SIGNUP.C")),
+        (MAJORBBS, "makhdl", text::makhdl, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SIGNUP.C")),
+        (MAJORBBS, "zonkhl", text::zonkhl, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SIGNUP.C")),
+        (MAJORBBS, "isuplo", text::isuplo, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SIGNUP.C")),
+        (MAJORBBS, "issupc", text::issupc, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SIGNUP.C")),
         (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "parsin", text::parsin, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "atol", text::atol, Cleans::Caller, Evidence::Unclassified),
