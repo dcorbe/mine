@@ -185,6 +185,10 @@ pub enum Stop {
 pub struct Helpers {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Ticks actually delivered. A program that times itself against the BIOS
+    /// clock is only as accurate as this is, so it is worth being able to say
+    /// what rate the guest really saw rather than what was intended.
+    pub ticks: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Drop for Helpers {
@@ -595,6 +599,8 @@ impl VmGuest {
         let mem = self.mem as usize;
         let run = self.run as usize;
 
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let clock_counter = Arc::clone(&counter);
         let clock_stop = Arc::clone(&stop);
         let clock = std::thread::spawn(move || {
             let ticks = (mem + BIOS_TICKS) as *mut u32;
@@ -608,6 +614,7 @@ impl VmGuest {
                 // SAFETY: the mapping outlives these threads, which the
                 // `Helpers` guard stops before `VmGuest` is dropped.
                 unsafe { ticks.write_volatile(n) };
+                clock_counter.store(n, Ordering::Relaxed);
             }
         });
 
@@ -650,6 +657,7 @@ impl VmGuest {
         Helpers {
             stop,
             threads: vec![clock, dog],
+            ticks: counter,
         }
     }
 

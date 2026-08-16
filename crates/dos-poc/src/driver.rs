@@ -96,6 +96,14 @@ pub trait Driver {
         None
     }
 
+    /// Has the driver run out of things to say?
+    ///
+    /// Distinct from returning `None`, which only means "no key at this exact
+    /// moment" -- a driver deliberately letting the guest idle is not finished.
+    fn finished(&self) -> bool {
+        true
+    }
+
     /// Why the driver stopped, for the report.
     fn ending(&self) -> String {
         "driver finished".to_string()
@@ -113,6 +121,12 @@ pub enum Step {
     ExpectCursor(String),
     /// Press a key.
     Send(Key),
+    /// Let the guest idle for this long, answering every poll with "no key".
+    ///
+    /// Without this a script cannot observe a pause at all: it answers each
+    /// poll with the next keystroke, so any wait loop exits on the first
+    /// iteration and the thing being measured never happens.
+    Wait(std::time::Duration),
 }
 
 /// Replays a fixed sequence, checking the screen as it goes.
@@ -120,6 +134,8 @@ pub enum Step {
 pub struct Script {
     steps: Vec<Step>,
     at: usize,
+    /// When the `Wait` step now at `at` began.
+    waiting_since: Option<std::time::Instant>,
     failure: Option<String>,
     /// Each `Send` consumes one idle moment; this bounds a script that keeps
     /// pressing keys at a program which never asks for another.
@@ -132,6 +148,7 @@ impl Script {
         Self {
             steps,
             at: 0,
+            waiting_since: None,
             failure: None,
             presses: 0,
             max_presses: 200,
@@ -169,6 +186,12 @@ impl Script {
                         steps.push(Step::Send(Key::Char(ch)));
                     }
                 }
+                "wait" => {
+                    let ms: u64 = rest
+                        .parse()
+                        .map_err(|_| format!("line {}: wait wants milliseconds", n + 1))?;
+                    steps.push(Step::Wait(std::time::Duration::from_millis(ms)));
+                }
                 "send" => {
                     for word in rest.split_whitespace() {
                         let key = Key::parse(word)
@@ -182,9 +205,6 @@ impl Script {
         Ok(Self::new(steps))
     }
 
-    pub fn finished(&self) -> bool {
-        self.at >= self.steps.len()
-    }
 }
 
 impl Driver for Script {
@@ -221,6 +241,15 @@ impl Driver for Script {
                     }
                     self.at += 1;
                 }
+                Step::Wait(how_long) => {
+                    let how_long = *how_long;
+                    let since = *self.waiting_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() < how_long {
+                        return None;
+                    }
+                    self.waiting_since = None;
+                    self.at += 1;
+                }
                 Step::Send(key) => {
                     let key = *key;
                     self.at += 1;
@@ -252,10 +281,19 @@ impl Driver for Script {
         self.next_key(screen)
     }
 
+    fn finished(&self) -> bool {
+        self.at >= self.steps.len()
+    }
+
     fn ending(&self) -> String {
         match &self.failure {
             Some(why) => format!("script failed: {why}"),
-            None => format!("script completed all {} steps", self.steps.len()),
+            // Saying "completed" whenever nothing explicitly failed is how a
+            // run that stopped at step 17 of 26 reported success.
+            None if self.at >= self.steps.len() => {
+                format!("script completed all {} steps", self.steps.len())
+            }
+            None => format!("script stopped at step {} of {}", self.at + 1, self.steps.len()),
         }
     }
 }

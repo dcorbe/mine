@@ -206,11 +206,24 @@ impl Terminal {
             revents: 0,
         };
         // SAFETY: polling our own stdin with a bounded timeout.
-        let ready = unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 20) };
-        (ready > 0).then(|| self.byte()).flatten()
+        let n = unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 20) };
+        // Same trap as `ready`: the count includes POLLHUP and POLLERR, and
+        // reading on those blocks or returns nothing.
+        if n > 0 && fds.revents & libc::POLLIN != 0 {
+            self.byte()
+        } else {
+            None
+        }
     }
 
     /// Is a byte already waiting? Never blocks.
+    ///
+    /// The count `poll` returns is not the answer. It counts descriptors with
+    /// *any* event, and `POLLHUP` and `POLLERR` are reported whether or not you
+    /// asked for them -- so a hung-up terminal answers "ready" forever. Since
+    /// this gates the repaint, that turns every keyboard poll the guest makes
+    /// into a full screen snapshot and redraw, which is precisely the shape of
+    /// a pause that only appears interactively.
     fn ready(&self) -> bool {
         let mut fds = libc::pollfd {
             fd: libc::STDIN_FILENO,
@@ -218,7 +231,8 @@ impl Terminal {
             revents: 0,
         };
         // SAFETY: polling our own stdin with a zero timeout.
-        unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 0) > 0 }
+        let n = unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 0) };
+        n > 0 && fds.revents & libc::POLLIN != 0
     }
 
     fn read_key(&mut self) -> Option<Key> {

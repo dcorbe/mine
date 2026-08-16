@@ -78,6 +78,7 @@ fn main() -> io::Result<()> {
     let mut script_path: Option<String> = None;
     let mut trace = false;
     let mut strict = false;
+    let mut max_calls = MAX_CALLS;
     let mut interactive = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -87,6 +88,9 @@ fn main() -> io::Result<()> {
             "--script" => script_path = it.next().cloned(),
             "--trace" => trace = true,
             "--strict" => strict = true,
+            "--max-calls" => {
+                max_calls = it.next().and_then(|v| v.parse().ok()).unwrap_or(MAX_CALLS);
+            }
             "--interactive" | "-i" => interactive = true,
             other => {
                 if !tail.is_empty() {
@@ -137,7 +141,7 @@ fn main() -> io::Result<()> {
     vm.enter(at.cs, at.ip, at.ss, at.sp, at.psp_seg, at.psp_seg)?;
     // A human takes as long as they take, so the watchdog that rescues an
     // unattended probe from a spinning guest must not fire on them.
-    let _helpers = vm.helpers(if interactive { 24 * 60 * 60 * 1000 } else { 10_000 });
+    let helpers = vm.helpers(if interactive { 24 * 60 * 60 * 1000 } else { 10_000 });
 
     // The sandbox. Everything the guest opens resolves beneath this one
     // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
@@ -184,18 +188,25 @@ fn main() -> io::Result<()> {
     // Blocked on a person. Lumping this in with our own work makes the harness
     // look like the slow part when it is simply waiting to be typed at.
     let mut waiting = std::time::Duration::ZERO;
+    // The busiest stretch between two moments the guest asked for input --
+    // which is exactly one user-visible action, so this characterises the
+    // pause rather than averaging it away over a whole session.
+    let mut since_settle = (0u32, std::time::Duration::ZERO, std::time::Instant::now());
+    let mut busiest = (0u32, std::time::Duration::ZERO, std::time::Duration::ZERO);
 
     let ending = loop {
         // The cap rescues an unattended probe from a program looping on a call
         // we keep refusing. A person playing a game is not that, and LORD idles
         // by polling -- it burns thousands of calls just waiting for a turn.
-        if !interactive && calls >= MAX_CALLS {
-            break format!("stopped after {MAX_CALLS} calls");
+        if !interactive && calls >= max_calls {
+            break format!("stopped after {max_calls} calls");
         }
         let ran = std::time::Instant::now();
         let stop = vm.run()?;
         let took = ran.elapsed();
         in_guest += took;
+        since_settle.0 += 1;
+        since_settle.1 += took;
         if took > longest.0 {
             longest = (took, format!("{stop:?}"));
         }
@@ -247,7 +258,10 @@ fn main() -> io::Result<()> {
                             // exactly as it does at a blocking read -- otherwise
                             // an exhausted script leaves the guest polling for a
                             // key that will never come.
-                            None if !interactive => break script.ending(),
+                            // "No key right now" is not "nothing left to say":
+                            // a `wait` step deliberately answers nothing while
+                            // the guest gets on with something.
+                            None if !interactive && script.finished() => break script.ending(),
                             None => {}
                         }
                     }
@@ -265,6 +279,10 @@ fn main() -> io::Result<()> {
                         (video.cursor_row, video.cursor_col),
                         video.cursor_visible,
                     );
+                    if since_settle.0 > busiest.0 {
+                        busiest = (since_settle.0, since_settle.1, since_settle.2.elapsed());
+                    }
+                    since_settle = (0, std::time::Duration::ZERO, std::time::Instant::now());
                     settles += 1;
                     if trace && !interactive {
                         println!(
@@ -274,7 +292,14 @@ fn main() -> io::Result<()> {
                         );
                     }
                     let idle = std::time::Instant::now();
-                    let answer = script.next_key(&screen);
+                    // A driver with nothing to say *yet* is not finished. The
+                    // guest is blocked, so the only correct answer is to wait
+                    // for it rather than to end the run.
+                    let mut answer = script.next_key(&screen);
+                    while answer.is_none() && !script.finished() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        answer = script.next_key(&screen);
+                    }
                     waiting += idle.elapsed();
                     match answer {
                         Some(key) => {
@@ -460,6 +485,18 @@ fn main() -> io::Result<()> {
         slept.as_secs_f64(),
         waiting.as_secs_f64(),
         other.as_secs_f64()
+    );
+    let ticks = helpers.ticks.load(std::sync::atomic::Ordering::Relaxed);
+    println!(
+        "bios clock: {ticks} ticks over {:.1}s = {:.2} Hz (should be 18.20)",
+        started.elapsed().as_secs_f64(),
+        f64::from(ticks) / started.elapsed().as_secs_f64()
+    );
+    println!(
+        "busiest single action: {} calls, {:.0} ms in the guest, {:.0} ms wall",
+        busiest.0,
+        busiest.1.as_secs_f64() * 1000.0,
+        busiest.2.as_secs_f64() * 1000.0
     );
     println!(
         "longest single guest run: {:.0} ms, ended in {}",
