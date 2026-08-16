@@ -1584,6 +1584,40 @@ impl<A: Abi> Block<A> {
             why,
         };
 
+        // A v6 file has nothing deferred to rebuild here, and running this
+        // function's v5 arithmetic over one would corrupt it.
+        //
+        // [`Self::insert_v6`] maintains the index **inline**: it rebuilds the
+        // key's tree, relocates the root through the `"PP"` allocation table
+        // and rewrites the file control record's shadow pair, all before it
+        // returns. That is not an optimisation, it is forced -- every v6 write
+        // relocates the page it touches, so there is no way to write a record
+        // now and fix its index later.
+        //
+        // Everything below this point assumes v5, in three separate places:
+        // `KEY_ROOT` is read as a page number (a v6 root is
+        // `0x8000_0000 | logical_id`), `pages::walk`/`pages::write_page`
+        // address pages physically (a v6 page number is a logical id resolved
+        // through the allocation table), and `pages::append_page` grows the
+        // file without claiming the new page in that table.
+        //
+        // The bounds check further down is what stopped the first of those
+        // from doing damage -- it refused `0x8000_0001` as "not inside an
+        // 8-page file" rather than letting `pages::walk` follow it into a real
+        // page and write a rebuilt index over whatever lived there. That
+        // refusal is how this was found: it stopped The Rose 3.0NT's boot in
+        // `dfaclose`, after the module had otherwise finished init.
+        //
+        // So this early return is a genuine no-op, not a gap papered over --
+        // but it is only a no-op **while v6 write is insert-only**. `update`
+        // and `delete` both refuse for v6 today (see their own doc comments).
+        // If either is implemented and defers index work to close time, this
+        // has to become a real v6 reindex instead.
+        if self.geometry.version == Version::V6 {
+            self.dirty = false;
+            return Ok(());
+        }
+
         let records = self.records.as_ref().ok_or_else(|| {
             fail("reindex called before the records were loaded".to_owned())
         })?;
@@ -3002,6 +3036,82 @@ mod tests {
     /// A `Block` over `seed`'s file, built directly rather than through
     /// `Btrieve::open` -- this test has no module and no heap, only the file
     /// and the geometry a real `opnbtv` would have read out of it.
+    /// Closing a v6 file this host inserted into must not run a v5-shaped
+    /// reindex over it.
+    ///
+    /// Found by booting The Rose 3.0NT (PE32), which got all the way through
+    /// init and then stopped on:
+    ///
+    /// ```text
+    /// dfaclose: rci_univ.dat: key 0: root page 2147483649 is not inside a 8-page file
+    /// ```
+    ///
+    /// `2147483649` is `0x8000_0001` — a v6 key root, which encodes
+    /// `0x8000_0000 | logical_id` rather than a page number ([`Block::insert_v6`]
+    /// strips exactly that bit). `Btrieve::close` reindexes any block whose
+    /// `dirty` flag is set, `insert_v6` sets it, and [`Block::reindex`] read
+    /// that root as a literal page and bounds-checked it against the file —
+    /// a check no v6 file can ever pass.
+    ///
+    /// **The refusal was the good outcome.** Had the bounds check not been
+    /// there, `pages::walk` would have followed `0x8000_0001` as a physical
+    /// page number into a file that has eight, and the rebuilt index would
+    /// have been written over whatever it landed on. This is the same shape
+    /// as the trap `docs/2026-08-15-btrieve-v5-v6-divergence.md` closes with:
+    /// a v5 rule applied to a v6 file addresses a real page and produces a
+    /// plausible wrong answer.
+    #[test]
+    fn a_v6_insert_survives_the_close_that_would_reindex_a_v5_file() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let dir = crate::testing::scratch("btv-v6-reindex");
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&fixture, &path).expect("copy fixture");
+
+        let mut block = block(path.clone());
+        block.name = "V6EMPTY1KEY.DAT".to_owned();
+        block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.maxlen = block.geometry.reclen;
+
+        let mut bytes = vec![0u8; usize::from(block.geometry.reclen)];
+        bytes[..4].copy_from_slice(b"ABCD");
+        let position = block.insert(&bytes).expect("a v6 insert");
+        assert!(block.dirty(), "the insert wrote, so the block is dirty");
+
+        // This is what `Btrieve::close` does with a dirty block, and what The
+        // Rose's boot died on.
+        block.reindex().expect("closing a v6 file must not run a v5 reindex over it");
+        assert!(!block.dirty(), "reindex clears the flag either way");
+
+        // And the index `insert_v6` built has to still be there afterwards --
+        // a `reindex` that "succeeded" by doing something destructive would
+        // pass the line above and fail here.
+        let file = std::fs::read(&path).expect("readable");
+        let page_size = block.geometry.page;
+        let map = v6::Map::read(&file, page_size).expect("the allocation table");
+        let key = &block.keys[0];
+        let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+        let root_at = definition + pages::fcr::KEY_ROOT;
+        let raw_root = pages::long(&file[root_at..root_at + 4]);
+        assert_eq!(
+            raw_root & 0x8000_0000,
+            0x8000_0000,
+            "the v6 marker bit must survive the close"
+        );
+        let root_physical = map
+            .physical(raw_root & 0x7fff_ffff)
+            .expect("the root is a claimed logical page");
+        let start = root_physical as usize * usize::from(page_size);
+        let index = pages::decode_index_page(&file[start..start + usize::from(page_size)], key.shape())
+            .expect("the root index page");
+        assert!(
+            index.entries.iter().any(|(_, head, _)| *head == position),
+            "the index must still point at the record after the close"
+        );
+    }
+
     /// Task 8 of `docs/plans/2026-08-15-host-api-surface-track-b.md`: is
     /// `version()`'s `3..=5` range real, or is v3 read with v5 rules?
     ///
