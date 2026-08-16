@@ -10,6 +10,7 @@
 //! Measured cost of one round trip on this box: 3.33 us -- see
 //! `re/spikes/kvm_realmode.c`, from which this is grown.
 
+use std::collections::BTreeMap;
 use std::io;
 
 use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
@@ -24,7 +25,11 @@ pub const TRAP_PORT: u16 = 0xe6;
 /// userspace when there is no in-kernel irqchip, whereas an unclaimed port is
 /// unconditional. `al` is written to a port whose data we discard, so the stub
 /// clobbers no guest register at all.
-const STUB: [u8; 3] = [0xe6, TRAP_PORT as u8, 0xcf];
+/// Four bytes per vector, not three, so that the vector a trap came from is
+/// `(rip - 2) / STUB_STRIDE` -- the disambiguation-by-address the design note
+/// describes, made into arithmetic instead of a lookup.
+const STUB: [u8; 4] = [0xe6, TRAP_PORT as u8, 0xcf, 0x90];
+const STUB_STRIDE: u16 = 4;
 
 const KVM_GET_API_VERSION: libc::c_ulong = 0xae00;
 const KVM_CREATE_VM: libc::c_ulong = 0xae01;
@@ -146,15 +151,44 @@ struct KvmRun {
     io_data_offset: u64,
 }
 
+const KVM_EXIT_INTR: u32 = 10;
+
+/// Physical address of the BIOS tick count at `0040:006C`, which every DOS-era
+/// runtime treats as the clock.
+const BIOS_TICKS: usize = 0x46c;
+/// 18.2 Hz, the rate the 8253 was divided down to and the rate every program
+/// written before 1995 assumes.
+const TICK_NANOS: u64 = 54_925_400;
+
 /// Why the guest stopped.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Stop {
-    /// The guest executed a hooked interrupt and is waiting to be serviced.
-    Trap,
+    /// The guest executed this interrupt vector and is waiting to be serviced.
+    Trap(u8),
     /// The guest halted.
     Halted,
+    /// The watchdog cut in: the guest is running but not asking for anything.
+    Interrupted,
     /// Something this proof of concept does not model.
     Unexpected(u32),
+}
+
+/// Stops the helper threads when dropped, and *waits* for them.
+///
+/// Joining is not tidiness: the clock thread writes into the guest mapping, so
+/// a thread still sleeping when `VmGuest` unmaps it wakes to a use-after-free.
+pub struct Helpers {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Helpers {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 fn last_err<T>() -> io::Result<T> {
@@ -173,6 +207,13 @@ pub struct VmGuest {
     regs: KvmRegs,
     sregs: KvmSregs,
     regs_dirty: bool,
+    sregs_dirty: bool,
+    stub_seg: u16,
+    /// Every hardware port the guest touched that is not our trap, and how
+    /// often. A real DOS box has hardware; a 1994 Borland startup will poke at
+    /// it, and refusing to answer stops the program dead. Answering `0xff` and
+    /// counting is how we find out what actually needs modelling.
+    pub port_log: BTreeMap<u16, u32>,
 }
 
 impl VmGuest {
@@ -268,6 +309,9 @@ impl VmGuest {
             regs: KvmRegs::default(),
             sregs: KvmSregs::default(),
             regs_dirty: false,
+            sregs_dirty: false,
+            stub_seg: 0,
+            port_log: BTreeMap::new(),
         })
     }
 
@@ -307,14 +351,46 @@ impl VmGuest {
         self.load(at, &entry)
     }
 
-    /// Install the trap stub at `seg:0` and hook `vector` to it.
+    /// Install the trap stub for `vector` and point the IVT at it.
     pub fn hook(&mut self, vector: u8, stub_seg: u16) -> io::Result<()> {
-        self.load(stub_seg as usize * 16, &STUB)?;
-        self.set_ivt(vector, stub_seg, 0)
+        let off = u16::from(vector) * STUB_STRIDE;
+        self.load(stub_seg as usize * 16 + off as usize, &STUB)?;
+        self.stub_seg = stub_seg;
+        self.set_ivt(vector, stub_seg, off)
     }
 
-    /// Put the vCPU in real mode at `cs:ip` with a stack at `ss:sp`.
+    /// Hook every interrupt.
+    ///
+    /// An unhooked vector is four zero bytes, so a program calling an
+    /// interrupt we have not modelled jumps to `0000:0000` and executes the
+    /// vector table as code -- which presents as an unexplained hang rather
+    /// than as "you are missing int 10h". Hooking all 256 turns every such
+    /// gap into a named report.
+    pub fn hook_all(&mut self, stub_seg: u16) -> io::Result<()> {
+        for vector in 0..=u8::MAX {
+            self.hook(vector, stub_seg)?;
+        }
+        Ok(())
+    }
+
+    /// Put the vCPU in real mode at `cs:ip` with a stack at `ss:sp`, and
+    /// `DS`/`ES` pointing at the same place -- the `.COM` convention.
     pub fn start(&mut self, cs: u16, ip: u16, ss: u16, sp: u16) -> io::Result<()> {
+        self.enter(cs, ip, ss, sp, ss, ss)
+    }
+
+    /// Enter with every segment stated. DOS hands an `.EXE` its PSP in
+    /// `DS` and `ES` while `SS` is the program's own stack, so the `.COM`
+    /// shorthand above cannot express it.
+    pub fn enter(
+        &mut self,
+        cs: u16,
+        ip: u16,
+        ss: u16,
+        sp: u16,
+        ds: u16,
+        es: u16,
+    ) -> io::Result<()> {
         let mut sregs = KvmSregs::default();
         // SAFETY: fills `sregs` with the vcpu's reset state, which is already
         // real-mode shaped -- we only retarget the segments we care about.
@@ -326,11 +402,17 @@ impl VmGuest {
         sregs.cs.base = (cs as u64) << 4;
         sregs.cs.limit = 0xffff;
 
-        sregs.ds.selector = ss;
-        sregs.ds.base = (ss as u64) << 4;
+        sregs.ds.selector = ds;
+        sregs.ds.base = (ds as u64) << 4;
         sregs.ds.limit = 0xffff;
+
         sregs.es = sregs.ds;
+        sregs.es.selector = es;
+        sregs.es.base = (es as u64) << 4;
+
         sregs.ss = sregs.ds;
+        sregs.ss.selector = ss;
+        sregs.ss.base = (ss as u64) << 4;
 
         sregs.cr0 &= !1u64; // clear PE: this is real mode, not a switch into it
 
@@ -352,6 +434,7 @@ impl VmGuest {
         }
         self.regs = regs;
         self.regs_dirty = false;
+        self.sregs_dirty = false;
         Ok(())
     }
 
@@ -374,6 +457,14 @@ impl VmGuest {
             }
             self.regs_dirty = false;
         }
+        if self.sregs_dirty {
+            let sregs = std::ptr::from_ref(&self.sregs);
+            // SAFETY: `sregs` outlives the call.
+            if unsafe { libc::ioctl(self.vcpu, KVM_SET_SREGS, sregs) } < 0 {
+                return last_err();
+            }
+            self.sregs_dirty = false;
+        }
 
         loop {
             // SAFETY: KVM_RUN takes no argument.
@@ -381,7 +472,18 @@ impl VmGuest {
             if rc < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+                    // The watchdog took the CPU back. The vCPU is stopped, so
+                    // its registers can be read to say where the guest is.
+                    let regs = std::ptr::from_mut(&mut self.regs);
+                    // SAFETY: both outlive their calls.
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_REGS, regs) } < 0 {
+                        return last_err();
+                    }
+                    let sregs = std::ptr::from_mut(&mut self.sregs);
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, sregs) } < 0 {
+                        return last_err();
+                    }
+                    return Ok(Stop::Interrupted);
                 }
                 return Err(err);
             }
@@ -397,11 +499,144 @@ impl VmGuest {
                     if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, sregs) } < 0 {
                         return last_err();
                     }
-                    Ok(Stop::Trap)
+                    // KVM leaves `rip` at the `out` on an I/O exit rather
+                    // than past it, so do not "correct" for the instruction
+                    // length: with a 4-byte stride, integer division lands on
+                    // the right vector whether rip is at the `out` or after it.
+                    Ok(Stop::Trap((self.regs.rip as u16 / STUB_STRIDE) as u8))
+                }
+                KVM_EXIT_IO => {
+                    self.answer_unclaimed_port();
+                    continue;
                 }
                 KVM_EXIT_HLT => Ok(Stop::Halted),
+                KVM_EXIT_INTR => {
+                    let regs = std::ptr::from_mut(&mut self.regs);
+                    // SAFETY: both outlive their calls.
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_REGS, regs) } < 0 {
+                        return last_err();
+                    }
+                    let sregs = std::ptr::from_mut(&mut self.sregs);
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, sregs) } < 0 {
+                        return last_err();
+                    }
+                    Ok(Stop::Interrupted)
+                }
                 other => Ok(Stop::Unexpected(other)),
             };
+        }
+    }
+
+    /// Satisfy a port the guest touched that we do not model: reads see all
+    /// ones, writes go nowhere. This is what an absent device looks like on a
+    /// real bus, and it keeps the program running instead of stopping at the
+    /// first `in al, dx` its runtime happens to do.
+    fn answer_unclaimed_port(&mut self) {
+        // SAFETY: `run` is a live mapping of at least `run_size` bytes.
+        let (port, direction, size, count, offset) = unsafe {
+            let r = &*self.run;
+            (
+                r.io_port,
+                r.io_direction,
+                r.io_size as usize,
+                r.io_count as usize,
+                r.io_data_offset as usize,
+            )
+        };
+        *self.port_log.entry(port).or_insert(0) += 1;
+
+        const KVM_EXIT_IO_IN: u8 = 0;
+        if direction != KVM_EXIT_IO_IN {
+            return;
+        }
+        let Some(bytes) = size.checked_mul(count) else {
+            return;
+        };
+        if offset.saturating_add(bytes) > self.run_size {
+            return;
+        }
+        // SAFETY: bounds checked against the mapping just above.
+        unsafe {
+            std::ptr::write_bytes(self.run.cast::<u8>().add(offset), 0xff, bytes);
+        }
+    }
+
+    /// Where the guest is now, for diagnostics.
+    pub fn cs_ip(&self) -> (u16, u16) {
+        (self.sregs.cs.selector, self.regs.rip as u16)
+    }
+
+    /// Start the BIOS clock, and a watchdog that interrupts `KVM_RUN` after
+    /// `watchdog_ms` of the guest not asking for anything.
+    ///
+    /// The clock is the clearest demonstration of what this architecture is:
+    /// guest physical memory is an ordinary shared mapping, so a *host thread*
+    /// bumps the tick count at `0040:006C` while the guest is running natively
+    /// on another core. No trap, no exit, no coordination. A Turbo Pascal
+    /// runtime calibrating its delay loop spins forever without it.
+    pub fn helpers(&mut self, watchdog_ms: u64) -> Helpers {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mem = self.mem as usize;
+        let run = self.run as usize;
+
+        let clock_stop = Arc::clone(&stop);
+        let clock = std::thread::spawn(move || {
+            let ticks = (mem + BIOS_TICKS) as *mut u32;
+            let mut n: u32 = 0;
+            while !clock_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_nanos(TICK_NANOS));
+                if clock_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                n = n.wrapping_add(1);
+                // SAFETY: the mapping outlives these threads, which the
+                // `Helpers` guard stops before `VmGuest` is dropped.
+                unsafe { ticks.write_volatile(n) };
+            }
+        });
+
+        // A spinning guest never re-enters KVM_RUN, so `immediate_exit` alone
+        // cannot reach it -- the kernel only reads that on entry. The only way
+        // to take the CPU back from a guest that is asking for nothing is to
+        // signal the thread blocked in the ioctl.
+        extern "C" fn nudge(_: libc::c_int) {}
+        // SAFETY: installing a no-op handler with no SA_RESTART, so that the
+        // interrupted `ioctl` reports EINTR rather than being resumed.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = nudge as *const () as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut());
+        }
+        // SAFETY: both are plain queries about the calling thread.
+        let (pid, tid) = unsafe {
+            (
+                libc::getpid(),
+                libc::syscall(libc::SYS_gettid) as libc::pid_t,
+            )
+        };
+        let _ = run;
+
+        let dog_stop = Arc::clone(&stop);
+        let dog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(watchdog_ms);
+            while !dog_stop.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= deadline {
+                    // SAFETY: signalling a thread of our own process.
+                    unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR1) };
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        Helpers {
+            stop,
+            threads: vec![clock, dog],
         }
     }
 
@@ -470,6 +705,21 @@ impl DosGuest for VmGuest {
         self.regs.rsi = (self.regs.rsi & !0xffff) | regs.si as u64;
         self.regs.rdi = (self.regs.rdi & !0xffff) | regs.di as u64;
         self.regs_dirty = true;
+
+        // Some calls answer in a segment register -- `35h` returns the vector
+        // in ES:BX, `2Fh` the DTA in ES:BX, `62h` the PSP in BX. Dropping the
+        // segment half silently hands the program a pointer into whatever it
+        // happened to have in ES, so this is not optional.
+        if regs.ds != self.sregs.ds.selector {
+            self.sregs.ds.selector = regs.ds;
+            self.sregs.ds.base = (regs.ds as u64) << 4;
+            self.sregs_dirty = true;
+        }
+        if regs.es != self.sregs.es.selector {
+            self.sregs.es.selector = regs.es;
+            self.sregs.es.base = (regs.es as u64) << 4;
+            self.sregs_dirty = true;
+        }
     }
 
     /// Write the carry flag into the `FLAGS` image the stub's `iret` will pop.

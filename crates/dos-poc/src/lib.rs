@@ -17,7 +17,9 @@
 //! `m16`'s signal handler would be a fourth, and is deliberately absent here so
 //! that this crate cannot collide with the work in flight on that branch.
 
+pub mod bios;
 pub mod dos;
 pub mod guest;
 pub mod kvm;
+pub mod mz;
 pub mod testguest;

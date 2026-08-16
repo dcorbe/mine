@@ -5,7 +5,7 @@
 //! `Vec<u8>` in a unit test, and would serve an `m16` signal handler without
 //! changing a line.
 
-use crate::guest::{DosFault, DosGuest, DosRegs};
+use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
 
 /// DOS error codes, as returned in AX with CF set.
 pub const ERR_INVALID_FUNCTION: u16 = 0x01;
@@ -70,6 +70,18 @@ fn fail<G: DosGuest>(g: &mut G, mut regs: DosRegs, code: u16) -> Outcome {
     Outcome::Continue
 }
 
+/// Which `AH` values [`dispatch`] actually services.
+///
+/// Exposed so a caller can tell "the program asked for something we do not
+/// have" apart from "the program made a call that legitimately failed" --
+/// both look like CF set from inside the guest.
+pub fn is_implemented(ah: u8) -> bool {
+    matches!(
+        ah,
+        0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x30 | 0x35 | 0x40 | 0x44 | 0x4c
+    )
+}
+
 /// Service one `int 21h`.
 pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
     let mut regs = g.regs();
@@ -109,6 +121,35 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
             ok(g, regs)
         }
 
+        // 25h -- set interrupt vector AL to DS:DX.
+        //
+        // In a real-mode guest the IVT *is* guest memory, so this is a plain
+        // four-byte store through the seam rather than anything KVM-specific.
+        // (A protected-mode edge has no IVT and would have to model one; not
+        // every DOS call is as mode-agnostic as the file services.)
+        0x25 => {
+            let at = DosPtr::new(0, u16::from(regs.al()) * 4);
+            let mut entry = [0u8; 4];
+            entry[0..2].copy_from_slice(&regs.dx.to_le_bytes());
+            entry[2..4].copy_from_slice(&regs.ds.to_le_bytes());
+            if let Err(f) = g.write(at, &entry) {
+                return Outcome::Fault(f);
+            }
+            ok(g, regs)
+        }
+
+        // 35h -- get interrupt vector AL, answered in ES:BX.
+        0x35 => {
+            let at = DosPtr::new(0, u16::from(regs.al()) * 4);
+            let entry = match g.read(at, 4) {
+                Ok(b) => [b[0], b[1], b[2], b[3]],
+                Err(f) => return Outcome::Fault(f),
+            };
+            regs.bx = u16::from_le_bytes([entry[0], entry[1]]);
+            regs.es = u16::from_le_bytes([entry[2], entry[3]]);
+            ok(g, regs)
+        }
+
         // 30h -- get DOS version.
         0x30 => {
             let (major, minor) = dos.version;
@@ -133,6 +174,24 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
             dos.out.extend_from_slice(&bytes);
             regs.ax = len as u16;
             ok(g, regs)
+        }
+
+        // 44h/00h -- get device information for handle BX.
+        //
+        // A C or Pascal runtime asks this of every handle it opens, to decide
+        // whether it is talking to a file or a console. Answering wrongly makes
+        // a runtime buffer output it should have flushed, or vice versa.
+        0x44 if regs.al() == 0 => {
+            // Bit 7 marks a character device; bits 0-1 mark it as the console.
+            const CON: u16 = 0x80 | 0x02 | 0x01;
+            match regs.bx {
+                0 | 1 | 2 => {
+                    regs.dx = CON;
+                    regs.ax = CON;
+                    ok(g, regs)
+                }
+                _ => fail(g, regs, ERR_INVALID_HANDLE),
+            }
         }
 
         // 4Ch -- terminate with the return code in AL.

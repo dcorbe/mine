@@ -74,7 +74,7 @@ fn main() -> io::Result<()> {
 
     let exit = loop {
         match vm.run()? {
-            Stop::Trap => {
+            Stop::Trap(_) => {
                 calls += 1;
                 match dispatch(&mut vm, &mut dos) {
                     Outcome::Continue => {}
@@ -86,6 +86,8 @@ fn main() -> io::Result<()> {
                 }
             }
             Stop::Halted => break 0,
+            // This demo runs no helper threads, so nothing can interrupt it.
+            Stop::Interrupted => break -3,
             Stop::Unexpected(reason) => {
                 eprintln!("unexpected KVM exit reason {reason}");
                 break -2;
