@@ -452,6 +452,185 @@ pub fn prfmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `VOID dspmsg(INT msgno, CHAR *parm1, CHAR *parm2, CHAR *parm3)` --
+/// `BBSUTILS.C:32-39` -- print a message, picking the ANSI variant when the
+/// caller's account wants ANSI.
+///
+///
+/// **The ANSI variant is the message *after* it.** `ANSON` is 1
+/// (`INC/UStructs.h:60`), and the convention the `.MSG` file follows is that
+/// an ANSI-capable message is written as a pair, plain first. So a module
+/// that hands `dspmsg` message *n* is really naming two messages, and getting
+/// the direction wrong prints the wrong one for every ANSI user rather than
+/// failing.
+///
+/// Three fixed `CHAR *` parameters, not a vararg tail -- but they reach the
+/// format through exactly the same [`crate::fmt::format_call`] path
+/// [`prfmsg`] uses, because after `msgno` is read the call's cursor is
+/// already sitting on them and the format string decides how many it
+/// consumes.
+///
+/// # Errors
+///
+/// If the chosen message is not in the current block, or formatting fails.
+pub fn dspmsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let msgno = Into::<u32>::into(call.int()) as u16;
+    let ansi = text::channel_ansi_mem(call.mem(), host);
+    let chosen = if ansi { msgno.wrapping_add(1) } else { msgno };
+
+    let at = message_mem(call.mem(), host, chosen)?;
+    let (rendered, _) = format_call(call, at)?;
+    text::append_mem(call.mem(), host, &rendered)?;
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID inimsg(UINT maxsiz)` -- `MCVAPI.C:37-51` -- make sure the message
+/// buffer is at least this big.
+///
+///
+/// **Monotonic**: a smaller request after a larger one does nothing at all,
+/// which is the whole of the `mxmssz < maxsiz` guard and the one behaviour
+/// worth pinning.
+///
+/// The vendor keeps a single shared `msgbuf` that `rawmsg` reads each message
+/// into. This host interns each message at its own exact length instead
+/// ([`crate::messages`]), so there is no one buffer to allocate -- the size is
+/// recorded rather than acted on. That is not a stub: `inimsg`'s promise to
+/// the module is "there is room for a message this big", and a host whose
+/// messages are individually sized keeps that promise for every value.
+///
+/// # Errors
+///
+/// Never.
+pub fn inimsg<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let maxsiz = Into::<u32>::into(call.int()) as u16;
+    host.grow_msgbuf(maxsiz);
+    Ok(abi::Ret::Void)
+}
+
+/// `MAXCHG` (`SETCNF.C:44`) -- how many `setcnf` changes fit before the
+/// vendor calls `catastro`.
+const MAXCHG: usize = 100;
+
+/// `VOID setcnf(CHAR *optnam, CHAR *optval)` -- `SETCNF.C:56-76` -- record a
+/// configuration change for a later `applyem`.
+///
+///
+/// Pure bookkeeping: nothing is written to any file until [`applyem`] runs.
+/// The first `setcnf` after an `applyem` clears the list, which is what the
+/// `applied` flag is for -- so the changes accumulate in rounds rather than
+/// forever.
+///
+/// **The bound is enforced one change earlier than the vendor's.** `onams`
+/// and `ovals` are `[MAXCHG]`, so writing `onams[nchgs]` with `nchgs == 100`
+/// is already one past the end -- the vendor stores out of bounds and *then*
+/// calls `catastro` on the next line. The overrun is the bug; the `catastro`
+/// is the intent. This refuses on the 101st change without writing, which
+/// reaches the same "the board stops" outcome the vendor's `catastro`
+/// reaches, without reproducing the write.
+///
+/// # Errors
+///
+/// If either string is unreadable, or this is the 101st change of a round.
+pub fn setcnf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let optnam = call.ptr();
+    let optval = call.ptr();
+
+    let name = optnam
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("setcnf: {e}")))?
+        .to_vec();
+    let value = optval
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("setcnf: {e}")))?
+        .to_vec();
+
+    if !host.record_setcnf(name, value, MAXCHG) {
+        return Err(ShimError::Failed(format!(
+            "setcnf: TOO MANY CHANGES -- more than MAXCHG ({MAXCHG}) options \
+             set without an applyem between them, which is where the vendor \
+             calls catastro (SETCNF.C:74)"
+        )));
+    }
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID applyem(CHAR *filnam)` -- `SETCNF.C:78-139` -- rewrite a `.MSG` file
+/// with everything [`setcnf`] has recorded.
+///
+/// **Refused: it is the MSGRDR subsystem, and this host has none of it.** The
+/// body is sixty lines over `inilingo`, `inimsgrdr`, `rdmsg`, `scanalt`,
+/// `litopts`, `lotype`, `putval` and `loadtv` -- a `.MSG` reader/writer that
+/// parses the file's option syntax, walks its alternate-language blocks, and
+/// rewrites it through a temporary file. Not one of those exists here.
+///
+/// **`setcnf` without `applyem` accumulates settings nobody reads**, and that
+/// is worth saying plainly rather than leaving to look like an oversight: a
+/// module that calls `setcnf` and then `applyem` will be stopped at the
+/// `applyem`, which is the honest place to stop it. Answering `Ok` would
+/// leave the module believing its configuration had been written to disk.
+///
+/// # Errors
+///
+/// Always.
+pub fn applyem<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let filnam = call.ptr();
+    let name = filnam
+        .read_cstr(call.mem())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .unwrap_or_else(|_| "?".to_owned());
+    Err(ShimError::Failed(format!(
+        "applyem({name:?}): rewriting a .MSG file needs the MSGRDR subsystem \
+         -- inilingo, inimsgrdr, rdmsg, scanalt, litopts, lotype, putval and \
+         loadtv (SETCNF.C:88-131) -- and this host implements none of it. The \
+         setcnf changes recorded so far have therefore not been written \
+         anywhere"
+    )))
+}
+
+/// `UINT hexopt(INT msgnum, UINT floor, UINT ceiling)` -- `MCVAPI.C:252-266`
+/// -- a hexadecimal option from the current message file.
+///
+///
+/// [`numopt`]'s shape with base 16, and it reaches the message text the same
+/// way -- the plan this was written against expected `rawmsg` to be missing
+/// and `hexopt` to depend on implementing it first; `rawmsg` is in fact
+/// already registered (`shims/mod.rs`), and the value is read through the
+/// same [`read_mem`]/[`crate::msg::value`] pair every other `*opt` uses.
+///
+/// Both of the vendor's `catastro` calls are errors -- a malformed value and
+/// an out-of-range one -- and `catastro` stops the board there too, so they
+/// are refusals here rather than an invented default.
+///
+/// # Errors
+///
+/// If the message is missing, its value is not hexadecimal, or it falls
+/// outside `floor..=ceiling`.
+pub fn hexopt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let number = Into::<u32>::into(call.int()) as u16;
+    let floor = Into::<u32>::into(call.int()) as u16;
+    let ceiling = Into::<u32>::into(call.int()) as u16;
+
+    let text = read_mem(call.mem(), host, number)?;
+    let name = option_mem(call.mem(), host, number)?;
+    let text = String::from_utf8_lossy(crate::msg::value(&text)).into_owned();
+
+    // `%lx` reads an unsigned hexadecimal run; a leading `0x` is not part of
+    // it, and neither is a sign.
+    let digits = text.trim();
+    let parsed = i64::from_str_radix(digits, 16).map_err(|_| {
+        ShimError::Failed(format!("{name} is {text:?}, which is not hexadecimal"))
+    })?;
+
+    if parsed < i64::from(floor) || parsed > i64::from(ceiling) {
+        return Err(ShimError::Failed(format!(
+            "{name} is {parsed:#x}, outside the {floor:#x}..={ceiling:#x} this \
+             module accepts"
+        )));
+    }
+    Ok(abi::Ret::Int(A::Int::from(parsed as u16)))
+}
+
 /// What `curmbk` holds, read back out of module memory every time.
 ///
 /// Generic core (Task 5). No `Wg16` facade under the old `current` name: only
@@ -678,6 +857,180 @@ mod tests {
         let mut f = Fixture::new();
         opened(&mut f);
         assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
+    }
+
+    /// `hexopt` reads the same last word `numopt` does, in base 16.
+    ///
+    /// Message 2 of `SAMPLE.MSG` is `GAMCRD`, whose value is `60`. As a
+    /// decimal that is sixty -- what `numopt` answers just above -- and as
+    /// hexadecimal it is 0x60, ninety-six. **The same message read two ways
+    /// giving two different numbers is what proves the radix is real** rather
+    /// than a base-10 parse with a different name.
+    #[test]
+    fn hexopt_reads_the_same_word_numopt_does_but_in_base_sixteen() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        assert_eq!(f.invoke(numopt, &[2, 0, 32767]).expect("read"), Ret::U16(60));
+        assert_eq!(f.invoke(hexopt, &[2, 0, 0xFFFF]).expect("read"), Ret::U16(0x60));
+    }
+
+    /// Out of range is a refusal that names the value, the same way `numopt`'s
+    /// is -- the vendor's `catastro` (`MCVAPI.C:262`) stops the board there.
+    #[test]
+    fn hexopt_outside_its_bounds_refuses_and_names_the_message() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let e = f.invoke(hexopt, &[2, 0, 0x5F]).expect_err("0x60 is over 0x5f");
+        assert!(e.to_string().contains("0x60"), "{e}");
+        assert!(e.to_string().contains("SAMPLE.MSG"), "{e}");
+    }
+
+    /// A value that is not hexadecimal at all is the other `catastro`
+    /// (`MCVAPI.C:259`, the `sscanf` returning 0).
+    #[test]
+    fn hexopt_refuses_a_value_that_is_not_hexadecimal() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        // Message 3 is `YESOPT`, whose value is `YES` -- `Y` and `S` are not
+        // hex digits, though `E` is, so this also checks the whole word is
+        // parsed rather than a leading run of it.
+        let e = f.invoke(hexopt, &[3, 0, 0xFFFF]).expect_err("YES is not hex");
+        assert!(e.to_string().contains("YES"), "{e}");
+    }
+
+    /// `inimsg` only ever grows (`MCVAPI.C:42`, `if (mxmssz < maxsiz)`).
+    ///
+    /// The smaller second request is the assertion that matters: a port that
+    /// simply assigned would shrink the buffer a module had already been
+    /// promised.
+    #[test]
+    fn inimsg_grows_the_message_buffer_and_never_shrinks_it() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.msgbuf_size(), 0, "nothing has asked yet");
+
+        assert!(matches!(f.invoke(inimsg, &[4096]), Ok(Ret::Void)));
+        assert_eq!(f.host.msgbuf_size(), 4096);
+
+        assert!(matches!(f.invoke(inimsg, &[1024]), Ok(Ret::Void)));
+        assert_eq!(f.host.msgbuf_size(), 4096, "a smaller request does nothing");
+
+        assert!(matches!(f.invoke(inimsg, &[8192]), Ok(Ret::Void)));
+        assert_eq!(f.host.msgbuf_size(), 8192);
+    }
+
+    /// `setcnf` records the pair it was given, in order.
+    #[test]
+    fn setcnf_records_the_name_and_value() {
+        let mut f = Fixture::new();
+        let name = f.text("MAXIMUM PLAYERS");
+        let value = f.text("64");
+        f.invoke(setcnf, &[name.offset, name.selector, value.offset, value.selector])
+            .expect("setcnf");
+
+        assert_eq!(
+            f.host.setcnf_changes(),
+            [(b"MAXIMUM PLAYERS".to_vec(), b"64".to_vec())]
+        );
+    }
+
+    /// The 101st change of a round is refused.
+    ///
+    /// `onams`/`ovals` are `[MAXCHG]` and `MAXCHG` is 100 (`SETCNF.C:44`), so
+    /// the vendor's `onams[nchgs]=` with `nchgs == 100` writes one past the
+    /// end and only *then* reaches its `catastro`. The overrun is the bug and
+    /// the `catastro` is the intent, so this stops one change earlier --
+    /// without writing -- and reaches the same outcome.
+    #[test]
+    fn setcnf_refuses_the_hundred_and_first_change() {
+        let mut f = Fixture::new();
+        let value = f.text("x");
+        for i in 0..MAXCHG {
+            let name = f.text(&format!("OPT{i}"));
+            f.invoke(setcnf, &[name.offset, name.selector, value.offset, value.selector])
+                .unwrap_or_else(|e| panic!("change {i} of {MAXCHG}: {e}"));
+        }
+        assert_eq!(f.host.setcnf_changes().len(), MAXCHG);
+
+        let name = f.text("ONE TOO MANY");
+        let e = f
+            .invoke(setcnf, &[name.offset, name.selector, value.offset, value.selector])
+            .expect_err("MAXCHG is a bound, not a suggestion");
+        assert!(e.to_string().contains("TOO MANY CHANGES"), "{e}");
+        assert_eq!(
+            f.host.setcnf_changes().len(),
+            MAXCHG,
+            "and the refused change was not recorded"
+        );
+    }
+
+    /// `applyem` refuses, naming MSGRDR.
+    ///
+    /// Asserting the message rather than `is_err()`: a refusal that only said
+    /// "no" would pass for an unreadable filename too, and the point is that
+    /// the whole `.MSG` reader/writer is absent.
+    #[test]
+    fn applyem_refuses_and_names_the_msgrdr_subsystem() {
+        let mut f = Fixture::new();
+        let name = f.text("SAMPLE.MSG");
+        let e = f.invoke(applyem, &Fixture::far(name)).expect_err("no MSGRDR here");
+        let message = e.to_string();
+        assert!(message.contains("MSGRDR"), "{message}");
+        assert!(message.contains("SAMPLE.MSG"), "{message}");
+    }
+
+    /// `setcnf` without `applyem` accumulates settings nobody reads, and the
+    /// pairing is worth pinning so it does not read as an oversight later.
+    #[test]
+    fn setcnf_changes_survive_an_applyem_that_refused() {
+        let mut f = Fixture::new();
+        let name = f.text("OPT");
+        let value = f.text("1");
+        f.invoke(setcnf, &[name.offset, name.selector, value.offset, value.selector])
+            .expect("setcnf");
+
+        let file = f.text("SAMPLE.MSG");
+        f.invoke(applyem, &Fixture::far(file)).expect_err("refuses");
+
+        assert_eq!(
+            f.host.setcnf_changes().len(),
+            1,
+            "nothing applied them, so they are still pending"
+        );
+    }
+
+    /// `dspmsg` picks `msgno+1` when the account wants ANSI and `msgno` when
+    /// it does not -- **both**, because a port that always picked one would
+    /// pass a single-case test.
+    #[test]
+    fn dspmsg_picks_the_ansi_variant_only_when_the_account_wants_ansi() {
+        let mut f = Fixture::new();
+        opened(&mut f);
+        let chan = f.console();
+        f.host
+            .connect_state(&mut f.machine, chan, &crate::Connection::ansi("rangerdan"))
+            .expect("connects");
+        let ansifl = Wg16::ptr_offset(
+            f.host.users().account(chan),
+            f.host.users().account_layout().ansifl,
+        );
+
+        // Message 3 is `YESOPT` and message 4 is `NOOPT`; their bodies hold
+        // `YES` and `NO`, so which one was printed is visible in the output.
+        // ANSON clear takes msgno, ANSON set takes msgno+1.
+        for (flag, expected) in [(0u8, &b"YES"[..]), (1, &b"NO"[..])] {
+            f.machine.write(ansifl, &[flag]).expect("ansifl");
+            assert!(matches!(f.invoke(text::clrprf, &[]), Ok(Ret::Void)));
+            f.invoke(dspmsg, &[3, 0, 0, 0, 0, 0, 0]).expect("dspmsg");
+
+            let prfbuf = f.host.globals().prf_buffer();
+            let printed = f.machine.read_cstr(prfbuf).expect("readable").to_vec();
+            assert!(
+                printed.windows(expected.len()).any(|w| w == expected),
+                "ansifl={flag} printed {:?}, expected the message holding {:?}",
+                String::from_utf8_lossy(&printed),
+                String::from_utf8_lossy(expected)
+            );
+        }
     }
 
     #[test]

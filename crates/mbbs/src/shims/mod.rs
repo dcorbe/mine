@@ -495,6 +495,19 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "numopt", msg::numopt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "lngopt", msg::lngopt, Cleans::Caller, Evidence::Unclassified),
+        // numopt's base-16 sibling. It reaches the message text through the
+        // same read/value pair, not through a rawmsg this task had to add
+        // first -- rawmsg is already registered above.
+        (MAJORBBS, "hexopt", msg::hexopt, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/MCVAPI.C")),
+        (MAJORBBS, "inimsg", msg::inimsg, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/MCVAPI.C")),
+        (MAJORBBS, "setcnf", msg::setcnf, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/SETCNF.C")),
+        (MAJORBBS, "applyem", msg::applyem, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/SETCNF.C")),
+        (MAJORBBS, "dspmsg", msg::dspmsg, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/BBSUTILS.C")),
         (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "chropt", msg::chropt, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller, Evidence::Unclassified),

@@ -890,6 +890,27 @@ pub struct Host<A: Abi> {
     l2as: A::Ptr,
     l2as_next: usize,
 
+    /// `MCVAPI.C:37-51`'s `mxmssz` -- the largest message buffer any module
+    /// has asked `inimsg` for.
+    ///
+    /// The vendor keeps one shared `msgbuf` of this size and `rawmsg` reads
+    /// each message into it, so `mxmssz` is that buffer's length. This host
+    /// interns each message at its own exact length instead
+    /// ([`crate::messages`]), so there is no single buffer to size -- but
+    /// `inimsg`'s promise is still "at least this much room for one message",
+    /// and it is still monotonic (`if (mxmssz < maxsiz)`), so the number is
+    /// kept and can be asserted.
+    msgbuf_size: u16,
+
+    /// `SETCNF.C:46-52`'s `onams`/`ovals` and the `applied` flag: the
+    /// name/value pairs `setcnf` has recorded but nothing has applied yet.
+    ///
+    /// Host-side rather than module memory, because the vendor's are
+    /// file-scope `static`s that no module can reach; the only way to observe
+    /// them is through `setcnf` and `applyem` themselves.
+    setcnf: Vec<(Vec<u8>, Vec<u8>)>,
+    setcnf_applied: bool,
+
     /// The console's display attribute and window, as `struct curatr`
     /// (`INC/VIDAPI.H:198-228`) holds them for the real host.
     ///
@@ -1607,6 +1628,9 @@ impl<A: Abi> Host<A> {
             l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
             l2as_next: 0,
             display: Display::default(),
+            msgbuf_size: 0,
+            setcnf: Vec::new(),
+            setcnf_applied: false,
             strtok: A::null_ptr(),
             datebuf: None,
             mdf: A::ptr_offset(base, spr_bytes as u16),
@@ -1874,6 +1898,39 @@ impl<A: Abi> Host<A> {
     /// stay consistent within one call; it is the *next* read that has moved.
     /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
     /// only a counter for them.
+    /// The largest message buffer `inimsg` has been asked for. See
+    /// [`Host::msgbuf_size`].
+    pub fn msgbuf_size(&self) -> u16 {
+        self.msgbuf_size
+    }
+
+    /// `inimsg`'s monotonic grow: `if (mxmssz < maxsiz)` (`MCVAPI.C:42`).
+    pub fn grow_msgbuf(&mut self, maxsiz: u16) {
+        self.msgbuf_size = self.msgbuf_size.max(maxsiz);
+    }
+
+    /// The name/value pairs `setcnf` has recorded. See [`Host::setcnf`].
+    pub fn setcnf_changes(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.setcnf
+    }
+
+    /// Record one `setcnf` pair, answering `false` if the vendor's `MAXCHG`
+    /// bound is already reached.
+    ///
+    /// `SETCNF.C:63-75`: a `setcnf` after an `applyem` clears the list first,
+    /// which is what `applied` tracks.
+    pub fn record_setcnf(&mut self, name: Vec<u8>, value: Vec<u8>, max: usize) -> bool {
+        if self.setcnf_applied {
+            self.setcnf_applied = false;
+            self.setcnf.clear();
+        }
+        if self.setcnf.len() >= max {
+            return false;
+        }
+        self.setcnf.push((name, value));
+        true
+    }
+
     /// The console's attribute and window state. See [`Host::display`].
     pub fn display(&self) -> Display {
         self.display

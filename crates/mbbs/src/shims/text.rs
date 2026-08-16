@@ -435,7 +435,7 @@ fn normalize_newlines(text: &[u8]) -> Vec<u8> {
 /// [`Abi::ptr_offset`] replace `Host::current_channel` and the hand-built
 /// `FarPtr` -- the same reading `Host::class_mem` already offsets `usrcls`
 /// off a channel's slot.
-fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
+pub(crate) fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
     let Ok(chan) = host.current_channel_mem(mem) else {
         return true;
     };
