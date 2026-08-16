@@ -1586,12 +1586,31 @@ impl<A: Abi> Host<A> {
     ///
     /// - a drive letter, or any `:` at all (`D:\MUD\DATA\X.DAT` and every
     ///   other reading of `:` DOS ever had);
-    /// - a leading `\` or `/` -- root-absolute, and root of *what* is a
-    ///   question this host has no business answering;
     /// - any `..` component, checked after separators are normalised, so a
     ///   name cannot walk back out through subdirectories it was just
     ///   allowed into (`lun5data\..\..\etc\passwd` is refused for the same
     ///   reason `D:\` is, not a weaker one).
+    ///
+    /// # A leading separator means *this board's* own root
+    ///
+    /// `\rci_univ.dat` and `/rci_univ.dat` resolve to `rci_univ.dat` under
+    /// [`Host::root`]. **This reverses an earlier rule** which refused a
+    /// leading separator outright, on the grounds that "root of *what* is a
+    /// question this host has no business answering".
+    ///
+    /// The Rose 3.0NT answered it. Its init calls `access("\rci_univ.dat")`,
+    /// and `RCI_UNIV.DAT` is a file the module ships in its own directory.
+    /// Under DOS a leading `\` is the root of the current drive, and a period
+    /// BBS install *was* the root of its drive — which is precisely what
+    /// `Host::root` models. So this host does have a defensible answer, and
+    /// refusing protected nothing: it stopped a module from opening a file it
+    /// had installed itself.
+    ///
+    /// **The escape guarantee is unchanged**, because it never rested on this
+    /// rule. `..` is still checked component-wise after normalisation, so
+    /// `\..\etc\passwd` and `\lun5data\..\..\etc\passwd` are refused exactly
+    /// as they were — starting at root is not a way *through* root. That is
+    /// pinned by `dos_name_root_absolute_still_cannot_escape`.
     ///
     /// # No `Machine`, and no `self`, and generic anyway
     ///
@@ -1612,8 +1631,9 @@ impl<A: Abi> Host<A> {
     ///
     /// # Errors
     ///
-    /// If the name has a drive letter, is root-absolute, or has a `..`
-    /// component anywhere in it.
+    /// If the name has a drive letter or a `..` component anywhere in it.
+    /// **Not** for a leading separator — that is mapped onto [`Host::root`],
+    /// see above.
     pub fn dos_name(named: &str) -> Result<String, String> {
         let bare = named
             .strip_prefix(".\\")
@@ -1633,11 +1653,13 @@ impl<A: Abi> Host<A> {
         if bare.contains(':') {
             return Err(escapes());
         }
-        // Root-absolute in either spelling. Root of *this host's* filesystem
-        // is not a question a module gets to ask.
-        if bare.starts_with('\\') || bare.starts_with('/') {
-            return Err(escapes());
-        }
+        // Root-absolute in either spelling is **mapped onto [`Host::root`]**,
+        // not refused. See this method's own doc comment, "A leading
+        // separator means this board's own root", for why the older refusal
+        // was wrong. No strip is needed: the component loop below drops empty
+        // parts, so a leading separator falls out on its own -- and, more
+        // importantly, the `..` check still runs over every remaining
+        // component, so starting at root is not a way through it.
 
         let mut parts = Vec::new();
         for part in bare.split(['\\', '/']) {
@@ -7823,10 +7845,50 @@ mod tests {
         assert!(e.contains("D:\\MUD\\DATA\\X.DAT"), "{e}");
     }
 
+    /// **Deliberate behaviour change, 2026-08-15**, replacing
+    /// `dos_name_refuses_a_leading_separator_root_absolute_in_either_spelling`,
+    /// which asserted the opposite.
+    ///
+    /// The old rule refused a leading separator on the grounds that "root of
+    /// *what* is a question this host has no business answering". The Rose
+    /// 3.0NT answered it: its init calls `access("\rci_univ.dat")`, and
+    /// `RCI_UNIV.DAT` is a file it ships in its own directory. Under DOS a
+    /// leading `\` means the root of the current drive, and a period BBS
+    /// install *was* the root of its drive -- which is exactly what
+    /// [`Host::root`] models here.
+    ///
+    /// So this host does have a defensible answer: root means the board
+    /// directory. Refusing instead did not protect anything, it just stopped
+    /// a module from opening its own shipped data file.
     #[test]
-    fn dos_name_refuses_a_leading_separator_root_absolute_in_either_spelling() {
-        for named in ["\\MUD\\DATA\\X.DAT", "/MUD/DATA/X.DAT"] {
-            assert!(Host::<Wg16>::dos_name(named).is_err(), "{named}");
+    fn dos_name_maps_a_leading_separator_onto_the_modules_own_root() {
+        for (named, want) in [
+            ("\\rci_univ.dat", "rci_univ.dat"),
+            ("/rci_univ.dat", "rci_univ.dat"),
+            ("\\MUD\\DATA\\X.DAT", "MUD/DATA/X.DAT"),
+            ("/MUD/DATA/X.DAT", "MUD/DATA/X.DAT"),
+        ] {
+            assert_eq!(Host::<Wg16>::dos_name(named).as_deref(), Ok(want), "{named}");
+        }
+    }
+
+    /// The half of the old rule that was always load-bearing, kept in full:
+    /// mapping the leading separator to root must not become a way *through*
+    /// root. The `..` check runs component-wise after separators are
+    /// normalised, so it sees these no differently than it saw
+    /// `lun5data\..\..\etc\passwd` before.
+    #[test]
+    fn dos_name_root_absolute_still_cannot_escape() {
+        for named in [
+            "\\..\\etc\\passwd",
+            "/../etc/passwd",
+            "\\lun5data\\..\\..\\etc\\passwd",
+            "\\D:\\MUD\\X.DAT",
+        ] {
+            assert!(
+                Host::<Wg16>::dos_name(named).is_err(),
+                "{named} must not reach outside root just because it starts at root"
+            );
         }
     }
 
