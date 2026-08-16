@@ -36,6 +36,9 @@ pub struct Video {
     crtc_index: u8,
     /// Toggles so a retrace poll terminates.
     retrace: u8,
+    /// The last few cursor moves and where each came from, so a cursor in the
+    /// wrong place can be blamed on the right mechanism.
+    pub moves: Vec<String>,
 }
 
 impl Default for Video {
@@ -51,6 +54,7 @@ impl Default for Video {
             cursor_shape: 0x0607,
             crtc_index: 0,
             retrace: 0,
+            moves: Vec::new(),
         }
     }
 }
@@ -71,6 +75,17 @@ impl Video {
         let cols = self.columns.max(1);
         self.cursor_row = (offset / cols) as u8;
         self.cursor_col = (offset % cols) as u8;
+        self.note(format!(
+            "crtc offset {offset} -> ({},{})",
+            self.cursor_row, self.cursor_col
+        ));
+    }
+
+    fn note(&mut self, what: String) {
+        self.moves.push(what);
+        if self.moves.len() > 24 {
+            self.moves.remove(0);
+        }
     }
 
     /// A write to a hardware port.
@@ -361,6 +376,10 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
         0x02 => {
             video.cursor_row = (regs.dx >> 8) as u8;
             video.cursor_col = (regs.dx & 0xff) as u8;
+            video.note(format!(
+                "int10 AH=02 -> ({},{})",
+                video.cursor_row, video.cursor_col
+            ));
             let page = usize::from(video.page).min(7);
             let at = DosPtr::new(0x0040, 0x0050 + (page as u16) * 2);
             let _ = g.write(at, &[video.cursor_col, video.cursor_row]);

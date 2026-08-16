@@ -220,7 +220,16 @@ fn main() -> io::Result<()> {
 
     // The program painted straight into the text buffer, which is just guest
     // memory -- so the screen can be read back out without the guest's help.
+    // A ruler, and lines marked at their true end. Trimming trailing spaces
+    // makes a correctly placed cursor look like it overshoots: the space it
+    // sits past is invisible, so "one past the content" reads as "two past the
+    // text". A dump that silently drops content is a dump that lies.
+    let screen_cursor = (video.cursor_row, video.cursor_col);
     println!("--- screen at B800:0000 ---");
+    let ruler: String = (0..80).map(|c| char::from(b'0' + (c / 10) % 10)).collect();
+    println!("    {ruler}");
+    let ruler: String = (0..80).map(|c| char::from(b'0' + c % 10)).collect();
+    println!("    {ruler}");
     for row in 0..25u16 {
         let at = DosPtr::new(0xb800, row * 160);
         let line: String = match vm.read(at, 160) {
@@ -234,7 +243,17 @@ fn main() -> io::Result<()> {
                 .collect(),
             Err(_) => continue,
         };
-        println!("{row:2} |{}|", line.trim_end());
+        let end = line.trim_end().len();
+        let (crow, ccol) = screen_cursor;
+        // Marking the cursor is what makes a trailing space visible: the text
+        // stops at one column and the cursor sits past it, and the gap between
+        // the two numbers is the content a trimmed dump silently dropped.
+        let note = if u16::from(crow) == row {
+            format!(" text ends col {end}, cursor at col {ccol}")
+        } else {
+            format!(" text ends col {end}")
+        };
+        println!("{row:2} |{}|{note}", &line[..end]);
     }
 
     if !vectors.is_empty() {
@@ -245,6 +264,13 @@ fn main() -> io::Result<()> {
         println!("--- interrupt vectors the program touched ---");
         for (what, n) in &counts {
             println!("  {what}  x{n}");
+        }
+    }
+
+    if !video.moves.is_empty() {
+        println!("--- last cursor moves ---");
+        for m in &video.moves {
+            println!("  {m}");
         }
     }
 
