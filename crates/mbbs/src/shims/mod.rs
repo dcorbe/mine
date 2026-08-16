@@ -540,6 +540,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "nctime", system::nctime, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "ncdate", system::ncdate, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "cofdat", system::cofdat, Cleans::Caller, Evidence::Unclassified),
+        // `cofdat`'s inverse, and the two other `DNTAPI.C` routines the
+        // corpus asks for. The three transitive helpers they use --
+        // `addDaysToDate`, `timeDecode`, `validTime` -- are deliberately not
+        // here: no oracle build exports any of them, so they are file-local
+        // to the vendor and are private Rust helpers here too.
+        (MAJORBBS, "datofc", system::datofc, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
+        (MAJORBBS, "daytoday", system::daytoday, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
+        (MAJORBBS, "dctime", system::dctime, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
         (MAJORBBS, "ncedat", system::ncedat, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "today", system::today, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "time", system::time, Cleans::Caller, Evidence::Unclassified),

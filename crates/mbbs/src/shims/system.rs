@@ -102,6 +102,224 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
+/// `GCINVALIDDOT` (`INC/DNTAPI.H:136`) -- what [`dctime`] answers for a time
+/// it cannot decode.
+///
+/// A **return value, not an error**: `dctime` is declared `USHORT` and the
+/// vendor's callers compare against this constant. Turning it into a
+/// `ShimError` would break a module that tests for it.
+const GCINVALIDDOT: u16 = 0xFFFF;
+
+/// Days from 1970-01-01, which [`crate::clock::Civil`] counts from, to
+/// 1980-01-01, which DOS counts from.
+///
+/// Ten years holding the two leap days 1972 and 1976: `10*365 + 2`.
+const DAYS_1970_TO_1980: i64 = 3652;
+
+/// `USHORT datofc(USHORT count)` -- `DNTAPI.C:466-478` -- a count of days
+/// since 1/1/1980, packed back into a DOS date.
+///
+///
+/// The vendor's `addDaysToDate` (`DNTAPI.C:407-456`) walks whole years and
+/// then whole months off the count, one iteration at a time, over its own
+/// `isLeapYear`. This host reaches the same calendar through
+/// [`crate::clock::Civil::from_local_epoch`], which is the converter `today`,
+/// `ncdate` and `fnd1st` already share -- a second, independently-written
+/// proleptic Gregorian calendar in this crate would be a place for the two to
+/// disagree, and the count is a whole number of days so the epoch arithmetic
+/// is exact.
+///
+/// `dddate` itself (`DNTAPI.H:184`,
+/// `((mon)<<5)+(day)+(((year)-1980)<<9)`) is [`crate::clock::Civil::dos_date`]
+/// for the same reason.
+///
+/// # Errors
+///
+/// If the count lands past 2107. `USHORT count` reaches 65535 days -- into
+/// 2159 -- and the year field is seven bits, so the vendor's shift overflows
+/// the word and hands back a small, plausible, wrong date. Refusing follows
+/// [`today`], which already refuses a year DOS cannot pack rather than
+/// clamping it.
+pub fn datofc<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let count = Into::<u32>::into(call.int()) as u16;
+    let civil = crate::clock::Civil::from_local_epoch(
+        (DAYS_1970_TO_1980 + i64::from(count)) * 86_400,
+    );
+    let packed = civil
+        .dos_date()
+        .map_err(|why| ShimError::Failed(format!("datofc({count}): {why}")))?;
+    Ok(abi::Ret::Int(A::Int::from(packed)))
+}
+
+/// `USHORT daytoday(VOID)` -- `DNTAPI.C:107-125` -- the day of the week,
+/// 0 = Sunday.
+///
+/// The vendor reads `localtime(time(NULL))->tm_wday` (or `GetLocalTime`'s
+/// `wDayOfWeek` on NT, which numbers the days the same way). Here the day
+/// number comes off the same [`crate::Clock`] every other date routine reads,
+/// so `today` and `daytoday` cannot disagree about what day it is: local
+/// midnight-aligned day count since the epoch, shifted by 4 because
+/// 1970-01-01 was a Thursday.
+///
+/// # Errors
+///
+/// If the host's clock cannot say what day it is.
+pub fn daytoday<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let clock = host.clock();
+    let local = i64::from(clock.epoch().map_err(ShimError::Failed)?) + i64::from(clock.offset());
+    let day = local.div_euclid(86_400);
+    // 1970-01-01 was a Thursday, and Sunday is 0.
+    let weekday = (day + 4).rem_euclid(7) as u16;
+    Ok(abi::Ret::Int(A::Int::from(weekday)))
+}
+
+/// `USHORT dctime(const CHAR *timstr)` -- `DNTAPI.C:299-310` -- decode a DOS
+/// time from `"HH:MM[:SS]"`.
+///
+///
+/// [`GCINVALIDDOT`] is the answer for anything that does not decode, and it
+/// is a *value*: a module tests the result against `0xFFFF`, so a
+/// `ShimError` here would break the very callers this serves. A valid time
+/// can also be zero -- midnight packs as `0` -- which is why "invalid" needs
+/// its own sentinel rather than being read off a falsy result.
+///
+/// `dttime` (`DNTAPI.H:190`) stores **seconds divided by two**, so odd
+/// seconds cannot be represented and 13:45:31 packs identically to 13:45:30.
+/// That is [`crate::clock::Civil::dos_time`]'s halving, shared rather than
+/// rewritten.
+///
+/// # Errors
+///
+/// If `timstr` is unreadable or unterminated. An undecodable *time* is not an
+/// error -- see above.
+pub fn dctime<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let timstr = call.ptr();
+    let text = timstr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("dctime: {e}")))?
+        .to_vec();
+
+    let (hour, minute, second) = time_decode(&text);
+    let packed = if valid_time(hour, minute, second) {
+        crate::clock::Civil {
+            year: 1980,
+            month: 1,
+            day: 1,
+            hour: hour as u32,
+            minute: minute as u32,
+            second: second as u32,
+        }
+        .dos_time()
+    } else {
+        GCINVALIDDOT
+    };
+    Ok(abi::Ret::Int(A::Int::from(packed)))
+}
+
+/// `timeDecode` (`DNTAPI.C:257-284`) -- pull hour, minute and second out of
+/// `"HH:MM[:SS]"`, answering `-1` for any field that is absent or out of
+/// range.
+///
+/// The vendor is two `sscanf`s in one condition:
+///
+///
+/// One scan answers both, because the two formats differ only in how many
+/// fields they ask for: scanning up to three colon-separated integers gives
+/// the first `sscanf`'s return directly, and the second's is that count
+/// capped at two. **Only a count of exactly three or exactly two enters the
+/// body at all** -- a lone `"13"` assigns `h` and leaves `m` at `-1`, which
+/// is why it decodes as invalid rather than as 13:00.
+///
+/// `%d` skips leading whitespace and takes an optional sign; the literal `:`
+/// does not skip anything, so `"13 :45"` stops after the hour exactly as the
+/// vendor's does.
+fn time_decode(src: &[u8]) -> (i64, i64, i64) {
+    let fields = scan_colon_separated_ints(src);
+    let (mut hour, mut minute, mut second) = (
+        fields.first().copied().unwrap_or(-1),
+        -1,
+        -1,
+    );
+
+    let three = fields.len();
+    let two = three.min(2);
+    if three == 3 || two == 2 {
+        hour = fields[0];
+        minute = fields[1];
+        if !(0..=23).contains(&hour) {
+            hour = -1;
+        }
+        if !(0..=59).contains(&minute) {
+            minute = -1;
+        }
+        if three == 3 {
+            second = fields[2];
+            if !(0..=59).contains(&second) {
+                second = -1;
+            }
+        } else {
+            second = 0;
+        }
+    }
+    (hour, minute, second)
+}
+
+/// How many colon-separated integers `src` begins with, and their values --
+/// what `sscanf(src, "%d:%d:%d", ...)` returns and assigns, for up to three
+/// fields.
+///
+/// Stops at the first thing that is not what the format wants, which is what
+/// makes the count meaningful. Values are accumulated in `i64` so that a run
+/// of digits too long for the vendor's `INT` lands out of range and is
+/// rejected by the caller's bounds check, rather than wrapping into a
+/// plausible hour.
+fn scan_colon_separated_ints(src: &[u8]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(3);
+    let mut i = 0;
+    while out.len() < 3 {
+        if !out.is_empty() {
+            // The literal `:` matches exactly, with no whitespace skipped.
+            if src.get(i) != Some(&b':') {
+                break;
+            }
+            i += 1;
+        }
+        // `%d` skips leading whitespace.
+        while src.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let negative = match src.get(i) {
+            Some(b'-') => {
+                i += 1;
+                true
+            }
+            Some(b'+') => {
+                i += 1;
+                false
+            }
+            _ => false,
+        };
+        let start = i;
+        let mut value: i64 = 0;
+        while let Some(d) = src.get(i).filter(|c| c.is_ascii_digit()) {
+            value = value.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+            i += 1;
+        }
+        if i == start {
+            // No digits: this conversion failed, so `sscanf` stops here.
+            break;
+        }
+        out.push(if negative { -value } else { value });
+    }
+    out
+}
+
+/// `validTime` (`DNTAPI.C:646-655`) -- the bounds `dctime` checks before
+/// packing.
+fn valid_time(hour: i64, minute: i64, second: i64) -> bool {
+    (0..=23).contains(&hour) && (0..=59).contains(&minute) && (0..=59).contains(&second)
+}
+
 /// `USHORT today(VOID)` -- `DNTAPI.H:199-200` -- the date, packed as DOS
 /// packs it.
 ///
@@ -1910,6 +2128,89 @@ mod tests {
 
     /// MajorMUD 1.11p's build stamp: `Dec 30 2005 14:20:05` UTC.
     const BUILD: u32 = 1_135_952_405;
+
+    /// `datofc` turns "days since 1/1/1980" into DOS's packed date word,
+    /// `((mon)<<5)+(day)+(((year)-1980)<<9)` (`DNTAPI.H:184`).
+    ///
+    /// Day 0 is 1 January 1980, which packs as `(1<<5)+1+(0<<9)` = 33. Every
+    /// value here is hand-computed from the macro rather than read off this
+    /// host's own answer -- both sides deriving from one implementation would
+    /// pin nothing.
+    #[test]
+    fn datofc_packs_days_since_1980_into_a_dos_date() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(datofc, &[0]).expect("datofc"), Ret::U16(33));
+        // 31 days on: 1 February 1980 -> (2<<5)+1 = 65.
+        assert_eq!(f.invoke(datofc, &[31]).expect("datofc"), Ret::U16(65));
+        // 366 days on -- 1980 was a leap year -- is 1 January 1981:
+        // (1<<5)+1+(1<<9) = 545.
+        assert_eq!(f.invoke(datofc, &[366]).expect("datofc"), Ret::U16(545));
+        // The last day of 1980, 31 December: 365 days on, (12<<5)+31 = 415.
+        assert_eq!(f.invoke(datofc, &[365]).expect("datofc"), Ret::U16(415));
+    }
+
+    /// A count that lands past 2107 is refused rather than wrapped.
+    ///
+    /// `USHORT count` reaches 65535 days, which is 2159 -- and the year field
+    /// is seven bits, so the vendor's `((year)-1980)<<9` silently overflows
+    /// the word and hands back a small, plausible, wrong date. This host
+    /// refuses, the same way `today` already refuses a year DOS cannot pack.
+    #[test]
+    fn datofc_refuses_a_count_past_what_seven_bits_can_hold() {
+        let mut f = Fixture::new();
+        // 46752 days after 1/1/1980 is in 2108, one year past the ceiling.
+        let e = f.invoke(datofc, &[46_752]).expect_err("2108 is not a DOS year");
+        assert!(format!("{e}").contains("2108"), "{e}");
+    }
+
+    /// `daytoday` answers the day of the week, 0 = Sunday
+    /// (`DNTAPI.C:107-125`, `tm_wday`).
+    ///
+    /// Driven off a pinned clock rather than the wall: a test that read the
+    /// real clock on both sides would assert nothing at all.
+    #[test]
+    fn daytoday_answers_the_day_of_week_with_sunday_as_zero() {
+        let mut f = Fixture::new();
+        // The epoch itself, 1 January 1970, was a Thursday.
+        f.host.set_clock(crate::Clock::pinned(0));
+        assert_eq!(f.invoke(daytoday, &[]).expect("daytoday"), Ret::U16(4));
+
+        // Three days later is the first Sunday, and the one value that
+        // distinguishes "0 = Sunday" from "0 = Monday".
+        f.host.set_clock(crate::Clock::pinned(3 * 86_400));
+        assert_eq!(f.invoke(daytoday, &[]).expect("daytoday"), Ret::U16(0));
+
+        f.host.set_clock(crate::Clock::pinned(4 * 86_400));
+        assert_eq!(f.invoke(daytoday, &[]).expect("daytoday"), Ret::U16(1));
+    }
+
+    /// `dctime` decodes `"HH:MM[:SS]"` and packs it, answering `GCINVALIDDOT`
+    /// (0xFFFF, `DNTAPI.H:136`) for anything invalid. **The invalid answer is
+    /// a return value, not an error** -- `dctime` is declared `USHORT` and the
+    /// vendor's callers test it against the constant.
+    ///
+    /// Seconds are stored halved (`(sec)>>1`, `DNTAPI.H:190`), so odd seconds
+    /// are lost: 13:45:31 and 13:45:30 pack identically.
+    #[test]
+    fn dctime_packs_a_time_and_reports_invalid_as_a_value() {
+        let mut f = Fixture::new();
+        let mut ask = |f: &mut Fixture, s: &str| -> u16 {
+            let at = f.text(s);
+            let Ret::U16(n) = f.invoke(dctime, &Fixture::far(at)).expect("dctime") else {
+                panic!("dctime returns a USHORT");
+            };
+            n
+        };
+        // 13:45:30 -> (13<<11)+(45<<5)+(30>>1) = 26624+1440+15 = 28079
+        assert_eq!(ask(&mut f, "13:45:30"), 28079);
+        assert_eq!(ask(&mut f, "13:45:31"), 28079, "odd seconds are lost to (sec)>>1");
+        assert_eq!(ask(&mut f, "13:45"), 26624 + 1440, "seconds default to zero");
+        assert_eq!(ask(&mut f, "00:00:00"), 0, "midnight packs as zero, and is valid");
+        assert_eq!(ask(&mut f, "25:00:00"), 0xFFFF, "GCINVALIDDOT, not an error");
+        assert_eq!(ask(&mut f, "13:60"), 0xFFFF, "minutes are bounded too");
+        assert_eq!(ask(&mut f, "13"), 0xFFFF, "one field is not a time");
+        assert_eq!(ask(&mut f, "not a time"), 0xFFFF);
+    }
 
     #[test]
     fn a_pinned_clock_packs_the_instant_it_was_pinned_to() {
