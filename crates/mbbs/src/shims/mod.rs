@@ -523,6 +523,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "alcdup", memory::alcdup, Cleans::Caller,
          Evidence::VendorBody("SRC/api/gcommlib/ALCDUP.C")),
+        // Six files carry a pltile; the galme one is the module-side library
+        // the NE corpus links against, and the other five are standalone
+        // utilities.
+        (MAJORBBS, "pltile", memory::pltile, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/galme/galfoman/PROTSTUF.C")),
         (MAJORBBS, "alczer", memory::alczer, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "galfree", memory::galfree, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller, Evidence::Unclassified),
@@ -581,6 +586,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // records what they do; INC/GCOMM.H:140's macro is the wrong
         // generation and is deliberately not cited.
         (MAJORBBS, "sstatr", system::sstatr, Cleans::Caller, Evidence::Oracle),
+        // The vendor's own empty bodies on any hosted build: IRPS.C wraps the
+        // single statement in each in #if !defined(UNIX) && !defined(GCWINNT).
+        (MAJORBBS, "dsairp", system::dsairp, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/IRPS.C")),
+        (MAJORBBS, "enairp", system::enairp, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/IRPS.C")),
+        // CATASTRO.C rather than CATASTVB.C/CATAWIN.C: those are the Visual
+        // Basic and Windows builds of the same routine, and the NE corpus is
+        // neither.
+        (MAJORBBS, "memcata", system::memcata, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/CATASTRO.C")),
         (MAJORBBS, "datofc", system::datofc, Cleans::Caller,
          Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
         (MAJORBBS, "daytoday", system::daytoday, Cleans::Caller,
@@ -614,6 +630,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdnan", fsd::fsdnan, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdord", fsd::fsdord, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdouc", fsd::fsdouc, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/FSDBBS.C")),
         (MAJORBBS, "fsdxan", fsd::fsdxan, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdrft", fsd::fsdrft, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "fsdbkg", fsd::fsdbkg, Cleans::Caller, Evidence::Unclassified),

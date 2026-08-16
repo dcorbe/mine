@@ -855,6 +855,35 @@ pub fn fsdord<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 ///
 /// If the answer string runs to the end of its segment without the empty entry
 /// that ends it, or either pointer will not resolve.
+/// `VOID fsdouc(CHAR c)` -- `FSDBBS.C:393-400` -- display one character of a
+/// full-screen form.
+///
+///
+/// **The `prf` branch is the live one**, and unlike the usual version of this
+/// claim it is checkable rather than assumed. `qikout` is `CHAR qikout=0`
+/// (`FSDBBS.C:50`) and the *only* code in the vendor that ever sets it is
+/// `fsdchi` (`FSDBBS.C:347-363`), the `btuchi()` character-input handler,
+/// which raises it around one call and lowers it again. This host does not
+/// register `fsdchi` and nothing installs it as a `btuchi` handler, so the
+/// flag is zero for the whole life of the process and the `chiout` branch is
+/// unreachable -- not because `chiout` is missing (it is registered, under
+/// GALGSBL) but because nothing can turn the flag on.
+///
+/// That is the difference the branch encodes: `qikout` means "we are inside
+/// an interrupt-time character handler, so write straight to the channel
+/// rather than through the output buffer". This host has no interrupt-time
+/// path into a module at all.
+///
+/// # Errors
+///
+/// If the character will not fit what `prf` has left.
+pub fn fsdouc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // `CHAR c`, one byte of an `INT`-wide slot.
+    let c = Into::<u32>::into(call.int()) as u8;
+    text::append_mem(call.mem(), host, &[c])?;
+    Ok(abi::Ret::Void)
+}
+
 pub fn fsdxan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *fsdxan(char *answer, char *name)` -- FSD.H:596-599.
     //
@@ -5075,5 +5104,21 @@ mod tests {
         ));
 
         assert_eq!(block(&f).flags(), 0, "fsdqoe would have had nothing to clear anyway");
+    }
+
+    /// `fsdouc` writes its character through `prf`, because `qikout` is zero.
+    ///
+    /// Two characters rather than one: a single character would pass for an
+    /// implementation that overwrote the buffer each time instead of
+    /// appending, which is what `prf("%c",c)` actually does.
+    #[test]
+    fn fsdouc_prints_the_character_through_prf() {
+        let mut f = Fixture::new();
+        assert!(matches!(f.invoke(text::clrprf, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdouc, &[u16::from(b'x')]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(fsdouc, &[u16::from(b'y')]), Ok(Ret::Void)));
+
+        let prfbuf = f.host.globals().prf_buffer();
+        assert_eq!(f.machine.read_cstr(prfbuf).expect("readable"), b"xy");
     }
 }

@@ -102,6 +102,75 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
+/// `VOID dsairp(VOID)` -- `IRPS.C:14-21` -- mask the CPU interrupt flag.
+///
+///
+/// **The empty body is the vendor's own**, not a stub this host wrote. On
+/// every build that is not bare-metal DOS the preprocessor removes the only
+/// statement in the function, and what is left is exactly this. That is a
+/// stronger version of Phase 2's `howbuy`/`clrxrf` case: there the emptiness
+/// was a branch of a body, here it is the whole body as the vendor itself
+/// compiles it for a hosted platform.
+///
+/// Masking the CPU interrupt flag has no meaning for a process that is not
+/// servicing interrupts. This host runs the module on one thread and never
+/// re-enters it from a signal handler, so there is no window for a
+/// `dsairp`/`enairp` pair to protect.
+///
+/// # Errors
+///
+/// Never.
+pub fn dsairp<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID enairp(VOID)` -- `IRPS.C:23-30` -- unmask the CPU interrupt flag.
+///
+/// [`dsairp`]'s other half, empty in the vendor for the same reason and on
+/// the same builds. See its doc comment.
+///
+/// # Errors
+///
+/// Never.
+pub fn enairp<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID memcata(VOID)` -- `CATASTRO.C:76-104` -- the out-of-memory dialog.
+///
+/// **Refused: it needs an attended console and a `longjmp`, and this host has
+/// neither.** The body prints four lines, calls `setatr(0x4E)` to turn the
+/// screen yellow-on-red, blocks in `getchc()` until somebody presses a key,
+/// and ends `longjmp(disaster,49)`.
+///
+/// The `longjmp` is not an implementation gap that effort would close. Its
+/// target is the `jmp_buf disaster` (`GCOMM.H:207`), and `Machine` exposes
+/// **no register setters at all** -- `sp`, `bp`, `si` and `di` are reads of
+/// what the module last left on an `Exit::Call`, and CS:IP appears only
+/// inside `Exit::Fault`/`Exit::Timeout`. The whole call/resume contract is
+/// that a module resumes where it left off, never where a saved buffer names.
+/// See [`crate::shims::crt::longjmp`] for the same reasoning at the source.
+///
+/// **This is the cheapest of the three unimplementables to live with**:
+/// `memcata` never returns to its caller in the vendor either -- the
+/// `longjmp` leaves for good -- so a refusal that stops the module is
+/// semantically close to what really happens. What is lost is the operator's
+/// chance to read the message.
+///
+/// # Errors
+///
+/// Always.
+pub fn memcata<A: Abi>(_: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Err(ShimError::Failed(
+        "memcata: the out-of-memory dialog needs an attended console -- four \
+         printfs, setatr(0x4E), then getchc() blocking for a keypress -- and \
+         ends in longjmp(disaster,49), which this host cannot perform because \
+         Machine has no register setters and resumes a module only where it \
+         left off (CATASTRO.C:76-104)"
+            .to_owned(),
+    ))
+}
+
 /// `VOID sstatr(INT attr)` -- set the display attribute.
 ///
 /// **No vendor body exists anywhere in `re/wg33src`** -- only call sites --
@@ -2421,6 +2490,51 @@ mod tests {
 
     /// MajorMUD 1.11p's build stamp: `Dec 30 2005 14:20:05` UTC.
     const BUILD: u32 = 1_135_952_405;
+
+    /// `dsairp`/`enairp` are the vendor's own empty bodies.
+    ///
+    /// `IRPS.C:14-30` wraps the single statement in each in
+    /// `#if !defined(UNIX) && !defined(GCWINNT)`, so on any hosted platform
+    /// the function the compiler emits is empty. This host is in exactly that
+    /// case.
+    ///
+    /// A routine that does nothing has nothing to assert, so this asserts
+    /// what it must **not** do: succeed without disturbing anything a module
+    /// can see. `usrnum` stands in for host state generally, and the display
+    /// attribute for the state this file's other routines do change -- if a
+    /// future edit gave either of these a body, one of the two would move.
+    #[test]
+    fn dsairp_and_enairp_are_the_vendors_own_empty_bodies() {
+        let mut f = Fixture::new();
+        let before = f.host.globals().word(&f.machine, "usrnum").expect("usrnum");
+        let attrib = f.host.display().attrib;
+
+        assert!(matches!(f.invoke(dsairp, &[]), Ok(Ret::Void)));
+        assert!(matches!(f.invoke(enairp, &[]), Ok(Ret::Void)));
+
+        assert_eq!(
+            f.host.globals().word(&f.machine, "usrnum").expect("usrnum"),
+            before,
+            "neither routine touches host state"
+        );
+        assert_eq!(f.host.display().attrib, attrib, "nor the display");
+    }
+
+    /// `memcata` refuses and names both things it would need.
+    ///
+    /// Asserting the message, not `is_err()`: the point is *which* two
+    /// capabilities are missing, and a bare error would pass for anything.
+    #[test]
+    fn memcata_refuses_and_names_what_it_needs() {
+        let mut f = Fixture::new();
+        let err = f.invoke(memcata, &[]).expect_err("there is no console");
+        let message = err.to_string();
+        assert!(message.contains("longjmp"), "{message}");
+        assert!(
+            message.contains("console") || message.contains("keypress"),
+            "{message}"
+        );
+    }
 
     /// `sstatr` sets the display attribute, and the value it sets is the one
     /// the genuine host writes.

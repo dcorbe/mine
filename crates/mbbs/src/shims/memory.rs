@@ -138,6 +138,47 @@ pub fn alcdup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
+/// `INT pltile(ULONG size, INT bsel, USHORT stride, USHORT tsize)` --
+/// `PROTSTUF.C:809-860` -- Phar Lap's tiling: allocate linear memory and map
+/// a run of selectors onto it.
+///
+/// **Refused, and not because the work was skipped.** The body is inline
+/// `asm int 31h` -- DPMI function 0 (allocate a run of contiguous selectors)
+/// and function 3 (the selector-increment) -- around three Phar Lap
+/// extender calls:
+///
+///
+/// `DosAllocLinMem`, `DosMapLinMemToSelector` and `DosFreeSeg` are in neither
+/// `re/vendor-bodies.tsv` nor `re/host-exports.tsv`, because they are not
+/// Galacticomm's: they belong to the DOS extender the module was linked
+/// against. Implementing this means deciding what this host does about Phar
+/// Lap generally, which is a group of seven symbols and a decision, not a
+/// port.
+///
+/// **[`alctile`] and [`ptrtile`] are not the same thing and must not be
+/// mistaken for it.** Those tile a region *this host allocated*, handing back
+/// a pointer into memory it owns. `pltile` maps arbitrary linear memory
+/// through freshly allocated selectors -- an address-space operation on
+/// behalf of an extender this host does not emulate.
+///
+/// # Errors
+///
+/// Always.
+pub fn pltile<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let size = call.long();
+    let bsel = Into::<u32>::into(call.int());
+    let stride = Into::<u32>::into(call.int());
+    let tsize = Into::<u32>::into(call.int());
+    Err(ShimError::Failed(format!(
+        "pltile({size}, {bsel}, {stride}, {tsize}): tiling linear memory needs \
+         DPMI (inline int 31h, functions 0 and 3) and the Phar Lap extender's \
+         DosAllocLinMem/DosMapLinMemToSelector/DosFreeSeg, none of which is \
+         Galacticomm's or emulated here. alctile/ptrtile are this host's own \
+         tiling over memory it allocated and are not a substitute \
+         (PROTSTUF.C:809-860)"
+    )))
+}
+
 /// `VOID *galmalloc(UINT size)` -- `GCOMM.H:768-769` -- "Galacticomm's
 /// malloc() for debugging."
 ///
@@ -1678,6 +1719,25 @@ mod tests {
             shim_body.as_nanos() as f64 / f64::from(ITERATIONS),
             (round_trip.as_nanos() as f64 - shim_body.as_nanos() as f64) / f64::from(ITERATIONS),
         );
+    }
+
+    /// `pltile` refuses and names DPMI and the extender.
+    ///
+    /// The message has to distinguish this from `alctile`/`ptrtile`, which do
+    /// exist: the two are easy to confuse by name and are not the same
+    /// operation, so the refusal says so rather than reading as "tiling is
+    /// unsupported".
+    #[test]
+    fn pltile_refuses_and_names_dpmi_and_the_extender() {
+        let mut f = Fixture::new();
+        // ULONG size (two words), INT bsel, USHORT stride, USHORT tsize.
+        let err = f
+            .invoke(pltile, &[0x0000, 0x0001, 0, 16, 4096])
+            .expect_err("there is no DOS extender here");
+        let message = err.to_string();
+        assert!(message.contains("DPMI"), "{message}");
+        assert!(message.contains("int 31h"), "{message}");
+        assert!(message.contains("alctile"), "{message}");
     }
 
     /// `alcdup` allocates `strlen(stg)+1` and copies (`ALCDUP.C:19-26`). The
