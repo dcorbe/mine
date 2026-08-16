@@ -19,7 +19,8 @@ use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
 use dos_poc::driver::{Driver, Script};
-use dos_poc::terminal::Terminal;
+use dos_poc::terminal::{RawStdin, Terminal};
+use dos_poc::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
 use dos_poc::files::Files;
 use dos_poc::mz::{self, MzImage};
 use dos_poc::screen::Screen;
@@ -80,6 +81,8 @@ fn main() -> io::Result<()> {
     let mut strict = false;
     let mut max_calls = MAX_CALLS;
     let mut interactive = false;
+    let mut door = false;
+    let mut baud: Option<u32> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -92,6 +95,8 @@ fn main() -> io::Result<()> {
                 max_calls = it.next().and_then(|v| v.parse().ok()).unwrap_or(MAX_CALLS);
             }
             "--interactive" | "-i" => interactive = true,
+            "--door" => door = true,
+            "--baud" => baud = it.next().and_then(|v| v.parse().ok()),
             other => {
                 if !tail.is_empty() {
                     tail.push(' ');
@@ -100,6 +105,12 @@ fn main() -> io::Result<()> {
             }
         }
     }
+
+    // Somebody is on the other end. Every guard in here exists to rescue an
+    // *unattended* probe from a guest that will not stop, and every one has now
+    // fired on a real session at least once -- the call cap, and the watchdog
+    // twice. One name for the condition, used everywhere, is the fix.
+    let attended = interactive || door;
 
     let data = std::fs::read(&path)?;
     let img = MzImage::parse(&data)?;
@@ -141,13 +152,22 @@ fn main() -> io::Result<()> {
     vm.enter(at.cs, at.ip, at.ss, at.sp, at.psp_seg, at.psp_seg)?;
     // A human takes as long as they take, so the watchdog that rescues an
     // unattended probe from a spinning guest must not fire on them.
-    let helpers = vm.helpers(if interactive { 24 * 60 * 60 * 1000 } else { 10_000 });
+    let helpers = vm.helpers(if attended { 24 * 60 * 60 * 1000 } else { 10_000 });
 
     // The sandbox. Everything the guest opens resolves beneath this one
     // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
     std::fs::create_dir_all(&root_dir)?;
     let root = std::fs::File::open(&root_dir)?;
     println!("root: {root_dir}");
+
+    // In door mode the guest talks to a UART, not to our screen: LORD programs
+    // the chip directly rather than using int 14h or a FOSSIL driver.
+    let mut serial = door.then(|| Uart::new(baud));
+    let mut pic = Pic::default();
+    let _raw = door.then(RawStdin::enter).transpose()?;
+    if door {
+        println!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}\r");
+    }
 
     let mut dos = DosState::default();
     dos.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
@@ -198,9 +218,50 @@ fn main() -> io::Result<()> {
         // The cap rescues an unattended probe from a program looping on a call
         // we keep refusing. A person playing a game is not that, and LORD idles
         // by polling -- it burns thousands of calls just waiting for a turn.
-        if !interactive && calls >= max_calls {
+        // A door serves a person, same as an interactive session: the cap is
+        // for unattended probes only.
+        if !attended && calls >= max_calls {
             break format!("stopped after {max_calls} calls");
         }
+        if let Some(uart) = serial.as_mut() {
+            // Host -> guest: anything the far end has typed.
+            let mut buf = [0u8; 256];
+            let mut fds = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: polling and reading our own stdin.
+            let ready = unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 0) };
+            if ready > 0 && fds.revents & libc::POLLIN != 0 {
+                // SAFETY: `buf` is a live buffer of the stated length.
+                let n = unsafe {
+                    libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len())
+                };
+                if n > 0 {
+                    for b in &buf[..n as usize] {
+                        uart.receive(*b);
+                    }
+                } else if n == 0 {
+                    // The far end hung up. Telling the guest is what lets it
+                    // save and exit instead of playing to nobody.
+                    uart.set_carrier(false);
+                }
+            }
+            // Guest -> host: whatever the transmitter has clocked out.
+            if !uart.tx.is_empty() {
+                let out = std::mem::take(&mut uart.tx);
+                // SAFETY: writing a live buffer to our own stdout.
+                unsafe { libc::write(libc::STDOUT_FILENO, out.as_ptr().cast(), out.len()) };
+            }
+            let want = uart.interrupting() && pic.may_deliver_irq4();
+            vm.set_interrupt_window(want);
+            if want && vm.ready_for_interrupt() {
+                pic.begin_irq4();
+                vm.inject(IRQ4_VECTOR)?;
+            }
+        }
+
         let ran = std::time::Instant::now();
         let stop = vm.run()?;
         let took = ran.elapsed();
@@ -365,10 +426,25 @@ fn main() -> io::Result<()> {
                     Outcome::Fault(f) => break format!("bad guest pointer: {f:?}"),
                 }
             }
-            Stop::PortWrite { port, value } => video.port_out(port, value),
+            Stop::PortWrite { port, value } => match (&mut serial, port) {
+                (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => uart.write(p, value),
+                (_, 0x20 | 0x21) => pic.write(port, value),
+                _ => video.port_out(port, value),
+            },
             Stop::PortRead { port } => {
-                let value = video.port_in(port);
+                let value = match (&mut serial, port) {
+                    (Some(uart), p) if (COM1_BASE..COM1_BASE + 8).contains(&p) => uart.read(p),
+                    (_, 0x20 | 0x21) => pic.read(port),
+                    _ => video.port_in(port),
+                };
                 vm.complete_port_read(value);
+            }
+            Stop::IrqWindow => {}
+            // With a UART present, `hlt` is not the end -- it is the guest
+            // saying it has nothing to do until an interrupt arrives, which is
+            // the whole point of having one.
+            Stop::Halted if serial.is_some() => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
             Stop::Halted => break "halted".to_string(),
             Stop::Interrupted => {
@@ -537,7 +613,10 @@ fn main() -> io::Result<()> {
     if !vm.port_log.is_empty() {
         println!("\nhardware ports touched (answered as an absent device):");
         for (port, n) in &vm.port_log {
-            println!("  {port:#06x}  {n:6}  {}", port_name(*port));
+            let modelled = door && ((COM1_BASE..COM1_BASE + 8).contains(port) || matches!(port, 0x20 | 0x21))
+                || matches!(port, 0x3d4 | 0x3d5 | 0x3b4 | 0x3b5 | 0x3da | 0x3ba);
+            let how = if modelled { "modelled" } else { "absent device" };
+            println!("  {port:#06x}  {n:6}  {:<48} {how}", port_name(*port));
         }
     }
     Ok(())

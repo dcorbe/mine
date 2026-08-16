@@ -88,6 +88,8 @@ fn main() -> io::Result<()> {
             // This demo models no hardware: an absent device reads as ones.
             Stop::PortWrite { .. } => {}
             Stop::PortRead { .. } => vm.complete_port_read(0xff),
+            // This demo raises no interrupts, so no window is ever requested.
+            Stop::IrqWindow => {}
             Stop::Halted => break 0,
             // This demo runs no helper threads, so nothing can interrupt it.
             Stop::Interrupted => break -3,

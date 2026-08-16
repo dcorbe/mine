@@ -64,6 +64,43 @@ const CP437: [char; 256] = [
 /// screen, which looks plausible enough to ship by mistake.
 const TO_ANSI: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 
+/// Put stdin in raw mode without touching the screen.
+///
+/// A door does not own the display -- the BBS does -- so it must not switch to
+/// an alternate screen or clear anything. It only needs the terminal to stop
+/// interpreting keystrokes on its behalf.
+pub struct RawStdin {
+    saved: libc::termios,
+}
+
+impl RawStdin {
+    pub fn enter() -> io::Result<Self> {
+        // SAFETY: reading the current settings of our own stdin.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut raw = saved;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL | libc::BRKINT | libc::INPCK | libc::ISTRIP);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: applying settings to our own stdin.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { saved })
+    }
+}
+
+impl Drop for RawStdin {
+    fn drop(&mut self) {
+        // SAFETY: restoring settings we saved from our own stdin.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
+    }
+}
+
 /// Restores the terminal however the program leaves.
 struct RawMode {
     saved: libc::termios,

@@ -151,7 +151,14 @@ struct KvmRun {
     io_data_offset: u64,
 }
 
+const KVM_INTERRUPT: libc::c_ulong = 0x4004_ae86;
+const KVM_EXIT_IRQ_WINDOW_OPEN: u32 = 7;
 const KVM_EXIT_INTR: u32 = 10;
+
+#[repr(C)]
+struct KvmInterrupt {
+    irq: u32,
+}
 
 /// Physical address of the BIOS tick count at `0040:006C`, which every DOS-era
 /// runtime treats as the clock.
@@ -170,6 +177,8 @@ pub enum Stop {
     /// The guest read a port we do not claim. The caller must answer with
     /// [`VmGuest::complete_port_read`] before the next [`VmGuest::run`].
     PortRead { port: u16 },
+    /// The guest is now able to take an interrupt.
+    IrqWindow,
     /// The guest halted.
     Halted,
     /// The watchdog cut in: the guest is running but not asking for anything.
@@ -534,6 +543,7 @@ impl VmGuest {
                         Ok(Stop::PortWrite { port, value })
                     }
                 }
+                KVM_EXIT_IRQ_WINDOW_OPEN => Ok(Stop::IrqWindow),
                 KVM_EXIT_HLT => Ok(Stop::Halted),
                 KVM_EXIT_INTR => {
                     let regs = std::ptr::from_mut(&mut self.regs);
@@ -576,6 +586,38 @@ impl VmGuest {
         unsafe {
             std::ptr::write_bytes(self.run.cast::<u8>().add(offset), value, bytes);
         }
+    }
+
+    /// Ask to be told the moment the guest can take an interrupt.
+    ///
+    /// Only worth setting while one is actually pending. Requesting it
+    /// unconditionally exits every time the guest is interruptible, which is
+    /// most of the time -- measured at 2,000 deliveries a second against
+    /// 119,000 once gated (`re/spikes/kvm_irq_inject.c`).
+    pub fn set_interrupt_window(&mut self, want: bool) {
+        // SAFETY: `run` is a live mapping; this is its first byte pair.
+        unsafe { (*self.run).request_interrupt_window = u8::from(want) };
+    }
+
+    /// Is the guest interruptible right now?
+    pub fn ready_for_interrupt(&self) -> bool {
+        // SAFETY: as above.
+        unsafe { (*self.run).ready_for_interrupt_injection != 0 }
+    }
+
+    /// Deliver a hardware interrupt by vector.
+    ///
+    /// With no in-kernel irqchip this takes the vector directly rather than an
+    /// IRQ line, so the caller does the 8259's mapping.
+    pub fn inject(&mut self, vector: u8) -> io::Result<()> {
+        let irq = KvmInterrupt {
+            irq: u32::from(vector),
+        };
+        // SAFETY: `irq` outlives the call, which copies it.
+        if unsafe { libc::ioctl(self.vcpu, KVM_INTERRUPT, std::ptr::from_ref(&irq)) } < 0 {
+            return last_err();
+        }
+        Ok(())
     }
 
     /// Where the guest is now, for diagnostics.
