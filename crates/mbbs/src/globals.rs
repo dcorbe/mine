@@ -190,6 +190,12 @@ pub const GLOBALS: &[Global] = &[
     // way every other global here is -- a `Wg32` module simply never writes
     // anything useful through it.
     g("othexp", PTR),
+    // MAJORBBS.H:314,316 -- struct module **module; int nmods; `module`
+    // itself is Task 1.5 (it joins immediately before this row, so the two
+    // stay adjacent the way the header declares them); `nmods` is the count
+    // beside it -- not a config value, the host knows this exactly. See the
+    // write beside `nterms`.
+    gi("nmods"),
     // MAJORBBS.H:400 -- int nglobs, (*globs[GLBMAX])();
     gi("nglobs"),
     g("globs", GLBMAX * PTR),
@@ -325,6 +331,10 @@ pub const GLOBALS: &[Global] = &[
     //   (MAJORBBS.H:507) is #define'd to it. sampln and outata are not placed
     //   here; no corpus module imports them.
     gi("outbsz"),
+    // MAJORBBS.H:581 -- int mmucrr; main-menu credit consumption rate per
+    // min. Same declaration block as `outbsz` above, two members over
+    // (`sampln` between them is not placed -- no corpus module imports it).
+    gi("mmucrr"),
     // REMOTE.H:10-17 -- one `extern` statement declaring seven remote-sysop
     // ints, in this order:
     //   int kilipg,   /* kill-system command in progress           */
@@ -355,6 +365,15 @@ pub const GLOBALS: &[Global] = &[
     gi("kilipg"),
     gi("errcod"),
     gi("kilsrc"),
+    // MAJORBBS.H:653 -- int digalw; digits allowed in User-IDs? A native
+    // MAJORBBS.H field again (unlike the REMOTE.H trio just above, which is
+    // its own header with no fixed position relative to this one), placed
+    // after it rather than disturbing that group's own established spot.
+    gi("digalw"),
+    // LINGO.H:41 -- int clingo; current language. `languages` (LINGO.H:42,
+    // Task 1.5) joins immediately after this row -- the header declares them
+    // consecutively, and this table follows suit.
+    gi("clingo"),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -751,6 +770,15 @@ impl<A: Abi> Globals<A> {
         // was allocated with above, so the two cannot drift.
         globals.write_mem(mem, "outbsz", &A::int_to_bytes(OUTBSZ.into()))?;
 
+        // `nmods` is a count the host owns, not a config value. A freshly
+        // built `Globals` has nothing loaded; `Host::load` is what moves it.
+        globals.write_mem(mem, "nmods", &A::int_to_bytes(0u16.into()))?;
+        // Defaults for the three whose config read is not implemented. Each
+        // cites the declaration whose comment names the meaning.
+        globals.write_mem(mem, "mmucrr", &A::int_to_bytes(0u16.into()))?;   // MAJORBBS.H:581
+        globals.write_mem(mem, "digalw", &A::int_to_bytes(1u16.into()))?;   // MAJORBBS.H:653
+        globals.write_mem(mem, "clingo", &A::int_to_bytes(0u16.into()))?;   // LINGO.H:41
+
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
         // is born with is a lie and not a placeholder.
@@ -841,6 +869,33 @@ mod tests {
         );
     }
 
+    /// `nmods` is not a configuration value -- it is how many modules are online,
+    /// which the host knows exactly. A fixture with no modules loaded must read
+    /// zero, and the number must move when a module lands.
+    #[test]
+    fn nmods_counts_the_modules_actually_online() {
+        let f = crate::testing::Fixture::new();
+        assert_eq!(
+            f.host.globals().word(&f.machine, "nmods").expect("nmods"),
+            0,
+            "a fixture loads no modules"
+        );
+    }
+
+    /// The three defaults, each the value a real host holds on a default install.
+    /// `MAJORBBS.H:581` (mmucrr), `:653` (digalw), `LINGO.H:41` (clingo).
+    #[test]
+    fn the_int_globals_hold_their_documented_defaults() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(g.word(&f.machine, "mmucrr").expect("mmucrr"), 0,
+                   "no main-menu credit consumption by default");
+        assert_eq!(g.word(&f.machine, "digalw").expect("digalw"), 1,
+                   "digits are allowed in User-IDs by default");
+        assert_eq!(g.word(&f.machine, "clingo").expect("clingo"), 0,
+                   "the first language is current");
+    }
+
     #[test]
     fn nobody_is_the_current_user_before_one_connects() {
         // `MAJORBBS.C:882` -- `usrnum=-1;`, three lines above the `inimod()`
@@ -912,7 +967,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 19, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 23, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -950,7 +1005,14 @@ mod tests {
         let last = *placed.last().expect("non-empty");
         // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
-        // Task 1.1 placed one more:
+        // Task 1.1 placed one more, 3530 until Task 1.2 placed four more:
+        //   +2 nmods     (MAJORBBS.H:316 -- the count beside `module`, Task 1.5)
+        //   +2 mmucrr    (MAJORBBS.H:581 -- same block as `outbsz`)
+        //   +2 digalw    (MAJORBBS.H:653)
+        //   +2 clingo    (LINGO.H:41)
+        // no new alignment byte: each of the four is 2 bytes and lands beside
+        // an already 2-byte-aligned neighbour -- 3530 + 2*4 = 3538.
+        // Before that:
         //   +2 outbsz    (MAJORBBS.H:579 -- 15 of 43 corpus modules, the most
         //                 widely imported symbol this host did not serve)
         // no new alignment byte: `outbsz` (2 bytes) sits between `emlsdrou`
@@ -977,7 +1039,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3530);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3538);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
