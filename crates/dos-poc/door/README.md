@@ -13,9 +13,27 @@ probes for. LORDCFG's per-node **"Fossil / Internal"** setting decides:
 | `Regular Fossil Driver` | calls `int 14h` | `fossil.rs` |
 
 Both are supported and both move bytes through the same queues, so the choice
-changes nothing on the wire and nothing in this directory. Measured on a real
-session, `Regular Fossil` produced 1467 `AH=01` transmits and exactly 1467
-bytes out.
+changes nothing in this directory. Measured on a real session, `Regular Fossil`
+produced 1467 `AH=01` transmits and exactly 1467 bytes out.
+
+**Run the live board on `Internal`.** The two settings do not put the same
+bytes on the wire, because LORD renders differently for each: over the same
+screens it sent 6035 bytes on `Internal` against 3050 on `Regular Fossil`, with
+675 colour changes against 267 and 38 cursor-forwards against 120. `Internal`
+pads with real spaces carrying attributes; FOSSIL compresses with `ESC[nC`
+skips and leans on the terminal for the rest, which was the right trade at 2400
+baud and is the wrong one now.
+
+The consequence is that FOSSIL output only lays out correctly on a terminal
+exactly 80 columns wide. LORD's own screen data assumes it -- around the
+`(F)lirt with Violet the Virgin` menu in `LORDTXT.DAT` there is an unbroken
+82-character run that is *meant* to wrap after column 80, and `ESC[nC` values
+up to 78 that only land where intended when the right margin clamps at 79. On
+a wider terminal neither happens and the screen is unreadable.
+
+That is a bug in LORD, not here, and it is deliberately not worked around: the
+transport does not rewrite a program's escape sequences. `Internal` does not
+have the problem, so the door uses it.
 
 If a door is set to a FOSSIL mode and the driver does not answer, the failure
 is not subtle -- LORD says `Fossil was not initialized properly! You should
