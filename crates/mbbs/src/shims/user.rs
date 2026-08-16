@@ -481,15 +481,66 @@ pub fn onsysn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
 
-    let found = scan_for(call, host, invis, |call, host, chan| {
+    let found = onsysn_for(call, host, &uid, invis)?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(found))))
+}
+
+/// [`onsysn`]'s scan, against a user-id the caller already has in hand.
+///
+/// Split out so `crate::shims::credits::crdusr` can ask the same question the
+/// vendor's `crdusr` asks (`ACCOUNT.C:725`, `onsysn(keyuid,1)`) without a
+/// second copy of the channel walk -- and so that when this host grows a
+/// signup flow that advances `usrcls` past `SUPIPG`, both callers start
+/// telling the truth on the same day. See
+/// [`onsysn_is_always_false_here_because_this_host_never_advances_usrcls_past_zero`](self::tests)
+/// for what that day changes.
+pub(crate) fn onsysn_for<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    uid: &[u8],
+    invis: bool,
+) -> Result<bool, ShimError> {
+    scan_for(call, host, invis, |call, host, chan| {
         let usrcls = host.users().usrcls_mem(call.mem(), chan)?;
         if usrcls <= SUPIPG {
             return Ok(false);
         }
-        userid_matches(call, host, chan, &uid)
-    })?;
+        userid_matches(call, host, chan, uid)
+    })
+}
 
-    Ok(abi::Ret::Int(A::Int::from(u16::from(found))))
+/// `INT nliniu(VOID)` -- how many of this host's channels are in use?
+/// `ACCOUNT.C:1086-1097`:
+///
+///
+/// **Fully implemented**, and it answers `0` today for every channel,
+/// including connected ones.
+///
+/// That is not a stub. `VACANT` is `0` (`MAJORBBS.H:221`), and this host
+/// never advances `usrcls` past `0` -- `Host::connect_state` writes it as
+/// zero and nothing here raises it, which is the same gap
+/// [`onsysn`] already carries and pins with a test of its own. A channel this
+/// host considers connected is one the *vendor's* own predicate calls vacant,
+/// so counting it would be inventing a signup flow that has not been built.
+///
+/// The loop is real rather than folded to a constant, so the day `usrcls`
+/// starts moving this routine starts counting without being revisited, and
+/// [`nliniu_counts_channels_whose_usrcls_left_vacant`](self::tests) fails
+/// that day rather than passing quietly.
+///
+/// # Errors
+///
+/// If a channel's `usrcls` cannot be read.
+pub fn nliniu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    const VACANT: u16 = 0;
+
+    let mut in_use = 0u16;
+    for chan in host.users().terms().all() {
+        if host.users().usrcls_mem(call.mem(), chan)? != VACANT {
+            in_use += 1;
+        }
+    }
+    Ok(abi::Ret::Int(A::Int::from(in_use)))
 }
 
 /// `INT othkey(const CHAR *lock)` -- does the channel `othusn` last pointed at
@@ -2088,6 +2139,42 @@ mod tests {
             Ret::U16(1),
             "channel 1's match is invisible, but channel 2's is not"
         );
+    }
+
+    #[test]
+    /// `nliniu` counts channels whose `usrcls` is not `VACANT` (0).
+    ///
+    /// This host writes `usrcls` as 0 at connect and never raises it, and
+    /// `VACANT` *is* 0, so the honest count is zero even with two channels
+    /// connected. Both halves are asserted: zero while `usrcls` stays put,
+    /// and a real count once it is written -- so the loop is proven to be a
+    /// loop rather than a folded constant, and the day a signup flow advances
+    /// `usrcls` this routine is already right.
+    #[test]
+    fn nliniu_counts_channels_whose_usrcls_left_vacant() {
+        let mut f = two_channels();
+        assert_eq!(
+            f.invoke(nliniu, &[]).expect("nliniu"),
+            Ret::U16(0),
+            "connected, but usrcls is 0 and VACANT is 0 -- see nliniu's doc comment"
+        );
+
+        // Write usrcls on one channel the way a signup flow eventually will.
+        let chan = f.host.users().terms().chan(1).expect("channel 1");
+        let field = f.host.users().user_layout().usrcls;
+        let at = Wg16::ptr_offset(f.host.users().slot(chan), field.at);
+        f.machine.write(at, &5u16.to_le_bytes()).expect("usrcls fits");
+
+        assert_eq!(
+            f.invoke(nliniu, &[]).expect("nliniu"),
+            Ret::U16(1),
+            "one channel is no longer VACANT, so one line is in use"
+        );
+
+        let chan = f.host.users().terms().chan(0).expect("channel 0");
+        let at = Wg16::ptr_offset(f.host.users().slot(chan), field.at);
+        f.machine.write(at, &3u16.to_le_bytes()).expect("usrcls fits");
+        assert_eq!(f.invoke(nliniu, &[]).expect("nliniu"), Ret::U16(2));
     }
 
     #[test]

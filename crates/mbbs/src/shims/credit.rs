@@ -98,6 +98,34 @@ pub fn dedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::Int::from(YES)))
 }
 
+/// `int rdedcrd(long amt, int asmuch)` -- deduct **real** credits from the
+/// current online account. `ACCOUNT.C:409-415`:
+///
+///
+/// **[`dedcrd`] with `real` set, and the same answer for the same reason.**
+/// The two differ by one argument to `ldedcrd`: `dedcrd` passes `real=0` and
+/// `rdedcrd` passes `real=1`, which selects whether the class table's debt
+/// limit and its `CRDXMT` credit-exemption are allowed to make the deduction
+/// succeed on an account that cannot really afford it. This host keeps no
+/// balance, no class table and no debt limit, so the distinction has nothing
+/// to distinguish and both answer yes -- see [`YES`] for whose decision that
+/// is and why it is a decision rather than a gap.
+///
+/// Answering this one differently from [`dedcrd`] would be the incoherent
+/// choice, not the careful one: a module charging through `dedcrd` would
+/// proceed and the same module charging through `rdedcrd` would stop, over a
+/// balance neither of them moved.
+///
+/// # Errors
+///
+/// If `usrnum` does not name a channel of this host; see [`dedcrd`].
+pub fn rdedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _amt = call.long();
+    let _asmuch = call.int();
+    host.current_channel_mem(call.mem())?;
+    Ok(abi::Ret::Int(A::Int::from(YES)))
+}
+
 /// `int tstcrd(long amt)` -- does the *current* user have `amt` credits to
 /// spare? `ACCOUNT.C:574-579`:
 ///
@@ -585,6 +613,42 @@ mod tests {
         let mut args = amt.to_vec();
         args.push(1); // asmuch
         assert_eq!(f.invoke(dedcrd, &args).expect("dedcrd"), Ret::U16(1));
+    }
+
+    /// `rdedcrd` is `dedcrd` with `real` set, and answers the same way.
+    /// Asserted side by side with `dedcrd` over the identical arguments,
+    /// because the failure worth catching is the two disagreeing -- a module
+    /// charging through one would proceed and through the other would stop,
+    /// over a balance neither moved.
+    #[test]
+    fn rdedcrd_answers_exactly_as_dedcrd_does() {
+        let mut f = Fixture::new();
+        connect(&mut f, &[]);
+
+        for amt in [0, 500, -500] {
+            let mut args = long_words(amt).to_vec();
+            args.push(1); // asmuch
+            assert_eq!(
+                f.invoke(rdedcrd, &args).expect("rdedcrd"),
+                f.invoke(dedcrd, &args).expect("dedcrd"),
+                "rdedcrd and dedcrd must agree on {amt}"
+            );
+            assert_eq!(f.invoke(rdedcrd, &args).expect("rdedcrd"), Ret::U16(1));
+        }
+    }
+
+    /// With nobody current, `rdedcrd` refuses rather than answering yes --
+    /// the real `uacoff(usrnum)` would be indexing the account table with
+    /// `-1`. The same guard `dedcrd` carries.
+    #[test]
+    fn rdedcrd_refuses_when_nobody_is_the_current_user() {
+        let mut f = Fixture::new();
+        let mut args = long_words(500).to_vec();
+        args.push(1);
+        assert!(
+            f.invoke(rdedcrd, &args).is_err(),
+            "usrnum is -1 before anyone connects"
+        );
     }
 
     #[test]

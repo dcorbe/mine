@@ -392,6 +392,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "ftgnew", ftf::ftgnew, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "ftgsbm", ftf::ftgsbm, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "dedcrd", credit::dedcrd, Cleans::Caller, Evidence::Unclassified),
+        // `ACCOUNT.C`'s current-user deduction, Phase 2 Task 2.4. `rdedcrd`
+        // is `dedcrd` with `real` set; both answer yes, because this host
+        // keeps no balance for either to move -- see `shims::credit::YES`.
+        (MAJORBBS, "rdedcrd", credit::rdedcrd, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         (MAJORBBS, "tstcrd", credit::tstcrd, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "condex", credit::condex, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "sscanf", credit::sscanf, Cleans::Caller, Evidence::Unclassified),
@@ -638,6 +643,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // current one's.
         (MAJORBBS, "instat", user::instat, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "onsysn", user::onsysn, Cleans::Caller, Evidence::Unclassified),
+        // `nliniu` counts channels whose `usrcls` is not VACANT. Beside
+        // `onsysn` because it shares that field and that gap: this host
+        // never advances `usrcls`, so both answer as though nobody is on.
+        (MAJORBBS, "nliniu", user::nliniu, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         (MAJORBBS, "othkey", user::othkey, Cleans::Caller, Evidence::Unclassified),
         // The default `stsrou` a module gets if it registers none of its
         // own. See `user::dfsthn`'s own doc comment for why its one real
@@ -653,6 +663,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // int)` and `(int, long, int, int)` exactly.
         (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller, Evidence::Unclassified),
+        // The rest of `ACCOUNT.C`'s Phase 2 block. `addcrd`/`crdusr` post
+        // nothing and answer the online-ness this host can measure;
+        // `howbuy` is the vendor's own `pester`-off branch. See each
+        // routine's doc comment -- none of the three is a stub, and none
+        // refuses.
+        (MAJORBBS, "addcrd", credits::addcrd, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
+        (MAJORBBS, "crdusr", credits::crdusr, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
+        (MAJORBBS, "howbuy", credits::howbuy, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         // Borland's own C++ runtime plumbing LunatiX links against from
         // `cw3220mt.DLL`, aliased onto `MAJORBBS` same as everything above --
         // and the one KERNEL32 call that can be served alongside it. See

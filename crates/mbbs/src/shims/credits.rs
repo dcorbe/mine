@@ -74,6 +74,8 @@
 #[cfg(test)]
 use mbbs_machine::m16::Ret;
 
+use mbbs_machine::ptr::ModulePtr;
+
 use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
@@ -144,10 +146,256 @@ pub fn odedcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::Int::from(YES)))
 }
 
+/// `int crdusr(char *keyuid, const char *tckstg, int real, int affall)` --
+/// post credits to a named account. `ACCOUNT.C:712-762`.
+///
+/// The vendor looks `keyuid` up in the accounts file, adds `atol(tckstg)` to
+/// `creds` (and to `totcreds`/`totpaid` when `affall`), and may switch the
+/// account's class if the posting takes it out of the red. It answers `-1`
+/// when there is no such account or it is flagged for deletion, and otherwise
+/// whether that user is currently online.
+///
+/// **Nothing is posted, and the answer is the online-ness this host can
+/// actually measure.** This is the deduction side's decision applied to the
+/// grant side: see the module docs above and
+/// [`YES`]. There is no `creds` field in this host's
+/// `struct usracc` (`crate::users::AccountLayout` models `userid` and the
+/// four screen-preference bytes and nothing else), no class table for
+/// `fndcls` to search, and no `sv2` statistics block -- so every one of the
+/// vendor's writes lands nowhere, and refusing instead would stop a module
+/// over a balance that would not have moved either way.
+///
+/// **It never answers `-1`.** That value means "this account does not exist",
+/// and this host cannot establish it: `onsysn` sees the channels that are
+/// connected right now, and there is no offline account database behind them
+/// to prove a name absent. Answering `-1` for every user who happens not to
+/// be online would report deletion-flagged and merely-offline accounts
+/// alike, and a module that treats `-1` as "bad user-ID" would reject a
+/// perfectly good one. `0` -- "posted; that user is not online" -- is the
+/// answer this host can stand behind.
+///
+/// `tckstg` is read rather than ignored, because the vendor reads it as a
+/// number and a caller passing a malformed one deserves the same treatment
+/// here as the argument frame it occupies.
+///
+/// # Errors
+///
+/// If either string argument is not a valid pointer, or a read runs off the
+/// segment.
+pub fn crdusr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let keyuid = call.ptr();
+    let tckstg = call.ptr();
+    let _real = call.int();
+    let _affall = call.int();
+    let online = posted_to::<A>(call, host, keyuid, tckstg)?;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(online))))
+}
+
+/// `int addcrd(char *keyuid, const char *tckstg, int real)` -- post credits
+/// and announce it on the console. `ACCOUNT.C:691-708`:
+///
+///
+/// **[`crdusr`] plus the console announcement, which this host really does
+/// emit** -- `shocst` is implemented (`crate::shims::system::shocst`), so the
+/// sysop console gets the same two lines the original wrote, with the same
+/// `PAID`/`FREE` wording chosen by `real`.
+///
+/// **The `sv2` running totals are not kept.** `sv2.paidpst`/`sv2.freepst` are
+/// fields of the system-statistics block this host does not model, so the
+/// pair of `+=` is the one part of this body that goes nowhere. Nothing reads
+/// those totals except the vendor's own sysop statistics screen, which is
+/// also not here; they are named in this comment rather than silently
+/// dropped so the omission is discoverable from the code.
+///
+/// **`real` is the third parameter and is a `GBOOL`, not an `INT`.**
+/// `INC/USRACC.H:87` and the later `VCPROJ/GCOMMLIB/USRACC.H` disagree on
+/// exactly this, and `INC/` is the generation the NE modules compiled
+/// against. It costs nothing at the call frame -- `GCTYPDEF.H:105` makes
+/// `GBOOL` a `short`, and this host reads the argument at `INT` width because
+/// that is what a 16-bit cdecl caller pushes for either -- but the
+/// disagreement is recorded because it is the exact trap this plan's own
+/// citation rule exists for.
+///
+/// # Errors
+///
+/// If either string argument is not a valid pointer, or a read runs off the
+/// segment.
+pub fn addcrd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let keyuid = call.ptr();
+    let tckstg = call.ptr();
+    let real = Into::<u32>::into(call.int()) != 0;
+
+    let online = posted_to::<A>(call, host, keyuid, tckstg)?;
+
+    // `crdusr`'s answer is never negative here, so the vendor's `>= 0` guard
+    // is always taken and the announcement always happens. See `crdusr` for
+    // why -1 is not an answer this host can give.
+    let uid = read_string::<A>(call, keyuid)?;
+    let ticks = read_string::<A>(call, tckstg)?;
+    let title = format!("{} CREDITS POSTED", if real { "PAID" } else { "FREE" });
+    let line = format!("User-ID: {uid:<29} Credits posted: {ticks:>7}");
+    crate::shims::system::shocst_line(host, &title, &line);
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(online))))
+}
+
+/// The part [`addcrd`] and [`crdusr`] share: read both strings so a bad
+/// pointer is caught, then answer whether `keyuid` is online.
+///
+/// `onsysn(keyuid,1)` is the vendor's own test (`ACCOUNT.C:725`), with
+/// `invis=1` so an invisible user still counts -- posting credits is not a
+/// social act and the original does not let the `INVISB` flag hide an account
+/// from it.
+fn posted_to<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    keyuid: A::Ptr,
+    tckstg: A::Ptr,
+) -> Result<bool, ShimError> {
+    let uid = read_string::<A>(call, keyuid)?;
+    // Read and discarded: there is no `creds` field for `atol(tckstg)` to be
+    // added to. Read anyway so a caller passing a bad pointer is told here
+    // rather than at whatever reads it next.
+    let _ticks = read_string::<A>(call, tckstg)?;
+
+    crate::shims::user::onsysn_for(call, host, uid.as_bytes(), true)
+}
+
+/// One NUL-terminated argument string.
+fn read_string<A: Abi>(call: &mut Call<A>, at: A::Ptr) -> Result<String, ShimError> {
+    let bytes = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `void howbuy(void)` -- emit the "how to buy credits" message.
+/// `ACCOUNT.C:1383-1391`:
+///
+///
+/// **Does nothing, because `pester` is off, and the vendor's own body does
+/// nothing when it is.** This is a real branch of the real routine rather
+/// than a stub: `if (pester)` guards the entire body, so a board with the
+/// option clear emitted no message either.
+///
+/// `pester` is not a host global a module can see or set -- `ACCOUNT.C:63`
+/// declares it file-scope, and `:113` fills it from `ynopt(PESTER)`, a
+/// message-file option this host has no parser for. What settles its value
+/// here is not the missing parser but the decision above it: **a host that
+/// bills nobody has nothing to pester anybody about.** Every routine in this
+/// module answers as though every account were credit-exempt, and "do not
+/// nag this user to buy more credits" is the same answer in the same voice.
+///
+/// The alternative was to refuse, and that would have been the wrong kind of
+/// honest. Refusing says "this host cannot answer"; the truth is that it can,
+/// and the answer is the empty one. What this host genuinely could not do is
+/// emit the message *if `pester` were set*: `HOWBUY` lives in `wgsacct.mcv`,
+/// reached through `acnmb` (`MAJORBBS.H:428`, opened at `ACCOUNT.C:101`),
+/// which is the **server's own** message file and not a module's -- this host
+/// loads module message files and has none of its own. That is why `pester`
+/// being off is load-bearing and is stated here rather than left implicit.
+///
+/// # Errors
+///
+/// Never. The signature is fallible because every shim's is.
+pub fn howbuy<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    /// Two connected channels, so `crdusr`'s scan has something to walk.
+    fn two_channels() -> Fixture {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        for (n, uid) in [(0i16, "rangerdan"), (1, "kaimon")] {
+            let chan = f.host.users().terms().chan(n).expect("a channel");
+            f.host
+                .connect_state(&mut f.machine, chan, &crate::Connection::ansi(uid))
+                .expect("connects");
+        }
+        f
+    }
+
+    /// `addcrd` writes the console line the vendor writes (`ACCOUNT.C:703`),
+    /// with `real` choosing the `PAID`/`FREE` wording. This host really does
+    /// emit it -- `shocst` is implemented -- so it is the one observable
+    /// effect of the routine and the one worth asserting.
+    #[test]
+    fn addcrd_announces_the_posting_on_the_console() {
+        let mut f = two_channels();
+        let uid = f.text("rangerdan");
+        let ticks = f.text("500");
+
+        let args = [uid.offset, uid.selector, ticks.offset, ticks.selector, 1];
+        assert!(matches!(f.invoke(addcrd, &args), Ok(Ret::U16(_))));
+
+        let audit = f.host.audit().last().expect("a console line").clone();
+        assert!(audit.starts_with("PAID CREDITS POSTED: "), "{audit}");
+        assert!(audit.contains("rangerdan"), "{audit}");
+        assert!(audit.contains("500"), "{audit}");
+
+        // `real=0` is the other wording, and the same line otherwise.
+        let args = [uid.offset, uid.selector, ticks.offset, ticks.selector, 0];
+        assert!(matches!(f.invoke(addcrd, &args), Ok(Ret::U16(_))));
+        let audit = f.host.audit().last().expect("a console line").clone();
+        assert!(audit.starts_with("FREE CREDITS POSTED: "), "{audit}");
+    }
+
+    /// `crdusr` answers whether the named user is online, and **never** -1.
+    ///
+    /// -1 means "no such account", which this host cannot establish: there is
+    /// no offline account database behind the connected channels to prove a
+    /// name absent. A user nobody has heard of gets `0` -- "posted, and that
+    /// user is not online" -- not a rejection.
+    #[test]
+    fn crdusr_never_answers_minus_one_for_an_unknown_user() {
+        let mut f = two_channels();
+        let uid = f.text("nobody-by-that-name");
+        let ticks = f.text("100");
+
+        let args = [uid.offset, uid.selector, ticks.offset, ticks.selector, 1, 1];
+        assert_eq!(
+            f.invoke(crdusr, &args).expect("crdusr"),
+            Ret::U16(0),
+            "not online, but not rejected either -- -1 is not an answer this host can give"
+        );
+    }
+
+    /// A connected user is still reported offline, because `crdusr` asks
+    /// `onsysn`, and `onsysn` requires `usrcls > SUPIPG` -- which this host
+    /// never sets.
+    ///
+    /// Pinned as the honest consequence rather than papered over: the day a
+    /// signup flow advances `usrcls`, this test fails and says so, instead of
+    /// `crdusr` silently starting to answer differently.
+    #[test]
+    fn crdusr_reports_a_connected_user_offline_while_usrcls_stays_zero() {
+        let mut f = two_channels();
+        let uid = f.text("rangerdan");
+        let ticks = f.text("100");
+
+        let args = [uid.offset, uid.selector, ticks.offset, ticks.selector, 1, 1];
+        assert_eq!(
+            f.invoke(crdusr, &args).expect("crdusr"),
+            Ret::U16(0),
+            "rangerdan IS connected; onsysn still says no because usrcls is 0"
+        );
+    }
+
+    /// `howbuy` emits nothing, because `pester` is off -- the vendor's own
+    /// body does nothing in that state (`ACCOUNT.C:1386`). Asserted against
+    /// the audit trail so "nothing happened" is measured rather than assumed.
+    #[test]
+    fn howbuy_says_nothing_because_this_host_pesters_nobody() {
+        let mut f = Fixture::new();
+        let before = f.host.audit().len();
+        assert!(matches!(f.invoke(howbuy, &[]), Ok(Ret::Void)));
+        assert_eq!(f.host.audit().len(), before, "howbuy wrote nothing anywhere");
+    }
 
     /// The answer that gets a player past the paywall. Zero from either of
     /// these is what bounces them back to the pre-game menu.

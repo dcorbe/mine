@@ -810,12 +810,21 @@ pub fn shocst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     let (detail, _) = format_call(call, template)?;
-    host.audit.push(format!(
-        "{}: {}",
-        String::from_utf8_lossy(&headline),
-        String::from_utf8_lossy(&detail)
-    ));
+    shocst_line(
+        host,
+        &String::from_utf8_lossy(&headline),
+        &String::from_utf8_lossy(&detail),
+    );
     Ok(abi::Ret::Void)
+}
+
+/// One audit-trail line, already formatted.
+///
+/// [`shocst`]'s tail, split out so a routine that *calls* `shocst` in the
+/// vendor -- `addcrd` (`ACCOUNT.C:703`) is the one that does -- writes the
+/// same line in the same shape rather than inventing a second audit format.
+pub(crate) fn shocst_line<A: Abi>(host: &mut Host<A>, brief: &str, detail: &str) {
+    host.audit.push(format!("{brief}: {detail}"));
 }
 
 /// `VOID rtkick(INT delay, VOID (*dstrou)())` -- `GCOMM.H:228-231` -- run
