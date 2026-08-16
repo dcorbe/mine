@@ -646,9 +646,16 @@ impl VmGuest {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(watchdog_ms);
             while !dog_stop.load(Ordering::Relaxed) {
                 if std::time::Instant::now() >= deadline {
+                    // Keep signalling rather than firing once. A single signal
+                    // that arrives while the main thread is in userspace -- not
+                    // blocked in KVM_RUN -- is swallowed by the no-op handler
+                    // and the watchdog silently never fires again, which is how
+                    // a guest spinning on port I/O hung past its deadline
+                    // forever.
                     // SAFETY: signalling a thread of our own process.
                     unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR1) };
-                    return;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
