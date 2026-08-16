@@ -773,6 +773,109 @@ pub fn issupc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::int_from_u32(u32::from(valid))))
 }
 
+/// `VOID clrinp(VOID)` -- `MAJORBBS.H:788`. `MAJORBBS.C:3204-3210`:
+///
+///
+/// **Fully implemented.** Four writes to four placed globals, and all four
+/// matter: `margv[0]=input` is the one a plausible implementation drops.
+/// Clearing the buffer without re-pointing `margv[0]` at it leaves the first
+/// parsed word addressing whatever the last line left behind, and `bgncnc`
+/// (`CNCUTL.C:29`) opens with `nxtcmd=margv[0]` -- so a stale `margv[0]`
+/// walks the concatenation cursor into freed text on the next command rather
+/// than at an empty string.
+///
+/// # Errors
+///
+/// If any of `input`, `margv`, `inplen` or `margc` is not placed, or a write
+/// runs off the segment.
+pub fn clrinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let globals = host.globals();
+    let input = globals
+        .address("input")
+        .ok_or_else(|| ShimError::Failed("input is not placed".into()))?;
+
+    // `input[0]='\0'`: the buffer's first byte, not the whole buffer. The
+    // vendor leaves the rest as it was.
+    globals
+        .write_mem(call.mem(), "input", &[0])
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    // `margv[0]=input`.
+    globals
+        .write_mem(call.mem(), "margv", &A::ptr_to_bytes(input))
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    globals
+        .write_int_mem(call.mem(), "inplen", 0)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    globals
+        .write_int_mem(call.mem(), "margc", 0)
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID xltctls(CHAR *txtbuf)` -- `MAJORBBS.H:751`. `MAJORBBS.C:1564-1584`:
+///
+///
+/// **Fully implemented**, in place and shrinking: `^A` becomes the single
+/// byte `0x01`, and `^^` becomes a literal `^`.
+///
+/// Three details a rewrite gets wrong:
+///
+/// - **The fold is `c & ~0x40`, not "uppercase then subtract 64".** So `^a`
+///   is `0x61 & ~0x40` = `0x21`, an exclamation mark, not `0x01`. The vendor
+///   does not upper-case first and neither does this.
+/// - **A trailing `^` survives.** The `case '\0'` arm breaks out of the
+///   switch without touching anything, so a buffer ending in `^` keeps it.
+/// - **`^^` leaves one `^`, and the loop's `cp++` steps over it**, so `^^^^`
+///   becomes `^^` rather than collapsing further.
+///
+/// The result is never longer than the input, so it is written back over the
+/// caller's own buffer at the length it arrived with.
+///
+/// # Errors
+///
+/// If `txtbuf` is not a valid pointer, or the read or write runs off the
+/// segment.
+pub fn xltctls<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let at = call.ptr();
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] != b'^' {
+            out.push(text[i]);
+            i += 1;
+            continue;
+        }
+        match text.get(i + 1) {
+            // `case '\0'`: nothing is done, and the trailing '^' stands.
+            None => {
+                out.push(b'^');
+                i += 1;
+            }
+            // `case '^'`: the pair collapses to one, and `cp++` steps past it.
+            Some(b'^') => {
+                out.push(b'^');
+                i += 2;
+            }
+            // `default`: the control character, and the letter is consumed.
+            Some(&c) => {
+                out.push(c & !0x40);
+                i += 2;
+            }
+        }
+    }
+
+    // Never longer than what came in, so it fits where it came from.
+    let capacity = text.len() as u16 + 1;
+    write_cstr_mem::<A>(call.mem(), at, &out, capacity)?;
+    Ok(abi::Ret::Void)
+}
+
 /// `void parsin(void)` -- parse `input` into `margv[]`.
 ///
 /// **Not in the v6 host source.** `MAJORBBS.C`'s `getin()` folds this
@@ -3040,6 +3143,67 @@ mod tests {
         };
         assert_eq!(n, 0, "leading padding is not padding");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  text");
+    }
+
+    /// `clrinp` empties the input buffer and re-points `margv[0]` at it.
+    ///
+    /// The `margv[0]=input` half is the one a plausible implementation drops,
+    /// so it is asserted directly: `bgncnc` opens with `nxtcmd=margv[0]`, and
+    /// a stale `margv[0]` would send the concatenation cursor into the
+    /// previous line's text.
+    #[test]
+    fn clrinp_empties_the_buffer_and_repoints_margv_zero() {
+        let mut f = Fixture::new();
+        f.host.globals().write(&mut f.machine, "input", b"look here now").expect("input");
+        assert!(matches!(f.invoke(parsin, &[]), Ok(Ret::Void)));
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 3);
+
+        // Point margv[0] somewhere else entirely, the way a previous command
+        // would have left it.
+        let elsewhere = f.text("stale");
+        let margv = f.host.globals().address("margv").expect("margv");
+        f.machine.write(margv, &FarPtr::to_bytes(elsewhere)).expect("margv seeded");
+
+        assert!(matches!(f.invoke(clrinp, &[]), Ok(Ret::Void)));
+
+        let input = f.host.globals().address("input").expect("input");
+        assert_eq!(f.machine.read_cstr(input).expect("readable"), b"", "input[0] is NUL");
+        assert_eq!(f.host.globals().word(&f.machine, "inplen").expect("inplen"), 0);
+        assert_eq!(f.host.globals().word(&f.machine, "margc").expect("margc"), 0);
+
+        let margv0 = FarPtr::from_bytes(
+            f.machine.resolve(margv, 4).expect("in bounds").try_into().expect("4 bytes"),
+        );
+        assert_eq!(margv0, input, "margv[0] points back at input, not at the stale word");
+    }
+
+    /// `xltctls` turns `^A` into `0x01` and `^^` into a literal `^`, in place
+    /// (`MAJORBBS.C:1564`).
+    ///
+    /// The three cases a rewrite gets wrong are each asserted: the fold is
+    /// `c & ~0x40` rather than "uppercase then subtract", a trailing `^`
+    /// survives, and `^^^^` becomes `^^` rather than collapsing further.
+    #[test]
+    fn xltctls_folds_caret_sequences_into_control_characters() {
+        let mut f = Fixture::new();
+        let mut run = |f: &mut Fixture, s: &str| -> Vec<u8> {
+            let at = f.text(s);
+            assert!(matches!(f.invoke(xltctls, &Fixture::far(at)), Ok(Ret::Void)));
+            f.machine.read_cstr(at).expect("readable").to_vec()
+        };
+
+        assert_eq!(run(&mut f, "^A"), vec![0x01]);
+        assert_eq!(run(&mut f, "a^Mb"), vec![b'a', 0x0d, b'b']);
+        assert_eq!(run(&mut f, "^^"), b"^".to_vec(), "a doubled caret is a literal one");
+        assert_eq!(run(&mut f, "^^^^"), b"^^".to_vec(), "cp++ steps over the survivor");
+        assert_eq!(run(&mut f, "no carets"), b"no carets".to_vec());
+
+        // `c & ~0x40` on a lowercase letter is NOT a control character: 'a' is
+        // 0x61, and 0x61 & ~0x40 is 0x21. The vendor does not upper-case first.
+        assert_eq!(run(&mut f, "^a"), b"!".to_vec(), "0x61 & ~0x40 == 0x21 == '!'");
+
+        // `case '\0'` breaks out of the switch without touching anything.
+        assert_eq!(run(&mut f, "end^"), b"end^".to_vec(), "a trailing caret survives");
     }
 
     /// A `UIDSIZ`-wide zeroed buffer holding `s`, which is what `zonkhl` and

@@ -820,6 +820,78 @@ pub fn istxvc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
     Ok(abi::Ret::Int(A::int_from_u32(valid)))
 }
 
+/// `VOID clrxrf(VOID)` -- `MAJORBBS.H:793`. `MAJORBBS.C:3437-3443`:
+///
+///
+/// **Does nothing, and that is the vendor's own `numxrf == 0` branch rather
+/// than a stub.**
+///
+/// `numxrf` is the number of alternate user-IDs a board lets one account
+/// carry, read at `MAJORBBS.C:992` as `numopt(NUMXRF,0,MAXXRF)` -- **minimum
+/// zero** -- and the very next line only allocates `xrfpos` at all when it
+/// came back non-zero:
+///
+///
+/// So a board that did not configure the cross-reference had `numxrf == 0`
+/// and `xrfpos == NULL`, and this routine did nothing there either. This host
+/// has no message-file parser to answer `numopt`, so it is in exactly that
+/// state, and the empty answer is the complete one.
+///
+/// Neither `numxrf` nor `xrfpos` is placed as a host global, and neither
+/// should be: `MAJORBBS.C:84` declares them in the server's own translation
+/// unit and `MAJORBBS.H` does not export them, so no module can address
+/// either. The macro that indexes them, `xrfidx(n)` = `usrnum*numxrf+n`
+/// (`MAJORBBS.C:91`), is file-scope too.
+///
+/// # Errors
+///
+/// Never. The signature is fallible because every shim's is.
+pub fn clrxrf<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
+/// `INT hdluid(CHAR *stg)` -- `MAJORBBS.H:796`. `MAJORBBS.C:3490` onward,
+/// K&R style (`hdluid(stg) CHAR *stg;`).
+///
+/// **Refuses.** The body is the user-ID cross-reference lookup end to end: it
+/// opens `xrfbb`, tests `xrfpos[xrfidx(0)]`, pulls a record with
+/// `dfaGetAbs(&uidxrf,...)`, and answers `UIDFND`/`UIDPMT` according to what
+/// it found.
+///
+/// Unlike [`clrxrf`], there is no `numxrf == 0` branch to fall into: this
+/// routine dereferences `xrfpos` unconditionally on its first line, so a
+/// board that never configured the cross-reference would have faulted here on
+/// a NULL. The routine presupposes the subsystem, and this host does not have
+/// it -- no `xrfbb` Btrieve file, no `xrfpos` table, no `numopt` to size one
+/// with.
+///
+/// `uidxrf` *is* placed (the 46-byte `struct` by value, `crate::globals`), so
+/// the destination of the read exists; what does not exist is anything to
+/// read into it. Answering `UIDPMT` -- "ask the user which ID they meant" --
+/// would be the plausible answer here, and it is wrong in the way that
+/// matters: the caller would prompt against a cross-reference list this host
+/// never built and then act on whichever entry the user picked out of
+/// nothing.
+///
+/// # Errors
+///
+/// Always, naming the cross-reference file that would have to exist.
+pub fn hdluid<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    let stg = stg
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let stg = String::from_utf8_lossy(&stg).into_owned();
+
+    Err(ShimError::Failed(format!(
+        "hdluid({stg:?}): this host keeps no user-ID cross-reference to \
+         resolve it against -- there is no `xrfbb` Btrieve file and no \
+         `xrfpos` table, because `numxrf` comes from a numopt() this host has \
+         no message-file parser to answer; see this routine's own doc comment"
+    )))
+}
+
 /// `INT nliniu(VOID)` -- how many of this host's channels are in use?
 /// `ACCOUNT.C:1086-1097`:
 ///
@@ -2631,6 +2703,46 @@ mod tests {
             Ret::U16(1),
             "the offline arm's empty-lock branch still answers"
         );
+    }
+
+    /// `clrxrf` is the vendor's `numxrf == 0` branch: it does nothing, and
+    /// there is nothing for it to do. Asserted against the one piece of
+    /// cross-reference state this host *does* place -- `uidxrf` -- so
+    /// "nothing happened" is measured rather than assumed by a bare
+    /// `Ok(Void)`.
+    #[test]
+    fn clrxrf_touches_nothing_because_no_cross_reference_is_configured() {
+        let mut f = Fixture::new();
+        let uidxrf = f.host.globals().address("uidxrf").expect("uidxrf");
+        let marker = [0xABu8; 8];
+        f.machine.write(uidxrf, &marker).expect("seed uidxrf");
+
+        assert!(matches!(f.invoke(clrxrf, &[]), Ok(Ret::Void)));
+
+        assert_eq!(
+            f.machine.resolve(uidxrf, 8).expect("in bounds"),
+            &marker,
+            "clrxrf clears xrfpos, which this host does not have -- and it must \
+             not have decided to clear uidxrf instead"
+        );
+    }
+
+    /// `hdluid` refuses, and the refusal names the cross-reference file.
+    ///
+    /// The value worth *not* returning here is `UIDPMT`: it reads as "ask the
+    /// user which of their IDs they meant", and the caller would then prompt
+    /// against a list this host never built.
+    #[test]
+    fn hdluid_refuses_and_names_the_cross_reference() {
+        let mut f = Fixture::new();
+        let stg = f.text("rangerdan");
+        let err = f
+            .invoke(hdluid, &Fixture::far(stg))
+            .expect_err("there is no cross-reference to resolve against");
+        let message = err.to_string();
+        assert!(message.contains("xrfbb"), "names the Btrieve file: {message}");
+        assert!(message.contains("numxrf"), "and the option that sizes it: {message}");
+        assert!(message.contains("rangerdan"), "and what was asked: {message}");
     }
 
     /// `nliniu` counts channels whose `usrcls` is not `VACANT` (0).

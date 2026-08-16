@@ -418,6 +418,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "cnvs2d", gcsp::cnvs2d, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "stp4cs", gcsp::stp4cs, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller, Evidence::Unclassified),
+        // `MAJORBBS.C`'s input/text pair, Phase 2 Task 2.6.
+        (MAJORBBS, "clrinp", text::clrinp, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "xltctls", text::xltctls, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "strlen", text::strlen, Cleans::Caller, Evidence::Unclassified),
@@ -621,6 +626,13 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "curusr", user::curusr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "usroff", user::usroff, Cleans::Caller, Evidence::Unclassified),
+        // The user-ID cross-reference half of Task 2.6. `clrxrf` is the
+        // vendor's own `numxrf == 0` branch and does nothing; `hdluid`
+        // presupposes the subsystem and refuses. See their doc comments.
+        (MAJORBBS, "clrxrf", user::clrxrf, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        (MAJORBBS, "hdluid", user::hdluid, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "getin", user::getin, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "haskey", user::haskey, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "hasmkey", user::hasmkey, Cleans::Caller, Evidence::Unclassified),
