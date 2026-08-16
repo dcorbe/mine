@@ -32,6 +32,10 @@ pub struct Video {
     pub cursor_visible: bool,
     /// Start and end scan lines, as `int 10h AH=01` set them.
     pub cursor_shape: u16,
+    /// Which CRTC register port 0x3D5 is currently addressing.
+    crtc_index: u8,
+    /// Toggles so a retrace poll terminates.
+    retrace: u8,
 }
 
 impl Default for Video {
@@ -45,11 +49,86 @@ impl Default for Video {
             cursor_col: 0,
             cursor_visible: true,
             cursor_shape: 0x0607,
+            crtc_index: 0,
+            retrace: 0,
         }
     }
 }
 
+/// CRTC register indices that matter for a text screen.
+const CRTC_CURSOR_START: u8 = 0x0a;
+const CRTC_CURSOR_END: u8 = 0x0b;
+const CRTC_CURSOR_HIGH: u8 = 0x0e;
+const CRTC_CURSOR_LOW: u8 = 0x0f;
+
 impl Video {
+    /// The cursor as a linear cell offset, which is how the CRTC holds it.
+    fn cursor_offset(&self) -> u16 {
+        u16::from(self.cursor_row) * self.columns + u16::from(self.cursor_col)
+    }
+
+    fn set_cursor_offset(&mut self, offset: u16) {
+        let cols = self.columns.max(1);
+        self.cursor_row = (offset / cols) as u8;
+        self.cursor_col = (offset % cols) as u8;
+    }
+
+    /// A write to a hardware port.
+    ///
+    /// Only the CRTC is modelled, and only its cursor registers. That is not
+    /// arbitrary: a text-mode program moves the cursor by writing 0x3D4/0x3D5
+    /// directly far more often than it calls `int 10h AH=02` -- LORDCFG does it
+    /// thousands of times per screen -- so a video model that only listens to
+    /// the BIOS has a cursor that is almost always in the wrong place.
+    pub fn port_out(&mut self, port: u16, value: u8) {
+        match port {
+            0x3d4 | 0x3b4 => self.crtc_index = value,
+            0x3d5 | 0x3b5 => match self.crtc_index {
+                CRTC_CURSOR_START => {
+                    // Bit 5 of the start register disables the cursor, the same
+                    // bit `int 10h AH=01` sets through CH.
+                    self.cursor_visible = value & 0x20 == 0;
+                    self.cursor_shape = (self.cursor_shape & 0x00ff) | (u16::from(value) << 8);
+                }
+                CRTC_CURSOR_END => {
+                    self.cursor_shape = (self.cursor_shape & 0xff00) | u16::from(value);
+                }
+                CRTC_CURSOR_HIGH => {
+                    let at = (self.cursor_offset() & 0x00ff) | (u16::from(value) << 8);
+                    self.set_cursor_offset(at);
+                }
+                CRTC_CURSOR_LOW => {
+                    let at = (self.cursor_offset() & 0xff00) | u16::from(value);
+                    self.set_cursor_offset(at);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// A read from a hardware port. Anything unmodelled reads as an absent
+    /// device, which is all ones.
+    pub fn port_in(&mut self, port: u16) -> u8 {
+        match port {
+            0x3d5 | 0x3b5 => match self.crtc_index {
+                CRTC_CURSOR_START => (self.cursor_shape >> 8) as u8,
+                CRTC_CURSOR_END => (self.cursor_shape & 0xff) as u8,
+                CRTC_CURSOR_HIGH => (self.cursor_offset() >> 8) as u8,
+                CRTC_CURSOR_LOW => (self.cursor_offset() & 0xff) as u8,
+                _ => 0xff,
+            },
+            // 0x3DA reports retrace status; programs poll it waiting for a
+            // blanking interval. Alternating the bits keeps such a loop from
+            // spinning forever on a constant answer.
+            0x3da | 0x3ba => {
+                self.retrace = self.retrace.wrapping_add(1);
+                if self.retrace & 1 == 0 { 0x00 } else { 0x09 }
+            }
+            _ => 0xff,
+        }
+    }
+
     fn cell(&self, row: u8, col: u8) -> DosPtr {
         let index = (u16::from(row) * self.columns + u16::from(col)) * 2;
         DosPtr::new(TEXT_BASE.seg, TEXT_BASE.off.wrapping_add(index))

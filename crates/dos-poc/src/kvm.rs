@@ -165,6 +165,11 @@ const TICK_NANOS: u64 = 54_925_400;
 pub enum Stop {
     /// The guest executed this interrupt vector and is waiting to be serviced.
     Trap(u8),
+    /// The guest wrote to a hardware port we do not claim.
+    PortWrite { port: u16, value: u8 },
+    /// The guest read a port we do not claim. The caller must answer with
+    /// [`VmGuest::complete_port_read`] before the next [`VmGuest::run`].
+    PortRead { port: u16 },
     /// The guest halted.
     Halted,
     /// The watchdog cut in: the guest is running but not asking for anything.
@@ -506,8 +511,24 @@ impl VmGuest {
                     Ok(Stop::Trap((self.regs.rip as u16 / STUB_STRIDE) as u8))
                 }
                 KVM_EXIT_IO => {
-                    self.answer_unclaimed_port();
-                    continue;
+                    // SAFETY: `run` is a live mapping of at least `run_size`.
+                    let (port, direction, offset) = unsafe {
+                        let r = &*self.run;
+                        (r.io_port, r.io_direction, r.io_data_offset as usize)
+                    };
+                    *self.port_log.entry(port).or_insert(0) += 1;
+                    const KVM_EXIT_IO_IN: u8 = 0;
+                    if direction == KVM_EXIT_IO_IN {
+                        Ok(Stop::PortRead { port })
+                    } else {
+                        let value = if offset < self.run_size {
+                            // SAFETY: bounds checked against the mapping.
+                            unsafe { self.run.cast::<u8>().add(offset).read() }
+                        } else {
+                            0
+                        };
+                        Ok(Stop::PortWrite { port, value })
+                    }
                 }
                 KVM_EXIT_HLT => Ok(Stop::Halted),
                 KVM_EXIT_INTR => {
@@ -527,28 +548,20 @@ impl VmGuest {
         }
     }
 
-    /// Satisfy a port the guest touched that we do not model: reads see all
-    /// ones, writes go nowhere. This is what an absent device looks like on a
-    /// real bus, and it keeps the program running instead of stopping at the
-    /// first `in al, dx` its runtime happens to do.
-    fn answer_unclaimed_port(&mut self) {
+    /// Answer the port read the guest is waiting on.
+    ///
+    /// `0xff` is what an absent device reads as on a real bus, and is the right
+    /// answer for anything not modelled -- but it has to be an explicit choice
+    /// by whoever knows the hardware, not a default buried in the CPU edge.
+    /// Swallowing port I/O here is what hid LORDCFG's cursor writes: it moves
+    /// the cursor through the CRTC registers, thousands of times, and none of
+    /// it ever reached the video model.
+    pub fn complete_port_read(&mut self, value: u8) {
         // SAFETY: `run` is a live mapping of at least `run_size` bytes.
-        let (port, direction, size, count, offset) = unsafe {
+        let (size, count, offset) = unsafe {
             let r = &*self.run;
-            (
-                r.io_port,
-                r.io_direction,
-                r.io_size as usize,
-                r.io_count as usize,
-                r.io_data_offset as usize,
-            )
+            (r.io_size as usize, r.io_count as usize, r.io_data_offset as usize)
         };
-        *self.port_log.entry(port).or_insert(0) += 1;
-
-        const KVM_EXIT_IO_IN: u8 = 0;
-        if direction != KVM_EXIT_IO_IN {
-            return;
-        }
         let Some(bytes) = size.checked_mul(count) else {
             return;
         };
@@ -557,7 +570,7 @@ impl VmGuest {
         }
         // SAFETY: bounds checked against the mapping just above.
         unsafe {
-            std::ptr::write_bytes(self.run.cast::<u8>().add(offset), 0xff, bytes);
+            std::ptr::write_bytes(self.run.cast::<u8>().add(offset), value, bytes);
         }
     }
 

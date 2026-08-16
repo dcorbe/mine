@@ -202,6 +202,11 @@ fn main() -> io::Result<()> {
                     Outcome::Fault(f) => break format!("bad guest pointer: {f:?}"),
                 }
             }
+            Stop::PortWrite { port, value } => video.port_out(port, value),
+            Stop::PortRead { port } => {
+                let value = video.port_in(port);
+                vm.complete_port_read(value);
+            }
             Stop::Halted => break "halted".to_string(),
             Stop::Interrupted => {
                 let (cs, ip) = vm.cs_ip();
