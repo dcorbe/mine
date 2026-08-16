@@ -353,7 +353,7 @@ pub(crate) mod runtime_name {
 
     fn distinct_libraries<A: Abi>() -> Vec<&'static str> {
         let mut seen = Vec::new();
-        for (dll, _, _, _) in super::super::routines::<A>() {
+        for (dll, _, _, _, _) in super::super::routines::<A>() {
             if !seen.contains(&dll) && !NOT_A_WORLDGROUP_PROBE.contains(&dll) {
                 seen.push(dll);
             }

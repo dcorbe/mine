@@ -9,6 +9,7 @@ pub mod dfa;
 pub mod crt;
 pub mod dosenv;
 pub mod echo;
+pub mod evidence;
 pub mod fsd;
 pub mod ftf;
 pub mod ftol;
@@ -35,6 +36,7 @@ use crate::Host;
 use crate::abi::{self, Abi, Call, Wg16};
 use crate::exports::{DOSCALLS, GALGSBL, GALME, GALMSG, MAJORBBS, PHAPI};
 use crate::globals::GLOBALS;
+use evidence::Evidence;
 
 /// `KERNEL32.dll`'s own import-directory spelling -- measured byte-for-byte
 /// from `LUNATIX.DLL` (`archive/modules/dlls/ISVCWD__LUNWG53F/LUNATIX.DLL`):
@@ -239,49 +241,49 @@ impl<A: Abi> Copy for Entry<A> {}
 /// a generic core -- `shims::btrieve`'s seventeen, `shims::runtime`'s eight,
 /// `shims::memory`'s `alctile`/`ptrtile` -- are not here; see [`Abi::native`]
 /// and [`wg16_native`] for where they live instead, and why.
-fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
+fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evidence)> {
     vec![
         // Strings, numbers and the print buffer.
-        (MAJORBBS, "spr", text::spr, Cleans::Caller),
-        (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller),
-        (MAJORBBS, "vsprintf", text::vsprintf, Cleans::Caller),
-        (MAJORBBS, "prf", text::prf, Cleans::Caller),
+        (MAJORBBS, "spr", text::spr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sprintf", text::sprintf, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "vsprintf", text::vsprintf, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "prf", text::prf, Cleans::Caller, Evidence::Unclassified),
 
         // --- Symbols surveyed as missing across the module corpus and
         // --- implemented 2026-08-14. Each cites its vendor source at its own
         // --- definition; see docs/2026-08-12-module-import-gaps.md for the
         // --- census that ranked them.
-        (MAJORBBS, "outmlt", output::outmlt, Cleans::Caller),
-        (MAJORBBS, "clrmlt", output::clrmlt, Cleans::Caller),
-        (MAJORBBS, "prat", output::prat, Cleans::Caller),
-        (MAJORBBS, "locate", output::locate, Cleans::Caller),
-        (MAJORBBS, "curcurx", output::curcurx, Cleans::Caller),
-        (MAJORBBS, "curcury", output::curcury, Cleans::Caller),
-        (MAJORBBS, "prfmlt", mlt::prfmlt, Cleans::Caller),
-        (MAJORBBS, "pmlt", mlt::pmlt, Cleans::Caller),
-        (MAJORBBS, "getmsg", mlt::getmsg, Cleans::Caller),
-        (MAJORBBS, "tfsopn", tfscan::tfsopn, Cleans::Caller),
-        (MAJORBBS, "tfsrdl", tfscan::tfsrdl, Cleans::Caller),
-        (MAJORBBS, "tfspfx", tfscan::tfspfx, Cleans::Caller),
-        (MAJORBBS, "tfsabt", tfscan::tfsabt, Cleans::Caller),
-        (MAJORBBS, "injacr", echo::injacr, Cleans::Caller),
-        (MAJORBBS, "hdlinp", echo::hdlinp, Cleans::Caller),
-        (MAJORBBS, "fwrite", crt::fwrite, Cleans::Caller),
-        (MAJORBBS, "itoa", crt::itoa, Cleans::Caller),
-        (MAJORBBS, "samend", crt::samend, Cleans::Caller),
+        (MAJORBBS, "outmlt", output::outmlt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "clrmlt", output::clrmlt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "prat", output::prat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "locate", output::locate, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "curcurx", output::curcurx, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "curcury", output::curcury, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "prfmlt", mlt::prfmlt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "pmlt", mlt::pmlt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getmsg", mlt::getmsg, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tfsopn", tfscan::tfsopn, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tfsrdl", tfscan::tfsrdl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tfspfx", tfscan::tfspfx, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tfsabt", tfscan::tfsabt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "injacr", echo::injacr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "hdlinp", echo::hdlinp, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fwrite", crt::fwrite, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "itoa", crt::itoa, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "samend", crt::samend, Cleans::Caller, Evidence::Unclassified),
         // `__LOCALECONVENTION` keeps ONE leading underscore: `exports::c_name`
         // strips exactly one, and stripping greedily would merge `_OLDSEND`
         // with `__OLDSEND`, which are two different symbols.
-        (MAJORBBS, "_localeconvention", crt::localeconvention, Cleans::Caller),
-        (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller),
-        (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller),
+        (MAJORBBS, "_localeconvention", crt::localeconvention, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfsthn", misc::dfsthn, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "hrtval", misc::hrtval, Cleans::Caller, Evidence::Unclassified),
         // Both MajorMUD NT builds and Rose 3.0NT import hrtval from GALGSBL,
         // not MAJORBBS -- see `hrtval_resolves_from_galgsbl_as_well_as_majorbbs`.
         // Same body, genuinely two libraries' export tables, not a
         // `canonical_dll` alias: only this one symbol is exported from both.
-        (GALGSBL, "hrtval", misc::hrtval, Cleans::Caller),
-        (MAJORBBS, "msgscan", misc::msgscan, Cleans::Caller),
-        (MAJORBBS, "byenow", misc::byenow, Cleans::Caller),
+        (GALGSBL, "hrtval", misc::hrtval, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "msgscan", misc::msgscan, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "byenow", misc::byenow, Cleans::Caller, Evidence::Unclassified),
         // GALME ordinal 30, not a MAJORBBS symbol -- see `exports.rs`'s own
         // `galme_ordinal_30_is_the_messaging_engines_6x_compatibility_entry`.
         // `GALMSG` ordinal 30 is `_OLDSEND` -- ONE underscore, where GALME's
@@ -291,8 +293,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // libraries, not one symbol seen twice; The Rose 2.0 imports the
         // GALMSG one. Both refuse for the same reason -- neither the Messaging
         // Engine nor its 6.x compatibility entry exists here.
-        (GALMSG, "oldsend", misc::oldsend, Cleans::Caller),
-        (MAJORBBS, "initask", task::initask, Cleans::Caller),
+        (GALMSG, "oldsend", misc::oldsend, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "initask", task::initask, Cleans::Caller, Evidence::Unclassified),
 
         // The `dfa*` facade -- the 32-bit Btrieve API. Registered under
         // MAJORBBS because `canonical_dll` already aliases `WGSERVER.EXE` to
@@ -302,196 +304,196 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         //
         // The host name is lowercased by `exports::c_name`, so `_dfaSetBlk`
         // arrives here as `dfasetblk`.
-        (MAJORBBS, "dfaopen", dfa::dfaOpen, Cleans::Caller),
-        (MAJORBBS, "dfaclose", dfa::dfaClose, Cleans::Caller),
-        (MAJORBBS, "dfasetblk", dfa::dfaSetBlk, Cleans::Caller),
-        (MAJORBBS, "dfarstblk", dfa::dfaRstBlk, Cleans::Caller),
-        (MAJORBBS, "dfaquery", dfa::dfaQuery, Cleans::Caller),
-        (MAJORBBS, "dfaquerynp", dfa::dfaQueryNP, Cleans::Caller),
-        (MAJORBBS, "dfagetlock", dfa::dfaGetLock, Cleans::Caller),
-        (MAJORBBS, "dfaacqlock", dfa::dfaAcqLock, Cleans::Caller),
-        (MAJORBBS, "dfaacqnplock", dfa::dfaAcqNPLock, Cleans::Caller),
-        (MAJORBBS, "dfaabs", dfa::dfaAbs, Cleans::Caller),
-        (MAJORBBS, "dfaacqabslock", dfa::dfaAcqAbsLock, Cleans::Caller),
-        (MAJORBBS, "dfagetabslock", dfa::dfaGetAbsLock, Cleans::Caller),
-        (MAJORBBS, "dfasteplock", dfa::dfaStepLock, Cleans::Caller),
-        (MAJORBBS, "dfainsertv", dfa::dfaInsertV, Cleans::Caller),
-        (MAJORBBS, "dfainsert", dfa::dfaInsert, Cleans::Caller),
-        (MAJORBBS, "dfainsertdup", dfa::dfaInsertDup, Cleans::Caller),
-        (MAJORBBS, "dfaupdatev", dfa::dfaUpdateV, Cleans::Caller),
-        (MAJORBBS, "dfaupdate", dfa::dfaUpdate, Cleans::Caller),
-        (MAJORBBS, "dfaupdatedup", dfa::dfaUpdateDup, Cleans::Caller),
-        (MAJORBBS, "dfadelete", dfa::dfaDelete, Cleans::Caller),
-        (MAJORBBS, "dfamode", dfa::dfaMode, Cleans::Caller),
-        (MAJORBBS, "dfabegtrans", dfa::dfaBegTrans, Cleans::Caller),
-        (MAJORBBS, "dfaendtrans", dfa::dfaEndTrans, Cleans::Caller),
-        (MAJORBBS, "dfaabttrans", dfa::dfaAbtTrans, Cleans::Caller),
-        (MAJORBBS, "dfacountrec", dfa::dfaCountRec, Cleans::Caller),
-        (MAJORBBS, "dfareclen", dfa::dfaRecLen, Cleans::Caller),
-        (MAJORBBS, "dfastat", dfa::dfaStat, Cleans::Caller),
-        (MAJORBBS, "dfaunlock", dfa::dfaUnlock, Cleans::Caller),
-        (MAJORBBS, "dfawaslocked", dfa::dfaWasLocked, Cleans::Caller),
-        (MAJORBBS, "dfalastlen", dfa::dfaLastLen, Cleans::Caller),
-        (MAJORBBS, "dfavirgin", dfa::dfaVirgin, Cleans::Caller),
-        (MAJORBBS, "dfacreate", dfa::dfaCreate, Cleans::Caller),
-        (MAJORBBS, "dfacreatespec", dfa::dfaCreateSpec, Cleans::Caller),
-        (MAJORBBS, "bgncnc", cnc::bgncnc, Cleans::Caller),
-        (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller),
-        (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller),
-        (MAJORBBS, "cncall", cnc::cncall, Cleans::Caller),
-        (MAJORBBS, "onsys", cnc::onsys, Cleans::Caller),
-        (MAJORBBS, "strupr", cnc::strupr, Cleans::Caller),
-        (MAJORBBS, "injoth", cnc::injoth, Cleans::Caller),
-        (MAJORBBS, "vdaoff", vda::vdaoff, Cleans::Caller),
-        (GALGSBL, "btuoba", vda::btuoba, Cleans::Caller),
-        (GALGSBL, "btuinp", vda::btuinp, Cleans::Caller),
-        (GALGSBL, "btupmt", vda::btupmt, Cleans::Caller),
-        (MAJORBBS, "mkdir", ftf::mkdir, Cleans::Caller),
-        (MAJORBBS, "stpans", ftf::stpans, Cleans::Caller),
-        (MAJORBBS, "farmalloc", ftf::farmalloc, Cleans::Caller),
-        (MAJORBBS, "dcdate", ftf::dcdate, Cleans::Caller),
-        (MAJORBBS, "ftgnew", ftf::ftgnew, Cleans::Caller),
-        (MAJORBBS, "ftgsbm", ftf::ftgsbm, Cleans::Caller),
-        (MAJORBBS, "dedcrd", credit::dedcrd, Cleans::Caller),
-        (MAJORBBS, "tstcrd", credit::tstcrd, Cleans::Caller),
-        (MAJORBBS, "condex", credit::condex, Cleans::Caller),
-        (MAJORBBS, "sscanf", credit::sscanf, Cleans::Caller),
-        (MAJORBBS, "memset", credit::memset, Cleans::Caller),
-        (MAJORBBS, "intdos", credit::intdos, Cleans::Caller),
-        (MAJORBBS, "getbtv", btrieve::getbtv, Cleans::Caller),
-        (MAJORBBS, "obtbtv", btrieve::obtbtv, Cleans::Caller),
-        (MAJORBBS, "anpbtv", btrieve::anpbtv, Cleans::Caller),
-        (MAJORBBS, "gabbtv", btrieve::gabbtv, Cleans::Caller),
-        (MAJORBBS, "stpbtv", btrieve::stpbtv, Cleans::Caller),
-        (MAJORBBS, "updbtv", btrieve::updbtv, Cleans::Caller),
-        (MAJORBBS, "upvbtv", btrieve::upvbtv, Cleans::Caller),
-        (MAJORBBS, "insbtv", btrieve::insbtv, Cleans::Caller),
-        (MAJORBBS, "stdmchk", gcsp::stdmchk, Cleans::Caller),
-        (MAJORBBS, "rejectreq", gcsp::rejectreq, Cleans::Caller),
-        (MAJORBBS, "rsp2read", gcsp::rsp2read, Cleans::Caller),
-        (MAJORBBS, "rsp2write", gcsp::rsp2write, Cleans::Caller),
-        (MAJORBBS, "senddpk", gcsp::senddpk, Cleans::Caller),
-        (MAJORBBS, "cnvs2d", gcsp::cnvs2d, Cleans::Caller),
-        (MAJORBBS, "stp4cs", gcsp::stp4cs, Cleans::Caller),
-        (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller),
-        (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller),
-        (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller),
-        (MAJORBBS, "strlen", text::strlen, Cleans::Caller),
-        (MAJORBBS, "rmvwht", text::rmvwht, Cleans::Caller),
-        (MAJORBBS, "skpwht", text::skpwht, Cleans::Caller),
-        (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller),
-        (MAJORBBS, "depad", text::depad, Cleans::Caller),
-        (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller),
-        (MAJORBBS, "parsin", text::parsin, Cleans::Caller),
-        (MAJORBBS, "atol", text::atol, Cleans::Caller),
-        (MAJORBBS, "l2as", text::l2as, Cleans::Caller),
-        (MAJORBBS, "toupper", text::toupper, Cleans::Caller),
-        (MAJORBBS, "tolower", text::tolower, Cleans::Caller),
-        (MAJORBBS, "sameas", text::sameas, Cleans::Caller),
-        (MAJORBBS, "sameto", text::sameto, Cleans::Caller),
-        (MAJORBBS, "samein", text::samein, Cleans::Caller),
+        (MAJORBBS, "dfaopen", dfa::dfaOpen, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaclose", dfa::dfaClose, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfasetblk", dfa::dfaSetBlk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfarstblk", dfa::dfaRstBlk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaquery", dfa::dfaQuery, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaquerynp", dfa::dfaQueryNP, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfagetlock", dfa::dfaGetLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaacqlock", dfa::dfaAcqLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaacqnplock", dfa::dfaAcqNPLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaabs", dfa::dfaAbs, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaacqabslock", dfa::dfaAcqAbsLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfagetabslock", dfa::dfaGetAbsLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfasteplock", dfa::dfaStepLock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfainsertv", dfa::dfaInsertV, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfainsert", dfa::dfaInsert, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfainsertdup", dfa::dfaInsertDup, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaupdatev", dfa::dfaUpdateV, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaupdate", dfa::dfaUpdate, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaupdatedup", dfa::dfaUpdateDup, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfadelete", dfa::dfaDelete, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfamode", dfa::dfaMode, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfabegtrans", dfa::dfaBegTrans, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaendtrans", dfa::dfaEndTrans, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaabttrans", dfa::dfaAbtTrans, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfacountrec", dfa::dfaCountRec, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfareclen", dfa::dfaRecLen, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfastat", dfa::dfaStat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfaunlock", dfa::dfaUnlock, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfawaslocked", dfa::dfaWasLocked, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfalastlen", dfa::dfaLastLen, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfavirgin", dfa::dfaVirgin, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfacreate", dfa::dfaCreate, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dfacreatespec", dfa::dfaCreateSpec, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "bgncnc", cnc::bgncnc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cncall", cnc::cncall, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "onsys", cnc::onsys, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strupr", cnc::strupr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "injoth", cnc::injoth, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "vdaoff", vda::vdaoff, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuoba", vda::btuoba, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuinp", vda::btuinp, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btupmt", vda::btupmt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "mkdir", ftf::mkdir, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stpans", ftf::stpans, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "farmalloc", ftf::farmalloc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dcdate", ftf::dcdate, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ftgnew", ftf::ftgnew, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ftgsbm", ftf::ftgsbm, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dedcrd", credit::dedcrd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tstcrd", credit::tstcrd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "condex", credit::condex, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sscanf", credit::sscanf, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "memset", credit::memset, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "intdos", credit::intdos, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getbtv", btrieve::getbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "obtbtv", btrieve::obtbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "anpbtv", btrieve::anpbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "gabbtv", btrieve::gabbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stpbtv", btrieve::stpbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "updbtv", btrieve::updbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "upvbtv", btrieve::upvbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "insbtv", btrieve::insbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stdmchk", gcsp::stdmchk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rejectreq", gcsp::rejectreq, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rsp2read", gcsp::rsp2read, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rsp2write", gcsp::rsp2write, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "senddpk", gcsp::senddpk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cnvs2d", gcsp::cnvs2d, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stp4cs", gcsp::stp4cs, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strlen", text::strlen, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rmvwht", text::rmvwht, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "skpwht", text::skpwht, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "depad", text::depad, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rstrin", text::rstrin, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "parsin", text::parsin, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "atol", text::atol, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "l2as", text::l2as, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "toupper", text::toupper, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tolower", text::tolower, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sameas", text::sameas, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sameto", text::sameto, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "samein", text::samein, Cleans::Caller, Evidence::Unclassified),
         // Implemented in `shims::user` rather than beside its three
         // siblings above: this session's file ownership was `shims::user`/
         // `shims::mod`, not `shims::text`, and `samend` needs nothing
         // `shims::text` has that `crate::strings::sameas` does not already
         // give it directly.
-        (MAJORBBS, "strcmp", text::strcmp, Cleans::Caller),
-        (MAJORBBS, "strcat", text::strcat, Cleans::Caller),
-        (MAJORBBS, "strncat", text::strncat, Cleans::Caller),
-        (MAJORBBS, "strncpy", text::strncpy, Cleans::Caller),
-        (MAJORBBS, "strchr", text::strchr, Cleans::Caller),
-        (MAJORBBS, "strstr", text::strstr, Cleans::Caller),
-        (MAJORBBS, "strtok", text::strtok, Cleans::Caller),
-        (MAJORBBS, "lastwd", text::lastwd, Cleans::Caller),
-        (MAJORBBS, "sortstgs", text::sortstgs, Cleans::Caller),
+        (MAJORBBS, "strcmp", text::strcmp, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strcat", text::strcat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strncat", text::strncat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strncpy", text::strncpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strchr", text::strchr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strstr", text::strstr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "strtok", text::strtok, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "lastwd", text::lastwd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sortstgs", text::sortstgs, Cleans::Caller, Evidence::Unclassified),
         // Message files, and the options in them.
-        (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller),
-        (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller),
-        (MAJORBBS, "setmbk", msg::setmbk, Cleans::Caller),
-        (MAJORBBS, "rstmbk", msg::rstmbk, Cleans::Caller),
-        (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller),
-        (MAJORBBS, "numopt", msg::numopt, Cleans::Caller),
-        (MAJORBBS, "lngopt", msg::lngopt, Cleans::Caller),
-        (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller),
-        (MAJORBBS, "chropt", msg::chropt, Cleans::Caller),
-        (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller),
-        (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller),
+        (MAJORBBS, "opnmsg", msg::opnmsg, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "clsmsg", msg::clsmsg, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "setmbk", msg::setmbk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rstmbk", msg::rstmbk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stgopt", msg::stgopt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "numopt", msg::numopt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "lngopt", msg::lngopt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ynopt", msg::ynopt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "chropt", msg::chropt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "tokopt", msg::tokopt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "prfmsg", msg::prfmsg, Cleans::Caller, Evidence::Unclassified),
         // Memory the module owns, and the leaves that move bytes about.
         // `alctile`/`ptrtile` are not here -- segment tiling has no
         // flat-memory counterpart, see `Abi::native`.
-        (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller),
-        (MAJORBBS, "alczer", memory::alczer, Cleans::Caller),
-        (MAJORBBS, "galfree", memory::galfree, Cleans::Caller),
-        (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller),
-        (MAJORBBS, "setmem", memory::setmem, Cleans::Caller),
-        (MAJORBBS, "movmem", memory::movmem, Cleans::Caller),
-        (MAJORBBS, "memcpy", memory::memcpy, Cleans::Caller),
-        (MAJORBBS, "memmove", memory::memmove, Cleans::Caller),
-        (MAJORBBS, "memcmp", memory::memcmp, Cleans::Caller),
+        (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "alczer", memory::alczer, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "galfree", memory::galfree, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "setmem", memory::setmem, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "movmem", memory::movmem, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "memcpy", memory::memcpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "memmove", memory::memmove, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "memcmp", memory::memcmp, Cleans::Caller, Evidence::Unclassified),
         // Streams: the module's own files, read and written.
-        (MAJORBBS, "fopen", stream::fopen, Cleans::Caller),
-        (MAJORBBS, "fclose", stream::fclose, Cleans::Caller),
-        (MAJORBBS, "fgets", stream::fgets, Cleans::Caller),
+        (MAJORBBS, "fopen", stream::fopen, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fclose", stream::fclose, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fgets", stream::fgets, Cleans::Caller, Evidence::Unclassified),
         // `GCOMM.H`'s own `fgets` sibling -- implemented in `shims::user`
         // for the same file-ownership reason `samend` is, above.
-        (MAJORBBS, "mdfgets", user::mdfgets, Cleans::Caller),
-        (MAJORBBS, "fgetc", stream::fgetc, Cleans::Caller),
-        (MAJORBBS, "fputc", stream::fputc, Cleans::Caller),
-        (MAJORBBS, "fread", stream::fread, Cleans::Caller),
-        (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller),
-        (MAJORBBS, "fflush", stream::fflush, Cleans::Caller),
-        (MAJORBBS, "flushall", stream::flushall, Cleans::Caller),
-        (MAJORBBS, "unlink", stream::unlink, Cleans::Caller),
-        (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller),
-        (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller),
-        (MAJORBBS, "fnd1st", stream::fnd1st, Cleans::Caller),
-        (MAJORBBS, "fndnxt", stream::fndnxt, Cleans::Caller),
-        (MAJORBBS, "fseek", stream::fseek, Cleans::Caller),
-        (MAJORBBS, "ftell", stream::ftell, Cleans::Caller),
-        (MAJORBBS, "rewind", stream::rewind, Cleans::Caller),
+        (MAJORBBS, "mdfgets", user::mdfgets, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fgetc", stream::fgetc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fputc", stream::fputc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fread", stream::fread, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fprintf", stream::fprintf, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fflush", stream::fflush, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "flushall", stream::flushall, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "unlink", stream::unlink, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getdtd", stream::getdtd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cntdir", stream::cntdir, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fnd1st", stream::fnd1st, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fndnxt", stream::fndnxt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fseek", stream::fseek, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ftell", stream::ftell, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rewind", stream::rewind, Cleans::Caller, Evidence::Unclassified),
         // The clock, the audit trail, and coming online.
-        (MAJORBBS, "access", system::access, Cleans::Caller),
-        (MAJORBBS, "now", system::now, Cleans::Caller),
-        (MAJORBBS, "nctime", system::nctime, Cleans::Caller),
-        (MAJORBBS, "ncdate", system::ncdate, Cleans::Caller),
-        (MAJORBBS, "cofdat", system::cofdat, Cleans::Caller),
-        (MAJORBBS, "ncedat", system::ncedat, Cleans::Caller),
-        (MAJORBBS, "today", system::today, Cleans::Caller),
-        (MAJORBBS, "time", system::time, Cleans::Caller),
-        (MAJORBBS, "srand", system::srand, Cleans::Caller),
-        (MAJORBBS, "rand", system::rand, Cleans::Caller),
-        (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller),
+        (MAJORBBS, "access", system::access, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "now", system::now, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "nctime", system::nctime, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ncdate", system::ncdate, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cofdat", system::cofdat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ncedat", system::ncedat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "today", system::today, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "time", system::time, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "srand", system::srand, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rand", system::rand, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "genrdn", system::genrdn, Cleans::Caller, Evidence::Unclassified),
         // Caller-cleaned, read off the host rather than assumed from its
         // neighbours: lngrnd ends in a bare `retf` (segment 13, offset
         // 0x167) with no immediate, so the module pops its own eight bytes
         // of arguments.
-        (MAJORBBS, "lngrnd", system::lngrnd, Cleans::Caller),
-        (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller),
-        (MAJORBBS, "shocst", system::shocst, Cleans::Caller),
-        (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller),
-        (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller),
-        (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller),
-        (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller),
-        (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller),
-        (MAJORBBS, "fsdnan", fsd::fsdnan, Cleans::Caller),
-        (MAJORBBS, "fsdord", fsd::fsdord, Cleans::Caller),
-        (MAJORBBS, "fsdxan", fsd::fsdxan, Cleans::Caller),
-        (MAJORBBS, "fsdrft", fsd::fsdrft, Cleans::Caller),
-        (MAJORBBS, "fsdbkg", fsd::fsdbkg, Cleans::Caller),
-        (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller),
-        (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller),
-        (MAJORBBS, "outprf", fsd::outprf, Cleans::Caller),
+        (MAJORBBS, "lngrnd", system::lngrnd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "gmdnam", system::gmdnam, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "shocst", system::shocst, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rtkick", system::rtkick, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "begin_polling", user::begin_polling, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stop_polling", user::stop_polling, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdroom", fsd::fsdroom, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdapr", fsd::fsdapr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdnan", fsd::fsdnan, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdord", fsd::fsdord, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdxan", fsd::fsdxan, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdrft", fsd::fsdrft, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdbkg", fsd::fsdbkg, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdego", fsd::fsdego, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "vfyadn", fsd::vfyadn, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "outprf", fsd::outprf, Cleans::Caller, Evidence::Unclassified),
         // MajorMUD's text and field-conversion helpers. See `shims::mudtext`.
-        (MAJORBBS, "profan", mudtext::profan, Cleans::Caller),
-        (MAJORBBS, "c2bcpy", mudtext::c2bcpy, Cleans::Caller),
-        (MAJORBBS, "b2ccpy", mudtext::b2ccpy, Cleans::Caller),
-        (MAJORBBS, "findtvar", mudtext::findtvar, Cleans::Caller),
+        (MAJORBBS, "profan", mudtext::profan, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "c2bcpy", mudtext::c2bcpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "b2ccpy", mudtext::b2ccpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "findtvar", mudtext::findtvar, Cleans::Caller, Evidence::Unclassified),
         // MajorMUD's remaining gameplay and screen helpers. `curcury` and
         // `listing`'s `whndun` half refuse rather than fabricate: this host
         // tracks no cursor row, and a `Shim<A>` is never handed the
         // `&A::Module` every callback-into-module mechanism needs. See
         // `shims::mudmisc`.
-        (MAJORBBS, "listing", mudmisc::listing, Cleans::Caller),
+        (MAJORBBS, "listing", mudmisc::listing, Cleans::Caller, Evidence::Unclassified),
         // Galacticomm's text-file scanner. Reachable and MajorMUD-exclusive
         // (zero sites in Lunatix/Tele-Arena/The Rose), which is the opposite
         // signature from `dfsthn`'s shared boilerplate. `tfsopn`/`tfsrdl`
@@ -502,9 +504,9 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // crt0 trampoline; `oldsend` refuses, because answering TRUE would
         // claim mail was sent that this host silently discarded. See
         // `docs/2026-08-14-dos-imports-reachability.md`.
-        (DOSCALLS, "dossetvec", dosenv::dossetvec, Cleans::Callee(10)),
-        (PHAPI, "doscreatedsalias", dosenv::doscreatedsalias, Cleans::Callee(6)),
-        (GALME, "_oldsend", dosenv::oldsend, Cleans::Caller),
+        (DOSCALLS, "dossetvec", dosenv::dossetvec, Cleans::Callee(10), Evidence::Unclassified),
+        (PHAPI, "doscreatedsalias", dosenv::doscreatedsalias, Cleans::Callee(6), Evidence::Unclassified),
+        (GALME, "_oldsend", dosenv::oldsend, Cleans::Caller, Evidence::Unclassified),
         // `shims::gcsp`'s seven GCSPSRV routines. All twelve of their real
         // call sites are provably unreachable on a telnet host
         // (`docs/2026-08-14-gcsp-reachability.md`: the module's `struct
@@ -537,30 +539,31 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // matches the `GCV2` branch's 3/3/6-argument prototypes exactly
         // (2+1+2, 1+1+2, 1+2+1+2+1+2 words) and does not match the
         // non-`GCV2` branch's 4/4/7 at all.
-        (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller),
-        (MAJORBBS, "register_module", system::register_module, Cleans::Caller),
-        (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller),
-        (MAJORBBS, "register_agent", system::register_agent, Cleans::Caller),
+        (MAJORBBS, "dclvda", system::dclvda, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "register_module", system::register_module, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "globalcmd", system::globalcmd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "register_agent", system::register_agent, Cleans::Caller, Evidence::Unclassified),
         (
             MAJORBBS,
             "register_textvar",
             system::register_textvar,
             Cleans::Caller,
+            Evidence::Unclassified,
         ),
-        (MAJORBBS, "catastro", system::catastro, Cleans::Caller),
+        (MAJORBBS, "catastro", system::catastro, Cleans::Caller, Evidence::Unclassified),
         // "Restore screen-length to usracc setting" -- `MAJORBBS.C:3776`
         // (wg1), one import, one call site. See `shims::screen`'s own doc
         // comment for what it does, what it does not, and where its one
         // caller actually leads.
-        (MAJORBBS, "rstrxf", screen::rstrxf, Cleans::Caller),
+        (MAJORBBS, "rstrxf", screen::rstrxf, Cleans::Caller, Evidence::Unclassified),
         // The current user: the two routines that turn a channel number into
         // the slot it names.
-        (MAJORBBS, "curusr", user::curusr, Cleans::Caller),
-        (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller),
-        (MAJORBBS, "usroff", user::usroff, Cleans::Caller),
-        (MAJORBBS, "getin", user::getin, Cleans::Caller),
-        (MAJORBBS, "haskey", user::haskey, Cleans::Caller),
-        (MAJORBBS, "hasmkey", user::hasmkey, Cleans::Caller),
+        (MAJORBBS, "curusr", user::curusr, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "uacoff", user::uacoff, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "usroff", user::usroff, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getin", user::getin, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "haskey", user::haskey, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "hasmkey", user::hasmkey, Cleans::Caller, Evidence::Unclassified),
         // The echo family. "Turn echo on" (`echon`) is `echonu(usrnum)`
         // against the current channel; "turn echo on utility" (`echonu`)
         // also ends any `echsec` secret-echo session still in progress. See
@@ -570,17 +573,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // own doc comment for the other half -- installing the session --
         // and what installing a real `secchi` handler would have added that
         // this host cannot.
-        (MAJORBBS, "echon", user::echon, Cleans::Caller),
-        (MAJORBBS, "echonu", user::echonu, Cleans::Caller),
-        (MAJORBBS, "echsec", user::echsec, Cleans::Caller),
+        (MAJORBBS, "echon", user::echon, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "echonu", user::echonu, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "echsec", user::echsec, Cleans::Caller, Evidence::Unclassified),
         // The other-user family: scan every channel for a user-id, in a
         // given module state (`instat`) or online at all (`onsysn`), leaving
         // `othusn`/`othusp`/`othuap` pointed at the result -- and `othkey`,
         // which asks that channel's own keys the way `haskey` asks the
         // current one's.
-        (MAJORBBS, "instat", user::instat, Cleans::Caller),
-        (MAJORBBS, "onsysn", user::onsysn, Cleans::Caller),
-        (MAJORBBS, "othkey", user::othkey, Cleans::Caller),
+        (MAJORBBS, "instat", user::instat, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "onsysn", user::onsysn, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "othkey", user::othkey, Cleans::Caller, Evidence::Unclassified),
         // The default `stsrou` a module gets if it registers none of its
         // own. See `user::dfsthn`'s own doc comment for why its one real
         // branch is unreachable on this host, measured rather than assumed.
@@ -593,40 +596,43 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // `add sp,8` after all three `otstcrd` sites and `add sp,0Ah` after
         // all three `odedcrd` sites, matching `USRACC.H`'s `(int, long,
         // int)` and `(int, long, int, int)` exactly.
-        (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller),
-        (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller),
+        (MAJORBBS, "otstcrd", credits::otstcrd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "odedcrd", credits::odedcrd, Cleans::Caller, Evidence::Unclassified),
         // Borland's own C++ runtime plumbing LunatiX links against from
         // `cw3220mt.DLL`, aliased onto `MAJORBBS` same as everything above --
         // and the one KERNEL32 call that can be served alongside it. See
         // `borland`'s own module doc for what each of these does, why nine
         // of the ten are no-ops, why `abort` is not, and why
         // `GetModuleHandleA`/`GetProcAddress` are deliberately *not* here.
-        (MAJORBBS, "_startup", borland::startup, Cleans::Caller),
-        (MAJORBBS, "_startupd", borland::startupd, Cleans::Caller),
-        (MAJORBBS, "@_catchcleanup$qv", borland::catch_cleanup, Cleans::Caller),
-        (MAJORBBS, "_exceptionhandler", borland::exception_handler, Cleans::Caller),
-        (MAJORBBS, "_errormessage", borland::error_message, Cleans::Caller),
+        (MAJORBBS, "_startup", borland::startup, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "_startupd", borland::startupd, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "@_catchcleanup$qv", borland::catch_cleanup, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "_exceptionhandler", borland::exception_handler, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "_errormessage", borland::error_message, Cleans::Caller, Evidence::Unclassified),
         (
             MAJORBBS,
             "@__lockdebuggerdata$qv",
             borland::lock_debugger_data,
             Cleans::Caller,
+            Evidence::Unclassified,
         ),
         (
             MAJORBBS,
             "@__unlockdebuggerdata$qv",
             borland::unlock_debugger_data,
             Cleans::Caller,
+            Evidence::Unclassified,
         ),
         (
             MAJORBBS,
             "__debuggerdisableterminatecallback",
             borland::debugger_disable_terminate_callback,
             Cleans::Caller,
+            Evidence::Unclassified,
         ),
-        (MAJORBBS, "_free_heaps", borland::free_heaps, Cleans::Caller),
-        (MAJORBBS, "abort", borland::abort, Cleans::Caller),
-        (KERNEL32, "getversion", borland::getversion, Cleans::Caller),
+        (MAJORBBS, "_free_heaps", borland::free_heaps, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "abort", borland::abort, Cleans::Caller, Evidence::Unclassified),
+        (KERNEL32, "getversion", borland::getversion, Cleans::Caller, Evidence::Unclassified),
         // stdcall, not cdecl -- measured at LunatiX's own call sites
         // (0x41d61d, 0x41d62c: 4 and 8 bytes pushed, neither followed by an
         // `add esp`). `Wg32::resume` services `Cleans::Callee` for exactly
@@ -637,12 +643,14 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
             "getmodulehandlea",
             borland::get_module_handle,
             Cleans::Callee(4),
+            Evidence::Unclassified,
         ),
         (
             KERNEL32,
             "getprocaddress",
             borland::get_proc_address,
             Cleans::Callee(8),
+            Evidence::Unclassified,
         ),
         // Btrieve. Seventeen routines, and the last block to reach this table
         // -- they sat in `WG16_ROUTINES` from the day it was created until
@@ -650,24 +658,24 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // `btrieve` field stopped eliding its parameter. Neither the shims
         // nor the engine were ever 16-bit in substance; a defaulted type
         // parameter on one struct field was holding all seventeen here.
-        (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller),
-        (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller),
-        (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller),
-        (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller),
-        (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller),
-        (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller),
-        (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller),
-        (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller),
-        (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller),
-        (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller),
-        (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller),
-        (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller),
-        (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller),
-        (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller),
-        (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller),
-        (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller),
-        (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller),
-        (MAJORBBS, "clsbb", btrieve::clsbb, Cleans::Caller),
+        (MAJORBBS, "omdbtv", btrieve::omdbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "opnbtv", btrieve::opnbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "setbtv", btrieve::setbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rstbtv", btrieve::rstbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "cntrbtv", btrieve::cntrbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "qrybtv", btrieve::qrybtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "qnpbtv", btrieve::qnpbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "obtbtvl", btrieve::obtbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stpbtvl", btrieve::stpbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "absbtv", btrieve::absbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "aabbtv", btrieve::aabbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "gabbtvl", btrieve::gabbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dinsbtv", btrieve::dinsbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "dupdbtv", btrieve::dupdbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "invbtv", btrieve::invbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "delbtv", btrieve::delbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "clsbtv", btrieve::clsbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "clsbb", btrieve::clsbb, Cleans::Caller, Evidence::Unclassified),
         // --- Track B, 2026-08-15: the rest of BTVSTF.H's declared surface ---
         // Twelve wrappers, taking this layer from 26 of 36 to all 36. Their
         // only surviving implementation is `PLBTVSTF.C`, the Phar Lap BTVSTF
@@ -685,18 +693,18 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // argument and is wired to nothing, because no consumer exists in
         // `archive/` or `re/` to wire it to. That uncertainty is recorded in
         // its own doc comment rather than papered over.
-        (MAJORBBS, "bxabtv", btrieve::bxabtv, Cleans::Caller),
-        (MAJORBBS, "exabtv", btrieve::exabtv, Cleans::Caller),
-        (MAJORBBS, "getbtvl", btrieve::getbtvl, Cleans::Caller),
-        (MAJORBBS, "anpbtvl", btrieve::anpbtvl, Cleans::Caller),
-        (MAJORBBS, "anpbtvlk", btrieve::anpbtvlk, Cleans::Caller),
-        (MAJORBBS, "aabbtvl", btrieve::aabbtvl, Cleans::Caller),
-        (MAJORBBS, "unlbtv", btrieve::unlbtv, Cleans::Caller),
-        (MAJORBBS, "sttbtv", btrieve::sttbtv, Cleans::Caller),
-        (MAJORBBS, "rlenbtv", btrieve::rlenbtv, Cleans::Caller),
-        (MAJORBBS, "wslbtv", btrieve::wslbtv, Cleans::Caller),
-        (MAJORBBS, "llnbtv", btrieve::llnbtv, Cleans::Caller),
-        (MAJORBBS, "crtbtv", btrieve::crtbtv, Cleans::Caller),
+        (MAJORBBS, "bxabtv", btrieve::bxabtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "exabtv", btrieve::exabtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getbtvl", btrieve::getbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "anpbtvl", btrieve::anpbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "anpbtvlk", btrieve::anpbtvlk, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "aabbtvl", btrieve::aabbtvl, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "unlbtv", btrieve::unlbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sttbtv", btrieve::sttbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rlenbtv", btrieve::rlenbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "wslbtv", btrieve::wslbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "llnbtv", btrieve::llnbtv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "crtbtv", btrieve::crtbtv, Cleans::Caller, Evidence::Unclassified),
         // The GSBL terminal layer. Fourteen routines, seventy-seven call
         // sites, none of them reached by initialisation, plus three more
         // (`btuhpk`/`btupbc`/`btucpc`) registered even though `WCCMMUD.DLL`
@@ -705,29 +713,29 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // table. They are registered anyway because they are ordinary
         // importable GSBL routines and this is where every other one
         // lives, in case a future module asks.
-        (GALGSBL, "btutsw", gsbl::btutsw, Cleans::Caller),
-        (GALGSBL, "btuxct", gsbl::btuxct, Cleans::Caller),
-        (GALGSBL, "btuxnf", gsbl::btuxnf, Cleans::Caller),
-        (GALGSBL, "btuxmt", gsbl::btuxmt, Cleans::Caller),
+        (GALGSBL, "btutsw", gsbl::btutsw, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuxct", gsbl::btuxct, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuxnf", gsbl::btuxnf, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuxmt", gsbl::btuxmt, Cleans::Caller, Evidence::Unclassified),
         // Not one of the fourteen above -- `WCCMMUD.DLL` never imports it.
         // `LUNATIX.DLL` does, seven times, and is why `GALGSBL.dll!_btuxmn`
         // was the seventh name Task 5's alias could not serve. See
         // `gsbl::btuxmn`'s own doc comment for the prototype, the call-site
         // arity check, and the one property it does not yet reproduce.
-        (GALGSBL, "btuxmn", gsbl::btuxmn, Cleans::Caller),
-        (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller),
-        (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller),
-        (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller),
-        (GALGSBL, "btucli", gsbl::btucli, Cleans::Caller),
-        (GALGSBL, "btuinj", gsbl::btuinj, Cleans::Caller),
-        (GALGSBL, "btutrg", gsbl::btutrg, Cleans::Caller),
-        (GALGSBL, "btuech", gsbl::btuech, Cleans::Caller),
-        (GALGSBL, "btumil", gsbl::btumil, Cleans::Caller),
-        (GALGSBL, "btuibw", gsbl::btuibw, Cleans::Caller),
-        (GALGSBL, "btuica", gsbl::btuica, Cleans::Caller),
-        (GALGSBL, "btuhpk", gsbl::btuhpk, Cleans::Caller),
-        (GALGSBL, "btupbc", gsbl::btupbc, Cleans::Caller),
-        (GALGSBL, "btucpc", gsbl::btucpc, Cleans::Caller),
+        (GALGSBL, "btuxmn", gsbl::btuxmn, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuoes", gsbl::btuoes, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuclo", gsbl::btuclo, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btulok", gsbl::btulok, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btucli", gsbl::btucli, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuinj", gsbl::btuinj, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btutrg", gsbl::btutrg, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuech", gsbl::btuech, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btumil", gsbl::btumil, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuibw", gsbl::btuibw, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuica", gsbl::btuica, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuhpk", gsbl::btuhpk, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btupbc", gsbl::btupbc, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btucpc", gsbl::btucpc, Cleans::Caller, Evidence::Unclassified),
         // --- Track A, 2026-08-15: closing the ten-build import survey ---
         // The GALGSBL character-interrupt family. Ordinals confirmed against
         // the vendor's own `re/wg33src/LIB/GALGSBL.DEF` (3, 4, 5, 8, 52, 64)
@@ -735,17 +743,17 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // replaces the character-translation stage of every later character,
         // and this host's input path has no equivalent of the `tasks`/
         // `Host::prctask` sweep that lets `initask` defer invocation.
-        (GALGSBL, "btuche", gsbl::btuche, Cleans::Caller),
-        (GALGSBL, "btuchi", gsbl::btuchi, Cleans::Caller),
-        (GALGSBL, "btuclc", gsbl::btuclc, Cleans::Caller),
-        (GALGSBL, "btucls", gsbl::btucls, Cleans::Caller),
-        (GALGSBL, "btutru", gsbl::btutru, Cleans::Caller),
-        (GALGSBL, "chiout", gsbl::chiout, Cleans::Caller),
+        (GALGSBL, "btuche", gsbl::btuche, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuchi", gsbl::btuchi, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btuclc", gsbl::btuclc, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btucls", gsbl::btucls, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "btutru", gsbl::btutru, Cleans::Caller, Evidence::Unclassified),
+        (GALGSBL, "chiout", gsbl::chiout, Cleans::Caller, Evidence::Unclassified),
         // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
         // vendor branches have structurally different headers, so they are
         // ABI-concrete in both native tables below.
-        (MAJORBBS, "galmalloc", memory::galmalloc, Cleans::Caller),
-        (MAJORBBS, "sizmem", memory::sizmem, Cleans::Caller),
+        (MAJORBBS, "galmalloc", memory::galmalloc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "sizmem", memory::sizmem, Cleans::Caller, Evidence::Unclassified),
         // Borland's runtime, re-exported through MAJORBBS. `_fgetc` points at
         // `stream::fgetc` deliberately: Borland's `_fgetc` is
         // `{ ++fp->level; return fgetc(fp); }`, observably the same routine,
@@ -753,50 +761,50 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
         // a *different symbol* from the already-registered `fgetc` because this
         // host strips exactly one leading underscore -- stripping greedily
         // would merge `_OLDSEND` and `__OLDSEND`, which are two real symbols.
-        (MAJORBBS, "_fgetc", stream::fgetc, Cleans::Caller),
-        (MAJORBBS, "stricmp", crt::stricmp, Cleans::Caller),
-        (MAJORBBS, "ultoa", crt::ultoa, Cleans::Caller),
-        (MAJORBBS, "ungetc", crt::ungetc, Cleans::Caller),
-        (MAJORBBS, "rename", crt::rename, Cleans::Caller),
-        (MAJORBBS, "getenv", crt::getenv, Cleans::Caller),
-        (MAJORBBS, "gettime", crt::gettime, Cleans::Caller),
-        (MAJORBBS, "_doserror", crt::doserror, Cleans::Caller),
-        (MAJORBBS, "__errno", crt::errno, Cleans::Caller),
-        (MAJORBBS, "_lrand", crt::lrand, Cleans::Caller),
-        (MAJORBBS, "searchpath", crt::searchpath, Cleans::Caller),
-        (MAJORBBS, "setmode", crt::setmode, Cleans::Caller),
-        (MAJORBBS, "read", crt::read, Cleans::Caller),
-        (MAJORBBS, "write", crt::write, Cleans::Caller),
+        (MAJORBBS, "_fgetc", stream::fgetc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stricmp", crt::stricmp, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ultoa", crt::ultoa, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ungetc", crt::ungetc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rename", crt::rename, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "getenv", crt::getenv, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "gettime", crt::gettime, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "_doserror", crt::doserror, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "__errno", crt::errno, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "_lrand", crt::lrand, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "searchpath", crt::searchpath, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "setmode", crt::setmode, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "read", crt::read, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "write", crt::write, Cleans::Caller, Evidence::Unclassified),
         // `mfytask` completes the pair `initask` opened: a module could
         // register a task and then fail modifying it.
-        (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller),
+        (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller, Evidence::Unclassified),
         // `.MSG` access. Both of these were previously "absent on purpose"
         // because `WCCMMUD.DLL` does not import them -- the reasoning the
         // scope rule suspends. The Rose imports `getasc` at six sites.
-        (MAJORBBS, "getasc", msg::getasc, Cleans::Caller),
-        (MAJORBBS, "rawmsg", msg::rawmsg, Cleans::Caller),
+        (MAJORBBS, "getasc", msg::getasc, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "rawmsg", msg::rawmsg, Cleans::Caller, Evidence::Unclassified),
         // FSD. `fsdfxt` deliberately does NOT refuse an out-of-range field:
         // it is the vendor's own guarded wrapper around the unguarded
         // `fsdnan`, and `buffer[0]='\0'` is its documented answer.
-        (MAJORBBS, "fsdfxt", fsd::fsdfxt, Cleans::Caller),
-        (MAJORBBS, "fsdrhd", fsd::fsdrhd, Cleans::Caller),
+        (MAJORBBS, "fsdfxt", fsd::fsdfxt, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "fsdrhd", fsd::fsdrhd, Cleans::Caller, Evidence::Unclassified),
         // Five fixed arguments, measured: the wg1 and WG3.3 headers and
         // `ACCOUNT.C` all agree, and Rose's own call site cleans 7 words.
-        (MAJORBBS, "swtcls", user::swtcls, Cleans::Caller),
+        (MAJORBBS, "swtcls", user::swtcls, Cleans::Caller, Evidence::Unclassified),
         // Runtime name resolution: one shared resolver, two ABI-native faces.
         // Both answer library presence truthfully and report "not found" for a
         // symbol address, which is the real API's own contract -- thunk indices
         // are minted only at module load.
-        (DOSCALLS, "dosgetmodhandle", dosenv::dosgetmodhandle, Cleans::Callee(8)),
-        (DOSCALLS, "dosgetprocaddr", dosenv::dosgetprocaddr, Cleans::Callee(10)),
-        (KERNEL32, "loadlibrarya", borland::loadlibrarya, Cleans::Callee(4)),
-        (KERNEL32, "freelibrary", borland::freelibrary, Cleans::Callee(4)),
+        (DOSCALLS, "dosgetmodhandle", dosenv::dosgetmodhandle, Cleans::Callee(8), Evidence::Unclassified),
+        (DOSCALLS, "dosgetprocaddr", dosenv::dosgetprocaddr, Cleans::Callee(10), Evidence::Unclassified),
+        (KERNEL32, "loadlibrarya", borland::loadlibrarya, Cleans::Callee(4), Evidence::Unclassified),
+        (KERNEL32, "freelibrary", borland::freelibrary, Cleans::Callee(4), Evidence::Unclassified),
         // The last unresolved import across all ten surveyed builds. Answers
         // GMEERR because that is what the vendor's own body answers when the
         // messaging engine is not running, which for this host is always --
         // see `dosenv::simpsnd`, and note it is NOT zero, which would mean
         // "still processing" and spin the caller.
-        (GALME, "simpsnd", dosenv::simpsnd, Cleans::Caller),
+        (GALME, "simpsnd", dosenv::simpsnd, Cleans::Caller, Evidence::Unclassified),
     ]
 }
 
@@ -807,31 +815,31 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans)> {
 /// A `const`, unlike [`routines`], because nothing here is generic over `A`
 /// -- every entry is already `Shim<Wg16>`, so there is no per-instantiation
 /// table to build.
-const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
+const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans, Evidence)] = &[
     // Segment tiling: no flat-memory counterpart. Never given a `Call`-taking
     // body (see `shims::memory`'s own doc comment on `alctile`), so these are
     // non-capturing closures adapting `Wg16Shim` into `Shim<Wg16>` -- a
     // reborrow of `call.cpu` (`Call<Wg16>::cpu` is `&mut mbbs_machine::m16::Machine`,
     // since `Wg16::Cpu = mbbs_machine::m16::Machine`) and the reverse `Ret` conversion
     // `impl From<mbbs_machine::m16::Ret> for abi::Ret<Wg16>` supplies.
-    (MAJORBBS, "alctile", memory::alctile, Cleans::Caller),
-    (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller),
+    (MAJORBBS, "alctile", memory::alctile, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "ptrtile", memory::ptrtile, Cleans::Caller, Evidence::Unclassified),
     // The compiler's own runtime, which this host exports because the real
     // one did. Same adapter shape as the tiling pair above. These four pop
     // their own arguments -- see `runtime`.
-    (MAJORBBS, "f_ldiv@", runtime::f_ldiv, Cleans::Callee(runtime::OPERANDS)),
-    (MAJORBBS, "f_lmod@", runtime::f_lmod, Cleans::Callee(runtime::OPERANDS)),
-    (MAJORBBS, "f_ludiv@", runtime::f_ludiv, Cleans::Callee(runtime::OPERANDS)),
-    (MAJORBBS, "f_lumod@", runtime::f_lumod, Cleans::Callee(runtime::OPERANDS)),
+    (MAJORBBS, "f_ldiv@", runtime::f_ldiv, Cleans::Callee(runtime::OPERANDS), Evidence::Unclassified),
+    (MAJORBBS, "f_lmod@", runtime::f_lmod, Cleans::Callee(runtime::OPERANDS), Evidence::Unclassified),
+    (MAJORBBS, "f_ludiv@", runtime::f_ludiv, Cleans::Callee(runtime::OPERANDS), Evidence::Unclassified),
+    (MAJORBBS, "f_lumod@", runtime::f_lumod, Cleans::Callee(runtime::OPERANDS), Evidence::Unclassified),
     // The rest of that runtime, and it does not share one convention. These
     // three take their operands in registers and put nothing on the stack,
     // so there is nothing for either side to clean.
-    (MAJORBBS, "f_lxmul@", runtime::f_lxmul, Cleans::Caller),
-    (MAJORBBS, "f_lxlsh@", runtime::f_lxlsh, Cleans::Caller),
-    (MAJORBBS, "f_lxursh@", runtime::f_lxursh, Cleans::Caller),
+    (MAJORBBS, "f_lxmul@", runtime::f_lxmul, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "f_lxlsh@", runtime::f_lxlsh, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "f_lxursh@", runtime::f_lxursh, Cleans::Caller, Evidence::Unclassified),
     // And this one is a struct copy: two far pointers on the stack, which it
     // pops, and the length in `CX`.
-    (MAJORBBS, "f_scopy@", runtime::f_scopy, Cleans::Callee(runtime::POINTERS)),
+    (MAJORBBS, "f_scopy@", runtime::f_scopy, Cleans::Callee(runtime::POINTERS), Evidence::Unclassified),
     // `f_spush@` looks like `f_scopy@`'s sibling and is NOT callee-cleaned.
     // Measured, not assumed: all six of The Rose's call sites disassemble to
     // `lea ax,[bp+disp]; mov dx,ss; mov cx,<len>; call far F_SPUSH@` -- nothing
@@ -839,20 +847,20 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
     // `f_lxmul@`/`f_lxlsh@`/`f_lxursh@` above, not the stack-argument shape of
     // the four division helpers. Getting this wrong does not crash; it leaves
     // arguments on the module's own stack and shifts every later frame.
-    (MAJORBBS, "f_spush@", runtime::f_spush, Cleans::Caller),
+    (MAJORBBS, "f_spush@", runtime::f_spush, Cleans::Caller, Evidence::Unclassified),
     // The block allocator, `Wg16` half. ABI-concrete rather than generic
     // because the vendor's two branches are structurally different, not just
     // reordered: GCDOS chains globs through a `segarray` of pointers, the flat
     // branch stores data inline. Both headers here are byte-identical to
     // `ALCBLOK.C`'s own.
-    (MAJORBBS, "alcblok", memory::alcblok, Cleans::Caller),
-    (MAJORBBS, "ptrblok", memory::ptrblok, Cleans::Caller),
-    (MAJORBBS, "freblok", memory::freblok, Cleans::Caller),
+    (MAJORBBS, "alcblok", memory::alcblok, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "ptrblok", memory::ptrblok, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "freblok", memory::freblok, Cleans::Caller, Evidence::Unclassified),
     // Screen and per-user state that only the 16-bit builds import. `extoff`
     // additionally *needs* `Wg16`: it reaches the GCV2-only `extusr` table.
-    (MAJORBBS, "explode", screen::explode, Cleans::Caller),
-    (MAJORBBS, "iniscn", screen::iniscn, Cleans::Caller),
-    (MAJORBBS, "extoff", user::extoff, Cleans::Caller),
+    (MAJORBBS, "explode", screen::explode, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "iniscn", screen::iniscn, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "extoff", user::extoff, Cleans::Caller, Evidence::Unclassified),
 ];
 
 /// [`Abi::native`]'s `Wg16` half: a lookup into [`WG16_ROUTINES`], the table
@@ -862,8 +870,8 @@ const WG16_ROUTINES: &[(&str, &str, Shim<Wg16>, Cleans)] = &[
 pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans)> {
     WG16_ROUTINES
         .iter()
-        .find(|(d, n, _, _)| *d == dll && *n == symbol)
-        .map(|(_, _, shim, cleans)| (*shim, *cleans))
+        .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
+        .map(|(_, _, shim, cleans, _)| (*shim, *cleans))
 }
 
 /// The `Wg32` half of the same idea: routines that cannot be generic over
@@ -886,8 +894,8 @@ pub(crate) fn wg16_native(dll: &str, symbol: &str) -> Option<(Shim<Wg16>, Cleans
 /// `Cleans::Caller` because no call site pushes a stack argument at all: the
 /// operand is on the FPU stack, and all thirteen of LunatiX's call sites are
 /// preceded by `fld`/`fild`/`fmul` with nothing pushed.
-const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans)] = &[
-    (MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller),
+const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans, Evidence)] = &[
+    (MAJORBBS, "_ftol", ftol::ftol, Cleans::Caller, Evidence::Unclassified),
     // The block allocator, `Wg32` half. Same C export names as the `Wg16`
     // entries in `WG16_ROUTINES` -- this is deliberate, not the duplicate
     // registration `6d8af77` cleaned up. One symbol, two ABI-concrete bodies,
@@ -897,24 +905,24 @@ const WG32_ROUTINES: &[(&str, &str, Shim<crate::abi::Wg32>, Cleans)] = &[
     // byte for byte and adds the `qty` the vendor omits, in the six header
     // bytes `alczer` already zeroes, so the bounds check the flat branch
     // structurally cannot have costs no compatibility.
-    (MAJORBBS, "alcblok", memory::alcblok32, Cleans::Caller),
-    (MAJORBBS, "ptrblok", memory::ptrblok32, Cleans::Caller),
-    (MAJORBBS, "freblok", memory::freblok32, Cleans::Caller),
+    (MAJORBBS, "alcblok", memory::alcblok32, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "ptrblok", memory::ptrblok32, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "freblok", memory::freblok32, Cleans::Caller, Evidence::Unclassified),
     // WGNT host services. Only the PE32 builds import these -- MajorMUD NT
     // for the first five, Rose 3.0NT for the rest.
-    (MAJORBBS, "getfiletm", system::getfiletm, Cleans::Caller),
-    (MAJORBBS, "paccit", user::paccit, Cleans::Caller),
-    (MAJORBBS, "samepatu", user::samepatu, Cleans::Caller),
-    (MAJORBBS, "vtmsend", system::vtmsend, Cleans::Caller),
-    (MAJORBBS, "vtmsndok", system::vtmsndok, Cleans::Caller),
+    (MAJORBBS, "getfiletm", system::getfiletm, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "paccit", user::paccit, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "samepatu", user::samepatu, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "vtmsend", system::vtmsend, Cleans::Caller, Evidence::Unclassified),
+    (MAJORBBS, "vtmsndok", system::vtmsndok, Cleans::Caller, Evidence::Unclassified),
 ];
 
 /// [`Abi::native`]'s `Wg32` half. See [`wg16_native`], which this mirrors.
 pub(crate) fn wg32_native(dll: &str, symbol: &str) -> Option<(Shim<crate::abi::Wg32>, Cleans)> {
     WG32_ROUTINES
         .iter()
-        .find(|(d, n, _, _)| *d == dll && *n == symbol)
-        .map(|(_, _, shim, cleans)| (*shim, *cleans))
+        .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
+        .map(|(_, _, shim, cleans, _)| (*shim, *cleans))
 }
 
 /// Every constant the host exports.
@@ -1077,9 +1085,9 @@ pub(crate) fn sign_extend<A: Abi>(raw: u32) -> i32 {
 /// neither needs its own copy of the alias.
 pub fn entry<A: Abi>(dll: &str, symbol: &str) -> Entry<A> {
     let dll = canonical_dll(dll);
-    if let Some((_, _, shim, cleans)) = routines::<A>()
+    if let Some((_, _, shim, cleans, _)) = routines::<A>()
         .into_iter()
-        .find(|(d, n, _, _)| *d == dll && *n == symbol)
+        .find(|(d, n, _, _, _)| *d == dll && *n == symbol)
     {
         return Entry::Routine(shim, cleans);
     }
@@ -1443,7 +1451,7 @@ mod tests {
         // whichever is consulted first -- a far call into globals memory, or a
         // variable at a code address, or the second door. Neither fails loudly.
         let generic = routines::<Wg16>();
-        for (dll, name, _, _) in &generic {
+        for (dll, name, _, _, _) in &generic {
             assert!(
                 !GLOBALS.iter().any(|g| g.dll == *dll && g.name == *name),
                 "{dll}.{name} is both a routine and a global"
@@ -1453,7 +1461,7 @@ mod tests {
                 "{dll}.{name} is both a routine and a constant"
             );
             assert!(
-                !WG16_ROUTINES.iter().any(|(d, n, _, _)| d == dll && n == name),
+                !WG16_ROUTINES.iter().any(|(d, n, _, _, _)| d == dll && n == name),
                 "{dll}.{name} is both a generic routine and behind Wg16's door"
             );
         }
@@ -1463,7 +1471,7 @@ mod tests {
                 "{dll}.{name} is both a constant and a global"
             );
         }
-        for (dll, name, _, _) in WG16_ROUTINES {
+        for (dll, name, _, _, _) in WG16_ROUTINES {
             assert!(
                 !GLOBALS.iter().any(|g| g.dll == *dll && g.name == *name),
                 "{dll}.{name} is both a routine and a global"
@@ -1506,8 +1514,8 @@ mod convention {
         let generic = routines::<Wg16>();
         let callee: Vec<(&str, Cleans)> = generic
             .iter()
-            .map(|(dll, name, _, cleans)| (*dll, *name, *cleans))
-            .chain(WG16_ROUTINES.iter().map(|(dll, name, _, cleans)| (*dll, *name, *cleans)))
+            .map(|(dll, name, _, cleans, _)| (*dll, *name, *cleans))
+            .chain(WG16_ROUTINES.iter().map(|(dll, name, _, cleans, _)| (*dll, *name, *cleans)))
             .filter(|(_, _, cleans)| !matches!(cleans, Cleans::Caller))
             .map(|(_, name, cleans)| (name, cleans))
             .collect();
