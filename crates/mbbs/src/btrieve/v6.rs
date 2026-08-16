@@ -791,6 +791,7 @@ pub(crate) fn write_fcr(
     page_size: u16,
     records: u32,
     key_record_counts: &[(usize, u32)],
+    free_head: Option<u32>,
 ) -> Result<(), String> {
     let page_size_usize = usize::from(page_size);
     if file.len() < 2 * page_size_usize || !file.len().is_multiple_of(page_size_usize) {
@@ -825,6 +826,15 @@ pub(crate) fn write_fcr(
 
     let records_at = stale_at + super::pages::fcr::RECORDS_HIGH;
     file[records_at..records_at + 4].copy_from_slice(&super::pages::to_long(records));
+
+    // `None` leaves whatever the live copy had, which is right for every
+    // caller that did not move a slot on or off the free list -- the whole
+    // live page was copied over the stale one above, so "leave it alone"
+    // costs nothing and says nothing.
+    if let Some(free) = free_head {
+        let free_at = stale_at + super::pages::fcr::FREE_V6;
+        file[free_at..free_at + 4].copy_from_slice(&super::pages::to_long(free));
+    }
 
     for &(offset, count) in key_record_counts {
         let at = stale_at + offset;

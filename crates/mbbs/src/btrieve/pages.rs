@@ -31,8 +31,28 @@ pub const NOWHERE: u32 = 0xffff_ffff;
 
 /// Where each field this host writes lives in the file control record.
 pub mod fcr {
-    /// Free-list head. A [`long`](super::long).
+    /// Free-list head, **version 5 only**. A [`long`](super::long).
+    ///
+    /// A v6 file keeps its own at [`FREE_V6`] and leaves this reading
+    /// `0xffffffff` -- measured on every v6 file this repository has, before
+    /// and after every insert, update and delete
+    /// (`docs/2026-08-16-v6-update-delete-oracle.md`). Reading this offset on
+    /// a v6 file does not fail, it just answers "no free slots" forever.
     pub const FREE: usize = 0x10;
+
+    /// Free-list head, **version 6 only**. A [`long`](super::long), holding a
+    /// record *position* (logical page times page length, plus the slot's
+    /// byte offset) exactly as [`FREE`] does for v5.
+    ///
+    /// Measured 2026-08-16 against genuine Btrieve 6.15: on a 2,048-byte-page
+    /// file of 32-byte records, three inserts walked it `0x1028` -> `0x104a`
+    /// -> `0x106c` (one 34-byte slot each time), deleting the record at
+    /// `0x1028` set it back to `0x1028` with `0x106c` written into the freed
+    /// slot's own first four bytes, and the next insert took `0x1028` and
+    /// restored `0x106c` by reading that link. A newly claimed page arrives
+    /// with all of its slots already threaded onto this list, ending at
+    /// `0xffffffff`.
+    pub const FREE_V6: usize = 0x9c;
     /// Record count, high half. The low half is two bytes later.
     pub const RECORDS_HIGH: usize = 0x1a;
     /// Record count, low half.

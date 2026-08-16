@@ -48,6 +48,7 @@ pub use create::{create, FileSpec, KeySpec, SegmentSpec};
 pub use keys::Key;
 pub use ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
 pub use records::{Record, Records};
+use records::V6_SLOT_MARKER;
 pub use stat::{deliver, Stat, StatKey};
 
 /// How much of the first page this host reads.
@@ -130,6 +131,24 @@ pub enum Version {
     /// fields below**; a v6 file's *pages* are not laid out like a v5 file's,
     /// so whatever walks pages later must not assume they are.
     V6,
+}
+
+/// Where a v6 record physically is, and the file it was found in.
+///
+/// [`Block::v6_slot`]'s answer: every v6 write needs all four of these and
+/// none of them should be re-derived from another. `file` rides along because
+/// every v6 write is a read-modify-append-elsewhere-and-flip-the-shadow-pair
+/// operation over the whole file, so reading it is the first thing each of
+/// them does anyway and reading it twice would let the two reads disagree.
+struct V6Slot {
+    /// The whole file, as it was before this write.
+    file: Vec<u8>,
+    /// The record's logical page -- what its position names.
+    logical: u32,
+    /// The physical page currently holding that logical page.
+    physical: u32,
+    /// The slot's byte offset within a page, marker included.
+    within: usize,
 }
 
 /// A Btrieve file's shape, out of its file control record.
@@ -1045,73 +1064,17 @@ impl<A: Abi> Block<A> {
         };
         let fcr = file[live_fcr * page_size_usize..][..page_size_usize].to_vec();
 
-        let shift = records_clone.key_shift();
-        let mut relocations: Vec<(u32, Vec<u8>)> = Vec::with_capacity(self.keys.len());
-        let mut key_record_counts: Vec<(usize, u32)> = Vec::with_capacity(self.keys.len());
-
-        for key in &self.keys {
-            let len = records_clone.ordered_len(key.number).ok_or_else(|| {
-                fail(format!(
-                    "key {}: not among the keys the loaded records were ordered by",
-                    key.number
-                ))
-            })?;
-            let mut entries: Vec<pages::Entry> = Vec::with_capacity(len);
-            for n in 0..len {
-                let record = records_clone.ordered(key.number, n).expect("in range");
-                entries.push(pages::Entry::unique(
-                    key.extract(&records::keyed(shift, &record.bytes)),
-                    record.position,
-                ));
-            }
-
-            let built = pages::build_index(layout, &entries, key.shape())
-                .map_err(|why| fail(format!("key {}: {why}", key.number)))?;
-            if built.nodes.len() != 1 {
-                return Err(fail(format!(
-                    "key {}: {len} records need {} index pages, and this host \
-                     only maintains a v6 key whose whole index fits one",
-                    key.number,
-                    built.nodes.len()
-                )));
-            }
-
-            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
-            let root_at = definition + pages::fcr::KEY_ROOT;
-            let raw_root = pages::long(&fcr[root_at..root_at + 4]);
-            if raw_root & 0x8000_0000 == 0 {
-                return Err(fail(format!(
-                    "key {}: root {raw_root:#x} does not carry the v6 marker \
-                     bit (0x80000000) this host's own measurement found on \
-                     every v6 key it has seen -- refusing rather than \
-                     guessing at a shape nothing has measured",
-                    key.number
-                )));
-            }
-            let root_logical = raw_root & 0x7fff_ffff;
-
-            relocations.push((root_logical, built.nodes[0].image.clone()));
-            key_record_counts.push((
-                definition + pages::fcr::KEY_RECORDS,
-                u32::try_from(len).expect("far fewer records than u32::MAX"),
-            ));
-        }
-
-        // Every key's index fits; now the writes actually happen. Relocating
-        // a key's root before the file control record's own write matches
-        // `Self::reindex`'s own ordering (`Self::reindex`'s doc comment: the
-        // index and the record count it describes should never be
-        // observably out of step for longer than one write has to leave
-        // them).
-        for (logical, content) in &relocations {
-            v6::Map::relocate(&mut file, page_size, *logical, content, [0x00, 0x80]).map_err(
-                |why| fail(format!("relocating the index root at logical {logical}: {why}")),
-            )?;
-        }
+        let key_record_counts = self
+            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .map_err(&fail)?;
 
         let total_records =
             u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
-        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts)
+        // `None`: an insert does not move a slot on or off the free list.
+        // This host's v6 insert claims a whole new page rather than popping
+        // the free head genuine Btrieve pops -- see this function's own
+        // "Scope" note and `Self::delete_v6`'s "What this host leaks".
+        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None)
             .map_err(|why| fail(format!("updating the file control record: {why}")))?;
 
         // The last point before this write actually changes anything on
@@ -1131,6 +1094,445 @@ impl<A: Abi> Block<A> {
         self.dirty = true;
 
         Ok(new_position)
+    }
+
+    /// A v6 record's page, and where its slot starts inside that page.
+    ///
+    /// The four quantities every v6 write below needs and none of them should
+    /// re-derive: the record's logical page, the physical page currently
+    /// holding it, the slot's byte offset within a page, and the whole file
+    /// read into memory (every v6 write is
+    /// read-modify-append-elsewhere-and-flip-the-shadow-pair, never an
+    /// in-place edit, so all of them start by reading the whole file anyway).
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read, `position` is not on a slot boundary, the
+    /// allocation table cannot be resolved or does not claim the record's
+    /// logical page, or the page it names lies past the end of the file.
+    fn v6_slot(&self, position: u32, layout: pages::Layout) -> Result<V6Slot, String> {
+        let file = std::fs::read(&self.path).map_err(|e| format!("{}: {e}", self.path.display()))?;
+
+        let (logical, slot) = layout.slot_of(position).ok_or_else(|| {
+            format!("position {position} is not on a slot boundary of this file's layout")
+        })?;
+
+        let map = v6::Map::read(&file, self.geometry.page)?;
+        let physical = map.physical(logical).ok_or_else(|| {
+            format!(
+                "the allocation table claims no physical page for logical page \
+                 {logical}, which is where position {position} says its record is"
+            )
+        })?;
+
+        let page_size = usize::from(self.geometry.page);
+        let at = page_size * physical as usize;
+        if at + page_size > file.len() {
+            return Err(format!(
+                "logical page {logical} resolves to physical page {physical}, past \
+                 the end of a {}-byte file",
+                file.len()
+            ));
+        }
+
+        // Within a page, a slot's offset is the same whichever page it is on,
+        // so `position(0, slot)` asks exactly that -- the same reasoning
+        // `records::walk_v6` gives at length for the same expression.
+        Ok(V6Slot {
+            file,
+            logical,
+            physical,
+            within: layout.position(0, slot) as usize,
+        })
+    }
+
+    /// Replace the record at `position` in a v6 file.
+    ///
+    /// # What genuine Btrieve does, which this follows
+    ///
+    /// Measured 2026-08-16 (`docs/2026-08-16-v6-update-delete-oracle.md`):
+    ///
+    /// - the record is rewritten **in its own slot**, so its position never
+    ///   changes -- not when the body changes, and not even when the key value
+    ///   does;
+    /// - the slot's two-byte marker is incremented (`1` on a fresh record, `2`
+    ///   after its first update, and so on);
+    /// - the data page is relocated;
+    /// - the index is touched **only if a key's value changed** -- an update
+    ///   that leaves every key alone leaves every index page byte-identical.
+    ///   [`Self::v6_reindex`] is what implements that last part, by comparing
+    ///   before relocating.
+    /// - the record count does not change, and neither does the free list.
+    ///
+    /// # A key that does not declare itself modifiable is not checked here
+    ///
+    /// Genuine 6.15 answers status 10 to an update that changes a key the file
+    /// declares non-modifiable, and nothing here does. That is a deliberate
+    /// gap and not an oversight: this host does not parse the modifiable
+    /// attribute at all (see [`keys::Key`], which has no field for it), and
+    /// inventing the refusal from an unparsed bit would be guessing at which
+    /// bit. Of the twelve v6 files The Rose ships, six declare their keys
+    /// modifiable, so the check is not free to add wrongly.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read or written, `position` does not resolve to a
+    /// claimed slot, or [`Self::v6_reindex`] refuses any key.
+    fn update_v6(&mut self, position: u32, bytes: &[u8], layout: pages::Layout) -> Result<(), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        let page_size = self.geometry.page;
+        let page_size_usize = usize::from(page_size);
+        let V6Slot {
+            mut file,
+            logical,
+            physical,
+            within,
+        } = self.v6_slot(position, layout).map_err(&fail)?;
+
+        let mut records_clone = self
+            .records
+            .as_ref()
+            .expect("Self::update calls Self::records() before this")
+            .clone();
+        records_clone
+            .update(&self.keys, position, bytes.to_vec())
+            .map_err(|why| fail(format!("updating the record in the model: {why}")))?;
+
+        let at = page_size_usize * physical as usize;
+        let mut content = file[at..at + page_size_usize].to_vec();
+
+        // The marker counts updates, and zero means free -- so it must never
+        // land back on zero. Genuine Btrieve's behaviour at the sixty-five
+        // thousandth update of one record was not measured; wrapping to `1`
+        // is this host's own choice, taken because the alternative readings
+        // (wrap to `0`, or refuse the write) are respectively corruption and
+        // a refusal no module could act on.
+        let marker = u16::from_le_bytes([content[within], content[within + 1]]);
+        let marker = marker.checked_add(1).filter(|&m| m != 0).unwrap_or(1);
+        content[within..within + 2].copy_from_slice(&marker.to_le_bytes());
+
+        let body = within + V6_SLOT_MARKER;
+        content[body..body + bytes.len()].copy_from_slice(bytes);
+
+        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+
+        v6::Map::relocate(&mut file, page_size, logical, &content, [0x00, 0x44])
+            .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
+
+        let key_record_counts = self
+            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .map_err(&fail)?;
+
+        let total_records =
+            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        v6::write_fcr(&mut file, page_size, total_records, &key_record_counts, None)
+            .map_err(|why| fail(format!("updating the file control record: {why}")))?;
+
+        self.capture_for_journal()?;
+        std::fs::write(&self.path, &file)
+            .map_err(|e| fail(format!("{}: writing the file: {e}", self.path.display())))?;
+
+        self.records = Some(records_clone);
+        self.geometry.pages = u32::try_from(file.len())
+            .expect("a Btrieve file under four gigabytes")
+            / u32::from(page_size);
+        self.dirty = true;
+
+        Ok(())
+    }
+
+    /// Take the record at `position` out of a v6 file.
+    ///
+    /// # What genuine Btrieve does, which this follows
+    ///
+    /// Measured 2026-08-16 (`docs/2026-08-16-v6-update-delete-oracle.md`):
+    ///
+    /// - the slot's marker goes to zero, and the first four bytes of its body
+    ///   become the free list's previous head, with everything behind that
+    ///   zeroed -- the same forwarding-link shape v5 uses, at the same place
+    ///   in the slot;
+    /// - the file control record's free-list head becomes this slot's own
+    ///   position. **`pages::fcr::FREE_V6`, not `pages::fcr::FREE`** -- the v5
+    ///   offset reads `0xffffffff` on every v6 file and never moves;
+    /// - the record count and the touched keys' record counts each drop by
+    ///   one, and the index is rebuilt without the entry;
+    /// - the page **keeps its claim in the allocation table**, whether or not
+    ///   other records share it, and *even when the deleted record was the
+    ///   only one on it*. Scenario B of the measurement is exactly that case.
+    ///   Nothing here unclaims a page, and that is the measured behaviour
+    ///   rather than a simplification.
+    ///
+    /// # What this host leaks, said out loud
+    ///
+    /// The freed slot goes on the free list and [`Self::insert_v6`] does not
+    /// pop it: this host's v6 insert claims a whole fresh page per record and
+    /// leaves the head alone. So a delete-then-insert pair costs a page and
+    /// leaves a slot on the list that only a real Btrieve would ever reuse.
+    /// That is a waste, not a corruption -- the chain this writes is
+    /// well-formed and the slot is genuinely free -- and it is written down
+    /// here rather than quietly tolerated because the two halves *ought* to be
+    /// one mechanism. Making insert pop the head is the next piece of work.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read or written, `position` does not resolve to a
+    /// claimed slot, or [`Self::v6_reindex`] refuses any key.
+    fn delete_v6(&mut self, position: u32, layout: pages::Layout) -> Result<(), BtvError> {
+        let name = self.name.clone();
+        let fail = |why: String| BtvError {
+            file: name.clone(),
+            why,
+        };
+
+        let page_size = self.geometry.page;
+        let page_size_usize = usize::from(page_size);
+        let V6Slot {
+            mut file,
+            logical,
+            physical,
+            within,
+        } = self.v6_slot(position, layout).map_err(&fail)?;
+
+        let mut records_clone = self
+            .records
+            .as_ref()
+            .expect("Self::delete calls Self::records() before this")
+            .clone();
+        records_clone
+            .delete(&self.keys, position)
+            .map_err(|why| fail(format!("removing the record from the model: {why}")))?;
+
+        let fcr = self.v6_live_fcr(&file).map_err(&fail)?;
+        let free_head = pages::long(&fcr[pages::fcr::FREE_V6..pages::fcr::FREE_V6 + 4]);
+
+        let at = page_size_usize * physical as usize;
+        let mut content = file[at..at + page_size_usize].to_vec();
+
+        // Zero the whole slot -- marker included -- and then write the
+        // forwarding link over the front of the body. Zeroing first rather
+        // than only writing the link is what leaves the measured shape: the
+        // freed slot's own record bytes do not survive the delete.
+        let slot_end = within + usize::from(self.geometry.physical);
+        content[within..slot_end].fill(0);
+        let body = within + V6_SLOT_MARKER;
+        content[body..body + 4].copy_from_slice(&pages::to_long(free_head));
+
+        v6::Map::relocate(&mut file, page_size, logical, &content, [0x00, 0x44])
+            .map_err(|why| fail(format!("relocating the record's page: {why}")))?;
+
+        let key_record_counts = self
+            .v6_reindex(&mut file, &records_clone, &fcr, layout)
+            .map_err(&fail)?;
+
+        let total_records =
+            u32::try_from(records_clone.len()).expect("far fewer records than u32::MAX");
+        v6::write_fcr(
+            &mut file,
+            page_size,
+            total_records,
+            &key_record_counts,
+            Some(position),
+        )
+        .map_err(|why| fail(format!("updating the file control record: {why}")))?;
+
+        self.capture_for_journal()?;
+        std::fs::write(&self.path, &file)
+            .map_err(|e| fail(format!("{}: writing the file: {e}", self.path.display())))?;
+
+        self.records = Some(records_clone);
+        self.geometry.records = total_records;
+        self.geometry.pages = u32::try_from(file.len())
+            .expect("a Btrieve file under four gigabytes")
+            / u32::from(page_size);
+        self.dirty = true;
+
+        Ok(())
+    }
+
+    /// The live half of a v6 file's file-control-record shadow pair.
+    ///
+    /// Physical pages 0 and 1 both carry a control record; the one with the
+    /// higher generation is the current one. A tie is refused rather than
+    /// broken, because no rule for breaking it has been measured -- the same
+    /// refusal [`v6::write_fcr`] and [`v6::Map::relocate`] each make about
+    /// their own pair.
+    ///
+    /// # Errors
+    ///
+    /// If the file does not hold two whole pages, or the two generations tie.
+    fn v6_live_fcr(&self, file: &[u8]) -> Result<Vec<u8>, String> {
+        let page_size = usize::from(self.geometry.page);
+        if file.len() < 2 * page_size {
+            return Err(format!(
+                "{} bytes does not hold two whole {page_size}-byte pages for the \
+                 file control record's shadow pair",
+                file.len()
+            ));
+        }
+        let generation = |page: usize| -> u16 {
+            let at = page * page_size + at::GENERATION;
+            u16::from_le_bytes([file[at], file[at + 1]])
+        };
+        let live = match generation(0).cmp(&generation(1)) {
+            std::cmp::Ordering::Greater => 0usize,
+            std::cmp::Ordering::Less => 1usize,
+            std::cmp::Ordering::Equal => {
+                return Err(format!(
+                    "both file-control-record copies claim generation {}, and \
+                     there is no rule measured for choosing between them",
+                    generation(0)
+                ));
+            }
+        };
+        Ok(file[live * page_size..][..page_size].to_vec())
+    }
+
+    /// Rebuild every key's index from `records`, and relocate each key's root
+    /// page whose content the rebuild actually changed.
+    ///
+    /// Shared by [`Self::insert_v6`], [`Self::update_v6`] and
+    /// [`Self::delete_v6`], which differ in what they do to a *record* and
+    /// agree completely on what that obliges them to do to the *indexes*.
+    /// Written once so they cannot drift: three copies of "build every key,
+    /// check every key fits, then write" is three places for a refusal to be
+    /// checked in the wrong order.
+    ///
+    /// # Every key is built before any key is written
+    ///
+    /// A refusal must never leave some keys' indexes updated and others not,
+    /// so the whole `built` vector is assembled -- and every scope check made
+    /// -- before the first [`v6::Map::relocate`] call. This is the property
+    /// [`Self::insert_v6`]'s doc comment states and the reason this is one
+    /// pass followed by another rather than a single loop.
+    ///
+    /// # A key whose index did not change is not relocated
+    ///
+    /// Measured (`docs/2026-08-16-v6-update-delete-oracle.md`): an update that
+    /// leaves every key's *value* alone leaves the index pages untouched --
+    /// not rewritten in place, not relocated, byte-identical. Only an update
+    /// that reorders a key moves its root. So the rebuilt image is compared
+    /// against what the file already holds, past the six-byte header whose
+    /// stamp and logical id are [`v6::Map::relocate`]'s to write, and an
+    /// unchanged key is skipped.
+    ///
+    /// That is not an optimisation for its own sake: [`v6::Map::relocate`]
+    /// **appends** the relocated page to the file, so a needless relocation
+    /// costs a page of growth per call, forever.
+    ///
+    /// `fcr` is the live half of the file control record's shadow pair, which
+    /// the caller has already chosen; `records` is the model **after** the
+    /// caller's own change, since that is what the indexes have to describe.
+    ///
+    /// # Errors
+    ///
+    /// If any key permits duplicates, is not among the orders the loaded
+    /// records carry, has a root without the v6 marker bit, or needs more
+    /// than one index page; or if a relocation fails.
+    fn v6_reindex(
+        &self,
+        file: &mut Vec<u8>,
+        records: &Records,
+        fcr: &[u8],
+        layout: pages::Layout,
+    ) -> Result<Vec<(usize, u32)>, String> {
+        let page_size = self.geometry.page;
+        let shift = records.key_shift();
+
+        struct Rebuilt {
+            root: u32,
+            image: Vec<u8>,
+            count_at: usize,
+            count: u32,
+        }
+        let mut built: Vec<Rebuilt> = Vec::with_capacity(self.keys.len());
+
+        for key in &self.keys {
+            if key.duplicates {
+                return Err(format!(
+                    "key {}: permits duplicate values, and this host does not \
+                     yet maintain a v6 duplicate key's index -- the chain that \
+                     joins records sharing a value is written into the records \
+                     themselves by `Self::reindex`, which is not v6-aware",
+                    key.number
+                ));
+            }
+
+            let len = records.ordered_len(key.number).ok_or_else(|| {
+                format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                )
+            })?;
+            let mut entries: Vec<pages::Entry> = Vec::with_capacity(len);
+            for n in 0..len {
+                let record = records.ordered(key.number, n).expect("in range");
+                entries.push(pages::Entry::unique(
+                    key.extract(&records::keyed(shift, &record.bytes)),
+                    record.position,
+                ));
+            }
+
+            let index = pages::build_index(layout, &entries, key.shape())
+                .map_err(|why| format!("key {}: {why}", key.number))?;
+            if index.nodes.len() != 1 {
+                return Err(format!(
+                    "key {}: {len} records need {} index pages, and this host \
+                     only maintains a v6 key whose whole index fits one",
+                    key.number,
+                    index.nodes.len()
+                ));
+            }
+
+            let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let root_at = definition + pages::fcr::KEY_ROOT;
+            let raw_root = pages::long(&fcr[root_at..root_at + 4]);
+            if raw_root & 0x8000_0000 == 0 {
+                return Err(format!(
+                    "key {}: root {raw_root:#x} does not carry the v6 marker \
+                     bit (0x80000000) this host's own measurement found on \
+                     every v6 key it has seen -- refusing rather than \
+                     guessing at a shape nothing has measured",
+                    key.number
+                ));
+            }
+
+            built.push(Rebuilt {
+                root: raw_root & 0x7fff_ffff,
+                image: index.nodes[0].image.clone(),
+                count_at: definition + pages::fcr::KEY_RECORDS,
+                count: u32::try_from(len).expect("far fewer records than u32::MAX"),
+            });
+        }
+
+        // Every key's index fits. Now, and only now, anything is written.
+        let mut counts = Vec::with_capacity(built.len());
+        for rebuilt in &built {
+            counts.push((rebuilt.count_at, rebuilt.count));
+
+            // The map is re-read per key rather than once: each relocation
+            // rewrites the allocation table, so a map read before the loop
+            // would answer about the file as it was two keys ago.
+            let map = v6::Map::read(file, page_size)?;
+            let body = usize::from(pages::HEADER);
+            if let Some(physical) = map.physical(rebuilt.root) {
+                let at = usize::from(page_size) * physical as usize;
+                if file[at + body..at + usize::from(page_size)] == rebuilt.image[body..] {
+                    continue;
+                }
+            }
+
+            v6::Map::relocate(file, page_size, rebuilt.root, &rebuilt.image, [0x00, 0x80])
+                .map_err(|why| {
+                    format!("relocating the index root at logical {}: {why}", rebuilt.root)
+                })?;
+        }
+
+        Ok(counts)
     }
 
     /// Add a record, choosing its slot and writing it.
@@ -1288,8 +1690,31 @@ impl<A: Abi> Block<A> {
     /// or the file cannot be written.
     pub fn update(&mut self, position: u32, bytes: &[u8]) -> Result<(), BtvError> {
         self.records()?;
-        self.writable()?;
         let name = self.name.clone();
+
+        // A v6 *variable-length* file refuses before the v5 variable path
+        // below can be entered at all. That path rewrites a fragment through
+        // `variable::rewrite_fragment_in_place`, which addresses pages by
+        // literal offset; on a v6 file every one of those numbers is a
+        // logical id instead, so it would write a real record over whatever
+        // page happens to sit at a logical id's arithmetic. This is the one
+        // half of the old blanket `writable` refusal that is still live.
+        if self.geometry.version == Version::V6 && self.geometry.variable {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "is a v6 file holding variable-length records up to {} bytes: \
+                     a fragment chain's page numbers are logical ids in a v6 file \
+                     and byte offsets in a v5 one, and this host has measured how \
+                     to rewrite one only for v5",
+                    self.geometry.reclen
+                ),
+            });
+        }
+
+        if self.geometry.version != Version::V6 {
+            self.writable()?;
+        }
 
         if self.geometry.variable {
             let reclen = usize::from(self.geometry.reclen);
@@ -1367,6 +1792,14 @@ impl<A: Abi> Block<A> {
             physical: self.geometry.physical,
             pages: self.geometry.pages,
         };
+
+        // v6 diverges completely from here, the same way `Self::insert` does
+        // and for the same reason: `pages::write_record` seeks `position` as
+        // a literal byte offset, and a v6 position names a logical page.
+        if self.geometry.version == Version::V6 {
+            return self.update_v6(position, bytes, layout);
+        }
+
         self.capture_for_journal()?;
         pages::write_record(&self.path, layout, pages::Slot::Existing(position), bytes, count)
             .map_err(|why| BtvError {
@@ -1506,7 +1939,9 @@ impl<A: Abi> Block<A> {
     /// records, `position` holds no record, or the file cannot be written.
     pub fn delete(&mut self, position: u32) -> Result<(), BtvError> {
         self.records()?;
-        self.writable()?;
+        if self.geometry.version != Version::V6 {
+            self.writable()?;
+        }
         let name = self.name.clone();
 
         if self.geometry.variable {
@@ -1538,6 +1973,14 @@ impl<A: Abi> Block<A> {
             physical: self.geometry.physical,
             pages: self.geometry.pages,
         };
+
+        // v6 diverges completely from here, the same way `Self::insert` and
+        // `Self::update` do: `pages::delete_record` seeks `position` as a
+        // literal byte offset and splices the v5 free list at
+        // `pages::fcr::FREE`, and a v6 file has neither.
+        if self.geometry.version == Version::V6 {
+            return self.delete_v6(position, layout);
+        }
 
         // The last point before this write actually changes anything -- see
         // `Self::capture_for_journal`'s doc comment for why it is taken here
@@ -3260,29 +3703,35 @@ mod tests {
         bytes
     }
 
-    /// Updating or deleting from a v6 file is refused, and the refusal is
-    /// load-bearing. Inserting is not -- see
-    /// `a_v6_insert_lands_on_a_fresh_single_key_file` -- but this file's one
-    /// key permits duplicates, which `Self::insert_v6` refuses for its own,
-    /// different reason (Task 13's stated scope: a duplicate key's chain is
-    /// not v6-aware yet), so it still exercises "nothing on disk moves"
-    /// end to end.
+    /// Every write to a v6 file whose key permits duplicates is refused --
+    /// insert, update and delete alike -- and not one byte of it moves.
     ///
-    /// Until Task 5 the write path was v6-safe only by accident:
-    /// `Records::read` refused every v6 file, and `insert`/`update` call it
-    /// before doing anything, so neither could get started. Task 5 lifted
-    /// that refusal for reads and un-guarded the writes behind it -- and
-    /// `pages::write_record` seeks to a record's `position` as a literal byte
-    /// offset, while a v6 position carries a **logical** page id (Evidence
-    /// 1c). On `DUPKEY30.DAT` logical 2 is physical 10, so an update would
-    /// have written over a different page entirely and reported success.
-    /// Task 13 gave insert its own v6-safe path; update and delete still
-    /// have not, and still refuse the same way.
+    /// This used to assert that *all* v6 updates and deletes were refused,
+    /// which they no longer are ([`Block::update_v6`],
+    /// [`Block::delete_v6`]). What survives that change is the narrower and
+    /// more interesting claim: a duplicate-permitting key is out of scope for
+    /// all three, because the chain joining records that share a value is
+    /// written into the records themselves by [`Block::reindex`], which is
+    /// not v6-aware -- and all three now refuse it in the same place, for the
+    /// same stated reason, because they share [`Block::v6_reindex`].
     ///
-    /// Found by Task 5's code review, not by any test: every v6 test in this
-    /// crate reads.
+    /// The "not one byte written" assertion is the load-bearing half. A v6
+    /// write mutates a copy of the whole file in memory and commits it with a
+    /// single `std::fs::write` at the very end, so a refusal raised anywhere
+    /// before that -- including one raised *after* the record's own page has
+    /// been relocated in the in-memory copy, which is exactly what happens
+    /// here -- must leave the file on disk exactly as it was.
+    ///
+    /// The history worth keeping: until Task 5 the write path was v6-safe
+    /// only by accident, because `Records::read` refused every v6 file and
+    /// every write calls it first. Task 5 lifted that for reads and left the
+    /// writes behind it un-guarded, while `pages::write_record` seeks a
+    /// record's `position` as a literal byte offset and a v6 position carries
+    /// a **logical** page id. On `DUPKEY30.DAT` logical 2 is physical 10, so
+    /// an update would have written over a different page entirely and
+    /// reported success. That is what the v6 paths exist to prevent.
     #[test]
-    fn a_v6_file_is_read_but_never_updated_or_deleted() {
+    fn a_v6_file_with_a_duplicate_key_refuses_every_write_and_moves_nothing() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
         let mut block = block(path.clone());
@@ -3305,13 +3754,345 @@ mod tests {
             .physical(0)
             .expect("a record")
             .position;
-        let e = block.update(at, &bytes).expect_err("v6 updates are refused");
-        assert!(e.why.contains("does not write"), "{e}");
-        let e = block.delete(at).expect_err("v6 deletes are refused");
-        assert!(e.why.contains("does not write"), "{e}");
+        let e = block.update(at, &bytes).expect_err("this file's duplicate key is refused");
+        assert!(e.why.contains("permits duplicate values"), "{e}");
+        let e = block.delete(at).expect_err("this file's duplicate key is refused");
+        assert!(e.why.contains("permits duplicate values"), "{e}");
 
         // And the file on disk is untouched.
         assert_eq!(std::fs::read(&path).expect("readable"), fcr, "not one byte written");
+    }
+
+    /// A v6 `Block` over a scratch copy of `V6EMPTY1KEY.DAT` -- genuine
+    /// Btrieve 6.15's own empty one-key file (`crtprobe.exe create`) -- with
+    /// `records` already loaded. `reclen` is 20, `physical` 22, page 512.
+    fn v6_scratch(scratch: &str) -> (Block<Wg16>, std::path::PathBuf) {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/btrieve-oracle/fixtures/V6EMPTY1KEY.DAT");
+        let dir = crate::testing::scratch(scratch);
+        let path = dir.join("V6EMPTY1KEY.DAT");
+        std::fs::copy(&fixture, &path).expect("copy fixture");
+
+        let mut block = block(path.clone());
+        block.name = "V6EMPTY1KEY.DAT".to_owned();
+        block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
+        let fcr = std::fs::read(&path).expect("readable");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.maxlen = block.geometry.reclen;
+        block.records().expect("v6 reads");
+        (block, path)
+    }
+
+    /// The record at a file position, or `None` if nothing is there.
+    ///
+    /// `Records::find_physical` answers with an *index into physical order*,
+    /// not a record; every caller below wants the record.
+    fn at_position(records: &Records, position: u32) -> Option<&Record> {
+        records.physical(records.find_physical(position)?)
+    }
+
+    /// A 20-byte record whose first four bytes -- the key -- are `key`, and
+    /// whose remaining sixteen are `0xEE`.
+    ///
+    /// **The filler is not decoration.** With a zero tail, a delete that only
+    /// zeroed the slot's marker and wrote the forwarding link -- leaving the
+    /// record's own bytes behind it intact -- passed
+    /// `a_v6_delete_threads_the_freed_slot_onto_the_free_list` unchanged,
+    /// because the bytes it failed to clear were zero already. Measured, by
+    /// mutation. A byte that is never anything but zero cannot tell "cleared"
+    /// from "never written".
+    fn v6_record(key: &[u8; 4]) -> Vec<u8> {
+        let mut bytes = vec![0xEEu8; 20];
+        bytes[..4].copy_from_slice(key);
+        bytes
+    }
+
+    /// Which physical page holds a key's root index, resolved the way the
+    /// engine does: the file control record's `KEY_ROOT`, v6 marker bit
+    /// stripped, through the `"PP"` allocation table.
+    fn v6_root_physical(block: &Block<Wg16>, file: &[u8]) -> u32 {
+        let key = &block.keys[0];
+        let definition = pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+        let raw_root = pages::long(&file[definition + pages::fcr::KEY_ROOT..][..4]);
+        let map = v6::Map::read(file, block.geometry.page).expect("the allocation table");
+        map.physical(raw_root & 0x7fff_ffff)
+            .expect("the key's root is a claimed logical page")
+    }
+
+    /// The live half of the file control record's shadow pair.
+    fn v6_fcr(block: &Block<Wg16>, file: &[u8]) -> Vec<u8> {
+        block.v6_live_fcr(file).expect("a live control record")
+    }
+
+    /// An update of a v6 record rewrites it **in its own slot**, leaving its
+    /// position alone, and -- because no key value changed -- does not touch
+    /// the index at all.
+    ///
+    /// Both halves are measured behaviour, not preference
+    /// (`docs/2026-08-16-v6-update-delete-oracle.md`). The index half is the
+    /// one worth a test: `Self::v6_reindex` decides it by comparing the
+    /// rebuilt image against what the file holds, and getting that comparison
+    /// wrong costs a page of file growth on every update forever, while every
+    /// read-back assertion stays green.
+    #[test]
+    fn a_v6_update_keeps_the_record_where_it_was_and_leaves_the_index_alone() {
+        let (mut block, path) = v6_scratch("btv-v6-update");
+
+        let first = block.insert(&v6_record(b"AAAA")).expect("first insert");
+        let second = block.insert(&v6_record(b"BBBB")).expect("second insert");
+
+        let before = std::fs::read(&path).expect("readable");
+        let root_before = v6_root_physical(&block, &before);
+        let count_before = pages::long(&v6_fcr(&block, &before)[pages::fcr::RECORDS_HIGH..][..4]);
+
+        let mut changed = v6_record(b"BBBB");
+        changed[4..8].copy_from_slice(b"body");
+        block.update(second, &changed).expect("a v6 update");
+
+        assert_eq!(
+            at_position(block.records().expect("loaded"), second).map(|r| r.bytes.clone()),
+            Some(changed.clone()),
+            "the model holds the new bytes at the same position"
+        );
+
+        // The read that matters: a fresh `Records::read` off disk, with
+        // nothing carried over in memory.
+        block.records = None;
+        let reread = block.records().expect("re-reads after the update");
+        assert_eq!(reread.len(), 2);
+        assert_eq!(at_position(reread, second).expect("still there").bytes, changed);
+        assert_eq!(at_position(reread, first).expect("untouched").bytes, v6_record(b"AAAA"));
+
+        let after = std::fs::read(&path).expect("readable");
+
+        // The slot's marker counts updates: 1 when the record was inserted,
+        // 2 after this. Zero would mean *free*, which is why it is the one
+        // value the increment must never reach.
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let (logical, slot) = layout.slot_of(second).expect("a slot boundary");
+        let physical = v6::Map::read(&after, block.geometry.page)
+            .expect("table")
+            .physical(logical)
+            .expect("claimed");
+        let at =
+            physical as usize * usize::from(block.geometry.page) + layout.position(0, slot) as usize;
+        assert_eq!(
+            u16::from_le_bytes([after[at], after[at + 1]]),
+            2,
+            "the marker counts this record's updates"
+        );
+
+        assert_eq!(
+            v6_root_physical(&block, &after),
+            root_before,
+            "no key value changed, so the index root must not have moved"
+        );
+        assert_eq!(
+            pages::long(&v6_fcr(&block, &after)[pages::fcr::RECORDS_HIGH..][..4]),
+            count_before,
+            "an update does not change the record count"
+        );
+    }
+
+    /// An update that reorders a key **does** move that key's index root, and
+    /// the record still does not move.
+    ///
+    /// The companion to the test above, and the reason that one is not enough
+    /// on its own: a `v6_reindex` that never relocated anything would pass
+    /// it. This one fails unless the comparison can also come out *unequal*.
+    #[test]
+    fn a_v6_update_that_reorders_a_key_relocates_that_keys_root() {
+        let (mut block, path) = v6_scratch("btv-v6-update-key");
+
+        block.insert(&v6_record(b"AAAA")).expect("first insert");
+        let second = block.insert(&v6_record(b"BBBB")).expect("second insert");
+
+        let before = std::fs::read(&path).expect("readable");
+        let root_before = v6_root_physical(&block, &before);
+
+        // "BBBB" -> "ZZZZ" keeps this record last; "0000" makes it first.
+        block.update(second, &v6_record(b"0000")).expect("a key-changing v6 update");
+
+        let after = std::fs::read(&path).expect("readable");
+        assert_ne!(
+            v6_root_physical(&block, &after),
+            root_before,
+            "the key order changed, so the index root must have been rewritten"
+        );
+
+        block.records = None;
+        let reread = block.records().expect("re-reads");
+        assert_eq!(reread.len(), 2);
+        assert_eq!(
+            at_position(reread, second).expect("same position").bytes,
+            v6_record(b"0000"),
+            "a v6 update never moves the record, whatever it does to the key"
+        );
+        assert_eq!(
+            reread.ordered(0, 0).expect("first in key order").bytes,
+            v6_record(b"0000"),
+            "and the model's key order followed the new value"
+        );
+    }
+
+    /// A v6 delete empties the slot, threads it onto the file's own free list
+    /// at `pages::fcr::FREE_V6`, drops the record count, and leaves the page
+    /// claimed.
+    ///
+    /// Every number asserted here was measured against genuine 6.15
+    /// (`docs/2026-08-16-v6-update-delete-oracle.md`): the zero marker, the
+    /// forwarding link in the freed body, the head moving to the freed slot's
+    /// own position, and `pages::fcr::FREE` -- the *v5* offset -- never
+    /// moving off `0xffffffff`.
+    #[test]
+    fn a_v6_delete_threads_the_freed_slot_onto_the_free_list() {
+        let (mut block, path) = v6_scratch("btv-v6-delete");
+
+        let first = block.insert(&v6_record(b"AAAA")).expect("first insert");
+        let second = block.insert(&v6_record(b"BBBB")).expect("second insert");
+
+        let before = std::fs::read(&path).expect("readable");
+        let head_before = pages::long(&v6_fcr(&block, &before)[pages::fcr::FREE_V6..][..4]);
+        let claims_before = v6::Map::read(&before, block.geometry.page)
+            .expect("table")
+            .entries()
+            .count();
+
+        block.delete(second).expect("a v6 delete");
+
+        let after = std::fs::read(&path).expect("readable");
+        let fcr = v6_fcr(&block, &after);
+
+        assert_eq!(
+            pages::long(&fcr[pages::fcr::FREE_V6..][..4]),
+            second,
+            "the free-list head becomes the freed slot's own position"
+        );
+        assert_eq!(
+            pages::long(&fcr[pages::fcr::RECORDS_HIGH..][..4]),
+            1,
+            "the record count drops by one"
+        );
+        assert_eq!(
+            pages::long(&fcr[pages::fcr::FREE..][..4]),
+            0xffff_ffff,
+            "the v5 free-list offset is not where a v6 file keeps its head, \
+             and writing it would be writing over a field this format uses \
+             for something else"
+        );
+        assert_eq!(
+            v6::Map::read(&after, block.geometry.page).expect("table").entries().count(),
+            claims_before,
+            "a v6 delete never unclaims a page, even one it just emptied"
+        );
+
+        // The freed slot itself: marker zero, then the previous head as a
+        // forwarding link, then nothing.
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let (logical, slot) = layout.slot_of(second).expect("a slot boundary");
+        let physical = v6::Map::read(&after, block.geometry.page)
+            .expect("table")
+            .physical(logical)
+            .expect("still claimed");
+        let at = physical as usize * usize::from(block.geometry.page)
+            + layout.position(0, slot) as usize;
+        assert_eq!(&after[at..at + 2], &[0, 0], "the slot's marker says free");
+        assert_eq!(
+            pages::long(&after[at + 2..at + 6]),
+            head_before,
+            "the freed body's first four bytes forward to the previous head"
+        );
+        assert!(
+            after[at + 6..at + usize::from(block.geometry.physical)].iter().all(|&b| b == 0),
+            "and everything behind the link is zeroed"
+        );
+
+        // And the file still reads as one record, from disk, with the
+        // survivor intact -- the freed slot is not mistaken for a record.
+        block.records = None;
+        let reread = block.records().expect("re-reads after the delete");
+        assert_eq!(reread.len(), 1);
+        assert_eq!(at_position(reread, first).expect("survivor").bytes, v6_record(b"AAAA"));
+        assert!(at_position(reread, second).is_none(), "the deleted record is gone");
+    }
+
+    /// Deleting a record from the *middle* of a page leaves the records
+    /// behind it readable.
+    ///
+    /// This is the whole reason `records::walk_v6` had to learn the slot
+    /// marker, and it is asserted here as well as there because this is the
+    /// path that creates the hole. Without the marker check the walk stops at
+    /// the freed slot and the third record silently vanishes.
+    ///
+    /// It needs three records on **one** page, which `insert_v6` does not
+    /// produce -- it claims a fresh page per record -- so the records are
+    /// placed by hand into a page this host's own insert claimed, and the
+    /// control record's count corrected to match, before the delete runs.
+    #[test]
+    fn a_v6_delete_from_the_middle_of_a_page_leaves_the_rest_readable() {
+        let (mut block, path) = v6_scratch("btv-v6-delete-middle");
+
+        let first = block.insert(&v6_record(b"AAAA")).expect("insert");
+        let layout = pages::Layout {
+            page: block.geometry.page,
+            physical: block.geometry.physical,
+            pages: block.geometry.pages,
+        };
+        let (logical, _) = layout.slot_of(first).expect("a slot boundary");
+
+        // Two more records into slots 1 and 2 of that same page, written
+        // straight into the file: marker 1, then the record.
+        let mut file = std::fs::read(&path).expect("readable");
+        let page_size = usize::from(block.geometry.page);
+        let physical = v6::Map::read(&file, block.geometry.page)
+            .expect("table")
+            .physical(logical)
+            .expect("claimed") as usize;
+        let (second, third) = (layout.position(logical, 1), layout.position(logical, 2));
+        for (slot, key) in [(1u32, b"BBBB"), (2u32, b"CCCC")] {
+            let slot_at = physical * page_size + layout.position(0, slot) as usize;
+            file[slot_at..slot_at + 2].copy_from_slice(&1u16.to_le_bytes());
+            file[slot_at + 2..slot_at + 2 + 20].copy_from_slice(&v6_record(key));
+        }
+        // The control record's own count has to agree, or `Records::read`
+        // refuses the file before the delete is ever reached. Write it into
+        // whichever half of the shadow pair is live.
+        let generation = |page: usize| -> u16 {
+            u16::from_le_bytes([
+                file[page * page_size + at::GENERATION],
+                file[page * page_size + at::GENERATION + 1],
+            ])
+        };
+        let live = if generation(0) > generation(1) { 0 } else { page_size };
+        file[live + pages::fcr::RECORDS_HIGH..][..4].copy_from_slice(&pages::to_long(3));
+        let definition = pages::fcr::KEYS + usize::from(block.keys[0].definition) * pages::fcr::KEY_WIDTH;
+        file[live + definition + pages::fcr::KEY_RECORDS..][..4]
+            .copy_from_slice(&pages::to_long(3));
+        std::fs::write(&path, &file).expect("written");
+
+        block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("re-reads the shape");
+        block.records = None;
+        assert_eq!(block.records().expect("three records on one page").len(), 3);
+
+        block.delete(second).expect("delete the middle record");
+
+        block.records = None;
+        let reread = block.records().expect("re-reads across the hole");
+        assert_eq!(reread.len(), 2, "the hole is skipped, not treated as the end");
+        assert_eq!(at_position(reread, first).expect("before the hole").bytes, v6_record(b"AAAA"));
+        assert_eq!(
+            at_position(reread, third).expect("behind the hole").bytes,
+            v6_record(b"CCCC"),
+            "the record behind the freed slot is still there"
+        );
     }
 
     /// `Self::insert_v6`'s narrow scope actually works: a fresh, virgin,

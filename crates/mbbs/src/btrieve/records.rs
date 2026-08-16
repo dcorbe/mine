@@ -36,7 +36,7 @@ use super::{BtvError, Geometry, Version};
 ///
 /// Named because three places depend on it and a bare `2` in any of them is
 /// unsearchable.
-const V6_SLOT_MARKER: usize = 2;
+pub(super) const V6_SLOT_MARKER: usize = 2;
 
 /// Where the free list starts, in the file control record.
 const FREE_LIST: usize = 0x10;
