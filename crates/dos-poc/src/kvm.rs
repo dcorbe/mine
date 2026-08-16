@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
+use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
 
 /// The port our trap stubs write to. Any unclaimed port works; the value is
 /// arbitrary and only has to agree with the stub bytes.
@@ -722,12 +722,12 @@ impl DosGuest for VmGuest {
         }
     }
 
-    /// Write the carry flag into the `FLAGS` image the stub's `iret` will pop.
+    /// Write a flag into the `FLAGS` image the stub's `iret` will pop.
     ///
     /// After `int n` the stack holds IP, CS, then FLAGS, so the word lives at
     /// `SS:SP+4`. Setting the *live* flags instead would be undone by `iret`
     /// the moment the guest resumes, and every DOS error return would vanish.
-    fn set_carry(&mut self, on: bool) {
+    fn set_flag(&mut self, flag: Flag, on: bool) {
         let base = (self.sregs.ss.base as usize) + (self.regs.rsp as u16 as usize) + 4;
         // Losing the carry here is the exact failure this convention exists to
         // avoid, so an unreachable stack address stops rather than quietly
@@ -738,9 +738,9 @@ impl DosGuest for VmGuest {
             .expect("stacked FLAGS word is outside guest memory");
         let mut flags = u16::from_le_bytes([slot[0], slot[1]]);
         if on {
-            flags |= 1;
+            flags |= flag.bit();
         } else {
-            flags &= !1;
+            flags &= !flag.bit();
         }
         slot.copy_from_slice(&flags.to_le_bytes());
     }

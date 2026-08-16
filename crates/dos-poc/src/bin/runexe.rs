@@ -12,10 +12,11 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use dos_poc::bios::{Video, int10};
+use dos_poc::bios::{Keyboard, Video, int10, int16};
 use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
+use dos_poc::files::Files;
 use dos_poc::mz::{self, MzImage};
 
 /// 1 MiB: the whole real-mode address space.
@@ -36,7 +37,23 @@ fn main() -> io::Result<()> {
     let path = args
         .next()
         .ok_or_else(|| io::Error::other("usage: runexe <program.exe> [command tail]"))?;
-    let tail: String = args.collect::<Vec<_>>().join(" ");
+    let rest: Vec<String> = args.collect();
+    let mut tail = String::new();
+    let mut keys = String::new();
+    let mut root_dir = String::from("tmp/lordroot");
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--keys" => keys = it.next().cloned().unwrap_or_default(),
+            "--root" => root_dir = it.next().cloned().unwrap_or(root_dir),
+            other => {
+                if !tail.is_empty() {
+                    tail.push(' ');
+                }
+                tail.push_str(other);
+            }
+        }
+    }
 
     let data = std::fs::read(&path)?;
     let img = MzImage::parse(&data)?;
@@ -66,7 +83,16 @@ fn main() -> io::Result<()> {
     vm.enter(at.cs, at.ip, at.ss, at.sp, at.psp_seg, at.psp_seg)?;
     let _helpers = vm.helpers(10_000);
 
+    // The sandbox. Everything the guest opens resolves beneath this one
+    // descriptor, enforced by openat2(RESOLVE_BENEATH), not by path munging.
+    std::fs::create_dir_all(&root_dir)?;
+    let root = std::fs::File::open(&root_dir)?;
+    println!("root: {root_dir}");
+
     let mut dos = DosState::default();
+    dos.files = Some(Files::new(root.into()));
+    let mut keyboard = Keyboard::default();
+    keyboard.feed(&keys);
     let mut video = Video::default();
     video.install_bda(&mut vm);
     let mut order: Vec<u8> = Vec::new();
@@ -84,6 +110,13 @@ fn main() -> io::Result<()> {
                 *bios.entry((0x10, vm.regs().ah())).or_insert(0) += 1;
                 calls += 1;
                 int10(&mut vm, &mut video);
+            }
+            Stop::Trap(0x16) => {
+                *bios.entry((0x16, vm.regs().ah())).or_insert(0) += 1;
+                calls += 1;
+                if !int16(&mut vm, &mut keyboard) {
+                    break "waiting for a keystroke, none queued".to_string();
+                }
             }
             Stop::Trap(vector) if vector != 0x21 => {
                 // Not DOS. Record it and let the stub's `iret` return, which
@@ -134,6 +167,28 @@ fn main() -> io::Result<()> {
         };
         if !line.trim().is_empty() {
             println!("|{}|", line.trim_end());
+        }
+    }
+
+    if let Some(files) = dos.files.as_ref() {
+        if !files.attempts.is_empty() {
+            println!("--- every file the guest asked for ---");
+            for (name, how, okd) in &files.attempts {
+                println!("  {how:<7} {name:<16} {}", if *okd { "ok" } else { "FAILED" });
+            }
+        }
+        if files.touched.is_empty() {
+            println!("--- no files were created or written ---");
+        } else {
+            println!("--- files the guest created or wrote ---");
+            for name in &files.touched {
+                let host = std::path::Path::new(&root_dir).join(name);
+                let size = std::fs::metadata(&host).map(|m| m.len());
+                match size {
+                    Ok(n) => println!("  {name}  ({n} bytes at {})", host.display()),
+                    Err(_) => println!("  {name}  (not present on the host)"),
+                }
+            }
         }
     }
 

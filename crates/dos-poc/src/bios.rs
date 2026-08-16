@@ -10,7 +10,7 @@
 //! Direct writes to `B800:0000` need nothing here -- that is guest memory, and
 //! the program can scribble on it freely. Only the *queries* need answering.
 
-use crate::guest::{DosGuest, DosPtr};
+use crate::guest::{DosGuest, DosPtr, Flag};
 
 /// Physical base of the colour text buffer.
 const TEXT_BASE: DosPtr = DosPtr {
@@ -71,6 +71,104 @@ impl Video {
         let _ = g.write(bda(0x0063), &0x03d4u16.to_le_bytes()); // CRTC base port
         let _ = g.write(bda(0x0084), &[self.rows - 1]);
         let _ = g.write(bda(0x0085), &16u16.to_le_bytes()); // character height
+    }
+}
+
+/// Keystrokes waiting to be handed to the guest.
+///
+/// A real console would block here. A probe cannot: it has to be able to say
+/// "the program is waiting for input and there is none" rather than hang.
+#[derive(Default)]
+pub struct Keyboard {
+    pending: std::collections::VecDeque<u8>,
+}
+
+impl Keyboard {
+    /// Queue keystrokes. `%XX` is an extended key -- scan code `0xXX` with a
+    /// zero character, which is how DOS reports arrows and function keys.
+    pub fn feed(&mut self, keys: &str) {
+        let b = keys.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let Ok(scan) = u8::from_str_radix(&keys[i + 1..i + 3], 16) {
+                    self.pending.push_back(0);
+                    self.pending.push_back(scan);
+                    i += 3;
+                    continue;
+                }
+            }
+            self.pending.push_back(b[i]);
+            i += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Service one `int 16h`. Returns false when the guest asked for a key and
+/// none is queued, which the caller should treat as "waiting for the user".
+pub fn int16<G: DosGuest>(g: &mut G, keys: &mut Keyboard) -> bool {
+    let mut regs = g.regs();
+    match regs.ah() {
+        // 00h/10h -- wait for a keystroke: AL is the character, AH the scan code.
+        0x00 | 0x10 => match keys.pending.pop_front() {
+            // A zero character marks the extended pair queued by `feed`.
+            Some(0) => match keys.pending.pop_front() {
+                Some(scan) => {
+                    regs.ax = u16::from(scan) << 8;
+                    g.set_regs(regs);
+                    true
+                }
+                None => false,
+            },
+            Some(ch) => {
+                regs.ax = (u16::from(scancode(ch)) << 8) | u16::from(ch);
+                g.set_regs(regs);
+                true
+            }
+            None => false,
+        },
+        // 01h/11h -- is a key ready? ZF set means no. Peek, never consume.
+        0x01 | 0x11 => {
+            match keys.pending.front().copied() {
+                Some(0) => {
+                    let scan = keys.pending.get(1).copied().unwrap_or(0);
+                    regs.ax = u16::from(scan) << 8;
+                }
+                Some(ch) => regs.ax = (u16::from(scancode(ch)) << 8) | u16::from(ch),
+                None => regs.ax = 0,
+            }
+            g.set_regs(regs);
+            g.set_flag(Flag::Zero, keys.pending.is_empty());
+            true
+        }
+
+        _ => {
+            regs.ax = 0;
+            g.set_regs(regs);
+            true
+        }
+    }
+}
+
+/// Enough of the scan-code table for letters and the keys a menu reads.
+fn scancode(ch: u8) -> u8 {
+    const ROW: &[u8] = b"qwertyuiop";
+    match ch.to_ascii_lowercase() {
+        b'\r' => 0x1c,
+        b' ' => 0x39,
+        0x1b => 0x01,
+        c if c.is_ascii_lowercase() => {
+            if let Some(i) = ROW.iter().position(|&k| k == c) {
+                0x10 + i as u8
+            } else {
+                0x1e
+            }
+        }
+        _ => 0,
     }
 }
 

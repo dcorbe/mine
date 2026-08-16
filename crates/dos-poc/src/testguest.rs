@@ -6,13 +6,13 @@
 //! same logic is testable only by faulting a real module, which in practice
 //! means it is not tested at all.
 
-use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
+use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
 
 /// A flat address space and a register file, and nothing else.
 pub struct TestGuest {
     mem: Vec<u8>,
     regs: DosRegs,
-    carry: bool,
+    flags: u16,
 }
 
 impl TestGuest {
@@ -21,7 +21,7 @@ impl TestGuest {
         Self {
             mem: vec![0; size],
             regs: DosRegs::default(),
-            carry: false,
+            flags: 0,
         }
     }
 
@@ -46,12 +46,16 @@ impl TestGuest {
     /// at the moment it executed `int 21h`.
     pub fn call_with(&mut self, regs: DosRegs) {
         self.regs = regs;
-        self.carry = false;
+        self.flags = 0;
     }
 
     /// Did the service report failure?
     pub fn carry(&self) -> bool {
-        self.carry
+        self.flag(Flag::Carry)
+    }
+
+    pub fn flag(&self, flag: Flag) -> bool {
+        self.flags & flag.bit() != 0
     }
 }
 
@@ -98,7 +102,11 @@ impl DosGuest for TestGuest {
         self.regs = regs;
     }
 
-    fn set_carry(&mut self, on: bool) {
-        self.carry = on;
+    fn set_flag(&mut self, flag: Flag, on: bool) {
+        if on {
+            self.flags |= flag.bit();
+        } else {
+            self.flags &= !flag.bit();
+        }
     }
 }

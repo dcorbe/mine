@@ -19,6 +19,7 @@
 
 pub mod bios;
 pub mod dos;
+pub mod files;
 pub mod guest;
 pub mod kvm;
 pub mod mz;

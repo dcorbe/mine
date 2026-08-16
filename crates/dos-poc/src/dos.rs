@@ -5,7 +5,8 @@
 //! `Vec<u8>` in a unit test, and would serve an `m16` signal handler without
 //! changing a line.
 
-use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
+use crate::files::Files;
+use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
 
 /// DOS error codes, as returned in AX with CF set.
 pub const ERR_INVALID_FUNCTION: u16 = 0x01;
@@ -42,6 +43,10 @@ pub struct DosState {
     /// A buffer rather than a `Write` so that a test can assert on it without
     /// a fixture, which is the whole point of the seam.
     pub out: Vec<u8>,
+    /// The filesystem, if this program has been given one. `None` means every
+    /// file call fails -- which is a legitimate configuration, and is how the
+    /// probe ran before file services existed.
+    pub files: Option<Files>,
 }
 
 impl Default for DosState {
@@ -51,6 +56,7 @@ impl Default for DosState {
             drives: 26,
             version: (5, 0),
             out: Vec::new(),
+            files: None,
         }
     }
 }
@@ -58,7 +64,7 @@ impl Default for DosState {
 /// Finish a successful call: registers back, carry clear.
 fn ok<G: DosGuest>(g: &mut G, regs: DosRegs) -> Outcome {
     g.set_regs(regs);
-    g.set_carry(false);
+    g.set_flag(Flag::Carry, false);
     Outcome::Continue
 }
 
@@ -66,7 +72,7 @@ fn ok<G: DosGuest>(g: &mut G, regs: DosRegs) -> Outcome {
 fn fail<G: DosGuest>(g: &mut G, mut regs: DosRegs, code: u16) -> Outcome {
     regs.ax = code;
     g.set_regs(regs);
-    g.set_carry(true);
+    g.set_flag(Flag::Carry, true);
     Outcome::Continue
 }
 
@@ -78,8 +84,14 @@ fn fail<G: DosGuest>(g: &mut G, mut regs: DosRegs, code: u16) -> Outcome {
 pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
-        0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x30 | 0x35 | 0x40 | 0x44 | 0x4c
+        0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c | 0x3d
+            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c
     )
+}
+
+/// Read an ASCIIZ path argument, bounded by DOS's own 128-byte path limit.
+fn path_at<G: DosGuest>(g: &G, at: DosPtr) -> Result<Vec<u8>, DosFault> {
+    g.read_until(at, 0, 128).map(<[u8]>::to_vec)
 }
 
 /// Service one `int 21h`.
@@ -162,18 +174,27 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
 
         // 40h -- write CX bytes at DS:DX to handle BX.
         0x40 => {
-            if regs.bx != 1 && regs.bx != 2 {
-                return fail(g, regs, ERR_INVALID_HANDLE);
-            }
             let at = regs.ds_dx();
             let len = regs.cx as usize;
             let bytes = match g.read(at, len) {
                 Ok(b) => b.to_vec(),
                 Err(f) => return Outcome::Fault(f),
             };
-            dos.out.extend_from_slice(&bytes);
-            regs.ax = len as u16;
-            ok(g, regs)
+            if regs.bx == 1 || regs.bx == 2 {
+                dos.out.extend_from_slice(&bytes);
+                regs.ax = len as u16;
+                return ok(g, regs);
+            }
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_HANDLE);
+            };
+            match files.write(regs.bx, &bytes) {
+                Ok(n) => {
+                    regs.ax = n as u16;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
+            }
         }
 
         // 44h/00h -- get device information for handle BX.
@@ -191,6 +212,118 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
                     ok(g, regs)
                 }
                 _ => fail(g, regs, ERR_INVALID_HANDLE),
+            }
+        }
+
+        // 2Ah/2Ch -- get date and time. 2Bh/2Dh -- set them, which we accept
+        // and ignore: the guest does not get to move the host's clock.
+        0x2a | 0x2c => {
+            regs.cx = 1994;
+            regs.dx = 0x0101;
+            regs.set_al(0);
+            ok(g, regs)
+        }
+        0x2b | 0x2d => {
+            regs.set_al(0);
+            ok(g, regs)
+        }
+
+        // 3Ch -- create or truncate DS:DX, returning a handle in AX.
+        0x3c => {
+            let path = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.create(&path) {
+                Ok(handle) => {
+                    regs.ax = handle;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 3Dh -- open DS:DX with the access mode in AL.
+        0x3d => {
+            let access = regs.al();
+            let path = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.open_existing(&path, access) {
+                Ok(handle) => {
+                    regs.ax = handle;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 3Eh -- close handle BX.
+        0x3e => {
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.close(regs.bx) {
+                Ok(()) => ok(g, regs),
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 3Fh -- read CX bytes from handle BX into DS:DX.
+        0x3f => {
+            let at = regs.ds_dx();
+            let want = regs.cx as usize;
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            let mut buf = vec![0u8; want];
+            let n = match files.read(regs.bx, &mut buf) {
+                Ok(n) => n,
+                Err(code) => return fail(g, regs, code),
+            };
+            if let Err(f) = g.write(at, &buf[..n]) {
+                return Outcome::Fault(f);
+            }
+            regs.ax = n as u16;
+            ok(g, regs)
+        }
+
+        // 41h -- delete the file named by DS:DX.
+        0x41 => {
+            let path = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.unlink(&path) {
+                Ok(()) => ok(g, regs),
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 42h -- seek handle BX to CX:DX by AL.
+        0x42 => {
+            let offset = (i64::from(regs.cx) << 16) | i64::from(regs.dx);
+            let whence = regs.al();
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.seek(regs.bx, offset, whence) {
+                Ok(at) => {
+                    regs.ax = (at & 0xffff) as u16;
+                    regs.dx = ((at >> 16) & 0xffff) as u16;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
             }
         }
 

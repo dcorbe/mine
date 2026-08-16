@@ -104,13 +104,35 @@ pub trait DosGuest {
 
     fn set_regs(&mut self, regs: DosRegs);
 
-    /// DOS reports failure with CF set and an error code in AX.
+    /// Set a status flag the caller will read.
     ///
     /// Separate from [`DosGuest::set_regs`] precisely because the two edges
-    /// write the flag to different places: the live `EFLAGS` in a signal
-    /// context, which `sigreturn` restores, versus the `FLAGS` image already
-    /// pushed on the guest stack, which `iret` will pop. Writing it to the
-    /// live flags under `iret` is the classic bug -- every error return
-    /// evaporates silently.
-    fn set_carry(&mut self, on: bool);
+    /// write flags to different places: the live `EFLAGS` in a signal context,
+    /// which `sigreturn` restores, versus the `FLAGS` image already pushed on
+    /// the guest stack, which `iret` will pop. Writing to the live flags under
+    /// `iret` is the classic bug -- every error return evaporates silently.
+    fn set_flag(&mut self, flag: Flag, on: bool);
+}
+
+/// A status bit a call answers through rather than through a register.
+///
+/// This began as `set_carry` alone, which was wrong: `int 16h AH=01` reports
+/// "no key waiting" in ZF, and with only carry available the service had to
+/// claim a key was always ready -- which livelocks any program that polls the
+/// keyboard. One call needing a second flag is the argument for naming the
+/// flag rather than the operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Flag {
+    Carry,
+    Zero,
+}
+
+impl Flag {
+    /// Bit position in the x86 FLAGS word.
+    pub fn bit(self) -> u16 {
+        match self {
+            Flag::Carry => 1 << 0,
+            Flag::Zero => 1 << 6,
+        }
+    }
 }
