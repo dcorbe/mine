@@ -118,6 +118,41 @@ pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
     Ok(abi::Ret::Ptr(at))
 }
 
+/// `char *ul2as(unsigned long ulongin)` -- [`l2as`] for a value that has no
+/// sign.
+///
+///
+/// `%lu`, not `%ld`: `0xFFFFFFFF` prints as `4294967295`, where [`l2as`]
+/// prints `-1`. That is the entire difference between the two, and
+/// `L2AS.C`'s own header comment states the ranges -- `l2as` answers
+/// `"-2147483648"` through `"2147483647"`, `ul2as` answers `"0"` through
+/// `"4294967296"` (sic; the true ceiling is 4294967295).
+///
+/// **The rotation is shared with [`l2as`], not a second one.** The vendor has
+/// one `static INT cycle` and one `static CHAR tkastg[4][16]`
+/// (`L2AS.C:27-28`) and both functions in the file advance and index them --
+/// so four calls in any mix answer four distinct buffers and the fifth
+/// overwrites the first. `Host::next_l2as_buffer` is that one rotation, which
+/// is why this routine calls it rather than allocating a pool of its own: a
+/// module that survives the overwrite in the real host must meet it here too.
+///
+/// Formatting is [`integer`], the same converter `%lu` itself goes through,
+/// rather than a second implementation -- see `fmt`'s module doc.
+///
+/// # Errors
+///
+/// If the rendered value and its terminator will not fit [`L2AS_BYTES`].
+/// Ten digits and a NUL is eleven bytes, so the widest `ULONG` fits.
+pub fn ul2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let value = call.long();
+    let text = integer(u64::from(value), false, 10, false, &Spec::default());
+
+
+    let at = host.next_l2as_buffer();
+    write_cstr_mem::<A>(call.mem(), at, &text, L2AS_BYTES)?;
+    Ok(abi::Ret::Ptr(at))
+}
+
 /// `int sprintf(char *buf, char *fmat, ...)` -- format into the caller's
 /// buffer, and return how many bytes that took.
 ///
@@ -513,6 +548,94 @@ pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
         .map_err(|e| ShimError::Failed(e.to_string()))?
         .to_vec();
     fill_to_width::<A>(call.mem(), dst, &text, num)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// `char *stlcpy(char *dst, const char *src, unsigned num)` -- copy,
+/// bounded, always terminated, and **nothing more**.
+///
+///
+/// `num` is the size of the destination and counts the terminator, so at most
+/// `num - 1` characters are copied -- the same contract as [`stzcpy`], which
+/// sits beside it in `GCOMM.H` and differs in exactly one way: `stzcpy`'s
+/// second loop clears the destination out to `num` and this routine's bare
+/// `*cp='\0'` does not. The `l` is "limit"; the `z` is "zero fill". Anything
+/// past the terminator is left as the caller had it, which
+/// [`stlcpy_does_not_zero_fill_the_way_stzcpy_does`](self::tests) pins.
+///
+/// # Errors
+///
+/// If `src` is unterminated or unreadable, or the copy will not fit the
+/// segment `dst` names.
+pub fn stlcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let num = Into::<u32>::into(call.int()) as u16;
+
+    if num == 0 {
+        // As in `stzcpy`: `num-1` is `UINT`, so the vendor's loop bound wraps
+        // to 65535 and it copies the whole source into a buffer the caller
+        // said had no room. Writing nothing is the only answer that cannot
+        // corrupt what follows `dst`.
+        return Ok(abi::Ret::Ptr(dst));
+    }
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let take = text.len().min(usize::from(num) - 1);
+    write_cstr_mem::<A>(call.mem(), dst, &text[..take], num)?;
+    Ok(abi::Ret::Ptr(dst))
+}
+
+/// `char *stzcat(char *dst, const char *src, unsigned num)` -- append, within
+/// a budget that counts what is already there.
+///
+///
+/// `num` is the size of the whole destination, not the room remaining, so the
+/// append gets `num - dstlen` bytes and the result is at most `num - 1`
+/// characters and a terminator. It is a [`stzcpy`] onto the end of what is
+/// already there, so it inherits the zero fill: between the two calls every
+/// byte of the destination up to `num` ends up written.
+///
+/// **`num - dstlen` is `UINT` arithmetic and underflows.** When the
+/// destination already holds `num` characters or more, the vendor hands
+/// `stzcpy` a `num` near 65535 and its fill loop runs that far past a buffer
+/// the caller declared much shorter. This host refuses instead, naming the
+/// underflow: reproducing a 64K overrun serves no module, and clamping it to
+/// "append nothing" would turn a caller's arithmetic bug into a silent no-op
+/// that looks like success.
+///
+/// # Errors
+///
+/// If either string is unterminated or unreadable, if the destination already
+/// holds `num` characters or more, or if the append will not fit the segment.
+pub fn stzcat<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let dst = call.ptr();
+    let src = call.ptr();
+    let num = Into::<u32>::into(call.int()) as u16;
+
+    let dstlen = dst
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .len();
+    if dstlen >= usize::from(num) {
+        return Err(ShimError::Failed(format!(
+            "stzcat(.., {num}): the destination already holds {dstlen} characters, \
+             so the vendor's num-dstlen underflows and would fill {} bytes past a \
+             buffer the caller sized at {num}",
+            usize::from(num).wrapping_sub(dstlen) & 0xffff
+        )));
+    }
+    let text = src
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let end = at::<A>(dst, dstlen)?;
+
+
+    // `dstlen < num` was just checked, so this subtraction cannot wrap.
+    fill_to_width::<A>(call.mem(), end, &text, num - dstlen as u16)?;
     Ok(abi::Ret::Ptr(dst))
 }
 
@@ -2498,6 +2621,161 @@ mod tests {
         let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
         assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "hi");
+    }
+
+    /// `stlcpy` copies at most `num-1` bytes and always terminates
+    /// (`STLCPY.C:27-31`). The truncation case is the one that proves the
+    /// bound was ported rather than assumed.
+    #[test]
+    fn stlcpy_truncates_at_num_minus_one_and_always_terminates() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(16);
+        let src = f.text("abcdefghij");
+
+        // num = 5: four characters and a NUL.
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 5];
+        assert_eq!(f.invoke(stlcpy, &args).expect("stlcpy"), Ret::Far(dst));
+        assert_eq!(f.machine.read_cstr(dst).expect("readable"), b"abcd");
+
+        // A source shorter than num copies whole, and still terminates.
+        let short = f.text("ab");
+        let args = [dst.offset, dst.selector, short.offset, short.selector, 5];
+        assert!(matches!(f.invoke(stlcpy, &args), Ok(Ret::Far(_))));
+        assert_eq!(f.machine.read_cstr(dst).expect("readable"), b"ab");
+    }
+
+    /// `stlcpy` writes the copy and **one** terminator, and stops.
+    ///
+    /// This is the whole difference from [`stzcpy`], whose second loop clears
+    /// the destination out to `num` (`STZCPY.C:30-32`). `STLCPY.C:31` is a
+    /// bare `*cp='\0'` with no fill loop after it, so the bytes past the
+    /// terminator are whatever the caller left there. A port that shared one
+    /// body between the two routines would be wrong in one direction or the
+    /// other, and only this assertion says which.
+    #[test]
+    fn stlcpy_does_not_zero_fill_the_way_stzcpy_does() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"AAAAAAAA", false);
+        let src = f.text("ab");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 8];
+        assert_eq!(f.invoke(stlcpy, &args).expect("stlcpy"), Ret::Far(dst));
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("in bounds"),
+            b"ab\0AAAAA",
+            "stlcpy terminates and stops; only stzcpy clears the tail"
+        );
+    }
+
+    /// `stzcat` appends within a total budget of `num` bytes *including* what
+    /// is already there (`STZCPY.C:44-45`:
+    /// `stzcpy(&dst[dstlen], src, num-dstlen)`).
+    #[test]
+    fn stzcat_appends_within_the_whole_buffers_budget() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"abc\0").expect("seed");
+        let src = f.text("defghij");
+
+        // num = 6: "abc" is 3, so 2 more characters and a NUL.
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 6];
+        assert_eq!(f.invoke(stzcat, &args).expect("stzcat"), Ret::Far(dst));
+        assert_eq!(f.machine.read_cstr(dst).expect("readable"), b"abcde");
+    }
+
+    /// `stzcat` inherits `stzcpy`'s fill, because the vendor defines it as a
+    /// `stzcpy` onto the end of what is already there. The budget it fills to
+    /// is `num-dstlen`, measured from the append point -- so the whole `num`
+    /// bytes of the destination end up written between the two.
+    #[test]
+    fn stzcat_zero_fills_the_tail_it_appends_into() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"abcXXXXX", false);
+        f.machine.write(dst, b"abc\0").expect("seed a terminator at 3");
+        let src = f.text("d");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 8];
+        assert_eq!(f.invoke(stzcat, &args).expect("stzcat"), Ret::Far(dst));
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("in bounds"),
+            b"abcd\0\0\0\0",
+            "the append clears everything from the new terminator to num"
+        );
+    }
+
+    /// `stzcat` refuses when the destination is already at or past `num`.
+    ///
+    /// `num-dstlen` is `UINT` arithmetic in the vendor (`STZCPY.C:45`), so it
+    /// wraps: `stzcat(dst, src, 4)` on a destination already holding 10
+    /// characters passes `stzcpy` a `num` of 65530, and the fill loop then
+    /// runs 65530 bytes past a buffer the caller said was 4 bytes long.
+    ///
+    /// That is not behaviour to reproduce, and it is not a case to clamp
+    /// silently either -- a clamp would turn a caller's arithmetic bug into a
+    /// quiet no-op. The refusal names the underflow.
+    #[test]
+    fn stzcat_refuses_when_the_destination_already_exceeds_num() {
+        let mut f = Fixture::new();
+        let dst = f.buffer(32);
+        f.machine.write(dst, b"0123456789\0").expect("seed");
+        let src = f.text("more");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 4];
+        let err = f.invoke(stzcat, &args).expect_err("10 characters do not fit in 4");
+        let message = err.to_string();
+        assert!(message.contains("stzcat"), "{message}");
+        assert!(message.contains("underflow"), "{message}");
+    }
+
+    /// `ul2as` is unsigned: a value above `LONG_MAX` prints as itself, not as
+    /// a negative. That is the whole difference from `l2as`, and the only
+    /// test that distinguishes the two.
+    #[test]
+    fn ul2as_prints_the_unsigned_value() {
+        let mut f = Fixture::new();
+        // 0xFFFFFFFF -- -1 as a signed long, 4294967295 as an unsigned one.
+        let Ret::Far(at) = f.invoke(ul2as, &[0xffff, 0xffff]).expect("ul2as") else {
+            panic!("ul2as returns char *");
+        };
+        assert_eq!(f.machine.read_cstr(at).expect("readable"), b"4294967295");
+    }
+
+    /// `ul2as` and `l2as` share one rotation, because in the vendor they share
+    /// one `cycle` and one `tkastg[4][16]` (`L2AS.C:27-28`) -- they are two
+    /// functions in one file over one pair of statics.
+    ///
+    /// So four calls in any mix of the two answer four different buffers and
+    /// the fifth reuses the first. A host that gave `ul2as` a rotation of its
+    /// own would let a module hold eight live results where the real host
+    /// gives it four, and the overwrite it was written to survive would stop
+    /// happening -- the failure would appear only in the module that relied
+    /// on it, long after.
+    #[test]
+    fn ul2as_shares_l2ass_rotation_rather_than_minting_a_second() {
+        let mut f = Fixture::new();
+        let mut seen = Vec::new();
+        for n in 0..2u16 {
+            let Ret::Far(at) = f.invoke(ul2as, &[n, 0]).expect("ul2as") else {
+                panic!("char *");
+            };
+            seen.push(at);
+        }
+        for n in 0..2i32 {
+            let Ret::Far(at) = f.invoke(l2as, &long(n)).expect("l2as") else {
+                panic!("char *");
+            };
+            seen.push(at);
+        }
+        // The fifth call -- whichever routine makes it -- wraps onto the first.
+        let Ret::Far(fifth) = f.invoke(ul2as, &[9, 0]).expect("ul2as") else {
+            panic!("char *");
+        };
+
+        let mut offsets: Vec<u16> = seen.iter().map(|p| p.offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 4, "four distinct slots across the two: {seen:?}");
+        assert_eq!(fifth, seen[0], "the fifth call reuses the first slot");
     }
 
     /// `stzcpy` clears the destination's tail -- the `z` in its name.

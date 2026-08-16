@@ -96,6 +96,48 @@ pub fn alcmem<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Ptr(at))
 }
 
+/// `CHAR *alcdup(const CHAR *stg)` -- allocate a copy of a string.
+///
+///
+/// The block comes from the same heap [`alcmem`] reserves out of, and the
+/// module frees it the same way -- `alcdup` is `alcmem` plus a `strcpy`, not
+/// a separate allocator. The `+1` is the terminator, so duplicating the empty
+/// string still asks for one byte rather than zero, which matters because
+/// `alcmem` refuses a zero-byte request outright.
+///
+/// The vendor's `ASSERT(stg != NULL)` compiles to `(VOID)0` in a shipped,
+/// non-`DEBUG` build, so a null argument there dereferences null inside
+/// `strlen`. Here it is a refusal from the read instead: same "this call
+/// cannot be answered", named at the point it happens rather than as a fault
+/// somewhere inside the copy.
+///
+/// # Errors
+///
+/// If `stg` is null, unreadable or unterminated; if the length plus its
+/// terminator exceeds what this heap's `u16` block size can express; or if
+/// the heap has no room.
+pub fn alcdup<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let stg = call.ptr();
+    let mut text = stg
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("alcdup: {e}")))?
+        .to_vec();
+    text.push(0);
+    let size = u16::try_from(text.len()).map_err(|_| {
+        ShimError::Failed(format!(
+            "alcdup: {} bytes and a terminator does not fit this heap's u16 block size",
+            text.len() - 1
+        ))
+    })?;
+    let at = host
+        .heap
+        .reserve(call.mem(), size)
+        .map_err(|e| ShimError::Failed(format!("alcdup: {e}")))?;
+    at.write(call.mem(), &text)
+        .map_err(|e| ShimError::Failed(format!("alcdup: {e}")))?;
+    Ok(abi::Ret::Ptr(at))
+}
+
 /// `VOID *galmalloc(UINT size)` -- `GCOMM.H:768-769` -- "Galacticomm's
 /// malloc() for debugging."
 ///
@@ -1636,5 +1678,43 @@ mod tests {
             shim_body.as_nanos() as f64 / f64::from(ITERATIONS),
             (round_trip.as_nanos() as f64 - shim_body.as_nanos() as f64) / f64::from(ITERATIONS),
         );
+    }
+
+    /// `alcdup` allocates `strlen(stg)+1` and copies (`ALCDUP.C:19-26`). The
+    /// returned block must be independent of the source: writing through one
+    /// must not change the other.
+    #[test]
+    fn alcdup_returns_an_independent_copy() {
+        let mut f = Fixture::new();
+        let src = f.text("rangerdan");
+        let Ret::Far(copy) = f.invoke(alcdup, &Fixture::far(src)).expect("alcdup") else {
+            panic!("alcdup returns char *");
+        };
+        assert_eq!(f.machine.read_cstr(copy).expect("readable"), b"rangerdan");
+        assert_ne!(copy, src, "a copy, not the argument handed back");
+
+        f.machine.write(src, b"kaimon\0").expect("overwrite the source");
+        assert_eq!(
+            f.machine.read_cstr(copy).expect("readable"),
+            b"rangerdan",
+            "the copy is independent storage"
+        );
+    }
+
+    /// `alcdup` asks the heap for exactly `strlen(stg)+1` bytes.
+    ///
+    /// The empty string is the case that separates that from a plausible
+    /// `strlen(stg)`: it allocates one byte and holds a terminator. A port
+    /// that dropped the `+1` would ask for zero, which [`alcmem`] refuses
+    /// outright -- so this is also the assertion that catches the off-by-one
+    /// as a refusal rather than as a truncated string much later.
+    #[test]
+    fn alcdup_of_the_empty_string_still_allocates_its_terminator() {
+        let mut f = Fixture::new();
+        let src = f.text("");
+        let Ret::Far(copy) = f.invoke(alcdup, &Fixture::far(src)).expect("alcdup") else {
+            panic!("alcdup returns char *");
+        };
+        assert_eq!(f.machine.read_cstr(copy).expect("readable"), b"");
     }
 }

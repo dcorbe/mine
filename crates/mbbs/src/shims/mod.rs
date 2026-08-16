@@ -434,6 +434,10 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "xltctls", text::xltctls, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "stzcpy", text::stzcpy, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "stlcpy", text::stlcpy, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/STLCPY.C")),
+        (MAJORBBS, "stzcat", text::stzcat, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/STZCPY.C")),
         (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "strlen", text::strlen, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "rmvwht", text::rmvwht, Cleans::Caller, Evidence::Unclassified),
@@ -462,6 +466,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "parsin", text::parsin, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "atol", text::atol, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "l2as", text::l2as, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "ul2as", text::ul2as, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/L2AS.C")),
         (MAJORBBS, "toupper", text::toupper, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "tolower", text::tolower, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "sameas", text::sameas, Cleans::Caller, Evidence::Unclassified),
@@ -497,6 +503,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // `alctile`/`ptrtile` are not here -- segment tiling has no
         // flat-memory counterpart, see `Abi::native`.
         (MAJORBBS, "alcmem", memory::alcmem, Cleans::Caller, Evidence::Unclassified),
+        (MAJORBBS, "alcdup", memory::alcdup, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/ALCDUP.C")),
         (MAJORBBS, "alczer", memory::alczer, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "galfree", memory::galfree, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "farcoreleft", memory::farcoreleft, Cleans::Caller, Evidence::Unclassified),
