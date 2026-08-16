@@ -1,82 +1,41 @@
-//! `prat`, `profan`, `c2bcpy`, `b2ccpy`, `findtvar`, `hdlinp` -- a cluster of
-//! six missing `WCCMMUD.DLL` imports (`docs/2026-08-14-majormud-missing-symbols.md`,
-//! ranks 3, 3, 5, 5, 5, 21) with nothing else in common: two string-format
-//! copies, a profanity scanner, a text-variable lookup, a positioned print,
-//! and one host-internal input dispatcher a module has no business calling
-//! at all. Grouped in one file because they are this session's assignment,
-//! not because they are one subsystem.
+//! `profan`, `c2bcpy`, `b2ccpy`, `findtvar` -- a cluster of four missing
+//! `WCCMMUD.DLL` imports (`docs/2026-08-14-majormud-missing-symbols.md`,
+//! ranks 3, 5, 5, 5) with nothing else in common: two string-format copies,
+//! a profanity scanner, and a text-variable lookup. Grouped in one file
+//! because they are this session's assignment, not because they are one
+//! subsystem.
 //!
-//! # What is faithful, and what is not
+//! # What is faithful
 //!
-//! **Faithful, byte-for-byte against the vendor source cited on each:**
+//! Faithful, byte-for-byte against the vendor source cited on each:
 //! [`profan`], [`c2bcpy`], [`b2ccpy`], [`findtvar`].
 //!
-//! **Faithful for the half this host has machinery for, degraded for the
-//! half it does not:** [`prat`]. See its own doc comment -- the text it
-//! formats and emits is the real `vsprintf`/print-buffer behaviour every
-//! other `MAJORBBS` print routine in this crate already gives a module; the
-//! `x`/`y` cursor position is read off the frame (so the pointer and vararg
-//! reads after it stay aligned) and then discarded, because this host has
-//! no cursor-addressing state at all -- no `locate`, no `pxoff`/`pyoff`, no
-//! `prtbuf` -- for ordinary (non-FSD) output. This is the same trade
-//! `shims::screen`'s pagination stub already made and the crate has not
-//! reversed: a headless host that prints the right characters in the wrong
-//! column is still readable; a host that refuses to print anything a module
-//! positioned is not.
+//! # `prat` and `hdlinp` used to be here too, both dead duplicates
 //!
-//! **A labelled hard error, not a silent no-op:** [`hdlinp`]. See its own
-//! doc comment for why -- the short version is that its real body is a
-//! synchronous callback into the module's own registered state routine, and
-//! that re-entrant "call back into the machine from inside a shim" hook does
-//! not exist on this host (the nearest thing, `Host::poll`'s `CYCLE`
-//! dispatch, lives in `lib.rs` and runs from the transport loop, never from
-//! inside another call). Inventing a plausible no-op here would mean input a
-//! module asked to have processed silently evaporates -- exactly the
-//! plausible-zero failure mode this crate's own `ShimError` design exists to
-//! refuse. `shims::user::dfsthn`'s doc comment sets this precedent: real
-//! behaviour reproduced wherever it can be, a hard error for the one branch
-//! that cannot.
+//! Removed 2026-08-15 (`docs/2026-08-15-dead-twin-shims.md`): each had a
+//! twin registered elsewhere (`shims::output::prat`, `shims::echo::hdlinp`)
+//! that `mod.rs` actually dispatches to.
+//!
+//! `prat` here is worth naming because it was not mere duplication: it fed
+//! the routine's formatted output into [`crate::shims::text::append_mem`],
+//! landing in the *current channel's* own output stream. `GCOMM.H:427`'s
+//! own comment files `prat` (with `locate`/`curcurx`/`curcury`) under
+//! `/* old MBBST.LIB prototype section */` -- the **local sysop console**,
+//! not any remote channel -- and the one fully-legible call site
+//! (`re/exports/WCCMMUD_named.c:14246-14288`) is a rotating status-phrase
+//! readout gated behind a flag, the textbook shape of an operator status
+//! line, never anything a player was meant to see. The registered
+//! `shims::output::prat` routes the same text to [`crate::Host::note`]
+//! instead -- the "the operator should know this" channel this host
+//! actually has. This file's `prat` would have leaked sysop console text
+//! into a player's own terminal.
 
 use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
-use crate::fmt::format_call;
-use crate::shims::text::append_mem;
 use crate::strings::sameas;
-
-/// `void prat(int x, int y, char *ctlstg, ...)` -- `GCOMM.H:314` (wg1
-/// citation; declared with no prototype at all, K&R-style, same as
-/// `echon`/`echonu`'s neighbours on this crate's own missing-symbol survey).
-/// Body from the only generation of Galacticomm's source tree that ships one
-/// -- `re/wg33src/SRC/api/gcommlib/dos/VIDAPI.C:295-312` (`wnt/VIDAPI.C:592-`
-/// `612` is the same shape once the DOS-vs-Windows-NT video transport is
-/// stripped out):
-///
-///
-/// Three things happen in the real routine: position the cursor at
-/// `(x+pxoff, y+pyoff)`, format `ctlstg` and its varargs into `prtbuf`, and
-/// flush `prtbuf` to the screen. This host reproduces the second and third
-/// -- through [`format_call`] and [`append_mem`], the exact pair `prf`
-/// (`shims::text::prf`) already uses -- and drops the first. See this
-/// file's own module doc comment for why: `locate`, `pxoff`, `pyoff` and
-/// `prtbuf` do not exist anywhere in this host (`locate` is itself on the
-/// same missing-symbol list, rank 21, unowned by this task), and inventing
-/// cursor-addressing state to serve one four-call-site routine is out of
-/// this file's scope. `x` and `y` are still read off the call frame, in
-/// declared order, at `A::Int`'s own width -- **not** because their value
-/// matters (it is discarded), but because a call that read `ctlstg` before
-/// them would misalign every vararg that follows, the same trap
-/// `crates/mbbs/src/shims/gsbl.rs`'s own width-trap warnings are about.
-pub fn prat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let _x = call.int();
-    let _y = call.int();
-    let ctlstg = call.ptr();
-    let (text, _) = format_call(call, ctlstg)?;
-    append_mem(call.mem(), host, &text)?;
-    Ok(abi::Ret::Void)
-}
 
 /// One profanity dictionary entry: the letters that must follow the starting
 /// letter [`WORD_LISTS`] indexes by, and the level (1-3) `profan` reports if
@@ -394,95 +353,12 @@ pub fn findtvar<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
     Ok(abi::Ret::Int(A::Int::from(super::NO)))
 }
 
-/// `void hdlinp(void)` -- `MAJORBBS.H:682` (wg1) / `MAJORBBS.C:2657-2662`
-/// (wg1):
-///
-///
-/// **A labelled hard error. Not implemented, and not safe to fake.**
-///
-/// `hdlcri()` (`MAJORBBS.C:2663` onward, `STATIC` -- file-local, exactly the
-/// `fsdcon`/`fsdcof` shape `shims::screen`'s own doc comment already found
-/// and named "unreachable by any module, ours included") is this host's own
-/// top-level CR-terminated-input dispatcher: global commands
-/// (`BEG_PHASE`/`for (i=0;i<nglobs;i++) (*globs[i])()`), then a synchronous
-/// call through `module[usrptr->state]->lonrou`/`sttrou`/`stsrou`/etc. --
-/// the module's *own* registered state routine, called back into while
-/// `hdlinp` (called by that same module) is still running.
-///
-/// This host already reimplements that dispatch -- `Host::poll`'s `CYCLE`
-/// handling, `crates/mbbs/src/lib.rs`, per its own doc comments around
-/// "`stsrou`, `injrou`, `lofrou`, `huprou`, `mcurou`, `dlarou`, `finrou`"
-/// and the `poll_dispatches_cycle_to_stsrou` test -- but it runs from
-/// `Host::poll`, driven by the transport loop between module calls, never
-/// from inside one. There is no hook on this host today for a shim to call
-/// back into the module's own state routine while a module call is already
-/// on the stack; building one is a `lib.rs`/`Host::poll` change, out of
-/// this file's ownership for this task.
-///
-/// A silent no-op was considered and rejected: `WCCMMUD.DLL` calls `hdlinp`
-/// three times specifically to have a simulated line of input processed
-/// *now* -- MajorMUD builds `input`/`margv`/`margn` itself (the same globals
-/// `shims::text::parsin_mem` re-tokenises) and hands control to the host to
-/// run the normal dispatch over them, most plausibly a programmatic command
-/// injection (paired with `injacr`, "inject a carriage return", rank 9 on
-/// the same missing-symbol survey and not part of this task). Answering
-/// `Ret::Void` and doing nothing would make that injected input vanish
-/// without a trace -- observably wrong in exactly the way a plausible zero
-/// always is, and the reason this crate's `ShimError` exists at all
-/// (`shims/mod.rs`'s own doc comment on `ShimError`: "a plausible zero is
-/// the failure mode this whole design exists to avoid"). The guard clause
-/// (`extptr->entstt`/`input == "x"`) is not reproduced as a partial success
-/// either: `extptr` is a per-channel extension struct this file does not
-/// own the layout of (`users.rs`, out of scope, and the struct-layout traps
-/// this plan has already hit four times over are exactly why a field is not
-/// read without first establishing its offset for real).
-///
-/// # Errors
-///
-/// Always. See above.
-pub fn hdlinp<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    Err(ShimError::Failed(
-        "hdlinp: real behaviour is a synchronous callback into the module's own \
-         registered state routine (MAJORBBS.C's hdlcri, STATIC, wg1), which this host \
-         has no re-entrant call-into-module hook to perform from inside a shim -- see \
-         this function's own doc comment before adding one"
-            .to_owned(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shims::system::register_textvar;
     use crate::testing::Fixture;
     use mbbs_machine::m16::{FarPtr, Ret};
-
-    // -- prat -----------------------------------------------------------
-
-    #[test]
-    fn prat_formats_and_appends_to_prfbuf_like_prf_does() {
-        let mut f = Fixture::new();
-        let template = f.text("hi %d");
-        // x=5, y=7: read and discarded, but must not shift the pointer/vararg
-        // reads that follow.
-        f.invoke(prat, &[5, 7, template.offset, template.selector, 42])
-            .expect("prat");
-
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(f.read(buffer), "hi 42");
-    }
-
-    #[test]
-    fn prat_appends_rather_than_overwriting_a_second_call() {
-        let mut f = Fixture::new();
-        let a = f.text("<%d>");
-        let b = f.text("[%d]");
-        f.invoke(prat, &[0, 0, a.offset, a.selector, 1]).expect("first");
-        f.invoke(prat, &[9, 9, b.offset, b.selector, 2]).expect("second");
-
-        let buffer = f.host.globals().prf_buffer();
-        assert_eq!(f.read(buffer), "<1>[2]");
-    }
 
     // -- profan -----------------------------------------------------------
 
@@ -683,15 +559,4 @@ mod tests {
         );
     }
 
-    // -- hdlinp -----------------------------------------------------------
-
-    #[test]
-    fn hdlinp_refuses_rather_than_silently_discarding_the_input() {
-        let mut f = Fixture::new();
-        let err = f.invoke(hdlinp, &[]).expect_err("hdlinp has no faithful implementation");
-        assert!(
-            format!("{err}").contains("hdlinp"),
-            "the refusal should name itself: {err}"
-        );
-    }
 }

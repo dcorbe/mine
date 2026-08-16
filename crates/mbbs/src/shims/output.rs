@@ -1,4 +1,4 @@
-//! Print-buffer flush and local-console cursor routines: `outprf`, `clrmlt`,
+//! Print-buffer flush and local-console cursor routines: `clrmlt`,
 //! `outmlt`, `prat`, `locate`, `curcurx`, `curcury`.
 //!
 //! Signatures and line numbers from `GCOMM.H` in
@@ -7,27 +7,18 @@
 //! numbers there and a wg20 citation would silently point at the wrong
 //! line).
 //!
-//! These seven split cleanly into two families, and the split is the whole
+//! These six split cleanly into two families, and the split is the whole
 //! of this file's design:
 //!
-//! * [`outprf`] and [`outmlt`] flush `prfbuf` to a channel. `GCOMM.H:447`
-//!   declares `outprf` with no body anywhere in this repo's copy of the
-//!   source -- it is host-internal, never one of `WCCMMUD.DLL`'s own
-//!   imports (`re/wccmmud_majorbbs_named.tsv` has no row for either
-//!   ordinal 463 or 785), so Galacticomm never had to ship one. It is
-//!   reconstructed from `powprf` (`MAJORBBS.C:1791-1795`), which says
-//!   outright what it stands in for. [`crate::shims::fsd`] already carries
-//!   a private, `Chan`-taking twin of this same logic
-//!   (`crates/mbbs/src/shims/fsd.rs:1503`, used by the FSD flush path,
-//!   which already has a resolved channel in hand and no module stack to
-//!   read); this file's version is the ABI-callable form that reads `chan`
-//!   off `call.int()`, the shape every routine actually registered in
-//!   `shims::mod`'s dispatch table takes. The two cannot share code as
-//!   written: `fsd::outprf` is a private `fn` of a different module, and
-//!   its whole reason to exist is that it is *not* reached through
-//!   `Call<A>`. Both are transcriptions of the same three lines of
-//!   `powprf`, and a change to one is a change that belongs in the other
-//!   too.
+//! * [`outmlt`] flushes `prfbuf` to a channel, via [`outprf_core`]. `outprf`
+//!   itself used to be here too -- an ABI-callable wrapper around the same
+//!   core -- but it was a dead duplicate of the registered
+//!   `shims::fsd::outprf` (removed 2026-08-15,
+//!   `docs/2026-08-15-dead-twin-shims.md`), which carries the same three
+//!   `powprf`-derived steps (`crates/mbbs/src/shims/fsd.rs:1668`) against a
+//!   `Chan` its own callers already have resolved. `outprf_core` is not
+//!   dead -- `outmlt` still shares it -- only the second, redundant
+//!   `Call<A>`-reading entry point was.
 //!
 //! * [`clrmlt`], [`prat`], [`locate`], [`curcurx`] and [`curcury`] have no
 //!   real body in the wg1 tree either, and for a different reason each:
@@ -45,36 +36,6 @@ use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::chan::Chan;
-
-/// `void outprf(int chan)` -- `GCOMM.H:447`. Flush whatever `prf`/`prfmsg`
-/// have queued in `prfbuf` to `chan`, then clear the buffer.
-///
-/// Reconstructed from `powprf` (`MAJORBBS.C:1791-1795`):
-///
-///
-/// `powprf` is `outprf` plus one more call (`btucli`, flushing input) --
-/// exactly the "power" the name claims, which is how we know what the two
-/// statements it shares with plain `outprf` do on their own: transmit
-/// `prfbuf`, then clear it the way [`crate::shims::text::clrprf`]
-/// (`clrprf()`) does.
-///
-/// **Not a `WCCMMUD.DLL` import** -- `re/wccmmud_majorbbs_named.tsv` has no
-/// row for ordinal 463 (`_OUTPRF`), so nothing in MajorMUD calls this
-/// directly by name. It exists here as the ABI-callable form of the same
-/// logic [`crate::shims::fsd`]'s own private, `Chan`-taking `outprf`
-/// (`crates/mbbs/src/shims/fsd.rs:1503`) already carries for the FSD flush
-/// path -- registered by name (per `shims::mod`'s own dispatch table shape)
-/// so that any module import that does resolve to this ordinal, now or in a
-/// module this host has not yet met, has a real routine to reach rather
-/// than an unresolved import.
-///
-/// Out of range: `outprf` is `void`, so there is no status code to answer
-/// with. [`crate::shims::gsbl::echonu`] sets the precedent for a `void`
-/// routine given a channel past `nterms` -- note it and return, rather than
-/// treat it as an error the caller could observe.
-pub fn outprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    outprf_core(call, host)
-}
 
 /// `void outmlt(int chan)` -- `GCOMM.H:475`, "Multilingual version of
 /// outprf()" (the phrase is MBBSEmu's own comment on its identical
@@ -104,8 +65,9 @@ pub fn outmlt<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     outprf_core(call, host)
 }
 
-/// The body [`outprf`] and [`outmlt`] share: read `chan` off the frame,
-/// resolve it, and flush.
+/// The body [`outmlt`] (and, before 2026-08-15, this file's own now-removed
+/// `outprf` wrapper) shares: read `chan` off the frame, resolve it, and
+/// flush.
 fn outprf_core<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     match host.gsbl().terms().chan(chan) {
@@ -300,8 +262,17 @@ mod tests {
     use super::*;
     use crate::testing::Fixture;
 
+    // `output::outprf` (the ABI-callable wrapper around `outprf_core`) was a
+    // dead duplicate of the registered `shims::fsd::outprf` and was removed
+    // 2026-08-15 (`docs/2026-08-15-dead-twin-shims.md`) -- `fsd.rs` carries
+    // that routine's own dedicated tests. `outprf_core`/`outprf_mem`
+    // themselves are not dead -- `outmlt` shares them -- so the two tests
+    // below exercise that shared core through `outmlt` instead, which is
+    // observably identical (see `outmlt_flushes_the_same_buffer_outprf_
+    // core_does`'s own comment).
+
     #[test]
-    fn outprf_transmits_prfbuf_and_clears_it() {
+    fn outmlt_transmits_prfbuf_and_clears_it() {
         let mut f = Fixture::new();
         let console = f.console();
         let template = f.text("<%d>");
@@ -311,18 +282,18 @@ mod tests {
         let buffer = f.host.globals().prf_buffer();
         assert_eq!(f.read(buffer), "<7>", "queued before the flush");
 
-        f.invoke(outprf, &[0]).expect("flushed");
+        f.invoke(outmlt, &[0]).expect("flushed");
 
         assert_eq!(
             f.host.gsbl_mut().drain_output(console),
             b"<7>".to_vec(),
-            "outprf transmits what prf queued"
+            "outmlt transmits what prf queued"
         );
         assert_eq!(f.read(buffer), "", "and clears the buffer the way clrprf does");
     }
 
     #[test]
-    fn outprf_on_a_channel_out_of_range_notes_rather_than_transmits() {
+    fn outmlt_on_a_channel_out_of_range_notes_rather_than_transmits() {
         let mut f = Fixture::new();
         let console = f.console();
         let past = f.host.gsbl().terms().count();
@@ -330,7 +301,7 @@ mod tests {
         f.invoke(crate::shims::text::prf, &[template.offset, template.selector])
             .expect("queued");
 
-        f.invoke(outprf, &[past]).expect("void, even out of range");
+        f.invoke(outmlt, &[past]).expect("void, even out of range");
 
         assert!(
             f.host.gsbl_mut().drain_output(console).is_empty(),
@@ -339,9 +310,10 @@ mod tests {
     }
 
     #[test]
-    fn outmlt_flushes_the_same_buffer_outprf_does() {
+    fn outmlt_flushes_the_same_buffer_outprf_core_does() {
         // No lingo buffer pool exists in this host (see outmlt's own doc
-        // comment), so it is outprf in every observable way.
+        // comment), so it flushes `prfbuf` the same as any other caller of
+        // `outprf_core` would.
         let mut f = Fixture::new();
         let console = f.console();
         let template = f.text("multilingual, in name only");
@@ -368,10 +340,10 @@ mod tests {
         f.invoke(clrmlt, &[]).expect("cleared");
         assert_eq!(f.read(buffer), "");
 
-        f.invoke(outprf, &[0]).expect("flushed (nothing left)");
+        f.invoke(outmlt, &[0]).expect("flushed (nothing left)");
         assert!(
             f.host.gsbl_mut().drain_output(console).is_empty(),
-            "clrmlt threw the text away before outprf could send it"
+            "clrmlt threw the text away before outmlt could send it"
         );
     }
 

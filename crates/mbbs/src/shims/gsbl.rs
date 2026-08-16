@@ -350,45 +350,6 @@ pub fn btuech<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
-/// `void echonu(int usrnum)` -- `MAJORBBS.C:3847`, "turn echo on utility".
-///
-///
-/// **The counterpart to the `btuech(chan,0)` a module makes when it begins a
-/// timed action, and reaching it is what ends one.** MajorMUD silences echo in
-/// its `_ADD_DELAY` and restores it here once the delay expires. Nothing could
-/// reach this routine until `Host::cycle` began calling the `syscyc` vector --
-/// which is why no survey ever named it, and why it surfaced as a module stop
-/// the first time a move ran to completion.
-///
-/// Two simplifications, both made from what this host *is* rather than by
-/// guessing at the original:
-///
-/// - `echtyp[grpnum[usrnum]]` is the echo type of the user's **group**. This
-///   host has neither: `echtyp` and `grpnum` are not placed globals, because
-///   no module it loads addresses them. Every channel it serves is an ordinary
-///   user, whose group echo type is "on", so this restores echo instead of
-///   indexing a table that would have exactly one entry.
-/// - The `extptr->wid` branch is `echsec`'s teardown -- `echsec` sets a
-///   secret echo character and a line width, and this clears both. `echsec` is
-///   not implemented here, so nothing can make `wid` non-zero and the branch is
-///   unreachable. Recorded rather than quietly dropped: a host that grows
-///   `echsec` must grow this with it.
-
-pub fn echonu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = Into::<u32>::into(call.int()) as i16;
-    if on_channel(host, chan, |g, chan| {
-        g.channel_mut(chan).echo = true;
-    })
-    .is_none()
-    {
-        // `void`, so there is no status to answer with -- the original would
-        // have indexed `grpnum` out of bounds here. A note is the only way to
-        // say it happened.
-        host.note(format!("echonu: channel {chan} is out of range; echo not restored"));
-    }
-    Ok(abi::Ret::Void)
-}
-
 /// `int btulok(int chan, int onoff)` -- input lockout: arriving bytes are
 /// discarded while locked.
 pub fn btulok<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
@@ -1106,8 +1067,7 @@ pub fn btutru<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// [`crate::gsbl::Channel::output`] -- ordinary echoed input already lands
 /// there (`Channel::take`'s echo stage) -- so `chiout` writes to the same
 /// place. `void`, so a bad channel or an over-wide character has no return
-/// code to carry a refusal; [`echonu`] is the precedent for what a `void`
-/// routine does instead: note it and otherwise do nothing, rather than
+/// code to carry a refusal: note it and otherwise do nothing, rather than
 /// stopping the machine over a byte nobody but this host's own log will
 /// ever see was dropped.
 pub fn chiout<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
@@ -1407,6 +1367,23 @@ mod tests {
             "real GSBL would refuse to clear this -- this host does; see \
              btuxmn's doc comment"
         );
+    }
+
+    /// Moved from the dead `echo::btuxmn` twin
+    /// (`docs/2026-08-15-dead-twin-shims.md`): neither this routine nor its
+    /// sibling [`btuxmt_transmits_and_btutsw_is_what_wraps_it`] was in
+    /// `every_routine_refuses_a_channel_out_of_range`'s sweep (both need a
+    /// real `ASCIIZ` pointer, not a bare `int`), so this is the one place
+    /// that bound check is pinned for `btuxmn` specifically.
+    #[test]
+    fn btuxmn_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        let text = f.text("paged");
+        let ret = f
+            .invoke(btuxmn, &[past, text.offset, text.selector])
+            .expect("refused, not an error");
+        assert_eq!(ret, Ret::U16(OUT_OF_RANGE));
     }
 
     #[test]
@@ -1848,6 +1825,6 @@ mod tests {
         let mut f = Fixture::new();
         let past = f.host.gsbl().terms().count();
         f.invoke(chiout, &[past, b'x' as u16])
-            .expect("void routines note and continue, like echonu -- see chiout's own doc comment");
+            .expect("void routines note and continue -- see chiout's own doc comment");
     }
 }

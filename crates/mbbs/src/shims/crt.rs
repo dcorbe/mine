@@ -325,7 +325,11 @@ pub fn fwrite<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 pub fn itoa<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     // `char *itoa(int value, char *string, int radix)` -- Borland's; no
     // Galacticomm header redeclares it.
-    let value = sign_extend::<A>(call.int().into());
+    // Kept in both forms, because which one is correct depends on the radix.
+    // `raw` is the argument zero-extended at this ABI's `int` width (`0xffff`
+    // stays 65,535 under `Wg16`); `value` is the same bits sign-extended.
+    let raw: u32 = call.int().into();
+    let value = sign_extend::<A>(raw);
     let dst = call.ptr();
     // `radix` is a small non-negative value in the one range this ever
     // legally is (2..=36) -- the same reasoning `fseek`'s own doc comment
@@ -334,6 +338,40 @@ pub fn itoa<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, 
     let radix = Into::<u32>::into(call.int());
 
     let mut text = if (2..=36).contains(&radix) {
+        // Signed at **every** radix, not only at ten -- and this was
+        // challenged on 2026-08-15 and survived, so the reasoning is recorded
+        // rather than left to be re-argued.
+        //
+        // The dead duplicate `shims::text::itoa` (deleted with the rest of
+        // the twins, `docs/2026-08-15-dead-twin-shims.md`) carried a test
+        // asserting the opposite: that `itoa(0xffff, buf, 16)` is `"ffff"`,
+        // on the stated grounds that "only radix ten is signed". That is the
+        // familiar rule from the *documentation* of `itoa` in several C
+        // libraries, and it may well be right -- but **no recovered source
+        // settles it**, and the one recoverable piece of evidence points the
+        // other way.
+        //
+        // `.scratch/bc452/LONGTOA.CAS` has `__longtoa`, which is where the
+        // decision actually lives -- and it takes `maybeSigned` as a
+        // *parameter*, so the radix does not decide anything by itself:
+        //
+        //     maybeSigned is treated as a boolean. If false then value is
+        //     treated as unsigned long and no sign will be placed in *strP.
+        //
+        // `itoa`'s own body is not in the recovered tree. Its sibling's is,
+        // and it passes the flag explicitly:
+        //
+        //     __utoa: return __longtoa(((long)value) & 0xffffL, buf, 10, 0, 'a');
+        //                                                              ^ maybeSigned = 0
+        //
+        // An `__utoa` that has to pass `0` to get unsigned rendering is an
+        // `itoa` that passes `1` -- unconditionally, since it has no other
+        // flag to vary. So signed-at-every-radix is what the evidence here
+        // supports, and `itoa(-255, buf, 16)` is `"-ff"`.
+        //
+        // If `itoa`'s body is ever recovered and shows otherwise, this is the
+        // line to change, and `raw` above is already the value the unsigned
+        // branch would need.
         let negative = value < 0;
         // `.unsigned_abs()`, not `-value`: the same overflow `l2as`'s own doc
         // comment names for `i32::MIN`, whose negation does not fit an `i32`.
@@ -1428,6 +1466,23 @@ mod tests {
         assert_eq!(std::fs::read(root.join("OUT.DAT")).expect("written").len(), 0);
     }
 
+    /// Moved from the dead `stream::fwrite` twin
+    /// (`docs/2026-08-15-dead-twin-shims.md`): the other half of `FWRITE.C:62`'s
+    /// asymmetry with `fread` -- a zero *count*, unlike a zero *size*, answers
+    /// plain `0`, not `nitems`.
+    #[test]
+    fn fwrite_of_zero_items_writes_nothing_and_is_not_a_refusal() {
+        let root = scratch("crt-fwrite-zero-count");
+        let mut f = Fixture::rooted(root.clone());
+        let fp = opened(&mut f, "OUT.DAT", "wb");
+        let data = f.bytes(b"x", false);
+
+        let ret = f
+            .invoke(fwrite, &[data.offset, data.selector, 4, 0, fp.offset, fp.selector])
+            .expect("fwrite");
+        assert_eq!(word(ret), 0);
+    }
+
     // ---- itoa -----------------------------------------------------------
 
     #[test]
@@ -1453,10 +1508,56 @@ mod tests {
     fn itoa_with_an_out_of_range_radix_writes_only_the_terminator() {
         // `LONGTOA.CAS:70-76`: "if the request is invalid, generate an empty
         // result."
+        //
+        // `shims::text` carried a dead duplicate `itoa` whose own test
+        // asserted the opposite -- that a bad radix is *refused*. The vendor
+        // line above settles it: an invalid request produces an empty result,
+        // not an error. The duplicate went with the rest of the dead twins
+        // (`docs/2026-08-15-dead-twin-shims.md`), and its refusal expectation
+        // went with it rather than being carried over. The three tests below
+        // are the ones it had that this file did not.
         let mut f = Fixture::new();
         let buf = f.buffer(4);
         f.invoke(itoa, &[42, buf.offset, buf.selector, 1]).expect("itoa");
         assert_eq!(f.read(buf), "");
+    }
+
+    #[test]
+    fn itoa_renders_decimal_with_a_sign() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(16);
+        let Ret::Far(at) = f
+            .invoke(itoa, &[(-42i16) as u16, buf.offset, buf.selector, 10])
+            .expect("formatted")
+        else {
+            panic!("itoa returns a pointer");
+        };
+        assert_eq!(at, buf, "itoa returns its own second argument");
+        assert_eq!(f.read(at), "-42");
+    }
+
+    // The dead twin's fourth test is deliberately NOT carried over:
+    // `itoa_at_a_non_decimal_radix_treats_a_negative_value_as_unsigned`
+    // asserted `itoa(0xffff, buf, 16) == "ffff"` on the grounds that "only
+    // radix ten is signed". That contradicts this file's own
+    // `itoa_renders_negative_hex_lowercase_and_returns_its_own_destination`,
+    // which expects `"-ff"`, and the conflict is genuinely unsettled by any
+    // recovered source -- see the long comment in `itoa` itself. Reinstating
+    // it would mean changing shipped behaviour on an unverifiable claim.
+    //
+    // Its fifth, `itoa_refuses_a_radix_outside_2_to_36`, is also dropped: it
+    // expected a refusal where `LONGTOA.CAS:70-76` says an invalid request
+    // produces an empty result, which
+    // `itoa_with_an_out_of_range_radix_writes_only_the_terminator` above
+    // already pins.
+
+    #[test]
+    fn itoa_renders_zero_at_any_radix() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(16);
+        f.invoke(itoa, &[0u16, buf.offset, buf.selector, 2])
+            .expect("formatted");
+        assert_eq!(f.read(buf), "0");
     }
 
     // ---- samend -----------------------------------------------------------

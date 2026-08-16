@@ -1,21 +1,24 @@
-//! Six routines named at `MAJORBBS.H:679-733` and `BRKTHU.H:185`, cited
-//! throughout against the **wg1** tree
-//! (`archive/galacticomm/extract/wg1/GALDSRC/SRC`) -- wg20 renumbers every
-//! one of these lines, see `crate::shims::gsbl`'s sibling doc comment on
-//! citing wg1.
+//! Two routines named at `MAJORBBS.H:679-733`, cited throughout against the
+//! **wg1** tree (`archive/galacticomm/extract/wg1/GALDSRC/SRC`) -- wg20
+//! renumbers every one of these lines, see `crate::shims::gsbl`'s sibling
+//! doc comment on citing wg1.
 //!
-//! Five of the six are `MAJORBBS.C` routines that read `usrnum` implicitly
-//! rather than taking a channel argument (`echon`, `echsec`, `injacr`,
-//! `hdlinp`, `instat` -- the last takes a `char *uid` to search *for*, which
-//! is a different thing from a channel to act *on*). The sixth, `btuxmn`,
-//! is the one genuine `GALGSBL` import here, and is grouped with these
-//! rather than filed in `crate::shims::gsbl` because its only vendor context
-//! is a call site inside `MAJORBBS.C` (`dftinj`, see [`btuxmn`]'s own doc
-//! comment) -- `GALGSBL`'s own source was never recovered (no `.C` file for
-//! it exists anywhere under `archive/`), so there is no companion routine of
-//! its own to sit next to.
+//! # This file used to hold four more routines, all dead duplicates
 //!
-//! # What none of these six can do, and why
+//! `echon`, `echsec`, `instat` and `btuxmn` were removed 2026-08-15
+//! (`docs/2026-08-15-dead-twin-shims.md`): each had a twin registered
+//! elsewhere (`shims::user::{echon,echsec,instat}`, `shims::gsbl::btuxmn`)
+//! that `mod.rs` actually dispatches to, and this crate never called any of
+//! the four copies here. `btuxmn`'s twin disagreement is worth naming: this
+//! file's dead copy transmitted *raw*, unwrapped bytes (citing MBBSEmu's
+//! independent reimplementation and the `dftinj` call site), while the
+//! registered `shims::gsbl::btuxmn` transmits word-wrapped, matching
+//! `btuxmt`. The primary source settles it -- `.scratch/gsbl_guide.txt`
+//! (the extracted GSBL Library Reference Guide, page 187): `btuxmn()` behaves like `btuxmt()` except that what it queues survives `btuclo()` -- the *only* documented
+//! difference is the `btuclo`-proof block marking, not the output mode.
+//! MBBSEmu's reimplementation is wrong on this point.
+//!
+//! # What neither surviving routine can do, and why
 //!
 //! `injacr` and `hdlinp` both end, in the vendor, by calling `hdlcri()`
 //! (`MAJORBBS.C:2666`, `STATIC`) **synchronously, before returning to the
@@ -37,108 +40,13 @@
 //! substitution -- see its own doc comment for why the substitution would be
 //! actively wrong for the one way the vendor tree actually calls *it*.
 
-use mbbs_machine::ptr::ModulePtr;
 #[cfg(test)]
 use mbbs_machine::m16::Ret;
 
 use super::ShimError;
-use super::gsbl::OUT_OF_RANGE;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
 use crate::gsbl::Gsbl;
-
-/// `void echon(void)` -- `MAJORBBS.C:3840-3844`:
-///
-///
-/// Fully implemented, as a straight call on `usrnum`. Not literally a call
-/// to [`crate::shims::gsbl::echonu`] -- that function reads its channel
-/// argument off the module's own argument frame with `call.int()`, and
-/// `echon` has no argument frame to forward (`void echon(void)`); the
-/// channel it means is `usrnum`, read back the way
-/// [`Host::current_channel_mem`] always does. So this restates `echonu`'s
-/// one line of *behaviour* against a [`Chan`](crate::chan::Chan) it already
-/// has, rather than fabricate an argument frame to call through. Every
-/// simplification `echonu`'s own doc comment records -- no `echtyp`/`grpnum`
-/// table, so every channel's group echo type is "on" -- applies here
-/// unchanged, for the same reason: this host is what it is regardless of
-/// which of the two routines asks.
-///
-/// # Errors
-///
-/// If `usrnum` does not name a channel of this host (propagated from
-/// [`Host::current_channel_mem`]).
-pub fn echon<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = host.current_channel_mem(call.mem())?;
-    host.gsbl_mut().channel_mut(chan).echo = true;
-    Ok(abi::Ret::Void)
-}
-
-/// `void echsec(char ech,int lwidth)` -- `MAJORBBS.C:3857-3867`:
-///
-///
-/// **Partially implemented: only the first line.** `btuech(usrnum,0)` turns
-/// ordinary echo off, and that much this host has -- it is
-/// [`crate::gsbl::Channel::echo`], the exact field
-/// [`crate::shims::gsbl::btuech`] sets. The other four lines are the actual
-/// point of the routine -- masking each keystroke as `ech` (`'*'` in every
-/// real caller) instead of showing nothing -- and none of the three things
-/// they need exist in this host:
-///
-/// - `extptr->col`/`wid`/`ech` are fields of `struct extusr`
-///   (`MAJORBBS.H:94-107`). This host's `EXTUSR` block (`crate::users`,
-///   `EXTUSR: u16 = 22`) is sized correctly but has **no fields placed in
-///   it** -- `crates/mbbs/src/users.rs:29-35`'s own doc comment: "neither
-///   `extusr` nor `extptr`" are named, because nothing this host has loaded
-///   addresses them. There is nowhere to write `col`, `wid` or `ech` without
-///   inventing an offset into that block myself, which is not a
-///   simplification, it is fabricating a struct layout with no vendor
-///   source and no measurement behind it.
-/// - `secchi` (`MAJORBBS.C:3869-3901`, `STATIC`) is the per-character
-///   interceptor `btuchi` installs, and it is what actually substitutes
-///   `ech` for the typed character on the way out. `crate::gsbl::Channel`
-///   has no interception point at all: input is cooked (backspace handling,
-///   line assembly, echo) entirely inside `Channel::take`, invisibly to
-///   every shim in this crate, and there is no `btuchi` shim anywhere in
-///   this host for the same reason `crate::shims::gsbl`'s own doc comment
-///   gives for `btuhpk`/`btupbc`/`btucpc` being registered without being
-///   imported: unlike those three, `btuchi` is not even in that list,
-///   because nothing in this host could act on the far pointer it takes.
-///
-/// So this clears the one bit that has somewhere to go and stops. A caller
-/// that typed a password under this host would see **nothing** echoed back,
-/// not asterisks -- degraded, not wrong in the sense of showing the
-/// password, and not silently pretending to be the real thing either.
-///
-/// **This does not make [`crate::shims::gsbl::echonu`]'s "unreachable
-/// branch" reachable.** That note says `extptr->wid` can never be positive
-/// because nothing sets it; this routine is the *only* thing in the vendor
-/// that ever would, and it is exactly the write this implementation cannot
-/// make, for the reason above. `wid` stays permanently absent, so
-/// `echonu`'s `if (extptr->wid > 0)` teardown remains dead code in this host
-/// even after this function exists -- unlike a routine that was merely
-/// unregistered, no future registration of `echsec` would change that
-/// without `EXTUSR` first growing a real `wid` field, which is a
-/// `users.rs`-owned change this file does not make.
-///
-/// # Arguments
-///
-/// Neither `ech` nor `lwidth` is read off the call frame: there is nowhere
-/// in this host that could hold either one (see above), so reading them
-/// into local bindings nothing does anything with would document nothing
-/// [`btuhpk`](crate::shims::gsbl::btuhpk)'s own doc comment does not already
-/// say about its own unread argument. Silent for the same reason: `echsec`
-/// is `Cleans::Caller` like every routine in this table, so the module
-/// itself pops both words regardless of whether this function ever reads
-/// them.
-///
-/// # Errors
-///
-/// If `usrnum` does not name a channel of this host.
-pub fn echsec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = host.current_channel_mem(call.mem())?;
-    host.gsbl_mut().channel_mut(chan).echo = false;
-    Ok(abi::Ret::Void)
-}
 
 /// `void injacr(void)` -- `MAJORBBS.C:2559-2567`:
 ///
@@ -276,168 +184,10 @@ pub fn hdlinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
-/// `int instat(char *uid,int qstate)` -- `MAJORBBS.C:3057-3072`:
-///
-///
-/// **Fully implemented.** Every piece this needs is already something this
-/// host places and a shim can read: `user[i].state`
-/// ([`crate::users::Users::state_mem`]), `uacoff(i)->userid`
-/// ([`crate::users::Users::account`] offset by
-/// [`crate::users::AccountLayout::userid`]) and `user[i].flags`
-/// ([`crate::users::Users::slot`] offset by [`crate::users::UserLayout::flags`]).
-/// `othexp` (`extoff(othusn)`, the extra-user pointer) is read by the
-/// vendor and never used inside the loop body -- dead in the original, so
-/// there is nothing to reproduce.
-///
-/// `sameas` (`MAJORBBS.C`, case-insensitive) is
-/// [`crate::strings::sameas`], the same free function
-/// [`crate::shims::text::sameas`] calls through.
-///
-/// `INVISB` is `0x00004000L` (`MAJORBBS.H:214`) -- bit 14 of the 4-byte
-/// little-endian `flags`, which is bit 6 of the *second* byte
-/// (`FLAGS + 1`), by the same per-byte addressing
-/// `crates/mbbs/src/users.rs`'s own `the_master_flag_lands_on_the_bit_
-/// majorbbs_h_names` test measures for `MASTER` (`0x40`, bit 6 of the
-/// *first* byte, `FLAGS + 0`) -- a different bit of the same field, read
-/// the same way, not guessed at.
-///
-/// A match whose owner *is* invisible does not return 0 immediately: the
-/// vendor's loop falls through to the next channel rather than stopping,
-/// in case some other channel matches with `INVISB` clear. This function's
-/// loop does the same -- there is no early return in the invisible case,
-/// only the absence of one, so the `for` simply continues.
-///
-/// # Errors
-///
-/// If `uid` is not a valid pointer, or if any channel's `state` cannot be
-/// read (both would mean the module handed this a bad argument, or this
-/// host's own tables are inconsistent -- either way the caller should stop,
-/// not guess).
-pub fn instat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let uid_ptr = call.ptr();
-    let qstate = Into::<u32>::into(call.int()) as u16;
-    let uid = uid_ptr
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-
-    for chan in host.gsbl().terms().all() {
-        let state = host.users().state_mem(call.mem(), chan)?;
-        if state != qstate {
-            continue;
-        }
-
-        let account = host.users().account(chan);
-        let userid_ptr = A::ptr_offset(account, host.users().account_layout().userid);
-        let userid = userid_ptr
-            .read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        if !crate::strings::sameas(&uid, userid) {
-            continue;
-        }
-
-        let slot = host.users().slot(chan);
-        let flags1 = A::ptr_offset(slot, host.users().user_layout().flags.at + 1);
-        let byte = flags1
-            .resolve(call.mem(), 1)
-            .map_err(|e| ShimError::Failed(e.to_string()))?[0];
-        if byte & 0x40 == 0 {
-            return Ok(abi::Ret::Int(A::Int::from(1u16)));
-        }
-    }
-    Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
-/// `int btuxmn(int chan,char *datstg)` -- `BRKTHU.H:185`.
-///
-/// **`GALGSBL`'s own source was never recovered**: no `.C` file under
-/// `archive/` implements it, unlike `MAJORBBS.C` for the host proper --
-/// `crate::shims::gsbl`'s own module doc comment notes the same absence for
-/// every routine in that file. What is available instead:
-///
-/// 1. Its one call site in the wg1 tree, `MAJORBBS.C:3933-3939`'s `dftinj`
-///    ("default injection routine" -- what runs when a module's own
-///    `injrou` is absent):
-///
-///
-///    `prfbuf` is the module's formatted-output buffer -- an ASCIIZ string,
-///    the same shape `btuxmt` takes -- being pushed into `othusn`'s channel
-///    as an *injected* message (a page/talk-style interrupt), immediately
-///    followed by `btuoes` (raise status on buffer-empty) rather than
-///    anything wrap-related.
-/// 2. `docs/mirrors/github-mbbsemu-MBBSEmu`'s independent reimplementation
-///    (`MBBSEmu/HostProcess/ExportedModules/Galgsbl.cs:712-725`), an MIT
-///    project with no shared authorship with this host, cross-checked
-///    rather than trusted alone:
-///
-///
-///    Compared with the same file's own `btuxmt` (`:525-542`), which reads
-///    an ASCIIZ string the identical way and then runs it through
-///    `FormatOutput` (word wrap, ANSI, text variables) before sending --
-///    `btuxmn` skips that step and sends the raw bytes. Both sources agree:
-///    an ASCIIZ string, sent to an explicit channel, bypassing whatever
-///    output formatting `btuxmt` applies.
-///
-/// **Implemented as `btuxmt`'s cstr-read paired with `btuxct`'s raw
-/// transmit**: [`crate::gsbl::Gsbl::transmit`] (what `btuxmt` calls) is the
-/// one that word-wraps at `Channel::width`; [`crate::gsbl::Gsbl::
-/// transmit_raw`] (what `btuxct` calls) sends the bytes exactly as given
-/// and is what both sources above describe `btuxmn` doing. The length
-/// comes from a NUL scan (`btuxmt`'s convention -- `char *datstg`, not
-/// `btuxct`'s explicit `nbyt`), so this reads like `btuxmt` and transmits
-/// like `btuxct`.
-///
-/// `-11` (out of range) is the only refusal this host can raise, for the
-/// reason every other `GALGSBL` routine in this crate gives:
-/// `crate::shims::gsbl`'s module doc comment on why `-10` is unreachable.
-pub fn btuxmn<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = Into::<u32>::into(call.int()) as i16;
-    let at = call.ptr();
-    let Some(chan) = host.gsbl().terms().chan(chan) else {
-        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
-    };
-    let text = at
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    host.gsbl_mut().transmit_raw(chan, &text);
-    Ok(abi::Ret::Int(A::Int::from(0u16)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Wg16;
     use crate::testing::Fixture;
-
-    #[test]
-    fn echon_restores_echo_on_the_current_channel() {
-        let mut f = Fixture::new();
-        let console = f.console();
-        f.host.point_curusr(&mut f.machine, console).expect("channel 0 is current");
-        f.host.gsbl_mut().channel_mut(console).echo = false;
-
-        let ret = f.invoke(echon, &[]).expect("echon");
-        assert_eq!(ret, Ret::Void);
-        assert!(f.host.gsbl().channel(console).echo);
-    }
-
-    #[test]
-    fn echsec_turns_ordinary_echo_off_and_nothing_else() {
-        // The vendor's whole point -- masking each keystroke as `ech` -- is
-        // not implemented (see this function's own doc comment), so this
-        // only pins the one line this host can do: echo off. There is
-        // nowhere to assert `ech`/`lwidth` landed, because nothing records
-        // them.
-        let mut f = Fixture::new();
-        let console = f.console();
-        f.host.point_curusr(&mut f.machine, console).expect("channel 0 is current");
-        assert!(f.host.gsbl().channel(console).echo, "the default");
-
-        let ret = f.invoke(echsec, &[u16::from(b'*'), 40]).expect("echsec");
-        assert_eq!(ret, Ret::Void);
-        assert!(!f.host.gsbl().channel(console).echo);
-    }
 
     #[test]
     fn injacr_queues_crstg_for_the_current_channel() {
@@ -477,123 +227,5 @@ mod tests {
         );
         assert!(f.host.notes().len() > notes_before, "the gap is recorded, not silent");
         assert!(f.host.notes().last().unwrap().contains("hdlinp"));
-    }
-
-    #[test]
-    fn instat_finds_a_matching_userid_in_the_matching_state() {
-        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
-        let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
-        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
-
-        f.host
-            .connect_state(&mut f.machine, zero, &crate::users::Connection::ansi("kaimon"))
-            .expect("channel 0 connected");
-        f.host
-            .connect_state(&mut f.machine, one, &crate::users::Connection::ansi("rangerdan"))
-            .expect("channel 1 connected");
-        // `connect_state` writes `state` as zero for both -- see its own doc
-        // comment -- so both channels start in the same state and the
-        // userid is what distinguishes the search.
-        assert_eq!(f.host.users().state_mem(Wg16::mem(&mut f.machine), zero).unwrap(), 0);
-
-        f.host.point_curusr(&mut f.machine, zero).expect("current");
-        let uid = f.text("rangerdan");
-        let ret = f.invoke(instat, &[uid.offset, uid.selector, 0]).expect("instat");
-        assert_eq!(ret, Ret::U16(1), "rangerdan is on channel 1, in state 0");
-
-        let missing = f.text("nobody");
-        let ret = f
-            .invoke(instat, &[missing.offset, missing.selector, 0])
-            .expect("instat");
-        assert_eq!(ret, Ret::U16(0), "no channel has this userid");
-    }
-
-    #[test]
-    fn instat_refuses_a_userid_found_only_in_the_wrong_state() {
-        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
-        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
-        f.host
-            .connect_state(&mut f.machine, one, &crate::users::Connection::ansi("rangerdan"))
-            .expect("channel 1 connected");
-        f.host
-            .users
-            .set_state_mem(Wg16::mem(&mut f.machine), one, 5)
-            .expect("state set");
-
-        f.host.point_curusr(&mut f.machine, one).expect("current");
-        let uid = f.text("rangerdan");
-
-        let ret = f
-            .invoke(instat, &[uid.offset, uid.selector, 0])
-            .expect("instat against the wrong state");
-        assert_eq!(ret, Ret::U16(0), "rangerdan is in state 5, not 0");
-
-        let ret = f
-            .invoke(instat, &[uid.offset, uid.selector, 5])
-            .expect("instat against the right state");
-        assert_eq!(ret, Ret::U16(1));
-    }
-
-    #[test]
-    fn instat_skips_an_invisible_match_but_keeps_looking() {
-        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(3));
-        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
-        let two = f.host.gsbl().terms().chan(2).expect("channel 2");
-        f.host
-            .connect_state(&mut f.machine, one, &crate::users::Connection::ansi("rangerdan"))
-            .expect("channel 1 connected");
-        f.host
-            .connect_state(&mut f.machine, two, &crate::users::Connection::ansi("rangerdan"))
-            .expect("channel 2 connected, same userid, still visible");
-
-        // `INVISB` is `0x00004000` (`MAJORBBS.H:214`): bit 6 of `FLAGS + 1`,
-        // by the same per-byte addressing `users.rs`'s own master-flag test
-        // measures for `MASTER` at `FLAGS + 0`. Channel 1 alone is marked
-        // invisible.
-        let slot = f.host.users().slot(one);
-        let flags1 = mbbs_machine::m16::FarPtr {
-            offset: slot.offset + f.host.users().user_layout().flags.at + 1,
-            selector: slot.selector,
-        };
-        let was = f.machine.resolve(flags1, 1).expect("in bounds")[0];
-        f.machine.write(flags1, &[was | 0x40]).expect("in bounds");
-
-        f.host.point_curusr(&mut f.machine, one).expect("current");
-        let uid = f.text("rangerdan");
-        let ret = f.invoke(instat, &[uid.offset, uid.selector, 0]).expect("instat");
-        assert_eq!(
-            ret,
-            Ret::U16(1),
-            "channel 1's match is invisible, but channel 2's is not"
-        );
-    }
-
-    #[test]
-    fn btuxmn_transmits_raw_and_ignores_the_wrap_width() {
-        let mut f = Fixture::new();
-        let console = f.console();
-        // A width narrow enough that btuxmt would have wrapped this text --
-        // see `crate::shims::gsbl`'s own
-        // `btuxmt_transmits_and_btutsw_is_what_wraps_it` test for the
-        // routine this is deliberately unlike.
-        f.host.gsbl_mut().channel_mut(console).width = 10;
-        let text = f.text("the quick brown fox");
-        f.invoke(btuxmn, &[0, text.offset, text.selector]).expect("transmitted");
-        assert_eq!(
-            f.host.gsbl_mut().drain_output(console),
-            b"the quick brown fox".to_vec(),
-            "sent exactly as given, no wrap applied despite the width set above"
-        );
-    }
-
-    #[test]
-    fn btuxmn_refuses_a_channel_out_of_range() {
-        let mut f = Fixture::new();
-        let past = f.host.gsbl().terms().count();
-        let text = f.text("paged");
-        let ret = f
-            .invoke(btuxmn, &[past, text.offset, text.selector])
-            .expect("refused, not an error");
-        assert_eq!(ret, Ret::U16(OUT_OF_RANGE));
     }
 }

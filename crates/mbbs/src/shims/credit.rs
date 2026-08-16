@@ -1,16 +1,21 @@
-//! Credits, module exit, a message-keyed key check, and three C-runtime
-//! leaves: `_DEDCRD`, `_TSTCRD`, `_CONDEX`, `_HASMKEY`, `_SSCANF`, `_MEMSET`,
-//! `_INTDOS`.
+//! Credits, module exit, and three C-runtime leaves: `_DEDCRD`, `_TSTCRD`,
+//! `_CONDEX`, `_SSCANF`, `_MEMSET`, `_INTDOS`.
 //!
-//! None of these seven are called by `WCCMMUD.DLL` -- `re/exports/WCCMMUD_named.c`
+//! (`_HASMKEY` was a sixth leaf here once -- a message-keyed key check --
+//! removed 2026-08-15 as a dead duplicate of [`crate::shims::user::hasmkey`],
+//! the registered twin: the same `LOCKNKEY.C:238-243` logic, reached through
+//! [`crate::shims::user`]'s own private `gen_haskey` helper instead of
+//! reimplemented inline. See `docs/2026-08-15-dead-twin-shims.md`.)
+//!
+//! None of these six are called by `WCCMMUD.DLL` -- `re/exports/WCCMMUD_named.c`
 //! and `WCCMMUD_decompiled.c` have zero occurrences of any of them, checked
 //! against every case-folding Ghidra might have used for an unresolved import.
 //! The oracle for this file is Tele-Arena instead:
 //! `/home/daniel/bbs/re/tasrc/tsgarn-2.c:385-386,440` calls `tstcrd`, `dedcrd`
 //! and `condex` as a real shipping module, and is cited as a module call site
-//! throughout, never as host source. `hasmkey`, `sscanf`, `memset` and
-//! `intdos` have no call site anywhere in `re/tasrc` either; those four are
-//! implemented from the vendor's own definition, and say so at each one.
+//! throughout, never as host source. `sscanf`, `memset` and `intdos` have no
+//! call site anywhere in `re/tasrc` either; those three are implemented from
+//! the vendor's own definition, and say so at each one.
 //!
 //! Vendor citations are the **wg1** archive tree
 //! (`archive/galacticomm/extract/wg1/GALDSRC/SRC`), never wg20 -- the same
@@ -195,69 +200,6 @@ pub fn condex<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
         ));
     }
     Ok(abi::Ret::Void)
-}
-
-/// `BBSPRV`, `MAJORBBS.H:163` -- online, private class (internal). Restated
-/// from `shims::user`'s own private copy of the same constant: `low_haskey`'s
-/// `keys == NULL` branch (quoted on [`hasmkey`]) is answered by it there and
-/// here both, and neither file's copy is `pub`.
-const BBSPRV: u16 = 2;
-
-/// `int hasmkey(int mnum)` -- does the current user have the key named by
-/// message `mnum`? `LOCKNKEY.C:238-243`:
-///
-///
-/// [`crate::shims::user::haskey`] in every respect except where the lock
-/// string comes from: a literal `char *` argument there, a message-file
-/// lookup here. `gen_haskey`/`low_haskey`'s own logic -- the `&`/`|`
-/// expression grammar, the `flags&MASTER` short-circuit, `keys == NULL`
-/// answering `class == BBSPRV` -- is [`crate::KeySet::evaluate`], the same
-/// engine `haskey` already reduced it to; nothing about that logic changes
-/// because the string arrived a different way, so this does not re-derive it.
-///
-/// `rawmsg(mnum)` is [`crate::shims::msg::message_mem`]: the text of message
-/// `mnum` in whatever `.MSG` block `setmbk` last made current. Read **before**
-/// `usrnum` is even consulted, matching the vendor's own evaluation order
-/// (`gen_haskey`'s arguments are evaluated left to right, and `rawmsg(mnum)`
-/// is the first one) -- a board that stores its lock names as message text
-/// (`LEVEL0 {SAMPLE}`-style option lines, `tests/data/SAMPLE.MSG:1`) needs the
-/// message file open regardless of who is asking.
-///
-/// No real call site: neither `WCCMMUD.DLL` nor Tele-Arena imports this
-/// ordinal (this file's own module doc comment). Implemented from the vendor
-/// definition alone, which is why every step above is cited to `LOCKNKEY.C`
-/// rather than to a measured module call.
-///
-/// # Errors
-///
-/// If `mnum` names no message of the current block, or no block is current at
-/// all -- [`crate::shims::msg::message_mem`]'s own errors, unchanged. Whether
-/// a channel is current is **not** an error condition here, matching
-/// `haskey`'s own `usrnum == -1` handling: there is no keyring to consult and
-/// the answer is 0.
-pub fn hasmkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let mnum = Into::<u32>::into(call.int()) as u16;
-    let at = crate::shims::msg::message_mem(call.mem(), host, mnum)?;
-    let lock = at
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    let lock = String::from_utf8_lossy(&lock);
-
-    let unum = host
-        .globals()
-        .word_mem(call.mem(), "usrnum")
-        .map_err(|e| ShimError::Failed(format!("hasmkey: usrnum: {e}")))? as i16;
-
-    let answer = match host.users().terms().chan(unum) {
-        None => false,
-        Some(chan) => match host.users().keys(chan) {
-            Some(keys) => keys.evaluate(&lock),
-            None => host.class_mem(call.mem(), chan)? == BBSPRV,
-        },
-    };
-    host.asked_for_key(unum, &lock, answer);
-    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
 }
 
 /// Advance `pos` past every ASCII whitespace byte in `input` at or after it.
@@ -696,49 +638,6 @@ mod tests {
     fn condex_refuses_when_no_channel_is_current() {
         let mut f = Fixture::new();
         assert!(f.invoke(condex, &[]).is_err());
-    }
-
-    fn open_sample(f: &mut Fixture) {
-        let name = f.text("SAMPLE.MSG");
-        f.invoke(crate::shims::msg::opnmsg, &Fixture::far(name))
-            .expect("SAMPLE.MSG opens");
-    }
-
-    #[test]
-    fn hasmkey_answers_for_the_key_message_1_names() {
-        // `tests/data/SAMPLE.MSG`'s `ACTIVATE` option is message 1 and its
-        // value is `DEMO` -- `shims::msg`'s own
-        // `stgopt_returns_the_whole_message` test reads the same message the
-        // same way.
-        let mut f = Fixture::new();
-        connect(&mut f, &["DEMO"]);
-        open_sample(&mut f);
-
-        assert_eq!(f.invoke(hasmkey, &[1]).expect("answered"), Ret::U16(1));
-    }
-
-    #[test]
-    fn hasmkey_refuses_a_key_the_current_user_does_not_hold() {
-        let mut f = Fixture::new();
-        connect(&mut f, &["SOMETHING_ELSE"]);
-        open_sample(&mut f);
-
-        assert_eq!(f.invoke(hasmkey, &[1]).expect("answered"), Ret::U16(0));
-    }
-
-    #[test]
-    fn hasmkey_refuses_with_no_message_block_open() {
-        let mut f = Fixture::new();
-        connect(&mut f, &["DEMO"]);
-        assert!(f.invoke(hasmkey, &[1]).is_err());
-    }
-
-    #[test]
-    fn hasmkey_answers_zero_when_no_channel_is_current() {
-        let mut f = Fixture::new();
-        open_sample(&mut f);
-        // `usrnum` left at -1: matches `haskey_refuses_when_no_channel_is_current`.
-        assert_eq!(f.invoke(hasmkey, &[1]).expect("answered"), Ret::U16(0));
     }
 
     #[test]

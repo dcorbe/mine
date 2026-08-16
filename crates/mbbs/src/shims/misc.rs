@@ -1,20 +1,14 @@
-//! Nine routines with nothing in common except that nothing had implemented
+//! Six routines with nothing in common except that nothing had implemented
 //! them yet: a default status handler, a high-resolution clock read, an
-//! ASCII file pager, an immediate hang-up, a by-name `.MSG` lookup, the 6.X
-//! messaging compatibility shim, two binary/C string converters, and a
-//! profanity check.
+//! ASCII file pager, an immediate hang-up, and a by-name `.MSG` lookup.
 //!
 //! # Two shapes of gap
 //!
 //! Three of these ([`dfsthn`], [`hrtval`], [`msgscan`]) are implementable,
 //! in whole or in the overwhelming common case, and are implemented below.
-//! Two ([`b2ccpy`], [`c2bcpy`]) are implemented from call-site evidence
-//! rather than surviving source, with the uncertainty that entails written
-//! down rather than hidden.
 //!
-//! Four ([`byenow`], [`listing`], [`oldsend`], [`profan`]) refuse outright,
-//! and each refuses for a different, specific reason rather than a shared
-//! excuse:
+//! Three ([`byenow`], [`listing`], [`oldsend`]) refuse outright, and each
+//! refuses for a different, specific reason rather than a shared excuse:
 //!
 //! - [`byenow`] and [`listing`] both need to call *back into a module
 //!   routine* -- `module00.huprou` and `whndun` respectively -- and no shim
@@ -27,12 +21,36 @@
 //!   does not implement at all -- the File Transfer Framework and the
 //!   Galacticomm Messaging Engine, respectively -- so even setting the
 //!   callback problem aside, there is no engine here to drive.
-//! - [`profan`] depends on a compiled-in word list that shipped inside the
-//!   real host's binary and was never part of any recovered source kit.
-//!   There is no way to answer the question at all, honestly.
 //!
 //! Every refusal below explains its own gap in full; this is the index, not
 //! the excuse.
+//!
+//! # `c2bcpy`, `b2ccpy`, `profan` and `listing` used to be here too
+//!
+//! Removed 2026-08-15 (`docs/2026-08-15-dead-twin-shims.md`), as dead
+//! duplicates of routines actually registered in `shims::mudtext`
+//! (`c2bcpy`/`b2ccpy`/`profan`) and `shims::mudmisc` (`listing`).
+//!
+//! `c2bcpy`/`b2ccpy` here had no vendor `.C` at hand and were read off call
+//! sites; `shims::mudtext`'s twins turned out to have real vendor bodies
+//! after all (`re/wg33src/SRC/api/gcommlib/C2BCPY.C` and `B2CCPY.C`, both
+//! extracted since this file's own comment was written) and match them
+//! byte for byte. `profan` here refused outright, arguing (correctly, as
+//! far as it went) that no compiled-in word list survives -- but
+//! `shims::mudtext::profan` has one anyway, reconstructed from
+//! `re/wg33src/SRC/api/gcommlib/PROFAN.C`'s own embedded table, which this
+//! file's doc comment simply predates.
+//!
+//! `listing` was the one true duplicate found only by re-reading this file
+//! against the registration table by hand, not by the twin-finding script
+//! `docs/2026-08-15-dead-twin-shims.md` documents: that script's `path not
+//! in modrs` check is a bare substring test, and `"misc::listing"` is
+//! literally a substring of `"mudmisc::listing"` (`mud` + `misc::listing`),
+//! so it never flagged this pair. This file's `listing` refused
+//! unconditionally, doing none of the file-read work
+//! `shims::mudmisc::listing` (the registered twin) actually does before its
+//! own, narrower refusal (calling `whndun`) -- strictly less complete, no
+//! vendor disagreement to settle.
 
 use mbbs_machine::ptr::ModulePtr;
 
@@ -313,193 +331,6 @@ fn scan_named(file: &str, bytes: &[u8], want: &[u8]) -> Result<Option<Vec<u8>>, 
     Ok(None)
 }
 
-/// `void c2bcpy(char *dest,char *src,unsigned length)` -- `GCOMM.H:332` --
-/// copy a C string into a fixed-width binary field, `length` bytes wide,
-/// NUL-padding whatever the string does not fill.
-///
-/// No `.C` survives for this or [`b2ccpy`]; both are read off their call
-/// sites, of which around eighty survive across `BBSMAINM.C`, `CSEFU.C`,
-/// `CSMJRTLC.C`, `GALP&QA.C`, `CSEML.C` and `GCSASYS.C` -- every one a
-/// client/server structure field (`csmodpg->appid`, `dmsg->fornam`,
-/// `sysinfvb->sysname`, ...) being filled from an ordinary C string for
-/// transmission to the Worldgroup graphical client.
-///
-/// **`length` is the *destination* field's width**, read off the "reserve a
-/// byte" pattern several call sites share: `c2bcpy(finf->userid,
-/// usaptr->userid, UIDSIZ-1)` (`CSMJRTLC.C:559`) passes one less than the
-/// field's own declared size (`UIDSIZ`), which only has a purpose if
-/// `length` bytes are written in full and the caller wants one guaranteed
-/// left over. That purpose is a terminator: if `length` were filled with a
-/// source string exactly that long, a dest read back as a C string later
-/// would have no NUL inside its own field at all unless the routine's pad
-/// byte is NUL and one byte of headroom is reserved for it. Not every call
-/// site subtracts one (`c2bcpy(sysinfvb->sysname,fldr_sysname(),TTLSIZ)`,
-/// `GCSASYS.C:1063`, does not) -- consistent with `length` being the
-/// caller's own choice of exactly how many bytes to fill, not a capacity
-/// this routine infers, the same freedom [`super::text::strncpy`]'s own `n`
-/// already has for the identical reason (see that routine's own doc
-/// comment). This shim is that routine's behaviour under a different name:
-/// `length` bytes written every time, the string truncated if it is longer,
-/// NUL-padded if it is shorter.
-pub fn c2bcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let dest = call.ptr();
-    let src = call.ptr();
-    let length = Into::<u32>::into(call.int()) as usize;
-
-    let text = src
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let take = text.len().min(length);
-    let mut out = vec![0u8; length];
-    out[..take].copy_from_slice(&text[..take]);
-
-    dest.write(call.mem(), &out)
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(abi::Ret::Void)
-}
-
-/// `void b2ccpy(char *dest,char *src,unsigned length)` -- `GCOMM.H:331` --
-/// [`c2bcpy`]'s inverse: read a fixed-width binary field and hand back an
-/// ordinary NUL-terminated C string.
-///
-/// **`length` is the *source* field's width, not the destination's
-/// capacity** -- the opposite convention from `c2bcpy`, and settled by the
-/// one call site whose `length` is not a manifest constant:
-/// `regwrite(struct saunam *dpknam, unsigned length /* length of dynapak
-/// value */, void *value)` calls `b2ccpy(prostg,(char *)value,length+1)`
-/// (`CSREGIS.C:210-238`) -- `length` there is documented, by the parameter's
-/// own comment, as the length of `value` (`src`), and `prostg`'s own
-/// declared size (`PROSIZ+SUMSIZ+1`, `CSREGIS.C:226`) is unrelated to it.
-/// `length+1` gives the scan one byte of headroom past the payload's own
-/// stated length to find a terminator the sender may have included; every
-/// other call site passes a plain manifest field-size constant
-/// (`b2ccpy(uid,finf->userid,UIDSIZ)`, `CSMJRTLC.C:532`) consistent with the
-/// same reading, since a field's declared size and its own content width
-/// coincide there too.
-///
-/// So this reads exactly `length` bytes from `src` -- bounded, since a
-/// binary field packed for wire transmission is not guaranteed to carry a
-/// terminator of its own within that span -- stops at the first embedded
-/// NUL if there is one, and writes that much of a proper C string (plus its
-/// own terminator) to `dest`. How much room `dest` has is the caller's
-/// affair, the same convention [`super::text::strcpy`]/[`super::text::strcat`]
-/// already use.
-pub fn b2ccpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let dest = call.ptr();
-    let src = call.ptr();
-    let length = Into::<u32>::into(call.int()) as usize;
-
-    let text = {
-        let field = src
-            .resolve(call.mem(), length)
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-        field[..end].to_vec()
-    };
-
-    write_cstr_mem::<A>(call.mem(), dest, &text, text.len() as u16 + 1)?;
-    Ok(abi::Ret::Void)
-}
-
-/// `int profan(char *string)` -- `GCOMM.H:460` -- how profane is this text?
-///
-/// Real call sites: `setpfn` (`MAJORBBS.C:3330-3336`, gates every line of
-/// chat input against `pfceil`) and `profane` (`GALFILU.C:2923-2937`, the
-/// file area's own softer gate against `pfnceil`). Both treat a non-zero
-/// answer as a severity to clamp, not a yes/no -- `profane` clamps to
-/// `pfnceil` (`0..=3`, `GALFIL.C:354`'s `numopt(PFNCEIL,0,3)`), so the
-/// contract is a graded score, not a boolean.
-///
-/// # What is missing, and why this refuses rather than guessing
-///
-/// No `.C` implementing `profan` itself survives anywhere in the recovered
-/// archive -- only its two callers. What it would score text against is
-/// Galacticomm's own compiled-in profanity word list, which shipped inside
-/// the binary and is not part of any recovered source kit. There is no way
-/// to reconstruct the list, so there is no way to answer this question
-/// honestly for any input at all.
-///
-/// MBBSEmu answers `0` unconditionally
-/// (`MBBSEmu/HostProcess/ExportedModules/Majorbbs.cs`'s `profan`: "MBBSEmu
-/// doesn't support multiple profanity levels, so the default value of 0 is
-/// returned", confirmed by its own `profan_Tests.cs`, which asserts exactly
-/// `AX == 0`). That is precisely the fabricated success this crate's design
-/// refuses to produce: `0` means "clean," every caller treats a clean
-/// answer as permission to proceed un-gated, and a host that always says
-/// "clean" has silently disabled every profanity filter downstream of it
-/// without saying so anywhere a caller could notice -- `setpfn`'s
-/// `usrptr->pfnacc` accumulator never grows, `profane`'s `PFNCEIL` clamp
-/// never has anything to clamp, and a sysop who configured either gets a
-/// board that silently ignores it. This shim refuses loudly instead, per
-/// this whole task's brief.
-pub fn profan<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let stg = call.ptr();
-    let text = String::from_utf8_lossy(
-        stg.read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?,
-    )
-    .into_owned();
-    let sample: String = text.chars().take(80).collect();
-
-    Err(ShimError::Failed(format!(
-        "profan({sample:?}): this host has no copy of Galacticomm's \
-         compiled-in profanity word list -- no source for the routine \
-         itself survives, only its two callers -- so there is no honest \
-         severity to answer with. Answering 0 (as MBBSEmu does) would \
-         silently disable every profanity gate downstream (setpfn's \
-         pfnacc accumulator, profane's PFNCEIL clamp) without telling \
-         anyone; this shim refuses instead."
-    )))
-}
-
-/// `void listing(char *path, void (*whndun)())` -- `FILEXFER.H:78-82` --
-/// page an ASCII file to the user's screen, then call `whndun(1)` once it
-/// has all been shown or `whndun(0)` if the user aborted partway through.
-///
-/// (`FILEXFER.C:936-951`). This is not a synchronous "dump the file"
-/// routine under an odd name: `ftgnew`/`ftgsbm` hand the whole job to the
-/// **File Transfer Framework**, the same subsystem that drives every
-/// download/upload protocol. `tshlst` (`FILEXFER.C:908-932`) is a tagspec
-/// handler the FTF calls back across as many polling passes as it takes to
-/// page the file and read a keystroke between screens, and its `TSHFIN` arm
-/// is what finally runs `lstptr->whndun((int)ftfscb->actfil)` -- on
-/// whichever pass the transfer actually finishes, not this call's own.
-///
-/// # What this host does not have, twice over
-///
-/// This host implements no File Transfer Framework at all: `ftgnew`,
-/// `ftgsbm`, `struct ftfpsp`, `ftfscb` and the tagspec-handler protocol they
-/// imply have no counterpart anywhere in this crate (checked; zero hits).
-/// Building one is a subsystem, not a shim.
-///
-/// And even a deliberately simplified stand-in -- dump the whole file into
-/// `prfbuf` in one pass and skip the paging -- could not finish the
-/// contract regardless, because the last step is calling `whndun`, a
-/// **module** routine, and no shim can call into module code: see this
-/// module's own doc comment for the general shape of that gap (`A::Module`,
-/// which only `crates/mbbs-server/src/host.rs`'s driver thread holds).
-///
-/// So this refuses outright rather than shipping a partial listing whose
-/// completion callback never runs: a caller told nothing ran to completion
-/// by a routine whose entire second half is telling it exactly that would
-/// be left waiting on a callback that is never coming.
-pub fn listing<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let path = call.ptr();
-    let whndun = call.ptr();
-    let name = String::from_utf8_lossy(
-        path.read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?,
-    )
-    .into_owned();
-
-    Err(ShimError::Failed(format!(
-        "listing({name:?}, {whndun}): this host has no File Transfer \
-         Framework (ftgnew/ftgsbm/the tagspec-handler protocol) for a \
-         listing to run on, and no way to call whndun back even if it did \
-         -- see this function's own doc comment"
-    )))
-}
-
 /// `void byenow(int msgnum, long p1, long p2, long p3)` -- log this channel
 /// off, now, with an optional `.MSG`-file message.
 ///
@@ -541,7 +372,7 @@ pub fn listing<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A
 ///    disconnect eventually gets triggered, actually running `huprou` --
 ///    [`Host::hangup`]'s own job -- takes `&A::Module`. No shim has one;
 ///    see this module's own doc comment for the general account, which is
-///    the identical gap [`dfsthn`] and [`listing`] hit.
+///    the identical gap [`dfsthn`] and `shims::mudmisc::listing` hit.
 ///
 /// `byenow` promises the calling module nothing at call time -- it is
 /// `void`, and MajorBBS's own callers of the pattern (`byenow(SEEYA)` and
@@ -765,112 +596,6 @@ mod tests {
 
         let e = msgscan_(&mut f, "galme.msg", "ANYTHING").expect_err("a refusal");
         assert!(e.to_string().contains("byte 0"), "{e}");
-    }
-
-    // ---- c2bcpy -----------------------------------------------------------
-
-    /// A buffer pre-filled with a non-zero sentinel, so a test can tell
-    /// "the shim wrote a real NUL here" from "this byte was already zero".
-    fn sentinel_buffer(f: &mut Fixture, len: u16) -> FarPtr {
-        let at = f.buffer(len);
-        f.machine.write(at, &vec![0xFFu8; len as usize]).expect("sentinel");
-        at
-    }
-
-    fn c2bcpy_(f: &mut Fixture, dest: FarPtr, src: &str, length: u16) -> Result<Ret, ShimError> {
-        let src_p = f.text(src);
-        f.invoke(
-            c2bcpy,
-            &[dest.offset, dest.selector, src_p.offset, src_p.selector, length],
-        )
-    }
-
-    #[test]
-    fn c2bcpy_pads_a_short_string_with_nuls_to_fill_the_destination_field() {
-        // No `.C` survives for c2bcpy -- this pins the behaviour read off
-        // call sites (see c2bcpy's own doc comment), not a measured
-        // correctness against vendor source.
-        let mut f = Fixture::new();
-        let dest = sentinel_buffer(&mut f, 5);
-        c2bcpy_(&mut f, dest, "hi", 5).expect("c2bcpy");
-        assert_eq!(f.machine.resolve(dest, 5).expect("in bounds"), b"hi\0\0\0");
-    }
-
-    #[test]
-    fn c2bcpy_truncates_a_longer_string_with_no_guaranteed_terminator() {
-        // Pins behaviour, not measured correctness -- see this file's own
-        // doc comment on c2bcpy/b2ccpy's provenance.
-        let mut f = Fixture::new();
-        let dest = sentinel_buffer(&mut f, 4);
-        c2bcpy_(&mut f, dest, "abcdef", 4).expect("c2bcpy");
-        assert_eq!(
-            f.machine.resolve(dest, 4).expect("in bounds"),
-            b"abcd",
-            "all 4 bytes are the source's own, no room left for a NUL"
-        );
-    }
-
-    // ---- b2ccpy -----------------------------------------------------------
-
-    #[test]
-    fn b2ccpy_stops_at_an_embedded_nul_within_the_fixed_width_field() {
-        // Pins behaviour, not measured correctness -- see this file's own
-        // doc comment on c2bcpy/b2ccpy's provenance.
-        //
-        // `f.read(dest)` alone would NOT catch a mutant that copied the
-        // whole 5-byte field ("ab\0cd") instead of stopping at the embedded
-        // NUL: `read_cstr` stops at the first NUL either way, and "ab" comes
-        // back either way. The sentinel bytes past the true 3-byte answer
-        // ("ab\0") are what actually prove the "cd" was never written.
-        let mut f = Fixture::new();
-        let src = f.bytes(b"ab\0cd", false);
-        let dest = sentinel_buffer(&mut f, 8);
-        f.invoke(b2ccpy, &[dest.offset, dest.selector, src.offset, src.selector, 5])
-            .expect("b2ccpy");
-        assert_eq!(f.read(dest), "ab");
-        assert_eq!(
-            f.machine.resolve(dest, 8).expect("in bounds"),
-            b"ab\0\xff\xff\xff\xff\xff",
-            "nothing past the embedded NUL's own terminator was written"
-        );
-    }
-
-    #[test]
-    fn b2ccpy_reads_the_full_field_when_there_is_no_embedded_terminator() {
-        // Pins behaviour, not measured correctness -- see this file's own
-        // doc comment on c2bcpy/b2ccpy's provenance.
-        let mut f = Fixture::new();
-        let src = f.bytes(b"abcde", false);
-        let dest = f.buffer(16);
-        f.invoke(b2ccpy, &[dest.offset, dest.selector, src.offset, src.selector, 5])
-            .expect("b2ccpy");
-        assert_eq!(f.read(dest), "abcde");
-    }
-
-    // ---- the loud refusals --------------------------------------------------
-
-    #[test]
-    fn profan_refuses_rather_than_fabricating_a_clean_score() {
-        let mut f = Fixture::new();
-        let text = f.text("damn you");
-        let e = f.invoke(profan, &Fixture::far(text)).expect_err("a refusal");
-        let msg = e.to_string();
-        assert!(msg.contains("profan("), "{msg}");
-        assert!(msg.contains("damn you"), "{msg}");
-    }
-
-    #[test]
-    fn listing_refuses_rather_than_running_a_file_transfer_framework_this_host_lacks() {
-        let mut f = Fixture::new();
-        let path = f.text("SOMEFILE.LST");
-        let ret = f.invoke(
-            listing,
-            &[path.offset, path.selector, 0x1234, 0x0000],
-        );
-        let e = ret.expect_err("a refusal");
-        let msg = e.to_string();
-        assert!(msg.contains("listing("), "{msg}");
-        assert!(msg.contains("SOMEFILE.LST"), "{msg}");
     }
 
     #[test]

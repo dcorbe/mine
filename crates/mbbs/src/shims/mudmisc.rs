@@ -1,23 +1,56 @@
-//! Seven odds and ends: the logoff entry point, an input re-prompt, an
-//! ASCII file lister, and the video-driver cursor primitives `WCCMMUD.DLL`
-//! imports but never gets a body for in any recovered source tree.
+//! One odd one out: an ASCII file lister that cannot honour its own
+//! completion callback.
 //!
 //! ```text
-//! injacr   2    byenow   1    listing  1
-//! locate   1    msgscan  1    curcurx  1    curcury  1
+//! listing  1
 //! ```
 //!
-//! Eight call sites total, measured with `re/ne_arity.py` against each
-//! symbol's ordinal in `crates/mbbs/data/majorbbs_wg101.tsv` (347, 91,
-//! 386, 392, 421, 147, 148 respectively) -- every one of them agrees with
-//! the vendor prototype's own argument count, cited per routine below.
+//! One call site, measured with `re/ne_arity.py` against the symbol's
+//! ordinal in `crates/mbbs/data/majorbbs_wg101.tsv` (421) -- it agrees with
+//! the vendor prototype's own argument count, cited below.
 //!
-//! # `hrtval` used to be here, at the wrong tick rate
+//! # This file used to hold six more routines, all dead duplicates
 //!
-//! This file carried a second `hrtval` -- never registered, so never
-//! reached -- deriving ticks at the PC BIOS rate of 1_193_182/65536 Hz
-//! (≈18.2065). `shims::misc::hrtval` is the registered one and uses 65536
-//! Hz. They disagreed by a factor of about 3600.
+//! `injacr`, `byenow`, `locate`, `curcurx`, `curcury` and `msgscan` were
+//! removed 2026-08-15 (`docs/2026-08-15-dead-twin-shims.md`): each had a
+//! twin registered elsewhere (`shims::echo::injacr`, `shims::misc::byenow`,
+//! `shims::output::{locate,curcurx,curcury}`, `shims::misc::msgscan`) that
+//! `mod.rs` actually dispatches to, and this crate never called any of the
+//! six copies here. Two are worth naming because they were not mere
+//! duplication:
+//!
+//! - **`locate`/`curcurx`/`curcury`, here, treated the routine as
+//!   remote-channel cursor control** -- emitting an ANSI CUP escape to the
+//!   user's own terminal and reading back `Channel::column`. The registered
+//!   `shims::output` twins get this right: `GCOMM.H:427`'s own comment files
+//!   `locate`/`curcurx`/`curcury` (with `prat`) under `/* old MBBST.LIB
+//!   prototype section */` -- the **local sysop console**, not any remote
+//!   channel. MBBSEmu reaches the same conclusion independently (`LOCATE`
+//!   sits in its own ignore list, "moves cursor (local screen, not telnet
+//!   session)"). This host has no local console to move a cursor on, so the
+//!   registered twins are no-ops (`curcury`, additionally, an explicit
+//!   refusal) rather than fabricated remote positioning.
+//! - **`injacr`, here, called `clrinp()` explicitly** before queueing
+//!   `CRSTG`. The registered `shims::echo::injacr` omits that call
+//!   deliberately, and argues why it is redundant rather than missing: an
+//!   unmatched `CRSTG` (queued with no line behind it) is answered by
+//!   [`crate::Host::get_input_mem`] taking `Channel::take_line`'s
+//!   `unwrap_or_default()` branch, which writes an empty `input` -- the same
+//!   observable effect `clrinp()` produces. See that routine's own doc
+//!   comment for the full argument.
+//!
+//! `byenow`, `curcurx` and `msgscan` agreed with their registered twins (or,
+//! for `byenow`, lost to a twin that refuses for a documented architectural
+//! reason -- see `shims::misc::byenow`'s own doc comment) and were deleted
+//! without any behavioural correction needed.
+//!
+//! # `hrtval` used to be here too, at the wrong tick rate
+//!
+//! Removed earlier the same day (`00805d7`), before the twin-shim sweep that
+//! found the other six: a second `hrtval`, never registered, deriving ticks
+//! at the PC BIOS rate of 1_193_182/65536 Hz (≈18.2065). `shims::misc::hrtval`
+//! is the registered one and uses 65536 Hz. They disagreed by a factor of
+//! about 3600.
 //!
 //! `BRKTHU.H:88` settles it outright: `volatile unsigned long btuhrt;`
 //! `/* increments 65536 times a second */`. The deleted version's own doc
@@ -34,463 +67,12 @@
 //! cooperatively scheduled host wants. At 18.2 Hz it is six minutes, by
 //! which time the board is dead. The exact-looking match was arithmetic
 //! coincidence, not evidence.
-//!
-//! # Three different kinds of "cannot reproduce", named rather than blurred
-//!
-//! This file has all three shapes the project's method calls for, and they
-//! are not interchangeable:
-//!
-//! 1. **Faithful.** [`injacr`], [`byenow`] and [`locate`] have
-//!    real vendor bodies (`byenow`'s cited from `MAJORBBS.C`, the other
-//!    three either bodied there too or reproducible from state this host
-//!    already keeps) and are implemented against them, with the specific
-//!    omissions named in each routine's own doc comment.
-//! 2. **Provably-always-one-answer**, the `onsysn`/`dfsthn` model from
-//!    `shims::user`. [`curcurx`] answers real, sourced state
-//!    ([`crate::gsbl::Channel::column`]). [`msgscan`] answers `NULL`
-//!    always -- not a guess, but the one answer the header itself declares
-//!    safe for "not found", and the only one this host's `.MSG` reader
-//!    (which structurally discards option names, `crate::msg::MsgFile`'s
-//!    own doc comment) can ever produce.
-//! 3. **Hard refusal.** [`curcury`] has no backing state anywhere in this
-//!    host to answer from -- not even a divergent approximation -- and a
-//!    fixed constant would be exactly the fabrication the method forbids.
-//!    [`listing`] partially refuses: the file-list half is real, but the
-//!    `whndun` callback cannot be invoked at all, for a reason stronger
-//!    than "not implemented yet" -- see that routine's own doc comment.
-//!
-//! # `byenow`, and what actually tears a channel down here
-//!
-//! `byenow`'s own doc comment covers the routine itself; this is the answer
-//! to the question the task brief asks directly. **The host already
-//! implements the chain `lib.rs:170-234`'s `Vector` doc comment traces**:
-//! `Host::logoff` runs the module's `lofrou` and then unconditionally
-//! resets the channel (`Host::disconnect`, `lib.rs:3486`) -- that reset does
-//! not check any per-channel "going away" flag, so it is not waiting on
-//! anything `byenow` could set. The real `byenow`'s `setbbye()` half
-//! (`user[usrnum].flags|=BYEBYE; extoff(usrnum)->byecnt=2;`) exists to make
-//! a *later*, host-internal per-second sweep (`imdrop`, not in this file's
-//! symbol set and not modelled anywhere in this crate) eventually call
-//! `huprou` once the goodbye message has drained. This host's
-//! `Host::disconnect` does not poll for that flag -- it is driven
-//! externally, by the driver calling `Host::logoff`/`Host::hangup` once the
-//! module's own vector returns or carrier is lost -- so nothing in this
-//! host's disconnect path is waiting on `BYEBYE`/`byecnt` and nothing is
-//! lost by not modelling them. `byenow` here does the part that is
-//! observable to the player (the goodbye message, the channel going deaf
-//! and mute) and leaves the actual teardown to the mechanism that already
-//! exists and already runs. See [`byenow`]'s own doc comment for the
-//! itemised C-to-Rust mapping.
 
 use mbbs_machine::ptr::ModulePtr;
 
 use super::ShimError;
 use crate::Host;
 use crate::abi::{self, Abi, Call};
-use crate::gsbl::Gsbl;
-
-/// The null pointer, in this ABI's own representation.
-///
-/// Same helper as `shims::stream::null_ptr`/`shims::text::null_ptr`, which
-/// this mirrors rather than shares -- see either's own doc comment for why
-/// `Abi::ptr_from_bytes` over `Abi::PTR_WIDTH` zero bytes is the
-/// established idiom for "no `Abi::NULL` constant exists".
-fn null_ptr<A: Abi>() -> A::Ptr {
-    A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])
-}
-
-/// `clrinp()`'s own body, `MAJORBBS.C:2569-2576` (wg1):
-///
-///
-/// Inlined here rather than called, because `clrinp` is its own MAJORBBS
-/// ordinal (112, `crates/mbbs/data/majorbbs_wg101.tsv:140`) outside this
-/// task's eight symbols and this file registers nothing for it -- see
-/// [`injacr`]'s own doc comment for why reproducing its effect inline,
-/// rather than inventing a `pub(crate)` export of a routine nobody asked
-/// for, is the narrower change.
-///
-/// `input`, `margv`, `margc` and `inplen` are all real, placed
-/// `MAJORBBS` globals (`crate::globals`'s own table; confirmed live by
-/// `shims::text::parsin_mem`/`rstrin`, which already read three of the
-/// same four), so every line of the C above has a real address to write
-/// through -- nothing here is invented state.
-fn clrinp<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), ShimError> {
-    let input = host
-        .globals()
-        .address("input")
-        .ok_or_else(|| ShimError::Failed("clrinp: input is not placed".into()))?;
-    input
-        .write(mem, &[0])
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.globals()
-        .write_mem(mem, "margv", &A::ptr_to_bytes(input))
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.globals()
-        .write_mem(mem, "margc", &vec![0u8; A::INT_WIDTH])
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    host.globals()
-        .write_mem(mem, "inplen", &vec![0u8; A::INT_WIDTH])
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    Ok(())
-}
-
-/// `void injacr(void)` -- "inject a `<CR>` to current channel (re-prompt
-/// current text)". `MAJORBBS.H:679` (wg1); body `MAJORBBS.C:2559-2567`
-/// (wg1):
-///
-///
-/// # What this host does instead of `hdlinp()`, and why it is the same idea
-///
-/// The real body clears the input line ([`clrinp`], reproduced above) and
-/// then calls `hdlinp()` *synchronously* -- a direct C function call that
-/// re-enters the module's current-state routine immediately, before
-/// `injacr` returns, exactly the way `hdlcri()`'s own default case would
-/// dispatch a genuine CR-terminated line (`MAJORBBS.C:2692-2723`, wg1).
-///
-/// This host's shims never call back into module dispatch synchronously --
-/// see [`listing`]'s own doc comment for exactly why that is not merely
-/// unusual here but, for an ordinary `Shim<A>`, structurally impossible.
-/// What this host has instead, already established for the identical
-/// purpose (`begin_polling`/`POLSTS`, `crate::gsbl::Gsbl::CYCLE`'s own doc
-/// comment), is: queue a status and let the driver's own dispatch loop
-/// deliver the re-entry on its next pass. `crate::gsbl::Gsbl::CRSTG` is not
-/// a substitute chosen for convenience -- it is the *real* status a
-/// CR-terminated line arriving raises, and `status=CRSTG` is the exact
-/// line the C body itself sets, so injecting it is the asynchronous form of
-/// the same synchronous act: `Host::poll`'s own dispatch already sends
-/// `CRSTG` to `sttrou` (`lib.rs:2633`, `PollTarget::Entry(1)`), the same
-/// entry point `hdlcri`'s default case reaches. The one real difference is
-/// timing -- the module sees its own re-prompt on the *next* dispatch pass
-/// rather than before `injacr` itself returns -- which is a return-value
-/// change no caller of a `void` routine can observe.
-///
-/// # `INJOIP` is not reproduced
-///
-/// `usrptr->flags` is a real, addressable field
-/// (`crate::users::user::FLAGS`), but nothing in this host ever reads
-/// `INJOIP` back -- there is no `condex`-equivalent here gating on it, and
-/// this crate does not carry `INJOIP`'s own bit position forward from any
-/// recovered header. Setting an unconfirmed bit in a word this host
-/// otherwise treats as meaningful (other bits of the same `flags` word are
-/// load-bearing elsewhere) for no consumer to ever read is exactly the
-/// "recorded but not measured" shape this project's method warns against
-/// when there is no reader to justify the write -- unlike
-/// `shims::screen::rstrxf`'s recorded-but-inert page-mode fields, which
-/// *are* backed by real `Channel` state this crate already owns and tests
-/// against. So this is omitted rather than guessed at.
-///
-/// # Errors
-///
-/// If no channel is current (`Host::current_channel_mem`'s contract), or if
-/// [`clrinp`] cannot reach the globals it writes.
-///
-/// Generic: reads no argument of its own.
-pub fn injacr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = host.current_channel_mem(call.mem())?;
-    clrinp(call.mem(), host)?;
-    host.gsbl_mut().inject(chan, Gsbl::CRSTG);
-    Ok(abi::Ret::Void)
-}
-
-/// `param to byenow() for "no message"` -- `MAJORBBS.H:227` (wg1),
-/// `#define NOMSG 0`.
-const NOMSG: i32 = 0;
-
-/// `param to byenow() for "prf()'d already"` -- `MAJORBBS.H:228` (wg1),
-/// `#define PAMSG -1`.
-const PAMSG: i32 = -1;
-
-/// `void byenow(int msgnum, ...)` -- "log-off a user w/ message utility".
-/// `MAJORBBS.H:712` (wg1, declared old-style: `void byenow();`); body
-/// `MAJORBBS.C:4716-4760` (wg1):
-///
-///
-/// See this file's own module doc comment ("`byenow`, and what actually
-/// tears a channel down here") for the disconnect-chain question the task
-/// brief asks about; this comment is the line-by-line mapping.
-///
-/// # The `ISGCSU` branch: omitted, and provably so -- the `onsysn` model
-///
-/// `ISGCSU` (`MAJORBBS.H:223`, wg1: `0x00800000L`, "user is a C/S client")
-/// marks a Worldgroup native-client session, reached over `senddpk`'s own
-/// binary packet protocol. This host serves Telnet only -- there is no
-/// GCSU wire format anywhere in this crate to send `senddpk` through, and
-/// nothing here ever sets the bit. Exactly `shims::user::onsysn`'s own
-/// situation: not merely unimplemented, but unreachable *for this host* by
-/// construction, so only the `else` branch below is implemented.
-///
-/// # The `else` branch, mapped
-///
-/// * `btulok(usrnum,1)` -> `Channel::locked = true` (the same field
-///   `crate::shims::gsbl::btulok` itself sets).
-/// * `btubsz(usrnum,INPSIZ,OUTSIZ)` -- **omitted**. `Channel`'s input and
-///   output are unbounded `VecDeque`s (`crate::gsbl`'s own doc comment);
-///   there is no fixed-size buffer anywhere in this host for a byte count
-///   to configure, and `btubsz` itself is not implemented by this crate at
-///   all (not one of `shims::gsbl`'s fourteen).
-/// * `btucli(usrnum)` -> clears `input`/`line`/`ready`, the same three
-///   fields `crate::shims::gsbl::btucli` clears.
-/// * `btuclo(usrnum)` -> clears `output` and resets `column` to 0, the same
-///   two fields `crate::shims::gsbl::btuclo` clears.
-/// * `btuoes(usrnum,1)` -> `Channel::oes = true`, the same field
-///   `crate::shims::gsbl::btuoes` sets.
-/// * The `bdelay` pause-message branch (`BYEDLY`, under `mjrmb`) --
-///   **omitted**. `mjrmb` is the *host's own* message catalog, loaded at
-///   `MAJORBBS.C:630-637` in the real host; this crate has no message
-///   catalog to load it from at all (the identical gap
-///   `shims::screen::rstrxf`'s own doc comment already names for
-///   `scnpaus`), so there is no `BYEDLY` text to print even if `bdelay`
-///   could be asked.
-/// * `outprf(usrnum); clrprf();` -> reproduced: flush `prfbuf` to the
-///   channel via [`crate::gsbl::Gsbl::transmit`], then
-///   [`crate::shims::text::clrprf_mem`] -- the same two steps
-///   `crate::shims::fsd`'s own (private) `outprf` helper performs, inlined
-///   here because that helper is not `pub(crate)` and this file owns
-///   nothing in `shims::fsd`.
-/// * `if (btuoba(usrnum)==OUTSIZ-1) btuinj(usrnum,OUTMT);` -- **omitted**,
-///   and provably unreachable rather than merely skipped: this is real
-///   hardware's "the output ring buffer is exactly one byte from full"
-///   edge case, and `Channel::output` is an unbounded `VecDeque` that is
-///   never at any fixed capacity, let alone exactly one short of it.
-///
-/// # `prfmsg(msgnum,p1,p2,p3)`, reproduced inline
-///
-/// Rather than a bare guard and a skipped call, the formatting itself is
-/// reproduced: `msgnum`'s message text is looked up under `curmbk`
-/// ([`crate::shims::msg::message_mem`], the same call
-/// [`crate::shims::msg::prfmsg`] itself makes) and formatted against
-/// whatever varargs follow on the *same* argument frame
-/// ([`crate::fmt::format_call`], again the same call `prfmsg` makes), then
-/// appended to `prfbuf` ([`crate::shims::text::append_mem`]). This is not
-/// a call to `prfmsg` -- `prfmsg`'s own shim re-reads `msgnum` off `call`
-/// from the start, and this routine has already consumed that word to
-/// decide whether to format at all -- so the three calls `prfmsg` itself
-/// makes are inlined here instead, in the same order, against the same
-/// cursor position.
-///
-/// # `setbbye()`
-///
-/// Not reproduced -- see this file's own module doc comment.
-///
-/// # `ASSERTM`
-///
-/// A debug-build developer assertion (`msgnum` is never anything but
-/// `NOMSG`, `PAMSG` or positive), not user-visible behaviour. Not
-/// reproduced; `msgnum > 0` is tested directly instead; a violation is
-/// silently outside the routine's real domain rather than fatal.
-///
-/// # Errors
-///
-/// If no channel is current, if `msgnum > 0` names no message under
-/// `curmbk`, or if formatting/appending fails.
-///
-/// Generic: reads exactly one fixed argument (`msgnum`), matching the
-/// prototype's one non-vararg parameter -- the same shape
-/// [`crate::shims::msg::prfmsg`] and `tokopt` already have in
-/// `crates/mbbs/tests/argument_widths.rs`'s `EXAMINED` ledger, with no
-/// `EXPECTED_COUNT_MISMATCHES` entry needed for the same reason theirs
-/// needs none.
-pub fn byenow<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let msgnum = super::sign_extend::<A>(Into::<u32>::into(call.int()));
-    let chan = host.current_channel_mem(call.mem())?;
-
-    if msgnum != NOMSG && msgnum != PAMSG && msgnum > 0 {
-        let at = crate::shims::msg::message_mem(call.mem(), host, msgnum as u16)?;
-        let (text, _) = crate::fmt::format_call(call, at)?;
-        crate::shims::text::append_mem(call.mem(), host, &text)?;
-    }
-
-    // The `else` (non-`ISGCSU`) branch. See this routine's own doc comment,
-    // "The `else` branch, mapped", for each line's C original.
-    {
-        let c = host.gsbl_mut().channel_mut(chan);
-        c.locked = true; // btulok(usrnum,1)
-        c.input.clear(); // btucli(usrnum)
-        c.line.clear();
-        c.ready.clear();
-        c.output.clear(); // btuclo(usrnum)
-        c.column = 0;
-        c.oes = true; // btuoes(usrnum,1)
-    }
-
-    if msgnum != NOMSG {
-        let prfbuf = host
-            .globals()
-            .pointer_mem(call.mem(), "prfbuf")
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        let text = prfbuf
-            .read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?
-            .to_vec();
-        host.gsbl_mut().transmit(chan, &text);
-        crate::shims::text::clrprf_mem(call.mem(), host)?;
-    }
-
-    Ok(abi::Ret::Void)
-}
-
-/// `void locate(int x, int y)` -- "move cursor to x,y position (0=left
-/// margin / 0=top line)". `GCOMM.H:434` (wg1). No body survives in any
-/// recovered source tree -- it is a video-driver primitive, not host
-/// application logic, and `GALDSRC` never included the driver.
-///
-/// # What is reproduced
-///
-/// The observable contract: an ANSI cursor-position (`CUP`) escape,
-/// `\x1b[{y+1};{x+1}f`, one-based and `f`-terminated -- the exact form this
-/// crate's own FSD engine already emits for the identical purpose
-/// (`crate::shims::fsd`, e.g. `format!("\x1b[{row};1f")`), and the form
-/// Galacticomm's own `FSD.C:368` (wg1) builds by hand for the same reason:
-/// `sprintf(fsdscb->hlpgto,"\x1B[%d;%df",curcury()+1,curcurx()+1)`. This
-/// host is Telnet-only, so an ANSI escape is not an approximation of the
-/// real video driver's behaviour -- it is the whole of what a real board's
-/// video driver would do once its output reached an ANSI terminal.
-///
-/// [`crate::gsbl::Channel::column`] is also updated to `x`, **not** left to
-/// [`crate::gsbl::Gsbl::transmit`]'s own CSI-aware accounting (which
-/// correctly leaves it untouched -- the escape bytes are invisible, per
-/// that method's own doc comment on `column`). The escape genuinely moves
-/// where the next visible byte lands, so leaving `column` at its
-/// pre-`locate` value would make [`curcurx`] wrong the instant a module
-/// called this. `column` is `pub(crate)`, and this write is exactly what
-/// its own doc comment describes it as recording -- "how far along the
-/// current output line the terminal's cursor is" -- true before and after
-/// this call either way.
-///
-/// There is no row-tracking field anywhere in `Channel` for the `y` half to
-/// update -- see [`curcury`]'s own doc comment.
-///
-/// # Errors
-///
-/// If no channel is current.
-///
-/// Generic: reads its two fixed `int` arguments in order, matching the
-/// prototype.
-pub fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let x = Into::<u32>::into(call.int()) as u16;
-    let y = Into::<u32>::into(call.int()) as u16;
-    let chan = host.current_channel_mem(call.mem())?;
-
-    let seq = format!("\x1b[{};{}f", y + 1, x + 1);
-    host.gsbl_mut().transmit(chan, seq.as_bytes());
-    host.gsbl_mut().channel_mut(chan).column = x;
-
-    Ok(abi::Ret::Void)
-}
-
-/// `int curcurx(void)` -- "get current cursor x coord". `GCOMM.H:436`
-/// (wg1). No body survives -- see [`locate`]'s own doc comment; same video
-/// driver, same gap in the recovered source.
-///
-/// # What answers it: real, sourced state
-///
-/// [`crate::gsbl::Channel::column`] -- "how far along the current output
-/// line the terminal's cursor is", the same field [`locate`] keeps in step
-/// with every cursor jump and [`crate::gsbl::Gsbl::transmit`] already
-/// advances on every visible byte and resets on every line break. This is
-/// the `onsysn` model, not the `dfsthn` one: not a stub, a real answer
-/// backed by state this crate already owns, tests, and updates for reasons
-/// that have nothing to do with this routine existing.
-///
-/// # Errors
-///
-/// If no channel is current.
-///
-/// Generic: reads no argument of its own.
-pub fn curcurx<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let chan = host.current_channel_mem(call.mem())?;
-    let column = host.gsbl().channel(chan).column;
-    Ok(abi::Ret::Int(A::Int::from(column)))
-}
-
-/// `int curcury(void)` -- "get current cursor y coord". `GCOMM.H:437`
-/// (wg1). No body survives -- see [`locate`]'s own doc comment.
-///
-/// # A hard refusal, and why this one gets a different answer than `curcurx`
-///
-/// `Channel` tracks `column` (an x position) and nothing else about cursor
-/// position -- no row, no line count, no scroll-region state. There is no
-/// field this file could read, not even an imperfect one, and this file
-/// owns no other module it could add one to. A fixed answer (`0`, or any
-/// other constant) would not be "the one answer this host's contract
-/// allows" the way [`msgscan`]'s `NULL` is -- a cursor row genuinely varies
-/// with everything printed before it, so a constant would be exactly the
-/// "plausible fabrication" this project's method forbids, not a documented
-/// limit of what this host models.
-///
-/// Whether `WCCMMUD.DLL`'s one real call site (`re/ne_arity.py 148
-/// re/WCCMMUD.DLL`, `seg 3 0xaa21`, paired with `curcurx` at `0xaa19` eight
-/// bytes earlier -- the shape of `int x=curcurx(); int y=curcury();`) is
-/// reached in ordinary MajorMUD play was not established; unlike
-/// `shims::btrieve`'s `aabbtv`/`qrybtv`, this is not claimed unreachable,
-/// only unanswerable.
-///
-/// # Errors
-///
-/// Always: `ShimError::Failed`, naming exactly this gap.
-///
-/// Generic: reads no argument of its own.
-pub fn curcury<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let _chan = host.current_channel_mem(call.mem())?;
-    Err(ShimError::Failed(
-        "curcury: this host tracks a channel's output column but no row -- there is no state \
-         anywhere in this crate a cursor y-coordinate could be read from, and a fixed answer \
-         would be fabricated rather than measured; see shims::mudmisc::curcury's own doc comment"
-            .into(),
-    ))
-}
-
-/// `char *msgscan(char *msgfil, char *vblnam)` -- "scan for vblnam in
-/// msgfil, no 'T'/'S'"; "return NULL if vblnam not found". `GCOMM.H:358`
-/// (wg1). No body survives in any recovered source tree, and its sibling
-/// `mstscan` (`GCOMM.H:359`, "'S' and 'T' type compatible msgscan") does
-/// not either.
-///
-/// # Always `NULL` -- the `onsysn` model, not a refusal
-///
-/// This is not a hard error like [`curcury`], because `NULL` is not a
-/// fabricated value here -- it is the routine's own documented answer for
-/// "not found", and every well-formed caller already has to handle it. Two
-/// independent facts make it the *only* answer this host can ever give,
-/// not merely a convenient default:
-///
-/// 1. **No grammar to scan by.** The one .MSG grammar this crate has ever
-///    measured, [`crate::msg::MsgFile::parse`], keeps `messages:
-///    Vec<Vec<u8>>` -- text only, addressed purely by *position*
-///    (`crate::msg`'s own module doc comment: "`stgopt(N)` indexes by
-///    position"). Option **names** are consumed and discarded while
-///    parsing; they are never stored anywhere this host could scan back
-///    through. `msgscan`'s whole job is a name-to-value lookup, and the
-///    name half of that pair does not survive parsing.
-/// 2. **No real grammar for a second reader to reproduce faithfully.**
-///    Even setting (1) aside, no vendor body for `msgscan` survives to
-///    measure a scan grammar from -- unlike `crate::msg::MsgFile`'s own
-///    grammar, which `crates/mbbs/tests/msgfile.rs` cross-checks against
-///    ten real `.MSG`/`.MCV` pairs (10,569 messages, byte for byte). A
-///    second, independent `.MSG` reader written for this one routine alone,
-///    with no comparable measurement to check it against, is exactly the
-///    "invent behaviour you cannot source" this project's method forbids --
-///    and it would fork the one grammar this crate has already measured
-///    into two copies free to disagree.
-///
-/// This file does not even attempt (1)'s file resolution as a gesture:
-/// doing the lookup's first half and then discarding the answer would
-/// suggest a scan is happening when it never can be.
-///
-/// # Errors
-///
-/// Never -- `NULL` is always a legal answer for this routine.
-///
-/// Generic: reads its two fixed pointer arguments, matching the prototype,
-/// even though neither is used for anything beyond that -- so a caller
-/// passing a bad pointer for either is not itself an error here, the same
-/// as every other "reads its arguments and answers a constant" shim in
-/// this crate.
-pub fn msgscan<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    let _msgfil = call.ptr();
-    let _vblnam = call.ptr();
-    Ok(abi::Ret::Ptr(null_ptr::<A>()))
-}
 
 /// `void listing(char *path, void (*whndun)())` -- "list an ASCII file to
 /// the user's screen"; `whndun`'s "optional argument": "1=list completed
@@ -576,7 +158,6 @@ pub fn listing<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 mod tests {
     use super::*;
     use crate::testing::Fixture;
-    use mbbs_machine::m16::Ret;
 
     fn current(f: &mut Fixture) -> crate::chan::Chan {
         let chan = f.console();
@@ -584,199 +165,6 @@ mod tests {
             .point_curusr(&mut f.machine, chan)
             .expect("channel 0 is current");
         chan
-    }
-
-    // ---- injacr ---------------------------------------------------------------
-
-    #[test]
-    fn injacr_clears_the_input_globals_and_queues_crstg() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-
-        // Seed non-empty input/margc/inplen so the clear is observable.
-        let input = f.host.globals().address("input").expect("input placed");
-        f.machine.write(input, b"north\0").expect("seed input");
-        f.host
-            .globals()
-            .write_mem(f.machine.mem_mut(), "margc", &2u16.to_le_bytes())
-            .expect("seed margc");
-        f.host
-            .globals()
-            .write_mem(f.machine.mem_mut(), "inplen", &5u16.to_le_bytes())
-            .expect("seed inplen");
-
-        f.invoke(injacr, &[]).expect("injacr does not stop the machine");
-
-        assert_eq!(
-            f.host
-                .globals()
-                .word_mem(f.machine.mem(), "margc")
-                .expect("margc"),
-            0,
-            "margc=0"
-        );
-        assert_eq!(
-            f.host
-                .globals()
-                .word_mem(f.machine.mem(), "inplen")
-                .expect("inplen"),
-            0,
-            "inplen=0"
-        );
-        let byte = input.resolve(f.machine.mem(), 1).expect("input[0]")[0];
-        assert_eq!(byte, 0, "input[0]='\\0'");
-
-        assert_eq!(
-            f.host.gsbl_mut().next_status(chan),
-            Some(crate::gsbl::Gsbl::CRSTG),
-            "status=CRSTG queued for the driver's next pass"
-        );
-    }
-
-    /// Mutation check: if `injacr` queued `POLSTS` instead of `CRSTG` (an
-    /// easy status-constant swap), this must fail -- `CRSTG` is the one
-    /// that reaches `sttrou`, matching the real `hdlcri` default case.
-    #[test]
-    fn injacr_queues_crstg_specifically_not_some_other_status() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-        f.invoke(injacr, &[]).expect("injacr does not stop the machine");
-        assert_eq!(f.host.gsbl_mut().next_status(chan), Some(crate::gsbl::Gsbl::CRSTG));
-    }
-
-    // ---- byenow ---------------------------------------------------------------
-
-    #[test]
-    fn byenow_nomsg_locks_and_clears_the_channel_without_printing() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-        f.host.gsbl_mut().channel_mut(chan).input.push_back(b'x');
-        f.host.gsbl_mut().channel_mut(chan).output.push_back(b'y');
-
-        f.invoke(byenow, &[0]).expect("byenow(NOMSG) does not stop the machine");
-
-        let c = f.host.gsbl().channel(chan);
-        assert!(c.locked, "btulok(usrnum,1)");
-        assert!(c.oes, "btuoes(usrnum,1)");
-        assert!(c.input.is_empty(), "btucli(usrnum)");
-        assert!(c.output.is_empty(), "btuclo(usrnum)");
-    }
-
-    #[test]
-    fn byenow_with_a_real_message_prints_it_to_the_channel() {
-        let root = crate::testing::scratch("mudmisc-byenow");
-        // Message 0 is reserved (`NOMSG`), so the target text is the
-        // *second* option in the file -- message index 1 -- with a dummy
-        // first option ahead of it, the same "index, not the constant
-        // name" convention `shims::msg`'s own `prfmsg` tests already use.
-        std::fs::write(
-            root.join("TEST.MSG"),
-            b"DUMMY {unused}S 0\nBYEMSG {Goodbye!}S 0\n",
-        )
-        .expect("a .MSG file");
-        let mut f = Fixture::rooted(root);
-        let chan = current(&mut f);
-        let path = f.text("TEST.MSG");
-        f.invoke(crate::shims::msg::opnmsg, &[path.offset, path.selector])
-            .expect("opnmsg");
-
-        f.invoke(byenow, &[1]).expect("byenow(1) does not stop the machine");
-
-        let c = f.host.gsbl().channel(chan);
-        assert!(c.locked);
-        let out: Vec<u8> = c.output.iter().copied().collect();
-        assert!(
-            out.windows(b"Goodbye!".len()).any(|w| w == b"Goodbye!"),
-            "the message text reached the channel, got {out:?}"
-        );
-    }
-
-    /// Mutation check: if the channel-state block ran unconditionally
-    /// AFTER the print instead of before, or `msgnum > 0`'s guard were
-    /// dropped, `NOMSG` would also attempt a lookup and stop the machine
-    /// instead of quietly locking the channel -- this is what catches
-    /// that.
-    #[test]
-    fn byenow_nomsg_never_touches_the_message_catalog() {
-        let mut f = Fixture::new();
-        current(&mut f);
-        // No message file opened at all -- if byenow(NOMSG) tried to look
-        // up a message it would fail; it must not try.
-        f.invoke(byenow, &[0]).expect("byenow(NOMSG) must not need a message catalog");
-    }
-
-    // ---- locate / curcurx / curcury --------------------------------------------
-
-    #[test]
-    fn locate_emits_a_cup_escape_and_updates_column() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-
-        f.invoke(locate, &[12, 5]).expect("locate does not stop the machine");
-
-        let c = f.host.gsbl().channel(chan);
-        let out: Vec<u8> = c.output.iter().copied().collect();
-        assert_eq!(out, b"\x1b[6;13f", "y+1;x+1, matching FSD.C's own %d;%df form");
-        assert_eq!(c.column, 12, "column tracks locate's x argument");
-    }
-
-    /// Mutation check: swapping the row/col order (`\x1b[{x};{y}f`) would
-    /// still emit *an* escape of the right length, so a bytes-non-empty
-    /// assertion would not catch it -- exact-content comparison does.
-    #[test]
-    fn locate_does_not_swap_x_and_y() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-        f.invoke(locate, &[1, 2]).expect("locate");
-        let out: Vec<u8> = f.host.gsbl().channel(chan).output.iter().copied().collect();
-        assert_eq!(out, b"\x1b[3;2f");
-    }
-
-    #[test]
-    fn curcurx_reads_back_what_locate_set() {
-        let mut f = Fixture::new();
-        current(&mut f);
-        f.invoke(locate, &[7, 0]).expect("locate");
-        let Ret::U16(x) = f.invoke(curcurx, &[]).expect("curcurx") else {
-            panic!("curcurx returns an int");
-        };
-        assert_eq!(x, 7);
-    }
-
-    #[test]
-    fn curcurx_tracks_ordinary_output_column_without_locate() {
-        let mut f = Fixture::new();
-        let chan = current(&mut f);
-        f.host.gsbl_mut().transmit(chan, b"hello");
-        let Ret::U16(x) = f.invoke(curcurx, &[]).expect("curcurx") else {
-            panic!("curcurx returns an int");
-        };
-        assert_eq!(x, 5, "column after five visible bytes");
-    }
-
-    #[test]
-    fn curcury_is_a_named_refusal_not_a_fabricated_constant() {
-        let mut f = Fixture::new();
-        current(&mut f);
-        let err = f.invoke(curcury, &[]).expect_err("curcury cannot answer");
-        assert!(format!("{err}").contains("curcury"));
-    }
-
-    // ---- msgscan ----------------------------------------------------------------
-
-    #[test]
-    fn msgscan_always_answers_null() {
-        let mut f = Fixture::new();
-        current(&mut f);
-        let a = f.text("SOME.MSG");
-        let b = f.text("VBLNAM");
-        let Ret::Far(at) = f
-            .invoke(msgscan, &[a.offset, a.selector, b.offset, b.selector])
-            .expect("msgscan never errors")
-        else {
-            panic!("msgscan returns a pointer");
-        };
-        assert_eq!(at, mbbs_machine::m16::FarPtr::NULL);
     }
 
     // ---- listing ------------------------------------------------------------

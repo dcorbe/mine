@@ -118,59 +118,6 @@ pub fn l2as<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A
     Ok(abi::Ret::Ptr(at))
 }
 
-/// `char *itoa(int value, char *buf, int radix)` -- render `value` into the
-/// caller's own buffer, in `radix`, and return that same buffer.
-///
-/// Borland's; no Galacticomm header redeclares it (`GCOMM.H`'s `gcitoa` is a
-/// different, two-argument routine -- see this file's own commit message).
-/// Stage 3's Task 8, one of the seven C library siblings landed eagerly
-/// (`docs/plans/2026-08-14-stage3-channel-entry-implementation.md`).
-///
-/// **Unlike [`l2as`], radix ten is not the only case.** Borland's own
-/// documented rule: radix ten treats `value` as signed and prints a leading
-/// `-`; every other radix treats the identical bits as unsigned, so
-/// `itoa(-1, buf, 16)` renders all-ones at `A`'s own int width (`ffff` under
-/// `Wg16`, `ffffffff` under `Wg32`) rather than inventing a sign the caller
-/// never asked a non-decimal radix to have.
-///
-/// Shares [`crate::fmt::integer`] with `sprintf`'s `%d`/`%x` conversions and
-/// with [`l2as`] above, rather than a third place a number becomes digits --
-/// the same discipline `l2as`'s own doc comment gives the reason for.
-/// Writes into the caller's buffer through [`fill`], the way [`sprintf`] and
-/// [`vsprintf`] already do, rather than one of this host's own rotating
-/// buffers -- `buf` is the module's own memory, not a pointer this host
-/// hands back.
-///
-/// # Errors
-///
-/// If `radix` is outside `2..=36`, which the digit alphabet (`0`-`9`,
-/// `a`-`z`) [`crate::fmt::integer`] renders with cannot represent, and which
-/// Borland's own `itoa` does not defend against either -- a crash there
-/// would be silent; a refusal here names the value asked for.
-pub fn itoa<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
-    // `char *itoa(int value, char *buf, int radix)` -- Borland's; no
-    // Galacticomm header redeclares it.
-    let raw = call.int();
-    let buf = call.ptr();
-    let radix: u32 = call.int().into();
-
-    if !(2..=36).contains(&radix) {
-        return Err(ShimError::Failed(format!("itoa: radix {radix} is not in 2..=36")));
-    }
-
-    let text = if radix == 10 {
-        let value = crate::shims::sign_extend::<A>(raw.into());
-        let negative = value < 0;
-        integer(u64::from(value.unsigned_abs()), negative, 10, false, &Spec::default())
-    } else {
-        let bits: u32 = raw.into();
-        integer(u64::from(bits), false, u64::from(radix), false, &Spec::default())
-    };
-
-    fill::<A>(call.mem(), buf, &text)?;
-    Ok(abi::Ret::Ptr(buf))
-}
-
 /// `int sprintf(char *buf, char *fmat, ...)` -- format into the caller's
 /// buffer, and return how many bytes that took.
 ///
@@ -2277,49 +2224,6 @@ mod tests {
             panic!("l2as returns a pointer");
         };
         assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"2147483647");
-    }
-
-    #[test]
-    fn itoa_renders_decimal_with_a_sign() {
-        let mut f = Fixture::new();
-        let buf = f.buffer(16);
-        let Ret::Far(at) = f
-            .invoke(itoa, &[(-42i16) as u16, buf.offset, buf.selector, 10])
-            .expect("formatted")
-        else {
-            panic!("itoa returns a pointer");
-        };
-        assert_eq!(at, buf, "itoa returns its own second argument");
-        assert_eq!(f.machine.read_cstr(at).expect("terminated"), b"-42");
-    }
-
-    #[test]
-    fn itoa_at_a_non_decimal_radix_treats_a_negative_value_as_unsigned() {
-        // Borland's own documented rule: only radix ten is signed. `-1`
-        // (`0xffff` at 16 bits) at radix 16 is "ffff", not "-1".
-        let mut f = Fixture::new();
-        let buf = f.buffer(16);
-        f.invoke(itoa, &[0xffffu16, buf.offset, buf.selector, 16])
-            .expect("formatted");
-        assert_eq!(f.machine.read_cstr(buf).expect("terminated"), b"ffff");
-    }
-
-    #[test]
-    fn itoa_renders_zero_at_any_radix() {
-        let mut f = Fixture::new();
-        let buf = f.buffer(16);
-        f.invoke(itoa, &[0u16, buf.offset, buf.selector, 2]).expect("formatted");
-        assert_eq!(f.machine.read_cstr(buf).expect("terminated"), b"0");
-    }
-
-    #[test]
-    fn itoa_refuses_a_radix_outside_2_to_36() {
-        let mut f = Fixture::new();
-        let buf = f.buffer(16);
-        let e = f
-            .invoke(itoa, &[10u16, buf.offset, buf.selector, 1])
-            .expect_err("a refusal");
-        assert!(e.to_string().contains("radix"), "{e}");
     }
 
     #[test]
