@@ -1651,6 +1651,130 @@ fn write_to(sink: &mut dyn std::io::Write, raw: &[u8], binary: bool) -> Result<(
     sink.write_all(&physical).map_err(|e| e.to_string())
 }
 
+/// `int printf(const char *fmat, ...)` -- format to standard output, and
+/// answer how many bytes that took.
+///
+/// # Where the bytes go, and the alternative that was not taken
+///
+/// Every other varargs routine in this crate has somewhere obvious to write:
+/// `fprintf` is handed a `FILE *`, `prf` appends to the channel's own output
+/// buffer. `printf` names no destination at all, so this is a decision
+/// rather than a reading, and it is made the way the vendor's own plumbing
+/// makes it: Borland's `printf` funnels through the CRT's buffered stdout,
+/// which bottoms out in the same `write(1, ...)` DOS call [`write`] already
+/// serves. So this writes to **this process's own stdout**, through the same
+/// [`write_to`] and the same `stdio_modes[1]` text/binary flag -- one path,
+/// not a second one that could drift.
+///
+/// [`read`]'s own doc comment makes the case for why that is the honest
+/// destination rather than a fabrication: a loaded module ran *in the host's
+/// process* and shared its standard handles, and this host is the equivalent
+/// process for a headless server.
+///
+/// **The named alternative is [`Host::audit`]**, this crate's other sink. A
+/// future host with a real sysop console would plausibly want a module's
+/// `printf` in the audit trail rather than on the server's terminal; that is
+/// a change of destination, not of formatting, and this is the one place it
+/// would be made.
+///
+/// `%f`, `%e`, `%g` and `%n` are refused, inherited from
+/// [`crate::fmt::format_call`] rather than re-checked here -- see `fmt`'s
+/// own module doc for why floating point cannot be served while the NE
+/// loader leaves the emulator fixups unapplied.
+///
+/// # Errors
+///
+/// If the format string is unreadable, if it uses a conversion `format_call`
+/// refuses, or if the write fails.
+pub fn printf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let fmat = call.ptr();
+    let (text, _) = crate::fmt::format_call(call, fmat)?;
+
+    write_to(&mut std::io::stdout(), &text, host.stdio_modes[1]).map_err(ShimError::Failed)?;
+
+    // The count is what was formatted, not what physically landed -- a
+    // text-mode `\n` puts two bytes out and still counts as one, matching
+    // `write`'s own answer.
+    Ok(abi::Ret::Int(A::int_from_u32(text.len() as u32)))
+}
+
+/// `int setjmp(jmp_buf env)` -- save the machine state to return to later.
+///
+/// **Refused, and the reason is structural rather than unfinished work.**
+///
+/// `Machine` has **no register setters at all**. `sp()`, `bp()`, `si()` and
+/// `di()` are *reads* of what the module last left on an `Exit::Call`
+/// (`m16/mod.rs:1026-1044`), and CS:IP is exposed only inside `Exit::Fault`
+/// and `Exit::Timeout`. Every one of SP, BP, SI, DI, DS and CS:IP is written
+/// in exactly one place -- inside `Machine::run`, from fields the call and
+/// resume path computed. Verified by count: the whole type has one `pub fn
+/// set_*`, and it is `set_budget`, a timeout.
+///
+/// The contract that follows from it is the real obstacle. A module resumes
+/// **where it left off**, at `frame_sp` -- never at an address a saved buffer
+/// names. `longjmp` needs to overwrite all six of those registers and force
+/// a resume somewhere else entirely; there is no host hook for that, and
+/// adding one is a machine-layer capability rather than a shim.
+///
+/// **Answering `0` would be the plausible lie.** Zero is what `setjmp`
+/// returns "the first time through", so a module would take exactly the
+/// branch it was written to take, run on, and then wait forever for a
+/// `longjmp` that can never arrive -- failing far from here, in code that
+/// looks unrelated. Refusing at the `setjmp` names the missing capability at
+/// the call that needed it.
+///
+/// This is already this crate's position, arrived at independently:
+/// `shims/credit.rs`'s `condex` reasons about a real `longjmp(eximod,1)`
+/// call site and declines it, and `lib.rs` mentions the `longjmp` landings at
+/// `MAJORBBS.C:2488` and `:4150` as something this host's structure makes
+/// unnecessary to reproduce.
+///
+/// # The `jmp_buf` layout is not tracked evidence either
+///
+/// Borland's struct was found at `tmp/btvcompat/dos/tc201/SETJMP.H` -- Turbo
+/// C 2.01 -- but `tmp/` is gitignored, so it is not part of the committed
+/// repository and it is not necessarily the compiler generation the module
+/// SDK used. It is deliberately **not** cited here. Implementing these means
+/// first re-deriving the layout from a tracked source, and noting that
+/// `GCOMM.H:207` exports `jmp_buf disaster` as a **datum**, so the buffer is
+/// a placement problem as well as a register one.
+///
+/// # Errors
+///
+/// Always.
+pub fn setjmp<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Err(ShimError::Failed(
+        "setjmp: this host cannot save a machine state to return to. Machine \
+         exposes no register setters -- sp/bp/si/di are reads of what the \
+         module last left, and CS:IP appears only in Exit::Fault/Exit::Timeout \
+         -- and a module resumes where it left off rather than where a saved \
+         buffer names, so the longjmp this would enable cannot be performed. \
+         Answering 0 would send the module down its first-time-through branch \
+         to wait for a longjmp that can never arrive"
+            .to_owned(),
+    ))
+}
+
+/// `void longjmp(jmp_buf env, int val)` -- resume where a [`setjmp`] saved.
+///
+/// Refused for the same structural reason, stated at [`setjmp`], which is
+/// where the whole argument lives. This one is if anything the clearer half:
+/// there can be no `env` to jump to, because nothing can have saved one.
+///
+/// # Errors
+///
+/// Always.
+pub fn longjmp<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _env = call.ptr();
+    let val = crate::shims::sign_extend::<A>(call.int().into());
+    Err(ShimError::Failed(format!(
+        "longjmp(.., {val}): this host cannot resume at a saved machine state. \
+         Machine exposes no register setters and a module resumes only where \
+         it left off; nothing can have saved an env here either, because \
+         setjmp refuses for the same reason"
+    )))
+}
+
 /// `int read(int handle, void *buf, unsigned len)` -- up to `len` bytes from
 /// standard input.
 ///
@@ -2562,6 +2686,139 @@ mod tests {
     /// assertion in [`write_through_the_real_shim_actually_translates_by_mode`]
     /// must not leave every later test's `eprintln!`/panic output silently
     /// redirected into a scratch file nobody is reading.
+    // ---- printf, setjmp, longjmp -------------------------------------------
+
+    /// `printf` answers how many bytes it formatted, and the format string's
+    /// conversions actually run.
+    ///
+    /// The count is observable without capturing stdout, which is what makes
+    /// this the cheap half of the pair; the destination is the expensive half
+    /// and has its own `#[ignore]`d test below.
+    #[test]
+    fn printf_formats_its_arguments_and_answers_the_length() {
+        let mut f = Fixture::new();
+        let fmat = f.text("%s has %d hp");
+        let who = f.text("rangerdan");
+        let n = int_of(
+            f.invoke(printf, &[fmat.offset, fmat.selector, who.offset, who.selector, 42])
+                .expect("printf"),
+        );
+        assert_eq!(n, "rangerdan has 42 hp".len() as u16);
+    }
+
+    /// `%f` is refused, inherited from `format_call` rather than re-checked.
+    ///
+    /// Floating point cannot be served while the NE loader leaves the
+    /// emulator fixups unapplied, and `printf` must not be the one varargs
+    /// routine that quietly pretends otherwise.
+    #[test]
+    fn printf_refuses_a_floating_point_conversion() {
+        let mut f = Fixture::new();
+        let fmat = f.text("%f");
+        let e = f
+            .invoke(printf, &[fmat.offset, fmat.selector, 0, 0])
+            .expect_err("no floating point on this host");
+        assert!(format!("{e}").contains('f'), "{e}");
+    }
+
+    /// `setjmp` refuses and names the missing capability.
+    ///
+    /// The message, not `is_err()`: the point is *which* thing is absent --
+    /// the register-setter API -- and a bare error would pass for an
+    /// unreadable pointer. The "would be the plausible lie" half matters too,
+    /// because answering 0 is exactly what a well-meaning implementation
+    /// would do.
+    #[test]
+    fn setjmp_refuses_and_names_the_missing_register_api() {
+        let mut f = Fixture::new();
+        let env = f.buffer(32);
+        let e = f
+            .invoke(setjmp, &Fixture::far(env))
+            .expect_err("no machine state can be saved");
+        let message = format!("{e}");
+        assert!(message.contains("register setters"), "{message}");
+        assert!(message.contains("longjmp"), "{message}");
+    }
+
+    /// `longjmp` refuses for the same reason, and says so.
+    #[test]
+    fn longjmp_refuses_and_names_the_same_reason() {
+        let mut f = Fixture::new();
+        let env = f.buffer(32);
+        let e = f
+            .invoke(longjmp, &[env.offset, env.selector, 1])
+            .expect_err("nothing can be resumed");
+        let message = format!("{e}");
+        assert!(message.contains("longjmp(.., 1)"), "{message}");
+        assert!(message.contains("register setters"), "{message}");
+    }
+
+    /// **`printf` writes to this process's own stdout**, not to the audit
+    /// trail and not nowhere.
+    ///
+    /// `#[ignore]`d for the same reason
+    /// [`write_through_the_real_shim_actually_translates_by_mode`] is:
+    /// swapping a real file descriptor is process-global and would race any
+    /// other test writing to the same one. Run alone with
+    /// `--ignored printf_writes_to_the_processs_own_stdout`.
+    ///
+    /// Pointing `printf` at `Host::audit` instead makes this fail, which is
+    /// the mutation that proves the destination is pinned rather than
+    /// assumed.
+    #[test]
+    #[ignore = "swaps the process's real stdout; run alone"]
+    fn printf_writes_to_the_processs_own_stdout() {
+        use std::os::fd::AsRawFd;
+
+        let root = scratch("crt-printf-stdout");
+        let capture_path = root.join("captured.bin");
+        let capture_file = std::fs::File::create(&capture_path).expect("scratch file");
+
+        // SAFETY: duplicates the process's own, definitely-open stdout.
+        // Owned by `_restore` and closed exactly once, in its `Drop`.
+        let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        assert!(saved >= 0, "dup(STDOUT_FILENO) failed");
+        let _restore = RestoreStdout(saved);
+
+        // SAFETY: replaces fd 1 with a duplicate of the capture file's fd;
+        // both stay independently valid, so dropping the file closes only its
+        // own number.
+        let rc = unsafe { libc::dup2(capture_file.as_raw_fd(), libc::STDOUT_FILENO) };
+        assert!(rc >= 0, "dup2 onto STDOUT_FILENO failed");
+        drop(capture_file);
+
+        {
+            let mut f = Fixture::new();
+            let fmat = f.text("hp=%d");
+            f.invoke(printf, &[fmat.offset, fmat.selector, 42]).expect("printf");
+        }
+        // `std::io::stdout()` is line-buffered, and the text has no newline.
+        std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+
+        drop(_restore); // real fd 1 back before reading the file below
+
+        assert_eq!(
+            std::fs::read(&capture_path).expect("captured output"),
+            b"hp=42",
+            "printf's bytes must reach the process's own stdout"
+        );
+    }
+
+    /// Puts the real `STDOUT_FILENO` back. See [`RestoreStderr`].
+    struct RestoreStdout(std::os::fd::RawFd);
+
+    impl Drop for RestoreStdout {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid fd duplicated from the real
+            // `STDOUT_FILENO` by `printf_writes_to_the_processs_own_stdout`
+            // and not yet closed.
+            unsafe {
+                libc::dup2(self.0, libc::STDOUT_FILENO);
+                libc::close(self.0);
+            }
+        }
+    }
+
     struct RestoreStderr(std::os::fd::RawFd);
 
     impl Drop for RestoreStderr {

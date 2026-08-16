@@ -1024,6 +1024,16 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "getftime", system::getftime, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "dostounix", system::dostounix, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "exit", borland::exit, Cleans::Caller, Evidence::Standard),
+        // printf writes to this process's own stdout, following Borland's
+        // own plumbing (its printf bottoms out in the same write(1, ...)
+        // call `write` above serves) rather than inventing a sink.
+        (MAJORBBS, "printf", crt::printf, Cleans::Caller, Evidence::Standard),
+        // Structural refusals: Machine has no register setters at all, so
+        // there is no way to save a machine state or resume at one. See
+        // crt::setjmp's doc comment for the full argument, including why
+        // answering 0 would be the plausible lie.
+        (MAJORBBS, "setjmp", crt::setjmp, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "longjmp", crt::longjmp, Cleans::Caller, Evidence::Standard),
         // `mfytask` completes the pair `initask` opened: a module could
         // register a task and then fail modifying it.
         (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller, Evidence::Unclassified),
