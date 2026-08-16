@@ -5,7 +5,7 @@
 //! `Vec<u8>` in a unit test, and would serve an `m16` signal handler without
 //! changing a line.
 
-use crate::files::Files;
+use crate::files::{self, Files};
 use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs, Flag};
 
 /// DOS error codes, as returned in AX with CF set.
@@ -47,6 +47,14 @@ pub struct DosState {
     /// file call fails -- which is a legitimate configuration, and is how the
     /// probe ran before file services existed.
     pub files: Option<Files>,
+    /// The real-mode segment the loader built this program's PSP at, if a
+    /// program has been loaded. `None` is a legitimate configuration too --
+    /// every unit test in this file constructs a `DosState` with no program
+    /// behind it at all -- and `AH=62h` below is what has to answer for that.
+    pub psp_seg: Option<u16>,
+    /// The Disk Transfer Address, `DS:DX` as last set by `AH=1Ah`. `None`
+    /// until the program calls it; see [`dta`] for what stands in until then.
+    pub dta: Option<DosPtr>,
 }
 
 impl Default for DosState {
@@ -57,6 +65,8 @@ impl Default for DosState {
             version: (5, 0),
             out: Vec::new(),
             files: None,
+            psp_seg: None,
+            dta: None,
         }
     }
 }
@@ -84,8 +94,9 @@ fn fail<G: DosGuest>(g: &mut G, mut regs: DosRegs, code: u16) -> Outcome {
 pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
-        0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c | 0x3d
-            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x56 | 0x5c
+        0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c
+            | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x4e | 0x4f | 0x56 | 0x5c
+            | 0x62
     )
 }
 
@@ -125,6 +136,49 @@ fn path_at<G: DosGuest>(g: &G, at: DosPtr) -> Result<Vec<u8>, DosFault> {
     g.read_until(at, 0, 128).map(<[u8]>::to_vec)
 }
 
+/// The Disk Transfer Address a find call should use.
+///
+/// Real DOS defaults the DTA to `PSP:0x80` until the program's first
+/// `AH=1Ah`, and a great many programs never call `1Ah` at all because that
+/// default is good enough. Isolated here the same way the `AH=25h`/`35h` IVT
+/// assumption is isolated above (dos.rs:167-172): a protected-mode edge for
+/// this same dispatcher is being designed and has no PSP, so it must not
+/// inherit this real-mode default by silently falling through this function
+/// -- it will simply have no `psp_seg` to fall back to, and `dta` will
+/// correctly report `None` rather than fabricate an address.
+fn dta(dos: &DosState) -> Option<DosPtr> {
+    dos.dta
+        .or_else(|| dos.psp_seg.map(|seg| DosPtr::new(seg, 0x80)))
+}
+
+/// Assemble the 43-byte record `AH=4Eh`/`4Fh` write to the DTA.
+///
+/// Layout -- 21 bytes reserved, 1 byte attribute, 2-byte packed time, 2-byte
+/// packed date, 4-byte size, 13-byte ASCIIZ name -- is the format documented
+/// for `INT 21/AH=4Eh` ("FINDFIRST using ASCIIZ") in Ralf Brown's Interrupt
+/// List, at DTA offsets 00h/15h/16h/18h/1Ah/1Eh respectively.
+///
+/// The reserved area is real DOS's own search-continuation state (drive, an
+/// FCB-style template, the attribute mask, an entry count and a directory
+/// cluster), which lets `4Fh` resume a search from nothing but the DTA
+/// address. This project keeps that state host-side instead
+/// (`files::Files`'s private search field, keyed to the `Files` rather than
+/// to a DTA address -- see its doc comment), so the reserved bytes are
+/// written as zero. That is a real simplification, not a cosmetic one: two
+/// concurrent searches through two different DTAs would collide here, where
+/// real DOS keeps them independent. Nothing in this crate does that yet.
+fn find_record(entry: &files::FindEntry) -> [u8; 43] {
+    let mut r = [0u8; 43];
+    r[0x15] = entry.attr;
+    r[0x16..0x18].copy_from_slice(&entry.dos_time.to_le_bytes());
+    r[0x18..0x1a].copy_from_slice(&entry.dos_date.to_le_bytes());
+    r[0x1a..0x1e].copy_from_slice(&entry.size.to_le_bytes());
+    let name = entry.name.as_bytes();
+    let n = name.len().min(12); // 12 bytes of name, the 13th is the NUL
+    r[0x1e..0x1e + n].copy_from_slice(&name[..n]);
+    r
+}
+
 /// Service one `int 21h`.
 pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
     let mut regs = g.regs();
@@ -161,6 +215,13 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
         0x19 => {
             let drive = dos.drive;
             regs.set_al(drive);
+            ok(g, regs)
+        }
+
+        // 1Ah -- set Disk Transfer Address to DS:DX. Required before AH=4Eh
+        // is meaningful; see `dta` for what stands in for it until called.
+        0x1a => {
+            dos.dta = Some(regs.ds_dx());
             ok(g, regs)
         }
 
@@ -405,6 +466,72 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
         // 4Ch -- terminate with the return code in AL.
         0x4c => Outcome::Terminate(regs.al()),
 
+        // 4Eh -- find first matching DS:DX, which may end in a wildcarded
+        // NAME.EXT; CX is the search attribute mask. Writes the 43-byte find
+        // record described at `find_record` into the DTA.
+        0x4e => {
+            let Some(at) = dta(dos) else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            let path = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let attr = regs.cx as u8;
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.find_first(&path, attr) {
+                Ok(entry) => {
+                    let record = find_record(&entry);
+                    if let Err(f) = g.write(at, &record) {
+                        return Outcome::Fault(f);
+                    }
+                    regs.ax = 0;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 4Fh -- find next, continuing the search the last 4Eh started.
+        0x4f => {
+            let Some(at) = dta(dos) else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.find_next() {
+                Ok(entry) => {
+                    let record = find_record(&entry);
+                    if let Err(f) = g.write(at, &record) {
+                        return Outcome::Fault(f);
+                    }
+                    regs.ax = 0;
+                    ok(g, regs)
+                }
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 62h -- get this program's PSP segment, in BX.
+        //
+        // Real DOS can never fail this call: some program is always running
+        // when int 21h executes. This harness can construct a DosState with
+        // no program loaded at all -- every other test in this file does --
+        // so there is no genuine segment to report. Rather than invent one,
+        // which is the exact trap this project keeps refusing to fall into,
+        // this follows the precedent set throughout this file for missing
+        // state (`dos.files` being `None` above) and fails the call outright.
+        0x62 => match dos.psp_seg {
+            Some(seg) => {
+                regs.bx = seg;
+                ok(g, regs)
+            }
+            None => fail(g, regs, ERR_INVALID_FUNCTION),
+        },
+
         _ => fail(g, regs, ERR_INVALID_FUNCTION),
     }
 }
@@ -576,5 +703,214 @@ mod tests {
             Outcome::Fault(DosFault::OutOfBounds { .. }) => {}
             other => panic!("expected OutOfBounds, got {other:?}"),
         }
+    }
+
+    // -- AH=62h: get PSP address --
+
+    #[test]
+    fn get_psp_reports_the_loaded_segment_not_a_constant() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            psp_seg: Some(0x1234),
+            ..DosState::default()
+        };
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x62);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.regs().bx, 0x1234);
+    }
+
+    #[test]
+    fn get_psp_without_a_loaded_program_fails_rather_than_inventing_a_segment() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x62);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry(), "no program means no real segment to report");
+        assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
+    }
+
+    // -- AH=1Ah: set DTA, and the AH=25h/35h-style default it feeds --
+
+    #[test]
+    fn set_dta_stores_the_far_pointer_from_ds_dx() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x1a);
+        regs.ds = 0x2000;
+        regs.dx = 0x0080;
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(dos.dta, Some(DosPtr::new(0x2000, 0x0080)));
+    }
+
+    #[test]
+    fn dta_defaults_to_psp_plus_0x80_before_ah_1a_is_ever_called() {
+        let dos = DosState {
+            psp_seg: Some(0x1000),
+            ..DosState::default()
+        };
+        assert_eq!(dta(&dos), Some(DosPtr::new(0x1000, 0x80)));
+    }
+
+    #[test]
+    fn dta_is_none_with_neither_an_explicit_set_nor_a_psp() {
+        assert_eq!(dta(&DosState::default()), None);
+    }
+
+    #[test]
+    fn an_explicit_dta_wins_over_the_psp_default() {
+        let dos = DosState {
+            psp_seg: Some(0x1000),
+            dta: Some(DosPtr::new(0x9999, 0x0001)),
+            ..DosState::default()
+        };
+        assert_eq!(dta(&dos), Some(DosPtr::new(0x9999, 0x0001)));
+    }
+
+    // -- AH=4Eh/4Fh: find first/next, driven through dispatch end to end --
+
+    /// A `Files` sandboxed at a scratch directory under the repo's gitignored
+    /// `tmp/`, mirroring `files.rs`'s own test helper.
+    fn with_files(name: &str) -> (std::path::PathBuf, Files) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/dos-poc-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        let fd = std::fs::File::open(&root).expect("open root");
+        let files = Files::new(fd.into(), root.clone());
+        (root, files)
+    }
+
+    #[test]
+    fn find_first_writes_the_43_byte_record_with_the_documented_layout() {
+        let (root, fs) = with_files("dos_find_layout");
+        std::fs::write(root.join("LORD.DAT"), vec![0u8; 10]).expect("seed");
+
+        let mut g = TestGuest::new(64 * 1024);
+        let path_at = DosPtr::new(0x100, 0x20);
+        g.poke(path_at, b"LORD.DAT\0");
+        let dta_at = DosPtr::new(0x100, 0x200);
+        // A guard byte just past the record, so a write one byte too long
+        // would be caught rather than silently landing in unused memory.
+        g.poke(DosPtr::new(0x100, 0x200 + 43), &[0xaa]);
+
+        let mut dos = DosState {
+            files: Some(fs),
+            dta: Some(dta_at),
+            ..DosState::default()
+        };
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x4e);
+        regs.ds = path_at.seg;
+        regs.dx = path_at.off;
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+
+        let record = g.peek(dta_at, 43);
+        assert_eq!(&record[0..0x15], &[0u8; 21], "the reserved area is left zero");
+        assert_eq!(record[0x15], files::ATTR_ARCHIVE, "attribute at offset 0x15");
+        let size = u32::from_le_bytes(record[0x1a..0x1e].try_into().unwrap());
+        assert_eq!(size, 10, "size at offset 0x1a");
+        let name_end = record[0x1e..].iter().position(|&b| b == 0).expect("ASCIIZ");
+        assert_eq!(&record[0x1e..0x1e + name_end], b"LORD.DAT", "name at offset 0x1e");
+
+        assert_eq!(
+            g.peek(DosPtr::new(0x100, 0x200 + 43), 1),
+            &[0xaa],
+            "the record is exactly 43 bytes, not one more"
+        );
+    }
+
+    #[test]
+    fn find_next_via_dispatch_continues_the_same_search_in_order() {
+        let (root, fs) = with_files("dos_find_next");
+        std::fs::write(root.join("A.DAT"), vec![0u8; 1]).expect("seed");
+        std::fs::write(root.join("B.DAT"), vec![0u8; 2]).expect("seed");
+
+        let mut g = TestGuest::new(64 * 1024);
+        let path_at = DosPtr::new(0x100, 0x20);
+        g.poke(path_at, b"*.DAT\0");
+        let dta_at = DosPtr::new(0x100, 0x200);
+
+        let mut dos = DosState {
+            files: Some(fs),
+            dta: Some(dta_at),
+            ..DosState::default()
+        };
+
+        let mut first_call = DosRegs::default();
+        first_call.set_ah(0x4e);
+        first_call.ds = path_at.seg;
+        first_call.dx = path_at.off;
+        g.call_with(first_call);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let name_of = |g: &TestGuest| {
+            let record = g.peek(dta_at, 43);
+            let end = record[0x1e..].iter().position(|&b| b == 0).expect("ASCIIZ");
+            record[0x1e..0x1e + end].to_vec()
+        };
+        let first = name_of(&g);
+
+        let mut next_call = DosRegs::default();
+        next_call.set_ah(0x4f);
+        g.call_with(next_call);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let second = name_of(&g);
+
+        assert_eq!(first, b"A.DAT");
+        assert_eq!(second, b"B.DAT");
+
+        let mut third_call = DosRegs::default();
+        third_call.set_ah(0x4f);
+        g.call_with(third_call);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry(), "a third find-next has nothing left to report");
+        assert_eq!(g.regs().ax, files::ERR_NO_MORE_FILES);
+    }
+
+    #[test]
+    fn find_first_without_a_dta_fails_rather_than_guessing_one() {
+        let (_root, fs) = with_files("dos_find_no_dta");
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            files: Some(fs),
+            ..DosState::default()
+        };
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x4e);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
+    }
+
+    #[test]
+    fn find_first_without_a_filesystem_fails() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            psp_seg: Some(0x1000), // so the DTA default resolves
+            ..DosState::default()
+        };
+        let mut regs = DosRegs::default();
+        regs.set_ah(0x4e);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
     }
 }

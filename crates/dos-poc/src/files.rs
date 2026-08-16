@@ -28,6 +28,18 @@ pub const ERR_INVALID_HANDLE: u16 = 0x06;
 /// Another holder has the region. DOS reports this from `5Ch`, and a program
 /// that shares files across nodes is written to expect and retry it.
 pub const ERR_LOCK_VIOLATION: u16 = 0x21;
+/// `4Fh` found no further entries -- and `4Eh` on a search that ends up empty
+/// reports `ERR_FILE_NOT_FOUND` instead, the same asymmetry real DOS has.
+pub const ERR_NO_MORE_FILES: u16 = 0x12;
+
+/// DOS file attribute bits, as read from `4Eh`/`4Fh`'s CX mask and written
+/// into a find record's attribute byte.
+pub const ATTR_READ_ONLY: u8 = 0x01;
+pub const ATTR_HIDDEN: u8 = 0x02;
+pub const ATTR_SYSTEM: u8 = 0x04;
+pub const ATTR_VOLUME: u8 = 0x08;
+pub const ATTR_DIRECTORY: u8 = 0x10;
+pub const ATTR_ARCHIVE: u8 = 0x20;
 
 /// The first handle DOS hands out; 0-2 are the inherited standard ones.
 const FIRST_HANDLE: u16 = 5;
@@ -108,6 +120,217 @@ pub fn translate(raw: &[u8]) -> Target {
     Target::File(text)
 }
 
+/// One matched directory entry, ready to become a `4Eh`/`4Fh` DTA record.
+///
+/// Kept host-shaped -- no far pointers, no guest access -- so it is testable
+/// on its own; `dos.rs` is what turns it into the 43-byte wire format, the
+/// same division of labour as everywhere else in this module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FindEntry {
+    /// `NAME.EXT`, upper-cased, with the dot omitted when there is no
+    /// extension -- exactly what the 13-byte ASCIIZ field holds.
+    pub name: String,
+    pub attr: u8,
+    pub size: u32,
+    /// Packed DOS date/time, FAT-style. See `dos.rs`'s `find_record` for the
+    /// bit layout and its source.
+    pub dos_time: u16,
+    pub dos_date: u16,
+}
+
+/// The state a `4Eh` search leaves behind for `4Fh` to continue.
+///
+/// Real DOS keeps this in the DTA's own 21 reserved bytes -- drive, an
+/// FCB-style template, the attribute mask, an entry count and a directory
+/// cluster -- so a search can resume from nothing but the DTA address, and
+/// several searches through several DTAs can run at once. This crate keeps
+/// it here instead, host-side and keyed to the one `Files`, which is a real
+/// simplification: two concurrent searches would collide. Nothing in this
+/// crate does that yet, and `dos.rs` documents the trade where it writes the
+/// (all-zero) reserved bytes.
+struct FindSearch {
+    entries: Vec<FindEntry>,
+    next: usize,
+}
+
+/// Build the 11-byte, space-padded FCB-style field DOS matches filenames
+/// against, from a `NAME.EXT` pattern that may contain `*`/`?`.
+///
+/// This is the classic FCB wildcard algorithm that `INT 21h AH=4Eh/4Fh`
+/// inherited from CP/M: the name and extension are laid into an 11-byte
+/// field, space-padded, with an implicit dot between position 8 and 9; a
+/// `*` fills the rest of whichever field it is in with `?` and everything
+/// else in that field is then ignored until the next `.` or the pattern
+/// ends. It is emphatically not shell globbing -- `?` matches a *padding*
+/// space too, so `*.???` matches a two-letter extension as readily as a
+/// three-letter one, and `*.*` matches a name with no extension at all.
+///
+/// Source: Raymond Chen, "How did wildcards work in MS-DOS?" (The Old New
+/// Thing, 2007-12-17), cross-checked against Ralf Brown's Interrupt List,
+/// `INT 21/AH=29h` ("Parse Filename into FCB"), which documents the same
+/// 11-byte expansion for the non-ASCIIZ FCB find calls that `4Eh` reuses.
+fn wildcard_template(pattern: &str) -> [u8; 11] {
+    let mut t = [b' '; 11];
+    let upper = pattern.to_ascii_uppercase();
+    let mut idx = 0usize; // 0..8 within the name, 8..11 within the extension
+    let mut in_ext = false;
+    let mut starred = false; // ignoring literals until the field changes
+    for c in upper.chars() {
+        match c {
+            '.' if !in_ext => {
+                in_ext = true;
+                idx = 8;
+                starred = false;
+            }
+            // A second dot has nothing sane to mean here; DOS paths never
+            // reach this with one, since the directory separator was already
+            // split off. Stop rather than guess.
+            '.' => break,
+            '*' => {
+                let end = if in_ext { 11 } else { 8 };
+                for slot in t.iter_mut().take(end).skip(idx) {
+                    *slot = b'?';
+                }
+                idx = end;
+                starred = true;
+            }
+            _ if starred => {}
+            _ if c.is_ascii() => {
+                let limit = if in_ext { 11 } else { 8 };
+                if idx < limit {
+                    t[idx] = c as u8;
+                    idx += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
+/// Fold a plain `NAME.EXT` (no wildcards) into the same 11-byte field layout
+/// [`wildcard_template`] produces, so the two can be compared position by
+/// position. `None` if the name does not fit an 8.3 shape at all -- more than
+/// eight characters of name, more than three of extension, or more than one
+/// dot -- which nothing walking this sandbox's own directories should
+/// produce, but a host filesystem is not obliged to agree.
+fn eight_dot_three(name: &str) -> Option<[u8; 11]> {
+    let upper = name.to_ascii_uppercase();
+    if !upper.is_ascii() {
+        return None;
+    }
+    let (stem, ext) = match upper.split_once('.') {
+        Some((s, e)) => (s, e),
+        None => (upper.as_str(), ""),
+    };
+    if stem.is_empty() || stem.len() > 8 || ext.len() > 3 || ext.contains('.') {
+        return None;
+    }
+    let mut t = [b' '; 11];
+    t[..stem.len()].copy_from_slice(stem.as_bytes());
+    t[8..8 + ext.len()].copy_from_slice(ext.as_bytes());
+    Some(t)
+}
+
+/// Does `name` (already folded by [`eight_dot_three`]) satisfy `template`?
+fn matches_template(template: &[u8; 11], name: &[u8; 11]) -> bool {
+    template
+        .iter()
+        .zip(name.iter())
+        .all(|(&t, &n)| t == b'?' || t == n)
+}
+
+/// The display form of a folded 8.3 name: trailing padding trimmed, the dot
+/// present only when there is an extension.
+fn display_name(tpl: &[u8; 11]) -> String {
+    let stem: String = tpl[..8]
+        .iter()
+        .take_while(|&&b| b != b' ')
+        .map(|&b| b as char)
+        .collect();
+    let ext: String = tpl[8..11]
+        .iter()
+        .take_while(|&&b| b != b' ')
+        .map(|&b| b as char)
+        .collect();
+    if ext.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
+const SYS_GETDENTS64: libc::c_long = 217;
+
+/// Entry names directly inside the directory named by `dirfd`.
+///
+/// `getdents64` rather than `opendir`/`readdir`: those wrap this same
+/// syscall behind a `DIR *` that is not safe to allocate from a signal
+/// handler, and `files.rs` is shared with the `m16` trap edge, where a
+/// future caller may be exactly that. The raw syscall has no such caveat, so
+/// using it here costs nothing today and avoids relitigating the choice
+/// later against a live trap.
+fn read_dir_raw(dirfd: RawFd) -> io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        // SAFETY: `buf` is a live, writable buffer of the stated length, and
+        // `dirfd` is a directory descriptor the caller owns for the
+        // duration of this call.
+        let n = unsafe { libc::syscall(SYS_GETDENTS64, dirfd, buf.as_mut_ptr(), buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            break;
+        }
+        let mut off = 0usize;
+        while off < n as usize {
+            // linux_dirent64: u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type,
+            // then the NUL-terminated name.
+            let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+            let name_start = off + 19;
+            let name_end = buf[name_start..off + reclen]
+                .iter()
+                .position(|&b| b == 0)
+                .map_or(off + reclen, |p| name_start + p);
+            let name = String::from_utf8_lossy(&buf[name_start..name_end]).into_owned();
+            if name != "." && name != ".." {
+                out.push(name);
+            }
+            off += reclen;
+        }
+    }
+    Ok(out)
+}
+
+/// Fold a Unix mtime into DOS's packed date/time words -- the same format
+/// the FAT directory entry and `INT 21/AH=5701h` (Set File Date and Time)
+/// use: time bits 15-11 hour (0-23), 10-5 minute (0-59), 4-0 seconds/2;
+/// date bits 15-9 year-1980, 8-5 month (1-12), 4-0 day (1-31). Source: Ralf
+/// Brown's Interrupt List, `INT 21/AH=57h`, and the FAT directory entry
+/// layout it shares.
+fn pack_datetime(mtime: libc::time_t) -> (u16, u16) {
+    // SAFETY: `localtime_r` fills a caller-owned struct and is safe to call
+    // from any thread.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(std::ptr::from_ref(&mtime), std::ptr::from_mut(&mut tm));
+        tm
+    };
+    // DOS cannot represent a year before 1980 or after 2107; clamp rather
+    // than wrap, since a wrapped year is a worse lie than a clamped one.
+    let year = ((tm.tm_year + 1900).clamp(1980, 2107) - 1980) as u16;
+    let month = (tm.tm_mon + 1) as u16;
+    let day = tm.tm_mday as u16;
+    let hour = tm.tm_hour as u16;
+    let min = tm.tm_min as u16;
+    let sec2 = (tm.tm_sec / 2) as u16;
+    let date = (year << 9) | (month << 5) | day;
+    let time = (hour << 11) | (min << 5) | sec2;
+    (time, date)
+}
+
 /// Entry names in `dir`, or nothing if it cannot be listed.
 fn list(dir: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -179,6 +402,8 @@ pub struct Files {
     /// files did it ask for?" is a different question from "which did it
     /// write", and answering only the second hides the interesting half.
     pub attempts: Vec<(String, &'static str, bool)>,
+    /// The search a `4Eh` started, if `4Fh` might still continue it.
+    search: Option<FindSearch>,
 }
 
 impl Files {
@@ -190,6 +415,7 @@ impl Files {
             touched: Vec::new(),
             ambiguous: Vec::new(),
             attempts: Vec::new(),
+            search: None,
         }
     }
 
@@ -498,6 +724,150 @@ impl Files {
         }
         Ok(at as u64)
     }
+
+    /// Resolve only a directory prefix. Unlike [`Files::resolve`], the final
+    /// component need not already exist -- callers here pass a directory
+    /// that a wildcarded filename sits inside, not a filename of its own. An
+    /// empty `dir` names the root itself.
+    fn resolve_dir(&mut self, dir: &str) -> Result<String, u16> {
+        if dir.is_empty() {
+            return Ok(String::new());
+        }
+        let mut here: PathBuf = self.root_path.clone();
+        let mut out: Vec<String> = Vec::new();
+        for part in dir.split('/') {
+            let entries = list(&here);
+            match pick(&entries, part) {
+                Pick::Exact(found) | Pick::Unique(found) => {
+                    here.push(&found);
+                    out.push(found);
+                }
+                Pick::Missing => return Err(ERR_PATH_NOT_FOUND),
+                Pick::Ambiguous(all) => {
+                    let note = format!("{dir}: host holds {}", all.join(", "));
+                    if !self.ambiguous.contains(&note) {
+                        self.ambiguous.push(note);
+                    }
+                    return Err(ERR_ACCESS_DENIED);
+                }
+            }
+        }
+        Ok(out.join("/"))
+    }
+
+    /// Attribute, size and packed mtime for `name` inside `dir_fd`, or
+    /// `None` if it vanished or cannot be stat'd -- which is not an error for
+    /// a search: the entry is simply left out, the same way a directory
+    /// listing racing a concurrent delete would drop it.
+    fn stat_entry(dir_fd: RawFd, name: &str) -> Option<(u8, u32, u16, u16)> {
+        let c_name = std::ffi::CString::new(name).ok()?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fstatat` against a directory descriptor the caller owns
+        // and a NUL-terminated name just read from that same directory.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd,
+                c_name.as_ptr(),
+                std::ptr::from_mut(&mut st),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
+        let writable = st.st_mode & libc::S_IWUSR != 0;
+        let attr = if is_dir {
+            ATTR_DIRECTORY
+        } else if !writable {
+            ATTR_READ_ONLY
+        } else {
+            ATTR_ARCHIVE
+        };
+        let size = if is_dir { 0 } else { st.st_size as u32 };
+        let (dos_time, dos_date) = pack_datetime(st.st_mtime);
+        Some((attr, size, dos_time, dos_date))
+    }
+
+    /// `4Eh` -- start a search for `path`, whose final component may be a
+    /// wildcarded `NAME.EXT`. `attr_mask` is CX's low byte, DOS's search
+    /// attribute mask; here it decides only whether directories are included
+    /// (`ATTR_DIRECTORY` set in the mask), since nothing in this sandbox ever
+    /// reports the hidden, system or volume-label bits that would otherwise
+    /// need the same subset-matching treatment.
+    pub fn find_first(&mut self, path: &[u8], attr_mask: u8) -> Result<FindEntry, u16> {
+        let (dir, pattern) = match translate(path) {
+            Target::File(name) => match name.rsplit_once('/') {
+                Some((d, p)) => (d.to_string(), p.to_string()),
+                None => (String::new(), name),
+            },
+            // A device is not a directory entry; nothing can find it.
+            Target::Device(_) => return Err(ERR_FILE_NOT_FOUND),
+            Target::Rejected => return Err(ERR_PATH_NOT_FOUND),
+        };
+        let dir = self.resolve_dir(&dir)?;
+        let dir_fd = self
+            .openat2(
+                if dir.is_empty() { "." } else { &dir },
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                0,
+            )
+            .map_err(|_| ERR_PATH_NOT_FOUND)?;
+
+        let template = wildcard_template(&pattern);
+        let want_dirs = attr_mask & ATTR_DIRECTORY != 0;
+
+        let mut matched = Vec::new();
+        let names = read_dir_raw(dir_fd.as_raw_fd()).map_err(|_| ERR_PATH_NOT_FOUND)?;
+        for name in names {
+            // Not representable in 8.3: DOS could not have listed it either.
+            let Some(name_tpl) = eight_dot_three(&name) else {
+                continue;
+            };
+            if !matches_template(&template, &name_tpl) {
+                continue;
+            }
+            let Some((attr, size, dos_time, dos_date)) =
+                Self::stat_entry(dir_fd.as_raw_fd(), &name)
+            else {
+                continue;
+            };
+            if attr & ATTR_DIRECTORY != 0 && !want_dirs {
+                continue;
+            }
+            matched.push(FindEntry {
+                name: display_name(&name_tpl),
+                attr,
+                size,
+                dos_time,
+                dos_date,
+            });
+        }
+        // Directory order is not meaningful here (`getdents64` returns
+        // whatever the host filesystem's own order is, which need not match
+        // real DOS's either); sorting makes the search deterministic instead
+        // of merely host-dependent.
+        matched.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let first = matched.first().cloned().ok_or(ERR_FILE_NOT_FOUND)?;
+        self.search = Some(FindSearch {
+            entries: matched,
+            next: 1,
+        });
+        Ok(first)
+    }
+
+    /// `4Fh` -- continue the search the last `4Eh` started.
+    pub fn find_next(&mut self) -> Result<FindEntry, u16> {
+        let search = self.search.as_mut().ok_or(ERR_NO_MORE_FILES)?;
+        let entry = search
+            .entries
+            .get(search.next)
+            .cloned()
+            .ok_or(ERR_NO_MORE_FILES)?;
+        search.next += 1;
+        Ok(entry)
+    }
 }
 
 #[cfg(test)]
@@ -642,5 +1012,154 @@ mod tests {
     fn an_empty_path_is_rejected_rather_than_naming_the_root() {
         assert_eq!(translate(b"\0"), Target::Rejected);
         assert_eq!(translate(b"C:\\\0"), Target::Rejected);
+    }
+
+    // -- wildcard template construction and matching, no filesystem at all --
+
+    #[test]
+    fn star_fills_the_rest_of_its_own_field_with_question_marks() {
+        assert_eq!(wildcard_template("*.DAT"), *b"????????DAT");
+        assert_eq!(wildcard_template("LORD.*"), *b"LORD    ???");
+    }
+
+    #[test]
+    fn literal_characters_after_a_star_in_the_same_field_are_ignored() {
+        // The Old New Thing's example: everything between the `*` and the
+        // next `.` has no effect, since the star already claimed the field.
+        assert_eq!(wildcard_template("A*B.TXT"), wildcard_template("A*.TXT"));
+    }
+
+    #[test]
+    fn question_mark_matches_a_padding_space_not_just_a_character() {
+        // The DOS-specific quirk this whole module exists to get right: `?`
+        // is satisfied by the *absence* of a character too, which ordinary
+        // shell globbing would never allow.
+        let tpl = wildcard_template("A?.DAT");
+        let short = eight_dot_three("A.DAT").unwrap();
+        let long = eight_dot_three("AB.DAT").unwrap();
+        assert!(
+            matches_template(&tpl, &short),
+            "A?.DAT must match A.DAT -- ? tolerates a missing character"
+        );
+        assert!(matches_template(&tpl, &long), "A?.DAT must still match AB.DAT");
+    }
+
+    #[test]
+    fn star_dot_star_matches_a_name_with_no_extension_at_all() {
+        // Another glob mismatch: `*.*` in a shell requires a literal dot;
+        // DOS's `*.*` means "everything", extension or not.
+        let tpl = wildcard_template("*.*");
+        let no_ext = eight_dot_three("README").unwrap();
+        assert!(matches_template(&tpl, &no_ext));
+    }
+
+    #[test]
+    fn a_fully_literal_pattern_matches_only_its_own_name() {
+        let tpl = wildcard_template("LORD.DAT");
+        assert!(matches_template(&tpl, &eight_dot_three("LORD.DAT").unwrap()));
+        assert!(!matches_template(&tpl, &eight_dot_three("LORD.CFG").unwrap()));
+    }
+
+    #[test]
+    fn eight_dot_three_rejects_a_name_that_does_not_fit() {
+        assert_eq!(eight_dot_three("TOOLONGNAME.DAT"), None, "name over 8 chars");
+        assert_eq!(eight_dot_three("A.TOOLONG"), None, "extension over 3 chars");
+        assert_eq!(eight_dot_three("A.B.C"), None, "more than one dot");
+    }
+
+    #[test]
+    fn display_name_round_trips_a_valid_eight_dot_three_name() {
+        assert_eq!(display_name(&eight_dot_three("LORD.DAT").unwrap()), "LORD.DAT");
+        assert_eq!(
+            display_name(&eight_dot_three("README").unwrap()),
+            "README",
+            "no extension means no trailing dot"
+        );
+    }
+
+    // -- find_first/find_next against a real, sandboxed directory --
+
+    #[test]
+    fn find_first_and_find_next_walk_a_wildcard_match_in_order_then_stop() {
+        let (root, mut a) = scratch("find_basic");
+        std::fs::write(root.join("LORD.DAT"), vec![0u8; 10]).expect("seed");
+        std::fs::write(root.join("LORD.CFG"), vec![0u8; 5]).expect("seed");
+        std::fs::write(root.join("OTHER.TXT"), vec![0u8; 3]).expect("seed");
+
+        let first = a.find_first(b"LORD.*\0", 0).expect("a match exists");
+        assert_eq!(first.name, "LORD.CFG", "alphabetically first of the two");
+        assert_eq!(first.size, 5);
+        assert_eq!(first.attr, ATTR_ARCHIVE);
+
+        let second = a.find_next().expect("a second match exists");
+        assert_eq!(second.name, "LORD.DAT");
+        assert_eq!(second.size, 10);
+
+        assert_eq!(
+            a.find_next(),
+            Err(ERR_NO_MORE_FILES),
+            "OTHER.TXT does not match LORD.*, so only two results exist"
+        );
+    }
+
+    #[test]
+    fn find_first_with_no_match_is_file_not_found_not_no_more_files() {
+        let (_root, mut a) = scratch("find_nomatch");
+        assert_eq!(a.find_first(b"NOPE.*\0", 0), Err(ERR_FILE_NOT_FOUND));
+    }
+
+    #[test]
+    fn find_next_with_no_prior_find_first_is_no_more_files() {
+        let (_root, mut a) = scratch("find_no_prior");
+        assert_eq!(a.find_next(), Err(ERR_NO_MORE_FILES));
+    }
+
+    #[test]
+    fn find_first_excludes_directories_unless_the_mask_asks_for_them() {
+        let (root, mut a) = scratch("find_dirs");
+        std::fs::create_dir(root.join("SUBDIR")).expect("seed dir");
+        std::fs::write(root.join("A.DAT"), b"x").expect("seed file");
+
+        let mut without_dirs = vec![a.find_first(b"*.*\0", 0).expect("a match exists").name];
+        while let Ok(e) = a.find_next() {
+            without_dirs.push(e.name);
+        }
+        assert!(
+            !without_dirs.contains(&"SUBDIR".to_string()),
+            "a plain search must not report directories: {without_dirs:?}"
+        );
+        assert!(without_dirs.contains(&"A.DAT".to_string()));
+
+        let mut with_dirs = vec![
+            a.find_first(b"*.*\0", ATTR_DIRECTORY)
+                .expect("a match exists")
+                .name,
+        ];
+        while let Ok(e) = a.find_next() {
+            with_dirs.push(e.name);
+        }
+        assert!(
+            with_dirs.contains(&"SUBDIR".to_string()),
+            "with ATTR_DIRECTORY set, directories must be included: {with_dirs:?}"
+        );
+    }
+
+    #[test]
+    fn find_first_reports_read_only_for_a_file_without_the_write_bit() {
+        let (root, mut a) = scratch("find_readonly");
+        let path = root.join("RO.DAT");
+        std::fs::write(&path, b"x").expect("seed");
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        let entry = a.find_first(b"RO.DAT\0", 0).expect("a match exists");
+        assert_eq!(entry.attr, ATTR_READ_ONLY);
+    }
+
+    #[test]
+    fn find_first_stays_inside_the_sandbox_for_a_traversal_attempt() {
+        let (_root, mut a) = scratch("find_escape");
+        assert_eq!(a.find_first(b"..\\*.*\0", 0), Err(ERR_PATH_NOT_FOUND));
     }
 }

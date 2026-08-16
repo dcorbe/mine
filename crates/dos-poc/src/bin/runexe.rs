@@ -212,6 +212,9 @@ fn main() -> io::Result<()> {
 
     let mut dos = DosState::default();
     dos.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
+    // The real segment the loader built this program's PSP at, so AH=62h
+    // answers with the program's own PSP rather than failing outright.
+    dos.psp_seg = Some(at.psp_seg);
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
     let mut driver: Option<Box<dyn Driver>> = if interactive {
