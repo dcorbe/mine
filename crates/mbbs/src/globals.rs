@@ -326,6 +326,21 @@ pub const GLOBALS: &[Global] = &[
     // reaches for by address, never a call. Unchanged in wg33
     // (`EXPWGSF(VOID,emlsdrou)(VOID);`, `re/wg33src/INC/MAJORBBS.H:527`).
     g("emlsdrou", PTR),
+    // MAJORBBS.H:558-567 -- CHAR *bbsttl, *company, *addres1, *addres2,
+    // *dataph, *liveph, *syskey. Host identity, displayed to users. Not
+    // strictly consecutive in the header -- *chghour, *chgmin and *chgtime
+    // interleave between `liveph` and `syskey`, and are not placed, the same
+    // as `sampln`/`outata` a few rows below (no corpus module imports them).
+    // This host has no configuration for any of the seven placed, so
+    // `Globals::new` points each at a defined string; see the allocation
+    // there for what a module will show.
+    g("bbsttl", PTR),
+    g("company", PTR),
+    g("addres1", PTR),
+    g("addres2", PTR),
+    g("dataph", PTR),
+    g("liveph", PTR),
+    g("syskey", PTR),
     // MAJORBBS.H:579-581 -- int outbsz, sampln, mmucrr, outata;
     //   outbsz is the output buffer size per channel, and PFBSIZ
     //   (MAJORBBS.H:507) is #define'd to it. sampln and outata are not placed
@@ -745,6 +760,37 @@ impl<A: Abi> Globals<A> {
         globals.write_mem(mem, "prfptr", &A::ptr_to_bytes(prf))?;
         globals.write_mem(mem, "_ctype", &ctype_table())?;
 
+        // The identity strings. Each global is a pointer, so the string needs
+        // storage of its own, and the pointer is written to address it.
+        //
+        // These values are not read from configuration anywhere -- this host
+        // has none -- so a module that displays the BBS title displays exactly
+        // what is here. They are deliberately not empty for the two that name
+        // a *thing* rather than a contact detail, because an empty title
+        // renders as a blank line that looks like a bug in the module.
+        //
+        // `syskey` is `"SYSOP"` rather than empty because `LOCKNKEY.C`
+        // compares against it to decide sysop-ness; an empty key would make
+        // the comparison match unpredictably. That is reasoning from the
+        // header comment, not a measured value, so it carries this comment
+        // rather than a citation.
+        const IDENTITY: &[(&str, &str)] = &[
+            ("bbsttl", "Worldgroup"),
+            ("company", ""),
+            ("addres1", ""),
+            ("addres2", ""),
+            ("dataph", ""),
+            ("liveph", ""),
+            ("syskey", "SYSOP"),
+        ];
+        for (name, value) in IDENTITY {
+            let mut bytes = value.as_bytes().to_vec();
+            bytes.push(0);
+            let at = mem.alloc_region(bytes.len())?;
+            at.write(mem, &bytes).map_err(|e| io::Error::other(e.to_string()))?;
+            globals.write_mem(mem, name, &A::ptr_to_bytes(at))?;
+        }
+
         // MAJORBBS.C:80-81 -- `int nterms=1, hichp1=1;`. Both were set before
         // any module's init ran, `:557` only ever adds configured groups to
         // `nterms`, and `:569` catastros above 256. There is no path to zero,
@@ -889,6 +935,35 @@ mod tests {
         assert_eq!(byte, 0x7F, "U.S.A. only by default");
     }
 
+    /// The seven `CHAR *` identity globals must point at readable NUL-terminated
+    /// storage, not at NULL.
+    ///
+    /// A module that does `prf("%s", bbsttl)` dereferences the pointer. A NULL
+    /// there faults inside module code, which is the hardest kind of failure to
+    /// attribute back to a missing host global -- so what is asserted is that the
+    /// pointer resolves and the byte it addresses is readable.
+    #[test]
+    fn the_identity_strings_point_at_readable_storage() {
+        const NAMES: &[&str] = &[
+            "bbsttl", "company", "addres1", "addres2", "dataph", "liveph", "syskey",
+        ];
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        for name in NAMES {
+            assert_eq!(g.size(name).expect(name), PTR, "{name} is a CHAR *");
+            let target = g.pointer(&f.machine, name).expect(name);
+            assert_ne!(
+                target,
+                mbbs_machine::m16::FarPtr::NULL,
+                "{name} must not be a NULL pointer"
+            );
+            // Readable, and terminated: reading it must not fault and must find a
+            // NUL within the arena.
+            let s = f.read(target);
+            assert!(s.len() < 256, "{name} is NUL-terminated within reason");
+        }
+    }
+
     /// `nmods` is not a configuration value -- it is how many modules are online,
     /// which the host knows exactly. A fixture with no modules loaded must read
     /// zero, and the number must move when a module lands.
@@ -1026,7 +1101,12 @@ mod tests {
         // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
         // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
-        // 3538 until Task 1.3 placed one:
+        // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven:
+        //   +28 bbsttl, company, addres1, addres2, dataph, liveph, syskey
+        //       (MAJORBBS.H:558-567, seven CHAR * at 4 bytes each)
+        // no new alignment byte: all seven are 4 bytes and PTR-width entries
+        // stay evenly aligned throughout -- 3540 + 4*7 = 3568.
+        // Before that:
         //   +1 eurmsk    (MAJORBBS.H:592, a CHAR -- 1 byte)
         // plus one alignment byte: eurmsk ends on an odd offset and `kilipg`
         // (an int) needs to start on an even one -- 3538 + 1 + 1 = 3540.
@@ -1064,7 +1144,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3540);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3568);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
