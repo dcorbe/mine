@@ -147,7 +147,10 @@ fn main() -> io::Result<()> {
     let mut calls = 0u32;
 
     let ending = loop {
-        if calls >= MAX_CALLS {
+        // The cap rescues an unattended probe from a program looping on a call
+        // we keep refusing. A person playing a game is not that, and LORD idles
+        // by polling -- it burns thousands of calls just waiting for a turn.
+        if !interactive && calls >= MAX_CALLS {
             break format!("stopped after {MAX_CALLS} calls");
         }
         match vm.run()? {
@@ -177,7 +180,26 @@ fn main() -> io::Result<()> {
                         break format!("unimplemented: int 16h AH={ah:02X} ({what})");
                     }
                 }
-                if !int16(&mut vm, &mut keyboard) {
+                if ah == 0x01 || ah == 0x11 {
+                    // "Is a key ready?" with none queued is the other way a
+                    // program idles. Offer the driver a chance without making
+                    // the guest wait for an answer it asked not to wait for.
+                    if keyboard.is_empty()
+                        && let Some(script) = driver.as_mut()
+                    {
+                        let screen = Screen::snapshot(
+                            &vm,
+                            video.columns as usize,
+                            video.rows as usize,
+                            (video.cursor_row, video.cursor_col),
+                            video.cursor_visible,
+                        );
+                        if let Some(key) = script.poll_key(&screen) {
+                            keyboard.push_key(key);
+                        }
+                    }
+                    int16(&mut vm, &mut keyboard);
+                } else if !int16(&mut vm, &mut keyboard) {
                     // The guest has drained its input and finished painting.
                     // This is the settle point: hand the screen to the driver.
                     let Some(script) = driver.as_mut() else {

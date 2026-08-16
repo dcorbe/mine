@@ -70,7 +70,22 @@ impl Key {
 /// Asked for the next keystroke whenever the guest goes idle.
 pub trait Driver {
     /// Return the next key, or `None` to stop the program.
+    ///
+    /// Called when the guest *blocks* for a key, so taking as long as the user
+    /// likes is correct here.
     fn next_key(&mut self, screen: &Screen) -> Option<Key>;
+
+    /// Offer a key without waiting, for when the guest only *asked whether* one
+    /// was ready.
+    ///
+    /// A blocking read is not the only way a program idles. LORD spends its
+    /// time between turns polling `int 16h AH=01` and yielding, and never
+    /// reaches a blocking read at all -- so a driver that only wakes on
+    /// `next_key` never repaints and never gets a keystroke in edgeways. This
+    /// must not block: the guest is entitled to be told "no key" and carry on.
+    fn poll_key(&mut self, _screen: &Screen) -> Option<Key> {
+        None
+    }
 
     /// Why the driver stopped, for the report.
     fn ending(&self) -> String {

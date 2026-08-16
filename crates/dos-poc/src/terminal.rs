@@ -208,6 +208,17 @@ impl Terminal {
         (ready > 0).then(|| self.byte()).flatten()
     }
 
+    /// Is a byte already waiting? Never blocks.
+    fn ready(&self) -> bool {
+        let mut fds = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polling our own stdin with a zero timeout.
+        unsafe { libc::poll(std::ptr::from_mut(&mut fds), 1, 0) > 0 }
+    }
+
     fn read_key(&mut self) -> Option<Key> {
         let first = self.byte()?;
         if first == Self::QUIT {
@@ -278,6 +289,15 @@ impl Terminal {
 impl Driver for Terminal {
     fn next_key(&mut self, screen: &Screen) -> Option<Key> {
         self.paint(screen);
+        self.read_key()
+    }
+
+    /// Repaint, and take a keystroke only if one is already waiting.
+    fn poll_key(&mut self, screen: &Screen) -> Option<Key> {
+        self.paint(screen);
+        if !self.ready() {
+            return None;
+        }
         self.read_key()
     }
 
