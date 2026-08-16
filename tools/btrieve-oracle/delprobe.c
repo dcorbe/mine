@@ -58,12 +58,16 @@
  * Microkernel's own cache -- see sweep.sh's "path is never reused" note):
  *
  *   create              <path>
+ *   create_mod          <path>
  *   create_var          <path>
  *   insert              <path> <key> <tag>
  *   insert_var          <path> <key> <total>
  *   get                 <path> <key>
  *   position            <path> <key>
+ *   update              <path> <key> <newtag>
+ *   update_key          <path> <oldkey> <newkey>
  *   delete              <path> <key>
+ *   delete_only         <path> <key>
  *   delete_var          <path> <key>
  *   delete_no_position  <path>
  *   delete_twice        <path> <key>
@@ -207,6 +211,48 @@ static void cmd_create(const char *path)
     if (st != 0)
         die("create", st);
     printf("created %s reclen=%d pagesize=2048 flags=0 (fixed)\n", path, RECLEN);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* Same rig as cmd_create, except the key is MODIFIABLE (attribute bit 1).
+ *
+ * cmd_create's key is not, and genuine 6.15 answers status 10 ("key value not
+ * modifiable") to any update that changes it -- which makes the whole
+ * "what does an update do to the index" question unmeasurable on that file.
+ * It is not a hypothetical distinction: of the twelve v6 files The Rose ships,
+ * RCI_HEL1 declares all six of its keys modifiable, and RCI_PLAY, RCI_NAM1,
+ * RCI_RAND, RCI_SPEL and RCI_UNIV declare theirs too. */
+static void cmd_create_mod(const char *path)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    DWORD dlen = sizeof data;
+    int st;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = RECLEN;
+    fs->pagesize = 2048;
+    fs->indexes_raw = 1;
+    fs->flags = 0;
+
+    ks->position = 1;
+    ks->length = 4;
+    ks->flags = 0x0102; /* EXTTYPE | MODIFIABLE: unique, ascending */
+    ks->ext_type = 0x0e; /* unsigned binary */
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("create_mod", st);
+    printf("created %s reclen=%d pagesize=2048 key flags=0x0102 (modifiable)\n",
+           path, RECLEN);
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
@@ -947,6 +993,102 @@ static void cmd_wcclass_delete(const char *path, unsigned key16)
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
+/* GET_EQUAL `key`, rewrite every byte after the key field with `tag`, and
+ * UPDATE. The key value itself is left alone, which is the whole point: it
+ * separates "does an update move the DATA page" from "does an update move the
+ * INDEX", questions a key-changing update would answer together and therefore
+ * answer neither of. Pair it with `update_key` below. */
+static void cmd_update(const char *path, DWORD key, unsigned char tag)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int st;
+    unsigned i;
+
+    st = open_file(posblk, path);
+    if (st != 0) die("open", st);
+
+    keybuf_from(keybuf, key);
+    dlen = DATA_SIZE;
+    memset(record, 0, sizeof record);
+    st = btrcall(B_GET_EQUAL, posblk, record, &dlen, keybuf, 4, 0);
+    printf("update: get key=%lu status=%d (%s) datalen=%lu\n",
+           (unsigned long)key, st, status_name(st), (unsigned long)dlen);
+    if (st != 0) { fprintf(stderr, "FAIL: get before update\n"); exit(1); }
+
+    for (i = 4; i < RECLEN; i++)
+        record[i] = tag;
+
+    dlen = RECLEN;
+    st = btrcall(B_UPDATE, posblk, record, &dlen, keybuf, 4, 0);
+    printf("update: key=%lu newtag=%02x status=%d (%s) returned_dlen=%lu\n",
+           (unsigned long)key, tag, st, status_name(st), (unsigned long)dlen);
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* GET_EQUAL `oldkey`, overwrite the record's key field with `newkey`, and
+ * UPDATE -- the case where the index genuinely has to change because the
+ * record's ordered position did. Body bytes are left as the GET returned
+ * them, so any byte that moves is attributable to the key change. */
+static void cmd_update_key(const char *path, DWORD oldkey, DWORD newkey)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    unsigned char keybuf[KEY_SIZE];
+    DWORD dlen;
+    int st;
+
+    st = open_file(posblk, path);
+    if (st != 0) die("open", st);
+
+    keybuf_from(keybuf, oldkey);
+    dlen = DATA_SIZE;
+    memset(record, 0, sizeof record);
+    st = btrcall(B_GET_EQUAL, posblk, record, &dlen, keybuf, 4, 0);
+    printf("update_key: get key=%lu status=%d (%s)\n",
+           (unsigned long)oldkey, st, status_name(st));
+    if (st != 0) { fprintf(stderr, "FAIL: get before update_key\n"); exit(1); }
+
+    record[0] = (unsigned char)(newkey & 0xff);
+    record[1] = (unsigned char)((newkey >> 8) & 0xff);
+    record[2] = (unsigned char)((newkey >> 16) & 0xff);
+    record[3] = (unsigned char)((newkey >> 24) & 0xff);
+
+    dlen = RECLEN;
+    st = btrcall(B_UPDATE, posblk, record, &dlen, keybuf, 4, 0);
+    printf("update_key: %lu -> %lu status=%d (%s) returned_dlen=%lu\n",
+           (unsigned long)oldkey, (unsigned long)newkey, st, status_name(st),
+           (unsigned long)dlen);
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* One GET_EQUAL, one DELETE, nothing else. `cmd_delete` above also runs a
+ * GET_NEXT and a second DELETE to probe cursor semantics; both are harmless to
+ * the file, but a byte-level before/after diff should be able to attribute
+ * every changed page to exactly one operation, and that is not true of a
+ * command that performs four. */
+static void cmd_delete_only(const char *path, DWORD key)
+{
+    char posblk[POSBLK_SIZE];
+    int st = open_file(posblk, path);
+    if (st != 0) die("open", st);
+
+    st = do_get(posblk, key, NULL);
+    printf("delete_only: get key=%lu status=%d (%s)\n",
+           (unsigned long)key, st, status_name(st));
+    if (st != 0) { fprintf(stderr, "FAIL: get before delete\n"); exit(1); }
+
+    st = do_delete(posblk);
+    printf("delete_only: delete key=%lu status=%d (%s)\n",
+           (unsigned long)key, st, status_name(st));
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
 /* Plain filesystem read, bypassing Btrieve entirely -- run AFTER a Btrieve
  * command has closed the file, in a separate invocation, so there is no
  * question of reading through the Microkernel's own cache instead of what
@@ -1010,6 +1152,8 @@ int main(int argc, char **argv)
 
     if (!strcmp(cmd, "create")) {
         cmd_create(path);
+    } else if (!strcmp(cmd, "create_mod")) {
+        cmd_create_mod(path);
     } else if (!strcmp(cmd, "create_var")) {
         cmd_create_var(path);
     } else if (!strcmp(cmd, "insert")) {
@@ -1027,6 +1171,17 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "delete")) {
         if (argc < 4) { fprintf(stderr, "needs <key>\n"); return 2; }
         cmd_delete(path, (DWORD)strtoul(argv[3], NULL, 10));
+    } else if (!strcmp(cmd, "update")) {
+        if (argc < 5) { fprintf(stderr, "needs <key> <newtag>\n"); return 2; }
+        cmd_update(path, (DWORD)strtoul(argv[3], NULL, 10),
+                   (unsigned char)strtoul(argv[4], NULL, 0));
+    } else if (!strcmp(cmd, "update_key")) {
+        if (argc < 5) { fprintf(stderr, "needs <oldkey> <newkey>\n"); return 2; }
+        cmd_update_key(path, (DWORD)strtoul(argv[3], NULL, 10),
+                       (DWORD)strtoul(argv[4], NULL, 10));
+    } else if (!strcmp(cmd, "delete_only")) {
+        if (argc < 4) { fprintf(stderr, "needs <key>\n"); return 2; }
+        cmd_delete_only(path, (DWORD)strtoul(argv[3], NULL, 10));
     } else if (!strcmp(cmd, "delete_var")) {
         if (argc < 4) { fprintf(stderr, "needs <key>\n"); return 2; }
         cmd_delete_var(path, (DWORD)strtoul(argv[3], NULL, 10));
