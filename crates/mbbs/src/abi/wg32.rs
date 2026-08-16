@@ -467,6 +467,23 @@ impl Abi for Wg32 {
         None
     }
 
+    /// `None`, always -- and for a reason that is not [`Self::caller`]'s.
+    ///
+    /// `caller` is `None` here because [`Wg32::Module`] does not *yet* carry
+    /// a section table to resolve against; it is future work. This one is
+    /// `None` because the question does not arise: a PE32 module runs flat,
+    /// so `m32::Poison`'s fault address is already a linear address in the
+    /// image rather than a selector that has to be un-mapped. There is no
+    /// per-run translation to undo, which is the entire hazard on the `Wg16`
+    /// side.
+    ///
+    /// A section-relative rendering (`.text+0x1234`) would be a readability
+    /// improvement, not a correctness one, and it belongs with `caller`'s
+    /// section table when that lands.
+    fn fault_site(_module: &Self::Module, _poison: &Self::Poison) -> Option<String> {
+        None
+    }
+
     /// `mbbs_machine::m32::Module::init` -- exported ordinal 1, not
     /// `Module::entry()` (the PE's `AddressOfEntryPoint`, a Borland startup
     /// stub for a real Worldgroup DLL). Conflating the two was a real,

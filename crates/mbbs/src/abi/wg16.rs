@@ -205,6 +205,48 @@ impl Abi for Wg16 {
     /// the question it answers (a live call frame's return address, decoded
     /// against the one loaded NE image), so it belongs on the `Wg16` side of
     /// the border rather than in `lib.rs`.
+    /// The NE segment and offset a fault or timeout stopped at.
+    ///
+    /// `Poison::Fault`/`Poison::Timeout` carry the `cs:ip` the CPU pushed,
+    /// and `cs` is a **selector** -- an LDT index the loader happened to
+    /// hand out on that run, not a fact about the file.
+    /// [`mbbs_machine::m16::Module::segment_at`] is the only correct
+    /// translation, and it has to be asked on the run that faulted.
+    ///
+    /// Measured, 2026-08-15: The Rose's NE build faulted at
+    /// `0x0047:0x0719`. Under `mbbs-server`, which allocates four host
+    /// segments before loading, `0x0047` is segment **1**. Resolving the
+    /// same number against a standalone load -- where segment 1 is `0x0027`
+    /// -- says segment **5**, which has real code near `0x719` and a
+    /// plausible far-pointer table walk sitting there to be read. The
+    /// instruction was `int 21h` in segment 1's C runtime
+    /// (`docs/2026-08-15-int21-dos-gap.md`).
+    ///
+    /// So the raw number is not merely unhelpful, it is *actively*
+    /// misleading, and this is the same rule `caller16` states for
+    /// refusals: a wrong address costs more than no address.
+    fn fault_site(module: &Self::Module, poison: &Self::Poison) -> Option<String> {
+        let (cs, ip) = match poison {
+            mbbs_machine::m16::Poison::Fault { cs, ip, .. }
+            | mbbs_machine::m16::Poison::Timeout { cs, ip } => (*cs, *ip),
+            // Refusals name a symbol instead; there is no code address here
+            // to translate, and `caller` is what answers "from where".
+            mbbs_machine::m16::Poison::Unimplemented { .. }
+            | mbbs_machine::m16::Poison::Refused { .. } => return None,
+        };
+        let segment = module.segment_at(cs)?;
+        Some(format!("seg {segment}:{ip:#06x}"))
+    }
+
+    /// Delegates to `caller16` below (private, so not doc-linked from here)
+    /// -- the free function this crate had as `crate::caller` in `lib.rs`
+    /// before `Abi` grew a loading surface. See `caller16`'s own doc comment
+    /// for the "seg NN:offset" shape this answers in. Moved here in Task 14
+    /// of `docs/plans/2026-08-12-abi-border-implementation.md`: it names
+    /// `mbbs_machine::m16::Machine`/`Module` concretely, by the nature of
+    /// the question it answers (a live call frame's return address, decoded
+    /// against the one loaded NE image), so it belongs on the `Wg16` side of
+    /// the border rather than in `lib.rs`.
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String> {
         caller16(cpu, module)
     }
@@ -694,5 +736,94 @@ mod tests {
              already returned",
         );
         assert_eq!(got, pattern, "the pointer's bytes must survive the load unchanged");
+    }
+
+    /// A fault reports a **raw selector**, and a selector is not a segment:
+    /// the loader hands out whatever LDT entries are free on the run that
+    /// happened, so the same module's segment 1 is a different selector
+    /// under `mbbs-server` (which allocates host segments first) than in a
+    /// test that loads it alone.
+    ///
+    /// That cost a real investigation an hour on 2026-08-15. The Rose's NE
+    /// build faulted at `0x0047:0x0719`; resolving `0x0047` against a
+    /// standalone load said **segment 5**, which has real code near `0x719`
+    /// and a plausible far-pointer table walk to read. It was segment 1.
+    /// The only reason the wrong answer did not stick is that `0x719` turned
+    /// out not to be an instruction boundary in segment 5 -- a mechanical
+    /// tell, not one anybody is guaranteed to notice.
+    ///
+    /// `caller16` already makes this exact point in prose for *refusals* --
+    /// "a wrong address costs more than no address" -- and refusals have had
+    /// the translation all along. The fault path, which needs it more
+    /// because nobody chose to be there, did not. This is that gap closed.
+    #[test]
+    fn a_fault_is_reported_as_a_segment_not_the_selector_the_loader_happened_to_hand_out() {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+
+        // Whatever selector this run gave the module's one segment -- the
+        // number is not knowable in advance, which is the whole point.
+        let selector = module.data_selector();
+        assert_eq!(
+            module.segment_at(selector),
+            Some(1),
+            "the minimal module is one segment, and it is segment 1"
+        );
+
+        let site = Wg16::fault_site(
+            &module,
+            &mbbs_machine::m16::Poison::Fault {
+                signo: 11,
+                cs: selector,
+                ip: 0x0719,
+            },
+        );
+        assert_eq!(
+            site.as_deref(),
+            Some("seg 1:0x0719"),
+            "a fault in code the module owns must name the NE segment a \
+             disassembly speaks, not the run's selector"
+        );
+
+        // A timeout carries the same cs:ip and is just as unreadable raw.
+        let timed_out = Wg16::fault_site(
+            &module,
+            &mbbs_machine::m16::Poison::Timeout {
+                cs: selector,
+                ip: 0x0719,
+            },
+        );
+        assert_eq!(timed_out.as_deref(), Some("seg 1:0x0719"));
+    }
+
+    /// `None` rather than a guess, on the same rule `caller16` follows: a
+    /// selector this module does not own cannot be translated, and inventing
+    /// a segment for it would send someone to a real instruction that had
+    /// nothing to do with the fault. A fault in host code, or in another
+    /// module, is exactly that case.
+    #[test]
+    fn a_fault_outside_this_modules_selectors_is_not_given_a_segment() {
+        let mut f = crate::testing::Fixture::new();
+        let module = f.minimal_module();
+
+        let site = Wg16::fault_site(
+            &module,
+            &mbbs_machine::m16::Poison::Fault {
+                signo: 11,
+                cs: 0xFFFF,
+                ip: 0x0719,
+            },
+        );
+        assert_eq!(site, None, "a selector the module does not own gets no segment");
+
+        // And a poison with no code address at all has nothing to translate.
+        let refused = Wg16::fault_site(
+            &module,
+            &mbbs_machine::m16::Poison::Unimplemented {
+                module: "MAJORBBS".to_owned(),
+                symbol: "nope".to_owned(),
+            },
+        );
+        assert_eq!(refused, None, "a refusal carries no cs:ip to translate");
     }
 }

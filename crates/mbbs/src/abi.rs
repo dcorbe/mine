@@ -573,6 +573,24 @@ pub trait Abi {
     /// carries enough to answer it (design §3).
     fn caller(cpu: &Self::Cpu, module: &Self::Module) -> Option<String>;
 
+    /// Where a **fault or timeout** stopped, as a place a disassembly names.
+    ///
+    /// [`Self::caller`]'s counterpart for the poison the module did not
+    /// choose. A refusal names a symbol and gets `caller` to say who called
+    /// it; a fault has only a raw `cs:ip`, and **a selector is not a
+    /// segment** -- the loader hands out whatever LDT entries are free on
+    /// the run that happened, so the same module's segment 1 is a different
+    /// selector under `mbbs-server` (host segments allocated first) than in
+    /// a test that loads it alone. Reading a selector as though it were
+    /// stable sends the reader to the wrong function in a different segment,
+    /// which is a failure that has actually happened here (see this
+    /// function's `Wg16` implementation).
+    ///
+    /// `None` on exactly `caller`'s rule -- no guess is better than a wrong
+    /// address: a poison that carries no code address at all (every refusal),
+    /// or a `cs` this module does not own (host code, or another module).
+    fn fault_site(module: &Self::Module, poison: &Self::Poison) -> Option<String>;
+
     /// Where the module's init routine sits -- resolved by NAME in both
     /// ABIs now (`_init__<dll>` PE-side, `_INIT__<DLL>` NE-side, both
     /// case-insensitive), with exported ordinal 1 as a fallback rather than
@@ -1190,6 +1208,10 @@ mod tests {
 
         fn caller(_cpu: &Self::Cpu, _module: &Self::Module) -> Option<String> {
             unreachable!("Call's read tests never call Abi::caller")
+        }
+
+        fn fault_site(_module: &Self::Module, _poison: &Self::Poison) -> Option<String> {
+            unreachable!("Call's read tests never call Abi::fault_site")
         }
 
         fn init_entry(_module: &Self::Module) -> Option<Self::Ptr> {

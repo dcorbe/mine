@@ -717,16 +717,34 @@ fn life<A: Abi>(
         })?;
         match host.run(&mut machine, &module, entry, &[], None)? {
             Outcome::Returned { .. } => {}
-            // Ordinal 1 itself poisoning the machine is a boot failure, not a
-            // survivable stop: `Host::run` reports it as `Ok(Outcome::Stopped)`
-            // rather than an `Err`, so it has to be checked here rather than
-            // relying on `?` above to catch it. Continuing to load the next
-            // module (or to `finish_init`) on an already-poisoned machine
-            // would run setup on a machine that will refuse every call, so
-            // this stops the whole boot before either happens.
+            // The init routine itself poisoning the machine is a boot
+            // failure, not a survivable stop: `Host::run` reports it as
+            // `Ok(Outcome::Stopped)` rather than an `Err`, so it has to be
+            // checked here rather than relying on `?` above to catch it.
+            // Continuing to load the next module (or to `finish_init`) on an
+            // already-poisoned machine would run setup on a machine that will
+            // refuse every call, so this stops the whole boot before either
+            // happens.
+            //
+            // "init", not "ordinal 1": init is resolved by NAME now
+            // (`_INIT__<DLL>`, `Abi::init_entry`), and ordinal 1 is only the
+            // fallback. This message said "ordinal 1" long after that stopped
+            // being true, naming an entry point the loader no longer uses --
+            // for The Rose it is ordinal 403, and ordinal 1 is a crt0 stub
+            // this host deliberately never enters.
+            //
+            // `A::fault_site` appends the NE segment when the poison carries
+            // a code address, because the raw `cs:ip` in it is a *selector*
+            // and reading one as a segment sends the reader to the wrong
+            // function entirely -- see that method's own doc comment for the
+            // hour that cost.
             Outcome::Stopped(poison) => {
+                let site = match A::fault_site(&module, &poison) {
+                    Some(at) => format!(" ({at})"),
+                    None => String::new(),
+                };
                 return Err(io::Error::other(format!(
-                    "{}: module ordinal 1 (init) stopped before boot completed: {poison}",
+                    "{}: module init stopped before boot completed: {poison}{site}",
                     path.display()
                 )));
             }
