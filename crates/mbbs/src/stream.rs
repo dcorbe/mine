@@ -44,7 +44,6 @@ use std::path::Path;
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::abi::Abi;
-use crate::arena::Arena;
 
 /// Bytes of Borland's `FILE`, as `INCLUDE/STDIO.H:104-114` declares it: two
 /// `int`s, two `char`s, an `int`, two far pointers, an `unsigned` and a `short`.
@@ -52,17 +51,17 @@ use crate::arena::Arena;
 /// Large model, so the pointers are four bytes each. Twenty in total, and no
 /// padding -- every field lands on its natural boundary already.
 ///
-/// One reservation size for every ABI, not `Wg16`'s alone, even though this
-/// sum is `Wg16`'s own field list: it has to be at least as large as
-/// `Wg32::FILE_FLAGS_OFFSET + 2`, the last byte either ABI's fabricated
-/// cookie is ever addressed at. Confirmed, not assumed -- `0x12 + 2 == 20`,
-/// exactly this constant, so `Wg32`'s flags word lands in the final two
-/// bytes of the same twenty rather than needing a wider reservation.
-pub const FILE_SIZE: usize = 2 + 2 + 1 + 1 + 2 + 4 + 4 + 2 + 2;
-
-// NOTE: the constant above is `Wg16`'s, kept only because this module's own
-// tests and `tests/wg32_stream_flags_offset.rs` name it. Everything that
-// writes or reserves a `FILE` uses `A::FILE_SIZE`.
+/// `Wg16`'s `sizeof(FILE)`, for tests that name a concrete ABI.
+///
+/// **Unified with [`Abi::FILE_SIZE`] as of Phases 3+4 Task 4.4**: it is now
+/// *defined as* `Wg16::FILE_SIZE` rather than being a second, independently
+/// written sum of the same field list. It used to be described as "one
+/// reservation size for every ABI" -- true while every `FILE` came out of an
+/// arena, and wrong the moment `_streams` became a real array, because an
+/// array whose stride disagrees with the structs in it is worse than no
+/// array. Nothing reserves or strides by this constant now; every such site
+/// uses `A::FILE_SIZE`.
+pub const FILE_SIZE: usize = <crate::abi::Wg16 as Abi>::FILE_SIZE;
 
 /// Where `fd` is, which `fileno(f)` expands to a read of. **One byte.**
 ///
@@ -108,6 +107,24 @@ mod flags {
 /// DOS's soft end-of-file. A text-mode read stops here and does not look past
 /// it, which `READ.CAS`'s `cmp al, _ctlZ / je endSeen` is the whole of.
 const CTRL_Z: u8 = 0x1a;
+
+/// How many `FILE` slots `_streams` holds -- Borland's `_NFILE`.
+///
+/// **Twenty, and this is a documented choice rather than a measurement.**
+/// `_NFILE` is 20 in Borland's 16-bit runtime, but it is defined in
+/// `INCLUDE/STDIO.H`, which is not in this repository's tracked tree --
+/// `re/wg33src/INC/` is Galacticomm's headers, not Borland's, and the Turbo C
+/// headers under `tmp/` are gitignored and so cannot be cited. No oracle
+/// build exports anything that would reveal the array's length either: the
+/// datum's address is exported (ordinal 43, `__STREAMS`) but its extent is
+/// not.
+///
+/// The number is load-bearing in one way and one way only: it bounds how
+/// many files may be open at once, because [`crate::stream::Streams`] puts
+/// each stream's `FILE` at the slot its own descriptor names. Five of the
+/// twenty are DOS's standard handles, so fifteen remain -- which is what the
+/// real runtime allowed too.
+pub const NFILE: u16 = 20;
 
 /// The first file descriptor a module's own stream may have.
 ///
@@ -558,7 +575,18 @@ pub struct Streams<A: Abi> {
     /// Borland `FILE` belongs to the runtime's own static `_streams[]` and the
     /// module never allocates or frees one, and putting them on the heap would
     /// make `farcoreleft` depend on how many files had been opened.
-    arena: Arena<A>,
+    /// Where `_streams` was placed, once the host knows.
+    ///
+    /// **`FILE` structs are carved out of the module-visible `_streams`
+    /// array, not out of an arena of this type's own.** Borland's `FILE`s
+    /// live in `_streams[]` and a module may compare a `FILE *` against
+    /// `&_streams[n]`, walk the array, or reach `stdin`/`stdout`/`stderr` as
+    /// `&_streams[0..3]`; a cookie at some arena address would satisfy none
+    /// of that, and the two were genuinely two address spaces for one concept
+    /// until Phases 3+4 Task 4.4.
+    ///
+    /// `None` only before [`Streams::place`] has run.
+    base: Option<A::Ptr>,
 
     open: Vec<Stream<A>>,
 
@@ -573,7 +601,7 @@ pub struct Streams<A: Abi> {
 impl<A: Abi> Default for Streams<A> {
     fn default() -> Self {
         Self {
-            arena: Arena::default(),
+            base: None,
             open: Vec::new(),
             retired: Vec::new(),
         }
@@ -608,10 +636,7 @@ impl<A: Abi> Streams<A> {
 
         let io = Self::io_for(path, mode)?;
 
-        let cookie = self
-            .arena
-            .reserve(mem, A::FILE_SIZE)
-            .map_err(|e| format!("{name}: {e}"))?;
+        let cookie = self.slot(fd).map_err(|e| format!("{name}: {e}"))?;
 
         let stream = Stream {
             name: name.to_owned(),
@@ -1209,8 +1234,50 @@ impl<A: Abi> Streams<A> {
     }
 
     /// The lowest descriptor no open stream is using.
+    /// The lowest descriptor no open stream is using.
+    ///
+    /// **Bounded by `NFILE`, not by `u8::MAX`**, because a descriptor is also
+    /// an index into `_streams` now: a handle the array has no slot for is a
+    /// handle whose `FILE` would have nowhere to live. Five of the twenty
+    /// slots are DOS's standard handles, so fifteen files may be open at
+    /// once -- which is what the real runtime allowed.
     fn free_fd(&self) -> Option<u8> {
-        (FIRST_FD..=u8::MAX).find(|fd| !self.open.iter().any(|s| s.fd == *fd))
+        let last = NFILE.saturating_sub(1) as u8;
+        (FIRST_FD..=last).find(|fd| !self.open.iter().any(|s| s.fd == *fd))
+    }
+
+    /// Tell this type where `_streams` was placed.
+    ///
+    /// Called once, by `Host::new`, after the globals are laid out. Nothing
+    /// may open a stream before it.
+    pub fn place(&mut self, base: A::Ptr) {
+        self.base = Some(base);
+    }
+
+    /// The address of `_streams[fd]`.
+    ///
+    /// **The slot is the descriptor.** That is the invariant that makes the
+    /// array meaningful to a module: `fileno(fp)` and `(fp - _streams) /
+    /// sizeof(FILE)` are the same number, so a module that indexes the array
+    /// by a descriptor it holds finds the very stream that descriptor names.
+    /// Borland's own runtime has the same correspondence for the standard
+    /// handles, and this host extends it to every stream rather than keeping
+    /// two numberings that agree only by luck.
+    ///
+    /// # Errors
+    ///
+    /// If `_streams` has not been placed, or `fd` is past the end of it.
+    fn slot(&self, fd: u8) -> Result<A::Ptr, String> {
+        let base = self
+            .base
+            .ok_or_else(|| "_streams has not been placed yet".to_owned())?;
+        if u16::from(fd) >= NFILE {
+            return Err(format!(
+                "descriptor {fd} is past the {} slots of _streams",
+                NFILE
+            ));
+        }
+        Ok(A::ptr_offset(base, u16::from(fd) * A::FILE_SIZE as u16))
     }
 }
 

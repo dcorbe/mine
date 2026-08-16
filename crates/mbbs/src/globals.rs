@@ -85,6 +85,14 @@ pub enum Width {
     /// A width both ABIs agree on, in bytes -- pointers, longs, arrays,
     /// structs, and the two single-byte flags.
     Bytes(u16),
+    /// An array of this many `FILE` structs: `n * `[`Abi::FILE_SIZE`] bytes.
+    ///
+    /// The second per-ABI width, and here for the same reason [`Width::Int`]
+    /// is: a `FILE` is 20 bytes under `Wg16` and 27 under `Wg32`, both
+    /// measured (see each `Abi` impl's own `FILE_SIZE` doc comment), so an
+    /// array of them cannot be a fixed byte count. `_streams` is the only
+    /// global of this shape.
+    Files(u16),
 }
 
 impl Width {
@@ -94,7 +102,18 @@ impl Width {
             // `INT_WIDTH` is 2 or 4; the cast cannot lose anything.
             Self::Int => A::INT_WIDTH as u16,
             Self::Bytes(n) => n,
+            Self::Files(n) => n * A::FILE_SIZE as u16,
         }
+    }
+}
+
+
+/// A `MAJORBBS` global that is an array of `n` `FILE` structs.
+const fn f(name: &'static str, n: u16) -> Global {
+    Global {
+        dll: crate::exports::MAJORBBS,
+        name,
+        size: Width::Files(n),
     }
 }
 
@@ -329,6 +348,13 @@ pub const GLOBALS: &[Global] = &[
     // cell has to be here; `shochl` refuses rather than writing through the
     // null.
     g("uidarr", PTR),
+    // Borland's array of FILE structs. A module reaches stdin/stdout/stderr
+    // as &_streams[0..3], and may compare a FILE * against &_streams[n] or
+    // walk the array -- which is why the streams this host opens live IN it
+    // rather than at arena addresses of their own. See NFILE for where the
+    // count comes from and `crate::stream::Streams::open_mem` for the
+    // slot-is-the-descriptor invariant that makes the array meaningful.
+    f("_streams", crate::stream::NFILE),
     // Borland's own ctype table: 257 bytes, indexed from -1, so that
     // `(_ctype+1)[c]` is in range for every `char` and for EOF.
     g("_ctype", CTYPE_LEN),
@@ -1412,15 +1438,32 @@ mod tests {
             assert_eq!(w16.size.bytes::<crate::abi::Wg32>(), 4, "{name} under Wg32");
         }
 
-        // Every other global is the same width under both, so the totals
-        // differ by exactly two bytes per `int` and nothing else.
+        // Every other global is the same width under both **except**
+        // `_streams`, so the totals differ by two bytes per `int` plus that
+        // one array's own difference -- and nothing else.
+        //
+        // `Width::Files` is the second per-ABI width and arrived with Phases
+        // 3+4 Task 4.4. Before it, "two bytes per int and nothing else" was
+        // the whole story; spelling the second term out here rather than
+        // loosening the assertion is what keeps a *third* per-ABI width from
+        // slipping in unnoticed.
+        let files: Vec<&str> = GLOBALS
+            .iter()
+            .filter(|g| matches!(g.size, Width::Files(_)))
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(files, ["_streams"], "the FILE-array globals: {files:?}");
+
+        let file_difference = u32::from(crate::stream::NFILE)
+            * (crate::abi::Wg32::FILE_SIZE as u32 - crate::abi::Wg16::FILE_SIZE as u32);
+
         let end = |placed: Vec<(&str, u16, u16)>| {
             let last = *placed.last().expect("non-empty");
             u32::from(last.1) + u32::from(last.2)
         };
         assert_eq!(
             end(layout::<crate::abi::Wg32>()) - end(layout::<crate::abi::Wg16>()),
-            2 * ints.len() as u32,
+            2 * ints.len() as u32 + file_difference,
         );
     }
 
@@ -1504,7 +1547,13 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3628);
+        //
+        // Phases 3+4 Task 4.4 added `_streams`, `NFILE` (20) `FILE` structs
+        // of `Wg16::FILE_SIZE` (20 bytes) each: 3628 + 400 = 4028. It is the
+        // first `Width::Files` global and the largest single datum in the
+        // table -- and it has to be a real region rather than a pointer,
+        // because the streams this host opens live inside it.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 4028);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as

@@ -2449,4 +2449,88 @@ mod tests {
         assert_eq!(found_name(&f, blk), "SAMPLE.MSG");
         assert_eq!(word(fndnxt_(&mut f, blk).expect("fndnxt")), 0);
     }
+
+    // ---- _streams -----------------------------------------------------------
+
+    /// `_streams` is placed, and it is `NFILE` `FILE` structs long.
+    #[test]
+    fn streams_is_placed_as_an_array_of_file_structs() {
+        let f = Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(
+            g.size("_streams").expect("_streams is placed"),
+            crate::stream::NFILE * FILE_SIZE as u16,
+            "NFILE FILE structs, at this ABI's own sizeof(FILE)"
+        );
+    }
+
+    /// A `FILE *` `fopen` answers lies **inside** `_streams`, and the slot it
+    /// sits at is its own descriptor.
+    ///
+    /// This is the invariant that makes the array meaningful to a module:
+    /// `fileno(fp)` and `(fp - _streams) / sizeof(FILE)` are the same number,
+    /// so a module that walks the array, or indexes it by a descriptor it
+    /// holds, finds the stream that descriptor names. Before Phases 3+4 Task
+    /// 4.4 the cookie came from an arena and none of that was true -- the two
+    /// were separate address spaces for one concept.
+    #[test]
+    fn a_file_star_lies_inside_streams_at_the_slot_its_descriptor_names() {
+        let mut f = Fixture::new();
+        let base = f.host.globals().address("_streams").expect("_streams is placed");
+
+        let path = f.text("LINES.TXT");
+        let mode = f.text("rb");
+        let Ret::Far(cookie) = f
+            .invoke(fopen, &[path.offset, path.selector, mode.offset, mode.selector])
+            .expect("fopen")
+        else {
+            panic!("fopen returns a FILE *");
+        };
+
+        assert_eq!(cookie.selector, base.selector, "the same segment as _streams");
+        let inside = cookie.offset - base.offset;
+        assert!(
+            usize::from(inside) < usize::from(crate::stream::NFILE) * FILE_SIZE,
+            "the cookie is past the end of the array"
+        );
+        assert_eq!(
+            usize::from(inside) % FILE_SIZE,
+            0,
+            "a FILE * must land on a slot boundary, not between two"
+        );
+
+        let index = usize::from(inside) / FILE_SIZE;
+        let fd = f.host.streams.fd_of_cookie(cookie).expect("the descriptor");
+        assert_eq!(
+            index,
+            usize::from(fd),
+            "the slot a FILE sits at IS its descriptor -- fileno(fp) and \
+             (fp - _streams)/sizeof(FILE) have to be the same number"
+        );
+    }
+
+    /// Two open streams get two different slots, and neither overlaps the
+    /// other.
+    #[test]
+    fn two_open_streams_occupy_two_distinct_slots() {
+        let mut f = Fixture::new();
+        let mode = f.text("rb");
+        let mut seen = Vec::new();
+        for name in ["LINES.TXT", "SAMPLE.DAT"] {
+            let path = f.text(name);
+            let Ret::Far(cookie) = f
+                .invoke(fopen, &[path.offset, path.selector, mode.offset, mode.selector])
+                .expect("fopen")
+            else {
+                panic!("FILE *");
+            };
+            seen.push(cookie);
+        }
+        assert_ne!(seen[0], seen[1]);
+        let apart = seen[0].offset.abs_diff(seen[1].offset);
+        assert!(
+            usize::from(apart) >= FILE_SIZE,
+            "two FILE structs closer together than sizeof(FILE) overlap"
+        );
+    }
 }

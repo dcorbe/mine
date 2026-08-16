@@ -31,7 +31,7 @@
 //! (see that file's doc comment on `minimal_with_one_section`): a private
 //! test fixture in one source file is not reachable from another.
 
-use mbbs::abi::{Wg32, Wg32Cpu};
+use mbbs::abi::{Abi, ModuleMem, Wg32, Wg32Cpu};
 use mbbs::stream::{FILE_SIZE, Mode, Streams};
 use mbbs::testing::scratch;
 use mbbs_machine::ptr::ModulePtr;
@@ -89,6 +89,23 @@ fn cpu() -> Wg32Cpu {
     Wg32Cpu::new(machine, mem)
 }
 
+/// A `Streams<Wg32>` with somewhere for its `FILE` structs to live.
+///
+/// Every `FILE` is carved out of the module-visible `_streams` array as of
+/// Phases 3+4 Task 4.4, so `Streams` has to be told where that array is
+/// before it can open anything -- `Host::new` does this from the placed
+/// global, and a test that builds a bare `Streams` has to do the equivalent.
+/// The region is `NFILE` structs at **this ABI's own** `FILE_SIZE`, which is
+/// 27 here and not `Wg16`'s 20; asking for the wrong one would put the last
+/// slots outside the region.
+fn place_streams(cpu: &mut Wg32Cpu) -> Streams<Wg32> {
+    let bytes = usize::from(mbbs::stream::NFILE) * <Wg32 as Abi>::FILE_SIZE;
+    let base = cpu.mem.alloc_region(bytes).expect("room for _streams");
+    let mut streams = Streams::<Wg32>::default();
+    streams.place(base);
+    streams
+}
+
 /// The test that matters (per the task brief): read a `Wg32` stream to
 /// true EOF and assert bit `0x20` (`_F_EOF`) is set at `cookie +
 /// Wg32::FILE_FLAGS_OFFSET` -- exactly where `cw3220mt`'s own `_feof`
@@ -110,7 +127,7 @@ fn reading_a_wg32_stream_to_eof_sets_f_eof_at_cw3220mts_own_offset() {
     let path = root.join("short.txt");
     std::fs::write(&path, b"hi\n").expect("a scratch file to open");
 
-    let mut streams = Streams::<Wg32>::default();
+    let mut streams = place_streams(&mut cpu);
     let cookie = streams
         .open_mem(
             &mut cpu.mem,
@@ -190,7 +207,7 @@ fn a_wg32_streams_descriptor_is_a_four_byte_int_at_cw3220mts_own_offset() {
     let path = root.join("fd.txt");
     std::fs::write(&path, b"hi\n").expect("a scratch file to open");
 
-    let mut streams = Streams::<Wg32>::default();
+    let mut streams = place_streams(&mut cpu);
     let cookie = streams
         .open_mem(
             &mut cpu.mem,

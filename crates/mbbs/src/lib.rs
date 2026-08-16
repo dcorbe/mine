@@ -1635,6 +1635,15 @@ impl<A: Abi> Host<A> {
             .write(A::mem(machine), &[0])
             .map_err(|e| io::Error::other(e.to_string()))?;
 
+        // `_streams` is where every `FILE` this host opens will live, so
+        // `Streams` has to be told the address before anything can open one.
+        // See `Streams::place` and `Streams::slot` for the slot-is-the-
+        // descriptor invariant that depends on it.
+        let mut streams_placed = stream::Streams::<A>::default();
+        streams_placed.place(globals.address("_streams").ok_or_else(|| {
+            io::Error::other("_streams is not placed, so no FILE has anywhere to live")
+        })?);
+
         Ok(Self {
             exports: Exports::wg101(),
             globals,
@@ -1669,7 +1678,7 @@ impl<A: Abi> Host<A> {
             messages: msg::Messages::default(),
             btrieve: btrieve::Btrieve::default(),
             gsbl,
-            streams: stream::Streams::default(),
+            streams: streams_placed,
             installed: Vec::new(),
             notes: Vec::new(),
             noted: HashSet::new(),
