@@ -3064,7 +3064,14 @@ mod tests {
     /// anything the host process can.
     #[test]
     fn open_cannot_escape_the_sandbox() {
-        let mut f = Fixture::new();
+        // **A scratch root, not the checked-in fixture directory.** This test
+        // opens for writing with O_CREAT, so if the sandbox check ever stops
+        // working the call succeeds and *creates a file* -- and rooted at
+        // `testing::data()` that file lands in the committed tree. That is
+        // not hypothetical: mutating `dos_name` out of `resolve_for_open` to
+        // check this very assertion left a stray `..\ESCAPE.TXT` in
+        // `crates/mbbs/tests/data/`, which is how the hazard was found.
+        let mut f = Fixture::rooted(scratch("crt-open-sandbox"));
         for named in ["..\\ESCAPE.TXT", "..\\..\\etc\\passwd", "C:\\ESCAPE.TXT"] {
             let at = f.text(named);
             let e = f
