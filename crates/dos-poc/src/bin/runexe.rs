@@ -101,7 +101,7 @@ fn main() -> io::Result<()> {
     println!("root: {root_dir}");
 
     let mut dos = DosState::default();
-    dos.files = Some(Files::new(root.into()));
+    dos.files = Some(Files::new(root.into(), std::path::PathBuf::from(&root_dir)));
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
     let mut driver: Option<Box<dyn Driver>> = if interactive {
@@ -249,6 +249,12 @@ fn main() -> io::Result<()> {
     }
 
     if let Some(files) = dos.files.as_ref() {
+        if !files.ambiguous.is_empty() {
+            println!("--- names the host cannot uniquely resolve ---");
+            for note in &files.ambiguous {
+                println!("  {note}");
+            }
+        }
         if !files.attempts.is_empty() {
             println!("--- every file the guest asked for ---");
             for (name, how, okd) in &files.attempts {

@@ -17,6 +17,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 
 /// DOS error codes, as returned in AX with CF set.
 pub const ERR_FILE_NOT_FOUND: u16 = 0x02;
@@ -98,6 +99,16 @@ pub fn translate(raw: &[u8]) -> Target {
     Target::File(text)
 }
 
+/// Entry names in `dir`, or nothing if it cannot be listed.
+fn list(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect()
+}
+
 struct Handle {
     fd: OwnedFd,
     /// Kept for diagnostics: "which file did it write?" is the whole question.
@@ -105,12 +116,56 @@ struct Handle {
     device: bool,
 }
 
+/// Which host spelling a DOS name refers to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// One entry matches byte for byte.
+    Exact(String),
+    /// No exact match, but exactly one differing only in case.
+    Unique(String),
+    /// Several entries differ only in case. DOS cannot name one of them, so
+    /// guessing would silently bind the program to the wrong file.
+    Ambiguous(Vec<String>),
+    /// Nothing matches -- which is not an error for a create.
+    Missing,
+}
+
+/// Choose the host spelling for a DOS name from a directory's entries.
+///
+/// Pure so it can be tested without a filesystem, and separate from the open
+/// because the interesting behaviour is entirely in the choice.
+pub fn pick(entries: &[String], want: &str) -> Pick {
+    if let Some(hit) = entries.iter().find(|e| *e == want) {
+        return Pick::Exact(hit.clone());
+    }
+    let mut folded: Vec<String> = entries
+        .iter()
+        .filter(|e| e.eq_ignore_ascii_case(want))
+        .cloned()
+        .collect();
+    match folded.len() {
+        0 => Pick::Missing,
+        1 => Pick::Unique(folded.remove(0)),
+        _ => {
+            folded.sort();
+            Pick::Ambiguous(folded)
+        }
+    }
+}
+
 /// The open-file table, and the root everything resolves beneath.
 pub struct Files {
     root: OwnedFd,
+    /// The same directory by path, used only to *list* it for case folding.
+    /// Opens still go through `openat2` against the descriptor, so this cannot
+    /// widen what is reachable -- it only decides which name to ask for.
+    root_path: PathBuf,
     open: Vec<Option<Handle>>,
     /// Every file the program created or wrote, in order first touched.
     pub touched: Vec<String>,
+    /// Names that could not be resolved because the host holds several
+    /// spellings of them.
+    pub ambiguous: Vec<String>,
     /// Every open or create the program attempted, and how it went. "Which
     /// files did it ask for?" is a different question from "which did it
     /// write", and answering only the second hides the interesting half.
@@ -118,11 +173,13 @@ pub struct Files {
 }
 
 impl Files {
-    pub fn new(root: OwnedFd) -> Self {
+    pub fn new(root: OwnedFd, root_path: PathBuf) -> Self {
         Self {
             root,
+            root_path,
             open: (0..MAX_HANDLES).map(|_| None).collect(),
             touched: Vec::new(),
+            ambiguous: Vec::new(),
             attempts: Vec::new(),
         }
     }
@@ -163,14 +220,44 @@ impl Files {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
-    /// Try the name as DOS spelled it, then as a host directory is likely to.
-    fn open_either_case(&self, name: &str, flags: i32, mode: u32) -> io::Result<OwnedFd> {
-        match self.openat2(name, flags, mode) {
-            Ok(fd) => Ok(fd),
-            Err(first) => self
-                .openat2(&name.to_ascii_lowercase(), flags, mode)
-                .map_err(|_| first),
+    /// Resolve a DOS path to the spelling the host actually uses.
+    ///
+    /// DOS is case-insensitive, so `LORD.DAT` and `lord.dat` are one file to a
+    /// DOS program -- and a real LORD directory has both. Trying uppercase then
+    /// lowercase, as this used to, silently binds the program to whichever it
+    /// guesses first and makes the other unreachable forever: write one, read
+    /// the other back, and the setting appears to revert on its own.
+    ///
+    /// Resolved component by component, so a directory's case matters as little
+    /// as a file's. A component that does not exist keeps the spelling DOS
+    /// gave, which is what a create needs.
+    fn resolve(&mut self, name: &str) -> Result<String, u16> {
+        let mut here: PathBuf = self.root_path.clone();
+        let mut out: Vec<String> = Vec::new();
+        for part in name.split('/') {
+            let entries = list(&here);
+            match pick(&entries, part) {
+                Pick::Exact(found) | Pick::Unique(found) => {
+                    here.push(&found);
+                    out.push(found);
+                }
+                Pick::Missing => {
+                    here.push(part);
+                    out.push(part.to_string());
+                }
+                Pick::Ambiguous(all) => {
+                    let note = format!("{name}: host holds {}", all.join(", "));
+                    if !self.ambiguous.contains(&note) {
+                        self.ambiguous.push(note);
+                    }
+                    // Refusing is the honest answer: the program asked for a
+                    // file the host cannot uniquely name, and picking one would
+                    // be undefined behaviour wearing a filename.
+                    return Err(ERR_ACCESS_DENIED);
+                }
+            }
         }
+        Ok(out.join("/"))
     }
 
     fn install(&mut self, fd: OwnedFd, name: String, device: bool) -> Result<u16, u16> {
@@ -210,7 +297,8 @@ impl Files {
                     1 => libc::O_WRONLY,
                     _ => libc::O_RDWR,
                 };
-                let attempt = self.open_either_case(&name, flags, 0);
+                let name = self.resolve(&name)?;
+                let attempt = self.openat2(&name, flags, 0);
                 self.attempts
                     .push((name.clone(), "open", attempt.is_ok()));
                 let fd = attempt
@@ -231,6 +319,7 @@ impl Files {
             Target::Device(dev) => self.device_handle(dev),
             Target::Rejected => Err(ERR_PATH_NOT_FOUND),
             Target::File(name) => {
+                let name = self.resolve(&name)?;
                 let attempt =
                     self.openat2(&name, libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC, 0o644);
                 self.attempts
@@ -300,17 +389,13 @@ impl Files {
             Target::Device(_) => return Ok(()),
             Target::Rejected => return Err(ERR_PATH_NOT_FOUND),
         };
-        for spelling in [name.clone(), name.to_ascii_lowercase()] {
-            let Ok(c_path) = std::ffi::CString::new(spelling) else {
-                continue;
-            };
-            // SAFETY: unlinking relative to a descriptor we own.
-            let rc = unsafe { libc::unlinkat(self.root.as_raw_fd(), c_path.as_ptr(), 0) };
-            if rc == 0 {
-                return Ok(());
-            }
-        }
-        Err(ERR_FILE_NOT_FOUND)
+        let name = self.resolve(&name)?;
+        let Ok(c_path) = std::ffi::CString::new(name) else {
+            return Err(ERR_FILE_NOT_FOUND);
+        };
+        // SAFETY: unlinking relative to a descriptor we own.
+        let rc = unsafe { libc::unlinkat(self.root.as_raw_fd(), c_path.as_ptr(), 0) };
+        if rc == 0 { Ok(()) } else { Err(ERR_FILE_NOT_FOUND) }
     }
 
     /// `42h` -- seek. `whence` is 0 set, 1 current, 2 end.
@@ -334,6 +419,40 @@ impl Files {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn an_exact_spelling_wins_even_when_others_differ_only_in_case() {
+        let entries = names(&["LORD.DAT", "lord.dat"]);
+        assert_eq!(pick(&entries, "LORD.DAT"), Pick::Exact("LORD.DAT".into()));
+        assert_eq!(pick(&entries, "lord.dat"), Pick::Exact("lord.dat".into()));
+    }
+
+    #[test]
+    fn one_differing_only_in_case_is_used() {
+        let entries = names(&["player.dat"]);
+        assert_eq!(pick(&entries, "PLAYER.DAT"), Pick::Unique("player.dat".into()));
+    }
+
+    #[test]
+    fn several_spellings_and_no_exact_match_is_refused_not_guessed() {
+        // The real hazard: a LORD directory holding both, and DOS asking for a
+        // third spelling. Picking either would bind the program to one file and
+        // make the other unreachable -- write one, read the other back.
+        let entries = names(&["LORD.DAT", "lord.dat"]);
+        match pick(&entries, "Lord.Dat") {
+            Pick::Ambiguous(all) => assert_eq!(all, names(&["LORD.DAT", "lord.dat"])),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_there_is_missing_so_a_create_can_use_it() {
+        assert_eq!(pick(&names(&["OTHER.DAT"]), "NEW.DAT"), Pick::Missing);
+    }
 
     #[test]
     fn a_drive_letter_is_stripped_and_backslashes_normalise() {
