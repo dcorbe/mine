@@ -925,6 +925,20 @@ pub(crate) fn wg32_native(dll: &str, symbol: &str) -> Option<(Shim<crate::abi::W
         .map(|(_, _, shim, cleans, _)| (*shim, *cleans))
 }
 
+/// Every registration's `(dll, name, evidence)`, across all three tables.
+///
+/// For `crates/mbbs/tests/evidence_manifest.rs`. Built against `Wg16` because
+/// the `Evidence` of a registration does not vary by ABI -- the generic table
+/// is the same rows either way, and the two ABI-concrete tables are unioned
+/// in so nothing is invisible to the audit.
+pub fn evidence_census() -> Vec<(&'static str, &'static str, evidence::Evidence)> {
+    let mut out: Vec<_> =
+        routines::<Wg16>().into_iter().map(|(dll, name, _, _, ev)| (dll, name, ev)).collect();
+    out.extend(WG16_ROUTINES.iter().map(|(dll, name, _, _, ev)| (*dll, *name, *ev)));
+    out.extend(WG32_ROUTINES.iter().map(|(dll, name, _, _, ev)| (*dll, *name, *ev)));
+    out
+}
+
 /// Every constant the host exports.
 ///
 /// Only one so far. `DOSCALLS.135` is the huge shift: how far to shift a count
