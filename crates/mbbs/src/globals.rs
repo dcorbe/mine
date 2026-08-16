@@ -440,7 +440,12 @@ pub const GLOBALS: &[Global] = &[
     // GME.H:199 -- UINT _txtlen; message text buffer size, reached through
     // the TXTLEN macro. GALME's, not MAJORBBS's -- it is not part of the
     // MAJORBBS.H sequence above, so declaration order does not bind it.
-    m("txtlen", 2),
+    //
+    // The leading underscore is the vendor's own and not a decoration this
+    // host added: the header spells the datum `_txtlen`, so the NE import is
+    // `__TXTLEN` and `exports::c_name` -- which strips exactly one leading
+    // underscore -- asks for `_txtlen`.
+    m("_txtlen", 2),
 ];
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
@@ -953,9 +958,9 @@ impl<A: Abi> Globals<A> {
 
         // No config read for the messaging engine's buffer size; TXTLEN is
         // what a module sizes a message body against, so it must be
-        // non-zero. `txtlen` is `Width::Bytes(2)`, not `Width::Int`, so this
+        // non-zero. `_txtlen` is `Width::Bytes(2)`, not `Width::Int`, so this
         // goes through `write_mem` directly rather than `int_to_bytes`.
-        globals.write_mem(mem, "txtlen", &OUTBSZ.to_le_bytes())?;
+        globals.write_mem(mem, "_txtlen", &OUTBSZ.to_le_bytes())?;
 
         // `nmods` is a count the host owns, not a config value. A freshly
         // built `Globals` has nothing loaded; `Host::load` is what moves it.
@@ -1261,12 +1266,26 @@ mod tests {
     fn txtlen_is_a_galme_global() {
         let f = crate::testing::Fixture::new();
         let g = f.host.globals();
-        assert_eq!(g.size("txtlen").expect("txtlen is placed"), 2, "UINT");
+        assert_eq!(g.size("_txtlen").expect("_txtlen is placed"), 2, "UINT");
         assert_eq!(
-            GLOBALS.iter().find(|x| x.name == "txtlen").expect("txtlen").dll,
+            GLOBALS.iter().find(|x| x.name == "_txtlen").expect("_txtlen").dll,
             crate::exports::GALME,
             "the Messaging Engine's, not the executive's"
         );
+    }
+
+    /// `GME.H:199` declares `extern UINT GMEEXP _txtlen;` -- the vendor's own
+    /// name carries a leading underscore, so the NE import is `__TXTLEN` and
+    /// `exports::c_name` (which strips exactly one) yields `_txtlen`.
+    ///
+    /// This was placed as `"txtlen"` in Phase 1 and has been one character away
+    /// from being served ever since. DIALCHAT is the module that asks.
+    #[test]
+    fn txtlen_is_placed_under_the_name_the_vendor_declares() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(g.size("_txtlen").expect("_txtlen is placed"), 2, "GME.H:199 -- UINT");
+        assert!(g.size("txtlen").is_none(), "the un-prefixed spelling is nobody's symbol");
     }
 
     /// `nmods` is not a configuration value -- it is how many modules are online,
