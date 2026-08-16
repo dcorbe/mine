@@ -498,16 +498,26 @@ mod boot_bug {
     }
 
     /// The same bug, reproduced and then shown fixed by actually entering
-    /// silicon -- not just comparing addresses. Calling through the raw PE
-    /// entry point on this real module faults (reproducing the server's
-    /// `signal 11`); calling through `init_entry` after the fix does not.
+    /// silicon -- not just comparing addresses. Entering the raw PE entry
+    /// point on this real module does not get where entering `init_entry`
+    /// gets, which is why the server crashed while answering the former.
     ///
     /// `Wg32::call` recovers a fault into `Exit::Stopped` rather than
     /// taking the test process down with it (`crates/mbbs-machine/src/m32/fault.rs`),
     /// so this can assert on the *shape* of what happened without a
     /// subprocess.
+    ///
+    /// This test used to assert that the stub *faults*, and failed about one
+    /// run in four because that is not an invariant -- see the comment where
+    /// the stub is entered. The asymmetry it demonstrates is real; the
+    /// particular way the wrong entry point misbehaves is not fixed.
+    /// The import `_init__lunatix` stops at, as `bind_imports` numbers them.
+    /// Fixture-derived and stable: it is a property of LunatiX's own import
+    /// table, not of anything this test does.
+    const INIT_FIRST_IMPORT: u16 = 48;
+
     #[test]
-    fn entering_the_pe_entry_stub_faults_but_the_real_init_routine_does_not() {
+    fn the_pe_entry_stub_does_not_reach_what_the_real_init_routine_reaches() {
         let Some(file) = lunatix_bytes() else { return };
 
         // The bug, reproduced: entering `Module::entry()` -- what
@@ -516,31 +526,55 @@ mod boot_bug {
         let mut stub_cpu = cpu();
         let module = Wg32::load(&mut stub_cpu, &file, &no_host).expect("LunatiX loads");
         let stub = mbbs_machine::m32::Flat32Ptr(module.entry());
-        let exit = Wg32::call(&mut stub_cpu, stub, &[]).expect("a fault is recovered, not fatal");
-        assert!(
-            matches!(exit, Exit::Stopped),
-            "expected the PE entry stub to fault (reproducing mbbs-server's \
-             signal 11), got {exit:?}"
-        );
-        assert!(
-            matches!(
-                Wg32::poisoned(&stub_cpu),
-                Some(mbbs_machine::m32::Poison::Fault { .. })
-            ),
-            "expected Poison::Fault entering the Borland startup stub, got {:?}",
-            Wg32::poisoned(&stub_cpu)
-        );
+        let stub_exit =
+            Wg32::call(&mut stub_cpu, stub, &[]).expect("a fault is recovered, not fatal");
+
+        // Deliberately *not* asserted: that this faults. It usually does --
+        // SIGSEGV at `base + 0xc0d`, which is the crash the server took -- but
+        // measured over 60 runs it instead reaches an unresolved import on
+        // roughly a quarter of them, answering `Call { index: 35 }` or `38`
+        // with no poison at all. Which of the two happens is decided by where
+        // the kernel put the image: `Image::load` maps with `MAP_32BIT` and no
+        // `MAP_FIXED` (see `m32/flatptr.rs`), so the base is a different
+        // address every run and the stub's path through it changes with it.
+        //
+        // So "it faults" was never the invariant, only the common case, and
+        // asserting it made this test fail about one run in four. What is
+        // invariant is that entering the stub does not get where entering the
+        // real init routine gets -- which is the actual claim, and the reason
+        // the server crashed when `init_entry` answered this address.
 
         // The fix: a fresh machine, entering `init_entry`'s answer instead.
         let mut init_cpu = cpu();
         let module = Wg32::load(&mut init_cpu, &file, &no_host).expect("LunatiX loads");
         let entry = <Wg32 as Abi>::init_entry(&module).expect("LunatiX exports ordinal 1");
-        let exit = Wg32::call(&mut init_cpu, entry, &[]).expect("must not error building the call");
+        let init_exit =
+            Wg32::call(&mut init_cpu, entry, &[]).expect("must not error building the call");
+
+        // `_init__lunatix` runs and stops at the first import it needs, every
+        // time -- the one deterministic outcome in this test, 10 runs out of
+        // 10 while the stub was busy being random. The index is fixture-
+        // derived (LunatiX's own import order under `bind_imports`), and
+        // pinning it exactly is what makes the regression detectable: revert
+        // `init_entry` to `Module::entry()` and this line fails on every run,
+        // where asserting merely "did not fault" would have missed it on the
+        // quarter of runs the stub does not fault.
         assert!(
-            !matches!(exit, Exit::Stopped),
-            "the real init routine must not fault the way the entry stub \
-             did -- got {exit:?}, poison {:?}",
+            matches!(init_exit, Exit::Call { index: INIT_FIRST_IMPORT }),
+            "the real init routine must run and stop at its first import \
+             (index {INIT_FIRST_IMPORT}), got {init_exit:?}, poison {:?}",
             Wg32::poisoned(&init_cpu)
+        );
+        assert!(
+            Wg32::poisoned(&init_cpu).is_none(),
+            "and it must not fault on the way there, got {:?}",
+            Wg32::poisoned(&init_cpu)
+        );
+        assert!(
+            !matches!(stub_exit, Exit::Call { index: INIT_FIRST_IMPORT }),
+            "the Borland startup stub must not reach the same place \
+             _init__lunatix does -- if it does, init_entry is answering the \
+             entry stub again and the server is about to take signal 11"
         );
     }
 }
