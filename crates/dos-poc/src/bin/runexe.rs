@@ -22,6 +22,7 @@ use dos_poc::driver::{Driver, Script};
 use dos_poc::terminal::{RawStdin, Terminal};
 use dos_poc::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
 use dos_poc::files::Files;
+use dos_poc::fossil;
 use dos_poc::mz::{self, MzImage};
 use dos_poc::screen::Screen;
 
@@ -196,9 +197,13 @@ fn main() -> io::Result<()> {
     let root = std::fs::File::open(&root_dir)?;
     println!("root: {root_dir}");
 
-    // In door mode the guest talks to a UART, not to our screen: LORD programs
-    // the chip directly rather than using int 14h or a FOSSIL driver.
+    // In door mode the guest talks to a caller rather than to our screen, and
+    // which way it does that is the door's own configuration -- LORDCFG's
+    // "Fossil / Internal" switch. `Internal` programs the chip directly and is
+    // served by `serial`; `Regular Fossil` calls int 14h and is served by
+    // `fossil`, which moves bytes through the very same queues.
     let mut serial = door.then(|| Uart::new(baud));
+    let fossil_info = fossil::Info::default();
     let mut pic = Pic::default();
     let _raw = door.then(RawStdin::enter).transpose()?;
     if door {
@@ -426,6 +431,50 @@ fn main() -> io::Result<()> {
                     let before = std::time::Instant::now();
                     std::thread::sleep(nap);
                     slept += before.elapsed();
+                }
+            }
+            // A door configured for a FOSSIL driver rather than for the bare
+            // chip. Both reach the same queues, so this is a second doorway on
+            // the same transport and not a second transport.
+            Stop::Trap(0x14) => {
+                let ah = vm.regs().ah();
+                *bios.entry((0x14, ah)).or_insert(0) += 1;
+                calls += 1;
+                match serial.as_mut() {
+                    Some(uart) => match fossil::dispatch(&mut vm, uart, &fossil_info) {
+                        // A block transfer whose ES:DI does not name memory.
+                        // Same treatment as a bad pointer into a DOS call: stop
+                        // and say so, rather than move bytes somewhere else.
+                        Err(fault) => break format!("bad guest pointer in int 14h: {fault:?}"),
+                        Ok(fossil::Serviced::Done) => {}
+                        Ok(fossil::Serviced::Yield) => {
+                            // The door asked for input that has not arrived.
+                            // Sleeping hands the core back until the top of the
+                            // loop can pump the socket; returning immediately
+                            // turns a polling door into a spin.
+                            let before = std::time::Instant::now();
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            slept += before.elapsed();
+                        }
+                        Ok(fossil::Serviced::Unsupported(func)) => {
+                            *gaps
+                                .entry(format!("int 14h AH={func:02X}  FOSSIL function"))
+                                .or_insert(0) += 1;
+                            if strict {
+                                break format!("unimplemented: int 14h AH={func:02X} (FOSSIL)");
+                            }
+                        }
+                    },
+                    // No serial means no far end -- a local run. Say so rather
+                    // than answering as a driver that has nothing behind it.
+                    None => {
+                        *gaps
+                            .entry("int 14h  FOSSIL, but this run has no serial port".to_string())
+                            .or_insert(0) += 1;
+                        if strict {
+                            break "int 14h with no serial port: use --door".to_string();
+                        }
+                    }
                 }
             }
             Stop::Trap(vector) if vector != 0x21 => {

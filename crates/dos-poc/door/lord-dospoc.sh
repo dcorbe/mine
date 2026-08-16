@@ -4,7 +4,9 @@
 # Synchronet runs this under forkpty() with XTRN_NATIVE|XTRN_STDIO, so our
 # stdin and stdout are the user's telnet session. The runtime turns that into a
 # COM1 the DOS program can drive, which is what LORD in door mode expects: it
-# programs the 8250 directly rather than using int 14h or a FOSSIL driver.
+# programs the 8250 directly on LORDCFG's default "Internal" setting. Switching
+# that node to "Regular Fossil" makes it call int 14h instead; both are served,
+# and nothing here changes either way.
 #
 #   cmd      = /sbbs/xtrn/lord/lord-dospoc.sh %#
 #   type     = 3        (DOOR.SYS dropfile)

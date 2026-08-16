@@ -1,9 +1,15 @@
 //! An 8250/16450 serial port, and the 8259 that carries its interrupt.
 //!
-//! This is the piece a door needs and a local session does not. LORD in door
-//! mode does not use `int 14h` or a FOSSIL driver -- measured, it programs the
-//! chip and spins on the interrupt-enable register -- so serving it over a BBS
-//! means being a UART, not answering an API.
+//! This is the piece a door needs and a local session does not. Which of the
+//! two a door uses is its own configuration, not something it probes for:
+//! LORDCFG's "Fossil / Internal" setting picks between them, and on `Internal`
+//! -- measured -- LORD programs the chip and spins on the interrupt-enable
+//! register, so serving it means being a UART rather than answering an API.
+//!
+//! On `Regular Fossil` the same door talks `int 14h` instead, which
+//! [`crate::fossil`] answers. Both front-ends move the same bytes through the
+//! queues below, so the transport does not care which one is in use; the
+//! accessors near the end of `impl Uart` exist for that second doorway.
 //!
 //! Two things here are easy to get subtly wrong and expensive to debug, so both
 //! are stated rather than implied:
@@ -176,6 +182,61 @@ impl Uart {
         (!self.transmitter_free()).then_some(self.tx_free_at)
     }
 
+    // ---- The second doorway -------------------------------------------
+    //
+    // `int 14h` reaches the same two queues the port registers do. These are
+    // the whole of that seam: FOSSIL adds no buffers of its own, so a byte is
+    // never in one path and not the other, and a door that is reconfigured
+    // between runs behaves identically on the wire.
+
+    /// Take one received byte, if the far end has sent any.
+    pub fn take(&mut self) -> Option<u8> {
+        self.rx.pop_front()
+    }
+
+    /// Look at the next received byte without consuming it.
+    pub fn peek(&self) -> Option<u8> {
+        self.rx.front().copied()
+    }
+
+    /// How many bytes are waiting to be read.
+    pub fn pending(&self) -> usize {
+        self.rx.len()
+    }
+
+    /// Queue a byte for the far end, paced exactly as a port write is.
+    ///
+    /// Shared with the port-0 write path rather than duplicated, so baud
+    /// modelling cannot drift between the two front-ends.
+    pub fn send(&mut self, byte: u8) {
+        self.tx.push(byte);
+        let from = self.tx_free_at.max(Instant::now());
+        self.tx_free_at = from + self.byte_time();
+        self.thre_pending = true;
+    }
+
+    /// Is the transmitter ready to accept another byte right now?
+    pub fn transmit_ready(&self) -> bool {
+        self.transmitter_free()
+    }
+
+    /// Is carrier up? FOSSIL reports this in the modem-status byte, and a door
+    /// that believes carrier dropped will hang up on a live caller.
+    pub fn carrier(&self) -> bool {
+        self.msr & MSR_DCD != 0
+    }
+
+    /// Discard everything received but not yet read.
+    pub fn purge_input(&mut self) {
+        self.rx.clear();
+    }
+
+    /// Discard everything queued for the far end that the host has not taken.
+    pub fn purge_output(&mut self) {
+        self.tx.clear();
+        self.tx_free_at = Instant::now();
+    }
+
     pub fn read(&mut self, port: u16) -> u8 {
         let dlab = self.lcr & 0x80 != 0;
         match port - COM1_BASE {
@@ -206,12 +267,7 @@ impl Uart {
         let dlab = self.lcr & 0x80 != 0;
         match port - COM1_BASE {
             0 if dlab => self.divisor = (self.divisor & 0xff00) | u16::from(value),
-            0 => {
-                self.tx.push(value);
-                let from = self.tx_free_at.max(Instant::now());
-                self.tx_free_at = from + self.byte_time();
-                self.thre_pending = true;
-            }
+            0 => self.send(value),
             1 if dlab => self.divisor = (self.divisor & 0x00ff) | (u16::from(value) << 8),
             1 => {
                 self.ier = value & 0x0f;

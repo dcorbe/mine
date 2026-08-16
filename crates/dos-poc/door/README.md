@@ -2,9 +2,24 @@
 
 The runtime already speaks the contract Synchronet uses for a native door: it
 is handed a pty on stdin/stdout, it reads `DOOR.SYS`, and it exits. What it
-adds over the dosemu path is that it *is* the serial port -- LORD in door mode
-programs an 8250 directly rather than calling `int 14h` or a FOSSIL driver, so
-being a UART is the job.
+adds over the dosemu path is that it *is* the far end of the line.
+
+How a door reaches that line is the door's own configuration, not something it
+probes for. LORDCFG's per-node **"Fossil / Internal"** setting decides:
+
+| Setting | What LORD does | Served by |
+|---|---|---|
+| `Internal (No fossil driver used)` | programs an 8250 directly | `uart.rs` |
+| `Regular Fossil Driver` | calls `int 14h` | `fossil.rs` |
+
+Both are supported and both move bytes through the same queues, so the choice
+changes nothing on the wire and nothing in this directory. Measured on a real
+session, `Regular Fossil` produced 1467 `AH=01` transmits and exactly 1467
+bytes out.
+
+If a door is set to a FOSSIL mode and the driver does not answer, the failure
+is not subtle -- LORD says `Fossil was not initialized properly! You should
+change to INTERNAL`. `AH=04h` returning `0x1954` is what prevents that.
 
 ## Install
 

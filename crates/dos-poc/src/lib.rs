@@ -1,9 +1,11 @@
-//! Proof of concept for `docs/2026-08-16-dos-trap-edges.md`.
+//! A DOS runtime, begun as the proof of concept for
+//! `docs/2026-08-16-dos-trap-edges.md` and kept because it serves a real door:
+//! LORD runs under it as a Synchronet external program.
 //!
-//! **This is a proposal, not a merge candidate.** It exists to demonstrate one
-//! claim before anyone writes a plan around it: that the DOS services are
-//! independent of how the `int 21h` reached them, and that saying so with a
-//! trait costs nothing and buys unit-testability.
+//! The claim it was written to demonstrate still holds and is still the
+//! organising idea -- that the DOS services are independent of how the
+//! `int 21h` reached them, and that saying so with a trait costs nothing and
+//! buys unit-testability.
 //!
 //! Three pieces:
 //!
@@ -21,6 +23,7 @@ pub mod bios;
 pub mod dos;
 pub mod driver;
 pub mod files;
+pub mod fossil;
 pub mod guest;
 pub mod kvm;
 pub mod mz;
