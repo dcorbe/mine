@@ -440,6 +440,15 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
          Evidence::VendorBody("SRC/api/gcommlib/STZCPY.C")),
         (MAJORBBS, "strcpy", text::strcpy, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "strlen", text::strlen, Cleans::Caller, Evidence::Unclassified),
+        // Borland's own, re-exported by MAJORBBS like every other C-runtime
+        // routine in this table. Evidence::Standard: ISO C settles the
+        // semantics and the crate already has each one's sibling to follow --
+        // strupr for strlwr, strcmp/stricmp for the two strn*cmp, atol for
+        // strtol.
+        (MAJORBBS, "strlwr", text::strlwr, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "strncmp", text::strncmp, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "strnicmp", text::strnicmp, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "strtol", text::strtol, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "rmvwht", text::rmvwht, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "skpwht", text::skpwht, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "skpwrd", text::skpwrd, Cleans::Caller, Evidence::Unclassified),

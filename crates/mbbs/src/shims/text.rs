@@ -1701,6 +1701,249 @@ pub fn strcmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     Ok(abi::Ret::Int(A::Int::from(crate::strings::strcmp(&a, b) as u16)))
 }
 
+/// `char *strlwr(char *s)` -- fold a string to lower case, in place.
+///
+/// [`crate::shims::cnc::strupr`]'s mirror, and deliberately built from the
+/// same pair: [`crate::strings::tolower`] is the exact per-byte fold
+/// `sameas`/`sameto`/`samein` already share, where `strupr` uses
+/// [`crate::strings::toupper`]. (`strupr` lives in `shims::cnc` for
+/// historical reasons rather than because it belongs there; the fold is what
+/// matters and it is shared.)
+///
+/// **ASCII `A`-`Z` only.** Nothing locale-aware, matching what Borland's own
+/// `strlwr` did under a `char` that is one byte regardless of `A`. That is
+/// not a simplification -- it is load-bearing here, because MajorMUD's text
+/// is full of CP437 high-bit bytes (box drawing, accented letters) and a fold
+/// that touched them would corrupt every room description that uses one.
+///
+/// **Length never changes**, so the write fits back exactly where the read
+/// came from: `capacity` is `text.len() + 1`, one byte for the terminator
+/// that was already there.
+///
+/// # Errors
+///
+/// If `s` is not a valid pointer, or the read or write runs off the segment.
+pub fn strlwr<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let s = call.ptr();
+    let original = s
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let lower: Vec<u8> = original.iter().map(|&b| crate::strings::tolower(b)).collect();
+    let capacity = lower.len() as u16 + 1;
+    write_cstr_mem::<A>(call.mem(), s, &lower, capacity)?;
+    Ok(abi::Ret::Ptr(s))
+}
+
+/// `int strncmp(const char *s1, const char *s2, size_t n)` -- compare at most
+/// `n` bytes.
+///
+/// Stops at the first difference **or at a terminator**, whichever comes
+/// first. The case that separates a real port from one that merely limits the
+/// loop is `n` larger than both strings: the comparison has to stop at the
+/// NUL rather than read on into whatever follows it, which under this host
+/// would be another module's bytes.
+///
+/// The answer is the difference of the first differing pair, read as
+/// **unsigned** bytes -- ISO C compares `unsigned char` regardless of whether
+/// plain `char` is signed, which decides the sign for any byte over 127.
+/// Same shape as [`crate::shims::crt::stricmp`]'s.
+///
+/// # Errors
+///
+/// If either pointer is unreadable or unterminated.
+pub fn strncmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let a_ptr = call.ptr();
+    let b_ptr = call.ptr();
+    let n = Into::<u32>::into(call.int()) as usize;
+
+    let a = a_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let b = b_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    Ok(abi::Ret::Int(A::int_from_u32(
+        bounded_compare(&a, &b, n, |c| c) as u32,
+    )))
+}
+
+/// `int strnicmp(const char *s1, const char *s2, size_t n)` -- [`strncmp`]
+/// ignoring case.
+///
+/// The fold is the same ASCII-only one [`strlwr`] uses, applied to both sides
+/// before the comparison, so a high-bit CP437 byte compares as itself.
+///
+/// # Errors
+///
+/// If either pointer is unreadable or unterminated.
+pub fn strnicmp<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let a_ptr = call.ptr();
+    let b_ptr = call.ptr();
+    let n = Into::<u32>::into(call.int()) as usize;
+
+    let a = a_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let b = b_ptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    Ok(abi::Ret::Int(A::int_from_u32(
+        bounded_compare(&a, &b, n, crate::strings::tolower) as u32,
+    )))
+}
+
+/// The shared core of [`strncmp`] and [`strnicmp`]: compare at most `n`
+/// bytes, each passed through `fold`, stopping at a difference or a
+/// terminator.
+///
+/// `a` and `b` arrive without their terminators (that is what `read_cstr`
+/// gives), so indexing past the end yields `0` -- which is the terminator,
+/// and makes "one string is a prefix of the other" fall out as a comparison
+/// against NUL rather than needing a length case of its own.
+fn bounded_compare(a: &[u8], b: &[u8], n: usize, fold: fn(u8) -> u8) -> i32 {
+    for i in 0..n {
+        let ca = fold(a.get(i).copied().unwrap_or(0));
+        let cb = fold(b.get(i).copied().unwrap_or(0));
+        if ca != cb {
+            return i32::from(ca) - i32::from(cb);
+        }
+        if ca == 0 {
+            // Both terminated here, so they are equal and the rest of `n`
+            // cannot change the answer.
+            //
+            // **This is a bound on work, not on memory.** What keeps a large
+            // `n` from reading past either string is `read_cstr` above, which
+            // hands back only the bytes up to the terminator; past that, the
+            // `unwrap_or(0)` supplies the terminator itself and the loop
+            // compares NUL against NUL for as long as `n` says. Deleting this
+            // `break` changes no answer -- checked by mutation -- and costs
+            // `n` iterations where the vendor's loop costs a handful.
+            break;
+        }
+    }
+    0
+}
+
+/// `long strtol(const char *nptr, char **endptr, int base)` -- parse a long,
+/// and report where parsing stopped.
+///
+/// Three things a rewrite gets wrong, in the order it gets them wrong:
+///
+/// 1. **`endptr` is written through.** It is a `char **`, and the caller's
+///    whole reason for passing it is to find out where the number ended --
+///    a tokeniser calls `strtol` in a loop and advances by it. A null
+///    `endptr` is legal and means "do not report".
+/// 2. **Base 0 infers the radix from the prefix**: `0x`/`0X` is hexadecimal,
+///    a leading `0` is octal, anything else decimal. Bases 2..=36 are
+///    explicit, and base 16 also accepts an optional `0x`.
+/// 3. **Nothing consumed means `endptr` gets `nptr` itself**, unchanged, and
+///    the answer is 0 -- including when the sign or the `0x` was consumed but
+///    no digit followed it.
+///
+/// Leading whitespace is skipped, then an optional `+`/`-`. Digits run while
+/// they are valid for the radix; letters count from `a`/`A` = 10, so base 36
+/// reaches `z`.
+///
+/// Overflow saturates at `LONG_MAX`/`LONG_MIN`, which is what ISO C's
+/// `strtol` does (and it sets `errno`, which this host does not model -- said
+/// here rather than left to look like an oversight).
+///
+/// # Errors
+///
+/// If `nptr` is unreadable, or `endptr` names memory that cannot be written.
+pub fn strtol<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let nptr = call.ptr();
+    let endptr = call.ptr();
+    let base = Into::<u32>::into(call.int()) as i32;
+
+    let text = nptr
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let (value, consumed) = parse_long(&text, base);
+
+    if !is_null::<A>(endptr) {
+        let stopped = at::<A>(nptr, consumed)?;
+        endptr
+            .write(call.mem(), &A::ptr_to_bytes(stopped))
+            .map_err(|e| ShimError::Failed(format!("strtol: endptr: {e}")))?;
+    }
+    Ok(abi::Ret::Long(value as u32))
+}
+
+/// [`strtol`]'s parse: the value, and how many bytes of `text` it consumed.
+///
+/// A consumed count of zero means no conversion was performed, which is what
+/// makes `endptr == nptr` the caller's signal for "that was not a number".
+fn parse_long(text: &[u8], base: i32) -> (i32, usize) {
+    let mut i = 0;
+    while text.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let negative = match text.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+
+    // Base 0 infers; base 16 tolerates the prefix it implies.
+    let mut radix = base;
+    if (base == 0 || base == 16)
+        && text.get(i) == Some(&b'0')
+        && matches!(text.get(i + 1), Some(b'x' | b'X'))
+    {
+        radix = 16;
+        i += 2;
+    } else if base == 0 {
+        radix = if text.get(i) == Some(&b'0') { 8 } else { 10 };
+    }
+
+    let digits_at = i;
+    let mut value: i64 = 0;
+    let mut overflowed = false;
+    while let Some(digit) = text.get(i).and_then(|&c| (c as char).to_digit(36)) {
+        if digit >= radix as u32 {
+            break;
+        }
+        value = value * i64::from(radix) + i64::from(digit);
+        if value > i64::from(i32::MAX) + 1 {
+            overflowed = true;
+            value = i64::from(i32::MAX) + 1;
+        }
+        i += 1;
+    }
+
+    if i == digits_at {
+        // No digits: nothing was converted, so nothing was consumed -- not
+        // even the sign or the `0x` that was skipped over to get here.
+        return (0, 0);
+    }
+
+    let value = if negative { -value } else { value };
+    let clamped = if overflowed || value > i64::from(i32::MAX) {
+        if negative { i32::MIN } else { i32::MAX }
+    } else if value < i64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        value as i32
+    };
+    (clamped, i)
+}
+
 /// `int toupper(int c)`.
 ///
 /// **Not a macro here.** Borland's macro is `_toupper`; `toupper` is a real
@@ -2621,6 +2864,182 @@ mod tests {
         let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
         assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "hi");
+    }
+
+    /// `strlwr` folds ASCII `A`-`Z` and nothing else, in place, returning its
+    /// argument.
+    ///
+    /// The two high-bit bytes are the point: `0xC4` and `0xE0` are CP437 box
+    /// drawing and a Greek alpha, and MajorMUD's text is full of them. A fold
+    /// that treated them as letters would corrupt every room description that
+    /// draws a line.
+    #[test]
+    fn strlwr_folds_ascii_only_and_returns_its_argument() {
+        let mut f = Fixture::new();
+        let at = f.bytes(b"AbC\xC4\xE0Z", true);
+        assert_eq!(f.invoke(strlwr, &Fixture::far(at)).expect("strlwr"), Ret::Far(at));
+        assert_eq!(
+            f.machine.read_cstr(at).expect("readable"),
+            b"abc\xC4\xE0z",
+            "0xC4 and 0xE0 are CP437 text, not letters to fold"
+        );
+    }
+
+    /// `strncmp` compares at most `n` bytes and stops at a terminator.
+    ///
+    /// The `n`-past-the-end case is what separates a real port from one that
+    /// reads on into whatever follows the NUL.
+    #[test]
+    fn strncmp_stops_at_n_and_at_the_terminator() {
+        let mut f = Fixture::new();
+        let a = f.text("kobold");
+        let b = f.text("kobolt");
+        let pair =
+            |x: FarPtr, y: FarPtr, n: u16| [x.offset, x.selector, y.offset, y.selector, n];
+
+        assert_eq!(
+            f.invoke(strncmp, &pair(a, b, 5)).expect("ok"),
+            Ret::U16(0),
+            "the first five bytes are equal"
+        );
+        assert_ne!(
+            f.invoke(strncmp, &pair(a, b, 6)).expect("ok"),
+            Ret::U16(0),
+            "the sixth differs"
+        );
+
+        // `n` far past both terminators must still answer equal for equal
+        // strings, which it can only do by stopping at the NUL.
+        let c = f.text("kobold");
+        assert_eq!(
+            f.invoke(strncmp, &pair(a, c, 500)).expect("ok"),
+            Ret::U16(0),
+            "the comparison stops at the NUL, it does not read 500 bytes"
+        );
+
+        // A prefix is less than the string that extends it.
+        let short = f.text("kob");
+        let cmp = f.invoke(strncmp, &pair(short, a, 500)).expect("ok");
+        assert_ne!(cmp, Ret::U16(0), "a prefix is not equal to the whole");
+    }
+
+    /// `n == 0` compares nothing at all and answers equal, whatever the
+    /// strings are.
+    #[test]
+    fn strncmp_of_zero_bytes_is_always_equal() {
+        let mut f = Fixture::new();
+        let a = f.text("alpha");
+        let b = f.text("omega");
+        assert_eq!(
+            f.invoke(strncmp, &[a.offset, a.selector, b.offset, b.selector, 0])
+                .expect("ok"),
+            Ret::U16(0)
+        );
+    }
+
+    /// `strnicmp` is `strncmp` with the same ASCII-only fold, so case stops
+    /// mattering and high-bit bytes still do.
+    #[test]
+    fn strnicmp_ignores_case_but_not_high_bit_bytes() {
+        let mut f = Fixture::new();
+        let upper = f.text("KOBOLD");
+        let lower = f.text("kobold");
+        let pair =
+            |x: FarPtr, y: FarPtr, n: u16| [x.offset, x.selector, y.offset, y.selector, n];
+
+        assert_eq!(f.invoke(strnicmp, &pair(upper, lower, 6)).expect("ok"), Ret::U16(0));
+        assert_ne!(
+            f.invoke(strncmp, &pair(upper, lower, 6)).expect("ok"),
+            Ret::U16(0),
+            "and strncmp still tells them apart -- otherwise this proves nothing"
+        );
+
+        // 0xC4 folds to itself, so it stays different from an ASCII letter.
+        let a = f.bytes(b"\xC4", true);
+        let b = f.bytes(b"\xE4", true);
+        assert_ne!(f.invoke(strnicmp, &pair(a, b, 1)).expect("ok"), Ret::U16(0));
+    }
+
+    /// `strtol` writes the first unconsumed character through `endptr`, and
+    /// base 0 infers the radix from the prefix.
+    #[test]
+    fn strtol_reports_where_it_stopped_and_infers_base_zero() {
+        let mut f = Fixture::new();
+        let src = f.text("0x1Frest");
+        let end = f.buffer(4);
+        let args = [src.offset, src.selector, end.offset, end.selector, 0];
+        assert_eq!(f.invoke(strtol, &args).expect("strtol"), Ret::U32(0x1F));
+
+        let stopped = FarPtr::from_bytes(
+            f.machine.resolve(end, 4).expect("in bounds").try_into().expect("4 bytes"),
+        );
+        assert_eq!(
+            f.machine.read_cstr(stopped).expect("readable"),
+            b"rest",
+            "endptr names the first character strtol did not consume"
+        );
+    }
+
+    /// Base 0's three cases, and the sign.
+    #[test]
+    fn strtol_base_zero_reads_hex_octal_and_decimal() {
+        let mut f = Fixture::new();
+        let mut ask = |f: &mut Fixture, s: &str, base: u16| -> u32 {
+            let at = f.text(s);
+            let Ret::U32(n) = f
+                .invoke(strtol, &[at.offset, at.selector, 0, 0, base])
+                .expect("strtol")
+            else {
+                panic!("strtol returns a long");
+            };
+            n
+        };
+        assert_eq!(ask(&mut f, "0x2A", 0), 42, "0x is hexadecimal");
+        assert_eq!(ask(&mut f, "052", 0), 42, "a leading zero is octal");
+        assert_eq!(ask(&mut f, "42", 0), 42, "and anything else is decimal");
+        assert_eq!(ask(&mut f, "  -42", 0), (-42i32) as u32, "whitespace then a sign");
+        assert_eq!(ask(&mut f, "2A", 16), 42, "an explicit base needs no prefix");
+        assert_eq!(ask(&mut f, "0x2A", 16), 42, "and tolerates one");
+        assert_eq!(ask(&mut f, "z", 36), 35, "base 36 reaches z");
+        // Base 10 stops at a digit the radix does not have.
+        assert_eq!(ask(&mut f, "12x34", 10), 12);
+    }
+
+    /// Nothing converted means `endptr` gets `nptr` back unchanged, which is
+    /// the caller's only signal that the text was not a number.
+    #[test]
+    fn strtol_that_converts_nothing_answers_zero_and_does_not_move_endptr() {
+        let mut f = Fixture::new();
+        let src = f.text("  not a number");
+        let end = f.buffer(4);
+        let args = [src.offset, src.selector, end.offset, end.selector, 10];
+        assert_eq!(f.invoke(strtol, &args).expect("strtol"), Ret::U32(0));
+
+        let stopped = FarPtr::from_bytes(
+            f.machine.resolve(end, 4).expect("in bounds").try_into().expect("4 bytes"),
+        );
+        assert_eq!(stopped, src, "endptr is nptr itself, whitespace and all");
+
+        // A sign with no digits after it converts nothing either.
+        let lone = f.text("-");
+        let args = [lone.offset, lone.selector, end.offset, end.selector, 10];
+        assert_eq!(f.invoke(strtol, &args).expect("strtol"), Ret::U32(0));
+        let stopped = FarPtr::from_bytes(
+            f.machine.resolve(end, 4).expect("in bounds").try_into().expect("4 bytes"),
+        );
+        assert_eq!(stopped, lone, "the sign is not consumed if no digit follows");
+    }
+
+    /// A null `endptr` is legal: the conversion still happens and nothing is
+    /// written.
+    #[test]
+    fn strtol_accepts_a_null_endptr() {
+        let mut f = Fixture::new();
+        let src = f.text("7");
+        assert_eq!(
+            f.invoke(strtol, &[src.offset, src.selector, 0, 0, 10]).expect("strtol"),
+            Ret::U32(7)
+        );
     }
 
     /// `stlcpy` copies at most `num-1` bytes and always terminates
