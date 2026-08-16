@@ -9,6 +9,7 @@ members = [
     "crates/mud-server",
     "crates/mud-oracle",
     "crates/mud-client",
+    "crates/dos-poc",
 ]
 
 [workspace.package]

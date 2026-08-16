@@ -1,0 +1,510 @@
+//! Edge B: a real-mode guest on a KVM vCPU.
+//!
+//! Not a trampoline and not a mode switch. This process stays in 64-bit long
+//! mode from start to finish; the guest is a *separate* CPU that is in real
+//! mode permanently. `KVM_RUN` is an ordinary blocking syscall that runs guest
+//! instructions natively on the core and returns when the guest asks a
+//! question. The two machines meet only through an `mmap` (the guest's
+//! physical memory) and a register file.
+//!
+//! Measured cost of one round trip on this box: 3.33 us -- see
+//! `re/spikes/kvm_realmode.c`, from which this is grown.
+
+use std::io;
+
+use crate::guest::{DosFault, DosGuest, DosPtr, DosRegs};
+
+/// The port our trap stubs write to. Any unclaimed port works; the value is
+/// arbitrary and only has to agree with the stub bytes.
+pub const TRAP_PORT: u16 = 0xe6;
+
+/// `out TRAP_PORT, al` then `iret`.
+///
+/// `out` rather than `hlt` because `hlt` is only guaranteed to exit to
+/// userspace when there is no in-kernel irqchip, whereas an unclaimed port is
+/// unconditional. `al` is written to a port whose data we discard, so the stub
+/// clobbers no guest register at all.
+const STUB: [u8; 3] = [0xe6, TRAP_PORT as u8, 0xcf];
+
+const KVM_GET_API_VERSION: libc::c_ulong = 0xae00;
+const KVM_CREATE_VM: libc::c_ulong = 0xae01;
+const KVM_GET_VCPU_MMAP_SIZE: libc::c_ulong = 0xae04;
+const KVM_CREATE_VCPU: libc::c_ulong = 0xae41;
+const KVM_SET_USER_MEMORY_REGION: libc::c_ulong = 0x4020_ae46;
+const KVM_RUN: libc::c_ulong = 0xae80;
+const KVM_GET_REGS: libc::c_ulong = 0x8090_ae81;
+const KVM_SET_REGS: libc::c_ulong = 0x4090_ae82;
+const KVM_GET_SREGS: libc::c_ulong = 0x8138_ae83;
+const KVM_SET_SREGS: libc::c_ulong = 0x4138_ae84;
+
+const KVM_EXIT_IO: u32 = 2;
+const KVM_EXIT_HLT: u32 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvmUserspaceMemoryRegion {
+    slot: u32,
+    flags: u32,
+    guest_phys_addr: u64,
+    memory_size: u64,
+    userspace_addr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvmRegs {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rsp: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvmSegment {
+    base: u64,
+    limit: u32,
+    selector: u16,
+    type_: u8,
+    present: u8,
+    dpl: u8,
+    db: u8,
+    s: u8,
+    l: u8,
+    g: u8,
+    avl: u8,
+    unusable: u8,
+    padding: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvmDtable {
+    base: u64,
+    limit: u16,
+    padding: [u16; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KvmSregs {
+    cs: KvmSegment,
+    ds: KvmSegment,
+    es: KvmSegment,
+    fs: KvmSegment,
+    gs: KvmSegment,
+    ss: KvmSegment,
+    tr: KvmSegment,
+    ldt: KvmSegment,
+    gdt: KvmDtable,
+    idt: KvmDtable,
+    cr0: u64,
+    cr2: u64,
+    cr3: u64,
+    cr4: u64,
+    cr8: u64,
+    efer: u64,
+    apic_base: u64,
+    interrupt_bitmap: [u64; 4],
+}
+
+/// The head of `struct kvm_run`, up to and including the `io` arm of its union.
+/// Only the fields this needs are named; the mapping is larger.
+///
+/// The unread fields are transcribed rather than padded so that the offsets of
+/// the ones that matter are checkable against `linux/kvm.h` by eye.
+#[repr(C)]
+#[allow(dead_code)]
+struct KvmRun {
+    request_interrupt_window: u8,
+    immediate_exit: u8,
+    padding1: [u8; 6],
+    exit_reason: u32,
+    ready_for_interrupt_injection: u8,
+    if_flag: u8,
+    flags: u16,
+    cr8: u64,
+    apic_base: u64,
+    io_direction: u8,
+    io_size: u8,
+    io_port: u16,
+    io_count: u32,
+    io_data_offset: u64,
+}
+
+/// Why the guest stopped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The guest executed a hooked interrupt and is waiting to be serviced.
+    Trap,
+    /// The guest halted.
+    Halted,
+    /// Something this proof of concept does not model.
+    Unexpected(u32),
+}
+
+fn last_err<T>() -> io::Result<T> {
+    Err(io::Error::last_os_error())
+}
+
+/// A real-mode guest, and the window onto its memory.
+pub struct VmGuest {
+    kvm: libc::c_int,
+    vm: libc::c_int,
+    vcpu: libc::c_int,
+    run: *mut KvmRun,
+    run_size: usize,
+    mem: *mut u8,
+    mem_len: usize,
+    regs: KvmRegs,
+    sregs: KvmSregs,
+    regs_dirty: bool,
+}
+
+impl VmGuest {
+    /// Create a VM with `mem_len` bytes of guest physical memory, starting at
+    /// guest physical zero so that the IVT lands where the CPU expects it.
+    pub fn new(mem_len: usize) -> io::Result<Self> {
+        // SAFETY: a plain open of a character device.
+        let kvm = unsafe { libc::open(c"/dev/kvm".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if kvm < 0 {
+            return last_err();
+        }
+
+        // SAFETY: KVM_GET_API_VERSION takes no argument.
+        let version = unsafe { libc::ioctl(kvm, KVM_GET_API_VERSION, 0) };
+        if version != 12 {
+            unsafe { libc::close(kvm) };
+            return Err(io::Error::other(format!(
+                "unexpected KVM API version {version}, expected 12"
+            )));
+        }
+
+        // SAFETY: KVM_CREATE_VM's argument is a machine type; 0 is the default.
+        let vm = unsafe { libc::ioctl(kvm, KVM_CREATE_VM, 0) };
+        if vm < 0 {
+            unsafe { libc::close(kvm) };
+            return last_err();
+        }
+
+        // SAFETY: an anonymous shared mapping; KVM requires a stable address,
+        // which is why this is not a `Vec`.
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mem_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return last_err();
+        }
+
+        let region = KvmUserspaceMemoryRegion {
+            slot: 0,
+            flags: 0,
+            guest_phys_addr: 0,
+            memory_size: mem_len as u64,
+            userspace_addr: mem as u64,
+        };
+        // SAFETY: `region` outlives the call, which copies it.
+        if unsafe { libc::ioctl(vm, KVM_SET_USER_MEMORY_REGION, std::ptr::from_ref(&region)) } < 0 {
+            return last_err();
+        }
+
+        // SAFETY: vcpu index 0.
+        let vcpu = unsafe { libc::ioctl(vm, KVM_CREATE_VCPU, 0) };
+        if vcpu < 0 {
+            return last_err();
+        }
+
+        // SAFETY: no argument.
+        let run_size = unsafe { libc::ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0) };
+        if run_size < 0 {
+            return last_err();
+        }
+        let run_size = run_size as usize;
+
+        // SAFETY: the kernel defines this mapping for the vcpu fd.
+        let run = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                run_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                vcpu,
+                0,
+            )
+        };
+        if run == libc::MAP_FAILED {
+            return last_err();
+        }
+
+        Ok(Self {
+            kvm,
+            vm,
+            vcpu,
+            run: run.cast::<KvmRun>(),
+            run_size,
+            mem: mem.cast::<u8>(),
+            mem_len,
+            regs: KvmRegs::default(),
+            sregs: KvmSregs::default(),
+            regs_dirty: false,
+        })
+    }
+
+    fn mem_ref(&self) -> &[u8] {
+        // SAFETY: `mem` is a live mapping of `mem_len` bytes for our lifetime.
+        unsafe { std::slice::from_raw_parts(self.mem, self.mem_len) }
+    }
+
+    fn mem_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` excludes any other reference.
+        unsafe { std::slice::from_raw_parts_mut(self.mem, self.mem_len) }
+    }
+
+    /// Copy `bytes` to guest physical `phys`.
+    pub fn load(&mut self, phys: usize, bytes: &[u8]) -> io::Result<()> {
+        let end = phys
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("load overflows the address space"))?;
+        let len = self.mem_len;
+        let slot = self
+            .mem_mut()
+            .get_mut(phys..end)
+            .ok_or_else(|| io::Error::other(format!("load {phys}..{end} exceeds {len}")))?;
+        slot.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Point real-mode interrupt `vector` at `seg:off`.
+    ///
+    /// The IVT is guest memory like any other -- four bytes per vector, offset
+    /// first -- so this is a plain store, not a KVM operation.
+    pub fn set_ivt(&mut self, vector: u8, seg: u16, off: u16) -> io::Result<()> {
+        let at = vector as usize * 4;
+        let mut entry = [0u8; 4];
+        entry[0..2].copy_from_slice(&off.to_le_bytes());
+        entry[2..4].copy_from_slice(&seg.to_le_bytes());
+        self.load(at, &entry)
+    }
+
+    /// Install the trap stub at `seg:0` and hook `vector` to it.
+    pub fn hook(&mut self, vector: u8, stub_seg: u16) -> io::Result<()> {
+        self.load(stub_seg as usize * 16, &STUB)?;
+        self.set_ivt(vector, stub_seg, 0)
+    }
+
+    /// Put the vCPU in real mode at `cs:ip` with a stack at `ss:sp`.
+    pub fn start(&mut self, cs: u16, ip: u16, ss: u16, sp: u16) -> io::Result<()> {
+        let mut sregs = KvmSregs::default();
+        // SAFETY: fills `sregs` with the vcpu's reset state, which is already
+        // real-mode shaped -- we only retarget the segments we care about.
+        if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, std::ptr::from_mut(&mut sregs)) } < 0 {
+            return last_err();
+        }
+
+        sregs.cs.selector = cs;
+        sregs.cs.base = (cs as u64) << 4;
+        sregs.cs.limit = 0xffff;
+
+        sregs.ds.selector = ss;
+        sregs.ds.base = (ss as u64) << 4;
+        sregs.ds.limit = 0xffff;
+        sregs.es = sregs.ds;
+        sregs.ss = sregs.ds;
+
+        sregs.cr0 &= !1u64; // clear PE: this is real mode, not a switch into it
+
+        // SAFETY: `sregs` outlives the call.
+        if unsafe { libc::ioctl(self.vcpu, KVM_SET_SREGS, std::ptr::from_ref(&sregs)) } < 0 {
+            return last_err();
+        }
+        self.sregs = sregs;
+
+        let regs = KvmRegs {
+            rip: ip as u64,
+            rsp: sp as u64,
+            rflags: 0x2, // bit 1 is reserved and must be set
+            ..KvmRegs::default()
+        };
+        // SAFETY: `regs` outlives the call.
+        if unsafe { libc::ioctl(self.vcpu, KVM_SET_REGS, std::ptr::from_ref(&regs)) } < 0 {
+            return last_err();
+        }
+        self.regs = regs;
+        self.regs_dirty = false;
+        Ok(())
+    }
+
+    fn exit_reason(&self) -> u32 {
+        // SAFETY: `run` is a live mapping of at least `size_of::<KvmRun>()`.
+        unsafe { (*self.run).exit_reason }
+    }
+
+    fn io_port(&self) -> u16 {
+        // SAFETY: as above.
+        unsafe { (*self.run).io_port }
+    }
+
+    /// Run until the guest asks a question.
+    pub fn run(&mut self) -> io::Result<Stop> {
+        if self.regs_dirty {
+            // SAFETY: `regs` outlives the call.
+            if unsafe { libc::ioctl(self.vcpu, KVM_SET_REGS, std::ptr::from_ref(&self.regs)) } < 0 {
+                return last_err();
+            }
+            self.regs_dirty = false;
+        }
+
+        loop {
+            // SAFETY: KVM_RUN takes no argument.
+            let rc = unsafe { libc::ioctl(self.vcpu, KVM_RUN, 0) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+
+            return match self.exit_reason() {
+                KVM_EXIT_IO if self.io_port() == TRAP_PORT => {
+                    // SAFETY: both outlive their calls.
+                    let regs = std::ptr::from_mut(&mut self.regs);
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_REGS, regs) } < 0 {
+                        return last_err();
+                    }
+                    let sregs = std::ptr::from_mut(&mut self.sregs);
+                    if unsafe { libc::ioctl(self.vcpu, KVM_GET_SREGS, sregs) } < 0 {
+                        return last_err();
+                    }
+                    Ok(Stop::Trap)
+                }
+                KVM_EXIT_HLT => Ok(Stop::Halted),
+                other => Ok(Stop::Unexpected(other)),
+            };
+        }
+    }
+
+    /// Resolve a far pointer the way real mode does.
+    fn linear(&self, at: DosPtr) -> usize {
+        at.seg as usize * 16 + at.off as usize
+    }
+
+    fn span(&self, at: DosPtr, len: usize) -> Result<(usize, usize), DosFault> {
+        let base = self.linear(at);
+        let end = base
+            .checked_add(len)
+            .ok_or(DosFault::OutOfBounds { at, len })?;
+        if end > self.mem_len {
+            return Err(DosFault::OutOfBounds { at, len });
+        }
+        Ok((base, end))
+    }
+}
+
+impl DosGuest for VmGuest {
+    fn read(&self, at: DosPtr, len: usize) -> Result<&[u8], DosFault> {
+        let (base, end) = self.span(at, len)?;
+        Ok(&self.mem_ref()[base..end])
+    }
+
+    fn read_until(&self, at: DosPtr, term: u8, max: usize) -> Result<&[u8], DosFault> {
+        let base = self.linear(at);
+        let mem = self.mem_ref();
+        let tail = mem
+            .get(base..)
+            .ok_or(DosFault::OutOfBounds { at, len: 0 })?;
+        let limit = max.min(tail.len());
+        match tail[..limit].iter().position(|&b| b == term) {
+            Some(n) => Ok(&tail[..n]),
+            None => Err(DosFault::Unterminated { at, term, max }),
+        }
+    }
+
+    fn write(&mut self, at: DosPtr, bytes: &[u8]) -> Result<(), DosFault> {
+        let (base, end) = self.span(at, bytes.len())?;
+        self.mem_mut()[base..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn regs(&self) -> DosRegs {
+        DosRegs {
+            ax: self.regs.rax as u16,
+            bx: self.regs.rbx as u16,
+            cx: self.regs.rcx as u16,
+            dx: self.regs.rdx as u16,
+            si: self.regs.rsi as u16,
+            di: self.regs.rdi as u16,
+            ds: self.sregs.ds.selector,
+            es: self.sregs.es.selector,
+        }
+    }
+
+    fn set_regs(&mut self, regs: DosRegs) {
+        // Only the low 16 bits are the guest's; leave the rest of each 64-bit
+        // register as the CPU left it.
+        self.regs.rax = (self.regs.rax & !0xffff) | regs.ax as u64;
+        self.regs.rbx = (self.regs.rbx & !0xffff) | regs.bx as u64;
+        self.regs.rcx = (self.regs.rcx & !0xffff) | regs.cx as u64;
+        self.regs.rdx = (self.regs.rdx & !0xffff) | regs.dx as u64;
+        self.regs.rsi = (self.regs.rsi & !0xffff) | regs.si as u64;
+        self.regs.rdi = (self.regs.rdi & !0xffff) | regs.di as u64;
+        self.regs_dirty = true;
+    }
+
+    /// Write the carry flag into the `FLAGS` image the stub's `iret` will pop.
+    ///
+    /// After `int n` the stack holds IP, CS, then FLAGS, so the word lives at
+    /// `SS:SP+4`. Setting the *live* flags instead would be undone by `iret`
+    /// the moment the guest resumes, and every DOS error return would vanish.
+    fn set_carry(&mut self, on: bool) {
+        let base = (self.sregs.ss.base as usize) + (self.regs.rsp as u16 as usize) + 4;
+        // Losing the carry here is the exact failure this convention exists to
+        // avoid, so an unreachable stack address stops rather than quietly
+        // discarding the program's error return.
+        let slot = self
+            .mem_mut()
+            .get_mut(base..base + 2)
+            .expect("stacked FLAGS word is outside guest memory");
+        let mut flags = u16::from_le_bytes([slot[0], slot[1]]);
+        if on {
+            flags |= 1;
+        } else {
+            flags &= !1;
+        }
+        slot.copy_from_slice(&flags.to_le_bytes());
+    }
+}
+
+impl Drop for VmGuest {
+    fn drop(&mut self) {
+        // SAFETY: each of these was produced by the matching call in `new`.
+        unsafe {
+            libc::munmap(self.run.cast::<libc::c_void>(), self.run_size);
+            libc::munmap(self.mem.cast::<libc::c_void>(), self.mem_len);
+            libc::close(self.vcpu);
+            libc::close(self.vm);
+            libc::close(self.kvm);
+        }
+    }
+}

@@ -1,0 +1,116 @@
+//! The seam: everything a DOS call needs from whatever is executing the program.
+//!
+//! The whole point of this module is what it does *not* mention. There is no
+//! `ucontext`, no vCPU, no LDT and no signal here. A DOS service reads some
+//! registers, follows a far pointer into memory, writes some registers back,
+//! and reports success or failure. Those four things are the entire contract,
+//! and both trap edges can satisfy them -- see `docs/2026-08-16-dos-trap-edges.md`.
+
+/// A DOS far pointer, which is how every INT 21h argument that is not a scalar
+/// arrives.
+///
+/// Deliberately *not* a linear address: resolving `seg` is the one thing the
+/// two edges genuinely disagree about (an LDT descriptor base under a signal,
+/// `seg << 4` under real mode), so the disagreement stays on their side of the
+/// trait rather than leaking into every call that takes a pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DosPtr {
+    pub seg: u16,
+    pub off: u16,
+}
+
+impl DosPtr {
+    pub fn new(seg: u16, off: u16) -> Self {
+        Self { seg, off }
+    }
+}
+
+/// The register file as a DOS call sees it.
+///
+/// `ds` and `es` are members because DOS argument conventions are built on
+/// them (`DS:DX` for paths and strings, `ES:BX` for buffers). That they are
+/// awkward to obtain on one of the two edges is that edge's problem: on
+/// x86-64 `struct sigcontext_64` carries no `ds`/`es` at all, and a handler
+/// has to recover them by reading its own live registers.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct DosRegs {
+    pub ax: u16,
+    pub bx: u16,
+    pub cx: u16,
+    pub dx: u16,
+    pub si: u16,
+    pub di: u16,
+    pub ds: u16,
+    pub es: u16,
+}
+
+impl DosRegs {
+    /// The function number. Every dispatch decision starts here.
+    pub fn ah(&self) -> u8 {
+        (self.ax >> 8) as u8
+    }
+
+    pub fn al(&self) -> u8 {
+        (self.ax & 0xff) as u8
+    }
+
+    pub fn set_ah(&mut self, v: u8) {
+        self.ax = (self.ax & 0x00ff) | ((v as u16) << 8);
+    }
+
+    pub fn set_al(&mut self, v: u8) {
+        self.ax = (self.ax & 0xff00) | v as u16;
+    }
+
+    pub fn dl(&self) -> u8 {
+        (self.dx & 0xff) as u8
+    }
+
+    /// `DS:DX` -- the argument convention of nearly every pointer-taking call.
+    pub fn ds_dx(&self) -> DosPtr {
+        DosPtr::new(self.ds, self.dx)
+    }
+}
+
+/// Why a guest memory access could not be served.
+///
+/// A fault is *not* a DOS error code. It means the program handed over a
+/// pointer that does not name memory, which under real DOS would have silently
+/// read something else. Surfacing it is the point: a runtime crash beats
+/// undefined behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DosFault {
+    /// The span starting at `at` leaves the address space.
+    OutOfBounds { at: DosPtr, len: usize },
+    /// A terminated string ran `max` bytes without its terminator.
+    Unterminated { at: DosPtr, term: u8, max: usize },
+}
+
+/// What a DOS call needs from whatever is executing the program.
+pub trait DosGuest {
+    /// `len` bytes at `at`.
+    fn read(&self, at: DosPtr, len: usize) -> Result<&[u8], DosFault>;
+
+    /// Bytes from `at` up to but excluding the first `term`.
+    ///
+    /// One method rather than two because DOS terminates strings two different
+    /// ways -- NUL for ASCIIZ paths, `$` for `AH=09` -- and the only thing that
+    /// differs is the byte.
+    fn read_until(&self, at: DosPtr, term: u8, max: usize) -> Result<&[u8], DosFault>;
+
+    fn write(&mut self, at: DosPtr, bytes: &[u8]) -> Result<(), DosFault>;
+
+    fn regs(&self) -> DosRegs;
+
+    fn set_regs(&mut self, regs: DosRegs);
+
+    /// DOS reports failure with CF set and an error code in AX.
+    ///
+    /// Separate from [`DosGuest::set_regs`] precisely because the two edges
+    /// write the flag to different places: the live `EFLAGS` in a signal
+    /// context, which `sigreturn` restores, versus the `FLAGS` image already
+    /// pushed on the guest stack, which `iret` will pop. Writing it to the
+    /// live flags under `iret` is the classic bug -- every error return
+    /// evaporates silently.
+    fn set_carry(&mut self, on: bool);
+}
