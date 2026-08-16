@@ -10,6 +10,7 @@
 //! Direct writes to `B800:0000` need nothing here -- that is guest memory, and
 //! the program can scribble on it freely. Only the *queries* need answering.
 
+use crate::driver::Key;
 use crate::guest::{DosGuest, DosPtr, Flag};
 
 /// Physical base of the colour text buffer.
@@ -106,6 +107,18 @@ impl Keyboard {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// Queue one key. An extended key goes in as the zero-then-scan-code pair
+    /// the BIOS reports, which is also how `feed` encodes `%XX`.
+    pub fn push_key(&mut self, key: Key) {
+        match key {
+            Key::Char(c) => self.pending.push_back(c),
+            Key::Ext(scan) => {
+                self.pending.push_back(0);
+                self.pending.push_back(scan);
+            }
+        }
+    }
 }
 
 /// Service one `int 16h`. Returns false when the guest asked for a key and
@@ -185,13 +198,28 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
         }
 
         // 02h -- set cursor position (DH row, DL col).
+        //
+        // The BDA copy at 0040:0050 is not bookkeeping: a program that draws
+        // its own screen reads the cursor back from there rather than asking
+        // the BIOS, so failing to write it leaves the program computing every
+        // write offset from a stale (0,0).
         0x02 => {
             video.cursor_row = (regs.dx >> 8) as u8;
             video.cursor_col = (regs.dx & 0xff) as u8;
+            let page = usize::from(video.page).min(7);
+            let at = DosPtr::new(0x0040, 0x0050 + (page as u16) * 2);
+            let _ = g.write(at, &[video.cursor_col, video.cursor_row]);
         }
 
-        // 03h -- get cursor position and shape.
+        // 03h -- get cursor position and shape. Read the BDA back, so that a
+        // program which moved the cursor by poking 0040:0050 sees its own value.
         0x03 => {
+            let page = usize::from(video.page).min(7);
+            let at = DosPtr::new(0x0040, 0x0050 + (page as u16) * 2);
+            if let Ok(b) = g.read(at, 2) {
+                video.cursor_col = b[0];
+                video.cursor_row = b[1];
+            }
             regs.dx = (u16::from(video.cursor_row) << 8) | u16::from(video.cursor_col);
             regs.cx = 0x0607; // an ordinary underline cursor
             g.set_regs(regs);

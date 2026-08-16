@@ -16,8 +16,10 @@ use dos_poc::bios::{Keyboard, Video, int10, int16};
 use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
+use dos_poc::driver::{Driver, Script};
 use dos_poc::files::Files;
 use dos_poc::mz::{self, MzImage};
+use dos_poc::screen::Screen;
 
 /// 1 MiB: the whole real-mode address space.
 const MEM: usize = 1 << 20;
@@ -41,11 +43,15 @@ fn main() -> io::Result<()> {
     let mut tail = String::new();
     let mut keys = String::new();
     let mut root_dir = String::from("tmp/lordroot");
+    let mut script_path: Option<String> = None;
+    let mut trace = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--keys" => keys = it.next().cloned().unwrap_or_default(),
             "--root" => root_dir = it.next().cloned().unwrap_or(root_dir),
+            "--script" => script_path = it.next().cloned(),
+            "--trace" => trace = true,
             other => {
                 if !tail.is_empty() {
                     tail.push(' ');
@@ -93,6 +99,13 @@ fn main() -> io::Result<()> {
     dos.files = Some(Files::new(root.into()));
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
+    let mut driver: Option<Script> = match &script_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)?;
+            Some(Script::parse(&text).map_err(io::Error::other)?)
+        }
+        None => None,
+    };
     let mut video = Video::default();
     video.install_bda(&mut vm);
     let mut order: Vec<u8> = Vec::new();
@@ -100,6 +113,7 @@ fn main() -> io::Result<()> {
     let mut missing: BTreeMap<u8, u32> = BTreeMap::new();
     let mut bios: BTreeMap<(u8, u8), u32> = BTreeMap::new();
     let mut vectors: Vec<String> = Vec::new();
+    let mut settles = 0u32;
     let mut calls = 0u32;
 
     let ending = loop {
@@ -116,7 +130,35 @@ fn main() -> io::Result<()> {
                 *bios.entry((0x16, vm.regs().ah())).or_insert(0) += 1;
                 calls += 1;
                 if !int16(&mut vm, &mut keyboard) {
-                    break "waiting for a keystroke, none queued".to_string();
+                    // The guest has drained its input and finished painting.
+                    // This is the settle point: hand the screen to the driver.
+                    let Some(script) = driver.as_mut() else {
+                        break "waiting for a keystroke, none queued".to_string();
+                    };
+                    let screen = Screen::snapshot(
+                        &vm,
+                        video.columns as usize,
+                        video.rows as usize,
+                        (video.cursor_row, video.cursor_col),
+                    );
+                    settles += 1;
+                    if trace {
+                        println!(
+                            "  [settle {settles}] selected={:?} cursor={:?}",
+                            screen.selected(),
+                            screen.cursor
+                        );
+                    }
+                    match script.next_key(&screen) {
+                        Some(key) => {
+                            if trace {
+                                println!("  [settle {settles}] send {key:?}");
+                            }
+                            keyboard.push_key(key);
+                            int16(&mut vm, &mut keyboard);
+                        }
+                        None => break script.ending(),
+                    }
                 }
             }
             Stop::Trap(vector) if vector != 0x21 => {
@@ -171,9 +213,7 @@ fn main() -> io::Result<()> {
                 .collect(),
             Err(_) => continue,
         };
-        if !line.trim().is_empty() {
-            println!("|{}|", line.trim_end());
-        }
+        println!("{row:2} |{}|", line.trim_end());
     }
 
     if !vectors.is_empty() {
