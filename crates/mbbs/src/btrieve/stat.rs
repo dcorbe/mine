@@ -468,6 +468,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            modifiable: true,
             chain: None,
         }
     }
@@ -672,6 +673,7 @@ mod tests {
                     Segment { offset: 6, length: 1, kind: Kind::Text, descending: false },
                 ],
                 duplicates: false,
+                modifiable: true,
                 chain: None,
             },
         ];

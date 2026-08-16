@@ -114,10 +114,17 @@
 //!
 //! # Registration
 //!
-//! Not registered here -- this file is new and `shims/mod.rs` is off limits
-//! to it; see this crate's own top-level report for the exact rows and the
-//! one open question (`crate::exports::WGSERVER` already exists, unused,
-//! and is *not* what these rows should key on -- see that report).
+//! All thirty-three routines below are registered in `shims/mod.rs` under
+//! `MAJORBBS`, lowercased -- `_dfaSetBlk` arrives at the table as
+//! `dfasetblk`, see `exports::c_name`. Worldgroup NT's PE modules import the
+//! identical symbols from a differently-named container, which one alias
+//! covers.
+//!
+//! This paragraph used to say the opposite -- "not registered here" --
+//! which was true of the commit that introduced this file and false from
+//! the one that registered its routines. A claim about another file's
+//! contents cannot be kept honest from here, so check it rather than
+//! trust it: the count is a grep for quoted `dfa` names in `shims/mod.rs`.
 
 // The C names throughout `DFAAPI.H`/`DFAAPI.C` are mixed-case
 // (`dfaSetBlk`, not `dfa_set_blk`), and every routine below keeps its

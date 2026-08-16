@@ -63,6 +63,14 @@ mod at {
 mod flag {
     /// More than one record may carry this key value.
     pub const DUPLICATES: u16 = 1 << 0;
+    /// An update may change this key's value.
+    ///
+    /// Without it, genuine Btrieve 6.15 answers **status 10** to any update
+    /// that changes the key -- and writes nothing. Measured directly by
+    /// creating the same file twice, once with attributes `0x0100` and once
+    /// with `0x0102`, and running the same key-changing update against both
+    /// (`tools/btrieve-oracle/delprobe.c`, `create` vs `create_mod`).
+    pub const MODIFIABLE: u16 = 1 << 1;
     /// The key is compared as a plain unsigned binary field.
     pub const OLD_BINARY: u16 = 1 << 2;
     /// **Another segment of the same key follows this one.** `BTVSTF.H:59`
@@ -259,6 +267,17 @@ pub struct Key {
     pub segments: Vec<Segment>,
     /// Whether two records may carry the same value.
     pub duplicates: bool,
+
+    /// Whether an update may change this key's value.
+    ///
+    /// `false` makes genuine Btrieve refuse such an update with status 10 and
+    /// write nothing -- see [`Block::update`](super::Block::update), which is
+    /// where that refusal lives, and [`flag::MODIFIABLE`] for the
+    /// measurement. Forty-three of the seventy-six key definitions in this
+    /// repository's real files are `false`, including `WCCUSERS.DAT` key 0 and
+    /// `WCCCLASS.DAT` key 0, so this is the common case rather than the
+    /// exotic one.
+    pub modifiable: bool,
     /// Where the in-record `[prev][next]` duplicate-chain pair lives, as a
     /// byte offset into a record's **physical** slot -- `None` when
     /// [`Self::duplicates`] is false, since a unique key has no chain to
@@ -445,6 +464,17 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
                 definition: start_definition as u16,
                 segments: std::mem::take(&mut segments),
                 duplicates,
+                // Read from this definition -- the key's *last* segment -- and
+                // that is safe for a segmented key rather than merely
+                // convenient: genuine Btrieve 6.15 refuses to CREATE a key
+                // whose segments disagree about this bit, answering status 45
+                // ("invalid key flags") at create time. Measured over the full
+                // two-by-two matrix (`delprobe modseg`, 2026-08-16): both
+                // segments modifiable creates and updates; neither creates and
+                // refuses the update with status 10; one of each does not
+                // produce a file at all. All four multi-segment keys in this
+                // repository's real files agree across their segments, checked.
+                modifiable: attributes & flag::MODIFIABLE != 0,
                 // Read from *this* definition -- the key's last one, which is
                 // also its first and only one for every duplicate-permitting
                 // key MajorMUD ships (none of the four is segmented). A
@@ -638,6 +668,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            modifiable: true,
             chain: None,
         }
     }
@@ -714,6 +745,7 @@ mod tests {
                 },
             ],
             duplicates: true,
+            modifiable: true,
             chain: Some(6),
         };
         assert_eq!(key.length(), 6);
@@ -749,6 +781,7 @@ mod tests {
                 },
             ],
             duplicates: true,
+            modifiable: true,
             chain: Some(6),
         };
 

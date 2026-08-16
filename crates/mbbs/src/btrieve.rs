@@ -1083,6 +1083,64 @@ impl<A: Abi> Block<A> {
         Ok(new_position)
     }
 
+    /// The number of a key that does not declare itself modifiable and whose
+    /// value this update would change, if there is one.
+    ///
+    /// # Why this is a refusal and not a shrug
+    ///
+    /// A key definition's attribute bit 1 ([`keys::flag::MODIFIABLE`]) says
+    /// whether an update may change that key's value. Without it, genuine
+    /// Btrieve 6.15 answers **status 10** and writes nothing -- measured by
+    /// creating one file with attributes `0x0100` and another with `0x0102`
+    /// and running the same key-changing update against both
+    /// (`tools/btrieve-oracle/delprobe.c`).
+    ///
+    /// The module never sees the number 10. `PLBTVSTF.C`'s wrappers turn it
+    /// into a catastrophic error: `upvbtv` (`:531-547`) sends **any** nonzero
+    /// status to `btverrptr("UPDATE")`, and `dupdbtv` (`:550-570`) carves out
+    /// exactly one status -- `case 5`, the duplicate key -- and sends
+    /// everything else, 10 included, to the same `btverrptr`. So the faithful
+    /// behaviour is to stop, which is what returning an error from here does,
+    /// and it is why this is not modelled as a quiet failure answer the way
+    /// `shims::btrieve::duplicate_key`'s status 5 is.
+    ///
+    /// # Where it lives, and why not in the four callers
+    ///
+    /// [`Self::update`] has four callers -- `dupdbtv`, `upvbtv`,
+    /// `dfa.rs`'s update, and `ops.rs`'s chunked update -- and the rule is a
+    /// property of the file format, not of any one wrapper's calling
+    /// convention. Put here once, all four inherit it; put in the shims, the
+    /// engine's own `ops` path would silently keep the old behaviour.
+    ///
+    /// # By value, not by bytes
+    ///
+    /// The comparison is [`Key::compare`], which is segment-by-segment and
+    /// type-aware, **not** a byte comparison of the key field. Measured: a
+    /// `Zstring` key holding `AB\0` followed by five `0xAA`, on a
+    /// non-modifiable key, updated so that only those five trailing bytes
+    /// change -- genuine 6.15 answers status 0 and commits the new bytes. The
+    /// value did not change; the bytes did. A byte comparison here would
+    /// refuse a write the real engine performs.
+    ///
+    /// Equally measured: rewriting a non-modifiable key with the value it
+    /// already holds is status 0. The engine refuses a *change*, not a touch.
+    ///
+    /// `existing` and `bytes` are both whole records, and both go through
+    /// [`records::keyed`] first, because a v6 key's offset is measured from
+    /// the physical slot and [`Record::bytes`] does not carry the two-byte
+    /// marker that slot opens with.
+    fn unmodifiable_key_changed(&self, existing: &[u8], bytes: &[u8]) -> Option<u16> {
+        let shift = self.records.as_ref().map_or(0, Records::key_shift);
+        let before = records::keyed(shift, existing);
+        let after = records::keyed(shift, bytes);
+        self.keys
+            .iter()
+            .find(|key| {
+                !key.modifiable && key.compare(&before, &after) != std::cmp::Ordering::Equal
+            })
+            .map(|key| key.number)
+    }
+
     /// Put `bytes` in the slot the free list's head names, and answer with
     /// that slot's position and the list's new head.
     ///
@@ -1299,15 +1357,15 @@ impl<A: Abi> Block<A> {
     ///   before relocating.
     /// - the record count does not change, and neither does the free list.
     ///
-    /// # A key that does not declare itself modifiable is not checked here
+    /// # A key that does not declare itself modifiable
     ///
-    /// Genuine 6.15 answers status 10 to an update that changes a key the file
-    /// declares non-modifiable, and nothing here does. That is a deliberate
-    /// gap and not an oversight: this host does not parse the modifiable
-    /// attribute at all (see [`keys::Key`], which has no field for it), and
-    /// inventing the refusal from an unparsed bit would be guessing at which
-    /// bit. Of the twelve v6 files The Rose ships, six declare their keys
-    /// modifiable, so the check is not free to add wrongly.
+    /// Refused before this is reached -- see
+    /// [`Self::unmodifiable_key_changed`], called from [`Self::update`] ahead
+    /// of the version split, because the rule is the file format's and not
+    /// v6's. An earlier version of this comment said the bit had never been
+    /// measured and so could not be acted on; it had been measured, in the
+    /// same session, by creating one file with key attributes `0x0100` and
+    /// another with `0x0102` and running the same update against both.
     ///
     /// # Errors
     ///
@@ -1914,12 +1972,29 @@ impl<A: Abi> Block<A> {
         }
 
         let records = self.records.as_ref().expect("just loaded");
-        if records.find_physical(position).is_none() {
+        let Some(at) = records.find_physical(position) else {
             return Err(BtvError {
                 file: name,
                 why: format!("position {position} holds no record"),
             });
+        };
+
+        // Genuine Btrieve refuses this write outright, and so does this. See
+        // `Self::unmodifiable_key_changed` for the measurement and for why the
+        // refusal lives here rather than in each of the four callers.
+        let existing = records.physical(at).expect("just found").bytes.clone();
+        if let Some(key) = self.unmodifiable_key_changed(&existing, bytes) {
+            return Err(BtvError {
+                file: name,
+                why: format!(
+                    "key {key} does not declare itself modifiable, and this \
+                     update changes its value -- genuine Btrieve answers status \
+                     10 and writes nothing"
+                ),
+            });
         }
+
+        let records = self.records.as_ref().expect("still loaded");
         let count = records.len() as u32;
 
         let layout = pages::Layout {
@@ -3811,6 +3886,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            modifiable: true,
             chain: None,
         }];
         Block {
@@ -3957,6 +4033,124 @@ mod tests {
     /// The live half of the file control record's shadow pair.
     fn v6_fcr(block: &Block<Wg16>, file: &[u8]) -> Vec<u8> {
         block.v6_live_fcr(file).expect("a live control record")
+    }
+
+    /// An update that changes the value of a key the file declares
+    /// non-modifiable is refused, and writes nothing.
+    ///
+    /// Genuine Btrieve 6.15 answers status 10 to this and writes nothing --
+    /// measured by creating the same file twice, once with key attributes
+    /// `0x0100` and once with `0x0102`, and running the same key-changing
+    /// update against both (`delprobe create` vs `create_mod`). Forty-three of
+    /// the seventy-six key definitions in this repository's real files are
+    /// non-modifiable, `WCCUSERS.DAT` key 0 among them.
+    #[test]
+    fn an_update_that_changes_a_non_modifiable_keys_value_is_refused() {
+        let dir = crate::testing::scratch("block-unmodifiable-key");
+        let path = seed(&dir);
+        let mut block = block(path.clone());
+
+        let position = block.insert(&record(1)).expect("insert");
+        block.keys[0].modifiable = false;
+        let before = std::fs::read(&path).expect("readable");
+
+        let e = block
+            .update(position, &record(9))
+            .expect_err("changing a non-modifiable key is refused");
+        assert!(e.why.contains("does not declare itself modifiable"), "{e}");
+        assert!(e.why.contains("status 10"), "the refusal names what Btrieve answers: {e}");
+
+        assert_eq!(
+            std::fs::read(&path).expect("readable"),
+            before,
+            "a refused update writes nothing"
+        );
+        assert_eq!(
+            at_position(block.records().expect("loaded"), position)
+                .expect("still there")
+                .bytes,
+            record(1),
+            "and leaves the model alone too"
+        );
+    }
+
+    /// The same key, the same file, an update that leaves the key's value
+    /// where it was: allowed.
+    ///
+    /// Measured (`delprobe modsame`): rewriting a non-modifiable key with the
+    /// value it already holds answers status 0. Btrieve refuses a *change*,
+    /// not a touch -- and a host that refused every update to a file with a
+    /// non-modifiable key would break almost every write MajorMUD makes.
+    #[test]
+    fn an_update_that_leaves_a_non_modifiable_keys_value_alone_is_written() {
+        let dir = crate::testing::scratch("block-unmodifiable-key-untouched");
+        let path = seed(&dir);
+        let mut block = block(path);
+
+        let position = block.insert(&record(1)).expect("insert");
+        block.keys[0].modifiable = false;
+
+        let mut changed = record(1);
+        changed[8..12].copy_from_slice(b"body");
+        block.update(position, &changed).expect("the key did not move");
+
+        block.records = None;
+        assert_eq!(
+            at_position(block.records().expect("re-reads"), position)
+                .expect("still there")
+                .bytes,
+            changed
+        );
+    }
+
+    /// A text key's bytes past its NUL terminator are not part of its value,
+    /// so changing them is not a change.
+    ///
+    /// Measured, and the reason the check is [`Key::compare`] rather than a
+    /// byte comparison of the key field: a `Zstring` key holding `AB\0` and
+    /// five `0xAA`, on a **non-modifiable** key, updated so only those five
+    /// trailing bytes move -- genuine 6.15 answers status 0 and commits the
+    /// new bytes (`delprobe modtail`). A byte comparison here would refuse a
+    /// write the real engine performs, on a file MajorMUD ships: every one of
+    /// its text keys is a `Zstring` inside a fixed-width field.
+    #[test]
+    fn a_text_keys_bytes_past_its_terminator_are_not_part_of_its_value() {
+        let dir = crate::testing::scratch("block-unmodifiable-text-key");
+        let path = seed(&dir);
+        let mut block = block(path);
+        block.keys = vec![Key {
+            number: 0,
+            definition: 0,
+            segments: vec![keys::Segment {
+                offset: 0,
+                length: 8,
+                kind: keys::Kind::Text,
+                descending: false,
+            }],
+            duplicates: false,
+            modifiable: false,
+            chain: None,
+        }];
+
+        let mut before = vec![0u8; 16];
+        before[..3].copy_from_slice(b"AB\0");
+        before[3..8].fill(0xAA);
+
+        let mut tail = before.clone();
+        tail[3..8].fill(0xBB);
+        assert_eq!(
+            block.unmodifiable_key_changed(&before, &tail),
+            None,
+            "the bytes after the terminator are not the value"
+        );
+
+        let mut value = before.clone();
+        value[1] = b'C';
+        assert_eq!(
+            block.unmodifiable_key_changed(&before, &value),
+            Some(0),
+            "and the bytes before it are"
+        );
     }
 
     /// v6 inserts pack: consecutive records land in consecutive slots of one
@@ -4200,6 +4394,17 @@ mod tests {
     #[test]
     fn a_v6_update_that_reorders_a_key_relocates_that_keys_root() {
         let (mut block, path) = v6_scratch("btv-v6-update-key");
+        // The fixture's key is not modifiable, and `Block::update` refuses a
+        // key-changing update on one -- that rule has its own test below. The
+        // subject here is index relocation, so the scratch copy is made
+        // modifiable and the block re-opened over it.
+        crate::testing::make_keys_modifiable(&path);
+        block.keys = keys::parse(
+            "V6EMPTY1KEY.DAT",
+            &std::fs::read(&path).expect("readable"),
+            block.geometry.keys,
+        )
+        .expect("keys");
 
         block.insert(&v6_record(b"AAAA")).expect("first insert");
         let second = block.insert(&v6_record(b"BBBB")).expect("second insert");
@@ -4867,6 +5072,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            modifiable: true,
             chain: None,
         }];
         Block {
@@ -5113,6 +5319,7 @@ mod tests {
                 descending: false,
             }],
             duplicates: false,
+            modifiable: true,
             chain: None,
         }];
         Block {
@@ -5597,6 +5804,7 @@ mod tests {
                 definition: 0,
                 segments: vec![segment(0), segment(2)],
                 duplicates: false,
+                modifiable: true,
                 chain: None,
             },
             Key {
@@ -5604,6 +5812,7 @@ mod tests {
                 definition: 2,
                 segments: vec![segment(4)],
                 duplicates: false,
+                modifiable: true,
                 chain: None,
             },
         ];

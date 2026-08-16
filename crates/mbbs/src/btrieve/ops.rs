@@ -2481,6 +2481,7 @@ mod tests {
                     descending: false,
                 }],
                 duplicates: false,
+                modifiable: true,
                 chain: None,
             },
             Key {
@@ -2493,6 +2494,7 @@ mod tests {
                     descending: false,
                 }],
                 duplicates: true,
+                modifiable: true,
                 chain: Some(8),
             },
         ]

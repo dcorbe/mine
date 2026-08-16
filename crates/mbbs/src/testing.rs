@@ -25,6 +25,62 @@ pub fn data() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data")
 }
 
+/// Set the MODIFIABLE attribute on every key definition of a Btrieve file, in
+/// place, so a test may update a record in a way that moves its key.
+///
+/// Without the bit, [`Block::update`](crate::btrieve::Block::update) refuses
+/// such a write, because genuine Btrieve answers status 10 to it and the
+/// vendor's own wrapper turns that into a `catastro`. A test whose subject is
+/// something else -- index relocation, cursor currency -- needs the write to
+/// go through, and saying so here is better than the alternatives: mutating
+/// the shared fixture on disk would change what every other test reads, and
+/// minting a second near-identical fixture would leave two files to keep in
+/// step.
+///
+/// **The bit's meaning is measured, so setting it is configuration and not
+/// invention** -- see `Block::unmodifiable_key_changed`. Both halves of a v6
+/// file's shadowed control record are written, so this does not depend on
+/// which one is live.
+///
+/// # Panics
+///
+/// If the file cannot be read or written, or is too short to hold the key
+/// definitions it claims.
+pub fn make_keys_modifiable(path: &std::path::Path) {
+    const PAGE: usize = 0x08;
+    const KEYS: usize = 0x14;
+    const BASE: usize = 0x110;
+    const WIDTH: usize = 0x1e;
+    const ATTRIBUTES: usize = 0x08;
+    const MODIFIABLE: u16 = 1 << 1;
+
+    let mut file = std::fs::read(path).expect("a Btrieve file to read");
+    let word = |file: &[u8], at: usize| u16::from_le_bytes([file[at], file[at + 1]]);
+
+    let page = usize::from(word(&file, PAGE));
+    let count = usize::from(word(&file, KEYS));
+    // v6 shadows the control record across physical pages 0 and 1; v5 has only
+    // page 0. Writing both is right either way -- a v5 file's page 1 is an
+    // ordinary page whose first bytes are not key definitions, so it is only
+    // touched when the file really is shadowed.
+    let copies: &[usize] = if file.len() >= 2 * page && &file[..2] == b"FC" {
+        &[0, 1]
+    } else {
+        &[0]
+    };
+
+    for &copy in copies {
+        for key in 0..count {
+            let at = copy * page + BASE + key * WIDTH + ATTRIBUTES;
+            assert!(at + 2 <= file.len(), "{}: too short for {count} keys", path.display());
+            let attributes = word(&file, at) | MODIFIABLE;
+            file[at..at + 2].copy_from_slice(&attributes.to_le_bytes());
+        }
+    }
+
+    std::fs::write(path, &file).expect("a Btrieve file to write back");
+}
+
 /// An empty directory a test may write into, under `target/`.
 ///
 /// Some of what the host does is *install* a file rather than read one, and a

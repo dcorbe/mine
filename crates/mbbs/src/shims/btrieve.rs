@@ -5013,6 +5013,13 @@ mod tests {
             "dupdbtv-currency-follows-the-move",
             &["SAMPLE.DAT"],
         );
+        // `SAMPLE.DAT`'s key declares attributes 0x0100 -- not modifiable --
+        // and this test's whole point is an update that moves the key, which
+        // `Block::update` now refuses on such a key because genuine Btrieve
+        // answers status 10 and `dupdbtv`'s own wrapper turns that into a
+        // catastro. The subject here is cursor currency, not that rule, so the
+        // scratch copy is made modifiable; the shared fixture is untouched.
+        crate::testing::make_keys_modifiable(&dir.join("SAMPLE.DAT"));
         let mut f = Fixture::rooted(dir);
         open(&mut f, "SAMPLE.DAT", 64);
 

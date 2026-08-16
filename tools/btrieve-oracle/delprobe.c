@@ -64,6 +64,9 @@
  *   insert_var          <path> <key> <total>
  *   get                 <path> <key>
  *   position            <path> <key>
+ *   modseg              <path> <seg0mod> <seg1mod> <change>
+ *   modsame             <path>
+ *   modtail             <path>
  *   update              <path> <key> <newtag>
  *   update_key          <path> <oldkey> <newkey>
  *   delete              <path> <key>
@@ -1089,6 +1092,235 @@ static void cmd_delete_only(const char *path, DWORD key)
     { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
 }
 
+/* ---------------------------------------------------------------------------
+ * The MODIFIABLE key attribute (bit 1 of a key definition's attribute word).
+ *
+ * Established already: a key WITHOUT it makes genuine 6.15 answer status 10 to
+ * an update that changes that key's value, and a key WITH it lets the same
+ * update through (`create` vs `create_mod`, 2026-08-15). These three commands
+ * answer what that leaves open, each self-contained -- create, insert and
+ * update inside one process -- so a scenario cannot be confused with a path
+ * the Microkernel is still caching from an earlier invocation.
+ * ------------------------------------------------------------------------- */
+
+/* Q1: on a MULTI-SEGMENT key, which segment's MODIFIABLE bit governs?
+ *
+ * Builds one key over two 4-byte segments (record bytes 1-4 and 5-8), each
+ * segment's MODIFIABLE bit set independently, then changes the bytes of one
+ * segment and reports the status. Run the four flag combinations against both
+ * change targets and the answer falls out: if only segment 0's bit matters the
+ * status tracks `seg0mod` whichever segment moved; if the bits are per-segment
+ * the status tracks the bit of the segment that changed.
+ *
+ * ANOSEG (0x10) on segment 0 is what makes these two definitions one key
+ * rather than two keys -- `BTVSTF.H:59`, and `keys.rs`'s own `flag::ANOSEG`. */
+static void cmd_modseg(const char *path, int seg0mod, int seg1mod, int change)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + 2 * sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *k0 = (KeySpec *)(data + sizeof(FileSpec));
+    KeySpec *k1 = k0 + 1;
+    unsigned char record[DATA_SIZE];
+    DWORD dlen = sizeof data;
+    int st;
+    unsigned i;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = RECLEN;
+    fs->pagesize = 2048;
+    /* ONE key. This field counts KEYS, not segments -- the segments are extra
+     * key-specification blocks joined by ANOSEG. Setting it to 2 makes the
+     * engine read blocks 0 and 1 as key 0 (ANOSEG says so) and then look for
+     * key 1's block, which is not there: status 22, "data buffer too short",
+     * which reads like a length mistake and is actually a count mistake. Our
+     * own `keys.rs` says the same thing from the read side -- `WCCBANKS.DAT`
+     * is one key over two definitions and its key-count field holds 1. */
+    fs->indexes_raw = 1;
+    fs->flags = 0;
+
+    k0->position = 1;
+    k0->length = 4;
+    k0->flags = (WORD)(0x0100 | 0x0010 | (seg0mod ? 0x0002 : 0));
+    k0->ext_type = 0x0e;
+    k1->position = 5;
+    k1->length = 4;
+    k1->flags = (WORD)(0x0100 | (seg1mod ? 0x0002 : 0));
+    k1->ext_type = 0x0e;
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("modseg create", st);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+
+    st = open_file(posblk, path);
+    if (st != 0) die("modseg open", st);
+
+    memset(record, 0, sizeof record);
+    for (i = 0; i < 8; i++)
+        record[i] = (unsigned char)(0x10 + i);
+    for (i = 8; i < RECLEN; i++)
+        record[i] = 0x77;
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_INSERT, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modseg insert", st);
+
+    memset(record, 0, sizeof record);
+    dlen = DATA_SIZE;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_GET_FIRST, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modseg get_first", st);
+
+    /* Move exactly one segment's bytes, leaving the other byte-identical. */
+    for (i = (change ? 4u : 0u); i < (change ? 8u : 4u); i++)
+        record[i] = (unsigned char)(record[i] + 0x40);
+
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_UPDATE, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    printf("modseg seg0mod=%d seg1mod=%d changed=seg%d status=%d (%s)\n",
+           seg0mod, seg1mod, change, st, status_name(st));
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* Q2: does status 10 fire when an update rewrites a non-modifiable key with
+ * the value it already had?
+ *
+ * Distinguishes "the engine refuses any update that touches a non-modifiable
+ * key" from "the engine refuses an update that CHANGES one". `cmd_update`
+ * already leaves the key field alone and succeeds on such a file, but it never
+ * writes the key bytes at all; this writes them, identically. */
+static void cmd_modsame(const char *path)
+{
+    char posblk[POSBLK_SIZE];
+    unsigned char record[DATA_SIZE];
+    DWORD dlen;
+    int st;
+
+    cmd_create(path); /* attributes 0x0100: NOT modifiable */
+
+    st = open_file(posblk, path);
+    if (st != 0) die("modsame open", st);
+
+    memset(record, 0, sizeof record);
+    fill_record(record, 7, 0x33);
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_INSERT, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modsame insert", st);
+
+    memset(record, 0, sizeof record);
+    dlen = DATA_SIZE;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_GET_FIRST, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modsame get_first", st);
+
+    /* Rewrite the key field with exactly what is already there, and change a
+     * non-key byte so the update is not a no-op the engine might skip. */
+    record[RECLEN - 1] = 0x5a;
+
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_UPDATE, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    printf("modsame (non-modifiable key, key bytes rewritten identically) "
+           "status=%d (%s)\n", st, status_name(st));
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* Q3: is the "did the key change" test raw bytes, or the collated value?
+ *
+ * A zstring key ends at its NUL; the bytes after it within the key's declared
+ * length are not part of the string. This inserts `AB\0` followed by five
+ * 0xAA, then changes only those five trailing bytes -- no change to the
+ * collated value, every change to the raw bytes -- on a key that is NOT
+ * modifiable. Status 10 means raw bytes; status 0 means collated value. */
+static void cmd_modtail(const char *path)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    unsigned char record[DATA_SIZE];
+    DWORD dlen = sizeof data;
+    int st;
+    unsigned i;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = RECLEN;
+    fs->pagesize = 2048;
+    fs->indexes_raw = 1;
+    fs->flags = 0;
+    ks->position = 1;
+    ks->length = 8;
+    ks->flags = 0x0100;  /* extended type only: NOT modifiable */
+    ks->ext_type = 0x0b; /* zstring */
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("modtail create", st);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+
+    st = open_file(posblk, path);
+    if (st != 0) die("modtail open", st);
+
+    memset(record, 0, sizeof record);
+    record[0] = 'A';
+    record[1] = 'B';
+    record[2] = '\0';
+    for (i = 3; i < 8; i++)
+        record[i] = 0xAA;
+    for (i = 8; i < RECLEN; i++)
+        record[i] = 0x77;
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_INSERT, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modtail insert", st);
+
+    memset(record, 0, sizeof record);
+    dlen = DATA_SIZE;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_GET_FIRST, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st != 0) die("modtail get_first", st);
+    printf("modtail: key field before %02x%02x%02x%02x%02x%02x%02x%02x\n",
+           record[0], record[1], record[2], record[3],
+           record[4], record[5], record[6], record[7]);
+
+    for (i = 3; i < 8; i++)
+        record[i] = 0xBB;
+
+    dlen = RECLEN;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_UPDATE, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    printf("modtail (zstring key, only the bytes past the NUL changed) "
+           "status=%d (%s)\n", st, status_name(st));
+
+    memset(record, 0, sizeof record);
+    dlen = DATA_SIZE;
+    { unsigned char kb[KEY_SIZE]; memset(kb, 0, sizeof kb);
+      st = btrcall(B_GET_FIRST, posblk, record, &dlen, kb, sizeof kb - 1, 0); }
+    if (st == 0)
+        printf("modtail: key field after  %02x%02x%02x%02x%02x%02x%02x%02x\n",
+               record[0], record[1], record[2], record[3],
+               record[4], record[5], record[6], record[7]);
+
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
 /* Plain filesystem read, bypassing Btrieve entirely -- run AFTER a Btrieve
  * command has closed the file, in a separate invocation, so there is no
  * question of reading through the Microkernel's own cache instead of what
@@ -1171,6 +1403,13 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "delete")) {
         if (argc < 4) { fprintf(stderr, "needs <key>\n"); return 2; }
         cmd_delete(path, (DWORD)strtoul(argv[3], NULL, 10));
+    } else if (!strcmp(cmd, "modseg")) {
+        if (argc < 6) { fprintf(stderr, "needs <seg0mod> <seg1mod> <change>\n"); return 2; }
+        cmd_modseg(path, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]));
+    } else if (!strcmp(cmd, "modsame")) {
+        cmd_modsame(path);
+    } else if (!strcmp(cmd, "modtail")) {
+        cmd_modtail(path);
     } else if (!strcmp(cmd, "update")) {
         if (argc < 5) { fprintf(stderr, "needs <key> <newtag>\n"); return 2; }
         cmd_update(path, (DWORD)strtoul(argv[3], NULL, 10),
