@@ -481,6 +481,16 @@ pub fn clrprf_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>) -> Result<(), Sh
 /// characters are copied and the NUL always fits; `strncpy` would copy `num`
 /// and leave an unterminated buffer, which is the bug this routine exists to
 /// avoid.
+///
+/// **It zero-fills**, which is the `z` in the name and what separates it from
+/// [`stlcpy`]. `STZCPY.C:27-32` is two loops -- copy until `num-1` or the
+/// source's terminator, then run the index out to `num` writing zeroes -- so
+/// exactly `num` bytes are written on every call and the destination's tail
+/// is cleared whether or not the copy needed it. Measured against a genuine
+/// `MAJORBBS.EXE` in `tests/oracle_gate.rs`
+/// (`stzcpy_zero_fills_the_whole_destination`), because a NUL-trimmed read
+/// cannot tell a cleared tail from an untouched one -- which is how this host
+/// shipped without the fill.
 pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dst = call.ptr();
     let src = call.ptr();
@@ -489,16 +499,40 @@ pub fn stzcpy<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>
     if num == 0 {
         // Nowhere to put even the terminator. Copying nothing is the only
         // thing that cannot overrun.
+        //
+        // The vendor does something else entirely here: `num-1` is `UINT`, so
+        // a zero wraps to 65535, the copy runs to the source's terminator and
+        // the fill loop then runs `i` out to 65535 -- a 64K overrun of a
+        // buffer the caller said had no room at all. That is not behaviour to
+        // reproduce; refusing to write is the only answer that cannot corrupt
+        // whatever follows `dst`.
         return Ok(abi::Ret::Ptr(dst));
     }
     let text = src
         .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?;
-    let take = text.len().min(usize::from(num) - 1);
-    let text = text[..take].to_vec();
-
-    write_cstr_mem::<A>(call.mem(), dst, &text, num)?;
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    fill_to_width::<A>(call.mem(), dst, &text, num)?;
     Ok(abi::Ret::Ptr(dst))
+}
+
+/// Copy at most `num - 1` bytes of `text` to `at` and clear the rest, writing
+/// exactly `num` bytes.
+///
+/// The shared core of [`stzcpy`] and [`stzcat`] -- `stzcat` is defined in the
+/// vendor as a `stzcpy` onto the end of what is already there
+/// (`STZCPY.C:44-45`), so the two must not be able to disagree about the
+/// fill.
+fn fill_to_width<A: Abi>(
+    mem: &mut A::Mem,
+    at: A::Ptr,
+    text: &[u8],
+    num: u16,
+) -> Result<(), ShimError> {
+    let take = text.len().min(usize::from(num) - 1);
+    let mut bytes = text[..take].to_vec();
+    bytes.resize(usize::from(num), 0);
+    at.write(mem, &bytes).map_err(|e| ShimError::Failed(e.to_string()))
 }
 
 /// `char *strcpy(char *dst, char *src)`.
@@ -2464,6 +2498,38 @@ mod tests {
         let args = [dst.offset, dst.selector, src.offset, src.selector, 16];
         assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
         assert_eq!(f.read(dst), "hi");
+    }
+
+    /// `stzcpy` clears the destination's tail -- the `z` in its name.
+    ///
+    /// `STZCPY.C:27-32` is two loops, not one: the copy stops at `num-1` or
+    /// the source's terminator, and then a second loop runs the index out to
+    /// `num` writing zeroes. Exactly `num` bytes are written on every call.
+    ///
+    /// Measured against a genuine `MAJORBBS.EXE`, not inferred: see
+    /// `tests/oracle_gate.rs`'s `stzcpy_zero_fills_the_whole_destination`,
+    /// which prefills the destination with `0xAA` and watches the real host
+    /// clear all eight bytes. This host shipped without the fill, and none of
+    /// the three tests above could see it -- every one of them reads back
+    /// through a NUL-trimming helper, which stops at the terminator and so
+    /// cannot distinguish a cleared tail from an untouched one.
+    ///
+    /// It is observable: a module that `stzcpy`s a short name into a
+    /// fixed-width record field and writes that record to a file gets the
+    /// previous occupant's bytes in the tail instead of zeroes.
+    #[test]
+    fn stzcpy_zero_fills_the_rest_of_the_destination() {
+        let mut f = Fixture::new();
+        let dst = f.bytes(b"AAAAAAAA", false);
+        let src = f.text("ab");
+
+        let args = [dst.offset, dst.selector, src.offset, src.selector, 8];
+        assert_eq!(f.invoke(stzcpy, &args).expect("copied"), Ret::Far(dst));
+        assert_eq!(
+            f.machine.resolve(dst, 8).expect("in bounds"),
+            b"ab\0\0\0\0\0\0",
+            "the tail is cleared, not left holding what was there"
+        );
     }
 
     #[test]
