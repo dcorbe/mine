@@ -1815,7 +1815,7 @@ fn fill<A: Abi>(mem: &mut A::Mem, at: A::Ptr, text: &[u8]) -> Result<(), ShimErr
 ///
 /// If `ptr` plus `n` bytes would leave the address space this ABI's own
 /// pointer can name.
-fn at<A: Abi>(ptr: A::Ptr, n: usize) -> Result<A::Ptr, ShimError> {
+pub(crate) fn at<A: Abi>(ptr: A::Ptr, n: usize) -> Result<A::Ptr, ShimError> {
     A::ptr_checked_add(ptr, n).ok_or_else(|| {
         ShimError::Failed(format!(
             "{n} bytes past this pointer overflows the address space this ABI's own pointer can name"

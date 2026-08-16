@@ -545,6 +545,24 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // `addDaysToDate`, `timeDecode`, `validTime` -- are deliberately not
         // here: no oracle build exports any of them, so they are file-local
         // to the vendor and are private Rust helpers here too.
+        // The console block. Three different vendor paths, and the manifest
+        // checks the (symbol, path) pair rather than the path alone --
+        // setwin/rstwin are the NT VIDAPI.C and scblank is the DOS one.
+        (MAJORBBS, "setwin", system::setwin, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/wnt/VIDAPI.C")),
+        (MAJORBBS, "rstwin", system::rstwin, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/wnt/VIDAPI.C")),
+        (MAJORBBS, "scblank", system::scblank, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/dos/VIDAPI.C")),
+        (MAJORBBS, "shochl", system::shochl, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/SUMMARY.C")),
+        (MAJORBBS, "baudat", system::baudat, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/OPRLOW.C")),
+        // No vendor body anywhere -- only call sites -- so this is the
+        // measured one. tests/oracle_gate.rs calls the genuine binaries and
+        // records what they do; INC/GCOMM.H:140's macro is the wrong
+        // generation and is deliberately not cited.
+        (MAJORBBS, "sstatr", system::sstatr, Cleans::Caller, Evidence::Oracle),
         (MAJORBBS, "datofc", system::datofc, Cleans::Caller,
          Evidence::VendorBody("SRC/api/gcommlib/DNTAPI.C")),
         (MAJORBBS, "daytoday", system::daytoday, Cleans::Caller,

@@ -102,6 +102,299 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
+/// `VOID sstatr(INT attr)` -- set the display attribute.
+///
+/// **No vendor body exists anywhere in `re/wg33src`** -- only call sites --
+/// so this is `Evidence::Oracle` and its behaviour was measured against
+/// genuine `MAJORBBS.EXE` binaries rather than read. Both period builds do
+/// the same thing: write the attribute into exactly one byte of host data
+/// (`curatr.attrib`, the first member of `struct curatr`, `INC/VIDAPI.H:198`)
+/// and touch nothing else. See
+/// `tests/oracle_gate.rs::sstatr_stores_the_attribute_in_one_byte_of_host_data`
+/// for the measurement and the two false starts that preceded it.
+///
+/// `INC/GCOMM.H:140`'s `#define sstatr(a) setatr(a)` is **not** the citation.
+/// That is the 32-bit WG3.3 header and NTHORDER, the module that asks for
+/// this symbol, is a 16-bit NE module compiled against a 16-bit `GCOMM.H`
+/// this repo does not hold. The measurement agrees with what the macro
+/// implies, which is worth something because it was not assumed.
+///
+/// The attribute lands in [`crate::Display`] rather than in a placed
+/// `curatr`; see [`Host::display`] for why. It is not merely discarded: a
+/// host with no console still has a current attribute, [`baudat`] sets it
+/// through this very routine, and that is what makes `baudat`'s own call
+/// observable.
+///
+/// # Errors
+///
+/// Never. The signature is fallible because every shim's is.
+pub fn sstatr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    // One byte, measured: the oracle writes the low half and nothing else.
+    let attr = Into::<u32>::into(call.int()) as u8;
+    host.display_mut().attrib = attr;
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID setwin(CHAR *scn, INT xul, INT yul, INT xlr, INT ylr, INT sen)` --
+/// `wnt/VIDAPI.C:375-390` -- set the window, saving the previous one.
+///
+///
+/// `CR` is `#define CR curatr` (`wnt/VIDAPI.C:26`). Pure state: it reads
+/// nothing, writes nothing outside the struct, and touches no screen.
+///
+/// **The coordinates are narrowed to `CHAR` by the vendor's own casts**, so
+/// `setwin(.., 300, ..)` keeps 44. That is a cast in the source, not a
+/// truncation invented here, and it is why these are `u8`.
+///
+/// # Errors
+///
+/// Never.
+pub fn setwin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let scn = call.ptr();
+    let xul = Into::<u32>::into(call.int()) as u8;
+    let yul = Into::<u32>::into(call.int()) as u8;
+    let xlr = Into::<u32>::into(call.int()) as u8;
+    let ylr = Into::<u32>::into(call.int()) as u8;
+    let sen = Into::<u32>::into(call.int()) as u8;
+
+    // `scnstt` is stored, never dereferenced -- `0` means real video and this
+    // host has none either way, so it is kept as the words the module passed.
+    let bytes = A::ptr_to_bytes(scn);
+    let scnstt = (
+        u16::from_le_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)]),
+        u16::from_le_bytes([
+            *bytes.get(2).unwrap_or(&0),
+            *bytes.get(3).unwrap_or(&0),
+        ]),
+    );
+
+    let display = host.display_mut();
+    display.saved = display.window;
+    display.window = crate::Window { scnstt, ulx: xul, uly: yul, lrx: xlr, lry: ylr, scropt: sen };
+    Ok(abi::Ret::Void)
+}
+
+/// `VOID rstwin(VOID)` -- `wnt/VIDAPI.C:398-406` -- put back the window
+/// [`setwin`] saved.
+///
+///
+/// **One save slot, not a stack.** `struct curatr` holds exactly one `o*`
+/// copy of each field, so two `setwin`s followed by two `rstwin`s restore the
+/// *second* saved state both times and the first window is gone. Nesting does
+/// not work in the vendor either, and a host that made it work would be
+/// serving a module a guarantee the real one never gave.
+///
+/// It also does not clear the save slot, so `rstwin` twice with no `setwin`
+/// between restores the same state twice.
+///
+/// # Errors
+///
+/// Never.
+pub fn rstwin<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let display = host.display_mut();
+    display.window = display.saved;
+    Ok(abi::Ret::Void)
+}
+
+/// `CHAR *scblank(CHAR *buf, CHAR attrib)` -- `dos/VIDAPI.C:160-178` -- clear
+/// a screen to blanks.
+///
+///
+/// **That early return is the whole reachable body here, and it is a complete
+/// implementation of it.** `vidmem` is `static CHAR *vidmem=NULL`
+/// (`dos/VIDAPI.C:25`), set only by the DOS video initialisation this host
+/// does not run, so the fill loop below it is unreachable. This is the same
+/// shape as Phase 2's `howbuy` and `clrxrf`: an empty-looking body that is a
+/// real branch of the real body rather than a stub.
+///
+/// **It answers `0`, not `buf`.** The successful path returns `buf`; this one
+/// returns NULL, which is a different and meaningful answer -- a caller that
+/// uses the result gets a null pointer and not a plausible buffer. Getting
+/// this backwards would be the quiet kind of wrong.
+///
+/// # Errors
+///
+/// Never.
+pub fn scblank<A: Abi>(call: &mut Call<A>, _: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let _buf = call.ptr();
+    let _attrib = call.int();
+    Ok(abi::Ret::Ptr(A::ptr_from_bytes(&vec![0u8; A::PTR_WIDTH])))
+}
+
+/// `INT baudat(ULONG baud, INT blink)` -- `OPRLOW.C:502-521` -- the display
+/// attribute for a channel running at `baud`.
+///
+///
+/// **The walk is downward**, so the answer is the colour of the *highest*
+/// threshold the rate reaches, not the lowest. `bauds[0]` is `0`, so the loop
+/// always breaks and `i` is never `-1`.
+///
+/// # `baud` is a `UINT`, one word -- and the vendor's own body disagrees
+///
+/// `MAJORBBS.H:950-955` declares this routine **twice**:
+///
+///
+/// and the body quoted above -- `OPRLOW.C:502`, from the 32-bit Worldgroup
+/// 3.3 tree -- is the `ULONG` one. Taking the body's word for it would have
+/// this shim read four bytes where the caller pushed two, swallowing `blink`
+/// as the high half of `baud` and then reading whatever followed the frame as
+/// `blink`.
+///
+/// **Measured instead.** `re/ne_arity.py 82` against MJWMUT -- the one corpus
+/// module that imports this symbol -- finds a single call site at
+/// `seg 3:0x3fb4` that cleans **2 words**. `INT blink` is one of them, so
+/// `baud` is the other: a `UINT`, and the `GCV2S` branch is what the 16-bit
+/// NE corpus was compiled against.
+///
+/// `widthscan.py` cannot settle this on its own -- it knows `GCV2` and this
+/// is `GCV2S`, a different macro -- which is why `baudat` shows up under its
+/// "ambiguous: disagreeing declarations" heading and is listed in
+/// `EXCLUDED_GALACTICOMM` rather than checked.
+///
+/// Reading `call.int()` is right under both ABIs and not only under `Wg16`:
+/// `Wg32`'s `int` is four bytes, which is what a 32-bit `ULONG` is too, so
+/// the `#else` branch and this one want the same read there.
+///
+/// `blink` adds `0x80`, the blink bit, to the attribute.
+///
+/// **It calls [`sstatr`]**, and that is not incidental: it is how the
+/// operator display's channel legend gets its colour. Setting
+/// [`crate::Display::attrib`] here is what makes that call observable on a
+/// host with no console, and the test asserts it.
+///
+/// # Errors
+///
+/// Never.
+pub fn baudat<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    const BAUDS: [u32; 7] = [0, 1200, 2400, 4800, 9600, 19200, 38400];
+    const COLORS: [u8; 7] = [0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F];
+
+    // `UINT baud`, one word -- not the `ULONG` the vendor's own body takes.
+    // See this routine's doc comment: MJWMUT's call site cleans two words.
+    let baud = Into::<u32>::into(call.int());
+    let blink = Into::<u32>::into(call.int()) != 0;
+
+    // Downward: the highest threshold this rate reaches. `BAUDS[0]` is zero,
+    // so some entry always matches and the vendor's `i` never runs off the
+    // bottom.
+    let i = BAUDS.iter().rposition(|&b| baud >= b).unwrap_or(0);
+    let attr = COLORS[i] + if blink { 0x80 } else { 0 };
+
+    host.display_mut().attrib = attr;
+    Ok(abi::Ret::Int(A::Int::from(u16::from(attr))))
+}
+
+/// `LGNSIZ` (`INC/OPRLOW.H:59`) -- the size of a channel legend, terminator
+/// included. `shochl` formats `%-*.*s` with `LGNSIZ-1` for both the width and
+/// the precision, so the label is padded *and* truncated to 46 characters.
+const LGNSIZ: usize = 47;
+
+/// `sizeof(struct uidisp)` (`INC/OPRLOW.H:61-65`): `sing`, `attrib`, then
+/// `labl[LGNSIZ]`.
+///
+/// **The field order is `sing`, `attrib`, `labl` -- in that order.** All
+/// three members are `CHAR`, so there is no padding to reason about and the
+/// offsets are 0, 1 and 2.
+const UIDISP_SIZE: usize = 2 + LGNSIZ;
+
+/// `VOID shochl(CHAR *legend, CHAR sing, INT attr)` -- `SUMMARY.C:1083-1111`
+/// -- record the operator console's legend for the calling channel.
+///
+/// The body has two halves and this host can serve one of them:
+///
+///
+/// **The three `uidarr[chan]` writes are real state and are performed.** The
+/// video poke below them, the `shochl_hook` and the trailing `usrchl()` are
+/// the operator console's, which this host does not have; they are skipped
+/// and this comment is the record of that.
+///
+/// **`chan` is not an argument.** The vendor computes it as
+/// `channel[usrnum]` -- the caller's own channel -- which is why the
+/// signature is `(legend, sing, attr)` and not `(chan, ...)`.
+///
+/// # `uidarr` is a pointer, and this host leaves it null
+///
+/// `INC/OPRLOW.H:67` declares `EXPWGSV(struct uidisp*) uidarr` -- a
+/// **pointer** to the array, not the array. `globals.rs` places the pointer
+/// cell and nothing ever fills it in, because the thing that allocates the
+/// array is OPRLOW, the operator console. So the writes have nowhere to go
+/// and this refuses, naming that.
+///
+/// It is a refusal rather than a silent success because the writes are the
+/// entire observable effect: a `shochl` that returned `Ok` having written
+/// nothing would be indistinguishable from one that worked. Note also that
+/// `globals.rs`'s comment on `uidarr` describes it as "a pointer to the array
+/// of user IDs" and cites `USRACC.H:59`; both are wrong, and both are fixed
+/// in the same change as this.
+///
+/// # Errors
+///
+/// If `legend` is unreadable, if `channel` or `uidarr` is null -- see above
+/// -- or if the computed slot is not writable.
+pub fn shochl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let legend = call.ptr();
+    let sing = Into::<u32>::into(call.int()) as u8;
+    let attr = Into::<u32>::into(call.int()) as u8;
+
+    let legend = legend
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?
+        .to_vec();
+
+    let uidarr = host
+        .globals()
+        .pointer_mem(call.mem(), "uidarr")
+        .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?;
+    if A::ptr_to_bytes(uidarr).iter().all(|&b| b == 0) {
+        return Err(ShimError::Failed(
+            "shochl: uidarr is null. OPRLOW.H:67 declares it as a pointer to \
+             the struct uidisp array, and the thing that allocates that array \
+             is the operator console -- which this host does not run, so \
+             there is nowhere to record the channel legend"
+                .to_owned(),
+        ));
+    }
+
+    let usrnum = host
+        .globals()
+        .word_mem(call.mem(), "usrnum")
+        .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?;
+    let channel = host
+        .globals()
+        .pointer_mem(call.mem(), "channel")
+        .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?;
+    if A::ptr_to_bytes(channel).iter().all(|&b| b == 0) {
+        return Err(ShimError::Failed(
+            "shochl: channel is null, so channel[usrnum] names no channel".to_owned(),
+        ));
+    }
+    let chan_at = crate::shims::text::at::<A>(channel, usize::from(usrnum) * 2)?;
+    let chan = u16::from_le_bytes(
+        chan_at
+            .resolve(call.mem(), 2)
+            .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?
+            .try_into()
+            .expect("two bytes"),
+    );
+
+    // `%-*.*s` with LGNSIZ-1 for both width and precision: left-justified,
+    // truncated at 46 and padded to 46, then sprintf's own terminator makes 47.
+    // `resize` both truncates and pads, which is exactly what a `%-*.*s`
+    // with the same width and precision does. A separate `truncate` call
+    // ahead of it was dead code -- a mutation that deleted it changed
+    // nothing, which is how it was found.
+    let mut labl = legend;
+    labl.resize(LGNSIZ - 1, b' ');
+    labl.push(0);
+
+    let slot = crate::shims::text::at::<A>(uidarr, usize::from(chan) * UIDISP_SIZE)?;
+    let mut record = vec![sing, attr];
+    record.extend_from_slice(&labl);
+    slot.write(call.mem(), &record)
+        .map_err(|e| ShimError::Failed(format!("shochl: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
 /// `GCINVALIDDOT` (`INC/DNTAPI.H:136`) -- what [`dctime`] answers for a time
 /// it cannot decode.
 ///
@@ -2128,6 +2421,211 @@ mod tests {
 
     /// MajorMUD 1.11p's build stamp: `Dec 30 2005 14:20:05` UTC.
     const BUILD: u32 = 1_135_952_405;
+
+    /// `sstatr` sets the display attribute, and the value it sets is the one
+    /// the genuine host writes.
+    ///
+    /// The default of 7 is measured, not conventional: both period builds
+    /// hold 7 in that byte before anything calls `sstatr`
+    /// (`tests/oracle_gate.rs`).
+    #[test]
+    fn sstatr_sets_the_display_attribute() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.display().attrib, 7, "the oracle's own starting value");
+
+        assert!(matches!(f.invoke(sstatr, &[0x1B]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().attrib, 0x1B);
+
+        assert!(matches!(f.invoke(sstatr, &[0x4E]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().attrib, 0x4E, "the second call replaces the first");
+    }
+
+    /// `setwin`/`rstwin` are a save/restore pair over **one** slot.
+    ///
+    /// Two `setwin`s then two `rstwin`s restore the *second* saved state both
+    /// times, because `struct curatr` holds exactly one `o*` copy of each
+    /// field (`INC/VIDAPI.H:216-226`). Nesting does not work in the vendor
+    /// either. A host that made it work -- a stack instead of a slot -- would
+    /// be handing the module a guarantee the real one never gave, and this is
+    /// the assertion that says so.
+    #[test]
+    fn setwin_and_rstwin_share_one_save_slot_rather_than_a_stack() {
+        let mut f = Fixture::new();
+
+        // First window, saving the initial (all-zero) state.
+        assert!(matches!(f.invoke(setwin, &[0, 0, 1, 2, 3, 4, 1]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().window.ulx, 1);
+        assert_eq!(f.host.display().window.scropt, 1);
+
+        // Second window, saving the first.
+        assert!(matches!(f.invoke(setwin, &[0, 0, 10, 20, 30, 40, 0]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().window.ulx, 10);
+
+        // One restore brings back the first window.
+        assert!(matches!(f.invoke(rstwin, &[]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().window.ulx, 1, "the first window is back");
+
+        // A second restore brings back the *same* one, not the initial state:
+        // the save slot still holds the first window.
+        assert!(matches!(f.invoke(rstwin, &[]), Ok(Ret::Void)));
+        assert_eq!(
+            f.host.display().window.ulx,
+            1,
+            "one slot: the second rstwin cannot reach the state before the \
+             first setwin"
+        );
+    }
+
+    /// `setwin` narrows its coordinates to `CHAR`, because the vendor's own
+    /// assignments cast (`CR.ulx=(CHAR)xul`, `wnt/VIDAPI.C:383-387`).
+    #[test]
+    fn setwin_narrows_its_coordinates_the_way_the_vendors_casts_do() {
+        let mut f = Fixture::new();
+        assert!(matches!(f.invoke(setwin, &[0, 0, 300, 0, 0, 0, 0]), Ok(Ret::Void)));
+        assert_eq!(f.host.display().window.ulx, 44, "300 as a CHAR is 44");
+    }
+
+    /// `scblank` answers **null**, not its buffer argument.
+    ///
+    /// `vidmem` is `static CHAR *vidmem=NULL` (`dos/VIDAPI.C:25`), set only by
+    /// a DOS video initialisation this host does not run, so the only
+    /// reachable branch is `if (vidmem == NULL) return(0);`. The successful
+    /// path would return `buf`; getting those two the wrong way round is the
+    /// quiet kind of wrong, because a plausible non-null pointer is exactly
+    /// what a caller would not check.
+    #[test]
+    fn scblank_answers_null_rather_than_the_buffer_it_was_given() {
+        let mut f = Fixture::new();
+        let buf = f.buffer(16);
+        let got = f.invoke(scblank, &[buf.offset, buf.selector, 0x07]).expect("scblank");
+        assert_eq!(
+            got,
+            Ret::Far(FarPtr { offset: 0, selector: 0 }),
+            "the vidmem == NULL branch returns 0, not buf"
+        );
+    }
+
+    /// `baudat` walks its table **downward**, so the answer is the colour of
+    /// the highest threshold the rate reaches (`OPRLOW.C:508-513`).
+    ///
+    /// Every value is read off the vendor's two tables by hand. An upward
+    /// walk would answer `0x19` for everything, which is why 2400 is here:
+    /// it is the first rate whose upward and downward answers differ
+    /// visibly.
+    #[test]
+    fn baudat_answers_the_highest_threshold_the_rate_reaches() {
+        let mut f = Fixture::new();
+        // Two words: `UINT baud` then `INT blink`. Measured from MJWMUT's
+        // own call site, which cleans two -- see the shim's doc comment for
+        // why the vendor body's `ULONG` is the wrong generation here.
+        let ask = |f: &mut Fixture, baud: u16, blink: u16| -> u16 {
+            let Ret::U16(n) = f
+                .invoke(baudat, &[baud, blink])
+                .expect("baudat")
+            else {
+                panic!("baudat returns an INT");
+            };
+            n
+        };
+        assert_eq!(ask(&mut f, 0, 0), 0x19, "bauds[0] is 0, so zero still matches");
+        assert_eq!(ask(&mut f, 2400, 0), 0x1B);
+        assert_eq!(ask(&mut f, 2399, 0), 0x1A, "just under 2400 is the 1200 entry");
+        assert_eq!(ask(&mut f, 38400, 0), 0x1F);
+        assert_eq!(ask(&mut f, 57600, 0), 0x1F, "above the top entry stays at the top");
+        assert_eq!(ask(&mut f, 38400, 1), 0x9F, "blink sets 0x80");
+    }
+
+    /// `baudat` calls `sstatr`, and that is observable.
+    ///
+    /// `sstatr(attr=colors[i]+...)` is the point of the routine -- it sets the
+    /// colour, and returning the attribute is secondary. A port that computed
+    /// the right answer and skipped the call would pass every assertion
+    /// above.
+    #[test]
+    fn baudat_sets_the_display_attribute_it_answers() {
+        let mut f = Fixture::new();
+        assert_eq!(f.host.display().attrib, 7);
+        f.invoke(baudat, &[2400, 0, 0]).expect("baudat");
+        assert_eq!(f.host.display().attrib, 0x1B, "baudat calls sstatr, it does not merely return");
+    }
+
+    /// `shochl` refuses while `uidarr` is null, and says why.
+    ///
+    /// `OPRLOW.H:67` declares `uidarr` as a *pointer* to the `struct uidisp`
+    /// array; `globals.rs` places the pointer cell and nothing fills it in,
+    /// because the operator console is what allocates the array. Succeeding
+    /// silently would be indistinguishable from having recorded the legend.
+    #[test]
+    fn shochl_refuses_while_uidarr_points_at_nothing() {
+        let mut f = Fixture::new();
+        let legend = f.text("Newhaven");
+        let err = f
+            .invoke(shochl, &[legend.offset, legend.selector, u16::from(b'N'), 0x1F])
+            .expect_err("uidarr is null");
+        let message = err.to_string();
+        assert!(message.contains("uidarr"), "{message}");
+        assert!(message.contains("null"), "{message}");
+    }
+
+    /// Given somewhere to write, `shochl` records the three fields at the
+    /// offsets `struct uidisp` gives them, with the legend padded and
+    /// truncated to 46 characters.
+    ///
+    /// `struct uidisp` is `{ CHAR sing; CHAR attrib; CHAR labl[LGNSIZ]; }`
+    /// (`OPRLOW.H:61-65`) -- `sing` **first**, then `attrib`, then the label
+    /// -- and `LGNSIZ` is 47, so `%-*.*s` with `LGNSIZ-1` for both width and
+    /// precision gives exactly 46 characters and a terminator.
+    ///
+    /// The long legend is what proves the precision: a `%-46s` with no
+    /// precision would pad but not truncate, and every short legend would
+    /// still pass.
+    #[test]
+    fn shochl_records_sing_attrib_and_a_46_character_label() {
+        let mut f = Fixture::new();
+
+        // Stand in for the operator console's allocation: one slot is enough,
+        // and channel[usrnum] is 0 in a fresh fixture.
+        let array = f.buffer(256);
+        let channels = f.buffer(16);
+        f.machine.write(channels, &[0, 0]).expect("channel[0] = 0");
+        {
+            let globals = f.host.globals().clone();
+            globals
+                .write_mem(f.machine.mem_mut(), "uidarr", &array.to_bytes())
+                .expect("uidarr");
+            globals
+                .write_mem(f.machine.mem_mut(), "channel", &channels.to_bytes())
+                .expect("channel");
+            // A fresh fixture holds 0xFFFF -- "no channel" -- and
+            // `channel[0xFFFF]` is correctly refused as out of range, so a
+            // caller has to be on a channel for this routine to mean
+            // anything.
+            globals
+                .write_mem(f.machine.mem_mut(), "usrnum", &0u16.to_le_bytes())
+                .expect("usrnum");
+        }
+
+        let legend = f.text("a legend considerably longer than forty-six characters wide");
+        f.invoke(shochl, &[legend.offset, legend.selector, u16::from(b'N'), 0x1F])
+            .expect("shochl");
+
+        let got = f.machine.resolve(array, 2 + 47).expect("in bounds").to_vec();
+        assert_eq!(got[0], b'N', "sing is the first member");
+        assert_eq!(got[1], 0x1F, "attrib is the second");
+        assert_eq!(
+            &got[2..48],
+            b"a legend considerably longer than forty-six ch".as_slice(),
+            "truncated to LGNSIZ-1 = 46"
+        );
+        assert_eq!(got[48], 0, "and terminated");
+
+        // A short legend is padded to the same width rather than left short.
+        let short = f.text("hi");
+        f.invoke(shochl, &[short.offset, short.selector, u16::from(b'h'), 0x07])
+            .expect("shochl");
+        let got = f.machine.resolve(array, 2 + 47).expect("in bounds").to_vec();
+        assert_eq!(&got[2..48], b"hi                                            ".as_slice());
+    }
 
     /// `datofc` turns "days since 1/1/1980" into DOS's packed date word,
     /// `((mon)<<5)+(day)+(((year)-1980)<<9)` (`DNTAPI.H:184`).

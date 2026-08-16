@@ -815,6 +815,55 @@ pub struct Query {
 ///
 /// [`btrieve::Btrieve`] is `Btrieve<A>` now. It was concrete while another
 /// session owned that file, and the field elided its parameter to say so.
+/// The members of `struct curatr` (`INC/VIDAPI.H:198-228`) the served console
+/// routines touch, and no others.
+///
+/// See [`Host::display`] for why this is host state rather than a placed
+/// global.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Display {
+    /// `curatr.attrib` -- the display attribute `sstatr` sets.
+    ///
+    /// Starts at **7**, which is what a genuine `MAJORBBS.EXE` holds before
+    /// anything calls `sstatr`: measured on both period builds in
+    /// `tests/oracle_gate.rs`
+    /// (`sstatr_stores_the_attribute_in_one_byte_of_host_data`), not chosen
+    /// because light-grey-on-black is the conventional default.
+    pub attrib: u8,
+
+    /// `scnstt`/`ulx`/`uly`/`lrx`/`lry`/`scropt` -- the current window, and
+    /// the **one** saved copy behind it (`oscnstt`/`oulx`/... in the same
+    /// struct).
+    ///
+    /// One slot, not a stack: `setwin` copies current to saved and `rstwin`
+    /// copies saved back, so two `setwin`s followed by two `rstwin`s restore
+    /// the second saved state both times. That is the vendor's behaviour, not
+    /// a simplification.
+    pub window: Window,
+    pub saved: Window,
+}
+
+/// One window's worth of `struct curatr`: where the screen starts, the two
+/// corners, and whether scrolling is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Window {
+    /// `scnstt` -- the screen this window writes to, `0` meaning real video.
+    /// Kept as the raw word pair a module passed rather than an `A::Ptr`,
+    /// because nothing here dereferences it.
+    pub scnstt: (u16, u16),
+    pub ulx: u8,
+    pub uly: u8,
+    pub lrx: u8,
+    pub lry: u8,
+    pub scropt: u8,
+}
+
+impl Default for Display {
+    fn default() -> Self {
+        Self { attrib: 7, window: Window::default(), saved: Window::default() }
+    }
+}
+
 pub struct Host<A: Abi> {
     exports: &'static Exports,
     globals: Globals<A>,
@@ -840,6 +889,25 @@ pub struct Host<A: Abi> {
     /// module-addressable segment `spr`, `mdf` and `empty` already share.
     l2as: A::Ptr,
     l2as_next: usize,
+
+    /// The console's display attribute and window, as `struct curatr`
+    /// (`INC/VIDAPI.H:198-228`) holds them for the real host.
+    ///
+    /// **Host state rather than a placed global, and that is a decision.**
+    /// `curatr` is an exported datum in the vendor
+    /// (`EXPWGSV(struct curatr) curatr`) but **no corpus module imports it**
+    /// -- checked against every `crates/mbbs/tests/data/corpus/*.tsv` -- so
+    /// nothing a module can do observes its layout. Placing it would mean
+    /// committing to a 59-byte field order whose packing this repo has no
+    /// evidence for (Borland's default alignment for the 16-bit build is not
+    /// recorded anywhere tracked), to serve a reader that does not exist. A
+    /// wrong layout is worse than no layout. The day a module imports
+    /// `curatr`, or this host grows a console, placing it becomes right and
+    /// this struct is what moves.
+    ///
+    /// Only the members the served routines touch are here: the attribute
+    /// `sstatr` sets, and the window `setwin` saves and `rstwin` restores.
+    display: Display,
 
     /// Where `strtok` left off.
     ///
@@ -1538,6 +1606,7 @@ impl<A: Abi> Host<A> {
             spr_next: 0,
             l2as: A::ptr_offset(base, spr_bytes as u16 + 64 + 1),
             l2as_next: 0,
+            display: Display::default(),
             strtok: A::null_ptr(),
             datebuf: None,
             mdf: A::ptr_offset(base, spr_bytes as u16),
@@ -1805,6 +1874,16 @@ impl<A: Abi> Host<A> {
     /// stay consistent within one call; it is the *next* read that has moved.
     /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
     /// only a counter for them.
+    /// The console's attribute and window state. See [`Host::display`].
+    pub fn display(&self) -> Display {
+        self.display
+    }
+
+    /// The console's attribute and window state, to change.
+    pub fn display_mut(&mut self) -> &mut Display {
+        &mut self.display
+    }
+
     pub fn clock(&mut self) -> Clock {
         self.clock = self.clock.advanced();
         self.clock_reads += 1;

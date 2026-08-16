@@ -311,7 +311,23 @@ pub const GLOBALS: &[Global] = &[
     // USRACC.H:39 -- struct uidxrf uidxrf; the struct BY VALUE, not a
     // pointer, so all of it lives here. The GCV2 `spare[6]` arm is not taken.
     g("uidxrf", (XRFSIZ + 1) + UIDSIZ),
-    // USRACC.H:59 -- a pointer to the array of user IDs.
+    // OPRLOW.H:67 -- struct uidisp *uidarr; a pointer to the operator
+    // console's per-channel display data, one `struct uidisp` per channel:
+    // `{ CHAR sing; CHAR attrib; CHAR labl[LGNSIZ]; }` (OPRLOW.H:61-65,
+    // LGNSIZ 47), which `shochl` writes and the console reads back to draw
+    // the channel summary.
+    //
+    // The citation used to read `USRACC.H:59 -- a pointer to the array of
+    // user IDs`, which was wrong twice over: that line is `EXPWGSV(INT)
+    // decusn`, an unrelated `INT`, and these are display records rather than
+    // user IDs. It was carried as a deferred finding out of Phase 0-1 and
+    // `shochl` is the routine that made it matter.
+    //
+    // **Placed but never populated**: the pointer cell exists and holds null,
+    // because the operator console is what allocates the array and this host
+    // does not run one. `WCCMMUD.DLL` imports the datum (ordinal 816), so the
+    // cell has to be here; `shochl` refuses rather than writing through the
+    // null.
     g("uidarr", PTR),
     // Borland's own ctype table: 257 bytes, indexed from -1, so that
     // `(_ctype+1)[c]` is in range for every `char` and for EOF.
