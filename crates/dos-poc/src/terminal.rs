@@ -23,8 +23,21 @@ use crate::screen::{Cell, Screen};
 
 /// CP437 as Unicode. Index is the byte the guest wrote.
 ///
-/// `0x00` and `0xFF` render as a space: a cleared cell is a NUL, and drawing it
-/// as a glyph fills the screen with noise.
+/// **This is a second copy of a table the workspace already has**, in
+/// `mud_core::cp437::HIGH`. Above `0x7F` the two agree entry for entry, and a
+/// test below pins that. They are not merged because `mud_core` is the MUD
+/// game crate -- the wrong direction for a DOS runtime to depend in -- and
+/// because only the table is shareable, not the function around it.
+///
+/// `mud_core::cp437::decode` is *identity* below `0x80` on purpose: it decodes
+/// the wire, where ANSI escapes, line endings and the anti-bot backspaces must
+/// pass through untouched. A text screen is the opposite case. Bytes under
+/// `0x20` in a screen cell are glyphs -- `0x11` is `◄` -- so decoding a screen
+/// with `decode` blanks every arrow a menu draws with. Using the right table
+/// through the wrong function is the failure mode here, not a missing table.
+///
+/// `0x00` is the one deliberate departure from CP437 proper: a cleared cell is
+/// a NUL, and rendering its glyph would fill the screen with noise.
 const CP437: [char; 256] = [
     ' ', '☺', '☻', '♥', '♦', '♣', '♠', '•', '◘', '○', '◙', '♂', '♀', '♪', '♫', '☼', //
     '►', '◄', '↕', '‼', '¶', '§', '▬', '↨', '↑', '↓', '→', '←', '∟', '↔', '▲', '▼', //
@@ -41,7 +54,7 @@ const CP437: [char; 256] = [
     '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', //
     '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐', '▀', //
     'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', //
-    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ', //
+    '≡', '±', '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{A0}',
 ];
 
 /// DOS colour index to ANSI colour index.
@@ -291,6 +304,19 @@ mod tests {
         assert_eq!(TO_ANSI[4], 1, "DOS red becomes ANSI red");
         assert_eq!(TO_ANSI[0], 0);
         assert_eq!(TO_ANSI[7], 7);
+    }
+
+    /// The high half is duplicated from `mud_core::cp437::HIGH`. These are the
+    /// entries a divergence would show up in first: the one that was actually
+    /// wrong (0xFF was a space, not a no-break space), and the ends of the
+    /// range. A real guard would compare the whole table, which needs the two
+    /// copies to live in one crate.
+    #[test]
+    fn the_high_half_agrees_with_the_workspace_copy() {
+        assert_eq!(CP437[0x80], 'Ç');
+        assert_eq!(CP437[0xff], '\u{A0}', "CP437 0xFF is a no-break space");
+        assert_eq!(CP437[0xe1], 'ß');
+        assert_eq!(CP437[0x9e], '₧');
     }
 
     #[test]
