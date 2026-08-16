@@ -176,6 +176,14 @@ fn main() -> io::Result<()> {
     // happen rather than inferred later from a screen that looks wrong.
     let mut gaps: BTreeMap<String, u32> = BTreeMap::new();
     let mut calls = 0u32;
+    // Where the wall clock goes. "Is the pause the program working, or us?" is
+    // not answerable from a total; it needs the split.
+    let mut in_guest = std::time::Duration::ZERO;
+    let mut slept = std::time::Duration::ZERO;
+    let mut longest = (std::time::Duration::ZERO, String::new());
+    // Blocked on a person. Lumping this in with our own work makes the harness
+    // look like the slow part when it is simply waiting to be typed at.
+    let mut waiting = std::time::Duration::ZERO;
 
     let ending = loop {
         // The cap rescues an unattended probe from a program looping on a call
@@ -184,7 +192,14 @@ fn main() -> io::Result<()> {
         if !interactive && calls >= MAX_CALLS {
             break format!("stopped after {MAX_CALLS} calls");
         }
-        match vm.run()? {
+        let ran = std::time::Instant::now();
+        let stop = vm.run()?;
+        let took = ran.elapsed();
+        in_guest += took;
+        if took > longest.0 {
+            longest = (took, format!("{stop:?}"));
+        }
+        match stop {
             Stop::Trap(0x10) => {
                 let ah = vm.regs().ah();
                 *bios.entry((0x10, ah)).or_insert(0) += 1;
@@ -258,7 +273,10 @@ fn main() -> io::Result<()> {
                             screen.cursor
                         );
                     }
-                    match script.next_key(&screen) {
+                    let idle = std::time::Instant::now();
+                    let answer = script.next_key(&screen);
+                    waiting += idle.elapsed();
+                    match answer {
                         Some(key) => {
                             if trace && !interactive {
                                 println!("  [settle {settles}] send {key:?}");
@@ -275,7 +293,9 @@ fn main() -> io::Result<()> {
                 *bios.entry((0x15, ah)).or_insert(0) += 1;
                 calls += 1;
                 if let Some(nap) = int15(&mut vm) {
+                    let before = std::time::Instant::now();
                     std::thread::sleep(nap);
+                    slept += before.elapsed();
                 }
             }
             Stop::Trap(vector) if vector != 0x21 => {
@@ -285,7 +305,9 @@ fn main() -> io::Result<()> {
                 *bios.entry((vector, ah)).or_insert(0) += 1;
                 calls += 1;
                 if vector == 0x2f && vm.regs().ax == 0x1680 {
+                    let before = std::time::Instant::now();
                     std::thread::sleep(std::time::Duration::from_millis(1));
+                    slept += before.elapsed();
                 }
                 if let Some(what) = missing(vector, ah) {
                     *gaps.entry(format!("int {vector:02X}h AH={ah:02X}  {what}")).or_insert(0) += 1;
@@ -425,6 +447,25 @@ fn main() -> io::Result<()> {
 
     println!("--- {calls} DOS calls, {ending} ---");
     println!("{}", cpu_report(started, calls));
+    let wall = started.elapsed();
+    let other = wall
+        .saturating_sub(in_guest)
+        .saturating_sub(slept)
+        .saturating_sub(waiting);
+    println!(
+        "wall: {:.1}s total = {:.1}s in the guest + {:.1}s asleep on its yields \
+         + {:.1}s waiting for you + {:.1}s ours",
+        wall.as_secs_f64(),
+        in_guest.as_secs_f64(),
+        slept.as_secs_f64(),
+        waiting.as_secs_f64(),
+        other.as_secs_f64()
+    );
+    println!(
+        "longest single guest run: {:.0} ms, ended in {}",
+        longest.0.as_secs_f64() * 1000.0,
+        longest.1
+    );
     let shown: Vec<String> = order.iter().map(|a| format!("{a:02X}")).collect();
     println!("first calls: {}", shown.join(" "));
 
