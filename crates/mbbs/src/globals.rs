@@ -320,6 +320,11 @@ pub const GLOBALS: &[Global] = &[
     // reaches for by address, never a call. Unchanged in wg33
     // (`EXPWGSF(VOID,emlsdrou)(VOID);`, `re/wg33src/INC/MAJORBBS.H:527`).
     g("emlsdrou", PTR),
+    // MAJORBBS.H:579-581 -- int outbsz, sampln, mmucrr, outata;
+    //   outbsz is the output buffer size per channel, and PFBSIZ
+    //   (MAJORBBS.H:507) is #define'd to it. sampln and outata are not placed
+    //   here; no corpus module imports them.
+    gi("outbsz"),
     // REMOTE.H:10-17 -- one `extern` statement declaring seven remote-sysop
     // ints, in this order:
     //   int kilipg,   /* kill-system command in progress           */
@@ -495,6 +500,13 @@ pub struct Globals<A: Abi> {
     /// Where `prfbuf` points: the print buffer, in a region of its own so that
     /// a module overrunning it cannot reach the globals.
     prf: A::Ptr,
+    /// The byte count `prf` was actually allocated with -- captured at the
+    /// [`ModuleMem::alloc_region`] call site itself, not re-derived from
+    /// [`OUTBSZ`], so that a test reading it back pins agreement between the
+    /// allocation and the `outbsz` global rather than comparing the same
+    /// constant to itself. See
+    /// `outbsz_is_the_size_the_print_buffer_was_actually_allocated_with`.
+    prf_len: usize,
 }
 
 impl<A: Abi> Globals<A> {
@@ -518,6 +530,17 @@ impl<A: Abi> Globals<A> {
     /// an already-generic value, and nothing else.
     pub fn prf_buffer(&self) -> A::Ptr {
         self.prf
+    }
+
+    /// The byte count [`Globals::prf_buffer`] was actually allocated with.
+    ///
+    /// `pub(crate)`, not exposed at the crate boundary: the one caller is the
+    /// `outbsz` test, which pins that the `outbsz` global agrees with this
+    /// allocation rather than with the [`OUTBSZ`] constant both are meant to
+    /// share -- a test built against the constant on both sides would pass
+    /// even if the constant and the allocation had drifted apart together.
+    pub(crate) fn prf_len(&self) -> usize {
+        self.prf_len
     }
 
     /// Where a global lives, or `None` for a name the host does not place.
@@ -681,13 +704,15 @@ impl<A: Abi> Globals<A> {
 
         let mem = A::mem(cpu);
         let base = mem.alloc_region(usize::from(at))?;
-        let prf = mem.alloc_region(usize::from(OUTBSZ))?;
+        let prf_len = usize::from(OUTBSZ);
+        let prf = mem.alloc_region(prf_len)?;
 
         let globals = Self {
             base,
             offsets,
             sizes,
             prf,
+            prf_len,
         };
 
         // `prfbuf` and `prfptr` are `char *`, not the buffer -- GCOMM.H:449.
@@ -719,6 +744,12 @@ impl<A: Abi> Globals<A> {
         // doc comment.
         globals.write_mem(mem, "nterms", &A::int_to_bytes(terms.count().into()))?;
         globals.write_mem(mem, "hichp1", &A::int_to_bytes(terms.count().into()))?;
+
+        // `MAJORBBS.C:572` -- outbsz=numopt(OUTBSZ,4096,16384). The config
+        // read is not implemented, so this is OUTBSZ, the low end of the range
+        // the real host accepts -- and, critically, the same constant `prf`
+        // was allocated with above, so the two cannot drift.
+        globals.write_mem(mem, "outbsz", &A::int_to_bytes(OUTBSZ.into()))?;
 
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
@@ -789,6 +820,27 @@ mod tests {
         assert_eq!(f.host.globals().word(&f.machine, "hichp1").expect("hichp1"), 1);
     }
 
+    /// `outbsz` is the print buffer's size, and the module reads it to size its
+    /// own work -- `PFBSIZ` is `#define`d to it (`MAJORBBS.H:507`). It must hold
+    /// the same number `Globals::new` allocated `prf` with, or a module that
+    /// fills `prfbuf` up to `outbsz` overruns a buffer the host made smaller.
+    #[test]
+    fn outbsz_is_the_size_the_print_buffer_was_actually_allocated_with() {
+        // Deliberately not compared against `OUTBSZ`: a test that reads the
+        // same constant the implementation writes would pass even if the
+        // constant and the `prf` allocation had drifted apart together. This
+        // reads `prf_len`, the byte count actually handed to
+        // `ModuleMem::alloc_region` when `prf` was allocated, so the
+        // assertion pins the allocation and the global to each other.
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(
+            u64::from(g.word(&f.machine, "outbsz").expect("outbsz")),
+            g.prf_len() as u64,
+            "outbsz must agree with the prf allocation at globals.rs:696"
+        );
+    }
+
     #[test]
     fn nobody_is_the_current_user_before_one_connects() {
         // `MAJORBBS.C:882` -- `usrnum=-1;`, three lines above the `inimod()`
@@ -843,11 +895,13 @@ mod tests {
 
     /// The one number this whole `Width` distinction exists for.
     ///
-    /// Eighteen globals are declared `int` (sixteen until `kilipg`/`kilsrc`
-    /// joined `errcod` as REMOTE.H's other two placed members). Under `Wg16`
-    /// that is two bytes and under `Wg32` it is four, so the 32-bit table is
-    /// exactly 36 bytes longer -- and, far more importantly, a 32-bit
-    /// module's four-byte write to `usrnum` lands entirely inside `usrnum`.
+    /// Nineteen globals are declared `int` (eighteen until `outbsz` joined as
+    /// MAJORBBS.H:579's placed member; sixteen before that, until
+    /// `kilipg`/`kilsrc` joined `errcod` as REMOTE.H's other two placed
+    /// members). Under `Wg16` that is two bytes and under `Wg32` it is four,
+    /// so the 32-bit table is exactly 38 bytes longer -- and, far more
+    /// importantly, a 32-bit module's four-byte write to `usrnum` lands
+    /// entirely inside `usrnum`.
     ///
     /// Before this, `const INT: u16 = 2` made both columns 2 and the whole
     /// table one length. Nothing failed, because nothing asked.
@@ -858,7 +912,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 18, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 19, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -895,7 +949,14 @@ mod tests {
         assert_eq!(at("margn"), 256 + 512);
         let last = *placed.last().expect("non-empty");
         // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
-        // 3520 until Task 12/13/15's second pass added three more:
+        // 3520 until Task 12/13/15's second pass added three more, 3528 until
+        // Task 1.1 placed one more:
+        //   +2 outbsz    (MAJORBBS.H:579 -- 15 of 43 corpus modules, the most
+        //                 widely imported symbol this host did not serve)
+        // no new alignment byte: `outbsz` (2 bytes) sits between `emlsdrou`
+        // (4-byte-aligned) and `kilipg` (already 2-byte-aligned) --
+        // 3528 + 2 = 3530.
+        // Before that:
         //   +4 othexp    (MAJORBBS.H:352 -- RTSLORD-NE, 15 sites)
         //   +2 kilipg    (MAJORBBS.H:590/REMOTE.H:44, an int -- Rose32, 1 site)
         //   +2 kilsrc    (REMOTE.H:46 -- 47, an int -- Rose32, 1 site)
@@ -916,7 +977,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3528);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3530);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
