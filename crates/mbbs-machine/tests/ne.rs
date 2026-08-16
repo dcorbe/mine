@@ -957,6 +957,73 @@ fn a_loaded_module_can_be_entered_by_ordinal_and_by_name() {
     assert!(matches!(exit, Exit::Returned { ax: 1, .. }), "got {exit:?}");
 }
 
+/// `Module::init` used to be `module.entry(1)`, called directly by
+/// `Wg16::init_entry` -- "ordinal 1 is the init routine" believed to be
+/// Galacticomm's own convention on the strength of `WCCMMUD.DLL`, whose
+/// ordinal 1 genuinely is `_INIT__WCCMMUD`. Measured against a second NE
+/// module, `RCIROSE.DLL`, that agreement turned out to be coincidence: its
+/// ordinal 1 is `BCC286_EXE`, Borland C++ 286's crt0 startup stub, while its
+/// real init routine, `_INIT__RCIROSE`, sits at ordinal 403 (both spellings
+/// and both ordinals measured directly off the file's resident name table).
+/// This test reproduces that shape synthetically: a decoy at ordinal 1 with
+/// a crt0-shaped name, and the real `_INIT__TESTMOD` several ordinals away.
+#[test]
+fn init_resolves_by_name_even_when_ordinal_one_is_something_else() {
+    let ne = Ne {
+        segments: vec![
+            Seg::code(vec![0u8; 0x20]),
+            Seg::data(vec![0; 16]),
+        ],
+        // Ordinal 1 is the crt0-shaped decoy; the real init routine sits
+        // four ordinals later, at a different offset in the same segment.
+        entries: vec![Some((1, 0x04)), None, None, None, Some((1, 0x10))],
+        resident: vec![("BCC286_EXE".into(), 1), ("_INIT__TESTMOD".into(), 5)],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+
+    let decoy = module.entry(1).expect("ordinal 1, the crt0-shaped decoy");
+    let real_init = module.entry(5).expect("ordinal 5, the real init routine");
+    assert_ne!(decoy, real_init, "the two ordinals must land at different offsets");
+
+    assert_eq!(
+        module.init(),
+        Some(real_init),
+        "init() must resolve _INIT__TESTMOD by name, not answer ordinal 1's decoy"
+    );
+    assert_ne!(
+        module.init(),
+        Some(decoy),
+        "the whole bug: init() must NOT answer what ordinal 1 answers here"
+    );
+}
+
+/// The other half of the fix: when no `_INIT__<name>` export exists at all
+/// (every NE module this host loaded before `RCIROSE.DLL` -- `WCCMMUD.DLL`
+/// included, whose init routine only happens to also carry that name),
+/// `init()` must still fall back to ordinal 1 rather than returning `None`.
+#[test]
+fn init_falls_back_to_ordinal_one_when_no_named_init_export_exists() {
+    let ne = Ne {
+        segments: vec![Seg::code(vec![0xcbu8; 4]), Seg::data(vec![0; 4])],
+        entries: vec![Some((1, 0x02))],
+        autodata: 2,
+        ..Ne::default()
+    };
+
+    let mut machine = Machine::new().expect("16-bit machine");
+    let module = machine.load_ne(&ne.finish(), &nothing).expect("loaded");
+
+    assert_eq!(
+        module.init(),
+        module.entry(1),
+        "no _INIT__TESTMOD export exists, so init() must fall back to ordinal 1"
+    );
+}
+
 #[test]
 fn a_file_that_is_not_ne_is_rejected() {
     assert_eq!(NeImage::parse(b"not an executable"), Err(NeError::NotNe));

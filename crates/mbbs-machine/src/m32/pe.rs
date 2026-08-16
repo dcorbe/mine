@@ -475,6 +475,30 @@ pub struct PeImage {
     /// correction from the one this doc comment warns `export_rva` must not
     /// make, because the value being adjusted is a different kind of number.
     pub export_base: Option<u32>,
+    /// The module's own name, as it recorded itself in its export
+    /// directory's `Name` field (`+12`) at link time -- e.g. `lunatix.DLL`,
+    /// `rcirose.DLL`. Measured, not assumed: both strings above are read
+    /// straight off `LUNATIX.DLL` and `RCIROSE.DLL`'s own export
+    /// directories.
+    ///
+    /// This field used to be described here as "deliberately never read":
+    /// true until `Wg32::load` needed to resolve a module's init routine by
+    /// *name* (`crate::m32::Module::init`'s doc comment -- exported ordinal
+    /// 1 is a coincidence for `LUNATIX.DLL`, not Galacticomm's convention,
+    /// and is flatly wrong for `RCIROSE.DLL`). That resolution needs the
+    /// linked DLL name, and this field is the only place to get one:
+    /// `Wg32::load` takes only `file: &[u8]` (`crates/mbbs/src/abi.rs`'s
+    /// `Abi::load`), so no filesystem path is ever threaded down to
+    /// `PeImage::parse` to read a stem from instead. The export directory's
+    /// `Name` is the name the linker itself burned into the file, so it
+    /// survives a renamed or copied DLL exactly where a filesystem path
+    /// would not.
+    ///
+    /// `None` when the image has no export directory (mirroring
+    /// `export_base`), or when it has one but the `Name` field does not
+    /// resolve to a readable string -- e.g. RVA 0, which is what an
+    /// otherwise-valid export directory that never set this field reads as.
+    pub export_name: Option<String>,
 }
 
 /// The file offset an RVA's bytes live at, plus how many contiguous raw bytes
@@ -944,15 +968,18 @@ impl PeImage {
         // header that overstates either count fails at the first read past
         // the covering section's raw end.
         //
-        // `+12 Name` (the RVA of the module's own name string) is
-        // deliberately never read: nothing in this crate's scope -- binding
-        // imports by name, finding an export's address by name -- needs the
-        // exporting module's own name string.
+        // `+12 Name` (the RVA of the module's own name string) used to go
+        // unread here -- nothing in this crate's original scope (binding
+        // imports by name, finding an export's address by name) needed the
+        // exporting module's own name string. `PeImage::export_name` now
+        // reads it: see that field's own doc comment for the caller that
+        // needs it and why no other source will do.
         let export_dir_rva = r.u32("export directory rva", dirs + DIR_EXPORT * 8)?;
         let export_dir_size = r.u32("export directory size", dirs + DIR_EXPORT * 8 + 4)?;
         let mut exports = Vec::new();
         let mut export_table = Vec::new();
         let mut export_base = None;
+        let mut export_name = None;
         if export_dir_rva != 0 && export_dir_size != 0 {
             let field = |offset: u32, what: &'static str| -> Result<u32, PeError> {
                 let rva = export_dir_rva
@@ -967,6 +994,23 @@ impl PeImage {
             let addr_of_names = field(32, "export address of names")?;
             let addr_of_name_ordinals = field(36, "export address of name ordinals")?;
             export_base = Some(base);
+
+            // The 4-byte `Name` field itself is read the same strict way as
+            // every sibling field above (`base`, `number_of_functions`, ...)
+            // -- a directory too short to hold it is exactly as malformed as
+            // one too short to hold `Base`. What it *points to* is read
+            // leniently: `.ok()`, not `?`. A well-formed PE's `Name` always
+            // resolves, but plenty of this file's own synthetic export-table
+            // fixtures build a directory that only ever populates the fields
+            // `export_rva`/`export_rva_by_ordinal` need and leave `Name` at
+            // its zeroed default -- RVA 0, unmapped in every one of them.
+            // Hard-erroring on that would fail parsing for a field nothing
+            // in those tests is exercising; `None` is the honest answer for
+            // "this image has an export directory but no readable name",
+            // and callers that need one (`init_rva`) already treat `None`
+            // as "no name to build a candidate from," not as a load failure.
+            let name_field_rva = field(12, "export directory name")?;
+            export_name = read_cstr_at_rva(&sections, &r, "export directory name", name_field_rva).ok();
 
             // The end of the export directory's own byte range: a function
             // RVA landing inside [export_dir_rva, dir_end) is a forwarder
@@ -1059,6 +1103,7 @@ impl PeImage {
             exports,
             export_table,
             export_base,
+            export_name,
         })
     }
 
@@ -1110,6 +1155,32 @@ impl PeImage {
         })
     }
 
+    /// The same lookup as `export_rva`, ASCII case-insensitive.
+    ///
+    /// Exists for `_init__<dll>`, Galacticomm's init-routine convention
+    /// carried over from the 16-bit side: NE modules spell it upper-case
+    /// (`_INIT__WCCMMUD`), this PE format lower-cases it (`_init__lunatix`,
+    /// `_init__rcirose` -- both measured, see `crate::m32::Module::init`'s
+    /// doc comment). `export_rva` itself stays exact-case on purpose --
+    /// every other caller (import binding, the `tests/pe.rs` fixtures) is
+    /// matching a name it already knows the exact spelling of, and a
+    /// case-blind default there would let a real spelling mismatch through
+    /// silently. Only the init lookup has to survive two different
+    /// toolchains' casing conventions, so only it gets the case-insensitive
+    /// path.
+    #[must_use]
+    pub fn export_rva_ignore_ascii_case(&self, name: &str) -> Option<u32> {
+        self.exports.iter().find_map(|e| {
+            if !e.name.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            match &e.address {
+                ExportAddress::Rva(rva) => Some(*rva),
+                ExportAddress::Forwarded(_) => None,
+            }
+        })
+    }
+
     /// The RVA of the function at *public* exported ordinal `ordinal`, by
     /// direct indexing into `export_table` -- O(1), unlike `export_rva`'s
     /// linear search by name.
@@ -1117,11 +1188,11 @@ impl PeImage {
     /// Unlike `export_rva`, this correctly serves an ordinal-only export
     /// (no entry in the name pointer table at all -- see `export_table`'s
     /// own doc comment for why those are not silently absent here the way
-    /// they are from `exports`). This is exactly the case a caller like
-    /// `Wg32::init_entry` needs: Galacticomm's own "ordinal 1" init-routine
-    /// convention (`crate::m16::ne::Module::entry`'s doc comment) says
-    /// nothing about the export having a name at all, only about its
-    /// public ordinal.
+    /// they are from `exports`). Used by [`PeImage::init_rva`] as the last
+    /// resort when no named `_init__<dll>` export exists -- see that
+    /// method's own doc comment for why ordinal 1 is a fallback and not,
+    /// as this crate believed until it was measured against `RCIROSE.DLL`,
+    /// Galacticomm's actual convention.
     ///
     /// `Base` is subtracted here, deliberately the opposite of what
     /// `export_base`'s own doc comment warns `export_rva`'s internal lookup
@@ -1142,6 +1213,59 @@ impl PeImage {
             ExportAddress::Rva(rva) => Some(*rva),
             ExportAddress::Forwarded(_) => None,
         }
+    }
+
+    /// The module's real init routine -- Galacticomm's `register_module`
+    /// caller -- resolved by **name** first, exported ordinal 1 only as a
+    /// fallback.
+    ///
+    /// This crate used to say "exported ordinal 1" *was* the convention,
+    /// on the strength of one module: `LUNATIX.DLL`'s ordinal 1 is
+    /// `_init__lunatix`. Measured today against a second module,
+    /// `RCIROSE.DLL` (935 exports), that agreement turned out to be
+    /// coincidence, not convention: its ordinal 1 is `_his_mods`, gameplay
+    /// code, while the real init routine, `_init__rcirose`, sits at
+    /// ordinal 352. Two-for-two on modules that both happened to be linked
+    /// with init first is not evidence of a rule -- it is evidence that
+    /// nobody had yet linked one the other way. `_init__<dll>` **by name**
+    /// is what both modules actually agree on: `LUNATIX.DLL` exports
+    /// `_init__lunatix`, `RCIROSE.DLL` exports `_init__rcirose`, and both
+    /// names are built from [`PeImage::export_name`] -- the module's own
+    /// linked name (`lunatix.DLL`, `rcirose.DLL`), not a filesystem path
+    /// (`Wg32::load` never receives one to begin with -- see
+    /// `export_name`'s own doc comment). The `.dll`/`.DLL` suffix is
+    /// stripped case-insensitively before building the candidate, and the
+    /// candidate is matched against the export table case-insensitively
+    /// too (`export_rva_ignore_ascii_case`) -- measured PE exports
+    /// lower-case the whole name (`_init__lunatix`, `_init__rcirose`), but
+    /// nothing about the format guarantees that.
+    ///
+    /// Ordinal 1 is tried only when the name lookup finds nothing --
+    /// **never** preferred once a name resolves, even if ordinal 1 also
+    /// happens to exist. That matters beyond `RCIROSE.DLL`'s PE build: its
+    /// *NE* sibling's ordinal 1 is `BCC286_EXE`, Borland C++ 286's crt0
+    /// startup stub, not an entry point at all (`m16::ne::Module::init`
+    /// has the full measurement) -- a strong sign that "ordinal 1" was
+    /// never a Worldgroup convention so much as where a C runtime's own
+    /// startup code happens to land when nothing else claims the slot.
+    ///
+    /// `None` exactly when both the name lookup and the ordinal-1 fallback
+    /// come up empty -- no export directory, no `_init__<dll>` export, and
+    /// no export at ordinal 1 either.
+    #[must_use]
+    pub fn init_rva(&self) -> Option<u32> {
+        if let Some(name) = &self.export_name {
+            let stem = if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".dll") {
+                &name[..name.len() - 4]
+            } else {
+                name.as_str()
+            };
+            let candidate = format!("_init__{stem}");
+            if let Some(rva) = self.export_rva_ignore_ascii_case(&candidate) {
+                return Some(rva);
+            }
+        }
+        self.export_rva_by_ordinal(1)
     }
 }
 

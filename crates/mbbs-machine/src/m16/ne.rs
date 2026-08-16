@@ -774,6 +774,52 @@ impl Module {
         self.entry(*self.names.get(name)?)
     }
 
+    /// The same lookup as [`Module::entry_by_name`], ASCII case-insensitive.
+    ///
+    /// A linear scan, unlike the exact-case lookup's `HashMap` hit --
+    /// [`Module::init`] is the only caller, it runs once per load, and a
+    /// second case-folded index would be a second table to keep in step
+    /// with `names`.
+    fn entry_by_name_ignore_ascii_case(&self, name: &str) -> Option<FarPtr> {
+        let ordinal = self
+            .names
+            .iter()
+            .find_map(|(n, &ordinal)| n.eq_ignore_ascii_case(name).then_some(ordinal))?;
+        self.entry(ordinal)
+    }
+
+    /// The module's real init routine -- `register_module`'s caller --
+    /// resolved by **name** first, exported ordinal 1 only as a fallback.
+    ///
+    /// **Not "exported ordinal 1."** That was believed to be Galacticomm's
+    /// own convention on the strength of one module: `WCCMMUD.DLL`'s
+    /// ordinal 1 is `_INIT__WCCMMUD`, its real init routine. Measured
+    /// against a second module, `RCIROSE.DLL` (NE), that agreement turned
+    /// out to be coincidence: its ordinal 1 is `BCC286_EXE` -- Borland C++
+    /// 286's crt0 startup stub, not an entry point at all -- while its real
+    /// init routine, `_INIT__RCIROSE`, sits at ordinal 403. A crt0-looking
+    /// name at ordinal 1 is itself a signal that ordinal 1 is not an entry
+    /// point; the name lookup below runs first for exactly that reason, and
+    /// ordinal 1 is never preferred once a name resolves, even when both
+    /// exist.
+    ///
+    /// The candidate name is `_INIT__` followed by [`Module::name`]
+    /// (`WCCMMUD` -> `_INIT__WCCMMUD`, `RCIROSE` -> `_INIT__RCIROSE`, both
+    /// measured) and matched case-insensitively -- both measured NE exports
+    /// happen to upper-case the whole name, matching [`Module::name`]'s own
+    /// case exactly, but nothing about the format guarantees that, and the
+    /// PE side of this same convention (`m32::PeImage::init_rva`) lower-cases
+    /// it instead.
+    ///
+    /// `None` when neither the name lookup nor ordinal 1 resolves -- the
+    /// module has no export by that name and no ordinal 1 either. Mirrors
+    /// `m32::PeImage::init_rva`'s own `None` case.
+    pub fn init(&self) -> Option<FarPtr> {
+        let candidate = format!("_INIT__{}", self.own_name);
+        self.entry_by_name_ignore_ascii_case(&candidate)
+            .or_else(|| self.entry(1))
+    }
+
     /// What thunk `index` stands for, as [`Exit::Call`](crate::m16::Exit::Call)
     /// reports it. This is how an unimplemented import is named rather than
     /// merely counted.
