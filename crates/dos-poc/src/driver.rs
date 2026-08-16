@@ -75,6 +75,15 @@ pub trait Driver {
     /// likes is correct here.
     fn next_key(&mut self, screen: &Screen) -> Option<Key>;
 
+    /// Is a poll worth taking a screen snapshot for?
+    ///
+    /// A polling guest asks thousands of times a second, and building the
+    /// snapshot costs a 4 KiB read and two thousand cells every time. Asking
+    /// first turns that from a per-poll cost into a per-repaint one.
+    fn poll_due(&self) -> bool {
+        false
+    }
+
     /// Offer a key without waiting, for when the guest only *asked whether* one
     /// was ready.
     ///
@@ -132,6 +141,7 @@ impl Script {
     /// Parse a script: one directive per line, `#` comments.
     ///
     /// ```text
+    /// type Corbe
     /// expect Exit the program
     /// cursor Exit the program
     /// selected Configure Nodes
@@ -151,6 +161,14 @@ impl Script {
                 "expect" => steps.push(Step::Expect(rest.to_string())),
                 "selected" => steps.push(Step::ExpectSelected(rest.to_string())),
                 "cursor" => steps.push(Step::ExpectCursor(rest.to_string())),
+                // `type` sends text a character at a time, which `send`
+                // cannot: it reads each word as a key name, so a name like
+                // "Corbe" is a parse error rather than five keystrokes.
+                "type" => {
+                    for ch in rest.bytes() {
+                        steps.push(Step::Send(Key::Char(ch)));
+                    }
+                }
                 "send" => {
                     for word in rest.split_whitespace() {
                         let key = Key::parse(word)
@@ -243,6 +261,19 @@ mod tests {
                 Step::Send(Key::Char(b'\r')),
                 Step::Send(Key::Char(b'A')),
                 Step::Expect("Main Menu".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_sends_a_word_one_character_at_a_time() {
+        let s = Script::parse("type Hi!").unwrap();
+        assert_eq!(
+            s.steps,
+            vec![
+                Step::Send(Key::Char(b'H')),
+                Step::Send(Key::Char(b'i')),
+                Step::Send(Key::Char(b'!')),
             ]
         );
     }

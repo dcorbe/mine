@@ -37,7 +37,36 @@ const PSP_SEG: u16 = 0x1000;
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
 
+/// CPU this process has burned, and how long it has been alive.
+///
+/// Reported at exit because "what did the CPU look like?" is otherwise
+/// unanswerable the moment the process ends -- /proc goes with it, and a
+/// session that has already finished cannot be measured retroactively.
+fn cpu_report(started: std::time::Instant, calls: u32) -> String {
+    // SAFETY: getrusage fills a caller-owned struct.
+    let usage = unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, std::ptr::from_mut(&mut u));
+        u
+    };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    let (user, sys) = (secs(usage.ru_utime), secs(usage.ru_stime));
+    let wall = started.elapsed().as_secs_f64().max(1e-9);
+    let busy = user + sys;
+    let per_call = if calls > 0 {
+        format!(", {:.1} us per DOS call", busy / f64::from(calls) * 1e6)
+    } else {
+        String::new()
+    };
+    format!(
+        "cpu: {busy:.2}s ({user:.2} user + {sys:.2} sys) over {wall:.1}s wall \
+         = {:.1}% of one core{per_call}",
+        busy / wall * 100.0
+    )
+}
+
 fn main() -> io::Result<()> {
+    let started = std::time::Instant::now();
     let mut args = std::env::args().skip(1);
     let path = args
         .next()
@@ -188,6 +217,7 @@ fn main() -> io::Result<()> {
                     // the guest wait for an answer it asked not to wait for.
                     if keyboard.is_empty()
                         && let Some(script) = driver.as_mut()
+                        && script.poll_due()
                     {
                         let screen = Screen::snapshot(
                             &vm,
@@ -388,6 +418,7 @@ fn main() -> io::Result<()> {
     }
 
     println!("--- {calls} DOS calls, {ending} ---");
+    println!("{}", cpu_report(started, calls));
     let shown: Vec<String> = order.iter().map(|a| format!("{a:02X}")).collect();
     println!("first calls: {}", shown.join(" "));
 

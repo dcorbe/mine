@@ -107,6 +107,7 @@ pub struct Terminal {
     _raw: RawMode,
     last: Vec<Cell>,
     quit: bool,
+    painted: std::time::Instant,
 }
 
 impl Terminal {
@@ -119,6 +120,7 @@ impl Terminal {
             _raw: RawMode::enter()?,
             last: Vec::new(),
             quit: false,
+            painted: std::time::Instant::now(),
         })
     }
 
@@ -292,8 +294,16 @@ impl Driver for Terminal {
         self.read_key()
     }
 
+    /// A repaint is due at most sixty times a second, or immediately when the
+    /// user has typed -- which is faster than an eye and far slower than the
+    /// guest's poll loop.
+    fn poll_due(&self) -> bool {
+        self.ready() || self.painted.elapsed() >= std::time::Duration::from_millis(16)
+    }
+
     /// Repaint, and take a keystroke only if one is already waiting.
     fn poll_key(&mut self, screen: &Screen) -> Option<Key> {
+        self.painted = std::time::Instant::now();
         self.paint(screen);
         if !self.ready() {
             return None;
