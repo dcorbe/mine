@@ -439,10 +439,30 @@ fn version(bytes: &[u8]) -> Option<Version> {
     if &bytes[..2] == b"FC" {
         return Some(Version::V6);
     }
-    // A v5 file control record opens with four zero bytes and carries its
-    // version in byte 7 -- 4 in every file MajorMUD ships. 3, 4 and 5 are the
-    // codes MBBSEmu accepts, which is the only independent transcription there
-    // is; a file outside them is refused rather than read on the assumption
+    // A v5-family file control record opens with four zero bytes and carries
+    // its version in byte 7. Measured 2026-08-15 (Track B Task 8), replacing a
+    // comment whose only authority was MBBSEmu's transcription of the same
+    // range:
+    //
+    // - **Byte 7 really is the version.** Genuine Btrieve 6.15's own `stat`
+    //   returns an index word whose high nibble is the file version -- `0x3001`
+    //   for a byte-7 == 3 file, `0x4001` for a byte-7 == 4 one, `0x6001` for a
+    //   v6 file. That arrives through the Btrieve API, not out of this header,
+    //   so it is a second agreeing source rather than the same byte read twice.
+    // - **3 is not theoretical.** A census of 849 `.DAT`/`.VIR` files across
+    //   this repository found 191 at byte 7 == 4 and six distinct files at
+    //   byte 7 == 3 -- and those six are MajorBBS's own core host files
+    //   (`USRACC.DAT`, `EMAIL.DAT`, `CLASSADS.DAT`, `CLASSRSP.DAT`,
+    //   `AUDITRAI.DAT`, `SYSVBL.DAT`). They read correctly at these offsets;
+    //   `a_v3_file_reads_with_the_geometry_the_genuine_engine_reports` pins
+    //   three of them against the engine's own numbers.
+    // - **5 was never observed.** Not one file in the census carries byte
+    //   7 == 5. It stays accepted because Btrieve 5.x existed and a 5 here
+    //   would mean the version this family is named for -- but it is accepted
+    //   on that reasoning, untested, and this comment is the disclosure. Every
+    //   v5-family file this host has actually read is a 3 or a 4.
+    //
+    // A file outside the range is refused rather than read on the assumption
     // that the fields did not move.
     if bytes[..4] == [0, 0, 0, 0] && bytes[6] == 0 && (3..=5).contains(&bytes[7]) {
         return Some(Version::V5);
@@ -2982,6 +3002,106 @@ mod tests {
     /// A `Block` over `seed`'s file, built directly rather than through
     /// `Btrieve::open` -- this test has no module and no heap, only the file
     /// and the geometry a real `opnbtv` would have read out of it.
+    /// Task 8 of `docs/plans/2026-08-15-host-api-surface-track-b.md`: is
+    /// `version()`'s `3..=5` range real, or is v3 read with v5 rules?
+    ///
+    /// It was the one range in this file whose only authority was a
+    /// transcription — [`version`]'s own comment conceded it was copied from
+    /// MBBSEmu, "the only independent transcription there is". That is now
+    /// measured instead, and the answer is that **v3 is not theoretical**:
+    /// six distinct files carry byte 7 == 3, and they are MajorBBS's own core
+    /// host files (`USRACC.DAT` is the user accounts file). A census of 849
+    /// `.DAT`/`.VIR` files across the whole repository found 564 v6, 191 with
+    /// byte 7 == 4, these 6 with byte 7 == 3 (each present twice, under
+    /// `archive/modules/majorbbs` and `archive/galacticomm/hosts/majorbbs`),
+    /// and **not one with byte 7 == 5**.
+    ///
+    /// The engine confirms byte 7 is the version, independently of the byte:
+    /// genuine Btrieve 6.15's own `stat` returns an index word whose high
+    /// nibble is the file version — `0x3001` for these, `0x4001` for a
+    /// byte-7 == 4 file, `0x6001` for a v6 one. That comes back through the
+    /// Btrieve API rather than from the header, so it is a second, agreeing
+    /// source rather than the same byte read twice.
+    ///
+    /// The numbers asserted below are the genuine engine's, taken from
+    /// `btrvprobe.exe stat` (and `walk 0` for `USRACC.DAT`, which reports
+    /// WALK OK over 2 records). So this is a cross-version acceptance test,
+    /// not a self-consistency one.
+    ///
+    /// `archive/` is gitignored, so this degrades to a skip rather than a
+    /// failure in a checkout without it — the same shape
+    /// `crates/mbbs-machine/tests/m16_rose.rs` uses. The files are copied to
+    /// scratch before being opened: this crate's rule is that no engine of
+    /// ours writes to a shipped `.DAT`, and the cheapest way to keep it is to
+    /// never hand the shipped path to anything.
+    #[test]
+    fn a_v3_file_reads_with_the_geometry_the_genuine_engine_reports() {
+        let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../archive/galacticomm/hosts/majorbbs");
+        if !from.exists() {
+            eprintln!("skipped: archive/galacticomm/hosts/majorbbs is not in this checkout");
+            return;
+        }
+        let dir = crate::testing::scratch("btv-v3-geometry");
+
+        // (file, reclen, page size, keys, records, key descriptors parse) --
+        // every number from `btrvprobe.exe stat` against genuine Btrieve 6.15.
+        //
+        // **Two of the three refuse at the key descriptors, and not for a
+        // version reason** -- pinned rather than skipped, because the
+        // distinction is the whole point. `EMAIL.DAT` and `CLASSADS.DAT` each
+        // declare a key with a **numbered alternate collating sequence**,
+        // which this host refuses outright ("changes what its index holds and
+        // is not reproduced by sorting the records") rather than guessing at a
+        // collation it does not have. Their geometry decodes perfectly; the
+        // refusal would fire identically on a v5 file declaring an ACS.
+        //
+        // That is a real gap in its own right, and worth knowing where it
+        // bites: ACS is not an exotic corner, it is what MajorBBS's own core
+        // host files use. It is a *collation* gap, not a *version* gap, and
+        // nothing about supporting v3 would move it.
+        for (name, reclen, page, keys, records, parses) in [
+            ("USRACC.DAT", 252u16, 512u16, 1u16, 2usize, true),
+            ("EMAIL.DAT", 1000, 1024, 3, 0, false),
+            ("CLASSADS.DAT", 402, 512, 2, 0, false),
+        ] {
+            let path = dir.join(name);
+            std::fs::copy(from.join(name), &path).expect("copy the fixture out of archive/");
+
+            let geometry = Geometry::read(name, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(geometry.version, Version::V5, "{name}: byte 7 == 3 is the v5 family");
+            assert_eq!(geometry.reclen, reclen, "{name}: record length");
+            assert_eq!(geometry.page, page, "{name}: page size");
+            assert_eq!(geometry.keys, keys, "{name}: key count");
+            assert_eq!(geometry.records, records as u32, "{name}: record count");
+
+            // Read the records too, not just the header -- a header that
+            // decodes at the right offsets proves nothing about whether the
+            // data pages are laid out where this host expects them.
+            let fcr = std::fs::read(&path).expect("readable");
+            let parsed = keys::parse(name, &fcr, geometry.keys);
+            if !parses {
+                let why = parsed.expect_err("EMAIL.DAT's ACS key must refuse").why;
+                assert!(
+                    why.contains("alternate collating sequence"),
+                    "{name}: must refuse for the ACS, not something else: {why}"
+                );
+                continue;
+            }
+
+            let mut block = block(path.clone());
+            block.name = name.to_owned();
+            block.geometry = geometry;
+            block.keys = parsed.unwrap_or_else(|e| panic!("{name}: {e}"));
+            block.maxlen = geometry.reclen;
+            assert_eq!(
+                block.records().unwrap_or_else(|e| panic!("{name}: {e}")).len(),
+                records,
+                "{name}: records read back"
+            );
+        }
+    }
+
     fn block(path: PathBuf) -> Block<Wg16> {
         let geometry = Geometry {
             version: Version::V5,
