@@ -874,8 +874,36 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             }
             let position = layout.position(logical, slot);
 
+            // The slot's own two-byte marker says whether it holds a record.
+            // Zero means free -- either never written, or emptied by a delete
+            // -- and a free slot's first four bytes are a link to the next
+            // free one, not a record.
+            //
+            // **This is the guard that lets a page have holes in it.** The
+            // scan used to stop at the first slot that `looks_empty`, which
+            // was right only while nothing had ever deleted from a v6 file:
+            // measured across all thirty-four real v6 files in this
+            // repository, not one has a live slot behind a free one, so a
+            // hole never occurred to be got wrong. `Block::delete_v6` makes
+            // them occur, and stopping at the first one would silently drop
+            // every later record on that page -- with the `records.len() ==
+            // geometry.records` guard above hiding the shortfall by ending
+            // the walk early rather than reporting a count that did not add
+            // up. `continue`, never `break`.
+            //
+            // The same thirty-four files are what makes the marker safe to
+            // *interpret* rather than skip over: on every one of them, the
+            // count of non-zero markers across every live data page equals
+            // the record count in the live half of the file control record's
+            // shadow pair, exactly, thirty-four times out of thirty-four.
+            // See `docs/2026-08-16-v6-update-delete-oracle.md`.
+            let marker_at = layout.position(0, slot) as usize;
+            if u16::from_le_bytes([buffer[marker_at], buffer[marker_at + 1]]) == 0 {
+                continue;
+            }
+
             // Evidence 1b: the record body starts two bytes into the slot,
-            // past a marker this reads past rather than interprets.
+            // past the marker read just above.
             //
             // `position(0, slot)` rather than a restated `HEADER + physical *
             // slot`, so the formula lives only in `Layout::position` -- Trap 1
@@ -887,17 +915,16 @@ fn walk_v6(geometry: &Geometry, path: &Path) -> Result<Vec<Record>, String> {
             // page 0 starts at byte 0, so asking for page 0 asks exactly that
             // question. This subtlety cost a broken refactor: `position - at`
             // compiles, reads plausibly, and is wrong.
-            let start = layout.position(0, slot) as usize + V6_SLOT_MARKER;
+            let start = marker_at + V6_SLOT_MARKER;
             let content_len = usize::from(geometry.physical) - V6_SLOT_MARKER;
             let record = &buffer[start..start + content_len];
 
-            // Slots fill from the front of a page here too -- see v5's
-            // identical comment in `walk_v5` -- so the first one that looks
-            // unwritten ends this page's live records.
-            if looks_empty(record, size) {
-                break;
-            }
-
+            // No `looks_empty` check here, unlike `walk_v5`. It used to end
+            // the page's scan; the marker above now answers the same question
+            // directly, and it answers it for a *hole* as well as for a tail,
+            // which `looks_empty` plus `break` could not. Asking both would be
+            // two rules for one question, and the weaker one would decide
+            // whenever they disagreed.
             let mut bytes = record[..geometry.reclen as usize].to_vec();
 
             // A variable-length record's fixed part is followed by four
@@ -1895,6 +1922,64 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records.physical(0).expect("first").bytes, b"AAAA");
         assert_eq!(records.physical(1).expect("second").bytes, b"BBBB");
+    }
+
+    /// [`v6_stale_twin_fixture`]'s claimed page, rebuilt with a **hole**: a
+    /// live record at slot 0, a freed slot at slot 1, and a live record at
+    /// slot 2. The freed slot carries what a real delete leaves behind -- a
+    /// zero marker and a four-byte forwarding link to the next free slot,
+    /// with everything past it zero (`docs/2026-08-16-v6-update-delete-oracle.md`).
+    ///
+    /// The record count stays 2, because a delete decrements it. On this
+    /// one-page fixture a walk that `break`s at the hole is caught by
+    /// `Records::read`'s own "the header says 2 records and walking the pages
+    /// found 1" check -- verified by mutation. It is only caught because there
+    /// is no *later* page to make the count up again: on a file with more
+    /// claimed pages the walk carries on, finds the missing record's worth of
+    /// slots elsewhere, and the totals agree while the wrong record is gone.
+    /// The refusal here is the cheap version of a failure that is silent in
+    /// general.
+    fn v6_hole_fixture() -> Vec<u8> {
+        const PAGE: usize = 512;
+        let mut out = v6_stale_twin_fixture();
+
+        let p4 = PAGE * 4;
+        // Slot 1 (bytes 12..18 of the page): freed. Marker zero, then a link
+        // to slot 2's position -- logical page 2, so `2 * 512 + 18`.
+        out[p4 + 12..p4 + 14].copy_from_slice(&0u16.to_le_bytes());
+        out[p4 + 14..p4 + 18].copy_from_slice(&super::super::pages::to_long(2 * 512 + 18));
+        // Slot 2: live, and behind the hole.
+        out[p4 + 18..p4 + 20].copy_from_slice(&1u16.to_le_bytes());
+        out[p4 + 20..p4 + 24].copy_from_slice(b"CCCC");
+
+        out
+    }
+
+    /// A record behind a freed slot is still read.
+    ///
+    /// Mutation this exists for: turn `walk_v6`'s `continue` on a zero marker
+    /// back into a `break`, or drop the marker check and restore the
+    /// `looks_empty` break, and this fails with `CCCC` missing -- which is
+    /// exactly what every v6 delete would have cost before the marker was
+    /// interpreted.
+    #[test]
+    fn a_v6_record_behind_a_freed_slot_is_still_read() {
+        let bytes = v6_hole_fixture();
+        let dir = crate::testing::scratch("btv-rec-v6-hole");
+        let path = dir.join("V6HOLE.DAT");
+        std::fs::write(&path, &bytes).expect("written");
+
+        let geometry = Geometry::read("V6HOLE.DAT", &path).expect("a v6 shape");
+        assert_eq!(geometry.version, Version::V6);
+
+        let records = Records::read("V6HOLE.DAT", &path, &geometry, &[]).expect("reads");
+        assert_eq!(records.len(), 2, "the freed slot is not a record, and CCCC is");
+        assert_eq!(records.physical(0).expect("first").bytes, b"AAAA");
+        assert_eq!(
+            records.physical(1).expect("second").bytes,
+            b"CCCC",
+            "the record behind the hole"
+        );
     }
 
     /// A second implementation of [`walk`]'s page arithmetic, built once as
