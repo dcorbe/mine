@@ -50,6 +50,10 @@ const MAXTFS: u16 = 129;
 const SIDSIZ: u16 = 5;
 /// `BBSUTILS.H:18` -- size of the ASCII rendition of a version.
 const VERSIZ: u16 = 9;
+/// `UStructs.h:14` -- maximum size for user-id cross reference strings.
+const XRFSIZ: u16 = 15;
+/// `UStructs.h:10` -- user-id size, *including* the trailing zero.
+const UIDSIZ: u16 = 30;
 
 /// A far pointer, as 16-bit C stores one: offset then selector. Four bytes
 /// under both ABIs ([`Abi::PTR_WIDTH`]), so it needs no [`Width`] of its own.
@@ -295,6 +299,9 @@ pub const GLOBALS: &[Global] = &[
     g("numdirs", LONG),
     // SAPUTL.H:93 -- struct saunam *namtmp;
     g("namtmp", PTR),
+    // USRACC.H:39 -- struct uidxrf uidxrf; the struct BY VALUE, not a
+    // pointer, so all of it lives here. The GCV2 `spare[6]` arm is not taken.
+    g("uidxrf", (XRFSIZ + 1) + UIDSIZ),
     // USRACC.H:59 -- a pointer to the array of user IDs.
     g("uidarr", PTR),
     // Borland's own ctype table: 257 bytes, indexed from -1, so that
@@ -854,6 +861,13 @@ impl<A: Abi> Globals<A> {
         globals.write_mem(mem, "mmucrr", &A::int_to_bytes(0u16.into()))?;   // MAJORBBS.H:581
         globals.write_mem(mem, "digalw", &A::int_to_bytes(1u16.into()))?;   // MAJORBBS.H:653
         globals.write_mem(mem, "clingo", &A::int_to_bytes(0u16.into()))?;   // LINGO.H:41
+        // `uidxrf` needs no write: all-zero is a valid empty cross reference,
+        // and `alloc_region` already zeroes -- confirmed against both ABIs'
+        // `ModuleMem` impls: `Wg16`'s `Segments::alloc_region` maps a fresh
+        // `MAP_ANONYMOUS` mmap (`m16/seg.rs`'s `Mapping::new`), and `Wg32`'s
+        // `Memory::alloc_region` bumps a pointer through one such mapping
+        // made once at construction (`m32/mem.rs`) -- the OS zeroes both, and
+        // neither ever reuses a byte range once handed out.
         // A CHAR, so written as one byte rather than through int_to_bytes.
         globals.write_mem(mem, "eurmsk", &[0x7F])?;
 
@@ -1015,6 +1029,24 @@ mod tests {
         );
     }
 
+    /// `USRACC.H:39` -- `struct uidxrf uidxrf`, the struct by value, not a
+    /// pointer. 46 bytes: `CHAR xrfstg[XRFSIZ+1]` (16) plus `CHAR userid[UIDSIZ]`
+    /// (30), with the `#ifdef GCV2 CHAR spare[6]` arm NOT taken -- `struct user`
+    /// measures 88 bytes non-GCV2 for these targets, so GCV2 is off here too.
+    ///
+    /// The width is the whole assertion. A pointer-sized placement would be four
+    /// bytes and would silently overlap whatever follows.
+    #[test]
+    fn uidxrf_is_the_struct_by_value_at_forty_six_bytes() {
+        let f = crate::testing::Fixture::new();
+        assert_eq!(
+            f.host.globals().size("uidxrf").expect("uidxrf is placed"),
+            (XRFSIZ + 1) + UIDSIZ,
+            "xrfstg[XRFSIZ+1] + userid[UIDSIZ], non-GCV2"
+        );
+        assert_eq!((XRFSIZ + 1) + UIDSIZ, 46, "the arithmetic, spelled out once");
+    }
+
     /// `nmods` is not a configuration value -- it is how many modules are online,
     /// which the host knows exactly. A fixture with no modules loaded must read
     /// zero, and the number must move when a module lands.
@@ -1153,7 +1185,12 @@ mod tests {
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
         // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
         // 3538 until Task 1.3 placed one, 3540 until Task 1.4 placed seven,
-        // 3568 until Task 1.5 placed two more:
+        // 3568 until Task 1.5 placed two more, 3576 until Task 1.6 placed one:
+        //   +46 uidxrf   (USRACC.H:39 -- the struct BY VALUE, xrfstg[16] +
+        //                 userid[30], non-GCV2)
+        // no new alignment byte: 46 is even, so alignment on both sides of it
+        // is unchanged -- 3576 + 46 = 3622.
+        // Before that:
         //   +4 module    (MAJORBBS.H:314 -- empty, safe only while nmods==0)
         //   +4 languages (LINGO.H:42 -- empty, no counter pairs it)
         // no new alignment byte: both are 4-byte pointers -- 3568 + 4*2 = 3576.
@@ -1200,7 +1237,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3576);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3622);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
