@@ -409,15 +409,22 @@ pub const GLOBALS: &[Global] = &[
     // its own header with no fixed position relative to this one), placed
     // after it rather than disturbing that group's own established spot.
     gi("digalw"),
+    // LINGO.H:40 -- int nlingo; number of languages. Placed in declaration
+    // order ahead of `clingo`, which is what LINGO.H does.
+    //
+    // No corpus module imports `nlingo`, and until Phase 2 it was left out
+    // for that reason. What changed is that `languages` stopped being empty:
+    // an array with an entry in it and no count beside it is the exact hazard
+    // the comment here used to describe, so the count is now placed and held
+    // at the array's real length. `nlingo` is to `languages` what `nmods` is
+    // to `module`.
+    gi("nlingo"),
     // LINGO.H:41 -- int clingo; current language.
     gi("clingo"),
     // LINGO.H:42 -- struct lingo **languages; dynamic array of lingo
-    // structs. `struct lingo` is not modelled here, so -- the same as
-    // `module` above -- this points at a real, empty region rather than
-    // NULL. There is no `nlingo` counter placed to pair it with (no corpus
-    // module imports `nlingo`), so this one has no analogue of the
-    // `nmods == 0` guarantee; it is simply an array a module must never
-    // walk expecting entries.
+    // structs. One entry, and `nlingo == 1` says so; see `Globals::place`
+    // for why the entry is a populated record rather than the NULL slot it
+    // was through Phase 1.
     g("languages", PTR),
     // GME.H:199 -- UINT _txtlen; message text buffer size, reached through
     // the TXTLEN macro. GALME's, not MAJORBBS's -- it is not part of the
@@ -427,6 +434,68 @@ pub const GLOBALS: &[Global] = &[
 
 /// Bytes of `bturno`. Eight digits and a NUL, which is what `%.9s` prints.
 const BTURNO: u16 = 9;
+
+/// The fields of `struct lingo` (`LINGO.H:29-37`), each as its offset and its
+/// declared width.
+///
+/// Every member is a `CHAR` array, so the struct packs with no padding under
+/// any alignment setting and the offsets are running sums of the widths:
+/// `LNGSIZ 16`, `LNGDSC 51`, `LNGEXT 5` three times, `LNGEDT 41`, `LNGYN 13`
+/// twice (`LINGO.H:23-27`).
+///
+/// Named rather than written into `default_lingo` as literals because
+/// `cncyesno` reads `yes` and `no` back out of module memory at these
+/// offsets, and one table both writers use is the only way the two agree.
+const LINGO_YES: u16 = 123;
+const LINGO_NO: u16 = 136;
+
+/// Bytes in `struct lingo`: `16+51+5+5+5+41+13+13`.
+const LINGO: u16 = LINGO_NO + 13;
+
+/// `struct lingo dftlang` as Galacticomm declares it, laid out for module
+/// memory.
+///
+/// Not a value this host chose. `SRC/server/utils/wgsint/INTEGROU.C:39-40`
+/// is the vendor's own statically-initialised default record --
+/// `{DFTLNG,DFTDSC,DFTEXTANS,DFTEXTASC,DFTEXTIBM,DFTEDR,DFTYES,DFTNO}` --
+/// and six of those eight macros are in `INC/LINGO.H` itself (`:44-49`).
+/// `DFTDSC` and the three extensions are defined at the top of that same
+/// `INTEGROU.C` (`:33-36`) rather than in a header, which is why they carry
+/// the longer citation.
+///
+/// `yes`/`no` matter most: `cncyesno` compares the user's keystroke against
+/// `toupper(lptr->yes[0])` and `toupper(lptr->no[0])`, so `"YES"`/`"NO"` are
+/// what makes `Y` and `N` the answers a module gets. `LINGO.H:36` requires
+/// the two to have unique first letters, and these do.
+fn default_lingo() -> Vec<u8> {
+    // Offset, width, value -- in declaration order, so this reads against
+    // `LINGO.H:29-37` line by line.
+    const FIELDS: &[(u16, u16, &str)] = &[
+        (0, 16, "English/ANSI"),                             // name,   DFTLNG
+        (16, 51, "English version of BBS-ANSI (or ASCII)"),   // desc,   DFTDSC
+        (67, 5, ".ans"),                                     // extans, DFTEXTANS
+        (72, 5, ".asc"),                                     // extasc, DFTEXTASC
+        (77, 5, ".ibm"),                                     // extibm, DFTEXTIBM
+        (82, 41, "wgsdraw %s"),                              // editor, DFTEDR
+        (LINGO_YES, 13, "YES"),                              // yes,    DFTYES
+        (LINGO_NO, 13, "NO"),                                // no,     DFTNO
+    ];
+
+    let mut out = vec![0u8; usize::from(LINGO)];
+    for &(at, width, value) in FIELDS {
+        // A C string initialiser fills the rest of the array with NULs, which
+        // is what the zeroed buffer already holds. The assertion is the part
+        // that matters: a value too long for its field would be silently
+        // truncated into the field beside it.
+        assert!(
+            value.len() < usize::from(width),
+            "{value:?} does not fit in {width} bytes with its NUL"
+        );
+        let at = usize::from(at);
+        out[at..at + value.len()].copy_from_slice(value.as_bytes());
+    }
+    out
+}
 
 /// Bytes in Borland's `_ctype` table: one per `char`, plus the entry at index
 /// -1 that makes `(_ctype+1)[EOF]` legal.
@@ -802,7 +871,7 @@ impl<A: Abi> Globals<A> {
             globals.write_mem(mem, name, &A::ptr_to_bytes(at))?;
         }
 
-        // Two arrays this host does not build. Each pointer addresses a real
+        // An array this host does not build. The pointer addresses a real
         // empty region rather than NULL, so a module that dereferences
         // without checking does not fault.
         //
@@ -810,13 +879,37 @@ impl<A: Abi> Globals<A> {
         // `module[0..nmods]` iterates nothing. If `nmods` ever becomes
         // non-zero, `module` must point at a table with that many entries
         // first -- otherwise the module walks whatever the arena holds next.
-        for name in ["module", "languages"] {
+        {
             // One pointer slot, zeroed. `Abi` has no NULL constant, and an
             // all-zero far pointer is what NULL is under both ABIs anyway.
             let at = mem.alloc_region(A::PTR_WIDTH)?;
             at.write(mem, &vec![0u8; A::PTR_WIDTH]).map_err(|e| io::Error::other(e.to_string()))?;
-            globals.write_mem(mem, name, &A::ptr_to_bytes(at))?;
+            globals.write_mem(mem, "module", &A::ptr_to_bytes(at))?;
         }
+
+        // `languages` is the same shape and is NOT empty, because a module
+        // dereferences it without asking anyone's permission first.
+        //
+        // `cncyesno` (`SRC/server/wgserver/CNCUTL.C:112`) opens with
+        // `lptr=languages[clingo]` and reads `lptr->yes[0]` on the very next
+        // line. Through Phase 1 `languages` addressed a single zeroed pointer
+        // slot, so that read would have dereferenced NULL *inside module
+        // code* -- a fault with the module's own address on it and nothing
+        // pointing back at the host gap that caused it. One real record is
+        // what makes the routine answerable at all.
+        //
+        // The record's contents are Galacticomm's own defaults, not this
+        // host's invention -- see [`default_lingo`]. A real host builds this
+        // array in `inilingo()` by reading `LNG` lines out of `wgserv.cfg`
+        // (`LINGO.H:50`); this host has no configuration, so it stands on the
+        // literal the vendor ships for exactly that case.
+        let record = mem.alloc_region(usize::from(LINGO))?;
+        record.write(mem, &default_lingo()).map_err(|e| io::Error::other(e.to_string()))?;
+        let array = mem.alloc_region(A::PTR_WIDTH)?;
+        array
+            .write(mem, &A::ptr_to_bytes(record))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        globals.write_mem(mem, "languages", &A::ptr_to_bytes(array))?;
 
         // MAJORBBS.C:80-81 -- `int nterms=1, hichp1=1;`. Both were set before
         // any module's init ran, `:557` only ever adds configured groups to
@@ -861,6 +954,11 @@ impl<A: Abi> Globals<A> {
         globals.write_mem(mem, "mmucrr", &A::int_to_bytes(0u16.into()))?;   // MAJORBBS.H:581
         globals.write_mem(mem, "digalw", &A::int_to_bytes(1u16.into()))?;   // MAJORBBS.H:653
         globals.write_mem(mem, "clingo", &A::int_to_bytes(0u16.into()))?;   // LINGO.H:41
+        // LINGO.H:40 -- the count beside `languages`, and the one thing that
+        // makes walking that array safe. One record is allocated above, so
+        // this is 1; the two are written in the same constructor so they
+        // cannot drift.
+        globals.write_mem(mem, "nlingo", &A::int_to_bytes(1u16.into()))?;
         // `uidxrf` needs no write: all-zero is a valid empty cross reference,
         // and `alloc_region` already zeroes -- confirmed against both ABIs'
         // `ModuleMem` impls: `Wg16`'s `Segments::alloc_region` maps a fresh
@@ -1016,29 +1114,104 @@ mod tests {
         }
     }
 
-    /// `module` and `languages` are pointers to arrays the host does not build.
+    /// `module` is a pointer to an array the host does not build.
     ///
-    /// Both are placed and both point at real, empty storage rather than NULL.
-    /// What makes that safe is `nmods == 0`: a module iterating `module[0..nmods]`
+    /// It is placed and points at real, empty storage rather than NULL. What
+    /// makes that safe is `nmods == 0`: a module iterating `module[0..nmods]`
     /// iterates nothing. This test pins the pairing, because the day `nmods`
     /// becomes non-zero without a table behind `module` is the day a module walks
     /// garbage.
+    ///
+    /// `languages` used to be checked here as the second empty array. It is no
+    /// longer empty -- see
+    /// [`languages_zero_is_a_readable_lingo_with_distinct_yes_and_no`], which
+    /// owns it and its `nlingo` counter now.
     #[test]
     fn the_pointer_arrays_are_empty_and_nmods_agrees() {
         let f = crate::testing::Fixture::new();
         let g = f.host.globals();
-        for name in ["module", "languages"] {
-            assert_eq!(g.size(name).expect(name), PTR, "{name} is a **");
-            assert_ne!(
-                g.pointer(&f.machine, name).expect(name),
-                mbbs_machine::m16::FarPtr::NULL,
-                "{name} must not be NULL even when the array is empty"
-            );
-        }
+        assert_eq!(g.size("module").expect("module"), PTR, "module is a **");
+        assert_ne!(
+            g.pointer(&f.machine, "module").expect("module"),
+            mbbs_machine::m16::FarPtr::NULL,
+            "module must not be NULL even when the array is empty"
+        );
         assert_eq!(
             g.word(&f.machine, "nmods").expect("nmods"), 0,
             "an empty `module` array is only safe while nmods is zero"
         );
+    }
+
+    /// The `struct lingo` behind `languages[0]`, read exactly the way
+    /// `cncyesno` reads it: the pointer stored in `languages`, then the
+    /// pointer in that array's slot zero, then the record itself.
+    ///
+    /// Goes through `Abi::ptr_from_bytes` rather than picking the two words
+    /// apart by hand, so this is not a second way to decode a far pointer.
+    fn read_lingo_zero(f: &crate::testing::Fixture) -> Vec<u8> {
+        use crate::abi::Abi;
+
+        let g = f.host.globals();
+        let array = g.pointer(&f.machine, "languages").expect("languages");
+        assert_ne!(array, mbbs_machine::m16::FarPtr::NULL, "languages must not be NULL");
+
+        let slot = f
+            .machine
+            .resolve(array, crate::abi::Wg16::PTR_WIDTH)
+            .expect("languages[0] is readable");
+        let record = crate::abi::Wg16::ptr_from_bytes(slot);
+        assert_ne!(record, mbbs_machine::m16::FarPtr::NULL, "languages[0] must not be NULL");
+
+        f.machine
+            .resolve(record, usize::from(LINGO))
+            .expect("the whole lingo record is readable")
+            .to_vec()
+    }
+
+    /// One NUL-terminated field of a `struct lingo`, by the offsets the host
+    /// wrote it with.
+    fn lingo_field(record: &[u8], at: u16, width: u16) -> String {
+        let field = &record[usize::from(at)..usize::from(at + width)];
+        let end = field.iter().position(|&b| b == 0).expect("NUL-terminated");
+        String::from_utf8_lossy(&field[..end]).into_owned()
+    }
+
+    /// `languages[clingo]` must be a readable `struct lingo`, not a NULL slot.
+    ///
+    /// `cncyesno` (`CNCUTL.C:112`) does `lptr=languages[clingo]` and
+    /// dereferences `lptr->yes[0]` on the next line. Phase 1 placed
+    /// `languages` pointing at one zeroed pointer, which would have faulted
+    /// inside module code. This pins that the slot resolves and that the
+    /// record carries Galacticomm's own defaults.
+    ///
+    /// `LINGO.H:36` also requires `yes` and `no` to have unique first letters,
+    /// because `cncyesno`'s two-branch compare is wrong without it. That is
+    /// **not** asserted separately here: `"YES"` and `"NO"` are pinned by
+    /// value, which implies it, so a `assert_ne!` on the two first letters
+    /// could never fire. An assertion that cannot fail reads like coverage
+    /// and is not.
+    #[test]
+    fn languages_zero_is_a_readable_lingo_with_distinct_yes_and_no() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+
+        assert_eq!(g.size("languages").expect("languages"), PTR, "languages is a **");
+        assert_eq!(g.word(&f.machine, "clingo").expect("clingo"), 0);
+        assert_eq!(
+            g.word(&f.machine, "nlingo").expect("nlingo"), 1,
+            "one language is configured, and nlingo is what says so"
+        );
+
+        let record = read_lingo_zero(&f);
+        let yes = lingo_field(&record, LINGO_YES, 13);
+        let no = lingo_field(&record, LINGO_NO, 13);
+
+        // Compared against the vendor macros by name, not against whatever
+        // `default_lingo` happens to hold -- otherwise both sides of the
+        // assertion would move together and it would pin nothing.
+        assert_eq!(yes, "YES", "LINGO.H:48 -- DFTYES");
+        assert_eq!(no, "NO", "LINGO.H:49 -- DFTNO");
+        assert_eq!(lingo_field(&record, 0, 16), "English/ANSI", "LINGO.H:44 -- DFTLNG");
     }
 
     /// `USRACC.H:39` -- `struct uidxrf uidxrf`, the struct by value, not a
@@ -1175,7 +1348,7 @@ mod tests {
             .filter(|g| g.size == Width::Int)
             .map(|g| g.name)
             .collect();
-        assert_eq!(ints.len(), 23, "the int globals: {ints:?}");
+        assert_eq!(ints.len(), 24, "the int globals: {ints:?}");
         assert!(ints.contains(&"usrnum") && ints.contains(&"margc") && ints.contains(&"nglobs"));
         assert!(ints.contains(&"errcod"), "REMOTE.H:11 declares errcod an int");
 
@@ -1219,7 +1392,12 @@ mod tests {
         // 3622 until Task 1.7 placed the last of this batch:
         //   +2 txtlen    (GME.H:199 -- GALME's, not MAJORBBS.H's; `Width::Bytes(2)`
         //                 rather than `Width::Int`, so it is 2 bytes under both ABIs)
-        // no new alignment byte: 2 is even -- 3622 + 2 = 3624.
+        // no new alignment byte: 2 is even -- 3622 + 2 = 3624. Then Phase 2's
+        // Task 2.1 placed one more:
+        //   +2 nlingo    (LINGO.H:40 -- the count beside `languages`, which
+        //                 stopped being an empty array in the same task)
+        // no new alignment byte: 2 is even, and `nlingo` sits beside `clingo`,
+        // already 2-byte-aligned -- 3624 + 2 = 3626.
         // Before that:
         //   +46 uidxrf   (USRACC.H:39 -- the struct BY VALUE, xrfstg[16] +
         //                 userid[30], non-GCV2)
@@ -1272,7 +1450,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3624);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3626);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
