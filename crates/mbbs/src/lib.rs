@@ -890,6 +890,14 @@ pub struct Host<A: Abi> {
     l2as: A::Ptr,
     l2as_next: usize,
 
+    /// When this host started, in epoch seconds -- what `clock` counts from.
+    ///
+    /// Borland's `clock()` answers ticks since the *program* started, so
+    /// something has to remember when that was. Taken from the same
+    /// [`Clock`] every other time routine reads, so a pinned clock pins this
+    /// too and `clock()` is testable at all.
+    started: u32,
+
     /// `MCVAPI.C:37-51`'s `mxmssz` -- the largest message buffer any module
     /// has asked `inimsg` for.
     ///
@@ -1644,7 +1652,7 @@ impl<A: Abi> Host<A> {
             io::Error::other("_streams is not placed, so no FILE has anywhere to live")
         })?);
 
-        Ok(Self {
+        let mut host = Self {
             exports: Exports::wg101(),
             globals,
             root: root.into(),
@@ -1654,6 +1662,10 @@ impl<A: Abi> Host<A> {
             l2as_next: 0,
             scnmdf: A::ptr_offset(base, spr_bytes as u16 + 64 + 1 + l2as_bytes as u16),
             display: Display::default(),
+            // Zero here, then set from `clock` immediately after the struct
+            // is built -- `Clock::system()` is constructed inline in this
+            // same literal, so there is no `clock` binding to read yet.
+            started: 0,
             msgbuf_size: 0,
             setcnf: Vec::new(),
             setcnf_applied: false,
@@ -1709,7 +1721,13 @@ impl<A: Abi> Host<A> {
             trace: std::env::var_os("MBBS_TRACE").is_some(),
             inited: false,
             survey: None,
-        })
+        };
+
+        // `clock()` counts from here. Set after construction because
+        // `Clock::system()` is built inline in the literal above, so there is
+        // no binding to read while it is being written.
+        host.started = host.clock.epoch().unwrap_or(0);
+        Ok(host)
     }
 
     /// The file a module named, with the directory it is allowed to name
@@ -1924,6 +1942,11 @@ impl<A: Abi> Host<A> {
     /// stay consistent within one call; it is the *next* read that has moved.
     /// A [`Clock::pinned`] or [`Clock::system`] clock does not move, so this is
     /// only a counter for them.
+    /// When this host started, in epoch seconds. See [`Host::started`].
+    pub fn started(&self) -> u32 {
+        self.started
+    }
+
     /// The largest message buffer `inimsg` has been asked for. See
     /// [`Host::msgbuf_size`].
     pub fn msgbuf_size(&self) -> u16 {

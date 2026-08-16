@@ -1015,6 +1015,15 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "tell", crt::tell, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "filelength", crt::filelength, Cleans::Caller, Evidence::Standard),
         (MAJORBBS, "_write", crt::_write, Cleans::Caller, Evidence::Standard),
+        // The time family, and exit. No oracle for any of the four time
+        // routines: the genuine ones trap to DOS/BIOS and fault when called
+        // (tests/oracle_gate.rs records the measurement), so these are
+        // documented Borland semantics rather than measured behaviour.
+        (MAJORBBS, "clock", system::clock, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "getdate", system::getdate, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "getftime", system::getftime, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "dostounix", system::dostounix, Cleans::Caller, Evidence::Standard),
+        (MAJORBBS, "exit", borland::exit, Cleans::Caller, Evidence::Standard),
         // `mfytask` completes the pair `initask` opened: a module could
         // register a task and then fail modifying it.
         (MAJORBBS, "mfytask", task::mfytask, Cleans::Caller, Evidence::Unclassified),

@@ -90,6 +90,36 @@ pub fn abort<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Re
     ))
 }
 
+/// `void exit(int status)` -- Borland's, and the C standard's: flushes,
+/// runs `atexit` handlers, and **terminates the program**.
+///
+/// **Never `Ok`**, for the same reason [`abort`] never is, and the doc
+/// comment there makes the whole argument: a module that called `exit` and
+/// kept running is precisely the failure this design exists to refuse. The
+/// status is read so the refusal can name it, which is what the sysop wants
+/// to know.
+///
+/// # Not `byenow`
+///
+/// [`crate::shims::misc::byenow`] also refuses, and the two are easy to
+/// confuse because both end something. They end different things: `exit`
+/// ends the **process** -- every channel, every module, the board -- while
+/// `byenow` hangs up **one channel** and leaves the board running. A host
+/// that mapped `exit` onto a channel hangup would keep serving a module that
+/// had asked to bring the whole system down.
+///
+/// # Errors
+///
+/// Always.
+pub fn exit<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let status = crate::shims::sign_extend::<A>(call.int().into());
+    Err(ShimError::Failed(format!(
+        "exit({status}): the module called the C runtime's exit(), which ends \
+         the process and never returns -- not byenow(), which hangs up one \
+         channel and leaves the board running"
+    )))
+}
+
 /// `__startup` / `__startupd` -- Borland's own per-module C runtime
 /// initialiser, and (per the trailing `d`) very likely its debug-build
 /// twin, both called from the code Borland's linker generates ahead of a
@@ -596,6 +626,23 @@ mod tests {
         let mut f = Fixture::new();
         let e = f.invoke(abort, &[]).expect_err("abort must stop the module");
         assert!(e.to_string().contains("abort"), "{e}");
+    }
+
+    /// `exit` does not return either, and its refusal names the status and
+    /// says which thing is ending.
+    ///
+    /// The `byenow` half of the message is the part worth asserting: the two
+    /// routines both refuse and both end something, and a reader who confuses
+    /// them will map a process exit onto a channel hangup. The status is
+    /// named because it is the only thing the sysop can act on.
+    #[test]
+    fn exit_does_not_return_and_is_not_a_channel_hangup() {
+        let mut f = Fixture::new();
+        let e = f.invoke(exit, &[3]).expect_err("exit must stop the module");
+        let message = e.to_string();
+        assert!(message.contains("exit(3)"), "{message}");
+        assert!(message.contains("never returns"), "{message}");
+        assert!(message.contains("byenow"), "{message}");
     }
 
     #[test]

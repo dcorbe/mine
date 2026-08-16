@@ -102,6 +102,174 @@ pub fn now<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, S
     Ok(abi::Ret::Int(A::Int::from(t.dos_time())))
 }
 
+/// `CLK_TCK` -- how many `clock()` ticks make a second on DOS.
+///
+/// The 8253's 18.2 Hz, which is `1193180 / 65536`. Borland's `CLK_TCK` is
+/// the integer 18, and the ratio is why a DOS program's timing is only ever
+/// good to about a twentieth of a second.
+const CLK_TCK: u32 = 18;
+
+/// `clock_t clock(void)` -- ticks since this host started.
+///
+/// Borland's answers the BIOS tick counter's value minus the one it recorded
+/// at startup, so it is elapsed time for *this program*, not the time of
+/// day. [`Host::started`] is that recorded value here, taken from the same
+/// [`crate::Clock`] every other time routine reads -- which is also what
+/// makes this testable: under a pinned clock it answers zero, and under a
+/// stepped one it advances.
+///
+/// **No oracle for this one, and that is measured rather than assumed.**
+/// `_CLOCK` is exported by all four builds, takes no arguments, and *faults*
+/// when the rig calls it -- it reads the BIOS tick counter directly, which
+/// this machine does not provide. See
+/// `tests/oracle_gate.rs::the_time_family_traps_to_dos_and_so_cannot_be_oracled`,
+/// which is a tripwire for the day `int 21h` support makes a real oracle
+/// possible.
+///
+/// # Errors
+///
+/// If the host's clock cannot say what time it is.
+pub fn clock<A: Abi>(_: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let started = host.started();
+    let now = host.clock().epoch().map_err(ShimError::Failed)?;
+    let ticks = now.saturating_sub(started).saturating_mul(CLK_TCK);
+    Ok(abi::Ret::Long(ticks))
+}
+
+/// `void getdate(struct date *d)` -- today, in Borland's own struct.
+///
+///
+/// **`da_year` is the full year, not an offset**, and it comes first -- the
+/// two `char`s follow it, day before month. Getting the last pair the wrong
+/// way round is invisible for the first twelve days of any month, which is
+/// exactly the kind of wrong this crate tries not to be.
+///
+/// The `int` is [`Abi::INT_WIDTH`] bytes, so the struct is 4 bytes under
+/// `Wg16` and 6 under `Wg32`; the two `char`s are one byte each in both.
+///
+/// The layout is documented Borland semantics rather than a tracked header:
+/// `INCLUDE/DOS.H` is not in this repository, and the genuine routine cannot
+/// be asked, because it traps to `int 21h` `AH=2Ah` and faults -- see
+/// [`clock`] for the measurement and the tripwire.
+///
+/// # Errors
+///
+/// If the host's clock cannot say, or `d` names memory the module does not
+/// own.
+pub fn getdate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let d = call.ptr();
+    let t = host.clock().civil().map_err(ShimError::Failed)?;
+
+    let mut image = A::int_to_bytes(A::int_from_u32(t.year as u32));
+    image.push(t.day as u8);
+    image.push(t.month as u8);
+    d.write(call.mem(), &image)
+        .map_err(|e| ShimError::Failed(format!("getdate: {e}")))?;
+    Ok(abi::Ret::Void)
+}
+
+/// `int getftime(int handle, struct ftime *ft)` -- when the file behind a
+/// handle was last written.
+///
+///
+/// **Those six bitfields are exactly DOS's two packed words**, in order: the
+/// first three fill a 16-bit time word and the last three a 16-bit date
+/// word, which is what `int 21h` `AH=57h` hands back in `CX` and `DX`. So
+/// this writes [`crate::clock::Civil::dos_time`] then
+/// [`crate::clock::Civil::dos_date`] -- the same two packers `today`, `now`
+/// and `datofc` share -- rather than assembling bitfields by hand.
+///
+/// The modification time comes from the open handle, not from the path,
+/// which is what `AH=57h` does too: it cannot be fooled by a rename between
+/// the open and the ask. [`crate::stream::Streams::modified`] is the same
+/// source `getdtd` already uses.
+///
+/// Answers 0. Borland answers -1 and sets `errno` for a bad handle; here a
+/// handle this host never issued stops the module, matching `close`.
+///
+/// # Errors
+///
+/// If `handle` names no open stream, the time cannot be read, or the year is
+/// one DOS's seven bits cannot hold.
+pub fn getftime<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let handle = crate::shims::sign_extend::<A>(call.int().into());
+    let ft = call.ptr();
+
+    let fd = u8::try_from(handle).map_err(|_| {
+        ShimError::Failed(format!("getftime({handle}, ..): not a descriptor this host issued"))
+    })?;
+    let modified = host
+        .streams
+        .modified(fd)
+        .map_err(|e| ShimError::Failed(format!("getftime({handle}, ..): {e}")))?;
+
+    let offset = host.clock().offset();
+    let civil = crate::clock::Civil::from_local_epoch(i64::from(modified) + i64::from(offset));
+    let date = civil
+        .dos_date()
+        .map_err(|why| ShimError::Failed(format!("getftime({handle}, ..): {why}")))?;
+
+    // Time word first, then date word -- the bitfield order above.
+    let mut image = civil.dos_time().to_le_bytes().to_vec();
+    image.extend_from_slice(&date.to_le_bytes());
+    ft.write(call.mem(), &image)
+        .map_err(|e| ShimError::Failed(format!("getftime: {e}")))?;
+    Ok(abi::Ret::Int(A::Int::from(0u16)))
+}
+
+/// `long dostounix(struct date *d, struct time *t)` -- a DOS date and time,
+/// as seconds since 1970.
+///
+///
+/// **`struct time`'s field order is not chronological**: minutes come first,
+/// then hours, then *hundredths*, then seconds. Reading it as
+/// hour/minute/second/hundredth -- the order anyone would write it in -- swaps
+/// the hour and minute and puts the seconds where the hundredths are, and
+/// still produces a plausible timestamp.
+///
+/// `ti_hund` is discarded: the answer is whole seconds.
+///
+/// The result is a *local* time turned into an epoch, using the same offset
+/// [`crate::Clock::offset`] applies everywhere else, so a timestamp this
+/// answers and one `time()` answers describe the same instant.
+///
+/// # Errors
+///
+/// If either pointer is unreadable, or the date is outside what an epoch
+/// second can express.
+pub fn dostounix<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let d = call.ptr();
+    let t = call.ptr();
+
+    let date = d
+        .resolve(call.mem(), A::INT_WIDTH + 2)
+        .map_err(|e| ShimError::Failed(format!("dostounix: date: {e}")))?
+        .to_vec();
+    let time = t
+        .resolve(call.mem(), 4)
+        .map_err(|e| ShimError::Failed(format!("dostounix: time: {e}")))?
+        .to_vec();
+
+    let year = Into::<u32>::into(A::int_from_bytes(&date[..A::INT_WIDTH])) as i32;
+    let day = u32::from(date[A::INT_WIDTH]);
+    let month = u32::from(date[A::INT_WIDTH + 1]);
+    // ti_min, ti_hour, ti_hund, ti_sec -- in that order.
+    let (minute, hour, second) = (u32::from(time[0]), u32::from(time[1]), u32::from(time[3]));
+
+    let civil = crate::clock::Civil { year, month, day, hour, minute, second };
+    let local = civil
+        .to_local_epoch()
+        .map_err(|why| ShimError::Failed(format!("dostounix: {why}")))?;
+    let epoch = local - i64::from(host.clock().offset());
+    let epoch = u32::try_from(epoch).map_err(|_| {
+        ShimError::Failed(format!(
+            "dostounix: {year}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} is \
+             outside what a time_t can hold"
+        ))
+    })?;
+    Ok(abi::Ret::Long(epoch))
+}
+
 /// `VOID dsairp(VOID)` -- `IRPS.C:14-21` -- mask the CPU interrupt flag.
 ///
 ///
@@ -2490,6 +2658,172 @@ mod tests {
 
     /// MajorMUD 1.11p's build stamp: `Dec 30 2005 14:20:05` UTC.
     const BUILD: u32 = 1_135_952_405;
+
+    /// `clock` counts from when the host started, not from the epoch.
+    ///
+    /// Under a pinned clock nothing elapses, so it answers zero however many
+    /// times it is called -- which is the assertion that separates "ticks
+    /// since we started" from "the time of day in ticks", a difference of
+    /// about a billion that a single call cannot see.
+    #[test]
+    fn clock_counts_ticks_since_the_host_started() {
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(BUILD));
+        // `started` was taken at construction from the wall clock; re-pin so
+        // the two agree, then measure from there.
+        let started = f.host.started();
+
+        let elapsed = |f: &mut Fixture, seconds: u32| -> u32 {
+            f.host.set_clock(crate::Clock::pinned(started + seconds));
+            let Ret::U32(t) = f.invoke(clock, &[]).expect("clock") else {
+                panic!("clock returns a long");
+            };
+            t
+        };
+        assert_eq!(elapsed(&mut f, 0), 0, "no time has passed since we started");
+        assert_eq!(elapsed(&mut f, 1), CLK_TCK, "one second is CLK_TCK ticks");
+        assert_eq!(elapsed(&mut f, 60), 60 * CLK_TCK);
+    }
+
+    /// `getdate` fills `struct date` -- full year first, then day, then
+    /// month.
+    ///
+    /// The day and month are adjacent single bytes, so having them the wrong
+    /// way round is invisible for the first twelve days of any month. The
+    /// pinned instant is 30 December, where 30 and 12 cannot be confused.
+    #[test]
+    fn getdate_fills_the_struct_year_first_then_day_then_month() {
+        let mut f = Fixture::new();
+        f.host.set_clock(crate::Clock::pinned(BUILD));
+        let at = f.buffer(8);
+        f.machine.write(at, &[0xAA; 8]).expect("prefill");
+
+        assert!(matches!(f.invoke(getdate, &Fixture::far(at)), Ok(Ret::Void)));
+
+        // BUILD is 2005-12-30 14:20:05 UTC.
+        let got = f.machine.resolve(at, 5).expect("in bounds").to_vec();
+        assert_eq!(&got[..2], 2005u16.to_le_bytes(), "da_year is the FULL year");
+        assert_eq!(got[2], 30, "da_day comes before da_mon");
+        assert_eq!(got[3], 12, "and da_mon after it");
+        assert_eq!(got[4], 0xAA, "nothing past the struct was written");
+    }
+
+    /// `dostounix` reads `struct time` in its own order -- minute, hour,
+    /// hundredths, second -- and answers the epoch second.
+    ///
+    /// The test time has a different number in every field, so any two
+    /// swapped fields change the answer. Read in the order anyone would
+    /// *write* it (hour, minute, second, hundredths) this would be 45 minutes
+    /// past 13 rather than 13 minutes past 45, which is still a perfectly
+    /// plausible timestamp.
+    #[test]
+    fn dostounix_reads_struct_time_in_its_own_field_order() {
+        let mut f = Fixture::new();
+        // UTC, so no offset arithmetic muddies the comparison.
+        f.host.set_clock(crate::Clock::pinned(0));
+
+        let date = f.buffer(8);
+        let mut image = 2005u16.to_le_bytes().to_vec();
+        image.push(30); // da_day
+        image.push(12); // da_mon
+        f.machine.write(date, &image).expect("date");
+
+        let time = f.buffer(8);
+        // ti_min, ti_hour, ti_hund, ti_sec.
+        f.machine.write(time, &[20, 14, 99, 5]).expect("time");
+
+        let Ret::U32(epoch) = f
+            .invoke(dostounix, &[date.offset, date.selector, time.offset, time.selector])
+            .expect("dostounix")
+        else {
+            panic!("dostounix returns a long");
+        };
+        // 2005-12-30 14:20:05 UTC -- the same instant BUILD names, computed
+        // independently of this host by the constant above.
+        assert_eq!(epoch, BUILD, "hundredths are discarded, seconds are not");
+    }
+
+    /// A `struct date` full of bytes that name no date is refused rather than
+    /// wrapped into one that looks real.
+    #[test]
+    fn dostounix_refuses_a_date_that_is_not_one() {
+        let mut f = Fixture::new();
+        let date = f.buffer(8);
+        let mut image = 2005u16.to_le_bytes().to_vec();
+        image.push(31); // 31 February
+        image.push(2);
+        f.machine.write(date, &image).expect("date");
+        let time = f.buffer(8);
+        f.machine.write(time, &[0, 0, 0, 0]).expect("time");
+
+        let e = f
+            .invoke(dostounix, &[date.offset, date.selector, time.offset, time.selector])
+            .expect_err("February has no 31st");
+        assert!(format!("{e}").contains("31"), "{e}");
+    }
+
+    /// `getftime` writes DOS's two packed words -- time first, then date.
+    #[test]
+    fn getftime_writes_the_packed_time_word_before_the_date_word() {
+        let mut f = Fixture::new();
+        let path = f.text("LINES.TXT");
+        let mode = f.text("rb");
+        let Ret::Far(cookie) = f
+            .invoke(crate::shims::stream::fopen, &[path.offset, path.selector, mode.offset, mode.selector])
+            .expect("fopen")
+        else {
+            panic!("FILE *");
+        };
+        let fd = f.host.streams.fd_of_cookie(cookie).expect("descriptor");
+
+        let at = f.buffer(8);
+        f.machine.write(at, &[0xAA; 8]).expect("prefill");
+        assert!(matches!(
+            f.invoke(getftime, &[u16::from(fd), at.offset, at.selector]),
+            Ok(Ret::U16(0))
+        ));
+
+        let got = f.machine.resolve(at, 5).expect("in bounds").to_vec();
+        let time = u16::from_le_bytes([got[0], got[1]]);
+        let date = u16::from_le_bytes([got[2], got[3]]);
+        assert_eq!(got[4], 0xAA, "four bytes and no more");
+
+        // Against the file's own mtime, read off the filesystem rather than
+        // through this host. Exact values, because a range check cannot tell
+        // the two words apart: a time word read as a date and a date word
+        // read as a time both land inside any plausible range, which is how
+        // an earlier version of this test passed with the halves swapped.
+        let mtime = std::fs::metadata(crate::testing::data().join("LINES.TXT"))
+            .expect("the fixture")
+            .modified()
+            .expect("an mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs();
+        let offset = i64::from(f.host.clock().offset());
+        let expected = crate::clock::Civil::from_local_epoch(mtime as i64 + offset);
+
+        assert_eq!(time, expected.dos_time(), "the FIRST word is the time");
+        assert_eq!(
+            date,
+            expected.dos_date().expect("a DOS year"),
+            "and the SECOND is the date -- swapping them is the bug this catches"
+        );
+    }
+
+    /// `_8087` is placed, two bytes, and reads zero.
+    #[test]
+    fn the_8087_flag_is_placed_and_says_there_is_no_coprocessor() {
+        let f = Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(g.size("_8087").expect("_8087 is placed"), 2);
+        assert_eq!(
+            g.word(&f.machine, "_8087").expect("readable"),
+            0,
+            "no coprocessor -- and the emulator fixups are not applied either, \
+             so a module computing a float faults whatever this says"
+        );
+    }
 
     /// `dsairp`/`enairp` are the vendor's own empty bodies.
     ///

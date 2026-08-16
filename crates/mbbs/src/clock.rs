@@ -257,6 +257,73 @@ impl Civil {
 /// needed; `146097` is the days in a 400-year era and `36524` the days in a
 /// century, which is where the "divisible by 100 but not 400" rule comes from
 /// without being written down anywhere.
+impl Civil {
+    /// The inverse of [`Civil::from_local_epoch`]: this civil date and time
+    /// as a *local* epoch second.
+    ///
+    /// The caller adds or subtracts [`Clock::offset`] as it needs; this does
+    /// no zone arithmetic of its own, exactly as `from_local_epoch` does
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// If the fields do not name a real instant -- month outside 1..=12, day
+    /// outside the month, or an hour, minute or second out of range. A DOS
+    /// `struct date`/`struct time` pair is four bytes of whatever the module
+    /// put there, so this is reachable input rather than a formality.
+    pub fn to_local_epoch(&self) -> Result<i64, String> {
+        if !(1..=12).contains(&self.month) {
+            return Err(format!("{} is not a month", self.month));
+        }
+        if self.hour > 23 || self.minute > 59 || self.second > 59 {
+            return Err(format!(
+                "{:02}:{:02}:{:02} is not a time of day",
+                self.hour, self.minute, self.second
+            ));
+        }
+        let days = days_from_civil(self.year, self.month, self.day)?;
+        Ok(days * 86_400
+            + i64::from(self.hour) * 3600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second))
+    }
+}
+
+/// Days since 1970-01-01 for a civil date -- Howard Hinnant's `days_from_civil`,
+/// the exact inverse of [`civil_from_days`] below.
+///
+/// # Errors
+///
+/// If `day` is not a day of that month, which is what makes a `struct date`
+/// full of arbitrary bytes a refusal rather than a date some months from
+/// where the module meant.
+fn days_from_civil(year: i32, month: u32, day: u32) -> Result<i64, String> {
+    let last = last_day_of_month(year, month);
+    if day < 1 || day > last {
+        return Err(format!(
+            "{day} is not a day of month {month} in {year}, which has {last}"
+        ));
+    }
+    let y = i64::from(if month <= 2 { year - 1 } else { year });
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // 0..=399
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok(era * 146_097 + doe - 719_468)
+}
+
+/// How many days month `month` of `year` has.
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);

@@ -348,6 +348,20 @@ pub const GLOBALS: &[Global] = &[
     // cell has to be here; `shochl` refuses rather than writing through the
     // null.
     g("uidarr", PTR),
+    // Borland's coprocessor-present flag, ordinal 737 (`__8087` in the
+    // export table, segment 209 -- a data segment, which is what says it is
+    // a datum rather than a routine).
+    //
+    // **Zero, meaning no coprocessor, and that is the honest answer rather
+    // than a conservative one.** `crates/mbbs-machine/src/m16/ne.rs:305-325`
+    // records that the NE loader carries but does not apply the
+    // floating-point emulator fixups (`FIERQQ`/`FIDRQQ`/`FIWRQQ`, 50 sites in
+    // MAJORBBS-mbbstd.EXE), so a module that actually computes a float faults
+    // on the emulator interrupt whatever this flag says; `crate::fmt`'s walk
+    // refuses %f/%e/%g for the same underlying reason. Setting this to 1
+    // would not make floating point work -- it would only change which of the
+    // two unimplemented paths a module takes to fail.
+    g("_8087", 2),
     // Borland's array of FILE structs. A module reaches stdin/stdout/stderr
     // as &_streams[0..3], and may compare a FILE * against &_streams[n] or
     // walk the array -- which is why the streams this host opens live IN it
@@ -1553,7 +1567,9 @@ mod tests {
         // first `Width::Files` global and the largest single datum in the
         // table -- and it has to be a real region rather than a pointer,
         // because the streams this host opens live inside it.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 4028);
+        //
+        // Task 4.5 then added `_8087`, two bytes: 4028 + 2 = 4030.
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 4030);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
