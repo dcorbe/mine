@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::io;
 
-use dos_poc::bios::{Keyboard, Video, int10, int16};
+use dos_poc::bios::{Keyboard, Video, int10, int10_implemented, int16, int16_implemented, missing};
 use dos_poc::dos::{DosState, Outcome, dispatch, is_implemented};
 use dos_poc::guest::{DosGuest, DosPtr};
 use dos_poc::kvm::{Stop, VmGuest};
@@ -46,6 +46,7 @@ fn main() -> io::Result<()> {
     let mut root_dir = String::from("tmp/lordroot");
     let mut script_path: Option<String> = None;
     let mut trace = false;
+    let mut strict = false;
     let mut interactive = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -54,6 +55,7 @@ fn main() -> io::Result<()> {
             "--root" => root_dir = it.next().cloned().unwrap_or(root_dir),
             "--script" => script_path = it.next().cloned(),
             "--trace" => trace = true,
+            "--strict" => strict = true,
             "--interactive" | "-i" => interactive = true,
             other => {
                 if !tail.is_empty() {
@@ -81,7 +83,19 @@ fn main() -> io::Result<()> {
     let mut vm = VmGuest::new(MEM)?;
     vm.hook_all(STUB_SEG)?;
 
-    let env = mz::environment(&["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"], "C:\\LORDCFG.EXE");
+    // The program's own path, which a DOS program reads back as ParamStr(0)
+    // and routinely uses to find its home directory. Hardcoding a name here
+    // silently misdirects that: LORD strips its own filename off the end, so a
+    // stale "C:\LORDCFG.EXE" had it hunting for C:\LOR\NODE0.DAT.
+    let program = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("PROGRAM.EXE")
+        .to_ascii_uppercase();
+    let env = mz::environment(
+        &["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"],
+        &format!("C:\\{program}"),
+    );
     vm.load(ENV_SEG as usize * 16, &env)?;
 
     let at = mz::load(&mut vm, &img, PSP_SEG, ENV_SEG, tail.as_bytes())?;
@@ -123,10 +137,13 @@ fn main() -> io::Result<()> {
     video.install_bda(&mut vm);
     let mut order: Vec<u8> = Vec::new();
     let mut seen: BTreeMap<u8, u32> = BTreeMap::new();
-    let mut missing: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut missing_dos: BTreeMap<u8, u32> = BTreeMap::new();
     let mut bios: BTreeMap<(u8, u8), u32> = BTreeMap::new();
     let mut vectors: Vec<String> = Vec::new();
     let mut settles = 0u32;
+    // Calls a real machine services and we do not, named at the moment they
+    // happen rather than inferred later from a screen that looks wrong.
+    let mut gaps: BTreeMap<String, u32> = BTreeMap::new();
     let mut calls = 0u32;
 
     let ending = loop {
@@ -135,13 +152,31 @@ fn main() -> io::Result<()> {
         }
         match vm.run()? {
             Stop::Trap(0x10) => {
-                *bios.entry((0x10, vm.regs().ah())).or_insert(0) += 1;
+                let ah = vm.regs().ah();
+                *bios.entry((0x10, ah)).or_insert(0) += 1;
                 calls += 1;
+                if !int10_implemented(ah)
+                    && let Some(what) = missing(0x10, ah)
+                {
+                    *gaps.entry(format!("int 10h AH={ah:02X}  {what}")).or_insert(0) += 1;
+                    if strict {
+                        break format!("unimplemented: int 10h AH={ah:02X} ({what})");
+                    }
+                }
                 int10(&mut vm, &mut video);
             }
             Stop::Trap(0x16) => {
-                *bios.entry((0x16, vm.regs().ah())).or_insert(0) += 1;
+                let ah = vm.regs().ah();
+                *bios.entry((0x16, ah)).or_insert(0) += 1;
                 calls += 1;
+                if !int16_implemented(ah)
+                    && let Some(what) = missing(0x16, ah)
+                {
+                    *gaps.entry(format!("int 16h AH={ah:02X}  {what}")).or_insert(0) += 1;
+                    if strict {
+                        break format!("unimplemented: int 16h AH={ah:02X} ({what})");
+                    }
+                }
                 if !int16(&mut vm, &mut keyboard) {
                     // The guest has drained its input and finished painting.
                     // This is the settle point: hand the screen to the driver.
@@ -178,8 +213,15 @@ fn main() -> io::Result<()> {
             Stop::Trap(vector) if vector != 0x21 => {
                 // Not DOS. Record it and let the stub's `iret` return, which
                 // is wrong but keeps the program moving so the next gap shows.
-                *bios.entry((vector, vm.regs().ah())).or_insert(0) += 1;
+                let ah = vm.regs().ah();
+                *bios.entry((vector, ah)).or_insert(0) += 1;
                 calls += 1;
+                if let Some(what) = missing(vector, ah) {
+                    *gaps.entry(format!("int {vector:02X}h AH={ah:02X}  {what}")).or_insert(0) += 1;
+                    if strict {
+                        break format!("unimplemented: int {vector:02X}h AH={ah:02X} ({what})");
+                    }
+                }
             }
             Stop::Trap(_) => {
                 let ah = vm.regs().ah();
@@ -191,7 +233,10 @@ fn main() -> io::Result<()> {
                 calls += 1;
                 *seen.entry(ah).or_insert(0) += 1;
                 if !is_implemented(ah) {
-                    *missing.entry(ah).or_insert(0) += 1;
+                    *missing_dos.entry(ah).or_insert(0) += 1;
+                    if strict {
+                        break format!("unimplemented: int 21h AH={ah:02X}");
+                    }
                 }
                 if order.len() < 40 {
                     order.push(ah);
@@ -320,9 +365,16 @@ fn main() -> io::Result<()> {
         };
         println!("  {ah:02X}  {n:6}  {status}");
     }
-    if !missing.is_empty() {
-        let list: Vec<String> = missing.keys().map(|a| format!("{a:02X}")).collect();
+    if !missing_dos.is_empty() {
+        let list: Vec<String> = missing_dos.keys().map(|a| format!("{a:02X}")).collect();
         println!("\nstill to implement: {}", list.join(" "));
+    }
+
+    if !gaps.is_empty() {
+        println!("\n*** CALLS A REAL MACHINE SERVICES AND WE DO NOT ***");
+        for (what, n) in &gaps {
+            println!("  {what}   x{n}");
+        }
     }
 
     if !bios.is_empty() {

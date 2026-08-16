@@ -503,3 +503,55 @@ pub fn int10<G: DosGuest>(g: &mut G, video: &mut Video) {
         _ => {}
     }
 }
+
+/// Which `int 10h` functions [`int10`] actually services.
+pub fn int10_implemented(ah: u8) -> bool {
+    matches!(
+        ah,
+        0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0a | 0x0e | 0x0f | 0x11 | 0x12
+    )
+}
+
+/// Which `int 16h` functions [`int16`] actually services.
+pub fn int16_implemented(ah: u8) -> bool {
+    matches!(ah, 0x00 | 0x01 | 0x10 | 0x11)
+}
+
+/// Name a BIOS call that a real machine implements and we do not.
+///
+/// The distinction this draws is the whole point. A real BIOS asked for a
+/// function it does not have simply returns, so mirroring that for an *unknown*
+/// function is correct. Doing the same for a function that genuinely exists is
+/// not: the program called something real, got silence, and carries on with
+/// whatever was already in its registers. That is how a missing `int 10h AH=06`
+/// presented as a screen that painted over itself rather than as an error.
+///
+/// `None` means "no real machine implements this either", and returning is the
+/// faithful answer.
+pub fn missing(vector: u8, ah: u8) -> Option<&'static str> {
+    let name = match (vector, ah) {
+        (0x10, 0x04) => "read light pen",
+        (0x10, 0x05) => "select active display page",
+        (0x10, 0x0b) => "set palette / background",
+        (0x10, 0x0c) => "write graphics pixel",
+        (0x10, 0x0d) => "read graphics pixel",
+        (0x10, 0x13) => "write string",
+        (0x10, 0x1a) => "get display combination code",
+        (0x10, 0x1b) => "get functionality info",
+        (0x11, _) => "get equipment list",
+        (0x12, _) => "get conventional memory size",
+        (0x13, _) => "disk services",
+        (0x14, _) => "serial port services",
+        (0x16, 0x02) => "get keyboard shift status",
+        (0x16, 0x05) => "push a keystroke",
+        (0x16, 0x12) => "get extended shift status",
+        (0x17, _) => "printer services",
+        (0x1a, 0x00) => "get system tick count",
+        (0x1a, 0x02) => "get real-time clock time",
+        (0x1a, 0x04) => "get real-time clock date",
+        (0x2f, _) => "multiplex (SHARE, network, TSR probes)",
+        (0x33, _) => "mouse services",
+        _ => return None,
+    };
+    Some(name)
+}
