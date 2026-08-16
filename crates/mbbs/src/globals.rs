@@ -446,8 +446,8 @@ const BTURNO: u16 = 9;
 /// Named rather than written into `default_lingo` as literals because
 /// `cncyesno` reads `yes` and `no` back out of module memory at these
 /// offsets, and one table both writers use is the only way the two agree.
-const LINGO_YES: u16 = 123;
-const LINGO_NO: u16 = 136;
+pub(crate) const LINGO_YES: u16 = 123;
+pub(crate) const LINGO_NO: u16 = 136;
 
 /// Bytes in `struct lingo`: `16+51+5+5+5+41+13+13`.
 const LINGO: u16 = LINGO_NO + 13;

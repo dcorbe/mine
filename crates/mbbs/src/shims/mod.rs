@@ -348,6 +348,36 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "cncall", cnc::cncall, Cleans::Caller, Evidence::Unclassified),
+        // The rest of `CNCUTL.C`'s family, Phase 2 Task 2.2. Six the corpus
+        // imports, and three -- `cnclon`, `cncsig`, `isuidc` -- that it does
+        // not: they are called by the six, and a symbol is implemented here
+        // because it exists in the API, not because something asked.
+        //
+        // `Cleans::Caller` throughout, and not by copying the neighbours:
+        // every one is a plain cdecl C routine in Galacticomm's own source
+        // with no `pascal` qualifier, and eight of the nine take no arguments
+        // at all, so there is nothing on the frame for either party to pop.
+        (MAJORBBS, "cncint", cnc::cncint, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cnclon", cnc::cnclon, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cncuid", cnc::cncuid, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cncsig", cnc::cncsig, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cncyesno", cnc::cncyesno, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cncwrd", cnc::cncwrd, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "cncnum", cnc::cncnum, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        (MAJORBBS, "morcnc", cnc::morcnc, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/CNCUTL.C")),
+        // `isuidc` is GCOMM.LIB's, not the server's -- its own file, and the
+        // `SRC/` generation rather than the `VCPROJ/` one the manifest also
+        // carries a row for.
+        (MAJORBBS, "isuidc", cnc::isuidc, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/ISUIDC.C")),
         (MAJORBBS, "onsys", cnc::onsys, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "strupr", cnc::strupr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "injoth", cnc::injoth, Cleans::Caller, Evidence::Unclassified),

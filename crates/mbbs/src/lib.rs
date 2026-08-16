@@ -1213,6 +1213,31 @@ pub struct Host<A: Abi> {
     /// candidate answer, never longer than `ANSLEN`.
     pub(crate) fsd_scratch: Option<A::Ptr>,
 
+    /// The `static` return buffers `CNCUTL.C`'s pointer-returning routines
+    /// hand back, in one region. `None` until the first of them is called.
+    ///
+    /// `cncuid`, `cncsig`, `cncwrd` and `cncnum` each `return` the address of
+    /// a function-scope `static` array (`CNCUTL.C:80`, `:96`, `:136`,
+    /// `:215`). That storage outlives the call and is overwritten by the next
+    /// call to *the same* routine -- a module holding two `cncwrd()` results
+    /// at once sees the second one twice. This host reproduces that rather
+    /// than improving on it, because a module written against the original
+    /// may copy the result before the next call precisely *because* it had
+    /// to, and one that does not was already relying on the aliasing.
+    ///
+    /// One allocation, four disjoint sub-buffers -- see `shims::cnc`'s own
+    /// `CNCUID_AT`/`CNCSIG_AT`/`CNCWRD_AT`/`CNCNUM_AT`. Disjoint because the
+    /// vendor's four statics are four distinct objects: `cncuid` calling
+    /// `cncsig` must not have its own answer overwritten by the answer it is
+    /// about to return instead, and `cncwrd` must not clobber a `cncuid`
+    /// result the caller still holds.
+    ///
+    /// Not per-channel, for the reason [`Host::fsd_scratch`] gives at
+    /// length: only one channel's command line is ever being parsed at a
+    /// time, this host being single-threaded by force, and the vendor's own
+    /// storage is a plain `static` rather than anything per-channel either.
+    pub(crate) cnc_statics: Option<A::Ptr>,
+
     /// The module's heap and its tiled regions.
     pub(crate) heap: Heap<A>,
 
@@ -1537,6 +1562,7 @@ impl<A: Abi> Host<A> {
             fsd_ain: vec![fsd::ain::Ainscb::default(); usize::from(terms.count())],
             fsd_ascii: std::collections::HashMap::new(),
             fsd_scratch: None,
+            cnc_statics: None,
             heap,
             users,
             asked: Vec::new(),
