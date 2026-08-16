@@ -83,6 +83,23 @@ pub fn is_uid_char(c: u8) -> bool {
         || (0xe0..=0xef).contains(&c)
 }
 
+/// Whether a character may appear in a text-variable name --
+/// `SRC/api/gcommlib/ISTXVC.C:19-30`'s whole body, as a byte test.
+///
+///
+/// [`is_uid_char`]'s sibling, written by the same author on the same day, with
+/// the same two CP437 ranges and a **different** punctuation set: `_` and `?`
+/// here, against `. space , - _ '` there. Only `_` is in both. The difference
+/// is the point -- `crate::shims::user::keynam` validates key names with this
+/// one, so a key may be called `WHO?` and may not contain a space, while a
+/// user-ID may contain a space and not a `?`.
+pub fn is_text_var_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, b'_' | b'?')
+        || (0x80..=0xa5).contains(&c)
+        || (0xe0..=0xef).contains(&c)
+}
+
 /// `int toupper(int c)`, for the byte the host actually indexes with.
 ///
 /// Ordinal 604, `seg 1:0x54a9`. The original tests **bit 3 of the ctype table**

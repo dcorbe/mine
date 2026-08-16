@@ -649,6 +649,28 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "nliniu", user::nliniu, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/ACCOUNT.C")),
         (MAJORBBS, "othkey", user::othkey, Cleans::Caller, Evidence::Unclassified),
+        // `LOCKNKEY.C`'s remainder, Phase 2 Task 2.5. `gen_haskey` is the
+        // general form `haskey`/`othkey` have been calling all along --
+        // registering it exposes an entry point rather than adding a second
+        // evaluator. `istxvc` is transitive: `keynam` validates with it, no
+        // corpus module imports it, and `GCOMM.H:339` declares it.
+        //
+        // `nkyrec` and `uidkey` refuse. Both are reads or writes of Btrieve
+        // files this host does not keep -- see their doc comments; `uidkey`
+        // still answers the empty lock, which the vendor resolves before
+        // touching a disk.
+        (MAJORBBS, "gen_haskey", user::gen_haskey_shim, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "uhskey", user::uhskey, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "uidkey", user::uidkey, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "nkyrec", user::nkyrec, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "keynam", user::keynam, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/LOCKNKEY.C")),
+        (MAJORBBS, "istxvc", user::istxvc, Cleans::Caller,
+         Evidence::VendorBody("SRC/api/gcommlib/ISTXVC.C")),
         // The default `stsrou` a module gets if it registers none of its
         // own. See `user::dfsthn`'s own doc comment for why its one real
         // branch is unreachable on this host, measured rather than assumed.

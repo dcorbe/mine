@@ -509,6 +509,317 @@ pub(crate) fn onsysn_for<A: Abi>(
     })
 }
 
+/// `INT gen_haskey(const CHAR *lock, INT unum, struct user *uptr)` --
+/// `LOCKNKEY.H:165` (recovered with `re/wgproto.py`; the declaration is
+/// Galacticomm's K&R multi-line style, so a single-line grep does not find
+/// it). `LOCKNKEY.C:216-231`:
+///
+///
+/// **Fully implemented, by exposing what this host already had.** This is the
+/// general form of [`haskey`], and [`crate::KeySet::evaluate`] is already that
+/// general form -- the `&`/`|` fold, `low_haskey`'s empty-lock and
+/// master-key branches, all of it. `haskey` and [`othkey`] have been calling
+/// it since the key subsystem landed; the only thing missing was the entry
+/// point that lets a module name the user itself.
+///
+/// So this **wraps** rather than generalises or stands separate. Writing a
+/// second expression evaluator beside `KeySet::evaluate` would leave two
+/// answers to one question, and the day they disagreed the module would
+/// believe whichever it happened to call.
+///
+/// **`uptr` must agree with `unum`, and is checked rather than ignored.** The
+/// vendor reads the keys out of `uptr` and uses `unum` only for the
+/// pseudo-key scan, so a caller passing a mismatched pair gets the *pointer's*
+/// keys there. This host holds keys per channel, indexed by number, and has
+/// nowhere to put a pointer that disagrees -- so rather than silently
+/// answering for `unum` and hoping, a mismatch is refused. Every real call
+/// site passes `(usrnum, usrptr)` or `(othusn, othusp)`, which agree by
+/// construction.
+///
+/// **The lock string is not written to.** The vendor NUL-terminates each term
+/// in place and restores the byte afterwards, which is why its `const` is a
+/// lie. Reading the string once and splitting a copy is observationally the
+/// same for any caller that is not watching its own buffer mid-call, and it
+/// keeps a `const CHAR *` argument genuinely const.
+///
+/// # Errors
+///
+/// If `lock` is not a valid pointer, if `unum` names no channel of this host,
+/// or if `uptr` does not address that channel's own `struct user` slot.
+pub fn gen_haskey_shim<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let lock = call.ptr();
+    let unum = Into::<u32>::into(call.int()) as i16;
+    let uptr = call.ptr();
+
+    let lock = lock
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let lock = String::from_utf8_lossy(&lock).into_owned();
+
+    let chan = host
+        .users()
+        .terms()
+        .chan(unum)
+        .ok_or_else(|| ShimError::Failed(format!("gen_haskey: unum {unum} names no channel")))?;
+
+    // `uptr` is `usroff(unum)` at every real call site. A pair that disagrees
+    // would have been answered from the pointer by the vendor, and this host
+    // has no way to do that -- keys live per channel number.
+    let slot = host.users().slot(chan);
+    if uptr != slot {
+        return Err(ShimError::Failed(format!(
+            "gen_haskey: uptr does not address channel {unum}'s own user slot -- \
+             this host holds keys per channel number and cannot answer for a \
+             `struct user` that is not one of its own"
+        )));
+    }
+
+    let answer = match host.users().keys(chan) {
+        Some(keys) => keys.evaluate(&lock),
+        None => host.class_mem(call.mem(), chan)? == BBSPRV,
+    };
+    host.asked_for_key(unum, &lock, answer);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+}
+
+/// `INT uhskey(const CHAR *uid, const CHAR *lock)` -- `LOCKNKEY.H:197`.
+/// `LOCKNKEY.C:317-322`:
+///
+///
+/// **Fully implemented as the branch it is**, and its two arms are not equally
+/// answerable here. Online, it is [`othkey`] -- and `onsysn`'s own scan is
+/// what leaves `othusn` pointing at the channel it found, which is exactly
+/// how the vendor's composition works. Offline, it is [`uidkey`], which this
+/// host can only answer for an empty lock; see that routine for why.
+///
+/// So in practice this refuses for any real lock name today, because
+/// [`onsysn_for`] answers false for every channel while `usrcls` stays at
+/// zero. That is the honest consequence of a gap this host already carries
+/// rather than a second gap of this routine's own, and the day a signup flow
+/// advances `usrcls` this routine starts answering from the online arm with
+/// no change here.
+///
+/// # Errors
+///
+/// If either string is not a valid pointer, or whatever [`uidkey`] reports on
+/// the offline arm.
+pub fn uhskey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uid = call.ptr();
+    let lock = call.ptr();
+
+    let uid_bytes = uid
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    if onsysn_for(call, host, &uid_bytes, true)? {
+        // `othusn` now names the channel `onsysn`'s scan stopped on, which is
+        // what the vendor's `othkey(lock)` reads. Answered here rather than by
+        // re-entering the `othkey` shim, whose own `Call` frame would be this
+        // one's and holds two arguments rather than the one it expects.
+        return othkey_for(call, host, lock);
+    }
+    uidkey_for(call, host, uid, lock)
+}
+
+/// [`othkey`]'s body, against a lock pointer the caller already has.
+fn othkey_for<A: Abi>(
+    call: &mut Call<A>,
+    host: &mut Host<A>,
+    lock: A::Ptr,
+) -> Result<abi::Ret<A>, ShimError> {
+    let lock = lock
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let lock = String::from_utf8_lossy(&lock).into_owned();
+
+    let othusn = host
+        .globals()
+        .word_mem(call.mem(), "othusn")
+        .map_err(|e| ShimError::Failed(format!("othkey: othusn: {e}")))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(othusn)
+        .ok_or_else(|| ShimError::Failed(format!("othkey: othusn {othusn} names no channel")))?;
+
+    let answer = match host.users().keys(chan) {
+        Some(keys) => keys.evaluate(&lock),
+        None => host.class_mem(call.mem(), chan)? == BBSPRV,
+    };
+    host.asked_for_key(othusn, &lock, answer);
+    Ok(abi::Ret::Int(A::Int::from(u16::from(answer))))
+}
+
+/// `INT uidkey(const CHAR *uid, const CHAR *lock)` -- `LOCKNKEY.H:210`
+/// (recovered with `re/wgproto.py`; a plain header grep for `uidkey` finds
+/// only a *comment*, which is why the plan names that tool as the authority).
+/// `LOCKNKEY.C:339-371`:
+///
+///
+/// **The empty lock is answered; anything else refuses.**
+///
+/// `lock[0] == '\0'` returns 1 before the routine touches a disk, so that
+/// branch is reproduced exactly -- an empty lock is no lock and everybody
+/// passes it, the same rule [`crate::KeySet`]'s own `holds` already carries.
+///
+/// Past that, the whole body is a database this host does not have. It opens
+/// the **accounts** file (`accbb`) to find an account that is not online, then
+/// reads that account's key list out of the **keys** file through `getlst`,
+/// then falls back to a `&`-prefixed keyring record named after the account's
+/// class. This host keeps keys as a per-channel `crate::KeySet` built at
+/// connect and has no account database, no keys file, and no keyring records
+/// -- so for an offline user there is nothing to consult and no honest answer
+/// to give. Answering `0` would be the plausible zero this crate refuses
+/// everywhere: it reads as "that user does not hold the key" when the truth
+/// is "this host cannot tell".
+///
+/// # Errors
+///
+/// Always, for a non-empty lock, naming the two Btrieve files that would have
+/// to exist.
+pub fn uidkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uid = call.ptr();
+    let lock = call.ptr();
+    uidkey_for(call, host, uid, lock)
+}
+
+/// [`uidkey`]'s body, against pointers the caller already has -- [`uhskey`]'s
+/// offline arm is the second caller.
+fn uidkey_for<A: Abi>(
+    call: &mut Call<A>,
+    _host: &mut Host<A>,
+    uid: A::Ptr,
+    lock: A::Ptr,
+) -> Result<abi::Ret<A>, ShimError> {
+    let lock_bytes = lock
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    if lock_bytes.is_empty() {
+        // `LOCKNKEY.C:345`, before any disk access: an empty lock is no lock.
+        return Ok(abi::Ret::Int(A::Int::from(1u16)));
+    }
+
+    let uid_bytes = uid
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let uid = String::from_utf8_lossy(&uid_bytes).into_owned();
+    let lock = String::from_utf8_lossy(&lock_bytes).into_owned();
+
+    Err(ShimError::Failed(format!(
+        "uidkey({uid:?}, {lock:?}): this host has no offline account or key \
+         database to look a user up in -- keys live only as a per-channel set \
+         built at connect, so there is no `accbb` account record, no `keysbb` \
+         key list and no class keyring to consult for a user who is not online; \
+         see this routine's own doc comment"
+    )))
+}
+
+/// `VOID nkyrec(const CHAR *uid)` -- `LOCKNKEY.H:149`. `LOCKNKEY.C:117-132`:
+///
+///
+/// **Refuses.** Every line of the body is a write to the keys Btrieve file,
+/// and this host has no such file: keys are a per-channel
+/// [`crate::KeySet`] built at connect and thrown away at disconnect, with
+/// nothing persistent behind them.
+///
+/// This is a `VOID` routine, which makes the refusal load-bearing rather than
+/// cosmetic. A `VOID` that returns quietly promises the caller nothing at call
+/// time -- which is exactly why returning quietly here would be wrong: the
+/// caller's next act is to grant keys into the record it believes was just
+/// created, and every one of those grants would land nowhere. Stopping the
+/// module at the creation is the only point where the failure is still
+/// attributable.
+///
+/// # Errors
+///
+/// Always, naming the keys file that would have to exist.
+pub fn nkyrec<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let uid = call.ptr();
+    let uid = uid
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    let uid = String::from_utf8_lossy(&uid).into_owned();
+
+    Err(ShimError::Failed(format!(
+        "nkyrec({uid:?}): this host keeps no key records to create one in -- \
+         keys are a per-channel set built at connect, and there is no `keysbb` \
+         Btrieve file behind them for a `struct keyrec` to be written to; \
+         see this routine's own doc comment"
+    )))
+}
+
+/// `INT keynam(const CHAR *keyname)` -- `LOCKNKEY.H:250`. `LOCKNKEY.C:594`
+/// is one line into `valkorl` (`:607-636`), which is `static` and so is
+/// reproduced here rather than registered:
+///
+///
+/// **Fully implemented.** A key name is 3 to `KEYSIZ-1` = 15 characters of
+/// [`crate::strings::is_text_var_char`], plus `#` and `=` which the switch
+/// lets through explicitly.
+///
+/// **`&` and `|` are rejected**, because `islock` is 0 here. That is the whole
+/// difference between `keynam` and its sibling `loknam`: a *lock* may be an
+/// expression joining several keys, and a *key* may not, which is why
+/// [`gen_haskey`](gen_haskey_shim) has an expression grammar to parse at all.
+///
+/// The length floor is 3 and applies unconditionally for a key -- `!islock`
+/// makes the `(... || len > 0)` guard true, so even the empty string is
+/// rejected, unlike a lock name where empty is allowed.
+///
+/// # Errors
+///
+/// If `keyname` is not a valid pointer, or the read runs off the segment.
+pub fn keynam<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    /// `KEYSIZ`, `LOCKNKEY.H:86` -- "max size of key name (and class name
+    /// also)". The name itself is bounded by `KEYSIZ-1`.
+    const KEYSIZ: usize = 16;
+
+    let keyname = call.ptr();
+    let name = keyname
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+
+    let valid = name.len() >= 3
+        && name.len() <= KEYSIZ - 1
+        && name.iter().all(|&c| match c {
+            // The switch's own two explicit passes.
+            b'#' | b'=' => true,
+            // `islock` is 0 for a key, so an expression operator is not a
+            // legal character in one.
+            b'&' | b'|' => false,
+            _ => crate::strings::is_text_var_char(c),
+        });
+
+    Ok(abi::Ret::Int(A::Int::from(u16::from(valid))))
+}
+
+/// `GBOOL istxvc(INT c)` -- `SRC/api/gcommlib/ISTXVC.C:19-30`, quoted in full
+/// on [`crate::strings::is_text_var_char`].
+///
+/// **Fully implemented**, and one no corpus module imports -- [`keynam`]
+/// calls it, `GCOMM.H:339` declares it and every oracle build exports it, so
+/// it is implemented on the same terms as `isuplo` and `cnclon`.
+///
+/// `GBOOL` is a `short` (`GCTYPDEF.H:105`), not an `INT`; see
+/// `crate::shims::cnc::isuidc` for why answering as [`abi::Ret::Int`] is
+/// still right.
+///
+/// # Errors
+///
+/// Never. The signature is fallible because every shim's is.
+pub fn istxvc<A: Abi>(call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let c: u32 = call.int().into();
+    let valid = u32::from(u8::try_from(c).is_ok_and(crate::strings::is_text_var_char));
+    Ok(abi::Ret::Int(A::int_from_u32(valid)))
+}
+
 /// `INT nliniu(VOID)` -- how many of this host's channels are in use?
 /// `ACCOUNT.C:1086-1097`:
 ///
@@ -574,30 +885,7 @@ pub fn nliniu<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// directly.
 pub fn othkey<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let lock = call.ptr();
-    let lock = lock
-        .read_cstr(call.mem())
-        .map_err(|e| ShimError::Failed(e.to_string()))?
-        .to_vec();
-    let lock = String::from_utf8_lossy(&lock);
-
-    let othusn = host
-        .globals()
-        .word_mem(call.mem(), "othusn")
-        .map_err(|e| ShimError::Failed(format!("othkey: othusn: {e}")))? as i16;
-    let chan = host
-        .users()
-        .terms()
-        .chan(othusn)
-        .ok_or_else(|| ShimError::Failed(format!("othkey: othusn {othusn} names no channel")))?;
-
-    let answer = match host.users().keys(chan) {
-        Some(keys) => keys.evaluate(&lock),
-        // `low_haskey`'s `keys == NULL` case, same as `haskey`'s own: a
-        // channel that exists but never logged on is answered by class.
-        None => host.class_mem(call.mem(), chan)? == BBSPRV,
-    };
-    host.asked_for_key(othusn, &lock, answer);
-    Ok(abi::Ret::Int(A::Int::from(answer as u16)))
+    othkey_for(call, host, lock)
 }
 
 /// The null pointer, in this ABI's own representation.
@@ -2142,6 +2430,209 @@ mod tests {
     }
 
     #[test]
+    /// `gen_haskey` answers for the channel `unum` names, and really does
+    /// evaluate the `&`/`|` grammar -- it is the same evaluator `haskey` has
+    /// been using all along, which is the point of exposing it rather than
+    /// writing a second one.
+    ///
+    /// Both a user who holds the key and one who does not, on both channels:
+    /// a predicate tested only on the true case passes when it always returns
+    /// true.
+    #[test]
+    fn gen_haskey_answers_for_the_channel_it_is_given() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let chan0 = f.host.users().terms().chan(0).expect("channel 0");
+        let chan1 = f.host.users().terms().chan(1).expect("channel 1");
+        f.host
+            .connect_state(&mut f.machine, chan0, &crate::Connection::ansi("rangerdan").with_keys(["USER"]))
+            .expect("channel 0 connects");
+        f.host
+            .connect_state(&mut f.machine, chan1, &crate::Connection::ansi("kaimon").with_keys(["WCCSYSOP"]))
+            .expect("channel 1 connects");
+
+        let ask = |f: &mut Fixture, lock: &str, unum: i16| -> u16 {
+            let lock = f.text(lock);
+            let chan = f.host.users().terms().chan(unum).expect("a channel");
+            let slot = f.host.users().slot(chan);
+            let args = [lock.offset, lock.selector, unum as u16, slot.offset, slot.selector];
+            let Ret::U16(n) = f.invoke(gen_haskey_shim, &args).expect("gen_haskey") else {
+                panic!("gen_haskey returns an int");
+            };
+            n
+        };
+
+        assert_eq!(ask(&mut f, "USER", 0), 1, "channel 0 holds USER");
+        assert_eq!(ask(&mut f, "USER", 1), 0, "channel 1 does not");
+        assert_eq!(ask(&mut f, "WCCSYSOP", 1), 1, "channel 1 holds WCCSYSOP");
+        assert_eq!(ask(&mut f, "WCCSYSOP", 0), 0, "channel 0 does not");
+
+        // The expression grammar, which is the whole reason this entry point
+        // exists rather than a bare per-key lookup.
+        assert_eq!(ask(&mut f, "USER|WCCSYSOP", 0), 1, "or: channel 0 holds one of them");
+        assert_eq!(ask(&mut f, "USER&WCCSYSOP", 0), 0, "and: channel 0 holds only one");
+    }
+
+    /// `uptr` must address the channel `unum` names. This host holds keys per
+    /// channel number and has nowhere to put a `struct user` that disagrees,
+    /// so a mismatched pair is refused rather than quietly answered for
+    /// `unum`.
+    #[test]
+    fn gen_haskey_refuses_a_uptr_that_is_not_that_channels_slot() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        for n in [0i16, 1] {
+            let chan = f.host.users().terms().chan(n).expect("a channel");
+            f.host
+                .connect_state(&mut f.machine, chan, &crate::Connection::ansi("someone").with_keys(["USER"]))
+                .expect("connects");
+        }
+        let lock = f.text("USER");
+        // Channel 1's slot, but unum 0.
+        let other = f.host.users().slot(f.host.users().terms().chan(1).expect("channel 1"));
+        let args = [lock.offset, lock.selector, 0, other.offset, other.selector];
+        assert!(
+            f.invoke(gen_haskey_shim, &args).is_err(),
+            "a uptr/unum pair that disagrees has no answer here"
+        );
+    }
+
+    /// `uidkey` answers the empty lock -- `LOCKNKEY.C:345` returns 1 before
+    /// touching a disk -- and refuses anything else, because there is no
+    /// offline account or key database to consult.
+    ///
+    /// The refusal is asserted to *name* the missing subsystem, not merely to
+    /// be an error: a test that only checked `is_err()` would pass for a
+    /// refusal that said nothing useful, or for a bad-pointer error.
+    #[test]
+    fn uidkey_answers_an_empty_lock_and_refuses_a_real_one() {
+        let mut f = Fixture::new();
+        let uid = f.text("rangerdan");
+
+        let empty = f.text("");
+        let args = [uid.offset, uid.selector, empty.offset, empty.selector];
+        assert_eq!(
+            f.invoke(uidkey, &args).expect("an empty lock is no lock"),
+            Ret::U16(1),
+            "LOCKNKEY.C:345 -- everybody passes an empty lock"
+        );
+
+        let lock = f.text("WCCSYSOP");
+        let args = [uid.offset, uid.selector, lock.offset, lock.selector];
+        let err = f.invoke(uidkey, &args).expect_err("a real lock cannot be answered");
+        let message = err.to_string();
+        assert!(message.contains("keysbb"), "the refusal names the keys file: {message}");
+        assert!(message.contains("not online"), "and says why it cannot answer: {message}");
+    }
+
+    /// `nkyrec` refuses, and the refusal names the keys file it would have
+    /// written to. It returns `VOID`, so a quiet return would let the caller
+    /// go on granting keys into a record that was never created.
+    #[test]
+    fn nkyrec_refuses_and_names_the_keys_file() {
+        let mut f = Fixture::new();
+        let uid = f.text("rangerdan");
+        let err = f
+            .invoke(nkyrec, &Fixture::far(uid))
+            .expect_err("there is no key record to create");
+        let message = err.to_string();
+        assert!(message.contains("keysbb"), "{message}");
+        assert!(message.contains("rangerdan"), "and names who it was for: {message}");
+    }
+
+    /// `keynam` is `valkorl(name,0)`: 3 to 15 characters of `istxvc`, plus
+    /// `#` and `=`, and **no** `&` or `|` -- those belong to lock names.
+    #[test]
+    fn keynam_bounds_the_length_and_rejects_expression_operators() {
+        let mut f = Fixture::new();
+        let mut ask = |f: &mut Fixture, name: &str| -> u16 {
+            let at = f.text(name);
+            let Ret::U16(n) = f.invoke(keynam, &Fixture::far(at)).expect("keynam") else {
+                panic!("keynam returns an int");
+            };
+            n
+        };
+
+        assert_eq!(ask(&mut f, "USER"), 1);
+        assert_eq!(ask(&mut f, "ABC"), 1, "three characters is the floor");
+        assert_eq!(ask(&mut f, "WHO?"), 1, "'?' is an istxvc character");
+        assert_eq!(ask(&mut f, "A_B#C=D"), 1, "'_' is istxvc; '#' and '=' are switch cases");
+        assert_eq!(ask(&mut f, "A".repeat(15).as_str()), 1, "KEYSIZ-1 is the ceiling");
+
+        assert_eq!(ask(&mut f, "AB"), 0, "two characters is under the floor");
+        assert_eq!(ask(&mut f, ""), 0, "and a key name may not be empty, unlike a lock name");
+        assert_eq!(ask(&mut f, "A".repeat(16).as_str()), 0, "one past KEYSIZ-1");
+        assert_eq!(ask(&mut f, "A&B"), 0, "'&' belongs to lock names, not key names");
+        assert_eq!(ask(&mut f, "A|B"), 0, "and so does '|'");
+        assert_eq!(ask(&mut f, "A B"), 0, "a space is not an istxvc character");
+        assert_eq!(ask(&mut f, "A.B"), 0, "nor is '.', though isuidc allows it");
+    }
+
+    /// `istxvc` is `isuidc`'s sibling with a different punctuation set: `_`
+    /// and `?` here, against `. space , - _ '` there. Only `_` is in both, and
+    /// the two are asserted against each other on exactly the characters that
+    /// separate them -- otherwise a port could answer `isuidc` for both.
+    #[test]
+    fn istxvc_takes_underscore_and_question_but_not_isuidcs_punctuation() {
+        let mut f = Fixture::new();
+        let mut ask = |f: &mut Fixture, c: u8| -> u16 {
+            let Ret::U16(n) = f.invoke(istxvc, &[u16::from(c)]).expect("istxvc") else {
+                panic!("istxvc returns an int");
+            };
+            n
+        };
+
+        for c in [b'A', b'z', b'0', b'_', b'?'] {
+            assert_eq!(ask(&mut f, c), 1, "{:?} is a text-variable character", c as char);
+        }
+        // The four isuidc accepts and istxvc does not -- the discriminating set.
+        for c in [b'.', b' ', b',', b'-', b'\''] {
+            assert_eq!(
+                ask(&mut f, c),
+                0,
+                "{:?} is an isuidc character but NOT an istxvc one",
+                c as char
+            );
+        }
+        // Shared high ranges, at their edges.
+        for c in [0x80u8, 0xa5, 0xe0, 0xef] {
+            assert_eq!(ask(&mut f, c), 1, "{c:#04x} is inside ISTXVC.C:27-28's ranges");
+        }
+        for c in [0xa6u8, 0xdf, 0xf0] {
+            assert_eq!(ask(&mut f, c), 0, "{c:#04x} is outside them");
+        }
+    }
+
+    /// `uhskey` is `onsysn(uid,1) ? othkey(lock) : uidkey(uid,lock)`.
+    ///
+    /// `onsysn` answers false for every channel while `usrcls` stays at zero,
+    /// so today this always takes the offline arm -- and therefore refuses for
+    /// a real lock and answers 1 for an empty one, exactly as `uidkey` does.
+    /// Pinned so that the day `usrcls` starts moving, this test fails and says
+    /// the branch changed rather than the behaviour drifting silently.
+    #[test]
+    fn uhskey_takes_the_offline_arm_while_usrcls_stays_zero() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        f.host
+            .connect_state(&mut f.machine, chan, &crate::Connection::ansi("rangerdan").with_keys(["USER"]))
+            .expect("connects");
+
+        let uid = f.text("rangerdan");
+        let lock = f.text("USER");
+        let args = [uid.offset, uid.selector, lock.offset, lock.selector];
+        let err = f
+            .invoke(uhskey, &args)
+            .expect_err("onsysn says offline, so this is uidkey");
+        assert!(err.to_string().contains("keysbb"), "{err}");
+
+        let empty = f.text("");
+        let args = [uid.offset, uid.selector, empty.offset, empty.selector];
+        assert_eq!(
+            f.invoke(uhskey, &args).expect("an empty lock"),
+            Ret::U16(1),
+            "the offline arm's empty-lock branch still answers"
+        );
+    }
+
     /// `nliniu` counts channels whose `usrcls` is not `VACANT` (0).
     ///
     /// This host writes `usrcls` as 0 at connect and never raises it, and
