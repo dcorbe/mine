@@ -99,6 +99,7 @@ fn main() -> io::Result<()> {
     let mut seen: BTreeMap<u8, u32> = BTreeMap::new();
     let mut missing: BTreeMap<u8, u32> = BTreeMap::new();
     let mut bios: BTreeMap<(u8, u8), u32> = BTreeMap::new();
+    let mut vectors: Vec<String> = Vec::new();
     let mut calls = 0u32;
 
     let ending = loop {
@@ -126,6 +127,11 @@ fn main() -> io::Result<()> {
             }
             Stop::Trap(_) => {
                 let ah = vm.regs().ah();
+                if ah == 0x25 || ah == 0x35 {
+                    let vec = vm.regs().al();
+                    let verb = if ah == 0x25 { "hooks" } else { "saves" };
+                    vectors.push(format!("{verb} int {vec:02X}h"));
+                }
                 calls += 1;
                 *seen.entry(ah).or_insert(0) += 1;
                 if !is_implemented(ah) {
@@ -167,6 +173,17 @@ fn main() -> io::Result<()> {
         };
         if !line.trim().is_empty() {
             println!("|{}|", line.trim_end());
+        }
+    }
+
+    if !vectors.is_empty() {
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+        for v in &vectors {
+            *counts.entry(v.clone()).or_insert(0) += 1;
+        }
+        println!("--- interrupt vectors the program touched ---");
+        for (what, n) in &counts {
+            println!("  {what}  x{n}");
         }
     }
 
