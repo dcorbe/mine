@@ -335,6 +335,10 @@ pub const GLOBALS: &[Global] = &[
     // min. Same declaration block as `outbsz` above, two members over
     // (`sampln` between them is not placed -- no corpus module imports it).
     gi("mmucrr"),
+    // MAJORBBS.H:592 -- CHAR eurmsk; 0x7F if U.S.A. only, 0xFF if European.
+    // A CHAR, one byte -- not an `int` -- so it gets its own constructor
+    // rather than `gi`; see that constructor's own doc comment.
+    g("eurmsk", 1),
     // REMOTE.H:10-17 -- one `extern` statement declaring seven remote-sysop
     // ints, in this order:
     //   int kilipg,   /* kill-system command in progress           */
@@ -778,6 +782,8 @@ impl<A: Abi> Globals<A> {
         globals.write_mem(mem, "mmucrr", &A::int_to_bytes(0u16.into()))?;   // MAJORBBS.H:581
         globals.write_mem(mem, "digalw", &A::int_to_bytes(1u16.into()))?;   // MAJORBBS.H:653
         globals.write_mem(mem, "clingo", &A::int_to_bytes(0u16.into()))?;   // LINGO.H:41
+        // A CHAR, so written as one byte rather than through int_to_bytes.
+        globals.write_mem(mem, "eurmsk", &[0x7F])?;
 
         // MAJORBBS.C:882 -- `usrnum=-1;`, set immediately before `inimod()`
         // runs every module's init routine. See the test for why the zero it
@@ -867,6 +873,20 @@ mod tests {
             g.prf_len() as u64,
             "outbsz must agree with the prf allocation at globals.rs:696"
         );
+    }
+
+    /// `MAJORBBS.H:592` -- CHAR eurmsk, "0x7F if U.S.A. only, 0xFF if European".
+    /// One byte, not an int: it masks a character, and the host is U.S.A. by
+    /// default. Placing it two bytes wide would overlap whatever follows.
+    #[test]
+    fn eurmsk_is_one_byte_and_masks_to_ascii() {
+        let f = crate::testing::Fixture::new();
+        let g = f.host.globals();
+        assert_eq!(g.size("eurmsk").expect("eurmsk is placed"), 1,
+                   "CHAR, not INT");
+        let at = g.address("eurmsk").expect("eurmsk is placed");
+        let byte = f.machine.resolve(at, 1).expect("readable")[0];
+        assert_eq!(byte, 0x7F, "U.S.A. only by default");
     }
 
     /// `nmods` is not a configuration value -- it is how many modules are online,
@@ -1005,7 +1025,12 @@ mod tests {
         let last = *placed.last().expect("non-empty");
         // 3415 until 2026-08-14, 3509 until 2026-08-15's first three datums,
         // 3520 until Task 12/13/15's second pass added three more, 3528 until
-        // Task 1.1 placed one more, 3530 until Task 1.2 placed four more:
+        // Task 1.1 placed one more, 3530 until Task 1.2 placed four more,
+        // 3538 until Task 1.3 placed one:
+        //   +1 eurmsk    (MAJORBBS.H:592, a CHAR -- 1 byte)
+        // plus one alignment byte: eurmsk ends on an odd offset and `kilipg`
+        // (an int) needs to start on an even one -- 3538 + 1 + 1 = 3540.
+        // Before that:
         //   +2 nmods     (MAJORBBS.H:316 -- the count beside `module`, Task 1.5)
         //   +2 mmucrr    (MAJORBBS.H:581 -- same block as `outbsz`)
         //   +2 digalw    (MAJORBBS.H:653)
@@ -1039,7 +1064,7 @@ mod tests {
         // plus one alignment byte. A change to this number is only ever
         // legitimate alongside a deliberate change to the table above; it is
         // pinned so that an accidental one is loud.
-        assert_eq!(u32::from(last.1) + u32::from(last.2), 3538);
+        assert_eq!(u32::from(last.1) + u32::from(last.2), 3540);
     }
 
     /// A module *addresses* these -- it never calls them. Registering one as
