@@ -25,6 +25,9 @@ pub const ERR_PATH_NOT_FOUND: u16 = 0x03;
 pub const ERR_TOO_MANY_OPEN: u16 = 0x04;
 pub const ERR_ACCESS_DENIED: u16 = 0x05;
 pub const ERR_INVALID_HANDLE: u16 = 0x06;
+/// Another holder has the region. DOS reports this from `5Ch`, and a program
+/// that shares files across nodes is written to expect and retry it.
+pub const ERR_LOCK_VIOLATION: u16 = 0x21;
 
 /// The first handle DOS hands out; 0-2 are the inherited standard ones.
 const FIRST_HANDLE: u16 = 5;
@@ -33,6 +36,12 @@ const FIRST_HANDLE: u16 = 5;
 const MAX_HANDLES: usize = 20;
 
 const SYS_OPENAT2: libc::c_long = 437;
+
+/// Open-file-description locks. Unlike the POSIX kind they belong to the open
+/// file rather than the process, so they are not silently dropped when any
+/// unrelated descriptor for the same file is closed -- a footgun DOS programs
+/// would trip over constantly, since they open the same data file repeatedly.
+const F_OFD_SETLK: libc::c_int = 37;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
@@ -398,6 +407,44 @@ impl Files {
         if rc == 0 { Ok(()) } else { Err(ERR_FILE_NOT_FOUND) }
     }
 
+    /// `5Ch` -- lock or unlock a byte range of an open file.
+    ///
+    /// This is what makes a multinode door safe. LORD locks a player's record
+    /// before touching it, and with no locking two people playing at once write
+    /// over each other. Returning "invalid function" for it, as this did until
+    /// now, is not a small gap: it is silent data loss under exactly the
+    /// conditions a BBS creates.
+    pub fn lock(&mut self, dos: u16, offset: u32, len: u32, take: bool) -> Result<(), u16> {
+        // DOS asks for a zero-length region now and then, and means "nothing".
+        // `fcntl` reads a zero `l_len` as "to end of file", so passing it
+        // through would lock the entire file on a request to lock none of it.
+        if len == 0 {
+            return Ok(());
+        }
+        let fd = {
+            let h = self.handle_of(dos).ok_or(ERR_INVALID_HANDLE)?;
+            if h.device {
+                return Ok(());
+            }
+            h.fd.as_raw_fd()
+        };
+        let mut fl: libc::flock = unsafe { std::mem::zeroed() };
+        fl.l_type = if take { libc::F_WRLCK } else { libc::F_UNLCK } as libc::c_short;
+        fl.l_whence = libc::SEEK_SET as libc::c_short;
+        fl.l_start = i64::from(offset);
+        fl.l_len = i64::from(len);
+        fl.l_pid = 0; // required to be zero for an OFD lock
+        // SAFETY: a well-formed flock against a descriptor we own.
+        let rc = unsafe { libc::fcntl(fd, F_OFD_SETLK, std::ptr::from_mut(&mut fl)) };
+        if rc == 0 {
+            return Ok(());
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EACCES) | Some(libc::EAGAIN) => Err(ERR_LOCK_VIOLATION),
+            _ => Err(ERR_ACCESS_DENIED),
+        }
+    }
+
     /// `56h` -- rename, which is also how a program replaces a file: write a
     /// temporary, delete the original, rename over it. Refusing it does not
     /// merely skip a tidy-up -- Turbo Pascal turns the DOS error into a fatal
@@ -459,6 +506,82 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A scratch directory under the repo's gitignored `tmp/`, and a `Files`
+    /// rooted at it.
+    fn scratch(name: &str) -> (std::path::PathBuf, Files) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/dos-poc-tests")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        std::fs::write(root.join("SHARED.DAT"), vec![0u8; 4096]).expect("seed file");
+        let fd = std::fs::File::open(&root).expect("open root");
+        (root.clone(), Files::new(fd.into(), root))
+    }
+
+    /// A second, independent view of the same directory -- which is what a
+    /// second node is.
+    fn second(root: &std::path::Path) -> Files {
+        let fd = std::fs::File::open(root).expect("open root");
+        Files::new(fd.into(), root.to_path_buf())
+    }
+
+    #[test]
+    fn a_locked_region_is_refused_to_another_holder() {
+        let (root, mut a) = scratch("lock_conflict");
+        let mut b = second(&root);
+        let ha = a.open_existing(b"SHARED.DAT\0", 2).expect("open in a");
+        let hb = b.open_existing(b"SHARED.DAT\0", 2).expect("open in b");
+
+        assert_eq!(a.lock(ha, 0, 100, true), Ok(()), "first holder takes it");
+        // The assertion the whole call exists for. A `lock` that quietly did
+        // nothing and returned Ok would pass every other test in this file.
+        assert_eq!(
+            b.lock(hb, 0, 100, true),
+            Err(ERR_LOCK_VIOLATION),
+            "a second holder must be refused"
+        );
+
+        assert_eq!(a.lock(ha, 0, 100, false), Ok(()), "first holder releases");
+        assert_eq!(
+            b.lock(hb, 0, 100, true),
+            Ok(()),
+            "and then the second may take it"
+        );
+    }
+
+    #[test]
+    fn regions_that_do_not_overlap_do_not_contend() {
+        let (root, mut a) = scratch("lock_disjoint");
+        let mut b = second(&root);
+        let ha = a.open_existing(b"SHARED.DAT\0", 2).expect("open in a");
+        let hb = b.open_existing(b"SHARED.DAT\0", 2).expect("open in b");
+        assert_eq!(a.lock(ha, 0, 100, true), Ok(()));
+        assert_eq!(b.lock(hb, 200, 100, true), Ok(()));
+    }
+
+    #[test]
+    fn a_zero_length_lock_takes_nothing_rather_than_the_whole_file() {
+        // fcntl reads l_len == 0 as "to end of file", so passing a DOS
+        // zero-length request straight through locks everything.
+        let (root, mut a) = scratch("lock_zero");
+        let mut b = second(&root);
+        let ha = a.open_existing(b"SHARED.DAT\0", 2).expect("open in a");
+        let hb = b.open_existing(b"SHARED.DAT\0", 2).expect("open in b");
+        assert_eq!(a.lock(ha, 0, 0, true), Ok(()));
+        assert_eq!(
+            b.lock(hb, 0, 100, true),
+            Ok(()),
+            "a zero-length lock must not have taken the file"
+        );
+    }
+
+    #[test]
+    fn locking_an_unopened_handle_is_an_invalid_handle() {
+        let (_root, mut a) = scratch("lock_badhandle");
+        assert_eq!(a.lock(99, 0, 100, true), Err(ERR_INVALID_HANDLE));
     }
 
     #[test]

@@ -85,7 +85,7 @@ pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
         0x02 | 0x09 | 0x0e | 0x19 | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c | 0x3d
-            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x56
+            | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x56 | 0x5c
     )
 }
 
@@ -383,6 +383,20 @@ pub fn dispatch<G: DosGuest>(g: &mut G, dos: &mut DosState) -> Outcome {
                 return fail(g, regs, ERR_INVALID_FUNCTION);
             };
             match files.rename(&from, &to) {
+                Ok(()) => ok(g, regs),
+                Err(code) => fail(g, regs, code),
+            }
+        }
+
+        // 5Ch -- lock (AL=0) or unlock (AL=1) CX:DX for SI:DI bytes on handle BX.
+        0x5c => {
+            let take = regs.al() == 0;
+            let offset = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
+            let len = (u32::from(regs.si) << 16) | u32::from(regs.di);
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            match files.lock(regs.bx, offset, len, take) {
                 Ok(()) => ok(g, regs),
                 Err(code) => fail(g, regs, code),
             }
