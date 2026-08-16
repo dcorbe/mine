@@ -348,6 +348,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "endcnc", cnc::endcnc, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "cncchr", cnc::cncchr, Cleans::Caller, Evidence::Unclassified),
         (MAJORBBS, "cncall", cnc::cncall, Cleans::Caller, Evidence::Unclassified),
+        // `dftinj` is `injoth`'s fallback, and its body was already inline
+        // there. Registering it exposes the entry point; `injoth` now calls
+        // the same core, so there is one implementation.
+        (MAJORBBS, "dftinj", cnc::dftinj, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         // The rest of `CNCUTL.C`'s family, Phase 2 Task 2.2. Six the corpus
         // imports, and three -- `cnclon`, `cncsig`, `isuidc` -- that it does
         // not: they are called by the six, and a symbol is implemented here
@@ -420,6 +425,11 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (MAJORBBS, "clrprf", text::clrprf, Cleans::Caller, Evidence::Unclassified),
         // `MAJORBBS.C`'s input/text pair, Phase 2 Task 2.6.
         (MAJORBBS, "clrinp", text::clrinp, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        // `stansi` syncs GSBL's own ANSI toggle from usracc.ansifl. This
+        // host has no second toggle -- `channel_ansi_mem` reads the account
+        // live on every output -- so the body is empty and complete.
+        (MAJORBBS, "stansi", text::stansi, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         (MAJORBBS, "xltctls", text::xltctls, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
@@ -637,6 +647,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // vendor's own `numxrf == 0` branch and does nothing; `hdluid`
         // presupposes the subsystem and refuses. See their doc comments.
         (MAJORBBS, "clrxrf", user::clrxrf, Cleans::Caller,
+         Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
+        // `paccit` already had a body, registered in `WG32_ROUTINES` alone
+        // because only MajorMUD NT was known to import it. HVSTW imports it
+        // off the NE side too, so the same shim is registered here rather
+        // than a second one written -- see its own doc comment.
+        (MAJORBBS, "paccit", user::paccit, Cleans::Caller,
          Evidence::VendorBody("SRC/server/wgserver/MAJORBBS.C")),
         // Task 2.7's channel/user pair. `usridx` inverts the `channel`
         // table; `rstchn` is a modem reset this host has no hardware for.

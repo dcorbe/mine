@@ -1043,21 +1043,9 @@ pub fn injoth<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     } else {
         // `dftinj()`, unconditionally -- see this routine's own doc comment
         // for why the real `injrou` branch can never be taken from a shim.
-        let prfbuf = host
-            .globals()
-            .pointer_mem(call.mem(), "prfbuf")
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
-        let text_bytes = prfbuf
-            .read_cstr(call.mem())
-            .map_err(|e| ShimError::Failed(e.to_string()))?
-            .to_vec();
-        host.gsbl_mut().transmit_raw(chan, &text_bytes);
-        host.gsbl_mut().channel_mut(chan).oes = true;
-
-        let new_flags0 = flags0 | INJOIP;
-        flags0_ptr
-            .write(call.mem(), &[new_flags0])
-            .map_err(|e| ShimError::Failed(e.to_string()))?;
+        // Called through the same core the registered `dftinj` shim uses, so
+        // there is one implementation of that body rather than two.
+        dftinj_mem::<A>(call.mem(), host, chan)?;
         1
     };
 
@@ -1068,6 +1056,73 @@ pub fn injoth<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     text::clrprf_mem(call.mem(), host)?;
 
     Ok(abi::Ret::Int(A::Int::from(retval)))
+}
+
+/// `VOID dftinj(VOID)` -- `MAJORBBS.H:848`. `MAJORBBS.C:4637-4643`:
+///
+///
+/// **Fully implemented**, and one of the two most demanded routines in Phase
+/// 2 -- six of the corpus's modules import it.
+///
+/// This is the default `(*injrou)()`: the routine [`injoth`] falls back on
+/// when a channel has registered no injection handler of its own. That body
+/// was already here, inline inside `injoth`; what this adds is the entry
+/// point, and `injoth` now calls the same [`dftinj_mem`] core rather than
+/// keeping a second copy. The day one of them changes, both change.
+///
+/// **It acts on `othusn`, not on the current channel.** The three statements
+/// all name it, and a module calling `dftinj` directly is expected to have
+/// pointed `othusn` at its target first -- which is what `injoth` does before
+/// it falls through.
+///
+/// # Errors
+///
+/// If `othusn` is not placed or names no channel, if `prfbuf` is not placed,
+/// or if a read or write runs off the segment.
+pub fn dftinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let othusn = host
+        .globals()
+        .word_mem(call.mem(), "othusn")
+        .map_err(|e| ShimError::Failed(format!("dftinj: othusn: {e}")))? as i16;
+    let chan = host
+        .users()
+        .terms()
+        .chan(othusn)
+        .ok_or_else(|| ShimError::Failed(format!("dftinj: othusn {othusn} names no channel")))?;
+
+    dftinj_mem::<A>(call.mem(), host, chan)?;
+    Ok(abi::Ret::Void)
+}
+
+/// [`dftinj`]'s three statements, against a channel the caller already
+/// resolved -- [`injoth`]'s fallback path is the second caller.
+fn dftinj_mem<A: Abi>(mem: &mut A::Mem, host: &mut Host<A>, chan: crate::Chan) -> Result<(), ShimError> {
+    // `btuxmn(othusn,prfbuf)`: the print buffer from its start, not from
+    // `prfptr`.
+    let prfbuf = host
+        .globals()
+        .pointer_mem(mem, "prfbuf")
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    let text_bytes = prfbuf
+        .read_cstr(mem)
+        .map_err(|e| ShimError::Failed(e.to_string()))?
+        .to_vec();
+    host.gsbl_mut().transmit_raw(chan, &text_bytes);
+
+    // `btuoes(othusn,1)`.
+    host.gsbl_mut().channel_mut(chan).oes = true;
+
+    // `usroff(othusn)->flags|=INJOIP`.
+    let slot = host.users().slot(chan);
+    let flags0_ptr = A::ptr_offset(slot, host.users().user_layout().flags.at);
+    let flags0 = flags0_ptr
+        .resolve(mem, 1)
+        .map_err(|e| ShimError::Failed(e.to_string()))?[0];
+    flags0_ptr
+        .write(mem, &[flags0 | INJOIP])
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1181,6 +1236,48 @@ mod tests {
             f.machine.resolve(nxtcmd, 4).expect("in bounds").try_into().expect("4 bytes"),
         );
         assert_eq!(f.machine.read_cstr(now).expect("readable"), b"", "nxtcmd exhausted");
+    }
+
+    /// `dftinj` acts on `othusn`: it transmits `prfbuf` to that channel,
+    /// raises its output-empty status and sets `INJOIP` on it.
+    ///
+    /// Two channels, so "acts on `othusn`" is separable from "acts on the
+    /// current channel" -- with one channel the two are the same and the test
+    /// would prove nothing.
+    #[test]
+    fn dftinj_injects_into_the_channel_othusn_names() {
+        let mut f = Fixture::rooted_with_terms(crate::testing::data(), crate::Terms::new(2));
+        let zero = f.host.gsbl().terms().chan(0).expect("channel 0");
+        let one = f.host.gsbl().terms().chan(1).expect("channel 1");
+        for (chan, uid) in [(zero, "rangerdan"), (one, "kaimon")] {
+            f.host
+                .connect_state(&mut f.machine, chan, &crate::users::Connection::ansi(uid))
+                .expect("connects");
+        }
+
+        // Something to inject, and `othusn` pointing at channel 1.
+        let prfbuf = f.host.globals().prf_buffer();
+        f.machine.write(prfbuf, b"a message\0").expect("seed prfbuf");
+        f.host
+            .globals()
+            .write(&mut f.machine, "othusn", &1u16.to_le_bytes())
+            .expect("othusn");
+
+        f.host.gsbl_mut().channel_mut(one).oes = false;
+        assert!(matches!(f.invoke(dftinj, &[]), Ok(Ret::Void)));
+
+        assert!(
+            f.host.gsbl().channel(one).oes,
+            "btuoes(othusn,1) raised the output-empty status"
+        );
+        let flags = crate::abi::Wg16::ptr_offset(f.host.users().slot(one), f.host.users().user_layout().flags.at);
+        let flags0 = f.machine.resolve(flags, 1).expect("in bounds")[0];
+        assert!(flags0 & INJOIP != 0, "INJOIP is set on othusn's channel");
+
+        // And not on the other one.
+        let other = crate::abi::Wg16::ptr_offset(f.host.users().slot(zero), f.host.users().user_layout().flags.at);
+        let other0 = f.machine.resolve(other, 1).expect("in bounds")[0];
+        assert_eq!(other0 & INJOIP, 0, "channel 0 was not the target");
     }
 
     /// Point `nxtcmd` at `line`, and answer the address of the `nxtcmd`

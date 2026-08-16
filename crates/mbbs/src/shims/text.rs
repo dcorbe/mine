@@ -412,6 +412,42 @@ fn channel_ansi_mem<A: Abi>(mem: &A::Mem, host: &Host<A>) -> bool {
     }
 }
 
+/// `VOID stansi(VOID)` -- `MAJORBBS.H:843`. `MAJORBBS.C:4536-4540`:
+///
+///
+/// **Fully implemented, and it has nothing to do** -- which is a statement
+/// about this host's design rather than a gap, and is the reason it is not a
+/// refusal.
+///
+/// The routine exists because the vendor's GSBL keeps its **own** per-channel
+/// ANSI toggle, separate from the account record: `btucmd(chan,"[")` turns
+/// GSBL's on and `"]"` turns it off (`BRKTHU.H:151`). `stansi` is the one
+/// call that copies `usracc.ansifl`'s `ANSON` bit into that second place, and
+/// it is needed precisely *because* there are two places.
+///
+/// **This host has one place.** [`channel_ansi_mem`] reads
+/// `usaptr->ansifl & ANSON` out of the account record live, on every single
+/// call to [`append_mem`], and that is what decides which half of every
+/// `ESC[[ansi|ascii]` construct is emitted (`crate::ifansi`). There is no
+/// copy to keep in step, so the synchronisation this routine performs is
+/// already permanently in effect -- before the call, during it, and after.
+///
+/// That makes the empty body a *complete* answer to what the module asked:
+/// after `stansi()`, ANSI handling matches the `usracc` setting, which is
+/// what the routine promises. [`stansi_leaves_output_following_the_account_setting`](self::tests)
+/// tests the promise rather than the emptiness, by flipping `ansifl` and
+/// checking what actually comes out both ways.
+///
+/// If this host ever grows a GSBL-side ANSI flag of its own, this routine
+/// stops being empty on the same day, and that test is where it will say so.
+///
+/// # Errors
+///
+/// Never. The signature is fallible because every shim's is.
+pub fn stansi<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    Ok(abi::Ret::Void)
+}
+
 /// `void clrprf(void)` -- throw away whatever `prf` has queued.
 pub fn clrprf<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     clrprf_mem(call.mem(), host).map(|()| abi::Ret::Void)
@@ -3143,6 +3179,49 @@ mod tests {
         };
         assert_eq!(n, 0, "leading padding is not padding");
         assert_eq!(f.machine.read_cstr(at).expect("a string"), b"  text");
+    }
+
+    /// `stansi` promises that ANSI handling matches the `usracc` setting.
+    ///
+    /// The body is empty, so testing the body would test nothing. This tests
+    /// the **promise**: flip `ansifl`'s `ANSON` bit both ways, call `stansi`,
+    /// and check which half of an `ESC[[ansi|ascii]` construct actually comes
+    /// out. That is what the vendor's `btucmd(usrnum,"[")`/`"]"` exists to
+    /// arrange, and here it is already arranged because `channel_ansi_mem`
+    /// reads the account record live.
+    ///
+    /// If this host ever grows a GSBL-side ANSI flag that `stansi` has to
+    /// copy into, this test fails the day it stops being kept in step.
+    #[test]
+    fn stansi_leaves_output_following_the_account_setting() {
+        let mut f = Fixture::new();
+        let chan = f.console();
+        f.host
+            .connect_state(&mut f.machine, chan, &crate::Connection::ansi("rangerdan"))
+            .expect("connects");
+
+        let ansifl = Wg16::ptr_offset(
+            f.host.users().account(chan),
+            f.host.users().account_layout().ansifl,
+        );
+
+        let emit = |f: &mut Fixture| -> Vec<u8> {
+            assert!(matches!(f.invoke(clrprf, &[]), Ok(Ret::Void)));
+            let at = f.text("\x1b[[colour|plain]");
+            assert!(matches!(f.invoke(prf, &Fixture::far(at)), Ok(Ret::Void)));
+            let prfbuf = f.host.globals().prf_buffer();
+            f.machine.read_cstr(prfbuf).expect("readable").to_vec()
+        };
+
+        // ANSON set: the ANSI form survives.
+        f.machine.write(ansifl, &[1]).expect("ansifl");
+        assert!(matches!(f.invoke(stansi, &[]), Ok(Ret::Void)));
+        assert_eq!(emit(&mut f), b"colour".to_vec(), "ANSON set, so the ANSI form");
+
+        // ANSON clear: the ASCII form does.
+        f.machine.write(ansifl, &[0]).expect("ansifl");
+        assert!(matches!(f.invoke(stansi, &[]), Ok(Ret::Void)));
+        assert_eq!(emit(&mut f), b"plain".to_vec(), "ANSON clear, so the ASCII form");
     }
 
     /// `clrinp` empties the input buffer and re-points `margv[0]` at it.

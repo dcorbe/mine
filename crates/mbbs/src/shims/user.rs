@@ -1854,9 +1854,15 @@ pub fn extoff<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// matters, but because every module-observable piece of it needs either a
 /// console this host does not have or a struct field this crate has not
 /// placed, and inventing either would be exactly the fabrication "no
-/// plausible zeros" refuses. One import, one call site each in MajorMUD NT
+/// plausible zeros" refuses.
+///
+/// **Registered for both ABIs since Phase 2 Task 2.8.** It was in
+/// `WG32_ROUTINES` alone -- one import, one call site each in MajorMUD NT
 /// (`tmp/gapsurvey/round2/out_mmud_nt7pk.txt`/`out_mmud_nt8pj.txt`), 32-bit
-/// only -- registered in `WG32_ROUTINES`.
+/// only -- and the corpus ledger then showed HVSTW importing it off the
+/// **NE** side too, where nothing served it. The same body answers both;
+/// writing a second one in `shims::text` was the first thing Task 2.8 did
+/// and the wrong thing, since the two would have been free to diverge.
 pub fn paccit<A: Abi>(_call: &mut Call<A>, _host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     Ok(abi::Ret::Void)
 }
