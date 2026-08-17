@@ -11,6 +11,8 @@
 //!
 //! `frame_len` counts everything after itself. All integers are little-endian.
 
+pub mod scenario;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub op: u16,
