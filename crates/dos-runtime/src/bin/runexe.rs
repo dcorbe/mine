@@ -7,12 +7,22 @@
 //! program's own answer, since a scan cannot tell a reachable call from a
 //! string of bytes that happens to read as `CD 21`.
 //!
-//! Usage: `runexe <program.exe> [command tail]`
+//! Usage: `runexe <program.exe> --root <dir> [options] [command tail]`
+//!
+//! Arguments are parsed with `clap`, as the rest of this workspace's binaries
+//! are. They were hand-rolled while this crate was `dos-poc` and had one user
+//! running one game, and the seams showed the first time somebody else used it:
+//! the program path had to come first or `--root` was silently taken as the
+//! filename, and `--root` defaulted to a LORD-specific relative path behind a
+//! `create_dir_all`, so pointing it at nothing did not fail -- it created the
+//! wrong directory wherever you happened to be standing.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
+
+use clap::Parser;
 
 use dos::count::{Counters, Counting};
 use dos::service::{Serviced, Services};
@@ -69,69 +79,118 @@ fn cpu_report(started: std::time::Instant, calls: u32) -> String {
     )
 }
 
+/// A hex or decimal address, as `--watch` has always accepted it.
+fn parse_addr(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).map_err(|e| format!("{t}: {e}")),
+        None => u32::from_str_radix(t, 16).map_err(|e| format!("{t}: {e}")),
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "runexe",
+    about = "Run a DOS program in a real-mode guest and report what it asks DOS for",
+    long_about = None,
+)]
+struct Cli {
+    /// The DOS program to run. Read from the host filesystem, relative to the
+    /// current directory -- this is not resolved against `--root`.
+    program: String,
+
+    /// Directory the guest sees as its whole filesystem.
+    ///
+    /// Required, and deliberately so. It used to default to `tmp/lordroot`,
+    /// which was one game's data directory in a general-purpose runtime, and
+    /// the code behind it calls `create_dir_all` -- so a wrong or forgotten
+    /// root did not fail, it quietly built that path wherever you were
+    /// standing. Refusing to guess is the whole point of it being required.
+    #[arg(long, value_name = "DIR")]
+    root: String,
+
+    /// Keystrokes to feed the guest, as a literal string.
+    #[arg(long, default_value = "")]
+    keys: String,
+
+    /// Drive the guest from a script file instead of `--keys`.
+    #[arg(long, value_name = "FILE")]
+    script: Option<String>,
+
+    /// Log every DOS call as it happens.
+    #[arg(long)]
+    trace: bool,
+
+    /// Stop at the first unimplemented call rather than recording it.
+    #[arg(long)]
+    strict: bool,
+
+    /// Give up after this many trapped interrupts.
+    #[arg(long, value_name = "N", default_value_t = MAX_CALLS)]
+    max_calls: u32,
+
+    /// Attach a live terminal to the guest.
+    #[arg(long, short = 'i')]
+    interactive: bool,
+
+    /// Serve the program as a BBS door over stdin/stdout.
+    #[arg(long)]
+    door: bool,
+
+    /// Line rate for door mode. Overrides the dropfile; 0 means no pacing.
+    #[arg(long, value_name = "RATE")]
+    baud: Option<u32>,
+
+    /// DOOR.SYS dropfile to read the connect rate from.
+    #[arg(long, value_name = "FILE")]
+    dropfile: Option<String>,
+
+    /// Break when the guest touches this address (hex, `0x` optional).
+    #[arg(long, value_name = "ADDR", value_parser = parse_addr)]
+    watch: Option<u32>,
+
+    /// Single-step this many instructions once `--watch` fires.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    watch_steps: u32,
+
+    /// Hits to ignore before arming the trace.
+    ///
+    /// The first accesses to an input variable are the code that *stored* it;
+    /// the check reads it later, so skipping past the store is how the trace
+    /// lands on the interesting half.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    watch_skip: u32,
+
+    /// Scan guest memory for these 16-bit values, comma separated.
+    #[arg(long, value_name = "N,N", value_delimiter = ',')]
+    scan_u16: Vec<u16>,
+
+    /// Command tail handed to the program, exactly as DOS would.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "TAIL")]
+    tail: Vec<String>,
+}
+
 fn main() -> io::Result<()> {
     let started = std::time::Instant::now();
-    let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .ok_or_else(|| io::Error::other("usage: runexe <program.exe> [command tail]"))?;
-    let rest: Vec<String> = args.collect();
-    let mut tail = String::new();
-    let mut keys = String::new();
-    let mut root_dir = String::from("tmp/lordroot");
-    let mut script_path: Option<String> = None;
-    let mut trace = false;
-    let mut strict = false;
-    let mut max_calls = MAX_CALLS;
-    let mut interactive = false;
-    let mut door = false;
-    let mut baud: Option<u32> = None;
-    let mut dropfile: Option<String> = None;
-    let mut watch: Option<u32> = None;
-    let mut watch_steps: u32 = 0;
-    let mut scan: Vec<u16> = Vec::new();
-    // Hits to ignore before arming the trace. The first accesses to an input
-    // variable are the code that *stored* it; the check reads it later, so
-    // skipping past the store is how the trace lands on the interesting half.
-    let mut watch_skip: u32 = 0;
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--keys" => keys = it.next().cloned().unwrap_or_default(),
-            "--root" => root_dir = it.next().cloned().unwrap_or(root_dir),
-            "--script" => script_path = it.next().cloned(),
-            "--trace" => trace = true,
-            "--strict" => strict = true,
-            "--max-calls" => {
-                max_calls = it.next().and_then(|v| v.parse().ok()).unwrap_or(MAX_CALLS);
-            }
-            "--interactive" | "-i" => interactive = true,
-            "--door" => door = true,
-            "--baud" => baud = it.next().and_then(|v| v.parse().ok()),
-            "--dropfile" => dropfile = it.next().cloned(),
-            "--watch" => {
-                watch = it.next().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-            }
-            "--watch-steps" => {
-                watch_steps = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "--watch-skip" => {
-                watch_skip = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            }
-            "--scan-u16" => {
-                scan = it
-                    .next()
-                    .map(|v| v.split(',').filter_map(|x| x.trim().parse::<u16>().ok()).collect())
-                    .unwrap_or_default();
-            }
-            other => {
-                if !tail.is_empty() {
-                    tail.push(' ');
-                }
-                tail.push_str(other);
-            }
-        }
-    }
+    let cli = Cli::parse();
+
+    let path = cli.program;
+    let root_dir = cli.root;
+    let tail = cli.tail.join(" ");
+    let keys = cli.keys;
+    let script_path = cli.script;
+    let trace = cli.trace;
+    let strict = cli.strict;
+    let max_calls = cli.max_calls;
+    let interactive = cli.interactive;
+    let door = cli.door;
+    let baud: Option<u32> = cli.baud;
+    let dropfile = cli.dropfile;
+    let watch = cli.watch;
+    let watch_steps = cli.watch_steps;
+    // Counted down as hits are ignored, so this one is genuinely mutable.
+    let mut watch_skip = cli.watch_skip;
+    let scan: Vec<u16> = cli.scan_u16;
 
     // Somebody is on the other end. Every guard in here exists to rescue an
     // *unattended* probe from a guest that will not stop, and every one has now
@@ -917,7 +976,71 @@ fn dropfile_baud(path: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::dropfile_baud;
+    use super::{Cli, dropfile_baud};
+    use clap::Parser;
+
+    /// The live door's invocation, verbatim from
+    /// `/sbbs/xtrn/lord/lord-dospoc.sh`: program first, then flags, then a bare
+    /// command tail. This is the shape that must never stop parsing.
+    #[test]
+    fn the_live_door_invocation_still_parses() {
+        let cli = Cli::try_parse_from([
+            "runexe",
+            "/sbbs/xtrn/lord/LORD.EXE",
+            "--root",
+            "/sbbs/xtrn/lord",
+            "--door",
+            "--dropfile",
+            "/sbbs/xtrn/lord/NODE1/DOOR.SYS",
+            "1",
+            "/DREW",
+        ])
+        .expect("the door's own command line must parse");
+
+        assert_eq!(cli.program, "/sbbs/xtrn/lord/LORD.EXE");
+        assert_eq!(cli.root, "/sbbs/xtrn/lord");
+        assert!(cli.door);
+        assert_eq!(cli.tail.join(" "), "1 /DREW", "the command tail is what LORD reads its node from");
+    }
+
+    /// The ordering trap that cost a real session two failed runs: with the old
+    /// hand-rolled parser `--root` was taken as the program name, and the error
+    /// was a bare ENOENT that named nothing.
+    #[test]
+    fn flags_may_precede_the_program_now() {
+        let cli = Cli::try_parse_from(["runexe", "--root", "/tmp/x", "SETUP.EXE"])
+            .expect("flags before the positional must be accepted");
+        assert_eq!(cli.program, "SETUP.EXE");
+        assert_eq!(cli.root, "/tmp/x");
+    }
+
+    /// The whole point of this change: no root, no run. The old default was
+    /// `tmp/lordroot` behind a `create_dir_all`, so a forgotten root silently
+    /// built one game's directory wherever the operator happened to be.
+    #[test]
+    fn a_missing_root_refuses_rather_than_guessing() {
+        let err = Cli::try_parse_from(["runexe", "SETUP.EXE"])
+            .expect_err("running without --root must be an error");
+        let text = err.to_string();
+        assert!(text.contains("--root"), "the error must name --root: {text}");
+    }
+
+    #[test]
+    fn watch_takes_hex_with_or_without_the_prefix() {
+        let with = Cli::try_parse_from(["runexe", "--root", ".", "--watch", "0x1eb0", "A.EXE"])
+            .expect("0x-prefixed address");
+        let without = Cli::try_parse_from(["runexe", "--root", ".", "--watch", "1eb0", "A.EXE"])
+            .expect("bare hex address");
+        assert_eq!(with.watch, Some(0x1eb0));
+        assert_eq!(without.watch, Some(0x1eb0), "bare values were hex before clap and still are");
+    }
+
+    #[test]
+    fn scan_u16_splits_on_commas() {
+        let cli = Cli::try_parse_from(["runexe", "--root", ".", "--scan-u16", "1,22,333", "A.EXE"])
+            .expect("comma separated list");
+        assert_eq!(cli.scan_u16, vec![1, 22, 333]);
+    }
 
     fn drop_with(connect: &str, dte: &str) -> String {
         let mut lines: Vec<String> = (0..52).map(|i| format!("field{i}")).collect();
