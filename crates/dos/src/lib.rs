@@ -6,6 +6,7 @@
 //! into DOS from protected mode. See
 //! `docs/plans/2026-08-16-dos-border-design.md`.
 
+pub mod count;
 pub mod guest;
 pub mod files;
 pub mod kernel;
