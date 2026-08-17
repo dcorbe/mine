@@ -33,6 +33,7 @@ pub mod fossil;
 pub use ::dos::guest;
 pub mod kvm;
 pub mod mz;
+pub mod pit;
 pub mod screen;
 pub mod terminal;
 pub mod uart;

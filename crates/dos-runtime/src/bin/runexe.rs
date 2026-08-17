@@ -36,6 +36,7 @@ use dos_runtime::uart::{COM1_BASE, IRQ4_VECTOR, Pic, Uart};
 use dos_runtime::files::Files;
 use dos_runtime::fossil::Fossil;
 use dos_runtime::mz::{self, MzImage};
+use dos_runtime::pit::Pit;
 use dos_runtime::screen::Screen;
 
 /// 1 MiB: the whole real-mode address space.
@@ -269,6 +270,7 @@ fn main() -> io::Result<()> {
     // live door test actually hung on that before this was shared.
     let serial = door.then(|| Rc::new(RefCell::new(Uart::new(baud))));
     let mut pic = Pic::default();
+    let mut pit = Pit::default();
     let _raw = door.then(RawStdin::enter).transpose()?;
     if door {
         println!("door mode: COM1 at {COM1_BASE:#06x}, IRQ4, baud {baud:?}\r");
@@ -645,6 +647,7 @@ fn main() -> io::Result<()> {
                     uart.borrow_mut().write(p, value);
                 }
                 (_, 0x20 | 0x21) => pic.write(port, value),
+                (_, 0x40..=0x43) => pit.write(port, value),
                 _ => video.borrow_mut().port_out(port, value),
             },
             Stop::PortRead { port } => {
@@ -653,6 +656,7 @@ fn main() -> io::Result<()> {
                         uart.borrow_mut().read(p)
                     }
                     (_, 0x20 | 0x21) => pic.read(port),
+                    (_, 0x40..=0x43) => pit.read(port),
                     _ => video.borrow_mut().port_in(port),
                 };
                 vm.complete_port_read(value);
@@ -948,7 +952,7 @@ fn main() -> io::Result<()> {
         println!("\nhardware ports touched:");
         for (port, n) in &vm.port_log {
             let modelled = door && ((COM1_BASE..COM1_BASE + 8).contains(port) || matches!(port, 0x20 | 0x21))
-                || matches!(port, 0x3d4 | 0x3d5 | 0x3b4 | 0x3b5 | 0x3da | 0x3ba);
+                || matches!(port, 0x3d4 | 0x3d5 | 0x3b4 | 0x3b5 | 0x3da | 0x3ba | 0x40..=0x43);
             let how = if modelled { "modelled" } else { "absent device" };
             println!("  {port:#06x}  {n:6}  {:<48} {how}", port_name(*port));
         }
