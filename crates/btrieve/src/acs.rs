@@ -161,6 +161,67 @@ pub fn declared(fcr: &[u8]) -> bool {
     logical_page(fcr) != 0
 }
 
+/// Byte offset, within a 30-byte key definition, of the low byte of the
+/// logical page holding that key's table.
+pub const PAGE_LOW_IN_KEY: usize = 0x1a;
+
+/// Byte offset of the middle byte of that page number.
+pub const PAGE_MID_IN_KEY: usize = 0x1b;
+
+/// Byte offset of the high byte of that page number.
+///
+/// Out of order on purpose -- see [`page_in_key`].
+pub const PAGE_HIGH_IN_KEY: usize = 0x19;
+
+/// The logical page of the table a **v6** key collates through, read out of its
+/// key definition.
+///
+/// This is what tells one of a file's tables from another, and it is a page
+/// number rather than an index into the file's blocks. The engine assembles it
+/// from three *discontiguous* bytes of the definition
+/// (`W32MKDE_decompiled.c:15369-15371`):
+///
+/// ```text
+/// local_4 = CONCAT13(byte@0x1b, CONCAT12(byte@0x1a, byte@0x19))
+/// ```
+///
+/// and hands that straight to the same generic page-resolve routine every
+/// ordinary data and index page goes through, with page type `'A'` (`:15381`).
+/// Working that routine's word-swap (`:14276`) back through gives the page as
+/// `byte@0x19 << 16 | byte@0x1b << 8 | byte@0x1a` -- so the *low* byte is at
+/// `0x1a` and the *high* byte at `0x19`, with `0x1b` in the middle. `Create`
+/// writes the same three bytes in the same order (`:18392-18394`).
+///
+/// **Not an ordinal.** Every table in this repository's corpus sits at logical
+/// page 1 or 2, in the same order the pages appear, so an index into the block
+/// list would fit the bytes equally well. The decompile settles it: an ACS page
+/// comes from the *generic* page allocator (`:18442`, the same one `'D'`, `'E'`
+/// and `'V'` pages use), so tables are only ever at small consecutive pages
+/// because a fresh file allocates them first. On any file where that is not
+/// true, an ordinal would bind the wrong table.
+///
+/// Zero for v5, whose key definitions leave all three bytes unset -- the engine
+/// takes that version's single table from `FCR+0x10a` instead and never looks
+/// here (`:15364-15367`). Measured: all 16 v5 ACS-flagged keys in the corpus
+/// read zero, and all 23 v6 ones read nonzero.
+#[must_use]
+pub fn page_in_key(definition: &[u8]) -> u32 {
+    let byte = |at: usize| definition.get(at).copied().map_or(0, u32::from);
+    byte(PAGE_HIGH_IN_KEY) << 16 | byte(PAGE_MID_IN_KEY) << 8 | byte(PAGE_LOW_IN_KEY)
+}
+
+/// One of a file's tables, and the logical page a key names it by.
+#[derive(Debug, Clone)]
+pub struct Table {
+    /// The logical page the block was found on, which is what a v6 key
+    /// definition stores. **Zero for v5**, whose definitions leave that field
+    /// unset and whose files carry exactly one table -- so registering it under
+    /// zero makes one matching rule serve both versions instead of two.
+    pub page: u32,
+    /// The table itself.
+    pub acs: std::sync::Arc<Acs>,
+}
+
 /// The sequence's name as the control record records it, if there is one.
 #[must_use]
 pub fn named_in(fcr: &[u8]) -> Option<[u8; 8]> {
@@ -313,6 +374,32 @@ mod tests {
     /// and `EMAIL.DAT` -- read **zero** at `FCR+0x10a` while genuinely holding
     /// a block on page 1. So [`declared`] is a v6 predicate and must never be
     /// what gates the search; see this module's header.
+    ///
+    /// The page number is assembled from three *discontiguous* bytes, with the
+    /// low byte at `0x1a` and the high byte at `0x19`. Every real file has zero
+    /// in `0x19` and `0x1b`, so a decoder that just read the `u16` at `0x1a`
+    /// would pass the whole corpus and still be wrong.
+    #[test]
+    fn a_keys_acs_page_is_three_bytes_and_not_the_u16_at_0x1a() {
+        let mut definition = vec![0u8; 0x1e];
+        definition[PAGE_HIGH_IN_KEY] = 0x01;
+        definition[PAGE_LOW_IN_KEY] = 0x02;
+        definition[PAGE_MID_IN_KEY] = 0x03;
+        assert_eq!(page_in_key(&definition), 0x01_03_02);
+
+        // The naive reading -- a plain little-endian u16 at 0x1a -- gives this
+        // instead, and the two must not be confused.
+        assert_ne!(page_in_key(&definition), 0x03_02);
+    }
+
+    /// A definition too short to hold the field reads zero rather than panicking.
+    #[test]
+    fn a_short_key_definition_yields_no_acs_page() {
+        for len in [0usize, 0x19, 0x1a, 0x1b] {
+            assert_eq!(page_in_key(&vec![0u8; len]), 0);
+        }
+    }
+
     #[test]
     fn a_v5_file_may_hold_a_block_while_declaring_nothing_at_the_pointer() {
         let fcr = vec![0u8; 512];

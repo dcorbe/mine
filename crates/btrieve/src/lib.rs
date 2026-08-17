@@ -568,7 +568,7 @@ fn acs_tables(
     path: &Path,
     geometry: &Geometry,
     fcr: &[u8],
-) -> Result<Vec<std::sync::Arc<acs::Acs>>, String> {
+) -> Result<Vec<acs::Table>, String> {
     if !keys::declares_alt_collating(fcr, geometry.keys) {
         return Ok(Vec::new());
     }
@@ -576,14 +576,33 @@ fn acs_tables(
     let page = usize::from(geometry.page);
     let mut found = Vec::new();
     match geometry.version {
-        // v6 tags the page, so the blocks are found by type and there may be
-        // more than one -- `MULTIACS.DAT` has two.
+        // A v6 key names its table by **logical** page, so the tables have to be
+        // found by logical page -- and the allocation table is the only thing
+        // that says which physical page a logical id is on.
+        //
+        // Deliberately not a scan for `'A'`-typed pages taking each page's own
+        // header id: a page's self-stamp is stale bytes nothing should trust
+        // (see [`v6`]'s header), and a freed former-ACS page that kept its type
+        // tag and a stale id would shadow the live table. Going through the
+        // allocation table sees only allocated slots, which is what the engine
+        // does -- it hands the key's page number straight to the same page
+        // resolver every other page goes through
+        // (`W32MKDE_decompiled.c:15381`).
         Version::V6 => {
-            for p in 0..geometry.pages as usize {
-                let bytes = read_at(path, p * page, page)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                if acs::is_acs_page(&bytes) {
-                    found.push(std::sync::Arc::new(acs::decode(&bytes)?));
+            let whole = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let map = v6::Map::read(&whole, geometry.page)?;
+            let mut resolved: Vec<(u32, u32)> = map.entries().collect();
+            resolved.sort_unstable();
+            for (logical, physical) in resolved {
+                let at = physical as usize * page;
+                let Some(bytes) = whole.get(at..at + page) else {
+                    continue;
+                };
+                if acs::is_acs_page(bytes) {
+                    found.push(acs::Table {
+                        page: logical,
+                        acs: std::sync::Arc::new(acs::decode(bytes)?),
+                    });
                 }
             }
         }
@@ -591,12 +610,20 @@ fn acs_tables(
         // the block is at a fixed page instead. A page that does not decode
         // leaves `found` empty and `keys::parse` refuses the file, which is the
         // right answer for a file that declares a sequence it does not hold.
+        //
+        // Registered under page **zero**, which is what a v5 key definition
+        // holds: that version has exactly one table and the engine takes it
+        // from `FCR+0x10a` rather than per key
+        // (`W32MKDE_decompiled.c:15364-15367`).
         Version::V5 => {
             let at = acs::V5_PAGE as usize * page;
             let bytes =
                 read_at(path, at, page).map_err(|e| format!("{}: {e}", path.display()))?;
             if let Ok(table) = acs::decode(&bytes) {
-                found.push(std::sync::Arc::new(table));
+                found.push(acs::Table {
+                    page: 0,
+                    acs: std::sync::Arc::new(table),
+                });
             }
         }
     }
@@ -6933,7 +6960,8 @@ mod tests {
 
         let tables = acs_tables(&path, &geometry, &fcr).expect("a locatable table");
         assert_eq!(tables.len(), 1, "WGSMENU2.DAT carries one table, GALCAPS");
-        assert_eq!(&tables[0].name, b"GALCAPS ");
+        assert_eq!(&tables[0].acs.name, b"GALCAPS ");
+        assert_eq!(tables[0].page, 1, "its logical page, which the key names it by");
 
         let parsed =
             keys::parse("WGSMENU2.DAT", &fcr, geometry.keys, &tables).expect("one table binds");
@@ -6963,8 +6991,9 @@ mod tests {
 
         let tables = acs_tables(&path, &geometry, &fcr).expect("page 1 holds the block");
         assert_eq!(tables.len(), 1, "CLASSADS.DAT carries UPPER on page 1");
-        assert_eq!(&tables[0].name, b"UPPER   ");
-        assert_eq!(tables[0].fold(b'a'), b'A');
+        assert_eq!(&tables[0].acs.name, b"UPPER   ");
+        assert_eq!(tables[0].acs.fold(b'a'), b'A');
+        assert_eq!(tables[0].page, 0, "v5 leaves the per-key page unset, so page zero");
 
         let parsed =
             keys::parse("CLASSADS.DAT", &fcr, geometry.keys, &tables).expect("one table binds");
@@ -6974,11 +7003,16 @@ mod tests {
         );
     }
 
-    /// The multi-table case this phase deliberately does not support: two
-    /// tables and no measured way to say which key uses which, so it is refused
-    /// rather than guessed. `MULTIACS.DAT` is the only corpus file here.
+    /// The last file in the corpus that could not be read, end to end on the
+    /// real bytes: two tables, and each key bound to the one it names by logical
+    /// page.
+    ///
+    /// `ALLCAPS` is on logical 1 and folds `a` to `A`; `LOWER` is on logical 2
+    /// and folds `A` to `a`. The two are opposites, so a binding that swapped
+    /// them would not merely be untidy -- every lookup on both keys would answer
+    /// wrongly, which is why this asserts the fold rather than the name.
     #[test]
-    fn a_multi_table_file_is_refused_until_the_per_key_number_is_measured() {
+    fn a_multi_table_file_binds_each_key_to_the_table_it_names() {
         let Some(path) = corpus("archive/tooling/wbtrv32/assets/MULTIACS.DAT") else {
             eprintln!("skipped: archive/ not populated in this checkout");
             return;
@@ -6989,13 +7023,53 @@ mod tests {
         let tables = acs_tables(&path, &geometry, &fcr).expect("two locatable tables");
         assert_eq!(tables.len(), 2, "MULTIACS.DAT carries ALLCAPS and LOWER");
         assert_ne!(
-            tables[0].table, tables[1].table,
+            tables[0].acs.table, tables[1].acs.table,
             "they are different sequences, not one block read twice"
         );
+        assert_eq!(
+            (tables[0].page, tables[1].page),
+            (1, 2),
+            "found through the allocation table, so these are logical pages"
+        );
 
+        // The alternate sequence is no longer what stops this file. What does is
+        // unrelated and was behind it all along: key 1's second segment is a
+        // `float` (type 0x02), an ordering this host has never had. Opening a
+        // file further finds the next thing wrong with it.
         let e = keys::parse("MULTIACS.DAT", &fcr, geometry.keys, &tables)
-            .expect_err("two tables: the per-key sequence number is not yet measured");
-        assert!(e.why.contains("more than one"), "{}", e.why);
+            .expect_err("key 1 is a float, which is a separate gap");
+        assert!(e.why.contains("float"), "{}", e.why);
+        assert!(
+            !e.why.contains("alternate collating"),
+            "the ACS refusal must be gone: {}",
+            e.why
+        );
+
+        // With that one type byte changed to a text segment -- and nothing else
+        // touched -- the real key definitions bind, which is what proves the
+        // per-key page is being read from the right place in real bytes rather
+        // than only in a synthetic control record.
+        let mut patched = fcr.clone();
+        patched[keys::BASE + 2 * keys::WIDTH + 0x1c] = 0x0b;
+        let parsed = keys::parse("MULTIACS.DAT", &patched, geometry.keys, &tables)
+            .expect("each key names the table it uses");
+        assert_eq!(parsed.len(), 3);
+
+        let folded = |key: &Key, b: u8| key.acs.as_ref().map(|acs| acs.fold(b));
+        assert_eq!(
+            folded(&parsed[0], b'a'),
+            Some(b'A'),
+            "key 0 names page 1, which is ALLCAPS"
+        );
+        assert_eq!(
+            folded(&parsed[2], b'A'),
+            Some(b'a'),
+            "key 2 names page 2, which is LOWER"
+        );
+        assert!(
+            parsed[1].acs.is_none(),
+            "key 1 declares no sequence and must stay on raw byte order"
+        );
     }
 
     /// A file no key of which declares a sequence must cost no page reads at

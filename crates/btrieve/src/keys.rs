@@ -24,7 +24,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use super::BtvError;
-use crate::acs::Acs;
+use crate::acs;
+use crate::acs::{Acs, Table};
 
 /// Where the key definitions start in the file control record.
 pub(crate) const BASE: usize = 0x110;
@@ -464,32 +465,29 @@ pub fn parse(
     name: &str,
     fcr: &[u8],
     count: u16,
-    tables: &[Arc<Acs>],
+    tables: &[Table],
 ) -> Result<Vec<Key>, BtvError> {
     let fail = |why: String| BtvError {
         file: name.to_owned(),
         why,
     };
 
-    // The binding rule, and the one thing about an ACS still unmeasured. A
-    // key's attribute word says *that* it collates through a sequence; which
-    // *numbered* sequence is stored per key segment for v6, and the engine
-    // reads it from an in-memory key structure whose on-disk byte offset has
-    // not been located. So:
+    // The binding rule. A key's attribute word says *that* it collates through
+    // an alternate sequence; **which** one is the logical page in its own key
+    // definition, read by [`acs::page_in_key`] -- a page number, not an index
+    // into the file's blocks, which that function's doc comment shows matters.
+    // So a key binds the located table sitting on the page it names, and a key
+    // naming a page no table was found on is refused rather than given whatever
+    // table happens to be to hand.
     //
-    // - no table          -> nothing to bind, and the refusal below stands.
-    // - exactly one table -> every flagged key binds it, unambiguously. This
-    //                        is 44 of the 45 corpus files that declare one.
-    // - more than one     -> REFUSED. Only `MULTIACS.DAT` lands here.
-    //
-    // Refusing the multi-table case is the honest position rather than the
-    // cautious one: binding the wrong table would order that key by the wrong
-    // sequence, silently and for as long as the file lives, which is the exact
-    // failure this module's header warns about and the whole reason the bit was
-    // refused outright before.
-    let bound = match tables {
-        [only] => Some(Arc::clone(only)),
-        _ => None,
+    // v5 leaves that field zero and carries exactly one table, which
+    // `acs_tables` registers under page zero -- so one rule serves both
+    // versions rather than two.
+    let bound = |page: u32| {
+        tables
+            .iter()
+            .find(|table| table.page == page)
+            .map(|table| Arc::clone(&table.acs))
     };
 
     let mut keys: Vec<Key> = Vec::with_capacity(usize::from(count));
@@ -506,6 +504,8 @@ pub fn parse(
     // could flag it anywhere, and a key ordered through a table for one segment
     // is a key whose order this host cannot reproduce without that table.
     let mut alt_collating = false;
+    // The logical page the key currently being assembled names its table by.
+    let mut alt_page: Option<u32> = None;
 
     while keys.len() < usize::from(count) {
         if definitions >= SEGMAX {
@@ -516,6 +516,7 @@ pub fn parse(
         if segments.is_empty() {
             start_definition = definitions;
             alt_collating = false;
+            alt_page = None;
         }
         let start = BASE + definitions * WIDTH;
         let definition = fcr.get(start..start + WIDTH).ok_or_else(|| {
@@ -530,6 +531,23 @@ pub fn parse(
         };
         let attributes = word(at::ATTRIBUTES);
         if attributes & flag::ALT_COLLATING != 0 {
+            let page = acs::page_in_key(definition);
+            match alt_page {
+                // Read per *segment*, the way the engine reads it (`:15362`),
+                // but bound per key -- so a segmented key whose segments name
+                // two different tables is a shape `Key` cannot represent and
+                // this refuses rather than picking one. No corpus file does it:
+                // GALTELA's segmented key names page 1 from both segments.
+                Some(first) if first != page => {
+                    return Err(fail(format!(
+                        "key {}'s segments collate through two different alternate \
+                         sequences, on logical pages {first} and {page}, and this \
+                         host binds one table per key",
+                        keys.len()
+                    )));
+                }
+                _ => alt_page = Some(page),
+            }
             alt_collating = true;
         }
         for (bit, what) in UNSUPPORTED {
@@ -540,19 +558,20 @@ pub fn parse(
             // null-all, null-any, repeating duplicates -- have no measured
             // behaviour here and stay unconditional.
             if bit == flag::ALT_COLLATING {
-                if tables.len() > 1 {
-                    return Err(fail(format!(
-                        "key {} collates through an alternate sequence and this file \
-                         carries more than one ({}), so which table the key uses is \
-                         ambiguous: the per-key sequence number's offset within a key \
-                         definition has not been measured, and binding the wrong table \
-                         would order the key by the wrong sequence silently",
-                        keys.len(),
-                        tables.len()
-                    )));
-                }
-                if bound.is_some() {
+                let page = acs::page_in_key(definition);
+                if bound(page).is_some() {
                     continue;
+                }
+                // A table was located, just not the one this key names. That is
+                // a different fault from carrying none at all, and worth saying
+                // so rather than reporting the generic refusal below.
+                if !tables.is_empty() {
+                    let found: Vec<u32> = tables.iter().map(|table| table.page).collect();
+                    return Err(fail(format!(
+                        "key {} collates through the alternate sequence on logical \
+                         page {page}, and this file's tables were found on {found:?}",
+                        keys.len()
+                    )));
                 }
             }
             return Err(fail(format!(
@@ -627,7 +646,7 @@ pub fn parse(
                 // carry a table that no key uses, and folding an unflagged
                 // key's bytes through it would reorder an index that genuine
                 // Btrieve leaves in raw byte order.
-                acs: alt_collating.then(|| bound.clone()).flatten(),
+                acs: alt_collating.then(|| alt_page.and_then(bound)).flatten(),
             });
         }
     }
@@ -1047,6 +1066,24 @@ mod tests {
         fcr
     }
 
+    /// A control record whose keys each collate through the table on the logical
+    /// page named, one key per entry.
+    fn acs_fcr_naming(pages: &[u32]) -> Vec<u8> {
+        let mut fcr = vec![0u8; 512];
+        for (slot, &page) in pages.iter().enumerate() {
+            let at = BASE + slot * WIDTH;
+            fcr[at..at + WIDTH].copy_from_slice(&definition(flag::ALT_COLLATING, 0, 8, 0));
+            fcr[at + crate::acs::PAGE_LOW_IN_KEY] = page as u8;
+            fcr[at + crate::acs::PAGE_MID_IN_KEY] = (page >> 8) as u8;
+            fcr[at + crate::acs::PAGE_HIGH_IN_KEY] = (page >> 16) as u8;
+        }
+        fcr
+    }
+
+    fn table_at(page: u32, acs: Arc<Acs>) -> Table {
+        Table { page, acs }
+    }
+
     /// With no table located, the refusal must stand. Lifting it
     /// unconditionally would collate the file by raw bytes and return a
     /// different order forever, silently.
@@ -1056,14 +1093,14 @@ mod tests {
         assert!(e.why.contains("alternate collating"), "{}", e.why);
     }
 
-    /// One table binds unambiguously, and it must actually reach the key --
-    /// parsing a file and leaving `acs` at `None` would read as success while
-    /// ordering every lookup by raw bytes.
+    /// A v5 file leaves the per-key page unset and carries exactly one table,
+    /// which `acs_tables` registers under page zero -- so the same matching rule
+    /// binds it without a version special case.
     #[test]
-    fn parse_binds_the_only_table_to_a_flagged_key() {
+    fn parse_binds_a_v5_files_unnumbered_table() {
         let table = case_fold_acs();
-        let keys = parse("ONETABLE.DAT", &acs_fcr(), 1, &[Arc::clone(&table)])
-            .expect("one table binds unambiguously");
+        let keys = parse("V5.DAT", &acs_fcr(), 1, &[table_at(0, Arc::clone(&table))])
+            .expect("page zero is what a v5 key names");
         assert_eq!(keys.len(), 1);
         assert_eq!(
             keys[0].acs.as_deref(),
@@ -1072,15 +1109,61 @@ mod tests {
         );
     }
 
-    /// More than one table is refused rather than guessed at: which numbered
-    /// sequence a key uses has not been measured. `MULTIACS.DAT` is the only
-    /// file in the corpus that lands here.
+    /// **The gap this closes.** Two tables, two keys, and each key gets the one
+    /// it names by logical page -- `MULTIACS.DAT`'s exact shape, and the only
+    /// file in the corpus that was refused after everything else was fixed.
     #[test]
-    fn parse_refuses_a_flagged_key_when_the_file_carries_two_tables() {
-        let two = [case_fold_acs(), case_fold_acs()];
-        let e = parse("MULTIACS.DAT", &acs_fcr(), 1, &two)
-            .expect_err("two tables: which one is unmeasured");
-        assert!(e.why.contains("more than one"), "{}", e.why);
+    fn parse_binds_each_key_to_the_table_on_the_page_it_names() {
+        let upper = case_fold_acs();
+        let mut lower_table = [0u8; 256];
+        for (i, slot) in lower_table.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        for c in b'A'..=b'Z' {
+            lower_table[c as usize] = c + 32;
+        }
+        let lower = Arc::new(Acs {
+            name: *b"LOWER\0\0\0",
+            table: lower_table,
+        });
+
+        let keys = parse(
+            "MULTIACS.DAT",
+            &acs_fcr_naming(&[1, 2]),
+            2,
+            &[table_at(1, Arc::clone(&upper)), table_at(2, Arc::clone(&lower))],
+        )
+        .expect("each key names its own table");
+
+        assert_eq!(keys[0].acs.as_deref(), Some(&*upper), "key 0 named page 1");
+        assert_eq!(keys[1].acs.as_deref(), Some(&*lower), "key 1 named page 2");
+        // And the binding is by page, not by position: swapping which page each
+        // table sits on must swap which key gets it.
+        let swapped = parse(
+            "SWAPPED.DAT",
+            &acs_fcr_naming(&[1, 2]),
+            2,
+            &[table_at(2, Arc::clone(&upper)), table_at(1, Arc::clone(&lower))],
+        )
+        .expect("still unambiguous");
+        assert_eq!(swapped[0].acs.as_deref(), Some(&*lower));
+        assert_eq!(swapped[1].acs.as_deref(), Some(&*upper));
+    }
+
+    /// A key naming a page no table was found on is refused rather than handed
+    /// whichever table is to hand -- the wrong sequence would order that key
+    /// wrongly, silently, for as long as the file lives.
+    #[test]
+    fn parse_refuses_a_key_naming_a_page_that_holds_no_table() {
+        let e = parse(
+            "ELSEWHERE.DAT",
+            &acs_fcr_naming(&[7]),
+            1,
+            &[table_at(1, case_fold_acs())],
+        )
+        .expect_err("no table on page 7");
+        assert!(e.why.contains("page 7"), "{}", e.why);
+        assert!(e.why.contains('1'), "it should say where tables were found: {}", e.why);
     }
 
     /// A key that does *not* declare a sequence must not be folded through a
@@ -1090,7 +1173,8 @@ mod tests {
     fn parse_leaves_an_unflagged_key_unbound_even_when_a_table_exists() {
         let mut fcr = vec![0u8; 512];
         fcr[BASE..BASE + WIDTH].copy_from_slice(&definition(0, 0, 8, 0));
-        let keys = parse("PLAIN.DAT", &fcr, 1, &[case_fold_acs()]).expect("a plain text key");
+        let keys =
+            parse("PLAIN.DAT", &fcr, 1, &[table_at(0, case_fold_acs())]).expect("a plain text key");
         assert!(
             keys[0].acs.is_none(),
             "an unflagged key collates by raw bytes even when a table is present"
