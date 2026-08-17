@@ -62,6 +62,61 @@ pub trait Service<G: Guest> {
     fn service(&mut self, vector: u8, g: &mut G) -> Serviced;
 }
 
+/// The composed set of services, and the routing that was previously written
+/// out by hand in every consumer.
+///
+/// Boxed because the composed services have different concrete types and the
+/// set is built at runtime by a `with` chain. This is one indirection per
+/// *interrupt*, against a measured 40.4 us per live DOS call -- the guest's
+/// memory accesses, which are the hot path, stay monomorphised through `G`.
+pub struct Services<G: Guest> {
+    services: Vec<Box<dyn Service<G>>>,
+    /// Vector -> index into `services`. 256 entries; `u8::MAX` means unclaimed.
+    route: [u8; 256],
+}
+
+impl<G: Guest> Default for Services<G> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<G: Guest> Services<G> {
+    pub fn new() -> Self {
+        Self { services: Vec::new(), route: [u8::MAX; 256] }
+    }
+
+    /// Add a service, claiming its vectors.
+    ///
+    /// # Panics
+    ///
+    /// If two services claim the same vector. That is a table bug, and the
+    /// house rule is to crash rather than pick one -- a silently shadowed
+    /// service is the defect that took 44 shim registrations dead once before.
+    pub fn with(mut self, s: impl Service<G> + 'static) -> Self {
+        let index = u8::try_from(self.services.len())
+            .expect("more than 255 services composed");
+        for &v in s.claims() {
+            assert!(
+                self.route[usize::from(v)] == u8::MAX,
+                "two services claim int {v:#04x}"
+            );
+            self.route[usize::from(v)] = index;
+        }
+        self.services.push(Box::new(s));
+        self
+    }
+
+    /// Route one interrupt. `None` means nothing claims this vector.
+    pub fn service(&mut self, vector: u8, g: &mut G) -> Option<Serviced> {
+        let index = self.route[usize::from(vector)];
+        if index == u8::MAX {
+            return None;
+        }
+        Some(self.services[usize::from(index)].service(vector, g))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +169,40 @@ mod tests {
 
         let mut d = Dos::default();
         assert!(matches!(d.service(0x21, &mut g), Serviced::Fault(_)));
+    }
+
+    struct Fake(Vec<u8>, u8);
+
+    impl Service<TestGuest> for Fake {
+        fn claims(&self) -> &[u8] { &self.0 }
+        fn service(&mut self, _v: u8, _g: &mut TestGuest) -> Serviced {
+            Serviced::Terminate(self.1)
+        }
+    }
+
+    #[test]
+    fn the_router_sends_a_vector_to_the_service_that_claims_it() {
+        let mut g = TestGuest::new(4096);
+        let mut s = Services::new()
+            .with(Fake(vec![0x21], 1))
+            .with(Fake(vec![0x10, 0x16], 2));
+
+        assert_eq!(s.service(0x21, &mut g), Some(Serviced::Terminate(1)));
+        assert_eq!(s.service(0x16, &mut g), Some(Serviced::Terminate(2)));
+    }
+
+    #[test]
+    fn an_unclaimed_vector_routes_nowhere_rather_than_to_a_default() {
+        let mut g = TestGuest::new(4096);
+        let mut s = Services::new().with(Fake(vec![0x21], 1));
+        assert_eq!(s.service(0x14, &mut g), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "0x21")]
+    fn two_services_claiming_one_vector_is_a_table_bug_and_panics() {
+        let _ = Services::<TestGuest>::new()
+            .with(Fake(vec![0x21], 1))
+            .with(Fake(vec![0x21], 2));
     }
 }
