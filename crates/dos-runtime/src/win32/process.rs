@@ -373,6 +373,25 @@ fn enter_main(loaded: &mut Loaded, process: &Process, record: u32) -> io::Result
         .call_on(loaded.mem.stack_mut(), main, &[argc, argv_ptr, envp_ptr])
 }
 
+/// [`enter_main`], for [`crate::win32::survey`].
+///
+/// The survey needs the same takeover `run` performs -- `__startup` never
+/// returns, so answering it zero ends the run at address zero three calls in --
+/// but has no business reaching into the rest of this module. Exposed as one
+/// named entry point rather than by making `enter_main` public, so the set of
+/// things outside this file that can enter the program stays enumerable.
+///
+/// # Errors
+///
+/// [`enter_main`]'s.
+pub fn enter_main_for_survey(
+    loaded: &mut Loaded,
+    process: &Process,
+    record: u32,
+) -> io::Result<Exit> {
+    enter_main(loaded, process, record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

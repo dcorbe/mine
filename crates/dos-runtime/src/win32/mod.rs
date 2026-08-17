@@ -16,3 +16,4 @@ pub mod console;
 pub mod kernel32;
 pub mod load;
 pub mod process;
+pub mod survey;
