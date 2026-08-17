@@ -135,7 +135,7 @@
 
 use std::path::Path;
 
-use crate::abi::Abi;
+use crate::btrieve::mem::Mem;
 
 use super::keys::Key;
 use super::{pages, BtvError, Geometry, Version};
@@ -412,7 +412,7 @@ pub fn deliver(full: &[u8], buffer_len: usize) -> (&[u8], bool) {
     (&full[..usable], usable < full.len())
 }
 
-impl<A: Abi> super::Block<A> {
+impl<M: Mem> super::Block<M> {
     /// This file's `B_STAT` reply, as [`Stat::read`] measures it -- see that
     /// function's doc comment for why `&self` is enough (no record load).
     ///

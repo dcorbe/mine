@@ -212,7 +212,7 @@
 
 use std::fmt;
 
-use crate::abi::Abi;
+use crate::btrieve::mem::Mem;
 
 use super::keys::Key;
 use super::{Block, BtvError, Cursor, Version};
@@ -893,7 +893,7 @@ fn here_for(cursor: Cursor, key: u16) -> Result<Option<usize>, OpError> {
 /// `GetNext` chain walk by this exact computation and gets the same record
 /// back. So [`Block::step`] keeps it; only [`here_for`] (the reverse
 /// direction Task 12 never tested) does not.
-fn physical_of<A: Abi>(block: &Block<A>, key: u16, at: usize) -> Result<usize, OpError> {
+fn physical_of<M: Mem>(block: &Block<M>, key: u16, at: usize) -> Result<usize, OpError> {
     let records = block.loaded().expect("Block::step already loaded the records");
     records
         .ordered(key, at)
@@ -901,7 +901,7 @@ fn physical_of<A: Abi>(block: &Block<A>, key: u16, at: usize) -> Result<usize, O
         .ok_or(OpError::CursorStale)
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve ops 55-63, `dfaQuery` -- position the file by `key`,
     /// delivering nothing. `dfaQuery` (`DFAAPI.C:227`) is the position-only
     /// half of the family; [`Block::get`] is the half that also delivers.
@@ -1506,7 +1506,7 @@ impl OwnerOp {
     }
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 29, `Set Owner` -- pp. 165-167. Assigns `name` (at most
     /// eight bytes, p. 165: "The owner name can be up to eight characters
     /// long") to this block's file in `owners`, gating future access on it.
@@ -1662,7 +1662,7 @@ pub struct Chunk {
     pub length: u32,
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 23 in its chunk-mode form, `Get Direct/Chunk` -- pp. 88-100.
     ///
     /// `position` is a physical record address, the same coordinate
@@ -1852,7 +1852,7 @@ pub enum ExtendedStart {
     AtCurrent,
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve ops 36/37, `Get Next/Previous Extended` -- pp. 125-141 --
     /// and the shared core [`Block::step_next_extended`]/[`Block::
     /// step_previous_extended`] (ops 38/39, pp. 185-196) reuse too.
@@ -1989,7 +1989,7 @@ pub struct InsertExtendedError {
     pub error: OpError,
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 40, `Insert Extended` -- pp. 147-150.
     ///
     /// `key` is the key currency is established by once every record has
@@ -2160,7 +2160,7 @@ pub enum PercentageBasis {
     Physical,
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 44, `Get By Percentage` -- pp. 83-87.
     ///
     /// `percentage` is p. 85's own 0-10,000 range (0.00% to 100.00%),
@@ -2233,7 +2233,7 @@ pub enum FindBasis {
     Physical(u32),
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 45, `Find Percentage` -- pp. 80-83, the inverse of
     /// [`Block::get_by_percentage`]: `at * 10,000 / count`, the natural
     /// inverse of that method's own formula, clamped into `0..=10_000` by
@@ -2328,7 +2328,7 @@ pub struct SystemDataStat {
     pub version: u16,
 }
 
-impl<A: Abi> Block<A> {
+impl<M: Mem> Block<M> {
     /// Btrieve op 65, `Stat Extended`, extended-files subfunction
     /// (Subfunction `1`) -- pp. 175-178. `first` is p. 176's "First File
     /// Sequence" (`0` for the base file, `1` for the first extension, and
@@ -2402,6 +2402,7 @@ pub fn begin_concurrent_transaction() -> Result<(), OpError> {
 mod tests {
     use super::*;
     use crate::abi::Wg16;
+    use crate::btrieve::mem::AbiMem;
     use crate::btrieve::keys::{Kind, Segment};
     use crate::btrieve::records::Records;
     use crate::btrieve::{Geometry, Version, pages};
@@ -2513,7 +2514,7 @@ mod tests {
         }
     }
 
-    fn block(path: PathBuf) -> Block<Wg16> {
+    fn block(path: PathBuf) -> Block<AbiMem<Wg16>> {
         Block {
             id: BlockId::fresh(),
             name: "OPS.DAT".to_owned(),
@@ -2537,7 +2538,7 @@ mod tests {
     /// scratch` clears and recreates the directory it names, and this
     /// crate's tests run in parallel, so two tests sharing a name would
     /// each see the other rewrite `OPS.DAT` out from under it mid-read.
-    fn fixture(name: &str) -> Block<Wg16> {
+    fn fixture(name: &str) -> Block<AbiMem<Wg16>> {
         block(seed(&crate::testing::scratch(&format!("ops-{name}"))))
     }
 
@@ -2557,7 +2558,7 @@ mod tests {
     /// check lets a v6 file through -- not whether this host's v6 page
     /// walk is correct, which is measured elsewhere entirely
     /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`).
-    fn fixture_v6(name: &str) -> Block<Wg16> {
+    fn fixture_v6(name: &str) -> Block<AbiMem<Wg16>> {
         let path = seed(&crate::testing::scratch(&format!("ops-{name}")));
         let read_geometry = ops_geometry();
         let keys = ops_keys();

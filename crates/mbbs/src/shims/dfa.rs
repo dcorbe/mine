@@ -137,6 +137,7 @@ use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
+use crate::btrieve::mem::AbiMem;
 use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
 use crate::shims::btrieve as btv;
@@ -149,7 +150,7 @@ use crate::shims::btrieve as btv;
 /// module could not have caught either.
 fn dfa_required<A: Abi>(host: &Host<A>, who: &str) -> Result<A::Ptr, ShimError> {
     let block = host.btrieve.dfa_current();
-    if block == Btrieve::<A>::null() {
+    if block == Btrieve::<AbiMem<A>>::null() {
         return Err(ShimError::Failed(format!(
             "{who} with no dfa file current -- DFAAPI.C has no dfa == NULL guard here, \
              and btvu()'s own dereference of dfa->posblk is what would have faulted on \
@@ -168,7 +169,7 @@ fn dfa_required<A: Abi>(host: &Host<A>, who: &str) -> Result<A::Ptr, ShimError> 
 /// convention [`btv::positioned`] gives `bb`.
 fn dfa_positioned<A: Abi>(host: &Host<A>, who: &str) -> Result<Option<A::Ptr>, ShimError> {
     let block = host.btrieve.dfa_current();
-    if block == Btrieve::<A>::null() {
+    if block == Btrieve::<AbiMem<A>>::null() {
         return Ok(None);
     }
     host.btrieve.block(block).map_err(|e| ShimError::Failed(format!("{who}: {e}")))?;
@@ -231,7 +232,7 @@ pub fn dfaOpen<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let filnam = call.ptr();
     let maxlen = btv::u16_arg::<A>(call.int(), "dfaOpen")?;
     let owner = call.ptr();
-    if owner != Btrieve::<A>::null() {
+    if owner != Btrieve::<AbiMem<A>>::null() {
         return Err(ShimError::Failed(
             "dfaOpen with a non-null owner -- DFAAPI.C:146-152 passes it to Btrieve's own \
              OPEN call as an access password, and this host checks no such password, so \
@@ -328,7 +329,7 @@ pub fn dfaClose<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::R
 /// behaviour, and a refusal beats a deferred one" reasoning.
 pub fn dfaSetBlk<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let dfaptr = call.ptr();
-    if dfaptr != Btrieve::<A>::null() {
+    if dfaptr != Btrieve::<AbiMem<A>>::null() {
         host.btrieve.block(dfaptr).map_err(|e| ShimError::Failed(format!("dfaSetBlk: {e}")))?;
     }
     if let Some(dropped) = host.btrieve.dfa_set(dfaptr) {
@@ -433,7 +434,7 @@ pub fn dfaQueryNP<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
             block,
             op,
             keynum: -1,
-            value: Btrieve::<A>::null(),
+            value: Btrieve::<AbiMem<A>>::null(),
             into: Some(into),
             lock: 0,
         },
@@ -477,7 +478,7 @@ pub fn dfaGetLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
              g-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => btv::data_buffer(host, block)?,
         false => into,
     };
@@ -536,7 +537,7 @@ pub fn dfaAcqLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi:
              a-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => btv::data_buffer(host, block)?,
         false => into,
     };
@@ -605,7 +606,7 @@ pub fn dfaAcqNPLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
     let op = btv::Op::of(anpopt).ok_or_else(|| {
         ShimError::Failed(format!("dfaAcqNPLock with option {anpopt}, which is not a get operation"))
     })?;
-    let into = match recptr == Btrieve::<A>::null() {
+    let into = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => btv::data_buffer(host, block)?,
         false => recptr,
     };
@@ -617,7 +618,7 @@ pub fn dfaAcqNPLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<ab
             block,
             op,
             keynum: -1,
-            value: Btrieve::<A>::null(),
+            value: Btrieve::<AbiMem<A>>::null(),
             into: Some(into),
             lock: loktyp,
         },
@@ -717,7 +718,7 @@ fn dfa_acq_abs<A: Abi>(
     }
 
     let block = dfa_required(host, who)?;
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => btv::data_buffer(host, block)?,
         false => recptr,
     };
@@ -816,7 +817,7 @@ pub fn dfaStepLock<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi
     let into = call.ptr();
     let opt = btv::i16_arg::<A>(call.int());
     let lock = btv::i16_arg::<A>(call.int());
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => btv::data_buffer(host, block)?,
         false => into,
     };
@@ -893,7 +894,7 @@ fn dfa_insert<A: Abi>(
     refuse_on_duplicate: bool,
 ) -> Result<bool, ShimError> {
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -1003,7 +1004,7 @@ fn dfa_update_dup<A: Abi>(
             ))
         })?
         .position;
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -1399,7 +1400,7 @@ pub fn dfaVirgin<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::
         src.read_cstr(call.mem()).map_err(|e| ShimError::Failed(e.to_string()))?,
     )
     .into_owned();
-    let dst_stem = if dst == Btrieve::<A>::null() {
+    let dst_stem = if dst == Btrieve::<AbiMem<A>>::null() {
         src_stem.clone()
     } else {
         String::from_utf8_lossy(
@@ -1725,7 +1726,7 @@ pub fn dfaCreateSpec<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<a
              pre-allocates exactly one data page"
         )));
     }
-    if alt_file != Btrieve::<A>::null() {
+    if alt_file != Btrieve::<AbiMem<A>>::null() {
         return Err(ShimError::Failed(format!(
             "dfaCreateSpec({name}) with a non-null altFile -- this host has no alternate \
              collating sequence support to read one into"
@@ -1942,7 +1943,7 @@ mod tests {
     fn acquire(f: &mut Fixture, key: Option<u16>, keynum: i16, opt: i16, lock: i16) -> bool {
         let value = match key {
             Some(n) => f.bytes(&n.to_le_bytes(), false),
-            None => Btrieve::<Wg16>::null(),
+            None => Btrieve::<AbiMem<Wg16>>::null(),
         };
         f.invoke(
             dfaAcqLock,
@@ -1972,7 +1973,7 @@ mod tests {
     #[test]
     fn dfa_current_is_null_before_any_open_and_dfaopen_makes_the_new_file_current() {
         let mut f = Fixture::new();
-        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<AbiMem<Wg16>>::null());
         let block = open(&mut f, "SAMPLE.DAT", 64);
         assert_eq!(f.host.btrieve().dfa_current(), block);
     }
@@ -2039,7 +2040,7 @@ mod tests {
         f.invoke(dfaRstBlk, &[]).expect("restores");
         assert_eq!(
             f.host.btrieve().dfa_current(),
-            Btrieve::<Wg16>::null(),
+            Btrieve::<AbiMem<Wg16>>::null(),
             "only the third restore runs the stack out"
         );
     }
@@ -2173,7 +2174,7 @@ mod tests {
     #[test]
     fn dfaquery_with_no_dfa_file_current_answers_nothing_found() {
         let mut f = Fixture::new();
-        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<AbiMem<Wg16>>::null());
         assert!(!query(&mut f, 0, 62));
     }
 
@@ -2303,7 +2304,7 @@ mod tests {
     #[test]
     fn dfasteplock_with_no_dfa_file_current_answers_quietly_unlike_stpbtvl() {
         let mut f = Fixture::new();
-        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<AbiMem<Wg16>>::null());
         assert_eq!(f.invoke(dfaStepLock, &[0, 0, 33, 0]).expect("answers"), Ret::U16(0));
     }
 
@@ -2431,7 +2432,7 @@ mod tests {
     #[test]
     fn dfaupdatedup_has_its_own_explicit_guard_and_answers_quietly_with_no_dfa_file_current() {
         let mut f = Fixture::new();
-        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<Wg16>::null());
+        assert_eq!(f.host.btrieve().dfa_current(), Btrieve::<AbiMem<Wg16>>::null());
         let recptr = f.bytes(&sample_record(1, "X"), false);
         assert_eq!(
             f.invoke(dfaUpdateDup, &[recptr.offset, recptr.selector]).expect("answers"),

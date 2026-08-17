@@ -1072,7 +1072,7 @@ pub struct Host<A: Abi> {
     /// `= Wg16` default from `Btrieve` (and every other declaration that had
     /// one): a bare `Btrieve` is now a hard `E0107` at every call site, not a
     /// silent pin, so this exact mistake can no longer compile.
-    pub(crate) btrieve: btrieve::Btrieve<A>,
+    pub(crate) btrieve: btrieve::Btrieve<btrieve::mem::AbiMem<A>>,
 
     /// The terminal channels. See [`gsbl`].
     pub(crate) gsbl: gsbl::Gsbl,
@@ -2081,7 +2081,7 @@ impl<A: Abi> Host<A> {
     }
 
     /// The Btrieve files that are open.
-    pub fn btrieve(&self) -> &btrieve::Btrieve<A> {
+    pub fn btrieve(&self) -> &btrieve::Btrieve<btrieve::mem::AbiMem<A>> {
         &self.btrieve
     }
 

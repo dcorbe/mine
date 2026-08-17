@@ -186,6 +186,7 @@ use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
+use crate::btrieve::mem::AbiMem;
 use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
 
@@ -378,7 +379,7 @@ pub fn opnbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 /// position block and read 128 bytes of whatever it was.
 pub fn setbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let block = call.ptr();
-    if block != Btrieve::<A>::null() {
+    if block != Btrieve::<AbiMem<A>>::null() {
         host.btrieve.block(block).map_err(ShimError::Failed)?;
     }
     push(call, host, block)?;
@@ -575,7 +576,7 @@ pub fn dinsbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
 
     let file = host.btrieve.block(block).map_err(ShimError::Failed)?;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -702,7 +703,7 @@ pub fn dupdbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
         })?
         .position;
     let length = file.maxlen();
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => file.data(),
         false => recptr,
     };
@@ -1110,7 +1111,7 @@ pub fn qnpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             block,
             op,
             keynum: -1,
-            value: Btrieve::<A>::null(),
+            value: Btrieve::<AbiMem<A>>::null(),
             into: Some(into),
             // `int qnpbtv(int getopt)` -- one argument, no `loktyp`.
             lock: 0,
@@ -1161,7 +1162,7 @@ pub fn obtbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             "obtbtvl with option {opt}, which is none of the nine BTVSTF.H's a-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1215,7 +1216,7 @@ pub fn stpbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
     let opt = i16_arg::<A>(call.int());
     let lock = i16_arg::<A>(call.int());
 
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1485,7 +1486,7 @@ pub(crate) fn absolute<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Posi
         return Ok(false);
     };
 
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -1593,7 +1594,7 @@ pub(crate) fn locate<A: Abi>(call: &mut Call<A>, host: &mut Host<A>, req: Reques
     // before anything else, and that is where it is read from afterwards. So a
     // module may pass the buffer it was given last time and mean "the same key
     // again", which only works if the copy really happens.
-    if value != Btrieve::<A>::null() {
+    if value != Btrieve::<AbiMem<A>>::null() {
         // **The original measured this copy with the key number as passed**,
         // before `:268` resolved a negative one to `bb->lastkn`:
         //
@@ -1936,7 +1937,7 @@ pub(crate) fn load<A: Abi>(host: &mut Host<A>, block: A::Ptr) -> Result<(), Shim
 /// which is [`setbtv`]'s contract and unrelated to the null case.
 pub(crate) fn positioned<A: Abi>(call: &mut Call<A>, host: &Host<A>, who: &str) -> Result<Option<A::Ptr>, ShimError> {
     let block = current(call, host)?;
-    if block == Btrieve::<A>::null() {
+    if block == Btrieve::<AbiMem<A>>::null() {
         return Ok(None);
     }
     host.btrieve
@@ -2124,7 +2125,7 @@ pub fn getbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             "getbtv with option {opt}, which is none of the nine BTVSTF.H's g-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -2186,7 +2187,7 @@ pub fn obtbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             "obtbtv with option {opt}, which is none of the nine BTVSTF.H's a-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -2291,7 +2292,7 @@ pub fn anpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     let op = Op::of(anpopt).ok_or_else(|| {
         ShimError::Failed(format!("anpbtv with option {anpopt}, which is not a get operation"))
     })?;
-    let into = match recptr == Btrieve::<A>::null() {
+    let into = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => recptr,
     };
@@ -2303,7 +2304,7 @@ pub fn anpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
             block,
             op,
             keynum: -1,
-            value: Btrieve::<A>::null(),
+            value: Btrieve::<AbiMem<A>>::null(),
             into: Some(into),
             lock: 0,
         },
@@ -2422,7 +2423,7 @@ pub fn stpbtv<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
 
     let into = call.ptr();
     let opt = i16_arg::<A>(call.int());
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -2617,7 +2618,7 @@ pub(crate) fn update_variable<A: Abi>(
     recptr: A::Ptr,
     length: u16,
 ) -> Result<(), ShimError> {
-    let recptr = match recptr == Btrieve::<A>::null() {
+    let recptr = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => recptr,
     };
@@ -2826,7 +2827,7 @@ pub fn getbtvl<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Re
             "getbtvl with option {opt}, which is none of the nine BTVSTF.H's g-macros produce"
         ))
     })?;
-    let into = match into == Btrieve::<A>::null() {
+    let into = match into == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => into,
     };
@@ -2937,7 +2938,7 @@ fn anp<A: Abi>(
     let op = Op::of(anpopt).ok_or_else(|| {
         ShimError::Failed(format!("{who} with option {anpopt}, which is not a get operation"))
     })?;
-    let into = match recptr == Btrieve::<A>::null() {
+    let into = match recptr == Btrieve::<AbiMem<A>>::null() {
         true => data_buffer(host, block)?,
         false => recptr,
     };
@@ -2949,7 +2950,7 @@ fn anp<A: Abi>(
             block,
             op,
             keynum: -1,
-            value: Btrieve::<A>::null(),
+            value: Btrieve::<AbiMem<A>>::null(),
             into: Some(into),
             lock,
         },
@@ -3511,7 +3512,7 @@ mod tests {
     #[test]
     fn opening_a_file_makes_it_current() {
         let mut f = Fixture::new();
-        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing is current to begin with");
+        assert_eq!(bb(&f), Btrieve::<AbiMem<Wg16>>::null(), "nothing is current to begin with");
         let block = open(&mut f, "SAMPLE.DAT", 64);
         assert_eq!(bb(&f), block);
     }
@@ -3593,7 +3594,7 @@ mod tests {
         // module was written to expect.
         let mut f = Fixture::new();
         f.invoke(rstbtv, &[]).expect("not an error");
-        assert_eq!(bb(&f), Btrieve::<Wg16>::null());
+        assert_eq!(bb(&f), Btrieve::<AbiMem<Wg16>>::null());
         assert!(
             f.host.notes().iter().any(|n| n.contains("rstbtv")),
             "and it is reported"
@@ -3754,7 +3755,7 @@ mod tests {
     fn acquire(f: &mut Fixture, key: Option<u16>, keynum: i16, opt: i16) -> bool {
         let value = match key {
             Some(n) => f.bytes(&n.to_le_bytes(), false),
-            None => Btrieve::<Wg16>::null(),
+            None => Btrieve::<AbiMem<Wg16>>::null(),
         };
         f.invoke(obtbtvl,
             &[0, 0, value.offset, value.selector, keynum as u16, opt as u16, 0],
@@ -3960,7 +3961,7 @@ mod tests {
         let mut f = Fixture::new();
         let block = open(&mut f, "SAMPLE.DAT", 64);
         let key = f.host.btrieve().block(block).expect("open").key();
-        assert_ne!(key, Btrieve::<Wg16>::null(), "opnbtv allocates it");
+        assert_ne!(key, Btrieve::<AbiMem<Wg16>>::null(), "opnbtv allocates it");
 
         assert!(query(&mut f, 0, 63), "highest");
         assert_eq!(got(&f, key), 7);
@@ -4528,7 +4529,7 @@ mod tests {
     /// `rstbtv` too many puts it back.
     fn nothing_current() -> Fixture {
         let f = Fixture::new();
-        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing is current to begin with");
+        assert_eq!(bb(&f), Btrieve::<AbiMem<Wg16>>::null(), "nothing is current to begin with");
         f
     }
 
@@ -4681,7 +4682,7 @@ mod tests {
 
         f.invoke(rstbtv, &[]).expect("restores");
         f.invoke(rstbtv, &[]).expect("and past the bottom");
-        assert_eq!(bb(&f), Btrieve::<Wg16>::null(), "nothing current now");
+        assert_eq!(bb(&f), Btrieve::<AbiMem<Wg16>>::null(), "nothing current now");
         let no_file = f.invoke(qrybtv, &[0, 0, 0, 62]).expect("no file");
 
         assert_eq!(not_found, no_file, "the module cannot tell them apart");

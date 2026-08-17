@@ -50,6 +50,7 @@ use std::path::{Path, PathBuf};
 
 use mbbs::abi::Wg16;
 use mbbs::btrieve::keys::Kind;
+use mbbs::btrieve::mem::AbiMem;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};
 use mbbs_machine::m16::Machine;
@@ -103,7 +104,7 @@ fn corpus(root: &str) -> PathBuf {
 struct Forge {
     machine: Machine,
     heap: Heap<Wg16>,
-    btrieve: Btrieve<Wg16>,
+    btrieve: Btrieve<AbiMem<Wg16>>,
     /// This forge's own corpus root, wiped on the way in. See [`corpus`].
     root: PathBuf,
 }
@@ -131,7 +132,7 @@ impl Forge {
         from: &Path,
         name: &str,
         variant: &str,
-        work: impl FnOnce(&mut mbbs::btrieve::Block<Wg16>) -> Result<(), String>,
+        work: impl FnOnce(&mut mbbs::btrieve::Block<AbiMem<Wg16>>) -> Result<(), String>,
     ) -> Result<PathBuf, String> {
         let dir = self.root.join(variant);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -408,7 +409,7 @@ const DUPLICATE_REPEATS: u32 = 6;
 /// single-segment keys (30-byte name, some-width owner, 4-byte
 /// duplicate-permitting experience) this assumes, or if a record cannot be
 /// inserted or the block cannot be reindexed.
-fn insert_duplicate_users(block: &mut mbbs::btrieve::Block<Wg16>) -> Result<(), String> {
+fn insert_duplicate_users(block: &mut mbbs::btrieve::Block<AbiMem<Wg16>>) -> Result<(), String> {
     let count = block.records().map_err(|e| e.to_string())?.len();
     if count != 0 {
         return Err(format!(
