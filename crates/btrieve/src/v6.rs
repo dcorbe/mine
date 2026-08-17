@@ -366,8 +366,15 @@ impl Map {
             by_logical.entry(logical).or_default().push(page);
         }
 
+        // Sorted before iterating, same as `block_indices` above -- `HashMap`
+        // order is randomized per-process, and this loop's first collision
+        // becomes part of an error message. Without the sort, the same file
+        // reports a different colliding logical page on every separate run.
+        let mut logicals: Vec<u32> = by_logical.keys().copied().collect();
+        logicals.sort_unstable();
         let mut physical = HashMap::with_capacity(by_logical.len());
-        for (logical, mut holders) in by_logical {
+        for logical in logicals {
+            let mut holders = by_logical.remove(&logical).unwrap_or_default();
             if holders.len() > 1 {
                 holders.sort_unstable();
                 return Err(format!(
