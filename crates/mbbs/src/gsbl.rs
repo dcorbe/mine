@@ -129,6 +129,24 @@ pub struct Channel {
     /// one call alone would be decided from the wrong number.
     pub(crate) column: u16,
 
+    /// `btuhcr` -- the hard-CR character (guide `btuhcr`): an output
+    /// byte unconditionally converted to ASCII CR during ASCII output.
+    /// Defaults to `0x0D`, which makes the translation an identity and is why
+    /// a channel nobody configures behaves exactly as it did before this
+    /// field existed.
+    pub(crate) hardcr: u8,
+
+    /// `btuscr` -- the soft-CR character (guide `btuscr`): becomes a
+    /// line break while the current line has not yet wrapped, and a SPACE once
+    /// it has. Zero disables the translation and is the default.
+    pub(crate) softcr: u8,
+
+    /// Whether [`Channel::width`] word wrap has fired since the last line
+    /// break, which is the condition [`Channel::softcr`] switches on. Reset
+    /// wherever `column` is reset to zero -- the guide's "yet" is per line,
+    /// not per channel.
+    pub(crate) wrapped: bool,
+
     /// `btutsw` -- output word-wrap width. Zero means no wrapping.
     pub width: u16,
     /// `btumil` -- maximum input line length. Zero means no limit.
@@ -301,6 +319,9 @@ impl Default for Channel {
             status: VecDeque::new(),
             since_trigger: 0,
             column: 0,
+            hardcr: b'\r',
+            softcr: 0,
+            wrapped: false,
             width: 0,
             maxinl: 0,
             echo: true,
@@ -832,6 +853,7 @@ impl Channel {
         let mut column = self.column;
         let mut supplied_lf = self.supplied_lf;
         let mut csi = self.csi;
+        let mut wrapped = self.wrapped;
 
         for &byte in bytes {
             match csi {
@@ -839,8 +861,11 @@ impl Channel {
                     &mut out,
                     &mut column,
                     &mut supplied_lf,
+                    &mut wrapped,
                     &mut csi,
                     self.width,
+                    self.hardcr,
+                    self.softcr,
                     byte,
                 ),
                 CsiScan::Esc => {
@@ -856,14 +881,26 @@ impl Channel {
                         // before this fix -- then the current byte is
                         // dispatched fresh, since it was never held back and
                         // may itself open a new escape.
-                        Self::emit_one(&mut out, &mut column, &mut supplied_lf, self.width, 0x1B);
+                        Self::emit_one(
+                            &mut out,
+                            &mut column,
+                            &mut supplied_lf,
+                            &mut wrapped,
+                            self.width,
+                            self.hardcr,
+                            self.softcr,
+                            0x1B,
+                        );
                         csi = CsiScan::Text;
                         Self::dispatch_normal(
                             &mut out,
                             &mut column,
                             &mut supplied_lf,
+                            &mut wrapped,
                             &mut csi,
                             self.width,
+                            self.hardcr,
+                            self.softcr,
                             byte,
                         );
                     }
@@ -896,8 +933,11 @@ impl Channel {
                             &mut out,
                             &mut column,
                             &mut supplied_lf,
+                            &mut wrapped,
                             &mut csi,
                             self.width,
+                            self.hardcr,
+                            self.softcr,
                             byte,
                         );
                     }
@@ -910,7 +950,9 @@ impl Channel {
         // line has touched the channel, so there is nothing to roll back --
         // `csi` included: a rejected call must not leave the channel
         // believing it is mid-CSI on the strength of bytes that never
-        // reached the wire.
+        // reached the wire. `wrapped` joins that guarantee for the same
+        // reason: a block that never reached the wire must not be able to
+        // arm or disarm the *next* accepted block's soft-CR behaviour.
         if self.output.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
             return;
@@ -919,6 +961,7 @@ impl Channel {
         self.column = column;
         self.supplied_lf = supplied_lf;
         self.csi = csi;
+        self.wrapped = wrapped;
     }
 
     /// `Text`-state dispatch: either the byte opens a possible CSI, or it is
@@ -930,15 +973,18 @@ impl Channel {
         out: &mut Vec<u8>,
         column: &mut u16,
         supplied_lf: &mut bool,
+        wrapped: &mut bool,
         csi: &mut CsiScan,
         width: u16,
+        hardcr: u8,
+        softcr: u8,
         byte: u8,
     ) {
         if byte == 0x1B {
             // Held, not emitted -- see `CsiScan::Esc`'s doc for why.
             *csi = CsiScan::Esc;
         } else {
-            Self::emit_one(out, column, supplied_lf, width, byte);
+            Self::emit_one(out, column, supplied_lf, wrapped, width, hardcr, softcr, byte);
         }
     }
 
@@ -946,19 +992,45 @@ impl Channel {
     /// (R1), the wrap check (R9), and the column count (R10). Used for every
     /// byte `transmit` decides is *not* part of a CSI -- which, before this
     /// fix, was every byte.
-    fn emit_one(out: &mut Vec<u8>, column: &mut u16, supplied_lf: &mut bool, width: u16, byte: u8) {
+    fn emit_one(
+        out: &mut Vec<u8>,
+        column: &mut u16,
+        supplied_lf: &mut bool,
+        wrapped: &mut bool,
+        width: u16,
+        hardcr: u8,
+        softcr: u8,
+        byte: u8,
+    ) {
+        // Guide `btuhcr` and `btuscr`. Done first, so a translated byte then
+        // takes the ordinary CR path below -- including the LF this host
+        // supplies -- rather than a parallel one that would have to repeat
+        // it. Order matters between the two: a channel could set both
+        // characters to the same byte, and the guide gives `btuhcr` no
+        // "unless softcr also claims it" exception, so hardcr's unconditional
+        // conversion is checked first.
+        let byte = if byte == hardcr {
+            b'\r'
+        } else if softcr != 0 && byte == softcr {
+            if *wrapped { b' ' } else { b'\r' }
+        } else {
+            byte
+        };
         match byte {
             b'\r' => {
                 // R1 -- guide, `btulfd` page 114: the default on channel
                 // initialisation is that an explicit LF is necessary after
-                // every CR to move to the next line, and `WCCMMUD.DLL` never
-                // calls `btulfd` or `btuhcr`, so the default stands.
+                // every CR to move to the next line. `btuhcr` now exists
+                // (this task), but `WCCMMUD.DLL` still never calls it or
+                // `btulfd` -- so the default (`hardcr` == `0x0D`, an identity
+                // translation) is what keeps existing behaviour unchanged.
                 // `supplied_lf` remembers that this LF is ours, so a module
                 // byte stream that already spells out `\r\n` -- even split
                 // across two `transmit` calls -- does not get a second one.
                 out.push(b'\r');
                 out.push(b'\n');
                 *column = 0;
+                *wrapped = false;
                 *supplied_lf = true;
                 return;
             }
@@ -982,33 +1054,44 @@ impl Channel {
         // visible columns, nowhere near the 79-column wrap boundary, so
         // there is no captured line where it would show. Left alone rather
         // than guessed at.
-        if width != 0 && *column >= width && Self::wrap(out, column, width, byte) {
-            // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
-            // *becomes* the break `wrap()` just inserted, so it is
-            // consumed here rather than carried onto the new line as a
-            // leading indent.
-            //
-            // `wrap()` reports this only when the trigger byte is a
-            // space and either nothing was carried, or the word it found
-            // already filled the line to exactly `width` on its own --
-            // see `wrap()`'s own doc for why those are the only two
-            // cases R9 may fire in.
-            //
-            // This host used to cite the specific words that surfaced
-            // the *first* half of this bug -- `thisis`, `andthese`,
-            // `Streetslead`, from `re/oracle/oracle_bank2.raw`'s Town
-            // Square description, glued together because an early `wrap`
-            // consumed a triggering space that belonged to a word it had
-            // genuinely carried. The CSI fix moved every wrap point in
-            // that paragraph, and a second, narrower bug -- `wrap`
-            // carrying a word that had already fit exactly at `width`,
-            // rather than recognising it needed no carry at all --
-            // surfaced only once wrap points started landing on the
-            // paragraph's real 79-column boundaries. See
-            // `crates/mbbs/tests/wccmmud.rs`,
-            // `a_returning_player_entering_the_realm`, for the citations
-            // measured against the oracle after both fixes.
-            return;
+        if width != 0 && *column >= width {
+            // `wrap()` always breaks the line when this far is reached --
+            // both its branches push `\r\n` and zero `column` -- so
+            // `wrapped` is set the instant it is called, ahead of looking at
+            // what it returns. This is the state [`Channel::softcr`] reads:
+            // a soft CR degrades to a SPACE once a wrap has fired on the
+            // current line, and stays a line break until it has (reset in
+            // the `b'\r'` arm above, on a genuine line break).
+            let consumed = Self::wrap(out, column, width, byte);
+            *wrapped = true;
+            if consumed {
+                // R9, guide `btutsw` page 172: word wrap works by turning a space into a carriage return -- the space
+                // *becomes* the break `wrap()` just inserted, so it is
+                // consumed here rather than carried onto the new line as a
+                // leading indent.
+                //
+                // `wrap()` reports this only when the trigger byte is a
+                // space and either nothing was carried, or the word it found
+                // already filled the line to exactly `width` on its own --
+                // see `wrap()`'s own doc for why those are the only two
+                // cases R9 may fire in.
+                //
+                // This host used to cite the specific words that surfaced
+                // the *first* half of this bug -- `thisis`, `andthese`,
+                // `Streetslead`, from `re/oracle/oracle_bank2.raw`'s Town
+                // Square description, glued together because an early `wrap`
+                // consumed a triggering space that belonged to a word it had
+                // genuinely carried. The CSI fix moved every wrap point in
+                // that paragraph, and a second, narrower bug -- `wrap`
+                // carrying a word that had already fit exactly at `width`,
+                // rather than recognising it needed no carry at all --
+                // surfaced only once wrap points started landing on the
+                // paragraph's real 79-column boundaries. See
+                // `crates/mbbs/tests/wccmmud.rs`,
+                // `a_returning_player_entering_the_realm`, for the citations
+                // measured against the oracle after both fixes.
+                return;
+            }
         }
         out.push(byte);
         // R10: with the default width of 0, wrap() is never called and
@@ -1420,10 +1503,11 @@ mod tests {
         // The guide's example also sets `btuhcr(chan,13)` and `btuscr(chan,10)`,
         // making its `\n`s *soft* carriage returns -- and its own rule is that
         // "when output word wrap has taken place in a paragraph, all subsequent
-        // soft carriage returns are converted into spaces". This host has
-        // neither `btuhcr` nor `btuscr` (`WCCMMUD.DLL` imports neither), so the
-        // soft CRs are supplied here already converted, which is the same input
-        // the guide's own machinery would hand the wrapper.
+        // soft carriage returns are converted into spaces". `btuhcr` and
+        // `btuscr` exist on this host now, but `WCCMMUD.DLL` imports neither,
+        // so this test still supplies the soft CRs already converted rather
+        // than calling them -- which is the same input the guide's own
+        // machinery would hand the wrapper.
         //
         // This is the assertion that fails on the code as it stood before the
         // carry fix: the old `transmit` produced `theEngelmann` and

@@ -711,6 +711,51 @@ pub fn chiinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// `int btuhcr(int chan,char hardcr)` -- set the hard-CR character (guide
+/// `btuhcr`): an output byte unconditionally converted to ASCII CR while
+/// [`crate::gsbl::Channel::transmit`] is in progress.
+///
+/// Unlike [`Channel::pause_char`](crate::gsbl::Channel::pause_char) and its
+/// neighbours, this one is acted on: the mechanism it configures -- ASCII
+/// output translation in [`crate::gsbl::Channel::transmit`] -- already
+/// exists, so recording it inert would be a choice rather than a constraint.
+///
+/// `hardcr` is read with [`u8_arg`], for the same reason as [`btupbc`]'s
+/// `pausch`.
+pub fn btuhcr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(hardcr) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).hardcr = hardcr;
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int btuscr(int chan,char softcr)` -- set the soft-CR character (guide
+/// `btuscr`): a line break while the current output line has not yet
+/// word-wrapped, and a SPACE once it has. Zero disables it, which is the
+/// default -- see [`btuhcr`]'s doc comment for why this one is acted on
+/// rather than recorded inert.
+///
+/// `softcr` is read with [`u8_arg`], for the same reason as [`btupbc`]'s
+/// `pausch`.
+pub fn btuscr<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(softcr) = u8_arg::<A>(call.int()) else {
+        return Ok(abi::Ret::Int(A::Int::from(OUT_OF_RANGE)));
+    };
+    Ok(match on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).softcr = softcr;
+    }) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
 /// `int btuibw(int chan)` -- input bytes waiting.
 ///
 /// Everything not yet handed to the module: raw binary-mode bytes, the line
@@ -1972,5 +2017,101 @@ mod tests {
         let console = f.console();
         f.invoke(chiinj, &[0, Gsbl::CRSTG as u16]).expect("void");
         assert_eq!(f.host.gsbl_mut().next_status(console), Some(Gsbl::CRSTG));
+    }
+
+    #[test]
+    fn a_hard_cr_character_becomes_a_real_carriage_return_on_output() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(btuhcr, &[0, b'~' as u16]).expect("ok");
+        f.host.gsbl_mut().transmit(console, b"a~b");
+        // '~' is unconditionally a CR, and this host supplies the LF (btulfd
+        // default), exactly as an ordinary CR would get.
+        assert_eq!(f.host.gsbl_mut().drain_output(console), b"a\r\nb".to_vec());
+    }
+
+    #[test]
+    fn a_soft_cr_is_a_line_break_until_the_line_wraps_and_a_space_after() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).width = 10;
+        f.invoke(btuscr, &[0, b'|' as u16]).expect("ok");
+
+        // No wrap has happened on this line yet: the soft CR breaks the line.
+        f.host.gsbl_mut().transmit(console, b"ab|");
+        assert_eq!(f.host.gsbl_mut().drain_output(console), b"ab\r\n".to_vec());
+
+        // Force a wrap, then the soft CR degrades to a space.
+        f.host.gsbl_mut().transmit(console, b"aaaaaaaaaaaa|");
+        let out = f.host.gsbl_mut().drain_output(console);
+        assert!(out.ends_with(b" "), "after a wrap the soft CR is a SPACE, got {out:?}");
+    }
+
+    /// `wrapped` is scoped to the current line, not the channel's whole
+    /// lifetime (guide `btuscr`: until the first word wrap on the line -- per line). A genuine line break -- here a hard CR --
+    /// must clear it, so a soft CR arriving after a wrap on an *earlier*
+    /// line still breaks the new one instead of inheriting the space.
+    #[test]
+    fn a_real_line_break_clears_the_wrapped_flag_a_soft_cr_relied_on() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().channel_mut(console).width = 10;
+        f.invoke(btuscr, &[0, b'|' as u16]).expect("ok");
+
+        // Force a wrap, then land on a genuine line break -- not the soft CR
+        // -- to end the line cleanly.
+        f.host.gsbl_mut().transmit(console, b"aaaaaaaaaaaa\r");
+        f.host.gsbl_mut().drain_output(console);
+
+        // The new line has not itself wrapped: the soft CR must break it,
+        // not degrade to a space carried over from the line before.
+        f.host.gsbl_mut().transmit(console, b"ab|");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"ab\r\n".to_vec(),
+            "a hard line break must reset `wrapped`, or this soft CR wrongly \
+             degrades to a SPACE"
+        );
+    }
+
+    /// `softcr == 0` is documented as "disabled" (guide `btuscr`), which
+    /// means NUL is not a wildcard soft-CR value on a default channel --
+    /// nobody has called `btuscr`, so a NUL byte in module output must reach
+    /// the wire untouched, the same as any other byte. This is the guard
+    /// `softcr != 0` exists to enforce; without it, `byte == softcr` is
+    /// trivially true for every NUL a default channel is ever asked to send.
+    #[test]
+    fn a_default_channel_does_not_translate_a_nul_byte() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().transmit(console, b"a\0b");
+        assert_eq!(
+            f.host.gsbl_mut().drain_output(console),
+            b"a\0b".to_vec(),
+            "softcr == 0 means disabled, not \"NUL is the soft CR\""
+        );
+    }
+
+    #[test]
+    fn the_defaults_pass_carriage_returns_through_and_disable_the_soft_cr() {
+        let f = Fixture::new();
+        let console = f.console();
+        let c = f.host.gsbl().channel(console);
+        assert_eq!(c.hardcr, b'\r', "guide `btuhcr`: hardcr defaults to ASCII CR");
+        assert_eq!(c.softcr, 0, "guide `btuscr`: softcr defaults to disabled");
+    }
+
+    #[test]
+    fn btuhcr_and_btuscr_refuse_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        assert_eq!(
+            f.invoke(btuhcr, &[past, b'~' as u16]).expect("btuhcr"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+        assert_eq!(
+            f.invoke(btuscr, &[past, b'|' as u16]).expect("btuscr"),
+            Ret::U16(OUT_OF_RANGE)
+        );
     }
 }

@@ -989,6 +989,8 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         (GALGSBL, "btusts", gsbl::btusts, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         (GALGSBL, "bturst", gsbl::bturst, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         (GALGSBL, "chiinj", gsbl::chiinj, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "btuhcr", gsbl::btuhcr, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "btuscr", gsbl::btuscr, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
         // vendor branches have structurally different headers, so they are
         // ABI-concrete in both native tables below.
