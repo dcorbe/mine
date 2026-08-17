@@ -59,15 +59,14 @@
 //! buffer, decodes them as UTF-8-lossy, and hands the result straight to
 //! `PathBuf::from` -- by design, that crate is dependency-free and has no
 //! notion of a sandbox (see its own doc comment). Something above it has to
-//! decide what a guest-controlled name is allowed to reach, the same
-//! decision `crate::win32::btrieve::resolve_open_path` already makes for the
-//! Win32 edge -- and for the identical reason: a guest that puts `/etc/passwd`,
-//! `..\..\secret`, or a symlink already planted inside the sandbox into an
-//! Open's key buffer must not get it opened, silently, on this host.
-//! [`resolve_open_path`] is this edge's copy of that decision, built on the
-//! same primitive: [`dos::files::translate`] does the DOS-syntax parsing
-//! (drive letters, `..`, device names) once, for every DOS file access this
-//! crate makes, so this does not restate it.
+//! decide what a guest-controlled name is allowed to reach: a guest that puts
+//! `/etc/passwd`, `..\..\secret`, or a symlink already planted inside the
+//! sandbox into an Open's key buffer must not get it opened, silently, on
+//! this host. [`crate::btrieve_open_path::resolve_open_path`] is that
+//! decision -- shared with the Win32 edge (`crate::win32::btrieve`) rather
+//! than duplicated, since the algorithm is pure `std::path` work independent
+//! of which guest type is asking. See that module's own doc comment for the
+//! full reasoning.
 
 use std::path::{Path, PathBuf};
 
@@ -76,6 +75,8 @@ use dos::service::{Serviced, Service};
 
 use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap, Status};
 use btrieve::mem::{Alloc, Mem};
+
+use crate::btrieve_open_path::{resolve_open_path, OpenResolution};
 
 /// What `DFAAPI.C:130` stamps into every `btvdat` it builds. Nothing else on
 /// this vector's calling convention could plausibly produce this value by
@@ -274,98 +275,6 @@ impl<G: Guest> Alloc<DosMem<G>> for DosHeap {
 
     fn free(&mut self, _at: Ptr) -> Result<(), String> {
         Ok(())
-    }
-}
-
-/// What resolving a Btrieve `Open`'s DOS-syntax filename against `root`
-/// found -- this edge's counterpart to
-/// `crate::win32::btrieve::OpenResolution`.
-///
-/// Deliberately has no "no root configured" case: unlike the Win32 edge's
-/// `Process`, which may or may not have a sandbox attached, [`Btrieve::new`]
-/// requires a root up front, so every call into [`resolve_open_path`] already
-/// has one.
-#[derive(Debug)]
-enum OpenResolution {
-    /// Safe to hand `crates/btrieve`: either verified to resolve beneath
-    /// `root` (canonicalized, and checked to still start with the
-    /// canonicalized root -- catches a symlink already planted inside the
-    /// sandbox before this ever ran), or -- a name that plainly does not
-    /// exist under either spelling -- unresolved. The second case is safe to
-    /// hand over unchecked precisely because nothing on disk answers to it,
-    /// symlink or not: see `crate::win32::btrieve::resolve_open_path`'s own
-    /// doc comment, which this mirrors exactly.
-    Path(PathBuf),
-    /// The guest's own name is why this failed: [`dos::files::translate`]
-    /// rejected it outright (`..`, empty, or a bare device name -- none of
-    /// which is a Btrieve file), or it resolved to something real but only
-    /// by following a symlink back out of `root`. Real Btrieve has no status
-    /// for either distinction, and neither is a host misconfiguration, so
-    /// both answer the same way a genuinely missing file does: status 12,
-    /// never a [`Gap`].
-    Refused,
-    /// `root` itself could not be canonicalized. Unlike [`Refused`], this is
-    /// not something the guest's own name could cause -- it means this
-    /// host's own sandbox is misconfigured, which is a [`Gap`], the same
-    /// class of failure `crate::win32::btrieve::OpenResolution::NoRoot` names
-    /// for its own "no sandbox at all" case.
-    RootUnusable,
-}
-
-/// Resolve a Btrieve `Open`'s filename -- DOS syntax such as `.\WCCACMS2.DAT`,
-/// or a guest's attempt at `\..\..\etc\passwd` -- into a real path beneath
-/// `root`, or a refusal.
-///
-/// Reuses [`dos::files::translate`] for the DOS-syntax parsing (drive
-/// letters, `..`, device names) rather than re-deriving it: two path
-/// translators that could disagree is worse than either one alone, and this
-/// crate already depends on `dos` for exactly this job everywhere else a DOS
-/// program names a file. What `translate` cannot do on its own is close a
-/// symlink already sitting inside `root` before this ever ran -- lexical
-/// rejection of `..` does not see that, only canonicalizing the candidate and
-/// checking it against the canonicalized root does -- so this function is
-/// still needed on top of it, the same shape (and the same reasoning)
-/// `crate::win32::btrieve::resolve_open_path`'s own doc comment lays out at
-/// length.
-fn resolve_open_path(root: &Path, keybuf: &[u8]) -> OpenResolution {
-    let Ok(canonical_root) = root.canonicalize() else {
-        return OpenResolution::RootUnusable;
-    };
-    match dos::files::translate(keybuf) {
-        dos::files::Target::File(rel) => {
-            let candidate = root.join(&rel);
-            if candidate.exists() {
-                return contained(&candidate, &canonical_root);
-            }
-            // `translate` upper-cases every byte; a DOS guest reliably
-            // writes upper case, but this host's directories are not
-            // guaranteed to be, so one lower-case retry, the same fallback
-            // `crate::win32::btrieve::resolve_open_path` documents for the
-            // same reason.
-            let lower = root.join(rel.to_ascii_lowercase());
-            if lower.exists() {
-                return contained(&lower, &canonical_root);
-            }
-            // Neither spelling exists, so there is nothing a symlink could
-            // have carried anywhere -- handing this back unresolved is safe.
-            OpenResolution::Path(candidate)
-        }
-        // Neither is a Btrieve file: `translate` already refused `..` and
-        // empty names outright, and a device name (`NUL`, `CON`, ...) is not
-        // something Btrieve's own `Geometry::read` could open either way.
-        // Both are the guest's own doing, not a host-configuration gap, so
-        // both answer status 12 rather than a `Gap`.
-        dos::files::Target::Device(_) | dos::files::Target::Rejected => OpenResolution::Refused,
-    }
-}
-
-/// `candidate`, canonicalized and checked against `canonical_root` -- the one
-/// check that catches a symlink already sitting inside `root` and pointing
-/// back out of it, which no amount of lexical rejection of `..` can see.
-fn contained(candidate: &Path, canonical_root: &Path) -> OpenResolution {
-    match candidate.canonicalize() {
-        Ok(real) if real.starts_with(canonical_root) => OpenResolution::Path(real),
-        _ => OpenResolution::Refused,
     }
 }
 

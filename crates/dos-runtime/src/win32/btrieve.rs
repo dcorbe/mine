@@ -33,14 +33,13 @@
 //! over that one primitive, and its `free` is a no-op for the identical
 //! reason `crt::free`'s is -- see [`Win32Heap`]'s own doc comment.
 
-use std::path::PathBuf;
-
 use mbbs_machine::m32::{Flat32Ptr, Flat32PtrError, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
 use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap, Status};
 use btrieve::mem::{Alloc, Mem};
 
+use crate::btrieve_open_path::{resolve_open_path, OpenResolution};
 use crate::win32::kernel32::Answer;
 use crate::win32::process::Process;
 
@@ -143,114 +142,6 @@ pub fn dispatch(
 fn gap(process: &mut Process, what: String) -> Option<Answer> {
     process.btrieve_gap = Some(what);
     None
-}
-
-/// What [`resolve_open_path`] found.
-#[derive(Debug)]
-enum OpenResolution {
-    /// A path safe to hand `crates/btrieve`: either verified, by
-    /// canonicalizing it and checking the result still starts with the
-    /// canonicalized root, to resolve beneath the sandbox -- or (a name that
-    /// plainly does not exist under either spelling) an unresolved path
-    /// `Geometry::read` will fail against exactly the way a genuinely
-    /// missing file fails. The second case is safe to hand over unchecked
-    /// precisely because nothing on disk answers to it, symlink or not.
-    Path(PathBuf),
-    /// No sandbox to resolve against at all -- a host-configuration gap
-    /// (a test with an empty `Process`, mirroring `Streams::root_path`'s own
-    /// `None`), or the name is not nameable at all (an escape attempt, or
-    /// empty). Real Btrieve has no status for "this host has no root", so
-    /// this is a [`Gap`], not a status.
-    NoRoot,
-    /// The name resolves to something real, but by a route -- a symlink
-    /// already sitting inside the sandboxed tree -- that leads outside
-    /// `--root`. See this function's own doc comment for why this matters.
-    /// Real Btrieve has no status for "a symlink refused" either, so this
-    /// answers the same status 12 a genuinely missing file gets, without
-    /// [`btrcall`] ever handing `crates/btrieve` a path that would follow
-    /// the symlink out.
-    Escaped,
-}
-
-/// Resolve a Btrieve `Open`'s filename -- DOS syntax such as `.\WCCACMS2.DAT`
-/// -- into a real path beneath this process's own sandbox root.
-///
-/// **Why this exists.** `crates/btrieve`'s own `btrcall::open` treats its key
-/// buffer as an already-usable path: every caller in that crate's own test
-/// suite hands `Geometry::read`/`Btrieve::open` a path built with
-/// `dir.join(name)`, because that crate's callers were always either those
-/// tests or (eventually) a real DOS process whose current directory already
-/// *was* the data directory. This host's guest is neither: it is a Win32
-/// program sandboxed beneath `--root`, and a DOS-syntax name handed to
-/// `std::path::PathBuf` unresolved does two things wrong at once -- the
-/// backslash is not a Linux separator, so it survives into a single bogus
-/// path component, and whatever *does* resolve, resolves against this
-/// process's actual working directory rather than the sandbox. Both failures
-/// return the same Btrieve status a genuinely missing file would (12), which
-/// is what let this go unnoticed until Task 7 ran the engine against a real
-/// board rather than an empty fixture directory.
-///
-/// Translation reuses `dos::files::translate` -- the same DOS-path decoder
-/// every other file access on this host goes through -- so `..`, an absolute
-/// path, and a `C:\` drive prefix are all refused lexically here exactly as
-/// they would be for any other DOS file call. That refusal is not the whole
-/// story, though: unlike `dos::files::Files`, nothing below this function
-/// opens through `openat2`, because `crates/btrieve` reads and writes
-/// through plain `std::fs` and is deliberately dependency-free (`crates/
-/// btrieve/tests/independence.rs` enforces that mechanically, so `openat2`
-/// does not belong in that crate). A symlink already sitting inside the
-/// sandboxed tree -- planted before this process ever started, not something
-/// a guest's own DOS-syntax name could spell -- would otherwise let `Open`
-/// walk out of `--root` the same way `..` would if lexical rejection were
-/// the only check. This function closes that door itself: every candidate
-/// that exists is canonicalized (resolving any symlink) and confirmed to
-/// still start with the canonicalized root before it is trusted.
-fn resolve_open_path(process: &Process, keybuf: &[u8]) -> OpenResolution {
-    let Some(root) = process.streams.root_path() else {
-        return OpenResolution::NoRoot;
-    };
-    // Canonicalized once per `Open` rather than cached on `Process`: this
-    // runs once per file a module opens (MajorMUD's own utilities open on
-    // the order of a dozen files, never one per record), not once per
-    // `BTRCALL`, so there is no hot loop here to optimise away.
-    let Ok(canonical_root) = root.canonicalize() else {
-        return OpenResolution::NoRoot;
-    };
-    match dos::files::translate(keybuf) {
-        dos::files::Target::File(rel) => {
-            let candidate = root.join(&rel);
-            if candidate.exists() {
-                return contained(&candidate, &canonical_root);
-            }
-            // `dos::files::translate` upper-cases every byte -- DOS is
-            // case-insensitive and the guest reliably writes upper case, but
-            // this host's directories are not, and this archive holds both
-            // spellings for some extensions (`WCCACMS2.DAT` beside
-            // `wccacms2.vir`). One lower-case retry, the same fallback
-            // `dos::files::Files` documents for the same reason.
-            let lower = root.join(rel.to_ascii_lowercase());
-            if lower.exists() {
-                return contained(&lower, &canonical_root);
-            }
-            // Neither spelling exists, so there is nothing a symlink could
-            // have carried anywhere -- handing this back unresolved is safe,
-            // and `Geometry::read` will fail on it exactly the way a
-            // genuinely missing file fails.
-            OpenResolution::Path(candidate)
-        }
-        dos::files::Target::Device(_) | dos::files::Target::Rejected => OpenResolution::NoRoot,
-    }
-}
-
-/// `candidate`, which [`resolve_open_path`] has already confirmed exists --
-/// canonicalized and checked against `canonical_root`, so a Btrieve `Open`
-/// is only ever handed the canonical (symlink-free) form of a path,
-/// verified to resolve beneath the sandbox.
-fn contained(candidate: &std::path::Path, canonical_root: &std::path::Path) -> OpenResolution {
-    match candidate.canonicalize() {
-        Ok(real) if real.starts_with(canonical_root) => OpenResolution::Path(real),
-        _ => OpenResolution::Escaped,
-    }
 }
 
 /// The seven stdcall arguments, read off the frame and resolved into owned
@@ -417,32 +308,47 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
     };
 
     // Btrieve Open's key buffer holds a filename in DOS syntax -- see
-    // `resolve_open_path`'s doc comment for why the engine cannot be handed
-    // that verbatim. Substitute a resolved path on this local copy before the
-    // engine ever sees it, and restore the guest's own bytes before anything
-    // is written back: real Btrieve does not rewrite the name it was asked to
-    // open, and the guest is entitled to read its own buffer back unchanged.
+    // `crate::btrieve_open_path`'s doc comment for why the engine cannot be
+    // handed that verbatim. Substitute a resolved path on this local copy
+    // before the engine ever sees it, and restore the guest's own bytes
+    // before anything is written back: real Btrieve does not rewrite the
+    // name it was asked to open, and the guest is entitled to read its own
+    // buffer back unchanged.
     let original_keybuf = (op == 0).then(|| keybuf.clone());
-    // Set only for a symlink escape: real Btrieve status 12, answered
-    // without ever calling `engine_btrcall` -- see `OpenResolution::Escaped`.
-    // Every other field is left exactly as `read_args` marshalled it
-    // (`keybuf` unsubstituted), which is safe because nothing below reads
-    // them when this is `Some`.
+    // Set for a refused name (rejected syntax, a device name, or a symlink
+    // escape): real Btrieve status 12, answered without ever calling
+    // `engine_btrcall` -- see `OpenResolution::Refused`. Every other field is
+    // left exactly as `read_args` marshalled it (`keybuf` unsubstituted),
+    // which is safe because nothing below reads them when this is `Some`.
     let mut refused: Option<Status> = None;
     if op == 0 {
-        match resolve_open_path(process, &keybuf) {
-            OpenResolution::Path(resolved) => {
-                let mut bytes = resolved.to_string_lossy().into_owned().into_bytes();
-                bytes.push(0);
-                keybuf = bytes;
-            }
-            OpenResolution::NoRoot => {
+        // No sandbox *configured* at all -- unlike `OpenResolution`'s own
+        // `RootUnusable` (a root that exists but cannot canonicalize), this
+        // is `Process`-specific (a test with an empty `Process`, mirroring
+        // `Streams::root_path`'s own `None`), so it is checked here rather
+        // than inside the shared function, which always requires a `&Path`.
+        let root = process.streams.root_path().map(std::path::Path::to_path_buf);
+        match root {
+            None => {
                 return gap(
                     process,
                     "Open: no sandboxed root to resolve a filename against".to_owned(),
                 );
             }
-            OpenResolution::Escaped => refused = Some(Status(12)),
+            Some(root) => match resolve_open_path(&root, &keybuf) {
+                OpenResolution::Path(resolved) => {
+                    let mut bytes = resolved.to_string_lossy().into_owned().into_bytes();
+                    bytes.push(0);
+                    keybuf = bytes;
+                }
+                OpenResolution::RootUnusable => {
+                    return gap(
+                        process,
+                        "Open: sandboxed root does not canonicalize".to_owned(),
+                    );
+                }
+                OpenResolution::Refused => refused = Some(Status(12)),
+            },
         }
     }
 
@@ -524,8 +430,12 @@ mod tests {
     /// data would be -- not something a DOS-syntax name in the key buffer
     /// could spell on its own (`dos::files::translate` already refuses
     /// `..`), so lexical rejection alone cannot catch this; only
-    /// canonicalizing the candidate and checking it against the
-    /// canonicalized root does.
+    /// `crate::btrieve_open_path::resolve_open_path`'s canonicalize-and-check
+    /// does. Goes through `Process`/`Streams` exactly as `btrcall` does
+    /// (`process.streams.root_path()`, then the shared function), rather
+    /// than only exercising the shared function's own unit test, so that a
+    /// mutation to the shared function is caught here too -- see this task's
+    /// own final-fix report for why that is the point.
     #[test]
     fn a_symlink_inside_the_root_cannot_walk_a_btrieve_open_out_of_it() {
         let base = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
@@ -553,9 +463,10 @@ mod tests {
             root.clone(),
         )));
 
-        let resolved = resolve_open_path(&p, b"ESCAPE.DAT\0");
+        let sandbox_root = p.streams.root_path().expect("root configured above").to_path_buf();
+        let resolved = resolve_open_path(&sandbox_root, b"ESCAPE.DAT\0");
         assert!(
-            matches!(resolved, OpenResolution::Escaped),
+            matches!(resolved, OpenResolution::Refused),
             "expected the symlink to be refused, got {resolved:?}"
         );
     }
