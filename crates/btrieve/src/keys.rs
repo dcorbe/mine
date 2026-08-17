@@ -135,6 +135,10 @@ pub enum Kind {
     /// `Unsigned`, `UnsignedBinary`, `OldBinary`: an unsigned little-endian
     /// number, of whatever width the segment is.
     Unsigned,
+
+    /// `Float`: an IEEE binary float, of whatever width the segment is --
+    /// eight bytes is an `f64`, four an `f32`. Both measured; see [`float`].
+    Float,
 }
 
 impl Kind {
@@ -152,6 +156,7 @@ impl Kind {
             0x00 | 0x0a | 0x0b | 0x20 => Some(Self::Text),
             0x01 | 0x0f => Some(Self::Signed),
             0x0d | 0x0e | 0x21 => Some(Self::Unsigned),
+            0x02 => Some(Self::Float),
             _ => None,
         }
     }
@@ -218,6 +223,7 @@ impl Segment {
             // an integer would corrupt the number rather than reorder it.
             Kind::Signed => signed(a, b),
             Kind::Unsigned => unsigned(a, b),
+            Kind::Float => float(a, b),
         };
         if self.descending { order.reverse() } else { order }
     }
@@ -263,6 +269,51 @@ fn signed(a: &[u8], b: &[u8]) -> Ordering {
         (true, false) => Ordering::Less,
         (false, true) => Ordering::Greater,
         _ => unsigned(a, b),
+    }
+}
+
+/// Compare two IEEE binary floats -- `f64` at eight bytes, `f32` at four.
+///
+/// **IEEE totalOrder, which is `total_cmp` and not `partial_cmp`.** Measured
+/// against genuine Pervasive Btrieve 6.15 with
+/// `tools/btrieve-oracle/floatprobe.c`, which inserted seven values and
+/// stepped the key: the engine answers
+///
+/// ```text
+/// -1e308  <  -1.0  <  -0.0  <  +0.0  <  1.0  <  1e308  <  NaN
+/// ```
+///
+/// Two of those would be wrong under the obvious implementation, and both
+/// are the "wrong only sometimes" failure this module refuses on principle:
+///
+/// - **`-0.0` sorts strictly before `+0.0`.** They were inserted `+0.0`
+///   first and came back the other way round, so the engine is ordering them
+///   rather than calling them one key. `partial_cmp` reports them equal.
+/// - **NaN sorts after every number.** `partial_cmp` reports `None`, and any
+///   `unwrap_or` of that invents an answer.
+///
+/// A four-byte segment is an `f32`, measured the same way and not assumed
+/// from the eight-byte case.
+///
+/// A width this host has no float for compares `Equal` rather than panicking:
+/// [`parse`] has already refused any *key* of an unreadable width long before
+/// a comparison can reach here, so this arm is unreachable rather than
+/// lenient.
+fn float(a: &[u8], b: &[u8]) -> Ordering {
+    match (a.len(), b.len()) {
+        (8, 8) => {
+            let read = |f: &[u8]| {
+                f64::from_le_bytes(f[..8].try_into().expect("eight bytes"))
+            };
+            read(a).total_cmp(&read(b))
+        }
+        (4, 4) => {
+            let read = |f: &[u8]| {
+                f32::from_le_bytes(f[..4].try_into().expect("four bytes"))
+            };
+            read(a).total_cmp(&read(b))
+        }
+        _ => Ordering::Equal,
     }
 }
 
@@ -863,6 +914,81 @@ mod tests {
         let key = named(Kind::Signed, 2);
         assert_eq!(key.compare(&[0, 1], &[1, 0]), Ordering::Greater);
         assert_eq!(key.compare(&[13, 0], &[1, 0]), Ordering::Greater);
+    }
+
+    /// The order genuine Pervasive Btrieve 6.15 puts float keys in, taken
+    /// straight off the engine: seven values inserted, the key stepped, and
+    /// this is what came back.
+    ///
+    /// `tools/btrieve-oracle/floatprobe.c`, and
+    /// `docs/2026-08-17-float-key-oracle.md` for the transcript. A rig of
+    /// only positive values would pass under a bytewise comparison and prove
+    /// nothing, so every value here is one some wrong reading gets right.
+    #[test]
+    fn a_float_key_is_ordered_the_way_the_engine_orders_it() {
+        let key = named(Kind::Float, 8);
+        let engines_order: [f64; 7] = [
+            -1e308,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            1e308,
+            f64::NAN,
+        ];
+        for pair in engines_order.windows(2) {
+            let (lower, higher) = (pair[0], pair[1]);
+            assert_eq!(
+                key.compare(&lower.to_le_bytes(), &higher.to_le_bytes()),
+                Ordering::Less,
+                "{lower} sorts before {higher} in the engine's own walk"
+            );
+        }
+    }
+
+    /// The two findings that make this `total_cmp` rather than `partial_cmp`.
+    ///
+    /// Both were measured, not reasoned about: `+0.0` was inserted before
+    /// `-0.0` and the engine's walk returned them the other way round, which
+    /// it could not do if it thought them equal; and NaN came back after
+    /// `1e308` rather than being refused or dropped.
+    #[test]
+    fn negative_zero_sorts_below_positive_zero_and_nan_sorts_above_everything() {
+        let key = named(Kind::Float, 8);
+
+        assert_eq!(
+            key.compare(&(-0.0f64).to_le_bytes(), &0.0f64.to_le_bytes()),
+            Ordering::Less,
+            "partial_cmp calls these equal; the engine does not"
+        );
+        assert_eq!(
+            key.compare(&f64::NAN.to_le_bytes(), &1e308f64.to_le_bytes()),
+            Ordering::Greater,
+            "partial_cmp answers None here, and any default for it is invented"
+        );
+    }
+
+    /// Four bytes is an `f32`, measured separately rather than assumed from
+    /// the eight-byte case -- `MULTIACS.DAT`'s own segment is eight, so
+    /// nothing in the corpus would have caught this being wrong.
+    #[test]
+    fn a_four_byte_float_segment_is_an_f32() {
+        let key = named(Kind::Float, 4);
+        assert_eq!(
+            key.compare(&(-3.4e38f32).to_le_bytes(), &(-1.0f32).to_le_bytes()),
+            Ordering::Less,
+        );
+        assert_eq!(
+            key.compare(&(-0.0f32).to_le_bytes(), &0.0f32.to_le_bytes()),
+            Ordering::Less,
+        );
+
+        // The same four bytes read as an f64 would be a different number
+        // entirely, and this is what says they are not.
+        assert_eq!(
+            key.compare(&1.0f32.to_le_bytes(), &(-1.0f32).to_le_bytes()),
+            Ordering::Greater,
+        );
     }
 
     #[test]

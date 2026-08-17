@@ -875,7 +875,12 @@ mod tests {
             record_length: 8,
             page_size: 512,
             keys: vec![KeySpec {
-                segments: vec![SegmentSpec { offset: 0, length: 8, kind: 0x02, descending: false }], // float
+                // `bfloat` (0x09). Borland's BCD, explicitly not IEEE, and
+                // the one numeric type still without an ordering here --
+                // `float` (0x02) used to serve as this test's example and
+                // stopped being unreadable once the engine's own float order
+                // was measured.
+                segments: vec![SegmentSpec { offset: 0, length: 8, kind: 0x09, descending: false }],
                 duplicates: false,
                 modifiable: false,
             }],

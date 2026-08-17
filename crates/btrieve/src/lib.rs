@@ -7763,28 +7763,20 @@ mod tests {
             "found through the allocation table, so these are logical pages"
         );
 
-        // The alternate sequence is no longer what stops this file. What does is
-        // unrelated and was behind it all along: key 1's second segment is a
-        // `float` (type 0x02), an ordering this host has never had. Opening a
-        // file further finds the next thing wrong with it.
-        let e = keys::parse("MULTIACS.DAT", &fcr, geometry.keys, &tables)
-            .expect_err("key 1 is a float, which is a separate gap");
-        assert!(e.why.contains("float"), "{}", e.why);
-        assert!(
-            !e.why.contains("alternate collating"),
-            "the ACS refusal must be gone: {}",
-            e.why
-        );
-
-        // With that one type byte changed to a text segment -- and nothing else
-        // touched -- the real key definitions bind, which is what proves the
-        // per-key page is being read from the right place in real bytes rather
-        // than only in a synthetic control record.
-        let mut patched = fcr.clone();
-        patched[keys::BASE + 2 * keys::WIDTH + 0x1c] = 0x0b;
-        let parsed = keys::parse("MULTIACS.DAT", &patched, geometry.keys, &tables)
-            .expect("each key names the table it uses");
+        // Two gaps stood behind each other here. The alternate sequence was
+        // closed first; key 1's second segment being a `float` (type 0x02)
+        // was what surfaced next, and is closed now that the engine's own
+        // float ordering has been measured
+        // (`docs/2026-08-17-float-key-oracle.md`). This test used to assert
+        // that refusal and now asserts its absence: the real definitions
+        // parse, unpatched.
+        let parsed = keys::parse("MULTIACS.DAT", &fcr, geometry.keys, &tables)
+            .expect("nothing about this file is refused any more");
         assert_eq!(parsed.len(), 3);
+        assert!(
+            parsed[1].segments.iter().any(|s| s.kind == keys::Kind::Float),
+            "key 1's second segment is the float that used to stop this file"
+        );
 
         let folded = |key: &Key, b: u8| key.acs.as_ref().map(|acs| acs.fold(b));
         assert_eq!(
