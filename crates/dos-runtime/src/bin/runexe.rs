@@ -38,6 +38,7 @@ use dos_runtime::fossil::Fossil;
 use dos_runtime::mz::{self, MzImage};
 use dos_runtime::pit::Pit;
 use dos_runtime::screen::Screen;
+use dos_runtime::win32;
 
 /// 1 MiB: the whole real-mode address space.
 const MEM: usize = 1 << 20;
@@ -171,6 +172,80 @@ struct Cli {
     tail: Vec<String>,
 }
 
+/// Which runtime a file belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    RealMode,
+    Pe32,
+    Unsupported,
+}
+
+/// How many import calls a PE32 program may make before the run is cut short.
+///
+/// Generous: the point of a run is to find the first thing this host cannot
+/// answer, and a program that gets further than this has already told us far
+/// more than the budget would.
+const PE_CALL_BUDGET: usize = 100_000;
+
+/// Which runtime `file` belongs to.
+///
+/// Reads the two bytes at `e_lfanew` rather than trusting the offset itself.
+/// `NE` is `Unsupported` rather than routed: `MAJORBBS.EXE` is NE plus a Phar
+/// Lap 286 extender and neither host can run it, so refusing it names the
+/// problem instead of faulting somewhere inside a loader.
+pub fn format_of(file: &[u8]) -> Format {
+    if file.len() < 0x40 || &file[0..2] != b"MZ" {
+        return Format::Unsupported;
+    }
+    let lfanew = u32::from_le_bytes([file[0x3c], file[0x3d], file[0x3e], file[0x3f]]) as usize;
+    // A real-mode MZ has no extended header at all, and `e_lfanew` is then
+    // whatever happened to sit at 0x3c -- all fifteen extracted DOS
+    // WCCMMUTL builds carry 0x10000 there, pointing at ordinary code. So an
+    // offset that is out of range, or that does not carry a signature we
+    // know, means real mode rather than "malformed".
+    let Some(sig) = file.get(lfanew..lfanew + 4) else {
+        return Format::RealMode;
+    };
+    match &sig[0..2] {
+        b"PE" if sig[2] == 0 && sig[3] == 0 => Format::Pe32,
+        b"NE" | b"LE" | b"LX" => Format::Unsupported,
+        _ => Format::RealMode,
+    }
+}
+
+/// Run a PE32 console program on the Win32 host.
+///
+/// Reports where it stopped rather than pretending to have finished: the
+/// measured frontier is at `cw3220mt.DLL!_time` (see
+/// `docs/2026-08-17-win32-import-trace.md`), so an ordinary run of this program
+/// today ends by naming the next symbol to implement. That is the useful
+/// output, and printing it is the whole reason this front door exists before
+/// the program can complete.
+fn run_pe32(path: &str, data: &[u8], tail: &str) -> io::Result<()> {
+    let mut loaded = win32::load::load(data)?;
+    println!(
+        "{path}: PE32 image, {} imports, entry {:#010x}",
+        loaded.imports.len(),
+        loaded.entry
+    );
+
+    // The same `C:\NAME.EXE` shape the real-mode path builds, and for the same
+    // reason: a program reads its own path back and finds its home directory
+    // by stripping the filename off the end.
+    let program = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("PROGRAM.EXE")
+        .to_ascii_uppercase();
+    let argv0 = format!("C:\\{program}");
+    let args: Vec<&str> = tail.split_whitespace().collect();
+    let mut process = win32::process::Process::new(&argv0, &args);
+
+    let outcome = win32::process::run(&mut loaded, &mut process, PE_CALL_BUDGET)?;
+    println!("--- {outcome:?} ---");
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     let started = std::time::Instant::now();
     let cli = Cli::parse();
@@ -205,6 +280,26 @@ fn main() -> io::Result<()> {
     let baud = baud.or_else(|| dropfile.as_deref().and_then(dropfile_baud));
 
     let data = std::fs::read(&path)?;
+
+    // One front door, two runtimes. Everything below this point is the
+    // real-mode path and is unchanged; a PE32 leaves here instead.
+    match format_of(&data) {
+        Format::Pe32 => return run_pe32(&path, &data, &tail),
+        Format::Unsupported => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{path}: not a program either runtime can run. \
+                     The 16-bit segmented formats (NE, LE, LX) are refused outright: \
+                     NE covers both Windows 3.x programs and MAJORBBS.EXE, which is \
+                     additionally a Phar Lap 286 extender. The real-mode guest runs MZ \
+                     and the Win32 host runs PE32"
+                ),
+            ));
+        }
+        Format::RealMode => {}
+    }
+
     let img = MzImage::parse(&data)?;
     println!(
         "{path}: {} byte image, {} relocations, entry {:#06x}:{:#06x}, \
@@ -987,8 +1082,71 @@ fn dropfile_baud(path: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, dropfile_baud};
+    use super::{Cli, Format, dropfile_baud, format_of};
     use clap::Parser;
+
+    /// The format sniff must read the signature bytes, not merely validate
+    /// `e_lfanew`. All fifteen extracted DOS `WCCMMUTL.EXE` builds carry
+    /// `e_lfanew == 0x10000`, a plausible-looking offset pointing at ordinary
+    /// code -- "is `e_lfanew` sane" would route every one of them to the Win32
+    /// host.
+    #[test]
+    fn the_format_sniff_reads_the_signature_not_the_offset() {
+        let mut mz = vec![0u8; 0x40];
+        mz[0..2].copy_from_slice(b"MZ");
+        mz[0x3c..0x40].copy_from_slice(&0x10000u32.to_le_bytes());
+        assert_eq!(format_of(&mz), Format::RealMode, "a nonsense e_lfanew is still MZ");
+
+        let mut pe = vec![0u8; 0x100];
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        assert_eq!(format_of(&pe), Format::Pe32);
+
+        let mut ne = vec![0u8; 0x100];
+        ne[0..2].copy_from_slice(b"MZ");
+        ne[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        ne[0x80..0x82].copy_from_slice(b"NE");
+        assert_eq!(format_of(&ne), Format::Unsupported, "NE is refused, not routed");
+    }
+
+    /// `PE\0\0` is checked in full. A real-mode image whose code happens to
+    /// begin with the two letters `PE` must not be routed to the Win32 host on
+    /// the strength of them.
+    #[test]
+    fn a_two_byte_pe_without_its_nulls_is_not_a_pe() {
+        let mut almost = vec![0u8; 0x100];
+        almost[0..2].copy_from_slice(b"MZ");
+        almost[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        almost[0x80..0x84].copy_from_slice(b"PEEK");
+        assert_eq!(format_of(&almost), Format::RealMode);
+    }
+
+    /// The real files, both of them, rather than only hand-built headers.
+    #[test]
+    fn the_real_binaries_route_where_they_belong() {
+        let pe = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the PE32 utility");
+        assert_eq!(format_of(&pe), Format::Pe32);
+
+        // Anchored to the manifest dir: cargo runs a test binary with the
+        // package root as its working directory, not the workspace root.
+        let mz = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../archive/lord/4.06/LORD.EXE"
+        ))
+        .expect("LORD");
+        assert_eq!(format_of(&mz), Format::RealMode);
+
+        // A real NE, not a hand-built header. The archive holds 3,497 of them,
+        // so "NE is refused rather than routed" is a claim worth making against
+        // one the vendor actually shipped.
+        let ne = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../archive/galacticomm/cdrom/wg33cd/INTRO/WGCD.EXE"
+        ))
+        .expect("an NE from the Worldgroup CD");
+        assert_eq!(format_of(&ne), Format::Unsupported);
+    }
 
     /// The live door's invocation, verbatim from
     /// `/sbbs/xtrn/lord/lord-dospoc.sh`: program first, then flags, then a bare
