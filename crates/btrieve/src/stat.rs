@@ -470,7 +470,8 @@ mod tests {
             duplicates: false,
             modifiable: true,
             chain: None,
-        }
+                    acs: None,
+}
     }
 
     /// The measured shape: 16 bytes of file spec, 16 of key spec, nothing
@@ -675,7 +676,8 @@ mod tests {
                 duplicates: false,
                 modifiable: true,
                 chain: None,
-            },
+                            acs: None,
+},
         ];
         let stat = Stat::read("multi.dat", &path, &geometry, &keys).expect("reads");
         assert_eq!(stat.key_specs.len(), 3, "one per segment: 1 + 2");

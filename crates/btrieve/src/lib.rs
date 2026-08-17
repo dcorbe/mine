@@ -2723,7 +2723,7 @@ impl<M: Mem> Btrieve<M> {
         // `opnbtv` does. A file whose keys cannot be read is refused here, not
         // at whatever much later moment something first searches by one.
         let fcr = read_head(path, FCR).map_err(|e| format!("{}: {e}", path.display()))?;
-        let parsed = keys::parse(name, &fcr, geometry.keys).map_err(|e| e.why)?;
+        let parsed = keys::parse(name, &fcr, geometry.keys, &[]).map_err(|e| e.why)?;
 
         // `PLBTVSTF.C:148` -- `bb->filnam=alcmem(strlen(filnam)+1)`. The
         // module's, not the host's: `clsbtv` frees it.
@@ -3526,7 +3526,7 @@ mod tests {
             .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
         let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys, &[]).expect("keys");
 
         let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed)
             .expect("v6 addressing is resolved as of Task 5");
@@ -3552,7 +3552,7 @@ mod tests {
             .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
         let geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("DUPKEY30.DAT", &fcr, geometry.keys, &[]).expect("keys");
         let records = Records::read("DUPKEY30.DAT", &path, &geometry, &parsed).expect("records");
 
         let key = &parsed[0];
@@ -3743,7 +3743,7 @@ mod tests {
         block.name = "V6EMPTY1KEY.DAT".to_owned();
         block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys, &[]).expect("keys");
         block.maxlen = block.geometry.reclen;
 
         let mut bytes = vec![0u8; usize::from(block.geometry.reclen)];
@@ -3860,7 +3860,7 @@ mod tests {
             // decodes at the right offsets proves nothing about whether the
             // data pages are laid out where this host expects them.
             let fcr = std::fs::read(&path).expect("readable");
-            let parsed = keys::parse(name, &fcr, geometry.keys);
+            let parsed = keys::parse(name, &fcr, geometry.keys, &[]);
             if !parses {
                 let why = parsed.expect_err("EMAIL.DAT's ACS key must refuse").why;
                 assert!(
@@ -3906,7 +3906,8 @@ mod tests {
             duplicates: false,
             modifiable: true,
             chain: None,
-        }];
+                    acs: None,
+}];
         Block {
             id: ops::BlockId::fresh(),
             name: "SCRATCH.DAT".to_owned(),
@@ -3967,7 +3968,7 @@ mod tests {
         block.name = "DUPKEY30.DAT".to_owned();
         block.geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        block.keys = keys::parse("DUPKEY30.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.keys = keys::parse("DUPKEY30.DAT", &fcr, block.geometry.keys, &[]).expect("keys");
         block.maxlen = block.geometry.reclen;
 
         // Reading it works -- that is Tasks 1-5, and the point of the refusal
@@ -4006,7 +4007,7 @@ mod tests {
         block.name = "V6EMPTY1KEY.DAT".to_owned();
         block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys, &[]).expect("keys");
         block.maxlen = block.geometry.reclen;
         block.records().expect("v6 reads");
         (block, path)
@@ -4148,7 +4149,8 @@ mod tests {
             duplicates: false,
             modifiable: false,
             chain: None,
-        }];
+                    acs: None,
+}];
 
         let mut before = vec![0u8; 16];
         before[..3].copy_from_slice(b"AB\0");
@@ -4421,6 +4423,7 @@ mod tests {
             "V6EMPTY1KEY.DAT",
             &std::fs::read(&path).expect("readable"),
             block.geometry.keys,
+            &[],
         )
         .expect("keys");
 
@@ -4632,7 +4635,7 @@ mod tests {
         block.name = "V6EMPTY1KEY.DAT".to_owned();
         block.geometry = Geometry::read("V6EMPTY1KEY.DAT", &path).expect("reads");
         let fcr = std::fs::read(&path).expect("readable");
-        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys).expect("keys");
+        block.keys = keys::parse("V6EMPTY1KEY.DAT", &fcr, block.geometry.keys, &[]).expect("keys");
         block.maxlen = block.geometry.reclen;
 
         assert_eq!(block.records().expect("v6 reads").len(), 0);
@@ -5092,7 +5095,8 @@ mod tests {
             duplicates: false,
             modifiable: true,
             chain: None,
-        }];
+                    acs: None,
+}];
         Block {
             id: ops::BlockId::fresh(),
             name: "VARIABLE.DAT".to_owned(),
@@ -5339,7 +5343,8 @@ mod tests {
             duplicates: false,
             modifiable: true,
             chain: None,
-        }];
+                    acs: None,
+}];
         Block {
             id: ops::BlockId::fresh(),
             name: "INDEXED.DAT".to_owned(),
@@ -5824,7 +5829,8 @@ mod tests {
                 duplicates: false,
                 modifiable: true,
                 chain: None,
-            },
+                            acs: None,
+},
             Key {
                 number: 1,
                 definition: 2,
@@ -5832,7 +5838,8 @@ mod tests {
                 duplicates: false,
                 modifiable: true,
                 chain: None,
-            },
+                            acs: None,
+},
         ];
         Block {
             id: ops::BlockId::fresh(),

@@ -2482,7 +2482,8 @@ mod tests {
                 duplicates: false,
                 modifiable: true,
                 chain: None,
-            },
+                            acs: None,
+},
             Key {
                 number: 1,
                 definition: 1,
@@ -2495,7 +2496,8 @@ mod tests {
                 duplicates: true,
                 modifiable: true,
                 chain: Some(8),
-            },
+                            acs: None,
+},
         ]
     }
 

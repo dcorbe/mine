@@ -21,8 +21,10 @@
 //! sorting into SQLite indexes rather than walking the B-tree.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use super::BtvError;
+use crate::acs::Acs;
 
 /// Where the key definitions start in the file control record.
 pub(crate) const BASE: usize = 0x110;
@@ -187,14 +189,32 @@ impl Segment {
     }
 
     /// Compare this segment of two records.
-    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-        self.order(self.of(a), self.of(b))
+    fn compare(&self, a: &[u8], b: &[u8], acs: Option<&Acs>) -> Ordering {
+        self.order(self.of(a), self.of(b), acs)
     }
 
     /// Compare two of this segment's fields, honouring its direction.
-    fn order(&self, a: &[u8], b: &[u8]) -> Ordering {
+    ///
+    /// Every key comparison in this crate funnels through here, which is why
+    /// an alternate collating sequence is applied at this one point rather
+    /// than anywhere nearer the callers.
+    fn order(&self, a: &[u8], b: &[u8], acs: Option<&Acs>) -> Ordering {
         let order = match self.kind {
-            Kind::Text => text(a).cmp(text(b)),
+            // The `None` arm is deliberately the bare `cmp` and not a shared
+            // iterator over both cases. `records.rs:239` measures this
+            // function at 18.5% of a live board's CPU and the `memcmp` this
+            // compiles to at roughly 23% more; folding both operands through
+            // an iterator unconditionally would charge all 470 files in the
+            // corpus for a feature 45 of them use.
+            Kind::Text => match acs {
+                None => text(a).cmp(text(b)),
+                Some(acs) => text(a)
+                    .iter()
+                    .map(|b| acs.fold(*b))
+                    .cmp(text(b).iter().map(|b| acs.fold(*b))),
+            },
+            // A table applies to text and nothing else. Folding a byte inside
+            // an integer would corrupt the number rather than reorder it.
             Kind::Signed => signed(a, b),
             Kind::Unsigned => unsigned(a, b),
         };
@@ -290,6 +310,24 @@ pub struct Key {
     /// [`Self::duplicates`] is false, since a unique key has no chain to
     /// offset. See [`at::CHAIN`].
     pub chain: Option<u16>,
+    /// The alternate collating sequence this key is ordered through, if it
+    /// declares one.
+    ///
+    /// **Per key, not per file** -- the format expresses exactly that, and
+    /// `MULTIACS.DAT` is the proof: it holds *two* tables, `ALLCAPS` on
+    /// physical page 4 and `LOWER` on 5, one for each of its two ACS-flagged
+    /// keys, and for v6 the engine stores the pointer per key segment
+    /// (`W32MKDE_decompiled.c:15364-15375`).
+    ///
+    /// It lives on [`Key`] rather than on [`Segment`] because `Segment` is
+    /// `Copy` and an `Arc` field would end that, and because [`Key::compare`]
+    /// and [`Key::compare_value`] are the only comparison entry points
+    /// [`records`](super::records) uses -- so the table reaches every
+    /// comparison without that module changing.
+    ///
+    /// An `Arc` because every ACS-flagged key of a file usually shares one
+    /// table, and a 256-byte array per key would be copied for nothing.
+    pub acs: Option<Arc<Acs>>,
 }
 
 impl Key {
@@ -342,7 +380,7 @@ impl Key {
     /// types imply.
     pub fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
         for segment in &self.segments {
-            match segment.compare(a, b) {
+            match segment.compare(a, b, self.acs.as_deref()) {
                 Ordering::Equal => continue,
                 other => return other,
             }
@@ -361,7 +399,7 @@ impl Key {
                 offset: at,
                 ..*segment
             };
-            match segment.order(segment.of(record), laid_out.of(value)) {
+            match segment.order(segment.of(record), laid_out.of(value), self.acs.as_deref()) {
                 Ordering::Equal => at += segment.length,
                 other => return other,
             }
@@ -378,14 +416,47 @@ impl Key {
 /// `WCCBANKS` has one key of two segments and `WCCITOWN` has two keys and three
 /// segments between them.
 ///
+/// `tables` is every alternate collating sequence the file carries, in page
+/// order, and empty when it has none. A key flagged as collating through one
+/// is bound to it here; see the binding rule below for why more than one is
+/// refused rather than guessed at.
+///
 /// # Errors
 ///
 /// If a definition runs past the end of the file control record, uses a data
-/// type this host has no ordering for, or leaves a key with no segments.
-pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
+/// type this host has no ordering for, leaves a key with no segments, is
+/// declared with an unsupported attribute, or collates through an alternate
+/// sequence that `tables` cannot unambiguously supply.
+pub fn parse(
+    name: &str,
+    fcr: &[u8],
+    count: u16,
+    tables: &[Arc<Acs>],
+) -> Result<Vec<Key>, BtvError> {
     let fail = |why: String| BtvError {
         file: name.to_owned(),
         why,
+    };
+
+    // The binding rule, and the one thing about an ACS still unmeasured. A
+    // key's attribute word says *that* it collates through a sequence; which
+    // *numbered* sequence is stored per key segment for v6, and the engine
+    // reads it from an in-memory key structure whose on-disk byte offset has
+    // not been located. So:
+    //
+    // - no table          -> nothing to bind, and the refusal below stands.
+    // - exactly one table -> every flagged key binds it, unambiguously. This
+    //                        is 44 of the 45 corpus files that declare one.
+    // - more than one     -> REFUSED. Only `MULTIACS.DAT` lands here.
+    //
+    // Refusing the multi-table case is the honest position rather than the
+    // cautious one: binding the wrong table would order that key by the wrong
+    // sequence, silently and for as long as the file lives, which is the exact
+    // failure this module's header warns about and the whole reason the bit was
+    // refused outright before.
+    let bound = match tables {
+        [only] => Some(Arc::clone(only)),
+        _ => None,
     };
 
     let mut keys: Vec<Key> = Vec::with_capacity(usize::from(count));
@@ -396,6 +467,12 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
     // count live (see [`Key::definition`]). Set fresh each time `segments`
     // is empty, i.e. at the start of a new key.
     let mut start_definition = 0usize;
+    // Whether *any* segment of the key currently being assembled declared an
+    // alternate sequence. Read across the whole key rather than off its last
+    // definition: for v6 the pointer is stored per segment, so a segmented key
+    // could flag it anywhere, and a key ordered through a table for one segment
+    // is a key whose order this host cannot reproduce without that table.
+    let mut alt_collating = false;
 
     while keys.len() < usize::from(count) {
         if definitions >= SEGMAX {
@@ -405,6 +482,7 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
         }
         if segments.is_empty() {
             start_definition = definitions;
+            alt_collating = false;
         }
         let start = BASE + definitions * WIDTH;
         let definition = fcr.get(start..start + WIDTH).ok_or_else(|| {
@@ -418,14 +496,37 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
             u16::from_le_bytes([definition[offset], definition[offset + 1]])
         };
         let attributes = word(at::ATTRIBUTES);
+        if attributes & flag::ALT_COLLATING != 0 {
+            alt_collating = true;
+        }
         for (bit, what) in UNSUPPORTED {
-            if attributes & bit != 0 {
-                return Err(fail(format!(
-                    "key {} is declared with {what}, which changes what its index \
-                     holds and is not reproduced by sorting the records",
-                    keys.len()
-                )));
+            if attributes & bit == 0 {
+                continue;
             }
+            // The one refusal a located table lifts. The other three --
+            // null-all, null-any, repeating duplicates -- have no measured
+            // behaviour here and stay unconditional.
+            if bit == flag::ALT_COLLATING {
+                if tables.len() > 1 {
+                    return Err(fail(format!(
+                        "key {} collates through an alternate sequence and this file \
+                         carries more than one ({}), so which table the key uses is \
+                         ambiguous: the per-key sequence number's offset within a key \
+                         definition has not been measured, and binding the wrong table \
+                         would order the key by the wrong sequence silently",
+                        keys.len(),
+                        tables.len()
+                    )));
+                }
+                if bound.is_some() {
+                    continue;
+                }
+            }
+            return Err(fail(format!(
+                "key {} is declared with {what}, which changes what its index \
+                 holds and is not reproduced by sorting the records",
+                keys.len()
+            )));
         }
 
         let length = word(at::LENGTH);
@@ -489,6 +590,11 @@ pub fn parse(name: &str, fcr: &[u8], count: u16) -> Result<Vec<Key>, BtvError> {
                 // `start_definition` instead, same as `Self::definition`; none
                 // exists to measure that against.
                 chain: duplicates.then(|| word(at::CHAIN)),
+                // Bound only for a key that actually declared one. A file may
+                // carry a table that no key uses, and folding an unflagged
+                // key's bytes through it would reorder an index that genuine
+                // Btrieve leaves in raw byte order.
+                acs: alt_collating.then(|| bound.clone()).flatten(),
             });
         }
     }
@@ -546,6 +652,7 @@ mod tests {
                 definition(flag::EXTENDED | flag::DUPLICATES, 60, 4, 0x0e),
             ]),
             3,
+            &[],
         )
         .expect("parses");
 
@@ -576,11 +683,12 @@ mod tests {
                 14,
             )]),
             1,
+            &[],
         )
         .expect("parses");
         assert_eq!(keys[0].chain, Some(14));
 
-        let unique = parse("WCCRACE.DAT", &fcr(&[definition(flag::EXTENDED, 0, 2, 0x0e)]), 1)
+        let unique = parse("WCCRACE.DAT", &fcr(&[definition(flag::EXTENDED, 0, 2, 0x0e)]), 1, &[])
             .expect("parses");
         assert_eq!(unique[0].chain, None, "a unique key has no chain to offset");
     }
@@ -598,6 +706,7 @@ mod tests {
                 definition(flag::EXTENDED | flag::DUPLICATES, 30, 4, 0x01),
             ]),
             1,
+            &[],
         )
         .expect("parses");
 
@@ -625,6 +734,7 @@ mod tests {
                 definition(flag::EXTENDED, 34, 2, 0x0e),
             ]),
             2,
+            &[],
         )
         .expect("parses");
 
@@ -641,24 +751,24 @@ mod tests {
     fn a_type_this_host_cannot_order_is_refused_by_name() {
         // A `date` key sorted as though it were text would be in the right
         // order for some pairs of records and not others.
-        let e = parse("SOMETHING.DAT", &fcr(&[definition(flag::EXTENDED, 0, 4, 0x03)]), 1)
+        let e = parse("SOMETHING.DAT", &fcr(&[definition(flag::EXTENDED, 0, 4, 0x03)]), 1, &[])
             .expect_err("no ordering for a date");
         assert!(e.why.contains("date"), "{e}");
     }
 
     #[test]
     fn a_type_is_implied_when_the_extended_bit_is_clear() {
-        let keys = parse("OLD.DAT", &fcr(&[definition(0, 0, 8, 0)]), 1).expect("parses");
+        let keys = parse("OLD.DAT", &fcr(&[definition(0, 0, 8, 0)]), 1, &[]).expect("parses");
         assert_eq!(keys[0].segments[0].kind, Kind::Text, "old-style ascii");
 
-        let keys = parse("OLD.DAT", &fcr(&[definition(flag::OLD_BINARY, 0, 8, 0)]), 1)
+        let keys = parse("OLD.DAT", &fcr(&[definition(flag::OLD_BINARY, 0, 8, 0)]), 1, &[])
             .expect("parses");
         assert_eq!(keys[0].segments[0].kind, Kind::Unsigned, "old-style binary");
     }
 
     #[test]
     fn a_file_claiming_more_keys_than_it_describes_is_refused() {
-        let e = parse("SHORT.DAT", &fcr(&[definition(flag::EXTENDED, 0, 30, 0x0b)]), 2)
+        let e = parse("SHORT.DAT", &fcr(&[definition(flag::EXTENDED, 0, 30, 0x0b)]), 2, &[])
             .expect_err("the second definition is all zeros");
         assert!(e.why.contains("zero-length"), "{e}");
     }
@@ -677,7 +787,8 @@ mod tests {
             duplicates: false,
             modifiable: true,
             chain: None,
-        }
+                    acs: None,
+}
     }
 
     #[test]
@@ -754,7 +865,8 @@ mod tests {
             duplicates: true,
             modifiable: true,
             chain: Some(6),
-        };
+                    acs: None,
+};
         assert_eq!(key.length(), 6);
         assert_eq!(key.extract(b"abc\0\x02\x00"), b"abc\0\x02\x00");
 
@@ -790,7 +902,8 @@ mod tests {
             duplicates: true,
             modifiable: true,
             chain: Some(6),
-        };
+                    acs: None,
+};
 
         let mut record = vec![0u8; 32];
         record[10..14].copy_from_slice(b"abc\0");
@@ -799,5 +912,155 @@ mod tests {
         assert_eq!(key.compare_value(&record, b"abc\0\x07\x00"), Ordering::Equal);
         assert_eq!(key.compare_value(&record, b"abc\0\x08\x00"), Ordering::Less);
         assert_eq!(key.compare_value(&record, b"abb\0\x07\x00"), Ordering::Greater);
+    }
+
+    fn case_fold_acs() -> Arc<Acs> {
+        let mut table = [0u8; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = i as u8;
+        }
+        for c in b'a'..=b'z' {
+            table[c as usize] = c - 32;
+        }
+        Arc::new(Acs {
+            name: *b"GALCAPS ",
+            table,
+        })
+    }
+
+    fn text_key(acs: Option<Arc<Acs>>) -> Key {
+        Key {
+            number: 0,
+            definition: 0,
+            segments: vec![Segment {
+                offset: 0,
+                length: 8,
+                kind: Kind::Text,
+                descending: false,
+            }],
+            duplicates: false,
+            modifiable: true,
+            chain: None,
+            acs,
+        }
+    }
+
+    /// The gap this closes: a case-mismatched lookup that genuine Btrieve
+    /// satisfies answers "not found" without an ACS.
+    #[test]
+    fn an_alternate_sequence_folds_case_for_an_equality_lookup() {
+        let plain = text_key(None);
+        let folded = text_key(Some(case_fold_acs()));
+        assert_ne!(
+            plain.compare_value(b"smith\0\0\0", b"SMITH\0\0\0"),
+            Ordering::Equal,
+            "without an ACS these are different keys"
+        );
+        assert_eq!(
+            folded.compare_value(b"smith\0\0\0", b"SMITH\0\0\0"),
+            Ordering::Equal,
+            "with a case-folding ACS they are one key"
+        );
+    }
+
+    /// The worse failure the design names: an ordered walk returns a different
+    /// order forever, silently. Raw bytes cluster all uppercase before all
+    /// lowercase; the folded order interleaves them.
+    #[test]
+    fn an_alternate_sequence_changes_the_order_of_a_walk() {
+        let plain = text_key(None);
+        let folded = text_key(Some(case_fold_acs()));
+        // 'B' (0x42) sorts before 'a' (0x61) by raw byte, after it when folded.
+        assert_eq!(plain.compare(b"Bravo\0\0\0", b"alpha\0\0\0"), Ordering::Less);
+        assert_eq!(
+            folded.compare(b"Bravo\0\0\0", b"alpha\0\0\0"),
+            Ordering::Greater
+        );
+    }
+
+    /// The table applies only to text. A folded byte inside an integer key
+    /// would corrupt the number.
+    #[test]
+    fn an_alternate_sequence_does_not_touch_a_numeric_key() {
+        let mut key = text_key(Some(case_fold_acs()));
+        key.segments[0].kind = Kind::Signed;
+        key.segments[0].length = 2;
+        // 0x61 'a' would fold to 0x41 'A' if this were text.
+        assert_eq!(key.compare(b"\x61\x00", b"\x41\x00"), Ordering::Greater);
+    }
+
+    /// `extract` hands a module its raw key buffer. An ACS is a
+    /// comparison-time transform; folding here would corrupt what the module
+    /// reads back.
+    #[test]
+    fn extract_returns_raw_bytes_even_with_an_alternate_sequence() {
+        let key = text_key(Some(case_fold_acs()));
+        assert_eq!(&key.extract(b"smith\0\0\0")[..5], b"smith");
+    }
+
+    #[test]
+    fn a_descending_alternate_key_still_reverses_after_folding() {
+        let mut key = text_key(Some(case_fold_acs()));
+        key.segments[0].descending = true;
+        assert_eq!(key.compare(b"Bravo\0\0\0", b"alpha\0\0\0"), Ordering::Less);
+    }
+
+    /// A control record declaring one text key that collates through an
+    /// alternate sequence.
+    fn acs_fcr() -> Vec<u8> {
+        let mut fcr = vec![0u8; 512];
+        let key = definition(flag::ALT_COLLATING, 0, 8, 0);
+        fcr[BASE..BASE + WIDTH].copy_from_slice(&key);
+        fcr
+    }
+
+    /// With no table located, the refusal must stand. Lifting it
+    /// unconditionally would collate the file by raw bytes and return a
+    /// different order forever, silently.
+    #[test]
+    fn parse_refuses_an_alternate_key_when_no_table_was_supplied() {
+        let e = parse("NOTABLE.DAT", &acs_fcr(), 1, &[]).expect_err("no table to bind");
+        assert!(e.why.contains("alternate collating"), "{}", e.why);
+    }
+
+    /// One table binds unambiguously, and it must actually reach the key --
+    /// parsing a file and leaving `acs` at `None` would read as success while
+    /// ordering every lookup by raw bytes.
+    #[test]
+    fn parse_binds_the_only_table_to_a_flagged_key() {
+        let table = case_fold_acs();
+        let keys = parse("ONETABLE.DAT", &acs_fcr(), 1, &[Arc::clone(&table)])
+            .expect("one table binds unambiguously");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].acs.as_deref(),
+            Some(&*table),
+            "the table must reach the key, not merely be read"
+        );
+    }
+
+    /// More than one table is refused rather than guessed at: which numbered
+    /// sequence a key uses has not been measured. `MULTIACS.DAT` is the only
+    /// file in the corpus that lands here.
+    #[test]
+    fn parse_refuses_a_flagged_key_when_the_file_carries_two_tables() {
+        let two = [case_fold_acs(), case_fold_acs()];
+        let e = parse("MULTIACS.DAT", &acs_fcr(), 1, &two)
+            .expect_err("two tables: which one is unmeasured");
+        assert!(e.why.contains("more than one"), "{}", e.why);
+    }
+
+    /// A key that does *not* declare a sequence must not be folded through a
+    /// table the file happens to carry -- that would reorder an index genuine
+    /// Btrieve leaves in raw byte order.
+    #[test]
+    fn parse_leaves_an_unflagged_key_unbound_even_when_a_table_exists() {
+        let mut fcr = vec![0u8; 512];
+        fcr[BASE..BASE + WIDTH].copy_from_slice(&definition(0, 0, 8, 0));
+        let keys = parse("PLAIN.DAT", &fcr, 1, &[case_fold_acs()]).expect("a plain text key");
+        assert!(
+            keys[0].acs.is_none(),
+            "an unflagged key collates by raw bytes even when a table is present"
+        );
     }
 }

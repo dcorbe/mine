@@ -1227,7 +1227,7 @@ mod tests {
         std::fs::write(&path, bytes).expect("written");
         let geometry = Geometry::read(name, &path)?;
         let fcr = std::fs::read(&path).expect("read");
-        let parsed = keys::parse(name, &fcr, geometry.keys)?;
+        let parsed = keys::parse(name, &fcr, geometry.keys, &[])?;
         Records::read(name, &path, &geometry, &parsed)
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
     fn a_key_lookup_finds_the_first_record_not_before_the_value() {
         let bytes = of(&[3, 1, 5]);
         let records = read("SEEK.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("SEEK.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("SEEK.DAT", &bytes, 1, &[]).expect("keys");
 
         assert_eq!(records.seek(&parsed, 0, &[1, 0]), 0);
         assert_eq!(records.seek(&parsed, 0, &[3, 0]), 1);
@@ -1354,7 +1354,7 @@ mod tests {
     #[test]
     fn splicing_matches_a_full_reindex_over_a_long_run_of_writes() {
         let bytes = of(&[5, 9, 1, 9]);
-        let parsed = keys::parse("SPLICE.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("SPLICE.DAT", &bytes, 1, &[]).expect("keys");
         let mut records = read("SPLICE.DAT", &bytes).expect("reads");
 
         // (what to do, which slot, which key value)
@@ -1425,7 +1425,7 @@ mod tests {
                 .collect();
             assert_eq!(physical, [3, 1, 2], "page {page} reordered them");
 
-            let parsed = keys::parse(&name, &bytes, 1).expect("keys");
+            let parsed = keys::parse(&name, &bytes, 1, &[]).expect("keys");
             let ordered: Vec<u8> = (0..3)
                 .map(|n| records.ordered(0, n).expect("in order").bytes[0])
                 .collect();
@@ -1464,7 +1464,7 @@ mod tests {
             let geometry =
                 Geometry::read(&name, &path).unwrap_or_else(|e| panic!("page {page}: {e}"));
             let fcr = std::fs::read(&path).expect("read");
-            let parsed = keys::parse(&name, &fcr, geometry.keys)
+            let parsed = keys::parse(&name, &fcr, geometry.keys, &[])
                 .unwrap_or_else(|e| panic!("page {page}: {e}"));
             let mut records = Records::read(&name, &path, &geometry, &parsed)
                 .unwrap_or_else(|e| panic!("page {page}: {e}"));
@@ -1515,7 +1515,7 @@ mod tests {
             let geometry2 =
                 Geometry::read(&name, &path).unwrap_or_else(|e| panic!("page {page}: {e}"));
             let fcr2 = std::fs::read(&path).expect("read again");
-            let parsed2 = keys::parse(&name, &fcr2, geometry2.keys).expect("keys");
+            let parsed2 = keys::parse(&name, &fcr2, geometry2.keys, &[]).expect("keys");
             let reread = Records::read(&name, &path, &geometry2, &parsed2)
                 .unwrap_or_else(|e| panic!("page {page}: {e}"));
             assert_eq!(
@@ -1550,7 +1550,7 @@ mod tests {
         assert_eq!(geometry.pages, 200);
 
         let fcr = std::fs::read(&path).expect("readable");
-        let parsed = keys::parse("RCI_HEL1.DAT", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("RCI_HEL1.DAT", &fcr, geometry.keys, &[]).expect("keys");
         let records =
             Records::read("RCI_HEL1.DAT", &path, &geometry, &parsed).expect("records");
         assert!(
@@ -1562,7 +1562,7 @@ mod tests {
     fn an_inserted_record_appears_in_physical_and_in_key_order() {
         let bytes = of(&[1, 3]);
         let mut records = read("INSERT.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("INSERT.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("INSERT.DAT", &bytes, 1, &[]).expect("keys");
         let position = slot(2); // the third slot of the page, unused by [1, 3]
 
         records.insert(&parsed, position, record(2)).expect("inserts");
@@ -1599,7 +1599,7 @@ mod tests {
 
         let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry");
         let fcr = std::fs::read(&path).expect("read");
-        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys, &[]).expect("keys");
         let mut records =
             Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("reads");
 
@@ -1638,7 +1638,7 @@ mod tests {
 
         let geometry = Geometry::read("FREESLOT.DAT", &path).expect("geometry after the write");
         let fcr = std::fs::read(&path).expect("read again");
-        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("FREESLOT.DAT", &fcr, geometry.keys, &[]).expect("keys");
         let reread =
             Records::read("FREESLOT.DAT", &path, &geometry, &parsed).expect("a fresh read");
 
@@ -1657,7 +1657,7 @@ mod tests {
     fn inserting_into_a_position_that_already_holds_a_record_is_refused() {
         let bytes = of(&[1]);
         let mut records = read("OCCUPIED.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("OCCUPIED.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("OCCUPIED.DAT", &bytes, 1, &[]).expect("keys");
         let position = records.physical(0).expect("first").position;
 
         assert!(records.insert(&parsed, position, record(2)).is_err());
@@ -1667,7 +1667,7 @@ mod tests {
     fn an_updated_record_keeps_its_position_and_moves_in_key_order() {
         let bytes = of(&[1, 2, 3]);
         let mut records = read("UPDATE.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("UPDATE.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("UPDATE.DAT", &bytes, 1, &[]).expect("keys");
         let position = records.physical(0).expect("first, holding key 1").position;
 
         records.update(&parsed, position, record(9)).expect("updates");
@@ -1690,7 +1690,7 @@ mod tests {
     fn updating_a_position_that_holds_no_record_is_refused() {
         let bytes = of(&[1]);
         let mut records = read("MISSING.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("MISSING.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("MISSING.DAT", &bytes, 1, &[]).expect("keys");
 
         // The module is entitled to be wrong; the host is not entitled to
         // invent a record.
@@ -1701,7 +1701,7 @@ mod tests {
     fn a_deleted_record_leaves_physical_order_and_every_key_order() {
         let bytes = of(&[1, 2, 3]);
         let mut records = read("DELETE.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("DELETE.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("DELETE.DAT", &bytes, 1, &[]).expect("keys");
         let position = records.physical(1).expect("the middle record, key 2").position;
 
         records.delete(&parsed, position).expect("deletes");
@@ -1721,7 +1721,7 @@ mod tests {
     fn deleting_a_position_that_holds_no_record_is_refused() {
         let bytes = of(&[1]);
         let mut records = read("GONE.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("GONE.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("GONE.DAT", &bytes, 1, &[]).expect("keys");
 
         assert!(records.delete(&parsed, slot(5)).is_err());
     }
@@ -1740,7 +1740,7 @@ mod tests {
     fn deleting_from_the_model_alone_does_not_touch_the_file() {
         let bytes = of(&[1, 2, 3]);
         let mut records = read("MODEL-ONLY.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("MODEL-ONLY.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("MODEL-ONLY.DAT", &bytes, 1, &[]).expect("keys");
         let position = records.physical(1).expect("the middle record").position;
 
         records.delete(&parsed, position).expect("deletes from the model");
@@ -1766,7 +1766,7 @@ mod tests {
     fn inserting_a_duplicate_key_is_counted_as_a_tie() {
         let bytes = of(&[1]);
         let mut records = read("TIES.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("TIES.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("TIES.DAT", &bytes, 1, &[]).expect("keys");
         assert_eq!(records.ties()[0], 0);
 
         records.insert(&parsed, slot(1), record(1)).expect("inserts");
@@ -1778,7 +1778,7 @@ mod tests {
     fn positions_lists_every_record_currently_held() {
         let bytes = of(&[1, 2, 3]);
         let mut records = read("POSITIONS.DAT", &bytes).expect("reads");
-        let parsed = keys::parse("POSITIONS.DAT", &bytes, 1).expect("keys");
+        let parsed = keys::parse("POSITIONS.DAT", &bytes, 1, &[]).expect("keys");
         let doomed = records.physical(1).expect("middle").position;
 
         records.delete(&parsed, doomed).expect("deletes");
@@ -2191,7 +2191,7 @@ mod tests {
             );
 
             let fcr = std::fs::read(&path).expect("readable");
-            let parsed = keys::parse(name, &fcr, geometry.keys)
+            let parsed = keys::parse(name, &fcr, geometry.keys, &[])
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
             let records = Records::read(name, &path, &geometry, &parsed)
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -2229,7 +2229,7 @@ mod tests {
             let geometry =
                 Geometry::read(name, &dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             let fcr = std::fs::read(dir.join(name)).expect("readable");
-            let parsed = keys::parse(name, &fcr, geometry.keys).expect("keys");
+            let parsed = keys::parse(name, &fcr, geometry.keys, &[]).expect("keys");
             Records::read(name, &dir.join(name), &geometry, &parsed)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.why))
                 .len()
@@ -2269,7 +2269,7 @@ mod tests {
         let geometry = Geometry::read("wccrace2.vir", &path).expect("geometry");
         assert_eq!(geometry.version, Version::V6);
         let fcr = std::fs::read(&path).expect("readable");
-        let parsed = keys::parse("wccrace2.vir", &fcr, geometry.keys).expect("keys");
+        let parsed = keys::parse("wccrace2.vir", &fcr, geometry.keys, &[]).expect("keys");
         let records =
             Records::read("wccrace2.vir", &path, &geometry, &parsed).expect("records");
         assert_eq!(records.len(), 13);
