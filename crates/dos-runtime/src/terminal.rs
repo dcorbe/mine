@@ -19,7 +19,7 @@
 use std::io::{self, Write};
 
 use crate::driver::{Driver, Key};
-use crate::screen::{Cell, Screen};
+use crate::screen::{Cell, Cells, Screen};
 
 /// CP437 as Unicode. Index is the byte the guest wrote.
 ///
@@ -162,21 +162,27 @@ impl Terminal {
     }
 
     /// Redraw, skipping rows that have not changed since the last paint.
-    fn paint(&mut self, screen: &Screen) {
+    ///
+    /// Takes a bare [`Cells`] and the cursor rather than a whole [`Screen`],
+    /// because painting is the half of `Screen` that a Win32 console can reuse:
+    /// that host owns its cells outright instead of sampling `B800:0000`, and
+    /// has a `Screen` nowhere in it. Nothing about turning a grid into ANSI
+    /// cares which of the two filled the grid in.
+    fn paint(&mut self, grid: &Cells, cursor: (u8, u8), cursor_visible: bool) {
         let mut out = String::with_capacity(8 * 1024);
         out.push_str("\x1b[?25l");
 
-        let unchanged = self.last.len() == screen.cells.len();
-        for row in 0..screen.rows {
-            let start = row * screen.cols;
-            let end = start + screen.cols;
-            if unchanged && self.last[start..end] == screen.cells[start..end] {
+        let unchanged = self.last.len() == grid.cells.len();
+        for row in 0..grid.rows {
+            let start = row * grid.cols;
+            let end = start + grid.cols;
+            if unchanged && self.last[start..end] == grid.cells[start..end] {
                 continue;
             }
             out.push_str(&format!("\x1b[{};1H", row + 1));
             let mut attr = None;
-            for col in 0..screen.cols {
-                let cell = screen.cell(row, col);
+            for col in 0..grid.cols {
+                let cell = grid.cell(row, col);
                 if attr != Some(cell.attr) {
                     let fg = cell.foreground();
                     let bg = cell.background();
@@ -196,13 +202,13 @@ impl Terminal {
 
         // Park the real cursor where the guest put its own, and show it only if
         // the guest wants it shown.
-        let (row, col) = screen.cursor;
+        let (row, col) = cursor;
         out.push_str(&format!(
             "\x1b[{};{}H",
             u16::from(row) + 1,
             u16::from(col) + 1
         ));
-        out.push_str(if screen.cursor_visible {
+        out.push_str(if cursor_visible {
             "\x1b[?25h"
         } else {
             "\x1b[?25l"
@@ -210,7 +216,7 @@ impl Terminal {
 
         print!("{out}");
         let _ = io::stdout().flush();
-        self.last = screen.cells.clone();
+        self.last = grid.cells.clone();
     }
 
     /// One byte from the terminal, or `None` at end of input.
@@ -341,7 +347,7 @@ impl Terminal {
 
 impl Driver for Terminal {
     fn next_key(&mut self, screen: &Screen) -> Option<Key> {
-        self.paint(screen);
+        self.paint(&screen.grid, screen.cursor, screen.cursor_visible);
         self.read_key()
     }
 
@@ -355,7 +361,7 @@ impl Driver for Terminal {
     /// Repaint, and take a keystroke only if one is already waiting.
     fn poll_key(&mut self, screen: &Screen) -> Option<Key> {
         self.painted = std::time::Instant::now();
-        self.paint(screen);
+        self.paint(&screen.grid, screen.cursor, screen.cursor_visible);
         if !self.ready() {
             return None;
         }

@@ -27,44 +27,37 @@ impl Cell {
     }
 }
 
-/// The text screen as it stands right now.
-pub struct Screen {
+/// A grid of character cells, and nothing else.
+///
+/// Split out of [`Screen`] because the two ways a grid comes to exist have
+/// nothing in common but the grid. A DOS program pokes `B800:0000` and
+/// [`Screen::snapshot`] *samples* the result; a Win32 console program has no
+/// memory-mapped buffer at all, and every change arrives as an explicit call to
+/// a host that owns the cells (see [`crate::win32`]). What both share is the
+/// grid itself and everything that reads one -- which is all of the querying
+/// below, and the painter in [`crate::terminal`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Cells {
     pub cols: usize,
     pub rows: usize,
     pub cells: Vec<Cell>,
-    pub cursor: (u8, u8),
-    pub cursor_visible: bool,
 }
 
-impl Screen {
-    /// Read the whole screen out of the guest's text buffer.
-    pub fn snapshot<G: Guest>(
-        g: &G,
-        cols: usize,
-        rows: usize,
-        cursor: (u8, u8),
-        cursor_visible: bool,
-    ) -> Self {
-        let mut cells = Vec::with_capacity(cols * rows);
-        for row in 0..rows {
-            let at = Ptr::new(0xb800, (row * cols * 2) as u16);
-            match g.read(at, cols * 2) {
-                Ok(bytes) => cells.extend(bytes.chunks_exact(2).map(|c| Cell {
-                    ch: c[0],
-                    attr: c[1],
-                })),
-                Err(_) => cells.extend(std::iter::repeat_n(Cell { ch: b' ', attr: 7 }, cols)),
-            }
-        }
+impl Cells {
+    /// A grid of spaces in the ordinary light-grey-on-black attribute.
+    pub fn blank(cols: usize, rows: usize) -> Self {
         Self {
             cols,
             rows,
-            cells,
-            cursor,
-            cursor_visible,
+            cells: vec![Cell { ch: b' ', attr: 7 }; cols * rows],
         }
     }
 
+    /// The cell at `(row, col)`, or a blank one for a position off the grid.
+    ///
+    /// Out of range reads a blank rather than panicking because every caller
+    /// here is scanning for text; a query that walks off the edge has found
+    /// nothing, which is what a space says.
     pub fn cell(&self, row: usize, col: usize) -> Cell {
         self.cells
             .get(row * self.cols + col)
@@ -157,16 +150,6 @@ impl Screen {
         rows
     }
 
-    /// The line the hardware cursor sits on, trimmed.
-    ///
-    /// Not every program marks its selection with colour. LORDCFG moves the
-    /// cursor and leaves the whole menu block one background, so `selected`
-    /// reports the block and this reports the item -- a script needs both,
-    /// and which one applies is a property of the program, not of the screen.
-    pub fn cursor_line(&self) -> String {
-        self.line(self.cursor.0 as usize).trim().to_string()
-    }
-
     /// The text of the single highlighted row, if exactly one stands out.
     ///
     /// Deliberately `None` when several rows are highlighted: a caller that
@@ -176,6 +159,88 @@ impl Screen {
             [row] => Some(self.line(*row).trim().to_string()),
             _ => None,
         }
+    }
+}
+
+/// The text screen as it stands right now: a grid, plus where the hardware
+/// cursor is.
+///
+/// The cursor is deliberately *not* part of [`Cells`]. A grid is a grid whoever
+/// filled it in, but "where the cursor is" belongs to whatever owns the screen
+/// -- the CRTC for a DOS guest, a `SetConsoleCursorPosition` call for a Win32
+/// one -- and the two do not keep it in the same place.
+pub struct Screen {
+    pub grid: Cells,
+    pub cursor: (u8, u8),
+    pub cursor_visible: bool,
+}
+
+impl Screen {
+    /// Read the whole screen out of the guest's text buffer.
+    pub fn snapshot<G: Guest>(
+        g: &G,
+        cols: usize,
+        rows: usize,
+        cursor: (u8, u8),
+        cursor_visible: bool,
+    ) -> Self {
+        let mut cells = Vec::with_capacity(cols * rows);
+        for row in 0..rows {
+            let at = Ptr::new(0xb800, (row * cols * 2) as u16);
+            match g.read(at, cols * 2) {
+                Ok(bytes) => cells.extend(bytes.chunks_exact(2).map(|c| Cell {
+                    ch: c[0],
+                    attr: c[1],
+                })),
+                Err(_) => cells.extend(std::iter::repeat_n(Cell { ch: b' ', attr: 7 }, cols)),
+            }
+        }
+        Self {
+            grid: Cells { cols, rows, cells },
+            cursor,
+            cursor_visible,
+        }
+    }
+
+    /// The line the hardware cursor sits on, trimmed.
+    ///
+    /// Not every program marks its selection with colour. LORDCFG moves the
+    /// cursor and leaves the whole menu block one background, so `selected`
+    /// reports the block and this reports the item -- a script needs both,
+    /// and which one applies is a property of the program, not of the screen.
+    ///
+    /// The one query that genuinely needs both halves, which is why it lives
+    /// here and the rest forward.
+    pub fn cursor_line(&self) -> String {
+        self.grid.line(self.cursor.0 as usize).trim().to_string()
+    }
+
+    pub fn cell(&self, row: usize, col: usize) -> Cell {
+        self.grid.cell(row, col)
+    }
+
+    pub fn line(&self, row: usize) -> String {
+        self.grid.line(row)
+    }
+
+    pub fn text(&self) -> String {
+        self.grid.text()
+    }
+
+    pub fn contains(&self, needle: &str) -> bool {
+        self.grid.contains(needle)
+    }
+
+    pub fn find(&self, needle: &str) -> Option<(usize, usize)> {
+        self.grid.find(needle)
+    }
+
+    pub fn highlighted_rows(&self, min_run: usize) -> Vec<usize> {
+        self.grid.highlighted_rows(min_run)
+    }
+
+    pub fn selected(&self) -> Option<String> {
+        self.grid.selected()
     }
 }
 
@@ -219,9 +284,7 @@ mod tests {
             }
         }
         Screen {
-            cols,
-            rows,
-            cells,
+            grid: Cells { cols, rows, cells },
             cursor: (0, 0),
             cursor_visible: true,
         }
@@ -244,9 +307,9 @@ mod tests {
     fn several_highlighted_rows_report_nothing_rather_than_the_first() {
         let mut s = screen_from(&["one", "two"], Some(0));
         // Colour the second row too.
-        for col in 0..s.cols {
-            let i = s.cols + col;
-            s.cells[i].attr = 0x70;
+        for col in 0..s.grid.cols {
+            let i = s.grid.cols + col;
+            s.grid.cells[i].attr = 0x70;
         }
         assert_eq!(s.selected(), None);
     }

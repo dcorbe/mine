@@ -12,6 +12,7 @@
 //! implemented because one of them calls it.
 
 pub mod advapi32;
+pub mod console;
 pub mod kernel32;
 pub mod load;
 pub mod process;
