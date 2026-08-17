@@ -179,6 +179,35 @@ fn find_record(entry: &files::FindEntry) -> [u8; 43] {
     r
 }
 
+/// The DOS kernel as a service.
+///
+/// `DosState` stays public and separate because the runtime reports on its
+/// fields at exit (`out`, and the diagnostics inside `Files`).
+#[derive(Default)]
+pub struct Dos {
+    pub state: DosState,
+}
+
+impl<G: crate::guest::Guest> crate::service::Service<G> for Dos {
+    fn claims(&self) -> &[u8] {
+        &[0x21]
+    }
+
+    fn service(&mut self, _vector: u8, g: &mut G) -> crate::service::Serviced {
+        use crate::service::Serviced;
+
+        let ah = g.regs().ah();
+        if !is_implemented(ah) {
+            return Serviced::Unclaimed { vector: 0x21, ah };
+        }
+        match dispatch(g, &mut self.state) {
+            Outcome::Continue => Serviced::Continue,
+            Outcome::Terminate(code) => Serviced::Terminate(code),
+            Outcome::Fault(f) => Serviced::Fault(f),
+        }
+    }
+}
+
 /// Service one `int 21h`.
 pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
     let mut regs = g.regs();

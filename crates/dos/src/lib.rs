@@ -9,4 +9,5 @@
 pub mod guest;
 pub mod files;
 pub mod kernel;
+pub mod service;
 pub mod testguest;
