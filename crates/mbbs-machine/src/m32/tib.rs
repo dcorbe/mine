@@ -255,6 +255,27 @@ impl Tib {
         self.stack_base
     }
 
+    /// The head of the SEH chain -- `FS:[0]`, [`tib_offset::EXCEPTION_LIST`].
+    /// [`EMPTY_SEH_CHAIN`] (`0xffff_ffff`) when no frame is registered.
+    ///
+    /// The module reaches this field through `FS:`-relative addressing, which
+    /// is why the mapping exists at all; this is the same four bytes, read
+    /// from the host side. Needed because a host implementation of
+    /// `KERNEL32!RtlUnwind` has to walk the chain the module built and leave
+    /// its head at the frame it unwound to -- see
+    /// `crates/dos-runtime/src/win32/kernel32.rs`.
+    pub(crate) fn exception_list(&self) -> u32 {
+        let at = tib_offset::EXCEPTION_LIST;
+        let bytes = &self.tib.as_slice()[at..at + 4];
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    /// Set [`Tib::exception_list`].
+    pub(crate) fn set_exception_list(&mut self, head: u32) {
+        let at = tib_offset::EXCEPTION_LIST;
+        self.tib.as_mut_slice()[at..at + 4].copy_from_slice(&head.to_le_bytes());
+    }
+
     /// Hand the stack mapping to whoever will own it from now on.
     ///
     /// `crate::m32::Memory` is that owner: a stack address is a linear

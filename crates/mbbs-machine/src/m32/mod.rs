@@ -624,6 +624,23 @@ impl Machine {
         self.tib.stack_base()
     }
 
+    /// The head of the module's SEH chain -- the `FS:[0]` the module reads
+    /// and writes directly, read here from the host side.
+    ///
+    /// `0xffff_ffff` is an empty chain, which is what a fresh machine holds.
+    /// Otherwise it is the linear address of the module's innermost
+    /// registration record, whose first two dwords are `{ prev, handler }`.
+    pub fn seh_head(&self) -> u32 {
+        self.tib.exception_list()
+    }
+
+    /// Set [`Machine::seh_head`]. A host implementing `RtlUnwind` leaves the
+    /// chain's head at the frame it unwound to; nothing else in this crate
+    /// writes it after construction.
+    pub fn set_seh_head(&mut self, head: u32) {
+        self.tib.set_exception_list(head);
+    }
+
     /// The register set a crossing would carry, and the one the module last
     /// left behind -- see [`Regs`].
     ///

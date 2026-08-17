@@ -229,6 +229,26 @@ pub struct Process {
     /// [`Outcome::BtrieveGap`] rather than [`Outcome::Unimplemented`] when it
     /// is set.
     pub btrieve_gap: Option<String>,
+    /// Set when a shim has redirected the module rather than answering it --
+    /// today only `KERNEL32!RtlUnwind`, which by contract never returns to
+    /// its caller and instead resumes the module somewhere else entirely.
+    ///
+    /// The same shape as [`Process::exit_code`] and [`Process::btrieve_gap`]:
+    /// [`dispatch`] still hands back an [`Answer`], because every arm must,
+    /// and [`run`] reads this field immediately afterwards to learn that the
+    /// answer is not to be delivered. Without it a redirect would have to
+    /// change the type every arm returns.
+    ///
+    /// Carries the register set to enter with; see
+    /// [`mbbs_machine::m32::Machine::jump`].
+    pub transfer: Option<mbbs_machine::m32::Regs>,
+    /// Set when `KERNEL32!RtlUnwind` was asked for an unwind this host cannot
+    /// perform faithfully -- today, one that would have to call a module's
+    /// own SEH handlers so its destructors run. Read by [`run`] right after a
+    /// `None`, exactly as [`Process::btrieve_gap`] is, so that "not
+    /// implemented" and "implemented, but this call cannot be honoured" stay
+    /// distinguishable.
+    pub unwind_gap: Option<String>,
 }
 
 /// One `ReportEventA` call: the program's own diagnostic.
@@ -303,6 +323,8 @@ impl Process {
             btrieve: ::btrieve::Btrieve::default(),
             btrieve_heap: btrieve::Win32Heap::default(),
             btrieve_gap: None,
+            transfer: None,
+            unwind_gap: None,
         }
     }
 
@@ -401,6 +423,13 @@ pub enum Outcome {
     /// a fabricated status, because a Btrieve caller's only channel is a
     /// status word and a wrong one is indistinguishable from a right one.
     BtrieveGap { what: String },
+    /// `KERNEL32!RtlUnwind` was asked for an unwind this host cannot perform
+    /// faithfully -- today, one that would have to call the module's own SEH
+    /// handlers so its destructors run. Stops the run for the same reason
+    /// [`Self::BtrieveGap`] does: transferring control without running them
+    /// resumes a program that believes it destroyed objects it did not, and
+    /// that is indistinguishable from a correct unwind until much later.
+    UnwindGap { what: String },
 }
 
 /// Answer one import call.
@@ -520,6 +549,15 @@ pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Res
                 if let Some(code) = process.exit_code {
                     return Ok(Outcome::Exited(code));
                 }
+                // A shim that redirected the module rather than answering it.
+                // The outstanding call is abandoned deliberately -- `RtlUnwind`
+                // does not return, so there is no frame to resume and no
+                // value to deliver. See `Process::transfer`.
+                if let Some(regs) = process.transfer.take() {
+                    loaded.machine.set_regs(regs);
+                    exit = loaded.machine.jump()?;
+                    continue;
+                }
                 exit = loaded.machine.resume_on_cleaning(
                     loaded.mem.stack_mut(),
                     Ret::U32(answer.value),
@@ -533,6 +571,9 @@ pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Res
                 // tells them apart. See `Process::btrieve_gap`.
                 if let Some(what) = process.btrieve_gap.take() {
                     return Ok(Outcome::BtrieveGap { what });
+                }
+                if let Some(what) = process.unwind_gap.take() {
+                    return Ok(Outcome::UnwindGap { what });
                 }
                 return Ok(Outcome::Unimplemented { module, symbol });
             }

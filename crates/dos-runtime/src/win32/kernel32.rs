@@ -23,7 +23,7 @@
 //! `LUNATIX.DLL`'s call sites, which is the same convention read off a
 //! different program.
 
-use mbbs_machine::m32::{Flat32Ptr, Machine, Memory};
+use mbbs_machine::m32::{Flat32Ptr, Machine, Memory, Regs};
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::win32::console;
@@ -97,6 +97,27 @@ pub fn dispatch(
         }
         // GetLastError(void)
         "GetLastError" => Some(Answer::stdcall(process.last_error, 0)),
+        // RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
+        //           PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue)
+        "RtlUnwind" => {
+            let target_frame = machine.arg_u32(mem.stack(), 0);
+            let target_ip = machine.arg_u32(mem.stack(), 1);
+            let return_value = machine.arg_u32(mem.stack(), 3);
+            match rtl_unwind(machine, mem, target_frame, target_ip, return_value) {
+                Ok(regs) => {
+                    process.transfer = Some(regs);
+                    // The value is never delivered -- `Process::transfer`
+                    // diverts the module before `run` can resume it -- but
+                    // every arm must answer something. The arity is the real
+                    // one so that a reader is not misled about the ABI.
+                    Some(Answer::stdcall(0, 4))
+                }
+                Err(why) => {
+                    process.unwind_gap = Some(why);
+                    None
+                }
+            }
+        }
         // CreateEventA(LPSECURITY_ATTRIBUTES, BOOL bManualReset,
         //              BOOL bInitialState, LPCSTR lpName)
         "CreateEventA" => {
@@ -1134,6 +1155,124 @@ fn create_event_a(
     })
 }
 
+/// `KERNEL32!RtlUnwind` -- the non-local transfer at the heart of a Borland
+/// C++ throw, and of `_longjmp`.
+///
+/// Returns the register set to enter the module with. It never produces a
+/// value for the caller, because by contract this function does not return to
+/// it: it resumes the module at `target_ip` instead.
+///
+/// # The contract, measured rather than looked up
+///
+/// Both call sites live in the runtime this repo ships
+/// (`re/wg/CW3220MT.DLL`), and the arithmetic at the canonical one pins the
+/// stack exactly. `__Global_unwind`'s helper (`0x405c0e`) does:
+///
+/// ```text
+/// push ebx; push esi; push edi        ; ESP = E-12
+/// push $0; push edx; push $0x405c1f; push eax   ; the four arguments
+/// call RtlUnwind                      ; ESP = E-32
+/// 0x405c1f: pop edi; pop esi; pop ebx; ret      ; needs ESP = E-12
+/// ```
+///
+/// `E-12` is `(E-32) + 20`, so **the module resumes with `ESP` as though this
+/// had executed a stdcall `ret 16`**: past its own return address and its four
+/// arguments. `EBP` must survive too -- that helper's own caller
+/// (`__Global_unwind`, `0x404407`) ends `mov %ebp,%esp; pop %ebp; ret` after
+/// the transfer -- and the other registers are preserved because the module
+/// is entitled to expect it, not because a call site was measured needing it.
+/// `EAX` carries `ReturnValue`. See
+/// `docs/2026-08-17-borland-unwind-layout.md`.
+///
+/// # Errors
+///
+/// If there is no outstanding call to read a frame from, or if the chain
+/// between the module's current `FS:[0]` and `target_frame` holds frames
+/// whose handlers would have to run. **That refusal is the point**: unwinding
+/// past a frame means calling its handler with `EH_UNWINDING` so the module's
+/// destructors run, and a host that skipped them would produce a program that
+/// keeps going with objects it believes it destroyed. Nothing here calls back
+/// into module code yet (no shim in this crate does), so the honest answer is
+/// to name the frames and stop.
+fn rtl_unwind(
+    machine: &mut Machine,
+    mem: &Memory,
+    target_frame: u32,
+    target_ip: u32,
+    return_value: u32,
+) -> Result<Regs, String> {
+    // Read before anything else: `frame_sp` names this very call's frame, and
+    // it is the only place the entry `ESP` can come from.
+    let entry_esp = machine
+        .frame_sp()
+        .ok_or_else(|| "RtlUnwind with no outstanding call to unwind from".to_owned())?;
+
+    // `TargetFrame == 0` is Windows' "exit unwind": unwind the whole chain and
+    // do not come back. Nothing in this runtime's two call sites asks for it,
+    // so it is refused rather than invented.
+    if target_frame == 0 {
+        return Err("RtlUnwind with TargetFrame=0 (an exit unwind), which no \
+                    measured call site of this runtime makes"
+            .to_owned());
+    }
+
+    let mut frames = Vec::new();
+    let mut head = machine.seh_head();
+    while head != target_frame {
+        if head == EMPTY_SEH_CHAIN {
+            return Err(format!(
+                "RtlUnwind to TargetFrame={target_frame:#010x}, which is not on the \
+                 module's own SEH chain (walked {} frame(s) from FS:[0] to the end)",
+                frames.len()
+            ));
+        }
+        // A registration record is `{ prev, handler }` -- the layout the
+        // module itself builds and that `__Return_unwind` pops with
+        // `mov (%ebx),%eax; mov %eax,%fs:0x0`.
+        let record = Flat32Ptr(head)
+            .resolve(mem, 8)
+            .map_err(|e| format!("SEH frame at {head:#010x}: {e}"))?;
+        let prev = u32::from_le_bytes([record[0], record[1], record[2], record[3]]);
+        let handler = u32::from_le_bytes([record[4], record[5], record[6], record[7]]);
+        frames.push((head, handler));
+        head = prev;
+    }
+
+    if !frames.is_empty() {
+        let listed: Vec<String> = frames
+            .iter()
+            .map(|(frame, handler)| format!("{frame:#010x}->{handler:#010x}"))
+            .collect();
+        return Err(format!(
+            "RtlUnwind must unwind {} SEH frame(s) before reaching \
+             TargetFrame={target_frame:#010x}, and each one's handler has to be called \
+             with EH_UNWINDING so the module's destructors run. Calling back into \
+             module code from a shim is not something this host does yet, and \
+             skipping the handlers would resume a program that believes it \
+             destroyed objects it did not. Frames (record->handler): {}",
+            frames.len(),
+            listed.join(", ")
+        ));
+    }
+
+    // Nothing to unwind: the chain's head already is the target. Leave it
+    // where the module will expect it and transfer.
+    machine.set_seh_head(target_frame);
+
+    Ok(Regs {
+        eip: target_ip,
+        // Past this call's own return address and its four stdcall arguments.
+        esp: entry_esp + 20,
+        eax: return_value,
+        ..machine.regs()
+    })
+}
+
+/// `FS:[0]` when no handler is registered -- the value
+/// `mbbs_machine::m32`'s TIB is built with, and what the end of a chain
+/// reads as.
+const EMPTY_SEH_CHAIN: u32 = 0xffff_ffff;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,6 +1288,146 @@ mod tests {
     fn loaded() -> crate::win32::load::Loaded {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
         crate::win32::load::load(&file).expect("loads")
+    }
+
+    /// `KERNEL32!RtlUnwind`: the module must resume at `TargetIp`, on the
+    /// stack a stdcall `ret 16` would have left, with `EAX` carrying
+    /// `ReturnValue` and `EBP` intact.
+    ///
+    /// Proven by where the module actually ends up -- it stores `EAX` and
+    /// `ESP` at the target and traps again -- rather than by reading the
+    /// `Regs` this host computed, which would only be checking the host
+    /// against itself.
+    #[test]
+    fn rtl_unwind_resumes_the_module_at_the_target_with_the_stack_a_ret_16_leaves() {
+        use mbbs_machine::m32::{Exit, Mapping};
+
+        const CALLER: u16 = 40;
+        const LANDED: u16 = 41;
+        const TARGET_FRAME: u32 = 0xffff_ffff; // the chain is empty, so this is its head
+        const RETURN_VALUE: u32 = 0x1234_5678;
+        const EBP_MARK: u32 = 0x0bad_f00d;
+        const SCRATCH: usize = 2048;
+
+        let mut l = loaded();
+        let mut p = Process::new("X.EXE", &[]);
+
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let scratch = base + SCRATCH as u32;
+        let target_ip = base + 512;
+
+        // The caller: mark EBP, push the four stdcall arguments right to
+        // left, and trap into the thunk this test answers as RtlUnwind.
+        let mut code = vec![0xbdu8]; // mov ebp, imm32
+        code.extend_from_slice(&EBP_MARK.to_le_bytes());
+        let push_imm32 = |code: &mut Vec<u8>, v: u32| {
+            code.push(0x68);
+            code.extend_from_slice(&v.to_le_bytes());
+        };
+        push_imm32(&mut code, RETURN_VALUE); // arg4: ReturnValue
+        push_imm32(&mut code, 0); // arg3: ExceptionRecord
+        push_imm32(&mut code, target_ip); // arg2: TargetIp
+        push_imm32(&mut code, TARGET_FRAME); // arg1: TargetFrame
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8); // call rel32
+        code.extend_from_slice(&l.machine.thunk_addr(CALLER).wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        // The target: store EAX, ESP and EBP where this test can read them,
+        // then trap again so the run stops somewhere nameable.
+        let mut landed = vec![0xa3u8]; // mov [scratch], eax
+        landed.extend_from_slice(&scratch.to_le_bytes());
+        landed.extend_from_slice(&[0x89, 0x25]); // mov [scratch+4], esp
+        landed.extend_from_slice(&(scratch + 4).to_le_bytes());
+        landed.extend_from_slice(&[0x89, 0x2d]); // mov [scratch+8], ebp
+        landed.extend_from_slice(&(scratch + 8).to_le_bytes());
+        let landed_next = target_ip + landed.len() as u32 + 5;
+        landed.push(0xe8);
+        landed.extend_from_slice(&l.machine.thunk_addr(LANDED).wrapping_sub(landed_next).to_le_bytes());
+        let at = (target_ip - base) as usize;
+        code_mapping.as_mut_slice()[at..at + landed.len()].copy_from_slice(&landed);
+
+        let exit = l.machine.call_on(l.mem.stack_mut(), base, &[]).expect("traps");
+        assert_eq!(exit, Exit::Call { index: CALLER }, "stopped at the RtlUnwind call");
+
+        // What a stdcall `ret 16` would leave: past the return address and
+        // the four arguments.
+        let expected_esp = l.machine.frame_sp().expect("an outstanding call") + 20;
+
+        let answer = dispatch(&mut p, &mut l.machine, &mut l.mem, "RtlUnwind");
+        assert!(answer.is_some(), "RtlUnwind is implemented: {:?}", p.unwind_gap);
+        let regs = p.transfer.take().expect("RtlUnwind redirects rather than answering");
+
+        l.machine.set_regs(regs);
+        let exit = l.machine.jump().expect("the module resumes at the target");
+        assert_eq!(exit, Exit::Call { index: LANDED }, "the module did not reach TargetIp");
+
+        let read = |off: usize| {
+            let b = &code_mapping.as_slice()[SCRATCH + off..SCRATCH + off + 4];
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+        assert_eq!(read(0), RETURN_VALUE, "EAX must carry ReturnValue");
+        assert_eq!(read(4), expected_esp, "ESP must be what a stdcall ret 16 leaves");
+        assert_eq!(read(8), EBP_MARK, "EBP must survive the unwind");
+
+        drop(code_mapping);
+    }
+
+    /// An unwind that would have to run a module's own handlers is refused,
+    /// not silently performed. Skipping them resumes a program that believes
+    /// it destroyed objects it did not, which looks correct until much later.
+    #[test]
+    fn rtl_unwind_refuses_an_unwind_that_would_skip_a_handler() {
+        use mbbs_machine::m32::{Exit, Mapping};
+
+        const CALLER: u16 = 42;
+        const HANDLER: u32 = 0x00c0_ffee;
+
+        let mut l = loaded();
+        let mut p = Process::new("X.EXE", &[]);
+
+        // One registration record `{ prev, handler }` on the module's own
+        // stack, and FS:[0] pointing at it -- the shape the module builds.
+        let (stack_limit, stack_base) = l.machine.stack_range();
+        let record_at = stack_limit + 64;
+        assert!(record_at < stack_base, "the record sits inside the stack");
+        let mut record = EMPTY_SEH_CHAIN.to_le_bytes().to_vec();
+        record.extend_from_slice(&HANDLER.to_le_bytes());
+        Flat32Ptr(record_at).write(&mut l.mem, &record).expect("the stack is writable");
+        l.machine.set_seh_head(record_at);
+
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let mut code = Vec::new();
+        let push_imm32 = |code: &mut Vec<u8>, v: u32| {
+            code.push(0x68);
+            code.extend_from_slice(&v.to_le_bytes());
+        };
+        push_imm32(&mut code, 0); // ReturnValue
+        push_imm32(&mut code, 0); // ExceptionRecord
+        push_imm32(&mut code, base); // TargetIp
+        push_imm32(&mut code, EMPTY_SEH_CHAIN); // TargetFrame: past the record
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8);
+        code.extend_from_slice(&l.machine.thunk_addr(CALLER).wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = l.machine.call_on(l.mem.stack_mut(), base, &[]).expect("traps");
+        assert_eq!(exit, Exit::Call { index: CALLER });
+
+        assert!(
+            dispatch(&mut p, &mut l.machine, &mut l.mem, "RtlUnwind").is_none(),
+            "an unwind that skips a handler must not be answered"
+        );
+        let why = p.unwind_gap.take().expect("and it must say why");
+        assert!(
+            why.contains("1 SEH frame") && why.contains("00c0ffee"),
+            "the refusal must name the frames it would have skipped: {why}"
+        );
+        assert!(p.transfer.is_none(), "a refused unwind redirects nothing");
+
+        drop(code_mapping);
     }
 
     /// The one fact in this file that would fail silently rather than loudly.
