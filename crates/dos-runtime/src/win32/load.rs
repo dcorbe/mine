@@ -2,17 +2,37 @@
 
 use std::io;
 
-use mbbs_machine::m32::{Exit, Image, Import32, Machine, PeImage, Ret};
+use mbbs_machine::m32::{Exit, Image, Import32, Machine, Memory, PeImage, Ret};
 use mbbs_machine::module::{ImportSite, Symbol};
+
+/// How much guest-addressable scratch the host gets for the things a real
+/// process finds already built: the command line, `argv`'s strings and its
+/// pointer array.
+///
+/// 64 KiB, which is four orders of magnitude more than a command line and its
+/// `argv` need. Sized generously rather than tightly because the arena is a
+/// bump allocator with no reclaim (`Memory::alloc`), so the only thing its size
+/// bounds is how many times a host call may hand the program fresh memory.
+const ARENA_LEN: usize = 64 * 1024;
 
 /// A loaded executable, ready to be entered.
 pub struct Loaded {
-    /// The mapped image. Held for its lifetime, not merely as a record of one:
-    /// [`Image`] owns the `mmap` the code was written into, so dropping it
-    /// unmaps every byte of the program. A `Loaded` that kept only `entry`
-    /// would hand out an address whose page had already been returned to the
-    /// kernel, and the first instruction would fault.
-    pub image: Image,
+    /// The program's memory: its mapped [`Image`], the host's arena, and the
+    /// module's own stack.
+    ///
+    /// Held for its lifetime, not merely as a record of one: the `Image` inside
+    /// owns the `mmap` the code was written into, so dropping this unmaps every
+    /// byte of the program. A `Loaded` that kept only `entry` would hand out an
+    /// address whose page had already been returned to the kernel.
+    ///
+    /// The stack is moved in here out of the [`Machine`]'s own `Tib`
+    /// ([`Memory::adopt_stack`]) so that a pointer to one of the program's own
+    /// locals resolves. That is not a nicety: `char buf[128]; GetVersionExA(&osvi)`
+    /// is the commonest shape there is in this API, and the address it passes
+    /// resolves in neither the image nor the arena. The cost is that every
+    /// crossing must go through `call_on`/`resume_on_cleaning` with
+    /// `mem.stack_mut()`, because the `Machine` no longer holds its own stack.
+    pub mem: Memory,
     pub machine: Machine,
     /// The linear address of `AddressOfEntryPoint`.
     pub entry: u32,
@@ -56,7 +76,7 @@ pub struct Called {
 pub fn load(file: &[u8]) -> io::Result<Loaded> {
     let parsed = PeImage::parse(file).map_err(io::Error::other)?;
 
-    let machine = Machine::new()?;
+    let mut machine = Machine::new()?;
 
     let mut image = Image::load(file, &parsed)?;
     image.relocate(&parsed).map_err(io::Error::other)?;
@@ -75,8 +95,17 @@ pub fn load(file: &[u8]) -> io::Result<Loaded> {
 
     let entry = image.base().wrapping_add(parsed.entry_point);
 
+    let mut mem = Memory::new(image, ARENA_LEN)?;
+    // After this the machine has no stack of its own, which is why every
+    // crossing below uses the `_on` forms. `Machine::call` panics rather than
+    // silently making a second stack, so the two cannot be mixed by accident.
+    let stack = machine
+        .take_stack()
+        .expect("a freshly built Machine still owns the stack it made");
+    mem.adopt_stack(stack);
+
     Ok(Loaded {
-        image,
+        mem,
         machine,
         entry,
         imports,
@@ -91,7 +120,10 @@ pub fn load(file: &[u8]) -> io::Result<Loaded> {
 /// valid up to the first call whose answer it actually uses.
 pub fn trace(loaded: &mut Loaded, budget: usize) -> (Vec<Called>, Stop) {
     let mut seen: Vec<Called> = Vec::new();
-    let mut exit = match loaded.machine.call(loaded.entry, &[]) {
+    let mut exit = match loaded
+        .machine
+        .call_on(loaded.mem.stack_mut(), loaded.entry, &[])
+    {
         Ok(e) => e,
         Err(e) => return (seen, Stop::Error(e.to_string())),
     };
@@ -121,7 +153,7 @@ pub fn trace(loaded: &mut Loaded, budget: usize) -> (Vec<Called>, Stop) {
         // anyway sees something deterministic rather than whatever the last
         // call left there. The answer is a lie regardless; a deterministic
         // lie at least makes the trace reproducible.
-        exit = match loaded.machine.resume(Ret::Void) {
+        exit = match loaded.machine.resume_on(loaded.mem.stack_mut(), Ret::Void) {
             Ok(e) => e,
             Err(e) => return (seen, Stop::Error(e.to_string())),
         };

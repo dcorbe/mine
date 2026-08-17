@@ -11,4 +11,7 @@
 //! `docs/plans/2026-08-17-offline-utilities-phases-design.md`. A symbol is
 //! implemented because one of them calls it.
 
+pub mod advapi32;
+pub mod kernel32;
 pub mod load;
+pub mod process;
