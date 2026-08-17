@@ -12,8 +12,21 @@
 
 use std::path::{Path, PathBuf};
 
-const ALLOWED_PREFIXES: &[&str] =
-    &["use std::", "use core::", "use crate::", "use super::", "use self::"];
+// `use btrieve::` is allowed alongside the crate-relative forms: a
+// `src/bin/*.rs` file is its own binary crate whose `crate::` root is the
+// *binary*, not the library, so the only way it can reach the library at
+// all is by the package's own name. That is a self-reference within one
+// Cargo package, not an external dependency -- the thing this guard exists
+// to catch -- so it belongs on the allowlist rather than being read as a
+// leak.
+const ALLOWED_PREFIXES: &[&str] = &[
+    "use std::",
+    "use core::",
+    "use crate::",
+    "use super::",
+    "use self::",
+    "use btrieve::",
+];
 
 fn rust_files_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
