@@ -164,6 +164,50 @@ pub enum Exit {
     Timeout { eip: u32 },
 }
 
+/// Every register a 32-bit crossing carries, in both directions.
+///
+/// Read with [`Machine::regs`], written with [`Machine::set_regs`] or the
+/// individual setters, and honoured wholesale by [`Machine::jump`]. The two
+/// structured entry points compute some of these for themselves and overwrite
+/// whatever was set:
+///
+/// | register | `call` | `resume` | `jump` |
+/// |---|---|---|---|
+/// | `eip` | the entry point | the outstanding call's return address | as set |
+/// | `esp` | below the frame it wrote | past the finished frame | as set |
+/// | `eax`, `edx` | zero | the host call's [`Ret`] | as set |
+/// | `ebx`, `esi`, `edi`, `ebp` | zero | as the module left them | as set |
+///
+/// # There is no `ecx`
+///
+/// Deliberately, and it is the one asymmetry here. `ECX` is caller-saved
+/// scratch under 32-bit cdecl, so nothing crosses *inward* in it and the
+/// entry sequence never loads it (`m32/asm.rs`'s `enter`). On the way *out*
+/// it carries the thunk-kind discriminant, which is this machine's own
+/// signalling rather than the module's data. A field here would be a setter
+/// that silently did nothing, which is worse than its absence.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Regs {
+    /// Where the next entry lands. A linear address.
+    pub eip: u32,
+    /// The stack pointer to enter with, likewise linear -- 32-bit
+    /// compatibility mode runs on the host's own flat `SS`.
+    pub esp: u32,
+    /// A host call's result, or a module return's.
+    pub eax: u32,
+    /// The high half of a 64-bit one.
+    pub edx: u32,
+    /// The callee-saved quad, restored on entry so a host call is transparent
+    /// to the module.
+    pub ebx: u32,
+    /// See [`Regs::ebx`].
+    pub esi: u32,
+    /// See [`Regs::ebx`].
+    pub edi: u32,
+    /// See [`Regs::ebx`].
+    pub ebp: u32,
+}
+
 /// Why a machine will not be entered again. See [`Machine::poisoned`].
 ///
 /// The first variant mirrors the one terminal [`Exit`], kept separately (as
@@ -578,6 +622,148 @@ impl Machine {
     /// Diagnostic-only, for the same reason as [`Machine::frame_sp`].
     pub fn stack_base(&self) -> u32 {
         self.tib.stack_base()
+    }
+
+    /// The register set a crossing would carry, and the one the module last
+    /// left behind -- see [`Regs`].
+    ///
+    /// After any crossing this reports what the *module* had, not what this
+    /// machine entered with: [`Machine::run`] folds the trampoline's
+    /// observations back in, and a fault fills the same fields from the
+    /// interrupted context (`m32/fault.rs`'s `rewrite`). Before the first
+    /// crossing it is all zero.
+    pub fn regs(&self) -> Regs {
+        Regs {
+            eip: self.ctx.target_offset,
+            esp: self.ctx.esp,
+            eax: self.ctx.eax,
+            edx: self.ctx.edx,
+            ebx: self.ctx.ebx,
+            esi: self.ctx.esi,
+            edi: self.ctx.edi,
+            ebp: self.ctx.ebp,
+        }
+    }
+
+    /// Replace the whole register set. See [`Regs`] for which of these
+    /// [`Machine::call`] and [`Machine::resume`] overwrite, and
+    /// [`Machine::jump`] for the entry point that honours all of them.
+    ///
+    /// Delegates to the individual setters rather than assigning the eight
+    /// fields itself, so there is exactly one definition of what setting each
+    /// register means -- `set_ebx` and friends have to touch `out_*` as well
+    /// as the entry field, and a second copy of that here would be a place
+    /// for the two to drift apart silently.
+    pub fn set_regs(&mut self, regs: Regs) {
+        self.set_eip(regs.eip);
+        self.set_esp(regs.esp);
+        self.set_eax(regs.eax);
+        self.set_edx(regs.edx);
+        self.set_ebx(regs.ebx);
+        self.set_esi(regs.esi);
+        self.set_edi(regs.edi);
+        self.set_ebp(regs.ebp);
+    }
+
+    /// Where [`Machine::jump`] will enter. Overwritten by [`Machine::call`]
+    /// (with its `entry`) and by [`Machine::resume`] (with the outstanding
+    /// call's own return address).
+    pub fn set_eip(&mut self, eip: u32) {
+        self.ctx.target_offset = eip;
+    }
+
+    /// The stack pointer to enter with, as a linear address -- there is no
+    /// segment base to add in 32-bit compatibility mode. Overwritten by
+    /// [`Machine::call`] (which computes it from the frame it just wrote) and
+    /// by [`Machine::resume`] (which steps it past the finished frame).
+    ///
+    /// Nothing here checks it against [`Machine::stack_range`]: a non-local
+    /// jump's whole purpose is to leave the stack somewhere the call path
+    /// would not have chosen, and this crate cannot know which of a module's
+    /// mappings is a legitimate stack for it. An `ESP` outside the module's
+    /// own mappings faults on first use, which is the honest outcome and the
+    /// one [`Machine::poisoned`] already reports.
+    pub fn set_esp(&mut self, esp: u32) {
+        self.ctx.esp = esp;
+    }
+
+    /// Overwritten by [`Machine::resume`], which carries a host call's result
+    /// here (`EDX:EAX` for a 64-bit one) -- see [`Ret`].
+    pub fn set_eax(&mut self, eax: u32) {
+        self.ctx.eax = eax;
+    }
+
+    /// The high half of a 64-bit result. Overwritten by [`Machine::resume`]
+    /// alongside [`Machine::set_eax`].
+    pub fn set_edx(&mut self, edx: u32) {
+        self.ctx.edx = edx;
+    }
+
+    /// One of the callee-saved quad. Every entry point restores these from
+    /// what the module last left, so a value set here survives a
+    /// [`Machine::resume`] -- unlike `EAX`/`EDX`/`EIP`/`ESP`.
+    pub fn set_ebx(&mut self, ebx: u32) {
+        self.ctx.ebx = ebx;
+        self.ctx.out_ebx = ebx;
+    }
+
+    /// See [`Machine::set_ebx`].
+    pub fn set_esi(&mut self, esi: u32) {
+        self.ctx.esi = esi;
+        self.ctx.out_esi = esi;
+    }
+
+    /// See [`Machine::set_ebx`].
+    pub fn set_edi(&mut self, edi: u32) {
+        self.ctx.edi = edi;
+        self.ctx.out_edi = edi;
+    }
+
+    /// See [`Machine::set_ebx`].
+    pub fn set_ebp(&mut self, ebp: u32) {
+        self.ctx.ebp = ebp;
+        self.ctx.out_ebp = ebp;
+    }
+
+    /// Enter the module with exactly the registers [`Machine::regs`] reports
+    /// -- the non-local jump.
+    ///
+    /// [`Machine::call`] and [`Machine::resume`] are the two structured
+    /// entries: one starts an entry point at a frame it writes itself, the
+    /// other continues an outstanding call at the address on the module's own
+    /// stack. Both compute `EIP` and `ESP` and refuse to be told. This one
+    /// computes nothing -- it is what a `longjmp` or a C++ unwind needs, where
+    /// the destination and the stack both come from a buffer the module saved
+    /// earlier and this host has no other way to honour.
+    ///
+    /// Everything else is identical to the structured entries: the same
+    /// selector and `FS`, the same trampoline, the same exit classification,
+    /// the same poisoning on a fault.
+    ///
+    /// # The watchdog is armed if nothing else armed it
+    ///
+    /// The budget is per *entry point*, not per crossing
+    /// ([`Machine::call`] arms it and a terminal exit disarms it), so a jump
+    /// taken from inside a running entry point must not restart it -- that
+    /// would make an unwind loop a way to buy unbounded CPU one jump at a
+    /// time. It re-arms only when the timer is not already running, which is
+    /// the cold-start case a caller driving the machine by jumps alone
+    /// would otherwise run entirely unwatched.
+    ///
+    /// # Errors
+    ///
+    /// If this machine is [`Machine::poisoned`], or the watchdog's timer
+    /// cannot be read or armed.
+    pub fn jump(&mut self) -> io::Result<Exit> {
+        if let Some(poison) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "refusing to enter a poisoned module: {poison}"
+            )));
+        }
+        if !self.ctx.armed()? {
+            self.ctx.arm(self.budget)?;
+        }
+        self.enter()
     }
 
     /// The linear address a module should `call` to reach import `index`.
@@ -1151,8 +1337,6 @@ impl Machine {
         let (eax, edx) = ret.registers();
 
         self.ctx.target_offset = entry;
-        self.ctx.target_selector = USER32_CS;
-        self.ctx.fs = self.tib.fs_selector();
         self.ctx.esp = sp;
         self.ctx.eax = eax;
         self.ctx.edx = edx;
@@ -1172,8 +1356,25 @@ impl Machine {
         self.ctx.edi = self.ctx.out_edi;
         self.ctx.ebp = self.ctx.out_ebp;
 
+        self.enter()
+    }
+
+    /// Cross with the register set already in `self.ctx`, and classify how it
+    /// came back.
+    ///
+    /// The tail [`Machine::run`] and [`Machine::jump`] share. Everything
+    /// above this line differs between them -- `run` computes `EIP`/`ESP` and
+    /// the argument registers, `jump` takes whatever a caller set -- and
+    /// everything below is the crossing itself, which is identical and must
+    /// stay that way: the selector, the `FS` reload, the fault classification
+    /// and the poisoning are properties of *this machine*, not of how a
+    /// caller chose to enter it.
+    fn enter(&mut self) -> io::Result<Exit> {
+        self.ctx.target_selector = USER32_CS;
+        self.ctx.fs = self.tib.fs_selector();
+
         // The trampoline writes these on every crossing, but a poisoned
-        // machine never re-enters `run`, and a fresh `Ctx` starts zeroed
+        // machine never re-enters here, and a fresh `Ctx` starts zeroed
         // anyway -- this is a defensive reset, not load-bearing today, kept
         // for the same reason `crate::m16::Machine::run` clears `out_signo`
         // before every entry: the next crossing must not be able to read a
@@ -1182,7 +1383,8 @@ impl Machine {
         self.ctx.out_eip = 0;
         self.ctx.out_ecx = 0;
 
-        // SAFETY: `target_offset`/`target_selector`/`fs`/`esp` are set
+        // SAFETY: `target_offset`/`target_selector`/`fs`/`esp` are all set --
+        // the first by whichever entry point called this, the rest
         // immediately above; the thunk table and trampoline in `self.bridge`
         // were written by `new` and live for as long as `self`; `self.tib`'s
         // stack and TIB mappings are likewise live for as long as `self`,
@@ -1190,9 +1392,30 @@ impl Machine {
         // is recoverable rather than fatal.
         unsafe { asm::enter(self.ctx.as_ptr()) };
 
+        // Fold what the module left into the set the next entry would carry,
+        // so [`Machine::regs`] answers about the *module* rather than about
+        // the values this crossing happened to start with. Deliberately not a
+        // replacement for `run`'s own quad propagation above: that one is
+        // what makes `call_on`'s zeroing of the `out_*` quad reach a fresh
+        // entry point, and this one would hand the new entry point the
+        // previous one's leftovers if it were relied on alone.
+        self.ctx.eax = self.ctx.out_eax;
+        self.ctx.edx = self.ctx.out_edx;
+        self.ctx.ebx = self.ctx.out_ebx;
+        self.ctx.esi = self.ctx.out_esi;
+        self.ctx.edi = self.ctx.out_edi;
+        self.ctx.ebp = self.ctx.out_ebp;
+        self.ctx.esp = self.ctx.out_esp;
         if self.ctx.out_signo != 0 {
             let signo = self.ctx.out_signo as i32;
             let eip = self.ctx.out_eip;
+            // Only a fault knows where the module actually was: an ordinary
+            // crossing comes back through the trampoline, and the module's
+            // own resume address is the near return address on its stack
+            // rather than anything the CPU handed back. Elsewhere
+            // `target_offset` keeps meaning "where the last entry went",
+            // which is the only answer this machine has.
+            self.ctx.target_offset = eip;
             // Which signal it was is the whole distinction -- everything
             // else (the recovery, the poisoning, the lost state) is
             // identical. Mirrors `crate::m16::Machine::run`'s own dispatch.
@@ -1313,5 +1536,297 @@ mod st0_tests {
     fn take_st0_refuses_to_answer_before_a_slot_is_armed() {
         let machine = Machine::new().expect("a fresh machine");
         let _ = machine.take_st0();
+    }
+}
+
+/// [`Machine::jump`] and the register setters it exists to honour.
+///
+/// Every test here asserts against something the *module* did with a value,
+/// never against the field it was written into -- a setter that stores into a
+/// struct nobody loads would pass any test that reads the struct back, and
+/// that was the whole objection to adding these at all.
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    const SLOT: u16 = 2;
+    const SCRATCH_OFF: usize = 1024;
+
+    /// Writes `code` at the base of a fresh low mapping and returns it with
+    /// that base. The mapping must outlive every crossing into it.
+    fn mapped(code: &[u8]) -> (Mapping, u32) {
+        let mut mapping = Mapping::new(4096).expect("a low code mapping");
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(code);
+        let base = mapping.base() as usize as u32;
+        (mapping, base)
+    }
+
+    /// `call rel32` to `target`, from an instruction stream whose next
+    /// instruction begins at `next_ip`.
+    fn call_rel32(target: u32, next_ip: u32) -> Vec<u8> {
+        let mut out = vec![0xe8u8];
+        out.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+        out
+    }
+
+    /// **Every** setter reaches the module, one row per register.
+    ///
+    /// The first version of this test set three registers through
+    /// [`Machine::set_regs`] and checked one of them. Making `set_ebx` a
+    /// no-op left it passing -- it never called `set_ebx` at all. So each
+    /// setter is now exercised on its own, and each is proven by the module
+    /// *storing that register to memory*, which no amount of writing into an
+    /// unread struct field can fake.
+    ///
+    /// `EIP` needs no row: every row only runs because [`Machine::set_eip`]
+    /// put it at `base`. A no-op there enters at zero and faults instead.
+    #[test]
+    fn every_register_setter_reaches_the_module() {
+        type Setter = fn(&mut Machine, u32);
+        // `mov [disp32], r32` is `89 /r` with ModRM `00 rrr 101`: the r/m
+        // field is the disp32 form and `rrr` names the source register.
+        // `ESP` is fine as a *source* -- the encoding that would be ambiguous
+        // is `100` in the r/m field, which is the SIB escape, not this.
+        let rows: &[(&str, Setter, u8)] = &[
+            ("eax", |m, v| m.set_eax(v), 0x05),
+            ("edx", |m, v| m.set_edx(v), 0x15),
+            ("ebx", |m, v| m.set_ebx(v), 0x1d),
+            ("esp", |m, v| m.set_esp(v), 0x25),
+            ("ebp", |m, v| m.set_ebp(v), 0x2d),
+            ("esi", |m, v| m.set_esi(v), 0x35),
+            ("edi", |m, v| m.set_edi(v), 0x3d),
+        ];
+
+        for (name, set, modrm) in rows {
+            let mut machine = Machine::new().expect("a fresh machine");
+            let (mut mapping, base) = mapped(&[]);
+            let scratch = base + SCRATCH_OFF as u32;
+            let (_limit, stack_base) = machine.stack_range();
+
+            // `ESP` has to name a real stack: the `call` below pushes onto
+            // it. The store happens first either way, so what is asserted is
+            // still exactly the value that was set.
+            let value = if *name == "esp" { stack_base - 128 } else { 0xdead_0000 | u32::from(modrm.to_owned()) };
+
+            let mut code = vec![0x89u8, *modrm];
+            code.extend_from_slice(&scratch.to_le_bytes());
+            let next_ip = base + code.len() as u32 + 5;
+            code.extend_from_slice(&call_rel32(machine.thunk_addr(SLOT), next_ip));
+            mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+            machine.set_eip(base);
+            machine.set_esp(stack_base - 64);
+            set(&mut machine, value);
+
+            let exit = machine.jump().expect("a jump into mapped code");
+            assert_eq!(
+                exit,
+                Exit::Call { index: SLOT },
+                "{name}: the module did not run and trap"
+            );
+
+            let stored = u32::from_le_bytes(
+                mapping.as_mut_slice()[SCRATCH_OFF..SCRATCH_OFF + 4]
+                    .try_into()
+                    .expect("four bytes"),
+            );
+            assert_eq!(
+                stored, value,
+                "{name} did not reach the module -- its setter wrote a field \
+                 the crossing does not load"
+            );
+
+            drop(mapping);
+        }
+    }
+
+    /// A callee-saved register set between crossings survives a
+    /// [`Machine::resume`], which is why those four setters write `out_*` as
+    /// well as the entry field.
+    ///
+    /// `resume` restores the quad from what the module last left
+    /// (`Machine::run`'s own propagation), so a setter that wrote only the
+    /// entry field would be silently undone on the way back in -- the setter
+    /// would appear to work under [`Machine::jump`] and do nothing under the
+    /// entry point a host actually uses in production.
+    #[test]
+    fn a_callee_saved_register_set_between_crossings_survives_a_resume() {
+        const VALUE: u32 = 0x5150_5150;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        let (mut mapping, base) = mapped(&[]);
+        let scratch = base + SCRATCH_OFF as u32;
+        let thunk = machine.thunk_addr(SLOT);
+
+        // call thunk; mov [scratch], ebx; call thunk
+        let mut code = call_rel32(thunk, base + 5);
+        code.extend_from_slice(&[0x89, 0x1d]);
+        code.extend_from_slice(&scratch.to_le_bytes());
+        let next_ip = base + code.len() as u32 + 5;
+        code.extend_from_slice(&call_rel32(thunk, next_ip));
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = machine.call(base, &[]).expect("the module traps");
+        assert_eq!(exit, Exit::Call { index: SLOT }, "stopped at the first thunk");
+
+        machine.set_ebx(VALUE);
+        let exit = machine.resume(Ret::Void).expect("the module resumes");
+        assert_eq!(exit, Exit::Call { index: SLOT }, "stopped at the second thunk");
+
+        let stored = u32::from_le_bytes(
+            mapping.as_mut_slice()[SCRATCH_OFF..SCRATCH_OFF + 4]
+                .try_into()
+                .expect("four bytes"),
+        );
+        assert_eq!(
+            stored, VALUE,
+            "resume restored the module's own EBX over the one that was set"
+        );
+
+        drop(mapping);
+    }
+
+    /// The other half of the same claim: what the module leaves in the
+    /// callee-saved quad is what [`Machine::regs`] reports afterwards, rather
+    /// than the value the crossing was entered with.
+    #[test]
+    fn regs_reports_what_the_module_left_not_what_it_was_entered_with() {
+        const ENTERED: u32 = 0x1111_1111;
+        const MODULE_SET: u32 = 0x2222_2222;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        let (mut mapping, base) = mapped(&[]);
+
+        // mov esi, imm32 -- BE id.
+        let mut code = vec![0xbeu8];
+        code.extend_from_slice(&MODULE_SET.to_le_bytes());
+        let next_ip = base + code.len() as u32 + 5;
+        code.extend_from_slice(&call_rel32(machine.thunk_addr(SLOT), next_ip));
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let (_limit, stack_base) = machine.stack_range();
+        machine.set_regs(Regs {
+            eip: base,
+            esp: stack_base - 64,
+            esi: ENTERED,
+            ..Regs::default()
+        });
+        machine.jump().expect("a jump into mapped code");
+
+        assert_eq!(
+            machine.regs().esi,
+            MODULE_SET,
+            "regs() answered about the entry rather than about the module"
+        );
+
+        drop(mapping);
+    }
+
+    /// After a fault, the registers reported are the ones the module held at
+    /// the faulting instruction. Without `fault.rs`'s own capture they would
+    /// be whatever the *previous* crossing left -- a plausible register set
+    /// belonging to another moment, which is the worst kind of wrong answer.
+    #[test]
+    fn regs_after_a_fault_are_the_modules_own_at_the_faulting_instruction() {
+        const ENTERED: u32 = 0x3333_3333;
+        const MODULE_SET: u32 = 0x4444_4444;
+
+        let mut machine = Machine::new().expect("a fresh machine");
+        let (mapping, base) = mapped(&[]);
+
+        // mov edi, imm32; then mov eax, moffs32(0) -- the null read
+        // `m32/fault.rs`'s own tests use to take a SIGSEGV inside 32-bit
+        // compatibility mode.
+        let mut code = vec![0xbfu8];
+        code.extend_from_slice(&MODULE_SET.to_le_bytes());
+        let fault_at = base + code.len() as u32;
+        code.extend_from_slice(&[0xa1, 0x00, 0x00, 0x00, 0x00]);
+        let mut mapping = mapping;
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let (_limit, stack_base) = machine.stack_range();
+        machine.set_regs(Regs {
+            eip: base,
+            esp: stack_base - 64,
+            edi: ENTERED,
+            ..Regs::default()
+        });
+
+        let exit = machine.jump().expect("a jump into mapped code");
+        assert_eq!(
+            exit,
+            Exit::Fault {
+                signo: libc::SIGSEGV,
+                eip: fault_at
+            },
+            "the module did not fault where this test placed the fault"
+        );
+
+        let regs = machine.regs();
+        assert_eq!(
+            regs.edi, MODULE_SET,
+            "the fault path reported a register from an earlier moment"
+        );
+        assert_eq!(regs.eip, fault_at, "regs().eip did not name the fault");
+
+        drop(mapping);
+    }
+
+    /// A jump is an entry like any other, so a poisoned machine refuses it --
+    /// the check `call` and `resume` already make, which a third entry point
+    /// would otherwise walk straight past.
+    #[test]
+    fn a_poisoned_machine_refuses_to_be_jumped_into() {
+        let mut machine = Machine::new().expect("a fresh machine");
+        let (mapping, base) = mapped(&[0xa1, 0x00, 0x00, 0x00, 0x00]); // null read
+
+        let (_limit, stack_base) = machine.stack_range();
+        machine.set_regs(Regs {
+            eip: base,
+            esp: stack_base - 64,
+            ..Regs::default()
+        });
+        machine.jump().expect("the first jump faults");
+        assert!(machine.poisoned().is_some(), "a fault must poison");
+
+        let refused = machine.jump().expect_err("a poisoned machine refuses");
+        assert!(
+            refused.to_string().contains("poisoned"),
+            "the refusal must say why: {refused}"
+        );
+
+        drop(mapping);
+    }
+
+    /// A caller driving the machine by jumps alone still gets a watchdog.
+    /// `call` is what arms it for a structured entry point, and a machine
+    /// entered only by `jump` would otherwise run with the timer stopped.
+    #[test]
+    fn a_cold_jump_arms_the_watchdog() {
+        let mut machine = Machine::new().expect("a fresh machine");
+        let (mut mapping, base) = mapped(&[]);
+
+        let code = call_rel32(machine.thunk_addr(SLOT), base + 5);
+        mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        assert!(
+            !machine.ctx.armed().expect("gettime"),
+            "a fresh machine's watchdog is stopped"
+        );
+
+        let (_limit, stack_base) = machine.stack_range();
+        machine.set_regs(Regs {
+            eip: base,
+            esp: stack_base - 64,
+            ..Regs::default()
+        });
+        machine.jump().expect("a jump into mapped code");
+
+        assert!(
+            machine.ctx.armed().expect("gettime"),
+            "a cold jump left the module running unwatched"
+        );
+
+        drop(mapping);
     }
 }

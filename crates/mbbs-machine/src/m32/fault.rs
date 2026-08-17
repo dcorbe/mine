@@ -301,6 +301,25 @@ unsafe fn rewrite(
         // Where it stopped, taken before the rewrite below destroys it. A
         // linear address, not an offset -- see the module doc comment.
         (*ctx32).out_eip = gregs[libc::REG_RIP as usize] as u32;
+
+        // The general-purpose registers at the same instant. The trampoline
+        // fills these `out_*` fields on an ordinary return, but a fault never
+        // reaches the trampoline, so without this they hold whatever the
+        // *previous* crossing left -- and [`crate::m32::Machine::regs`] would
+        // report a plausible register set belonging to another moment
+        // entirely. Only the low 32 bits are meaningful: the module runs in
+        // 32-bit compatibility mode, so the upper halves are the host's
+        // business.
+        (*ctx32).out_eax = gregs[libc::REG_RAX as usize] as u32;
+        (*ctx32).out_edx = gregs[libc::REG_RDX as usize] as u32;
+        (*ctx32).out_ecx = gregs[libc::REG_RCX as usize] as u32;
+        (*ctx32).out_ebx = gregs[libc::REG_RBX as usize] as u32;
+        (*ctx32).out_esi = gregs[libc::REG_RSI as usize] as u32;
+        (*ctx32).out_edi = gregs[libc::REG_RDI as usize] as u32;
+        (*ctx32).out_ebp = gregs[libc::REG_RBP as usize] as u32;
+        // Taken from the interrupted context, before the rewrite below
+        // replaces `RSP` with the host's own re-entry stack.
+        (*ctx32).out_esp = gregs[libc::REG_RSP as usize] as u32;
     }
 
     gregs[libc::REG_RIP as usize] = gregs[libc::REG_R11 as usize];
