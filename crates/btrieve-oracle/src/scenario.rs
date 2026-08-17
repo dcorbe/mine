@@ -809,7 +809,7 @@ mod generate {
                 update_request(42, 9),
                 get_request(B_GET_EQUAL, 42), // payload changed
                 delete_request(),             // deletes the record Get just positioned on
-                get_request(B_GET_EQUAL, 42), // status 9: gone
+                get_request(B_GET_EQUAL, 42), // status 4: gone
                 close_request(),
             ],
             name: "update_and_delete".to_owned(),
@@ -836,7 +836,7 @@ mod generate {
                 // Refused: changes the key's value.
                 update_request(99, 1),
                 get_request(B_GET_EQUAL, 42), // still there, untouched
-                get_request(B_GET_EQUAL, 99), // status 9: nothing written under the new key
+                get_request(B_GET_EQUAL, 99), // status 4: nothing written under the new key
                 get_request(B_GET_EQUAL, 42), // re-establish currency
                 // Allowed: the key is rewritten with the value it already
                 // has, only the payload changes.

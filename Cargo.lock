@@ -122,6 +122,9 @@ dependencies = [
 [[package]]
 name = "btrieve"
 version = "0.1.0"
+dependencies = [
+ "btrieve-oracle",
+]
 
 [[package]]
 name = "btrieve-oracle"

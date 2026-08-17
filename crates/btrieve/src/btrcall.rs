@@ -336,8 +336,19 @@ fn get<M: Mem>(
             // a truncated answer, not a failure -- real Btrieve status 22.
             Ok(if d.truncated { Status(22) } else { Status::OK })
         }
-        // No record matched: status 9, end of file.
-        Ok(None) => Ok(Status(9)),
+        // No record matched. Genuine Btrieve distinguishes a keyed `Get
+        // Equal` miss -- status 4, "the application cannot find the key
+        // value" -- from every other Get's miss, which stays status 9, "end
+        // of file". Measured directly, not inferred: `update_and_delete.
+        // fixture` (a `Get Equal` for a just-deleted key) and `status_ten_
+        // refusal_and_same_value_rewrite.fixture` (a `Get Equal` for a key
+        // that was never written) both answer 4, while
+        // `insert_get_step_stat.fixture`'s `Get Next`/`Get Previous` misses
+        // and its Step family's own exhaustion both answer 9. No fixture
+        // exercises a miss on `Greater`/`AtLeast`/`Less`/`AtMost`/`Lowest`/
+        // `Highest`, so those keep answering 9 rather than guessing beyond
+        // what was measured -- see Task 12's report.
+        Ok(None) => Ok(if op == Op::Equal { Status(4) } else { Status(9) }),
         Err(e) => status_of(&e),
     }
 }
@@ -447,6 +458,11 @@ fn acquire_absolute<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> 
         // comment calls this "not an error", matching `Block::query`'s
         // not-found contract -- the same shape `get` already answers with
         // status 9 for a search that comes up empty.
+        //
+        // Task 12 left this at 9 deliberately rather than folding it into
+        // `get`'s new `Get Equal` -> 4 split: an absolute position is not a
+        // keyed value search, and no fixture exercises Acquire Absolute at
+        // all, so there is no measurement to answer 4 from here either.
         Ok(None) => Ok(Status(9)),
         Err(e) => status_of(&e),
     }
@@ -1021,7 +1037,10 @@ mod tests {
         .expect("Delete is modelled");
         assert_eq!(status, Status::OK, "the record was deleted");
 
-        // Get Equal once more: nothing answers key 42 any longer.
+        // Get Equal once more: nothing answers key 42 any longer -- status
+        // 4, "key value not found", not 9 ("end of file"; that status names
+        // sequential exhaustion, not a keyed Get Equal miss -- Task 12's
+        // fix to `get`, measured against `update_and_delete.fixture`).
         let mut databuf = vec![0u8; 8];
         let mut datalen = 8u32;
         let status = btrcall(
@@ -1039,7 +1058,7 @@ mod tests {
             },
         )
         .expect("Get Equal is modelled");
-        assert_eq!(status, Status(9), "the deleted record is gone");
+        assert_eq!(status, Status(4), "the deleted record is gone");
     }
 
     /// Task 7b: real Btrieve refuses an update that would change a key that
