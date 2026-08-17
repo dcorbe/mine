@@ -2172,7 +2172,9 @@ mod tests {
     /// a logical page the allocation table did not claim). This is not the
     /// packed/unpacked axis Task 9 asked about -- see `tmp/scratch/lane-a-findings.md`
     /// for that writeup -- but a genuine `v6.rs` allocation-table gap:
-    /// [`super::v6::OVERFLOW`]'s doc comment has the root cause and the fix.
+    /// `v6::ENTRIES`'s doc comment has the root cause and the fix --
+    /// the entry array starts at `0x08`, and the slot this module used to miss
+    /// is the one the whole gap was about.
     /// All three now read exactly the counts below, through this same loop,
     /// no special case.
     #[test]
@@ -2204,7 +2206,8 @@ mod tests {
     }
 
     /// The multi-allocation-table-block gap, pinned as the fix rather than
-    /// as the failure it used to be. Before `v6::OVERFLOW`, `Records::read`
+    /// as the failure it used to be. Before `v6::ENTRIES` was corrected to
+    /// `0x08`, `Records::read`
     /// refused all three of these (an undercount for `wccknms2.vir`, short
     /// by exactly 1 of 1,101, and `wccmp002.vir`, short by exactly 24 of
     /// 26,720; an outright refusal chasing a variable-length fragment chain
@@ -2221,7 +2224,7 @@ mod tests {
     /// existing, not size.
     #[test]
     #[ignore = "needs archive/modules/majormud-nt/; run with -- --ignored"]
-    fn majormud_nts_multi_block_v6_files_now_read_the_overflow_claim() {
+    fn majormud_nts_multi_block_v6_files_now_read_their_first_slot() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../archive/modules/majormud-nt/wccnt8pj/out");
 

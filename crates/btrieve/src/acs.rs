@@ -10,7 +10,7 @@
 //! # The block
 //!
 //! A block is 265 bytes: a tag byte, an 8-byte name, then the 256-byte table.
-//! It sits at offset [`BLOCK`] (6) within its page, after the ordinary 6-byte
+//! It sits at offset 6 within its page, after the ordinary 6-byte
 //! page header -- so the table itself begins 15 bytes in. The engine confirms
 //! that base independently by indexing its own cached copy at `+0xf`
 //! (`:15461-15473`), and `6 + 1 + 8 == 15`.
@@ -113,7 +113,7 @@ pub fn is_acs_page(page: &[u8]) -> bool {
     page.get(TYPE) == Some(&PAGE_TYPE)
 }
 
-/// Decode the block at [`BLOCK`] within `page`, whatever found it.
+/// Decode the block at offset 6 within `page`, whatever found it.
 ///
 /// The same layout serves both versions, so the v5 page-1 read and the v6
 /// type scan share this one decoder.

@@ -22,20 +22,28 @@
 //! both shadow copies of that block, and a **generation** at `[0x04]` --
 //! file-global, not per-block, so comparing it *across* blocks means nothing;
 //! only the higher generation *within* a pair says which copy is live.
-//! Entries start at `[0x0c]`, `(page_size - 0x0c) / 4` of them, each a plain
-//! (not word-swapped) little-endian `[u16 marker][u16 page]` pair. A non-zero
-//! marker means the named physical page is currently claimed; the marker's
-//! value is observed to equal that page's own type tag.
+//! Entries start at `0x08`, `(page_size - 8) / 4` of them, each a
+//! plain (not word-swapped) little-endian `[u16 marker][u16 page]` pair. The
+//! marker's **high byte is the page type** the engine checks, and equals the
+//! claimed page's own type tag; a marker whose high byte is zero is a slot that
+//! was never allocated.
 //!
-//! **A page absent from the table, or present with a zero marker, is
-//! unclaimed** -- freed pages and pages that were never written both keep
-//! stale or all-zero headers, and both collide on logical id 0 or on
-//! whatever they held before being freed. Filtering by the marker *before*
-//! grouping by logical id is what tells a freed twin from the live page
-//! (Evidence 3, 3a); every one of the eight fixtures this module is tested
-//! against has zero *conflicts* left after that filter. Not zero unresolved
-//! ids: a logical id with no live claimant at all is the ordinary case, not
-//! an error, and [`Map::physical`] answers `None` for it.
+//! # A slot's position is the logical id -- nothing else is
+//!
+//! **This is the whole of how resolution works, and it runs the opposite way
+//! round from how this module used to read it.** The engine takes the logical id
+//! it wants, computes `n = logical - 1`, and fetches block `n / entries + 1`,
+//! slot `n % entries`; the 4-byte entry stored there *is* the answer
+//! (`W32MKDE_decompiled.c:14276-14286`). It never reads a page's own header to
+//! learn what logical id that page holds.
+//!
+//! This module used to do exactly that inverse: scan every page, read the
+//! logical id out of its header, and group. Two things follow from the
+//! correction. A page's self-stamped logical id is **decorative** as far as
+//! resolution goes -- freed twins and never-written templates keep stale ids,
+//! and nothing reads them. And "two pages claim one logical id" is not a
+//! contradiction to refuse but a question the format does not pose; six real
+//! files were refused for it, and genuine Btrieve reads all six.
 //!
 //! # Physical pages 0 and 1 are never ordinary pages
 //!
@@ -48,33 +56,29 @@
 //! handed back as an ordinary claimed page, which is exactly the plausible
 //! wrong answer the plan's Trap 2 exists to forbid.
 //!
-//! # Where further allocation-table blocks live
+//! # Where allocation-table blocks live, and why scanning for them was wrong
 //!
-//! Block 1 is always shadowed across physical pages 2 and 3 -- measured on
-//! every fixture this module has ever seen, and treated as an established
-//! fact rather than discovered. A file that outgrows one block's capacity
-//! gets a second (`PP2BLOCK.DAT` has one at physical 130/131), but **where**
-//! is not established (Evidence 5), so this module finds every block -- 1
-//! included -- by scanning every page for the magic, and refuses only if
-//! neither physical page 2 nor 3 is one of them: that specific refusal is
-//! the one shape this module trusts a fixed position for.
+//! Block `k`'s shadow **pair** -- exactly two copies, never more -- sits at
+//! physical `2 + (k - 1) * (entries_per_page + 2)` and the page after it. Each
+//! block governs `entries_per_page` logical pages plus its own two copies, so
+//! the blocks repeat on that stride. Measured across every multi-block file in
+//! `archive/modules/majormud-nt` at three page sizes with no exceptions:
+//! 4096-byte pages put blocks 1 to 14 at 2, 1026, 2050 ... 13314
+//! (`wccnt8pj/wccmp002.vir`); 2048-byte at 2, 514 ... 3586
+//! (`wccnt8pj/wcctext2.vir`); 1536-byte at 2 and 386
+//! (`wccnt8pj/wccknms2.vir`); `PP2BLOCK.DAT`'s 512-byte pages at 2 and 130.
 //!
-//! # The regular entry array is not the whole allocation table
-//!
-//! Every block's own entry array is internally contiguous -- across every
-//! fixture measured, `self_declared_logical - entry_index` is one constant
-//! for every live entry of one block, no exceptions -- but block *N+1*'s
-//! array never starts where block *N*'s left off; it always starts one
-//! logical id further. That one skipped id is a real page (`DUPKEY30.DAT`'s
-//! is an empty `0x8000` template; MajorMUD NT's real files hold genuine
-//! record and fragment content there), and it is not in *any* block's
-//! regular array, live or stale. `OVERFLOW` is where it actually is: a
-//! second, markerless claim on every allocation-table page, at a fixed
-//! offset the earlier page-addressing investigation flagged and left open
-//! ("a small integer; role NOT established (exceeds entry capacity)") --
-//! its value is a physical page number, which is why it looked too large to
-//! be an entry count. See [`OVERFLOW`]'s own doc comment for the
-//! measurement this rests on.
+//! Finding blocks by scanning for the `"PP"` magic was not a slower way to the
+//! same answer, it was a wrong one, and it is what made the "shadow pair is
+//! really two *or more*" reading look true. Real files carry **abandoned** pages
+//! that still hold the magic, a block index of 1, and a *higher* generation than
+//! the live table: `wccnt7pq/wccrace2.vir` has them at physical 8 and 9 with
+//! generations 1 and 3, against the real pair's 1 and 2. A scan chose physical 9
+//! and read an entry array claiming pages 26 and 10 to 14 of a ten-page file.
+//! Thirteen files in that tree have the shape -- `wccnt7po/wccshop2.vir` at
+//! 20/21, `wccnt7pv/wccmp002.vir` at 10056/10057 -- always near the end of the
+//! file and never at a position the formula names. The engine fetches a block by
+//! page number and so cannot see them; neither can this.
 
 use std::collections::HashMap;
 
@@ -93,38 +97,6 @@ const BLOCK: usize = 0x02;
 /// own copy of the offset rather than depending on that module's internals.
 const GENERATION: usize = 0x04;
 
-/// Byte offset, within an allocation-table page, of a bonus claim its regular
-/// entry array cannot represent (`u16` little-endian, no separate marker --
-/// see [`Map::read`]'s block loop for why presence alone is the marker here).
-///
-/// Measured 2026-08-15 against three real MajorMUD NT files that need two or
-/// more allocation-table blocks (`wccknms2.vir`, `wcctext2.vir`,
-/// `wccmp002.vir`, under `archive/modules/majormud-nt/wccnt8pj/out/`), after
-/// the earlier multi-block gap (`tmp/scratch/lane-a-findings.md`) turned out
-/// to have nothing to do with finding the blocks themselves: every regular
-/// entry array is internally contiguous -- `self_logical - entry_index` is
-/// one constant across all 509, or 381, or 1021, live entries of every block
-/// this was checked against, with zero exceptions -- but block *N+1*'s array
-/// always starts one logical id past where block *N*'s would have continued,
-/// never at the contiguous next id. That one skipped id is a real, live page
-/// (tag `'V'` or `0x44`, non-empty) whose logical id genuinely cannot be
-/// found in *any* block's regular array, live or stale, checked entry by
-/// entry. This field is where it actually is: **every block's PP page, this
-/// one included, carries the physical page number of the logical id one less
-/// than its own array's first entry, at this fixed offset.**
-///
-/// This is exactly the field the page-addressing plan's Evidence catalogue
-/// flagged and left open: "a small integer; role NOT established (exceeds
-/// entry capacity)" -- its value is a physical page number, which is why it
-/// looked too large to be an entry count.
-///
-/// Read for **every** block uniformly, block 1 included, rather than only
-/// blocks after the first: block 1's own copy of this field resolves the
-/// same way in all three files measured (a `0x8000`-tagged empty template
-/// holding logical id 1, the id immediately after the file control record's
-/// own physical/logical reservation of 0 and 1) -- harmless to add, since an
-/// empty template contributes no records downstream, and carrying the
-/// special case would cost more than the uniformity it would buy.
 /// Byte offset, within an allocation-table page, of its first entry.
 ///
 /// **`0x08`, read off the engine.** It fetches entry `slot` of a block at
@@ -435,11 +407,10 @@ impl Map {
     /// Constraints forbid. Appending costs space a real engine might not
     /// spend, and nothing here claims otherwise.
     ///
-    /// **The new logical id is one past the highest currently claimed one**,
-    /// matching every real allocation this module has measured (`OVERFLOW`'s
-    /// own doc comment: `self_logical - entry_index` is one constant across
-    /// every block ever measured, meaning entries fill in strictly ascending
-    /// logical order) -- not merely picking any id nothing else has taken.
+    /// **The new logical id is the first free slot's own position**,
+    /// because a slot's position within its block *is* the id it answers for
+    /// (`W32MKDE_decompiled.c:14276-14278`). There is no id to pick: filling
+    /// slot `n` claims logical `n + 1` and nothing else can.
     ///
     /// # Errors
     ///
@@ -617,9 +588,9 @@ impl Map {
     /// # Scope, the same boundary [`Self::claim`] states
     ///
     /// **Single block only**, for the identical reason: relocating into a
-    /// second block is not established. `logical` must already be claimed --
-    /// by a regular entry or by the block's [`OVERFLOW`] claim, either one --
-    /// in the live copy; a `logical` nothing claims is refused rather than
+    /// second block is not established. `logical`'s own slot -- `logical - 1`
+    /// of block 1 -- must already be claimed in the live copy; a `logical`
+    /// nothing claims is refused rather than
     /// silently claimed fresh, because that is [`Self::claim`]'s job, and a
     /// caller that meant to call it should not be quietly redirected here.
     ///
@@ -627,8 +598,8 @@ impl Map {
     ///
     /// If more than one `"PP"` block exists, if block 1's two copies are not
     /// at physical 2 and 3, if their generations tie, if `content` is not
-    /// exactly `page_size` bytes, or if `logical` is not currently claimed
-    /// by block 1's live copy (regular array or `OVERFLOW`).
+    /// exactly `page_size` bytes, or if `logical`'s own slot is not claimed
+    /// in block 1's live copy.
     pub(crate) fn relocate(
         file: &mut Vec<u8>,
         page_size: u16,
@@ -1138,13 +1109,14 @@ mod tests {
         assert_eq!(map.physical(11), Some(7));
         assert_eq!(map.physical(14), Some(17));
         assert_eq!(map.physical(26), Some(36));
-        // 23 from the regular entry array, plus block 1's `OVERFLOW` claim --
-        // logical 1, an empty `0x8000` template, exactly as it is in every
-        // other fixture this module reads. Harmless (an empty template holds
-        // no records `records::walk_v6` would ever read), but real: it is
-        // where this file's own allocation table says logical 1 lives.
+        // 24 slots allocated in block 1, logical 1 among them -- an empty
+        // `0x8000` template, exactly as in every other fixture here. Harmless
+        // (an empty template holds no records `records::walk_v6` would read) but
+        // real: slot 0 is where this file's allocation table puts logical 1.
+        // Slot 0 is the entry an earlier reading of this format mistook for a
+        // separate `OVERFLOW` field at `0x0a`.
         assert_eq!(map.physical(1), Some(13));
-        assert_eq!(map.physical.len(), 24, "23 regular plus the OVERFLOW claim");
+        assert_eq!(map.physical.len(), 24, "24 allocated slots, slot 0 included");
     }
 
     /// The control for the pair above: the same file immediately *before*
@@ -1159,8 +1131,7 @@ mod tests {
         assert_map(
             &map,
             &[
-                // Logical 1: block 1's `OVERFLOW` claim, an empty `0x8000`
-                // template -- see `OVERFLOW`'s doc comment.
+                // Logical 1: block 1's slot 0, an empty `0x8000` template.
                 (1, 13),
                 (2, 12), (5, 8), (6, 9), (7, 10), (8, 14), (9, 6), (10, 7),
                 (11, 17), (12, 15), (13, 16), (14, 20), (15, 18), (16, 19),
@@ -1179,11 +1150,11 @@ mod tests {
     fn dupkey30_only_two_logical_ids_have_a_live_claimant() {
         let file = fixture("DUPKEY30.DAT");
         let map = Map::read(&file, 512).expect("resolves");
-        // Logical 1 resolves too, via block 1's `OVERFLOW` claim -- physical
-        // 9, an empty `0x8000` template. It reads no differently than any
-        // other logical id nothing claims: `records::walk_v6` skips it by
-        // its tag, same as it always has. See `OVERFLOW`'s doc comment for
-        // why this field is read at all, and why block 1 always resolves it
+        // Logical 1 resolves too, from block 1's slot 0 -- physical 9, an
+        // empty `0x8000` template. It reads no differently than any other
+        // logical id: `records::walk_v6` skips it by its tag, same as it always
+        // has. Slot 0 is the entry an earlier reading of this format mistook
+        // for a separate field at `0x0a`, which is why block 1 resolves it
         // to something harmless like this one.
         assert_map(&map, &[(1, 9), (2, 10), (5, 8)]);
         assert_eq!(map.physical(0), None);
@@ -1196,8 +1167,8 @@ mod tests {
     fn pp2048_a_2048_byte_page_still_finds_its_one_live_id() {
         let file = fixture("PP2048.DAT");
         let map = Map::read(&file, 2048).expect("resolves");
-        // Logical 1 -> physical 9: block 1's `OVERFLOW` claim, same as every
-        // other fixture in this file, at whatever page size.
+        // Logical 1 -> physical 9: block 1's slot 0, same as every other
+        // fixture in this file, at whatever page size.
         assert_map(&map, &[(1, 9), (2, 8)]);
     }
 
@@ -1207,9 +1178,9 @@ mod tests {
     /// 136 logical ids have a live claimant in the regular entry arrays, and
     /// this asserts every one of them against the reference implementation's
     /// own output (`.scratch-v6-exec/expected_map.py`, `expected_maps.txt`)
-    /// rather than a handful of spot checks -- plus the two `OVERFLOW`
-    /// claims (logical 1 and 127) neither block's regular array can
-    /// represent, for 138 total.
+    /// rather than a handful of spot checks -- plus each block's slot 0
+    /// (logical 1 and logical 127), which that reference implementation and
+    /// this module both used to read as a separate field, for 138 total.
     #[test]
     fn pp2block_a_second_allocation_table_block_is_found_by_scanning() {
         let file = fixture("PP2BLOCK.DAT");
@@ -1217,7 +1188,7 @@ mod tests {
         assert_map(
             &map,
             &[
-                // Each block's own `OVERFLOW` claim: block 1's is logical 1
+                // Each block's slot 0: block 1's is logical 1
                 // at physical 147, block 2's is logical 127 at physical 128
                 // -- the exact page the page-addressing plan's own Evidence
                 // catalogue named as "unclaimed" (`128 and 147... is
@@ -1534,9 +1505,8 @@ mod tests {
     }
 
     /// Mutation: claim a physical page (write its content, header included)
-    /// but do not record the entry -- the exact bug `OVERFLOW` was written
-    /// to fix, reproduced deliberately this time rather than found by
-    /// accident. A page's own header is never what proves it live (Evidence
+    /// but do not record the entry -- reproduced deliberately rather than
+    /// found by accident. A page's own header is never what proves it live (Evidence
     /// 3/3a, this module's own top doc comment); only an allocation-table
     /// entry naming it is. If this test failed to fail, that whole design
     /// would be false.
