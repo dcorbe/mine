@@ -221,7 +221,7 @@ pub fn format_of(file: &[u8]) -> Format {
 /// today ends by naming the next symbol to implement. That is the useful
 /// output, and printing it is the whole reason this front door exists before
 /// the program can complete.
-fn run_pe32(path: &str, data: &[u8], tail: &str) -> io::Result<()> {
+fn run_pe32(path: &str, data: &[u8], tail: &str, root_dir: &str) -> io::Result<()> {
     let mut loaded = win32::load::load(data)?;
     println!(
         "{path}: PE32 image, {} imports, entry {:#010x}",
@@ -240,6 +240,18 @@ fn run_pe32(path: &str, data: &[u8], tail: &str) -> io::Result<()> {
     let argv0 = format!("C:\\{program}");
     let args: Vec<&str> = tail.split_whitespace().collect();
     let mut process = win32::process::Process::new(&argv0, &args);
+
+    // The same sandbox the real-mode guest gets, built the same way: one
+    // directory descriptor, and `openat2(RESOLVE_BENEATH)` beneath it. The PE32
+    // host resolves every `fopen` and `access` through this, so neither runtime
+    // can reach a byte the other could not.
+    std::fs::create_dir_all(root_dir)?;
+    let root = std::fs::File::open(root_dir)?;
+    println!("root: {root_dir}");
+    process.streams = win32::stream::Streams::new(Some(Files::new(
+        root.into(),
+        std::path::PathBuf::from(root_dir),
+    )));
 
     let outcome = win32::process::run(&mut loaded, &mut process, PE_CALL_BUDGET)?;
     println!("--- {outcome:?} ---");
@@ -284,7 +296,7 @@ fn main() -> io::Result<()> {
     // One front door, two runtimes. Everything below this point is the
     // real-mode path and is unchanged; a PE32 leaves here instead.
     match format_of(&data) {
-        Format::Pe32 => return run_pe32(&path, &data, &tail),
+        Format::Pe32 => return run_pe32(&path, &data, &tail, &root_dir),
         Format::Unsupported => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

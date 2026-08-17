@@ -14,7 +14,12 @@
 pub mod advapi32;
 pub mod console;
 pub mod crt;
+pub mod format;
 pub mod kernel32;
 pub mod load;
 pub mod process;
+pub mod stream;
 pub mod survey;
+pub mod user32;
+pub mod wintime;
+pub mod wsock32;

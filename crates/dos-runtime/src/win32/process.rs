@@ -19,8 +19,12 @@ use mbbs_machine::ptr::ModulePtr;
 
 use crate::win32::advapi32;
 use crate::win32::crt;
+use crate::win32::stream;
+use crate::win32::user32;
+use crate::win32::wsock32;
 use crate::win32::kernel32::{self, Answer};
 use crate::win32::load::Loaded;
+use crate::win32::stream::Streams;
 
 /// Where Borland's startup record carries the address of `main`.
 ///
@@ -148,12 +152,74 @@ pub struct Process {
     /// switches it to OEM during startup -- it is a DOS-era utility, and OEM is
     /// the code page its filenames were always written in.
     pub file_apis_ansi: bool,
+    /// The open C streams, and the root jail they resolve through.
+    ///
+    /// Holds its own `Option<Files>` rather than this struct holding one, so
+    /// that the file table and the sandbox that backs it cannot get separated
+    /// -- a `Streams` with no `Files` is a coherent thing (every call fails as
+    /// a missing file would), whereas a `Files` with no stream table is not.
+    pub streams: Streams,
+    /// The process environment, as `NAME=VALUE` pairs.
+    ///
+    /// **Empty, and that is a decision with a measured caller.** This program
+    /// asks for exactly one variable -- `getenv("MCVPATH")`, MajorBBS's search
+    /// path for `.MCV` message catalogues -- and the honest answer on this host
+    /// is that it is unset, because there is no search path: everything the
+    /// program can reach is under the one root directory the jail resolves
+    /// against, which is where an unset `MCVPATH` makes it look anyway.
+    ///
+    /// Kept as real (if empty) state rather than having `getenv` return a
+    /// constant NULL, because [`enter_main`] builds `envp` from this same
+    /// vector. Two representations of one environment that can disagree is the
+    /// bug this crate's own `bind_imports` doc comment describes for globals
+    /// bound per-site, and it would surface as a program that finds a variable
+    /// in `envp` which `getenv` denies.
+    pub env: Vec<(String, String)>,
+    /// How many times the program has called `Sleep`.
+    ///
+    /// Counted rather than ignored because a program spinning in a retry loop
+    /// and one making progress produce the same trace otherwise -- this is the
+    /// number that tells them apart.
+    pub slept_calls: u64,
+    /// Winsock's per-thread error slot -- see [`crate::win32::wsock32`] for why
+    /// it is not the same storage as `last_error`.
+    pub wsa_last_error: u32,
+    /// What the program reported to the NT event log.
+    ///
+    /// Kept because this host has no event log to write to, and the
+    /// alternative to keeping it is discarding the program's own account of
+    /// what went wrong -- which on the error paths this utility takes is the
+    /// most informative thing it produces. `runexe` prints these after a run.
+    pub events: Vec<LoggedEvent>,
+    /// The running image's own exports, name to linear address.
+    ///
+    /// Copied out of [`Loaded`] by [`run`] rather than looked up through it,
+    /// because `dispatch` is handed the machine and its memory and has no
+    /// reference to the loaded image. One copy, made once, at the point where
+    /// both are in scope.
+    pub exports: Vec<(String, u32)>,
+    /// `(caption, text)` of every `MessageBoxA` the program tried to show.
+    ///
+    /// There is no desktop here, so the box cannot appear -- but the text is
+    /// the program's own account of a failure, and discarding it would throw
+    /// away the clearest diagnostic on the paths that produce one.
+    pub messages: Vec<(String, String)>,
     /// Kernel objects this process has made, indexed by handle minus one.
     ///
     /// Handles are `1..=len` so that zero stays available as the NULL a failed
     /// open returns -- `OpenEventA` answering "no such event" and a valid
     /// handle must never be the same value.
     objects: Vec<Object>,
+}
+
+/// One `ReportEventA` call: the program's own diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedEvent {
+    /// `EVENTLOG_ERROR_TYPE` (1), `WARNING` (2), `INFORMATION` (4)...
+    pub kind: u32,
+    pub id: u32,
+    /// The insertion strings, in order. Usually one: the message itself.
+    pub strings: Vec<String>,
 }
 
 /// What a handle refers to.
@@ -178,6 +244,13 @@ pub enum Object {
     /// really works: input and output modes are different bit sets over the
     /// same two calls, and a program sets each through its own handle.
     Console { input: bool, mode: u32 },
+    /// A real file opened with `CreateFileA`, and the [`dos::files::Files`]
+    /// handle behind it.
+    ///
+    /// Distinct from a C stream: this one has no `FILE` struct, because the
+    /// program that opens a file this way writes to it with `WriteFile` rather
+    /// than `fwrite` and never sees a `FILE *`.
+    File { dos: u16 },
 }
 
 impl Process {
@@ -200,6 +273,13 @@ impl Process {
             // program expects.
             console: crate::win32::console::Console::new(80, 25),
             file_apis_ansi: true,
+            streams: Streams::default(),
+            env: Vec::new(),
+            slept_calls: 0,
+            wsa_last_error: 0,
+            events: Vec::new(),
+            exports: Vec::new(),
+            messages: Vec::new(),
             objects: Vec::new(),
         }
     }
@@ -231,7 +311,9 @@ impl Process {
                 // name of a *device* passed to `CreateFileA`, not a kernel
                 // object name `OpenEventA` could ever find, so matching it here
                 // would let an event lookup return a console.
-                Object::Console { .. } => false,
+                // Neither a console device name nor a filesystem path is a
+                // kernel object name `OpenEventA` could ever find.
+                Object::Console { .. } | Object::File { .. } => false,
             })
             .map(|i| u32::try_from(i + 1).expect("index fits, it came from a Vec"))
     }
@@ -320,7 +402,22 @@ pub fn dispatch(
     if site.module.eq_ignore_ascii_case("ADVAPI32.dll") {
         return advapi32::dispatch(process, machine, mem, &symbol);
     }
+    if site.module.eq_ignore_ascii_case("USER32.dll") {
+        return user32::dispatch(process, machine, mem, &symbol);
+    }
+    if site.module.eq_ignore_ascii_case("WSOCK32.dll") {
+        return wsock32::dispatch(process, machine, mem, &symbol);
+    }
     if site.module.eq_ignore_ascii_case("cw3220mt.DLL") {
+        // The C runtime is split by concern across two files: `crt` for the
+        // pure functions with no host state behind them, `stream` for the ones
+        // that reach the filesystem. Streams are tried first because that
+        // split is by *ownership* -- anything holding a `FILE` or a path
+        // belongs to one module, and a symbol answered in both would be a
+        // first-match-wins bug rather than a compile error.
+        if let Some(a) = stream::dispatch(process, machine, mem, &symbol) {
+            return Some(a);
+        }
         return crt::dispatch(process, machine, mem, &symbol);
     }
     None
@@ -364,6 +461,7 @@ pub fn read_cstr(mem: &Memory, at: u32) -> Option<String> {
 /// If the machine cannot be entered or resumed, or the arena cannot hold the
 /// process's own startup data.
 pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Result<Outcome> {
+    process.exports.clone_from(&loaded.exports);
     let mut exit = loaded
         .machine
         .call_on(loaded.mem.stack_mut(), loaded.entry, &[])?;
@@ -436,7 +534,13 @@ fn enter_main(loaded: &mut Loaded, process: &Process, record: u32) -> io::Result
     let argc = u32::try_from(argv.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argc overflows"))?;
     let argv_ptr = put_ptr_array(&mut loaded.mem, &argv)?;
-    let envp_ptr = put_ptr_array(&mut loaded.mem, &[])?;
+    // Built from `Process::env`, which is the same vector `getenv` answers
+    // from -- see that field on why there is one source rather than two.
+    let mut envp = Vec::with_capacity(process.env.len());
+    for (name, value) in &process.env {
+        envp.push(put_cstr(&mut loaded.mem, &format!("{name}={value}"))?);
+    }
+    let envp_ptr = put_ptr_array(&mut loaded.mem, &envp)?;
 
     loaded
         .machine
@@ -500,12 +604,19 @@ mod tests {
     /// configuration block -> `SetFileApisToOEM` -> the six console-buffer
     /// calls -> `LoadLibraryA` -> `_malloc` -> here.
     ///
-    /// `_access("WCCMMPLS.MCV")` is a different kind of frontier from all of
-    /// those, which is why the phase stops at it rather than pushing on: every
-    /// symbol behind it was process, console or arithmetic, and this one is the
-    /// program asking the filesystem a question. Answering it means wiring
-    /// `dos::files::Files` -- the root jail the DOS guest already goes through
-    /// -- into this host, which is its own body of work.
+    /// **`__Return_unwind` is a gate rather than a frontier**, and it is the one
+    /// the phase plan predicted. It is Borland's C++ exception unwind: it
+    /// restores a saved register set and resumes at a stored address, and
+    /// `mbbs_machine::m32::Machine` has no register setters -- its only setter
+    /// is `set_budget`. That is the same wall the plan recorded for `_longjmp`,
+    /// reached from the exception path instead. Adding register setters is a
+    /// change in `mbbs-machine`, deliberately out of scope, and explicitly not
+    /// to be done speculatively.
+    ///
+    /// The program reaches it because it throws: `WCCMMUD.MCV` does not exist
+    /// (only the uncompiled `WCCMMUD.MSG` does), so it reports the failure,
+    /// writes a full `GALCAT.OUT` crash dump, and unwinds. Supplying the whole
+    /// 73-file fixture does not change this -- it was measured both ways.
     ///
     /// One thing this route confirmed is worth keeping: `CreateFileA` was both
     /// the survey's first *mis-cleaned* call and this runner's stopping point
@@ -517,13 +628,76 @@ mod tests {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
         let mut loaded = crate::win32::load::load(&file).expect("loads");
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
-        let out = run(&mut loaded, &mut p, 400).expect("the machine runs");
+        let out = run(&mut loaded, &mut p, 500_000).expect("the machine runs");
+        assert_eq!(
+            out,
+            Outcome::Exited(90),
+            "the program runs to completion and exits of its own accord"
+        );
+    }
+
+    /// **The gate**, and it only appears once the host is capable enough to
+    /// reach it.
+    ///
+    /// Given a real filesystem the program gets *further* and ends *worse*: it
+    /// finds its data directory, fails on `WCCMMUD.MCV` -- which genuinely does
+    /// not exist, only the uncompiled `WCCMMUD.MSG` does -- reports the failure,
+    /// writes a full `GALCAT.OUT` crash dump, and then unwinds.
+    /// `cw3220mt.DLL!__Return_unwind` is Borland's C++ exception unwind: it
+    /// restores a saved register set and resumes at a stored address.
+    ///
+    /// `mbbs_machine::m32::Machine` has no register setters -- its only setter
+    /// is `set_budget` -- so this cannot be implemented here. It is the same
+    /// wall the phase plan recorded for `_longjmp`, reached from the exception
+    /// path instead of directly, and the plan is explicit that adding register
+    /// setters is a change in `mbbs-machine` and must not be done
+    /// speculatively.
+    ///
+    /// Supplying the whole 73-file fixture from the real board does not change
+    /// this; it was measured both ways.
+    #[test]
+    fn with_a_filesystem_it_reaches_the_borland_unwind_gate() {
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut loaded = crate::win32::load::load(&file).expect("loads");
+        let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
+
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-unwind-gate");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("root dir");
+        let fd = std::fs::File::open(&dir).expect("root fd");
+        p.streams = crate::win32::stream::Streams::new(Some(dos::files::Files::new(
+            fd.into(),
+            dir.clone(),
+        )));
+
+        let out = run(&mut loaded, &mut p, 500_000).expect("the machine runs");
         assert_eq!(
             out,
             Outcome::Unimplemented {
                 module: "cw3220mt.DLL".to_owned(),
-                symbol: "_access".to_owned(),
-            }
+                symbol: "__Return_unwind".to_owned(),
+            },
+            "the Borland unwind group is the gate; see this test's comment"
+        );
+
+        // On the way there it produced its own diagnostic, which this host
+        // keeps because there is no NT event log to put it in.
+        assert!(
+            p.events.iter().any(|e| e
+                .strings
+                .iter()
+                .any(|s| s.contains("CANNOT FIND"))),
+            "the program reported why it failed: {:?}",
+            p.events
+        );
+        // And a real crash dump, not a runaway log. It was 2.3 MB of repeated
+        // lines before `VirtualQuery` reported page-aligned region sizes.
+        let dump = std::fs::metadata(dir.join("GALCAT.OUT")).expect("a crash dump");
+        assert!(
+            dump.len() > 200 && dump.len() < 100_000,
+            "GALCAT.OUT is {} bytes; a runaway memory-map walk makes it megabytes",
+            dump.len()
         );
     }
 

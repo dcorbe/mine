@@ -37,6 +37,10 @@ const CONTROL: u32 = 2;
 /// Byte offset of the `Dacl` pointer within that structure.
 const DACL: u32 = 16;
 
+/// The cookie `RegisterEventSourceA` answers with. Any non-zero value serves;
+/// a recognisable one makes it obvious in a trace.
+const EVENT_SOURCE_HANDLE: u32 = 0x0047_4f4c;
+
 /// `SE_DACL_PRESENT` -- the `Control` bit that says the `Dacl` field means
 /// something. Without it a null `Dacl` reads as "no DACL, deny everyone"
 /// rather than "null DACL, allow everyone", which are opposites.
@@ -44,12 +48,54 @@ const SE_DACL_PRESENT: u16 = 0x0004;
 
 /// Answer an ADVAPI32 import, or `None` for one still unimplemented.
 pub fn dispatch(
-    _process: &mut Process,
+    process: &mut Process,
     machine: &mut Machine,
     mem: &mut Memory,
     symbol: &str,
 ) -> Option<Answer> {
     match symbol {
+        // RegisterEventSourceA(LPCSTR lpUNCServerName, LPCSTR lpSourceName)
+        //
+        // The NT event log. A non-null cookie, because the only thing the
+        // program does with the result is pass it to `ReportEventA` and test it
+        // against NULL -- and a NULL would make it skip the report, which is
+        // the one thing here worth *not* losing.
+        "RegisterEventSourceA" => Some(Answer::stdcall(EVENT_SOURCE_HANDLE, 2)),
+        // DeregisterEventSource(HANDLE)
+        "DeregisterEventSource" => Some(Answer::stdcall(TRUE, 1)),
+        // ReportEventA(HANDLE, WORD wType, WORD wCategory, DWORD dwEventID,
+        //              PSID, WORD wNumStrings, DWORD dwDataSize,
+        //              LPCSTR *lpStrings, LPVOID lpRawData)
+        //
+        // **Kept, not discarded.** This is the program telling an operator what
+        // went wrong, in its own words. On a real NT box it lands in the event
+        // log; here there is no log, so the alternative to keeping it is
+        // throwing away the best diagnostic the program produces. Nine
+        // arguments, and `lpStrings` is an *array of pointers* -- reading it as
+        // a single string yields one line of rubbish instead of the message.
+        "ReportEventA" => {
+            let kind = machine.arg_u32(mem.stack(), 1);
+            let id = machine.arg_u32(mem.stack(), 3);
+            let count = machine.arg_u32(mem.stack(), 5);
+            let strings = machine.arg_u32(mem.stack(), 7);
+            let mut lines = Vec::new();
+            for i in 0..count {
+                let slot = strings.wrapping_add(i * 4);
+                let Ok(bytes) = Flat32Ptr(slot).resolve(mem, 4) else {
+                    break;
+                };
+                let ptr = u32::from_le_bytes(bytes.try_into().expect("4 bytes"));
+                if let Some(s) = crate::win32::process::read_cstr(mem, ptr) {
+                    lines.push(s);
+                }
+            }
+            process.events.push(crate::win32::process::LoggedEvent {
+                kind,
+                id,
+                strings: lines,
+            });
+            Some(Answer::stdcall(TRUE, 9))
+        }
         // InitializeSecurityDescriptor(PSECURITY_DESCRIPTOR, DWORD dwRevision)
         "InitializeSecurityDescriptor" => {
             let at = machine.arg_u32(mem.stack(), 0);

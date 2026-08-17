@@ -253,6 +253,18 @@ const DEFAULT_INPUT_MODE: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010;
 /// `ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT`, the output default.
 const DEFAULT_OUTPUT_MODE: u32 = 0x0001 | 0x0002;
 
+/// The mode a freshly opened console handle starts with.
+///
+/// Public because `CreateFileA` lives in [`crate::win32::kernel32`]; the two
+/// defaults stay here, beside the console they describe.
+pub fn default_mode(input: bool) -> u32 {
+    if input {
+        DEFAULT_INPUT_MODE
+    } else {
+        DEFAULT_OUTPUT_MODE
+    }
+}
+
 /// `INVALID_HANDLE_VALUE` -- what `CreateFileA` fails with.
 ///
 /// **Not zero.** `CreateFileA` is the one Win32 opener that reports failure as
@@ -263,9 +275,13 @@ pub const INVALID_HANDLE_VALUE: u32 = 0xffff_ffff;
 
 /// The two console device names `CreateFileA` accepts.
 ///
+/// Public because `CreateFileA` lives in [`crate::win32::kernel32`] -- it has
+/// to choose between opening a console device and opening a real file through
+/// the jail, and that choice is this predicate.
+///
 /// Compared case-insensitively because they are DOS device names and the API
 /// has always matched them that way.
-fn console_device(name: &str) -> Option<bool> {
+pub fn console_device(name: &str) -> Option<bool> {
     if name.eq_ignore_ascii_case("CONIN$") {
         Some(true)
     } else if name.eq_ignore_ascii_case("CONOUT$") {
@@ -306,28 +322,6 @@ pub fn dispatch(
     symbol: &str,
 ) -> Option<Answer> {
     match symbol {
-        // CreateFileA(LPCSTR lpFileName, DWORD dwDesiredAccess,
-        //             DWORD dwShareMode, LPSECURITY_ATTRIBUTES,
-        //             DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes,
-        //             HANDLE hTemplateFile)
-        //
-        // Only the console devices. A real file arriving here is a symbol this
-        // host has not measured a caller for, and it stays `None` so it names
-        // itself rather than being opened by a path this program has never
-        // been seen to take. When one is measured, it goes through
-        // `dos::files::Files` -- the root jail the DOS guest already uses.
-        "CreateFileA" => {
-            let name_ptr = machine.arg_u32(mem.stack(), 0);
-            let name = crate::win32::process::read_cstr(mem, name_ptr)?;
-            let input = console_device(&name)?;
-            let mode = if input {
-                DEFAULT_INPUT_MODE
-            } else {
-                DEFAULT_OUTPUT_MODE
-            };
-            let handle = process.insert_object(Object::Console { input, mode });
-            Some(Answer::stdcall(handle, 7))
-        }
         // GetConsoleMode(HANDLE, LPDWORD lpMode)
         "GetConsoleMode" => {
             let handle = machine.arg_u32(mem.stack(), 0);

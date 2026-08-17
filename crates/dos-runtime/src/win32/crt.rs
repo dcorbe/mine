@@ -29,7 +29,7 @@ use mbbs_machine::m32::{Flat32Ptr, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::win32::kernel32::Answer;
-use crate::win32::process::Process;
+use crate::win32::process::{self, Process};
 
 /// Borland's `rand`, which is a specific 32-bit LCG rather than "an LCG".
 ///
@@ -137,6 +137,106 @@ pub fn memmove(mem: &mut Memory, dest: u32, src: u32, n: u32) -> u32 {
     dest
 }
 
+/// `void *memset(void *dest, int c, size_t n)` -- returns `dest`.
+///
+/// Only the low byte of `c` is written, which is C's rule and not a
+/// simplification: `memset(p, 0x1ff, n)` fills with `0xff`.
+pub fn memset(mem: &mut Memory, dest: u32, c: u32, n: u32) -> u32 {
+    let len = n as usize;
+    if len == 0 {
+        return dest;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let byte = c as u8;
+    let _ = Flat32Ptr(dest).write(mem, &vec![byte; len]);
+    dest
+}
+
+/// The bytes of a C string at `at`, without its terminator.
+///
+/// `None` when the address resolves nowhere or the string has no terminator
+/// before the end of its mapping. Both are "there is no string here", and no
+/// caller in this module distinguishes them.
+fn cstr(mem: &Memory, at: u32) -> Option<Vec<u8>> {
+    if at == 0 {
+        return None;
+    }
+    Flat32Ptr(at).read_cstr(mem).ok().map(<[u8]>::to_vec)
+}
+
+/// Write `bytes` plus a terminator at `at`, and answer `at`.
+///
+/// The terminator is added here rather than by each caller, because a `strcpy`
+/// that forgets it is a bug that shows up in whatever happens to follow the
+/// destination in memory.
+fn put_cstr_at(mem: &mut Memory, at: u32, bytes: &[u8]) -> u32 {
+    let mut owned = bytes.to_vec();
+    owned.push(0);
+    let _ = Flat32Ptr(at).write(mem, &owned);
+    at
+}
+
+/// C's three-way comparison as an `int`: negative, zero or positive.
+///
+/// **The sign is the contract and the magnitude is not.** Callers write
+/// `if (strcmp(a, b) < 0)`, so what matters is that unequal strings order
+/// consistently -- returning the byte difference, as most implementations do,
+/// is one valid choice among many.
+fn compare(a: &[u8], b: &[u8]) -> u32 {
+    let ord = match a.cmp(b) {
+        std::cmp::Ordering::Less => -1i32,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    ord as u32
+}
+
+/// `stricmp` -- case-insensitive, and the reason this program can match its own
+/// switches however the operator typed them.
+pub fn stricmp_bytes(a: &[u8], b: &[u8]) -> u32 {
+    let lower = |s: &[u8]| s.to_ascii_lowercase();
+    compare(&lower(a), &lower(b))
+}
+
+/// `atol` -- leading whitespace, an optional sign, then digits, stopping at the
+/// first byte that is not one.
+///
+/// Never fails: C's `atol` has no error report, and a string with no digits at
+/// all is zero. Saturating rather than wrapping on overflow, because a wrapped
+/// record number is a plausible-looking wrong answer and a saturated one is
+/// visibly wrong.
+pub fn atol_bytes(s: &[u8]) -> u32 {
+    let mut i = 0;
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let negative = match s.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut value: i64 = 0;
+    while i < s.len() && s[i].is_ascii_digit() {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(s[i] - b'0'));
+        i += 1;
+    }
+    if negative {
+        value = -value;
+    }
+    let clamped = value.clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    #[allow(clippy::cast_possible_truncation)]
+    let narrowed = clamped as i32;
+    narrowed as u32
+}
+
 /// `void *malloc(size_t)` -- a pointer out of the program's own arena.
 ///
 /// **Nothing is ever freed**, and that is a bounded decision rather than an
@@ -222,6 +322,29 @@ pub fn dispatch(
         // of one generator rather than one of two functions. The pair is the
         // unit.
         "_rand" => Some(Answer::cdecl(process.random.rand())),
+        // char *getenv(const char *name)
+        //
+        // A real lookup that finds nothing, rather than a constant NULL. See
+        // `Process::env` for why the environment is empty and why that is the
+        // right answer for the one variable this program asks about.
+        //
+        // The value is copied into the arena on each call rather than cached.
+        // C's `getenv` may hand back a pointer the next call invalidates, so
+        // nothing is promised by reusing one; and with an empty environment
+        // this never allocates at all.
+        "_getenv" => {
+            let name_at = machine.arg_u32(mem.stack(), 0);
+            let name = process::read_cstr(mem, name_at)?;
+            let found = process
+                .env
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.clone());
+            match found {
+                Some(v) => Some(Answer::cdecl(process::put_cstr(mem, &v).unwrap_or(0))),
+                None => Some(Answer::cdecl(0)),
+            }
+        }
         // void *malloc(size_t size)
         "_malloc" => {
             let bytes = machine.arg_u32(mem.stack(), 0);
@@ -237,6 +360,152 @@ pub fn dispatch(
         "_strdup" => {
             let at = machine.arg_u32(mem.stack(), 0);
             Some(Answer::cdecl(strdup(mem, at)))
+        }
+        // void _exit(int status) / void exit(int status)
+        //
+        // Sets the code and stops the run, exactly as `ExitProcess` does --
+        // `run` returns as soon as `exit_code` is set. Returning a value here
+        // would be meaningless: both are declared `noreturn`, and a host that
+        // let the program carry on past its own exit produces a trace that
+        // looks healthy while being fiction.
+        "_exit" => {
+            let status = machine.arg_u32(mem.stack(), 0);
+            process.exit(status);
+            Some(Answer::cdecl(0))
+        }
+        // void abort(void)
+        //
+        // Exit code 3, which is what a Borland `abort` leaves behind -- it is
+        // the value `_exit(3)` its own implementation calls. Distinct from a
+        // clean exit on purpose: a caller looking at the code should be able to
+        // tell "the program decided to stop" from "the program gave up".
+        "_abort" => {
+            process.exit(3);
+            Some(Answer::cdecl(0))
+        }
+        // void *memset(void *dest, int c, size_t n)
+        "_memset" => {
+            let dest = machine.arg_u32(mem.stack(), 0);
+            let c = machine.arg_u32(mem.stack(), 1);
+            let n = machine.arg_u32(mem.stack(), 2);
+            Some(Answer::cdecl(memset(mem, dest, c, n)))
+        }
+        // size_t strlen(const char *s)
+        "_strlen" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            let len = cstr(mem, at).map_or(0, |s| u32::try_from(s.len()).unwrap_or(u32::MAX));
+            Some(Answer::cdecl(len))
+        }
+        // char *strcpy(char *dest, const char *src)
+        "_strcpy" => {
+            let dest = machine.arg_u32(mem.stack(), 0);
+            let src = machine.arg_u32(mem.stack(), 1);
+            let bytes = cstr(mem, src).unwrap_or_default();
+            Some(Answer::cdecl(put_cstr_at(mem, dest, &bytes)))
+        }
+        // char *strncpy(char *dest, const char *src, size_t n)
+        //
+        // **Not a bounded `strcpy`.** C's `strncpy` writes exactly `n` bytes:
+        // it pads with NULs when the source is short, and writes *no*
+        // terminator when the source is `n` or longer. A host that terminated
+        // anyway would silently truncate a fixed-width record field by a byte,
+        // which is precisely the shape of data this program handles.
+        "_strncpy" => {
+            let dest = machine.arg_u32(mem.stack(), 0);
+            let src = machine.arg_u32(mem.stack(), 1);
+            let n = machine.arg_u32(mem.stack(), 2) as usize;
+            let bytes = cstr(mem, src).unwrap_or_default();
+            let mut out = vec![0u8; n];
+            let copy = bytes.len().min(n);
+            out[..copy].copy_from_slice(&bytes[..copy]);
+            let _ = Flat32Ptr(dest).write(mem, &out);
+            Some(Answer::cdecl(dest))
+        }
+        // char *strcat(char *dest, const char *src)
+        "_strcat" => {
+            let dest = machine.arg_u32(mem.stack(), 0);
+            let src = machine.arg_u32(mem.stack(), 1);
+            let head = cstr(mem, dest).unwrap_or_default();
+            let tail = cstr(mem, src).unwrap_or_default();
+            let mut joined = head;
+            joined.extend_from_slice(&tail);
+            Some(Answer::cdecl(put_cstr_at(mem, dest, &joined)))
+        }
+        // int strcmp(const char *a, const char *b)
+        "_strcmp" => {
+            let a = machine.arg_u32(mem.stack(), 0);
+            let b = machine.arg_u32(mem.stack(), 1);
+            let (a, b) = (cstr(mem, a).unwrap_or_default(), cstr(mem, b).unwrap_or_default());
+            Some(Answer::cdecl(compare(&a, &b)))
+        }
+        // int stricmp(const char *a, const char *b)
+        "_stricmp" => {
+            let a = machine.arg_u32(mem.stack(), 0);
+            let b = machine.arg_u32(mem.stack(), 1);
+            let (a, b) = (cstr(mem, a).unwrap_or_default(), cstr(mem, b).unwrap_or_default());
+            Some(Answer::cdecl(stricmp_bytes(&a, &b)))
+        }
+        // char *strchr(const char *s, int c) -- NULL when absent.
+        //
+        // Searching for `\0` finds the terminator, which C requires and which
+        // a search over the string's bytes alone would miss.
+        "_strchr" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            #[allow(clippy::cast_possible_truncation)]
+            let c = machine.arg_u32(mem.stack(), 1) as u8;
+            let found = cstr(mem, at).and_then(|s| {
+                if c == 0 {
+                    Some(u32::try_from(s.len()).ok()?)
+                } else {
+                    u32::try_from(s.iter().position(|&b| b == c)?).ok()
+                }
+            });
+            Some(Answer::cdecl(found.map_or(0, |off| at + off)))
+        }
+        // char *strrchr(const char *s, int c) -- the *last* one.
+        "_strrchr" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            #[allow(clippy::cast_possible_truncation)]
+            let c = machine.arg_u32(mem.stack(), 1) as u8;
+            let found = cstr(mem, at).and_then(|s| {
+                if c == 0 {
+                    Some(u32::try_from(s.len()).ok()?)
+                } else {
+                    u32::try_from(s.iter().rposition(|&b| b == c)?).ok()
+                }
+            });
+            Some(Answer::cdecl(found.map_or(0, |off| at + off)))
+        }
+        // char *strlwr(char *s) / char *strupr(char *s) -- in place, answering s.
+        "_strlwr" | "_strupr" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            let bytes = cstr(mem, at).unwrap_or_default();
+            let cased = if symbol == "_strlwr" {
+                bytes.to_ascii_lowercase()
+            } else {
+                bytes.to_ascii_uppercase()
+            };
+            Some(Answer::cdecl(put_cstr_at(mem, at, &cased)))
+        }
+        // long atol(const char *s)
+        "_atol" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            let bytes = cstr(mem, at).unwrap_or_default();
+            Some(Answer::cdecl(atol_bytes(&bytes)))
+        }
+        // int tolower(int c) / int toupper(int c)
+        //
+        // Values outside `0..=255` pass through unchanged rather than being
+        // truncated: C defines these for `EOF` as well as for characters, and
+        // narrowing first would turn `EOF` into `0xff`.
+        "_tolower" | "_toupper" => {
+            let c = machine.arg_u32(mem.stack(), 0);
+            let mapped = match u8::try_from(c) {
+                Ok(b) if symbol == "_tolower" => u32::from(b.to_ascii_lowercase()),
+                Ok(b) => u32::from(b.to_ascii_uppercase()),
+                Err(_) => c,
+            };
+            Some(Answer::cdecl(mapped))
         }
         // void *memmove(void *dest, const void *src, size_t n)
         "_memmove" => {
@@ -394,7 +663,7 @@ mod tests {
     fn unreached_symbols_are_declined_rather_than_answered() {
         let mut l = loaded();
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
-        for symbol in ["_strlen", "_fopen", "_longjmp", "_sprintf", "_strtok"] {
+        for symbol in ["_longjmp", "_strtok", "_clreol", "_getch", "_fnsplit"] {
             assert!(
                 dispatch(&mut p, &mut l.machine, &mut l.mem, symbol).is_none(),
                 "{symbol} is unreached and must stay diagnosable"

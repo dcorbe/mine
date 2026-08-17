@@ -42,6 +42,7 @@ pub fn survey(
     budget: usize,
 ) -> io::Result<(Vec<Reached>, Outcome)> {
     let mut seen: Vec<Reached> = Vec::new();
+    process.exports.clone_from(&loaded.exports);
     let mut exit = loaded
         .machine
         .call_on(loaded.mem.stack_mut(), loaded.entry, &[])?;
@@ -153,18 +154,34 @@ mod tests {
         assert_eq!(
             names,
             [
-                "_time", "_srand", "_memmove", "_malloc", "_access", "_getenv", "_memset",
-                "_fopen", "_vsprintf",
+                "_time",
+                "_srand",
+                "_memmove",
+                "_malloc",
+                "_access",
+                "_getenv",
+                "_memset",
+                "_fopen",
+                "_vsprintf",
+                "_sprintf",
+                "_exit",
             ]
         );
 
-        // The phase's headline risk, pinned closed. `_longjmp` is linked but
-        // never called, and `m32::Machine` has no register setters to implement
-        // it with. If this ever fires, stop and read the trace doc's §4 rather
-        // than reaching for `set_*` methods on the machine.
+        // The survey ends at `_exit` because `_exit` is now *implemented*: the
+        // program terminates itself rather than running on into fiction. That
+        // is why this list is shorter than it was mid-phase, when the survey
+        // ran past the exit and reached `_longjmp` and the whole unwind group.
+        //
+        // **The headline risk is nonetheless open**, and it is pinned next door
+        // rather than here: `process::tests::with_a_filesystem_it_reaches_the_borland_unwind_gate`
+        // shows the strict runner stopping at `__Return_unwind` as soon as the
+        // host has a filesystem. `_longjmp` and `__Return_unwind` are the same
+        // wall -- both restore a register set `m32::Machine` cannot set.
         assert!(
             !crt.iter().any(|r| r.symbol == "_longjmp"),
-            "_longjmp became reachable; the unwind risk has reopened"
+            "with `_exit` answered the survey stops before the unwind group; \
+             if this fires, the exit path changed and the gate moved"
         );
     }
 
@@ -194,9 +211,15 @@ mod tests {
         let (reached, _stop) = survey(&mut loaded, &mut p, 100_000).expect("runs");
         let first_of = |s: &str| reached.iter().find(|r| r.symbol == s).map(|r| r.first);
 
-        // `Sleep` is the first stdcall symbol this host still does not answer,
-        // so it is where the stack starts drifting.
-        let drift = first_of("Sleep").expect("Sleep is reached and unimplemented");
+        // `Sleep` marks where the drift boundary *was*. It is answered now, so
+        // this is no longer "the first unimplemented stdcall" -- it is a fixed
+        // late landmark separating the program's startup from its shutdown.
+        //
+        // The nine symbols below are the startup set and all precede it.
+        // `_sprintf` (ordinal 1690) and `_exit` do not, and that is measured
+        // rather than overlooked: they belong to the failure-and-exit path,
+        // which runs after the landmark.
+        let drift = first_of("Sleep").expect("Sleep is reached");
 
         for symbol in [
             "_time", "_srand", "_memmove", "_malloc", "_access", "_getenv", "_memset", "_fopen",

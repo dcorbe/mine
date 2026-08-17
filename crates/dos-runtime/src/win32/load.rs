@@ -2,7 +2,8 @@
 
 use std::io;
 
-use mbbs_machine::m32::{Exit, Image, Import32, Machine, Memory, PeImage, Ret};
+use mbbs_machine::m32::{Exit, ExportAddress, Image, Import32, Machine, Memory, PeImage, Ret};
+
 use mbbs_machine::module::{ImportSite, Symbol};
 
 /// How much guest-addressable scratch the host gets for the things a real
@@ -48,6 +49,17 @@ pub struct Loaded {
     /// `Image::bind_imports` asks its resolver once per symbol and caches the
     /// answer, so a symbol named at twenty sites appears here once.
     pub imports: Vec<ImportSite>,
+    /// This image's own exports, resolved to linear addresses.
+    ///
+    /// An *executable* with an export table is unusual enough to look like a
+    /// mistake, and it is not one: `wccmmutl.exe` has an `.edata` section and
+    /// calls `GetProcAddress(GetModuleHandleA(NULL), "_input")` -- it looks
+    /// symbols up in itself. That is how a Galacticomm utility reaches the
+    /// entry points the server would otherwise have called directly.
+    ///
+    /// Forwarded exports are dropped rather than represented: following a
+    /// forwarder means loading the DLL it names, and this host loads none.
+    pub exports: Vec<(String, u32)>,
 }
 
 /// One import the program actually called, and how often.
@@ -101,6 +113,15 @@ pub fn load(file: &[u8]) -> io::Result<Loaded> {
     });
 
     let entry = image.base().wrapping_add(parsed.entry_point);
+    let base = image.base();
+    let exports = parsed
+        .exports
+        .iter()
+        .filter_map(|e| match e.address {
+            ExportAddress::Rva(rva) => Some((e.name.clone(), base.wrapping_add(rva))),
+            ExportAddress::Forwarded(_) => None,
+        })
+        .collect();
 
     let mut mem = Memory::new(image, ARENA_LEN)?;
     // After this the machine has no stack of its own, which is why every
@@ -116,6 +137,7 @@ pub fn load(file: &[u8]) -> io::Result<Loaded> {
         machine,
         entry,
         imports,
+        exports,
     })
 }
 
