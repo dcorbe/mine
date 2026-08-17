@@ -6235,6 +6235,30 @@ mod tests {
         bytes[512..1024].to_vec()
     }
 
+    /// Every v5 write keeps the key's stored count live, not just insert.
+    ///
+    /// This test exists because a mutation found its absence: disabling
+    /// [`Btrieve::write_key_record_counts`] in `delete` alone left the whole
+    /// suite green, so `delete`'s half of the fix was covered by nothing. A
+    /// fix watched failing in one caller and not the others is one third of
+    /// a fix.
+    #[test]
+    fn a_delete_takes_the_keys_stored_count_down_with_it() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut btrieve = Btrieve::default();
+
+        let path = seed_indexed(&crate::testing::scratch("btrieve-delete-key-count"));
+        let at = open_indexed(&mut mem, &mut heap, &mut btrieve, path.clone());
+
+        let first = btrieve.block_mut(at).expect("open").insert(&record(1)).expect("insert");
+        btrieve.block_mut(at).expect("open").insert(&record(2)).expect("insert");
+        assert_eq!(key_records(&path), 2, "two records, two distinct key values");
+
+        btrieve.block_mut(at).expect("open").delete(first).expect("delete");
+        assert_eq!(key_records(&path), 1, "a delete lowers the key's own stored count");
+    }
+
     /// Register `seed_indexed`'s block as a real open file: allocate its four
     /// module-memory pieces on a real heap and write `field::FILNAM` the way
     /// [`Btrieve::open`] does, then push it directly rather than going
