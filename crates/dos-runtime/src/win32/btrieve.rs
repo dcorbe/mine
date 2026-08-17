@@ -143,11 +143,39 @@ fn gap(process: &mut Process, what: String) -> Option<Answer> {
     None
 }
 
-fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Option<Answer> {
+/// The seven stdcall arguments, read off the frame and resolved into owned
+/// buffers -- everything `btrcall` needs to build a
+/// `btrieve::btrcall::Call` and, afterwards, to write the answer back to the
+/// same guest addresses.
+///
+/// Split out of `btrcall` so the marshalling itself -- which of the seven
+/// stdcall slots becomes which field -- can be asserted directly against
+/// known sentinel values, rather than only indirectly through whichever
+/// `Call` fields one particular Btrieve operation happens to read. `open()`,
+/// the one operation this crate's fixture ever reaches end-to-end, never
+/// reads `keynum` at all and skips `databuf` whenever `datalen` is zero; no
+/// real program run can exercise this function's reads on its behalf.
+struct Marshalled {
+    op: u16,
+    posblk_at: u32,
+    posblk: [u8; 128],
+    databuf_at: u32,
+    databuf: Vec<u8>,
+    datalen_at: u32,
+    datalen: u32,
+    keybuf_at: u32,
+    keybuf: Vec<u8>,
+    keylen: u8,
+    keynum: i8,
+}
+
+/// Read the seven stdcall arguments and resolve the three pointers among
+/// them, or say which one did not resolve.
+fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
     // Seven stdcall arguments, in Galacticomm's own order -- see this
     // module's doc comment. Read eagerly, before anything below borrows
-    // `mem` for a resolve/write, the same discipline every other dispatch
-    // arm in this crate follows.
+    // `mem` for a resolve, the same discipline every other dispatch arm in
+    // this crate follows.
     let op_raw = machine.arg_u32(mem.stack(), 0);
     let posblk_at = machine.arg_u32(mem.stack(), 1);
     let databuf_at = machine.arg_u32(mem.stack(), 2);
@@ -164,31 +192,31 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
     let mut posblk = [0u8; 128];
     match Flat32Ptr(posblk_at).resolve(mem, 128) {
         Ok(bytes) => posblk.copy_from_slice(bytes),
-        Err(e) => return gap(process, format!("position block at {posblk_at:#010x}: {e}")),
+        Err(e) => return Err(format!("position block at {posblk_at:#010x}: {e}")),
     }
 
     // `*dataLength` -- the caller's own `ULONG`, read before this call
     // overwrites it with how many bytes the engine actually used.
-    let mut datalen: u32 = match Flat32Ptr(datalen_at).resolve(mem, 4) {
+    let datalen: u32 = match Flat32Ptr(datalen_at).resolve(mem, 4) {
         Ok(bytes) => u32::from_le_bytes(bytes.try_into().expect("resolve returned 4 bytes")),
-        Err(e) => return gap(process, format!("data length at {datalen_at:#010x}: {e}")),
+        Err(e) => return Err(format!("data length at {datalen_at:#010x}: {e}")),
     };
 
-    let mut databuf: Vec<u8> = if datalen == 0 {
+    let databuf: Vec<u8> = if datalen == 0 {
         Vec::new()
     } else {
         match Flat32Ptr(databuf_at).resolve(mem, datalen as usize) {
             Ok(bytes) => bytes.to_vec(),
-            Err(e) => return gap(process, format!("data buffer at {databuf_at:#010x}: {e}")),
+            Err(e) => return Err(format!("data buffer at {databuf_at:#010x}: {e}")),
         }
     };
 
-    let mut keybuf: Vec<u8> = if keylen == 0 {
+    let keybuf: Vec<u8> = if keylen == 0 {
         Vec::new()
     } else {
         match Flat32Ptr(keybuf_at).resolve(mem, usize::from(keylen)) {
             Ok(bytes) => bytes.to_vec(),
-            Err(e) => return gap(process, format!("key buffer at {keybuf_at:#010x}: {e}")),
+            Err(e) => return Err(format!("key buffer at {keybuf_at:#010x}: {e}")),
         }
     };
 
@@ -206,6 +234,39 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
     // do; `u16::try_from` would instead fail on exactly this shape of value
     // and mask a real, small operation code behind `Unmodelled(65535)`.
     let op = op_raw as u16;
+
+    Ok(Marshalled {
+        op,
+        posblk_at,
+        posblk,
+        databuf_at,
+        databuf,
+        datalen_at,
+        datalen,
+        keybuf_at,
+        keybuf,
+        keylen,
+        keynum,
+    })
+}
+
+fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Option<Answer> {
+    let Marshalled {
+        op,
+        posblk_at,
+        mut posblk,
+        databuf_at,
+        mut databuf,
+        datalen_at,
+        mut datalen,
+        keybuf_at,
+        mut keybuf,
+        keylen,
+        keynum,
+    } = match read_args(machine, mem) {
+        Ok(args) => args,
+        Err(what) => return gap(process, what),
+    };
 
     let status = match engine_btrcall(
         &mut process.btrieve,
@@ -251,6 +312,9 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use mbbs_machine::m32::{Exit, Mapping};
+
     /// The seven stdcall arguments are read in Btrieve's own order, and the
     /// callee cleans all twenty-eight bytes of them.
     ///
@@ -266,5 +330,115 @@ mod tests {
     #[test]
     fn the_answer_cleans_seven_arguments() {
         assert_eq!(super::CLEANS_ARGS, 7);
+    }
+
+    /// Push seven distinct sentinel values onto a real stdcall frame, trap
+    /// through an armed thunk exactly the way a module's own `call [IAT]`
+    /// would, and check `read_args` put every one of them in the field
+    /// Galacticomm's declaration says it belongs in.
+    ///
+    /// **Why this cannot be proven by running the real program instead.**
+    /// The only operation `wccmmutl.exe` reaches in this crate's fixture is
+    /// Btrieve Open (op 0), and `btrieve::btrcall::open` never reads
+    /// `keynum` at all, and skips resolving `databuf` whenever `datalen` is
+    /// zero. No amount of running the real program discriminates those
+    /// reads; only a direct test of the marshalling can.
+    ///
+    /// Each buffer gets its own fill byte (`databuf`/`keybuf` are even the
+    /// same length) so that a mixed-up read shows up as *wrong content* in
+    /// the assertions below, not as a resolve error that would only say
+    /// something failed without saying which read broke it.
+    #[test]
+    fn read_args_puts_each_of_the_seven_in_its_own_field() {
+        const POSBLK_FILL: u8 = 0xA1;
+        const DATABUF_FILL: u8 = 0xB2;
+        const KEYBUF_FILL: u8 = 0xC3;
+        const BUF_LEN: usize = 32;
+        // Upper sixteen bits are deliberately garbage, the same shape the
+        // real call site produces (see `read_args`'s own comment on `op`):
+        // this also proves the truncating cast, not just the argument's
+        // position.
+        const OP_PUSHED: u32 = 0xABCD_1234;
+        const OP_EXPECTED: u16 = 0x1234;
+        // Matches `BUF_LEN` so a `databuf`/`keybuf` mixup still resolves
+        // (proving itself via content, not via a masking resolve failure).
+        const KEYLEN: u8 = 32;
+        const KEYNUM: i8 = -5;
+
+        let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
+        let mut l = crate::win32::load::load(&file).expect("loads");
+
+        let posblk_at = l.mem.alloc(128).expect("posblk region").0;
+        Flat32Ptr(posblk_at)
+            .write(&mut l.mem, &[POSBLK_FILL; 128])
+            .expect("posblk region is writable");
+
+        let databuf_at = l.mem.alloc(BUF_LEN).expect("databuf region").0;
+        Flat32Ptr(databuf_at)
+            .write(&mut l.mem, &[DATABUF_FILL; BUF_LEN])
+            .expect("databuf region is writable");
+
+        let datalen_at = l.mem.alloc(4).expect("datalen region").0;
+        Flat32Ptr(datalen_at)
+            .write(&mut l.mem, &u32::try_from(BUF_LEN).unwrap().to_le_bytes())
+            .expect("datalen region is writable");
+
+        let keybuf_at = l.mem.alloc(BUF_LEN).expect("keybuf region").0;
+        Flat32Ptr(keybuf_at)
+            .write(&mut l.mem, &[KEYBUF_FILL; BUF_LEN])
+            .expect("keybuf region is writable");
+
+        // Seven `push imm32`, in Galacticomm's own right-to-left stdcall
+        // order -- `ckeynum` first (rightmost declared parameter),
+        // `operation` last (leftmost, ends up nearest the return address) --
+        // then a near call into an armed thunk slot: the same trap every
+        // real import call produces, built by hand instead of by running
+        // the program up to a real call site.
+        const SLOT: u16 = 450;
+        let mut code_mapping = Mapping::new(4096).expect("a low code mapping");
+        let base = code_mapping.base() as usize as u32;
+        let mut code = Vec::new();
+        let push_imm32 = |code: &mut Vec<u8>, v: u32| {
+            code.push(0x68);
+            code.extend_from_slice(&v.to_le_bytes());
+        };
+        #[allow(clippy::cast_sign_loss)]
+        push_imm32(&mut code, KEYNUM as u32); // arg6: ckeynum
+        push_imm32(&mut code, u32::from(KEYLEN)); // arg5: keyLength
+        push_imm32(&mut code, keybuf_at); // arg4: keyBuffer
+        push_imm32(&mut code, datalen_at); // arg3: dataLength
+        push_imm32(&mut code, databuf_at); // arg2: dataBuffer
+        push_imm32(&mut code, posblk_at); // arg1: posBlock
+        push_imm32(&mut code, OP_PUSHED); // arg0: operation
+
+        let target = l.machine.thunk_addr(SLOT);
+        let next_ip = base + code.len() as u32 + 5;
+        code.push(0xe8); // call rel32
+        code.extend_from_slice(&target.wrapping_sub(next_ip).to_le_bytes());
+        code_mapping.as_mut_slice()[..code.len()].copy_from_slice(&code);
+
+        let exit = l
+            .machine
+            .call_on(l.mem.stack_mut(), base, &[])
+            .expect("the hand-built frame traps into the armed thunk");
+        assert_eq!(
+            exit,
+            Exit::Call { index: SLOT },
+            "the armed thunk must report the slot this test armed"
+        );
+
+        let args = read_args(&l.machine, &l.mem).expect("every pointer above resolves");
+
+        assert_eq!(args.op, OP_EXPECTED, "operation: garbage upper bits must be truncated away");
+        assert_eq!(args.posblk_at, posblk_at, "posBlock pointer");
+        assert_eq!(args.posblk, [POSBLK_FILL; 128], "posBlock contents");
+        assert_eq!(args.databuf_at, databuf_at, "dataBuffer pointer");
+        assert_eq!(args.databuf, vec![DATABUF_FILL; BUF_LEN], "dataBuffer contents");
+        assert_eq!(args.datalen_at, datalen_at, "dataLength pointer");
+        assert_eq!(args.datalen, u32::try_from(BUF_LEN).unwrap(), "*dataLength");
+        assert_eq!(args.keybuf_at, keybuf_at, "keyBuffer pointer");
+        assert_eq!(args.keybuf, vec![KEYBUF_FILL; BUF_LEN], "keyBuffer contents");
+        assert_eq!(args.keylen, KEYLEN, "keyLength");
+        assert_eq!(args.keynum, KEYNUM, "ckeynum");
     }
 }
