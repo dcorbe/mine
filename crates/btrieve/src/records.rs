@@ -532,7 +532,7 @@ impl Records {
     /// order of what is left; `update` mutates a record in place), so the
     /// invariant holds for the whole lifetime of a `Records`.
     ///
-    /// [`pages::Layout::next_slot`]: crate::btrieve::pages::Layout::next_slot
+    /// [`pages::Layout::next_slot`]: crate::pages::Layout::next_slot
     ///
     /// # Errors
     ///
@@ -1110,7 +1110,7 @@ pub(crate) fn looks_empty(record: &[u8], size: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::btrieve::keys;
+    use crate::keys;
 
     /// Bytes of a record in these fixtures.
     ///
@@ -1146,7 +1146,7 @@ mod tests {
     /// Where the `n`th record slot of the first data page is, at an
     /// arbitrary page size.
     fn slot_with_page(page: u16, n: u32) -> u32 {
-        u32::from(page) + u32::from(crate::btrieve::pages::HEADER) + u32::from(RECLEN) * n
+        u32::from(page) + u32::from(crate::pages::HEADER) + u32::from(RECLEN) * n
     }
 
     /// Where the `n`th record slot of the first data page is.
@@ -1171,7 +1171,7 @@ mod tests {
     /// A file of one page of control record and `pages` data pages.
     fn file(page: u16, reclen: u16, records: &[&[u8]], free: &[u32]) -> Vec<u8> {
         let physical = reclen;
-        let per_page = (page - crate::btrieve::pages::HEADER) / physical;
+        let per_page = (page - crate::pages::HEADER) / physical;
         let pages = 1 + records.len().div_ceil(usize::from(per_page)).max(1);
         let mut out = vec![0u8; usize::from(page) * pages];
 
@@ -1209,7 +1209,7 @@ mod tests {
             let base = u32::try_from(usize::from(page) * number).expect("small");
             out[usize::try_from(base).unwrap() + 5] |= 0x80;
             for slot in 0..u32::from(per_page) {
-                slots.push(base + u32::from(crate::btrieve::pages::HEADER) + u32::from(physical) * slot);
+                slots.push(base + u32::from(crate::pages::HEADER) + u32::from(physical) * slot);
             }
         }
         let mut live = slots.iter().filter(|s| !free.contains(s));
@@ -1498,15 +1498,15 @@ mod tests {
             // `Records::read`, the same way
             // `an_insert_through_a_free_slot_at_a_low_position_agrees_with_a_fresh_read`
             // checks the 512 case.
-            let layout = crate::btrieve::pages::Layout {
+            let layout = crate::pages::Layout {
                 page: geometry.page,
                 physical: geometry.physical,
                 pages: geometry.pages,
             };
-            crate::btrieve::pages::write_record(
+            crate::pages::write_record(
                 &path,
                 layout,
-                crate::btrieve::pages::Slot::Existing(position),
+                crate::pages::Slot::Existing(position),
                 &record(7),
                 2,
             )
@@ -1622,15 +1622,15 @@ mod tests {
         // fixture built, whose link already terminates the list at
         // `NOWHERE` -- and read back completely fresh, independent of the
         // `records` model above.
-        let layout = crate::btrieve::pages::Layout {
+        let layout = crate::pages::Layout {
             page: geometry.page,
             physical: geometry.physical,
             pages: geometry.pages,
         };
-        crate::btrieve::pages::write_record(
+        crate::pages::write_record(
             &path,
             layout,
-            crate::btrieve::pages::Slot::Free(slot(0)),
+            crate::pages::Slot::Free(slot(0)),
             &record(9),
             3,
         )
@@ -1997,7 +1997,7 @@ mod tests {
             .map_err(|_| "a Btrieve file larger than four gigabytes".to_owned())?;
 
         let dead = free_list(&mut file, size)?;
-        let layout = crate::btrieve::pages::Layout {
+        let layout = crate::pages::Layout {
             page: geometry.page,
             physical: geometry.physical,
             pages: geometry.pages,
@@ -2012,12 +2012,12 @@ mod tests {
             // The page's own start, derived from `Layout` rather than
             // reimplementing its multiplication: a slot-0 position is always
             // `HEADER` bytes past the page start.
-            let at = layout.position(number, 0) - u32::from(crate::btrieve::pages::HEADER);
+            let at = layout.position(number, 0) - u32::from(crate::pages::HEADER);
             file.seek(SeekFrom::Start(u64::from(at)))
                 .and_then(|_| file.read_exact(&mut buffer))
                 .map_err(|e| format!("page {number}: {e}"))?;
 
-            if !crate::btrieve::pages::Header::decode(&buffer).data {
+            if !crate::pages::Header::decode(&buffer).data {
                 continue;
             }
 

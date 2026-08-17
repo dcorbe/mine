@@ -120,6 +120,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "btrieve"
+version = "0.1.0"
+
+[[package]]
 name = "btrieve-engine"
 version = "0.1.0"
 
@@ -454,6 +458,7 @@ dependencies = [
 name = "mbbs"
 version = "0.1.0"
 dependencies = [
+ "btrieve",
  "btrieve-engine",
  "libc",
  "mbbs-machine",

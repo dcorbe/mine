@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+btrieve = { path = "../btrieve" }
 libc = "0.2"
 mbbs-machine = { path = "../mbbs-machine" }
 

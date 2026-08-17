@@ -212,7 +212,7 @@
 
 use std::fmt;
 
-use crate::btrieve::mem::Mem;
+use crate::mem::Mem;
 
 use super::keys::Key;
 use super::{Block, BtvError, Cursor, Version};
@@ -798,7 +798,7 @@ impl LockTable {
     }
 
     /// Release every lock this session holds on `block`, as
-    /// [`crate::btrieve::Btrieve::close`] does for a file going out of this
+    /// [`crate::Btrieve::close`] does for a file going out of this
     /// host's reach -- measured: "closing a file releases every lock it
     /// held, immediately."
     pub fn release_all_for(&mut self, block: BlockId) {
@@ -1355,7 +1355,7 @@ impl WorkingDirectory {
     /// # Errors
     /// [`OpError::InvalidDirectory`] on an empty path. This host does not
     /// check that the resulting path exists on disk -- p. 164 documents no
-    /// such prerequisite either, and [`crate::btrieve::Btrieve::open`] (out
+    /// such prerequisite either, and [`crate::Btrieve::open`] (out
     /// of this module's scope) is what would fail on a nonexistent
     /// directory in practice.
     pub fn set(&mut self, path: &[u8]) -> Result<(), OpError> {
@@ -2356,7 +2356,7 @@ impl<M: Mem> Block<M> {
 /// Btrieve op `1019`, `Begin Transaction` in its **concurrent** form --
 /// Programmer's Reference p. 38: "Set the Operation Code to 19 to begin an
 /// exclusive transaction, or 1019 to begin a concurrent transaction." Op
-/// 19's own exclusive form is [`crate::btrieve::Btrieve::begin`]
+/// 19's own exclusive form is [`crate::Btrieve::begin`]
 /// (`btrieve.rs:2064`), out of this file's freeze, and this file does not
 /// call it -- this function names only what a `1019` dispatcher needs to
 /// know before it can decide anything else: **this engine cannot honour
@@ -2401,12 +2401,10 @@ pub fn begin_concurrent_transaction() -> Result<(), OpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::Wg16;
-    use crate::btrieve::mem::AbiMem;
-    use crate::btrieve::keys::{Kind, Segment};
-    use crate::btrieve::records::Records;
-    use crate::btrieve::{Geometry, Version, pages};
-    use mbbs_machine::m16::FarPtr;
+    use crate::testing::{Flat, FlatPtr};
+    use crate::keys::{Kind, Segment};
+    use crate::records::Records;
+    use crate::{Geometry, Version, pages};
     use std::path::{Path, PathBuf};
 
     /// A file with six records over two keys, chosen so key 0's order and
@@ -2514,17 +2512,17 @@ mod tests {
         }
     }
 
-    fn block(path: PathBuf) -> Block<AbiMem<Wg16>> {
+    fn block(path: PathBuf) -> Block<Flat> {
         Block {
             id: BlockId::fresh(),
             name: "OPS.DAT".to_owned(),
             path,
             geometry: ops_geometry(),
             keys: ops_keys(),
-            block: FarPtr::NULL,
+            block: FlatPtr::NULL,
             maxlen: RECLEN,
-            data: FarPtr::NULL,
-            key: FarPtr::NULL,
+            data: FlatPtr::NULL,
+            key: FlatPtr::NULL,
             records: None,
             cursor: Cursor::Nowhere,
             dirty: false,
@@ -2538,7 +2536,7 @@ mod tests {
     /// scratch` clears and recreates the directory it names, and this
     /// crate's tests run in parallel, so two tests sharing a name would
     /// each see the other rewrite `OPS.DAT` out from under it mid-read.
-    fn fixture(name: &str) -> Block<AbiMem<Wg16>> {
+    fn fixture(name: &str) -> Block<Flat> {
         block(seed(&crate::testing::scratch(&format!("ops-{name}"))))
     }
 
@@ -2558,7 +2556,7 @@ mod tests {
     /// check lets a v6 file through -- not whether this host's v6 page
     /// walk is correct, which is measured elsewhere entirely
     /// (`docs/plans/2026-08-11-btrieve-v6-page-addressing.md`).
-    fn fixture_v6(name: &str) -> Block<AbiMem<Wg16>> {
+    fn fixture_v6(name: &str) -> Block<Flat> {
         let path = seed(&crate::testing::scratch(&format!("ops-{name}")));
         let read_geometry = ops_geometry();
         let keys = ops_keys();
@@ -2572,10 +2570,10 @@ mod tests {
             path,
             geometry,
             keys,
-            block: FarPtr::NULL,
+            block: FlatPtr::NULL,
             maxlen: RECLEN,
-            data: FarPtr::NULL,
-            key: FarPtr::NULL,
+            data: FlatPtr::NULL,
+            key: FlatPtr::NULL,
             records: Some(records),
             cursor: Cursor::Nowhere,
             dirty: false,

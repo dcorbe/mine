@@ -186,7 +186,7 @@ use mbbs_machine::ptr::ModulePtr;
 
 use crate::Host;
 use crate::abi::{self, Abi, Call};
-use crate::btrieve::mem::AbiMem;
+use crate::btrieve::AbiMem;
 use crate::btrieve::{Btrieve, Cursor, Geometry};
 use crate::shims::ShimError;
 

@@ -13,6 +13,13 @@ use crate::Host;
 use crate::abi::{self, Call, Wg16};
 use crate::shims::ShimError;
 
+/// Both of these moved into the `btrieve` crate with the engine, because that
+/// crate's own tests are their heaviest users -- `scratch` alone has 86 call
+/// sites there against a handful here. Re-exported rather than relocated in
+/// this crate's callers, so `crate::testing::scratch` keeps meaning what it
+/// always did.
+pub use ::btrieve::testing::{make_keys_modifiable, scratch};
+
 pub struct Fixture {
     pub machine: Machine,
     pub host: Host<Wg16>,
@@ -23,108 +30,6 @@ pub struct Fixture {
 /// Where the sample files a shim reads live.
 pub fn data() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data")
-}
-
-/// Set the MODIFIABLE attribute on every key definition of a Btrieve file, in
-/// place, so a test may update a record in a way that moves its key.
-///
-/// Without the bit, [`Block::update`](crate::btrieve::Block::update) refuses
-/// such a write, because genuine Btrieve answers status 10 to it and the
-/// vendor's own wrapper turns that into a `catastro`. A test whose subject is
-/// something else -- index relocation, cursor currency -- needs the write to
-/// go through, and saying so here is better than the alternatives: mutating
-/// the shared fixture on disk would change what every other test reads, and
-/// minting a second near-identical fixture would leave two files to keep in
-/// step.
-///
-/// **The bit's meaning is measured, so setting it is configuration and not
-/// invention** -- see `Block::unmodifiable_key_changed`. Both halves of a v6
-/// file's shadowed control record are written, so this does not depend on
-/// which one is live.
-///
-/// # Panics
-///
-/// If the file cannot be read or written, or is too short to hold the key
-/// definitions it claims.
-pub fn make_keys_modifiable(path: &std::path::Path) {
-    const PAGE: usize = 0x08;
-    const KEYS: usize = 0x14;
-    const BASE: usize = 0x110;
-    const WIDTH: usize = 0x1e;
-    const ATTRIBUTES: usize = 0x08;
-    const MODIFIABLE: u16 = 1 << 1;
-
-    let mut file = std::fs::read(path).expect("a Btrieve file to read");
-    let word = |file: &[u8], at: usize| u16::from_le_bytes([file[at], file[at + 1]]);
-
-    let page = usize::from(word(&file, PAGE));
-    let count = usize::from(word(&file, KEYS));
-    // v6 shadows the control record across physical pages 0 and 1; v5 has only
-    // page 0. Writing both is right either way -- a v5 file's page 1 is an
-    // ordinary page whose first bytes are not key definitions, so it is only
-    // touched when the file really is shadowed.
-    let copies: &[usize] = if file.len() >= 2 * page && &file[..2] == b"FC" {
-        &[0, 1]
-    } else {
-        &[0]
-    };
-
-    for &copy in copies {
-        for key in 0..count {
-            let at = copy * page + BASE + key * WIDTH + ATTRIBUTES;
-            assert!(at + 2 <= file.len(), "{}: too short for {count} keys", path.display());
-            let attributes = word(&file, at) | MODIFIABLE;
-            file[at..at + 2].copy_from_slice(&attributes.to_le_bytes());
-        }
-    }
-
-    std::fs::write(path, &file).expect("a Btrieve file to write back");
-}
-
-/// An empty directory a test may write into, under `target/`.
-///
-/// Some of what the host does is *install* a file rather than read one, and a
-/// test of that has to have somewhere to put it that is neither the checked-in
-/// sample directory nor the system temporary one. `target/` is both inside the
-/// repository and already ignored by git.
-///
-/// Cleared on each call, so a test never sees what the last run left.
-///
-/// # Why the thread is part of the path
-///
-/// `name` alone is not unique. Callers derive it from data rather than from
-/// the test -- `btrieve::records`' own helper is
-/// `scratch(&format!("btv-rec-{name}"))`, keyed on the `.DAT` filename -- so
-/// four tests sharing `FREESLOT.DAT` shared one directory. Under the default
-/// parallel harness that is a race against this function's own opening
-/// `remove_dir_all`: one test deletes the directory between another's
-/// `create_dir_all` and its first `write`, and the write fails `NotFound`, or
-/// succeeds into a directory that is then removed and reads back as 0 bytes.
-///
-/// Both failures were observed, intermittently, in
-/// `splicing_matches_a_full_reindex_over_a_long_run_of_writes`, which is not
-/// itself one of the colliding tests -- it just shares the helper. That is
-/// what made it look like a flaky Btrieve test for weeks rather than a
-/// broken test fixture, and every parallel agent working in this crate hit
-/// it and was told to ignore it.
-///
-/// Keying on the thread as well makes collision impossible without changing
-/// the contract: a single test still gets one directory, still cleared on
-/// each call. Directory names stay readable because
-/// [`std::thread::ThreadId`] renders as `ThreadId(N)` and only the digits are
-/// kept.
-pub fn scratch(name: &str) -> PathBuf {
-    let thread = format!("{:?}", std::thread::current().id())
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>();
-    let at = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test-scratch")
-        .join(format!("t{thread}"))
-        .join(name);
-    let _ = std::fs::remove_dir_all(&at);
-    std::fs::create_dir_all(&at).expect("a scratch directory");
-    at
 }
 
 /// A scratch directory holding copies of `files` from [`data`].

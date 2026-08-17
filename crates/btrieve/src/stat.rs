@@ -135,7 +135,7 @@
 
 use std::path::Path;
 
-use crate::btrieve::mem::Mem;
+use crate::mem::Mem;
 
 use super::keys::Key;
 use super::{pages, BtvError, Geometry, Version};
@@ -224,8 +224,8 @@ pub struct StatKey {
 }
 
 /// A file's STAT reply, before it is serialised to Btrieve's wire bytes.
-/// Plain data -- no [`super::super::mbbs_machine::m16::Machine`], no
-/// [`super::super::mbbs_machine::m16::FarPtr`] -- so both ABIs' `dfaStat`/`dfaStatus`
+/// Plain data -- no `mbbs_machine::m16::Machine`, no
+/// `mbbs_machine::m16::FarPtr` -- so both ABIs' `dfaStat`/`dfaStatus`
 /// marshalling can build on the same reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stat {
@@ -427,8 +427,8 @@ impl<M: Mem> super::Block<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::btrieve::keys::Segment;
-    use crate::btrieve::keys::Kind;
+    use crate::keys::Segment;
+    use crate::keys::Kind;
 
     /// A minimal file control record holding one 30-byte key at record
     /// offset 0, no duplicates, unsigned extended type -- enough bytes for

@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use mbbs::abi::Wg16;
 use mbbs::btrieve::keys::Kind;
-use mbbs::btrieve::mem::AbiMem;
+use mbbs::btrieve::AbiMem;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};
 use mbbs_machine::m16::Machine;
