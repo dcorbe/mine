@@ -15,7 +15,7 @@
 //! does. Folding the two would let a differential harness score a gap as a
 //! passing disagreement, and let a guest branch on a lie.
 
-use crate::ops::OpError;
+use crate::ops::{Op, OpError, Step};
 
 /// A real Btrieve status word. Zero is success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,10 +104,70 @@ pub fn status_of(e: &OpError) -> Result<Status, Gap> {
     }
 }
 
+/// What one Btrieve operation code names.
+///
+/// The families delegate to the engine's own tables rather than restating
+/// them: [`Op::from_get`], [`Op::from_query`] and [`Step::from_code`] were
+/// each verified against `shims/btrieve.rs`, and the Get codes are not in
+/// numeric order, so a second table here would be a second chance to get that
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Op 0.
+    Open,
+    /// Op 1.
+    Close,
+    /// Op 2.
+    Insert,
+    /// Op 3.
+    Update,
+    /// Op 4.
+    Delete,
+    /// Op 15.
+    Stat,
+    /// Op 25 -- close every file and release everything.
+    Stop,
+    /// Ops 5-13: a keyed read.
+    Get(Op),
+    /// Ops 55-63: the same nine comparisons without reading the record.
+    Query(Op),
+    /// Ops 24, 33-35: physical order, no key.
+    Step(Step),
+    /// An operation code this engine does not model, carried so a caller can
+    /// name it rather than report a bare failure.
+    Unmodelled(u16),
+}
+
+/// What operation code `op` names.
+#[must_use]
+pub fn describe(op: u16) -> Outcome {
+    if let Ok(code) = i16::try_from(op) {
+        if let Some(o) = Op::from_get(code) {
+            return Outcome::Get(o);
+        }
+        if let Some(o) = Op::from_query(code) {
+            return Outcome::Query(o);
+        }
+        if let Some(s) = Step::from_code(code) {
+            return Outcome::Step(s);
+        }
+    }
+    match op {
+        0 => Outcome::Open,
+        1 => Outcome::Close,
+        2 => Outcome::Insert,
+        3 => Outcome::Update,
+        4 => Outcome::Delete,
+        15 => Outcome::Stat,
+        25 => Outcome::Stop,
+        other => Outcome::Unmodelled(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{LockMode, OpError};
+    use crate::ops::{LockMode, Op, OpError, Step};
 
     /// The statuses each variant's own doc comment records, measured against
     /// the Programmer's Reference and `BtrieveStatusCodes.pdf`.
@@ -168,5 +228,53 @@ mod tests {
             why: "unreadable".to_owned()
         }))
         .is_err());
+    }
+
+    /// The Get family is the engine's own table, not a second copy of it.
+    /// `11` being `AtMost` rather than `Lowest` is the trap this guards.
+    #[test]
+    fn the_get_family_delegates_to_the_engines_own_table() {
+        assert_eq!(describe(5), Outcome::Get(Op::Equal));
+        assert_eq!(describe(6), Outcome::Get(Op::Next));
+        assert_eq!(describe(11), Outcome::Get(Op::AtMost));
+        assert_eq!(describe(12), Outcome::Get(Op::Lowest));
+        assert_eq!(describe(13), Outcome::Get(Op::Highest));
+    }
+
+    /// The Query family is the same nine comparisons, fifty apart.
+    #[test]
+    fn the_query_family_is_the_get_family_plus_fifty() {
+        assert_eq!(describe(55), Outcome::Query(Op::Equal));
+        assert_eq!(describe(62), Outcome::Query(Op::Lowest));
+    }
+
+    /// Step is physical order and has its own four codes, which are not
+    /// contiguous: 24 is Next, 33/34/35 are First/Last/Previous.
+    #[test]
+    fn the_step_family_keeps_its_own_discontiguous_codes() {
+        assert_eq!(describe(24), Outcome::Step(Step::Next));
+        assert_eq!(describe(33), Outcome::Step(Step::First));
+        assert_eq!(describe(34), Outcome::Step(Step::Last));
+        assert_eq!(describe(35), Outcome::Step(Step::Previous));
+    }
+
+    /// The file-level operations.
+    #[test]
+    fn the_file_operations_are_named() {
+        assert_eq!(describe(0), Outcome::Open);
+        assert_eq!(describe(1), Outcome::Close);
+        assert_eq!(describe(2), Outcome::Insert);
+        assert_eq!(describe(3), Outcome::Update);
+        assert_eq!(describe(4), Outcome::Delete);
+        assert_eq!(describe(15), Outcome::Stat);
+        assert_eq!(describe(25), Outcome::Stop);
+    }
+
+    /// An operation code this engine does not model is named rather than
+    /// guessed at, and carries the number so a caller can report it.
+    #[test]
+    fn an_unmodelled_operation_names_its_own_number() {
+        assert_eq!(describe(60_000), Outcome::Unmodelled(60_000));
+        assert_eq!(describe(31), Outcome::Unmodelled(31), "Create Index");
     }
 }
