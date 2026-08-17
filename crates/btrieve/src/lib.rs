@@ -842,6 +842,66 @@ fn normalized(bytes: &[u8], reclen: u16) -> Vec<u8> {
     out
 }
 
+/// One key's index entries over `records`, in that key's order, plus the
+/// record positions grouped under each entry.
+///
+/// **One entry per distinct key value**, and for a key that permits duplicates
+/// that is fewer than `len`. Grouped with `key.compare` -- the same comparator
+/// `Records::reindex` sorted by, so the group boundaries cannot disagree with
+/// the order they fall in -- rather than by comparing the extracted key bytes,
+/// which would split a group whenever a key folds two spellings of a value
+/// onto one (an alternate collating sequence, or a case-insensitive name).
+/// Btrieve's own index holds one entry per *value*, and two entries a binary
+/// search cannot tell apart is a tree that reads back in a plausible wrong
+/// order.
+///
+/// `len` is the caller's already-checked `records.ordered_len(key.number)`:
+/// this function is reached from two places that report a key the records were
+/// not ordered by differently, and neither wants that refusal duplicated here.
+///
+/// # Why this is a shared function rather than one loop
+///
+/// [`Btrieve::reindex`] needs the entries to build the tree and the groups to
+/// write the duplicate chains; [`Btrieve::key_record_counts`] needs only how
+/// many entries there are. That count is what genuine Btrieve stores as a
+/// key's `approx_count` -- *distinct entries*, measured, not records; see
+/// `stat.rs`'s own "`approx_count` is a stored field" section, where three
+/// records sharing one key value read back 1. A second loop computing "the
+/// same" count independently is exactly how the number a `B_STAT` reports and
+/// the tree a close writes would come to disagree.
+fn index_entries(
+    records: &records::Records,
+    key: &keys::Key,
+    shift: usize,
+    len: usize,
+) -> (Vec<pages::Entry>, Vec<Vec<u32>>) {
+    let mut entries: Vec<pages::Entry> = Vec::new();
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for n in 0..len {
+        let record = records.ordered(key.number, n).expect("in range");
+        let joins = n > 0
+            && key.compare(
+                &records::keyed(
+                    shift,
+                    &records.ordered(key.number, n - 1).expect("in range").bytes,
+                ),
+                &records::keyed(shift, &record.bytes),
+            ) == std::cmp::Ordering::Equal;
+        if joins && key.duplicates {
+            let last = entries.last_mut().expect("a group to join");
+            last.tail = record.position;
+            groups.last_mut().expect("a group to join").push(record.position);
+        } else {
+            entries.push(pages::Entry::unique(
+                key.extract(&records::keyed(shift, &record.bytes)),
+                record.position,
+            ));
+            groups.push(vec![record.position]);
+        }
+    }
+    (entries, groups)
+}
+
 impl<M: Mem> Block<M> {
     /// What the module named this file.
     pub fn name(&self) -> &str {
@@ -1989,6 +2049,14 @@ impl<M: Mem> Block<M> {
         }
         self.dirty = true;
 
+        // After the model, never before it: the count is read off the model,
+        // so taking it any earlier would store the number this insert was
+        // about to make wrong. See `Self::write_key_record_counts`.
+        self.write_key_record_counts().map_err(|why| BtvError {
+            file: name,
+            why,
+        })?;
+
         Ok(position)
     }
 
@@ -2165,9 +2233,20 @@ impl<M: Mem> Block<M> {
             .as_mut()
             .expect("just loaded")
             .update(&self.keys, position, bytes.to_vec())
-            .map_err(|why| BtvError { file: name, why })?;
+            .map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
 
         self.dirty = true;
+
+        // An update can change a key's value, and a changed value can join or
+        // leave a duplicate group -- so the entry count moves even though the
+        // record count does not. See `Self::write_key_record_counts`.
+        self.write_key_record_counts().map_err(|why| BtvError {
+            file: name,
+            why,
+        })?;
 
         Ok(())
     }
@@ -2350,11 +2429,131 @@ impl<M: Mem> Block<M> {
             .as_mut()
             .expect("just loaded")
             .delete(&self.keys, position)
-            .map_err(|why| BtvError { file: name, why })?;
+            .map_err(|why| BtvError {
+                file: name.clone(),
+                why,
+            })?;
 
         self.geometry.records = count;
         self.dirty = true;
 
+        // Measured on the genuine engine: a delete takes the key's own count
+        // down with the file's (`docs/2026-08-16-v6-update-delete-oracle.md`,
+        // "per-key record count | 3 -> 2"). See
+        // `Self::write_key_record_counts`.
+        self.write_key_record_counts().map_err(|why| BtvError {
+            file: name,
+            why,
+        })?;
+
+        Ok(())
+    }
+
+    /// Every key's stored `approx_count`, paired with the offset in the file
+    /// control record that holds it -- the `(offset, count)` shape
+    /// [`v6::write_fcr`] already takes, so the two versions describe the same
+    /// thing the same way.
+    ///
+    /// The count is the number of index entries, not the number of records:
+    /// see [`index_entries`], and `stat.rs`'s own "`approx_count` is a stored
+    /// field" section for the measurement behind that distinction.
+    ///
+    /// # Errors
+    ///
+    /// If the records have never been loaded, or a key is not one they were
+    /// ordered by.
+    fn key_record_counts(&self) -> Result<Vec<(usize, u32)>, String> {
+        let records = self
+            .records
+            .as_ref()
+            .ok_or_else(|| "the key counts were asked for before the records were loaded".to_owned())?;
+        let shift = records.key_shift();
+        let mut counts = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let len = records.ordered_len(key.number).ok_or_else(|| {
+                format!(
+                    "key {}: not among the keys the loaded records were ordered by",
+                    key.number
+                )
+            })?;
+            let (entries, _) = index_entries(records, key, shift, len);
+            let definition =
+                pages::fcr::KEYS + usize::from(key.definition) * pages::fcr::KEY_WIDTH;
+            let count = u32::try_from(entries.len())
+                .map_err(|_| format!("key {}: more than four billion entries", key.number))?;
+            counts.push((definition + pages::fcr::KEY_RECORDS, count));
+        }
+        Ok(counts)
+    }
+
+    /// Bring every key's stored `approx_count` on disk up to date with the
+    /// model, touching no other byte of the file control record.
+    ///
+    /// v5 only, and called by every v5 write. Genuine Btrieve keeps this field
+    /// live per operation -- `docs/2026-08-16-v6-update-delete-oracle.md:120`
+    /// measured a delete taking a key's count from 3 to 2 -- while this
+    /// engine's v5 write path rebuilt the *index* lazily at close
+    /// ([`Self::reindex`]) and let the count ride along with it. That is a
+    /// defensible place to defer a whole B-tree to. It is not a defensible
+    /// place to defer a four-byte counter to: a `B_STAT` between an insert and
+    /// the close answered a number that was true before the write, and it was
+    /// this engine's own replay of a genuine transcript that caught it --
+    /// three inserts, then a stat, where genuine Btrieve answered 3 and this
+    /// engine answered 0 (`crates/btrieve/tests/differential.rs`, and
+    /// follow-up 3 of `docs/2026-08-17-btrcall-facade-landed.md`).
+    ///
+    /// The index stays deferred. This writes the count alone, so a file left
+    /// unclosed by a crash now holds a count that agrees with its records
+    /// rather than one that trails them -- the same direction the file-level
+    /// record count already goes, which `pages::write_record` has always
+    /// written on the spot.
+    ///
+    /// # Four bytes at a time, not a page
+    ///
+    /// [`Self::reindex`] reads the file control record as
+    /// `geometry.page` bytes, patches its counts in memory and writes the
+    /// whole thing back. That is safe for it -- it is rewriting the head
+    /// wholesale anyway -- but it is wrong here twice over: the key
+    /// definitions start at [`pages::fcr::KEYS`] (`0x110`), which lies past a
+    /// page smaller than 276 bytes, and writing a whole page back would put
+    /// this function in the business of preserving every other field in it.
+    /// Keys are parsed from the first [`FCR`] bytes regardless of page size
+    /// ([`Self::open`]), so this seeks to each count and writes its four bytes,
+    /// touching nothing else. The test fixtures' 64-byte pages are what made
+    /// the difference visible.
+    ///
+    /// # Errors
+    ///
+    /// If [`Self::key_record_counts`] cannot be taken, a count lies past the
+    /// file control record, or the file cannot be written.
+    fn write_key_record_counts(&self) -> Result<(), String> {
+        let counts = self.key_record_counts()?;
+        if counts.is_empty() {
+            return Ok(());
+        }
+
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        for (at, count) in counts {
+            if at + 4 > FCR {
+                return Err(format!(
+                    "{}: a key's record count at {at:#x} lies past the \
+                     {FCR}-byte file control record",
+                    self.path.display()
+                ));
+            }
+            file.seek(SeekFrom::Start(at as u64))
+                .and_then(|_| file.write_all(&pages::to_long(count)))
+                .map_err(|e| {
+                    format!(
+                        "{}: writing a key's record count at {at:#x}: {e}",
+                        self.path.display()
+                    )
+                })?;
+        }
         Ok(())
     }
 
@@ -2455,40 +2654,7 @@ impl<M: Mem> Block<M> {
                     key.number
                 ))
             })?;
-            // One entry per distinct key value, and for a key that permits
-            // duplicates that is fewer than `len`. Grouped with `key.compare`
-            // -- the same comparator `Records::reindex` sorted by, so the
-            // group boundaries cannot disagree with the order they fall in --
-            // rather than by comparing the extracted key bytes, which would
-            // split a group whenever a key folds two spellings of a value onto
-            // one (an alternate collating sequence, or a case-insensitive
-            // name). Btrieve's own index holds one entry per *value*, and two
-            // entries a binary search cannot tell apart is a tree that reads
-            // back in a plausible wrong order.
-            let mut entries: Vec<pages::Entry> = Vec::new();
-            let mut groups: Vec<Vec<u32>> = Vec::new();
-            for n in 0..len {
-                let record = records.ordered(key.number, n).expect("in range");
-                let joins = n > 0
-                    && key.compare(
-                        &records::keyed(
-                            shift,
-                            &records.ordered(key.number, n - 1).expect("in range").bytes,
-                        ),
-                        &records::keyed(shift, &record.bytes),
-                    ) == std::cmp::Ordering::Equal;
-                if joins && key.duplicates {
-                    let last = entries.last_mut().expect("a group to join");
-                    last.tail = record.position;
-                    groups.last_mut().expect("a group to join").push(record.position);
-                } else {
-                    entries.push(pages::Entry::unique(
-                        key.extract(&records::keyed(shift, &record.bytes)),
-                        record.position,
-                    ));
-                    groups.push(vec![record.position]);
-                }
-            }
+            let (mut entries, groups) = index_entries(records, key, shift, len);
 
             // The chain that joins each group, written into the records
             // themselves. Every record of a duplicate-permitting key carries
@@ -6061,6 +6227,14 @@ mod tests {
         pages::long(&bytes[0x114..0x118])
     }
 
+    /// `seed_indexed`'s key names page 1 as its root (`0x110`, [`pages::fcr`]'s
+    /// `KEY_ROOT`), and that page starts out empty behind its header. Only
+    /// [`Btrieve::reindex`] ever writes it.
+    fn root_page(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).expect("read the file back");
+        bytes[512..1024].to_vec()
+    }
+
     /// Register `seed_indexed`'s block as a real open file: allocate its four
     /// module-memory pieces on a real heap and write `field::FILNAM` the way
     /// [`Btrieve::open`] does, then push it directly rather than going
@@ -6114,9 +6288,15 @@ mod tests {
         let mut heap = FlatHeap::new(0x100);
         let mut btrieve = Btrieve::default();
 
-        // Dirty: an insert alone never touches a key's own record count --
-        // only `reindex` does. That field moving from 0 to 1 is proof the
-        // rebuild ran, not merely that the close did not error.
+        // Dirty: the observable is the key's own index page -- page 1, which
+        // `seed_indexed` names as the key's root and leaves empty. An insert
+        // writes the record and keeps the key's stored count live (see
+        // `Btrieve::write_key_record_counts`) but never rebuilds the tree;
+        // only `reindex` does, and it is the only thing that can put an entry
+        // on that page. This test used to read the *count* instead, asserting
+        // it was still 0 after the insert -- which pinned a real defect as if
+        // it were the design, and stopped being a signal the moment the
+        // defect was fixed.
         let dirty_path = seed_indexed(&crate::testing::scratch("btrieve-close-reindex-dirty"));
         let dirty = open_indexed(&mut mem, &mut heap, &mut btrieve, dirty_path.clone());
         btrieve
@@ -6124,19 +6304,29 @@ mod tests {
             .expect("open")
             .insert(&record(1))
             .expect("insert");
+        let root_after_insert = root_page(&dirty_path);
+        assert!(
+            root_after_insert[usize::from(pages::HEADER)..].iter().all(|b| *b == 0),
+            "an insert alone leaves the key's index page alone"
+        );
         assert_eq!(
             key_records(&dirty_path),
-            0,
-            "an insert alone leaves the key's own count alone"
+            1,
+            "an insert does keep the key's own stored count live"
         );
 
         btrieve
             .close(&mut mem, &mut heap, dirty)
             .expect("closes, and reindexes on the way");
+        assert_ne!(
+            root_page(&dirty_path),
+            root_after_insert,
+            "closing a dirty block rebuilds the index"
+        );
         assert_eq!(
             key_records(&dirty_path),
             1,
-            "closing a dirty block rebuilds the index"
+            "and the rebuild agrees with the count the insert already wrote"
         );
 
         // Clean: a second file with the same shape and the same real index

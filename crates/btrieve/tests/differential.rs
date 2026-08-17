@@ -42,17 +42,22 @@
 //!   bytes through this crate's own reader (`Get First`/`Get Next` walked to
 //!   exhaustion) and compares what each answers: the records, in key order,
 //!   and how many there are.
-//! - **`B_STAT` (op 15) is excluded from the per-call `databuf` diff too --
-//!   and not for the version-format reason alone.** Measured directly on
-//!   `insert_get_step_stat`: this engine's own v5 `Btrieve::insert`
-//!   (`crates/btrieve/src/lib.rs:1912`) updates the file's own record count
-//!   but never a key's own stored `approx_count`
-//!   (`pages::fcr::KEY_RECORDS`), so a freshly created and written v5 file
-//!   reports `approx_count: 0` after three inserts where genuine Btrieve
-//!   answers 3. That is a real, reported-not-fixed gap in this engine --
-//!   see [`replay_and_diff`]'s own comment and Task 12's report -- not
-//!   merely the v5/v6 wire-format difference [`Stat::wire`](btrieve::Stat)
-//!   already accounts for by taking a `version` parameter.
+//! - **`B_STAT` (op 15) is excluded from the whole-buffer `databuf` diff, but
+//!   its `approx_count` fields are compared on their own** ([`approx_counts`]).
+//!   The exclusion is the v5/v6 wire-format difference
+//!   [`Stat::wire`](btrieve::Stat) already accounts for by taking a `version`
+//!   parameter: every fixture's own file is genuine Btrieve 6.15's v6 layout
+//!   and [`btrieve::create`] only ever builds v5.
+//!
+//!   It used to hide a second thing, which was not a format difference at all:
+//!   this engine's v5 write path updated the file's own record count but never
+//!   a key's own stored `approx_count` (`pages::fcr::KEY_RECORDS`), so a
+//!   freshly created and written v5 file reported `approx_count: 0` after
+//!   three inserts where genuine Btrieve answers 3. Reported rather than
+//!   fixed at the time (Task 12 was scoped to the status 4/9 defect);
+//!   fixed since, and this is the comparison that pins it. The lesson is the
+//!   narrower one: an exclusion drawn wider than its reason takes real
+//!   findings out with it.
 //!
 //! # An empty sweep is a failure
 //!
@@ -150,6 +155,27 @@ fn delivers(status: i16) -> bool {
 /// verbatim would hand `stat` a zero-length buffer no matter what `datalen`
 /// said, so every `B_STAT` call would answer a spurious 22. This is the
 /// harness translating between the two wire shapes, not a product change.
+/// Each key spec's stored `approx_count` in a `B_STAT` reply.
+///
+/// The reply is one 16-byte file spec followed by one 16-byte spec per key
+/// *segment* (`crates/btrieve/src/stat.rs`'s own doc comment), and
+/// `approx_count` is the little-endian `u32` six bytes into each of those --
+/// `position`, `length`, `flags`, then the count (`Stat::wire`). Comparing
+/// this and not the whole buffer is deliberate: the rest of the reply
+/// legitimately differs between a v5 file and the v6 one genuine Btrieve
+/// created, and `approx_count` does not.
+fn approx_counts(reply: &[u8]) -> Vec<u32> {
+    const FILE_SPEC: usize = 16;
+    const KEY_SPEC: usize = 16;
+    const AT: usize = 6;
+    reply
+        .get(FILE_SPEC..)
+        .unwrap_or_default()
+        .chunks_exact(KEY_SPEC)
+        .map(|k| u32::from_le_bytes([k[AT], k[AT + 1], k[AT + 2], k[AT + 3]]))
+        .collect()
+}
+
 fn sized(databuf: &[u8], capacity: u32) -> Vec<u8> {
     let capacity = usize::try_from(capacity).unwrap_or(0).max(databuf.len());
     let mut out = databuf.to_vec();
@@ -361,26 +387,35 @@ fn replay_and_diff(fixture: &scenario::Fixture) {
         // comment on `open_maxlen`), so its post-call length answers this
         // harness's own choice, not anything genuine Btrieve said.
         //
-        // Op 15 (`B_STAT`) is excluded too, and this exclusion is itself a
-        // finding, not a convenience -- see Task 12's report. Two reasons,
-        // both real: every fixture's own file is genuine Btrieve 6.15's own
-        // v6 layout while this harness's own `btrieve::create` only ever
-        // builds v5 (this module's own doc comment), and `Stat::wire` takes
-        // a `version` precisely because the two formats legitimately
-        // differ; separately, and measured directly on
-        // `insert_get_step_stat`, this engine's own v5 `Btrieve::insert`
-        // (`crates/btrieve/src/lib.rs:1912`) updates the *file's* record
-        // count but never a *key's* own stored `approx_count`
-        // (`pages::fcr::KEY_RECORDS`) -- so this harness's own freshly
-        // created and written v5 file reports `approx_count: 0` after three
-        // inserts, where genuine Btrieve's answers 3. That second one is a
-        // real gap in this engine, not a version-format artifact; it is
-        // reported, not fixed, because Task 12 is scoped to the status 4/9
-        // defect alone.
+        // Op 15 (`B_STAT`) is excluded from the *whole-buffer* diff, and that
+        // exclusion is a finding rather than a convenience -- see Task 12's
+        // report. It had two reasons. One stands: every fixture's own file is
+        // genuine Btrieve 6.15's v6 layout while this harness's own
+        // `btrieve::create` only ever builds v5 (this module's own doc
+        // comment), and `Stat::wire` takes a `version` precisely because the
+        // two legitimately differ.
+        //
+        // The other was a real gap in this engine, and it is now closed: this
+        // engine's v5 write path updated the *file's* record count but never
+        // a *key's* own stored `approx_count` (`pages::fcr::KEY_RECORDS`), so
+        // a freshly created and written v5 file reported `approx_count: 0`
+        // after three inserts where genuine Btrieve answered 3. Excluding the
+        // whole reply hid that behind a version-format difference that has
+        // nothing to do with it. `approx_count` is compared on its own below,
+        // which is what would have caught it.
         if i != 0 && op != 15 && delivers(recorded.status) {
             assert_eq!(
                 databuf, &recorded.databuf,
                 "{name}: call {i} (op {op}): data buffer disagrees on a delivering status ({status})"
+            );
+        }
+        if op == 15 && delivers(recorded.status) {
+            assert_eq!(
+                approx_counts(databuf),
+                approx_counts(&recorded.databuf),
+                "{name}: call {i} (op 15): the keys' stored approx_count disagrees -- \
+                 this is the field a v5 write path has to keep live per operation, not \
+                 defer to close"
             );
         }
     }
