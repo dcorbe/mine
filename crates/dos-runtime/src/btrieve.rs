@@ -52,11 +52,29 @@
 //! produce it) is not a Btrieve call at all, so it goes back the way
 //! [`crate::fossil::Fossil`] reports a function it does not model: unclaimed,
 //! not serviced, nothing written.
+//!
+//! # A guest's Open filename is not a host path
+//!
+//! `crates/btrieve/src/btrcall.rs::open` takes whatever bytes sit in the key
+//! buffer, decodes them as UTF-8-lossy, and hands the result straight to
+//! `PathBuf::from` -- by design, that crate is dependency-free and has no
+//! notion of a sandbox (see its own doc comment). Something above it has to
+//! decide what a guest-controlled name is allowed to reach, the same
+//! decision `crate::win32::btrieve::resolve_open_path` already makes for the
+//! Win32 edge -- and for the identical reason: a guest that puts `/etc/passwd`,
+//! `..\..\secret`, or a symlink already planted inside the sandbox into an
+//! Open's key buffer must not get it opened, silently, on this host.
+//! [`resolve_open_path`] is this edge's copy of that decision, built on the
+//! same primitive: [`dos::files::translate`] does the DOS-syntax parsing
+//! (drive letters, `..`, device names) once, for every DOS file access this
+//! crate makes, so this does not restate it.
+
+use std::path::{Path, PathBuf};
 
 use dos::guest::{Fault, Guest, Ptr};
 use dos::service::{Serviced, Service};
 
-use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap};
+use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap, Status};
 use btrieve::mem::{Alloc, Mem};
 
 /// What `DFAAPI.C:130` stamps into every `btvdat` it builds. Nothing else on
@@ -87,18 +105,24 @@ fn ptr_from_far_bytes(b: &[u8]) -> Ptr {
     Ptr::new(u16::from_le_bytes([b[2], b[3]]), u16::from_le_bytes([b[0], b[1]]))
 }
 
-/// `field::AT + delta`, staying inside the same segment `at` already names.
+/// `at.off + delta`, staying inside the same segment `at` already names.
 ///
-/// Every use here is a fixed field offset within the one 28-byte block the
-/// guest handed over, never an address a program computed and might have
-/// let carry past a segment boundary, so the two possible readings of
-/// "advance a real-mode offset" cannot disagree at any call site in this
-/// file. `wrapping_add` is still the one that is *honest* about which
-/// reading this is: real 8086 offset arithmetic never touches the segment
-/// half on its own, so an offset that did run past `0xffff` would wrap
-/// within the segment rather than spill into it, and silently normalising
-/// into the segment instead would be inventing carry behaviour real mode
-/// does not have.
+/// Two call sites, not one. [`DosMem::ptr_offset`] uses this for a fixed
+/// field offset within the one 28-byte block the guest handed over -- an
+/// offset that can never run past `0xffff` in practice. [`DosHeap::reserve`]
+/// uses it too, with its own accumulating bump-allocator cursor, and *that*
+/// site genuinely could overflow if nothing stopped it -- which is why
+/// [`DosHeap::new`] refuses to construct a heap whose `base.off + capacity`
+/// would run past the segment at all: `reserve`'s own `end > self.capacity`
+/// check then makes it structurally impossible for `self.cursor` to exceed
+/// what `base.off` has room for, so this function's `wrapping_add` never
+/// actually wraps at either call site -- it is still the *honest* choice of
+/// arithmetic even though it cannot fire, because real 8086 offset
+/// arithmetic never touches the segment half on its own: there is no
+/// hardware carry out of the offset into the segment for register
+/// arithmetic. Normalising here (`seg += carry, off = wrapped`) would be
+/// modelling segment:offset *pointer normalisation*, a DOS memory manager's
+/// convention, not what either call site's own arithmetic does.
 fn field_ptr(at: Ptr, delta: u16) -> Ptr {
     Ptr::new(at.seg, at.off.wrapping_add(delta))
 }
@@ -201,9 +225,32 @@ pub struct DosHeap {
 
 impl DosHeap {
     /// A heap of `capacity` bytes, all within `base`'s segment.
-    #[must_use]
-    pub fn new(base: Ptr, capacity: u16) -> Self {
-        Self { base, capacity, cursor: 0 }
+    ///
+    /// # Errors
+    ///
+    /// If `base.off + capacity` would run past the end of the segment
+    /// (`0xffff`). Checked once, here, rather than left as something
+    /// [`Self::reserve`] merely happens not to trigger today: accepting an
+    /// oversized window would let a late allocation's address wrap back
+    /// around into an earlier one, silently aliasing two live allocations --
+    /// exactly the failure mode this type's own doc comment promises never
+    /// happens. Rejecting it at construction makes that impossible rather
+    /// than merely unlikely.
+    pub fn new(base: Ptr, capacity: u16) -> Result<Self, String> {
+        // Widened to `u32` rather than `base.off.checked_add(capacity)`:
+        // a segment holds exactly `0x10000` distinct offsets (`0x0000` through
+        // `0xffff`), so a `capacity`-byte window starting at `base.off` fits
+        // exactly when `base.off + capacity <= 0x10000` -- a sum `u16`
+        // arithmetic cannot even represent at the one boundary case where it
+        // is still valid (`base.off = 0xfff0, capacity = 0x10`, using every
+        // remaining offset through `0xffff`).
+        if u32::from(base.off) + u32::from(capacity) > 0x1_0000 {
+            return Err(format!(
+                "a {capacity}-byte heap at {:04x}:{:04x} would run past the end of its segment",
+                base.seg, base.off
+            ));
+        }
+        Ok(Self { base, capacity, cursor: 0 })
     }
 }
 
@@ -227,6 +274,98 @@ impl<G: Guest> Alloc<DosMem<G>> for DosHeap {
 
     fn free(&mut self, _at: Ptr) -> Result<(), String> {
         Ok(())
+    }
+}
+
+/// What resolving a Btrieve `Open`'s DOS-syntax filename against `root`
+/// found -- this edge's counterpart to
+/// `crate::win32::btrieve::OpenResolution`.
+///
+/// Deliberately has no "no root configured" case: unlike the Win32 edge's
+/// `Process`, which may or may not have a sandbox attached, [`Btrieve::new`]
+/// requires a root up front, so every call into [`resolve_open_path`] already
+/// has one.
+#[derive(Debug)]
+enum OpenResolution {
+    /// Safe to hand `crates/btrieve`: either verified to resolve beneath
+    /// `root` (canonicalized, and checked to still start with the
+    /// canonicalized root -- catches a symlink already planted inside the
+    /// sandbox before this ever ran), or -- a name that plainly does not
+    /// exist under either spelling -- unresolved. The second case is safe to
+    /// hand over unchecked precisely because nothing on disk answers to it,
+    /// symlink or not: see `crate::win32::btrieve::resolve_open_path`'s own
+    /// doc comment, which this mirrors exactly.
+    Path(PathBuf),
+    /// The guest's own name is why this failed: [`dos::files::translate`]
+    /// rejected it outright (`..`, empty, or a bare device name -- none of
+    /// which is a Btrieve file), or it resolved to something real but only
+    /// by following a symlink back out of `root`. Real Btrieve has no status
+    /// for either distinction, and neither is a host misconfiguration, so
+    /// both answer the same way a genuinely missing file does: status 12,
+    /// never a [`Gap`].
+    Refused,
+    /// `root` itself could not be canonicalized. Unlike [`Refused`], this is
+    /// not something the guest's own name could cause -- it means this
+    /// host's own sandbox is misconfigured, which is a [`Gap`], the same
+    /// class of failure `crate::win32::btrieve::OpenResolution::NoRoot` names
+    /// for its own "no sandbox at all" case.
+    RootUnusable,
+}
+
+/// Resolve a Btrieve `Open`'s filename -- DOS syntax such as `.\WCCACMS2.DAT`,
+/// or a guest's attempt at `\..\..\etc\passwd` -- into a real path beneath
+/// `root`, or a refusal.
+///
+/// Reuses [`dos::files::translate`] for the DOS-syntax parsing (drive
+/// letters, `..`, device names) rather than re-deriving it: two path
+/// translators that could disagree is worse than either one alone, and this
+/// crate already depends on `dos` for exactly this job everywhere else a DOS
+/// program names a file. What `translate` cannot do on its own is close a
+/// symlink already sitting inside `root` before this ever ran -- lexical
+/// rejection of `..` does not see that, only canonicalizing the candidate and
+/// checking it against the canonicalized root does -- so this function is
+/// still needed on top of it, the same shape (and the same reasoning)
+/// `crate::win32::btrieve::resolve_open_path`'s own doc comment lays out at
+/// length.
+fn resolve_open_path(root: &Path, keybuf: &[u8]) -> OpenResolution {
+    let Ok(canonical_root) = root.canonicalize() else {
+        return OpenResolution::RootUnusable;
+    };
+    match dos::files::translate(keybuf) {
+        dos::files::Target::File(rel) => {
+            let candidate = root.join(&rel);
+            if candidate.exists() {
+                return contained(&candidate, &canonical_root);
+            }
+            // `translate` upper-cases every byte; a DOS guest reliably
+            // writes upper case, but this host's directories are not
+            // guaranteed to be, so one lower-case retry, the same fallback
+            // `crate::win32::btrieve::resolve_open_path` documents for the
+            // same reason.
+            let lower = root.join(rel.to_ascii_lowercase());
+            if lower.exists() {
+                return contained(&lower, &canonical_root);
+            }
+            // Neither spelling exists, so there is nothing a symlink could
+            // have carried anywhere -- handing this back unresolved is safe.
+            OpenResolution::Path(candidate)
+        }
+        // Neither is a Btrieve file: `translate` already refused `..` and
+        // empty names outright, and a device name (`NUL`, `CON`, ...) is not
+        // something Btrieve's own `Geometry::read` could open either way.
+        // Both are the guest's own doing, not a host-configuration gap, so
+        // both answer status 12 rather than a `Gap`.
+        dos::files::Target::Device(_) | dos::files::Target::Rejected => OpenResolution::Refused,
+    }
+}
+
+/// `candidate`, canonicalized and checked against `canonical_root` -- the one
+/// check that catches a symlink already sitting inside `root` and pointing
+/// back out of it, which no amount of lexical rejection of `..` can see.
+fn contained(candidate: &Path, canonical_root: &Path) -> OpenResolution {
+    match candidate.canonicalize() {
+        Ok(real) if real.starts_with(canonical_root) => OpenResolution::Path(real),
+        _ => OpenResolution::Refused,
     }
 }
 
@@ -258,6 +397,7 @@ pub fn dispatch<G: Guest>(
     guest: &mut G,
     session: &mut btrieve::Btrieve<DosMem<G>>,
     heap: &mut DosHeap,
+    root: &Path,
 ) -> Result<Answer, Fault> {
     let at = guest.regs().ds_dx();
     let block = guest.read(at, usize::from(field::SIZE))?.to_vec();
@@ -312,26 +452,60 @@ pub fn dispatch<G: Guest>(
         guest.read(key_ptr, usize::from(keylen))?.to_vec()
     };
 
-    let outcome = engine_btrcall(
-        session,
-        guest,
-        heap,
-        Call {
-            op: funcno,
-            posblk: &mut posblk,
-            databuf: &mut databuf,
-            datalen: &mut datalen,
-            keybuf: &mut keybuf,
-            keylen,
-            keynum: keyno,
-        },
-    );
+    // Btrieve `Open`'s key buffer holds a filename in DOS syntax -- see this
+    // module's own doc comment for why the engine cannot be handed that
+    // verbatim. Substitute a resolved, sandboxed path on this local copy
+    // before the engine ever sees it, and restore the guest's own bytes
+    // before anything is written back: real Btrieve does not rewrite the
+    // name it was asked to open, and the guest is entitled to read its own
+    // buffer back unchanged -- the identical discipline
+    // `crate::win32::btrieve::btrcall` follows for the same reason.
+    const OPEN: u16 = 0;
+    let original_keybuf = (funcno == OPEN).then(|| keybuf.clone());
+    let mut refused: Option<Status> = None;
+    if funcno == OPEN {
+        match resolve_open_path(root, &keybuf) {
+            OpenResolution::Path(resolved) => {
+                let mut bytes = resolved.to_string_lossy().into_owned().into_bytes();
+                bytes.push(0);
+                keybuf = bytes;
+            }
+            // The guest's own name is why this failed -- real Btrieve status
+            // 12, never a fabricated one and never a `Gap`.
+            OpenResolution::Refused => refused = Some(Status(12)),
+            // A host-configuration gap, not something the guest's own name
+            // could cause -- see `OpenResolution::RootUnusable`'s own doc
+            // comment.
+            OpenResolution::RootUnusable => return Ok(Answer::Unclaimed(funcno)),
+        }
+    }
 
-    let status = match outcome {
-        Ok(status) => status,
-        // A gap is never a status -- see this module's own doc comment.
-        Err(Gap { what: _ }) => return Ok(Answer::Unclaimed(funcno)),
+    let status = if let Some(status) = refused {
+        status
+    } else {
+        match engine_btrcall(
+            session,
+            guest,
+            heap,
+            Call {
+                op: funcno,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut keybuf,
+                keylen,
+                keynum: keyno,
+            },
+        ) {
+            Ok(status) => status,
+            // A gap is never a status -- see this module's own doc comment.
+            Err(Gap { what: _ }) => return Ok(Answer::Unclaimed(funcno)),
+        }
     };
+
+    if let Some(original) = original_keybuf {
+        keybuf = original;
+    }
 
     // Write every field an operation might have touched back -- the same
     // "always write all four" discipline `crate::win32::btrieve::btrcall`
@@ -354,19 +528,25 @@ pub fn dispatch<G: Guest>(
 }
 
 /// `int 7Bh`, composed the way `bin/runexe.rs` will use it (Task 10): a
-/// [`Service`] wrapping a persistent Btrieve session and heap, so a caller
-/// never has to know [`dispatch`] exists.
+/// [`Service`] wrapping a persistent Btrieve session, a heap, and the
+/// sandbox root every `Open` is resolved against, so a caller never has to
+/// know [`dispatch`] exists.
 pub struct Btrieve<G: Guest> {
     session: btrieve::Btrieve<DosMem<G>>,
     heap: DosHeap,
+    root: PathBuf,
 }
 
 impl<G: Guest> Btrieve<G> {
     /// A fresh session -- nothing open -- backed by `heap` for whatever an
-    /// `Open` allocates.
+    /// `Open` allocates, with every `Open`'s filename resolved beneath
+    /// `root`. Required, not optional: unlike the Win32 edge, whose
+    /// `Process` may or may not have a sandbox attached, this edge has no
+    /// "no sandbox configured" state to fall back on -- see
+    /// [`OpenResolution::RootUnusable`].
     #[must_use]
-    pub fn new(heap: DosHeap) -> Self {
-        Self { session: btrieve::Btrieve::default(), heap }
+    pub fn new(heap: DosHeap, root: PathBuf) -> Self {
+        Self { session: btrieve::Btrieve::default(), heap, root }
     }
 }
 
@@ -376,7 +556,7 @@ impl<G: Guest + 'static> Service<G> for Btrieve<G> {
     }
 
     fn service(&mut self, vector: u8, g: &mut G) -> Serviced {
-        match dispatch(g, &mut self.session, &mut self.heap) {
+        match dispatch(g, &mut self.session, &mut self.heap, &self.root) {
             Ok(Answer::Done) => Serviced::Continue,
             Ok(Answer::Unclaimed(op)) => Serviced::Unclaimed { vector, ah: op as u8 },
             Err(f) => Serviced::Fault(f),
@@ -403,15 +583,40 @@ mod tests {
     const DATABUF_SEG: u16 = 0x1040;
     const HEAP_SEG: u16 = 0x2000;
 
-    /// The absolute path to a real Btrieve fixture -- the same
+    /// The real Btrieve fixture every test here copies from -- the same
     /// `SAMPLE.DAT` `crates/btrieve/src/btrcall.rs`'s own
     /// `a_file_opens_reads_and_closes_through_numbers_alone` test opens.
     fn sample_dat() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../mbbs/tests/data/SAMPLE.DAT")
     }
 
-    /// Lay out a 28-byte `btvdat` asking for `funcno` (Open, by default) on
-    /// `SAMPLE.DAT`, and point the guest's `DS:DX` at it.
+    /// A fresh sandbox root, containing one legitimate Btrieve file,
+    /// `SAMPLE.DAT`. `btrieve::testing::scratch` rather than a hand-rolled
+    /// `tmp/` directory: it is already the crate's own parallel-safe scratch
+    /// convention (cleared per call, keyed by name and thread), so this does
+    /// not invent a second one.
+    fn sandbox(name: &str) -> std::path::PathBuf {
+        let root = btrieve::testing::scratch(name);
+        std::fs::copy(sample_dat(), root.join("SAMPLE.DAT")).expect("seed the sandbox");
+        root
+    }
+
+    /// A real Btrieve file living *outside* any sandbox root this test suite
+    /// builds -- what an escape would actually reach if one worked.
+    /// `btrieve::testing::scratch(name)` sits beside, never beneath, a
+    /// `sandbox(...)` call with a different name (both are direct children of
+    /// the same per-thread scratch directory), so this is genuinely outside
+    /// every root below, not merely a different subdirectory of one.
+    fn outside_file(name: &str) -> std::path::PathBuf {
+        let dir = btrieve::testing::scratch(name);
+        let file = dir.join("REAL.DAT");
+        std::fs::copy(sample_dat(), &file).expect("seed the file outside the sandbox");
+        file
+    }
+
+    /// Lay out a 28-byte `btvdat` asking for `funcno` (Open, by default)
+    /// against the DOS-syntax name `key_text`, and point the guest's `DS:DX`
+    /// at it.
     ///
     /// **Deliberately does not use `field::*`.** If it did, a mutation that
     /// swapped two offsets in `field` would move the exact same way on both
@@ -423,7 +628,7 @@ mod tests {
     /// believes it is -- so a mutation to `field` has something fixed to
     /// contradict. `crate::win32::btrieve`'s own `read_args_puts_each_of_the_seven_in_its_own_field`
     /// test docments the identical trap for that edge.
-    fn setup_open(guest: &mut TestGuest, magic: u16) {
+    fn setup_open(guest: &mut TestGuest, magic: u16, key_text: &[u8]) {
         const DATBUF: usize = 0;
         const DBFLEN: usize = 4;
         const POSBLK: usize = 10;
@@ -434,10 +639,9 @@ mod tests {
         const STATPT: usize = 22;
         const MAGIC_OFF: usize = 26;
 
-        let path = sample_dat();
-        let mut key_bytes = path.to_string_lossy().into_owned().into_bytes();
+        let mut key_bytes = key_text.to_vec();
         key_bytes.push(0);
-        assert!(key_bytes.len() <= 255, "the fixture path must fit the key buffer");
+        assert!(key_bytes.len() <= 255, "the key must fit the key buffer");
         guest.poke(Ptr::new(KEY_SEG, 0), &key_bytes);
 
         // A sentinel so a test can tell "never written" from "written zero".
@@ -466,30 +670,37 @@ mod tests {
         guest.set_regs(regs);
     }
 
-    fn service() -> Btrieve<TestGuest> {
-        Btrieve::new(DosHeap::new(Ptr::new(HEAP_SEG, 0), 4096))
+    fn service(root: std::path::PathBuf) -> Btrieve<TestGuest> {
+        let heap = DosHeap::new(Ptr::new(HEAP_SEG, 0), 4096).expect("heap fits its segment");
+        Btrieve::new(heap, root)
     }
 
-    #[test]
-    fn open_answers_status_zero_through_statpt() {
+    /// Open a Btrieve file whose status word this test reads back through
+    /// `statpt`, and whose position-block handle it can inspect.
+    fn open_and_read_status(root: std::path::PathBuf, key_text: &[u8]) -> (u16, [u8; 4]) {
         let mut guest = TestGuest::new(1 << 20);
-        setup_open(&mut guest, MAGIC);
-        let mut svc = service();
+        setup_open(&mut guest, MAGIC, key_text);
+        let mut svc = service(root);
 
         assert_eq!(svc.service(0x7b, &mut guest), Serviced::Continue);
 
         let status = u16::from_le_bytes(guest.peek(Ptr::new(STATPT_SEG, 0), 2).try_into().unwrap());
-        assert_eq!(status, 0, "Open succeeded, and the status went through statpt");
+        let posblk = guest.peek(Ptr::new(POSBLK_SEG, 0), 4).try_into().unwrap();
+        (status, posblk)
+    }
 
-        let posblk = guest.peek(Ptr::new(POSBLK_SEG, 0), 4);
+    #[test]
+    fn open_answers_status_zero_through_statpt() {
+        let (status, posblk) = open_and_read_status(sandbox("dos-btrieve-open"), b"SAMPLE.DAT");
+        assert_eq!(status, 0, "Open succeeded, and the status went through statpt");
         assert_ne!(posblk, [0, 0, 0, 0], "Open recorded a handle in the position block");
     }
 
     #[test]
     fn a_block_whose_magic_does_not_match_is_refused_not_serviced() {
         let mut guest = TestGuest::new(1 << 20);
-        setup_open(&mut guest, MAGIC.wrapping_add(1));
-        let mut svc = service();
+        setup_open(&mut guest, MAGIC.wrapping_add(1), b"SAMPLE.DAT");
+        let mut svc = service(sandbox("dos-btrieve-bad-magic"));
 
         assert_eq!(
             svc.service(0x7b, &mut guest),
@@ -505,7 +716,73 @@ mod tests {
 
     #[test]
     fn btrieve_claims_only_int_7bh() {
-        let svc = service();
+        let svc = service(sandbox("dos-btrieve-claims"));
         assert_eq!(Service::<TestGuest>::claims(&svc), &[0x7b]);
+    }
+
+    /// An absolute *host* path in the key buffer must not reach a real file
+    /// that only happens to sit outside the sandbox -- the exact hole this
+    /// task's review found: `crates/btrieve/src/btrcall.rs::open` takes
+    /// whatever `PathBuf::from` makes of the guest's bytes and hands it
+    /// straight to `std::fs::File::open` with no idea a sandbox exists. The
+    /// target here is a second, genuine copy of `SAMPLE.DAT` -- not a
+    /// nonexistent name -- specifically so this test is *sensitive* to the
+    /// fix: without sandboxing this would answer status 0 (opened for real),
+    /// and only with it does `dos::files::translate`'s leading-`/` strip turn
+    /// the absolute path into a sandbox-relative one that plainly does not
+    /// exist under `root`, so it answers status 12 same as any missing file.
+    #[test]
+    fn an_absolute_host_path_cannot_reach_a_file_outside_the_sandbox() {
+        let root = sandbox("dos-btrieve-abs-root");
+        let real = outside_file("dos-btrieve-abs-outside");
+        let key = real.to_string_lossy().into_owned().into_bytes();
+
+        let (status, posblk) = open_and_read_status(root, &key);
+        assert_eq!(status, 12, "an absolute host path must not open the real file it names");
+        assert_eq!(posblk, [0, 0, 0, 0], "no handle for a refused open");
+    }
+
+    /// `..` in a guest's Open filename must be refused outright --
+    /// `dos::files::translate` already rejects it lexically, before this
+    /// edge ever touches the filesystem.
+    #[test]
+    fn dot_dot_in_the_open_filename_is_refused() {
+        let root = sandbox("dos-btrieve-dotdot-root");
+        let (status, posblk) = open_and_read_status(root, b"..\\..\\REAL.DAT");
+        assert_eq!(status, 12, "a `..` name must never resolve to anything");
+        assert_eq!(posblk, [0, 0, 0, 0], "no handle for a refused open");
+    }
+
+    /// A symlink already sitting inside the sandbox root, pointing outside
+    /// it, must not let a Btrieve `Open` follow it out. Planted before the
+    /// "guest" ever runs, the way a symlink already present in real board
+    /// data would be -- not something a DOS-syntax name in the key buffer
+    /// could spell on its own (`dos::files::translate` already refuses
+    /// `..`), so lexical rejection alone cannot catch this; only
+    /// `resolve_open_path`'s `contained` check, canonicalizing the candidate
+    /// and comparing it against the canonicalized root, does. Mirrors
+    /// `crate::win32::btrieve`'s own
+    /// `a_symlink_inside_the_root_cannot_walk_a_btrieve_open_out_of_it`.
+    #[test]
+    fn a_symlink_inside_the_root_cannot_walk_a_btrieve_open_out_of_it() {
+        let root = sandbox("dos-btrieve-symlink-root");
+        let real = outside_file("dos-btrieve-symlink-outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, root.join("ESCAPE.DAT")).expect("symlink");
+
+        let (status, posblk) = open_and_read_status(root, b"ESCAPE.DAT");
+        assert_eq!(status, 12, "a symlink out of the sandbox must be refused");
+        assert_eq!(posblk, [0, 0, 0, 0], "no handle for a refused open");
+    }
+
+    /// A window that would run past the end of its segment must be refused
+    /// at construction, not accepted and left for `reserve` to wrap around
+    /// later.
+    #[test]
+    fn a_heap_window_that_would_overflow_its_segment_is_refused_at_construction() {
+        DosHeap::new(Ptr::new(HEAP_SEG, 0xfff0), 0x20)
+            .expect_err("0xfff0 + 0x20 runs past 0xffff");
+        DosHeap::new(Ptr::new(HEAP_SEG, 0xfff0), 0x10)
+            .expect("0xfff0 + 0x10 == 0x10000 - 1, exactly the last byte of the segment");
     }
 }
