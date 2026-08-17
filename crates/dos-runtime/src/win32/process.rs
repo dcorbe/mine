@@ -636,27 +636,33 @@ mod tests {
         );
     }
 
-    /// **The gate**, and it only appears once the host is capable enough to
-    /// reach it.
+    /// **The gate wasn't a gate.** A prior version of this test gave the
+    /// program a real filesystem but an empty directory. It found its data
+    /// directory, failed on `WCCMMUD.MCV`, reported the failure, wrote a full
+    /// `GALCAT.OUT` crash dump, and unwound into
+    /// `cw3220mt.DLL!__Return_unwind` -- Borland's C++ exception unwind,
+    /// which restores a saved register set and resumes at a stored address.
+    /// `mbbs_machine::m32::Machine` has no register setters for that, so the
+    /// doc comment at the time read this as a structural wall.
     ///
-    /// Given a real filesystem the program gets *further* and ends *worse*: it
-    /// finds its data directory, fails on `WCCMMUD.MCV` -- which genuinely does
-    /// not exist, only the uncompiled `WCCMMUD.MSG` does -- reports the failure,
-    /// writes a full `GALCAT.OUT` crash dump, and then unwinds.
-    /// `cw3220mt.DLL!__Return_unwind` is Borland's C++ exception unwind: it
-    /// restores a saved register set and resumes at a stored address.
+    /// It wasn't. The program reaches the unwind only because it throws, and
+    /// it throws only because `WCCMMUD.MCV` -- the *compiled* message
+    /// catalogue -- did not exist; only the uncompiled `WCCMMUD.MSG` did.
+    /// Supplying the whole 73-file fixture from the real board was measured
+    /// and made no difference, but neither of those two measurements ever
+    /// included a `.MCV`: the fixture has no compiler, so nothing in it can
+    /// produce one, and the 73-file fixture apparently doesn't carry a
+    /// prebuilt one either. Compile `WCCMMUD.MSG` with `msgcomp` and hand the
+    /// program that file, and it never throws. `__Return_unwind` and the
+    /// register-setter wall behind it are simply not on this program's path;
+    /// the register-setter gap is real but this test was never evidence of
+    /// hitting it.
     ///
-    /// `mbbs_machine::m32::Machine` has no register setters -- its only setter
-    /// is `set_budget` -- so this cannot be implemented here. It is the same
-    /// wall the phase plan recorded for `_longjmp`, reached from the exception
-    /// path instead of directly, and the plan is explicit that adding register
-    /// setters is a change in `mbbs-machine` and must not be done
-    /// speculatively.
-    ///
-    /// Supplying the whole 73-file fixture from the real board does not change
-    /// this; it was measured both ways.
+    /// With the catalogue in place the program runs on into ordinary
+    /// Borland C runtime file I/O and stops at `_fseek`, which is Task 5's
+    /// first target.
     #[test]
-    fn with_a_filesystem_it_reaches_the_borland_unwind_gate() {
+    fn with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
         let mut loaded = crate::win32::load::load(&file).expect("loads");
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
@@ -671,49 +677,30 @@ mod tests {
             dir.clone(),
         )));
 
+        // The program throws when it cannot read its message catalogue, and
+        // the throw is the only reason it reaches Borland's unwind. Give it
+        // one and the unwind is not on the path at all.
+        //
+        // Regenerate with:
+        //   cargo build -p mbbs --bin msgcomp
+        //   target/debug/msgcomp /home/daniel/peepeebbs/WCCMMUD.MSG \
+        //       -o crates/dos-runtime/tests/data/WCCMMUD.MCV
+        let mcv = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/WCCMMUD.MCV"
+        ));
+        std::fs::copy(&mcv, dir.join("WCCMMUD.MCV")).expect("the message catalogue");
+
         let out = run(&mut loaded, &mut p, 500_000).expect("the machine runs");
         assert_eq!(
             out,
             Outcome::Unimplemented {
                 module: "cw3220mt.DLL".to_owned(),
-                symbol: "__Return_unwind".to_owned(),
+                symbol: "_fseek".to_owned(),
             },
-            "the Borland unwind group is the gate; see this test's comment"
-        );
-
-        // On the way there it produced its own diagnostic, which this host
-        // keeps because there is no NT event log to put it in.
-        assert!(
-            p.events.iter().any(|e| e
-                .strings
-                .iter()
-                .any(|s| s.contains("CANNOT FIND"))),
-            "the program reported why it failed: {:?}",
-            p.events
-        );
-        // And a real crash dump, not a runaway log. It was 2.3 MB of repeated
-        // lines before `VirtualQuery` reported page-aligned region sizes.
-        let dump = std::fs::metadata(dir.join("GALCAT.OUT")).expect("a crash dump");
-        assert!(
-            dump.len() > 200 && dump.len() < 100_000,
-            "GALCAT.OUT is {} bytes; a runaway memory-map walk makes it megabytes",
-            dump.len()
-        );
-
-        // **It drew the message on screen**, which is one assertion standing in
-        // for a whole chain: `GetLocalTime` filled a `SYSTEMTIME`, the format
-        // engine rendered it and the message, `WriteConsoleOutputCharacterA`
-        // marshalled a packed `COORD` and a count out-parameter, and the
-        // console buffer kept the cells. Any one of those being wrong shows up
-        // here as missing or misplaced text rather than as a passing unit test.
-        let text = p.console.cells().text();
-        assert!(
-            text.contains("CANNOT FIND"),
-            "the console should carry what the program drew:\n{text}"
-        );
-        assert!(
-            text.contains("-26 "),
-            "and the date it formatted through GetLocalTime:\n{text}"
+            "with a catalogue present the program never throws, so it runs on \
+             past where the unwind gate used to be, into ordinary C runtime \
+             file I/O; see this test's comment"
         );
     }
 
