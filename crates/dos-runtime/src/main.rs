@@ -1,13 +1,16 @@
 //! Run a hand-assembled `.COM` under a real-mode KVM guest, servicing its
-//! `int 21h` calls with the same `dos::dispatch` the unit tests drive.
+//! `int 21h` calls through the composed `dos::service::Services` router --
+//! the same abstraction `bin/runexe.rs` drives, here with a single service.
 //!
 //! If this prints its line, the whole of Edge B is proven end to end: IVT,
-//! trap stub, vmexit, register marshalling, guest memory, DOS dispatch, the
-//! carry-on-the-stack convention, and program termination.
+//! trap stub, vmexit, register marshalling, guest memory, the `Service`
+//! router, DOS dispatch, the carry-on-the-stack convention, and program
+//! termination.
 
 use std::io;
 
-use dos_runtime::dos::{DosState, Outcome, dispatch};
+use dos::service::{Serviced, Services};
+use dos_runtime::dos::Dos;
 use dos_runtime::kvm::{Stop, VmGuest};
 
 /// Where the program is loaded. `.COM` convention: PSP at `seg:0`, code at
@@ -69,19 +72,47 @@ fn main() -> io::Result<()> {
     vm.load(PROG_SEG as usize * 16 + PROG_OFF as usize, &code)?;
     vm.start(PROG_SEG, PROG_OFF, PROG_SEG, 0xfffe)?;
 
-    let mut dos = DosState::default();
+    let mut services: Services<VmGuest> = Services::new().with(Dos::default());
     let mut calls = 0u32;
 
     let exit = loop {
         match vm.run()? {
-            Stop::Trap(_) => {
+            Stop::Trap(vector) => {
                 calls += 1;
-                match dispatch(&mut vm, &mut dos) {
-                    Outcome::Continue => {}
-                    Outcome::Terminate(c) => break i32::from(c),
-                    Outcome::Fault(f) => {
+                match services.service(vector, &mut vm) {
+                    Some(Serviced::Continue) => {}
+                    Some(Serviced::Terminate(c)) => break i32::from(c),
+                    Some(Serviced::Fault(f)) => {
                         eprintln!("guest handed over a bad pointer: {f:?}");
                         break -1;
+                    }
+                    // The hand-assembled program above only ever asks the
+                    // three functions `Dos` implements (AH=02h, 09h, 19h)
+                    // plus AH=4Ch to end, so this arm can only mean the
+                    // bytes above stopped matching what `Dos` claims. A
+                    // fixed, hand-written probe earning a gap it did not
+                    // expect is a bug in this file, not a program `runexe`
+                    // has to carry on past -- so it is a hard stop here,
+                    // unlike `runexe`, which serves arbitrary `.EXE`s and
+                    // must keep going past a call it cannot answer.
+                    Some(Serviced::Unclaimed { vector, ah }) => {
+                        eprintln!("unclaimed: int {vector:02x}h AH={ah:02x}");
+                        break -4;
+                    }
+                    // `Dos` never yields -- nothing composed here models a
+                    // device with its own clock -- so this arm is
+                    // unreachable in practice. Sleeping and resuming, rather
+                    // than treating it as an error, is what stays correct if
+                    // a later change composes something that can.
+                    Some(Serviced::Yield(d)) => std::thread::sleep(d),
+                    // `vm.hook` arms only int 21h, and that is the only
+                    // vector `Dos` claims, so nothing can produce this
+                    // arm today. Kept, rather than matched with `_`, so the
+                    // match stays total instead of silently resuming on a
+                    // case that should not be possible.
+                    None => {
+                        eprintln!("no service claims int {vector:02x}h");
+                        break -5;
                     }
                 }
             }
@@ -100,7 +131,11 @@ fn main() -> io::Result<()> {
         }
     };
 
-    print!("{}", String::from_utf8_lossy(&dos.out));
+    let out = services
+        .claiming(0x21)
+        .and_then(|s| s.as_any().downcast_ref::<Dos>())
+        .map_or(&[][..], |d| d.state.out.as_slice());
+    print!("{}", String::from_utf8_lossy(out));
     println!("--- {calls} DOS calls serviced, guest exited with {exit}");
 
     if exit != i32::from(WANT_EXIT) {
