@@ -281,6 +281,13 @@ fn main() -> io::Result<()> {
     // The real segment the loader built this program's PSP at, so AH=62h
     // answers with the program's own PSP rather than failing outright.
     kernel.state.psp_seg = Some(at.psp_seg);
+    // `img.paragraphs()` already totals PSP + image + the header's declared
+    // `min_alloc` -- the same figure DOS itself would use to size the block
+    // it hands this process before any AH=4Ah shrinks it. Everything above
+    // that, up to conventional memory's own ceiling, starts out free; see
+    // `dos::kernel::Arena::new` for why this exact number is the boundary.
+    let first_free = at.psp_seg + img.paragraphs() as u16;
+    kernel.state.mem = Some(dos_runtime::dos::Arena::new(at.psp_seg, first_free));
     let mut keyboard = Keyboard::default();
     keyboard.feed(&keys);
     let mut driver: Option<Box<dyn Driver>> = if interactive {

@@ -5,12 +5,168 @@
 //! `Vec<u8>` in a unit test, and would serve an `m16` signal handler without
 //! changing a line.
 
+use std::collections::BTreeMap;
+
 use crate::files::{self, Files};
 use crate::guest::{Fault, Guest, Ptr, Regs, Flag};
 
 /// DOS error codes, as returned in AX with CF set.
 pub const ERR_INVALID_FUNCTION: u16 = 0x01;
 pub const ERR_INVALID_HANDLE: u16 = 0x06;
+/// `AH=48h`/`4Ah` when there is not enough room, carried with the largest
+/// size in paragraphs that would have succeeded, per each call's own contract.
+pub const ERR_INSUFFICIENT_MEMORY: u16 = 0x08;
+/// `AH=49h`/`4Ah` naming a segment nothing has allocated.
+pub const ERR_INVALID_MEMORY_BLOCK: u16 = 0x09;
+
+/// Conventional memory ends here: segment `0xa000` is where video RAM
+/// (`0xb800` for text mode, `0xa000` itself for EGA/VGA graphics planes)
+/// begins, and DOS's own allocator never hands out a paragraph at or past it.
+/// `dos-runtime`'s loader picks `PSP_SEG`/`ENV_SEG` far below this for the
+/// same reason (`crates/dos-runtime/src/bin/runexe.rs`).
+const CONV_TOP: u16 = 0xa000;
+
+/// Why a resize (`AH=4Ah`) failed.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeErr {
+    /// No block is allocated at the named segment -- the `AH=49h` case as
+    /// applied to `4Ah`, so it is reported the same way: `AX=9`.
+    NoSuchBlock,
+    /// Not enough room to grow the block *in place*. This project's arena
+    /// never relocates a block on resize -- nothing walks a guest-visible MCB
+    /// chain that a relocation would have to keep honest, and a program that
+    /// already holds pointers into the block would have those pointers
+    /// invalidated by a move DOS itself does not silently make either. Carries
+    /// the largest size that would have succeeded, exactly as `4Ah`'s own
+    /// contract requires in `BX`.
+    TooSmall(u16),
+}
+
+/// Conventional memory above whatever the loaded program occupies, modelled
+/// as a host-side list of blocks -- not a guest-visible MCB chain. Nothing
+/// measured under `runexe` ever walks one (see the Task 1c brief), and
+/// inventing a structure nothing reads is exactly the speculative work this
+/// project refuses.
+///
+/// Two collections, not one, because "allocated" and "free" need different
+/// keys: a caller names an allocated block by its *segment* (`AH=49h`/`4Ah`'s
+/// `ES`), while satisfying a new request only needs to know free blocks'
+/// *sizes*. A single sorted `Vec<Block>` tagged free/allocated would make
+/// every free-list scan also skip past allocated entries for nothing.
+pub struct Arena {
+    /// Segment -> size in paragraphs, for every block currently allocated.
+    /// The program's own block (seeded by [`Arena::new`]) lives in here too,
+    /// so `AH=4Ah` resizing it is the same code path as resizing anything
+    /// `AH=48h` returned -- DOS itself draws no distinction between the two.
+    allocated: BTreeMap<u16, u16>,
+    /// Free ranges as `(segment, size)`, sorted by segment and coalesced so
+    /// that two adjacent free blocks are never left as two entries -- without
+    /// that, a resize growing into a block that was itself assembled from two
+    /// prior frees would see less contiguous space than genuinely exists.
+    free: Vec<(u16, u16)>,
+}
+
+impl Arena {
+    /// `owner_seg` is the segment `AH=62h` reports as this program's PSP; its
+    /// block starts out owning every paragraph up to `first_free`.
+    /// `first_free` is the first paragraph the loader did *not* hand to the
+    /// program -- `mz::MzImage::paragraphs()` (PSP + image + the header's own
+    /// declared `min_alloc`) is exactly that figure, the same one real DOS
+    /// would use to size a new process's block before any `4Ah` shrinks it.
+    /// Everything from `first_free` to [`CONV_TOP`] starts out free.
+    pub fn new(owner_seg: u16, first_free: u16) -> Self {
+        let mut allocated = BTreeMap::new();
+        allocated.insert(owner_seg, first_free.saturating_sub(owner_seg));
+        let free = if first_free < CONV_TOP {
+            vec![(first_free, CONV_TOP - first_free)]
+        } else {
+            Vec::new()
+        };
+        Self { allocated, free }
+    }
+
+    /// The largest single free block, in paragraphs -- what a failed `48h`
+    /// or a failed `4Ah` growing with no adjacent room reports in `BX`.
+    fn largest_free(&self) -> u16 {
+        self.free.iter().map(|&(_, size)| size).max().unwrap_or(0)
+    }
+
+    /// Return `(seg, size)` to the free list, merging it into whichever
+    /// neighbour(s) it now touches so two frees either side of the same gap
+    /// collapse into one entry instead of surviving as two.
+    fn release(&mut self, seg: u16, size: u16) {
+        if size == 0 {
+            return;
+        }
+        self.free.push((seg, size));
+        self.free.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u16, u16)> = Vec::with_capacity(self.free.len());
+        for (s, sz) in self.free.drain(..) {
+            match merged.last_mut() {
+                Some(last) if last.0 + last.1 == s => last.1 += sz,
+                _ => merged.push((s, sz)),
+            }
+        }
+        self.free = merged;
+    }
+
+    /// `AH=48h` -- take the first free block with room for `want` paragraphs,
+    /// address order low to high (first-fit; see `AH=58h`'s doc comment for
+    /// why nothing here honours a program's chosen strategy beyond accepting
+    /// it). `Err` carries [`Arena::largest_free`], per `48h`'s own contract.
+    pub fn alloc(&mut self, want: u16) -> Result<u16, u16> {
+        match self.free.iter().position(|&(_, size)| size >= want) {
+            Some(i) => {
+                let (seg, size) = self.free[i];
+                if size == want {
+                    self.free.remove(i);
+                } else {
+                    self.free[i] = (seg + want, size - want);
+                }
+                self.allocated.insert(seg, want);
+                Ok(seg)
+            }
+            None => Err(self.largest_free()),
+        }
+    }
+
+    /// `AH=49h` -- free the block at `seg`. `Err` means nothing is allocated
+    /// there, `49h`'s own "invalid memory block address" case.
+    pub fn dealloc(&mut self, seg: u16) -> Result<(), ()> {
+        let size = self.allocated.remove(&seg).ok_or(())?;
+        self.release(seg, size);
+        Ok(())
+    }
+
+    /// `AH=4Ah` -- resize the block at `seg` to `new_size` paragraphs.
+    /// Shrinking always succeeds and frees the tail; growing only succeeds
+    /// in place, against whatever free block immediately follows the block
+    /// (see [`ResizeErr::TooSmall`] for why relocation is not on offer).
+    fn resize(&mut self, seg: u16, new_size: u16) -> Result<(), ResizeErr> {
+        let &old_size = self.allocated.get(&seg).ok_or(ResizeErr::NoSuchBlock)?;
+        if new_size <= old_size {
+            self.allocated.insert(seg, new_size);
+            self.release(seg + new_size, old_size - new_size);
+            return Ok(());
+        }
+        let want_extra = new_size - old_size;
+        let after = seg + old_size;
+        let adjacent = self.free.iter().position(|&(s, _)| s == after);
+        let available = adjacent.map_or(0, |i| self.free[i].1);
+        if available < want_extra {
+            return Err(ResizeErr::TooSmall(old_size + available));
+        }
+        let i = adjacent.expect("available > 0 implies an adjacent free block was found");
+        let (fseg, fsize) = self.free[i];
+        if fsize == want_extra {
+            self.free.remove(i);
+        } else {
+            self.free[i] = (fseg + want_extra, fsize - want_extra);
+        }
+        self.allocated.insert(seg, new_size);
+        Ok(())
+    }
+}
 
 /// What the caller should do once a call has been serviced.
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +211,18 @@ pub struct DosState {
     /// The Disk Transfer Address, `DS:DX` as last set by `AH=1Ah`. `None`
     /// until the program calls it; see [`dta`] for what stands in until then.
     pub dta: Option<Ptr>,
+    /// Conventional memory above the loaded program, if a program has been
+    /// loaded at all. `None` is the same "no program behind it" case
+    /// `psp_seg` already documents -- every unit test in this file that does
+    /// not need memory management constructs a `DosState` with no arena, and
+    /// `AH=48h`/`49h`/`4Ah` must fail cleanly against that rather than panic.
+    pub mem: Option<Arena>,
+    /// The value last set by `AH=58h` (AL=1), and reported back by AL=0.
+    /// Stored so the call round-trips truthfully; nothing here reads it,
+    /// because nothing here allocates any way other than first-fit -- see
+    /// the `AH=58h` arm in `dispatch` for why that is not the same claim as
+    /// "the strategy was honoured".
+    pub alloc_strategy: u16,
 }
 
 impl Default for DosState {
@@ -67,6 +235,8 @@ impl Default for DosState {
             files: None,
             psp_seg: None,
             dta: None,
+            mem: None,
+            alloc_strategy: 0,
         }
     }
 }
@@ -95,8 +265,8 @@ pub fn is_implemented(ah: u8) -> bool {
     matches!(
         ah,
         0x02 | 0x09 | 0x0e | 0x19 | 0x1a | 0x25 | 0x2a | 0x2b | 0x2c | 0x2d | 0x30 | 0x35 | 0x3c
-            | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x44 | 0x4c | 0x4e | 0x4f | 0x56 | 0x5c
-            | 0x62
+            | 0x3d | 0x3e | 0x3f | 0x40 | 0x41 | 0x42 | 0x43 | 0x44 | 0x48 | 0x49 | 0x4a | 0x4c
+            | 0x4e | 0x4f | 0x56 | 0x58 | 0x5c | 0x62 | 0x67
     )
 }
 
@@ -462,6 +632,120 @@ pub fn dispatch<G: Guest>(g: &mut G, dos: &mut DosState) -> Outcome {
                 Err(code) => fail(g, regs, code),
             }
         }
+
+        // 43h -- get (AL=0) or set (AL=1) file attributes for DS:DX.
+        //
+        // This sandbox tracks no attribute bits of its own beyond what
+        // `Files::stat_entry` already derives from the host file for a
+        // search (`find_first`'s doc comment). AL=1 therefore stores nothing
+        // and just succeeds -- the same "accepted, no effect" shape `AH=67h`
+        // below has, for the same reason: a program that sets attributes
+        // only to keep going must not see the call itself fail. AL=0 reuses
+        // `find_first` rather than a second name-resolution path: a plain
+        // (unwildcarded) name resolves to exactly the one entry a real
+        // `43h` would report on, at the cost of clobbering whatever `4Eh`
+        // search happens to be open -- the same shared-search simplification
+        // `find_record`'s doc comment already accepts, and nothing measured
+        // interleaves the two calls.
+        0x43 => {
+            let path = match path_at(g, regs.ds_dx()) {
+                Ok(p) => p,
+                Err(f) => return Outcome::Fault(f),
+            };
+            let Some(files) = dos.files.as_mut() else {
+                return fail(g, regs, ERR_INVALID_FUNCTION);
+            };
+            if regs.al() == 1 {
+                return ok(g, regs);
+            }
+            match files.find_first(&path, files::ATTR_DIRECTORY) {
+                Ok(entry) => {
+                    regs.cx = u16::from(entry.attr);
+                    ok(g, regs)
+                }
+                Err(_) => fail(g, regs, files::ERR_FILE_NOT_FOUND),
+            }
+        }
+
+        // 48h -- allocate BX paragraphs, answered as a segment in AX.
+        0x48 => {
+            let result = match dos.mem.as_mut() {
+                Some(arena) => arena.alloc(regs.bx),
+                // No program means no arena at all: every request is over
+                // an empty pool, so the largest available is truthfully 0.
+                None => Err(0),
+            };
+            match result {
+                Ok(seg) => {
+                    regs.ax = seg;
+                    ok(g, regs)
+                }
+                Err(largest) => {
+                    regs.bx = largest;
+                    fail(g, regs, ERR_INSUFFICIENT_MEMORY)
+                }
+            }
+        }
+
+        // 49h -- free the block at ES.
+        0x49 => {
+            let result = match dos.mem.as_mut() {
+                Some(arena) => arena.dealloc(regs.es),
+                // No arena means nothing was ever handed out, so ES cannot
+                // name a real block either -- the same failure `dealloc`
+                // itself gives a segment it does not recognise.
+                None => Err(()),
+            };
+            match result {
+                Ok(()) => ok(g, regs),
+                Err(()) => fail(g, regs, ERR_INVALID_MEMORY_BLOCK),
+            }
+        }
+
+        // 4Ah -- resize the block at ES to BX paragraphs. The call a
+        // Borland C startup depends on: it shrinks its own PSP-anchored
+        // block before building a heap in what that shrink freed.
+        0x4a => {
+            let result = match dos.mem.as_mut() {
+                Some(arena) => arena.resize(regs.es, regs.bx),
+                None => Err(ResizeErr::NoSuchBlock),
+            };
+            match result {
+                Ok(()) => ok(g, regs),
+                Err(ResizeErr::TooSmall(largest)) => {
+                    regs.bx = largest;
+                    fail(g, regs, ERR_INSUFFICIENT_MEMORY)
+                }
+                Err(ResizeErr::NoSuchBlock) => fail(g, regs, ERR_INVALID_MEMORY_BLOCK),
+            }
+        }
+
+        // 58h -- get (AL=0) or set (AL=1) the memory allocation strategy.
+        //
+        // Real DOS's strategy (first fit / best fit / last fit) picks which
+        // free block a `48h` prefers when more than one would fit. This
+        // arena has exactly one allocation policy -- `Arena::alloc`'s
+        // first-fit scan -- so a program that sets a strategy is answered
+        // truthfully on the round trip (AL=0 reports back whatever AL=1
+        // last stored) without that value ever steering `alloc`. That is a
+        // real gap, not a deliberate choice to honour first-fit specifically:
+        // nothing measured so far sets anything but the default, so there is
+        // no evidence yet that a second policy is worth building.
+        0x58 => {
+            if regs.al() == 1 {
+                dos.alloc_strategy = regs.bx;
+            } else {
+                regs.ax = dos.alloc_strategy;
+            }
+            ok(g, regs)
+        }
+
+        // 67h -- set the handle count to BX. `Files` is a fixed-capacity
+        // table (`MAX_HANDLES`, `files.rs`) with no per-process limit a
+        // program can raise or lower, so there is nothing to store; this
+        // just keeps a program that calls it from seeing a call fail that
+        // real DOS would not have failed either.
+        0x67 => ok(g, regs),
 
         // 56h -- rename DS:DX to ES:DI.
         0x56 => {
@@ -945,5 +1229,253 @@ mod tests {
         assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
         assert!(g.carry());
         assert_eq!(g.regs().ax, ERR_INVALID_FUNCTION);
+    }
+
+    // -- AH=48h/49h/4Ah: memory management, the reason WCCMMUTL.EXE stalls
+    // before this task and gets past its own startup after it. --
+
+    /// A fresh arena, matching what the loader builds for a program 16
+    /// paragraphs long (`Arena::new`'s own PSP-plus-image accounting):
+    /// owner block `[0x1000, 0x1010)`, everything else up to `CONV_TOP`
+    /// free. Distinct owner/free boundaries, rather than round numbers, so a
+    /// test asserting on an exact address cannot pass by coincidentally
+    /// matching a boundary that happens to be zero.
+    fn with_arena() -> DosState {
+        DosState {
+            psp_seg: Some(0x1000),
+            mem: Some(Arena::new(0x1000, 0x1010)),
+            ..DosState::default()
+        }
+    }
+
+    fn call_ah(g: &mut TestGuest, ah: u8, es: u16, bx: u16, al: u8) {
+        let mut regs = Regs::default();
+        regs.set_ah(ah);
+        regs.set_al(al);
+        regs.es = es;
+        regs.bx = bx;
+        g.call_with(regs);
+    }
+
+    #[test]
+    fn allocate_returns_a_usable_segment_and_two_allocations_do_not_overlap() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x48, 0, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        let first = g.regs().ax;
+        assert_eq!(first, 0x1010, "the first block comes from the arena's own start");
+
+        call_ah(&mut g, 0x48, 0, 6, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        let second = g.regs().ax;
+        assert!(
+            second >= first + 4,
+            "second allocation ({second:#06x}) must start at or past the first's end ({:#06x})",
+            first + 4
+        );
+    }
+
+    #[test]
+    fn allocate_more_than_the_arena_holds_fails_with_the_exact_largest_size() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x48, 0, 0x9000, 0); // far more than the ~0x8ff0 free
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INSUFFICIENT_MEMORY);
+        assert_eq!(
+            g.regs().bx,
+            0xa000 - 0x1010,
+            "BX must be the exact largest block, not merely non-zero"
+        );
+    }
+
+    #[test]
+    fn free_then_allocate_the_same_size_reuses_the_space() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x48, 0, 10, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        let seg = g.regs().ax;
+
+        call_ah(&mut g, 0x49, seg, 0, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry(), "freeing a block this arena owns must succeed");
+
+        call_ah(&mut g, 0x48, 0, 10, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.regs().ax, seg, "a leaking free would hand out different memory instead");
+    }
+
+    #[test]
+    fn free_of_a_segment_never_allocated_fails() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x49, 0x2000, 0, 0); // never returned by any 48h
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_MEMORY_BLOCK);
+    }
+
+    #[test]
+    fn resize_down_then_allocate_succeeds_in_the_freed_tail() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        // Shrink the owner's own block from 0x10 paragraphs to 4 -- the
+        // Borland startup's own move, freeing 0x1004..0x1010.
+        call_ah(&mut g, 0x4a, 0x1000, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+
+        call_ah(&mut g, 0x48, 0, 8, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(
+            g.regs().ax,
+            0x1004,
+            "must land in the tail the resize just freed, not the untouched arena beyond it"
+        );
+    }
+
+    #[test]
+    fn resize_up_beyond_the_arena_fails_with_a_truthful_largest_size() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x4a, 0x1000, 0xffff, 0); // far more than conventional memory holds
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INSUFFICIENT_MEMORY);
+        assert_eq!(
+            g.regs().bx,
+            0xa000 - 0x1000,
+            "the largest this block could grow to in place is the whole span up to CONV_TOP"
+        );
+    }
+
+    #[test]
+    fn resize_of_a_segment_never_allocated_fails_with_invalid_memory_block() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = with_arena();
+
+        call_ah(&mut g, 0x4a, 0x2000, 4, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INVALID_MEMORY_BLOCK);
+    }
+
+    #[test]
+    fn allocate_with_no_program_loaded_fails_cleanly_rather_than_panicking() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default(); // mem: None, exactly like every other test in this file
+
+        call_ah(&mut g, 0x48, 0, 10, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, ERR_INSUFFICIENT_MEMORY);
+        assert_eq!(g.regs().bx, 0, "an empty arena has nothing to offer as a retry size");
+    }
+
+    // -- AH=58h/67h: allocation strategy and handle count, both no-ops that
+    // must simply not fail. --
+
+    #[test]
+    fn get_set_allocation_strategy_round_trips_through_state() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+
+        call_ah(&mut g, 0x58, 0, 2, 1); // AL=1 set, BX=2 (DOS's own "last fit" code)
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(dos.alloc_strategy, 2);
+
+        call_ah(&mut g, 0x58, 0, 0, 0); // AL=0 get
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.regs().ax, 2, "must report what was actually set, not a constant");
+    }
+
+    #[test]
+    fn set_handle_count_always_succeeds() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState::default();
+
+        call_ah(&mut g, 0x67, 0, 40, 0);
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+    }
+
+    // -- AH=43h: get/set file attributes --
+
+    #[test]
+    fn get_file_attributes_reports_the_real_entry() {
+        let (root, fs) = with_files("dos_attr_get");
+        std::fs::write(root.join("LORD.DAT"), vec![0u8; 1]).expect("seed");
+
+        let mut g = TestGuest::new(64 * 1024);
+        let path_at = Ptr::new(0x100, 0x20);
+        g.poke(path_at, b"LORD.DAT\0");
+        let mut dos = DosState {
+            files: Some(fs),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x43);
+        regs.set_al(0);
+        regs.ds = path_at.seg;
+        regs.dx = path_at.off;
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
+        assert_eq!(g.regs().cx, u16::from(files::ATTR_ARCHIVE));
+    }
+
+    #[test]
+    fn get_file_attributes_of_a_missing_file_fails_with_file_not_found() {
+        let (_root, fs) = with_files("dos_attr_missing");
+
+        let mut g = TestGuest::new(64 * 1024);
+        let path_at = Ptr::new(0x100, 0x20);
+        g.poke(path_at, b"NOPE.DAT\0");
+        let mut dos = DosState {
+            files: Some(fs),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x43);
+        regs.set_al(0);
+        regs.ds = path_at.seg;
+        regs.dx = path_at.off;
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(g.carry());
+        assert_eq!(g.regs().ax, files::ERR_FILE_NOT_FOUND);
+    }
+
+    #[test]
+    fn set_file_attributes_is_accepted_without_a_filesystem_read() {
+        let mut g = TestGuest::new(4096);
+        let mut dos = DosState {
+            files: Some(with_files("dos_attr_set").1),
+            ..DosState::default()
+        };
+        let mut regs = Regs::default();
+        regs.set_ah(0x43);
+        regs.set_al(1);
+        g.call_with(regs);
+
+        assert_eq!(dispatch(&mut g, &mut dos), Outcome::Continue);
+        assert!(!g.carry());
     }
 }
