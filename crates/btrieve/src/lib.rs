@@ -2028,8 +2028,11 @@ impl<M: Mem> Block<M> {
             if key.duplicates {
                 let offset = usize::from(key.chain.ok_or_else(|| {
                     format!(
-                        "key {}: permits duplicate values and its definition names no \
-                         offset for the chain that joins them",
+                        "key {}: permits duplicate values but names no chain offset, \
+                         so it repeats its key in the index instead (attribute \
+                         1<<7) -- this host reads such a file and does not write \
+                         one, because there is no in-record pair to maintain and \
+                         writing one at offset 0 would land on the record itself",
                         key.number
                     )
                 })?);

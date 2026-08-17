@@ -106,6 +106,19 @@ pub(crate) mod flag {
     /// A record is left OUT of this key's index when **any** segment of it is
     /// entirely [`at::NULL_VALUE`].
     pub const NULL_ANY_SEGMENT: u16 = 1 << 9;
+    /// Duplicate values repeat the key in the index instead of chaining the
+    /// records together, so the record carries **no** `[prev][next]` pair.
+    ///
+    /// Measured against genuine 6.15 by creating the same file twice and
+    /// changing only this bit: with it the engine chose `physical` 18 for a
+    /// `reclen` of 16 -- two bytes of v6 slot marker and nothing else -- and
+    /// wrote `0` into [`at::CHAIN`]; without it, `physical` 26 and a chain
+    /// offset of 18. Eight bytes of record, and the whole mechanism, gone.
+    ///
+    /// The **order is identical either way**, which is why this crate can read
+    /// such a file: it derives order by sorting the records and never reads
+    /// the chain. Writing one is a different matter -- see [`Key::chain`].
+    pub const REPEATING_DUPLICATES: u16 = 1 << 7;
 }
 
 /// Attribute bits that change what an index *contains* or how it collates, and
@@ -124,10 +137,8 @@ pub(crate) mod flag {
 /// **None of them is set on any key of any file MajorMUD ships**, which is
 /// checked by `crates/mbbs/tests/btrieve.rs` -- so this refuses on nothing that
 /// exists here, and refuses rather than guesses on a file that used one.
-const UNSUPPORTED: [(u16, &str); 2] = [
-    (flag::ALT_COLLATING, "a numbered alternate collating sequence"),
-    (1 << 7, "repeating duplicates"),
-];
+const UNSUPPORTED: [(u16, &str); 1] =
+    [(flag::ALT_COLLATING, "a numbered alternate collating sequence")];
 
 /// When a key leaves a record out of its index altogether.
 ///
@@ -836,7 +847,15 @@ pub fn parse(
                 // segmented duplicate key would need this read at
                 // `start_definition` instead, same as `Self::definition`; none
                 // exists to measure that against.
-                chain: duplicates.then(|| word(at::CHAIN)),
+                // `None` when the key repeats its duplicates in the index
+                // rather than chaining the records: such a key has no pair to
+                // point at, and its definition duly reads 0 here. Writing
+                // eight bytes at offset 0 would land on the front of the
+                // record -- which is why the write paths ask for this and
+                // refuse when it is absent, rather than defaulting.
+                chain: (duplicates
+                    && attributes & flag::REPEATING_DUPLICATES == 0)
+                    .then(|| word(at::CHAIN)),
                 // Which bit wins if a definition somehow set both is not
                 // measured, and no file here sets either; `Any` is the
                 // stricter of the two and omitting more than the engine does
@@ -1282,6 +1301,48 @@ mod tests {
         let zeroes = key(Some(Null::All(0)));
         assert!(zeroes.excluded(b"\0\0\0\0"));
         assert!(!zeroes.excluded(b"    "));
+    }
+
+    /// A key that repeats its duplicates in the index has no in-record chain,
+    /// and must not claim one.
+    ///
+    /// Measured: the same file created twice, differing only in this bit, got
+    /// `physical` 18 with it and 26 without -- eight bytes of `[prev][next]`
+    /// that simply are not there -- and the definition's chain offset reads 0
+    /// rather than a real offset. `Some(0)` would send the write path to the
+    /// front of the record.
+    #[test]
+    fn a_repeating_duplicate_key_names_no_chain_at_all() {
+        let definition = |attributes: u16| {
+            let mut bytes = vec![0u8; WIDTH];
+            bytes[at::ATTRIBUTES..at::ATTRIBUTES + 2]
+                .copy_from_slice(&attributes.to_le_bytes());
+            bytes[at::LENGTH..at::LENGTH + 2].copy_from_slice(&4u16.to_le_bytes());
+            bytes[at::EXTENDED] = 0x0b;
+            // A real chain offset, so `None` below cannot come from the bytes
+            // happening to be zero.
+            bytes[at::CHAIN..at::CHAIN + 2].copy_from_slice(&18u16.to_le_bytes());
+            bytes
+        };
+
+        let plain = parse("D.DAT", &fcr(&[definition(flag::DUPLICATES | flag::EXTENDED)]), 1, &[])
+            .expect("a plain duplicate key parses");
+        assert_eq!(plain[0].chain, Some(18), "a chained duplicate key names its pair");
+
+        let repeating = parse(
+            "R.DAT",
+            &fcr(&[definition(
+                flag::DUPLICATES | flag::EXTENDED | flag::REPEATING_DUPLICATES,
+            )]),
+            1,
+            &[],
+        )
+        .expect("a repeating duplicate key parses rather than being refused");
+        assert_eq!(
+            repeating[0].chain, None,
+            "there is no in-record pair, whatever the definition's bytes say"
+        );
+        assert!(repeating[0].duplicates, "it still permits duplicates");
     }
 
     #[test]
