@@ -995,6 +995,12 @@ fn routines<A: Abi>() -> Vec<(&'static str, &'static str, Shim<A>, Cleans, Evide
         // datum it reports through -- is registered in `crate::globals`,
         // not here; see `gsbl::btuict`'s own doc comment.
         (GALGSBL, "btuict", gsbl::btuict, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        // Task 5: btueba, chiinp and chious -- the echo buffer. All three
+        // agree with chiout (above) that this host has no echo buffer
+        // distinct from Channel::output.
+        (GALGSBL, "btueba", gsbl::btueba, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "chiinp", gsbl::chiinp, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
+        (GALGSBL, "chious", gsbl::chious, Cleans::Caller, Evidence::VendorProto("INC/BRKTHU.H")),
         // Allocation. `alcblok`/`ptrblok`/`freblok` are NOT here -- the two
         // vendor branches have structurally different headers, so they are
         // ABI-concrete in both native tables below.

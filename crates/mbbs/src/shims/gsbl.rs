@@ -1266,6 +1266,78 @@ pub fn chiout<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Void)
 }
 
+/// The guide's echo-buffer capacity (`btueba`; `btuchi` CAUTIONS,
+/// page 49). This host has no echo buffer distinct from
+/// [`crate::gsbl::Channel::output`] -- [`chiout`] established that -- so the
+/// figure is a reporting scale rather than a real bound.
+const ECHO_BUFFER: usize = 255;
+
+/// `int btueba(int chan)` -- echo buffer space available, in bytes (guide
+/// `btueba`).
+///
+/// Guide: 0 is full, 255 is empty. Answered against [`ECHO_BUFFER`] rather
+/// than against `OUTSIZ`, because a caller asks this to decide how much it
+/// may hand [`chious`], and the guide's 255-byte contract is what such a
+/// caller was written against.
+///
+/// **What would reveal this wrong:** a module that treats the answer as the
+/// genuine remaining capacity of the output buffer and stops writing while
+/// `OUTSIZ` still has room, or one that spins waiting for a number this can
+/// never reach. Nothing in the corpus does either today.
+pub fn btueba<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    Ok(match on_channel(host, chan, |g, chan| {
+        ECHO_BUFFER.saturating_sub(g.channel(chan).output.len()) as u16
+    }) {
+        Some(free) => abi::Ret::Int(A::Int::from(free)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `void chiinp(int chan,char c)` -- simulate one received character (guide
+/// `btuchi` ADVANCED USAGE, pages 47-49).
+///
+/// Goes through [`crate::gsbl::Gsbl::push_input`], the same door a byte off
+/// the socket uses, so the guide's "just as if it had been received" holds
+/// for the translate table, backspace cooking, `maxinl` and the `CRSTG`
+/// status alike. Injecting into `Channel::input` directly would bypass all
+/// four and is the obvious wrong shortcut here.
+pub fn chiinp<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(c) = u8_arg::<A>(call.int()) else {
+        host.note(format!("chiinp: channel {chan}: character argument does not fit a byte"));
+        return Ok(abi::Ret::Void);
+    };
+    let Some(chan) = host.gsbl().terms().chan(chan) else {
+        host.note(format!("chiinp: channel {chan} is out of range; character dropped"));
+        return Ok(abi::Ret::Void);
+    };
+    host.gsbl_mut().push_input(chan, &[c]);
+    Ok(abi::Ret::Void)
+}
+
+/// `void chious(int chan,const char *stg)` -- string output via the echo
+/// buffer (guide `btuchi` ADVANCED USAGE, pages 47-49).
+///
+/// [`chiout`] for a whole ASCIIZ string. Writes into
+/// [`crate::gsbl::Channel::output`] for the reason `chiout` documents: there
+/// is no separate echo buffer on this host.
+pub fn chious<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let at = call.ptr();
+    let text = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    if on_channel(host, chan, |g, chan| {
+        g.channel_mut(chan).output.extend(text.iter().copied());
+    })
+    .is_none()
+    {
+        host.note(format!("chious: channel {chan} is out of range; string dropped"));
+    }
+    Ok(abi::Ret::Void)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2297,5 +2369,74 @@ mod tests {
             Some(Gsbl::CRSTG),
             "the completed line is still queued -- btuict must not have touched it"
         );
+    }
+
+    // # Task 5: btueba, chiinp and chious -- the echo buffer
+    //
+    // The ruling: this host has no echo buffer distinct from
+    // `Channel::output` -- `chiout`, above, established that -- so all three
+    // of these must agree with it or they disagree about what "the echo
+    // buffer" is.
+
+    #[test]
+    fn btueba_reports_the_guides_255_byte_echo_buffer_scale() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        assert_eq!(f.invoke(btueba, &[0]).expect("btueba"), Ret::U16(255), "empty");
+
+        f.host
+            .gsbl_mut()
+            .channel_mut(console)
+            .output
+            .extend(b"12345".iter().copied());
+        assert_eq!(f.invoke(btueba, &[0]).expect("btueba"), Ret::U16(250));
+    }
+
+    #[test]
+    fn btueba_saturates_at_zero_rather_than_going_negative() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let full = vec![b'x'; 300];
+        f.host.gsbl_mut().channel_mut(console).output.extend(full);
+        assert_eq!(f.invoke(btueba, &[0]).expect("btueba"), Ret::U16(0));
+    }
+
+    #[test]
+    fn chiinp_simulates_a_received_character() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(chiinp, &[0, b'q' as u16]).expect("void");
+        // A DEFAULT CHANNEL IS COOKED, so the byte lands in `line`, not
+        // `input`. `Channel::take` fills `input` only in raw mode
+        // (`gsbl.rs:732,734`); a cooked byte lands in `line` (`:790`) until a
+        // CR moves it to `ready` (`:797`). Asserting on `input` would assert
+        // on a buffer this path never touches.
+        assert_eq!(f.host.gsbl().channel(console).line, b"q".to_vec());
+    }
+
+    #[test]
+    fn chiinp_goes_through_the_cooking_pipeline_not_around_it() {
+        // The discriminating test: only the `push_input` path raises CRSTG
+        // and completes a line. A `chiinp` that shoved the byte straight
+        // into a buffer would satisfy the test above and fail this one.
+        let mut f = Fixture::new();
+        let console = f.console();
+        for b in b"hi\r" {
+            f.invoke(chiinp, &[0, u16::from(*b)]).expect("void");
+        }
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(Gsbl::CRSTG));
+        assert_eq!(
+            f.host.gsbl().channel(console).ready.front().map(Vec::as_slice),
+            Some(&b"hi"[..])
+        );
+    }
+
+    #[test]
+    fn chious_writes_a_whole_string_where_chiout_writes_one_byte() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        let s = f.text("hello");
+        f.invoke(chious, &[0, s.offset, s.selector]).expect("void");
+        assert_eq!(f.host.gsbl_mut().drain_output(console), b"hello".to_vec());
     }
 }
