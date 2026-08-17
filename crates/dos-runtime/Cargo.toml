@@ -9,6 +9,7 @@ publish.workspace = true
 clap = { version = "4", features = ["derive"] }
 dos = { path = "../dos" }
 libc = "0.2"
+mbbs-machine = { path = "../mbbs-machine" }
 
 [lints]
 workspace = true

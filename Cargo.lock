@@ -264,6 +264,7 @@ dependencies = [
  "clap",
  "dos",
  "libc",
+ "mbbs-machine",
 ]
 
 [[package]]
