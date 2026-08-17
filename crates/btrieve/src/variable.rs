@@ -77,13 +77,24 @@ const TAG: usize = 0x01;
 
 /// Where a variable page names the next variable page with room in it.
 ///
-/// The **write side's** free list, and `0xffffffff` when there is none, which
-/// is what all 3,467 of `WCCTEXT`'s variable pages read. Nothing here follows
-/// it -- a read never needs to know where there is space -- but it is decoded
-/// rather than skipped so that the four bytes are never mistaken for the
-/// fragment count or for payload. `W32MKDE_decompiled.c:19267`
-/// (`FUN_00420da0`) is the allocator that maintains it.
+/// The **write side's** free list. A [`super::pages::long`], with three
+/// meanings rather than two -- see [`FreeChain`], and
+/// `docs/2026-08-17-variable-write-oracle.md` for the ladder that measured
+/// them. `W32MKDE_decompiled.c:19267` (`FUN_00420da0`) is the allocator that
+/// maintains it, and `0xa0` of the live file control record is where the
+/// chain starts.
 const FREE_CHAIN: usize = 0x06;
+
+/// Where the file control record keeps the head of the free-space chain.
+///
+/// A [`super::pages::long`] in the **live** half of the control-record shadow
+/// pair. Not recoverable from the decompile, which reads the head out of the
+/// engine's in-memory file block: measured in
+/// `docs/2026-08-17-variable-write-oracle.md` by filling one variable page and
+/// spilling onto a second, then cross-checked against every populated
+/// `wcctext2.vir` here, in each of which it names a page the file tags `'V'`.
+#[allow(dead_code, reason = "consumed by `Space`; landed with its measurement first")]
+pub(crate) const FREE_HEAD: usize = 0xa0;
 
 /// Where a page says how many fragments it holds.
 const FRAGMENT_COUNT: usize = 0x0a;
@@ -201,11 +212,41 @@ struct Header {
     /// How many fragments the page holds.
     fragments: u16,
 
-    /// The next variable page with free space, if there is one. See
-    /// [`FREE_CHAIN`] -- read so that the four bytes are accounted for rather
-    /// than mistaken for payload or for the fragment count, never followed.
-    #[allow(dead_code, reason = "the write side's free list; decoded so the field is not payload")]
-    free_chain: Option<u32>,
+    /// Whether this page is on the file's free-space chain, and what follows
+    /// it there. See [`FreeChain`].
+    free_chain: FreeChain,
+}
+
+/// Where a variable page stands in its file's free-space chain.
+///
+/// **Three states, not two**, which is what
+/// `docs/2026-08-17-variable-write-oracle.md` measured and what this crate
+/// read wrongly before it did. The field at [`FREE_CHAIN`] is a
+/// [`super::pages::long`] like every other page number in the format, and:
+///
+/// | on disk | `pages::long` | meaning |
+/// |---|---|---|
+/// | `00 00 05 00` | 5 | [`Self::Next`] -- on the chain, logical 5 follows |
+/// | `ff 00 ff ff` | [`END_PAGE`] | [`Self::Last`] -- on the chain, and last |
+/// | `ff ff ff ff` | [`NO_PAGE`] | [`Self::Off`] -- not on the chain at all |
+///
+/// Collapsing the last two -- which is what testing only against [`NO_PAGE`]
+/// did -- decodes an ordinary on-chain page as `Some(0x00ff_ffff)`, a page
+/// number no file has. That was invisible while nothing followed the field
+/// and would have been a corruption the moment [`Space`] did.
+///
+/// The head of the chain is **not** here: it is at `0xa0` of the live half of
+/// the file control record, measured in the same document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreeChain {
+    /// The page is full, or otherwise not offered for new fragments.
+    Off,
+
+    /// The page has room and is the last member of the chain.
+    Last,
+
+    /// The page has room, and the next page with room is this one.
+    Next(u32),
 }
 
 impl Header {
@@ -260,8 +301,9 @@ impl Header {
             number,
             fragments,
             free_chain: match super::pages::long(&page[FREE_CHAIN..FREE_CHAIN + 4]) {
-                NO_PAGE => None,
-                page => Some(page),
+                NO_PAGE => FreeChain::Off,
+                END_PAGE => FreeChain::Last,
+                next => FreeChain::Next(next),
             },
         })
     }
@@ -700,6 +742,64 @@ impl PagesMut for FilePages<'_> {
             .and_then(|_| file.flush())
             .map_err(|e| format!("page {number}: {e}"))
     }
+}
+
+/// The divisor behind the engine's default roominess threshold.
+///
+/// `W32MKDE_decompiled.c:19937-19939`: when the file's own threshold is zero
+/// the engine tests `pageSize / 0x14 <= free`. The file's own threshold lives
+/// in the engine's *in-memory* block, so its on-disk home is unknown and every
+/// file here gets this default -- see
+/// `docs/2026-08-17-variable-write-oracle.md`.
+#[allow(dead_code, reason = "consumed by `Space`; landed with its measurement first")]
+const ROOM_DIVISOR: u32 = 20;
+
+/// How many bytes of this page are neither header, fragment, nor entry array.
+///
+/// **Derived, never stored.** `W32MKDE_decompiled.c:19930-19934`
+/// (`FUN_00421ba0`):
+///
+///
+/// `param_1 + 10` is [`FRAGMENT_COUNT`], which is how that routine's offsets
+/// are known to be a page's rather than the in-memory file block's -- the
+/// distinction that governs everything else read off this decompile.
+///
+/// The entry array costs `2 * (fragments + 1)` because it always holds one
+/// more entry than the page has fragments: entry `i` says where fragment `i`
+/// starts, so the last one says where the free space begins.
+///
+/// Confirmed against the genuine engine: inserting a 200-byte body into a page
+/// this reports 86 free bytes for produced an 84-byte fragment and left the
+/// page at exactly zero.
+#[allow(dead_code, reason = "consumed by `Space`; landed with its measurement first")]
+fn free_bytes(page: &[u8], header: Header) -> Result<u32, String> {
+    let len = page.len() as u32;
+    let last = entry_at(len, u32::from(header.fragments))?;
+    let ends = Entry::decode(&page[last..last + 2]).offset;
+    if ends == UNUSED {
+        return Err(format!(
+            "the entry after this page's {} fragments is free, so nothing says where its \
+             fragments end",
+            header.fragments
+        ));
+    }
+    let array = 2 * (u32::from(header.fragments) + 1);
+    len.checked_sub(array)
+        .and_then(|left| left.checked_sub(ends))
+        .ok_or_else(|| {
+            format!(
+                "a {len}-byte page whose {} fragments end at {ends} and whose array needs \
+                 {array} bytes has less than nothing left",
+                header.fragments
+            )
+        })
+}
+
+/// Whether this page has enough room left to be worth offering for new
+/// fragments. `W32MKDE_decompiled.c:19937-19944`.
+#[allow(dead_code, reason = "consumed by `Space`; landed with its measurement first")]
+fn is_roomy(page: &[u8], header: Header) -> Result<bool, String> {
+    Ok(free_bytes(page, header)? >= page.len() as u32 / ROOM_DIVISOR)
 }
 
 #[cfg(test)]
@@ -1157,7 +1257,80 @@ mod tests {
         let header = Header::read(&bytes, 0x1234, Version::V5).expect("a header");
         assert_eq!(header.number, 0x1234);
         assert_eq!(header.fragments, 1);
-        assert_eq!(header.free_chain, None, "no page after it has room");
+        assert_eq!(header.free_chain, FreeChain::Off, "a full page is not on the chain");
+    }
+
+    /// A variable page with the given entry offsets, laid out the way the
+    /// format does: 12-byte header, entry array at the end growing down,
+    /// entry `i` at `len - 2*(i+1)`. `entries` must hold one more offset than
+    /// there are fragments.
+    fn with_entries(len: usize, fragments: u16, chain: [u8; 4], entries: &[u16]) -> Vec<u8> {
+        let mut page = vec![0u8; len];
+        page[PAGE_NUMBER..PAGE_NUMBER + 4].copy_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        page[FREE_CHAIN..FREE_CHAIN + 4].copy_from_slice(&chain);
+        page[FRAGMENT_COUNT..FRAGMENT_COUNT + 2].copy_from_slice(&fragments.to_le_bytes());
+        for (which, offset) in entries.iter().enumerate() {
+            let at = len - 2 * (which + 1);
+            page[at..at + 2].copy_from_slice(&offset.to_le_bytes());
+        }
+        page
+    }
+
+    /// The three states of a page's own link, exactly as they sit on disk.
+    ///
+    /// `docs/2026-08-17-variable-write-oracle.md` measured all three in one
+    /// ladder. Reading `ff 00 ff ff` as "no successor" -- which testing only
+    /// against `NO_PAGE` did -- yielded `Some(0x00ffffff)`, a page number no
+    /// file has.
+    #[test]
+    fn a_pages_link_says_off_the_chain_last_on_it_or_who_is_next() {
+        let off = with_entries(512, 1, [0xff, 0xff, 0xff, 0xff], &[0x0c, 0x70]);
+        let last = with_entries(512, 1, [0xff, 0x00, 0xff, 0xff], &[0x0c, 0x70]);
+        let next = with_entries(512, 1, [0x00, 0x00, 0x05, 0x00], &[0x0c, 0x70]);
+
+        let read = |p: &[u8]| Header::read(p, 1, Version::V5).expect("a header").free_chain;
+
+        assert_eq!(read(&off), FreeChain::Off, "ffffffff: full, not offered");
+        assert_eq!(read(&last), FreeChain::Last, "ff00ffff: on the chain, and last");
+        assert_eq!(read(&next), FreeChain::Next(5), "the chain went 3 -> 5 -> 4 -> end");
+    }
+
+    /// Free space is derived from the fragment count and the last entry;
+    /// there is no field holding it.
+    ///
+    /// The numbers are the genuine engine's own, from the oracle ladder: a
+    /// 512-byte page holding two 204-byte fragments reports 86 free bytes,
+    /// and the engine then wrote an 84-byte fragment into it and left the
+    /// page at exactly zero.
+    #[test]
+    fn free_space_is_the_page_less_its_fragments_and_its_entry_array() {
+        let two = with_entries(512, 2, [0xff, 0x00, 0xff, 0xff], &[0x0c, 0xd8, 0x1a4]);
+        let header = Header::read(&two, 1, Version::V5).expect("a header");
+        assert_eq!(free_bytes(&two, header), Ok(86), "512 - 2*(2+1) - 0x1a4");
+
+        let full = with_entries(512, 3, [0xff, 0xff, 0xff, 0xff], &[0x0c, 0xd8, 0x1a4, 0x1f8]);
+        let header = Header::read(&full, 1, Version::V5).expect("a header");
+        assert_eq!(free_bytes(&full, header), Ok(0), "the engine filled it exactly");
+    }
+
+    /// The page the engine filled to zero came off the chain; the one with
+    /// 246 bytes left stayed on it. The threshold between them is
+    /// `pageSize / 20`.
+    #[test]
+    fn a_page_is_roomy_only_above_a_twentieth_of_its_size() {
+        let full = with_entries(512, 3, [0xff, 0xff, 0xff, 0xff], &[0x0c, 0xd8, 0x1a4, 0x1f8]);
+        let header = Header::read(&full, 1, Version::V5).expect("a header");
+        assert_eq!(is_roomy(&full, header), Ok(false), "0 free is not roomy");
+
+        // 512/20 = 25, so 25 free bytes is roomy and 24 is not. The engine
+        // compares `pageSize / 0x14 <= free`, so the boundary is inclusive.
+        let at = with_entries(512, 1, [0xff, 0x00, 0xff, 0xff], &[0x0c, 512 - 4 - 25]);
+        let header = Header::read(&at, 1, Version::V5).expect("a header");
+        assert_eq!(is_roomy(&at, header), Ok(true), "exactly at the threshold is roomy");
+
+        let below = with_entries(512, 1, [0xff, 0x00, 0xff, 0xff], &[0x0c, 512 - 4 - 24]);
+        let header = Header::read(&below, 1, Version::V5).expect("a header");
+        assert_eq!(is_roomy(&below, header), Ok(false), "one byte below is not");
     }
 
     // `rewrite_fragment_in_place` -- the one shape a `dupdbtv` write to
