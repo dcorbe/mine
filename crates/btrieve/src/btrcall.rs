@@ -540,7 +540,7 @@ mod tests {
     }
 
     use crate::testing::{Flat, FlatHeap, FlatMem};
-    use crate::{Btrieve, Geometry};
+    use crate::{create, Btrieve, FileSpec, Geometry, KeySpec, SegmentSpec};
     use std::path::Path;
 
     /// The whole round trip through numbers: open a real file, read its
@@ -711,5 +711,338 @@ mod tests {
         )
         .expect("Get Next is modelled");
         assert_eq!(status, Status(9), "no record past the last one");
+    }
+
+    /// A fresh, empty, single-key file this task's tests can insert into,
+    /// update and delete freely -- unlike `SAMPLE.DAT`, which is a shared
+    /// fixture other tests read and must not be mutated.
+    ///
+    /// One key: an unsigned-binary 4-byte value at offset 0. Record length
+    /// 8 -- the 4-byte key plus a 4-byte payload -- is enough to prove a
+    /// value round-trips without needing a real MajorMUD record shape.
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let path = crate::testing::scratch(name).join("SCRATCH.DAT");
+        let spec = FileSpec {
+            record_length: 8,
+            page_size: 512,
+            keys: vec![KeySpec {
+                segments: vec![SegmentSpec {
+                    offset: 0,
+                    length: 4,
+                    kind: 0x0e, // DFAST_UNSIGNED_BINARY
+                    descending: false,
+                }],
+                duplicates: false,
+                modifiable: false,
+            }],
+        };
+        create(&path, &spec).expect("creates a scratch Btrieve file");
+        path
+    }
+
+    /// Open `path` through `btrcall` op 0 and hand back the position block
+    /// it recorded -- every test below starts here, through the numeric
+    /// interface, exactly like a real guest would.
+    fn open_scratch(
+        session: &mut Btrieve<Flat>,
+        mem: &mut FlatMem,
+        heap: &mut FlatHeap,
+        path: &std::path::Path,
+    ) -> [u8; 128] {
+        let mut posblk = [0u8; 128];
+        let mut keybuf = path.to_string_lossy().as_bytes().to_vec();
+        keybuf.push(0);
+        let status = btrcall(
+            session,
+            mem,
+            heap,
+            Call {
+                op: 0,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 64,
+                keybuf: &mut keybuf,
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Open is modelled");
+        assert_eq!(status, Status::OK, "the scratch file opened");
+        posblk
+    }
+
+    /// Insert, Get, Update, Get, Delete, Get -- every write-path dispatch
+    /// arm (`insert`, `update`, `delete`) proven through the numeric
+    /// interface, never by calling the typed engine directly.
+    #[test]
+    fn insert_update_and_delete_round_trip_through_numbers_alone() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("insert-update-delete-round-trip");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        // Insert (op 2): key 42, payload [1, 2, 3, 4].
+        let mut databuf = vec![42, 0, 0, 0, 1, 2, 3, 4];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status::OK, "the record was inserted");
+
+        // Get Equal (op 5) by key 42: the inserted record comes back, and
+        // this also establishes currency for the Update below.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "the inserted record was found");
+        assert_eq!(databuf, vec![42, 0, 0, 0, 1, 2, 3, 4], "the bytes round-tripped");
+
+        // Update (op 3): same key, new payload [9, 9, 9, 9].
+        let mut databuf = vec![42, 0, 0, 0, 9, 9, 9, 9];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 3,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Update is modelled");
+        assert_eq!(status, Status::OK, "the record was updated");
+
+        // Get Equal again: the update landed, and this re-establishes
+        // currency for the Delete below.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "the updated record was found");
+        assert_eq!(databuf, vec![42, 0, 0, 0, 9, 9, 9, 9], "the update landed");
+
+        // Delete (op 4): the record Get just positioned on.
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 4,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Delete is modelled");
+        assert_eq!(status, Status::OK, "the record was deleted");
+
+        // Get Equal once more: nothing answers key 42 any longer.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status(9), "the deleted record is gone");
+    }
+
+    /// Step First, Step Next, Step Next past the end -- `step_op` proven
+    /// through the numeric interface, walking physical (insertion) order.
+    #[test]
+    fn step_first_and_next_walk_physical_order_then_answer_status_nine() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("step-first-and-next");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        for record in [vec![100, 0, 0, 0, 1, 1, 1, 1], vec![200, 0, 0, 0, 2, 2, 2, 2]] {
+            let mut databuf = record;
+            let status = btrcall(
+                &mut session,
+                &mut mem,
+                &mut heap,
+                Call {
+                    op: 2,
+                    posblk: &mut posblk,
+                    databuf: &mut databuf,
+                    datalen: &mut 8,
+                    keybuf: &mut Vec::new(),
+                    keylen: 255,
+                    keynum: 0,
+                },
+            )
+            .expect("Insert is modelled");
+            assert_eq!(status, Status::OK);
+        }
+
+        // Step First (op 33): the record inserted first, in physical order.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 33,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Step First is modelled");
+        assert_eq!(status, Status::OK);
+        assert_eq!(databuf, vec![100, 0, 0, 0, 1, 1, 1, 1], "the first-inserted record");
+
+        // Step Next (op 24): the second record.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 24,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Step Next is modelled");
+        assert_eq!(status, Status::OK);
+        assert_eq!(databuf, vec![200, 0, 0, 0, 2, 2, 2, 2], "the second-inserted record");
+
+        // Step Next again: nowhere left to go.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 24,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Step Next is modelled");
+        assert_eq!(status, Status(9), "no third record to step to");
+    }
+
+    /// Close, then the same position block answers a Gap rather than
+    /// silently succeeding -- `close` proven through the numeric interface:
+    /// the block really left `session.open`, not just returned a status.
+    #[test]
+    fn close_removes_the_file_so_a_later_operation_on_the_same_posblk_is_a_gap() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("close-then-gap");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 1,
+                posblk: &mut posblk,
+                databuf: &mut Vec::new(),
+                datalen: &mut 0,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Close is modelled");
+        assert_eq!(status, Status::OK, "the file closed");
+
+        let gap = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5, // Get Equal
+                posblk: &mut posblk,
+                databuf: &mut vec![0u8; 8],
+                datalen: &mut 8,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect_err("a closed file's handle names nothing this session has open");
+        assert!(
+            gap.what.contains("open Btrieve file") || gap.what.contains("not"),
+            "{}",
+            gap.what
+        );
     }
 }
