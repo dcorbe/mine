@@ -60,12 +60,12 @@ use std::path::{Path, PathBuf};
 
 use crate::mem::{Alloc, Mem};
 
-pub use create::{create, FileSpec, KeySpec, SegmentSpec};
-pub use keys::Key;
-pub use ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
-pub use records::{Record, Records};
-use records::V6_SLOT_MARKER;
-pub use stat::{deliver, Stat, StatKey};
+pub use crate::create::{create, FileSpec, KeySpec, SegmentSpec};
+pub use crate::keys::Key;
+pub use crate::ops::{BlockId, Delivery, LockMode, LockTable, Op, OpError, Step};
+pub use crate::records::{Record, Records};
+use crate::records::V6_SLOT_MARKER;
+pub use crate::stat::{deliver, Stat, StatKey};
 
 /// How much of the first page this host reads.
 ///
