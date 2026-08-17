@@ -928,11 +928,17 @@ pub fn btuict<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     at.resolve(call.mem(), take)
         .map_err(|e| ShimError::Failed(e.to_string()))?;
 
-    // `want > 0` matters: an ASCII-mode channel has `trigger == 0`, and
-    // `have >= want` is trivially true against it, so without this guard an
-    // ASCII-mode call would take the drain arm and claim a whole (empty)
-    // block was satisfied instead of falling through to the copy-without-
-    // drain arm below, which is what a `take == 0` genuinely means here.
+    // `want > 0` is checked but, as written, does not change any observable
+    // result -- an ASCII-mode channel has `trigger == 0`, so `take` is
+    // already `want.min(have) == 0` before this branch runs at all, and
+    // `drain(..0)` (the arm below) and `.iter().take(0)` (the arm after it)
+    // are both no-ops on identical state. Dropping the guard has been
+    // mutation-tested and confirmed to fail nothing, for exactly this
+    // reason -- it is an equivalent mutant, not a missed test. It stays
+    // anyway as defence against a future refactor that stops pre-capping
+    // `take` at `want`: the day `take` is computed some other way, this
+    // guard is what keeps an unsatisfied block out of the drain arm rather
+    // than relying on `take` happening to be zero.
     let bytes: Vec<u8> = if have >= want && want > 0 {
         host.gsbl_mut().channel_mut(chan).input.drain(..take).collect()
     } else {
