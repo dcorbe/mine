@@ -45,6 +45,7 @@
 //! `crates/mbbs/tests/btrieve.rs`.
 
 pub mod acs;
+pub mod btrcall;
 pub mod census;
 mod create;
 pub mod keys;
