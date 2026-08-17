@@ -173,11 +173,17 @@ mod tests {
         // is why this list is shorter than it was mid-phase, when the survey
         // ran past the exit and reached `_longjmp` and the whole unwind group.
         //
-        // **The headline risk is nonetheless open**, and it is pinned next door
-        // rather than here: `process::tests::with_a_filesystem_it_reaches_the_borland_unwind_gate`
-        // shows the strict runner stopping at `__Return_unwind` as soon as the
-        // host has a filesystem. `_longjmp` and `__Return_unwind` are the same
-        // wall -- both restore a register set `m32::Machine` cannot set.
+        // `m32::Machine` still has no register setters, so `_longjmp` (and
+        // Borland's `__Return_unwind`, which restores a register set the same
+        // way) would still be a wall if this program's path led there. It no
+        // longer does, as far as anything measured here shows:
+        // `process::tests::with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime`
+        // found that the program only ever reached `__Return_unwind` because
+        // it threw over a missing `WCCMMUD.MCV` -- not because of the
+        // register setters. Supplying a compiled catalogue removes the throw,
+        // and the program runs on into ordinary C runtime file I/O instead of
+        // the unwind group. The gap in `m32::Machine` is real; this program
+        // hitting it is not.
         assert!(
             !crt.iter().any(|r| r.symbol == "_longjmp"),
             "with `_exit` answered the survey stops before the unwind group; \
