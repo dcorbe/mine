@@ -640,6 +640,77 @@ pub fn btuinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     })
 }
 
+/// `int btusts(int chan)` -- the next status code from the channel's status
+/// buffer (guide `btusts`, page 154).
+///
+/// The buffer is a FIFO and this is its only consumer verb; `0` means nothing to report (guide page 155), which is why an empty queue
+/// answers `0` rather than [`OUT_OF_RANGE`]. The named codes are
+/// `BRKTHU.H:30-52` (`RING`, `CMDOK`, `CRSTG`, `INBLK`, `OUTMT`, ...); this
+/// host raises the subset [`crate::gsbl::Gsbl`] declares.
+///
+/// **This host's own poll loop is also a caller.** `Host::poll`
+/// (`crate::Host::poll`, `lib.rs:3401`) pops the same FIFO to decide which
+/// module entry point to dispatch to, so a module that calls `btusts`
+/// directly takes statuses the host would otherwise have routed. That is the
+/// original's behaviour, not a defect introduced here: `MAJORBBS.C`'s main
+/// loop is itself a `btusts` caller, and a module polling underneath it
+/// competes there in exactly the same way. Do not "fix" this by giving the
+/// module a private queue -- there is one status buffer per channel in the
+/// guide, and inventing a second would make `chiinj`/`btuinj` ambiguous
+/// about which one they inject into.
+pub fn btusts<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    Ok(match on_channel(host, chan, |g, chan| g.next_status(chan).unwrap_or(0)) {
+        Some(status) => abi::Ret::Int(A::Int::from(status as u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `int bturst(int chan)` -- reset a channel to its initial default
+/// conditions (guide `bturst`, page 138).
+///
+/// [`crate::gsbl::Gsbl::reset`] is the whole operation and predates this
+/// shim; the guide's hardware and software alike reduces to software
+/// alone on a socket, where there is no hardware half to reset.
+///
+/// **Returns `0`, not `1`.** The guide's four success codes name hardware
+/// categories -- Xecom, Hayes/UART, X.25, LAN -- and the caller acts on which
+/// one it gets. `MAJORBBS.C:4177`'s `case 1` follows up with `btubbr`,
+/// `btuhwh` and `btuusp`, none of which this host serves, so answering 1
+/// would invite three calls it must refuse. `case 0` falls through to the
+/// common tail and asks for nothing further. See this task's ruling in the
+/// plan for the full switch.
+pub fn bturst<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    Ok(match on_channel(host, chan, |g, chan| g.reset(chan)) {
+        Some(()) => abi::Ret::Int(A::Int::from(0u16)),
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
+/// `void chiinj(int chan,int s)` -- inject a status code (guide `btuchi`
+/// ADVANCED USAGE, pages 47-49).
+///
+/// [`btuinj`] with no return value. The guide restricts `chiinj` to being
+/// called from a `btuchi` character interceptor or a `bturti` real-time
+/// handler (page 49); this host installs neither, so today the restriction
+/// cannot be violated and nothing is gained by enforcing it. [`chiout`] --
+/// registered under the same restriction since Track A -- set that
+/// precedent, and the reason holds here: the restriction is the vendor's
+/// advice about interrupt-level reentrancy on a 1994 PC, not a property of
+/// the operation.
+pub fn chiinj<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let Some(status) = i16_arg::<A>(call.int()) else {
+        host.note(format!("chiinj: channel {chan}: status argument does not fit an int16"));
+        return Ok(abi::Ret::Void);
+    };
+    if on_channel(host, chan, |g, chan| g.inject(chan, status)).is_none() {
+        host.note(format!("chiinj: channel {chan} is out of range; status dropped"));
+    }
+    Ok(abi::Ret::Void)
+}
+
 /// `int btuibw(int chan)` -- input bytes waiting.
 ///
 /// Everything not yet handed to the module: raw binary-mode bytes, the line
@@ -1826,5 +1897,80 @@ mod tests {
         let past = f.host.gsbl().terms().count();
         f.invoke(chiout, &[past, b'x' as u16])
             .expect("void routines note and continue -- see chiout's own doc comment");
+    }
+
+    // # Task 2: btusts, chiinj and bturst -- shims over methods that already
+    // existed
+    //
+    // All three delegate to `Gsbl` methods `Host::poll` and `btuinj`/`btucli`
+    // already exercised; what is new here is only that a module can reach
+    // them.
+
+    #[test]
+    fn btusts_pops_the_status_fifo_in_order_then_answers_quiet() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.host.gsbl_mut().inject(console, Gsbl::CRSTG);
+        f.host.gsbl_mut().inject(console, Gsbl::OUTMT);
+
+        assert_eq!(f.invoke(btusts, &[0]).expect("btusts"), Ret::U16(Gsbl::CRSTG as u16));
+        assert_eq!(f.invoke(btusts, &[0]).expect("btusts"), Ret::U16(Gsbl::OUTMT as u16));
+        // Guide page 155: 0 is nothing to report -- an empty
+        // FIFO is not an error and must not answer OUT_OF_RANGE.
+        assert_eq!(f.invoke(btusts, &[0]).expect("btusts"), Ret::U16(0));
+    }
+
+    #[test]
+    fn btusts_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(btusts, &[9999]).expect("btusts"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn bturst_returns_a_channel_to_its_defaults() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        // Dirty every kind of state a reset must clear.
+        f.host.gsbl_mut().channel_mut(console).width = 40;
+        f.host.gsbl_mut().channel_mut(console).echo = false;
+        // Seeded directly into `input`, not through `push_input`: this
+        // channel is in cooked ASCII mode (the default), where an
+        // unterminated byte string is assembled into `Channel::line`, not
+        // `Channel::input` -- see `Channel::take`'s default-arm. Going
+        // through `push_input` here would leave `input` empty before *and*
+        // after `bturst`, making the assertion below pass whether or not
+        // the reset ran at all.
+        f.host.gsbl_mut().channel_mut(console).input.extend(b"half-typed".iter().copied());
+        f.host.gsbl_mut().inject(console, Gsbl::CRSTG);
+
+        assert_eq!(
+            f.invoke(bturst, &[0]).expect("bturst"),
+            Ret::U16(0),
+            "see the ruling: 0, not 1"
+        );
+
+        let c = f.host.gsbl().channel(console);
+        assert_eq!(c.width, 0);
+        assert!(c.echo, "echo defaults on");
+        assert!(c.input.is_empty(), "a half-typed line must not survive into the next session");
+        assert_eq!(
+            f.host.gsbl_mut().next_status(console),
+            None,
+            "and neither must a queued status"
+        );
+    }
+
+    #[test]
+    fn bturst_refuses_a_channel_out_of_range() {
+        let mut f = Fixture::new();
+        assert_eq!(f.invoke(bturst, &[9999]).expect("bturst"), Ret::U16(OUT_OF_RANGE));
+    }
+
+    #[test]
+    fn chiinj_queues_a_status_the_host_then_dispatches() {
+        let mut f = Fixture::new();
+        let console = f.console();
+        f.invoke(chiinj, &[0, Gsbl::CRSTG as u16]).expect("void");
+        assert_eq!(f.host.gsbl_mut().next_status(console), Some(Gsbl::CRSTG));
     }
 }
