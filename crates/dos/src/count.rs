@@ -104,6 +104,13 @@ mod tests {
     }
 
     #[test]
+    fn claims_forwards_the_inner_services_claim() {
+        let c = Counting::new(Echo);
+        assert_eq!(c.claims(), Echo.claims());
+        assert_eq!(c.claims(), &[0x21]);
+    }
+
+    #[test]
     fn it_counts_calls_and_preserves_the_order_they_arrived_in() {
         let mut g = TestGuest::new(4096);
         let mut c = Counting::new(Echo);
