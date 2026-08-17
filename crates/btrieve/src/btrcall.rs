@@ -228,7 +228,8 @@ pub fn btrcall<M: Mem>(
         Outcome::Insert => insert(session, call),
         Outcome::Update => update(session, call),
         Outcome::Delete => delete(session, call),
-        Outcome::Query(_) | Outcome::Stat | Outcome::Stop => Err(Gap {
+        Outcome::Stat => stat(session, call),
+        Outcome::Query(_) | Outcome::Stop => Err(Gap {
             what: format!("operation {} is named but not yet dispatched", call.op),
         }),
         Outcome::Unmodelled(n) => Err(Gap {
@@ -329,6 +330,41 @@ fn get<M: Mem>(
         Ok(None) => Ok(Status(9)),
         Err(e) => status_of(&e),
     }
+}
+
+/// Op 15: report a file's shape and key definitions in Btrieve's own reply
+/// format.
+///
+/// **Not a byte layout invented here.** [`crate::stat::Stat::read`] and
+/// [`crate::stat::Stat::wire`] already build the full reply -- see that
+/// module's own doc comment for the provenance: every field measured against
+/// genuine Pervasive Btrieve 6.15 under Wine, not inferred from the vendor
+/// header. This is the numeric door onto that already-built and already-
+/// tested reply, the same shape every other arm in this file is: delegate,
+/// never restate. [`crate::stat::deliver`] then trims the full reply to
+/// whatever the caller's own buffer can hold, exactly the way [`get`] trims a
+/// record it delivers.
+fn stat<M: Mem>(session: &crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    let block = &session.open[index];
+
+    let built = crate::stat::Stat::read(&block.name, &block.path, &block.geometry, &block.keys)
+        .map_err(|e| Gap {
+            what: format!("STAT on {}: {e}", block.name),
+        })?;
+    let full = built.wire(block.geometry.version, call.keynum);
+    let (bytes, short) = crate::stat::deliver(&full, call.databuf.len());
+
+    *call.datalen = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    call.databuf.clear();
+    call.databuf.extend_from_slice(bytes);
+
+    // A reply cut short of the full one is a success with a truncated
+    // answer, not a failure -- the same real Btrieve status 22 `get` answers
+    // for the same reason. See `crate::stat::deliver`'s own doc comment for
+    // what "short" means here: whole 16-byte units only, nothing narrower.
+    Ok(if short { Status(22) } else { Status::OK })
 }
 
 /// Ops 24, 33-35: physical order, no key. Same shape as [`get`], but
