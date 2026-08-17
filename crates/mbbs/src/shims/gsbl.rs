@@ -119,6 +119,13 @@ use crate::gsbl::Gsbl;
 /// cannot happen.
 pub(crate) const OUT_OF_RANGE: u16 = -11i16 as u16;
 
+/// `btucmd`'s answer: the command was not accepted. `BRKTHU.H:151` gives the
+/// return as "zero means OK" and enumerates no failure values, so any non-zero
+/// will do; `-1` is chosen because it is distinct from [`OUT_OF_RANGE`] and
+/// from every `btusts` status code, so a log showing it cannot be confused
+/// with either.
+pub(crate) const CMD_NOT_ACCEPTED: u16 = -1i16 as u16;
+
 /// Run `body` against a channel, or answer `-11`.
 ///
 /// Every one of the fourteen begins this way, so it is written once. The
@@ -995,19 +1002,61 @@ pub fn btuica<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret
     Ok(abi::Ret::Int(A::int_from_u32(take as u32)))
 }
 
+/// `int btucmd(int chan,const char *cmdstg)` -- command the UART or modem on a
+/// channel (guide `btucmd`, page 54). **Always answers "not accepted".**
+///
+/// The guide's own example is `btucmd(chan,"WT13055837808M")` -- dial
+/// Galacticomm's demonstration system -- and success is reported later as
+/// `btusts` 12 (Hayes) or 2 (Xecom). There is no modem behind a TCP socket and
+/// there never will be, so this is structural rather than unimplemented. This
+/// is the same ruling [`btuclc`] rests on: it can clear a command buffer
+/// trivially *because* no command can ever be in progress.
+///
+/// **Why this answers rather than returning `Err`, unlike [`btuchi`].**
+/// `btuchi` refuses because it cannot tell its caller anything -- it installs a
+/// callback and returns, so a caller quietly never called back has no way to
+/// notice, which is why its doc calls a silent success "worse than refusing".
+/// `btucmd` has the opposite property: `BRKTHU.H:151` documents the return as
+/// "zero means OK", so non-zero is the vendor's own in-band way to say the
+/// command was not accepted. Six modules in the corpus import this; telling
+/// them "no" lets them handle it, where an `Err` would fail the call itself.
+///
+/// **What would reveal this wrong:** a module that ignores the return and then
+/// waits on `btusts` for `CMDOK`, which cannot arrive either way. The fix then
+/// is not `Err` -- it is deciding whether this host should synthesise the
+/// failure status. Nothing in the corpus is known to do it.
+pub fn btucmd<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
+    let chan = Into::<u32>::into(call.int()) as i16;
+    let at = call.ptr();
+    let cmdstg = at
+        .read_cstr(call.mem())
+        .map_err(|e| ShimError::Failed(e.to_string()))?;
+    Ok(match on_channel(host, chan, |_, _| ()) {
+        Some(()) => {
+            host.note(format!(
+                "btucmd: channel {chan}: no modem to command on a socket-based host; \
+                 answering not-accepted for {:?}",
+                String::from_utf8_lossy(&cmdstg)
+            ));
+            abi::Ret::Int(A::Int::from(CMD_NOT_ACCEPTED))
+        }
+        None => abi::Ret::Int(A::Int::from(OUT_OF_RANGE)),
+    })
+}
+
 /// `int btuclc(int chan)` -- abort any command in progress and clear the
 /// command output buffer (guide `btuclc`, page 50): cancels any command in progress (`btucmd()`, page 54) and empties the channel's command buffer.
 ///
-/// This host has no command channel at all. `btucmd` -- Xecom/Hayes/UART
-/// modem-command control, guide page 54 -- is not implemented anywhere in
-/// this crate (checked: no `btucmd` shim, no command-buffer field on
-/// [`crate::gsbl::Channel`]), and nothing else writes to a "command buffer"
-/// distinct from [`btuclo`]'s ordinary data output buffer. So "a command
-/// was in progress" is never true on this host -- there is no code path
-/// that could have started one -- and "clears the command buffer" is
-/// satisfied because the buffer it would clear does not exist. This
-/// follows from `btucmd`'s absence, checked directly, not from a guess
-/// standing in for unconfirmed vendor behaviour.
+/// This host has no command channel at all. [`btucmd`] -- Xecom/Hayes/UART
+/// modem-command control, guide page 54 -- is implemented, but structurally:
+/// it always answers `CMD_NOT_ACCEPTED` (see its own doc comment for why),
+/// so no command it is handed is ever "in progress", and nothing else writes
+/// to a "command buffer" distinct from [`btuclo`]'s ordinary data output
+/// buffer. So "a command was in progress" is never true on this host --
+/// there is no code path that could have started one -- and "clears the
+/// command buffer" is satisfied because the buffer it would clear does not
+/// exist. This follows from `btucmd` never accepting a command, checked
+/// directly, not from a guess standing in for unconfirmed vendor behaviour.
 pub fn btuclc<A: Abi>(call: &mut Call<A>, host: &mut Host<A>) -> Result<abi::Ret<A>, ShimError> {
     let chan = Into::<u32>::into(call.int()) as i16;
     Ok(match on_channel(host, chan, |_, _| ()) {
@@ -2647,5 +2696,49 @@ mod tests {
         assert_eq!(f.invoke(btumon2, &[0]).expect("btumon2"), Ret::U16(0));
         f.host.gsbl_mut().transmit_raw(console, b"Q");
         assert_eq!(f.invoke(btumds2, &[]).expect("btumds2"), Ret::U16(u16::from(b'Q')));
+    }
+
+    // # Task 7: btucmd -- the one symbol that cannot be performed
+    //
+    // btucmd commands a UART or modem, and there is no modem behind a TCP
+    // socket. It answers CMD_NOT_ACCEPTED rather than 0 (which would claim a
+    // dial succeeded) or Err (which would fail the call for all six
+    // importing modules instead of telling them "no"). See btucmd's own doc
+    // comment for the full ruling and why it departs from btuchi's refusal.
+
+    #[test]
+    fn btucmd_answers_not_accepted_rather_than_claiming_a_dial_succeeded() {
+        let mut f = Fixture::new();
+        let cmd = f.text("WT13055837808M");
+        let ret = f
+            .invoke(btucmd, &[0, cmd.offset, cmd.selector])
+            .expect("must not stop the machine");
+        assert_ne!(ret, Ret::U16(0), "zero would claim the command was accepted");
+        assert_ne!(ret, Ret::U16(OUT_OF_RANGE), "the channel is fine; the command is not");
+    }
+
+    #[test]
+    fn btucmd_still_bound_checks_its_channel() {
+        let mut f = Fixture::new();
+        let past = f.host.gsbl().terms().count();
+        let cmd = f.text("WT1");
+        assert_eq!(
+            f.invoke(btucmd, &[past, cmd.offset, cmd.selector])
+                .expect("must not stop the machine"),
+            Ret::U16(OUT_OF_RANGE)
+        );
+    }
+
+    #[test]
+    fn btucmd_says_why_in_the_host_log() {
+        let mut f = Fixture::new();
+        let cmd = f.text("WT13055837808M");
+        f.invoke(btucmd, &[0, cmd.offset, cmd.selector])
+            .expect("must not stop the machine");
+        assert!(
+            f.host.notes().iter().any(|n| n.contains("no modem")),
+            "a refusal nobody can read is a silent failure: {:?}",
+            f.host.notes()
+        );
     }
 }
