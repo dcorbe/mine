@@ -1121,9 +1121,16 @@ mod tests {
         std::fs::write(root.join("A.DAT"), b"x").expect("seed file");
 
         let mut without_dirs = vec![a.find_first(b"*.*\0", 0).expect("a match exists").name];
-        while let Ok(e) = a.find_next() {
-            without_dirs.push(e.name);
+        for _ in 0..8 {
+            match a.find_next() {
+                Ok(e) => without_dirs.push(e.name),
+                Err(_) => break,
+            }
         }
+        assert!(
+            without_dirs.len() < 8,
+            "find_next did not terminate: {without_dirs:?}"
+        );
         assert!(
             !without_dirs.contains(&"SUBDIR".to_string()),
             "a plain search must not report directories: {without_dirs:?}"
@@ -1135,9 +1142,16 @@ mod tests {
                 .expect("a match exists")
                 .name,
         ];
-        while let Ok(e) = a.find_next() {
-            with_dirs.push(e.name);
+        for _ in 0..8 {
+            match a.find_next() {
+                Ok(e) => with_dirs.push(e.name),
+                Err(_) => break,
+            }
         }
+        assert!(
+            with_dirs.len() < 8,
+            "find_next did not terminate: {with_dirs:?}"
+        );
         assert!(
             with_dirs.contains(&"SUBDIR".to_string()),
             "with ATTR_DIRECTORY set, directories must be included: {with_dirs:?}"
