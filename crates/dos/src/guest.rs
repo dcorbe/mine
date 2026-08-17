@@ -13,7 +13,7 @@
 /// two edges genuinely disagree about (an LDT descriptor base under a signal,
 /// `seg << 4` under real mode), so the disagreement stays on their side of the
 /// trait rather than leaking into every call that takes a pointer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Ptr {
     pub seg: u16,
     pub off: u16,
@@ -85,6 +85,27 @@ pub enum Fault {
     /// A terminated string ran `max` bytes without its terminator.
     Unterminated { at: Ptr, term: u8, max: usize },
 }
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fault::OutOfBounds { at, len } => {
+                write!(f, "{:04x}:{:04x}+{len} leaves the address space", at.seg, at.off)
+            }
+            Fault::Unterminated { at, term, max } => write!(
+                f,
+                "{:04x}:{:04x}: no {term:#04x} terminator within {max} bytes",
+                at.seg, at.off
+            ),
+        }
+    }
+}
+
+/// So `Fault` can be `btrieve::mem::Mem::Error` -- a `Mem` implementor over
+/// guest memory has nothing to report a bad pointer with *except* the fault
+/// this trait already defines, and the engine only ever renders it with
+/// `to_string`.
+impl std::error::Error for Fault {}
 
 /// What a DOS call needs from whatever is executing the program.
 pub trait Guest {

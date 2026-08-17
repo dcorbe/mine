@@ -33,6 +33,7 @@
 //! crate cannot collide with the work in flight on that branch.
 
 pub mod bios;
+pub mod btrieve;
 pub use ::dos::kernel as dos;
 pub mod driver;
 pub use ::dos::files;
