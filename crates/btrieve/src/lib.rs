@@ -44,6 +44,7 @@
 //! FCR, verified against all eighteen files MajorMUD ships by
 //! `crates/mbbs/tests/btrieve.rs`.
 
+pub mod census;
 mod create;
 pub mod keys;
 pub mod mem;

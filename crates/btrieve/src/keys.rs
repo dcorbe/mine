@@ -25,16 +25,16 @@ use std::cmp::Ordering;
 use super::BtvError;
 
 /// Where the key definitions start in the file control record.
-const BASE: usize = 0x110;
+pub(crate) const BASE: usize = 0x110;
 
 /// Bytes of one key definition.
-const WIDTH: usize = 0x1e;
+pub(crate) const WIDTH: usize = 0x1e;
 
 /// `BTVSTF.H:13` -- the most segments a file may have.
 pub const SEGMAX: usize = 24;
 
 /// Where each field of a key definition sits.
-mod at {
+pub(crate) mod at {
     /// Attribute flags.
     pub const ATTRIBUTES: usize = 0x08;
     /// Where a duplicate-permitting key's in-record `[prev][next]` chain pair
@@ -60,7 +60,7 @@ mod at {
 }
 
 /// The attribute bits this reader understands.
-mod flag {
+pub(crate) mod flag {
     /// More than one record may carry this key value.
     pub const DUPLICATES: u16 = 1 << 0;
     /// An update may change this key's value.
@@ -76,6 +76,13 @@ mod flag {
     /// **Another segment of the same key follows this one.** `BTVSTF.H:59`
     /// names this one: `#define ANOSEG 0x10`.
     pub const ANOSEG: u16 = 1 << 4;
+    /// The key collates through a numbered alternate character sequence.
+    ///
+    /// Named here rather than written as a bare `1 << 5` in [`UNSUPPORTED`]
+    /// because [`crate::census`] reports this bit for definitions this module
+    /// *refuses*, and a second literal in a second file is one edit away from
+    /// disagreeing with this one.
+    pub const ALT_COLLATING: u16 = 1 << 5;
     /// The segment sorts backwards.
     pub const DESCENDING: u16 = 1 << 6;
     /// The type is in [`at::EXTENDED`] rather than implied by the flags.
@@ -101,7 +108,7 @@ mod flag {
 const UNSUPPORTED: [(u16, &str); 4] = [
     (1 << 3, "null-all-segments"),
     (1 << 9, "null-any-segment"),
-    (1 << 5, "a numbered alternate collating sequence"),
+    (flag::ALT_COLLATING, "a numbered alternate collating sequence"),
     (1 << 7, "repeating duplicates"),
 ];
 
