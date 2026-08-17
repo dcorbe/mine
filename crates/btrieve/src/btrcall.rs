@@ -126,6 +126,9 @@ pub enum Outcome {
     Delete,
     /// Op 15.
     Stat,
+    /// Op 22, `dfaAbs`: where the file is currently positioned, as a
+    /// physical position.
+    AbsolutePosition,
     /// Op 25 -- close every file and release everything.
     Stop,
     /// Ops 5-13: a keyed read.
@@ -160,6 +163,7 @@ pub fn describe(op: u16) -> Outcome {
         3 => Outcome::Update,
         4 => Outcome::Delete,
         15 => Outcome::Stat,
+        22 => Outcome::AbsolutePosition,
         25 => Outcome::Stop,
         other => Outcome::Unmodelled(other),
     }
@@ -229,6 +233,7 @@ pub fn btrcall<M: Mem>(
         Outcome::Update => update(session, call),
         Outcome::Delete => delete(session, call),
         Outcome::Stat => stat(session, call),
+        Outcome::AbsolutePosition => absolute_position(session, call),
         Outcome::Query(_) | Outcome::Stop => Err(Gap {
             what: format!("operation {} is named but not yet dispatched", call.op),
         }),
@@ -365,6 +370,28 @@ fn stat<M: Mem>(session: &crate::Btrieve<M>, call: Call<'_>) -> Result<Status, G
     // for the same reason. See `crate::stat::deliver`'s own doc comment for
     // what "short" means here: whole 16-byte units only, nothing narrower.
     Ok(if short { Status(22) } else { Status::OK })
+}
+
+/// Op 22, `dfaAbs`: where the file is currently positioned.
+///
+/// [`crate::ops::Block::get_position`] already computes this -- another case
+/// where the numeric door was simply never opened onto an existing, already-
+/// tested method, the same shape [`stat`] wires in. `re/wg33src/SRC/api/
+/// gcommlib/DFAAPI.C:453`'s `dfaAbs` calls `btvu(22,&abspos,NULL,0,
+/// sizeof(LONG))`: the position comes back through the data buffer as a
+/// four-byte value, not the position block, so that is where this writes it.
+fn absolute_position<M: Mem>(session: &crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    match session.open[index].get_position() {
+        Ok(position) => {
+            call.databuf.clear();
+            call.databuf.extend_from_slice(&position.to_le_bytes());
+            *call.datalen = 4;
+            Ok(Status::OK)
+        }
+        Err(e) => status_of(&e),
+    }
 }
 
 /// Ops 24, 33-35: physical order, no key. Same shape as [`get`], but
@@ -1080,5 +1107,148 @@ mod tests {
             "{}",
             gap.what
         );
+    }
+
+    /// Stat (op 15), proven through the numeric interface rather than only
+    /// through `crate::stat`'s own unit tests -- those cover `Stat::read`/
+    /// `wire`/`deliver` directly, but never `btrcall`'s dispatch arm, which
+    /// is the part this task added. A freshly opened scratch file has one
+    /// key, is not variable-length, and starts with zero records.
+    #[test]
+    fn stat_reports_the_open_files_shape_through_numbers_alone() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("stat-through-numbers");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        // A buffer larger than any real reply gets the whole thing back
+        // untruncated: the file spec (16 bytes) plus one key spec (16 bytes)
+        // for the scratch file's single key.
+        let mut databuf = vec![0u8; 1024];
+        let mut datalen = 1024u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 15,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Stat is modelled");
+        assert_eq!(status, Status::OK, "the whole reply fit");
+        assert_eq!(datalen, 32, "one file spec plus one key spec, 16 bytes each");
+        let reclen = u16::from_le_bytes([databuf[0], databuf[1]]);
+        assert_eq!(reclen, 8, "the scratch file's own record length");
+
+        // Now offer only the file spec's own 16 bytes: a whole unit, but
+        // short of the full 32-byte reply -- status 22, the same truncated-
+        // but-not-failed convention `get` uses, and the key spec must not
+        // appear at all.
+        let mut databuf = vec![0u8; 16];
+        let mut datalen = 16u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 15,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Stat is modelled");
+        assert_eq!(status, Status(22), "short of the full reply by one key spec");
+        assert_eq!(datalen, 16, "the file spec alone, no partial key spec");
+    }
+
+    /// Absolute Position (op 22), `dfaAbs`: not positioned yet is status 8,
+    /// then a Get Equal establishes currency and the position comes back as
+    /// a four-byte value in the data buffer -- `re/wg33src/SRC/api/gcommlib/
+    /// DFAAPI.C:453`'s own calling convention, not the position block.
+    #[test]
+    fn absolute_position_answers_not_positioned_then_a_real_position() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("absolute-position-through-numbers");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        let abs = |session: &mut Btrieve<Flat>, mem: &mut FlatMem, heap: &mut FlatHeap, posblk: &mut [u8; 128]| {
+            let mut databuf = vec![0xffu8; 4];
+            let mut datalen = 4u32;
+            let status = btrcall(
+                session,
+                mem,
+                heap,
+                Call {
+                    op: 22,
+                    posblk,
+                    databuf: &mut databuf,
+                    datalen: &mut datalen,
+                    keybuf: &mut Vec::new(),
+                    keylen: 255,
+                    keynum: 0,
+                },
+            )
+            .expect("Absolute Position is modelled");
+            (status, databuf, datalen)
+        };
+
+        let (status, _, _) = abs(&mut session, &mut mem, &mut heap, &mut posblk);
+        assert_eq!(status, Status(8), "nothing has positioned this file yet");
+
+        let mut databuf = vec![7, 0, 0, 0, 1, 2, 3, 4];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+        assert_eq!(status, Status::OK);
+
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5, // Get Equal
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![7, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "positioned on the record just inserted");
+
+        let (status, databuf, datalen) = abs(&mut session, &mut mem, &mut heap, &mut posblk);
+        assert_eq!(status, Status::OK);
+        assert_eq!(datalen, 4, "a LONG, per DFAAPI.C's own sizeof(LONG)");
+        let position = u32::from_le_bytes(databuf.try_into().expect("4 bytes"));
+        assert_ne!(position, 0, "a real physical position, not the fill byte pattern read back");
     }
 }
