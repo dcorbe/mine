@@ -4392,6 +4392,7 @@ mod tests {
             modifiable: true,
             chain: None,
                     acs: None,
+                    null: None,
 }];
         Block {
             id: ops::BlockId::fresh(),
@@ -4751,6 +4752,7 @@ mod tests {
             modifiable: false,
             chain: None,
                     acs: None,
+                    null: None,
 }];
 
         let mut before = vec![0u8; 16];
@@ -5864,6 +5866,7 @@ mod tests {
             modifiable: true,
             chain: None,
                     acs: None,
+                    null: None,
 }];
         Block {
             id: ops::BlockId::fresh(),
@@ -6112,6 +6115,7 @@ mod tests {
             modifiable: true,
             chain: None,
                     acs: None,
+                    null: None,
 }];
         Block {
             id: ops::BlockId::fresh(),
@@ -6598,6 +6602,7 @@ mod tests {
                 modifiable: true,
                 chain: None,
                             acs: None,
+                            null: None,
 },
             Key {
                 number: 1,
@@ -6607,6 +6612,7 @@ mod tests {
                 modifiable: true,
                 chain: None,
                             acs: None,
+                            null: None,
 },
         ];
         Block {

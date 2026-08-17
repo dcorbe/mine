@@ -105,6 +105,106 @@ static void die(const char *what, int st)
     exit(1);
 }
 
+/* A key with arbitrary attribute flags and a declared null value.
+ *
+ * `keys::UNSUPPORTED` refuses three bits outright -- null-all-segments
+ * (1<<3), repeating-duplicates (1<<7) and null-any-segment (1<<9) -- because
+ * all three change what the INDEX CONTAINS, and this host derives order by
+ * sorting the records rather than reading the index. A record the engine's
+ * index omits would still be handed to a module, with nothing reporting an
+ * error.
+ *
+ * So the question is not how such a key is ordered but which records it
+ * leaves out, and that needs a file with the bit set and a record whose key
+ * is the null value. This makes one. */
+static void create_flags(const char *path, WORD width, BYTE type, WORD flags,
+                         BYTE nullval)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    DWORD dlen = sizeof data;
+    int st;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = 16;
+    fs->pagesize = 512;
+    fs->indexes_raw = 1;
+    fs->flags = 0x0000;
+
+    ks->position = 1;
+    ks->length = width;
+    ks->flags = flags;
+    ks->ext_type = type;
+    ks->null_value = nullval;
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                 (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("create_flags", st);
+    printf("created %s key len=%u type=%#04x flags=%#06x null=%#04x\n",
+           path, width, type, flags, nullval);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
+/* One key over TWO two-byte segments, both carrying `flags`.
+ *
+ * The discriminating rig for the two null bits. Over a single segment,
+ * "all segments are null" and "any segment is null" are the same test and a
+ * one-segment file cannot tell them apart -- which is exactly what the
+ * single-segment runs showed, both omitting one record. With two segments a
+ * record whose FIRST half is null and second half is not separates them:
+ * null-any should drop it, null-all should keep it.
+ *
+ * `ANOSEG` (0x0010) on the first segment is what says a second follows;
+ * `crtprobe.c` uses the same bit. */
+static void create_two_segments(const char *path, WORD flags, BYTE nullval)
+{
+    char posblk[POSBLK_SIZE];
+    char keybuf[KEY_SIZE];
+    unsigned char data[sizeof(FileSpec) + 2 * sizeof(KeySpec)];
+    FileSpec *fs = (FileSpec *)data;
+    KeySpec *ks = (KeySpec *)(data + sizeof(FileSpec));
+    DWORD dlen = sizeof data;
+    int st;
+
+    memset(posblk, 0, sizeof posblk);
+    memset(data, 0, sizeof data);
+    memset(keybuf, 0, sizeof keybuf);
+    strncpy(keybuf, path, sizeof keybuf - 1);
+
+    fs->reclen = 16;
+    fs->pagesize = 512;
+    fs->indexes_raw = 1;
+    fs->flags = 0x0000;
+
+    ks[0].position = 1;
+    ks[0].length = 2;
+    ks[0].flags = (WORD)(flags | 0x0010);   /* ANOSEG: another segment follows */
+    ks[0].ext_type = 0x0b;
+    ks[0].null_value = nullval;
+
+    ks[1].position = 3;
+    ks[1].length = 2;
+    ks[1].flags = flags;
+    ks[1].ext_type = 0x0b;
+    ks[1].null_value = nullval;
+
+    st = btrcall(B_CREATE, posblk, data, &dlen, keybuf,
+                 (BYTE)(strlen(keybuf) + 1), (char)0);
+    if (st != 0)
+        die("create_two_segments", st);
+    printf("created %s one key over two 2-byte segments flags=%#06x null=%#04x\n",
+           path, flags, nullval);
+    { DWORD d = 0; btrcall(B_CLOSE, posblk, NULL, &d, NULL, 0, 0); }
+}
+
 /* `width` is the key segment's length: 8 for a double, 4 for a float. */
 static void create_typed(const char *path, WORD width, BYTE type)
 {
@@ -324,6 +424,18 @@ int main(int argc, char **argv)
     } else if (!strcmp(cmd, "insert4")) {
         if (argc < 5) { fprintf(stderr, "FAIL: insert needs <value> <tag>\n"); return 2; }
         cmd_insert(path, 4, argv[3], (DWORD)strtoul(argv[4], NULL, 10));
+    } else if (!strcmp(cmd, "create2")) {
+        if (argc < 5) { fprintf(stderr, "FAIL: create2 needs <flags> <null>\n"); return 2; }
+        create_two_segments(path, (WORD)strtoul(argv[3], NULL, 0),
+                            (BYTE)strtoul(argv[4], NULL, 0));
+    } else if (!strcmp(cmd, "createf")) {
+        if (argc < 7) {
+            fprintf(stderr, "FAIL: createf needs <width> <type> <flags> <null>\n");
+            return 2;
+        }
+        create_flags(path, (WORD)atoi(argv[3]), (BYTE)strtoul(argv[4], NULL, 0),
+                     (WORD)strtoul(argv[5], NULL, 0),
+                     (BYTE)strtoul(argv[6], NULL, 0));
     } else if (!strcmp(cmd, "insertraw")) {
         if (argc < 5) { fprintf(stderr, "FAIL: insertraw needs <hex> <tag>\n"); return 2; }
         cmd_insert_raw(path, argv[3], (DWORD)strtoul(argv[4], NULL, 10));

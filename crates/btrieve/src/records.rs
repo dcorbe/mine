@@ -41,6 +41,14 @@ pub(super) const V6_SLOT_MARKER: usize = 2;
 /// Where the free list starts, in the file control record.
 const FREE_LIST: usize = 0x10;
 
+/// A record's place in a key's order when that key omits it from its index.
+///
+/// A sentinel rather than an `Option<usize>` in the rank table: the tables are
+/// rebuilt on every write and `reindex` is measured at 40% of a live board's
+/// CPU, so this keeps them exactly as wide as they were. `Records::place_in`
+/// is the only reader and turns it back into `None`.
+const NOT_INDEXED: usize = usize::MAX;
+
 /// The record pointer that ends a chain.
 pub(super) const NOWHERE: u32 = 0xffff_ffff;
 
@@ -380,7 +388,14 @@ impl Records {
         let mut rank = Vec::with_capacity(keys.len());
         let mut ties = Vec::with_capacity(keys.len());
         for key in keys {
-            let mut sorted: Vec<usize> = (0..self.records.len()).collect();
+            // A key may leave records OUT of its index -- see `keys::Null`,
+            // measured against the genuine engine. This crate derives order by
+            // sorting the records, so the omission has to be reproduced
+            // deliberately: sorting every record would offer a module one that
+            // Btrieve's own index skips, and nothing would report it.
+            let mut sorted: Vec<usize> = (0..self.records.len())
+                .filter(|n| !key.excluded(&self.keyed(&self.records[*n].bytes)))
+                .collect();
             // Ties broken by physical position, so the order is total: two
             // records with the same duplicate key must still come out in the
             // same sequence every run, or `qnxbtv` would step somewhere else on
@@ -395,7 +410,10 @@ impl Records {
                     other => other,
                 }
             });
-            let mut places = vec![0usize; self.records.len()];
+            // `NOT_INDEXED` rather than 0 for a record this key omits: 0 is a
+            // real place, and leaving it there would have an omitted record
+            // claim to be the first in the order.
+            let mut places = vec![NOT_INDEXED; self.records.len()];
             for (place, record) in sorted.iter().enumerate() {
                 places[*record] = place;
             }
@@ -480,7 +498,8 @@ impl Records {
         self.records.get(*order.get(at)?)
     }
 
-    /// How many records a key orders, which is all of them.
+    /// How many records a key orders, which is all of them **unless the key
+    /// declares a null value** -- see [`keys::Null`](super::keys::Null).
     pub fn ordered_len(&self, key: u16) -> Option<usize> {
         Some(self.order.get(usize::from(key))?.len())
     }
@@ -492,7 +511,10 @@ impl Records {
 
     /// Where the record at a place in physical order sits in a key's order.
     pub fn place_in(&self, key: u16, physical: usize) -> Option<usize> {
-        self.rank.get(usize::from(key))?.get(physical).copied()
+        match self.rank.get(usize::from(key))?.get(physical).copied()? {
+            NOT_INDEXED => None,
+            place => Some(place),
+        }
     }
 
     /// The first place in `key`'s order whose record is not before `value`.
@@ -1249,6 +1271,73 @@ mod tests {
             .map(|n| records.ordered(0, n).expect("in order").bytes[0])
             .collect();
         assert_eq!(ordered, [1, 2, 3]);
+    }
+
+    /// A key that declares a null value leaves matching records out of its
+    /// **order**, not just out of a predicate.
+    ///
+    /// `keys::Key::excluded` has its own tests; this is the one that pins the
+    /// integration, and it is not redundant with them: deleting the filter in
+    /// `reindex` entirely left every `keys::` test green, and so did ranking
+    /// an omitted record 0 instead of `NOT_INDEXED`.
+    ///
+    /// Measured behaviour, see `keys::Null`: the record is still IN THE FILE
+    /// and merely absent from the index, so `len()` must not change.
+    #[test]
+    fn a_key_that_declares_a_null_value_leaves_those_records_out_of_its_order() {
+        let dir = crate::testing::scratch("btv-rec-null");
+        let path = dir.join("NULLKEY.DAT");
+        std::fs::write(&path, of(&[3, 0, 2])).expect("written");
+        let geometry = Geometry::read("NULLKEY.DAT", &path).expect("a header");
+
+        let one_byte_key = |null| {
+            vec![keys::Key {
+                number: 0,
+                definition: 0,
+                segments: vec![keys::Segment {
+                    offset: 0,
+                    length: 1,
+                    kind: keys::Kind::Unsigned,
+                    descending: false,
+                }],
+                duplicates: false,
+                modifiable: true,
+                chain: None,
+                acs: None,
+                null,
+            }]
+        };
+
+        let plain = Records::read("NULLKEY.DAT", &path, &geometry, &one_byte_key(None))
+            .expect("reads");
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain.ordered_len(0), Some(3), "no null bit orders every record");
+
+        let nulled = Records::read(
+            "NULLKEY.DAT",
+            &path,
+            &geometry,
+            &one_byte_key(Some(keys::Null::All(0))),
+        )
+        .expect("reads");
+
+        assert_eq!(nulled.len(), 3, "the record is still in the file");
+        assert_eq!(nulled.ordered_len(0), Some(2), "and out of the index");
+
+        let ordered: Vec<u8> = (0..2)
+            .map(|n| nulled.ordered(0, n).expect("in order").bytes[0])
+            .collect();
+        assert_eq!(ordered, [2, 3], "the zero-keyed record is not among them");
+
+        // And it has no place, rather than claiming the first one -- which is
+        // what a rank table of zeroes would have it do.
+        let zero_at = (0..nulled.len())
+            .find(|n| nulled.physical(*n).expect("in range").bytes[0] == 0)
+            .expect("the omitted record is still physically there");
+        assert_eq!(nulled.place_in(0, zero_at), None, "an omitted record has no place");
+        for n in (0..nulled.len()).filter(|n| *n != zero_at) {
+            assert!(nulled.place_in(0, n).is_some(), "the others still have one");
+        }
     }
 
     #[test]

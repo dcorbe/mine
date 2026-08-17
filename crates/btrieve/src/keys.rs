@@ -60,6 +60,16 @@ pub(crate) mod at {
     pub const LENGTH: usize = 0x16;
     /// The extended data type, when the attributes say to use it.
     pub const EXTENDED: usize = 0x1c;
+    /// The byte value this key treats as *null*, when either null attribute
+    /// bit is set.
+    ///
+    /// Located by creating the same file twice through genuine Btrieve 6.15
+    /// and changing nothing but this: `tools/btrieve-oracle/floatprobe.c`'s
+    /// `createf` with null `0x00` and `0xaa`, and the only meaningful byte
+    /// that moved was file offset `0x12d` -- which is
+    /// [`BASE`](super::BASE) + `0x1d`, one past [`EXTENDED`]. (The other byte
+    /// that moved was the control record's own write counter at `0x68`.)
+    pub const NULL_VALUE: usize = 0x1d;
 }
 
 /// The attribute bits this reader understands.
@@ -90,6 +100,12 @@ pub(crate) mod flag {
     pub const DESCENDING: u16 = 1 << 6;
     /// The type is in [`at::EXTENDED`] rather than implied by the flags.
     pub const EXTENDED: u16 = 1 << 8;
+    /// A record is left OUT of this key's index when **every** segment of it
+    /// is entirely [`at::NULL_VALUE`].
+    pub const NULL_ALL_SEGMENTS: u16 = 1 << 3;
+    /// A record is left OUT of this key's index when **any** segment of it is
+    /// entirely [`at::NULL_VALUE`].
+    pub const NULL_ANY_SEGMENT: u16 = 1 << 9;
 }
 
 /// Attribute bits that change what an index *contains* or how it collates, and
@@ -108,12 +124,44 @@ pub(crate) mod flag {
 /// **None of them is set on any key of any file MajorMUD ships**, which is
 /// checked by `crates/mbbs/tests/btrieve.rs` -- so this refuses on nothing that
 /// exists here, and refuses rather than guesses on a file that used one.
-const UNSUPPORTED: [(u16, &str); 4] = [
-    (1 << 3, "null-all-segments"),
-    (1 << 9, "null-any-segment"),
+const UNSUPPORTED: [(u16, &str); 2] = [
     (flag::ALT_COLLATING, "a numbered alternate collating sequence"),
     (1 << 7, "repeating duplicates"),
 ];
+
+/// When a key leaves a record out of its index altogether.
+///
+/// Both bits were measured against genuine Pervasive Btrieve 6.15 with
+/// `tools/btrieve-oracle/floatprobe.c`, over **one key of two two-byte
+/// segments** -- a single-segment key cannot tell them apart, and the
+/// single-segment run showed both omitting the same one record.
+///
+/// Four records, keys `AB CD`, `-- CD`, `AB --` and `-- --` where `--` is the
+/// null value, walked through the engine's own index:
+///
+/// | attribute | in the index |
+/// |---|---|
+/// | neither bit | all four |
+/// | [`flag::NULL_ALL_SEGMENTS`] | three -- only `-- --` is dropped |
+/// | [`flag::NULL_ANY_SEGMENT`] | one -- only `AB CD` survives |
+///
+/// Every record was inserted with status 0 in all three cases, so the omitted
+/// ones are **in the file and absent from the index**. That is why this
+/// matters here at all: this crate derives key order by sorting the records
+/// (see the module comment), so without reproducing the omission it would
+/// hand a module a record the genuine engine skips, with nothing anywhere
+/// reporting an error.
+///
+/// The value itself is the key definition's own byte at [`at::NULL_VALUE`],
+/// not a hardcoded zero -- measured by declaring `0x20` and watching the
+/// all-spaces record vanish while the all-zeroes record stayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Null {
+    /// Omit the record when every segment is entirely this byte.
+    All(u8),
+    /// Omit the record when any segment is entirely this byte.
+    Any(u8),
+}
 
 /// How a key segment's bytes are to be compared.
 ///
@@ -446,6 +494,11 @@ pub struct Key {
     /// An `Arc` because every ACS-flagged key of a file usually shares one
     /// table, and a 256-byte array per key would be copied for nothing.
     pub acs: Option<Arc<Acs>>,
+
+    /// When this key leaves a record out of its index altogether, and on
+    /// which byte. `None` unless the definition sets one of the two null
+    /// attribute bits. See [`Null`].
+    pub null: Option<Null>,
 }
 
 impl Key {
@@ -484,6 +537,31 @@ impl Key {
             out.resize(out.len() + usize::from(segment.length) - field.len(), 0);
         }
         out
+    }
+
+    /// Whether this key leaves `record` out of its index entirely.
+    ///
+    /// See [`Null`] for the measurement. A segment counts as null when
+    /// **every** byte of it is the declared value; a record shorter than a
+    /// segment contributes the zero bytes [`Self::extract`] pads with, so the
+    /// two agree about what a truncated record's segment holds.
+    pub fn excluded(&self, record: &[u8]) -> bool {
+        let Some(null) = self.null else {
+            return false;
+        };
+        let byte = match null {
+            Null::All(byte) | Null::Any(byte) => byte,
+        };
+        let segment_is_null = |segment: &Segment| {
+            let field = segment.of(record);
+            let width = usize::from(segment.length);
+            field.iter().all(|b| *b == byte)
+                && (field.len() == width || byte == 0)
+        };
+        match null {
+            Null::All(_) => self.segments.iter().all(segment_is_null),
+            Null::Any(_) => self.segments.iter().any(segment_is_null),
+        }
     }
 
     /// Compare two records by this key.
@@ -759,6 +837,17 @@ pub fn parse(
                 // `start_definition` instead, same as `Self::definition`; none
                 // exists to measure that against.
                 chain: duplicates.then(|| word(at::CHAIN)),
+                // Which bit wins if a definition somehow set both is not
+                // measured, and no file here sets either; `Any` is the
+                // stricter of the two and omitting more than the engine does
+                // shows up as a missing record rather than a phantom one.
+                null: if attributes & flag::NULL_ANY_SEGMENT != 0 {
+                    Some(Null::Any(definition[at::NULL_VALUE]))
+                } else if attributes & flag::NULL_ALL_SEGMENTS != 0 {
+                    Some(Null::All(definition[at::NULL_VALUE]))
+                } else {
+                    None
+                },
                 // Bound only for a key that actually declared one. A file may
                 // carry a table that no key uses, and folding an unflagged
                 // key's bytes through it would reorder an index that genuine
@@ -957,6 +1046,7 @@ mod tests {
             modifiable: true,
             chain: None,
                     acs: None,
+                    null: None,
 }
     }
 
@@ -1121,6 +1211,79 @@ mod tests {
         );
     }
 
+    /// One key over two two-byte segments, and the four records the oracle
+    /// walked through the genuine engine's own index.
+    ///
+    /// A single-segment key cannot tell these two bits apart -- both omit the
+    /// same one record -- which is why the rig, and this test, use two.
+    #[test]
+    fn the_two_null_bits_omit_different_records() {
+        let two_segments = |null| Key {
+            number: 0,
+            definition: 0,
+            segments: vec![
+                Segment { offset: 0, length: 2, kind: Kind::Text, descending: false },
+                Segment { offset: 2, length: 2, kind: Kind::Text, descending: false },
+            ],
+            duplicates: false,
+            modifiable: true,
+            chain: None,
+            acs: None,
+            null,
+        };
+
+        let both = b"ABCD";      // neither segment null
+        let first = b"\0\0CD";   // first segment null
+        let second = b"AB\0\0";  // second segment null
+        let neither = b"\0\0\0\0"; // both segments null
+
+        let plain = two_segments(None);
+        for record in [both, first, second, neither] {
+            assert!(!plain.excluded(record), "a key with no null bit omits nothing");
+        }
+
+        // Measured: three of the four survive, and only the wholly-null one
+        // is dropped.
+        let all = two_segments(Some(Null::All(0)));
+        assert!(!all.excluded(both));
+        assert!(!all.excluded(first));
+        assert!(!all.excluded(second));
+        assert!(all.excluded(neither), "every segment null -- the only one dropped");
+
+        // Measured: only the record with no null segment at all survives.
+        let any = two_segments(Some(Null::Any(0)));
+        assert!(!any.excluded(both), "the only one kept");
+        assert!(any.excluded(first));
+        assert!(any.excluded(second));
+        assert!(any.excluded(neither));
+    }
+
+    /// The null value is the key definition\'s own byte, not a hardcoded zero.
+    ///
+    /// Measured by declaring `0x20` and watching the all-spaces record vanish
+    /// from the engine\'s index while the all-zeroes record stayed in it.
+    #[test]
+    fn the_null_value_is_the_one_the_definition_declares() {
+        let key = |null| Key {
+            number: 0,
+            definition: 0,
+            segments: vec![Segment { offset: 0, length: 4, kind: Kind::Text, descending: false }],
+            duplicates: false,
+            modifiable: true,
+            chain: None,
+            acs: None,
+            null,
+        };
+
+        let spaces = key(Some(Null::All(b' ')));
+        assert!(spaces.excluded(b"    "), "all spaces is null when 0x20 is declared");
+        assert!(!spaces.excluded(b"\0\0\0\0"), "and all zeroes is not");
+
+        let zeroes = key(Some(Null::All(0)));
+        assert!(zeroes.excluded(b"\0\0\0\0"));
+        assert!(!zeroes.excluded(b"    "));
+    }
+
     #[test]
     fn a_signed_key_reads_its_sign_from_its_own_width() {
         let key = named(Kind::Signed, 2);
@@ -1174,6 +1337,7 @@ mod tests {
             modifiable: true,
             chain: Some(6),
                     acs: None,
+                    null: None,
 };
         assert_eq!(key.length(), 6);
         assert_eq!(key.extract(b"abc\0\x02\x00"), b"abc\0\x02\x00");
@@ -1211,6 +1375,7 @@ mod tests {
             modifiable: true,
             chain: Some(6),
                     acs: None,
+                    null: None,
 };
 
         let mut record = vec![0u8; 32];
@@ -1250,6 +1415,7 @@ mod tests {
             modifiable: true,
             chain: None,
             acs,
+            null: None,
         }
     }
 

@@ -2520,6 +2520,7 @@ mod tests {
                 modifiable: true,
                 chain: None,
                             acs: None,
+                            null: None,
 },
             Key {
                 number: 1,
@@ -2534,6 +2535,7 @@ mod tests {
                 modifiable: true,
                 chain: Some(8),
                             acs: None,
+                            null: None,
 },
         ]
     }

@@ -471,6 +471,7 @@ mod tests {
             modifiable: true,
             chain: None,
                     acs: None,
+                    null: None,
 }
     }
 
@@ -677,6 +678,7 @@ mod tests {
                 modifiable: true,
                 chain: None,
                             acs: None,
+                            null: None,
 },
         ];
         let stat = Stat::read("multi.dat", &path, &geometry, &keys).expect("reads");
