@@ -682,9 +682,20 @@ impl Gsbl {
     }
 
     /// `btuxmt` -- ASCII output, word-wrapped at the `btutsw` width.
+    ///
+    /// The monitor copy only happens if [`Channel::transmit`] reports it
+    /// actually committed the block -- see that method's own doc comment for
+    /// the R6 all-or-nothing rollback this is guarding against. Without the
+    /// check, an oversized block [`Channel::transmit`] entirely refused
+    /// (queuing `OVRFLW` and touching nothing) would still show up in
+    /// [`Gsbl::monitor_out`]: a sysop watching the monitored channel would
+    /// see output that never reached the channel or the wire, which is a
+    /// worse failure than the wrap-artefact one the pre-translation copy
+    /// point in [`Gsbl::monitor`] already guards against.
     pub fn transmit(&mut self, chan: Chan, bytes: &[u8]) {
-        self.channel_mut(chan).transmit(bytes);
-        self.monitor(chan, bytes);
+        if self.channel_mut(chan).transmit(bytes) {
+            self.monitor(chan, bytes);
+        }
     }
 
     /// `btuxct` -- binary output, exactly as given.
@@ -874,7 +885,15 @@ impl Channel {
         }
     }
 
-    /// ASCII output, wrapped at `width`.
+    /// ASCII output, wrapped at `width`. Answers whether the block was
+    /// actually committed -- `false` means the R6 rollback below fired and
+    /// nothing reached `self.output`.
+    ///
+    /// This host's only caller is [`Gsbl::transmit`], which uses the answer
+    /// to decide whether the monitor buffer should see these bytes too: an
+    /// oversized block this method entirely refused must not still turn up
+    /// in [`Gsbl::monitor_out`], "characters transmitted" means characters
+    /// that actually were.
     ///
     /// R6, guide `btuxmt` CAUTIONS page 191: an oversized call is atomic.
     /// Either the whole transformed block -- CRLF expansion, wrap breaks and
@@ -882,7 +901,7 @@ impl Channel {
     /// queued instead. That is why bytes are pushed below without a
     /// per-byte capacity check and measured only once, at the end, against a
     /// snapshot to roll back to.
-    fn transmit(&mut self, bytes: &[u8]) {
+    fn transmit(&mut self, bytes: &[u8]) -> bool {
         // Built here and committed at the end, rather than pushed straight at
         // `self.output`. Two things fall out of that, and the second is the
         // reason:
@@ -1015,13 +1034,14 @@ impl Channel {
         // arm or disarm the *next* accepted block's soft-CR behaviour.
         if self.output.len() + out.len() > OUTSIZ {
             self.status.push_back(Gsbl::OVRFLW);
-            return;
+            return false;
         }
         self.output.extend(out);
         self.column = column;
         self.supplied_lf = supplied_lf;
         self.csi = csi;
         self.wrapped = wrapped;
+        true
     }
 
     /// `Text`-state dispatch: either the byte opens a possible CSI, or it is
@@ -2397,6 +2417,29 @@ mod tests {
         g.transmit(chan(), &huge);
         assert!(g.drain_output(chan()).is_empty());
         assert_eq!(g.next_status(chan()), Some(Gsbl::OVRFLW));
+    }
+
+    /// Task 6 review finding: `Channel::transmit`'s R6 rollback (above) is
+    /// invisible one level up unless `Gsbl::transmit` checks its return
+    /// value before copying into the monitor buffer. Without that check, a
+    /// block entirely refused here would still show up in
+    /// `Gsbl::monitor_out` -- a sysop watching a monitored channel would see
+    /// output that never reached the channel or the wire, worse than the
+    /// wrap-artefact case `Gsbl::monitor`'s pre-translation copy point
+    /// already guards against. `Gsbl::transmit_raw` already had this
+    /// property (its overflow check is a visible early return in the same
+    /// function); this is `Gsbl::transmit`'s counterpart, where the
+    /// rollback lives one call down in `Channel::transmit` instead.
+    #[test]
+    fn an_oversized_ascii_write_does_not_populate_the_monitor_buffer() {
+        let mut g = one();
+        g.monitored = Some(chan());
+        let huge = vec![b'x'; OUTSIZ + 1];
+        g.transmit(chan(), &huge);
+        assert!(
+            g.monitor_out.is_empty(),
+            "nothing was actually transmitted, so nothing should be monitored"
+        );
     }
 
     #[test]
