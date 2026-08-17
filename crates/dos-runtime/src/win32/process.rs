@@ -18,6 +18,7 @@ use mbbs_machine::module::ImportSite;
 use mbbs_machine::ptr::ModulePtr;
 
 use crate::win32::advapi32;
+use crate::win32::btrieve;
 use crate::win32::crt;
 use crate::win32::stream;
 use crate::win32::user32;
@@ -210,6 +211,24 @@ pub struct Process {
     /// open returns -- `OpenEventA` answering "no such event" and a valid
     /// handle must never be the same value.
     objects: Vec<Object>,
+    /// This process's Btrieve session -- `wbtrv32.dll!BTRCALL`'s state, kept
+    /// here rather than reconstructed per call because the position blocks
+    /// `crate::win32::btrieve` hands back are only meaningful against the
+    /// same open files across calls.
+    pub btrieve: ::btrieve::Btrieve<btrieve::Win32Mem>,
+    /// Where a Btrieve `Open` allocates the module's block, name, record and
+    /// key buffers. See [`btrieve::Win32Heap`] for why this is not a second
+    /// allocator alongside `Memory::alloc`.
+    pub btrieve_heap: btrieve::Win32Heap,
+    /// Set when `wbtrv32.dll!BTRCALL` asked for something this engine does
+    /// not model, or handed a guest pointer that would not resolve. `None`
+    /// otherwise. [`dispatch`] answers `None` in both cases -- "not
+    /// implemented" and "this DLL, but a call this engine cannot honour" look
+    /// the same from the answer alone -- so [`run`] reads this field right
+    /// after a `None` to tell which one actually happened, and reports
+    /// [`Outcome::BtrieveGap`] rather than [`Outcome::Unimplemented`] when it
+    /// is set.
+    pub btrieve_gap: Option<String>,
 }
 
 /// One `ReportEventA` call: the program's own diagnostic.
@@ -281,6 +300,9 @@ impl Process {
             exports: Vec::new(),
             messages: Vec::new(),
             objects: Vec::new(),
+            btrieve: ::btrieve::Btrieve::default(),
+            btrieve_heap: btrieve::Win32Heap::default(),
+            btrieve_gap: None,
         }
     }
 
@@ -374,6 +396,11 @@ pub enum Outcome {
     /// A thunk fired whose index names no import -- see
     /// [`crate::win32::load::Stop::UnknownThunk`].
     UnknownThunk(u16),
+    /// It asked Btrieve for something this engine does not model. Like
+    /// [`Self::Unimplemented`] the run stops here rather than continuing with
+    /// a fabricated status, because a Btrieve caller's only channel is a
+    /// status word and a wrong one is indistinguishable from a right one.
+    BtrieveGap { what: String },
 }
 
 /// Answer one import call.
@@ -407,6 +434,9 @@ pub fn dispatch(
     }
     if site.module.eq_ignore_ascii_case("WSOCK32.dll") {
         return wsock32::dispatch(process, machine, mem, &symbol);
+    }
+    if site.module.eq_ignore_ascii_case("wbtrv32.dll") {
+        return btrieve::dispatch(process, machine, mem, &symbol);
     }
     if site.module.eq_ignore_ascii_case("cw3220mt.DLL") {
         // The C runtime is split by concern across two files: `crt` for the
@@ -496,7 +526,16 @@ pub fn run(loaded: &mut Loaded, process: &mut Process, budget: usize) -> io::Res
                     answer.cleans,
                 )?;
             }
-            None => return Ok(Outcome::Unimplemented { module, symbol }),
+            None => {
+                // `wbtrv32.dll!BTRCALL` answers `None` for two different
+                // reasons -- an unimplemented symbol, and a real Btrieve
+                // call this engine cannot honour -- and only this field
+                // tells them apart. See `Process::btrieve_gap`.
+                if let Some(what) = process.btrieve_gap.take() {
+                    return Ok(Outcome::BtrieveGap { what });
+                }
+                return Ok(Outcome::Unimplemented { module, symbol });
+            }
         }
     }
     Ok(Outcome::Budget)
@@ -659,8 +698,19 @@ mod tests {
     /// hitting it.
     ///
     /// With the catalogue in place the program runs on into ordinary
-    /// Borland C runtime file I/O and stops at `_fseek`, which is Task 5's
-    /// first target.
+    /// Borland C runtime file I/O, reaches its first Btrieve call, and --
+    /// since Task 6 answered `wbtrv32.dll!BTRCALL` -- actually makes it: Open
+    /// on `.\WCCACMS2.DAT`, which real Btrieve status 12 answers ("cannot
+    /// find the specified file") because this fixture directory carries only
+    /// `WCCMMUD.MCV`. That is a real status, not a gap, so the program
+    /// carries on -- and throws on it, landing in the same
+    /// `cw3220mt.DLL!__Return_unwind` this test's own history already
+    /// describes: Borland's C++ exception unwind, which restores a saved
+    /// register set and resumes at a stored address that
+    /// `mbbs_machine::m32::Machine` has no setters for. That register-setter
+    /// wall is real and out of this task's scope; supplying `WCCACMS2.DAT`
+    /// so the program does not need to throw at all is future work, not
+    /// something this task's marshalling edge should paper over.
     #[test]
     fn with_a_catalogue_it_runs_past_the_unwind_into_the_c_runtime() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
@@ -695,12 +745,14 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Unimplemented {
-                module: "wbtrv32.dll".to_owned(),
-                symbol: "BTRCALL".to_owned(),
+                module: "cw3220mt.DLL".to_owned(),
+                symbol: "__Return_unwind".to_owned(),
             },
-            "with a catalogue present and the reached C runtime file I/O \
-             symbols answered, the program runs all the way to its first \
-             Btrieve call; see this test's comment"
+            "with a catalogue present the program reaches BTRCALL, opens it, \
+             gets a real \"file not found\" status back rather than a gap, \
+             and throws on it -- landing at the same register-setter wall \
+             this test's own history already found by a different route; \
+             see this test's comment"
         );
     }
 

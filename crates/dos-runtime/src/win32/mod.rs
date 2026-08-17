@@ -12,6 +12,7 @@
 //! implemented because one of them calls it.
 
 pub mod advapi32;
+pub mod btrieve;
 pub mod console;
 pub mod crt;
 pub mod format;

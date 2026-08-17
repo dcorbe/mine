@@ -261,6 +261,7 @@ dependencies = [
 name = "dos-runtime"
 version = "0.1.0"
 dependencies = [
+ "btrieve",
  "clap",
  "dos",
  "libc",
