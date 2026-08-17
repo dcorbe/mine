@@ -68,6 +68,46 @@ const _: () = assert!(
     "ENV_SEG must start at or after the stub table hook_all fills"
 );
 
+/// Where the Btrieve service's bump-allocator heap ([`dos_runtime::btrieve::
+/// DosHeap`]) lives: a segment on its own, in the gap between the
+/// environment block and `PSP_SEG` that nothing else in this file's memory
+/// map claims.
+///
+/// Nothing else can land here: the interrupt stub table `hook_all` fills
+/// ends at physical `STUB_SEG*16 + STUB_TABLE_BYTES` (`0xa03`), the
+/// environment block starts right after at `ENV_SEG*16` (`0xa10`) and is a
+/// few dozen bytes, and the loaded program -- PSP, image, and its own stack,
+/// all of it -- starts at `PSP_SEG*16` (`0x10000`). `HEAP_SEG` sits well
+/// inside that gap, with room on both sides. What actually *enforces* that,
+/// rather than merely describing it, is the pair of assertions below this
+/// constant plus the runtime check next to where the environment block is
+/// built: this file has one already-fixed comment (the old `ENV_SEG`) that
+/// quietly stopped being true, and it corrupted a stub silently for as long
+/// as nobody read the comment critically -- these are written so the same
+/// mistake here fails a build or a run, not a code review.
+const HEAP_SEG: u16 = 0x0200;
+/// Room for about twenty simultaneous `Open`s (`crates/btrieve`'s
+/// `struct btvblk` is 196 bytes, and [`dos_runtime::btrieve::DosHeap`] never
+/// frees) -- generous for the synthetic guest this crate's own tests drive,
+/// and for any real DOS utility this host runs today.
+const HEAP_CAPACITY: u16 = 4096;
+
+/// The heap must start at or after the stub table's own high-water mark --
+/// the same discipline, and the same reasoning, as the `ENV_SEG` assertion
+/// below.
+const _: () = assert!(
+    (HEAP_SEG as u32) * 16 >= (STUB_SEG as u32) * 16 + dos_runtime::kvm::STUB_TABLE_BYTES as u32,
+    "HEAP_SEG must start at or after the stub table hook_all fills"
+);
+/// The heap must end at or before the loaded program begins. `HEAP_CAPACITY`
+/// bytes are reserved from `HEAP_SEG`'s own offset zero, so this is exactly
+/// the same "does the window fit before the next thing" shape as the
+/// `ENV_SEG` check, just measured from the other end of the gap.
+const _: () = assert!(
+    (HEAP_SEG as u32) * 16 + HEAP_CAPACITY as u32 <= (PSP_SEG as u32) * 16,
+    "the Btrieve heap must fit entirely below PSP_SEG, where the loaded program begins"
+);
+
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
 
@@ -451,6 +491,18 @@ fn main() -> io::Result<()> {
         &["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"],
         &format!("C:\\{program}"),
     );
+    // The compile-time assertions above `HEAP_SEG` only check the *fixed*
+    // ends of the gap it lives in; the environment block's own length
+    // depends on the program's own filename, which is runtime data. This is
+    // the check that closes the loop: it is what would actually catch a
+    // program whose name is long enough to run the environment block into
+    // the heap, rather than leaving that to be discovered as silent
+    // corruption the way the old `ENV_SEG` bug was.
+    assert!(
+        env.len() <= (HEAP_SEG - ENV_SEG) as usize * 16,
+        "the DOS environment block ({} bytes) would run into the Btrieve heap at {HEAP_SEG:#06x}",
+        env.len()
+    );
     vm.load(ENV_SEG as usize * 16, &env)?;
 
     let at = mz::load(&mut vm, &img, PSP_SEG, ENV_SEG, tail.as_bytes())?;
@@ -532,9 +584,21 @@ fn main() -> io::Result<()> {
     let video = Rc::new(RefCell::new(Video::default()));
     video.borrow().install_bda(&mut vm);
 
+    // The Btrieve heap: a fresh `DosHeap` over the fixed, pre-checked window
+    // `HEAP_SEG`/`HEAP_CAPACITY` name above. `DosHeap::new` only fails when
+    // its window would run past the end of its own segment, which the
+    // compile-time assertions on `HEAP_SEG`/`HEAP_CAPACITY` already rule
+    // out, so this `expect` is reporting a broken invariant, not a runtime
+    // condition this file expects to see fire.
+    let btrieve_heap = dos_runtime::btrieve::DosHeap::new(Ptr::new(HEAP_SEG, 0), HEAP_CAPACITY)
+        .expect("HEAP_SEG/HEAP_CAPACITY are checked at compile time to fit their segment");
     let mut services: Services<VmGuest> = Services::new()
         .with(Counting::new(kernel))
-        .with(Counting::new(Bios { video: Rc::clone(&video) }));
+        .with(Counting::new(Bios { video: Rc::clone(&video) }))
+        .with(Counting::new(dos_runtime::btrieve::Btrieve::new(
+            btrieve_heap,
+            std::path::PathBuf::from(&root_dir),
+        )));
     if let Some(uart) = &serial {
         services = services.with(Counting::new(Fossil::new(Rc::clone(uart))));
     }
