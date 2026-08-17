@@ -493,30 +493,47 @@ fn main() -> io::Result<()> {
                     // this call; whether that is REPORTED is the runtime's
                     // policy, and it differs per vector (Task 6's table):
                     Some(Serviced::Unclaimed { vector, ah }) => {
-                        let note = match vector {
-                            // int 21h: always reported, no `missing()` filter.
-                            0x21 => Some(format!("int 21h AH={ah:02X}")),
-                            // int 14h (FOSSIL): always reported too, once a
-                            // FOSSIL driver is composed at all (door mode).
-                            0x14 => Some(format!("int 14h AH={ah:02X}  FOSSIL function")),
-                            // int 10h/16h: reported only when `missing()`
-                            // knows the function's name.
-                            0x10 | 0x16 => missing(vector, ah)
-                                .map(|what| format!("int {vector:02X}h AH={ah:02X}  {what}")),
-                            // Everything else: never reported here. Nothing
-                            // claims these vectors as a `Service` either, so
-                            // in practice this arm is unreachable -- a claimed
-                            // vector's `Unclaimed` always names 0x21, 0x14,
-                            // 0x10 or 0x16 above. Kept for the same reason the
-                            // `None` arm below is: silence, not a panic, is
-                            // the right answer to a policy question no vector
-                            // this router can compose actually asks.
-                            _ => None,
-                        };
-                        if let Some(note) = note {
-                            *gaps.entry(note.clone()).or_insert(0) += 1;
+                        // int 21h does NOT go into `gaps`: `Counting::unclaimed()`
+                        // already records this same event, and the report
+                        // reconstructs it into `missing_dos` (R20), printed
+                        // under "still to implement". Adding it to `gaps` too
+                        // would print one unimplemented call under both that
+                        // section AND "CALLS A REAL MACHINE SERVICES AND WE
+                        // DO NOT" -- the brief's own prose keeps those two
+                        // maps and sections separate; only its Step 2
+                        // pseudocode contradicted that by routing 0x21
+                        // through here as well. `--strict` still breaks,
+                        // matching the pre-refactor message exactly.
+                        if vector == 0x21 {
                             if strict {
-                                break format!("unimplemented: {note}");
+                                break format!("unimplemented: int 21h AH={ah:02X}");
+                            }
+                        } else {
+                            let note = match vector {
+                                // int 14h (FOSSIL): always reported, once a
+                                // FOSSIL driver is composed at all (door mode).
+                                0x14 => Some(format!("int 14h AH={ah:02X}  FOSSIL function")),
+                                // int 10h/16h: reported only when `missing()`
+                                // knows the function's name.
+                                0x10 | 0x16 => missing(vector, ah)
+                                    .map(|what| format!("int {vector:02X}h AH={ah:02X}  {what}")),
+                                // Everything else: never reported here.
+                                // Nothing claims these vectors as a `Service`
+                                // either, so in practice this arm is
+                                // unreachable -- a claimed vector's
+                                // `Unclaimed` always names 0x14, 0x10 or
+                                // 0x16 here (0x21 is handled above). Kept for
+                                // the same reason the `None` arm below is:
+                                // silence, not a panic, is the right answer
+                                // to a policy question no vector this router
+                                // can compose actually asks.
+                                _ => None,
+                            };
+                            if let Some(note) = note {
+                                *gaps.entry(note.clone()).or_insert(0) += 1;
+                                if strict {
+                                    break format!("unimplemented: {note}");
+                                }
                             }
                         }
                     }
@@ -534,7 +551,26 @@ fn main() -> io::Result<()> {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             slept += before.elapsed();
                         }
-                        if let Some(what) = missing(vector, ah) {
+                        // int 14h with no serial port: nothing claims 0x14
+                        // unless `--door` composed `Fossil`, so reaching this
+                        // arm for 0x14 means a local run configured for a
+                        // FOSSIL driver has nothing behind it. Say so, with
+                        // the pre-refactor diagnostic and `--strict` message
+                        // verbatim (`f9253cb`) -- falling through to
+                        // `missing()` prints "serial port services", which is
+                        // indistinguishable from a genuinely missing BIOS
+                        // function and drops the actionable "use --door" hint.
+                        if vector == 0x14 && serial.is_none() {
+                            *gaps
+                                .entry(
+                                    "int 14h  FOSSIL, but this run has no serial port"
+                                        .to_string(),
+                                )
+                                .or_insert(0) += 1;
+                            if strict {
+                                break "int 14h with no serial port: use --door".to_string();
+                            }
+                        } else if let Some(what) = missing(vector, ah) {
                             *gaps
                                 .entry(format!("int {vector:02X}h AH={ah:02X}  {what}"))
                                 .or_insert(0) += 1;
