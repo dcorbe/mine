@@ -419,6 +419,17 @@ impl Files {
         }
     }
 
+    /// The directory everything under this jail resolves beneath.
+    ///
+    /// For a host component that needs to build a real path *outside* this
+    /// type's own `openat2` calls -- the `btrieve` crate reads and writes
+    /// data files through plain `std::fs`, not through a descriptor this
+    /// struct owns, so it cannot ask `Files` to open on its behalf. It still
+    /// needs to know where the jail's floor is, which is what this answers.
+    pub fn root_path(&self) -> &Path {
+        &self.root_path
+    }
+
     fn slot(&mut self) -> Option<usize> {
         self.open.iter().position(Option::is_none)
     }

@@ -131,6 +131,16 @@ impl Streams {
         self.files.is_some()
     }
 
+    /// The directory this process's file access is jailed beneath, or `None`
+    /// when there is no filesystem at all.
+    ///
+    /// For a caller that needs a real path rather than a DOS handle -- see
+    /// `crate::win32::btrieve`'s use of this, resolving a Btrieve `Open`
+    /// filename the way every other file access on this host already does.
+    pub fn root_path(&self) -> Option<&std::path::Path> {
+        self.files.as_ref().map(dos::files::Files::root_path)
+    }
+
     /// The stream a `FILE *` refers to.
     ///
     /// Looked up by the pointer's own value rather than by reading the `fd`
@@ -164,6 +174,24 @@ impl Streams {
                 let _ = files.close(dos);
                 0
             }
+            Err(_) => MINUS_ONE,
+        }
+    }
+
+    /// `unlink(path)` -- 0 on success, -1 (C's `unlink`, not Win32's bool) on
+    /// failure.
+    ///
+    /// Delegates straight to [`dos::files::Files::unlink`], which already
+    /// does the one thing this needs: translate the DOS-syntax path and
+    /// remove it beneath the sandbox root. No new containment logic belongs
+    /// here -- see that method's own doc comment for what does and does not
+    /// bound it.
+    pub fn unlink(&mut self, path: &[u8]) -> u32 {
+        let Some(files) = self.files.as_mut() else {
+            return MINUS_ONE;
+        };
+        match files.unlink(path) {
+            Ok(()) => 0,
             Err(_) => MINUS_ONE,
         }
     }
@@ -526,6 +554,12 @@ pub fn dispatch(
             let path = read_path(mem, path_at)?;
             Some(Answer::cdecl(process.streams.access(&path, mode)))
         }
+        // int unlink(const char *path)
+        "_unlink" => {
+            let path_at = machine.arg_u32(mem.stack(), 0);
+            let path = read_path(mem, path_at)?;
+            Some(Answer::cdecl(process.streams.unlink(&path)))
+        }
         // FILE *fopen(const char *path, const char *mode)
         "_fopen" => {
             let path_at = machine.arg_u32(mem.stack(), 0);
@@ -717,6 +751,26 @@ mod tests {
         assert_eq!(s.access(b"GONE.TXT", 0), MINUS_ONE, "it does not");
     }
 
+    /// `unlink` answers 0 and the file is actually gone, or -1 for one that
+    /// was never there -- C's own polarity, not Win32's `DeleteFileA` bool.
+    /// This is what `-recover` uses to remove a `.VIR` template or a stale
+    /// scratch file once it has rebuilt what it needed from it; a host that
+    /// left the file in place while claiming success would leave a "recovered"
+    /// board still holding the wreckage it was meant to clear.
+    #[test]
+    fn unlink_removes_the_file_and_answers_zero() {
+        let files = root_at("win32-unlink");
+        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-unlink");
+        std::fs::write(dir.join("GONE.DAT"), b"x").expect("fixture");
+
+        let mut s = Streams::new(Some(files));
+        assert_eq!(s.unlink(b"GONE.DAT"), 0, "the file was there to remove");
+        assert!(!dir.join("GONE.DAT").exists(), "and now it is gone");
+        assert_eq!(s.unlink(b"GONE.DAT"), MINUS_ONE, "removing it twice fails");
+        assert_eq!(s.unlink(b"NEVER.DAT"), MINUS_ONE, "and so does a name never used");
+    }
+
     /// With no root at all, every call fails the way a missing file fails
     /// rather than panicking. That is what makes `Process::new` able to stay
     /// infallible.
@@ -728,6 +782,7 @@ mod tests {
         assert_eq!(s.access(b"ANY.TXT", 0), MINUS_ONE);
         assert_eq!(s.fopen(&mut l.mem, b"ANY.TXT", b"r"), 0, "NULL, not a panic");
         assert_eq!(s.fclose(0), EOF);
+        assert_eq!(s.unlink(b"ANY.TXT"), MINUS_ONE);
     }
 
     /// A stream opened, written through the host, closed, and reopened. The

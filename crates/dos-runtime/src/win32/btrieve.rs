@@ -33,6 +33,8 @@
 //! over that one primitive, and its `free` is a no-op for the identical
 //! reason `crt::free`'s is -- see [`Win32Heap`]'s own doc comment.
 
+use std::path::PathBuf;
+
 use mbbs_machine::m32::{Flat32Ptr, Flat32PtrError, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
@@ -143,6 +145,61 @@ fn gap(process: &mut Process, what: String) -> Option<Answer> {
     None
 }
 
+/// Resolve a Btrieve `Open`'s filename -- DOS syntax such as `.\WCCACMS2.DAT`
+/// -- into a real path beneath this process's own sandbox root.
+///
+/// **Why this exists.** `crates/btrieve`'s own `btrcall::open` treats its key
+/// buffer as an already-usable path: every caller in that crate's own test
+/// suite hands `Geometry::read`/`Btrieve::open` a path built with
+/// `dir.join(name)`, because that crate's callers were always either those
+/// tests or (eventually) a real DOS process whose current directory already
+/// *was* the data directory. This host's guest is neither: it is a Win32
+/// program sandboxed beneath `--root`, and a DOS-syntax name handed to
+/// `std::path::PathBuf` unresolved does two things wrong at once -- the
+/// backslash is not a Linux separator, so it survives into a single bogus
+/// path component, and whatever *does* resolve, resolves against this
+/// process's actual working directory rather than the sandbox. Both failures
+/// return the same Btrieve status a genuinely missing file would (12), which
+/// is what let this go unnoticed until Task 7 ran the engine against a real
+/// board rather than an empty fixture directory.
+///
+/// Translation reuses `dos::files::translate` -- the same DOS-path decoder
+/// every other file access on this host goes through -- so a `..` escape is
+/// refused here exactly as it would be for any other DOS file call, even
+/// though (unlike `dos::files::Files`) nothing below this point opens through
+/// `openat2`: `crates/btrieve` reads and writes through plain `std::fs`, so
+/// there is no kernel-enforced jail once the join happens, only this check.
+///
+/// `None` when there is no sandbox to resolve against (a test with an empty
+/// `Process`, mirroring `Streams::root_path`'s own `None`) or the name is not
+/// nameable at all (an escape attempt, or empty). Both cases are calls this
+/// function cannot answer, and both end up producing an ordinary Btrieve
+/// "file not found" from a path that plainly cannot resolve to anything real,
+/// which is the same honest answer a real missing file gets.
+fn resolve_open_path(process: &Process, keybuf: &[u8]) -> Option<PathBuf> {
+    let root = process.streams.root_path()?;
+    match dos::files::translate(keybuf) {
+        dos::files::Target::File(rel) => {
+            let candidate = root.join(&rel);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // `dos::files::translate` upper-cases every byte -- DOS is
+            // case-insensitive and the guest reliably writes upper case, but
+            // this host's directories are not, and this archive holds both
+            // spellings for some extensions (`WCCACMS2.DAT` beside
+            // `wccacms2.vir`). One lower-case retry, the same fallback
+            // `dos::files::Files` documents for the same reason.
+            let lower = root.join(rel.to_ascii_lowercase());
+            if lower.exists() {
+                return Some(lower);
+            }
+            Some(candidate)
+        }
+        dos::files::Target::Device(_) | dos::files::Target::Rejected => None,
+    }
+}
+
 /// The seven stdcall arguments, read off the frame and resolved into owned
 /// buffers -- everything `btrcall` needs to build a
 /// `btrieve::btrcall::Call` and, afterwards, to write the answer back to the
@@ -211,12 +268,21 @@ fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
         }
     };
 
-    let keybuf: Vec<u8> = if keylen == 0 {
+    // `keyLength` is not a reliable "is there a key buffer" flag on its own:
+    // measured at a real call site (op 1, Close, inside this run's own
+    // `-recover` pass) `DFAAPI.C` passes its blanket `keyLength = 255` --
+    // see this function's own comment on that constant -- while `keyBuffer`
+    // itself is NULL, because Close has no key to offer. A non-zero length
+    // over a null pointer is exactly the case every C caller of `BTRCALL`
+    // treats as "no buffer", not as a 255-byte read through address zero, so
+    // this checks the pointer first and the length only when the pointer is
+    // real.
+    let keybuf: Vec<u8> = if keylen == 0 || keybuf_at == 0 {
         Vec::new()
     } else {
         match Flat32Ptr(keybuf_at).resolve(mem, usize::from(keylen)) {
             Ok(bytes) => bytes.to_vec(),
-            Err(e) => return Err(format!("key buffer at {keybuf_at:#010x}: {e}")),
+            Err(e) => return Err(format!("op {op_raw:#x}: key buffer at {keybuf_at:#010x}, keylen {keylen}: {e}")),
         }
     };
 
@@ -268,6 +334,29 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
         Err(what) => return gap(process, what),
     };
 
+    // Btrieve Open's key buffer holds a filename in DOS syntax -- see
+    // `resolve_open_path`'s doc comment for why the engine cannot be handed
+    // that verbatim. Substitute a resolved path on this local copy before the
+    // engine ever sees it, and restore the guest's own bytes before anything
+    // is written back: real Btrieve does not rewrite the name it was asked to
+    // open, and the guest is entitled to read its own buffer back unchanged.
+    let original_keybuf = (op == 0).then(|| keybuf.clone());
+    if op == 0 {
+        match resolve_open_path(process, &keybuf) {
+            Some(resolved) => {
+                let mut bytes = resolved.to_string_lossy().into_owned().into_bytes();
+                bytes.push(0);
+                keybuf = bytes;
+            }
+            None => {
+                return gap(
+                    process,
+                    "Open: no sandboxed root to resolve a filename against".to_owned(),
+                );
+            }
+        }
+    }
+
     let status = match engine_btrcall(
         &mut process.btrieve,
         mem,
@@ -285,6 +374,10 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
         Ok(status) => status,
         Err(Gap { what }) => return gap(process, what),
     };
+
+    if let Some(original) = original_keybuf {
+        keybuf = original;
+    }
 
     // Write everything back: the position block, the data buffer and its
     // length, and the key buffer -- an operation may have changed any of
