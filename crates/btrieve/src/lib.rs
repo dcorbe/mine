@@ -1154,16 +1154,6 @@ impl<M: Mem> Block<M> {
             why,
         };
 
-        for key in &self.keys {
-            if key.duplicates {
-                return Err(fail(format!(
-                    "key {}: permits duplicate values, and this host does not \
-                     yet maintain a v6 duplicate key's index on insert",
-                    key.number
-                )));
-            }
-        }
-
         let page_size = self.geometry.page;
         let physical = usize::from(self.geometry.physical);
         let reclen = usize::from(self.geometry.reclen);
@@ -1865,6 +1855,111 @@ impl<M: Mem> Block<M> {
     /// If any key permits duplicates, is not among the orders the loaded
     /// records carry, has a root without the v6 marker bit, or needs more
     /// than one index page; or if a relocation fails.
+    /// Write the `[prev][next]` pairs that join records sharing a key value,
+    /// into the records themselves, **v6-aware**.
+    ///
+    /// # Why `pages::write_chain` cannot be used
+    ///
+    /// It seeks `position + offset` as a literal file offset
+    /// (`pages.rs:613`), which is right for v5 and wrong for v6: a v6
+    /// record's position embeds the page's **logical** id, not its physical
+    /// one (`records.rs:798-813`). On `DUPKEY30.DAT` logical 2 is physical
+    /// 10, so seeking a v6 position writes over an entirely different page
+    /// and reports success -- the silent corruption this crate exists to
+    /// refuse. Here the logical id is resolved through the allocation table
+    /// first.
+    ///
+    /// # Why whole pages, and why relocation
+    ///
+    /// A v6 page is never written in place; it is rewritten to the other half
+    /// of its shadow pair with the allocation table repointed
+    /// (`v6::Map::relocate`). So the pairs are grouped by the page they land
+    /// on and each page is relocated exactly once, however many records on it
+    /// need chaining.
+    ///
+    /// # What it writes
+    ///
+    /// Eight bytes per record: `[prev][next]`, each a
+    /// [`pages::to_long`], and [`pages::NOWHERE`] at either end of a group. A
+    /// record whose value is unique gets `NOWHERE` in both, which is what
+    /// genuine 6.15 writes -- zeros would name page 0, the control record, as
+    /// the next record in the chain
+    /// (`docs/2026-08-17-v6-duplicate-key-oracle.md`).
+    fn v6_write_chains(
+        &self,
+        file: &mut Vec<u8>,
+        layout: pages::Layout,
+        chains: &[(usize, Vec<Vec<u32>>)],
+    ) -> Result<(), String> {
+        let page_size = self.geometry.page;
+        let page_size_usize = usize::from(page_size);
+
+        // Every eight-byte write this call owes, keyed by the logical page it
+        // lands on: (offset within the page, the pair).
+        let mut per_page: std::collections::BTreeMap<u32, Vec<(usize, [u32; 2])>> =
+            std::collections::BTreeMap::new();
+
+        for (offset, groups) in chains {
+            for group in groups {
+                for (at, position) in group.iter().enumerate() {
+                    let pair = [
+                        if at == 0 { pages::NOWHERE } else { group[at - 1] },
+                        if at + 1 == group.len() {
+                            pages::NOWHERE
+                        } else {
+                            group[at + 1]
+                        },
+                    ];
+                    let (logical, slot) = layout.slot_of(*position).ok_or_else(|| {
+                        format!("record position {position} is not on a slot boundary")
+                    })?;
+                    let within = layout.position(0, slot) as usize + offset;
+                    if within + 8 > page_size_usize {
+                        return Err(format!(
+                            "a chain offset of {offset} puts its eight bytes at {within} of \
+                             a {page_size}-byte page, past its end"
+                        ));
+                    }
+                    per_page.entry(logical).or_default().push((within, pair));
+                }
+            }
+        }
+
+        for (logical, writes) in per_page {
+            // Re-read every time: each relocation below rewrites the
+            // allocation table, so a map taken once would resolve later pages
+            // to their stale twins.
+            let physical = v6::Map::read(file, page_size)?
+                .physical(logical)
+                .ok_or_else(|| {
+                    format!(
+                        "a record lives on logical page {logical}, which the allocation \
+                         table claims no physical page for"
+                    )
+                })?;
+            let at = physical as usize * page_size_usize;
+            let mut content = file
+                .get(at..at + page_size_usize)
+                .ok_or_else(|| {
+                    format!(
+                        "logical page {logical} resolves to physical {physical}, past the \
+                         end of a {}-byte file",
+                        file.len()
+                    )
+                })?
+                .to_vec();
+
+            for (within, [prev, next]) in writes {
+                content[within..within + 4].copy_from_slice(&pages::to_long(prev));
+                content[within + 4..within + 8].copy_from_slice(&pages::to_long(next));
+            }
+
+            v6::Map::relocate(file, page_size, logical, &content, [0x00, 0x44])?;
+        }
+
+        Ok(())
+    }
+
     fn v6_reindex(
         &self,
         file: &mut Vec<u8>,
@@ -1883,30 +1978,62 @@ impl<M: Mem> Block<M> {
         }
         let mut built: Vec<Rebuilt> = Vec::with_capacity(self.keys.len());
 
-        for key in &self.keys {
-            if key.duplicates {
-                return Err(format!(
-                    "key {}: permits duplicate values, and this host does not \
-                     yet maintain a v6 duplicate key's index -- the chain that \
-                     joins records sharing a value is written into the records \
-                     themselves by `Self::reindex`, which is not v6-aware",
-                    key.number
-                ));
-            }
+        // Every duplicate-permitting key's chain offset and its groups,
+        // collected while the indexes are built and written once at the end.
+        // Written last because each write relocates a *data* page, and doing
+        // that while the index roots are still being placed would interleave
+        // two page-relocation sequences for no reason.
+        let mut chains: Vec<(usize, Vec<Vec<u32>>)> = Vec::new();
 
+        for key in &self.keys {
             let len = records.ordered_len(key.number).ok_or_else(|| {
                 format!(
                     "key {}: not among the keys the loaded records were ordered by",
                     key.number
                 )
             })?;
+            // One entry per distinct *value*, not per record: records sharing
+            // a value join the entry before them and move its `tail`, which
+            // is the four extra bytes `Key::shape` reserves for a
+            // duplicate-permitting key. Genuine 6.15 writes exactly this --
+            // three records under key 7 produced one entry reading head 1030,
+            // tail 1102 (`docs/2026-08-17-v6-duplicate-key-oracle.md`).
+            //
+            // The same shape as `Self::reindex`'s v5 loop, deliberately: the
+            // grouping is a property of the format, and the two differ only
+            // in how the chain is then written to disk.
             let mut entries: Vec<pages::Entry> = Vec::with_capacity(len);
+            let mut groups: Vec<Vec<u32>> = Vec::new();
             for n in 0..len {
                 let record = records.ordered(key.number, n).expect("in range");
-                entries.push(pages::Entry::unique(
-                    key.extract(&records::keyed(shift, &record.bytes)),
-                    record.position,
-                ));
+                let joins = n > 0
+                    && key.compare(
+                        &records::keyed(
+                            shift,
+                            &records.ordered(key.number, n - 1).expect("in range").bytes,
+                        ),
+                        &records::keyed(shift, &record.bytes),
+                    ) == std::cmp::Ordering::Equal;
+                if joins && key.duplicates {
+                    entries.last_mut().expect("a group to join").tail = record.position;
+                    groups.last_mut().expect("a group to join").push(record.position);
+                } else {
+                    entries.push(pages::Entry::unique(
+                        key.extract(&records::keyed(shift, &record.bytes)),
+                        record.position,
+                    ));
+                    groups.push(vec![record.position]);
+                }
+            }
+            if key.duplicates {
+                let offset = usize::from(key.chain.ok_or_else(|| {
+                    format!(
+                        "key {}: permits duplicate values and its definition names no \
+                         offset for the chain that joins them",
+                        key.number
+                    )
+                })?);
+                chains.push((offset, groups));
             }
 
             let index = pages::build_index(layout, &entries, key.shape())
@@ -1963,6 +2090,11 @@ impl<M: Mem> Block<M> {
                     format!("relocating the index root at logical {}: {why}", rebuilt.root)
                 })?;
         }
+
+        // Last, and after every index root has been placed: the chains join
+        // records on *data* pages, and relocating those is a separate
+        // sequence that should not be interleaved with the index's.
+        self.v6_write_chains(file, layout, &chains)?;
 
         Ok(counts)
     }
@@ -4313,37 +4445,153 @@ mod tests {
     /// a **logical** page id. On `DUPKEY30.DAT` logical 2 is physical 10, so
     /// an update would have written over a different page entirely and
     /// reported success. That is what the v6 paths exist to prevent.
+    /// A record inserted into a v6 file whose key permits duplicates, joining
+    /// a value that already has records under it.
+    ///
+    /// **This test used to assert the opposite**, and drove its writes at
+    /// `tools/btrieve-oracle/fixtures/DUPKEY30.DAT` *in place* -- safe only
+    /// for as long as every one of those writes refused. The moment insert
+    /// started working it rewrote a committed fixture and took an unrelated
+    /// `v6::tests` case down with it. It works on a scratch copy now, and no
+    /// test should ever again point a write at a path under `fixtures/`.
+    ///
+    /// `DUPKEY30.DAT` is genuine Btrieve 6.15's own: 30 records, 10 distinct
+    /// values, three records per value. Inserting a 31st under an existing
+    /// value has to extend that value's chain and move its index entry's
+    /// tail, without disturbing the other nine groups.
     #[test]
-    fn a_v6_file_with_a_duplicate_key_refuses_every_write_and_moves_nothing() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT");
-        let mut block = block(path.clone());
-        block.name = "DUPKEY30.DAT".to_owned();
-        block.geometry = Geometry::read("DUPKEY30.DAT", &path).expect("reads");
-        let fcr = std::fs::read(&path).expect("readable");
-        block.keys = keys::parse("DUPKEY30.DAT", &fcr, block.geometry.keys, &[]).expect("keys");
-        block.maxlen = block.geometry.reclen;
+    fn insert_extends_a_v6_duplicate_keys_chain_rather_than_refusing() {
+        let dir = crate::testing::scratch("v6-duplicate-insert");
+        let path = dir.join("DUPKEY30.DAT");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/btrieve-oracle/fixtures/DUPKEY30.DAT"),
+            &path,
+        )
+        .expect("the fixture copies into a scratch directory");
 
-        // Reading it works -- that is Tasks 1-5, and the point of the refusal
-        // being on the write path alone.
+        let mut block = block_from_file(path.clone(), "DUPKEY30.DAT");
+        assert!(block.keys.iter().any(|k| k.duplicates), "its key permits duplicates");
         assert_eq!(block.records().expect("v6 reads").len(), 30);
 
-        let bytes = vec![0u8; usize::from(block.geometry.reclen)];
-        let e = block.insert(&bytes).expect_err("this file's duplicate key is refused");
-        assert!(e.why.contains("permits duplicate values"), "{e}");
-        let at = block
-            .records()
-            .expect("read")
-            .physical(0)
-            .expect("a record")
-            .position;
-        let e = block.update(at, &bytes).expect_err("this file's duplicate key is refused");
-        assert!(e.why.contains("permits duplicate values"), "{e}");
-        let e = block.delete(at).expect_err("this file's duplicate key is refused");
-        assert!(e.why.contains("permits duplicate values"), "{e}");
+        // A record carrying the same key bytes as the file's first record, so
+        // it must join that value's existing group rather than start one.
+        let first = block.records().expect("read").physical(0).expect("a record").bytes.clone();
+        let mut bytes = first.clone();
+        // Leave the key alone; change a byte that is not part of it so the
+        // record is distinguishable.
+        let last = bytes.len() - 1;
+        bytes[last] = 0x5b;
 
-        // And the file on disk is untouched.
-        assert_eq!(std::fs::read(&path).expect("readable"), fcr, "not one byte written");
+        block.insert(&bytes).expect("a duplicate value is a chain to extend, not a refusal");
+
+        let dup = block
+            .keys
+            .iter()
+            .find(|k| k.duplicates)
+            .expect("this file has a duplicate-permitting key")
+            .clone();
+        let number = dup.number;
+        let offset = usize::from(dup.chain.expect("the key names its chain offset"));
+
+        let geometry = block.geometry;
+        block.records = None;
+        let after = block.records().expect("a fresh read from disk");
+        assert_eq!(after.len(), 31, "the record went in");
+
+        let shift = after.key_shift();
+
+        // The chain lives on the page, not in the model -- `Record::bytes`
+        // carries `reclen` bytes and the pair sits past them -- so this reads
+        // the slots back off the disk, resolving each record's LOGICAL page
+        // through the allocation table exactly as the writer had to.
+        let whole = std::fs::read(&path).expect("the file reads");
+        let page_size = geometry.page;
+        let map = v6::Map::read(&whole, page_size).expect("its allocation table reads");
+        let layout = pages::Layout {
+            page: page_size,
+            physical: geometry.physical,
+            pages: geometry.pages,
+        };
+        let pair_at = |position: u32| -> [u32; 2] {
+            let (logical, slot) = layout.slot_of(position).expect("a slot boundary");
+            let physical = map.physical(logical).expect("a live page");
+            let at = usize::from(page_size) * physical as usize
+                + layout.position(0, slot) as usize
+                + offset;
+            [
+                pages::long(&whole[at..at + 4]),
+                pages::long(&whole[at + 4..at + 8]),
+            ]
+        };
+
+        // The groups the chain is supposed to describe, in the order this
+        // key puts the records in -- which is the order the writer walked
+        // when it built them.
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        for n in 0..after.ordered_len(number).expect("ordered by this key") {
+            let record = after.ordered(number, n).expect("in range");
+            let joins = n > 0
+                && dup.compare(
+                    &records::keyed(shift, &after.ordered(number, n - 1).expect("in range").bytes),
+                    &records::keyed(shift, &record.bytes),
+                ) == std::cmp::Ordering::Equal;
+            if joins {
+                groups.last_mut().expect("a group").push(record.position);
+            } else {
+                groups.push(vec![record.position]);
+            }
+        }
+        assert!(
+            groups.iter().any(|g| g.len() > 1),
+            "a file of 31 records over 10 values has groups to chain"
+        );
+
+        // Walking `next` from each group's head must reproduce the group, in
+        // order. Checking only that the links agree with each other is not
+        // enough: swapping `prev` and `next` everywhere gives a consistently
+        // mirrored list that satisfies any symmetric check, and did.
+        for group in &groups {
+            let [prev, _] = pair_at(group[0]);
+            assert_eq!(
+                prev,
+                pages::NOWHERE,
+                "the first record of a group has nothing before it"
+            );
+            let mut walked = vec![group[0]];
+            let mut at = group[0];
+            while walked.len() <= group.len() {
+                let [_, next] = pair_at(at);
+                if next == pages::NOWHERE {
+                    break;
+                }
+                assert!(
+                    after.find_physical(next).is_some(),
+                    "record at {at} names {next}, which is not a record"
+                );
+                walked.push(next);
+                at = next;
+            }
+            assert_eq!(
+                walked, *group,
+                "following `next` must reproduce the group in key order"
+            );
+
+            // And every member points back at the one before it. Checking
+            // only the head's `prev` and then walking forward leaves a writer
+            // that puts NOWHERE in every `prev` indistinguishable from a
+            // correct one -- genuine 6.15 writes real back-links, measured in
+            // `docs/2026-08-17-v6-duplicate-key-oracle.md`.
+            for (at, position) in group.iter().enumerate() {
+                let [prev, _] = pair_at(*position);
+                let expected = if at == 0 { pages::NOWHERE } else { group[at - 1] };
+                assert_eq!(
+                    prev, expected,
+                    "record {at} of a group of {} must name the one before it",
+                    group.len()
+                );
+            }
+        }
     }
 
     /// A v6 `Block` over a scratch copy of `V6EMPTY1KEY.DAT` -- genuine
