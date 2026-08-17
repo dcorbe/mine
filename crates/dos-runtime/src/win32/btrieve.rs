@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use mbbs_machine::m32::{Flat32Ptr, Flat32PtrError, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
-use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap};
+use btrieve::btrcall::{btrcall as engine_btrcall, Call, Gap, Status};
 use btrieve::mem::{Alloc, Mem};
 
 use crate::win32::kernel32::Answer;
@@ -145,6 +145,33 @@ fn gap(process: &mut Process, what: String) -> Option<Answer> {
     None
 }
 
+/// What [`resolve_open_path`] found.
+#[derive(Debug)]
+enum OpenResolution {
+    /// A path safe to hand `crates/btrieve`: either verified, by
+    /// canonicalizing it and checking the result still starts with the
+    /// canonicalized root, to resolve beneath the sandbox -- or (a name that
+    /// plainly does not exist under either spelling) an unresolved path
+    /// `Geometry::read` will fail against exactly the way a genuinely
+    /// missing file fails. The second case is safe to hand over unchecked
+    /// precisely because nothing on disk answers to it, symlink or not.
+    Path(PathBuf),
+    /// No sandbox to resolve against at all -- a host-configuration gap
+    /// (a test with an empty `Process`, mirroring `Streams::root_path`'s own
+    /// `None`), or the name is not nameable at all (an escape attempt, or
+    /// empty). Real Btrieve has no status for "this host has no root", so
+    /// this is a [`Gap`], not a status.
+    NoRoot,
+    /// The name resolves to something real, but by a route -- a symlink
+    /// already sitting inside the sandboxed tree -- that leads outside
+    /// `--root`. See this function's own doc comment for why this matters.
+    /// Real Btrieve has no status for "a symlink refused" either, so this
+    /// answers the same status 12 a genuinely missing file gets, without
+    /// [`btrcall`] ever handing `crates/btrieve` a path that would follow
+    /// the symlink out.
+    Escaped,
+}
+
 /// Resolve a Btrieve `Open`'s filename -- DOS syntax such as `.\WCCACMS2.DAT`
 /// -- into a real path beneath this process's own sandbox root.
 ///
@@ -164,25 +191,36 @@ fn gap(process: &mut Process, what: String) -> Option<Answer> {
 /// board rather than an empty fixture directory.
 ///
 /// Translation reuses `dos::files::translate` -- the same DOS-path decoder
-/// every other file access on this host goes through -- so a `..` escape is
-/// refused here exactly as it would be for any other DOS file call, even
-/// though (unlike `dos::files::Files`) nothing below this point opens through
-/// `openat2`: `crates/btrieve` reads and writes through plain `std::fs`, so
-/// there is no kernel-enforced jail once the join happens, only this check.
-///
-/// `None` when there is no sandbox to resolve against (a test with an empty
-/// `Process`, mirroring `Streams::root_path`'s own `None`) or the name is not
-/// nameable at all (an escape attempt, or empty). Both cases are calls this
-/// function cannot answer, and both end up producing an ordinary Btrieve
-/// "file not found" from a path that plainly cannot resolve to anything real,
-/// which is the same honest answer a real missing file gets.
-fn resolve_open_path(process: &Process, keybuf: &[u8]) -> Option<PathBuf> {
-    let root = process.streams.root_path()?;
+/// every other file access on this host goes through -- so `..`, an absolute
+/// path, and a `C:\` drive prefix are all refused lexically here exactly as
+/// they would be for any other DOS file call. That refusal is not the whole
+/// story, though: unlike `dos::files::Files`, nothing below this function
+/// opens through `openat2`, because `crates/btrieve` reads and writes
+/// through plain `std::fs` and is deliberately dependency-free (`crates/
+/// btrieve/tests/independence.rs` enforces that mechanically, so `openat2`
+/// does not belong in that crate). A symlink already sitting inside the
+/// sandboxed tree -- planted before this process ever started, not something
+/// a guest's own DOS-syntax name could spell -- would otherwise let `Open`
+/// walk out of `--root` the same way `..` would if lexical rejection were
+/// the only check. This function closes that door itself: every candidate
+/// that exists is canonicalized (resolving any symlink) and confirmed to
+/// still start with the canonicalized root before it is trusted.
+fn resolve_open_path(process: &Process, keybuf: &[u8]) -> OpenResolution {
+    let Some(root) = process.streams.root_path() else {
+        return OpenResolution::NoRoot;
+    };
+    // Canonicalized once per `Open` rather than cached on `Process`: this
+    // runs once per file a module opens (MajorMUD's own utilities open on
+    // the order of a dozen files, never one per record), not once per
+    // `BTRCALL`, so there is no hot loop here to optimise away.
+    let Ok(canonical_root) = root.canonicalize() else {
+        return OpenResolution::NoRoot;
+    };
     match dos::files::translate(keybuf) {
         dos::files::Target::File(rel) => {
             let candidate = root.join(&rel);
             if candidate.exists() {
-                return Some(candidate);
+                return contained(&candidate, &canonical_root);
             }
             // `dos::files::translate` upper-cases every byte -- DOS is
             // case-insensitive and the guest reliably writes upper case, but
@@ -192,11 +230,26 @@ fn resolve_open_path(process: &Process, keybuf: &[u8]) -> Option<PathBuf> {
             // `dos::files::Files` documents for the same reason.
             let lower = root.join(rel.to_ascii_lowercase());
             if lower.exists() {
-                return Some(lower);
+                return contained(&lower, &canonical_root);
             }
-            Some(candidate)
+            // Neither spelling exists, so there is nothing a symlink could
+            // have carried anywhere -- handing this back unresolved is safe,
+            // and `Geometry::read` will fail on it exactly the way a
+            // genuinely missing file fails.
+            OpenResolution::Path(candidate)
         }
-        dos::files::Target::Device(_) | dos::files::Target::Rejected => None,
+        dos::files::Target::Device(_) | dos::files::Target::Rejected => OpenResolution::NoRoot,
+    }
+}
+
+/// `candidate`, which [`resolve_open_path`] has already confirmed exists --
+/// canonicalized and checked against `canonical_root`, so a Btrieve `Open`
+/// is only ever handed the canonical (symlink-free) form of a path,
+/// verified to resolve beneath the sandbox.
+fn contained(candidate: &std::path::Path, canonical_root: &std::path::Path) -> OpenResolution {
+    match candidate.canonicalize() {
+        Ok(real) if real.starts_with(canonical_root) => OpenResolution::Path(real),
+        _ => OpenResolution::Escaped,
     }
 }
 
@@ -255,21 +308,29 @@ fn read_args(machine: &Machine, mem: &Memory) -> Result<Marshalled, String> {
     // `*dataLength` -- the caller's own `ULONG`, read before this call
     // overwrites it with how many bytes the engine actually used.
     //
-    // **Only the low sixteen bits of this read are trustworthy.**
-    // `re/wg33src/SRC/api/gcommlib/DFAAPI.C:914,978` is the measured reason:
-    // `btvu`'s own record-length parameter, `rlen`, is declared `USHORT` --
-    // two bytes -- and its Win32 call site takes that two-byte local's
+    // **Only the low sixteen bits of this read are trustworthy, for every
+    // caller on this ABI, not just the one that was measured.**
+    // `re/wg33src/SRC/api/gcommlib/DFAAPI.C:914` declares `btvu`'s own
+    // record-length parameter, `rlen`, as `USHORT` -- two bytes -- and
+    // `:978` is its Win32 call site, which takes that two-byte local's
     // address and casts it straight to `ULONG *` (`(ULONG*)&rlen`) before
-    // handing it to `BTRCALL`. Whatever this host resolves as the high
-    // sixteen bits is therefore not `dataLength` at all: it is two bytes of
-    // whatever sits next to `rlen` on the guest's own stack frame, which
-    // depends on stack layout this host has no reason to reproduce and the
-    // module never reads back as anything but the `USHORT` it declared.
-    // Measured at a real call site inside this run's own `-recover` pass
-    // (op 33, Step First): resolving all four bytes as the buffer length
-    // read `0x4101_0190` -- a plausible small record length, `0x0190`
-    // (400), sitting under an upper half that is address-shaped stack
-    // noise, the same signature `op`/`keyLength`/`ckeynum`'s own doc
+    // handing it to `BTRCALL`. `btvu` is `static` and is the *only* call to
+    // `BTRCALL` anywhere in `DFAAPI.C` (`grep -n "BTRCALL(" DFAAPI.C` finds
+    // exactly the two mutually-exclusive `#ifdef` branches inside it, lines
+    // 958 and 975, nothing else) -- every `dfa*` wrapper (`dfaOpen`,
+    // `dfaStepLock`, `dfaAbs`, `dfaAcqAbsLock`, ...) funnels through this one
+    // `rlen`. So this is an ABI invariant of how this vendor source calls
+    // `BTRCALL`, not a guess extrapolated from one op: whatever this host
+    // resolves as the high sixteen bits is never `dataLength` for any
+    // caller, only two bytes of whatever sits next to `rlen` on the guest's
+    // own stack frame, which depends on stack layout this host has no
+    // reason to reproduce and no `dfa*` wrapper ever reads back as anything
+    // but the `USHORT` it declared. Measured at a real call site inside this
+    // run's own `-recover` pass (op 33, Step First): resolving all four
+    // bytes as the buffer length read `0x4101_0190` -- a plausible small
+    // record length, `0x0190` (400), sitting under an upper half that is
+    // address-shaped stack noise, the same signature `op`/`keyLength`/
+    // `ckeynum`'s own doc
     // comments in this function already describe for the identical
     // narrow-write-into-a-wide-slot shape.
     let datalen: u32 = match Flat32Ptr(datalen_at).resolve(mem, 4) {
@@ -362,38 +423,49 @@ fn btrcall(process: &mut Process, machine: &mut Machine, mem: &mut Memory) -> Op
     // is written back: real Btrieve does not rewrite the name it was asked to
     // open, and the guest is entitled to read its own buffer back unchanged.
     let original_keybuf = (op == 0).then(|| keybuf.clone());
+    // Set only for a symlink escape: real Btrieve status 12, answered
+    // without ever calling `engine_btrcall` -- see `OpenResolution::Escaped`.
+    // Every other field is left exactly as `read_args` marshalled it
+    // (`keybuf` unsubstituted), which is safe because nothing below reads
+    // them when this is `Some`.
+    let mut refused: Option<Status> = None;
     if op == 0 {
         match resolve_open_path(process, &keybuf) {
-            Some(resolved) => {
+            OpenResolution::Path(resolved) => {
                 let mut bytes = resolved.to_string_lossy().into_owned().into_bytes();
                 bytes.push(0);
                 keybuf = bytes;
             }
-            None => {
+            OpenResolution::NoRoot => {
                 return gap(
                     process,
                     "Open: no sandboxed root to resolve a filename against".to_owned(),
                 );
             }
+            OpenResolution::Escaped => refused = Some(Status(12)),
         }
     }
 
-    let status = match engine_btrcall(
-        &mut process.btrieve,
-        mem,
-        &mut process.btrieve_heap,
-        Call {
-            op,
-            posblk: &mut posblk,
-            databuf: &mut databuf,
-            datalen: &mut datalen,
-            keybuf: &mut keybuf,
-            keylen,
-            keynum,
-        },
-    ) {
-        Ok(status) => status,
-        Err(Gap { what }) => return gap(process, what),
+    let status = if let Some(status) = refused {
+        status
+    } else {
+        match engine_btrcall(
+            &mut process.btrieve,
+            mem,
+            &mut process.btrieve_heap,
+            Call {
+                op,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut keybuf,
+                keylen,
+                keynum,
+            },
+        ) {
+            Ok(status) => status,
+            Err(Gap { what }) => return gap(process, what),
+        }
     };
 
     if let Some(original) = original_keybuf {
@@ -444,6 +516,48 @@ mod tests {
     #[test]
     fn the_answer_cleans_seven_arguments() {
         assert_eq!(super::CLEANS_ARGS, 7);
+    }
+
+    /// A symlink already sitting inside the sandbox root, pointing outside
+    /// it, must not let a Btrieve `Open` follow it out. Planted before the
+    /// "guest" ever runs, the way a symlink already present in real board
+    /// data would be -- not something a DOS-syntax name in the key buffer
+    /// could spell on its own (`dos::files::translate` already refuses
+    /// `..`), so lexical rejection alone cannot catch this; only
+    /// canonicalizing the candidate and checking it against the
+    /// canonicalized root does.
+    #[test]
+    fn a_symlink_inside_the_root_cannot_walk_a_btrieve_open_out_of_it() {
+        let base = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tmp"))
+            .join("win32-btrieve-escape");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("root dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+
+        // A real file outside the sandbox -- what a followed symlink would
+        // actually open.
+        std::fs::write(outside.join("SECRET.DAT"), b"not yours").expect("outside file");
+
+        // A symlink inside the sandbox, named the way a module would ask
+        // for it, pointing straight out.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("SECRET.DAT"), root.join("ESCAPE.DAT"))
+            .expect("symlink");
+
+        let fd = std::fs::File::open(&root).expect("root fd");
+        let mut p = crate::win32::process::Process::new("C:\\WCCMMUTL.EXE", &[]);
+        p.streams = crate::win32::stream::Streams::new(Some(dos::files::Files::new(
+            fd.into(),
+            root.clone(),
+        )));
+
+        let resolved = resolve_open_path(&p, b"ESCAPE.DAT\0");
+        assert!(
+            matches!(resolved, OpenResolution::Escaped),
+            "expected the symlink to be refused, got {resolved:?}"
+        );
     }
 
     /// Push seven distinct sentinel values onto a real stdcall frame, trap
@@ -582,6 +696,11 @@ mod tests {
     /// `0x4101` is address-shaped stack noise -- resolving the full 32-bit
     /// value failed outright ("1090584976 bytes runs past the end of the
     /// image"), which is what surfaced this.
+    ///
+    /// `read_args`'s own comment on `datalen` records why the fix belongs at
+    /// this shared layer rather than being special-cased to op 33: `btvu` is
+    /// the *only* call to `BTRCALL` anywhere in `DFAAPI.C`, so this is an ABI
+    /// invariant every `dfa*` wrapper shares, not a guess from one op.
     #[test]
     fn a_datalength_with_garbage_upper_bits_still_resolves_the_real_length() {
         const DATABUF_FILL: u8 = 0xB2;
