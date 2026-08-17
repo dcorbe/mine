@@ -490,7 +490,7 @@ fn insert_duplicate_users(block: &mut mbbs::btrieve::Block<AbiMem<Wg16>>) -> Res
 /// check. But `2042` is `page (2048) - HEADER (6)`, the page's own usable
 /// end, and `WCCUSERS.VIR` holds one record per page -- nothing shares that
 /// page, so the 36 bytes past `physical` belong to no other record.
-/// **Measured, not assumed, by `crates/btrieve-engine/tests/engine.rs`'s
+/// **Measured, not assumed, by `crates/btrieve-oracle/tests/engine.rs`'s
 /// `wccusers_vir_chain_offset_measurement`** (Task 5 of
 /// `docs/plans/2026-08-09-btrieve-engine-in-the-loop.md`): three records
 /// inserted into a fresh copy of the `.VIR` over the real engine, all

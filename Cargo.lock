@@ -124,7 +124,7 @@ name = "btrieve"
 version = "0.1.0"
 
 [[package]]
-name = "btrieve-engine"
+name = "btrieve-oracle"
 version = "0.1.0"
 
 [[package]]
@@ -459,7 +459,7 @@ name = "mbbs"
 version = "0.1.0"
 dependencies = [
  "btrieve",
- "btrieve-engine",
+ "btrieve-oracle",
  "libc",
  "mbbs-machine",
 ]
@@ -468,7 +468,7 @@ dependencies = [
 name = "mbbs-machine"
 version = "0.1.0"
 dependencies = [
- "btrieve-engine",
+ "btrieve-oracle",
  "libc",
 ]
 

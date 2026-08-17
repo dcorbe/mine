@@ -15,9 +15,9 @@
 #         tools/cargo-serial.sh clippy -p mbbs --all-targets
 #
 # NEVER run `cargo test --workspace` through this or any other path: it does
-# not finish. btrieve-engine's engine.rs runs two Wine-spawning tests in
+# not finish. btrieve-oracle's engine.rs runs two Wine-spawning tests in
 # parallel against one Wine prefix and they deadlock. Use
-# `--workspace --exclude btrieve-engine`.
+# `--workspace --exclude btrieve-oracle`.
 
 set -euo pipefail
 

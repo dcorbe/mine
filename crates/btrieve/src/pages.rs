@@ -2425,7 +2425,7 @@ mod tests {
 
     /// `write_chain`'s bound against a page holding exactly one record --
     /// `WCCUSERS.VIR`'s own shape, measured in
-    /// `crates/btrieve-engine/tests/engine.rs`'s
+    /// `crates/btrieve-oracle/tests/engine.rs`'s
     /// `wccusers_vir_chain_offset_measurement`. Its key 2 names a chain
     /// offset of 2034, past `physical` (2006) but inside the page's real
     /// usable end (`page - HEADER` = 2042): nothing else shares this page,

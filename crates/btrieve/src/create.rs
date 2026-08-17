@@ -10,7 +10,7 @@
 //! size, and a list of keys, each a list of segments with a position,
 //! length, type and flags. That is what [`FileSpec`]/[`KeySpec`]/
 //! [`SegmentSpec`] below carry, in the same shape `tools/btrieve-oracle/
-//! btrvprobe.c`'s `cmd_create` and `crates/btrieve-engine`'s
+//! btrvprobe.c`'s `cmd_create` and `crates/btrieve-oracle`'s
 //! `create_file_spec()` already build for the real engine, and what
 //! `tools/btrieve-oracle/crtprobe.c` (this task's own probe) generalised to
 //! any shape and confirmed live: a unique ascending key, a duplicate

@@ -4,7 +4,7 @@ members = [
     "crates/mbbs",
     "crates/mbbs-machine",
     "crates/btrieve",
-    "crates/btrieve-engine",
+    "crates/btrieve-oracle",
     "crates/mbbs-server",
     "crates/mud-core",
     "crates/mud-server",

@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use btrieve_engine::{Engine, Request};
+use btrieve_oracle::{Engine, Request};
 use mbbs::abi::Wg16;
 use mbbs::btrieve::{Btrieve, Geometry};
 use mbbs::{Config, Heap};

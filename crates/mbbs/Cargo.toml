@@ -11,7 +11,7 @@ libc = "0.2"
 mbbs-machine = { path = "../mbbs-machine" }
 
 [dev-dependencies]
-btrieve-engine = { path = "../btrieve-engine" }
+btrieve-oracle = { path = "../btrieve-oracle" }
 
 [lints]
 workspace = true

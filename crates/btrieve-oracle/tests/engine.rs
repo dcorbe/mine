@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use btrieve_engine::{Engine, Request, Response};
+use btrieve_oracle::{Engine, Request, Response};
 
 /// Btrieve operation codes, `tools/btrieve-oracle/btrvprobe.c:42-51`.
 const B_OPEN: u16 = 0;

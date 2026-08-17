@@ -10,7 +10,7 @@ libc = "0.2"
 
 [dev-dependencies]
 libc = "0.2"
-btrieve-engine = { path = "../btrieve-engine" }
+btrieve-oracle = { path = "../btrieve-oracle" }
 
 [lints]
 workspace = true

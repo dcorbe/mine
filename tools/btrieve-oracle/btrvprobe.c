@@ -824,7 +824,7 @@ static void cmd_dump(const char *path, int keynum)
 
 /*
  * serve: turn one TCP connection's framed requests into BTRCALLs, one at a
- * time, for crates/btrieve-engine's Rust client. Wire format is
+ * time, for crates/btrieve-oracle's Rust client. Wire format is
  * docs/plans/2026-08-09-btrieve-engine-in-the-loop.md, Task 1:
  *
  *   Request   u32 frame_len | u16 op | [128] posblk | u32 datalen_in
@@ -1103,7 +1103,7 @@ int main(int argc, char **argv)
             "           descending, 4-byte key (WCCUSERS key 2, minus the rest)\n"
             "  insert   insert <count> records; key values collide in groups of 3\n"
             "  serve    <port>: turn one TCP connection's framed requests into\n"
-            "           BTRCALLs, for crates/btrieve-engine's Rust client\n");
+            "           BTRCALLs, for crates/btrieve-oracle's Rust client\n");
         return 2;
     }
     cmd  = argv[1];

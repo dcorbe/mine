@@ -48,7 +48,7 @@
 //! Btrieve, not real Btrieve itself, and one place below **disagrees with
 //! it on purpose**: see [`here_for`]'s doc comment. Genuine Pervasive
 //! Btrieve 6.15 under Wine (`tools/btrieve-oracle/`, driven here through
-//! `crates/btrieve-engine`) decided every case the vendor source left open,
+//! `crates/btrieve-oracle`) decided every case the vendor source left open,
 //! and `crates/mbbs/tests/btrieve.rs`'s `position_ops_oracle_scenarios`
 //! (`#[ignore]`d, needs `wine`) is the transcript. Its scenario names (S1,
 //! S2, ...) are cited throughout this file's doc comments so a measurement
