@@ -9,11 +9,18 @@ use mbbs_machine::module::{ImportSite, Symbol};
 /// process finds already built: the command line, `argv`'s strings and its
 /// pointer array.
 ///
-/// 64 KiB, which is four orders of magnitude more than a command line and its
-/// `argv` need. Sized generously rather than tightly because the arena is a
-/// bump allocator with no reclaim (`Memory::alloc`), so the only thing its size
-/// bounds is how many times a host call may hand the program fresh memory.
-const ARENA_LEN: usize = 64 * 1024;
+/// **It now also backs the program's own `malloc`**, which is why it is
+/// megabytes rather than the 64 KiB a command line and its `argv` needed. Once
+/// `cw3220mt.DLL!_malloc` is answered out of here (`crate::win32::crt::malloc`),
+/// the arena is the program's heap, and the first thing this program does with
+/// it is ask for 8 KiB.
+///
+/// The arena is a bump allocator with no reclaim (`Memory::alloc`) and nothing
+/// here frees, so this size is a hard ceiling on everything a run allocates
+/// rather than a working-set figure. That is a deliberate bound: exhaustion is
+/// a clean refusal -- `malloc` answers NULL, as C says it may -- rather than a
+/// reused block, and raising this number is the first response to hitting it.
+const ARENA_LEN: usize = 4 * 1024 * 1024;
 
 /// A loaded executable, ready to be entered.
 pub struct Loaded {

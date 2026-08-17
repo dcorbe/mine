@@ -134,6 +134,20 @@ pub struct Process {
     /// on what ran before it. The same reasoning applies to every other piece
     /// of C runtime state with a cursor in it.
     pub random: crate::win32::crt::Random,
+    /// The console screen buffer this process draws on.
+    ///
+    /// One buffer, not one per handle: `CONIN$` and `CONOUT$` are two handles
+    /// onto the same console, and a program that sets the text attribute
+    /// through one and writes through the other expects the colour to apply.
+    /// Per-handle state -- the console *mode* -- lives on the handle instead,
+    /// in [`Object::Console`].
+    pub console: crate::win32::console::Console,
+    /// Whether the narrow file APIs interpret filenames as ANSI or OEM.
+    ///
+    /// Starts ANSI, which is what a Win32 process starts as. This program
+    /// switches it to OEM during startup -- it is a DOS-era utility, and OEM is
+    /// the code page its filenames were always written in.
+    pub file_apis_ansi: bool,
     /// Kernel objects this process has made, indexed by handle minus one.
     ///
     /// Handles are `1..=len` so that zero stays available as the NULL a failed
@@ -157,6 +171,13 @@ pub enum Object {
         manual_reset: bool,
         signalled: bool,
     },
+    /// A handle onto the process's console, from `CreateFileA("CONIN$")` or
+    /// `CreateFileA("CONOUT$")`.
+    ///
+    /// The `mode` is per *handle* rather than per console, which is how Win32
+    /// really works: input and output modes are different bit sets over the
+    /// same two calls, and a program sets each through its own handle.
+    Console { input: bool, mode: u32 },
 }
 
 impl Process {
@@ -171,6 +192,14 @@ impl Process {
             exit_code: None,
             last_error: ERROR_SUCCESS,
             random: crate::win32::crt::Random::default(),
+            // 80x25, the console every DOS-era program assumes until it says
+            // otherwise. This one says otherwise almost immediately -- it calls
+            // `SetConsoleScreenBufferSize` during startup -- so this is the
+            // value it reads *before* resizing, and it has to be the ordinary
+            // one for the arithmetic it does on it to come out where the
+            // program expects.
+            console: crate::win32::console::Console::new(80, 25),
+            file_apis_ansi: true,
             objects: Vec::new(),
         }
     }
@@ -194,10 +223,38 @@ impl Process {
     /// name is already taken, rather than a second one; this is how that is
     /// answered.
     pub fn named_object(&self, name: &str) -> Option<u32> {
-        self.objects.iter().position(|o| match o {
-            Object::Event { name: n, .. } => n.as_deref() == Some(name),
-        })
-        .map(|i| u32::try_from(i + 1).expect("index fits, it came from a Vec"))
+        self.objects
+            .iter()
+            .position(|o| match o {
+                Object::Event { name: n, .. } => n.as_deref() == Some(name),
+                // A console handle has no name in this sense. `CONIN$` is the
+                // name of a *device* passed to `CreateFileA`, not a kernel
+                // object name `OpenEventA` could ever find, so matching it here
+                // would let an event lookup return a console.
+                Object::Console { .. } => false,
+            })
+            .map(|i| u32::try_from(i + 1).expect("index fits, it came from a Vec"))
+    }
+
+    /// `SetConsoleMode`, which needs mutable access to one object and so
+    /// cannot be written at the call site while `process` is borrowed for the
+    /// console beside it.
+    ///
+    /// Answers whether the handle was a console at all -- Windows fails the
+    /// call rather than ignoring it, and a program that checks the result would
+    /// otherwise be told its terminal setup succeeded on a handle that is not a
+    /// terminal.
+    pub fn set_console_mode(&mut self, handle: u32, wanted: u32) -> bool {
+        let Some(index) = handle.checked_sub(1).and_then(|i| usize::try_from(i).ok()) else {
+            return false;
+        };
+        match self.objects.get_mut(index) {
+            Some(Object::Console { mode, .. }) => {
+                *mode = wanted;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Record an exit code. [`run`] stops as soon as one is set, which is what
@@ -436,18 +493,25 @@ mod tests {
     /// went wrong. When that phase lands this assertion is expected to change;
     /// what it must never do is move *backwards*.
     ///
-    /// **Phase 3, Task 2 moved it forward, and by exactly the predicted
-    /// amount.** `_time` and `_srand` are answered now, so the frontier is
-    /// `KERNEL32!CreateFileA` -- which is ordinal 12 of
-    /// `docs/2026-08-17-win32-crt-trace.md` §1, the first symbol past `_srand`
-    /// in the survey's list.
+    /// **Phase 3 moved it forward, one symbol at a time.** This assertion is
+    /// the phase's odometer: each time it failed, the symbol it named was
+    /// implemented and it was re-pointed at the next one. The route was
+    /// `_time` -> `_srand` -> `CreateFileA` -> the ten-call console
+    /// configuration block -> `SetFileApisToOEM` -> the six console-buffer
+    /// calls -> `LoadLibraryA` -> `_malloc` -> here.
     ///
-    /// That agreement is worth more than either measurement alone. The survey
-    /// answers unimplemented symbols with a lie and is only sound up to its
-    /// first mis-cleaned stdcall call, which is this very symbol; this runner
-    /// never lies and stops dead at it. Two instruments with different failure
-    /// modes naming the same boundary is what makes the trace's ordinals 0-11
-    /// evidence rather than an artefact of how the survey resumes.
+    /// `_access("WCCMMPLS.MCV")` is a different kind of frontier from all of
+    /// those, which is why the phase stops at it rather than pushing on: every
+    /// symbol behind it was process, console or arithmetic, and this one is the
+    /// program asking the filesystem a question. Answering it means wiring
+    /// `dos::files::Files` -- the root jail the DOS guest already goes through
+    /// -- into this host, which is its own body of work.
+    ///
+    /// One thing this route confirmed is worth keeping: `CreateFileA` was both
+    /// the survey's first *mis-cleaned* call and this runner's stopping point
+    /// at the time, and two instruments with opposite failure modes naming one
+    /// boundary is what made the survey's ordinals 0-11 evidence rather than an
+    /// artefact of how it resumes.
     #[test]
     fn the_process_carries_main_as_far_as_the_c_runtime() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
@@ -457,8 +521,8 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Unimplemented {
-                module: "KERNEL32.dll".to_owned(),
-                symbol: "CreateFileA".to_owned(),
+                module: "cw3220mt.DLL".to_owned(),
+                symbol: "_access".to_owned(),
             }
         );
     }

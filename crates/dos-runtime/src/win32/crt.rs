@@ -137,6 +137,53 @@ pub fn memmove(mem: &mut Memory, dest: u32, src: u32, n: u32) -> u32 {
     dest
 }
 
+/// `void *malloc(size_t)` -- a pointer out of the program's own arena.
+///
+/// **Nothing is ever freed**, and that is a bounded decision rather than an
+/// oversight. `Memory::alloc` is a bump allocator; this is a maintenance
+/// utility that runs once and exits; and the arena's fixed size is what will
+/// say so if that assumption breaks -- loudly, by refusing, rather than quietly,
+/// by handing back a block that is still in use. If a run ever exhausts it,
+/// raising `ARENA_LEN` is the first response and a real allocator is a decision
+/// for whoever hits it, not something to build in advance.
+///
+/// Zero bytes returns a distinct non-null pointer, as C requires: a `malloc(0)`
+/// that answered NULL would be indistinguishable from failure, and the caller
+/// would take its out-of-memory path over a request it made deliberately.
+///
+/// NULL on exhaustion, which is `malloc`'s own way of reporting it.
+pub fn malloc(mem: &mut Memory, bytes: u32) -> u32 {
+    let want = (bytes.max(1)) as usize;
+    mem.alloc(want).map_or(0, |p| p.0)
+}
+
+/// `void free(void *)` -- accepted and ignored. See [`malloc`].
+///
+/// Taking the pointer as an argument rather than being elided at the call site
+/// keeps the dispatch arm honest about what the C function's signature is; the
+/// argument is read off the frame either way.
+pub fn free(_at: u32) {}
+
+/// `char *strdup(const char *)` -- a copy of the string in fresh memory.
+///
+/// Fails to NULL on either half: an unreadable source or an exhausted arena.
+/// C's `strdup` reports both the same way, and a caller checking the result
+/// cannot tell them apart either.
+pub fn strdup(mem: &mut Memory, at: u32) -> u32 {
+    let Ok(bytes) = Flat32Ptr(at).read_cstr(mem) else {
+        return 0;
+    };
+    let mut owned = bytes.to_vec();
+    owned.push(0);
+    let Ok(dest) = mem.alloc(owned.len()) else {
+        return 0;
+    };
+    if dest.write(mem, &owned).is_err() {
+        return 0;
+    }
+    dest.0
+}
+
 /// Answer a `cw3220mt.DLL` import, or `None` for one still unimplemented.
 ///
 /// `None` is what makes an unimplemented symbol a *diagnosable* event:
@@ -175,6 +222,22 @@ pub fn dispatch(
         // of one generator rather than one of two functions. The pair is the
         // unit.
         "_rand" => Some(Answer::cdecl(process.random.rand())),
+        // void *malloc(size_t size)
+        "_malloc" => {
+            let bytes = machine.arg_u32(mem.stack(), 0);
+            Some(Answer::cdecl(malloc(mem, bytes)))
+        }
+        // void free(void *block)
+        "_free" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            free(at);
+            Some(Answer::cdecl(0))
+        }
+        // char *strdup(const char *s)
+        "_strdup" => {
+            let at = machine.arg_u32(mem.stack(), 0);
+            Some(Answer::cdecl(strdup(mem, at)))
+        }
         // void *memmove(void *dest, const void *src, size_t n)
         "_memmove" => {
             let dest = machine.arg_u32(mem.stack(), 0);
@@ -331,7 +394,7 @@ mod tests {
     fn unreached_symbols_are_declined_rather_than_answered() {
         let mut l = loaded();
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
-        for symbol in ["_strlen", "_fopen", "_malloc", "_longjmp", "_sprintf"] {
+        for symbol in ["_strlen", "_fopen", "_longjmp", "_sprintf", "_strtok"] {
             assert!(
                 dispatch(&mut p, &mut l.machine, &mut l.mem, symbol).is_none(),
                 "{symbol} is unreached and must stay diagnosable"
@@ -339,3 +402,5 @@ mod tests {
         }
     }
 }
+
+

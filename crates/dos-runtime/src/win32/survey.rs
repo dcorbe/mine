@@ -140,12 +140,23 @@ mod tests {
             "_time is the measured frontier Phase 2 stopped at"
         );
 
-        // The measurement itself, pinned. Three of 66, in this order -- see
-        // `docs/2026-08-17-win32-crt-trace.md` §1. Asserted rather than merely
-        // bounded because the *size* of this set is the finding: it is what
-        // says Tasks 3-5 of the phase plan have nothing to implement yet.
+        // The measurement itself, pinned -- see
+        // `docs/2026-08-17-win32-crt-trace.md`. Nine of 66, in this order.
+        //
+        // It was **three** when this test was written, and the six that joined
+        // it were not found by looking harder at the import table: they became
+        // reachable because the console was implemented. A survey is a function
+        // of how much of the host exists, not a fixed property of the program,
+        // and this list growing as the host grows is the instrument working
+        // rather than the measurement having been wrong.
         let names: Vec<&str> = crt.iter().map(|r| r.symbol.as_str()).collect();
-        assert_eq!(names, ["_time", "_srand", "_memmove"]);
+        assert_eq!(
+            names,
+            [
+                "_time", "_srand", "_memmove", "_malloc", "_access", "_getenv", "_memset",
+                "_fopen", "_vsprintf",
+            ]
+        );
 
         // The phase's headline risk, pinned closed. `_longjmp` is linked but
         // never called, and `m32::Machine` has no register setters to implement
@@ -161,30 +172,54 @@ mod tests {
     /// forgotten by someone reading only the reached list.
     ///
     /// The survey answers unimplemented symbols with `cleans: 0`, which is
-    /// right for the cdecl C runtime and wrong for stdcall Win32. Everything
-    /// after the first such call is suspect, so the boundary is worth naming:
-    /// `_time` and `_srand` sit *before* it and are sound; `_memmove` does not.
+    /// right for the cdecl C runtime and wrong for stdcall Win32 -- so the
+    /// ordering after the first *unimplemented stdcall* call is built on a
+    /// drifted stack and cannot be trusted.
+    ///
+    /// **That boundary moved from ordinal 12 to ordinal 1518 when the console
+    /// was implemented,** which is the single most useful consequence of this
+    /// phase. It used to be `CreateFileA`, twelve calls in, leaving almost the
+    /// whole list suspect. It is now `Sleep`, and every C runtime symbol the
+    /// program reaches sits *before* it -- so the reached list above is no
+    /// longer a hint, it is a measurement.
+    ///
+    /// Implementing a stdcall symbol is therefore not only progress through the
+    /// program; it is a widening of what the survey can honestly see.
     #[test]
-    fn the_trustworthy_prefix_ends_before_the_first_unimplemented_stdcall() {
+    fn implementing_the_console_moved_the_trustworthy_prefix_to_the_whole_list() {
         let file = std::fs::read("/home/daniel/peepeebbs/wccmmutl.exe").expect("the utility");
         let mut loaded = crate::win32::load::load(&file).expect("loads");
         let mut p = Process::new("C:\\WCCMMUTL.EXE", &[]);
 
         let (reached, _stop) = survey(&mut loaded, &mut p, 100_000).expect("runs");
-
         let first_of = |s: &str| reached.iter().find(|r| r.symbol == s).map(|r| r.first);
-        let drift = first_of("CreateFileA").expect("CreateFileA is reached");
+
+        // `Sleep` is the first stdcall symbol this host still does not answer,
+        // so it is where the stack starts drifting.
+        let drift = first_of("Sleep").expect("Sleep is reached and unimplemented");
+
+        for symbol in [
+            "_time", "_srand", "_memmove", "_malloc", "_access", "_getenv", "_memset", "_fopen",
+            "_vsprintf",
+        ] {
+            let at = first_of(symbol).unwrap_or_else(|| panic!("{symbol} is reached"));
+            assert!(
+                at < drift,
+                "{symbol} at {at} must sit before the drift at {drift}"
+            );
+        }
+
+        // And the program gets far enough to draw. Twenty character writes and
+        // twenty attribute writes is a screen being painted, not a probe.
+        let painted = reached
+            .iter()
+            .find(|r| r.symbol == "WriteConsoleOutputCharacterA")
+            .expect("the program paints");
         assert!(
-            first_of("_time").expect("_time") < drift,
-            "_time is measured, not inferred"
-        );
-        assert!(
-            first_of("_srand").expect("_srand") < drift,
-            "_srand is measured, not inferred"
-        );
-        assert!(
-            first_of("_memmove").expect("_memmove") > drift,
-            "_memmove sits past the drift and is a hint, not a measurement"
+            painted.calls >= 20,
+            "expected a screenful of writes, got {}",
+            painted.calls
         );
     }
 }
+

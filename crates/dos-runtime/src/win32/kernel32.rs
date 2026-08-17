@@ -26,6 +26,7 @@
 use mbbs_machine::m32::{Flat32Ptr, Machine, Memory};
 use mbbs_machine::ptr::ModulePtr;
 
+use crate::win32::console;
 use crate::win32::process::{self, Object, Process};
 
 /// Win32's `BOOL`: zero is failure, and any non-zero is success. Named because
@@ -121,13 +122,43 @@ pub fn dispatch(
             let at = machine.arg_u32(mem.stack(), 0);
             Some(Answer::stdcall(get_version_ex_a(mem, at), 1))
         }
+        // LoadLibraryA(LPCSTR lpLibFileName)
+        //
+        // **Answered NULL, and only for `galmemdb.dll`.** NULL is what
+        // `LoadLibraryA` returns when the library is not there, and it is the
+        // truth: this host has no `galmemdb.dll` and there is no copy of one
+        // anywhere in `archive/`.
+        //
+        // It is also *safe*, which was measured rather than hoped for. Told the
+        // load failed, the program does not stop -- it falls through to
+        // `malloc` and carries on. `galmemdb` is Galacticomm's shared-memory
+        // database (its source survives as
+        // `re/wg33src/SRC/api/gcommlib/GALMEMDB.C`), which an offline utility
+        // needs only when it is sharing memory with a running board. There is
+        // no running board here, so the fallback path is the correct path, not
+        // a degraded one. The "NO MEMORY - restart!" string sitting near this
+        // call site belongs to a later allocation failure, not to this.
+        //
+        // Any *other* library stays `None` and so names itself: "this program
+        // asked for a DLL we have not considered" is a finding, and answering
+        // every `LoadLibraryA` with NULL would bury it.
+        "LoadLibraryA" => {
+            let name_ptr = machine.arg_u32(mem.stack(), 0);
+            let name = process::read_cstr(mem, name_ptr)?;
+            name.eq_ignore_ascii_case("galmemdb.dll")
+                .then(|| Answer::stdcall(0, 1))
+        }
         // ExitProcess(UINT) -- declared `noreturn`, so the value is never
         // read; `run` stops as soon as `exit_code` is set.
         "ExitProcess" => {
             process.exit(0);
             Some(Answer::stdcall(0, 1))
         }
-        _ => None,
+        // The console subset lives next door. Split by concern rather than by
+        // DLL: these are KERNEL32 exports like the arms above, but a console
+        // screen buffer has nothing to do with process and kernel-object
+        // handling, and keeping them in one match would bury both.
+        _ => console::dispatch(process, machine, mem, symbol),
     }
 }
 
@@ -308,13 +339,15 @@ mod tests {
     fn an_unimplemented_symbol_answers_nothing_at_all() {
         let mut l = loaded();
         let mut p = Process::new("X.EXE", &[]);
+        // `SetConsoleCtrlHandler` rather than the console-buffer call this
+        // once named: that family is implemented now (see
+        // `crate::win32::console`), and this one is the console symbol still
+        // deliberately unanswered. The test is about the *mechanism* -- an
+        // unimplemented symbol declining rather than guessing -- so it needs a
+        // symbol that is genuinely unimplemented, and it must be updated rather
+        // than deleted whenever the frontier eats the one it was using.
         assert_eq!(
-            dispatch(
-                &mut p,
-                &mut l.machine,
-                &mut l.mem,
-                "WriteConsoleOutputCharacterA"
-            ),
+            dispatch(&mut p, &mut l.machine, &mut l.mem, "SetConsoleCtrlHandler"),
             None
         );
     }
