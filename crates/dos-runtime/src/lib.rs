@@ -1,23 +1,29 @@
-//! A DOS runtime, begun as the proof of concept for
+//! A DOS *runtime*, begun as the proof of concept for
 //! `docs/2026-08-16-dos-trap-edges.md` and kept because it serves a real door:
 //! LORD runs under it as a Synchronet external program.
 //!
-//! The claim it was written to demonstrate still holds and is still the
-//! organising idea -- that the DOS services are independent of how the
-//! `int 21h` reached them, and that saying so with a trait costs nothing and
-//! buys unit-testability.
+//! This crate used to hold the DOS kernel itself; the border refactor moved
+//! that (the seam and the services) out into the `dos` crate, so what remains
+//! here is the *machine*: a real-mode KVM guest ([`kvm`]), the BIOS, FOSSIL
+//! over a UART ([`bios`], [`fossil`], [`uart`]), the text-mode [`screen`], a
+//! [`terminal`] and scripted/interactive [`driver`] for feeding it input, and
+//! the `.EXE`/`.COM` loader ([`mz`]). [`dos`], [`files`], [`guest`] and
+//! [`testguest`] below are re-exports of the `dos` crate's `kernel`, `files`,
+//! `guest` and `testguest` modules, not defined in this crate -- see that
+//! crate's own `lib.rs` for what they are.
 //!
-//! Three pieces:
-//!
-//! - [`guest`] -- the seam. No `ucontext`, no vCPU, no LDT.
-//! - [`dos`] -- the services. One match on `AH`; knows nothing about either edge.
-//! - [`kvm`] and [`testguest`] -- two implementors of the seam, one a real
-//!   real-mode CPU and one a `Vec<u8>`.
-//!
-//! The third implementor is the argument that does not depend on KVM: it is
-//! what makes every service in [`dos`] testable without a machine at all.
-//! `m16`'s signal handler would be a fourth, and is deliberately absent here so
-//! that this crate cannot collide with the work in flight on that branch.
+//! The claim this crate was written to demonstrate still holds, and is now
+//! *realised* rather than merely claimed: the DOS services in [`dos`] know
+//! nothing about how their `int 21h` arrived. [`kvm`]'s `VmGuest` is one
+//! implementor of the seam ([`guest::Guest`]); [`testguest`]'s `TestGuest` (a
+//! `Vec<u8>` and a register file) is another, and this crate's own `Bios` and
+//! `Fossil` services are unit-tested against it directly, no machine
+//! required. `bin/runexe.rs` and `main.rs` both compose the services this
+//! crate and `dos` provide behind `dos::service::Services`, which is what
+//! turns "independent of the edge" from a design note into routing that
+//! actually runs that way. `m16`'s signal handler would be a third
+//! implementor of the seam, and is deliberately absent here so that this
+//! crate cannot collide with the work in flight on that branch.
 
 pub mod bios;
 pub use ::dos::kernel as dos;
