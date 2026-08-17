@@ -556,6 +556,26 @@ pub fn dispatch(
                 .is_some();
             Some(Answer::cdecl(u32::from(!ok)))
         }
+        // size_t fread(void *buf, size_t size, size_t count, FILE *fp)
+        //
+        // Answers the number of *complete elements* read, not the byte count
+        // -- a short read (end-of-file mid-element) truncates down rather than
+        // rounding up, matching the C standard's "the value of a partially
+        // read element is indeterminate" by simply not counting it.
+        "_fread" => {
+            let buf = machine.arg_u32(mem.stack(), 0);
+            let size = machine.arg_u32(mem.stack(), 1) as usize;
+            let count = machine.arg_u32(mem.stack(), 2) as usize;
+            let fp = machine.arg_u32(mem.stack(), 3);
+            let want = size.saturating_mul(count);
+            let bytes = process.streams.read(mem, fp, want);
+            let got = bytes.len();
+            if Flat32Ptr(buf).write(mem, &bytes).is_err() {
+                return Some(Answer::cdecl(0));
+            }
+            let items = if size == 0 { 0 } else { got / size };
+            Some(Answer::cdecl(items as u32))
+        }
         // int vsprintf(char *buf, const char *fmt, va_list ap)
         //
         // A `va_list` on 32-bit cdecl is a bare pointer to the first variable

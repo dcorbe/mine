@@ -695,12 +695,12 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Unimplemented {
-                module: "cw3220mt.DLL".to_owned(),
-                symbol: "_fread".to_owned(),
+                module: "wbtrv32.dll".to_owned(),
+                symbol: "BTRCALL".to_owned(),
             },
-            "with a catalogue present the program never throws, so it runs on \
-             past where the unwind gate used to be, into ordinary C runtime \
-             file I/O; see this test's comment"
+            "with a catalogue present and the reached C runtime file I/O \
+             symbols answered, the program runs all the way to its first \
+             Btrieve call; see this test's comment"
         );
     }
 
