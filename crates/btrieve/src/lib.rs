@@ -1,8 +1,14 @@
 //! A Btrieve 6.15 engine, and the session that holds open files.
 //!
-//! Depends on nothing but `std`, deliberately, and
-//! `tests/independence.rs` is a mechanical guard that it stays that way.
-//! Three consumers need this engine and no two of them agree on anything
+//! Depends on nothing but `std` at runtime, deliberately, and
+//! `tests/independence.rs` is a mechanical guard that it stays that way. The
+//! one exception is test-only and named, not silent: `[dev-dependencies]`
+//! carries exactly `btrieve-oracle`, and only
+//! `crates/btrieve/tests/differential.rs` (Task 12's replay of genuine
+//! Pervasive Btrieve 6.15's own recorded fixtures) is allowed to name it --
+//! `independence.rs` checks both the manifest section and the source scan
+//! for that exact shape, not just that `src/` is clean. Three consumers need
+//! this engine and no two of them agree on anything
 //! else: the MajorBBS/Worldgroup host serves it to 16- and 32-bit modules, a
 //! DOS guest reaches it through an interrupt, and a Win32 host reaches it
 //! through `wbtrv32.dll!BTRCALL`. Those last two are what the vendor's offline
