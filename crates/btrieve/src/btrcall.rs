@@ -129,6 +129,9 @@ pub enum Outcome {
     /// Op 22, `dfaAbs`: where the file is currently positioned, as a
     /// physical position.
     AbsolutePosition,
+    /// Op 23, `dfaAcqAbsLock`: position at an absolute physical position and
+    /// deliver that record.
+    AcquireAbsolute,
     /// Op 25 -- close every file and release everything.
     Stop,
     /// Ops 5-13: a keyed read.
@@ -164,6 +167,7 @@ pub fn describe(op: u16) -> Outcome {
         4 => Outcome::Delete,
         15 => Outcome::Stat,
         22 => Outcome::AbsolutePosition,
+        23 => Outcome::AcquireAbsolute,
         25 => Outcome::Stop,
         other => Outcome::Unmodelled(other),
     }
@@ -234,6 +238,7 @@ pub fn btrcall<M: Mem>(
         Outcome::Delete => delete(session, call),
         Outcome::Stat => stat(session, call),
         Outcome::AbsolutePosition => absolute_position(session, call),
+        Outcome::AcquireAbsolute => acquire_absolute(session, call),
         Outcome::Query(_) | Outcome::Stop => Err(Gap {
             what: format!("operation {} is named but not yet dispatched", call.op),
         }),
@@ -390,6 +395,59 @@ fn absolute_position<M: Mem>(session: &crate::Btrieve<M>, call: Call<'_>) -> Res
             *call.datalen = 4;
             Ok(Status::OK)
         }
+        Err(e) => status_of(&e),
+    }
+}
+
+/// Op 23, `dfaAcqAbsLock`: position at an absolute physical position and
+/// deliver that record, establishing `keynum`'s key path.
+///
+/// `re/wg33src/SRC/api/gcommlib/DFAAPI.C:483`'s own calling convention is the
+/// mirror of [`absolute_position`]'s: `dfaAcqAbsLock` writes `*(LONG
+/// *)recptr = abspos` into the record buffer **before** calling `BTRCALL`,
+/// then hands that same buffer as `dataBuffer` -- the position goes in where
+/// the record comes back out. [`crate::ops::Block::acquire_absolute`]
+/// already computes this; wiring it in is the same shape [`stat`] and
+/// [`absolute_position`] are.
+///
+/// Lock bias is hardcoded to `0`, matching [`get`]'s own precedent: neither
+/// this crate's op table nor `describe` decodes a `loktyp` offset out of the
+/// operation code today, so a locked Acquire Absolute (op 123/223/323/423)
+/// falls to [`Outcome::Unmodelled`] rather than silently taking the wrong
+/// lock -- the same gap `get`'s own hardcoded `0` already leaves open for
+/// every keyed read.
+fn acquire_absolute<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
+    let at = handle_of::<M>(call.posblk);
+    let index = session.find(at).map_err(|why| Gap { what: why })?;
+    if call.databuf.len() < 4 {
+        return Err(Gap {
+            what: format!(
+                "Acquire Absolute: {} data bytes offered, need at least 4 to carry the position",
+                call.databuf.len()
+            ),
+        });
+    }
+    let position = u32::from_le_bytes(call.databuf[..4].try_into().expect("checked above"));
+    let key = u16::try_from(call.keynum.max(0)).unwrap_or(0);
+
+    match session.open[index].acquire_absolute(position, key, 0, &mut session.locks) {
+        Ok(Some(d)) => {
+            *call.datalen = u32::try_from(d.bytes.len()).unwrap_or(u32::MAX);
+            call.databuf.clear();
+            call.databuf.extend_from_slice(&d.bytes);
+            if let Some(k) = d.key {
+                call.keybuf.clear();
+                call.keybuf.extend_from_slice(&k);
+            }
+            // Truncated, not failed -- the same convention `get` and `stat`
+            // use for a record too big for the caller's own buffer.
+            Ok(if d.truncated { Status(22) } else { Status::OK })
+        }
+        // The position names no record: `Block::acquire_absolute`'s own doc
+        // comment calls this "not an error", matching `Block::query`'s
+        // not-found contract -- the same shape `get` already answers with
+        // status 9 for a search that comes up empty.
+        Ok(None) => Ok(Status(9)),
         Err(e) => status_of(&e),
     }
 }
@@ -1250,5 +1308,148 @@ mod tests {
         assert_eq!(datalen, 4, "a LONG, per DFAAPI.C's own sizeof(LONG)");
         let position = u32::from_le_bytes(databuf.try_into().expect("4 bytes"));
         assert_ne!(position, 0, "a real physical position, not the fill byte pattern read back");
+    }
+
+    /// Acquire Absolute (op 23), `dfaAcqAbsLock`: insert two records, read
+    /// the first one's own position back with op 22, then use op 23 to jump
+    /// straight to it by that position and get the very record back -- the
+    /// full round trip real `DFAAPI.C` code performs to revisit a record it
+    /// once positioned on. A position naming nothing answers status 9, the
+    /// same "not found" convention `get` already uses.
+    #[test]
+    fn acquire_absolute_jumps_straight_to_a_position_and_delivers_the_record() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("acquire-absolute-through-numbers");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        for record in [vec![11, 0, 0, 0, 1, 1, 1, 1], vec![22, 0, 0, 0, 2, 2, 2, 2]] {
+            let mut databuf = record;
+            let status = btrcall(
+                &mut session,
+                &mut mem,
+                &mut heap,
+                Call {
+                    op: 2,
+                    posblk: &mut posblk,
+                    databuf: &mut databuf,
+                    datalen: &mut 8,
+                    keybuf: &mut Vec::new(),
+                    keylen: 255,
+                    keynum: 0,
+                },
+            )
+            .expect("Insert is modelled");
+            assert_eq!(status, Status::OK);
+        }
+
+        // Get Equal on the first record establishes currency, then op 22
+        // reads back its own physical position.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5, // Get Equal
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![11, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK);
+
+        let mut posbuf = vec![0u8; 4];
+        let mut poslen = 4u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 22,
+                posblk: &mut posblk,
+                databuf: &mut posbuf,
+                datalen: &mut poslen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Absolute Position is modelled");
+        assert_eq!(status, Status::OK);
+
+        // Get Next moves currency onto the second record, so this Acquire
+        // Absolute really does jump rather than merely re-reading whatever
+        // was already current.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 6, // Get Next
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Next is modelled");
+        assert_eq!(status, Status::OK);
+        assert_eq!(databuf, vec![22, 0, 0, 0, 2, 2, 2, 2], "currency moved to the second record");
+
+        // Acquire Absolute (op 23): the position goes in as the first four
+        // bytes of the data buffer, and the found record replaces them.
+        let mut databuf = vec![0u8; 8];
+        posbuf.resize(8, 0);
+        databuf[..4].copy_from_slice(&posbuf[..4]);
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 23,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Acquire Absolute is modelled");
+        assert_eq!(status, Status::OK);
+        assert_eq!(databuf, vec![11, 0, 0, 0, 1, 1, 1, 1], "jumped back to the first record");
+
+        // A position naming nothing at all: not found, status 9.
+        let mut databuf = vec![0xffu8; 8];
+        databuf[..4].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 23,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Acquire Absolute is modelled");
+        assert_eq!(status, Status(9), "no record at that position");
     }
 }
