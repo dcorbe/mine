@@ -107,6 +107,23 @@ const _: () = assert!(
     (HEAP_SEG as u32) * 16 + HEAP_CAPACITY as u32 <= (PSP_SEG as u32) * 16,
     "the Btrieve heap must fit entirely below PSP_SEG, where the loaded program begins"
 );
+/// The third relationship, and the one a review caught missing: neither
+/// assert above says anything about where `HEAP_SEG` sits *relative to
+/// `ENV_SEG`*, which is exactly the ordering the runtime check just below
+/// `main`'s `vm.load(ENV_SEG...)` depends on. Without this, a future repack
+/// that moved `ENV_SEG` at or past `HEAP_SEG` would not fail here -- it would
+/// only be caught, if at all, by that runtime check, and only in a *debug*
+/// build: the check there is `env.len() <= (HEAP_SEG - ENV_SEG) * 16`-shaped
+/// arithmetic on plain `u16`s, and this workspace sets no `overflow-checks`
+/// override, so in `--release` a negative difference wraps to a huge `u16`
+/// and the assert always passes -- silent corruption, not a caught bug,
+/// exactly the failure mode every other assert in this file exists to
+/// rule out.
+const _: () = assert!(
+    (HEAP_SEG as u32) * 16 > (ENV_SEG as u32) * 16,
+    "HEAP_SEG must start strictly after ENV_SEG, or the environment block \
+     could run into a heap that starts at or before it"
+);
 
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
@@ -498,8 +515,19 @@ fn main() -> io::Result<()> {
     // program whose name is long enough to run the environment block into
     // the heap, rather than leaving that to be discovered as silent
     // corruption the way the old `ENV_SEG` bug was.
+    //
+    // Compared as widened sums, never as a subtraction of the two segments.
+    // `HEAP_SEG - ENV_SEG` on plain `u16`s would be correct only as long as
+    // `HEAP_SEG > ENV_SEG` holds -- which the compile-time assert above this
+    // function does pin today, but this expression has no way to *know*
+    // that, and this workspace's `Cargo.toml` sets no `overflow-checks`
+    // override, so a release build of a subtraction that went negative would
+    // wrap to a huge `u16` and this `assert!` would silently always pass --
+    // exactly the failure this check exists to catch. Addition cannot
+    // underflow the same way, so there is nothing here for a future change
+    // to silently get wrong.
     assert!(
-        env.len() <= (HEAP_SEG - ENV_SEG) as usize * 16,
+        u32::from(ENV_SEG) * 16 + env.len() as u32 <= u32::from(HEAP_SEG) * 16,
         "the DOS environment block ({} bytes) would run into the Btrieve heap at {HEAP_SEG:#06x}",
         env.len()
     );
