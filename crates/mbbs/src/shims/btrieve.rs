@@ -4837,13 +4837,7 @@ mod tests {
     /// this class of quiet divergence -- see `note_duplicate_key`.
     #[test]
     fn dinsbtv_notes_which_key_and_value_collided() {
-        // `WGSGEN2.DAT` is in the copy list so `Host::new`'s own
-        // `Host::open_genbb` finds it already there rather than creating one
-        // -- the assertion below is a notes() *equality*, and a fresh scratch
-        // directory otherwise picks up a "created WGSGEN2.DAT" note ahead of
-        // the one this test exists to check.
-        let dir =
-            crate::testing::scratch_with("dinsbtv-collide-notes", &["SAMPLE.DAT", "WGSGEN2.DAT"]);
+        let dir = crate::testing::scratch_with("dinsbtv-collide-notes", &["SAMPLE.DAT"]);
         let mut f = Fixture::rooted(dir);
         open(&mut f, "SAMPLE.DAT", 64);
         let recptr = f.bytes(&sample_record(5, "Imposter"), false);
@@ -4873,12 +4867,7 @@ mod tests {
     /// call, so the two must read differently.
     #[test]
     fn dupdbtv_notes_which_key_and_value_collided() {
-        // See `dinsbtv_notes_which_key_and_value_collided`'s own comment: the
-        // scratch directory needs `WGSGEN2.DAT` already present so this
-        // notes()-equality assertion is not also seeing `Host::open_genbb`'s
-        // own "created" note.
-        let dir =
-            crate::testing::scratch_with("dupdbtv-collide-notes", &["SAMPLE.DAT", "WGSGEN2.DAT"]);
+        let dir = crate::testing::scratch_with("dupdbtv-collide-notes", &["SAMPLE.DAT"]);
         let mut f = Fixture::rooted(dir);
         open(&mut f, "SAMPLE.DAT", 64);
 

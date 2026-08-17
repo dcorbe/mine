@@ -479,16 +479,6 @@ fn shut_down<A: Abi>(
             who.0
         ),
     }
-
-    // `MAJORBBS.C:5628-5646` -- the module sweep above is `finsup()`, and
-    // `dfaClose(genbb)` is three lines later, still before the process
-    // actually exits. See `Host::close_genbb`'s own doc comment for why this
-    // is the one place in this crate that call belongs, and for the three
-    // sibling `dfaClose`s (`mstbb`, `xrfbb`) this host does not implement.
-    if let Err(e) = host.close_genbb(machine) {
-        eprintln!("mbbs-server: shutdown[m{}]: closing WGSGEN2.DAT: {e}", who.0);
-    }
-
     report_notes(host);
 }
 
