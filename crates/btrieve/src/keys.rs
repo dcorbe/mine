@@ -416,6 +416,39 @@ impl Key {
 /// `WCCBANKS` has one key of two segments and `WCCITOWN` has two keys and three
 /// segments between them.
 ///
+/// Whether any key of this file collates through an alternate sequence.
+///
+/// The gate a caller uses to decide whether locating the file's tables is
+/// worth any I/O at all -- and the *only* sound gate, because the control
+/// record's own pointer at `FCR+0x10a` is a v6 field: `CLASSADS.DAT` and
+/// `EMAIL.DAT` read zero there while genuinely holding a block. See
+/// [`crate::acs`] for that measurement.
+///
+/// Follows `ANOSEG` exactly as [`parse`] does rather than scanning every
+/// definition slot, because slots past the file's last key hold bytes that
+/// belong to no key and may have anything in them.
+#[must_use]
+pub fn declares_alt_collating(fcr: &[u8], count: u16) -> bool {
+    let mut keys = 0usize;
+    let mut definitions = 0usize;
+    while keys < usize::from(count) && definitions < SEGMAX {
+        let start = BASE + definitions * WIDTH;
+        let Some(definition) = fcr.get(start..start + WIDTH) else {
+            return false;
+        };
+        definitions += 1;
+        let attributes =
+            u16::from_le_bytes([definition[at::ATTRIBUTES], definition[at::ATTRIBUTES + 1]]);
+        if attributes & flag::ALT_COLLATING != 0 {
+            return true;
+        }
+        if attributes & flag::ANOSEG == 0 {
+            keys += 1;
+        }
+    }
+    false
+}
+
 /// `tables` is every alternate collating sequence the file carries, in page
 /// order, and empty when it has none. A key flagged as collating through one
 /// is bound to it here; see the binding rule below for why more than one is

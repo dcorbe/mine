@@ -550,6 +550,59 @@ fn read_at(path: &Path, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Every alternate collating sequence `path` carries, in page order.
+///
+/// Empty when no key of the file declares one, which is the overwhelmingly
+/// common case and costs no I/O to establish -- the gate is a walk of the key
+/// definitions already in `fcr`, not a read.
+///
+/// One function rather than two so that [`Btrieve::open`] and
+/// [`census::verdict`] cannot drift: the census exists to predict what `open`
+/// will do, and a second copy of this search is a second thing to be wrong.
+///
+/// # Errors
+///
+/// If a page cannot be read, or a v6 page tagged as holding a block does not
+/// hold one.
+fn acs_tables(
+    path: &Path,
+    geometry: &Geometry,
+    fcr: &[u8],
+) -> Result<Vec<std::sync::Arc<acs::Acs>>, String> {
+    if !keys::declares_alt_collating(fcr, geometry.keys) {
+        return Ok(Vec::new());
+    }
+
+    let page = usize::from(geometry.page);
+    let mut found = Vec::new();
+    match geometry.version {
+        // v6 tags the page, so the blocks are found by type and there may be
+        // more than one -- `MULTIACS.DAT` has two.
+        Version::V6 => {
+            for p in 0..geometry.pages as usize {
+                let bytes = read_at(path, p * page, page)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if acs::is_acs_page(&bytes) {
+                    found.push(std::sync::Arc::new(acs::decode(&bytes)?));
+                }
+            }
+        }
+        // A v5 page carries no type byte, so there is nothing to scan for and
+        // the block is at a fixed page instead. A page that does not decode
+        // leaves `found` empty and `keys::parse` refuses the file, which is the
+        // right answer for a file that declares a sequence it does not hold.
+        Version::V5 => {
+            let at = acs::V5_PAGE as usize * page;
+            let bytes =
+                read_at(path, at, page).map_err(|e| format!("{}: {e}", path.display()))?;
+            if let Ok(table) = acs::decode(&bytes) {
+                found.push(std::sync::Arc::new(table));
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Bytes of `struct btvblk`, and where each field of it sits.
 ///
 /// `BTVSTF.H:17`, with the `PHARLAP` fields -- which `WCCMMUD.DLL` is built
@@ -2723,7 +2776,12 @@ impl<M: Mem> Btrieve<M> {
         // `opnbtv` does. A file whose keys cannot be read is refused here, not
         // at whatever much later moment something first searches by one.
         let fcr = read_head(path, FCR).map_err(|e| format!("{}: {e}", path.display()))?;
-        let parsed = keys::parse(name, &fcr, geometry.keys, &[]).map_err(|e| e.why)?;
+        // The control record says only *that* a key collates through an
+        // alternate sequence; the table is on another page, so a file that uses
+        // one costs a second read here. Files that do not -- 425 of the 470 the
+        // census swept -- pay nothing for this.
+        let tables = acs_tables(path, &geometry, &fcr)?;
+        let parsed = keys::parse(name, &fcr, geometry.keys, &tables).map_err(|e| e.why)?;
 
         // `PLBTVSTF.C:148` -- `bb->filnam=alcmem(strlen(filnam)+1)`. The
         // module's, not the host's: `clsbtv` frees it.
@@ -6846,6 +6904,119 @@ mod tests {
         assert!(
             model.is_none_or(|records| records.is_empty()),
             "the insert this test never got to keep was rolled back"
+        );
+    }
+
+    /// A corpus file, or `None` when `archive/` is not populated here.
+    fn corpus(relative: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative);
+        path.exists().then_some(path)
+    }
+
+    /// The case B1 exists to close, end to end on a real **v6** file: one
+    /// table, found by page type, reaching the key that declares it.
+    #[test]
+    fn a_v6_file_with_one_table_opens_and_its_key_carries_it() {
+        let Some(path) = corpus("archive/tooling/wbtrv32/assets/WGSMENU2.DAT") else {
+            eprintln!("skipped: archive/ not populated in this checkout");
+            return;
+        };
+        let geometry = Geometry::read("WGSMENU2.DAT", &path).expect("a v6 header");
+        assert_eq!(geometry.version, Version::V6);
+        let fcr = read_head(&path, FCR).expect("a control record");
+        assert!(
+            keys::declares_alt_collating(&fcr, geometry.keys),
+            "this file has an ACS-flagged key"
+        );
+
+        let tables = acs_tables(&path, &geometry, &fcr).expect("a locatable table");
+        assert_eq!(tables.len(), 1, "WGSMENU2.DAT carries one table, GALCAPS");
+        assert_eq!(&tables[0].name, b"GALCAPS ");
+
+        let parsed =
+            keys::parse("WGSMENU2.DAT", &fcr, geometry.keys, &tables).expect("one table binds");
+        assert!(
+            parsed.iter().any(|k| k.acs.is_some()),
+            "the table must reach the key, not merely be read"
+        );
+    }
+
+    /// The same, on a real **v5** file -- which has no `'A'`-typed page to scan
+    /// for and reads zero at `FCR+0x10a`. A search gated on the engine's own v6
+    /// predicate would find nothing here, and 13 of the 45 corpus files that
+    /// declare a sequence are v5.
+    #[test]
+    fn a_v5_file_holds_its_table_on_page_one_and_still_opens() {
+        let Some(path) = corpus("archive/galacticomm/hosts/majorbbs/CLASSADS.DAT") else {
+            eprintln!("skipped: archive/ not populated in this checkout");
+            return;
+        };
+        let geometry = Geometry::read("CLASSADS.DAT", &path).expect("a v5 header");
+        assert_eq!(geometry.version, Version::V5);
+        let fcr = read_head(&path, FCR).expect("a control record");
+        assert!(
+            !acs::declared(&fcr),
+            "the v6 pointer reads zero here -- gating on it would miss this file"
+        );
+
+        let tables = acs_tables(&path, &geometry, &fcr).expect("page 1 holds the block");
+        assert_eq!(tables.len(), 1, "CLASSADS.DAT carries UPPER on page 1");
+        assert_eq!(&tables[0].name, b"UPPER   ");
+        assert_eq!(tables[0].fold(b'a'), b'A');
+
+        let parsed =
+            keys::parse("CLASSADS.DAT", &fcr, geometry.keys, &tables).expect("one table binds");
+        assert!(
+            parsed.iter().any(|k| k.acs.is_some()),
+            "the table must reach the key"
+        );
+    }
+
+    /// The multi-table case this phase deliberately does not support: two
+    /// tables and no measured way to say which key uses which, so it is refused
+    /// rather than guessed. `MULTIACS.DAT` is the only corpus file here.
+    #[test]
+    fn a_multi_table_file_is_refused_until_the_per_key_number_is_measured() {
+        let Some(path) = corpus("archive/tooling/wbtrv32/assets/MULTIACS.DAT") else {
+            eprintln!("skipped: archive/ not populated in this checkout");
+            return;
+        };
+        let geometry = Geometry::read("MULTIACS.DAT", &path).expect("a v6 header");
+        let fcr = read_head(&path, FCR).expect("a control record");
+
+        let tables = acs_tables(&path, &geometry, &fcr).expect("two locatable tables");
+        assert_eq!(tables.len(), 2, "MULTIACS.DAT carries ALLCAPS and LOWER");
+        assert_ne!(
+            tables[0].table, tables[1].table,
+            "they are different sequences, not one block read twice"
+        );
+
+        let e = keys::parse("MULTIACS.DAT", &fcr, geometry.keys, &tables)
+            .expect_err("two tables: the per-key sequence number is not yet measured");
+        assert!(e.why.contains("more than one"), "{}", e.why);
+    }
+
+    /// A file no key of which declares a sequence must cost no page reads at
+    /// all -- the gate is the point, since the v6 search is a whole-file scan.
+    #[test]
+    fn a_file_without_an_alternate_key_locates_nothing() {
+        let Some(path) = corpus("archive/tooling/wbtrv32/assets/GALTELA.DAT") else {
+            eprintln!("skipped: archive/ not populated in this checkout");
+            return;
+        };
+        let geometry = Geometry::read("GALTELA.DAT", &path).expect("a header");
+        // GALTELA.DAT *does* declare one, so the inverse is what needs showing:
+        // a control record whose key definitions are blank declares nothing, and
+        // must short-circuit before a single page is read.
+        let plain = vec![0u8; FCR];
+        assert!(!keys::declares_alt_collating(&plain, geometry.keys));
+        assert!(
+            acs_tables(&path, &geometry, &plain)
+                .expect("no search happens")
+                .is_empty(),
+            "an unflagged file must locate nothing"
         );
     }
 }
