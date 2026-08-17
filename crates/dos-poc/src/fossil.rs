@@ -70,7 +70,7 @@ const CHAR_NOT_AVAILABLE: u16 = 0xffff;
 
 /// What became of one `int 14h`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Serviced {
+pub enum Answer {
     /// Answered. Registers are set.
     Done,
     /// Answered, but nothing moved -- the door asked for a byte that has not
@@ -166,15 +166,45 @@ fn status(uart: &Uart) -> u16 {
     s
 }
 
+/// The FOSSIL driver as a service.
+pub struct Fossil {
+    pub uart: Uart,
+    pub info: Info,
+}
+
+impl Fossil {
+    pub fn new(uart: Uart) -> Self {
+        Self { uart, info: Info::default() }
+    }
+}
+
+impl<G: Guest> dos::service::Service<G> for Fossil {
+    fn claims(&self) -> &[u8] {
+        &[0x14]
+    }
+
+    fn service(&mut self, vector: u8, g: &mut G) -> dos::service::Serviced {
+        use dos::service::Serviced;
+
+        let ah = g.regs().ah();
+        match dispatch(g, &mut self.uart, &self.info) {
+            Ok(Answer::Done) => Serviced::Continue,
+            Ok(Answer::Yield) => Serviced::Yield(std::time::Duration::from_millis(1)),
+            Ok(Answer::Unsupported(_)) => Serviced::Unclaimed { vector, ah },
+            Err(f) => Serviced::Fault(f),
+        }
+    }
+}
+
 /// Answer one `int 14h`.
 pub fn dispatch(
     guest: &mut impl Guest,
     uart: &mut Uart,
     info: &Info,
-) -> Result<Serviced, Fault> {
+) -> Result<Answer, Fault> {
     let mut regs = guest.regs();
     let func = regs.ah();
-    let mut serviced = Serviced::Done;
+    let mut serviced = Answer::Done;
 
     match func {
         // Set baud rate. We do not re-clock the line: the far end is a socket
@@ -198,7 +228,7 @@ pub fn dispatch(
             Some(byte) => regs.ax = u16::from(byte),
             None => {
                 regs.ax = LINE_TIMEOUT;
-                serviced = Serviced::Yield;
+                serviced = Answer::Yield;
             }
         },
 
@@ -257,7 +287,7 @@ pub fn dispatch(
                 regs.ax = 1;
             } else {
                 regs.ax = 0;
-                serviced = Serviced::Yield;
+                serviced = Answer::Yield;
             }
         }
 
@@ -266,7 +296,7 @@ pub fn dispatch(
             Some(byte) => regs.ax = u16::from(byte),
             None => {
                 regs.ax = CHAR_NOT_AVAILABLE;
-                serviced = Serviced::Yield;
+                serviced = Answer::Yield;
             }
         },
 
@@ -298,7 +328,7 @@ pub fn dispatch(
             }
             regs.ax = u16::try_from(buf.len()).unwrap_or(u16::MAX);
             if buf.is_empty() {
-                serviced = Serviced::Yield;
+                serviced = Answer::Yield;
             }
         }
 
@@ -325,7 +355,7 @@ pub fn dispatch(
             regs.ax = u16::try_from(n).unwrap_or(0);
         }
 
-        other => return Ok(Serviced::Unsupported(other)),
+        other => return Ok(Answer::Unsupported(other)),
     }
 
     guest.set_regs(regs);
@@ -342,7 +372,7 @@ mod tests {
         (TestGuest::new(1 << 20), Uart::new(Some(0)))
     }
 
-    fn call(guest: &mut TestGuest, uart: &mut Uart, ax: u16) -> Serviced {
+    fn call(guest: &mut TestGuest, uart: &mut Uart, ax: u16) -> Answer {
         let mut r = guest.regs();
         r.ax = ax;
         guest.set_regs(r);
@@ -352,7 +382,7 @@ mod tests {
     #[test]
     fn init_answers_with_the_signature_lord_checks_for() {
         let (mut g, mut u) = setup();
-        assert_eq!(call(&mut g, &mut u, 0x0400), Serviced::Done);
+        assert_eq!(call(&mut g, &mut u, 0x0400), Answer::Done);
         // Written out rather than compared against `SIGNATURE`, deliberately.
         // This is not our constant to choose: LORD does `cmp ax,0x1954 / jnz
         // fail`, so the literal here is the other half of a contract with a
@@ -390,7 +420,7 @@ mod tests {
     fn receive_returns_the_character_in_al() {
         let (mut g, mut u) = setup();
         u.receive(b'Z');
-        assert_eq!(call(&mut g, &mut u, 0x0200), Serviced::Done);
+        assert_eq!(call(&mut g, &mut u, 0x0200), Answer::Done);
         assert_eq!(g.regs().al(), b'Z', "LORD reads this straight out of AL");
     }
 
@@ -402,11 +432,11 @@ mod tests {
         // at 5.3 seconds of a 16.5 second session. An idle door says so via
         // `int 15h AH=10` instead, which the caller already honours.
         let (mut g, mut u) = setup();
-        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "empty buffer");
+        assert_eq!(call(&mut g, &mut u, 0x0300), Answer::Done, "empty buffer");
         u.send(b'x');
-        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "mid-transmit");
+        assert_eq!(call(&mut g, &mut u, 0x0300), Answer::Done, "mid-transmit");
         u.receive(b'y');
-        assert_eq!(call(&mut g, &mut u, 0x0300), Serviced::Done, "input waiting");
+        assert_eq!(call(&mut g, &mut u, 0x0300), Answer::Done, "input waiting");
     }
 
     #[test]
@@ -414,7 +444,7 @@ mod tests {
         let (mut g, mut u) = setup();
         assert_eq!(
             call(&mut g, &mut u, 0x0200),
-            Serviced::Yield,
+            Answer::Yield,
             "an empty buffer must not spin the host"
         );
         assert_eq!(g.regs().ax, LINE_TIMEOUT);
@@ -431,7 +461,7 @@ mod tests {
     #[test]
     fn peek_does_not_consume_and_says_so_when_empty() {
         let (mut g, mut u) = setup();
-        assert_eq!(call(&mut g, &mut u, 0x0c00), Serviced::Yield);
+        assert_eq!(call(&mut g, &mut u, 0x0c00), Answer::Yield);
         assert_eq!(g.regs().ax, CHAR_NOT_AVAILABLE);
         u.receive(b'q');
         call(&mut g, &mut u, 0x0c00);
@@ -524,9 +554,54 @@ mod tests {
         let before = g.regs();
         assert_eq!(
             dispatch(&mut g, &mut u, &Info::default()).unwrap(),
-            Serviced::Unsupported(0x7e)
+            Answer::Unsupported(0x7e)
         );
         assert_eq!(g.regs(), before, "registers untouched so the gap is visible");
+    }
+
+    #[test]
+    fn fossil_claims_only_int_14h() {
+        use dos::service::Service;
+
+        let f = Fossil::new(Uart::new(None));
+        assert_eq!(Service::<TestGuest>::claims(&f), &[0x14]);
+    }
+
+    #[test]
+    fn receive_with_an_empty_buffer_yields_one_millisecond_through_the_service() {
+        // The mirror of the AH=03 test above: AH=02 (receive) with nothing
+        // queued is the case that IS supposed to yield, and the Service
+        // adapter must pass that through rather than swallowing it.
+        use dos::service::{Service, Serviced};
+        use dos::testguest::TestGuest;
+
+        let mut f = Fossil::new(Uart::new(None));
+        let mut g = TestGuest::new(64 * 1024);
+        let mut regs = g.regs();
+        regs.ax = 0x0200;
+        g.set_regs(regs);
+
+        assert_eq!(
+            f.service(0x14, &mut g),
+            Serviced::Yield(std::time::Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn a_status_poll_never_yields_however_empty_the_buffer_is() {
+        // The regression 7dadb5f fixed: AH=03 asks whether there is room to
+        // TRANSMIT. Treating an empty receive buffer as idleness put a 1 ms sleep
+        // between output characters and cost 13.6 of 16.5 seconds of wall clock.
+        use dos::service::{Service, Serviced};
+        use dos::testguest::TestGuest;
+
+        let mut f = Fossil::new(Uart::new(None));
+        let mut g = TestGuest::new(64 * 1024);
+        let mut regs = g.regs();
+        regs.ax = 0x0300;
+        g.set_regs(regs);
+
+        assert_eq!(f.service(0x14, &mut g), Serviced::Continue);
     }
 
     #[test]
@@ -537,7 +612,7 @@ mod tests {
         for func in [0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x0a] {
             let got = call(&mut g, &mut u, u16::from(func) << 8);
             assert!(
-                !matches!(got, Serviced::Unsupported(_)),
+                !matches!(got, Answer::Unsupported(_)),
                 "LORD calls int 14h AH={func:02X} and we must answer it"
             );
         }

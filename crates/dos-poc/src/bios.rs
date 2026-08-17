@@ -526,6 +526,52 @@ pub fn int15<G: Guest>(g: &mut G) -> Option<std::time::Duration> {
     }
 }
 
+/// The BIOS as a service: video and the timeslice calls.
+///
+/// No `keyboard` field. `int 16h`'s `bool` does not mean "should I sleep" --
+/// on a blocking read it drives a settle protocol involving the screen, the
+/// driver script and the run statistics, none of which a `Service` has. So
+/// `int 16h` is not serviced here, and `Keyboard` stays where that protocol
+/// lives -- in the runtime's loop.
+#[derive(Default)]
+pub struct Bios {
+    pub video: Video,
+}
+
+impl<G: Guest> dos::service::Service<G> for Bios {
+    fn claims(&self) -> &[u8] {
+        // Not 0x16 -- its handling is a driver settle protocol, not a service
+        // call (screen snapshot, driver script, run statistics), and it stays
+        // in the runtime's loop, verbatim.
+        &[0x10, 0x15]
+    }
+
+    fn service(&mut self, vector: u8, g: &mut G) -> dos::service::Serviced {
+        use dos::service::Serviced;
+
+        let ah = g.regs().ah();
+        match vector {
+            0x10 => {
+                if !int10_implemented(ah) {
+                    return Serviced::Unclaimed { vector, ah };
+                }
+                int10(g, &mut self.video);
+                Serviced::Continue
+            }
+            // `int15` returns Some(duration) for the two calls it models
+            // (AH=10 timeslice, AH=86 wait) and None for everything else.
+            // None is Unclaimed: the service does not model it. Whether this
+            // vector's unmodelled calls get reported is the runtime's policy,
+            // not this function's.
+            0x15 => match int15(g) {
+                Some(d) => Serviced::Yield(d),
+                None => Serviced::Unclaimed { vector, ah },
+            },
+            _ => Serviced::Unclaimed { vector, ah },
+        }
+    }
+}
+
 /// Which `int 10h` functions [`int10`] actually services.
 pub fn int10_implemented(ah: u8) -> bool {
     matches!(
@@ -576,4 +622,67 @@ pub fn missing(vector: u8, ah: u8) -> Option<&'static str> {
         _ => return None,
     };
     Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bios_claims_video_and_the_timeslice_call_but_not_the_keyboard() {
+        // int 16h deliberately stays out: its bool does not mean "should I
+        // sleep", it drives a settle protocol (screen snapshot, driver
+        // script, run statistics) that lives in the runtime's loop, not in a
+        // Service. Claiming it here would silently swallow that protocol.
+        use dos::service::Service;
+        use dos::testguest::TestGuest;
+
+        let b = Bios::default();
+        assert_eq!(Service::<TestGuest>::claims(&b), &[0x10, 0x15]);
+    }
+
+    #[test]
+    fn int15_ah10_yields_one_millisecond_and_ah86_yields_its_capped_request() {
+        use dos::service::{Service, Serviced};
+        use dos::testguest::TestGuest;
+
+        let mut b = Bios::default();
+        let mut g = TestGuest::new(64 * 1024);
+
+        let mut regs = g.regs();
+        regs.ax = 0x1000;
+        g.set_regs(regs);
+        assert_eq!(
+            b.service(0x15, &mut g),
+            Serviced::Yield(std::time::Duration::from_millis(1))
+        );
+
+        // AH=86 waits CX:DX microseconds, capped at 50 ms.
+        let mut regs = g.regs();
+        regs.ax = 0x8600;
+        regs.cx = 0xffff;
+        regs.dx = 0xffff;
+        g.set_regs(regs);
+        assert_eq!(
+            b.service(0x15, &mut g),
+            Serviced::Yield(std::time::Duration::from_micros(50_000))
+        );
+    }
+
+    #[test]
+    fn an_int15_function_we_do_not_model_is_unclaimed_not_a_yield() {
+        use dos::service::{Service, Serviced};
+        use dos::testguest::TestGuest;
+
+        let mut b = Bios::default();
+        let mut g = TestGuest::new(64 * 1024);
+        let mut regs = g.regs();
+        regs.ax = 0xc000;
+        g.set_regs(regs);
+
+        assert_eq!(
+            b.service(0x15, &mut g),
+            Serviced::Unclaimed { vector: 0x15, ah: 0xc0 }
+        );
+    }
 }

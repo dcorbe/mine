@@ -449,8 +449,8 @@ fn main() -> io::Result<()> {
                         // Same treatment as a bad pointer into a DOS call: stop
                         // and say so, rather than move bytes somewhere else.
                         Err(fault) => break format!("bad guest pointer in int 14h: {fault:?}"),
-                        Ok(fossil::Serviced::Done) => {}
-                        Ok(fossil::Serviced::Yield) => {
+                        Ok(fossil::Answer::Done) => {}
+                        Ok(fossil::Answer::Yield) => {
                             // The door asked for input that has not arrived.
                             // Sleeping hands the core back until the top of the
                             // loop can pump the socket; returning immediately
@@ -459,7 +459,7 @@ fn main() -> io::Result<()> {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             slept += before.elapsed();
                         }
-                        Ok(fossil::Serviced::Unsupported(func)) => {
+                        Ok(fossil::Answer::Unsupported(func)) => {
                             *gaps
                                 .entry(format!("int 14h AH={func:02X}  FOSSIL function"))
                                 .or_insert(0) += 1;
