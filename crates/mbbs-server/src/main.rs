@@ -119,20 +119,34 @@ const DEFAULT_PASSES: usize = 32;
 #[derive(Parser, Debug)]
 #[command(name = "mbbs-server", about = "a tokio edge in front of one or more MajorBBS-family modules")]
 struct Cli {
-    /// The board directory (holds the module's own data files)
+    /// The board directory (holds the module's own data files).
+    ///
+    /// Required only when a `Wg16` machine actually boots -- that is,
+    /// whenever `--module` is non-empty, or both `--module` and `--module32`
+    /// are empty (the default-module fallback, see `--module`'s own doc
+    /// comment). A `--module32`-only board, with no `Wg16` machine at all,
+    /// need not give this. [`plan`] is what checks this, not clap: whether
+    /// `--root` is required depends on what *else* was given, which clap's
+    /// own `required`/`requires` cannot express.
     #[arg(long)]
-    root: PathBuf,
+    root: Option<PathBuf>,
 
-    /// The module to load onto the `Wg16` machine. Repeatable: give it more
+    /// The module(s) to load onto a `Wg16` machine. Repeatable: give it more
     /// than once to boot more than one module, in dependency order --
     /// `mbbs_server::host::Boot`'s own doc, "Booting N modules", is the full
     /// contract. The first one given is the one every connecting channel
     /// enters (`Host::connect`'s `first_module()`); anything after it is an
     /// addon, loaded and initialised so its own exports are reachable and its
     /// own imports can resolve against the module before it, but never
-    /// dispatched a channel directly. One `--module` with no others, the
-    /// default, is exactly this binary's original single-module behaviour.
-    #[arg(long, default_value = DEFAULT_MODULE)]
+    /// dispatched a channel directly.
+    ///
+    /// Left empty, [`plan`] decides what happens from `--module32`: given,
+    /// this board boots `Wg32` *only* -- no `Wg16` machine exists at all, so
+    /// there is nothing for `--module`'s default to name. Absent too, `plan`
+    /// falls back to `DEFAULT_MODULE`, exactly this binary's original
+    /// single-module behaviour -- deliberate backward compatibility, so
+    /// `mbbs-server --root tmp` keeps booting MajorMUD unchanged.
+    #[arg(long)]
     module: Vec<PathBuf>,
 
     /// Address to bind for a modern client: CP437 transcoded to UTF-8, and
@@ -177,14 +191,20 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     survey_unimplemented_and_corrupt_the_session: Option<PathBuf>,
 
-    /// A second, 32-bit machine to boot alongside the primary `Wg16` one
-    /// (LunatiX, design doc §4a). When given, a connect-time selector
-    /// appears -- see `mbbs_server::conn`'s module doc, "The connect-time
-    /// selector" -- naming this machine `LunatiX` and the always-present one
-    /// `MajorMUD`. When absent, this binary behaves exactly as it did before
-    /// this flag existed: no prompt, one machine. Requires `--root32`, since
-    /// this machine's own data files must not share a directory with the
-    /// primary machine's.
+    /// A second, 32-bit machine to boot -- alongside a primary `Wg16` one
+    /// when `--module` is also given (or falls back to its default), or
+    /// *alone*, with no `Wg16` machine at all, when `--module` is empty
+    /// (LunatiX, design doc §4a). When two machines boot, a connect-time
+    /// selector appears -- see `mbbs_server::conn`'s module doc, "The
+    /// connect-time selector" -- naming this machine `LunatiX` and the other
+    /// `MajorMUD`. When absent entirely, this binary behaves exactly as it
+    /// did before this flag existed: no prompt, one `Wg16` machine.
+    ///
+    /// Requires `--root32`, since this machine's own data files must not
+    /// share a directory with the primary machine's -- but that is [`plan`]'s
+    /// check, not clap's: giving `--module32` without `--root32` is a named,
+    /// explicit `Err` from `plan`, not a `requires`-attribute parse failure,
+    /// so the decision stays in the one place all of it is testable.
     ///
     /// Repeatable in the same shape `--module` is, for CLI uniformity --
     /// `mbbs::Host<Wg32>` has no architectural objection to more than one
@@ -198,7 +218,7 @@ struct Cli {
     /// module (LunatiX has no known addon) exists to prove multi-module Wg32
     /// boot against, and extending `Memory::replace_image` to append rather
     /// than replace is `mbbs-machine`'s call to make, not this binary's.
-    #[arg(long, requires = "root32", value_name = "PATH")]
+    #[arg(long, value_name = "PATH")]
     module32: Vec<PathBuf>,
 
     /// The 32-bit module's own board directory -- only meaningful together
@@ -312,6 +332,113 @@ fn check_module32_count(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// A `Wg16` machine's own boot parameters, as decided by [`plan`].
+#[derive(Debug, PartialEq, Eq)]
+struct Wg16Plan {
+    /// Always `MachineId(0)` -- see [`Plan`]'s own doc comment on why this is
+    /// fixed rather than computed from which machines happen to be present.
+    machine: MachineId,
+    modules: Vec<PathBuf>,
+    root: PathBuf,
+}
+
+/// A `Wg32` machine's own boot parameters, as decided by [`plan`].
+#[derive(Debug, PartialEq, Eq)]
+struct Wg32Plan {
+    /// Always `MachineId(1)`, even when no `Wg16` machine boots alongside it
+    /// -- see [`Plan`]'s own doc comment.
+    machine: MachineId,
+    module: PathBuf,
+    root: PathBuf,
+}
+
+/// Which machines a given command line asks for -- the pure decision `main`
+/// turns into `Boot<Wg16>`/`Boot<Wg32>` values and spawns from. Building this
+/// never touches a filesystem or spawns a thread; that is deliberate, so the
+/// boot decision itself is unit-testable, which is how the bug this replaced
+/// (`--module32` without `--root32` silently booting a `Wg16`-only board, no
+/// warning) went unnoticed: the decision used to live inline in `main`,
+/// which no test can reach.
+///
+/// Each present machine carries its own fixed `MachineId` (`Wg16Plan`'s and
+/// `Wg32Plan`'s own doc comments) -- `MachineId(1)` for `Wg32` even when
+/// `wg16` is `None`, never renumbered down to close the gap.
+#[derive(Debug, PartialEq, Eq)]
+struct Plan {
+    wg16: Option<Wg16Plan>,
+    wg32: Option<Wg32Plan>,
+}
+
+/// Decide which machines a command line boots, and with what. Three rules:
+///
+/// 1. `--module` given (one or more) -- boot `Wg16` with those. Requires
+///    `--root`.
+/// 2. `--module` empty **and** `--module32` given -- no `Wg16` machine at
+///    all. `Wg32` only.
+/// 3. Both empty -- boot `Wg16` with [`DEFAULT_MODULE`], exactly as this
+///    binary has always done. Requires `--root`. This is deliberate backward
+///    compatibility: `mbbs-server --root tmp` must keep booting MajorMUD
+///    unchanged, so the default cannot simply be removed.
+///
+/// Every rejection is a plain, named `Err(String)` -- never a panic, and
+/// never a silent no-op the way the `if let (Some(a), Some(b))` pattern this
+/// replaced was: `--module32` without `--root32` used to fall through that
+/// `if let` and boot a `Wg16`-only board with no message at all, despite
+/// `--root32`'s own doc comment calling itself required.
+///
+/// `MachineId(0)` for `Wg16` and `MachineId(1)` for `Wg32` are assigned here,
+/// fixed, never computed from presence: `pool.rs`'s module doc explains that
+/// a `Chan`'s id tag is what keeps two boards' channel zeros distinguishable
+/// process-wide, so a `Wg32`-only board must keep `MachineId(1)` rather than
+/// being renumbered down to `0` just because no `Wg16` machine sits at that
+/// slot this time.
+fn plan(cli: &Cli) -> Result<Plan, String> {
+    check_module32_count(cli)?;
+
+    let wg32 = match (cli.module32.first().cloned(), cli.root32.clone()) {
+        (Some(module), Some(root)) => Some(Wg32Plan { machine: MachineId(1), module, root }),
+        (Some(_), None) => {
+            return Err(
+                "--module32 was given but --root32 was not -- a Wg32 machine's own board \
+                 directory must never share a directory with another machine's (see \
+                 --root32's own doc comment)"
+                    .to_string(),
+            );
+        }
+        (None, _) => None,
+    };
+
+    let modules = if !cli.module.is_empty() {
+        Some(cli.module.clone())
+    } else if wg32.is_none() {
+        // Rule 3: both empty, fall back to the default -- but only when no
+        // Wg32 machine is picking up the board instead (rule 2).
+        Some(vec![PathBuf::from(DEFAULT_MODULE)])
+    } else {
+        None
+    };
+
+    let wg16 = match modules {
+        Some(modules) => {
+            let root = cli.root.clone().ok_or_else(|| {
+                "--root is required to boot a Wg16 machine (give --module32 alone, with no \
+                 --module, to boot a Wg32-only board instead)"
+                    .to_string()
+            })?;
+            Some(Wg16Plan { machine: MachineId(0), modules, root })
+        }
+        None => None,
+    };
+
+    if wg16.is_none() && wg32.is_none() {
+        // Defensive: rule 3's fallback should make this unreachable, since
+        // it only yields `None` when `wg32` is `Some`.
+        return Err("no machines to boot".to_string());
+    }
+
+    Ok(Plan { wg16, wg32 })
+}
+
 /// Build [`Boot::build`]'s closure for a `Wg32` machine: read `module_path`'s
 /// bytes, parse them as a PE, and build a placeholder [`Wg32Cpu`] -- a
 /// [`mbbs_machine::m32::Machine`] plus a [`mbbs_machine::m32::Memory`]
@@ -373,10 +500,20 @@ async fn main() -> ExitCode {
         );
     }
 
-    // This CLI always boots `Wg16` -- `re/WCCMMUD.DLL`'s own ABI -- and
-    // optionally a second, `Wg32` machine when `--module32` is given
-    // (LunatiX, design doc §4a). `conn::spawn_machine` is generic over
-    // `A: Abi` since Task 20 of
+    // `plan` is the one place that decides which machines this command line
+    // boots -- see its own doc comment for the three rules. Everything past
+    // this point just builds from the result; the decision itself never
+    // spawns a thread or touches a filesystem, which is what makes it
+    // testable at all.
+    let plan = match plan(&cli) {
+        Ok(plan) => plan,
+        Err(msg) => {
+            eprintln!("mbbs-server: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // `conn::spawn_machine` is generic over `A: Abi` since Task 20 of
     // `docs/plans/2026-08-12-abi-border-implementation.md`; each call spawns
     // its own dedicated thread that builds its own `A::Cpu` *on* that thread
     // (`Boot::build`, called from `host::life` -- never here, since `A::Cpu`
@@ -389,44 +526,41 @@ async fn main() -> ExitCode {
     // placeholders: every `Chan` a machine's `Pool` hands out is tagged with
     // its own id (`pool.rs`), and that tag is what keeps the two boards'
     // channel zeros distinguishable process-wide. See `mbbs_server::pool`'s
-    // module doc.
-    let boot: Boot<Wg16> = Boot {
-        machine: MachineId(0),
-        build: Box::new(mbbs_machine::m16::Machine::new),
-        root: cli.root.clone(),
-        modules: cli.module.clone(),
-        terms,
-        bturno: cli.bturno.clone(),
-        polls_per_wake: cli.polls_per_wake,
-        passes: cli.passes,
-        clock_reads: None,
-        wake_age_ms: None,
-        dispatched_total: None,
-        calls_total: None,
-        survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
-    };
+    // module doc. The ids stay fixed per ABI even when `Wg16` is absent --
+    // `MachineId(1)` for a `Wg32`-only board, never renumbered down to `0` --
+    // so a board's channels stay distinguishable in logs and artifacts
+    // regardless of which machines happen to be present.
+    let mut machines = Vec::new();
 
-    let mut machines = vec![Machine {
-        id: MachineId(0),
-        label: WG16_LABEL.to_string(),
-        tx: conn::spawn_machine(boot),
-    }];
-
-    // `--module32` is repeatable for surface uniformity with `--module` (see
-    // its own doc comment), but `Wg32::load`'s wholesale `replace_image`
-    // cannot host a second module without discarding the first -- so more
-    // than one value here is refused, loudly, before anything is built.
-    if let Err(msg) = check_module32_count(&cli) {
-        eprintln!("mbbs-server: {msg}");
-        return ExitCode::FAILURE;
+    if let Some(wg16) = plan.wg16 {
+        let boot: Boot<Wg16> = Boot {
+            machine: wg16.machine,
+            build: Box::new(mbbs_machine::m16::Machine::new),
+            root: wg16.root,
+            modules: wg16.modules,
+            terms,
+            bturno: cli.bturno.clone(),
+            polls_per_wake: cli.polls_per_wake,
+            passes: cli.passes,
+            clock_reads: None,
+            wake_age_ms: None,
+            dispatched_total: None,
+            calls_total: None,
+            survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
+        };
+        machines.push(Machine {
+            id: wg16.machine,
+            label: WG16_LABEL.to_string(),
+            tx: conn::spawn_machine(boot),
+        });
     }
 
-    if let (Some(module32), Some(root32)) = (cli.module32.first().cloned(), cli.root32.clone()) {
+    if let Some(wg32) = plan.wg32 {
         let boot32: Boot<Wg32> = Boot {
-            machine: MachineId(1),
-            build: Box::new(build_wg32_cpu(module32.clone())),
-            root: root32,
-            modules: vec![module32],
+            machine: wg32.machine,
+            build: Box::new(build_wg32_cpu(wg32.module.clone())),
+            root: wg32.root,
+            modules: vec![wg32.module],
             terms,
             bturno: cli.bturno32.clone().or_else(|| cli.bturno.clone()),
             polls_per_wake: cli.polls_per_wake,
@@ -438,7 +572,7 @@ async fn main() -> ExitCode {
             survey: cli.survey_unimplemented_and_corrupt_the_session.clone(),
         };
         machines.push(Machine {
-            id: MachineId(1),
+            id: wg32.machine,
             label: WG32_LABEL.to_string(),
             tx: conn::spawn_machine(boot32),
         });
@@ -556,7 +690,10 @@ async fn shut_down_machines(machines: &[(String, std::sync::mpsc::Sender<In>)], 
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, check_module32_count, listeners};
+    use super::{
+        Cli, DEFAULT_MODULE, DEFAULT_PASSES, DEFAULT_POLLS_PER_WAKE, MachineId,
+        check_module32_count, listeners, plan,
+    };
 
     fn args<'a>(v: &[&'a str]) -> Vec<&'a str> {
         let mut a = vec!["mbbs-server"];
@@ -608,13 +745,15 @@ mod tests {
         );
     }
 
-    /// The only required flag is `--root`; everything else takes the
-    /// documented default.
+    /// `--root` alone parses cleanly and everything else takes its documented
+    /// default; `--module` no longer carries a clap-level default (that
+    /// fallback moved into `plan`, see `no_module_flags_falls_back_to_the_default_module`
+    /// below), so it parses as empty here.
     #[test]
     fn defaults_are_applied_when_only_root_is_given() {
         let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
-        assert_eq!(cli.root, std::path::PathBuf::from("tmp"));
-        assert_eq!(cli.module, vec![std::path::PathBuf::from("re/WCCMMUD.DLL")]);
+        assert_eq!(cli.root, Some(std::path::PathBuf::from("tmp")));
+        assert!(cli.module.is_empty(), "--module's default now lives in plan(), not clap");
         assert_eq!(cli.listen, vec!["127.0.0.1:2323".to_string()]);
         assert!(cli.listen_raw.is_empty(), "no default period port -- opt in with --listen-raw");
         assert_eq!(cli.terms, 2);
@@ -708,28 +847,28 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 
-    /// No `--root` at all is a clear error, not a silent default.
+    /// `--root` is no longer a clap-level required flag -- parsing succeeds
+    /// with it absent, since whether it is actually needed depends on
+    /// whether a `Wg16` machine ends up booting at all, which only `plan`
+    /// knows.
     #[test]
-    fn missing_root_is_an_error() {
-        let err = Cli::try_parse_from(args(&["--terms", "2"])).unwrap_err();
-        assert!(err.to_string().contains("--root"), "error should name the missing flag: {err}");
+    fn root_is_optional_at_the_parse_layer() {
+        let cli = Cli::try_parse_from(args(&["--terms", "2"])).expect("parses");
+        assert_eq!(cli.root, None);
     }
 
-    /// `--module32` without `--root32` is refused by clap's own `requires`
-    /// enforcement, not left to `main` to notice at boot -- two machines
-    /// sharing one root would silently corrupt one module's Btrieve files
-    /// with the other's (see `--root32`'s own doc comment).
+    /// `--module32` without `--root32` still parses cleanly at the clap
+    /// layer -- the `requires` attribute was removed in favour of `plan`'s
+    /// own check, below, which is what `main` actually consults, and which
+    /// is where a mutation to this rule would need to be caught.
     #[test]
-    fn module32_without_root32_is_an_error() {
-        let err = Cli::try_parse_from(args(&[
-            "--root",
-            "tmp",
-            "--module32",
-            "LUNATIX.EXE",
-        ]))
-        .unwrap_err();
+    fn module32_without_root32_parses_but_plan_refuses_it() {
+        let cli =
+            Cli::try_parse_from(args(&["--root", "tmp", "--module32", "LUNATIX.EXE"]))
+                .expect("parses; --root32's absence is plan's problem, not clap's");
+        let err = plan(&cli).expect_err("plan must refuse --module32 without --root32");
         assert!(
-            err.to_string().contains("root32"),
+            err.contains("--root32"),
             "error should name the flag that is missing: {err}"
         );
     }
@@ -754,6 +893,138 @@ mod tests {
         .expect("parses");
         assert_eq!(cli.module32, vec![std::path::PathBuf::from("LUNATIX.EXE")]);
         assert_eq!(cli.root32, Some(std::path::PathBuf::from("tmp32")));
+    }
+
+    /// Rule 2: `--module32`/`--root32` given, `--module` empty -- `plan`
+    /// boots `Wg32` only. No `Wg16` machine at all, and no `--root` needed
+    /// for one that never boots.
+    #[test]
+    fn module32_alone_boots_wg32_only() {
+        let cli = Cli::try_parse_from(args(&[
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses; --root is not required when no Wg16 machine boots");
+        let plan = plan(&cli).expect("a Wg32-only board is a valid plan");
+
+        assert!(plan.wg16.is_none(), "no --module and no default fallback: no Wg16 machine");
+        let wg32 = plan.wg32.expect("--module32 + --root32 were given");
+        assert_eq!(wg32.machine, MachineId(1));
+        assert_eq!(wg32.module, std::path::PathBuf::from("LUNATIX.EXE"));
+        assert_eq!(wg32.root, std::path::PathBuf::from("tmp32"));
+    }
+
+    /// Rule 3: no module flags at all -- `plan` falls back to
+    /// `DEFAULT_MODULE`, the same single-module behaviour this binary has
+    /// always had. This is the backward-compatibility case: `mbbs-server
+    /// --root tmp` must keep booting MajorMUD unchanged.
+    #[test]
+    fn no_module_flags_falls_back_to_the_default_module() {
+        let cli = Cli::try_parse_from(args(&["--root", "tmp"])).expect("parses");
+        let plan = plan(&cli).expect("the default module fills in when both are empty");
+
+        let wg16 = plan.wg16.expect("the default-module fallback boots a Wg16 machine");
+        assert_eq!(wg16.machine, MachineId(0));
+        assert_eq!(wg16.modules, vec![std::path::PathBuf::from(DEFAULT_MODULE)]);
+        assert_eq!(wg16.root, std::path::PathBuf::from("tmp"));
+        assert!(plan.wg32.is_none(), "no --module32 was given");
+    }
+
+    /// Rule 1: `--module` given -- `plan` boots `Wg16` with exactly those
+    /// modules, and no `Wg32` machine, since `--module32` was not given.
+    #[test]
+    fn explicit_module_boots_wg16_with_no_wg32() {
+        let cli = Cli::try_parse_from(args(&["--module", "A", "--root", "R"])).expect("parses");
+        let plan = plan(&cli).expect("an explicit module with --root is a valid plan");
+
+        let wg16 = plan.wg16.expect("--module was given");
+        assert_eq!(wg16.machine, MachineId(0));
+        assert_eq!(wg16.modules, vec![std::path::PathBuf::from("A")]);
+        assert_eq!(wg16.root, std::path::PathBuf::from("R"));
+        assert!(plan.wg32.is_none(), "no --module32 was given");
+    }
+
+    /// `--module32` without `--root32` is a named `Err` from `plan`, not a
+    /// silent skip -- the bug the old `if let (Some(a), Some(b))` pattern in
+    /// `main` had, where a Wg32 machine that could not be built simply
+    /// vanished with no message.
+    #[test]
+    fn module32_without_root32_is_a_named_plan_error() {
+        let cli = Cli::try_parse_from(args(&["--root", "tmp", "--module32", "LUNATIX.EXE"]))
+            .expect("parses at the clap layer; plan is what refuses it");
+        let err = plan(&cli).expect_err("--module32 without --root32 must be refused");
+        assert!(err.contains("--root32"), "error should name the missing flag: {err}");
+    }
+
+    /// `plan` defers to `check_module32_count` rather than duplicating its
+    /// own count check -- two `--module32` values must still be refused when
+    /// reached through `plan`, not just when `check_module32_count` is
+    /// called directly.
+    #[test]
+    fn plan_refuses_more_than_one_module32_via_check_module32_count() {
+        let cli = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module32",
+            "LUNATIX.EXE",
+            "--module32",
+            "SECOND.DLL",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        let err = plan(&cli).expect_err("two --module32 values must be refused");
+        assert!(err.contains("--module32"), "error should name the flag: {err}");
+    }
+
+    /// A `Wg16` machine that would boot (the default-module fallback, here)
+    /// with `--root` absent is a named `Err` from `plan`, not a panic and not
+    /// a boot with an empty root path.
+    #[test]
+    fn wg16_boot_without_root_is_a_named_plan_error() {
+        let cli = Cli::try_parse_from(args(&[])).expect("parses; --root is optional at the clap layer");
+        let err = plan(&cli).expect_err("the default module wants to boot Wg16, which needs --root");
+        assert!(err.contains("--root"), "error should name the missing flag: {err}");
+    }
+
+    /// `MachineId`s stay fixed per ABI: `Wg32` is always `MachineId(1)`, even
+    /// on a board with no `Wg16` machine at all -- `pool.rs`'s module doc
+    /// explains why renumbering by presence would make a `Wg32`-only board's
+    /// channels indistinguishable, in logs and artifacts, from a paired
+    /// board's `Wg16` channels.
+    #[test]
+    fn machine_ids_stay_fixed_per_abi_even_when_wg16_is_absent() {
+        let paired = Cli::try_parse_from(args(&[
+            "--root",
+            "tmp",
+            "--module",
+            "A",
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        let paired_plan = plan(&paired).expect("both an explicit module and --module32 is valid");
+        assert_eq!(paired_plan.wg16.expect("--module was given").machine, MachineId(0));
+        assert_eq!(paired_plan.wg32.expect("--module32 was given").machine, MachineId(1));
+
+        let wg32_only = Cli::try_parse_from(args(&[
+            "--module32",
+            "LUNATIX.EXE",
+            "--root32",
+            "tmp32",
+        ]))
+        .expect("parses");
+        let wg32_only_plan = plan(&wg32_only).expect("a Wg32-only board is a valid plan");
+        assert!(wg32_only_plan.wg16.is_none());
+        assert_eq!(
+            wg32_only_plan.wg32.expect("--module32 was given").machine,
+            MachineId(1),
+            "Wg32 keeps MachineId(1) even with no Wg16 machine to share the id space with"
+        );
     }
 
     /// `--module` is repeatable, and in the order given -- load order is the
