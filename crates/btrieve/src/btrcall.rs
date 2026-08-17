@@ -504,6 +504,13 @@ fn insert<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Sta
 /// of [`crate::ops::Block::current`]. No record positioned is real Btrieve
 /// status 8, the same status [`OpError::NotPositioned`] and
 /// [`OpError::NoKeyEstablished`] already answer with in [`status_of`].
+///
+/// Before writing, this checks
+/// [`crate::Block::would_change_unmodifiable_key`] the same way genuine
+/// Btrieve does -- refuse before touching the file -- and answers status 10
+/// rather than falling through to [`crate::Block::update`]'s stringly-typed
+/// [`crate::BtvError`], which this dispatcher has no way to distinguish from
+/// any other update refusal.
 fn update<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Status, Gap> {
     let at = handle_of::<M>(call.posblk);
     let index = session.find(at).map_err(|why| Gap { what: why })?;
@@ -511,8 +518,19 @@ fn update<M: Mem>(session: &mut crate::Btrieve<M>, call: Call<'_>) -> Result<Sta
         return Ok(Status(8));
     };
     let len = usize::try_from(*call.datalen).unwrap_or(0).min(call.databuf.len());
+    let bytes = &call.databuf[..len];
 
-    match session.open[index].update(position, &call.databuf[..len]) {
+    match session.open[index].would_change_unmodifiable_key(position, bytes) {
+        Ok(Some(_key)) => return Ok(Status(10)),
+        Ok(None) => {}
+        Err(why) => {
+            return Err(Gap {
+                what: format!("checking key modifiability before update: {why}"),
+            })
+        }
+    }
+
+    match session.open[index].update(position, bytes) {
         Ok(()) => Ok(Status::OK),
         Err(why) => Err(Gap {
             what: format!("updating: {why}"),
@@ -1022,6 +1040,195 @@ mod tests {
         )
         .expect("Get Equal is modelled");
         assert_eq!(status, Status(9), "the deleted record is gone");
+    }
+
+    /// Task 7b: real Btrieve refuses an update that would change a key that
+    /// does not declare itself modifiable, with status 10 -- and this has to
+    /// be an `Ok`, not the `Gap` a caller can't tell apart from any other
+    /// hole in the engine. `scratch_file`'s one key is already declared
+    /// `modifiable: false`, so an update that moves it is exactly the
+    /// condition `wccmmutl.exe -recover`'s op 3 against `WCCMP002.DAT` hit.
+    #[test]
+    fn an_update_that_moves_a_non_modifiable_key_answers_status_ten() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("update-moves-unmodifiable-key");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        // Insert (op 2): key 42, payload [1, 2, 3, 4].
+        let mut databuf = vec![42, 0, 0, 0, 1, 2, 3, 4];
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+
+        // Get Equal (op 5) by key 42 establishes currency for the Update.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+
+        // Update (op 3): key 42 -> 99. The engine detects this exactly
+        // (`Block::would_change_unmodifiable_key`); the dispatcher must
+        // answer a real status, not a Gap.
+        let mut databuf = vec![99, 0, 0, 0, 1, 2, 3, 4];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 3,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("a key-field update is a modelled refusal, not a Gap");
+        assert_eq!(status, Status(10), "the key field is not modifiable");
+
+        // And the record was not touched: key 42 still answers, key 99
+        // still does not.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK, "a refused update writes nothing");
+        assert_eq!(databuf, vec![42, 0, 0, 0, 1, 2, 3, 4], "the record is unchanged");
+    }
+
+    /// The boundary a naive "did the record change" check gets wrong:
+    /// rewriting a non-modifiable key with the same value it already holds,
+    /// while changing the rest of the record, is allowed --
+    /// `Block::unmodifiable_key_changed`'s doc comment at `lib.rs:1235`
+    /// records this as measured against genuine Btrieve 6.15. If the op-3
+    /// dispatch arm checked "does this update touch the key bytes at all"
+    /// instead of "does it change the key's *value*", this would wrongly
+    /// answer status 10.
+    #[test]
+    fn an_update_that_rewrites_the_key_with_its_own_value_still_succeeds() {
+        let mut mem = FlatMem::new(64 * 1024);
+        let mut heap = FlatHeap::new(0x100);
+        let mut session: Btrieve<Flat> = Btrieve::default();
+        let path = scratch_file("update-key-unchanged-still-succeeds");
+        let mut posblk = open_scratch(&mut session, &mut mem, &mut heap, &path);
+
+        // Insert (op 2): key 42, payload [1, 2, 3, 4].
+        let mut databuf = vec![42, 0, 0, 0, 1, 2, 3, 4];
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 2,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Insert is modelled");
+
+        // Get Equal (op 5) by key 42 establishes currency for the Update.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+
+        // Update (op 3): key stays 42, payload changes to [9, 9, 9, 9].
+        let mut databuf = vec![42, 0, 0, 0, 9, 9, 9, 9];
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 3,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut 8,
+                keybuf: &mut Vec::new(),
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Update is modelled");
+        assert_eq!(status, Status::OK, "touching the key without changing its value is allowed");
+
+        // Get Equal again: the payload update landed.
+        let mut databuf = vec![0u8; 8];
+        let mut datalen = 8u32;
+        let status = btrcall(
+            &mut session,
+            &mut mem,
+            &mut heap,
+            Call {
+                op: 5,
+                posblk: &mut posblk,
+                databuf: &mut databuf,
+                datalen: &mut datalen,
+                keybuf: &mut vec![42, 0, 0, 0],
+                keylen: 255,
+                keynum: 0,
+            },
+        )
+        .expect("Get Equal is modelled");
+        assert_eq!(status, Status::OK);
+        assert_eq!(databuf, vec![42, 0, 0, 0, 9, 9, 9, 9], "the payload update landed");
     }
 
     /// Step First, Step Next, Step Next past the end -- `step_op` proven

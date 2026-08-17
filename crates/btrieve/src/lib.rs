@@ -1244,6 +1244,41 @@ impl<M: Mem> Block<M> {
             .map(|key| key.number)
     }
 
+    /// Whether calling [`Self::update`] with `bytes` at `position` would
+    /// refuse because it changes a key that does not declare itself
+    /// modifiable, without writing anything.
+    ///
+    /// A read-only mirror of the check [`Self::update`] runs internally
+    /// (`:2096`), exposed so a caller that must answer with a *status* --
+    /// `btrcall`'s op 3, which real Btrieve answers with status 10 rather
+    /// than a driver-level error -- can consult the same predicate before
+    /// calling `update`, instead of parsing [`BtvError::why`]'s prose. Kept
+    /// as a thin wrapper rather than a change to `update`'s return type: see
+    /// the task 7b brief for why a typed [`BtvError`] would ripple into
+    /// `mbbs`'s six-thousand-line BTVSTF shims.
+    ///
+    /// Answers `None` -- not a refusal -- when `position` names no known
+    /// record. `update` itself is what turns that into status 8 or a "holds
+    /// no record" gap; this predicate only ever answers the one question its
+    /// name asks.
+    ///
+    /// # Errors
+    ///
+    /// If the file's records cannot be loaded.
+    pub fn would_change_unmodifiable_key(
+        &mut self,
+        position: u32,
+        bytes: &[u8],
+    ) -> Result<Option<u16>, BtvError> {
+        self.records()?;
+        let records = self.records.as_ref().expect("just loaded");
+        let Some(at) = records.find_physical(position) else {
+            return Ok(None);
+        };
+        let existing = records.physical(at).expect("just found").bytes.clone();
+        Ok(self.unmodifiable_key_changed(&existing, bytes))
+    }
+
     /// Put `bytes` in the slot the free list's head names, and answer with
     /// that slot's position and the list's new head.
     ///
