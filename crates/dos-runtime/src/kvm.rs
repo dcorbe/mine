@@ -25,11 +25,81 @@ pub const TRAP_PORT: u16 = 0xe6;
 /// userspace when there is no in-kernel irqchip, whereas an unclaimed port is
 /// unconditional. `al` is written to a port whose data we discard, so the stub
 /// clobbers no guest register at all.
-/// Four bytes per vector, not three, so that the vector a trap came from is
-/// `(rip - 2) / STUB_STRIDE` -- the disambiguation-by-address the design note
-/// describes, made into arithmetic instead of a lookup.
+/// Four bytes per vector, not three -- the fourth is dead padding to
+/// [`STUB_STRIDE`], kept so every vector's stub occupies the same width. The
+/// vector a trap came from is recovered from the `out`'s own address by
+/// [`vector_from_offset`], the disambiguation-by-address the design note
+/// describes; see [`stub_offset`] for why that is not simply `rip /
+/// STUB_STRIDE` for every vector.
 const STUB: [u8; 4] = [0xe6, TRAP_PORT as u8, 0xcf, 0x90];
 const STUB_STRIDE: u16 = 4;
+
+/// `int 7Bh` -- the vector Galacticomm's own Btrieve presence probe reads.
+///
+/// `re/wg33src/SRC/api/gcommlib/DFAAPI.C:921-931`:
+/// That is `int 21h AH=35h` (get interrupt vector) for vector `0x7B`, and it
+/// requires the returned *offset* (`BX`) to be `0x33`: the Btrieve TSR's
+/// signature. A vendor DOS utility measured under this runtime
+/// (`WCCMMUTL.EXE`, see `docs/2026-08-17-dos-btrieve-edge-parked.md`) aborts
+/// in Borland RTL startup before ever reaching this probe -- `--watch 0x1ec`
+/// (`4 * BTRIEVE_VECTOR`, the vector's IVT address) never fires. So this is
+/// built from Galacticomm's source, not from an observed probe.
+const BTRIEVE_VECTOR: u8 = 0x7b;
+
+/// The offset `DFAAPI.C:925` requires `int 7Bh` to read back as.
+const BTRIEVE_STUB_OFFSET: u16 = 0x33;
+
+/// One past the last byte of the `0x7B` stub -- the reserved window no other
+/// vector's stub may occupy.
+const BTRIEVE_STUB_END: u16 = BTRIEVE_STUB_OFFSET + STUB.len() as u16;
+
+/// Where vector `v`'s trap stub lives inside the stub segment.
+///
+/// Every vector but [`BTRIEVE_VECTOR`] is packed at [`STUB_STRIDE`]
+/// intervals from zero, in vector order -- the original uniform layout.
+/// [`BTRIEVE_VECTOR`] is the one exception: `DFAAPI.C:925` requires its
+/// offset to be exactly [`BTRIEVE_STUB_OFFSET`] (`0x33`), which is not
+/// stride-aligned, so it cannot live at its "natural" slot. Rather than
+/// special-case the vector that reads it (`int 21h AH=35h`) to report an
+/// address nothing occupies, the vector table stays honest: the packing run
+/// hops over `[BTRIEVE_STUB_OFFSET, BTRIEVE_STUB_END)` -- reserved for
+/// `0x7B`'s own stub -- and does not consume a slot for `0x7B` itself, which
+/// is seated in that reserved window directly.
+///
+/// This is a pure function of `v` alone (no shared allocator state), so a
+/// lone [`VmGuest::hook`] call agrees with what [`VmGuest::hook_all`] would
+/// have placed there.
+fn stub_offset(vector: u8) -> u16 {
+    if vector == BTRIEVE_VECTOR {
+        return BTRIEVE_STUB_OFFSET;
+    }
+    let mut cursor: u16 = 0;
+    for v in 0..=u8::MAX {
+        if v == BTRIEVE_VECTOR {
+            continue;
+        }
+        if cursor < BTRIEVE_STUB_END && cursor + STUB_STRIDE > BTRIEVE_STUB_OFFSET {
+            cursor = BTRIEVE_STUB_END;
+        }
+        if v == vector {
+            return cursor;
+        }
+        cursor += STUB_STRIDE;
+    }
+    unreachable!("the loop above visits every u8, including `vector`")
+}
+
+/// The inverse of [`stub_offset`]: which vector's stub sits at `offset`.
+///
+/// Traps are disambiguated by the address the guest's `out` executed from,
+/// so decoding a trap is finding whichever vector [`stub_offset`] would place
+/// there. 256 candidates, checked once per trap -- not the hot path (that is
+/// the KVM round trip itself, measured at 3.33 us).
+fn vector_from_offset(offset: u16) -> u8 {
+    (0..=u8::MAX)
+        .find(|&v| stub_offset(v) == offset)
+        .unwrap_or_else(|| panic!("no hooked vector's stub lives at offset {offset:#06x}"))
+}
 
 const KVM_GET_API_VERSION: libc::c_ulong = 0xae00;
 const KVM_CREATE_VM: libc::c_ulong = 0xae01;
@@ -385,8 +455,13 @@ impl VmGuest {
     }
 
     /// Install the trap stub for `vector` and point the IVT at it.
+    ///
+    /// Every vector but [`BTRIEVE_VECTOR`] lands at its uniform
+    /// [`STUB_STRIDE`] slot; that one is seated at [`BTRIEVE_STUB_OFFSET`]
+    /// because `int 21h AH=35h` -- Galacticomm's Btrieve presence probe --
+    /// reads it back and rejects anything else. See [`stub_offset`].
     pub fn hook(&mut self, vector: u8, stub_seg: u16) -> io::Result<()> {
-        let off = u16::from(vector) * STUB_STRIDE;
+        let off = stub_offset(vector);
         self.load(stub_seg as usize * 16 + off as usize, &STUB)?;
         self.stub_seg = stub_seg;
         self.set_ivt(vector, stub_seg, off)
@@ -533,10 +608,10 @@ impl VmGuest {
                         return last_err();
                     }
                     // KVM leaves `rip` at the `out` on an I/O exit rather
-                    // than past it, so do not "correct" for the instruction
-                    // length: with a 4-byte stride, integer division lands on
-                    // the right vector whether rip is at the `out` or after it.
-                    Ok(Stop::Trap((self.regs.rip as u16 / STUB_STRIDE) as u8))
+                    // than past it -- exactly the address `stub_offset`
+                    // assigned that vector's stub, which `vector_from_offset`
+                    // inverts.
+                    Ok(Stop::Trap(vector_from_offset(self.regs.rip as u16)))
                 }
                 KVM_EXIT_IO => {
                     // SAFETY: `run` is a live mapping of at least `run_size`.
@@ -936,5 +1011,73 @@ impl Drop for VmGuest {
             libc::close(self.vm);
             libc::close(self.kvm);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stub segment matching `runexe.rs`'s `STUB_SEG` -- any unused
+    /// paragraph works, this just keeps the test's memory picture familiar.
+    const STUB_SEG: u16 = 0x0060;
+
+    /// Galacticomm's own Btrieve probe reads the `int 7Bh` vector and
+    /// requires its offset to be `0x33` -- `DFAAPI.C:921-931` rejects
+    /// anything else with "BTRIEVE must be running before this program can
+    /// run!". So the stub for that one vector is placed at that offset, and
+    /// the vector table says what is actually there. The alternative --
+    /// special-casing `int 21h AH=35h` to report an address nothing occupies
+    /// -- would be a host lying in its own vector table to a program that
+    /// then jumps through it.
+    #[test]
+    fn the_btrieve_vector_is_where_btrieve_is_expected_to_be() {
+        let mut vm = VmGuest::new(1 << 20).expect("open /dev/kvm and map guest memory");
+        vm.hook_all(STUB_SEG).expect("hook every vector");
+
+        // Read the IVT the way the guest would: little-endian offset, then
+        // segment, at physical `4 * vector`.
+        let at = 4 * 0x7b;
+        let mem = vm.mem_ref();
+        let offset = u16::from_le_bytes([mem[at], mem[at + 1]]);
+
+        assert_eq!(offset, 0x33, "DFAAPI.C:925 rejects any other offset");
+    }
+
+    /// The other 255 vectors must still resolve to a real stub -- hooking
+    /// `0x7B` out of the uniform layout must not leave a neighbour pointing
+    /// at nothing, or silently aliasing another vector's stub.
+    #[test]
+    fn every_other_vector_still_hooks_to_a_distinct_stub() {
+        let mut vm = VmGuest::new(1 << 20).expect("open /dev/kvm and map guest memory");
+        vm.hook_all(STUB_SEG).expect("hook every vector");
+
+        let mem_ref = vm.mem_ref();
+        let mut offsets = std::collections::BTreeMap::new();
+        for vector in 0..=u8::MAX {
+            let at = 4 * vector as usize;
+            let off = u16::from_le_bytes([mem_ref[at], mem_ref[at + 1]]);
+            let seg = u16::from_le_bytes([mem_ref[at + 2], mem_ref[at + 3]]);
+            assert_eq!(seg, STUB_SEG, "vector {vector:#04x} must point at the stub segment");
+            // Every vector's stub must actually be `out TRAP_PORT, al; iret`
+            // at the offset its IVT entry claims.
+            let stub_at = STUB_SEG as usize * 16 + off as usize;
+            assert_eq!(
+                &mem_ref[stub_at..stub_at + 3],
+                &STUB[0..3],
+                "vector {vector:#04x}'s IVT entry points at dead bytes, not its stub"
+            );
+            if let Some(prev) = offsets.insert(off, vector) {
+                panic!(
+                    "vectors {prev:#04x} and {vector:#04x} alias the same stub offset {off:#06x}"
+                );
+            }
+        }
+
+        // Spot-check one concrete vector far from 0x7B's neighbourhood: int
+        // 14h (the serial BIOS), heavily exercised by the rest of the suite.
+        let at = 4 * 0x14;
+        let off = u16::from_le_bytes([mem_ref[at], mem_ref[at + 1]]);
+        assert_ne!(off, 0x33, "int 14h must not have been bumped onto 0x7B's slot");
     }
 }
