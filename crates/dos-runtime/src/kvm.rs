@@ -69,25 +69,47 @@ const BTRIEVE_STUB_END: u16 = BTRIEVE_STUB_OFFSET + STUB.len() as u16;
 /// This is a pure function of `v` alone (no shared allocator state), so a
 /// lone [`VmGuest::hook`] call agrees with what [`VmGuest::hook_all`] would
 /// have placed there.
-fn stub_offset(vector: u8) -> u16 {
+///
+/// A `while` loop, not a `for` over a range, so this can be `const fn`:
+/// [`STUB_TABLE_BYTES`] below calls it at compile time, which is what turns
+/// "did the reserved window grow the table past where the next thing in the
+/// segment starts?" from a fact someone has to remember and recompute by
+/// hand into one a stale downstream constant fails to compile against.
+const fn stub_offset(vector: u8) -> u16 {
     if vector == BTRIEVE_VECTOR {
         return BTRIEVE_STUB_OFFSET;
     }
     let mut cursor: u16 = 0;
-    for v in 0..=u8::MAX {
-        if v == BTRIEVE_VECTOR {
-            continue;
+    let mut v: u16 = 0;
+    while v <= u8::MAX as u16 {
+        let this = v as u8;
+        if this != BTRIEVE_VECTOR {
+            if cursor < BTRIEVE_STUB_END && cursor + STUB_STRIDE > BTRIEVE_STUB_OFFSET {
+                cursor = BTRIEVE_STUB_END;
+            }
+            if this == vector {
+                return cursor;
+            }
+            cursor += STUB_STRIDE;
         }
-        if cursor < BTRIEVE_STUB_END && cursor + STUB_STRIDE > BTRIEVE_STUB_OFFSET {
-            cursor = BTRIEVE_STUB_END;
-        }
-        if v == vector {
-            return cursor;
-        }
-        cursor += STUB_STRIDE;
+        v += 1;
     }
-    unreachable!("the loop above visits every u8, including `vector`")
+    panic!("the loop above visits every u8, including `vector`")
 }
+
+/// Total bytes [`VmGuest::hook_all`] fills in a stub segment, from offset 0
+/// through the end of vector `0xFF`'s stub -- the high-water mark, since
+/// `stub_offset`'s cursor is monotonically non-decreasing in vector order and
+/// `0xFF` is the last vector it places.
+///
+/// Anything else sharing that segment (an environment block, a loaded
+/// program image) must start at or after this many bytes past the segment's
+/// base. This is 3 bytes more than the old uniform `256 * STUB_STRIDE`
+/// (`0x400`) invariant some callers were sized against by hand: the
+/// `[BTRIEVE_STUB_OFFSET, BTRIEVE_STUB_END)` reservation is not
+/// `STUB_STRIDE`-aligned, so packing 255 ordinary vectors around it costs a
+/// few bytes of padding that the old arithmetic never had to pay.
+pub const STUB_TABLE_BYTES: u16 = stub_offset(0xff) + STUB.len() as u16;
 
 /// The inverse of [`stub_offset`]: which vector's stub sits at `offset`.
 ///

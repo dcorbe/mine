@@ -42,13 +42,31 @@ use dos_runtime::win32;
 
 /// 1 MiB: the whole real-mode address space.
 const MEM: usize = 1 << 20;
-/// Above the BIOS data area. 256 vectors x 4 bytes occupies 0x600..0xa00, so
-/// the environment block below must start past that.
+/// Above the BIOS data area. `hook_all` fills `dos_runtime::kvm::
+/// STUB_TABLE_BYTES` bytes from here -- not a plain `256 * 4`, because
+/// vector `0x7B`'s stub sits at a fixed, non-stride-aligned offset (see
+/// `kvm::stub_offset`) -- so the environment block below must start past
+/// that many bytes, checked below rather than restated by hand.
 const STUB_SEG: u16 = 0x0060;
-const ENV_SEG: u16 = 0x00a0;
+/// One paragraph past the end of the stub table's actual high-water mark
+/// (`0x600 + STUB_TABLE_BYTES` = physical `0xa03`; `0xa10` is the next
+/// paragraph boundary), not the round `0xa0` an old, now-false 1024-byte
+/// assumption used -- that placement let `hook_all`'s last stub (vector
+/// `0xFF`) get silently overwritten by this segment's own load.
+const ENV_SEG: u16 = 0x00a1;
 /// Leaves ~576 KiB for the program, which is more than a 1994 config utility
 /// was ever going to see.
 const PSP_SEG: u16 = 0x1000;
+
+/// The stub table and the environment block share one segment's worth of
+/// low memory; if a future change to the table's packing (or to either
+/// segment) lets them overlap again, this must fail to compile rather than
+/// silently corrupt vector `0xFF`'s stub on every run, the way the old
+/// hand-picked `ENV_SEG` did.
+const _: () = assert!(
+    (ENV_SEG as u32) * 16 >= (STUB_SEG as u32) * 16 + dos_runtime::kvm::STUB_TABLE_BYTES as u32,
+    "ENV_SEG must start at or after the stub table hook_all fills"
+);
 
 /// Stop rather than spin if the program loops on a call we keep refusing.
 const MAX_CALLS: u32 = 2000;
@@ -1367,6 +1385,92 @@ mod tests {
     #[test]
     fn a_dropfile_that_is_not_there_yields_nothing() {
         assert_eq!(dropfile_baud("/nonexistent/DOOR.SYS"), None);
+    }
+
+    /// What `main` actually does, in order: `hook_all`, then load the
+    /// environment block at `ENV_SEG`. A review caught that the old
+    /// `ENV_SEG` (`0x00a0`) was sized against a false "256 vectors * 4
+    /// bytes = 0x400" invariant -- `hook_all`'s real high-water mark is
+    /// `dos_runtime::kvm::STUB_TABLE_BYTES` (`0x403`), 3 bytes more, because
+    /// vector `0x7B`'s stub sits at a non-stride-aligned offset. The old
+    /// `ENV_SEG` load silently overwrote 3 of vector `0xFF`'s 4 stub bytes
+    /// -- the `TRAP_PORT` operand, the `iret`, and the padding -- on every
+    /// run. This is the test that would have caught it: it reads vector
+    /// `0xFF`'s actual stub bytes back out of guest memory, not just the
+    /// segment arithmetic.
+    #[test]
+    fn loading_the_real_environment_leaves_the_last_stub_intact() {
+        use dos_runtime::guest::{Guest, Ptr};
+        use dos_runtime::kvm::{STUB_TABLE_BYTES, TRAP_PORT, VmGuest};
+
+        let mut vm = VmGuest::new(super::MEM).expect("open /dev/kvm and map guest memory");
+        vm.hook_all(super::STUB_SEG).expect("hook every vector");
+
+        let env = dos_runtime::mz::environment(
+            &["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"],
+            "C:\\PROGRAM.EXE",
+        );
+        vm.load(super::ENV_SEG as usize * 16, &env)
+            .expect("load the environment block");
+
+        // Vector 0xFF is the last stub hook_all places, so its offset is
+        // STUB_TABLE_BYTES minus one stub's width.
+        let last_stub_off = STUB_TABLE_BYTES - 4;
+        let bytes = vm
+            .read(Ptr::new(super::STUB_SEG, last_stub_off), 3)
+            .expect("read vector 0xFF's stub");
+        assert_eq!(
+            bytes,
+            [0xe6, TRAP_PORT as u8, 0xcf],
+            "out TRAP_PORT,al ; iret -- vector 0xFF's stub must survive the environment load"
+        );
+    }
+
+    /// The failure the test above would have caught, reproduced directly:
+    /// loading the environment at the *old* `ENV_SEG` (`0x00a0`) does
+    /// corrupt vector `0xFF`'s stub. Kept as an executable mutation rather
+    /// than a one-off hand-edit of `super::ENV_SEG`, because that constant
+    /// is now behind a `const _: () = assert!(...)` -- setting it back to
+    /// `0x00a0` fails the *build*, not this test, which is a stronger
+    /// guarantee but means the historical failure mode needs its own
+    /// reproduction to stay checked by `cargo test` rather than only by
+    /// memory of a manual edit. (Confirmed separately, by hand: restoring
+    /// `const ENV_SEG: u16 = 0x00a0;` does not compile --
+    /// `error[E0080]: evaluation panicked: ENV_SEG must start at or after
+    /// the stub table hook_all fills`.)
+    #[test]
+    fn the_old_env_seg_would_have_clobbered_the_last_stub() {
+        use dos_runtime::guest::{Guest, Ptr};
+        use dos_runtime::kvm::{STUB_TABLE_BYTES, TRAP_PORT, VmGuest};
+
+        const OLD_ENV_SEG: u16 = 0x00a0;
+        let intact = [0xe6u8, TRAP_PORT as u8, 0xcf];
+        let last_stub_off = STUB_TABLE_BYTES - 4;
+
+        let mut vm = VmGuest::new(super::MEM).expect("open /dev/kvm and map guest memory");
+        vm.hook_all(super::STUB_SEG).expect("hook every vector");
+        let before = vm
+            .read(Ptr::new(super::STUB_SEG, last_stub_off), 3)
+            .expect("read vector 0xFF's stub")
+            .to_vec();
+        assert_eq!(before, intact, "hook_all must place an intact stub before any load");
+
+        let env = dos_runtime::mz::environment(
+            &["PATH=C:\\", "COMSPEC=C:\\COMMAND.COM"],
+            "C:\\PROGRAM.EXE",
+        );
+        vm.load(OLD_ENV_SEG as usize * 16, &env)
+            .expect("load the environment block at the old segment");
+
+        let after = vm
+            .read(Ptr::new(super::STUB_SEG, last_stub_off), 3)
+            .expect("read vector 0xFF's stub");
+        assert_ne!(
+            after, intact,
+            "the old ENV_SEG no longer reproduces the corruption -- if STUB_TABLE_BYTES or \
+             the packing changed, this test and the const assert above ENV_SEG need to move \
+             together"
+        );
     }
 }
 
