@@ -173,3 +173,58 @@ fn majormuds_message_files_are_the_size_they_were() {
         assert_eq!(file.len(), count, "{name}");
     }
 }
+
+/// **The compiler's oracle.** Every pair in [`PAIRS`] shipped a `.MSG` and the
+/// `.MCV` the real host's indexer built from it, so compiling ours and comparing
+/// bytes is a total check on the format -- layout, offsets, terminators and
+/// trailer at once. Nothing here trusts our own reader to validate our own
+/// writer.
+#[test]
+fn compiling_a_msg_reproduces_the_mcv_that_shipped_with_it() {
+    let mut checked = 0usize;
+    let mut bytes = 0usize;
+
+    for stem in PAIRS {
+        let (Ok(msg), Ok(mcv)) = (
+            std::fs::read(repo(&format!("{stem}.MSG"))),
+            std::fs::read(repo(&format!("{stem}.MCV"))),
+        ) else {
+            continue;
+        };
+
+        let name = Path::new(stem).file_name().unwrap().to_string_lossy();
+        let ours = MsgFile::parse(&name, &msg).expect("the archive's files parse");
+        let language = ours.language().unwrap_or(mbbs::mcv::DEFAULT_LANGUAGE);
+        let built = mbbs::mcv::compile(ours.messages(), language);
+
+        assert_eq!(
+            built.len(),
+            mcv.len(),
+            "{name}: compiled {} bytes, shipped {} bytes",
+            built.len(),
+            mcv.len()
+        );
+        if built != mcv {
+            let at = built
+                .iter()
+                .zip(&mcv)
+                .position(|(a, b)| a != b)
+                .expect("lengths match so a byte must differ");
+            panic!(
+                "{name}: first difference at byte {at}: compiled {:#04x}, shipped {:#04x}",
+                built[at], mcv[at]
+            );
+        }
+
+        eprintln!("{name}: {} bytes, byte for byte", built.len());
+        checked += 1;
+        bytes += built.len();
+    }
+
+    if checked == 0 {
+        eprintln!("skipped: the module archive is not present in this checkout");
+        return;
+    }
+    eprintln!("{checked} files compiled, {bytes} bytes, all identical");
+    assert!(checked >= 9, "only {checked} of {} pairs found", PAIRS.len());
+}

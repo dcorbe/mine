@@ -52,6 +52,7 @@ pub mod gsbl;
 pub mod heap;
 pub mod ifansi;
 pub mod keys;
+pub mod mcv;
 pub mod msg;
 pub mod random;
 // `pub`, not `mod`: `tests/corpus_coverage.rs` is a legitimate external

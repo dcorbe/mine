@@ -53,6 +53,12 @@ use crate::arena::Arena;
 #[derive(Debug)]
 pub struct MsgFile {
     messages: Vec<Vec<u8>>,
+    /// The `LANGUAGE` line's value, if the file declares one.
+    ///
+    /// Not a message -- it is deliberately excluded from the numbering, which is
+    /// the whole subtlety this module's header warns about -- but a `.MCV`
+    /// carries it, so [`crate::mcv`] needs it to compile one.
+    language: Option<Vec<u8>>,
 }
 
 /// Why a `.MSG` file could not be read.
@@ -124,6 +130,7 @@ impl MsgFile {
     /// [`MsgError::Unexpected`].
     pub fn parse(name: &str, bytes: &[u8]) -> Result<Self, MsgError> {
         let mut messages = Vec::new();
+        let mut language: Option<Vec<u8>> = None;
         let mut state = State::PreName;
         let mut option = Vec::new();
         let mut value = Vec::new();
@@ -183,7 +190,9 @@ impl MsgFile {
                         // admits no lower case, so a name can only ever be
                         // upper case and a tolerant compare would be a
                         // reassurance about something that cannot happen.
-                        if option != LANGUAGE {
+                        if option == LANGUAGE {
+                            language = Some(value.clone());
+                        } else {
                             messages.push(line_endings(&value));
                         }
                         option.clear();
@@ -209,7 +218,7 @@ impl MsgFile {
             previous = consumed;
         }
 
-        Ok(Self { messages })
+        Ok(Self { messages, language })
     }
 
     /// The message numbered `n`, or `None` past the end of the file.
@@ -228,6 +237,17 @@ impl MsgFile {
     }
 
     /// Every message, in order.
+    /// The `LANGUAGE` this file declares, if any.
+    ///
+    /// `None` is ordinary: MajorMUD's own three `.MSG` files carry no `LANGUAGE`
+    /// line, and every `.MCV` in the archive nonetheless records
+    /// `English/ANSI`, so a compiler substitutes that default rather than
+    /// writing an empty language list.
+    #[must_use]
+    pub fn language(&self) -> Option<&[u8]> {
+        self.language.as_deref()
+    }
+
     pub fn messages(&self) -> &[Vec<u8>] {
         &self.messages
     }
